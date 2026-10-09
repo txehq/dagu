@@ -337,6 +337,21 @@ describe('sidebar menu', () => {
     ).not.toBeInTheDocument();
   });
 
+  // The fork does not offer the licensed incident feature, so a user who
+  // may manage notifications (and would see Incidents upstream) sees no
+  // Incidents section.
+  it('does not offer the incident feature', () => {
+    renderMenu();
+
+    expect(screen.getByRole('link', { name: 'Notifications' })).toBeVisible();
+    expect(
+      screen.queryByRole('link', { name: 'Incidents' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Incidents' })
+    ).not.toBeInTheDocument();
+  });
+
   it('expands the workflows section', () => {
     renderMenu();
 

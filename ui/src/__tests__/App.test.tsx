@@ -309,19 +309,6 @@ describe('App license routing', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('keeps incident management routes behind an active license', async () => {
-    renderAt('/incidents');
-
-    await waitFor(() => {
-      expect(
-        screen.getByRole('heading', { name: 'Incident routing' })
-      ).toBeVisible();
-    });
-    expect(
-      screen.queryByRole('heading', { name: 'Incidents' })
-    ).not.toBeInTheDocument();
-  });
-
   it('does not show the local license while a remote status is pending', async () => {
     const config = makeConfig({ remoteNodes: 'local,remote' });
     config.license = {
@@ -358,10 +345,10 @@ describe('App license routing', () => {
       },
     });
 
-    renderAt('/incidents');
+    renderAt('/audit-logs');
 
     expect(
-      await screen.findByRole('heading', { name: 'Incidents' })
+      await screen.findByRole('heading', { name: 'Audit Logs' })
     ).toBeVisible();
     expect(useQueryMock).toHaveBeenCalledWith(
       '/license/status',
@@ -395,4 +382,27 @@ describe('App license routing', () => {
 
     consoleError.mockRestore();
   });
+
+  // This fork does not offer the licensed incident feature: its routes go
+  // home instead of showing the feature or a license prompt. These render
+  // the home route, so they run after the test that needs its lazy chunk to
+  // fail on first load.
+  it.each(['/incidents', '/incident-providers', '/incident-policies'])(
+    'sends %s home',
+    async (path) => {
+      renderAt(path);
+
+      await waitFor(() => {
+        expect(window.location.pathname).toBe('/');
+      });
+      for (const name of [
+        'Incidents',
+        'Incident Connections',
+        'Incident Routing',
+        'Incident routing',
+      ]) {
+        expect(screen.queryByRole('heading', { name })).not.toBeInTheDocument();
+      }
+    }
+  );
 });

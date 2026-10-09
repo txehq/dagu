@@ -70,7 +70,8 @@ test('shows activation, benefits, and deactivation on desktop and mobile', async
   await expect(
     page.getByText('Team activated. Explore your included features below.')
   ).toBeVisible();
-  await expect(page.getByText('Included', { exact: true })).toHaveCount(5);
+  // The fork does not offer incident routing, so four features are listed.
+  await expect(page.getByText('Included', { exact: true })).toHaveCount(4);
   await expect(page.getByRole('link', { name: 'Setup guide' })).toHaveAttribute(
     'href',
     'https://docs.dagu.sh/server-admin/authentication/oidc'
@@ -125,10 +126,11 @@ test('shows activation, benefits, and deactivation on desktop and mobile', async
     .getByRole('button', { name: 'Deactivate', exact: true })
     .click();
   await expect(mobileBadge).toHaveText('Community');
+  // The fork does not offer incidents: their page goes home.
   await page.goto('/incidents');
-  await expect(
-    page.getByRole('heading', { name: 'Incident routing' })
-  ).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await page.goto('/audit-logs');
+  await expect(page.getByRole('heading', { name: 'Audit logs' })).toBeVisible();
   await expect(
     page.getByRole('link', { name: 'Start free trial' })
   ).toBeVisible();
@@ -146,11 +148,12 @@ test('gives non-admins status and administrator guidance', async ({ page }) => {
     const response = await route.fetch();
     const body = await response.json();
     await route.fulfill({
-      json: { ...body, user: { ...body.user, role: 'developer' } },
+      json: { ...body, user: { ...body.user, role: 'manager' } },
     });
   });
   await loginViaUI(page, stack.auth.adminUsername, stack.auth.adminPassword);
-  await page.goto('/incidents');
+  // Audit logs are licensed and open to managers, who are not administrators.
+  await page.goto('/audit-logs');
   const guidance =
     'Ask your administrator to manage the license and available features.';
   await expect(page.getByText(guidance)).toBeVisible();
