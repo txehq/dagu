@@ -117,7 +117,7 @@ func (store *Store) retainExecution(root ir.DAGRunRef, att *Attempt, status *ir.
 			return fmt.Errorf("retain execution: copy log %s: %w", l.name, err)
 		}
 		f.Name = l.name
-		f.Final = streamFinal(l.src, status, f.Bytes)
+		f.Final = streamFinal(l.src, status, f)
 		m.Files = append(m.Files, f)
 	}
 	m.LogsFinal = len(m.Files) > 0
@@ -376,8 +376,12 @@ func insideNoLinks(base, p string) bool {
 }
 
 // streamFinal reports whether the coordinator recorded the log stream at
-// src as finished for this execution with exactly size bytes.
-func streamFinal(src string, status *ir.DAGRunStatus, size int64) bool {
+// src as finished for this execution with exactly the bytes copied: the
+// record names the execution's queue marker and attempt, and its size and
+// sha256 are those of the copy. The copy and the coordinator's writes are
+// not serialized, so only the digest proves the copy is the finished log; a
+// copy that caught a concurrent rewrite of the same length cannot match it.
+func streamFinal(src string, status *ir.DAGRunStatus, copied persis.RetainedFile) bool {
 	info, err := os.Lstat(src + finalSuffix)
 	if err != nil || !info.Mode().IsRegular() {
 		return false
@@ -390,11 +394,13 @@ func streamFinal(src string, status *ir.DAGRunStatus, size int64) bool {
 		ExecutionMarker string `json:"executionMarker"`
 		AttemptID       string `json:"attemptId"`
 		Size            int64  `json:"size"`
+		SHA256          string `json:"sha256"`
 	}
-	if json.Unmarshal(data, &rec) != nil {
+	if json.Unmarshal(data, &rec) != nil || rec.SHA256 == "" {
 		return false
 	}
-	return rec.ExecutionMarker == status.QueuedAt && rec.AttemptID == status.AttemptID && rec.Size == size
+	return rec.ExecutionMarker == status.QueuedAt && rec.AttemptID == status.AttemptID &&
+		rec.Size == copied.Bytes && rec.SHA256 == copied.SHA256
 }
 
 var unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
