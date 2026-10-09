@@ -19,6 +19,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/runtime/agentloop"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -359,6 +360,8 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 	return api.DAGRunSummary{
 		Name:               s.Name,
 		DagRunId:           s.DAGRunID,
+		AttemptId:          optionalString(s.AttemptID),
+		ExecutionRef:       runExecutionRef(s),
 		Workspace:          workspaceResponseNameFromLabelStrings(s.Labels),
 		Params:             ptrOf(s.Params),
 		ProfileName:        toRuntimeProfileName(s.ProfileName),
@@ -443,6 +446,8 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		Log:                    s.Log,
 		Name:                   s.Name,
 		Params:                 ptrOf(s.Params),
+		AttemptId:              optionalString(s.AttemptID),
+		ExecutionRef:           runExecutionRef(s),
 		DagRunId:               s.DAGRunID,
 		Workspace:              workspaceResponseNameFromLabelStrings(s.Labels),
 		Error:                  runError,
@@ -1067,4 +1072,13 @@ func authoredOutputDeclarations(declarations []ir.StepOutputDeclaration) []api.S
 		outputs = append(outputs, output)
 	}
 	return outputs
+}
+
+// runExecutionRef is the portable reference of the run's execution, or nil
+// for a status with no attempt.
+func runExecutionRef(s ir.DAGRunStatus) *string {
+	if s.AttemptID == "" {
+		return nil
+	}
+	return ptrOf(registry.ExecutionRef(s.AttemptID, s.QueuedAt))
 }

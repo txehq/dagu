@@ -81,6 +81,10 @@ type DAGRunCompareAndSwapStatusRequest struct {
 	ExpectedAttemptKey string
 	ExpectedStatus     ir.Status
 	Mutate             func(*ir.DAGRunStatus) error
+	// RetainBeforeSwap keeps an immutable copy of the latest execution (its
+	// whole status and its logs) before Mutate replaces it, when that
+	// execution has finished. A failure to retain refuses the swap.
+	RetainBeforeSwap bool
 }
 
 // DAGRunRetentionRequest describes normalized DAG-run cleanup policy.
@@ -175,6 +179,54 @@ type DAGRunCompareAndSwapOptions struct {
 	RootDAGRun ir.DAGRunRef
 	// ExpectedAttemptKey rejects an update when the persisted key differs.
 	ExpectedAttemptKey string
+	// RetainBeforeSwap keeps an immutable copy of the finished execution the
+	// swap replaces; see DAGRunCompareAndSwapStatusRequest.
+	RetainBeforeSwap bool
+}
+
+// ErrExecutionRetentionUnsupported refuses a swap that asked to retain the
+// execution it replaces from a store that cannot: history is never dropped
+// silently.
+var ErrExecutionRetentionUnsupported = errors.New("this DAG-run store cannot retain executions")
+
+// ExecutionRetainingStore is a DAGRunStore that honours RetainBeforeSwap and
+// serves the executions it retained.
+type ExecutionRetainingStore interface {
+	ListRetainedExecutions(ctx context.Context, root, dagRun ir.DAGRunRef) ([]RetainedExecution, error)
+	ReadRetainedExecutionFile(ctx context.Context, root, dagRun ir.DAGRunRef, executionRef, name string) ([]byte, error)
+}
+
+// RetainedExecution describes an immutable copy of one execution of a run,
+// taken before a queued retry replaced it.
+type RetainedExecution struct {
+	Schema    int    `json:"schema"`
+	Execution string `json:"execution"`
+	AttemptID string `json:"attempt_id"`
+	QueuedAt  string `json:"queued_at"`
+	Status    string `json:"status"`
+	// StatusComplete is true when the copied status is the execution's
+	// terminal status.
+	StatusComplete bool `json:"status_complete"`
+	// LogsFinal is true only when every log stream of the execution was
+	// proven finished before the copy; otherwise the logs may be partial.
+	LogsFinal     bool           `json:"logs_final"`
+	LogsNote      string         `json:"logs_note,omitempty"`
+	RetainedAt    time.Time      `json:"retained_at"`
+	StatusSHA256  string         `json:"status_sha256"`
+	Files         []RetainedFile `json:"files"`
+	ArtifactFiles []RetainedFile `json:"artifact_files,omitempty"`
+}
+
+// RetainedFile is a file of a retained execution: a copied log, or an
+// artifact the execution published, referenced by digest.
+type RetainedFile struct {
+	Name   string `json:"name"`
+	Bytes  int64  `json:"bytes"`
+	SHA256 string `json:"sha256"`
+	// Final is true for a log whose stream was proven finished for this
+	// execution: the coordinator's <log>.final record names the execution's
+	// queue marker and attempt and the copied size.
+	Final bool `json:"final,omitempty"`
 }
 
 // DAGRunRetentionOptions configures retention cleanup.
