@@ -1112,3 +1112,63 @@ func TestStaleProcessorStopsWhenJobAlreadyApplied(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleActive, got.Lifecycle)
 }
+
+// An unknown observation (a lookup that neither confirms nor denies the
+// resource) is recorded on each dependent and changes nothing; it cannot be
+// authoritative.
+func TestUnknownObservationChangesNothing(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-1")}
+		v.RetirementRules.OnTargetDeleted = RuleRetire
+	})
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Authoritative: true}, agent)
+	assert.Equal(t, CodeInvalid, code(t, err))
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Detail: "issue lookup returned null"}, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeRecorded, ev.Dispositions[0].Outcome)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, job.Lifecycle, got.Lifecycle, "not retired")
+	assert.Equal(t, job.Availability.State, got.Availability.State, "availability unchanged")
+}
+
+// Incomplete events are listed oldest first, by the reporter's machine when
+// asked, a page at a time; complete events are not listed.
+func TestIncompleteResourceEventsAreListed(t *testing.T) {
+	f := newFixture(t)
+	save := func(machine string, complete bool) string {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-1"), Observation: ResourceUnreachable,
+			ObservedAt: f.now, Reporter: Actor{Kind: ActorReconciler, ID: "rec", MachineID: machine}, Complete: complete}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		if !complete {
+			require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+id, indexEntry{}))
+		}
+		f.now = f.now.Add(time.Second)
+		return id
+	}
+	a1, b1, a2 := save("mch_a", false), save("mch_b", false), save("mch_a", false)
+	save("mch_a", true)
+
+	ids := func(evs []ResourceEvent) []string {
+		var out []string
+		for _, e := range evs {
+			out = append(out, e.EventID)
+		}
+		return out
+	}
+	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "mch_a", "", 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a1}, ids(page))
+	require.NotEmpty(t, next)
+	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "mch_a", next, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a2}, ids(page))
+	assert.Empty(t, next)
+	all, _, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 10)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a1, b1, a2}, ids(all))
+}

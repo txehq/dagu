@@ -258,6 +258,14 @@ func TestProposalClosures(t *testing.T) {
 	closures, err := f.store.ListClosures(f.ctx, job.JobID, 0)
 	require.NoError(t, err)
 	assert.Len(t, closures, 2, "every attempt is kept")
+
+	// The other task's run ended before anyone answered: that ends it too.
+	ended, err := record(other.ProposalID, ClosureRunEnded)
+	require.NoError(t, err)
+	assert.Equal(t, ClosureRunEnded, ended.Outcome)
+	pending, err = f.store.PendingClosures(f.ctx, f.machine, 0, nil)
+	require.NoError(t, err)
+	assert.Empty(t, pending)
 }
 
 // Repeated observations of one condition keep one unresolved exception, for
@@ -585,4 +593,42 @@ func TestSettledIntentsAreDropped(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Empty(t, got.Intents)
+}
+
+// A decided retry whose run moved on can never be executed: it is
+// superseded (by the registry, when the grant is refused or a new retry is
+// requested) instead of waiting in the decision queue forever. A decided
+// retry that still binds, and one being executed, are left alone.
+func TestDecidedRetriesWhoseRunMovedOnAreEnded(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	r.rc.attempts["run-2"] = failedAttempt("b1", r.job.DAGSpecSHA256)
+	p1, _, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	p2, _, err := r.propose(r.params("run-2", "b1"), "key-2")
+	require.NoError(t, err)
+
+	affected, err := r.f.store.EndMovedOnRetries(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.Empty(t, affected, "both still bind")
+
+	// Run 1 moved on without this decision.
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+	affected, err = r.f.store.EndMovedOnRetries(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, []Affected{{ProposalID: p1.ProposalID, Disposition: DispositionSuperseded}}, affected)
+	got, err := r.f.store.GetJob(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.NotContains(t, got.Proposals, p1.ProposalID, "it left the decision queue")
+	archived, err := r.f.store.ListArchivedProposals(r.f.ctx, r.job.JobID, 0)
+	require.NoError(t, err)
+	require.Len(t, archived, 1)
+	assert.Equal(t, p1.ProposalID, archived[0].ProposalID)
+	assert.Equal(t, ProposalSuperseded, archived[0].State)
+	assert.Contains(t, archived[0].Reasoning, "is now at execution")
+	assert.Equal(t, ProposalDecided, got.Proposals[p2.ProposalID].State)
+
+	affected, err = r.f.store.EndMovedOnRetries(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.Empty(t, affected, "ending them again changes nothing")
 }

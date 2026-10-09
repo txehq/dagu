@@ -437,6 +437,53 @@ func (tx *JobTx) takeResolution(prior string, a *Action) error {
 // without a review claim. The executor then authorizes it under an
 // execution claim. A replayed idempotency key returns the stored decision.
 // The caller has checked that runID is a run of the job's DAG.
+// EndMovedOnRetries supersedes the job's decided dagu.retry_run proposals
+// that can never be executed because their run moved on (or no longer
+// binds: another execution, version or package), so they leave the
+// decision queue instead of waiting forever. A retry being executed is
+// left alone.
+func (tx *JobTx) EndMovedOnRetries() ([]Affected, error) {
+	var affected []Affected
+	for _, p := range sortedProposals(tx.Job.Proposals) {
+		if p.Action.Name != ActionRetryRun || p.State != ProposalDecided || tx.proposalInFlight(p.ProposalID) {
+			continue
+		}
+		var rp RetryRunParams
+		if err := decodeParams(p.Action.Params, &rp); err != nil {
+			return nil, err
+		}
+		err := tx.checkRunBinding(rp, false)
+		if err == nil {
+			continue
+		}
+		if ErrorCode(err) != CodeStaleBinding {
+			return nil, err
+		}
+		p.State = ProposalSuperseded
+		p.Revision++
+		p.Reasoning = err.Error()
+		p.Updated = Stamp{At: tx.now, By: tx.actor}
+		tx.closeLater(p)
+		if err := tx.archiveProposal(p); err != nil {
+			return nil, err
+		}
+		tx.touch()
+		affected = append(affected, Affected{ProposalID: p.ProposalID, Disposition: DispositionSuperseded})
+	}
+	return affected, nil
+}
+
+// EndMovedOnRetries runs JobTx.EndMovedOnRetries for jobID as the registry.
+func (s *Store) EndMovedOnRetries(ctx context.Context, jobID string) ([]Affected, error) {
+	var out []Affected
+	_, err := s.WithJobTx(ctx, jobID, Actor{Kind: ActorSystem, ID: "registry"}, func(tx *JobTx) error {
+		var err error
+		out, err = tx.EndMovedOnRetries()
+		return err
+	})
+	return out, err
+}
+
 func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Proposal, *Decision, error) {
 	j := tx.Job
 	if tx.actor.Kind != ActorHuman {
@@ -450,6 +497,9 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	}
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
+	}
+	if _, err := tx.EndMovedOnRetries(); err != nil {
+		return nil, nil, err
 	}
 	raw, err := json.Marshal(params)
 	if err != nil {
@@ -508,6 +558,9 @@ const (
 	ClosureRunMissing ClosureOutcome = "run_missing"
 	// ClosureLocatorRefused: the machine refused the task's locator.
 	ClosureLocatorRefused ClosureOutcome = "locator_refused"
+	// ClosureRunEnded: the task's run ended (aborted, failed, the step
+	// skipped) before anyone answered; nothing was completed.
+	ClosureRunEnded ClosureOutcome = "run_ended"
 	// ClosureFailed: the attempt failed and will be retried.
 	ClosureFailed ClosureOutcome = "failed"
 )
@@ -517,7 +570,7 @@ func (o ClosureOutcome) Final() bool { return o != ClosureFailed }
 
 func knownClosureOutcome(o ClosureOutcome) bool {
 	switch o {
-	case ClosureClosed, ClosureAlreadyAnswered, ClosureRunMissing, ClosureLocatorRefused, ClosureFailed:
+	case ClosureClosed, ClosureAlreadyAnswered, ClosureRunMissing, ClosureLocatorRefused, ClosureRunEnded, ClosureFailed:
 		return true
 	}
 	return false

@@ -3762,7 +3762,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List incomplete resource events
+         * @description Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter.
+         */
+        get: operations["listTxeResourceEvents"];
         put?: never;
         /**
          * Report a resource event
@@ -4367,7 +4371,7 @@ export interface paths {
         put?: never;
         /**
          * Record an attempt to close a superseded proposal's Dagu human task
-         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
+         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
          */
         post: operations["recordTxeProposalClosure"];
         delete?: never;
@@ -7822,7 +7826,10 @@ export interface components {
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
-        /** @enum {string} */
+        /**
+         * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative, is recorded on each dependent, and changes nothing.
+         * @enum {string}
+         */
         TxeResourceObservation: TxeResourceObservation;
         TxeResourceEventRequest: {
             /** @description Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409 */
@@ -8537,6 +8544,11 @@ export interface components {
             /** Format: date-time */
             last_attempt_at?: string;
             last_error?: string;
+        };
+        TxeResourceEventList: {
+            events: components["schemas"]["TxeResourceEvent"][];
+            /** @description Present when more events follow; pass it as after. */
+            next_cursor?: string;
         };
         TxePendingClosureList: {
             closures: components["schemas"]["TxePendingClosure"][];
@@ -21429,6 +21441,41 @@ export interface operations {
             };
         };
     };
+    listTxeResourceEvents: {
+        parameters: {
+            query: {
+                complete: false;
+                reporter_machine_id?: string;
+                /** @description The next_cursor of the previous page. */
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incomplete events */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeResourceEventList"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     recordTxeResourceEvent: {
         parameters: {
             query?: never;
@@ -24558,7 +24605,8 @@ export enum TxeResourceObservation {
     present = "present",
     unreachable = "unreachable",
     auth_denied = "auth_denied",
-    timeout = "timeout"
+    timeout = "timeout",
+    unknown = "unknown"
 }
 export enum TxeResourceDispositionMatch {
     identity = "identity",
@@ -24747,6 +24795,7 @@ export enum TxeClosureOutcome {
     already_answered = "already_answered",
     run_missing = "run_missing",
     locator_refused = "locator_refused",
+    run_ended = "run_ended",
     failed = "failed"
 }
 export enum TxeArtifactRecordInputLocation {

@@ -10359,6 +10359,51 @@ paths:
 
   # TXE job registry (fork extension; see internal/txe/registry).
   /txe/resource-events:
+    get:
+      summary: "List incomplete resource events"
+      description: "Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter."
+      operationId: "listTxeResourceEvents"
+      tags:
+        - "txe"
+      parameters:
+        - name: complete
+          in: query
+          required: true
+          schema:
+            type: boolean
+            enum: [false]
+        - name: reporter_machine_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          description: "The next_cursor of the previous page."
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: "Incomplete events"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEventList"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       summary: "Report a resource event"
       description: "Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
@@ -11925,7 +11970,7 @@ paths:
       - $ref: "#/components/parameters/TxeProposalId"
     post:
       summary: "Record an attempt to close a superseded proposal's Dagu human task"
-      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
+      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
       operationId: "recordTxeProposalClosure"
       tags:
         - "txe"
@@ -19268,7 +19313,8 @@ components:
     # TXE job registry (fork extension).
     TxeResourceObservation:
       type: string
-      enum: [deleted, absent, present, unreachable, auth_denied, timeout]
+      enum: [deleted, absent, present, unreachable, auth_denied, timeout, unknown]
+      description: "unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative, is recorded on each dependent, and changes nothing."
 
     TxeResourceEventRequest:
       type: object
@@ -20677,7 +20723,7 @@ components:
 
     TxeClosureOutcome:
       type: string
-      enum: [closed, already_answered, run_missing, locator_refused, failed]
+      enum: [closed, already_answered, run_missing, locator_refused, run_ended, failed]
 
     TxeClosureRequest:
       type: object
@@ -20729,6 +20775,18 @@ components:
         last_error:
           type: string
       required: [job_id, proposal_id, machine_id, native_task, superseded_at, failures]
+
+    TxeResourceEventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeResourceEvent"
+        next_cursor:
+          type: string
+          description: "Present when more events follow; pass it as after."
+      required: [events]
 
     TxePendingClosureList:
       type: object
