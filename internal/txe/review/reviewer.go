@@ -137,6 +137,14 @@ func (r *Reviewer) closeSuperseded(ctx context.Context, jobID string) []string {
 		if proposal.NativeTask.RunID == "" {
 			continue
 		}
+		// The reviewer completes a human task here with its own credential,
+		// so it only ever touches the task it would itself have opened for
+		// this proposal. A stored locator pointing anywhere else, such as
+		// another workflow's approval, is left alone and reported.
+		if proposal.NativeTask != r.taskLocator(proposal.ID) {
+			warnings = append(warnings, fmt.Sprintf("proposal %s names a task that is not its decision run; not closed", proposal.ID))
+			continue
+		}
 		if err := r.Opener.CloseDecision(ctx, proposal); err != nil {
 			warnings = append(warnings, fmt.Sprintf("close decision run of proposal %s: %v", proposal.ID, err))
 		}

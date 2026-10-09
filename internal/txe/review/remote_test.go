@@ -22,11 +22,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/humantask"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/review"
 )
@@ -86,6 +89,7 @@ type remoteFixture struct {
 	target apigen.TxeTarget
 	fx     *effects
 	opener *opener
+	tasks  *taskRecorder
 }
 
 // runsRemote supplies run evidence, which the real service reads from its
@@ -113,10 +117,17 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
 	require.NoError(t, err)
 	cfg := &config.Config{}
-	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
 	a := apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(store))
 
 	router := chi.NewRouter()
+	// The decision endpoint needs an authenticated person, as in production.
+	router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := &auth.User{ID: "u-connor", Username: "connor", Role: auth.RoleAdmin}
+			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
+		})
+	})
 	strict := apigen.NewStrictHandlerWithOptions(a, nil, apigen.StrictHTTPServerOptions{
 		RequestErrorHandlerFunc: func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -173,7 +184,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 		Remote: &review.Remote{Transport: transport, MachineID: machine, RunID: "tick-1", AgentClient: "fixture-agent 1.0"},
 		runs:   []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
-	return &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}}
+	return &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}}
 }
 
 func writeAPIError(w http.ResponseWriter, _ *http.Request, err error) {
@@ -439,4 +450,105 @@ func TestRemoteCompleteClosesAWaitingTask(t *testing.T) {
 	}
 	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway}}
 	require.Error(t, complete(context.Background(), task, nil))
+}
+
+// taskRecorder stands in for the service's human-task backend and records
+// which native task the decision service completes, and with what.
+type taskRecorder struct {
+	completed []humantask.CompleteRequest
+}
+
+func (r *taskRecorder) Complete(_ context.Context, req humantask.CompleteRequest) (humantask.Result, error) {
+	r.completed = append(r.completed, req)
+	return humantask.Result{}, nil
+}
+
+// decide records the owner's verdict with the real decision service against
+// the real registry, the way the dashboard endpoint does. Only the native
+// human-task backend is replaced, because no decide run exists in this test.
+func (f *remoteFixture) decide(p review.Proposal, revision int, verdict string) (*decision.Result, error) {
+	svc := &decision.Service{
+		Registry:          f.store,
+		Tasks:             f.tasks,
+		AuthorizeDecision: func(context.Context, *registry.Job) error { return nil },
+		AuthorizeTask:     func(context.Context, string, string) error { return nil },
+	}
+	return svc.Decide(context.Background(), f.jobID, p.ID, decision.Request{
+		BindingDigest: p.BindingDigest, ExpectedProposalRevision: revision,
+		IdempotencyKey: "test-" + p.ID + "-" + verdict, Verdict: decision.Verdict(verdict),
+	}, registry.Actor{Kind: registry.ActorHuman, ID: "connor"})
+}
+
+// The approve path over HTTP against the real registry and the real decision
+// handler: an approved proposal is executed once under a fresh execution
+// claim, a repeat does nothing, and the reviewer's next packet carries the
+// owner's decisions.
+func TestRemoteApprovedProposalExecutesOnce(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	targetID := "cluster_uid=c-1,uid=vol-1"
+	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "grow", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{
+			{Name: "expand_volume", TargetID: targetID, Params: map[string]string{"size_gb": "200"}, Reason: "grow"},
+			{Name: "expand_volume", TargetID: targetID, Params: map[string]string{"size_gb": "400"}, Reason: "grow more"},
+		},
+	})
+	require.NoError(t, err)
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 2)
+
+	approved, err := f.decide(open[0], 1, "approve")
+	require.NoError(t, err)
+	rejected, err := f.decide(open[1], 1, "reject")
+	require.NoError(t, err)
+
+	// The decision service completed exactly the native task the reviewer
+	// filed for each proposal.
+	require.Len(t, f.tasks.completed, 2)
+	for i, done := range f.tasks.completed {
+		assert.Equal(t, open[i].NativeTask.RunID, done.DAGRunID)
+		assert.Equal(t, review.DecideDAGName(f.remote.MachineID), done.DAGName)
+	}
+
+	exec := f.reviewer("executor")
+	out, err := exec.Execute(ctx, f.jobID, open[0].ID, approved.Decision.DecisionID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, 1, f.fx.count("expand_volume"))
+
+	// A repeat is refused by the registry: the proposal is already executed.
+	out, err = exec.Execute(ctx, f.jobID, open[0].ID, approved.Decision.DecisionID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+
+	out, err = exec.Execute(ctx, f.jobID, open[1].ID, rejected.Decision.DecisionID)
+	require.NoError(t, err)
+	assert.Equal(t, "verdict is reject", out.Skipped)
+
+	out, err = exec.Execute(ctx, f.jobID, open[0].ID, review.NoDecisionID)
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "no recorded decision")
+	assert.Equal(t, 1, f.fx.count("expand_volume"))
+
+	actions, err := f.remote.Actions(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, actions, 1)
+	assert.Equal(t, approved.Decision.DecisionID, actions[0].DecisionID)
+	assert.Equal(t, review.ActionSucceeded, actions[0].State)
+
+	// The next review is told what the owner decided.
+	decisions, err := f.remote.DecisionsAfter(ctx, f.jobID, "")
+	require.NoError(t, err)
+	require.Len(t, decisions, 2)
+	assert.Equal(t, review.VerdictApprove, decisions[0].Verdict)
+	assert.Equal(t, review.VerdictReject, decisions[1].Verdict)
+	after, err := f.remote.DecisionsAfter(ctx, f.jobID, decisions[0].ID)
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	assert.Equal(t, decisions[1].ID, after[0].ID)
 }

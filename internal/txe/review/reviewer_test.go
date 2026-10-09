@@ -1175,3 +1175,26 @@ func TestSupersededProposalsHaveTheirDecisionRunsClosed(t *testing.T) {
 	assert.Equal(t, review.SkipNotReviewable, f.prepare("reviewer-c").Skipped)
 	assert.Equal(t, 1, f.opener.closed[second.NativeTask.RunID])
 }
+
+// Security finding: closing a superseded proposal completes a human task
+// with the reviewer's credential. A proposal whose stored locator points at
+// any task other than its own decision run is not acted on.
+func TestCloseIgnoresALocatorThatIsNotTheProposalsOwnRun(t *testing.T) {
+	f := newFixture(t)
+	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	// The stored proposal is altered to point at another workflow's task.
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		s.Proposals[jobID][0].NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+		s.Proposals[jobID][0].State = review.ProposalSuperseded
+		return nil
+	}))
+
+	f.clock.Advance(2 * time.Hour)
+	prepared := f.prepare("reviewer-b")
+	assert.Empty(t, f.opener.closed, "a foreign task was completed with the reviewer's credential")
+	require.Len(t, prepared.Warnings, 1)
+	assert.Contains(t, prepared.Warnings[0], "not its decision run")
+}

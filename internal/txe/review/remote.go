@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,10 +148,10 @@ func deref[T any](p *T) T {
 	return *p
 }
 
-func paramsOf(v any) map[string]string {
+func paramsOf(raw json.RawMessage) map[string]string {
 	out := map[string]string{}
-	m, ok := v.(map[string]any)
-	if !ok {
+	var m map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
 		return out
 	}
 	for k, val := range m {
@@ -163,15 +164,13 @@ func paramsOf(v any) map[string]string {
 	return out
 }
 
-func paramsValue(params map[string]string) any {
+func paramsValue(params map[string]string) json.RawMessage {
 	if len(params) == 0 {
 		return nil
 	}
-	out := make(map[string]any, len(params))
-	for k, v := range params {
-		out[k] = v
-	}
-	return out
+	// A string map always marshals, with its keys in order.
+	raw, _ := json.Marshal(params)
+	return raw
 }
 
 // shellCommand runs a registered command line through the shell. Parameters
@@ -415,8 +414,11 @@ func (r *Remote) DecisionsAfter(ctx context.Context, jobID, cursor string) ([]De
 	if err := r.do(ctx, http.MethodGet, path, nil, &list); err != nil {
 		return nil, err
 	}
+	// The registry lists decisions newest first. The reviewer needs them in
+	// the order they were made: the last one is its cursor, and the latest
+	// answer to a proposal is the one that counts.
 	out := make([]Decision, 0, len(list.Decisions))
-	for _, d := range list.Decisions {
+	for _, d := range slices.Backward(list.Decisions) {
 		out = append(out, decisionOf(jobID, d))
 	}
 	return out, nil
@@ -585,8 +587,11 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 	if g := a.Grant; g != nil {
 		out.GrantID, out.GrantExpiresAt = g.GrantId, g.ExpiresAt
 	}
-	if m, ok := a.Outcome.(map[string]any); ok {
-		out.Detail, _ = m["detail"].(string)
+	var outcome struct {
+		Detail string `json:"detail"`
+	}
+	if len(a.Outcome) > 0 && json.Unmarshal(a.Outcome, &outcome) == nil {
+		out.Detail = outcome.Detail
 	}
 	// The registry's first state for an authorized attempt is one the
 	// reviewer treats the same as executing: the effect may have begun.
@@ -718,7 +723,7 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 		body.Receipt = &req.Receipt
 	}
 	if req.Detail != "" {
-		body.Outcome = map[string]any{"detail": req.Detail}
+		body.Outcome, _ = json.Marshal(map[string]string{"detail": req.Detail})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }
