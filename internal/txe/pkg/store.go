@@ -489,15 +489,25 @@ func hashFile(p string) (string, int64, error) {
 }
 
 // sealTree removes write permission from a package so neither a job nor a
-// later session edits it in place. Directories lose it last.
+// later session edits it in place. Directories lose it last. The changes go
+// through a root handle on the package, so nothing outside it can be reached
+// by way of a link.
 func sealTree(dir string) error {
-	var dirs []string
+	type entry struct {
+		rel  string
+		perm os.FileMode
+	}
+	var files, dirs []entry
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
 		if d.IsDir() {
-			dirs = append(dirs, p)
+			dirs = append(dirs, entry{rel, 0o555})
 			return nil
 		}
 		info, err := d.Info()
@@ -508,13 +518,22 @@ func sealTree(dir string) error {
 		if info.Mode()&0o100 != 0 {
 			perm = 0o555
 		}
-		return os.Chmod(p, perm)
+		files = append(files, entry{rel, perm})
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("seal package: %w", err)
 	}
-	for _, p := range slices.Backward(dirs) {
-		if err := os.Chmod(p, 0o555); err != nil { //nolint:gosec // read and traverse only
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("seal package: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	// Deepest directories first, and every directory after the files in it.
+	slices.Reverse(dirs)
+	for _, e := range slices.Concat(files, dirs) {
+		if err := root.Chmod(e.rel, e.perm); err != nil {
 			return fmt.Errorf("seal package: %w", err)
 		}
 	}

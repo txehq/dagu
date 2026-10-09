@@ -121,6 +121,33 @@ func TestRenderDAGLoads(t *testing.T) {
 	assert.Contains(t, dag.Labels.Strings(), "txe.job=job_01k7a5zq8m3n4p5r6s7t8v9w0x")
 }
 
+// A job's step output reaches the hub only as the worker's log stream. The
+// definition never redirects it to a file or an artifact, and captures no
+// output variable: those paths write through other writers and, for an
+// artifact, upload the file.
+func TestRenderDAGHasNoOutputRedirect(t *testing.T) {
+	s := testDAGSpec()
+	data, err := RenderDAG(s)
+	require.NoError(t, err)
+	for _, key := range []string{"stdout", "stderr", "output", "artifacts", "log_output", "dependencies"} {
+		assert.NotContains(t, string(data), key+":", "the rendered DAG sets %s", key)
+	}
+
+	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
+	require.NoError(t, err)
+	require.Len(t, dag.Steps, 1)
+	step := dag.Steps[0]
+	assert.Empty(t, step.Stdout)
+	assert.Empty(t, step.Stderr)
+	assert.Empty(t, step.StdoutArtifact)
+	assert.Empty(t, step.StderrArtifact)
+	assert.Empty(t, step.Output)
+	assert.False(t, dag.ArtifactsEnabled())
+	// The worker selector is what makes the run execute on a worker, where
+	// step output is streamed, and never in the hub's own process.
+	assert.NotEmpty(t, dag.WorkerSelector)
+}
+
 func TestRenderDAGRefusals(t *testing.T) {
 	tests := []struct {
 		name    string
