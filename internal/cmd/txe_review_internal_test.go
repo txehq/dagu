@@ -75,9 +75,21 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	home := txepkg.Home{Root: t.TempDir()}
 	dir := filepath.Join(home.ReceiptsDir(), jobID)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "requests"), 0o700))
-	receipt, err := json.Marshal(txepkg.Receipt{Schema: 1, JobID: jobID, Version: 2, RequestID: "req_1"})
+	receipt, err := json.Marshal(txepkg.Receipt{Schema: 1, JobID: jobID, Version: 2, OwnerID: "own_1", RequestID: "req_1"})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "v2.json"), receipt, 0o600))
+	older, err := json.Marshal(txepkg.Receipt{Schema: 1, JobID: jobID, Version: 1, OwnerID: "own_1", RequestID: "req_0"})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "v1.json"), older, 0o600))
+
+	// The newest version this machine registered, and for whom.
+	latest, owner, err := localLatest(home)(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, latest)
+	assert.Equal(t, "own_1", owner)
+	_, _, err = localLatest(home)("job_01JTXE00000000000000000BBB")
+	require.Error(t, err, "a job this machine never registered has no receipt")
+
 	version := `{"package":{"digest":"sha256:aa","path":"/pkg","entrypoint":"run.sh","credential_refs":[{"name":"LINEAR_API_KEY","kind":"file","locator":"/home/me/.config/txe/linear"}]},"review_policy":{"permitted_actions":[{"name":"restart","command":"./restart.sh","routine":true,"timeout_sec":60}]}}`
 	entry, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 2, Request: json.RawMessage(`{"job_id":"` + jobID + `","version":` + version + `}`)})
 	require.NoError(t, err)
@@ -91,6 +103,13 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	_, err = local(jobID, 3)
 	require.Error(t, err, "a version this machine did not register has no record")
 	_, err = local("job_01JTXE00000000000000000BBB", 2)
+	require.Error(t, err)
+
+	// A record filed under another request id is not the receipt's.
+	mismatched, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_9", JobID: jobID, Version: 2, Request: json.RawMessage(`{"version":` + version + `}`)})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), mismatched, 0o600))
+	_, err = local(jobID, 2)
 	require.Error(t, err)
 
 	// A record filed for another job or version is not this one's.

@@ -104,15 +104,20 @@ machine's own record of the registration (the request `dagu txe register`
 filed beside the version's receipt) and starts a job's commands only when
 the registry's current version says exactly the same in everything that
 reaches execution: the package (digest, path, working directory,
-entrypoint), every permitted action (command and reconcile lines, the
-`routine` flag, idempotency class, timeout, attempt limits, parameter
-schema) and the credential references. This holds for every job, with or
-without credentials. The references used are the local ones.
+entrypoint), the registered targets, every permitted action (command and
+reconcile lines, the `routine` flag, idempotency class, timeout, attempt
+limits, parameter schema), the review brief and the conditions for asking
+a person, the credential references, and the job's owner. The registry's
+current version must also not be older than the newest version this
+machine registered: an older one may match what was once registered and
+was replaced. This holds for every job, with or without credentials. The
+references used are the local ones. Title and purpose are not compared.
 
 If this machine has no usable record of the version, or anything differs,
 none of the job's commands is started: no routine action, no approved
 action (its decision is kept for later), no reconcile probe. Nothing is
-read. The job is still reviewed and questions still reach the owner, and
+read, and the job's declaration is not used to settle an interrupted
+action either: it stays unresolved. The job is still reviewed and questions still reach the owner, and
 the exception `job_commands_unbound` says what differs, without a locator
 or a command line. A recorded review does not clear it; it ends when the
 job is bound again. Registering the job again from that machine with

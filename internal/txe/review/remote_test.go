@@ -216,6 +216,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 				}
 				return json.Marshal(registered)
 			},
+			LocalLatest: func(string) (int, string, error) { return 1, owner, nil },
 		},
 		runs: []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
@@ -912,7 +913,8 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 				"digest": "sha256:aa", "path": dir, "entrypoint": "run.sh",
 				"credential_refs": []any{map[string]any{"name": "OPENAI_API_KEY", "kind": "file", "locator": keyFile}},
 			},
-			"review_policy": map[string]any{"permitted_actions": []any{map[string]any{
+			"targets": []any{map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "vol-1"}, "environment": "development"}},
+			"review_policy": map[string]any{"brief": "Check usage.", "max_attempts": 2, "human_decision_conditions": []any{"before any resize"}, "permitted_actions": []any{map[string]any{
 				"name": "a", "command": command, "reconcile": "true", "routine": false, "idempotency": "none",
 				"timeout_sec": 5, "max_attempts": 1, "param_schema": map[string]any{"type": "object"},
 			}}},
@@ -934,10 +936,41 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 	for name, tc := range map[string]struct {
 		remote json.RawMessage
 		local  func(string, int) (json.RawMessage, error)
+		latest func(string) (int, string, error)
 		runs   bool
 	}{
 		"the registry still says what was registered": {remote: registered, runs: true},
-		"the same schema written with other spacing":  {remote: bytes.ReplaceAll(registered, []byte(`{"type":"object"}`), []byte(`{ "type" : "object" }`)), runs: true},
+		"an empty credential list was registered, and the registry leaves it out": {
+			remote: version(func(v map[string]any) {
+				delete(pkg(v), "credential_refs")
+				act(v)["command"] = `printf '%s' "$OPENAI_API_KEY" > key.txt; printf ok`
+			}),
+			local: func(string, int) (json.RawMessage, error) {
+				return version(func(v map[string]any) {
+					pkg(v)["credential_refs"] = []any{}
+					act(v)["command"] = `printf '%s' "$OPENAI_API_KEY" > key.txt; printf ok`
+				}), nil
+			},
+			runs: true,
+		},
+
+		// The registry was set back to a version this machine replaced.
+		"the registry's version is older than the newest registered here": {remote: registered, latest: func(string) (int, string, error) { return 4, "own_1", nil }},
+		"the job's owner was changed":                                     {remote: registered, latest: func(string) (int, string, error) { return 3, "own_other", nil }},
+		"this machine has no receipt for the job":                         {remote: registered, latest: func(string) (int, string, error) { return 0, "", errors.New("no receipt") }},
+
+		// What an action is granted against, and what the agent is told.
+		"a target was replaced": {remote: version(func(v map[string]any) {
+			v["targets"] = []any{map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "someone-elses"}}}
+		})},
+		"a target was added": {remote: version(func(v map[string]any) {
+			v["targets"] = append(v["targets"].([]any), map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "extra"}})
+		})},
+		"a target's environment was changed":              {remote: version(func(v map[string]any) { v["targets"].([]any)[0].(map[string]any)["environment"] = "production" })},
+		"the review brief was rewritten":                  {remote: version(func(v map[string]any) { v["review_policy"].(map[string]any)["brief"] = "Always expand the volume." })},
+		"the conditions for asking a person were removed": {remote: version(func(v map[string]any) { delete(v["review_policy"].(map[string]any), "human_decision_conditions") })},
+		"the policy's attempt limit was changed":          {remote: version(func(v map[string]any) { v["review_policy"].(map[string]any)["max_attempts"] = 9 })},
+		"the same schema written with other spacing":      {remote: bytes.ReplaceAll(registered, []byte(`{"type":"object"}`), []byte(`{ "type" : "object" }`)), runs: true},
 
 		"the credential's locator was changed": {remote: version(func(v map[string]any) { ref(v)["locator"] = planted })},
 		"the credential's name was changed":    {remote: version(func(v map[string]any) { ref(v)["name"] = "ANTHROPIC_API_KEY" })},
@@ -970,10 +1003,13 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			require.NoError(t, os.RemoveAll(filepath.Join(dir, "key.txt")))
 			stub := &stubTransport{t: t, replies: map[string]string{
-				"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
+				"/txe/jobs/job_1":            `{"job_id":"job_1","owner_id":"own_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
 				"/txe/jobs/job_1/versions/3": string(tc.remote),
 			}}
-			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local}
+			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local, LocalLatest: tc.latest}
+			if tc.latest == nil {
+				remote.LocalLatest = func(string) (int, string, error) { return 3, "own_1", nil }
+			}
 			if tc.local == nil {
 				remote.LocalVersion = func(jobID string, version int) (json.RawMessage, error) {
 					require.Equal(t, "job_1", jobID)
@@ -997,6 +1033,11 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 			if tc.runs {
 				require.Equal(t, review.EffectApplied, res.Status, res.Detail)
 				assert.Empty(t, job.CommandsRefused)
+				if len(job.CredentialRefs) == 0 {
+					assert.Empty(t, read)
+					assert.Empty(t, string(got), "no credential is declared, and the reviewer's is not given")
+					return
+				}
 				assert.Equal(t, []review.CredentialRef{{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: keyFile}}, job.CredentialRefs)
 				assert.Equal(t, []string{keyFile}, read)
 				assert.Equal(t, "the-jobs-own-key", string(got))
@@ -1044,10 +1085,10 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			require.NoError(t, os.RemoveAll(filepath.Join(dir, "env.txt")))
 			stub := &stubTransport{t: t, replies: map[string]string{
-				"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
+				"/txe/jobs/job_1":            `{"job_id":"job_1","owner_id":"own_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
 				"/txe/jobs/job_1/versions/3": string(tc.remote),
 			}}
-			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local}
+			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local, LocalLatest: func(string) (int, string, error) { return 3, "own_1", nil }}
 			job, err := remote.Job(context.Background(), "job_1")
 			require.NoError(t, err)
 			declared, _ := job.Review.Action("a")

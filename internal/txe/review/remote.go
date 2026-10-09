@@ -71,6 +71,11 @@ type Remote struct {
 	// of a job: the "version" object of the registration request it sent,
 	// from its own record of the registration. See localBinding.
 	LocalVersion func(jobID string, version int) (json.RawMessage, error)
+	// LocalLatest returns the newest version of a job this machine
+	// registered, and the owner it registered the job for. A registry whose
+	// current version is older than that has been set back to a version
+	// that was replaced, perhaps to remove something it allowed.
+	LocalLatest func(jobID string) (version int, ownerID string, err error)
 }
 
 var _ Registry = (*Remote)(nil)
@@ -89,9 +94,17 @@ type executed struct {
 	WorkingDir     string                 `json:"working_dir"`
 	Entrypoint     string                 `json:"entrypoint"`
 	CredentialRefs []api.TxeCredentialRef `json:"credential_refs"`
-	// MaxAttempts is the policy's limit on attempts of an action.
-	MaxAttempts int              `json:"max_attempts"`
-	Actions     []executedAction `json:"actions"`
+	// Targets are the registered targets, each as its canonical identity
+	// and environment. An action is granted against one of them and its
+	// command is told which, so they are part of what is executed.
+	Targets []string `json:"targets"`
+	// MaxAttempts is the policy's limit on attempts of an action. Brief and
+	// HumanDecisionConditions are what the review agent is told to do and
+	// when it must ask a person: they steer which commands run unasked.
+	MaxAttempts             int              `json:"max_attempts"`
+	Brief                   string           `json:"brief"`
+	HumanDecisionConditions []string         `json:"human_decision_conditions"`
+	Actions                 []executedAction `json:"actions"`
 }
 
 type executedAction struct {
@@ -107,16 +120,27 @@ type executedAction struct {
 }
 
 // executedOf puts the executed part of a version into one comparable form.
-func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy) executed {
-	out := executed{
-		Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint,
-		CredentialRefs: slices.Clone(deref(pkg.CredentialRefs)),
+//
+// A list that is empty and one that is absent are the same thing here: the
+// service leaves an empty list out of what it returns, and a registration
+// may have sent one.
+func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.TxeTarget) executed {
+	out := executed{Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint}
+	if refs := deref(pkg.CredentialRefs); len(refs) > 0 {
+		out.CredentialRefs = slices.Clone(refs)
 	}
+	for _, t := range targets {
+		out.Targets = append(out.Targets, targetKey(t)+"\x00"+deref(t.Environment))
+	}
+	slices.Sort(out.Targets)
 	slices.SortFunc(out.CredentialRefs, func(a, b api.TxeCredentialRef) int {
 		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Locator, b.Locator))
 	})
 	if policy != nil {
-		out.MaxAttempts = deref(policy.MaxAttempts)
+		out.MaxAttempts, out.Brief = deref(policy.MaxAttempts), deref(policy.Brief)
+		if conditions := deref(policy.HumanDecisionConditions); len(conditions) > 0 {
+			out.HumanDecisionConditions = slices.Clone(conditions)
+		}
 		for _, pa := range deref(policy.PermittedActions) {
 			schema := ""
 			if len(pa.ParamSchema) > 0 {
@@ -163,27 +187,43 @@ func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy) executed {
 // This protects the path of a job registered from this machine. It is not
 // isolation from the service that dispatches work to this machine, nor from
 // other code running as the same user.
-func (r *Remote) localBinding(jobID string, version int, v api.TxeJobVersion) ([]CredentialRef, string) {
+func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVersion) ([]CredentialRef, string) {
 	refuse := func(why string) ([]CredentialRef, string) {
 		return nil, why + ": none of the job's commands is started"
 	}
-	if r.LocalVersion == nil {
+	if r.LocalVersion == nil || r.LocalLatest == nil {
 		return refuse("this reviewer was given no local registration record to check the job against")
+	}
+	latest, owner, err := r.LocalLatest(jobID)
+	switch {
+	case err != nil:
+		return refuse("this machine has no usable record of registering the job")
+	case version < latest:
+		// Every word of an older version may match what this machine once
+		// registered. It was replaced, and what replaced it is what counts.
+		return refuse(fmt.Sprintf("the registry's current version of the job is %d and this machine registered version %d after it", version, latest))
+	case owner != ownerID:
+		return refuse("the registry's owner of the job is not the one this machine registered it for")
 	}
 	raw, err := r.LocalVersion(jobID, version)
 	var registered struct {
 		Package      api.TxePackage       `json:"package"`
 		ReviewPolicy *api.TxeReviewPolicy `json:"review_policy"`
+		Targets      []api.TxeTarget      `json:"targets"`
 	}
 	if err != nil || json.Unmarshal(raw, &registered) != nil {
 		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	local, remote := executedOf(registered.Package, registered.ReviewPolicy), executedOf(v.Package, v.ReviewPolicy)
+	local, remote := executedOf(registered.Package, registered.ReviewPolicy, registered.Targets), executedOf(v.Package, v.ReviewPolicy, deref(v.Targets))
 	switch {
 	case !reflect.DeepEqual(local.CredentialRefs, remote.CredentialRefs):
 		return refuse(fmt.Sprintf("the registry's credential references for version %d of the job are not the ones this machine registered", version))
 	case local.Digest != remote.Digest || local.Path != remote.Path || local.WorkingDir != remote.WorkingDir || local.Entrypoint != remote.Entrypoint:
 		return refuse(fmt.Sprintf("the registry's package for version %d of the job is not the one this machine registered", version))
+	case !reflect.DeepEqual(local.Targets, remote.Targets):
+		return refuse(fmt.Sprintf("the registry's targets for version %d of the job are not the ones this machine registered", version))
+	case local.Brief != remote.Brief || !reflect.DeepEqual(local.HumanDecisionConditions, remote.HumanDecisionConditions):
+		return refuse(fmt.Sprintf("the registry's review policy for version %d of the job is not the one this machine registered", version))
 	case local.MaxAttempts != remote.MaxAttempts || !reflect.DeepEqual(local.Actions, remote.Actions):
 		return refuse(fmt.Sprintf("the registry's permitted actions for version %d of the job are not the ones this machine registered", version))
 	}
@@ -438,7 +478,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	if job.WorkingDir == "" {
 		job.WorkingDir = v.Package.Path
 	}
-	job.CredentialRefs, job.CommandsRefused = r.localBinding(jobID, doc.Version, v)
+	job.CredentialRefs, job.CommandsRefused = r.localBinding(jobID, doc.OwnerId, doc.Version, v)
 	// The DAG a version runs and the package it runs from are bound by the
 	// version's immutable record. The job's digest is given only when that
 	// record and the job agree on both, so a run whose snapshot matches it

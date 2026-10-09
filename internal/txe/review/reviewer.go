@@ -464,6 +464,15 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		}
 	}
 
+	if job.CommandsRefused != "" && action.Name != RetryRunAction {
+		// What the registry says this action is could not be established
+		// as what was registered. Its declaration is not used for anything:
+		// not to run its probe, and not to decide from its idempotency
+		// class that the interrupted attempt had no effect. The outcome
+		// stays as it is, unresolved and visible, until the job is bound
+		// again; the owner already has the exception about that.
+		return nil
+	}
 	declared, ok := job.Review.Action(action.Name)
 	res := EffectResult{Status: EffectUnknown, Detail: "the action is no longer declared by the job"}
 	if action.Name == RetryRunAction {
@@ -515,9 +524,6 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 	}
 	if ok {
 		switch {
-		case len(declared.Reconcile) > 0 && job.CommandsRefused != "":
-			// The probe is one of the job's commands too.
-			res = EffectResult{Status: EffectUnknown, Detail: "the reconcile probe was not run: " + job.CommandsRefused}
 		case len(declared.Reconcile) > 0:
 			res = r.Effector.Probe(ctx, job, declared, action)
 		case declared.Idempotency == IdempotencyReadOnly:

@@ -719,6 +719,56 @@ func TestAbsentProbeDoesNotCloseAnInterruptedAttempt(t *testing.T) {
 	assert.Len(t, f.effects.keys, 1, "only the interrupted attempt was ever made")
 }
 
+// When what the registry says a job's actions are could not be established
+// as what was registered, that declaration is not used to settle anything
+// either. An interrupted attempt of an action the registry now calls
+// read-only is not closed as "had no effect" on the registry's word: it
+// stays unresolved, no question is put to the owner about it, and the
+// action is not run again, until the job is bound again.
+func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	dying := f.reviewer("reviewer-a")
+	dying.Registry = crashAfterEffect{f.registry}
+	collect := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Collect.",
+		Actions: []review.AgentAction{act("collect_diagnostics", nil)},
+	}
+	_, err := dying.Apply(context.Background(), prepared, collect)
+	require.ErrorIs(t, err, errCrash)
+
+	// The job's record now fails the check against the local registration.
+	job := f.state().Jobs[jobID]
+	job.CommandsRefused = "the registry's permitted actions for version 1 of the job are not the ones this machine registered: none of the job's commands is started"
+	require.NoError(t, f.registry.PutJob(job))
+
+	f.clock.Advance(11 * time.Minute)
+	recovered := f.prepare("reviewer-b")
+	action := f.state().Actions[jobID][0]
+	assert.NotEqual(t, review.ActionNotApplied, action.State, "not closed on the strength of an unverified declaration")
+	assert.True(t, action.State.Open())
+	require.Len(t, recovered.Packet.UnresolvedActions, 1)
+	assert.Empty(t, f.state().Proposals[jobID], "the owner has the exception about the job; no question about the action")
+	applied := f.apply("reviewer-b", recovered, collect)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 1, f.effects.count("collect_diagnostics"), "only the interrupted attempt was ever made")
+	var raised int
+	for _, e := range f.state().Exceptions {
+		if e.Kind == review.ExceptionCommandsUnbound {
+			raised++
+			assert.Contains(t, e.Message, "dagu txe register")
+		}
+	}
+	assert.Positive(t, raised)
+
+	// Bound again, the interrupted read-only attempt is closed as before.
+	job.CommandsRefused = ""
+	require.NoError(t, f.registry.PutJob(job))
+	f.clock.Advance(2 * time.Hour)
+	f.prepare("reviewer-c")
+	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
+}
+
 // An interrupted read-only action has no external effect to wait for, so it
 // is closed as not applied and may be requested again.
 func TestInterruptedReadOnlyActionIsClosed(t *testing.T) {

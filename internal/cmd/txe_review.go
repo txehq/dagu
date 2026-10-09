@@ -136,8 +136,8 @@ func localVersion(home txepkg.Home) func(string, int) (json.RawMessage, error) {
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return nil, fmt.Errorf("parse registration record: %w", err)
 		}
-		if entry.JobID != jobID || entry.Version != version {
-			return nil, fmt.Errorf("registration record is for %s v%d", entry.JobID, entry.Version)
+		if entry.JobID != jobID || entry.Version != version || entry.RequestID != receipt.RequestID {
+			return nil, fmt.Errorf("registration record is request %s for %s v%d", entry.RequestID, entry.JobID, entry.Version)
 		}
 		var request struct {
 			Version json.RawMessage `json:"version"`
@@ -146,6 +146,26 @@ func localVersion(home txepkg.Home) func(string, int) (json.RawMessage, error) {
 			return nil, fmt.Errorf("registration request has no version (%v)", err)
 		}
 		return request.Version, nil
+	}
+}
+
+// localLatest reads the newest version of a job this machine registered and
+// the owner it registered it for, from the receipts `dagu txe register`
+// leaves.
+func localLatest(home txepkg.Home) func(string) (int, string, error) {
+	return func(jobID string) (int, string, error) {
+		receipts, err := txepkg.NewJournal(home).Receipts(jobID)
+		if err != nil {
+			return 0, "", err
+		}
+		if len(receipts) == 0 {
+			return 0, "", fmt.Errorf("no receipt for job %s on this machine", jobID)
+		}
+		newest := receipts[len(receipts)-1]
+		if newest.JobID != jobID {
+			return 0, "", fmt.Errorf("receipt is for job %s", newest.JobID)
+		}
+		return newest.Version, newest.OwnerID, nil
 	}
 }
 
@@ -192,6 +212,7 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 			Registry: &review.Remote{
 				Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient,
 				LocalVersion: localVersion(txeHome),
+				LocalLatest:  localLatest(txeHome),
 			},
 			// A job's file credentials are read with the checks this
 			// machine applies to them everywhere else. On Windows that read
