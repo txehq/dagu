@@ -24,6 +24,7 @@ func openNoFollow(path string) (*os.File, error) {
 	return os.Open(path) //nolint:gosec // path checked absolute and clean by the caller
 }
 
-// checkOwner is not enforced on Windows, where file permissions are ACLs;
-// the path and type checks still apply.
-func checkOwner(string, fs.FileInfo) error { return nil }
+// checkOwnership is not enforced on Windows, where permissions are ACLs and
+// Go reports every writable file as mode 0666; the path, type and symbolic
+// link checks still apply.
+func checkOwnership(string, fs.FileInfo) error { return nil }

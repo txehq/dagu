@@ -137,10 +137,7 @@ func readCredentialFile(locator string) (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("%s is not a regular file", locator)
 	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return "", fmt.Errorf("%s can be written by others (mode %v)", locator, info.Mode().Perm())
-	}
-	if err := checkOwner(locator, info); err != nil {
+	if err := checkOwnership(locator, info); err != nil {
 		return "", err
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxCredentialBytes+1))
