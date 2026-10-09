@@ -344,9 +344,18 @@ type txePublishRun struct {
 	workerHome string
 }
 
+// txePublishStore says where the CLI's "txe" context is created, when that is
+// not the TXE home's own store.
+type txePublishStore struct {
+	// flags select the store for "dagu context add".
+	flags []string
+	// dir is the directory that command runs in.
+	dir string
+}
+
 // txeStartPublishRun renders the job's DAG, with the publish step bound to a
 // context store by the flags bind returns, and starts it.
-func txeStartPublishRun(t *testing.T, bind func(home txepkg.Home, workerHome string) []string) *txePublishRun {
+func txeStartPublishRun(t *testing.T, bind func(home txepkg.Home, workerHome string) []string, stores ...txePublishStore) *txePublishRun {
 	t.Helper()
 	pkg := txeCommitPackage(t, map[string]string{"collect.sh": `#!/bin/sh
 set -eu
@@ -408,7 +417,12 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 
 	// The CLI's context, created the way an installer would: a synthetic key
 	// in the TXE home's own store, and nowhere else.
-	add := exec.Command(executable, "context", "add", "txe", "--server", server.URL, "--api-key", "dagu_test_key", "--dagu-home", home.ClientDir()) //nolint:gosec // the binary built by the test harness
+	store := txePublishStore{flags: []string{"--dagu-home", home.ClientDir()}}
+	if len(stores) > 0 {
+		store = stores[0]
+	}
+	add := exec.Command(executable, append([]string{"context", "add", "txe", "--server", server.URL, "--api-key", "dagu_test_key"}, store.flags...)...) //nolint:gosec // the binary built by the test harness
+	add.Dir = store.dir
 	out, err := add.CombinedOutput()
 	require.NoError(t, err, string(out))
 
@@ -527,4 +541,33 @@ func TestTXEPackage_PublishFailsWithoutContext(t *testing.T) {
 	_, ok, _ := run.manifest(status.DAGRunID)
 	assert.False(t, ok, "a manifest was recorded without the job's context")
 	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-hub-deliverable"), "a deliverable was uploaded without a recorded manifest")
+}
+
+// The context store was set up through a configuration whose paths are
+// relative, so it sits wherever the session ran. The publish step runs in the
+// package's directory, where the same configuration would name another,
+// empty store. Given the two directories the session resolved, it reads the
+// session's store and reaches the registry.
+func TestTXEPackage_PublishUsesResolvedStore(t *testing.T) {
+	base := t.TempDir()
+	session := filepath.Join(base, "session")
+	require.NoError(t, os.MkdirAll(session, 0o700))
+	config := filepath.Join(base, "hub.yaml")
+	require.NoError(t, os.WriteFile(config, []byte("paths:\n  contexts_dir: ./contexts\n  data_dir: ./data\n"), 0o600))
+	flags := []string{"--dagu-home", filepath.Join(base, "hub-home"), "--config", config}
+
+	run := txeStartPublishRun(t, func(txepkg.Home, string) []string {
+		return append(slices.Clone(flags), "--contexts-dir", filepath.Join(session, "contexts"), "--data-dir", filepath.Join(session, "data"))
+	}, txePublishStore{flags: flags, dir: session})
+
+	// The relative paths did put the store in the session's directory.
+	stored, err := os.ReadDir(filepath.Join(session, "contexts"))
+	require.NoError(t, err)
+	require.NotEmpty(t, stored, "the context was not stored under the session's directory; the test proves nothing")
+
+	status := run.f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	run.f.assertAllNodesSucceeded(status)
+	_, ok, unknown := run.manifest(status.DAGRunID)
+	assert.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
+	assert.Empty(t, unknown)
 }

@@ -561,6 +561,15 @@ func TestPublishStepUsesRegistrationContext(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, plan.DAGSpec, "--dagu-home "+filepath.Join(stores, "other-hub")+" --config "+filepath.Join(stores, "hub.yaml")+" --context staging")
 
+	// The two directories the flags resolved to in the session are named
+	// outright, so a step does not have to resolve them again.
+	s.Hub.ContextsDir, s.Hub.DataDir = filepath.Join(stores, "session", "contexts"), filepath.Join(stores, "session", "data")
+	plan, err = s.Plan(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Contains(t, plan.DAGSpec, "--config "+filepath.Join(stores, "hub.yaml")+
+		" --contexts-dir "+filepath.Join(stores, "session", "contexts")+" --data-dir "+filepath.Join(stores, "session", "data")+" --context staging")
+	s.Hub.ContextsDir, s.Hub.DataDir = "", ""
+
 	// A store that a later run could not rely on is refused, wherever the
 	// flags resolved it to.
 	scratch := t.TempDir()
