@@ -687,7 +687,7 @@ func (s *Store) GetResourceEvent(ctx context.Context, eventID string) (*Resource
 }
 
 // errEventComplete stops applying an event another processor completed.
-var errEventComplete = refuse(CodeEventComplete, "resource event is already complete")
+var errEventComplete = refuse(CodeEventComplete, "resource event is already applied to this job")
 
 // errVersionChanged marks a job that moved to another version after the
 // event was evaluated against it; the caller evaluates it again.
@@ -714,11 +714,13 @@ func atVersion(version int, permitted ResourceJobFilter) jobCheck {
 // recheck runs check inside the commit, so authorization and the evaluated
 // version hold for the state committed.
 // A job keeps up to maxAppliedResourceEvents applied-event records, over all
-// targets, before dropping the oldest whose event is complete. A record of
-// an incomplete event is never dropped: it is what stops a replay applying
-// the event twice. When hardMaxAppliedResourceEvents records remain after
-// compaction, new events are refused for the job until the incomplete ones
-// are finished, so reports cannot grow a job record without bound.
+// targets, before dropping the oldest whose event's saved progress already
+// holds the job's result. A record whose event still lists the job is never
+// dropped: it is what stops a replay applying the event twice, and only a
+// lost progress write leaves one. When hardMaxAppliedResourceEvents records
+// remain after compaction, new events other than a retirement are refused
+// for the job until those are re-sent, so reports cannot grow a job record
+// without bound.
 const (
 	maxAppliedResourceEvents     = 50
 	hardMaxAppliedResourceEvents = 500
@@ -745,17 +747,21 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 			// Applied by a concurrent replay; re-read its result.
 			return errVersionChanged
 		}
-		// A processor of an event another one completed stops here. The
-		// check shares this job's commit with the compaction that drops
-		// complete events' records, so a dropped record is never reapplied.
+		// A processor holding a stale copy of the event stops here once the
+		// saved event no longer lists this job as pending. The check shares
+		// this job's commit with the compaction that drops such records, so
+		// a dropped record is never reapplied.
 		if saved, err := c.s.GetResourceEvent(ctx, c.eventID); err != nil {
 			return err
-		} else if saved.Complete {
+		} else if !saved.pendingFor(tx.Job.JobID, c.d.Match) {
 			return errEventComplete
 		}
-		list := c.s.compactApplied(ctx, tx.Job.AppliedResourceEvents)
-		if len(list) >= hardMaxAppliedResourceEvents {
-			return refuse(CodeNotReady, "job %s holds %d resource events that are not complete; send them again with their event_id before new events apply",
+		list := c.s.compactApplied(ctx, tx.Job.JobID, tx.Job.AppliedResourceEvents)
+		// Retirement always applies: it happens once, and a job that cannot
+		// be retired by a confirmed deletion would be locked out of its
+		// lifecycle.
+		if len(list) >= hardMaxAppliedResourceEvents && c.d.Outcome != OutcomeRetired {
+			return refuse(CodeNotReady, "job %s holds %d resource events whose progress was not saved; send them again with their event_id before new events apply",
 				tx.Job.JobID, len(list))
 		}
 		tx.Job.AppliedResourceEvents = append(list, AppliedResourceEvent{Key: c.key, EventID: c.eventID, At: tx.now, Disposition: *c.d})
@@ -764,11 +770,12 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 	}
 }
 
-// compactApplied drops the oldest records beyond maxAppliedResourceEvents
-// whose event is recorded complete. A record whose event is incomplete, or
-// cannot be read, is kept: a replay of a complete event returns the saved
-// event and never reaches the job, while an incomplete one still needs it.
-func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent) []AppliedResourceEvent {
+// compactApplied drops the oldest of jobID's records beyond
+// maxAppliedResourceEvents whose event no longer lists the job as pending:
+// its saved progress already holds the job's result, so a replay never
+// reaches the job again. A record whose event still lists the job, or cannot
+// be read, is kept; only a lost progress write leaves one behind.
+func (s *Store) compactApplied(ctx context.Context, jobID string, list []AppliedResourceEvent) []AppliedResourceEvent {
 	excess := len(list) - maxAppliedResourceEvents
 	if excess <= 0 {
 		return list
@@ -776,7 +783,7 @@ func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent)
 	out := make([]AppliedResourceEvent, 0, len(list))
 	for _, a := range list {
 		if excess > 0 {
-			if ev, err := s.GetResourceEvent(ctx, a.EventID); err == nil && ev.Complete {
+			if ev, err := s.GetResourceEvent(ctx, a.EventID); err == nil && !ev.pendingFor(jobID, a.Disposition.Match) {
 				excess--
 				continue
 			}
@@ -784,6 +791,20 @@ func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent)
 		out = append(out, a)
 	}
 	return out
+}
+
+// pendingFor reports whether the event's saved progress still owes jobID
+// the given match.
+func (e *ResourceEvent) pendingFor(jobID, match string) bool {
+	if e.Complete {
+		return false
+	}
+	for _, p := range e.Pending {
+		if p.JobID == jobID && p.Match == match {
+			return true
+		}
+	}
+	return false
 }
 
 // appliedKey keys a job's applied-event records by how the event matched
