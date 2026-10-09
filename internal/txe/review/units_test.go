@@ -1773,6 +1773,28 @@ func TestAgentTextInAQuestionIsQuotedAndCannotBreakOut(t *testing.T) {
 		assert.True(t, strings.HasSuffix(q, " [cut]\""), "the quotation is bounded and closed by the reviewer")
 		assert.Less(t, len(q), 900)
 	}
+	// The same holds for every other string the agent chose: a name the
+	// job does not declare, a target it does not register, a run it was not
+	// shown, the rationale stored beside the question, and the reasoning in
+	// an exception.
+	f.clock.Advance(2 * time.Hour)
+	undeclared := review.AgentAction{Name: hostile, TargetID: hostile, Reason: hostile}
+	unshown := review.AgentAction{Name: review.RetryRunAction, TargetID: targetID, Params: map[string]string{review.RetryRunParam: hostile}, Reason: hostile}
+	f.apply("reviewer-c", f.prepare("reviewer-c"), review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "x", Actions: []review.AgentAction{undeclared, unshown}})
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-d", f.prepare("reviewer-d"), review.AgentDecision{Outcome: review.OutcomePauseUnavailable, Reasoning: hostile})
+	all := f.state().Proposals[jobID]
+	require.Len(t, all, 4)
+	texts := []string{f.state().Exceptions[0].Message}
+	for _, p := range all {
+		texts = append(texts, p.Question, p.Rationale)
+	}
+	for _, text := range texts {
+		assert.NotContains(t, text, "\n")
+		assert.NotContains(t, text, "\u202e")
+		assert.NotContains(t, text, strings.Repeat("x", 601), "no agent string runs on unbounded")
+		assert.Less(t, len(text), 2400)
+	}
 	assert.True(t, strings.HasPrefix(proposals[0].Question, `Approve "expand_volume" on `))
 	assert.True(t, strings.HasPrefix(proposals[1].Question, "The review agent asks, in its own words (not checked): "))
 }

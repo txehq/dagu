@@ -810,7 +810,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		runID := requested.Params[RetryRunParam]
 		run, shown := packet.run(runID)
 		if len(requested.Params) != 1 || !shown {
-			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q). %s", runID, agentReason(requested.Reason)))
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%s). %s", agentText(runID), agentReason(requested.Reason)))
 		}
 		if !run.Execution().known() {
 			// Without the service's identity of the failed execution there
@@ -834,7 +834,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 	}
 	switch {
 	case !isDeclared:
-		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s, which this job does not declare. %s", requested.Name, agentText(requested.TargetID), agentReason(requested.Reason)))
+		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %s on %s, which this job does not declare. %s", agentText(requested.Name), agentText(requested.TargetID), agentReason(requested.Reason)))
 	case !job.HasTarget(requested.TargetID):
 		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s (the target as the agent wrote it), which is not a registered target of this job. %s", requested.Name, agentText(requested.TargetID), agentReason(requested.Reason)))
 	case !paramsDeclared(declared, requested.Params):
@@ -967,13 +967,14 @@ func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Pac
 	}
 	id := ProposalID(packet.ReviewID, kind, requested.Name, requested.TargetID, requested.Params, question)
 	draft := Proposal{
-		ID:              id,
-		JobID:           job.ID,
-		JobVersion:      job.Version,
-		PackageDigest:   job.PackageDigest,
-		Kind:            kind,
-		Question:        question,
-		Rationale:       requested.Reason,
+		ID:            id,
+		JobID:         job.ID,
+		JobVersion:    job.Version,
+		PackageDigest: job.PackageDigest,
+		Kind:          kind,
+		Question:      question,
+		// The rationale is the agent's text too, shown beside the question.
+		Rationale:       agentText(requested.Reason),
 		EvidenceRuns:    review.EvidenceRuns,
 		ArtifactRefs:    packet.artifactRefs(review.EvidenceRuns),
 		ObservedAt:      packet.GeneratedAt,
@@ -1017,7 +1018,8 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomePauseUnavailable:
 		err := r.Registry.RaiseException(ctx, Exception{
 			JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,
-			Message: decision.Reasoning, ReviewID: packet.ReviewID,
+			Message:  "The review agent judged the job's target, credentials or machine unreachable. Its reasoning, in its own words (not checked): " + agentText(decision.Reasoning),
+			ReviewID: packet.ReviewID,
 		})
 		if err != nil {
 			return fmt.Errorf("raise exception: %w", err)
