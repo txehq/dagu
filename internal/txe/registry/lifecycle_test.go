@@ -866,24 +866,6 @@ func TestFailedUndoKeepsWriterToken(t *testing.T) {
 	assert.Empty(t, got.SuspendWriters)
 }
 
-// Applied records past the limit are dropped only for complete events.
-func TestCompactAppliedKeepsIncompleteEvents(t *testing.T) {
-	f := newFixture(t)
-	save := func(complete bool) string {
-		id := f.mint(PrefixEvent)
-		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-14"), Observation: ResourcePresent, Complete: complete}
-		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
-		return id
-	}
-	list := []AppliedResourceEvent{{EventID: save(false)}, {EventID: save(true)}}
-	for range maxAppliedResourceEvents {
-		list = append(list, AppliedResourceEvent{EventID: save(false)})
-	}
-	out := f.store.compactApplied(f.ctx, list)
-	assert.Len(t, out, maxAppliedResourceEvents+1)
-	assert.Equal(t, list[0].EventID, out[0].EventID, "the incomplete event keeps its record")
-	assert.Equal(t, list[2].EventID, out[1].EventID, "the complete one is dropped")
-}
 
 // A job matching an event both by identity and as a replacement has both
 // applied: the identity result does not stand in for the replacement rule.
@@ -910,56 +892,6 @@ func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
 	assert.Equal(t, LifecycleRetired, got.Lifecycle)
 }
 
-// A job holding the maximum of incomplete-event records refuses new events
-// instead of dropping any of them, and replaying one of the old incomplete
-// events still returns its recorded result without changing the job again.
-func TestAppliedRecordsAtHardLimitRefuseNewEvents(t *testing.T) {
-	f := newFixture(t)
-	job := f.readyWith("k", func(v *JobVersion) {
-		v.Targets = []Target{target("v-18")}
-		v.RetirementRules.OnTargetDeleted = RuleReview
-	})
-	// The oldest incomplete event put the job in needs_human, then a person
-	// reactivated it.
-	oldID := f.mint(PrefixEvent)
-	old := ResourceEvent{Schema: SchemaVersion, EventID: oldID, Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true,
-		ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
-	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+oldID, &old))
-	key := appliedKey(matchIdentity, target("v-18"))
-	records := []AppliedResourceEvent{{Key: key, EventID: oldID, At: f.now,
-		Disposition: ResourceDisposition{JobID: job.JobID, Match: matchIdentity, Outcome: OutcomeNeedsHuman}}}
-	for range hardMaxAppliedResourceEvents - 1 {
-		id := f.mint(PrefixEvent)
-		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-18"), Observation: ResourceUnreachable, Reporter: agent}
-		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
-		records = append(records, AppliedResourceEvent{Key: key, EventID: id, At: f.now})
-	}
-	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
-		tx.Job.AppliedResourceEvents = records
-		tx.touch()
-		return nil
-	})
-	require.NoError(t, err)
-
-	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
-	require.NoError(t, err)
-	assert.False(t, ev.Complete)
-	require.Len(t, ev.Failures, 1)
-	assert.Contains(t, ev.Failures[0].Error, "send them again")
-	got, err := f.store.GetJob(f.ctx, job.JobID)
-	require.NoError(t, err)
-	assert.Equal(t, LifecycleActive, got.Lifecycle, "the refused event changed nothing")
-	assert.Len(t, got.AppliedResourceEvents, hardMaxAppliedResourceEvents, "no incomplete record was dropped")
-
-	replayed, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: oldID, Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
-	require.NoError(t, err)
-	assert.True(t, replayed.Complete)
-	require.Len(t, replayed.Dispositions, 1)
-	assert.Equal(t, OutcomeNeedsHuman, replayed.Dispositions[0].Outcome, "the recorded result is returned")
-	got, err = f.store.GetJob(f.ctx, job.JobID)
-	require.NoError(t, err)
-	assert.Equal(t, LifecycleActive, got.Lifecycle, "the old event is not applied again")
-}
 
 // An older writer's undo does not release ownership of a suspension a newer
 // writer made after it: the newer suspension is still lifted on resume.
@@ -1035,4 +967,133 @@ func TestStaleEventProcessorStops(t *testing.T) {
 	read, err := f.store.GetResourceEvent(f.ctx, id)
 	require.NoError(t, err)
 	assert.True(t, read.Complete)
+}
+
+// fillApplied gives job count applied records whose events still list it
+// as pending, as a lost progress write leaves them, starting with first.
+func (f *fixture) fillApplied(job *Job, t Target, first ResourceEvent, count int) {
+	f.t.Helper()
+	key := appliedKey(matchIdentity, t)
+	pending := []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}
+	first.Pending = pending
+	require.NoError(f.t, f.store.createJSON(f.ctx, resourceEventsPrefix+first.EventID, &first))
+	records := []AppliedResourceEvent{{Key: key, EventID: first.EventID, At: f.now,
+		Disposition: ResourceDisposition{JobID: job.JobID, Match: matchIdentity, Outcome: OutcomeNeedsHuman}}}
+	for range count - 1 {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: t, Observation: ResourceUnreachable, Reporter: agent, Pending: pending}
+		require.NoError(f.t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		records = append(records, AppliedResourceEvent{Key: key, EventID: id, At: f.now,
+			Disposition: ResourceDisposition{JobID: job.JobID, Match: matchIdentity, Outcome: OutcomeAvailability}})
+	}
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		tx.Job.AppliedResourceEvents = records
+		tx.touch()
+		return nil
+	})
+	require.NoError(f.t, err)
+}
+
+// Past the limit, a record is dropped once its event's saved progress no
+// longer lists the job, even while the event waits on other jobs; a record
+// whose event still lists the job is kept.
+func TestCompactAppliedIsScopedToTheJob(t *testing.T) {
+	f := newFixture(t)
+	save := func(pending ...ResourceDependent) string {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-14"), Observation: ResourcePresent, Pending: pending}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		return id
+	}
+	mine := ResourceDependent{JobID: "job-a", Match: matchIdentity}
+	other := ResourceDependent{JobID: "job-b", Match: matchIdentity}
+	rec := func(id string) AppliedResourceEvent {
+		return AppliedResourceEvent{EventID: id, Disposition: ResourceDisposition{JobID: "job-a", Match: matchIdentity}}
+	}
+	list := []AppliedResourceEvent{rec(save(mine)), rec(save(other))}
+	for range maxAppliedResourceEvents {
+		list = append(list, rec(save(mine)))
+	}
+	out := f.store.compactApplied(f.ctx, "job-a", list)
+	assert.Len(t, out, maxAppliedResourceEvents+1)
+	assert.Equal(t, list[0].EventID, out[0].EventID, "the event still owing this job keeps its record")
+	assert.Equal(t, list[2].EventID, out[1].EventID, "the event waiting only on another job does not")
+}
+
+// A job whose records are full of lost progress refuses new events before
+// any change, and replaying one of those events returns its recorded result
+// without changing the job again.
+func TestAppliedRecordsAtHardLimitRefuseNewEvents(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-18")}
+		v.RetirementRules.OnTargetDeleted = RuleReview
+	})
+	oldID := f.mint(PrefixEvent)
+	f.fillApplied(job, target("v-18"), ResourceEvent{Schema: SchemaVersion, EventID: oldID, Target: target("v-18"),
+		Observation: ResourceDeleted, Authoritative: true, ObservedAt: f.now, Reporter: agent}, hardMaxAppliedResourceEvents)
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.False(t, ev.Complete)
+	require.Len(t, ev.Failures, 1)
+	assert.Contains(t, ev.Failures[0].Error, "send them again")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the refused event changed nothing")
+	assert.Len(t, got.AppliedResourceEvents, hardMaxAppliedResourceEvents, "no record was dropped")
+
+	replayed, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: oldID, Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.True(t, replayed.Complete)
+	require.Len(t, replayed.Dispositions, 1)
+	assert.Equal(t, OutcomeNeedsHuman, replayed.Dispositions[0].Outcome, "the recorded result is returned")
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the old event is not applied again")
+}
+
+// A confirmed deletion still retires a job whose records are full: the
+// lifecycle is never locked by the record bound.
+func TestRetirementAppliesAtHardLimit(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-19")}
+		v.RetirementRules.OnTargetDeleted = RuleRetire
+	})
+	f.fillApplied(job, target("v-19"), ResourceEvent{Schema: SchemaVersion, EventID: f.mint(PrefixEvent), Target: target("v-19"),
+		Observation: ResourceUnreachable, ObservedAt: f.now, Reporter: agent}, hardMaxAppliedResourceEvents)
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-19"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.True(t, ev.Complete)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeRetired, ev.Dispositions[0].Outcome)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleRetired, got.Lifecycle)
+}
+
+// A stale processor stops once the saved event no longer owes the job, even
+// while the event is still incomplete for another job.
+func TestStaleProcessorStopsWhenJobAlreadyApplied(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-20")}
+		v.RetirementRules.OnTargetDeleted = RuleReview
+	})
+	id := f.mint(PrefixEvent)
+	pending := ResourceDependent{JobID: job.JobID, Match: matchIdentity}
+	stale := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-20"), Observation: ResourceDeleted, Authoritative: true,
+		ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{pending}}
+	// Saved progress: this job is done, another job is still owed.
+	saved := stale
+	saved.Pending = []ResourceDependent{{JobID: "job-other", Match: matchIdentity}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &saved))
+
+	_, err := f.store.applyDependent(f.ctx, pending, &stale, agent, func(context.Context, *Job) bool { return true })
+	assert.Equal(t, CodeEventComplete, code(t, err))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
 }
