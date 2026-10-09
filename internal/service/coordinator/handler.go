@@ -877,6 +877,9 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		}
 	}
 	if existingStatus != nil && existingStatus.Status == ir.Queued {
+		if task.RequireLatestIsPrevious {
+			return nil, fmt.Errorf("%w: latest is a queued execution", persis.ErrLatestExecutionChanged)
+		}
 		task.AttemptId = existingAttempt.ID()
 		task.AttemptKey = generateRootAttemptKey(task)
 
@@ -899,7 +902,11 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 
 	// Create new attempt (either first attempt or retry)
 	isRetry := task.Operation == coordinatorv1.Operation_OPERATION_RETRY || findErr == nil
-	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry}
+	expect, err := expectedLatest(task)
+	if err != nil {
+		return nil, err
+	}
+	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, ExpectLatest: expect}
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, opts)
 	if err != nil {
@@ -1171,6 +1178,9 @@ func dispatchErrorCode(err error) codes.Code {
 func prepareAttemptErrorCode(err error) codes.Code {
 	if _, ok := errors.AsType[*queue.StaleQueueDispatchError](err); ok {
 		return codes.FailedPrecondition
+	}
+	if errors.Is(err, persis.ErrLatestExecutionChanged) {
+		return codes.Aborted
 	}
 	return codes.Internal
 }

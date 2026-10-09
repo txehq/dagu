@@ -12114,6 +12114,10 @@ export interface operations {
                     /** @description Optional. When true, skip step precondition evaluation for the steps reset by this retry. Requires stepName. DAG-level preconditions and lifecycle handlers still apply. */
                     bypassPreconditions?: boolean;
                     subDAGRunId?: components["schemas"]["DAGRunId"] & unknown;
+                    /** @description Optional, with expectedQueuedAt. Makes the retry conditional: it is admitted only if the run's latest execution is this attempt under expectedQueuedAt and has finished, checked atomically with the retry's admission. Otherwise 409 with details.code execution_changed and nothing is queued or created. A retry that would run in a local process is refused with details.code conditional_retry_unsupported. */
+                    expectedAttemptId?: string;
+                    /** @description Optional, with expectedAttemptId. The queue marker (queuedAt) of the expected execution; empty for an execution that was never queued. */
+                    expectedQueuedAt?: string;
                 };
             };
         };

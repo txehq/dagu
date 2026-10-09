@@ -634,3 +634,19 @@ func cloneDAGRunStatus(status *ir.DAGRunStatus) *ir.DAGRunStatus {
 	cloned := *status
 	return &cloned
 }
+
+// A queued retry is bound to the execution the caller read: a later
+// execution of the same attempt (another queue marker) is not retried in its
+// place.
+func TestPrepareRetryIsBoundToTheExecution(t *testing.T) {
+	status := &ir.DAGRunStatus{Name: "job", DAGRunID: "run", AttemptID: "attempt", Status: ir.Failed, QueuedAt: "q1"}
+	latest := cloneDAGRunStatus(status)
+	latest.QueuedAt = "q2"
+	backend := &stubDAGRunStore{status: latest}
+	repository := persis.NewDAGRunRepository(backend, nil, persis.DAGRunRepositoryOptions{})
+	admission, err := queue.PrepareRetry(t.Context(), repository, nil, status, queue.EnqueueRetryOptions{})
+	require.ErrorIs(t, err, queue.ErrRetryStaleLatest)
+	assert.Nil(t, admission)
+	assert.Equal(t, ir.Failed, backend.status.Status)
+	assert.Equal(t, "q2", backend.status.QueuedAt)
+}
