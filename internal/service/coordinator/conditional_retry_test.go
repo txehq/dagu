@@ -174,3 +174,47 @@ func TestAdmittedResponseNamesTheSavedExecution(t *testing.T) {
 	assert.Empty(t, got.GetQueuedAt(), "never queued")
 	assert.Empty(t, admittedResponse(task(""), nil).GetAttemptId(), "nothing prepared, nothing named")
 }
+
+// Through the real Dispatch and file store, the receipt names exactly the
+// execution the saved statuses carry: the new attempt with the retried
+// status's queued-at for a run queued before, none for a run never queued.
+func TestDispatchReceiptMatchesTheSavedExecution(t *testing.T) {
+	for _, queuedAt := range []string{"2026-10-09T12:00:00Z", ""} {
+		t.Run("queuedAt="+queuedAt, func(t *testing.T) {
+			registerCommandExecutorCapsForCoordinatorTest()
+			ctx := context.Background()
+			dir := t.TempDir()
+			repo := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+			dag := &ir.DAG{Name: "test-dag"}
+			first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-123", persis.DAGRunCreateAttemptOptions{})
+			require.NoError(t, err)
+			s := ir.InitialStatus(dag)
+			s.DAGRunID, s.AttemptID, s.Status, s.QueuedAt = "run-123", first.ID(), ir.Failed, queuedAt
+			require.NoError(t, first.Open(ctx))
+			require.NoError(t, first.Write(ctx, s))
+			require.NoError(t, first.Close(ctx))
+			previous, err := convert.DAGRunStatusToProto(&s)
+			require.NoError(t, err)
+
+			dispatchStore := newTestDispatchTaskStore(filepath.Join(dir, "distributed"))
+			heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
+			require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
+			h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+			resp, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+				Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
+				Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
+				PreviousStatus: previous, RequireLatestIsPrevious: true,
+			}})
+			require.NoError(t, err)
+			require.NotEqual(t, first.ID(), resp.GetAttemptId(), "a new attempt")
+			assert.Equal(t, queuedAt, resp.GetQueuedAt())
+
+			latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-123"))
+			require.NoError(t, err)
+			saved, err := latest.ReadStatus(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, resp.GetAttemptId(), saved.AttemptID)
+			assert.Equal(t, resp.GetQueuedAt(), saved.QueuedAt, "the initial status names the receipt's execution")
+		})
+	}
+}
