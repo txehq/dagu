@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/txe/probe"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -111,6 +112,22 @@ func (t txeReviewTransport) Do(ctx context.Context, method, path string, in, out
 	return err
 }
 
+// localCredentials adapts this machine's record of what it registered to
+// the reviewer: the credential references of a version of a job.
+func localCredentials(local probe.LocalCredentials) func(string, int) ([]review.CredentialRef, error) {
+	return func(jobID string, version int) ([]review.CredentialRef, error) {
+		refs, err := local.Refs(jobID, version)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]review.CredentialRef, len(refs))
+		for i, ref := range refs {
+			out[i] = review.CredentialRef{Name: ref.Name, Kind: ref.Kind, Locator: ref.Locator}
+		}
+		return out, nil
+	}
+}
+
 // txeReviewSteps builds the reviewer for one step process.
 func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 	client, err := txeClient(ctx)
@@ -141,14 +158,25 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 		}
 	}
 	transport := txeReviewTransport{client: client}
+	txeHome, err := txepkg.DefaultHome()
+	if err != nil {
+		return nil, err
+	}
 	return &review.Steps{
 		MachineID:   machine,
 		StateDir:    stateDir,
 		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
-			MachineID:   machine,
-			Registry:    &review.Remote{Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient},
-			Effector:    &review.CommandEffector{},
+			MachineID: machine,
+			Registry: &review.Remote{
+				Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient,
+				LocalCredentials: localCredentials(probe.LocalCredentials{Home: txeHome}),
+			},
+			// A job's file credentials are read with the checks this
+			// machine applies to them everywhere else. On Windows that read
+			// inspects no ownership or access list and its symlink check
+			// can be raced, so it is weaker there.
+			Effector:    &review.CommandEffector{ReadCredentialFile: probe.ReadCredentialFile},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(transport), Complete: review.RemoteComplete(transport)},
 			Runs:        review.RemoteRuns(transport),
 			Holder:      machine + "/" + runID,

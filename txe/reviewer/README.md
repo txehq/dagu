@@ -95,9 +95,19 @@ record names the reference and the kind of failure: not a value, and not
 where the credential is kept. A reference cannot use a name that
 identifies the action or marks the review. The references are not part of
 what the review agent is shown. They are trusted input to the reviewer: it
-reads whatever a reference names. Whatever supplies a job to the reviewer
-from a record that can change after registration has to check the
-references against what was authorized on the job's machine first.
+reads whatever a reference names. So `dagu txe review` does not take them
+from the registry, whose record can be changed after registration. It
+takes them from this machine's own record of the registration (the request
+`dagu txe register` filed beside the version's receipt), and only when the
+registry's copy still lists the same names, kinds and locators. If the
+copies differ in any way, or this machine has no record of the version
+while the registry lists references, none of the job's commands is
+started and nothing is read; the record says so without naming a
+locator. A job's credential files are read with the checks this machine
+applies to them elsewhere (an absolute, clean path to a regular file that
+is not a symbolic link and that only its owner can write). On Windows that
+read inspects no ownership or access list and its symbolic-link check can
+be raced, so it is weaker there.
 
 This removes accidental inheritance. It is not isolation: the command runs
 as the same operating-system user as the reviewer and can read the same

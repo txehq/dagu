@@ -176,6 +176,11 @@ type Job struct {
 	// on the job's machine when the job was registered, and leave out, or
 	// refuse the job over, any that differ. The effector does not check.
 	CredentialRefs []CredentialRef `json:"credential_refs,omitempty"`
+	// CredentialsRefused is set, with the reason, when the job's credential
+	// references could not be established as the ones authorized on its
+	// machine. No command of the job is started while it is set. It never
+	// says where a credential is kept.
+	CredentialsRefused string `json:"credentials_refused,omitempty"`
 }
 
 // CredentialRef names a credential a job declares. The locator is a path or

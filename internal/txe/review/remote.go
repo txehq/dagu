@@ -64,12 +64,62 @@ type Remote struct {
 	MachineID   string
 	RunID       string
 	AgentClient string
+	// LocalCredentials returns the credential references this machine
+	// itself registered for a version of a job, from its own record of the
+	// registration. They are the only references a job's commands are given.
+	// The registry's copy is never used for that: it is compared with the
+	// local one, and a job whose copies differ gets none of its commands
+	// started. Without LocalCredentials no job with references runs a
+	// command.
+	LocalCredentials func(jobID string, version int) ([]CredentialRef, error)
 }
 
 var _ Registry = (*Remote)(nil)
 
 func (r *Remote) actor() *api.TxeActor {
 	return &api.TxeActor{Kind: api.TxeActorKindReviewer, Id: r.MachineID + "/" + r.RunID, MachineId: &r.MachineID}
+}
+
+// credentialRefs establishes the references a job's commands are given. The
+// registry's record of them can be changed by whoever can write to the
+// registry, after the job was registered; what was authorized is what this
+// machine recorded when it registered the version. So the references come
+// from that local record only, and the registry's copy must say the same:
+// the same names, kinds and locators. If the local record is missing or
+// unreadable, or the two differ in any way, no reference is used and the
+// reason is returned, which stops every command of the job. The reason
+// names no locator.
+func (r *Remote) credentialRefs(jobID string, version int, remote []api.TxeCredentialRef) ([]CredentialRef, string) {
+	if r.LocalCredentials == nil {
+		if len(remote) == 0 {
+			return nil, ""
+		}
+		return nil, "the job declares credentials and this reviewer has no local registration record to check them against: none of the job's commands is started"
+	}
+	local, err := r.LocalCredentials(jobID, version)
+	if err != nil {
+		if len(remote) == 0 {
+			// Nothing is declared and nothing would be read. A job
+			// registered from another machine has no record here.
+			return nil, ""
+		}
+		return nil, fmt.Sprintf("version %d of the job has no usable registration record on this machine, so its credential references cannot be checked: none of the job's commands is started", version)
+	}
+	if len(local) != len(remote) {
+		return nil, fmt.Sprintf("the registry lists %d credential reference(s) for version %d of the job and this machine registered %d: none of the job's commands is started", len(remote), version, len(local))
+	}
+	seen := make(map[CredentialRef]int, len(local))
+	for _, ref := range local {
+		seen[ref]++
+	}
+	for _, ref := range remote {
+		key := CredentialRef{Name: ref.Name, Kind: string(ref.Kind), Locator: ref.Locator}
+		if seen[key] == 0 {
+			return nil, fmt.Sprintf("the registry's credential reference %s for version %d of the job is not the one this machine registered: none of the job's commands is started", agentText(ref.Name), version)
+		}
+		seen[key]--
+	}
+	return local, ""
 }
 
 func jobPath(jobID string, rest ...string) string {
@@ -316,6 +366,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	if job.WorkingDir == "" {
 		job.WorkingDir = v.Package.Path
 	}
+	job.CredentialRefs, job.CredentialsRefused = r.credentialRefs(jobID, doc.Version, deref(v.Package.CredentialRefs))
 	// The DAG a version runs and the package it runs from are bound by the
 	// version's immutable record. The job's digest is given only when that
 	// record and the job agree on both, so a run whose snapshot matches it

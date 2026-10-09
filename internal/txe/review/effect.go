@@ -72,6 +72,10 @@ type CommandEffector struct {
 	// given. When nil it is this process's environment without what is the
 	// reviewer's own; see baseEnv.
 	Env []string
+	// ReadCredentialFile reads the file of a job's file credential. When
+	// nil the file is read as it is. Production supplies the checked read
+	// the job's own machine uses for its credentials.
+	ReadCredentialFile func(locator string) (string, error)
 }
 
 var _ Effector = (*CommandEffector)(nil)
@@ -136,7 +140,10 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// #nosec G204 -- argv comes from the job's registered policy, not from the agent.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
-	credentials, err := credentialEnv(job)
+	if job.CredentialsRefused != "" {
+		return 0, "", fmt.Errorf("%w: %s", errNotStarted, job.CredentialsRefused)
+	}
+	credentials, err := credentialEnv(job, e.ReadCredentialFile)
 	if err != nil {
 		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
 	}
@@ -261,7 +268,7 @@ func jobEnv(env []string) []string {
 // name of a credential reference.
 var credentialNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-func credentialEnv(job Job) ([]string, error) {
+func credentialEnv(job Job, readFile func(string) (string, error)) ([]string, error) {
 	env := make([]string, 0, len(job.CredentialRefs))
 	for _, ref := range job.CredentialRefs {
 		upper := strings.ToUpper(ref.Name)
@@ -274,12 +281,20 @@ func credentialEnv(job Job) ([]string, error) {
 		var value string
 		switch ref.Kind {
 		case CredentialFile:
-			// #nosec G304 -- the path is the job's registered credential locator on its own machine.
-			raw, err := os.ReadFile(ref.Locator)
+			var err error
+			if readFile != nil {
+				// The checked reader's errors name the path; only the
+				// kind of failure is reported.
+				value, err = readFile(ref.Locator)
+			} else {
+				var raw []byte
+				// #nosec G304 -- the path is the job's registered credential locator on its own machine.
+				raw, err = os.ReadFile(ref.Locator)
+				value = string(raw)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("credential %s: its file %s", ref.Name, unreadable(err))
 			}
-			value = string(raw)
 		case CredentialEnv:
 			found, ok := os.LookupEnv(ref.Locator)
 			if !ok {

@@ -13,7 +13,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -842,6 +844,109 @@ func TestRemoteFailedRunEvidenceSaysWhetherItWasEverDispatched(t *testing.T) {
 			assert.NotContains(t, l.stub.calls, "GET "+path(l, "r2"))
 		})
 	}
+}
+
+// A registered job's credential references are the ones this machine
+// recorded when it registered the version, and only when the registry's
+// copy still says the same. The registry's record can be changed after
+// registration; a changed name, kind or locator, an added or removed
+// reference, or a missing local record gives the job no references and
+// stops every one of its commands, and nothing is read: not the file the
+// registry now points at, and not a credential of the reviewer.
+func TestRemoteJobCredentialsComeFromTheLocalRegistrationAndMustMatchTheRegistry(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	t.Setenv("OPENAI_API_KEY", "the-review-agents-key")
+	secrets := t.TempDir()
+	registered := filepath.Join(secrets, "job-key")
+	planted := filepath.Join(secrets, "planted")
+	require.NoError(t, os.WriteFile(registered, []byte("the-jobs-own-key"), 0o600))
+	require.NoError(t, os.WriteFile(planted, []byte("something-else-on-this-machine"), 0o600))
+	local := []review.CredentialRef{{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: registered}}
+	ref := func(name, kind, locator string) string {
+		return fmt.Sprintf(`{"name":%q,"kind":%q,"locator":%q}`, name, kind, locator)
+	}
+	same := ref("OPENAI_API_KEY", "file", registered)
+
+	for name, tc := range map[string]struct {
+		remote  string
+		local   func(string, int) ([]review.CredentialRef, error)
+		noLocal bool
+		runs    bool
+	}{
+		"the registry still says what was registered":    {remote: same, runs: true},
+		"the locator was changed after registration":     {remote: ref("OPENAI_API_KEY", "file", planted)},
+		"the name was changed after registration":        {remote: ref("ANTHROPIC_API_KEY", "file", registered)},
+		"the kind was changed after registration":        {remote: ref("OPENAI_API_KEY", "env", registered)},
+		"a reference was added after registration":       {remote: same + "," + ref("EXTRA", "file", planted)},
+		"the reference was removed after registration":   {remote: ""},
+		"this machine has no record of the registration": {remote: same, local: func(string, int) ([]review.CredentialRef, error) { return nil, errors.New("no receipt") }},
+		"the reviewer was given no local record to read": {remote: same, noLocal: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			stub := &stubTransport{t: t, replies: map[string]string{
+				"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
+				"/txe/jobs/job_1/versions/3": fmt.Sprintf(`{"title":"t","purpose":"p","package":{"digest":"sha256:aa","path":%q,"entrypoint":"run.sh","credential_refs":[%s]},"dag":{}}`, dir, tc.remote),
+			}}
+			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalCredentials: tc.local}
+			if tc.local == nil && !tc.noLocal {
+				remote.LocalCredentials = func(jobID string, version int) ([]review.CredentialRef, error) {
+					require.Equal(t, "job_1", jobID)
+					require.Equal(t, 3, version)
+					return local, nil
+				}
+			}
+			job, err := remote.Job(context.Background(), "job_1")
+			require.NoError(t, err)
+
+			var read []string
+			effector := &review.CommandEffector{ReadCredentialFile: func(locator string) (string, error) {
+				read = append(read, locator)
+				raw, err := os.ReadFile(locator)
+				return string(raw), err
+			}}
+			res := effector.Run(context.Background(), job, shellAction(`printf '%s' "$OPENAI_API_KEY" > key.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
+			got, readErr := os.ReadFile(filepath.Join(dir, "key.txt"))
+			if tc.runs {
+				require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+				assert.Equal(t, local, job.CredentialRefs)
+				assert.Equal(t, []string{registered}, read)
+				assert.Equal(t, "the-jobs-own-key", string(got))
+				return
+			}
+			assert.Empty(t, job.CredentialRefs)
+			assert.NotEmpty(t, job.CredentialsRefused)
+			assert.Equal(t, review.EffectNotApplied, res.Status, "the command is not started")
+			assert.ErrorIs(t, readErr, os.ErrNotExist, "nothing ran")
+			assert.Empty(t, read, "no file is read: not the registered one and not the one the registry points at")
+			for _, text := range []string{job.CredentialsRefused, res.Detail} {
+				assert.NotContains(t, text, secrets, "the reason does not say where a credential is kept")
+				assert.NotContains(t, text, "the-jobs-own-key")
+				assert.NotContains(t, text, "the-review-agents-key")
+			}
+		})
+	}
+
+	// A job that declares no credentials, on a machine with no record of
+	// it, runs its commands: there is nothing to read and nothing to check.
+	t.Run("no references anywhere", func(t *testing.T) {
+		dir := t.TempDir()
+		stub := &stubTransport{t: t, replies: map[string]string{
+			"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
+			"/txe/jobs/job_1/versions/3": fmt.Sprintf(`{"title":"t","purpose":"p","package":{"digest":"sha256:aa","path":%q,"entrypoint":"run.sh"},"dag":{}}`, dir),
+		}}
+		remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalCredentials: func(string, int) ([]review.CredentialRef, error) { return nil, errors.New("no receipt") }}
+		job, err := remote.Job(context.Background(), "job_1")
+		require.NoError(t, err)
+		assert.Empty(t, job.CredentialsRefused)
+		res := (&review.CommandEffector{}).Run(context.Background(), job, shellAction(`env > env.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), "the-review-agents-key")
+	})
 }
 
 // A run that ended in the queue has no finish time and is still a result,
