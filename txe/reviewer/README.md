@@ -24,21 +24,21 @@ turns anything undeclared into a question. Parameters reach an action as
 
 ## Reviewer profile
 
-Use a dedicated agent profile for reviews and set it as `AgentConfigDir`.
-A shared interactive profile loads that profile's global instructions into
-every review (measured: about 38k tokens with the shared profile) and may
-carry session hooks.
+Set `AgentConfigDir` to an agent profile that is already logged in on the
+machine that runs the worker. The profile is used by reference only: do not
+copy it or its credentials anywhere.
 
-The profile must:
+The rendered agent step isolates the review from that profile's everyday
+configuration. It passes an empty tool list, an empty settings source list
+(so the profile's settings, hooks and plugins are not loaded), no MCP
+servers and no saved session. Measured with claude 2.1.295 on a shared
+interactive profile: about 4.7k input tokens per review with these flags,
+against about 38k when they are missing.
 
-- be logged in once, interactively, on the machine that runs the worker;
-- contain no hooks, plugins, MCP servers or global instruction files;
-- live outside any worktree.
-
-Do not copy credentials into it from another profile. If its login expires,
-the review records a `reviewer_authentication_required` exception for the
-machine and defers the job's next review by one cadence; it does not retry
-on every tick and leaves no session waiting.
+If the profile's login expires, the review records a
+`reviewer_authentication_required` exception for the machine and defers the
+job's next review by one cadence; it does not retry on every tick and leaves
+no session waiting.
 
 ## Environment
 
@@ -60,7 +60,13 @@ else a review step needs must be rendered into the DAG:
   disconnect cancellation window.
 - Attempts: a routine action that failed `max_attempts` times in a row is
   proposed instead of tried again. An action whose outcome is unknown is
-  never retried: a declared `reconcile` probe settles it, or a human does.
+  never retried: a declared `reconcile` probe settles it, or the owner
+  answers its escalation. Until then the same action on the same target is
+  not run again, and only the answer `retry` allows it.
+- Leases: an action starts only if the claim outlives its timeout, and its
+  process is killed when its grant ends. A process frozen between that
+  check and its start can still act late; a destination that must exclude
+  this has to enforce the attempt's key itself.
 
 ## Declared actions
 
@@ -72,8 +78,11 @@ ending:
 | Class | Non-zero exit | Timeout or crash |
 | --- | --- | --- |
 | `read_only` | failed | failed |
-| `keyed` (destination deduplicates on `TXE_IDEMPOTENCY_KEY`) | failed | uncertain |
+| `keyed` (destination deduplicates on `TXE_IDEMPOTENCY_KEY`) | uncertain | uncertain |
 | `none` | uncertain | uncertain |
+
+`TXE_IDEMPOTENCY_KEY` is the id of one attempt. It lets a destination ignore
+a repeat of that same attempt; a later review's attempt has a new key.
 
 A `reconcile` probe exits `0` if the effect is present at the destination,
 `3` if it is absent, and anything else if it cannot tell.

@@ -38,9 +38,12 @@ steps:
       json-schema: {{yaml .Schema}}
       # The agent only reads the packet and answers. It gets no tools, no MCP
       # servers, no user settings or hooks, and leaves no resumable session.
-      tools: ""
+      # These two are one-element lists on purpose: harness.run drops an
+      # option whose value is an empty string, which would leave the agent
+      # with its default tools and the profile's settings and hooks.
+      tools: [""]
       strict-mcp-config: true
-      setting-sources: ""
+      setting-sources: [""]
       no-session-persistence: true
     output: TXE_DECISION
 

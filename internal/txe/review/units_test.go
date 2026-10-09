@@ -115,7 +115,8 @@ func TestRenderDAGs(t *testing.T) {
 		"dagu txe review prepare --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID}",
 		"action: harness.run",
 		`provider: "claude"`,
-		`tools: ""`,
+		`tools: [""]`,
+		`setting-sources: [""]`,
 		"strict-mcp-config: true",
 		"no-session-persistence: true",
 		`dagu txe review apply --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
@@ -128,11 +129,16 @@ func TestRenderDAGs(t *testing.T) {
 	for _, want := range []string{
 		"action: human.task",
 		"required: [decision_id, verdict]",
-		`dagu txe review execute --job ${JOB_ID} --proposal ${PROPOSAL_ID} --decision "$TXE_DECISION_ID"`,
+		`dagu txe review execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
 		`- TXE_DAGU_REVIEWER: "1"`,
 	} {
 		assert.Contains(t, dags.Decide, want)
 	}
+	assert.NotContains(t, dags.Decide, "--job ${JOB_ID}", "a run parameter must not be shell text")
+	// harness.run drops an option whose value is an empty string, so the
+	// isolating flags must never be rendered as one.
+	assert.NotContains(t, dags.Reviewer, `tools: ""`)
+	assert.NotContains(t, dags.Reviewer, `setting-sources: ""`)
 	assert.NotContains(t, dags.Decide, "schedule:")
 	assert.NotContains(t, dags.Decide, "max_active_runs", "unanswered proposals must not queue behind each other")
 }
@@ -182,7 +188,10 @@ func TestCommandEffector(t *testing.T) {
 
 	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 3", review.IdempotencyNone), action).Status)
 	assert.Equal(t, review.EffectUnknown, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyNone), action).Status)
-	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyKeyed), action).Status)
+	assert.Equal(t, review.EffectUnknown, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyKeyed), action).Status,
+		"a keyed action can fail after it applied its effect")
+	assert.Equal(t, review.EffectUnknown, e.Run(ctx, job, shellAction("exit 1", review.Idempotency("typo")), action).Status,
+		"an unrecognised class is not read as harmless")
 	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyReadOnly), action).Status)
 
 	start := time.Now()
@@ -374,4 +383,33 @@ func TestPrepareSkipsAJobThatCannotBePrepared(t *testing.T) {
 	err := steps.Prepare(ctx, "tick-2", &none)
 	require.ErrorContains(t, err, "record unreadable")
 	assert.Empty(t, none.String())
+}
+
+func TestAgentUsage(t *testing.T) {
+	in, out := review.AgentUsage([]byte(`{"usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":4000,"output_tokens":471}}`))
+	assert.Equal(t, 4102, in)
+	assert.Equal(t, 471, out)
+	in, out = review.AgentUsage([]byte("not json"))
+	assert.Zero(t, in)
+	assert.Zero(t, out)
+}
+
+// The execute step's ids come from run parameters and task input, so
+// anything that is not a plain record id is refused before the registry is
+// asked.
+func TestExecuteStepRejectsMalformedIDs(t *testing.T) {
+	f := newFixture(t)
+	steps := f.steps("exec", t.TempDir())
+	ctx := context.Background()
+	var out bytes.Buffer
+	for _, ids := range [][3]string{
+		{"job_A; rm -rf /", "prp_1", "dec_1"},
+		{"job_A", "prp_$(id)", "dec_1"},
+		{"job_A", "prp_1", ""},
+		{"prp_1", "prp_1", "dec_1"},
+	} {
+		require.Error(t, steps.Execute(ctx, ids[0], ids[1], ids[2], &out), "%v", ids)
+	}
+	assert.Empty(t, out.String())
+	assert.Empty(t, f.state().Transitions, "no claim was taken")
 }

@@ -57,7 +57,9 @@ const (
 	// a diagnostic. Its failures are never uncertain.
 	IdempotencyReadOnly Idempotency = "read_only"
 	// IdempotencyKeyed means the destination deduplicates on the key passed
-	// in TXE_IDEMPOTENCY_KEY.
+	// in TXE_IDEMPOTENCY_KEY. The key is per attempt, so it makes a repeat
+	// of the same attempt safe; it says nothing about whether a failed
+	// attempt took effect.
 	IdempotencyKeyed Idempotency = "keyed"
 	// IdempotencyNone means a repeat may repeat the external effect.
 	IdempotencyNone Idempotency = "none"
@@ -220,10 +222,14 @@ type Action struct {
 	Detail     string      `json:"detail,omitempty"`
 	// GrantID is the registry's authorization of this attempt; settling
 	// the action requires it.
-	GrantID    string    `json:"grant_id"`
-	ClaimID    string    `json:"claim_id"`
-	StartedAt  time.Time `json:"started_at,omitzero"`
-	FinishedAt time.Time `json:"finished_at,omitzero"`
+	GrantID string `json:"grant_id"`
+	// GrantExpiresAt bounds the attempt: its holder must not start or
+	// continue the effect after this time, and nobody else may conclude
+	// anything about the attempt before it.
+	GrantExpiresAt time.Time `json:"grant_expires_at,omitzero"`
+	ClaimID        string    `json:"claim_id"`
+	StartedAt      time.Time `json:"started_at,omitzero"`
+	FinishedAt     time.Time `json:"finished_at,omitzero"`
 }
 
 // ProposalKind distinguishes what a human is being asked.
@@ -337,10 +343,14 @@ type Review struct {
 	ProposalIDs      []string `json:"proposal_ids,omitempty"`
 	Notes            []string `json:"notes,omitempty"`
 	// PacketBytes is the size of the context the agent was given.
-	PacketBytes int       `json:"packet_bytes"`
-	Reviewer    string    `json:"reviewer"`
-	AgentClient string    `json:"agent_client,omitempty"`
-	RecordedAt  time.Time `json:"recorded_at,omitzero"`
+	PacketBytes int `json:"packet_bytes"`
+	// AgentInputTokens and AgentOutputTokens are what the agent CLI reports
+	// for the whole invocation, cached input included.
+	AgentInputTokens  int       `json:"agent_input_tokens,omitempty"`
+	AgentOutputTokens int       `json:"agent_output_tokens,omitempty"`
+	Reviewer          string    `json:"reviewer"`
+	AgentClient       string    `json:"agent_client,omitempty"`
+	RecordedAt        time.Time `json:"recorded_at,omitzero"`
 }
 
 // ExceptionKind classifies a condition that needs local attention.

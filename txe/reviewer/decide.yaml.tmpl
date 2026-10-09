@@ -40,6 +40,10 @@ steps:
     retry_policy:
       limit: 5
       interval_sec: 60
+    # Parameters and task input reach the command only as quoted variables,
+    # never as shell text.
     env:
+      - TXE_JOB_ID: ${JOB_ID}
+      - TXE_PROPOSAL_ID: ${PROPOSAL_ID}
       - TXE_DECISION_ID: ${steps.decide.outputs.decision_id}
-    run: {{.ReviewCommand}} execute --job ${JOB_ID} --proposal ${PROPOSAL_ID} --decision "$TXE_DECISION_ID"
+    run: {{.ReviewCommand}} execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"

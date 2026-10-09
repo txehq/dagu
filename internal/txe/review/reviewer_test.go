@@ -797,3 +797,230 @@ func TestApprovalDoesNotSurviveRetirement(t *testing.T) {
 	assert.Equal(t, 0, f.effects.count("expand_volume"))
 	assert.Empty(t, f.state().Actions[jobID])
 }
+
+// Review finding 1: once an attempt's outcome is unknown, the same action on
+// the same target is not run again in a later episode, whatever the agent
+// asks, until the owner answers the escalation with "retry".
+func TestUnresolvedIntentIsNotRunAgain(t *testing.T) {
+	f := newFixture(t)
+	f.effects.run = func(review.Action) (review.EffectResult, bool) {
+		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
+	}
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), notify)
+	require.Equal(t, review.ActionUncertain, f.state().Actions[jobID][0].State)
+	f.effects.run = nil
+
+	// Episode 2: the uncertain attempt is escalated, and the agent asks again.
+	f.clock.Advance(2 * time.Hour)
+	second := f.prepare("reviewer-b")
+	require.Len(t, second.Packet.UnresolvedActions, 1, "an escalated action stays unresolved while its question is open")
+	applied := f.apply("reviewer-b", second, notify)
+	assert.Empty(t, applied.Executed)
+	assert.Contains(t, applied.Review.Notes[0], "unresolved")
+	assert.Equal(t, 1, f.effects.count("notify"))
+	assert.Len(t, f.state().Actions[jobID], 1)
+
+	// The registry guard refuses it as well, independently of the reviewer.
+	f.clock.Advance(2 * time.Hour)
+	third := f.prepare("reviewer-c")
+	_, err := f.registry.BeginAction(context.Background(), review.BeginRequest{
+		Claim: third.Claim, ActionID: "act_direct", JobVersion: 1, Name: "notify", TargetID: targetID,
+		IntentKey: review.IntentKey("notify", targetID, nil), ReviewID: third.Packet.ReviewID,
+	})
+	var denied *review.GuardDeniedError
+	require.ErrorAs(t, err, &denied)
+	assert.Equal(t, review.DenyIntentUnresolved, denied.Reason)
+
+	// Any answer but "retry" keeps it blocked.
+	escalation := f.state().Proposals[jobID][0]
+	require.Equal(t, review.ProposalUncertain, escalation.Kind)
+	f.apply("reviewer-c", third, notify)
+	assert.Equal(t, 1, f.effects.count("notify"))
+
+	// "retry" from the owner is the explicit resolution.
+	_, err = f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
+	require.NoError(t, err)
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-d", f.prepare("reviewer-d"), notify)
+	assert.Equal(t, 2, f.effects.count("notify"))
+}
+
+// Review finding 3: a crash between recording a review and advancing the
+// checkpoint is finished from the stored review. Evidence that arrived
+// afterwards is not skipped, and a second decision cannot replace the first.
+func TestInterruptedEpisodeAdvancesOnlyOverItsOwnReview(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "succeeded")
+	prepared := f.prepare("reviewer-a")
+
+	dying := f.reviewer("reviewer-a")
+	dying.Registry = crashBeforeCheckpoint{f.registry}
+	_, err := dying.Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeContinue, Reasoning: "Healthy.", EvidenceRunIDs: []string{"run-1"},
+	})
+	require.ErrorIs(t, err, errCrash)
+	require.Len(t, f.state().Reviews[jobID], 1)
+	require.Equal(t, 0, f.state().Checkpoints[jobID].Version)
+
+	f.addRun("run-2", "failed")
+	f.clock.Advance(11 * time.Minute)
+	recovered := f.prepare("reviewer-b")
+	require.Empty(t, recovered.Skipped)
+
+	// The interrupted episode ended at run-1; run-2 belongs to a new one.
+	assert.Equal(t, 1, recovered.Packet.Episode)
+	assert.Equal(t, []string{"run-2"}, recovered.Packet.RunIDs())
+	assert.NotEqual(t, prepared.Packet.ReviewID, recovered.Packet.ReviewID)
+
+	f.apply("reviewer-b", recovered, review.AgentDecision{
+		Outcome: review.OutcomeContinue, Reasoning: "run-2 failed once.", EvidenceRunIDs: []string{"run-2"},
+	})
+	s := f.state()
+	require.Len(t, s.Reviews[jobID], 2)
+	assert.Equal(t, []string{"run-1"}, s.Reviews[jobID][0].CoveredRuns)
+	assert.Equal(t, []string{"run-2"}, s.Reviews[jobID][1].CoveredRuns)
+	assert.Equal(t, 2, s.Checkpoints[jobID].Version)
+	assert.Equal(t, "run-2", s.Checkpoints[jobID].RunCursor)
+
+	// The registry itself refuses a review id recorded over other evidence.
+	f.clock.Advance(2 * time.Hour)
+	claim := f.prepare("reviewer-c").Claim
+	clash := s.Reviews[jobID][0]
+	clash.CoveredRuns = []string{"run-1", "run-2"}
+	require.ErrorIs(t, f.registry.RecordReview(context.Background(), claim, clash), review.ErrConflict)
+}
+
+// crashBeforeCheckpoint loses the checkpoint write, as if the process died
+// right after the review was recorded.
+type crashBeforeCheckpoint struct {
+	*reviewtest.Registry
+}
+
+func (c crashBeforeCheckpoint) AdvanceCheckpoint(context.Context, review.Claim, review.Checkpoint, int) error {
+	return errCrash
+}
+
+// Review finding 4: a holder does not start an effect its claim cannot
+// outlive, and a later holder does not probe an attempt whose grant is still
+// running, so "nothing there yet" is never recorded as "not applied".
+func TestEffectsAreBoundedByLeaseAndGrant(t *testing.T) {
+	f := newFixture(t)
+	job := fixtureJob()
+	job.Review.Actions[1].Reconcile = []string{"probe"}
+	job.Review.Actions[1].TimeoutSec = 15 * 60
+	require.NoError(t, f.registry.PutJob(job))
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	}
+
+	// A 10 minute claim cannot cover a 15 minute action.
+	applied := f.apply("reviewer-a", f.prepare("reviewer-a"), notify)
+	assert.Empty(t, applied.Executed)
+	assert.Contains(t, applied.Review.Notes[0], "claim ends before")
+	assert.Empty(t, f.state().Actions[jobID])
+	assert.Equal(t, 0, f.effects.count("notify"))
+
+	// An attempt whose grant is still running may yet perform its effect,
+	// so the next holder leaves it alone instead of probing it.
+	probes := 0
+	f.effects.probe = func(review.Action) review.EffectResult {
+		probes++
+		return review.EffectResult{Status: review.EffectNotApplied}
+	}
+	inFlight := review.Action{
+		ID: "act_INFLIGHT", JobID: jobID, JobVersion: 1, Name: "notify", TargetID: targetID,
+		IntentKey: review.IntentKey("notify", targetID, nil), State: review.ActionExecuting,
+		GrantID: "grt_INFLIGHT", GrantExpiresAt: f.clock.Now().Add(3 * time.Hour),
+	}
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		s.Actions[jobID] = append(s.Actions[jobID], inFlight)
+		return nil
+	}))
+	f.clock.Advance(2 * time.Hour)
+	early := f.prepare("reviewer-b")
+	assert.Zero(t, probes)
+	assert.Equal(t, review.ActionExecuting, f.state().Actions[jobID][0].State)
+	require.Len(t, early.Packet.UnresolvedActions, 1)
+
+	// While it is in flight the same intent is not started a second time.
+	applied = f.apply("reviewer-b", early, notify)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 0, f.effects.count("notify"))
+
+	// Once the grant and its margin have passed, the probe may settle it.
+	f.clock.Advance(2 * time.Hour)
+	f.prepare("reviewer-c")
+	assert.Equal(t, 1, probes)
+	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
+}
+
+// A holder whose grant has already ended does not start the effect at all.
+func TestEffectIsNotStartedAfterItsGrant(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	slow := f.reviewer("reviewer-a")
+	slow.Registry = stallAfterBegin{f.registry, f.clock}
+	applied, err := slow.Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	})
+	// The stall also outlives the claim, so the outcome write is refused.
+	require.ErrorIs(t, err, review.ErrStaleFence)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 0, f.effects.count("notify"))
+	assert.Empty(t, f.effects.keys, "the effect was never attempted")
+}
+
+// stallAfterBegin freezes the holder between journaling an action and
+// running it, for longer than its grant and its claim.
+type stallAfterBegin struct {
+	*reviewtest.Registry
+	clock *clock
+}
+
+func (s stallAfterBegin) BeginAction(ctx context.Context, req review.BeginRequest) (review.Action, error) {
+	action, err := s.Registry.BeginAction(ctx, req)
+	s.clock.Advance(time.Hour)
+	return action, err
+}
+
+// Review finding 5: an attempt journaled under another job version is not
+// interpreted through the current declaration. It stays unknown and goes to
+// the owner, even if the action is now declared read-only.
+func TestReconcileDoesNotApplyANewPolicyToAnOldAttempt(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	dying := f.reviewer("reviewer-a")
+	dying.Registry = crashAfterEffect{f.registry}
+	_, err := dying.Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	})
+	require.ErrorIs(t, err, errCrash)
+	require.Equal(t, 1, f.effects.count("notify"))
+
+	// Version 2 redeclares notify as a read-only diagnostic with a probe.
+	v2 := fixtureJob()
+	v2.Version = 2
+	v2.Review.Actions[1].Idempotency = review.IdempotencyReadOnly
+	v2.Review.Actions[1].Reconcile = []string{"probe"}
+	require.NoError(t, f.registry.PutJob(v2))
+	probes := 0
+	f.effects.probe = func(review.Action) review.EffectResult {
+		probes++
+		return review.EffectResult{Status: review.EffectNotApplied}
+	}
+
+	f.clock.Advance(11 * time.Minute)
+	f.prepare("reviewer-b")
+	s := f.state()
+	assert.Zero(t, probes, "the new version's probe says nothing about the old attempt")
+	assert.Equal(t, review.ActionEscalated, s.Actions[jobID][0].State)
+	require.Len(t, s.Proposals[jobID], 1)
+	assert.Contains(t, s.Proposals[jobID][0].Question, "version 1")
+}

@@ -108,8 +108,16 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 		r.Outputs = truncateOutputs(r.Outputs)
 		p.NewRuns = append(p.NewRuns, r)
 	}
+	awaiting := map[string]bool{}
+	for _, proposal := range proposals {
+		if proposal.RelatedAction != "" {
+			awaiting[proposal.RelatedAction] = true
+		}
+	}
 	for _, a := range actions {
-		if a.State.Open() {
+		// An escalated action is still unresolved while its question to
+		// the owner is open.
+		if a.State.Open() || (a.State == ActionEscalated && awaiting[a.ID]) {
 			p.UnresolvedActions = append(p.UnresolvedActions, a)
 		}
 	}

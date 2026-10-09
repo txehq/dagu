@@ -34,6 +34,9 @@ const (
 	DenyDecisionStale  DenyReason = "decision_stale"
 	DenyNotApproved    DenyReason = "not_approved"
 	DenyNotPermitted   DenyReason = "not_permitted"
+	// DenyIntentUnresolved means an earlier attempt of the same intent has
+	// an outcome nobody has settled yet.
+	DenyIntentUnresolved DenyReason = "intent_unresolved"
 )
 
 // GuardDeniedError reports that the guard refused an effect. It is an
@@ -72,6 +75,9 @@ type BeginRequest struct {
 	ReviewID   string
 	ProposalID string
 	DecisionID string
+	// Timeout is how long the attempt may take. The registry grants the
+	// attempt for exactly this long.
+	Timeout time.Duration
 }
 
 // FinishRequest records the outcome of a journaled action.
@@ -109,6 +115,8 @@ type Registry interface {
 	Decision(ctx context.Context, jobID, decisionID string) (Decision, error)
 	Proposal(ctx context.Context, jobID, proposalID string) (Proposal, error)
 	OpenProposals(ctx context.Context, jobID string) ([]Proposal, error)
+	// Review returns a recorded review, or ErrNotFound.
+	Review(ctx context.Context, jobID, reviewID string) (Review, error)
 	// Actions returns the job's journaled actions, oldest first.
 	Actions(ctx context.Context, jobID string) ([]Action, error)
 
@@ -122,7 +130,8 @@ type Registry interface {
 	// CreateProposal is idempotent on the proposal id, which the reviewer
 	// derives, and returns the stored proposal on a repeat.
 	CreateProposal(ctx context.Context, claim Claim, draft Proposal) (Proposal, error)
-	// RecordReview is idempotent on the review id.
+	// RecordReview is idempotent on the review id for the same coverage and
+	// returns ErrConflict when the stored review covers different evidence.
 	RecordReview(ctx context.Context, claim Claim, review Review) error
 	// AdvanceCheckpoint replaces the checkpoint when its stored version
 	// still equals expectedVersion.

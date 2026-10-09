@@ -54,6 +54,24 @@ type agentEnvelope struct {
 	Result           json.RawMessage            `json:"result"`
 	StructuredOutput json.RawMessage            `json:"structured_output"`
 	ModelUsage       map[string]json.RawMessage `json:"modelUsage"`
+	Usage            struct {
+		Input         int `json:"input_tokens"`
+		CacheCreation int `json:"cache_creation_input_tokens"`
+		CacheRead     int `json:"cache_read_input_tokens"`
+		Output        int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// AgentUsage returns the input and output tokens the agent CLI reports for
+// the invocation. Input includes cached context, which is still context the
+// agent was given.
+func AgentUsage(raw []byte) (input, output int) {
+	var env agentEnvelope
+	if json.Unmarshal(raw, &env) != nil {
+		return 0, 0
+	}
+	u := env.Usage
+	return u.Input + u.CacheCreation + u.CacheRead, u.Output
 }
 
 // AgentModels returns the models the agent CLI reports having used, so the

@@ -32,7 +32,10 @@ type Steps struct {
 	AuthCheck []string
 }
 
-var runIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+var (
+	runIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+	recordIDPattern = regexp.MustCompile(`^[a-z]{3}_[0-9A-Za-z]{1,64}$`)
+)
 
 const (
 	maxAgentOutput  = 4 << 20
@@ -121,6 +124,7 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 	if models := AgentModels(raw); len(models) > 0 {
 		reviewer.AgentClient = strings.TrimSpace(reviewer.AgentClient + " " + strings.Join(models, ","))
 	}
+	reviewer.AgentInputTokens, reviewer.AgentOutputTokens = AgentUsage(raw)
 
 	decision, err := ParseAgentOutput(raw)
 	if err != nil && strings.TrimSpace(string(raw)) == "" {
@@ -151,6 +155,13 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 
 // Execute runs the single effect an approve decision authorizes.
 func (s *Steps) Execute(ctx context.Context, jobID, proposalID, decisionID string, stdout io.Writer) error {
+	// These arrive as run parameters and task input, which anyone able to
+	// enqueue or complete the run controls.
+	for prefix, id := range map[string]string{"job_": jobID, "prp_": proposalID, "dec_": decisionID} {
+		if !strings.HasPrefix(id, prefix) || !recordIDPattern.MatchString(id) {
+			return fmt.Errorf("invalid %sid %q", prefix, id)
+		}
+	}
 	executed, err := s.Reviewer.Execute(ctx, jobID, proposalID, decisionID)
 	if err != nil {
 		return err

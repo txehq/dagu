@@ -16,7 +16,10 @@ const (
 	defaultMaxAttempts = 3
 	minReviewInterval  = time.Minute
 	decideStepID       = "decide"
-	waitingOnPerson    = "person"
+	// leaseMargin separates the end of an attempt from anyone else drawing
+	// conclusions about it, to absorb clock and scheduling slack.
+	leaseMargin     = 30 * time.Second
+	waitingOnPerson = "person"
 )
 
 var (
@@ -37,6 +40,10 @@ type Reviewer struct {
 	Holder string
 	// AgentClient is the agent CLI name and version actually used.
 	AgentClient string
+	// AgentInputTokens and AgentOutputTokens are the agent CLI's reported
+	// usage for the decision being applied.
+	AgentInputTokens  int
+	AgentOutputTokens int
 	// DecideDAG is the DAG whose runs carry proposals as native human tasks.
 	DecideDAG string
 	ClaimTTL  time.Duration
@@ -147,6 +154,9 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 	if err != nil {
 		return Packet{}, fmt.Errorf("read checkpoint: %w", err)
 	}
+	if cp, err = r.finishInterrupted(ctx, claim, cp); err != nil {
+		return Packet{}, fmt.Errorf("finish interrupted episode: %w", err)
+	}
 	runs, err := r.Registry.RunsAfter(ctx, job.ID, cp.RunCursor)
 	if err != nil {
 		return Packet{}, fmt.Errorf("read runs: %w", err)
@@ -164,6 +174,40 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 		return Packet{}, fmt.Errorf("read actions: %w", err)
 	}
 	return buildPacket(r.now(), job, cp, runs, decisions, proposals, actions), nil
+}
+
+// finishInterrupted completes an episode whose review was recorded but whose
+// checkpoint never advanced. The stored review is the only decision that
+// exists for that episode, so the checkpoint moves over exactly what it
+// covered and anything newer is left for the next episode. Without this, a
+// second decision made in the same episode would be dropped by the
+// idempotent record while its evidence was skipped.
+func (r *Reviewer) finishInterrupted(ctx context.Context, claim Claim, cp Checkpoint) (Checkpoint, error) {
+	stored, err := r.Registry.Review(ctx, claim.JobID, ReviewID(claim.JobID, cp.Version))
+	if errors.Is(err, ErrNotFound) {
+		return cp, nil
+	}
+	if err != nil {
+		return cp, err
+	}
+	next := Checkpoint{
+		JobID:          claim.JobID,
+		Version:        cp.Version + 1,
+		RunCursor:      cp.RunCursor,
+		DecisionCursor: cp.DecisionCursor,
+		LastReviewID:   stored.ID,
+		NextReviewAt:   r.now(),
+	}
+	if n := len(stored.CoveredRuns); n > 0 {
+		next.RunCursor = stored.CoveredRuns[n-1]
+	}
+	if n := len(stored.CoveredDecisions); n > 0 {
+		next.DecisionCursor = stored.CoveredDecisions[n-1]
+	}
+	if err := r.Registry.AdvanceCheckpoint(ctx, claim, next, cp.Version); err != nil {
+		return cp, err
+	}
+	return next, nil
 }
 
 // reconcile settles every action whose effect is unresolved. Holding the
@@ -194,9 +238,16 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			State: state, Receipt: res.Receipt, Detail: res.Detail,
 		})
 	}
-	// The interrupted attempt is recorded as uncertain before anything else,
-	// so the journal never shows a dead attempt as still running.
 	if action.State == ActionExecuting {
+		// Until its grant has run out, the attempt's holder may still be
+		// about to perform the effect. A probe now could see nothing and
+		// settle as absent an effect that then lands, so the attempt is
+		// left alone and stays in the packet as unresolved.
+		if r.now().Before(action.GrantExpiresAt.Add(leaseMargin)) {
+			return nil
+		}
+		// The interrupted attempt is recorded as uncertain before anything
+		// else, so the journal never shows a dead attempt as still running.
 		if err := finish(ActionUncertain, EffectResult{Detail: "the attempt ended without a recorded outcome"}); err != nil {
 			return err
 		}
@@ -204,6 +255,13 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 
 	declared, ok := job.Review.Action(action.Name)
 	res := EffectResult{Status: EffectUnknown, Detail: "the action is no longer declared by the job"}
+	if ok && action.JobVersion != job.Version {
+		// The attempt ran under another version's declaration. The current
+		// one may name a different command, probe or idempotency class, so
+		// it cannot say what the old attempt did.
+		ok = false
+		res.Detail = fmt.Sprintf("the attempt ran under job version %d and the job is now at version %d", action.JobVersion, job.Version)
+	}
 	if ok {
 		switch {
 		case len(declared.Reconcile) > 0:
@@ -302,28 +360,34 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 	}
 
 	review := Review{
-		ID:               packet.ReviewID,
-		JobID:            jobID,
-		JobVersion:       job.Version,
-		Episode:          packet.Episode,
-		Outcome:          decision.Outcome,
-		Reasoning:        decision.Reasoning,
-		EvidenceRuns:     decision.EvidenceRunIDs,
-		CoveredRuns:      packet.RunIDs(),
-		CoveredDecisions: packet.DecisionIDs(),
-		PacketBytes:      packet.size(),
-		Reviewer:         r.Holder,
-		AgentClient:      r.AgentClient,
-		RecordedAt:       r.now(),
+		ID:                packet.ReviewID,
+		JobID:             jobID,
+		JobVersion:        job.Version,
+		Episode:           packet.Episode,
+		Outcome:           decision.Outcome,
+		Reasoning:         decision.Reasoning,
+		EvidenceRuns:      decision.EvidenceRunIDs,
+		CoveredRuns:       packet.RunIDs(),
+		CoveredDecisions:  packet.DecisionIDs(),
+		PacketBytes:       packet.size(),
+		AgentInputTokens:  r.AgentInputTokens,
+		AgentOutputTokens: r.AgentOutputTokens,
+		Reviewer:          r.Holder,
+		AgentClient:       r.AgentClient,
+		RecordedAt:        r.now(),
 	}
 	result := Applied{}
 	history, err := r.Registry.Actions(ctx, jobID)
 	if err != nil {
 		return Applied{}, fmt.Errorf("read actions: %w", err)
 	}
+	decisions, err := r.Registry.DecisionsAfter(ctx, jobID, "")
+	if err != nil {
+		return Applied{}, fmt.Errorf("read decisions: %w", err)
+	}
 
 	for _, requested := range decision.Actions {
-		if err := r.applyAction(ctx, claim, job, packet, requested, history, &review, &result); err != nil {
+		if err := r.applyAction(ctx, claim, job, packet, requested, history, decisions, &review, &result); err != nil {
 			return Applied{}, err
 		}
 	}
@@ -385,7 +449,7 @@ func (r *Reviewer) nextReviewAt(job Job, decision AgentDecision, packet Packet) 
 
 // applyAction runs a requested action when the saved policy makes it
 // routine, and otherwise turns it into a proposal.
-func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet Packet, requested AgentAction, history []Action, review *Review, result *Applied) error {
+func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet Packet, requested AgentAction, history []Action, decisions []Decision, review *Review, result *Applied) error {
 	declared, isDeclared := job.Review.Action(requested.Name)
 	propose := func(kind ProposalKind, question string) error {
 		return r.propose(ctx, claim, job, packet, kind, requested, question, review, result)
@@ -403,6 +467,16 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 	}
 
 	intent := IntentKey(requested.Name, requested.TargetID, requested.Params)
+	if blocking, ok := r.unresolvedAttempt(history, decisions, intent); ok {
+		// The effect of an earlier attempt is still unknown. Running the
+		// intent again could apply it twice, whatever the agent asks.
+		review.Notes = append(review.Notes, fmt.Sprintf("action %q not run: earlier attempt %s is %s and unresolved", requested.Name, blocking.ID, blocking.State))
+		return nil
+	}
+	if !r.leaseCovers(claim, declared) {
+		review.Notes = append(review.Notes, fmt.Sprintf("action %q not run: the claim ends before the action's timeout", requested.Name))
+		return nil
+	}
 	if failures := trailingFailures(history, intent); failures >= maxAttempts(job) {
 		return propose(ProposalQuestion, fmt.Sprintf("Routine action %q on %s failed %d times in a row and was not tried again: %s", requested.Name, requested.TargetID, failures, requested.Reason))
 	}
@@ -416,6 +490,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		TargetID:   requested.TargetID,
 		Params:     requested.Params,
 		ReviewID:   packet.ReviewID,
+		Timeout:    declared.Timeout(),
 	})
 	var denied *GuardDeniedError
 	switch {
@@ -445,7 +520,16 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 // process dies between the two, the action stays started and the next
 // Prepare reconciles it.
 func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, declared DeclaredAction, action Action) (Action, error) {
-	res := r.Effector.Run(ctx, job, declared, action)
+	var res EffectResult
+	if r.now().Before(action.GrantExpiresAt) {
+		// The effect is killed when the grant ends, so a later holder that
+		// waits for that moment never probes an attempt still in progress.
+		runCtx, cancel := context.WithDeadline(ctx, action.GrantExpiresAt)
+		res = r.Effector.Run(runCtx, job, declared, action)
+		cancel()
+	} else {
+		res = EffectResult{Status: EffectNotApplied, Detail: "the grant ended before the effect could start"}
+	}
 	state := ActionSucceeded
 	switch res.Status {
 	case EffectApplied:
@@ -523,6 +607,43 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomeContinue, OutcomeAct:
 	}
 	return nil
+}
+
+// leaseCovers reports whether the claim outlives one full attempt of the
+// action with room to record its outcome.
+func (r *Reviewer) leaseCovers(claim Claim, declared DeclaredAction) bool {
+	return claim.ExpiresAt.Sub(r.now()) >= declared.Timeout()+leaseMargin
+}
+
+// unresolvedAttempt returns the latest attempt of an intent when its effect
+// is still unknown: executing, uncertain, or escalated to a human who has
+// not answered "retry". Only that answer says the intent may run again.
+func (r *Reviewer) unresolvedAttempt(history []Action, decisions []Decision, intent string) (Action, bool) {
+	for i := len(history) - 1; i >= 0; i-- {
+		a := history[i]
+		if a.IntentKey != intent {
+			continue
+		}
+		switch a.State {
+		case ActionExecuting, ActionUncertain:
+			return a, true
+		case ActionEscalated:
+			return a, !retryDecided(decisions, UncertainProposalID(a.ID))
+		case ActionSucceeded, ActionFailed, ActionNotApplied:
+			return Action{}, false
+		}
+	}
+	return Action{}, false
+}
+
+func retryDecided(decisions []Decision, proposalID string) bool {
+	verdict := Verdict("")
+	for _, d := range decisions {
+		if d.ProposalID == proposalID {
+			verdict = d.Verdict
+		}
+	}
+	return verdict == VerdictRetry
 }
 
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
@@ -652,8 +773,12 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 }
 
 func (r *Reviewer) executeClaimed(ctx context.Context, claim Claim, job Job, declared DeclaredAction, proposal Proposal, decision Decision) (Executed, error) {
+	if !r.leaseCovers(claim, declared) {
+		return Executed{}, fmt.Errorf("execution claim ends before the timeout of action %q", declared.Name)
+	}
 	action, err := r.Registry.BeginAction(ctx, BeginRequest{
 		Claim:      claim,
+		Timeout:    declared.Timeout(),
 		ActionID:   ApprovedActionID(proposal.ID, decision.ID),
 		IntentKey:  IntentKey(proposal.ActionName, proposal.TargetID, proposal.Params),
 		JobVersion: job.Version,

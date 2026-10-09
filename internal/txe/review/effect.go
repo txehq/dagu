@@ -70,13 +70,13 @@ func (e *CommandEffector) Run(ctx context.Context, job Job, declared DeclaredAct
 		return EffectResult{Status: EffectNotApplied, Detail: "action reported that it did not apply"}
 	case err == nil:
 		detail := fmt.Sprintf("action exited with code %d", code)
-		// A read-only action has no effect to be unsure about, and a keyed
-		// one is deduplicated by its destination, so a clean failure of
-		// either is known. Anything else may have partly happened.
-		if declared.Idempotency == IdempotencyNone {
-			return EffectResult{Status: EffectUnknown, Detail: detail}
+		// Only a read-only action has no effect to be unsure about. Any
+		// other action may have applied its effect before failing, whatever
+		// its destination deduplicates, so the outcome is unknown.
+		if declared.Idempotency == IdempotencyReadOnly {
+			return EffectResult{Status: EffectNotApplied, Detail: detail}
 		}
-		return EffectResult{Status: EffectNotApplied, Detail: detail}
+		return EffectResult{Status: EffectUnknown, Detail: detail}
 	case errors.Is(err, errNotStarted):
 		return EffectResult{Status: EffectNotApplied, Detail: err.Error()}
 	default:
@@ -113,10 +113,7 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	if len(argv) == 0 {
 		return 0, "", fmt.Errorf("%w: action %q declares no command", errNotStarted, declared.Name)
 	}
-	timeout := defaultActionTimeout
-	if declared.TimeoutSec > 0 {
-		timeout = time.Duration(declared.TimeoutSec) * time.Second
-	}
+	timeout := declared.Timeout()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -182,4 +179,12 @@ func receiptFrom(out string) string {
 		receipt = receipt[:maxReceiptLen]
 	}
 	return receipt
+}
+
+// Timeout is how long one attempt of the action may run.
+func (a DeclaredAction) Timeout() time.Duration {
+	if a.TimeoutSec > 0 {
+		return time.Duration(a.TimeoutSec) * time.Second
+	}
+	return defaultActionTimeout
 }

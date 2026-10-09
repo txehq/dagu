@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -349,6 +350,21 @@ func (r *Registry) OpenProposals(_ context.Context, jobID string) ([]review.Prop
 	return out, err
 }
 
+// Review implements review.Registry.
+func (r *Registry) Review(_ context.Context, jobID, reviewID string) (review.Review, error) {
+	var out review.Review
+	err := r.Update(func(s *State) error {
+		for _, rev := range s.Reviews[jobID] {
+			if rev.ID == reviewID {
+				out = rev
+				return nil
+			}
+		}
+		return review.ErrNotFound
+	})
+	return out, err
+}
+
 // Actions implements review.Registry.
 func (r *Registry) Actions(_ context.Context, jobID string) ([]review.Action, error) {
 	var out []review.Action
@@ -397,6 +413,9 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			if !declared.Routine {
 				return &review.GuardDeniedError{Reason: review.DenyNotPermitted, Detail: "action needs a human decision"}
 			}
+			if s.intentUnresolved(jobID, req.IntentKey) {
+				return &review.GuardDeniedError{Reason: review.DenyIntentUnresolved}
+			}
 		} else if denied := s.checkDecision(job, req); denied != nil {
 			return denied
 		}
@@ -406,12 +425,48 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			IntentKey: req.IntentKey, ReviewID: req.ReviewID,
 			ProposalID: req.ProposalID, DecisionID: req.DecisionID,
 			State: review.ActionExecuting, ClaimID: req.Claim.ID, StartedAt: now,
-			GrantID: s.nextID("grt"),
+			GrantID:        s.nextID("grt"),
+			GrantExpiresAt: now.Add(grantTimeout(req.Timeout)),
 		}
 		s.Actions[jobID] = append(s.Actions[jobID], out)
 		return nil
 	})
 	return out, err
+}
+
+func grantTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 2 * time.Minute
+	}
+	return d
+}
+
+// intentUnresolved reports whether the latest attempt of an intent still has
+// an unknown effect: executing, uncertain, or escalated without a retry
+// decision on its escalation.
+func (s *State) intentUnresolved(jobID, intent string) bool {
+	actions := s.Actions[jobID]
+	for i := len(actions) - 1; i >= 0; i-- {
+		a := actions[i]
+		if a.IntentKey != intent {
+			continue
+		}
+		switch a.State {
+		case review.ActionExecuting, review.ActionUncertain:
+			return true
+		case review.ActionEscalated:
+			verdict := review.Verdict("")
+			for _, d := range s.Decisions[jobID] {
+				if d.ProposalID == review.UncertainProposalID(a.ID) {
+					verdict = d.Verdict
+				}
+			}
+			return verdict != review.VerdictRetry
+		case review.ActionSucceeded, review.ActionFailed, review.ActionNotApplied:
+			return false
+		}
+	}
+	return false
 }
 
 // checkDecision requires the proposal's latest decision to be an approval
@@ -512,9 +567,15 @@ func (r *Registry) RecordReview(_ context.Context, claim review.Claim, rev revie
 			return err
 		}
 		for _, existing := range s.Reviews[rev.JobID] {
-			if existing.ID == rev.ID {
-				return nil
+			if existing.ID != rev.ID {
+				continue
 			}
+			// The first recorded review is the episode's decision. A second
+			// one over other evidence must not pass as the same record.
+			if !slices.Equal(existing.CoveredRuns, rev.CoveredRuns) || !slices.Equal(existing.CoveredDecisions, rev.CoveredDecisions) {
+				return fmt.Errorf("%w: review %s is already recorded over other evidence", review.ErrConflict, rev.ID)
+			}
+			return nil
 		}
 		s.Reviews[rev.JobID] = append(s.Reviews[rev.JobID], rev)
 		return nil
