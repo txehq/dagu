@@ -735,3 +735,34 @@ func TestObservationsNeverRetire(t *testing.T) {
 		assert.NotNil(t, e.ResolvedAt)
 	}
 }
+
+// A rejected proposal leaves the aggregate, but its pending native task
+// completion stays retryable and is found by decision ID.
+func TestNativeResumeSurvivesClosedProposal(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Minute)
+	var p *Proposal
+	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+		var err error
+		p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: f.mint(PrefixProposal), Action: ActionSpec{Name: "resize"},
+			NativeTask: &NativeTask{DAG: "txe-decide-x", RunID: "r1", StepID: "decide"}})
+		return err
+	})
+	require.NoError(t, err)
+	d, err := decide(f, job.JobID, p, VerdictReject, ProposalRejected, "")
+	require.NoError(t, err)
+	assert.Equal(t, "pending", d.NativeResume)
+
+	got, err := f.tx(job.JobID, person, func(tx *JobTx) error {
+		pending := tx.PendingNativeResumes()
+		require.Len(t, pending, 1)
+		assert.Equal(t, d.DecisionID, pending[0].DecisionID)
+		return tx.MarkNativeResumed(d.DecisionID)
+	})
+	require.NoError(t, err)
+	assert.Empty(t, got.NativeResumes)
+	stored, err := f.store.GetDecision(f.ctx, job.JobID, d.DecisionID)
+	require.NoError(t, err)
+	assert.Equal(t, VerdictReject, stored.Verdict)
+}

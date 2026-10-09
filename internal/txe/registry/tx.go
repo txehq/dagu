@@ -6,6 +6,7 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -599,8 +600,12 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	if d.Actor.Kind == "" {
 		d.Actor = tx.actor
 	}
-	if d.NativeResume == "" && p.NativeTask != nil {
+	if p.NativeTask != nil {
 		d.NativeResume = "pending"
+		if j.NativeResumes == nil {
+			j.NativeResumes = map[string]*NativeResume{}
+		}
+		j.NativeResumes[d.DecisionID] = &NativeResume{DecisionID: d.DecisionID, ProposalID: p.ProposalID, NativeTask: *p.NativeTask, Since: tx.now}
 	}
 	stored := d
 	if _, err := tx.attach(kindDecisions, &stored, func(prev string) { stored.Prev = prev }); err != nil {
@@ -629,17 +634,33 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	return &out, nil
 }
 
-// MarkNativeResumed records that the Dagu human task was completed for the
-// proposal's latest decision.
-func (tx *JobTx) MarkNativeResumed(proposalID, decisionID string) error {
-	p := tx.Job.Proposals[proposalID]
-	if p == nil || p.Decision == nil || p.Decision.DecisionID != decisionID {
-		return refuse(CodeProposalState, "decision %s is not the latest on an open proposal", decisionID)
+// PendingNativeResumes returns decisions whose Dagu human task has not been
+// completed yet, oldest first.
+func (tx *JobTx) PendingNativeResumes() []NativeResume {
+	out := make([]NativeResume, 0, len(tx.Job.NativeResumes))
+	for _, r := range tx.Job.NativeResumes {
+		out = append(out, *r)
 	}
-	if p.Decision.NativeResume != "completed" {
-		p.Decision.NativeResume = "completed"
-		tx.touch()
+	sort.Slice(out, func(i, k int) bool { return out[i].Since.Before(out[k].Since) })
+	return out
+}
+
+// MarkNativeResumed records that the Dagu human task for decisionID was
+// completed. It works after the proposal left the aggregate and is a no-op
+// when already recorded.
+func (tx *JobTx) MarkNativeResumed(decisionID string) error {
+	if _, ok := tx.Job.NativeResumes[decisionID]; !ok {
+		return nil
 	}
+	delete(tx.Job.NativeResumes, decisionID)
+	if p := tx.Job.Proposals; p != nil {
+		for _, prop := range p {
+			if prop.Decision != nil && prop.Decision.DecisionID == decisionID {
+				prop.Decision.NativeResume = "completed"
+			}
+		}
+	}
+	tx.touch()
 	return nil
 }
 

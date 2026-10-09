@@ -336,6 +336,25 @@ func (s *Store) ListDecisions(ctx context.Context, jobID string, limit int) ([]*
 	return walkChain[Decision](ctx, s, jobID, func(c Chains) string { return c.Decisions }, func(d *Decision) string { return d.Prev }, limit)
 }
 
+// GetDecision returns one decision by ID from the committed history.
+func (s *Store) GetDecision(ctx context.Context, jobID, decisionID string) (*Decision, error) {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	for id := job.Chains.Decisions; id != ""; {
+		var d Decision
+		if err := s.getJSON(ctx, id, &d); err != nil {
+			return nil, fmt.Errorf("registry: history %s: %w", id, err)
+		}
+		if d.DecisionID == decisionID {
+			return &d, nil
+		}
+		id = d.Prev
+	}
+	return nil, refuse(CodeNotFound, "decision %s not found", decisionID)
+}
+
 // ListReviews returns reviews, newest first.
 func (s *Store) ListReviews(ctx context.Context, jobID string, limit int) ([]*Review, error) {
 	return walkChain[Review](ctx, s, jobID, func(c Chains) string { return c.Reviews }, func(r *Review) string { return r.Prev }, limit)
