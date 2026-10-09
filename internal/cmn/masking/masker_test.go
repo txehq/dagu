@@ -146,3 +146,22 @@ func TestSplitEnv(t *testing.T) {
 		})
 	}
 }
+
+// A value read from a file usually ends with a newline. Both the stored form
+// and the form a script prints after stripping it are masked.
+func TestMasker_TrimmedValue(t *testing.T) {
+	m := NewMasker(SourcedEnvVars{Secrets: []string{"TOKEN=s3cr3t\n", "PADDED=  spaced value\t"}})
+
+	assert.Equal(t, "token=******* end", m.MaskString("token=s3cr3t end"))
+	assert.Equal(t, "token=*******next", m.MaskString("token=s3cr3t\nnext"))
+	assert.Equal(t, "[*******]", m.MaskString("[spaced value]"))
+}
+
+// A value that is only whitespace is not masked in its stripped form, which
+// would be empty and match everywhere.
+func TestMasker_WhitespaceOnlyValue(t *testing.T) {
+	m := NewMasker(SourcedEnvVars{Secrets: []string{"BLANK= "}})
+
+	assert.Equal(t, "a*******b", m.MaskString("a b"))
+	assert.Equal(t, "ab", m.MaskString("ab"))
+}

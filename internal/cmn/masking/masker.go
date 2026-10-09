@@ -22,7 +22,11 @@ type Masker struct {
 	sensitiveVals map[string]bool // Set of values to mask
 }
 
-// NewMasker creates a masker from sourced environment variables
+// NewMasker creates a masker from sourced environment variables.
+//
+// A value is also masked with its surrounding whitespace removed. A secret
+// read from a file usually ends with a newline, and a script strips it before
+// using the value, so the stripped form is the one that appears in output.
 func NewMasker(sources SourcedEnvVars) *Masker {
 	sensitiveVals := make(map[string]bool)
 
@@ -32,6 +36,9 @@ func NewMasker(sources SourcedEnvVars) *Masker {
 		// (strings.ReplaceAll with empty string would insert mask between every character)
 		if val != "" {
 			sensitiveVals[val] = true
+		}
+		if trimmed := strings.TrimSpace(val); trimmed != "" {
+			sensitiveVals[trimmed] = true
 		}
 	}
 
