@@ -228,11 +228,72 @@ func (store *Store) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGR
 	if rootDAGRun.Zero() {
 		rootDAGRun = dagRun
 	}
+	var record *persis.AttemptAbandonment
+	err := store.withRunAttemptsLocked(ctx, dagRun, rootDAGRun, func(run *DAGRun, dirs []string) error {
+		for _, dir := range dirs {
+			att, err := run.AttemptByDir(dir, nil)
+			if err != nil {
+				// An attempt directory this build cannot open may be the one
+				// asked about; refuse to say it has no record.
+				return fmt.Errorf("%w: attempt directory %s: %v", persis.ErrAttemptAbandonmentConflict, dir, err)
+			}
+			if att.ID() != attemptID {
+				continue
+			}
+			var found bool
+			record, found, err = readStoredAbandonment(att, dagRun, rootDAGRun)
+			if !found {
+				record = nil
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+// ListAttemptAbandonmentsStrict implements persis.DAGRunAttemptAbandoner,
+// under the same lock and with the same checks as ReadAttemptAbandonment.
+func (store *Store) ListAttemptAbandonmentsStrict(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]persis.AttemptAbandonmentResult, error) {
+	if rootDAGRun.Zero() {
+		rootDAGRun = dagRun
+	}
+	var results []persis.AttemptAbandonmentResult
+	err := store.withRunAttemptsLocked(ctx, dagRun, rootDAGRun, func(run *DAGRun, dirs []string) error {
+		for _, dir := range dirs {
+			att, err := run.AttemptByDir(dir, nil)
+			if err != nil {
+				results = append(results, persis.AttemptAbandonmentResult{
+					AttemptID: attemptIDOrDir(dir),
+					Err:       fmt.Errorf("%w: attempt directory %s: %v", persis.ErrAttemptAbandonmentConflict, dir, err),
+				})
+				continue
+			}
+			record, found, err := readStoredAbandonment(att, dagRun, rootDAGRun)
+			if !found && err == nil {
+				continue
+			}
+			results = append(results, persis.AttemptAbandonmentResult{AttemptID: att.ID(), Record: record, Err: err})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// withRunAttemptsLocked runs fn with the run's attempt directories, newest
+// first, holding the run's data-root lock.
+func (store *Store) withRunAttemptsLocked(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, fn func(run *DAGRun, dirs []string) error) error {
 	root := store.dataRoot(rootDAGRun.Name)
 	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := root.Lock(lockCtx); err != nil {
-		return nil, fmt.Errorf("failed to acquire lock for dag-run %s: %w", dagRun.ID, err)
+		return fmt.Errorf("failed to acquire lock for dag-run %s: %w", dagRun.ID, err)
 	}
 	defer func() {
 		if err := root.Unlock(); err != nil {
@@ -241,38 +302,38 @@ func (store *Store) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGR
 	}()
 	run, err := store.findRunLocked(ctx, root, rootDAGRun, dagRun)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	dirs, err := run.listAttemptDirs()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list attempts: %w", err)
+		return fmt.Errorf("failed to list attempts: %w", err)
 	}
-	for _, dir := range dirs {
-		att, err := run.AttemptByDir(dir, nil)
-		if err != nil {
-			// An attempt directory this build cannot open may be the one
-			// asked about; refuse to say it has no record.
-			return nil, fmt.Errorf("%w: attempt directory %s: %v", persis.ErrAttemptAbandonmentConflict, dir, err)
+	return fn(run, dirs)
+}
+
+// readStoredAbandonment reads and fully validates one attempt's record.
+// found is false, with no error, only when the attempt's directory exists
+// and holds no record. Anything that cannot be trusted is a conflict.
+func readStoredAbandonment(att *Attempt, dagRun, rootDAGRun ir.DAGRunRef) (*persis.AttemptAbandonment, bool, error) {
+	record, err := readAbandonmentRecord(att.file)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Absent only if nothing is at the record's name: a dangling link
+		// reads as not found, but something is there.
+		if _, lstatErr := os.Lstat(filepath.Join(filepath.Dir(att.file), AbandonmentRecordFile)); !errors.Is(lstatErr, os.ErrNotExist) {
+			return nil, true, fmt.Errorf("%w: attempt %s: unreadable %s: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), AbandonmentRecordFile, err)
 		}
-		if att.ID() != attemptID {
-			continue
+		if _, statErr := os.Stat(filepath.Dir(att.file)); statErr != nil {
+			return nil, true, fmt.Errorf("%w: attempt %s directory: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), statErr)
 		}
-		record, err := readAbandonmentRecord(att.file)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			if _, statErr := os.Stat(filepath.Dir(att.file)); statErr != nil {
-				return nil, fmt.Errorf("%w: attempt %s directory: %v", persis.ErrAttemptAbandonmentConflict, attemptID, statErr)
-			}
-			return nil, nil
-		case err != nil:
-			return nil, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, attemptID, err)
-		}
-		if err := validateStoredAbandonment(*record, dagRun, rootDAGRun, attemptID); err != nil {
-			return nil, err
-		}
-		return record, nil
+		return nil, false, nil
+	case err != nil:
+		return nil, true, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), err)
 	}
-	return nil, nil
+	if err := validateStoredAbandonment(*record, dagRun, rootDAGRun, att.ID()); err != nil {
+		return nil, true, err
+	}
+	return record, true, nil
 }
 
 // ListAttemptAbandonments implements persis.DAGRunAttemptAbandoner.
@@ -456,4 +517,12 @@ func validateStoredAbandonment(record persis.AttemptAbandonment, dagRun, root ir
 		return fmt.Errorf("%w: record has an inconsistent outcome %q", persis.ErrAttemptAbandonmentConflict, record.Outcome)
 	}
 	return nil
+}
+
+// attemptIDOrDir is the attempt id a directory name carries, or the name.
+func attemptIDOrDir(dir string) string {
+	if id, ok := attemptIDFromDir(dir); ok {
+		return id
+	}
+	return dir
 }
