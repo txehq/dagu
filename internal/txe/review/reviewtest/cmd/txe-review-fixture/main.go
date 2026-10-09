@@ -64,9 +64,10 @@ func run(ctx context.Context, args []string) error {
 	}
 	reg := reviewtest.Open(o.registry)
 	steps := &review.Steps{
-		MachineID: o.machine,
-		StateDir:  o.stateDir,
-		AuthCheck: strings.Fields(o.authCheck),
+		MachineID:   o.machine,
+		StateDir:    o.stateDir,
+		AuthCheck:   strings.Fields(o.authCheck),
+		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
 			Registry:    reg,
 			Effector:    &review.CommandEffector{},

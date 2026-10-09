@@ -131,6 +131,14 @@ func targetKey(stable map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
+// optional returns nil for an empty string, so an absent value is omitted.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 func deref[T any](p *T) T {
 	var zero T
 	if p == nil {
@@ -534,6 +542,7 @@ func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, er
 			CoveredRuns: detail.CoveredRuns, CoveredDecisions: detail.CoveredDecisions,
 			ActionIDs: detail.ActionIDs, ProposalIDs: detail.ProposalIDs, Notes: detail.Notes,
 			Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: detail.PacketBytes,
+			PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
 		}, nil
 	}
 	return Review{}, ErrNotFound
@@ -748,6 +757,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 			ReviewId: rev.ID, Outcome: api.TxeReviewOutcome(rev.Outcome), Reasoning: &rev.Reasoning,
 			EvidenceRunIds: &rev.EvidenceRuns, EvidenceDecisionIds: &rev.CoveredDecisions,
 			AgentClientVersion: &rev.AgentClient, Detail: detail,
+			PacketArtifact: optional(rev.PacketArtifact), DecisionArtifact: optional(rev.DecisionArtifact),
 		},
 	}
 	return r.do(ctx, http.MethodPost, jobPath(rev.JobID, "reviews"), body, nil)

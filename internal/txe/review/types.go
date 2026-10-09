@@ -342,6 +342,10 @@ type Review struct {
 	ActionIDs        []string `json:"action_ids,omitempty"`
 	ProposalIDs      []string `json:"proposal_ids,omitempty"`
 	Notes            []string `json:"notes,omitempty"`
+	// PacketArtifact and DecisionArtifact name the run artifacts holding
+	// the context the agent was given and the decision it returned.
+	PacketArtifact   string `json:"packet_artifact,omitempty"`
+	DecisionArtifact string `json:"decision_artifact,omitempty"`
 	// PacketBytes is the size of the context the agent was given.
 	PacketBytes int `json:"packet_bytes"`
 	// AgentInputTokens and AgentOutputTokens are what the agent CLI reports

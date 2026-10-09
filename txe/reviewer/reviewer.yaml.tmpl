@@ -7,6 +7,9 @@
 description: Fresh periodic review of registered TXE jobs on {{.MachineID}}
 schedule: {{yaml .Schedule}}
 overlap_policy: skip
+# The packet and the decision of each review are kept as run artifacts.
+artifacts:
+  enabled: true
 max_active_runs: 1
 timeout_sec: {{.TimeoutSec}}
 working_dir: {{yaml .StateDir}}

@@ -41,6 +41,10 @@ type Reviewer struct {
 	Holder string
 	// AgentClient is the agent CLI name and version actually used.
 	AgentClient string
+	// PacketArtifact and DecisionArtifact are recorded on the review when
+	// the step saved them as run artifacts.
+	PacketArtifact   string
+	DecisionArtifact string
 	// AgentInputTokens and AgentOutputTokens are the agent CLI's reported
 	// usage for the decision being applied.
 	AgentInputTokens  int
@@ -388,6 +392,8 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		EvidenceRuns:      decision.EvidenceRunIDs,
 		CoveredRuns:       packet.RunIDs(),
 		CoveredDecisions:  packet.DecisionIDs(),
+		PacketArtifact:    r.PacketArtifact,
+		DecisionArtifact:  r.DecisionArtifact,
 		PacketBytes:       packet.size(),
 		AgentInputTokens:  r.AgentInputTokens,
 		AgentOutputTokens: r.AgentOutputTokens,

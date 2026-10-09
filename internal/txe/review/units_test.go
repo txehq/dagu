@@ -110,6 +110,7 @@ func TestRenderDAGs(t *testing.T) {
 		`txe.machine: "mch_0000000000000000000F1XT001"`,
 		"overlap_policy: skip",
 		"max_active_runs: 1",
+		"artifacts:\n  enabled: true",
 		"timeout_sec: 900",
 		`- TXE_DAGU_REVIEWER: "1"`,
 		`- CLAUDE_CONFIG_DIR: "/home/reviewer/.claude-reviewer"`,
@@ -514,4 +515,31 @@ func TestPrepareTakesTheLongestOverdueJob(t *testing.T) {
 	}
 	assert.Positive(t, reviewed[slow.ID], "the slower job was never reviewed")
 	assert.Positive(t, reviewed[jobID])
+}
+
+// With an artifact directory, the packet and the decision are written there
+// by the step itself and the review record points at them.
+func TestStepsSaveReviewArtifacts(t *testing.T) {
+	f := newFixture(t)
+	dir, artifacts := t.TempDir(), t.TempDir()
+	ctx := context.Background()
+	f.addRun("run-1", "succeeded")
+	steps := f.steps("tick-1", dir)
+	steps.ArtifactDir = artifacts
+
+	var packet, out bytes.Buffer
+	require.NoError(t, steps.Prepare(ctx, "tick-1", &packet))
+	saved, err := os.ReadFile(filepath.Join(artifacts, "txe-review", "packet.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(saved), `"run_id": "run-1"`)
+	assert.NotContains(t, string(saved), "claim_id", "the artifact holds the packet, not the claim")
+
+	require.NoError(t, steps.Apply(ctx, "tick-1", strings.NewReader(`{"outcome":"continue","reasoning":"fine","evidence_run_ids":["run-1"]}`), "", &out))
+	saved, err = os.ReadFile(filepath.Join(artifacts, "txe-review", "decision.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(saved), `"outcome": "continue"`)
+
+	rev := f.state().Reviews[jobID][0]
+	assert.Equal(t, "txe-review/packet.json", rev.PacketArtifact)
+	assert.Equal(t, "txe-review/decision.json", rev.DecisionArtifact)
 }

@@ -25,6 +25,10 @@ type Steps struct {
 	// StateDir holds the hand-off between a run's steps. It must be durable
 	// and outside any worktree.
 	StateDir string
+	// ArtifactDir, when set, is the run's artifact directory. The packet
+	// and the decision are written there by this process, so they are kept
+	// with the run on the service without redirecting any step output.
+	ArtifactDir string
 	// AuthCheck is an optional command that reports whether the agent CLI
 	// is logged in, without calling a model. It runs only after an agent
 	// produced nothing, to tell a missing login from any other failure.
@@ -77,6 +81,10 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save prepared review: %w", err)
 		}
+		if err := s.saveArtifact(packetArtifact, prepared.Packet); err != nil {
+			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
+			return fmt.Errorf("save packet artifact: %w", err)
+		}
 		return json.NewEncoder(stdout).Encode(prepared.Packet)
 	}
 	return failed
@@ -125,6 +133,12 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 	reviewer.AgentInputTokens, reviewer.AgentOutputTokens = AgentUsage(raw)
 
 	decision, err := ParseAgentOutput(raw)
+	if err == nil && s.ArtifactDir != "" {
+		if saveErr := s.saveArtifact(decisionArtifact, decision); saveErr != nil {
+			return fmt.Errorf("save decision artifact: %w", saveErr)
+		}
+		reviewer.PacketArtifact, reviewer.DecisionArtifact = packetArtifact, decisionArtifact
+	}
 	if err != nil && strings.TrimSpace(string(raw)) == "" {
 		failure := ClassifyAgentFailure(readLogTail(agentLog))
 		if failure.Kind != ExceptionReviewerAuth && !s.agentLoggedIn(ctx) {
@@ -187,6 +201,20 @@ func (s *Steps) agentLoggedIn(ctx context.Context) bool {
 		return true
 	}
 	return *status.LoggedIn
+}
+
+const (
+	packetArtifact   = "txe-review/packet.json"
+	decisionArtifact = "txe-review/decision.json"
+)
+
+// saveArtifact writes v into the run's artifact directory. It does nothing
+// when the run has none.
+func (s *Steps) saveArtifact(name string, v any) error {
+	if s.ArtifactDir == "" {
+		return nil
+	}
+	return writeJSONFile(filepath.Join(s.ArtifactDir, filepath.FromSlash(name)), v)
 }
 
 // readLogTail returns the end of a log file, or nothing if it is unreadable.
