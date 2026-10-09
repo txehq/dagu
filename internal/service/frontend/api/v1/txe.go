@@ -57,7 +57,7 @@ func txeError(err error) error {
 	case registry.CodeVersionConflict, registry.CodeDuplicate, registry.CodeNotReady, registry.CodeLifecycle,
 		registry.CodeTransition, registry.CodeClaimHeld, registry.CodeClaimStale, registry.CodeNotPermitted,
 		registry.CodeStaleBinding, registry.CodeProposalState, registry.CodeActionExists, registry.CodeActionState,
-		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete:
+		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved:
 		// Refused against current state: 409 with the record to re-read.
 	}
 	if re.Current != nil {

@@ -129,6 +129,9 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 		if a.Name == "" || seen[a.Name] {
 			return refuse(CodeInvalid, "review_policy.permitted_actions[%d] needs a unique name", i)
 		}
+		if IsReservedAction(a.Name) {
+			return refuse(CodeInvalid, "permitted action %q uses a reserved prefix (txe., dagu.)", a.Name)
+		}
 		seen[a.Name] = true
 		if a.TimeoutSec <= 0 {
 			return refuse(CodeInvalid, "permitted action %q needs timeout_sec", a.Name)

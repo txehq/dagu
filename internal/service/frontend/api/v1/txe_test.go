@@ -376,7 +376,7 @@ func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
 	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
 		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
 			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
-			NativeTask: &apigen.TxeNativeTask{Dag: jobID, RunId: "run-1", StepId: "approve"},
+			NativeTask: &apigen.TxeNativeTask{Dag: registry.DecideTaskDAG(f.machine), RunId: "run-1", StepId: registry.DecideTaskStep},
 		}}})
 	require.NoError(t, err)
 	p := propResp.(apigen.CreateTxeProposal200JSONResponse)

@@ -436,11 +436,14 @@ const (
 	ProposalExecuted   ProposalState = "executed"
 	ProposalRejected   ProposalState = "rejected"
 	ProposalSuperseded ProposalState = "superseded"
+	// ProposalClosed is an escalation answered with retry: finished, never
+	// executed itself.
+	ProposalClosed ProposalState = "closed"
 )
 
 // Terminal reports whether the proposal is finished.
 func (s ProposalState) Terminal() bool {
-	return s == ProposalExecuted || s == ProposalRejected || s == ProposalSuperseded
+	return s == ProposalExecuted || s == ProposalRejected || s == ProposalSuperseded || s == ProposalClosed
 }
 
 // NativeTask points at the Dagu human task that collects the decision.
@@ -753,6 +756,11 @@ type Job struct {
 	// AdmittedRuns are runs a worker was allowed to start, by run ID, so a
 	// later retirement knows them even before Dagu reports them running.
 	AdmittedRuns map[string]AdmittedRun `json:"admitted_runs,omitempty"`
+	// UncertainResolutions are retry verdicts on escalations, by action ID,
+	// each allowing one more attempt of that action.
+	UncertainResolutions map[string]*UncertainResolution `json:"uncertain_resolutions,omitempty"`
+	// Intents are the latest action of each intent, by intent key.
+	Intents map[string]*IntentRecord `json:"intents,omitempty"`
 	// SuspendWriters are suspend writes in progress, by token, with when each
 	// started. Ownership of the suspension is not released while one is live.
 	SuspendWriters map[string]time.Time `json:"suspend_writers,omitempty"`
