@@ -643,7 +643,9 @@ var statusTailBytesRead func(n int64)
 // parseLatestStatusFromTail returns the last valid status in the file, as
 // parseStatusFileWithContext does, reading backwards from the end so that its
 // cost does not grow with the file's history. A final line without a newline
-// is incomplete and skipped, as are lines that do not decode.
+// is incomplete and skipped, as are lines that do not decode. Each byte is
+// examined at most twice, once to find line boundaries and once to read a
+// candidate line, and only one candidate line is held in memory.
 func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStatus, error) {
 	f, err := openStatusFileWithRetry(file)
 	if err != nil {
@@ -664,46 +666,53 @@ func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStat
 		}
 	}()
 
-	// buf holds the file's bytes from start up to the end of the last
-	// complete line not yet rejected; complete means it ends in a newline.
-	var buf []byte
-	start := info.Size()
-	terminated := false
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	chunk := make([]byte, statusTailChunk)
+	// end is the offset of the newline that terminates the candidate line;
+	// anything after the last newline is an incomplete line and is skipped.
+	end, err := lastNewlineBefore(ctx, f, info.Size(), chunk, &read)
+	for err == nil && end >= 0 {
+		var prev int64
+		prev, err = lastNewlineBefore(ctx, f, end, chunk, &read)
+		if err != nil {
+			break
 		}
-		if !terminated {
-			if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
-				buf = buf[:i+1]
-				terminated = true
+		if n := end - (prev + 1); n > 0 {
+			line := make([]byte, n)
+			if _, err = f.ReadAt(line, prev+1); err != nil {
+				break
+			}
+			read += n
+			if status, decodeErr := ir.StatusFromJSON(string(line)); decodeErr == nil {
+				return status, nil
 			}
 		}
-		for terminated && len(buf) > 0 {
-			body := buf[:len(buf)-1]
-			j := bytes.LastIndexByte(body, '\n')
-			if j < 0 && start > 0 {
-				break // the line may begin before the bytes read so far
-			}
-			if line := body[j+1:]; len(line) > 0 {
-				if status, err := ir.StatusFromJSON(string(line)); err == nil {
-					return status, nil
-				}
-			}
-			buf = buf[:j+1]
-		}
-		if start == 0 {
-			return nil, io.EOF
-		}
-		n := min(int64(statusTailChunk), start)
-		start -= n
-		piece := make([]byte, n)
-		if _, err := f.ReadAt(piece, start); err != nil && !errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
-		}
-		read += n
-		buf = append(piece, buf...)
+		end = prev
 	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+	return nil, io.EOF
+}
+
+// lastNewlineBefore returns the offset of the last newline before pos, or -1,
+// reading backwards one chunk at a time into buf.
+func lastNewlineBefore(ctx context.Context, f *os.File, pos int64, buf []byte, read *int64) (int64, error) {
+	for pos > 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		n := min(int64(len(buf)), pos)
+		start := pos - n
+		if _, err := f.ReadAt(buf[:n], start); err != nil {
+			return 0, err
+		}
+		*read += n
+		if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
+			return start + int64(i), nil
+		}
+		pos = start
+	}
+	return -1, nil
 }
 
 func openStatusFileWithRetry(path string) (*os.File, error) {

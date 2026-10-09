@@ -221,6 +221,7 @@ func TestParseLatestStatusFromTailMatchesFullParse(t *testing.T) {
 		"valid lines":                         line(ir.Running) + line(ir.Failed),
 		"invalid last line":                   line(ir.Running) + "{not json\n",
 		"partial trailing line":               line(ir.Running) + `{"status":`,
+		"long unterminated tail":              line(ir.Running) + strings.Repeat("y", 3*statusTailChunk),
 		"complete record without its newline": line(ir.Running) + strings.TrimSuffix(line(ir.Failed), "\n"),
 		"blank lines":                         line(ir.Failed) + "\n\n",
 		"line longer than a chunk":            line(ir.Running) + string(longData) + "\n",
@@ -259,9 +260,13 @@ func TestStatusFileWriteIfLatestReadsOnlyTheTail(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, info.Size(), int64(4*statusTailChunk), "the history must span several chunks")
 
-	var read int64
+	read := int64(-1)
 	statusTailBytesRead = func(n int64) { read = n }
 	t.Cleanup(func() { statusTailBytesRead = nil })
 	require.NoError(t, owner.WriteIfLatest(ctx, createTestStatus(ir.Running), func(*ir.DAGRunStatus) error { return nil }))
-	assert.LessOrEqual(t, read, int64(statusTailChunk), "only the last chunk is read")
+	require.Positive(t, read, "the conditional write must read through the tail reader")
+	// Finding the last record's end and start, then reading it, stays within
+	// a few chunks however long the history is.
+	assert.LessOrEqual(t, read, int64(3*statusTailChunk), "only the end of the file is read")
+	assert.Less(t, read, info.Size()/2, "the history is not read")
 }
