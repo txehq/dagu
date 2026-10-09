@@ -131,6 +131,8 @@ func TestRenderDAGs(t *testing.T) {
 	} {
 		assert.Contains(t, dags.Reviewer, want)
 	}
+	assert.NotContains(t, dags.Reviewer, "\r", "the rendered DAG has the same line endings on every build")
+	assert.NotContains(t, dags.Decide, "\r")
 	assert.NotContains(t, dags.Reviewer, "human.task", "a waiting task would hold the reviewer DAG")
 	assert.NotContains(t, dags.Reviewer, "name:")
 

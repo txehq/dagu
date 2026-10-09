@@ -318,8 +318,10 @@ var (
 	// ErrTaskAnswered means the task already holds a different answer.
 	ErrTaskAnswered = errors.New("txe review: task already answered")
 	// ErrTaskEnded means the task can no longer be answered because its
-	// step or its run is over, and nothing shows that anyone answered it.
-	ErrTaskEnded = errors.New("txe review: task ended without an answer")
+	// step or its run is over, and the service records no completion for
+	// it. That is not proof that nobody answered: a service that does not
+	// record who completed a task shows an answered one the same way.
+	ErrTaskEnded = errors.New("txe review: task is over with no completion on record")
 	// ErrRunMissing means the service has no such run.
 	ErrRunMissing = errors.New("txe review: run not found")
 )

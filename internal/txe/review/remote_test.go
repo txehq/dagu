@@ -1706,7 +1706,9 @@ func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, closures, 1)
 	assert.Equal(t, registry.ClosureClosed, closures[0].Outcome)
-	assert.Contains(t, closures[0].Detail, "ended without an answer")
+	assert.Contains(t, closures[0].Detail, "records no completion")
+	assert.Contains(t, closures[0].Detail, "is not known from the run", "the record does not claim that nobody answered")
+	assert.NotContains(t, closures[0].Detail, "without an answer")
 }
 
 // Superseded proposals leave their decision runs waiting. The registry

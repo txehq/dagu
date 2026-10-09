@@ -824,6 +824,10 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 	return out, nil
 }
 
+// endedDetail is what the registry is told about a decision run that was
+// already over when the reviewer came to close it.
+const endedDetail = "the decision run's task was already over and the service records no completion for it; whether it had been answered is not known from the run. The reviewer completed nothing."
+
 // maxUnreadReported bounds how many unreadable runs one listing names.
 const maxUnreadReported = 10
 
@@ -833,12 +837,13 @@ const maxUnreadReported = 10
 func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error) {
 	outcome, detail := api.TxeClosureOutcome(closure.Outcome), closure.Detail
 	if closure.Outcome == ClosureEnded {
-		// The registry has no outcome of its own for a task that ended
-		// unanswered. It is recorded as closed, which is what it is, with
-		// the detail saying that the reviewer completed nothing; it is not
-		// recorded as answered, which it was not.
+		// The registry has no outcome of its own for a task that was
+		// already over with no completion on record. It is recorded as
+		// closed, with a detail that says exactly what is known: the task
+		// was over, the service shows no completion, the reviewer completed
+		// nothing. It neither claims an answer nor denies one.
 		outcome = api.TxeClosureOutcomeClosed
-		detail = strings.TrimSpace("the decision run had already ended without an answer; the reviewer completed nothing. " + detail)
+		detail = strings.TrimSpace(endedDetail + " " + detail)
 	}
 	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: outcome, Detail: optional(detail)}
 	var out api.TxeClosure
@@ -1244,13 +1249,15 @@ func RemoteEnqueue(t Transport) EnqueueFunc {
 //
 //   - answered, only when the task's step records who completed it;
 //   - ended, when the step or the whole run is over and no completion is
-//     recorded: nothing is waiting, and nothing says anyone answered;
+//     recorded: nothing is waiting, and whether anyone answered is not
+//     known;
 //   - otherwise an error, which leaves the task to be tried again and is
 //     never recorded as a final outcome.
 //
 // A service that does not record who completed a task, as one running
-// without authentication, reports an answered task as ended. Both are final
-// and neither claims an answer that is not on record.
+// without authentication, shows an answered task as ended. Both are final,
+// and what is recorded for an ended task says that no completion is on
+// record, not that nobody answered.
 func RemoteComplete(t Transport) CompleteFunc {
 	return func(ctx context.Context, task TaskLocator, input map[string]string) error {
 		base := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID)

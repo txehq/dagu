@@ -158,7 +158,7 @@ func RenderDAGs(cfg DAGConfig) (RenderedDAGs, error) {
 		Prompt string
 		Schema string
 		Vars   []envVar
-	}{cfg, strings.TrimSpace(reviewer.Prompt), schema.String(), vars}
+	}{cfg, strings.TrimSpace(unixLines(reviewer.Prompt)), schema.String(), vars}
 
 	out := RenderedDAGs{
 		ReviewerName: ReviewerDAGName(cfg.MachineID),
@@ -173,8 +173,16 @@ func RenderDAGs(cfg DAGConfig) (RenderedDAGs, error) {
 	return out, nil
 }
 
+// unixLines gives embedded text the same line endings whatever checked the
+// source out. A Windows checkout can carry CRLF into the embedded files, and
+// the rendered DAGs and the agent's prompt must be the same bytes on every
+// build.
+func unixLines(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
 func renderTemplate(name, text string, data any) (string, error) {
-	tmpl, err := template.New(name).Funcs(template.FuncMap{"yaml": yamlString}).Option("missingkey=error").Parse(text)
+	tmpl, err := template.New(name).Funcs(template.FuncMap{"yaml": yamlString}).Option("missingkey=error").Parse(unixLines(text))
 	if err != nil {
 		return "", fmt.Errorf("parse %s template: %w", name, err)
 	}
