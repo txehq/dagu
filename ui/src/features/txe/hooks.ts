@@ -4,6 +4,7 @@
 import React from 'react';
 import useSWR from 'swr';
 
+import { useConfig } from '@/contexts/ConfigContext';
 import { useClient } from '@/hooks/api';
 
 import { createTxeApi, type TxeApi } from './api';
@@ -13,6 +14,16 @@ import type { Decision, Proposal, TxeJob } from './types';
 const REFRESH_MS = 10_000;
 
 export const TxeApiContext = React.createContext<TxeApi | null>(null);
+
+// usePersonDecisions reports whether this hub can attribute a decision to a
+// person. Only builtin authentication signs people in individually; with no
+// authentication, or with basic auth's one shared credential, the hub cannot
+// tell a person from a reviewer holding the same access, so it refuses human
+// decisions and the dashboard does not offer them.
+export function usePersonDecisions(): boolean {
+  const config = useConfig();
+  return config?.authMode === 'builtin';
+}
 
 // useTxeApi returns the injected API (tests, fixtures) or one bound to the
 // configured server.

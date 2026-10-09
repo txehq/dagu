@@ -11,7 +11,12 @@ import { I18nText } from '@/i18n/I18nText';
 
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { InboxItemCard } from '@/features/txe/components/InboxItemCard';
-import { useInboxData, useTxeApi } from '@/features/txe/hooks';
+import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
+import {
+  useInboxData,
+  usePersonDecisions,
+  useTxeApi,
+} from '@/features/txe/hooks';
 import { buildInbox } from '@/features/txe/inbox';
 
 const CLOCK_TICK_MS = 15_000;
@@ -20,7 +25,9 @@ const CLOCK_TICK_MS = 15_000;
 // and proposed action needed to decide.
 export default function TxeInboxPage(): React.ReactElement {
   const appBarContext = React.useContext(AppBarContext);
-  const canDecide = useCanExecute();
+  const personDecisions = usePersonDecisions();
+  // A person may decide only where the hub can tell who they are.
+  const canDecide = useCanExecute() && personDecisions;
   const api = useTxeApi();
   const { data, error, isLoading, mutate } = useInboxData();
   // A refused decision usually removes its card on reload (the proposal was
@@ -48,6 +55,7 @@ export default function TxeInboxPage(): React.ReactElement {
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4">
+      {!personDecisions && <DecisionAuthNotice />}
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">
           <I18nText text="Job inbox" />
