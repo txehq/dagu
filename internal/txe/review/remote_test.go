@@ -169,13 +169,12 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	target := apigen.TxeTarget{Kind: "fixture.volume", StableId: map[string]string{"cluster_uid": "c-1", "uid": "vol-1"}}
 	digest := fmt.Sprintf("sha256:%064x", 7)
 	readOnly, none := apigen.TxePermittedActionIdempotency("read_only"), apigen.TxePermittedActionIdempotency("none")
-	depthSchema := map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
-		"depth":   map[string]any{"type": "integer", "minimum": 1, "maximum": 5},
-		"ratio":   map[string]any{"type": "number", "maximum": 1},
-		"verbose": map[string]any{"type": "boolean"},
-		"label":   map[string]any{"type": "string", "maxLength": 8},
-	}}
-	sizeSchema := map[string]any{"type": "object", "properties": map[string]any{"size_gb": map[string]any{"type": "string"}}}
+	depthSchema := json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{
+		"depth":{"type":"integer","minimum":1,"maximum":5},
+		"ratio":{"type":"number","maximum":1},
+		"verbose":{"type":"boolean"},
+		"label":{"type":"string","maxLength":8}}}`)
+	sizeSchema := json.RawMessage(`{"type":"object","properties":{"size_gb":{"type":"string"}}}`)
 	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)
 	post("/txe/jobs", apigen.TxeRegisterRequest{
 		JobId: jobID, RequestId: "r1", OwnerId: owner, ProjectId: project.ProjectId, MachineId: machine, JobKey: "volume:vol-1",

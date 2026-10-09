@@ -180,8 +180,7 @@ func paramsValue(params map[string]string, schema any) json.RawMessage {
 	if len(params) == 0 {
 		return nil
 	}
-	m, _ := schema.(map[string]any)
-	props, _ := m["properties"].(map[string]any)
+	props := schemaProperties(schema)
 	typed := make(map[string]json.RawMessage, len(params))
 	for name, text := range params {
 		prop, _ := props[name].(map[string]any)
@@ -225,9 +224,29 @@ func shellCommand(line *string) []string {
 	return []string{"/bin/sh", "-c", *line}
 }
 
-func paramNames(schema any) []string {
-	m, _ := schema.(map[string]any)
+// schemaProperties returns the properties of an action's param_schema. The
+// service hands the schema over as the JSON the job registered; a decoded
+// map is accepted too. Anything else has no properties.
+func schemaProperties(schema any) map[string]any {
+	var m map[string]any
+	switch v := schema.(type) {
+	case map[string]any:
+		m = v
+	case json.RawMessage:
+		_ = json.Unmarshal(v, &m)
+	case *json.RawMessage:
+		if v != nil {
+			_ = json.Unmarshal(*v, &m)
+		}
+	case []byte:
+		_ = json.Unmarshal(v, &m)
+	}
 	props, _ := m["properties"].(map[string]any)
+	return props
+}
+
+func paramNames(schema any) []string {
+	props := schemaProperties(schema)
 	names := make([]string, 0, len(props))
 	for name := range props {
 		names = append(names, name)
