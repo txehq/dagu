@@ -31,14 +31,6 @@ type TaskCompleter interface {
 	Complete(ctx context.Context, request humantask.CompleteRequest) (humantask.Result, error)
 }
 
-// RunRetrier queues a native retry of a job's latest run for a retry
-// decision made at decidedAt. It dispatches only while that run is finished
-// and started before the decision, so replaying the decision never retries
-// twice. It returns the run ID and whether this call dispatched it.
-type RunRetrier interface {
-	RetryLatest(ctx context.Context, dagName string, decidedAt time.Time) (runID string, dispatched bool, err error)
-}
-
 // DecisionAuthorizer must allow the caller to record verdict on the job as it
 // is inside the decision transaction. It may run more than once, so it must
 // only read.
@@ -86,7 +78,6 @@ func checkNativeTask(job *registry.Job, task *registry.NativeTask) error {
 type Service struct {
 	Registry Registry
 	Tasks    TaskCompleter
-	Retrier  RunRetrier
 	// AuthorizeDecision is required: without it every decision is refused.
 	// It runs for replays too.
 	AuthorizeDecision DecisionAuthorizer
@@ -108,17 +99,12 @@ type Result struct {
 	// NativeErr is set when the decision is stored but its native human task
 	// could not be completed yet; replaying the request retries it.
 	NativeErr error
-	// RetryRunID is the DAG-run a retry verdict retried, or found already
-	// retried. RetryErr is set when the decision is stored but the retry could
-	// not be dispatched; replaying the request retries it.
-	RetryRunID string
-	RetryErr   error
 }
 
-// FollowUpPending reports a stored decision whose native completion or
-// retry still has to happen.
+// FollowUpPending reports a stored decision whose native completion still
+// has to happen.
 func (r *Result) FollowUpPending() bool {
-	return r.NativeErr != nil || r.RetryErr != nil
+	return r.NativeErr != nil
 }
 
 func (s *Service) now() time.Time {
@@ -184,7 +170,7 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 			if err := tx.MarkNativeResumed(decisionID); err != nil {
 				return err
 			}
-			d.NativeResume = "none"
+			d.NativeResume = ""
 		}
 		if err := applyLifecycle(tx, effect.Lifecycle, decisionID); err != nil {
 			return err
@@ -213,13 +199,6 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 	} else {
 		result.Decision = stored
 	}
-	if effect.RetryRun {
-		if s.Retrier == nil {
-			result.RetryErr = errors.New("decision: run retry is not configured")
-		} else {
-			result.RetryRunID, _, result.RetryErr = s.Retrier.RetryLatest(ctx, jobID, result.Decision.DecidedAt)
-		}
-	}
 
 	// The registry tracks a pending native completion per decision; the
 	// immutable decision record keeps the state it was stored with.
@@ -244,7 +223,7 @@ func CurrentNativeResume(job *registry.Job, d *registry.Decision) string {
 	case job.NativeResumes[d.DecisionID] != nil:
 		return "pending"
 	case d.Verdict == VerdictSnooze:
-		return "none"
+		return ""
 	case d.NativeResume == "pending":
 		return "completed"
 	}
