@@ -76,6 +76,7 @@ export default function TxeInboxPage(): React.ReactElement {
               canDecide={canDecide}
               onSubmit={async (request) => {
                 const result = await api.decide(
+                  item.job.jobId,
                   item.proposal!.proposalId,
                   request
                 );

@@ -4,7 +4,7 @@
 import React from 'react';
 import useSWR from 'swr';
 
-import { useConfig } from '@/contexts/ConfigContext';
+import { useClient } from '@/hooks/api';
 
 import { createTxeApi, type TxeApi } from './api';
 import type { Decision, Proposal, TxeJob } from './types';
@@ -17,10 +17,10 @@ export const TxeApiContext = React.createContext<TxeApi | null>(null);
 // configured server.
 export function useTxeApi(): TxeApi {
   const injected = React.useContext(TxeApiContext);
-  const config = useConfig();
+  const client = useClient();
   return React.useMemo(
-    () => injected ?? createTxeApi(config.apiURL),
-    [injected, config.apiURL]
+    () => injected ?? createTxeApi(client),
+    [injected, client]
   );
 }
 

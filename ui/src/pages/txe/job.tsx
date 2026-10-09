@@ -88,7 +88,11 @@ function ProposalSection({
           proposal={proposal}
           canDecide={canDecide}
           onSubmit={async (request) => {
-            const result = await api.decide(proposal.proposalId, request);
+            const result = await api.decide(
+              proposal.jobId,
+              proposal.proposalId,
+              request
+            );
             if (result.ok) await onChanged();
             return result;
           }}
