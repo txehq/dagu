@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install or upgrade the native Dagu worker and its tunnel on this Mac (TXE-3727).
 #
-#   txe/worker/install.sh --tag txe-v2.18.2-1 --owner-id own_...   # first install
+#   txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_...   # first install
 #   txe/worker/install.sh --tag txe-v2.18.3-1                       # upgrade
 #
 # It builds the worker from the same fork tag as the cluster image, keeps every
@@ -42,7 +42,7 @@ kubectl_bin="$(command -v kubectl)" || die "kubectl is not on PATH"
 command -v go >/dev/null || die "go is not on PATH"
 
 umask 077
-mkdir -p "$TXE_DAGU_HOME"/{bin,packages,outputs,logs,tunnel,worker-home}
+mkdir -p "$TXE_DAGU_HOME"/{bin,packages,outputs,receipts,client,skill,logs,tunnel,worker-home}
 
 # Machine identity: minted once, then only read.
 machine="$TXE_DAGU_HOME/machine.json"
