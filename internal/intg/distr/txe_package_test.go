@@ -62,23 +62,27 @@ func txeCommitPackage(t *testing.T, sourceFiles map[string]string, include, entr
 	return pkg
 }
 
-// txeFilesContaining returns the files under roots that contain needle.
-func txeFilesContaining(t *testing.T, needle string, roots ...string) []string {
+// txePackageFilesContaining returns the files of a package that contain needle.
+func txePackageFilesContaining(t *testing.T, pkg *txepkg.Package, needle string) []string {
 	t.Helper()
 	var found []string
-	for _, root := range roots {
-		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil //nolint:nilerr // unreadable entries cannot hold the value
-			}
-			data, err := os.ReadFile(p) //nolint:gosec // test directory
-			if err == nil && bytes.Contains(data, []byte(needle)) {
-				found = append(found, p)
-			}
+	err := filepath.WalkDir(pkg.Dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
 			return nil
-		})
-		require.NoError(t, err)
-	}
+		}
+		data, err := os.ReadFile(p) //nolint:gosec // test directory
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte(needle)) {
+			found = append(found, p)
+		}
+		return nil
+	})
+	require.NoError(t, err)
 	return found
 }
 
@@ -151,10 +155,11 @@ func TestTXEPackage_CredentialStaysOnWorker(t *testing.T) {
 	pkg := txeCommitPackage(t, map[string]string{"probe.sh": `#!/bin/sh
 set -eu
 mkdir -p "$TXE_OUTPUT_DIR"
-if [ "$FIXTURE_TOKEN" = "$(cat "$TOKEN_FILE")" ]; then
+token="$(printf '%s' "$FIXTURE_TOKEN")"
+if [ "$token" = "$(cat "$TOKEN_FILE")" ]; then
   echo match > "$TXE_OUTPUT_DIR/result"
 fi
-echo "token=$FIXTURE_TOKEN"
+echo "token=$token end"
 echo "ambient=${TXE_AMBIENT_SECRET:-unset}"
 echo "probe=${LC_TXE_PROBE:-unset}"
 `}, []string{"probe.sh"}, []string{"./probe.sh"})
@@ -163,7 +168,7 @@ echo "probe=${LC_TXE_PROBE:-unset}"
 	// outside everything the hub stores.
 	tokenFile := filepath.Join(t.TempDir(), "machine-credentials", "fixture-token")
 	require.NoError(t, os.MkdirAll(filepath.Dir(tokenFile), 0o700))
-	require.NoError(t, os.WriteFile(tokenFile, []byte(credential), 0o600))
+	require.NoError(t, os.WriteFile(tokenFile, []byte(credential+"\n"), 0o600))
 	outputs := filepath.Join(t.TempDir(), "outputs", txeTestJob)
 
 	f := newTestFixture(t, fmt.Sprintf(`
@@ -206,7 +211,7 @@ steps:
 	log := getLogContent(t, logPath)
 	assert.Contains(t, log, "ambient=unset")
 	assert.Contains(t, log, "probe=visible")
-	assert.Contains(t, log, "token=")
+	assert.Contains(t, log, "token=******* end")
 	assert.NotContains(t, log, credential)
 
 	// Nothing the hub holds contains the credential.
@@ -214,12 +219,10 @@ steps:
 	statusJSON, err := json.Marshal(status)
 	require.NoError(t, err)
 	assert.NotContains(t, string(statusJSON), credential)
-	paths := f.coord.Config.Paths
-	assert.Empty(t, txeFilesContaining(t, credential, paths.DataDir, paths.LogDir, paths.ArtifactDir, paths.DAGsDir),
-		"the credential was written to hub storage")
+	assert.Empty(t, hubFilesContaining(t, f, credential), "the credential was written to hub storage")
 
 	// Neither does the package.
-	assert.Empty(t, txeFilesContaining(t, credential, pkg.Dir))
+	assert.Empty(t, txePackageFilesContaining(t, pkg, credential))
 }
 
 // A missing credential fails the run before the script starts, and the hub's
