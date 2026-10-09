@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -70,35 +69,42 @@ type DAGSpec struct {
 	Env            map[string]string
 	CredentialRefs []CredentialRef
 
-	// Publish, when set, adds a final step that records the run's declared
-	// deliverables. Without it the run publishes nothing.
+	// CLI is how the job's DAG calls dagu on the assigned machine. Every
+	// job's DAG calls it: the resource check runs before the job does.
+	CLI CLI
+
+	// Publish, when set, seals what the job wrote and adds a final step that
+	// records the run's declared deliverables. Without it the run publishes
+	// nothing.
 	Publish *Publish
 }
 
-// Publish describes the step that records a run's deliverables.
-type Publish struct {
-	// Command is the absolute path of the dagu binary on the assigned
-	// machine followed by its arguments.
-	Command []string
-	// HomeRoot is the TXE home on the assigned machine. The step needs it
+// CLI is how a job's DAG calls dagu on the assigned machine.
+type CLI struct {
+	// Dagu is the absolute path of the dagu binary.
+	Dagu string
+	// StoreFlags name the context store the job was registered with. They
+	// go on every command: a step inherits the worker's own Dagu home, not
+	// the one the hub's context is in, and every "dagu txe" command resolves
+	// that context before it does anything. A job therefore does not
+	// execute when the hub could not be told about it for lack of one.
+	StoreFlags []string
+	// HomeRoot is the TXE home on the assigned machine. The steps need it
 	// spelled out: a step does not inherit the worker's environment.
 	HomeRoot string
+}
+
+// command is a "dagu txe" command line with the store flags appended.
+func (c CLI) command(words ...string) []string {
+	argv := append([]string{c.Dagu, "txe"}, words...)
+	return append(argv, c.StoreFlags...)
+}
+
+// Publish describes how a run's deliverables are recorded.
+type Publish struct {
 	// HubArtifacts enables the run's native artifact directory, which the
 	// worker uploads to the hub when the run ends.
 	HubArtifacts bool
-}
-
-// publishVerb is what follows the dagu binary in a publish command.
-var publishVerb = []string{"txe", "artifacts", "publish"}
-
-// verb is the publish command with another verb of "txe artifacts" in place
-// of "publish". It keeps the publish command's flags: every "dagu txe"
-// command resolves the hub's context before it does anything, so a command
-// without them would look for the context in another store. A job therefore
-// does not execute when its results could not be recorded for lack of one.
-func (p *Publish) verb(name string) []string {
-	argv := []string{p.Command[0], publishVerb[0], publishVerb[1], name}
-	return append(argv, p.Command[1+len(publishVerb):]...)
 }
 
 // RunOutputEnv is the variable holding the output directory of the attempt
@@ -185,9 +191,7 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	line("  - %s: %s", AttemptEnv, quote(attemptRef))
 	line("  - %s: %s", QueuedAtEnv, quote(queuedAtRef))
 	line("  - %s: %s", RunOutputEnv, quote(AttemptOutputDir(s.OutputDir, "${DAG_RUN_ID}", attemptRef)))
-	if s.Publish != nil {
-		line("  - %s: %s", EnvHome, quote(s.Publish.HomeRoot))
-	}
+	line("  - %s: %s", EnvHome, quote(s.CLI.HomeRoot))
 	names := make([]string, 0, len(s.Env))
 	for name := range s.Env {
 		names = append(names, name)
@@ -206,21 +210,30 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 		}
 	}
 
+	// The job's command is one of several commands of one step, run in
+	// order; a failing command stops the step.
+	//
+	// The resource check comes first, so it runs every time the job runs,
+	// a retry included, and the job does not run when a target it works on
+	// is gone or cannot be observed. A check in a step of its own would not
+	// run again when a later step failed and the run was retried.
+	//
+	// With deliverables, the job's command also runs between "begin", which
+	// gives it an empty output directory and keeps what an earlier
+	// execution left there, and "seal", which records what the job wrote;
+	// that is what the publish step reads. Nothing is sealed unless the
+	// job's command succeeded.
 	line("steps:")
 	line("  - name: run")
-	if s.Publish == nil {
-		line("    command: %s", quote(shellJoin(s.Entrypoint)))
-	} else {
-		// The job's command runs between two commands of the same step.
-		// The first gives it an empty output directory, keeping what an
-		// earlier execution left there; the last seals what the job
-		// wrote, which is what the publish step reads. A failed command
-		// stops the step, so nothing is sealed unless the job's command
-		// succeeded.
-		line("    command:")
-		line("      - %s", quote(shellJoin(s.Publish.verb("begin"))))
-		line("      - %s", quote(shellJoin(s.Entrypoint)))
-		line("      - %s", quote(shellJoin(s.Publish.verb("seal"))))
+	line("    command:")
+	line("      - %s", quote(shellJoin(s.CLI.command("resource", "check",
+		"--job", s.JobID, "--job-version", fmt.Sprint(s.Version), "--machine", s.MachineID))))
+	if s.Publish != nil {
+		line("      - %s", quote(shellJoin(s.CLI.command("artifacts", "begin"))))
+	}
+	line("      - %s", quote(shellJoin(s.Entrypoint)))
+	if s.Publish != nil {
+		line("      - %s", quote(shellJoin(s.CLI.command("artifacts", "seal"))))
 	}
 	if s.Schedule.Retry > 0 {
 		line("    retry_policy:")
@@ -229,7 +242,7 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	}
 	if s.Publish != nil {
 		line("  - name: publish")
-		line("    command: %s", quote(shellJoin(s.Publish.Command)))
+		line("    command: %s", quote(shellJoin(s.CLI.command("artifacts", "publish"))))
 	}
 	return []byte(b.String()), nil
 }
@@ -283,22 +296,20 @@ func (s DAGSpec) validate() error {
 		return fmt.Errorf("render DAG: entrypoint is required")
 	}
 
-	if p := s.Publish; p != nil {
-		if len(p.Command) == 0 || !filepath.IsAbs(p.Command[0]) {
-			return fmt.Errorf("render DAG: the publish command must start with the absolute path of the dagu binary")
-		}
-		if len(p.Command) < 1+len(publishVerb) || !slices.Equal(p.Command[1:1+len(publishVerb)], publishVerb) {
-			return fmt.Errorf("render DAG: the publish command must be %q after the dagu binary", strings.Join(publishVerb, " "))
-		}
-		if !filepath.IsAbs(p.HomeRoot) {
-			return fmt.Errorf("render DAG: the TXE home %q must be absolute", p.HomeRoot)
-		}
-		for i, arg := range p.Command {
-			if err := literal(fmt.Sprintf("publish command argument %d", i), arg); err != nil {
-				return err
-			}
-		}
-		if err := literal("TXE home", p.HomeRoot); err != nil {
+	if !filepath.IsAbs(s.CLI.Dagu) {
+		return fmt.Errorf("render DAG: the dagu binary %q must be an absolute path on the assigned machine", s.CLI.Dagu)
+	}
+	if !filepath.IsAbs(s.CLI.HomeRoot) {
+		return fmt.Errorf("render DAG: the TXE home %q must be absolute", s.CLI.HomeRoot)
+	}
+	if err := literal("dagu binary", s.CLI.Dagu); err != nil {
+		return err
+	}
+	if err := literal("TXE home", s.CLI.HomeRoot); err != nil {
+		return err
+	}
+	for i, flag := range s.CLI.StoreFlags {
+		if err := literal(fmt.Sprintf("store flag %d", i), flag); err != nil {
 			return err
 		}
 	}

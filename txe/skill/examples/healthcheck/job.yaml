@@ -15,7 +15,12 @@ targets:
     stable_id:
       id: example-target-0001
     display_name: example target
-    existence_check: pre_run
+    # event_only: nothing checks this target automatically. No probe knows a
+    # local file, so the registry learns that it is gone or replaced only
+    # when someone records that; this job's own script is what looks at the
+    # file on every run. A Kubernetes or Linear target can be checked before
+    # every run instead; see "Targets" in SKILL.md.
+    existence_check: event_only
 schedule:
   cron: "*/5 * * * *"
   timezone: Australia/Perth
