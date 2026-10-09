@@ -217,9 +217,9 @@ describe('run retry', () => {
 });
 
 describe('dispatched retry', () => {
-  // A receipt proves the retry was dispatched, not that the run succeeded:
-  // the run's own status is shown beside it.
-  it('shows the attempt receipt and the run status separately', async () => {
+  // A dispatch says nothing about how the run went: the run's own status is
+  // shown beside it, and the receipt is not presented as an attempt.
+  it('shows the dispatch and the run status, not the receipt', async () => {
     renderAt(
       baseApi({
         getJob: async () =>
@@ -248,8 +248,10 @@ describe('dispatched retry', () => {
       '/txe/jobs/job_volume_monitor'
     );
     const retry = await screen.findByTestId('txe-run-retry');
-    expect(retry).toHaveTextContent('Retry dispatched as attempt attempt-2');
+    expect(retry).toHaveTextContent('Retry dispatched');
     expect(retry).toHaveTextContent('run is now running');
+    // The journal receipt is not an attempt identity and is never shown as one.
+    expect(retry).not.toHaveTextContent('attempt-2');
     expect(retry).not.toHaveTextContent('Retried');
   });
 });
