@@ -182,6 +182,11 @@ func (s *Store) ChangeLifecycle(ctx context.Context, jobID string, t Transition,
 	}
 	var policy ActiveRunPolicy
 	committed, err := s.WithJobTx(ctx, jobID, by, func(tx *JobTx) error {
+		if t.Authorize != nil {
+			if err := t.Authorize(tx); err != nil {
+				return err
+			}
+		}
 		tt := t
 		if stopping {
 			policy = tt.ActiveRunPolicy

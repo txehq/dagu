@@ -131,7 +131,20 @@ type ResourceEvent struct {
 // pointed at it; the job's replacement rule applies. Every other job is
 // untouched. Reporting the same event again is safe: transitions that already
 // happened are recorded as unchanged.
-func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Actor) (*ResourceEvent, error) {
+// ResourceJobFilter decides whether a resource event may affect a job, for
+// example whether the reporter may write it. Jobs it refuses are skipped and
+// not reported.
+type ResourceJobFilter func(ctx context.Context, job *Job) bool
+
+func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Actor, allow ...ResourceJobFilter) (*ResourceEvent, error) {
+	permitted := func(ctx context.Context, job *Job) bool {
+		for _, f := range allow {
+			if f != nil && !f(ctx, job) {
+				return false
+			}
+		}
+		return true
+	}
 	t := ev.Target
 	if t.Kind == "" || len(t.StableID) == 0 {
 		return nil, refuse(CodeInvalid, "target needs kind and stable_id")
@@ -159,7 +172,7 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 	}
 	var errs []error
 	for _, jobID := range exact {
-		d, err := s.applyIdentityEvent(ctx, jobID, &ev, by)
+		d, err := s.applyIdentityEvent(ctx, jobID, &ev, by, permitted)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", jobID, err))
 			continue
@@ -174,7 +187,7 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 			return nil, err
 		}
 		for _, jobID := range named {
-			d, err := s.applyReplacement(ctx, jobID, &ev, by)
+			d, err := s.applyReplacement(ctx, jobID, &ev, by, permitted)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", jobID, err))
 				continue
@@ -210,12 +223,15 @@ func (s *Store) currentTargets(ctx context.Context, jobID string, match func(Tar
 	return job, out, nil
 }
 
-func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *ResourceEvent, by Actor) (*ResourceDisposition, error) {
+func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) (*ResourceDisposition, error) {
 	key := TargetKey(ev.Target)
 	job, hits, err := s.currentTargets(ctx, jobID, func(t Target) bool { return TargetKey(t) == key })
 	if err != nil || len(hits) == 0 {
 		// The index named a target the current version no longer has.
 		return nil, ignoreNotFound(err)
+	}
+	if !permitted(ctx, job) {
+		return nil, nil
 	}
 	d := &ResourceDisposition{JobID: jobID, Match: "identity"}
 	evidence := append([]string{"resource_event:" + ev.EventID}, ev.Evidence...)
@@ -253,7 +269,7 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 	return nil, refuse(CodeInvalid, "unknown observation %q", ev.Observation)
 }
 
-func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *ResourceEvent, by Actor) (*ResourceDisposition, error) {
+func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) (*ResourceDisposition, error) {
 	key := TargetKey(ev.Target)
 	job, hits, err := s.currentTargets(ctx, jobID, func(t Target) bool {
 		return t.Kind == ev.Target.Kind && t.Environment == ev.Target.Environment &&
@@ -261,6 +277,9 @@ func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *Resource
 	})
 	if err != nil || len(hits) == 0 {
 		return nil, ignoreNotFound(err)
+	}
+	if !permitted(ctx, job) {
+		return nil, nil
 	}
 	d := &ResourceDisposition{JobID: jobID, Match: "replacement"}
 	if job.Lifecycle.Terminal() {
