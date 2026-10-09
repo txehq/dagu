@@ -6,7 +6,12 @@ package probe
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	goruntime "runtime"
+	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -62,7 +67,7 @@ func fakeKube(t *testing.T, objs ...runtime.Object) (Kubernetes, *dynamicfake.Fa
 	}
 	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, lists, objs...)
 	var gotPath string
-	k := Kubernetes{NewClient: func(cred Credential, _ string) (dynamic.Interface, error) {
+	k := Kubernetes{NewClient: func(_ context.Context, cred Credential, _ string) (dynamic.Interface, error) {
 		gotPath = cred.Path
 		return client, nil
 	}}
@@ -216,13 +221,108 @@ contexts:
   context: {cluster: dev, user: probe}
 current-context: dev
 `
-	if _, err := kubeconfigClient(Credential{Value: kubeconfig}, ""); err != nil {
+	if _, err := kubeconfigClient(context.Background(), Credential{Value: kubeconfig}, ""); err != nil {
 		t.Fatalf("content: %v", err)
 	}
-	if _, err := kubeconfigClient(Credential{Value: kubeconfig}, "dev"); err != nil {
+	if _, err := kubeconfigClient(context.Background(), Credential{Value: kubeconfig}, "dev"); err != nil {
 		t.Fatalf("named context: %v", err)
 	}
-	if _, err := kubeconfigClient(Credential{Value: "not yaml: ["}, ""); err == nil {
+	if _, err := kubeconfigClient(context.Background(), Credential{Value: "not yaml: ["}, ""); err == nil {
 		t.Fatal("garbage kubeconfig built a client")
+	}
+}
+
+// execKubeconfig is a kubeconfig whose user runs plugin for its credential.
+func execKubeconfig(plugin string) string {
+	return `apiVersion: v1
+kind: Config
+clusters:
+- name: dev
+  cluster: {server: "https://127.0.0.1:6443"}
+users:
+- name: probe
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: ` + plugin + `
+      interactiveMode: Never
+contexts:
+- name: dev
+  context: {cluster: dev, user: probe}
+current-context: dev
+`
+}
+
+func writePlugin(t *testing.T, body string) string {
+	t.Helper()
+	if goruntime.GOOS == "windows" {
+		t.Skip("shell plugin")
+	}
+	path := filepath.Join(t.TempDir(), "plugin.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// An exec credential plugin that never answers, such as one waiting for a
+// login, is bounded by the check's deadline instead of hanging the run.
+func TestExecPluginIsBounded(t *testing.T) {
+	plugin := writePlugin(t, "sleep 30")
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := kubeconfigClient(ctx, Credential{Value: execKubeconfig(plugin)}, "")
+	if err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("err = %v after %s", err, time.Since(start))
+	}
+	if r := clientError(ctx, err); r.Outcome != Timeout {
+		t.Fatalf("result = %+v, want timeout", r)
+	}
+}
+
+// The plugin's token is handed to the client; a failing plugin is a
+// credential that cannot be used, reported without its output.
+func TestExecPluginCredential(t *testing.T) {
+	ok := writePlugin(t, `echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"tok"}}'`)
+	if _, err := kubeconfigClient(context.Background(), Credential{Value: execKubeconfig(ok)}, ""); err != nil {
+		t.Fatalf("token plugin: %v", err)
+	}
+	failing := writePlugin(t, "echo 'secret-in-stderr' >&2; exit 4")
+	_, err := kubeconfigClient(context.Background(), Credential{Value: execKubeconfig(failing)}, "")
+	r := clientError(context.Background(), err)
+	if r.Outcome != AuthDenied || strings.Contains(r.Detail, "secret-in-stderr") || !strings.Contains(r.Detail, "status 4") {
+		t.Fatalf("failing plugin: %+v", r)
+	}
+	empty := writePlugin(t, "echo '{}'")
+	if _, err := kubeconfigClient(context.Background(), Credential{Value: execKubeconfig(empty)}, ""); clientError(context.Background(), err).Outcome != AuthDenied {
+		t.Fatalf("plugin without a credential: %v", err)
+	}
+}
+
+// A client-building error can quote the kubeconfig, credentials included;
+// the reported detail never does.
+func TestClientErrorsDoNotQuoteTheKubeconfig(t *testing.T) {
+	kubeconfig := `apiVersion: v1
+kind: Config
+clusters:
+- name: dev
+  cluster: {server: "https://127.0.0.1:6443", proxy-url: "http://user:hunter2@[::1"}
+users:
+- name: probe
+  user: {token: "tok-hunter2"}
+contexts:
+- name: dev
+  context: {cluster: dev, user: probe}
+current-context: dev
+`
+	_, err := kubeconfigClient(context.Background(), Credential{Value: kubeconfig}, "")
+	r := clientError(context.Background(), err)
+	if err == nil || strings.Contains(r.Detail, "hunter2") {
+		t.Fatalf("err %v, detail %q", err, r.Detail)
+	}
+	r = kubeError(context.Background(), errors.New(`Get "http://user:hunter2@host": dial tcp: connection refused`), "GET x")
+	if strings.Contains(r.Detail, "hunter2") {
+		t.Fatalf("transport detail %q", r.Detail)
 	}
 }

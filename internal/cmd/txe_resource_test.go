@@ -5,6 +5,8 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"os/exec"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -30,11 +32,8 @@ func runTXEResource(t *testing.T, args ...string) error {
 }
 
 func exitCode(err error) int {
-	if coded, ok := errors.AsType[interface {
-		error
-		ExitCode() int
-	}](err); ok {
-		return coded.ExitCode()
+	if coded, ok := errors.AsType[*ExitCodeError](err); ok {
+		return coded.Code
 	}
 	if err != nil {
 		return 1
@@ -63,11 +62,22 @@ func TestTXEResourceCheckRefusesUnboundArguments(t *testing.T) {
 	}
 }
 
-// --machine is required: the check never guesses which machine it is on.
+// --machine is required: the check never guesses which machine it is on,
+// and a missing one is a usage error (2), like every other binding error.
 func TestTXEResourceCheckRequiresMachine(t *testing.T) {
 	err := runTXEResource(t, "--job", txeTestJob, "--job-version", "1")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "machine")
+	assert.Equal(t, probe.ExitUsage, exitCode(err), err.Error())
+}
+
+// main honours only the TXE exit code; any other error carrying an exit
+// code (a shell step's *exec.ExitError) is not mistaken for one.
+func TestExitCodeErrorIsExplicit(t *testing.T) {
+	_, ok := errors.AsType[*ExitCodeError](fmt.Errorf("wrapped: %w", &exec.ExitError{}))
+	assert.False(t, ok)
+	coded, ok := errors.AsType[*ExitCodeError](fmt.Errorf("wrapped: %w", txeExit(probe.ExitStop, errors.New("gone"))))
+	require.True(t, ok)
+	assert.Equal(t, probe.ExitStop, coded.Code)
 }
 
 // Without the worker installer's machine identity there is nothing to bind

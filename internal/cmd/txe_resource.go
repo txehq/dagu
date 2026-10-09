@@ -24,7 +24,7 @@ import (
 var (
 	txeResourceJobFlag     = commandLineFlag{name: "job", usage: "Job id: check the pre_run targets before this job's run"}
 	txeResourceVersionFlag = commandLineFlag{name: "job-version", usage: "Job version the run was rendered for (with --job)"}
-	txeResourceMachineFlag = commandLineFlag{name: "machine", usage: "Machine id the check runs on; must be this machine", required: true}
+	txeResourceMachineFlag = commandLineFlag{name: "machine", usage: "Machine id the check runs on; must be this machine (required)"}
 	txeResourceTimeoutFlag = commandLineFlag{name: "timeout", usage: "Bound for the whole check (default 60s with --job, 9m otherwise)"}
 )
 
@@ -66,29 +66,28 @@ Exit 2 means the arguments do not bind: another machine, or a missing version.`,
 	return command
 }
 
-// txeExitError ends the process with a chosen exit code.
-type txeExitError struct {
-	code int
-	err  error
+// ExitCodeError ends the process with a chosen exit code. main honours it
+// and only it, so an error from another command that happens to carry an
+// exit code (a step's *exec.ExitError) still exits 1.
+type ExitCodeError struct {
+	Code int
+	Err  error
 }
 
-func (e *txeExitError) Error() string {
-	if e.err == nil {
-		return fmt.Sprintf("exit %d", e.code)
+func (e *ExitCodeError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exit %d", e.Code)
 	}
-	return e.err.Error()
+	return e.Err.Error()
 }
 
-func (e *txeExitError) Unwrap() error { return e.err }
-
-// ExitCode is the process exit code main uses.
-func (e *txeExitError) ExitCode() int { return e.code }
+func (e *ExitCodeError) Unwrap() error { return e.Err }
 
 func txeExit(code int, err error) error {
 	if code == probe.ExitOK {
 		return err
 	}
-	return &txeExitError{code: code, err: err}
+	return &ExitCodeError{Code: code, Err: err}
 }
 
 func runTXEResourceCheck(ctx *Context, _ []string) error {
@@ -109,6 +108,9 @@ func runTXEResourceCheck(ctx *Context, _ []string) error {
 		return err
 	}
 	// The ids name local journal files, so they must be registry ids.
+	if machineID == "" {
+		return txeExit(probe.ExitUsage, errors.New("--machine is required: the check never guesses which machine it is on"))
+	}
 	if !txeResourceIDPattern.MatchString(machineID) || !strings.HasPrefix(machineID, "mch_") {
 		return txeExit(probe.ExitUsage, fmt.Errorf("--machine %q is not a machine id", machineID))
 	}
@@ -152,11 +154,7 @@ func runTXEResourceCheck(ctx *Context, _ []string) error {
 	if err != nil {
 		return txeExit(probe.ExitUnobserved, err)
 	}
-	journalName := "machine-" + machineID + ".json"
-	if preRun {
-		journalName = "job-" + jobID + ".json"
-	}
-	journal, err := probe.OpenJournal(filepath.Join(home.Root, "state", "probe", journalName))
+	journal, err := probe.OpenJournal(filepath.Join(home.Root, "state", "probe", "journal-"+machineID+".json"))
 	if err != nil {
 		return txeExit(probe.ExitInternal, err)
 	}

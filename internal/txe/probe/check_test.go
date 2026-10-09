@@ -292,20 +292,131 @@ func TestUndeliveredReportIsResentUnchanged(t *testing.T) {
 	if len(f.reg.recorded) != 0 {
 		t.Fatal("an unacknowledged report was counted")
 	}
-	j, _ := OpenJournal(f.path)
-	held := j.Undelivered()
-	if len(held) != 1 || !strings.HasPrefix(held[0].EventID, "evt_") {
+	held := f.pending(t, "")
+	if len(held) != 1 || !strings.HasPrefix(held[0].Event.EventID, "evt_") || held[0].JobID != jobA {
 		t.Fatalf("journal holds %+v", held)
 	}
 	f.check = f.newCheck(t)
 	if code := f.preRun(t, 2); code != ExitOK {
 		t.Fatalf("second run exit = %d", code)
 	}
-	if len(f.reg.recorded) != 2 || f.reg.recorded[0].EventID != held[0].EventID || f.reg.recorded[1].EventID == held[0].EventID {
+	if len(f.reg.recorded) != 2 || f.reg.recorded[0].EventID != held[0].Event.EventID || f.reg.recorded[1].EventID == held[0].Event.EventID {
 		t.Fatalf("recorded %+v; want the held report first, then a new one", f.reg.recorded)
 	}
-	if j, _ := OpenJournal(f.path); len(j.Undelivered()) != 0 {
+	if len(f.pending(t, "")) != 0 {
 		t.Fatal("delivered report still held")
+	}
+}
+
+func (f *fixture) pending(t *testing.T, jobID string) []pendingReport {
+	t.Helper()
+	j, err := OpenJournal(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := j.pending(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// A pre-run resends its job's unacknowledged reports whatever the job's
+// targets and state are now: a report about a target the next version no
+// longer names, or for a job that has since ended, is not stranded.
+func TestPreRunReplaysStrandedReports(t *testing.T) {
+	f := newFixture(t)
+	f.reg.failRecord = 1
+	f.preRun(t, 2)
+	stranded := f.pending(t, jobA)[0].Event.EventID
+	// Version 3 names another target, and the job has been paused.
+	f.reg.versions[jobA][3] = &txeclient.JobVersion{Version: 3, Targets: []txeclient.Target{cm("u-7", "seven", CheckPreRun)}}
+	f.reg.jobs[jobA].Version, f.reg.jobs[jobA].Lifecycle = 3, "paused"
+	f.check = f.newCheck(t)
+	if code := f.preRun(t, 3); code != ExitStop {
+		t.Fatalf("paused job: exit %d, want 3", code)
+	}
+	if len(f.reg.recorded) != 1 || f.reg.recorded[0].EventID != stranded {
+		t.Fatalf("recorded %+v; want the stranded report resent", f.reg.recorded)
+	}
+	if len(f.pending(t, "")) != 0 {
+		t.Fatal("the resent report is still held")
+	}
+}
+
+// Concurrent checks on one machine share the journal without losing each
+// other's reports.
+func TestJournalConcurrentHoldsAreKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.json")
+	const n = 40
+	errs := make(chan error, n)
+	for i := range n {
+		go func() {
+			j, err := OpenJournal(path)
+			if err == nil {
+				err = j.hold(context.Background(), pendingReport{JobID: jobA, Key: "k", Event: Event{EventID: "evt_" + strings.Repeat("0", 25) + string(rune('A'+i%26)) + string(rune('a'+i/26))}})
+			}
+			errs <- err
+		}()
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	j, _ := OpenJournal(path)
+	if p, _ := j.pending(context.Background(), ""); len(p) != n {
+		t.Fatalf("journal holds %d reports, want %d", len(p), n)
+	}
+}
+
+// A target whose identity does not meet the contract is not looked up: a
+// padded uid could otherwise match another exact identity.
+func TestPreRunDoesNotProbeAMalformedTarget(t *testing.T) {
+	f := newFixture(t)
+	f.reg.versions[jobA][2].Targets = []txeclient.Target{{Kind: kindCM, Environment: "dev", DisplayName: "ns/one",
+		StableID: map[string]string{KeyClusterUID: "c1", KeyUID: "u-1 "}, ExistenceCheck: CheckPreRun}}
+	if code := f.preRun(t, 2); code != ExitUnobserved || len(f.probe.probed) != 0 {
+		t.Fatalf("exit %d, probed %v", code, f.probe.probed)
+	}
+	if f.reg.recorded[0].Observation != Unknown {
+		t.Fatalf("reported %+v", f.reg.recorded[0])
+	}
+}
+
+// An incomplete event about a replacement names the new identity while the
+// job still names the old one; it is matched by place and observed under the
+// identity it names. One no job of the machine names is reported unfinished.
+func TestPeriodicIncompleteReplacementAndUnmatched(t *testing.T) {
+	f := newFixture(t)
+	replaced := toTarget(cm("u-9", "two", CheckReconcile))
+	stray := toTarget(cm("u-x", "elsewhere", CheckReconcile))
+	f.reg.incomplete = []RecordedEvent{{EventID: "evt_r", Target: replaced}, {EventID: "evt_s", Target: stray}}
+	res, code, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), noCreds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(f.probe.probed, ","), "u-9") {
+		t.Fatalf("probed %v, want the replacement's identity", f.probe.probed)
+	}
+	if code != ExitUnobserved || res.Unfinished != 1 || !strings.Contains(f.out.String(), `"unfinished":true`) {
+		t.Fatalf("exit %d, %+v, out %s", code, res, f.out.String())
+	}
+}
+
+// Scheduling progress is recorded against the target the check asked about,
+// so a replacement observed for it does not leave it looking never checked.
+func TestReplacementProgressIsRecordedForTheRequestedTarget(t *testing.T) {
+	f := newFixture(t)
+	f.reg.versions[jobA][2].Targets = []txeclient.Target{cm("u-2", "two", CheckReconcile), cm("u-5", "five", CheckReconcile)}
+	f.probe.results["u-2"] = Result{Outcome: Present, Observed: &Target{Kind: kindCM, Environment: "dev", DisplayName: "ns/two", StableID: map[string]string{KeyClusterUID: "c1", KeyUID: "u-9"}}}
+	if _, _, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), noCreds); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := OpenJournal(f.path)
+	checked, _ := j.lastChecked(context.Background())
+	if checked[TargetKey(toTarget(cm("u-2", "two", CheckReconcile)))].IsZero() {
+		t.Fatal("the requested target was not recorded as checked")
 	}
 }
 

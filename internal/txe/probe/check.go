@@ -13,6 +13,7 @@ import (
 	"time"
 
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
 // Exit codes of `dagu txe resource check`. A non-zero exit of the pre-run
@@ -25,17 +26,18 @@ const (
 	ExitInternal = 1
 	// ExitUsage: the arguments are wrong or do not bind (another machine).
 	ExitUsage = 2
-	// ExitStop: do not run: a target is gone or replaced, or the job ended.
+	// ExitStop: do not run: a target is gone or replaced, or the registry
+	// would not admit the run.
 	ExitStop = 3
 	// ExitUnobserved: a target could not be observed, a report could not be
-	// saved, or (periodic) some targets were left for the next run.
+	// saved, or (periodic) some work was left for the next run.
 	ExitUnobserved = 75
 )
 
 // Existence checks a target declares.
 const (
-	CheckPreRun    = "pre_run"
-	CheckReconcile = "reconcile"
+	CheckPreRun    = target.CheckPreRun
+	CheckReconcile = target.CheckReconcile
 )
 
 // ActorKindReconciler is the reporter kind of a check's resource events.
@@ -63,7 +65,7 @@ type Check struct {
 type Line struct {
 	JobID         string   `json:"job_id,omitempty"`
 	Target        Target   `json:"target"`
-	Observation   Outcome  `json:"observation"`
+	Observation   Outcome  `json:"observation,omitempty"`
 	Authoritative bool     `json:"authoritative,omitempty"`
 	Replacement   *Target  `json:"replacement,omitempty"`
 	Detail        string   `json:"detail,omitempty"`
@@ -71,6 +73,10 @@ type Line struct {
 	Reported      bool     `json:"reported"`
 	ReportError   string   `json:"report_error,omitempty"`
 	Dispositions  []string `json:"dispositions,omitempty"`
+	// Resent marks a report delivered again from the journal.
+	Resent bool `json:"resent,omitempty"`
+	// Unfinished marks work this check did not do and the next one will.
+	Unfinished bool `json:"unfinished,omitempty"`
 }
 
 func (c *Check) now() time.Time {
@@ -98,31 +104,55 @@ func (c *Check) event(t Target, r Result) Event {
 	return ev
 }
 
-// report delivers ev, resending an undelivered report about the same
-// target first so a lost acknowledgement never leaves an orphan event.
-func (c *Check) report(ctx context.Context, ev Event) (*RecordedEvent, error) {
-	if old, ok := c.Journal.pending(ev.Target); ok {
-		if _, err := c.Registry.RecordEvent(ctx, old); err != nil {
-			return nil, fmt.Errorf("resend undelivered report %s: %w", old.EventID, err)
-		}
-		c.Journal.delivered(old)
-	}
+// report holds ev in the journal, sends it, and on acknowledgement drops it
+// and records the requested target as observed.
+func (c *Check) report(ctx context.Context, jobID string, requested Target, ev Event) (*RecordedEvent, error) {
 	id, err := txeclient.NewID("evt")
 	if err != nil {
 		return nil, err
 	}
 	ev.EventID = id
-	c.Journal.hold(ev)
-	if err := c.Journal.Save(); err != nil {
+	p := pendingReport{JobID: jobID, Key: TargetKey(requested), Event: ev}
+	if err := c.Journal.hold(ctx, p); err != nil {
 		return nil, err
 	}
 	rec, err := c.Registry.RecordEvent(ctx, ev)
 	if err != nil {
 		return nil, err
 	}
-	c.Journal.delivered(ev)
-	c.Journal.checked(ev.Target, c.now())
+	if err := c.Journal.delivered(ctx, p, c.now()); err != nil {
+		return rec, err
+	}
 	return rec, nil
+}
+
+// replay resends the journal's unacknowledged reports unchanged, under
+// their event ids; with a job id, only that job's. It reports how many could
+// not be delivered.
+func (c *Check) replay(ctx context.Context, jobID string) (int, error) {
+	pending, err := c.Journal.pending(ctx, jobID)
+	if err != nil {
+		return 0, err
+	}
+	failed := 0
+	for _, p := range pending {
+		line := Line{JobID: p.JobID, Target: p.Event.Target, Observation: p.Event.Observation, EventID: p.Event.EventID, Resent: true}
+		rec, err := c.Registry.RecordEvent(ctx, p.Event)
+		if err == nil {
+			err = c.Journal.delivered(ctx, p, c.now())
+		}
+		if err != nil {
+			failed++
+			line.ReportError = err.Error()
+		} else {
+			line.Reported = true
+			for _, d := range rec.Dispositions {
+				line.Dispositions = append(line.Dispositions, d.JobID+":"+d.Outcome)
+			}
+		}
+		c.print(line)
+	}
+	return failed, nil
 }
 
 func (c *Check) observe(ctx context.Context, jobID string, t Target, creds Credentials) (Line, Result) {
@@ -130,7 +160,7 @@ func (c *Check) observe(ctx context.Context, jobID string, t Target, creds Crede
 	line := Line{JobID: jobID, Target: t, Observation: r.Outcome, Authoritative: r.Outcome == Absent && r.Authoritative,
 		Replacement: r.Observed, Detail: r.Detail}
 	ev := c.event(t, r)
-	rec, err := c.report(ctx, ev)
+	rec, err := c.report(ctx, jobID, t, ev)
 	if err != nil {
 		line.ReportError = err.Error()
 	} else {
@@ -138,9 +168,6 @@ func (c *Check) observe(ctx context.Context, jobID string, t Target, creds Crede
 		for _, d := range rec.Dispositions {
 			line.Dispositions = append(line.Dispositions, d.JobID+":"+d.Outcome)
 		}
-	}
-	if !line.Reported {
-		line.EventID = ev.EventID
 	}
 	c.print(line)
 	return line, r
@@ -182,10 +209,11 @@ func toTarget(t txeclient.Target) Target {
 
 // PreRun checks the pre_run targets of version of jobID before the job's
 // command runs on machineID, and says whether it may run. It binds the
-// version the run was rendered for, never a newer one. It stops (3) where
-// the registry's run admission would refuse, and where a target is gone or
-// replaced; it stops (75) when a target could not be observed or a report
-// could not be saved. A job waiting for a person (needs_human) still runs.
+// version the run was rendered for, never a newer one. It first resends the
+// job's unacknowledged reports, whatever its targets and state now. It stops
+// (3) where the registry's run admission would refuse, and where a target is
+// gone or replaced; it stops (75) when a target could not be observed or a
+// report could not be saved. A job waiting for a person (needs_human) runs.
 func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Credentials) (int, error) {
 	job, err := c.Registry.Job(ctx, jobID)
 	if err != nil {
@@ -194,8 +222,15 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 	if job.MachineID != c.MachineID {
 		return ExitUsage, fmt.Errorf("job %s runs on %s, not on %s", jobID, job.MachineID, c.MachineID)
 	}
+	failed, err := c.replay(ctx, jobID)
+	if err != nil {
+		return ExitUnobserved, err
+	}
 	if err := admits(job, version, c.now()); err != nil {
 		return ExitStop, err
+	}
+	if failed > 0 {
+		return ExitUnobserved, fmt.Errorf("%d earlier reports for job %s could not be delivered", failed, jobID)
 	}
 	v, err := c.Registry.JobVersion(ctx, jobID, version)
 	if err != nil {
@@ -220,9 +255,6 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 		case r.Outcome != Present:
 			worse(ExitUnobserved)
 		}
-	}
-	if err := c.Journal.Save(); err != nil {
-		return ExitUnobserved, err
 	}
 	if code != ExitOK {
 		return code, nil
@@ -261,32 +293,40 @@ type candidate struct {
 // PeriodicResult summarises one periodic run.
 type PeriodicResult struct {
 	Observed   int `json:"observed"`
+	Resent     int `json:"resent"`
 	Unfinished int `json:"unfinished"`
 	Failed     int `json:"failed"`
 }
 
-// Periodic observes the reconcile targets of the machine's jobs and the
-// targets of events this machine reported that are not complete, until the
-// deadline. Targets it has waited longest to see go first, so a run cut
-// short by slow targets resumes with the rest next time; what it did not
-// reach is reported as unfinished.
+// Periodic resends every unacknowledged report, then observes the
+// reconcile targets of the machine's jobs and the targets of the incomplete
+// events this machine reported, until the deadline. Targets it has waited
+// longest to see go first, so a run cut short by slow targets resumes with
+// the rest next time. An incomplete event whose target no job of the
+// machine names, by identity or as a replacement of a target's name, cannot
+// be observed with any credential here and is reported unfinished, as is
+// whatever the deadline cut off.
 func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(jobID string, version int) Credentials) (PeriodicResult, int, error) {
 	var res PeriodicResult
-	for _, ev := range c.Journal.Undelivered() {
-		if _, err := c.Registry.RecordEvent(ctx, ev); err != nil {
-			return res, ExitUnobserved, fmt.Errorf("resend undelivered report %s: %w", ev.EventID, err)
-		}
-		c.Journal.delivered(ev)
+	pendingBefore, err := c.Journal.pending(ctx, "")
+	if err != nil {
+		return res, ExitUnobserved, err
 	}
+	failed, err := c.replay(ctx, "")
+	if err != nil {
+		return res, ExitUnobserved, err
+	}
+	res.Resent, res.Failed = len(pendingBefore)-failed, failed
 	jobs, err := c.Registry.ListJobs(ctx, txeclient.JobFilter{MachineID: c.MachineID})
 	if err != nil {
 		return res, ExitUnobserved, fmt.Errorf("list jobs of %s: %w", c.MachineID, err)
 	}
 	seen := map[string]bool{}
 	var cands []candidate
-	// byKey finds, for an incomplete event's target, a job of this machine
-	// whose current version names it, for its credentials.
-	byKey := map[string]candidate{}
+	// byKey and byName find, for an incomplete event's target, a job of this
+	// machine that names it, or names its place (a replacement), for its
+	// credentials.
+	byKey, byName := map[string]candidate{}, map[string]candidate{}
 	for _, job := range jobs {
 		if terminal(job.Lifecycle) || job.MachineID != c.MachineID {
 			continue
@@ -303,6 +343,9 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 			if _, ok := byKey[key]; !ok {
 				byKey[key] = cand
 			}
+			if _, ok := byName[nameKey(pt)]; !ok && pt.DisplayName != "" {
+				byName[nameKey(pt)] = cand
+			}
 			if t.ExistenceCheck == CheckReconcile && !seen[key] {
 				seen[key] = true
 				cands = append(cands, cand)
@@ -317,22 +360,40 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		}
 		for _, ev := range events {
 			key := TargetKey(ev.Target)
-			if cand, ok := byKey[key]; ok && !seen[key] {
-				seen[key] = true
-				cands = append(cands, cand)
+			if seen[key] {
+				continue
 			}
+			seen[key] = true
+			if cand, ok := byKey[key]; ok {
+				cands = append(cands, cand)
+				continue
+			}
+			if cand, ok := byName[nameKey(ev.Target)]; ok && ev.Target.DisplayName != "" {
+				cands = append(cands, candidate{jobID: cand.jobID, target: ev.Target, creds: cand.creds})
+				continue
+			}
+			res.Unfinished++
+			c.print(Line{Target: ev.Target, EventID: ev.EventID, Unfinished: true,
+				Detail: "incomplete event about a target no job of this machine names; nothing here can observe it"})
 		}
 		if next == "" || len(events) == 0 {
 			break
 		}
 		after = next
 	}
+	checked, err := c.Journal.lastChecked(ctx)
+	if err != nil {
+		return res, ExitUnobserved, err
+	}
 	sort.SliceStable(cands, func(i, j int) bool {
-		return c.Journal.LastChecked(cands[i].target).Before(c.Journal.LastChecked(cands[j].target))
+		return checked[TargetKey(cands[i].target)].Before(checked[TargetKey(cands[j].target)])
 	})
 	for i, cand := range cands {
 		if deadline.Sub(c.now()) < TargetTimeout {
-			res.Unfinished = len(cands) - i
+			res.Unfinished += len(cands) - i
+			for _, left := range cands[i:] {
+				c.print(Line{JobID: left.jobID, Target: left.target, Unfinished: true, Detail: "not reached before the deadline; first next time"})
+			}
 			break
 		}
 		line, _ := c.observe(ctx, cand.jobID, cand.target, cand.creds)
@@ -341,9 +402,6 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		} else {
 			res.Failed++
 		}
-	}
-	if err := c.Journal.Save(); err != nil {
-		return res, ExitUnobserved, err
 	}
 	if res.Unfinished > 0 || res.Failed > 0 {
 		return res, ExitUnobserved, nil

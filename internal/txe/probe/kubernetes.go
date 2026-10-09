@@ -4,90 +4,70 @@
 package probe
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
-	"strings"
+	"net"
+	"os"
+	"os/exec"
+	"syscall"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
-// KubernetesKindPrefix starts every Kubernetes target kind, as in
-// "kubernetes.configmap".
-const KubernetesKindPrefix = "kubernetes."
-
-// Stable identity keys of a Kubernetes target. The stable id holds only the
-// identity; where the object lives is its display name, "namespace/name" for
-// a namespaced kind and "name" for a cluster-scoped one.
+// Kubernetes target constants, as package target defines them.
 const (
-	KeyClusterUID = "cluster_uid"
-	KeyUID        = "uid"
+	KubernetesKindPrefix        = target.KubernetesKindPrefix
+	KeyClusterUID               = target.KeyClusterUID
+	KeyUID                      = target.KeyUID
+	KubernetesCredential        = target.KubernetesCredential
+	KubernetesContextCredential = target.KubernetesContextCredential
 )
-
-// KubernetesCredential names the credential reference holding the
-// kubeconfig (a file reference; the step receives its content);
-// KubernetesContextCredential optionally names the context. The names are
-// also the variables the job's own script receives, so they avoid
-// KUBECONFIG, which kubectl reads as a path.
-const (
-	KubernetesCredential        = "TXE_KUBECONFIG"   //nolint:gosec // A credential reference name, not a credential.
-	KubernetesContextCredential = "TXE_KUBE_CONTEXT" //nolint:gosec // A credential reference name, not a credential.
-)
-
-type kubeResource struct {
-	gvr        schema.GroupVersionResource
-	namespaced bool
-}
-
-// kubeResources are the Kubernetes kinds a target may name.
-var kubeResources = map[string]kubeResource{
-	"configmap":             {schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, true},
-	"secret":                {schema.GroupVersionResource{Version: "v1", Resource: "secrets"}, true},
-	"service":               {schema.GroupVersionResource{Version: "v1", Resource: "services"}, true},
-	"persistentvolumeclaim": {schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}, true},
-	"namespace":             {schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}, false},
-	"deployment":            {schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}, true},
-	"statefulset":           {schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}, true},
-	"job":                   {schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, true},
-	"cronjob":               {schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"}, true},
-}
 
 var namespacesGVR = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 
 // KubeClientFactory builds a client from a kubeconfig credential (a file
 // path, or the kubeconfig's content as a resolved secret) and an optional
-// context name.
-type KubeClientFactory func(kubeconfig Credential, contextName string) (dynamic.Interface, error)
+// context name, within ctx.
+type KubeClientFactory func(ctx context.Context, kubeconfig Credential, contextName string) (dynamic.Interface, error)
 
 // Kubernetes probes Kubernetes objects.
 type Kubernetes struct {
-	// NewClient defaults to a client built from the kubeconfig file.
+	// NewClient defaults to a client built from the kubeconfig.
 	NewClient KubeClientFactory
 }
 
 func (Kubernetes) Supports(kind string) bool {
-	_, ok := kubeResources[strings.TrimPrefix(kind, KubernetesKindPrefix)]
-	return strings.HasPrefix(kind, KubernetesKindPrefix) && ok
+	_, ok := target.LookupKube(kind)
+	return ok
 }
 
 // Probe first proves the client reaches the cluster the target names (the
 // kube-system namespace's UID is the cluster's identity); only then is a
 // NotFound evidence that the object is gone. The object found by name must
-// carry the target's UID; another UID is the same name on a new object.
+// carry the target's UID exactly; another UID is the same name on a new
+// object. Errors are reported by category, never verbatim, since a client
+// error can quote a kubeconfig's credentials.
 func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Result {
-	res := kubeResources[strings.TrimPrefix(t.Kind, KubernetesKindPrefix)]
-	clusterUID, uid := trimmed(t.StableID[KeyClusterUID]), trimmed(t.StableID[KeyUID])
-	if clusterUID == "" || uid == "" {
-		return Result{Outcome: Unknown, Detail: "target's stable id lacks cluster_uid or uid; nothing to compare with"}
-	}
-	namespace, name, ok := kubeObjectName(t.DisplayName, res.namespaced)
-	if !ok {
-		return Result{Outcome: Unknown, Detail: fmt.Sprintf("display name %q is not an exact %s locator; not guessed", t.DisplayName, kubeLocatorShape(res.namespaced))}
+	kind, _ := target.LookupKube(t.Kind)
+	clusterUID, uid := t.StableID[KeyClusterUID], t.StableID[KeyUID]
+	namespace, name, ok := target.ParseKubeLocator(t.DisplayName, kind.Namespaced)
+	if clusterUID == "" || uid == "" || !ok {
+		return Result{Outcome: Unknown, Detail: "target does not name a Kubernetes object exactly; not guessed"}
 	}
 	cred, ok := creds.Lookup(KubernetesCredential)
 	if !ok || (cred.Path == "" && cred.Value == "") {
@@ -101,9 +81,9 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 	if newClient == nil {
 		newClient = kubeconfigClient
 	}
-	client, err := newClient(cred, contextName)
+	client, err := newClient(ctx, cred, contextName)
 	if err != nil {
-		return Result{Outcome: Unreachable, Detail: "build Kubernetes client: " + err.Error()}
+		return clientError(ctx, err)
 	}
 
 	ns, err := client.Resource(namespacesGVR).Get(ctx, "kube-system", metav1.GetOptions{})
@@ -117,13 +97,15 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 	}
 	evidence := []string{"kube-system uid=" + clusterUID}
 
-	ri := client.Resource(res.gvr)
+	gvr := schema.GroupVersionResource{Group: kind.Group, Version: kind.Version, Resource: kind.Resource}
+	ri := client.Resource(gvr)
 	var getter dynamic.ResourceInterface = ri
-	if res.namespaced {
+	ref := kind.Resource + "/" + name
+	if kind.Namespaced {
 		getter = ri.Namespace(namespace)
+		ref = kind.Resource + "/" + namespace + "/" + name
 	}
 	found, err := getter.Get(ctx, name, metav1.GetOptions{})
-	ref := kubeRef(res, namespace, name)
 	switch {
 	case apierrors.IsNotFound(err):
 		return Result{Outcome: Absent, Authoritative: true, Detail: ref + " not found in cluster " + clusterUID,
@@ -144,52 +126,64 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 		Evidence: evidence}
 }
 
-// kubeObjectName parses a display name that must be exactly
-// "namespace/name" (namespaced) or "name" (cluster-scoped). Anything else is
-// refused rather than guessed.
-func kubeObjectName(displayName string, namespaced bool) (namespace, name string, ok bool) {
-	parts := strings.Split(displayName, "/")
-	for _, p := range parts {
-		if p == "" || p != strings.TrimSpace(p) {
-			return "", "", false
-		}
-	}
+// errNoCredential marks a kubeconfig that holds no usable credential.
+var errNoCredential = errors.New("no usable credential")
+
+// clientError reports a failure to build a client without quoting it.
+func clientError(ctx context.Context, err error) Result {
 	switch {
-	case namespaced && len(parts) == 2:
-		return parts[0], parts[1], true
-	case !namespaced && len(parts) == 1:
-		return "", parts[0], true
+	case errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil:
+		return Result{Outcome: Timeout, Detail: "acquiring the Kubernetes credential took too long"}
+	case errors.Is(err, errNoCredential):
+		return Result{Outcome: AuthDenied, Detail: "the kubeconfig's credential cannot be used: " + err.Error()}
 	}
-	return "", "", false
+	return Result{Outcome: Unreachable, Detail: "the kubeconfig could not be used to build a client"}
 }
 
-func kubeLocatorShape(namespaced bool) string {
-	if namespaced {
-		return `"namespace/name"`
-	}
-	return `"name"`
-}
-
-func kubeRef(res kubeResource, namespace, name string) string {
-	if res.namespaced {
-		return res.gvr.Resource + "/" + namespace + "/" + name
-	}
-	return res.gvr.Resource + "/" + name
-}
-
-// kubeError maps an API error to what it allows. A refusal is auth_denied;
-// everything else that is not an answer is unreachable or timeout.
+// kubeError maps an API or transport error to what it allows, by category.
 func kubeError(ctx context.Context, err error, what string) Result {
-	switch {
-	case apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err):
-		return Result{Outcome: AuthDenied, Detail: what + ": " + err.Error()}
-	case apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err):
-		return Result{Outcome: Timeout, Detail: what + ": " + err.Error()}
+	if status, ok := errors.AsType[*apierrors.StatusError](err); ok {
+		s := status.ErrStatus
+		detail := fmt.Sprintf("%s: HTTP %d %s", what, s.Code, s.Reason)
+		switch {
+		case apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err):
+			return Result{Outcome: AuthDenied, Detail: detail}
+		case apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err):
+			return Result{Outcome: Timeout, Detail: detail}
+		}
+		return Result{Outcome: Unreachable, Detail: detail}
 	}
-	return Result{Outcome: classify(ctx, err), Detail: what + ": " + err.Error()}
+	outcome := classify(ctx, err)
+	return Result{Outcome: outcome, Detail: what + ": " + transportCategory(outcome, err)}
 }
 
-func kubeconfigClient(kubeconfig Credential, contextName string) (dynamic.Interface, error) {
+// transportCategory names what kind of transport failure err is, without
+// its text.
+func transportCategory(outcome Outcome, err error) string {
+	var dns *net.DNSError
+	var unknownCA x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	var record tls.RecordHeaderError
+	switch {
+	case outcome == Timeout:
+		return "timed out"
+	case errors.As(err, &dns):
+		return "the server's name did not resolve"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused"
+	case errors.As(err, &unknownCA), errors.As(err, &hostname), errors.As(err, &invalid), errors.As(err, &record):
+		return "TLS verification failed"
+	}
+	return "the request failed"
+}
+
+// kubeconfigClient builds a client from the kubeconfig. A background check
+// must never wait for someone to log in, so an exec credential plugin is run
+// here, non-interactively and within ctx, and its credential handed to the
+// client; client-go would run it without a deadline. Legacy auth providers
+// are refused.
+func kubeconfigClient(ctx context.Context, kubeconfig Credential, contextName string) (dynamic.Interface, error) {
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
 	var loader clientcmd.ClientConfig
 	if kubeconfig.Path != "" {
@@ -198,20 +192,94 @@ func kubeconfigClient(kubeconfig Credential, contextName string) (dynamic.Interf
 	} else {
 		raw, err := clientcmd.Load([]byte(kubeconfig.Value))
 		if err != nil {
-			return nil, fmt.Errorf("parse kubeconfig: %w", err)
+			return nil, errors.New("parse kubeconfig")
 		}
 		loader = clientcmd.NewNonInteractiveClientConfig(*raw, contextName, overrides, nil)
 	}
 	cfg, err := loader.ClientConfig()
 	if err != nil {
-		return nil, err
+		return nil, errors.New("resolve kubeconfig")
 	}
-	// A background check must never wait for someone to log in: an exec
-	// credential plugin may not prompt, and every request is bounded.
+	if cfg.AuthProvider != nil {
+		return nil, fmt.Errorf("%w: auth provider %q is not supported; use an exec plugin or a token", errNoCredential, cfg.AuthProvider.Name)
+	}
 	if cfg.ExecProvider != nil {
-		cfg.ExecProvider.InteractiveMode = clientcmdapi.NeverExecInteractiveMode
-		cfg.ExecProvider.StdinUnavailable = true
+		if err := applyExecCredential(ctx, cfg); err != nil {
+			return nil, err
+		}
 	}
 	cfg.Timeout = requestTimeout
 	return dynamic.NewForConfig(cfg)
+}
+
+// execCredential is the output of a client-go exec credential plugin.
+type execCredential struct {
+	Status *struct {
+		Token                 string `json:"token"`
+		ClientCertificateData string `json:"clientCertificateData"`
+		ClientKeyData         string `json:"clientKeyData"`
+	} `json:"status"`
+}
+
+// applyExecCredential runs cfg's exec plugin under ctx and puts the
+// credential it prints into cfg in place of the plugin.
+func applyExecCredential(ctx context.Context, cfg *rest.Config) error {
+	ec := cfg.ExecProvider
+	info, _ := json.Marshal(map[string]any{
+		"apiVersion": ec.APIVersion, "kind": "ExecCredential", "spec": map[string]any{"interactive": false},
+	})
+	cmd := exec.CommandContext(ctx, ec.Command, ec.Args...) //nolint:gosec // the plugin the machine's own kubeconfig names
+	cmd.Env = append(os.Environ(), "KUBERNETES_EXEC_INFO="+string(info))
+	for _, e := range ec.Env {
+		cmd.Env = append(cmd.Env, e.Name+"="+e.Value)
+	}
+	cmd.Stdin = nil
+	cmd.Stderr = io.Discard
+	cmd.WaitDelay = time.Second
+	var out bytes.Buffer
+	cmd.Stdout = &limitedWriter{w: &out, n: maxCredentialBytes}
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return context.DeadlineExceeded
+		}
+		if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+			return fmt.Errorf("%w: the credential plugin exited with status %d (it may need an interactive login)", errNoCredential, exit.ExitCode())
+		}
+		return fmt.Errorf("%w: the credential plugin could not run", errNoCredential)
+	}
+	var cred execCredential
+	if err := json.Unmarshal(out.Bytes(), &cred); err != nil || cred.Status == nil {
+		return fmt.Errorf("%w: the credential plugin printed no credential", errNoCredential)
+	}
+	switch {
+	case cred.Status.Token != "":
+		cfg.BearerToken = cred.Status.Token
+	case cred.Status.ClientCertificateData != "" && cred.Status.ClientKeyData != "":
+		cfg.CertData, cfg.KeyData = []byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData)
+	default:
+		return fmt.Errorf("%w: the credential plugin printed no token or certificate", errNoCredential)
+	}
+	cfg.ExecProvider = nil
+	return nil
+}
+
+// limitedWriter keeps at most n bytes and drops the rest.
+type limitedWriter struct {
+	w io.Writer
+	n int
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if l.n <= 0 {
+		return len(p), nil
+	}
+	keep := p
+	if len(keep) > l.n {
+		keep = keep[:l.n]
+	}
+	l.n -= len(keep)
+	if _, err := l.w.Write(keep); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
