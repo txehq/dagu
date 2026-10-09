@@ -74,16 +74,26 @@ else a review step needs must be rendered into the DAG:
   answers its escalation. Until then the same action on the same target is
   not run again, and only the answer `retry` allows it, for one attempt.
 - Retrying a run: `dagu.retry_run` is bound to one failed execution of the
-  run (attempt id and queued time), the DAG snapshot it ran and the job's
-  package. A run of an older version is never retried, and nothing is
-  dispatched once the run has moved on from that execution. A retry the
-  reviewer proposes runs from its decision run once the owner answers
-  `retry`; one the owner requests directly is already decided and is run by
-  the next tick. Either way it is dispatched at most once, and it is
-  recorded as done only when another execution is seen on the run; the
-  receipt is that execution's reference and says what it was doing, not
-  that the job succeeded. A dispatch whose result was not seen is recorded
-  as uncertain and is settled from the run later or put to the owner.
+  run (attempt id and queue marker), the DAG snapshot it ran and the job's
+  package. A run of an older version is never retried. The retry is sent
+  with the execution it is for, and the service admits it only while that
+  is the run's latest execution, checking it as it admits the retry; a run
+  that moved on is refused there, whatever the reviewer read a moment
+  before. A retry the reviewer proposes runs from its decision run once the
+  owner answers `retry`; one the owner requests directly is already decided
+  and is run by the next tick. Either way it is sent at most once.
+  What is recorded: done, only when the service admitted the request and
+  another execution of the run is seen queued, running or over, with that
+  execution's reference as receipt and its status, never "the job
+  succeeded"; not dispatched, only for the two refusals the service makes
+  before starting anything (`execution_changed`,
+  `conditional_retry_unsupported`); uncertain for everything else. An
+  attempt that was created but is not started is a reservation, not a
+  retry. An uncertain retry the service had admitted is settled from the
+  run when its execution shows up. One whose answer was never known, such
+  as a failed request or a reviewer that died first, is not settled from
+  the run, because a newer execution may be someone else's retry: it goes
+  to the owner. Nothing is ever sent again because time passed.
 - Leases: an action starts only if the claim outlives its timeout, and its
   process is killed when its grant ends. A process frozen between that
   check and its start can still act late; a destination that must exclude
@@ -127,8 +137,11 @@ else a review step needs must be rendered into the DAG:
   everything the review was not shown: runs with evidence left out, runs
   whose steps printed more than was shown, runs not shown at all, and other
   records left out to fit.
-- Bounds: at most 50 runs per review, oldest first; the rest wait for the
-  next one. No number of results, unfinished runs or queued runs stops a
+- Bounds: at most 50 runs per review, oldest first, and a packet of at
+  most 120 KiB; the rest wait for the next one. The size is what the
+  process hand-off allows: the packet travels as a step output, which the
+  service puts into the environment of the later steps, and Linux starts no
+  process with an environment string over 128 KiB. No number of results, unfinished runs or queued runs stops a
   job's reviews.
 - Cost: every review reads the job's whole review history and run list.
   The registry's review list has no paging yet. This is the plain, exact

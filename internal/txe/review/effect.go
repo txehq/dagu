@@ -33,6 +33,11 @@ type EffectResult struct {
 	Status  EffectStatus
 	Receipt string
 	Detail  string
+	// Admitted is true when the destination accepted the request for the
+	// effect and only its result was not seen. It is what later allows the
+	// effect to be recognised when it shows up: without it, something that
+	// looks like the effect may be someone else's doing.
+	Admitted bool
 }
 
 // Effector performs declared actions on the local machine.

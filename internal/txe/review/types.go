@@ -302,6 +302,9 @@ type Action struct {
 	Name       string            `json:"name"`
 	TargetID   string            `json:"target_id"`
 	Params     map[string]string `json:"params,omitempty"`
+	// Admitted is true when the destination accepted the request for this
+	// action's effect and only the result was not seen.
+	Admitted bool `json:"admitted,omitempty"`
 	// Attempt is the registry's count of attempts of this action. An
 	// owner's answer about an unknown outcome is about one attempt.
 	Attempt int `json:"attempt,omitempty"`

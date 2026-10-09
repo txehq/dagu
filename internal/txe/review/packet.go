@@ -19,6 +19,19 @@ var ErrPacketTooLarge = errors.New("txe review: context packet exceeds its size 
 // PacketSchemaVersion is the version of the context packet format.
 const PacketSchemaVersion = 1
 
+// MaxPacketBytes bounds the whole packet, and what it must fit is not only
+// the agent's context. The reviewer DAG hands the packet from the prepare
+// step to the later steps as a step output, and the service puts a step's
+// output into the environment of every later step's process. On Linux one
+// environment string, name and terminator included, may be at most 128 KiB
+// (MAX_ARG_STRLEN, 32 pages of 4 KiB); a process given a longer one is not
+// started at all. A packet over that would stop the agent from starting on
+// every tick, with the same evidence waiting each time. So the bound is
+// 120 KiB, which leaves room for the variable's name and for the service
+// to frame the value. Carrying more context than this means handing the
+// packet over in a file instead, which is capacity work.
+const MaxPacketBytes = 120 << 10
+
 const (
 	// maxPacketRuns bounds one review. Runs beyond it stay after the
 	// checkpoint and are reviewed in the next episode.
@@ -26,10 +39,8 @@ const (
 	maxOutputValueLen = 4096
 	// maxRunSteps bounds the steps of one run that carry their own output.
 	maxRunSteps = 12
-	// maxPacketBytes bounds the whole packet. It is the agent's context and
-	// it travels as one captured step output, so it must stay well under
-	// the service's output limit whatever the job's scripts print.
-	maxPacketBytes      = 256 << 10
+	// maxPacketBytes bounds the whole packet; see MaxPacketBytes.
+	maxPacketBytes      = MaxPacketBytes
 	maxPacketFeedback   = 50
 	maxPacketProposals  = 50
 	maxPacketUnresolved = 50

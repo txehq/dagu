@@ -94,6 +94,9 @@ type FinishRequest struct {
 	State    ActionState
 	Receipt  string
 	Detail   string
+	// Admitted records, for an outcome that is not known, that the
+	// destination accepted the request.
+	Admitted bool
 }
 
 // Registry is the part of the TXE job registry the reviewer consumes. The

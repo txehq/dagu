@@ -818,6 +818,25 @@ func TestTrimmedEvidenceCannotBeUsedToBuryAFailure(t *testing.T) {
 	assert.True(t, run.EvidenceTrimmed)
 }
 
+// The packet reaches the agent's process, and the apply step's, as a step
+// output, which the service puts into the process's environment. The
+// largest packet the reviewer accepts must be one a process can be started
+// with: this starts a real process with an environment string of that size
+// under the name the DAG uses. On Linux, where one environment string may
+// be at most 128 KiB, a larger bound fails here with "argument list too
+// long".
+func TestTheLargestPacketFitsTheProcessHandOff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	assert.LessOrEqual(t, len("TXE_PACKET=")+review.MaxPacketBytes+1, 128<<10, "one environment string, name and terminator included")
+	cmd := exec.Command("/bin/sh", "-c", `printf '%s' "${#TXE_PACKET}"`)
+	cmd.Env = append(os.Environ(), "TXE_PACKET="+strings.Repeat("x", review.MaxPacketBytes))
+	out, err := cmd.Output()
+	require.NoError(t, err, "a process must start with a packet of the largest accepted size in its environment")
+	assert.Equal(t, strconv.Itoa(review.MaxPacketBytes), string(out))
+}
+
 // A job whose scripts print a lot cannot blow up the packet, and cannot use
 // volume to hide results either: runs that do not fit are left for the next
 // review instead of being covered without their output.
@@ -835,7 +854,7 @@ func TestPacketIsBoundedWithoutHidingEvidence(t *testing.T) {
 	packet := prepared.Packet
 	raw, err := json.Marshal(packet)
 	require.NoError(t, err)
-	assert.LessOrEqual(t, len(raw), 256<<10)
+	assert.LessOrEqual(t, len(raw), review.MaxPacketBytes)
 	require.NotEmpty(t, packet.NewRuns)
 	assert.Less(t, len(packet.NewRuns), 40)
 	assert.True(t, packet.MoreRunsPending)
@@ -870,7 +889,7 @@ func TestOversizedSingleRunIsShortenedAndFlagged(t *testing.T) {
 	packet := f.prepare("reviewer-a").Packet
 	raw, err := json.Marshal(packet)
 	require.NoError(t, err)
-	assert.LessOrEqual(t, len(raw), 256<<10)
+	assert.LessOrEqual(t, len(raw), review.MaxPacketBytes)
 	assert.True(t, packet.EvidenceTrimmed)
 	require.Len(t, packet.NewRuns, 1)
 	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stdout, "END-A"), "the end of the output is what is kept")
@@ -1265,33 +1284,159 @@ func TestRetryRunIsRefusedByTheServiceWhenTheRunMovesBeforeAdmission(t *testing.
 	assert.Len(t, f.runs.requested, 1)
 }
 
-// When the service itself cannot say whether it dispatched the retry, the
-// reviewer does not decide for it. With no other execution to be seen the
-// outcome is uncertain; with one, it is recorded as the retry. Either way
-// nothing is sent a second time.
-func TestRetryRunTheServiceCouldNotConfirmIsUncertainUntilTheRunShowsIt(t *testing.T) {
-	uncertain := errors.New("503 dispatch_uncertain: the retry may or may not have been dispatched")
-	t.Run("nothing to be seen on the run", func(t *testing.T) {
-		f := newRetryFixture(t)
-		f.runs.retry = func(string) error { return uncertain }
-		out := f.execute("executor")
-		assert.Equal(t, review.ActionUncertain, out.Action.State)
-		assert.Empty(t, out.Action.Receipt)
-		assert.Contains(t, out.Action.Detail, "dispatch_uncertain")
-		assert.Len(t, f.runs.requested, 1)
-	})
-	t.Run("the run shows another execution", func(t *testing.T) {
-		f := newRetryFixture(t)
-		f.runs.retry = func(runID string) error {
-			// The dispatch did go out before the service lost track of it.
-			f.runs.start(runID)
-			return uncertain
+// The service creates a retry's new attempt before it hands it to a worker,
+// and can stop in between. An attempt that exists but is not started is a
+// reservation, not a dispatch: it is not recorded as the retry, whatever
+// the service answered. The outcome stays uncertain and names the attempt.
+// It is settled as done once that attempt is seen queued or running, and
+// put to the owner if it never moves; nothing is dispatched again on the
+// passing of time.
+func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
+	reserve := func(f *retryFixture) func(string) error {
+		return func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
 		}
+	}
+	nextReview := func(f *retryFixture) review.Action {
+		t.Helper()
+		f.clock.Advance(2 * time.Hour)
+		r := f.executor("reviewer-b")
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		return f.state().Actions[jobID][0]
+	}
+
+	t.Run("stranded: the attempt never starts", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.retry = reserve(f)
 		out := f.execute("executor")
-		assert.Equal(t, review.ActionSucceeded, out.Action.State, "observed on the run, so recorded as done")
-		assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+		assert.Equal(t, review.ActionUncertain, out.Action.State, "accepted by the service, but nothing was seen dispatched")
+		assert.Empty(t, out.Action.Receipt, "a reservation is not a receipt")
+		assert.Contains(t, out.Action.Detail, review.ExecutionRef("att-reserved", ""))
+		assert.Contains(t, out.Action.Detail, "not seen queued or started")
+
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State, "still only reserved: the owner is asked")
+		assert.Empty(t, action.Receipt)
+		assert.Len(t, f.runs.requested, 1, "nothing is dispatched again because time passed")
+	})
+	t.Run("the reserved attempt is then handed to a worker", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.retry = reserve(f)
+		out := f.execute("executor")
+		require.Equal(t, review.ActionUncertain, out.Action.State)
+
+		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionSucceeded, action.State)
+		assert.Equal(t, review.ExecutionRef("att-reserved", ""), action.Receipt)
+		assert.Contains(t, action.Detail, "running")
 		assert.Len(t, f.runs.requested, 1)
 	})
+	t.Run("it starts within the time the retry is watched", func(t *testing.T) {
+		f := newRetryFixture(t)
+		reads := 0
+		f.runs.retry = reserve(f)
+		moving := &movingRuns{runs: f.runs, onRead: func() {
+			// Reads: the executor's check, the check after the grant, then
+			// the watch. The worker picks the attempt up as the watch begins.
+			if reads++; reads == 3 {
+				f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+			}
+		}}
+		r := f.reviewer("executor")
+		r.Runs, r.RetryObserve = moving, 3*time.Second
+		out, err := r.Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionSucceeded, out.Action.State)
+		assert.Equal(t, review.ExecutionRef("att-reserved", ""), out.Action.Receipt)
+	})
+}
+
+// When the service's answer says nothing about whether it started the
+// retry, the reviewer does not decide for it, and it does not take what the
+// run shows as the answer either. A newer execution on the run may be
+// another caller's retry: the very thing that made the service refuse this
+// request in a way this client does not recognise. So the outcome is
+// uncertain, the record says what the run showed, and the owner is asked.
+// It is never recorded as this retry's success, and nothing is sent again.
+func TestRetryRunAnUnknownAnswerIsNeverSettledFromWhatTheRunShows(t *testing.T) {
+	for name, answer := range map[string]error{
+		"the service says the dispatch is uncertain": errors.New("503 dispatch_uncertain: the retry may or may not have been dispatched"),
+		"a conflict this client does not recognise":  errors.New("409: DAG-run is active and cannot be retried"),
+		"the request failed in transit":              errors.New("connection reset"),
+	} {
+		t.Run(name+", run unchanged", func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.retry = func(string) error { return answer }
+			out := f.execute("executor")
+			assert.Equal(t, review.ActionUncertain, out.Action.State)
+			assert.Empty(t, out.Action.Receipt)
+			assert.False(t, out.Action.Admitted)
+			assert.Contains(t, out.Action.Detail, "still shows execution "+review.ExecutionRef("att-1", ""))
+			assert.Len(t, f.runs.requested, 1)
+		})
+		t.Run(name+", run shows another caller's retry", func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.retry = func(runID string) error {
+				// Someone else's retry is what the run shows.
+				f.runs.state[runID] = review.RunState{AttemptID: "att-other", Status: "running", Active: true}
+				return answer
+			}
+			out := f.execute("executor")
+			assert.Equal(t, review.ActionUncertain, out.Action.State, "another execution on the run is not this request's success")
+			assert.Empty(t, out.Action.Receipt)
+			assert.Contains(t, out.Action.Detail, review.ExecutionRef("att-other", ""))
+			assert.Contains(t, out.Action.Detail, "cannot be told")
+
+			// The next review does not settle it from the run either.
+			f.clock.Advance(2 * time.Hour)
+			r := f.executor("reviewer-b")
+			prepared, err := r.Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+			require.NoError(t, err)
+			action := f.state().Actions[jobID][0]
+			assert.Equal(t, review.ActionEscalated, action.State, "the owner is asked")
+			assert.Empty(t, action.Receipt)
+			assert.Len(t, f.runs.requested, 1)
+		})
+	}
+}
+
+// A reviewer that dies between sending the retry and recording its outcome
+// leaves an attempt with no answer on record. The next review cannot know
+// whether the service admitted the request, so a newer execution on the run
+// is not taken for this retry: the owner is asked, and nothing is sent
+// again.
+func TestRetryRunInterruptedBeforeItsAnswerIsNotSettledFromTheRun(t *testing.T) {
+	f := newRetryFixture(t)
+	exec := f.executor("executor")
+	claim, err := f.registry.AcquireClaim(context.Background(), review.ClaimRequest{JobID: jobID, Kind: review.ClaimExecution, Holder: "executor", TTL: 10 * time.Minute})
+	require.NoError(t, err)
+	_, err = f.registry.BeginAction(context.Background(), review.BeginRequest{
+		Claim: claim, Timeout: time.Minute, ActionID: review.ApprovedActionID(f.proposal.ID, f.decision.ID),
+		IntentKey: review.IntentKey(f.proposal.ActionName, "", f.proposal.Params), JobVersion: 1,
+		Name: f.proposal.ActionName, Params: f.proposal.Params, ProposalID: f.proposal.ID, DecisionID: f.decision.ID,
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.registry.ReleaseClaim(context.Background(), claim))
+	// The run shows a newer execution: this request's, or someone else's.
+	f.runs.start("run-1")
+
+	f.clock.Advance(2 * time.Hour)
+	prepared, err := exec.Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	_, err = exec.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+	require.NoError(t, err)
+	action := f.state().Actions[jobID][0]
+	assert.Equal(t, review.ActionEscalated, action.State)
+	assert.Empty(t, action.Receipt)
+	assert.Contains(t, action.Detail, "not known whether the service admitted")
+	assert.Empty(t, f.runs.requested, "the reviewer sends nothing")
 }
 
 // A refusal by the service started nothing and is recorded as such.

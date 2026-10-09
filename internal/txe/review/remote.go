@@ -914,11 +914,9 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 	if g := a.Grant; g != nil {
 		out.GrantID, out.GrantExpiresAt = g.GrantId, g.ExpiresAt
 	}
-	var outcome struct {
-		Detail string `json:"detail"`
-	}
+	var outcome actionOutcome
 	if len(a.Outcome) > 0 && json.Unmarshal(a.Outcome, &outcome) == nil {
-		out.Detail = outcome.Detail
+		out.Detail, out.Admitted = outcome.Detail, outcome.Admitted
 	}
 	// The registry's first state for an authorized attempt is one the
 	// reviewer treats the same as executing: the effect may have begun.
@@ -1040,6 +1038,14 @@ func (r *Remote) BeginAction(ctx context.Context, req BeginRequest) (Action, err
 	}, nil
 }
 
+// actionOutcome is what the reviewer keeps in an action's free-form outcome.
+type actionOutcome struct {
+	Detail string `json:"detail,omitempty"`
+	// Admitted: the destination accepted the request; only its result was
+	// not seen.
+	Admitted bool `json:"admitted,omitempty"`
+}
+
 // FinishAction implements Registry.
 func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 	body := api.TxeSettleRequest{
@@ -1049,8 +1055,8 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 	if req.Receipt != "" {
 		body.Receipt = &req.Receipt
 	}
-	if req.Detail != "" {
-		body.Outcome, _ = json.Marshal(map[string]string{"detail": req.Detail})
+	if req.Detail != "" || req.Admitted {
+		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }

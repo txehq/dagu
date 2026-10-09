@@ -672,6 +672,7 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 			actions[i].State = req.State
 			actions[i].Receipt = req.Receipt
 			actions[i].Detail = req.Detail
+			actions[i].Admitted = req.Admitted
 			actions[i].FinishedAt = now
 			return nil
 		}

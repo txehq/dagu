@@ -818,12 +818,12 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 	}
 	err := r.Registry.FinishAction(ctx, FinishRequest{
 		Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
-		State: state, Receipt: res.Receipt, Detail: res.Detail,
+		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted,
 	})
 	if err != nil {
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", action.ID, err)
 	}
-	action.State, action.Receipt, action.Detail = state, res.Receipt, res.Detail
+	action.State, action.Receipt, action.Detail, action.Admitted = state, res.Receipt, res.Detail, res.Admitted
 	return action, nil
 }
 
@@ -1020,64 +1020,126 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		if errors.Is(err, ErrRunNotRetryable) {
 			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: " + err.Error()}
 		}
-		// The request may have reached the service. Only the run can say.
-		if res, ok := r.observeRetry(ctx, job.ID, runID, bound, 0); ok {
-			return res
-		}
-		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + runID + ": " + err.Error()}
+		// Whether the service started anything is not known. What the run
+		// shows now cannot settle it either: without the service's word
+		// that it admitted this request, a newer execution on the run may
+		// be another caller's retry, such as the one that made the service
+		// refuse this request in a way this client does not recognise.
+		// The outcome stays unknown and says what was seen.
+		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + runID + ": " + err.Error() + ". " + r.seenOnRun(ctx, job.ID, runID, bound)}
 	}
 	watch := r.RetryObserve
 	if watch <= 0 {
 		watch = retryObserveFor
 	}
-	if res, ok := r.observeRetry(ctx, job.ID, runID, bound, watch); ok {
+	// The service admitted this request, and it admits a retry of an
+	// execution only while that execution is the latest. So an execution
+	// after it is this retry's doing, now or whenever it is seen.
+	res, dispatched, reserved := r.observeRetry(ctx, job.ID, runID, bound, watch)
+	if dispatched {
 		return res
 	}
-	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf(
-		"the service accepted a retry of run %s but no execution after %s was observed", runID, bound.Ref())}
+	res = unobserved(runID, bound, reserved, "the service accepted a retry of run "+runID)
+	res.Admitted = true
+	return res
 }
 
-// observeRetry reads the run until an execution other than the bound one is
-// seen or the time is up. With no time to watch it reads once. The wait is
-// real time: it is spent waiting for the service, not measured against the
-// registry's clock.
-func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound Execution, watch time.Duration) (EffectResult, bool) {
+// seenOnRun says what the run shows, for the record of an outcome that
+// cannot be settled from it.
+func (r *Reviewer) seenOnRun(ctx context.Context, jobID, runID string, bound Execution) string {
+	state, err := r.Runs.RunState(ctx, jobID, runID)
+	switch now := state.Execution(); {
+	case err != nil:
+		return "The run could not be read afterwards."
+	case now == bound:
+		return fmt.Sprintf("The run still shows execution %s (%s).", now.Ref(), state.Status)
+	default:
+		return fmt.Sprintf("The run now shows execution %s (%s); whether this request or another caller started it cannot be told.", now.Ref(), state.Status)
+	}
+}
+
+// observeRetry reads the run until it shows the retry dispatched, or the
+// time is up. With no time to watch it reads once. The wait is real time:
+// it is spent waiting for the service, not measured against the registry's
+// clock.
+//
+// An execution other than the bound one shows that the retry was given an
+// execution. It shows the retry dispatched only once that execution is
+// queued, running or over. While it is not started, it is a reservation:
+// the service creates the new attempt before it hands it to a worker, and
+// can stop in between, leaving the attempt behind without anything having
+// run. A reservation is reported as such, never as the retry.
+func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound Execution, watch time.Duration) (res EffectResult, dispatched bool, reserved string) {
 	until := time.Now().Add(watch)
 	for {
 		state, err := r.Runs.RunState(ctx, jobID, runID)
 		if now := state.Execution(); err == nil && now.known() && now != bound {
-			return EffectResult{
-				Status:  EffectApplied,
-				Receipt: now.Ref(),
-				Detail:  fmt.Sprintf("run %s was retried as execution %s (attempt %s), which was %s when observed", runID, now.Ref(), now.AttemptID, state.Status),
-			}, true
+			if state.Status != runNotStarted && state.Status != "" {
+				return EffectResult{
+					Status:  EffectApplied,
+					Receipt: now.Ref(),
+					Detail:  fmt.Sprintf("run %s was retried as execution %s (attempt %s), which was %s when observed", runID, now.Ref(), now.AttemptID, state.Status),
+				}, true, ""
+			}
+			reserved = now.Ref()
 		}
 		left := time.Until(until)
 		if left <= 0 {
-			return EffectResult{}, false
+			return EffectResult{}, false, reserved
 		}
 		select {
 		case <-ctx.Done():
-			return EffectResult{}, false
+			return EffectResult{}, false, reserved
 		case <-time.After(min(left, retryObserveEvery)):
 		}
 	}
 }
 
-// probeRetry settles an interrupted or unobserved retry from the run
-// itself. An attempt after the bound one proves the retry happened. The
-// same attempt still being the latest proves nothing: the dispatch may yet
-// land, so it stays unknown and is left to the owner.
+// runNotStarted is the service's status of an attempt that exists but has
+// not been queued or started.
+const runNotStarted = "not_started"
+
+// unobserved is the unknown outcome of a retry that was not seen
+// dispatched, saying what was seen instead.
+func unobserved(runID string, bound Execution, reserved, cause string) EffectResult {
+	detail := fmt.Sprintf("no execution of run %s after %s was seen queued or started", runID, bound.Ref())
+	if reserved != "" {
+		detail = fmt.Sprintf("an attempt (%s) was created for the retry of run %s but was not seen queued or started; it may never have been handed to a worker", reserved, runID)
+	}
+	if cause != "" {
+		detail = cause + ": " + detail
+	}
+	return EffectResult{Status: EffectUnknown, Detail: detail}
+}
+
+// probeRetry settles a retry whose result was not seen, from the run, when
+// that is sound. It is sound only when the service had admitted the
+// request: it admits a retry of an execution only while that execution is
+// the latest, so an execution after it is this retry's. Then one that is
+// queued, running or over proves the retry happened, and one that is not
+// started proves nothing yet.
+//
+// When the service's answer was never known, because the request failed in
+// a way that says nothing or the reviewer died before recording it, a newer
+// execution on the run may be someone else's retry. Nothing is settled from
+// it: the outcome stays unknown, says what the run shows, and goes to the
+// owner.
 func (r *Reviewer) probeRetry(ctx context.Context, job Job, action Action) EffectResult {
 	runID := action.Params[RetryRunParam]
 	bound, complete := retriedExecution(action.Params)
 	if r.Runs == nil || !complete {
 		return EffectResult{Status: EffectUnknown, Detail: "the retry of run " + runID + " cannot be checked against the run"}
 	}
-	if res, ok := r.observeRetry(ctx, job.ID, runID, bound, 0); ok {
+	if !action.Admitted {
+		return EffectResult{Status: EffectUnknown, Detail: "it is not known whether the service admitted the retry of run " + runID + ". " + r.seenOnRun(ctx, job.ID, runID, bound)}
+	}
+	res, dispatched, reserved := r.observeRetry(ctx, job.ID, runID, bound, 0)
+	if dispatched {
 		return res
 	}
-	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf("no execution of run %s after %s has been observed", runID, bound.Ref())}
+	res = unobserved(runID, bound, reserved, "")
+	res.Admitted = true
+	return res
 }
 
 // leaseCovers reports whether the claim outlives one full attempt of the
