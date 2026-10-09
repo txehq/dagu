@@ -243,3 +243,69 @@ func TestDecisionsArePersonOnly(t *testing.T) {
 	})
 	assert.Equal(t, CodeNotPermitted, code(t, err), "an agent cannot request a retry")
 }
+
+// A superseded proposal with a Dagu human task leaves a closure owed on its
+// machine; failures are counted and retried oldest first, a final outcome
+// ends it, and its replay returns the stored closure.
+func TestProposalClosures(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	put := func(task *NativeTask) *Proposal {
+		var p *Proposal
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: f.mint(PrefixProposal), Action: ActionSpec{Name: "resize"}, NativeTask: task})
+			return err
+		})
+		require.NoError(t, err)
+		return p
+	}
+	withTask := put(&NativeTask{DAG: DecideTaskDAG(f.machine), RunID: "r-1", StepID: DecideTaskStep})
+	other := put(&NativeTask{DAG: DecideTaskDAG(f.machine), RunID: "r-2", StepID: DecideTaskStep})
+	put(nil)
+
+	_, err := f.tx(job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: OpPause}) })
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, person, func(tx *JobTx) error {
+		return tx.Transition(Transition{Op: OpRetire, Reason: RetireManual})
+	})
+	require.NoError(t, err)
+
+	pending, err := f.store.PendingClosures(f.ctx, f.machine, 0, nil)
+	require.NoError(t, err)
+	require.Len(t, pending, 2, "only proposals with a task are owed a closure")
+
+	record := func(prp string, outcome ClosureOutcome) (*Closure, error) {
+		var cl *Closure
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			cl, err = tx.RecordClosure(f.ctx, f.store, prp, outcome, "detail")
+			return err
+		})
+		return cl, err
+	}
+	_, err = record(withTask.ProposalID, ClosureFailed)
+	require.NoError(t, err)
+	pending, err = f.store.PendingClosures(f.ctx, f.machine, 0, nil)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+	assert.Equal(t, other.ProposalID, pending[0].ProposalID, "never-attempted closures come first")
+	assert.Equal(t, 1, pending[1].Failures)
+
+	final, err := record(withTask.ProposalID, ClosureClosed)
+	require.NoError(t, err)
+	assert.Equal(t, 2, final.Attempt)
+	replayed, err := record(withTask.ProposalID, ClosureClosed)
+	require.NoError(t, err)
+	assert.Equal(t, final.ClosureID, replayed.ClosureID)
+	_, err = record(withTask.ProposalID, ClosureRunMissing)
+	assert.Equal(t, CodeProposalState, code(t, err))
+
+	pending, err = f.store.PendingClosures(f.ctx, f.machine, 0, nil)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	closures, err := f.store.ListClosures(f.ctx, job.JobID, 0)
+	require.NoError(t, err)
+	assert.Len(t, closures, 2, "every attempt is kept")
+}

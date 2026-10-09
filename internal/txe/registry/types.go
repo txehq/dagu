@@ -724,6 +724,7 @@ type Chains struct {
 	Reviews   string `json:"reviews,omitempty"`
 	Actions   string `json:"actions,omitempty"`
 	Proposals string `json:"proposals,omitempty"`
+	Closures  string `json:"closures,omitempty"`
 }
 
 // Job is the job aggregate: every mutable fact about one job lives in this
@@ -772,6 +773,9 @@ type Job struct {
 	// UncertainResolutions are retry verdicts on escalations, by action ID,
 	// each allowing one more attempt of that action.
 	UncertainResolutions map[string]*UncertainResolution `json:"uncertain_resolutions,omitempty"`
+	// PendingClosures are superseded proposals whose Dagu human task is still
+	// waiting, by proposal ID, until a closure with a final outcome.
+	PendingClosures map[string]*PendingClosure `json:"pending_closures,omitempty"`
 	// Intents are the latest action of each intent, by intent key.
 	Intents map[string]*IntentRecord `json:"intents,omitempty"`
 	// SuspendWriters are suspend writes in progress, by token, with when each

@@ -221,6 +221,7 @@ func (tx *JobTx) supersedeProposals(reason string) ([]Affected, error) {
 		p.Revision++
 		p.Reasoning = reason
 		p.Updated = Stamp{At: tx.now, By: tx.actor}
+		tx.closeLater(p)
 		if err := tx.archiveProposal(p); err != nil {
 			return nil, err
 		}

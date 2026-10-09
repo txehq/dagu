@@ -43,6 +43,7 @@ const (
 	kindReviews   = "reviews"
 	kindActions   = "actions"
 	kindProposals = "proposals"
+	kindClosures  = "closures"
 )
 
 // Dir returns the registry directory under the Dagu data directory.
@@ -491,6 +492,9 @@ func (tx *JobTx) attach(kind string, v any, setPrev func(prev string)) (string, 
 	case kindProposals:
 		setPrev(tx.Job.Chains.Proposals)
 		tx.Job.Chains.Proposals = id
+	case kindClosures:
+		setPrev(tx.Job.Chains.Closures)
+		tx.Job.Chains.Closures = id
 	case kindVersions:
 		setPrev("")
 		tx.Job.VersionRefs = append(tx.Job.VersionRefs, id)

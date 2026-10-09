@@ -1101,3 +1101,45 @@ func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEve
 	out, err := txeConvert[api.TxeResourceEvent](ev)
 	return api.GetTxeResourceEvent200JSONResponse(out), err
 }
+
+func (a *API) ListTxePendingClosures(ctx context.Context, req api.ListTxePendingClosuresRequestObject) (api.ListTxePendingClosuresResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if err := registry.ValidateID(registry.PrefixMachine, req.Params.Machine); err != nil {
+		return nil, txeError(err)
+	}
+	pending, err := s.PendingClosures(ctx, req.Params.Machine, txeLimit(req.Params.Limit), func(job *registry.Job) bool {
+		return a.txeJobVisible(ctx, s, job) == nil
+	})
+	if err != nil {
+		return nil, txeError(err)
+	}
+	out, err := txeConvert[[]api.TxePendingClosure](pending)
+	if out == nil {
+		out = []api.TxePendingClosure{}
+	}
+	return api.ListTxePendingClosures200JSONResponse{Closures: out}, err
+}
+
+func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxeProposalClosureRequestObject) (api.RecordTxeProposalClosureResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var closure *registry.Closure
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+		var err error
+		closure, err = tx.RecordClosure(ctx, s, req.ProposalId, registry.ClosureOutcome(body.Outcome), valueOf(body.Detail))
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeClosure](closure)
+	return api.RecordTxeProposalClosure200JSONResponse(out), err
+}
