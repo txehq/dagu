@@ -4,7 +4,6 @@
 package cmd_test
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -54,32 +53,30 @@ review_policy:
       idempotency: keyed
       timeout_sec: 60
       max_attempts: 3
-      param_schema:
-%s
-    - name: recount
+%s    - name: recount
       command: ./recount.sh
       timeout_sec: 30
 `
 
-const txeAdmittedSchema = `        type: object
+const txeAdmittedSchema = `      param_schema:
+        type: object
         properties:
           reason: {type: string, maxLength: 200, pattern: "^[a-z <&]+$"}
         required: [reason]
-        additionalProperties: false`
+        additionalProperties: false
+`
 
-// A schema that promises a restriction nothing checks: format.
-const txeRefusedSchema = `        type: object
-        properties:
-          contact: {type: string, format: email}`
-
-// A permitted action's param_schema, declared in a job spec, against the
-// registry's real registration endpoint with authentication on.
+// The client's gate against a real registry that does not say it enforces
+// parameter schemas (it lists no capabilities in its installation record).
 //
-// It shows three things: the registry stores the schema the spec declared;
-// the version the registry answers equals the request filed on the machine
-// in every field that says what a job's commands are; and a schema the
-// registry does not admit is refused and leaves no job.
-func TestTXECandidateParamSchema(t *testing.T) {
+// Registering a spec that declares a param_schema, or planning it, is
+// refused before anything is sent, and the registry holds no job. The same
+// job without the schema registers.
+//
+// What this registry does with a schema it is sent, measured before the gate
+// existed, is in the history of this file and under
+// 2026-10-10-param-schema-candidate in the evidence directory.
+func TestTXECandidateParamSchemaGate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("job packages are shell scripts run by a Unix worker")
 	}
@@ -126,85 +123,35 @@ func TestTXECandidateParamSchema(t *testing.T) {
 		require.NoError(t, os.WriteFile(specPath, fmt.Appendf(nil, txeParamSchemaSpec, key, credential, schema), 0o644)) //nolint:gosec // test file
 	}
 
-	// 1. The registry stores the schema the spec declared.
-	writeSpec("bounded-action", txeAdmittedSchema)
-	registered, err := cli.json("cc2-s000001", "txe", "register", "-f", specPath)
-	require.NoError(t, err, "register: %v", registered)
-	receipt, _ := registered["receipt"].(map[string]any)
-	jobID, _ := receipt["job_id"].(string)
-	requestID, _ := receipt["request_id"].(string)
-	require.NotEmpty(t, jobID, "no receipt: %v", registered)
-	require.NotEmpty(t, requestID, "no request id: %v", registered)
-
-	code, version, raw := hub.call(http.MethodGet, "/txe/jobs/"+jobID+"/versions/1", nil)
+	code, installation, raw := hub.call(http.MethodGet, "/txe/installation", nil)
 	require.Equal(t, http.StatusOK, code, raw)
-	txeKeep(t, "raw/registry-version-1.json", []byte(raw))
-	policy, _ := version["review_policy"].(map[string]any)
-	actions, _ := policy["permitted_actions"].([]any)
-	require.Len(t, actions, 2, raw)
-	bounded, _ := actions[0].(map[string]any)
-	unbounded, _ := actions[1].(map[string]any)
-	assert.Equal(t, map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"reason": map[string]any{"type": "string", "maxLength": float64(200), "pattern": "^[a-z <&]+$"},
-		},
-		"required":             []any{"reason"},
-		"additionalProperties": false,
-	}, bounded["param_schema"], "the registry's version 1")
-	assert.NotContains(t, unbounded, "param_schema")
+	txeKeep(t, "raw/registry-installation.json", []byte(raw))
+	require.NotContains(t, installation, "capabilities", "this registry lists capabilities; the gate's refusal cannot be shown against it")
 
-	// 2. The request filed on the machine equals the registry's version in
-	// every field that says what the job's commands are.
-	filedPath := filepath.Join(home, "receipts", jobID, "requests", requestID+".json")
-	filedRaw, err := os.ReadFile(filedPath) //nolint:gosec // test directory
-	require.NoError(t, err)
-	txeKeep(t, "raw/filed-request.json", filedRaw)
-	var filed struct {
-		Request struct {
-			Version map[string]any `json:"version"`
-		} `json:"request"`
+	writeSpec("bounded-action", txeAdmittedSchema)
+	for name, args := range map[string][]string{
+		"register": {"txe", "register", "-f", specPath, "--json"},
+		"dry-run":  {"txe", "register", "-f", specPath, "--dry-run", "--json"},
+	} {
+		out, err := cli.run("cc2-s000001", args...)
+		require.Error(t, err, "%v was not refused: %s", args, out)
+		txeKeep(t, "raw/refused-"+name+".txt", []byte(out+"\n"+err.Error()+"\n"))
+		assert.Contains(t, out+err.Error(), "does not say it checks action parameters")
+		assert.Contains(t, out+err.Error(), "reopen-ticket")
 	}
-	require.NoError(t, json.Unmarshal(filedRaw, &filed))
-	sentPackage, _ := filed.Request.Version["package"].(map[string]any)
-	gotPackage, _ := version["package"].(map[string]any)
-	for _, field := range []string{"digest", "path", "working_dir", "entrypoint", "credential_refs"} {
-		require.Contains(t, sentPackage, field)
-		assert.Equal(t, sentPackage[field], gotPackage[field], "package.%s", field)
-	}
-	sentPolicy, _ := filed.Request.Version["review_policy"].(map[string]any)
-	assert.Equal(t, float64(2), sentPolicy["max_attempts"])
-	assert.Equal(t, sentPolicy["max_attempts"], policy["max_attempts"], "review_policy.max_attempts")
-	assert.Equal(t, sentPolicy["permitted_actions"], policy["permitted_actions"], "review_policy.permitted_actions")
-	// The registry adds nothing to an action and drops nothing from it.
-	assert.Equal(t, map[string]any{
-		"name": "reopen-ticket", "command": `./reopen.sh "$TXE_PARAM_REASON" 2>&1`, "idempotency": "keyed",
-		"timeout_sec": float64(60), "max_attempts": float64(3), "routine": false, "param_schema": bounded["param_schema"],
-	}, bounded)
-	assert.Equal(t, map[string]any{"name": "recount", "command": "./recount.sh", "timeout_sec": float64(30), "routine": false}, unbounded)
-
-	// 3. A schema that promises a restriction nothing checks. A registry
-	// that admits schemas refuses it and keeps no job; one that only stores
-	// them accepts it. Which this registry does is recorded either way, and
-	// asserted only when TXE_REGISTRY_ADMITS_SCHEMAS says it must refuse.
-	writeSpec("refused-action", txeRefusedSchema)
-	out, err := cli.run("cc2-s000001", "txe", "register", "-f", specPath, "--json")
-	outcome := "ACCEPTED: this registry stored a param_schema that uses format\n"
-	if err != nil {
-		outcome = "REFUSED: " + err.Error() + "\n"
-	}
-	t.Log(outcome)
-	txeKeep(t, "raw/format-schema-registration.txt", []byte(outcome+out))
 	code, _, raw = hub.call(http.MethodGet, "/txe/jobs", nil)
 	require.Equal(t, http.StatusOK, code, raw)
-	txeKeep(t, "raw/registry-jobs-after-format-schema.json", []byte(raw))
-	assert.Contains(t, raw, "bounded-action")
-	if os.Getenv("TXE_REGISTRY_ADMITS_SCHEMAS") == "1" {
-		require.Error(t, err, "a schema with format was registered: %s", out)
-		assert.Contains(t, out+err.Error(), "param_schema")
-		assert.NotContains(t, raw, "refused-action")
-	}
-	for _, kept := range [][]byte{[]byte(raw), filedRaw} {
-		assert.NotContains(t, string(kept), "txe-sentinel-credential")
-	}
+	txeKeep(t, "raw/registry-jobs-after-refusal.json", []byte(raw))
+	assert.NotContains(t, raw, "bounded-action")
+	pending, _ := filepath.Glob(filepath.Join(home, "receipts", "pending", "*.json"))
+	assert.Empty(t, pending, "a refused registration left a journal entry")
+
+	writeSpec("unbounded-action", "")
+	registered, err := cli.json("cc2-s000001", "txe", "register", "-f", specPath)
+	require.NoError(t, err, "register: %v", registered)
+	code, _, raw = hub.call(http.MethodGet, "/txe/jobs", nil)
+	require.Equal(t, http.StatusOK, code, raw)
+	txeKeep(t, "raw/registry-jobs-after-unbounded.json", []byte(raw))
+	assert.Contains(t, raw, "unbounded-action")
+	assert.NotContains(t, raw, "txe-sentinel-credential")
 }
