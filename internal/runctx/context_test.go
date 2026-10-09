@@ -323,6 +323,7 @@ func TestNewContext_DAGEnvCanReferenceBuiltInRunContext(t *testing.T) {
 			"DAG_REF=${context.dag.name}",
 			"RUN_REF=${context.run.id}",
 			"ATTEMPT_REF=${context.attempt.id}",
+			"QUEUED_REF=${context.attempt.queued_at}",
 			"TRIGGER_REF=${context.trigger.type}",
 			"TRIGGER_ACTOR_REF=${context.trigger.actor}",
 			"STARTED_REF=${context.attempt.started_at}",
@@ -339,6 +340,7 @@ func TestNewContext_DAGEnvCanReferenceBuiltInRunContext(t *testing.T) {
 
 	ctx := runctx.NewContext(context.Background(), dag, "run-1", logFile,
 		runctx.WithAttemptID("attempt-1"),
+		runctx.WithAttemptQueuedAt("2026-03-13T17:59:58.123456+08:00"),
 		runctx.WithRootDAGRun(ir.NewDAGRunRef("root", "root-run-1")),
 		runctx.WithTriggerType(ir.TriggerTypeScheduler),
 		runctx.WithTriggerActor("alice"),
@@ -353,6 +355,8 @@ func TestNewContext_DAGEnvCanReferenceBuiltInRunContext(t *testing.T) {
 	assert.Equal(t, "daily", envs["DAG_REF"])
 	assert.Equal(t, "run-1", envs["RUN_REF"])
 	assert.Equal(t, "attempt-1", envs["ATTEMPT_REF"])
+	// As stored: not converted to UTC and not cut to seconds.
+	assert.Equal(t, "2026-03-13T17:59:58.123456+08:00", envs["QUEUED_REF"])
 	assert.Equal(t, "scheduler", envs["TRIGGER_REF"])
 	assert.Equal(t, "alice", envs["TRIGGER_ACTOR_REF"])
 	assert.Equal(t, startedAt, envs["STARTED_REF"])

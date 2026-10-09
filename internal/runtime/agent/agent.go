@@ -742,6 +742,7 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		runtime.WithTriggerType(a.triggerType),
 		runtime.WithTriggerActor(a.triggerActor),
 		runtime.WithRunStartedAt(contextTimeString(a.plan.StartAt())),
+		runtime.WithAttemptQueuedAt(a.contextQueuedAt()),
 		runtime.WithParams(a.dag.Params),
 		runtime.WithRuntimeProfileValues(
 			profileValues.defaultEnvs,
@@ -1654,6 +1655,17 @@ func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 	return a.retryTarget
 }
 
+// contextQueuedAt is the queue marker of this execution: the queuedAt every
+// status this agent reports carries, so a step and the stored status name the
+// same execution. It is passed as stored, never reformatted. A run that was
+// not dispatched from a queued or earlier status has none.
+func (a *Agent) contextQueuedAt() string {
+	if source := a.statusSourceTarget(); source != nil {
+		return source.QueuedAt
+	}
+	return ""
+}
+
 func (a *Agent) contextScheduleTime() string {
 	var raw string
 	if source := a.statusSourceTarget(); source != nil && source.ScheduleTime != "" {
@@ -2350,6 +2362,7 @@ func (a *Agent) dryRun(ctx context.Context) error {
 		runtime.WithTriggerType(a.triggerType),
 		runtime.WithTriggerActor(a.triggerActor),
 		runtime.WithRunStartedAt(contextTimeString(a.plan.StartAt())),
+		runtime.WithAttemptQueuedAt(a.contextQueuedAt()),
 		runtime.WithParams(a.dag.Params),
 	}
 	if scheduleTime := a.contextScheduleTime(); scheduleTime != "" {

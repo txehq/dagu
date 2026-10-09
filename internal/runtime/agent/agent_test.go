@@ -2565,3 +2565,73 @@ func (s *failingWorkDirStore) Snapshot(context.Context, dagrun.WorkDirRef, strin
 func (*failingWorkDirStore) Remove(context.Context, dagrun.WorkDirRef) error {
 	return nil
 }
+
+// A step reads the queue marker of its own execution, in a DAG-level variable
+// and in its command, and it is the marker the stored status carries: the two
+// are compared to tell one execution of an attempt from another.
+func TestAgent_AttemptQueuedAtReachesSteps(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses POSIX shell commands")
+	}
+	t.Parallel()
+
+	const reference = "${context.attempt.queued_at}"
+	// inCommand is what the step's command passes as its second value.
+	yaml := func(out, inCommand string) string {
+		return `
+env:
+  - QUEUED_AT: "` + reference + `"
+steps:
+  - name: record
+    run: printf '%s|%s' "$QUEUED_AT" "` + inCommand + `" > ` + out
+	}
+
+	t.Run("Queued", func(t *testing.T) {
+		th := test.Setup(t)
+		out := filepath.Join(t.TempDir(), "seen")
+		dag := th.DAG(t, yaml(out, reference))
+
+		// A queued retry writes UTC with a fraction; it must arrive unchanged.
+		const queuedAt = "2026-10-09T15:48:58.155644Z"
+		runID := "queued-marker-run"
+		prepared, err := th.DAGRunRepository.CreateAttempt(th.Context, dag.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+		require.NoError(t, err)
+		require.NoError(t, prepared.Open(th.Context))
+		queued := ir.NewStatusBuilder(dag.DAG).Create(runID, ir.Queued, 0, time.Time{},
+			ir.WithAttemptID(prepared.ID()), ir.WithQueuedAt(queuedAt))
+		require.NoError(t, prepared.Write(th.Context, queued))
+		require.NoError(t, prepared.Close(th.Context))
+
+		dagAgent := dag.Agent(test.WithDAGRunID(runID), test.WithAgentOptions(agent.Options{
+			RunStateStore: persis.NewRunStateStore(th.DAGRunRepository, prepared),
+			RetryTarget:   &queued,
+		}))
+		dagAgent.RunSuccess(t)
+
+		seen, err := os.ReadFile(out)
+		require.NoError(t, err)
+		require.Equal(t, queuedAt+"|"+queuedAt, string(seen))
+		latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+		require.NoError(t, err)
+		require.Equal(t, queuedAt, latest.QueuedAt, "the step and the stored status name different executions")
+		require.Equal(t, prepared.ID(), latest.AttemptID)
+	})
+
+	t.Run("NeverQueued", func(t *testing.T) {
+		th := test.Setup(t)
+		out := filepath.Join(t.TempDir(), "seen")
+		// The reference is left as written when there is no marker. In a
+		// variable that is harmless text; in a shell command it would be a
+		// bad substitution, so a command that must survive it reads the
+		// variable.
+		dag := th.DAG(t, yaml(out, "from-env"))
+		dag.Agent().RunSuccess(t)
+
+		seen, err := os.ReadFile(out)
+		require.NoError(t, err)
+		require.Equal(t, reference+"|from-env", string(seen), "a run that was never queued has no marker")
+		latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+		require.NoError(t, err)
+		require.Empty(t, latest.QueuedAt)
+	})
+}

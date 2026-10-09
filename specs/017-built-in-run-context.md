@@ -103,6 +103,7 @@ ${context.run.root_name}
 ${context.run.root_id}
 ${context.attempt.id}
 ${context.attempt.started_at}
+${context.attempt.queued_at}
 ${context.step.id}
 ${context.step.name}
 ${context.trigger.type}
@@ -198,6 +199,7 @@ Rules:
 | --- | --- | --- |
 | `context.attempt.id` | Attempt-aware run, step, and handler scopes | Identifier for the current DAG-run attempt. |
 | `context.attempt.started_at` | After run-attempt start is recorded | UTC RFC3339 timestamp for the start of this DAG-run attempt. |
+| `context.attempt.queued_at` | When this execution was dispatched from a queued or an earlier status | Queue marker of this execution: the `queuedAt` of the status it was dispatched with, as stored. |
 
 Rules:
 
@@ -205,6 +207,20 @@ Rules:
 - `context.attempt.id` is not the same as `context.run.id`.
 - Step retry attempts are outside this namespace unless a step-retry-owning
   spec adds a separate field.
+- `context.attempt.id` alone does not identify one execution. A retry that is
+  queued executes again under the same attempt ID and gets a new
+  `context.attempt.queued_at`; a retry dispatched directly gets a new attempt
+  ID and keeps the earlier attempt's `context.attempt.queued_at`. The pair of
+  the two values identifies one execution of a DAG run.
+- `context.attempt.queued_at` equals the `queuedAt` of every status the
+  execution reports, byte for byte. It is an opaque string: the first enqueue
+  writes RFC3339 at second resolution in the enqueuing host's zone, and a
+  queued retry writes UTC with a fraction. Compare it for equality; do not
+  parse or reformat it.
+- `context.attempt.queued_at` is unavailable for a run that was started
+  without being queued. Like any unavailable field, a reference to it is left
+  unchanged. A shell command that may run without one should read the value
+  from an environment variable, where the unchanged reference is plain text.
 
 `context.step` fields:
 
