@@ -172,6 +172,13 @@ func (f *fixture) fileProposalWith(p registry.Proposal) *registry.Proposal {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	return f.fileProposalWithID(id, p)
+}
+
+// fileProposalWithID files p with the given ID under a review claim.
+func (f *fixture) fileProposalWithID(id string, p registry.Proposal) *registry.Proposal {
+	f.t.Helper()
+	var err error
 	p.ProposalID = id
 	var filed *registry.Proposal
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
@@ -587,19 +594,150 @@ func TestDecideRefusesRetryOnUntypedProposal(t *testing.T) {
 	}
 }
 
-// Until the registry can authorize a bound native retry, retry on a
-// dagu.retry_run proposal is refused rather than recorded as unexecutable.
-func TestDecideRefusesRunRetryUntilAuthorizable(t *testing.T) {
+func (f *fixture) job() *registry.Job {
+	f.t.Helper()
+	j, err := f.store.GetJob(f.ctx, f.jobID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return j
+}
+
+func (f *fixture) retryRequest(runID, key string) RetryRequest {
+	j := f.job()
+	return RetryRequest{
+		RunID: runID, ExpectedJobVersion: j.Version, RunSpecSHA256: j.DAGSpecSHA256,
+		RunStartedAt: f.now.Add(time.Minute), IdempotencyKey: key,
+	}
+}
+
+// A retry request is a decided dagu.retry_run proposal whose bound action
+// the reviewer can be granted exactly once, settled with the new attempt as
+// receipt.
+func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	f := newFixture(t)
-	p := f.fileProposalWith(registry.Proposal{
-		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: json.RawMessage(`{"run_id":"run-0003"}`)},
+	res, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0042", "key-retry-run-1"), f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Proposal == nil || res.Proposal.State != registry.ProposalDecided || res.Proposal.Action.Name != ActionRetryRun {
+		t.Fatalf("proposal = %+v, want decided %s", res.Proposal, ActionRetryRun)
+	}
+	if res.Decision.Verdict != VerdictRetry || res.Decision.Actor.ID != "connor" {
+		t.Fatalf("decision = %+v", res.Decision)
+	}
+	actionID, err := registry.ApprovedActionID(res.Proposal.ProposalID, res.Decision.DecisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := registry.Actor{Kind: registry.ActorReviewer, ID: "executor"}
+	grant := func() (*registry.Grant, *registry.Claim, error) {
+		var g *registry.Grant
+		var c *registry.Claim
+		_, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
+			var err error
+			if c, err = tx.AcquireClaim(registry.ClaimExecution, registry.Reviewer{MachineID: f.machineID}, time.Hour); err != nil {
+				return err
+			}
+			j := tx.Job
+			g, err = tx.Authorize(registry.EffectRequest{ActionID: actionID, JobVersion: j.Version, PackageDigest: j.PackageDigest,
+				Approved: &registry.ApprovedEffect{ProposalID: res.Proposal.ProposalID, DecisionID: res.Decision.DecisionID, ClaimID: c.ClaimID, Fence: c.Fence}})
+			return err
+		})
+		return g, c, err
+	}
+	g, claim, err := grant()
+	if err != nil {
+		t.Fatalf("first grant: %v", err)
+	}
+	if _, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
+		_, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: claim.ClaimID,
+			Fence: claim.Fence, State: registry.ActionSucceeded, Receipt: "attempt-0042-2"})
+		if err != nil {
+			return err
+		}
+		return tx.ReleaseClaim(claim.ClaimID, claim.Fence)
+	}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if _, _, err := grant(); registry.ErrorCode(err) == "" {
+		t.Fatalf("second grant err = %v, want a refusal", err)
+	}
+}
+
+func TestRequestRetryRefusesStaleRuns(t *testing.T) {
+	f := newFixture(t)
+	wrongSpec := f.retryRequest("run-0042", "key-stale-spec")
+	wrongSpec.RunSpecSHA256 = digestB
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, wrongSpec, f.human); registry.ErrorCode(err) != CodeRunStale {
+		t.Fatalf("other spec err = %v, want run_stale", err)
+	}
+	// Same DAG text but started before the current version existed: the
+	// package may differ, so it is not retried on the new version's code.
+	early := f.retryRequest("run-0041", "key-stale-time")
+	early.RunStartedAt = f.now.Add(-time.Hour)
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, early, f.human); registry.ErrorCode(err) != CodeRunStale {
+		t.Fatalf("earlier run err = %v, want run_stale", err)
+	}
+	// A run recorded in the version's creation second, at whole-second
+	// precision, is of this version.
+	sameSecond := f.retryRequest("run-0040", "key-same-second")
+	sameSecond.RunStartedAt = f.now.Truncate(time.Second)
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, sameSecond, f.human); err != nil {
+		t.Fatalf("run in the version's second: %v", err)
+	}
+	moved := f.retryRequest("run-0042", "key-stale-version")
+	moved.ExpectedJobVersion++
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, moved, f.human); registry.ErrorCode(err) != registry.CodeVersionConflict {
+		t.Fatalf("version err = %v, want version_conflict", err)
+	}
+	if n := len(f.decisions()); n != 1 {
+		t.Fatalf("decisions = %d, want only the same-second retry", n)
+	}
+}
+
+func TestRequestRetryReplay(t *testing.T) {
+	f := newFixture(t)
+	req := f.retryRequest("run-0042", "key-retry-replay")
+	first, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.AlreadyRecorded || again.Decision.DecisionID != first.Decision.DecisionID {
+		t.Fatalf("replay = %+v", again.Decision)
+	}
+	other := f.retryRequest("run-0043", "key-retry-replay")
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, other, f.human); registry.ErrorCode(err) != CodeIdempotencyMismatch {
+		t.Fatalf("key reused for another run err = %v, want idempotency_mismatch", err)
+	}
+	if n := len(f.decisions()); n != 1 {
+		t.Fatalf("decisions = %d, want 1", n)
+	}
+}
+
+// A reviewer-filed dagu.retry_run proposal is decided by a retry verdict.
+func TestDecideRetryOnRetryRunProposal(t *testing.T) {
+	f := newFixture(t)
+	j := f.job()
+	params, _ := json.Marshal(registry.RetryRunParams{RunID: "run-0044", RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest})
+	id, err := registry.RetryProposalID("run-0044", j.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.fileProposalWithID(id, registry.Proposal{
+		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: params},
 		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
 	})
 	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-run-retry-1"}
-	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
-		t.Fatalf("err = %v, want not_permitted", err)
+	res, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := len(f.decisions()); n != 0 {
-		t.Fatalf("decisions = %d, want 0", n)
+	if res.Proposal == nil || res.Proposal.State != registry.ProposalDecided {
+		t.Fatalf("proposal = %+v, want decided", res.Proposal)
 	}
 }
