@@ -594,6 +594,9 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
+	if prepared != nil && prepared.newlyCreated {
+		h.endPreparation(ctx, ir.NewDAGRunRef(req.Task.GetTarget(), req.Task.GetDagRunId()), taskRootRef(req.Task), req.Task.GetAttemptId())
+	}
 	unlockRun()
 	h.notifyDispatchAvailable()
 	return &coordinatorv1.DispatchResponse{}, nil
@@ -934,7 +937,7 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 
 	// Create new attempt (either first attempt or retry)
 	isRetry := task.Operation == coordinatorv1.Operation_OPERATION_RETRY || findErr == nil
-	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry}
+	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, TrackPreparation: h.canAbandonPreparations()}
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, opts)
 	if err != nil {
@@ -1029,7 +1032,8 @@ func (h *Handler) createSubAttemptForTask(ctx context.Context, task *coordinator
 	task.Labels = strings.Join(labels, ",")
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, persis.DAGRunCreateAttemptOptions{
-		RootDAGRun: rootRef,
+		RootDAGRun:       rootRef,
+		TrackPreparation: h.canAbandonPreparations(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sub-attempt: %w", err)
@@ -1041,13 +1045,15 @@ func (h *Handler) createSubAttemptForTask(ctx context.Context, task *coordinator
 		task.Target, task.DagRunId, attempt.ID(),
 	)
 
+	createdRun := ir.NewDAGRunRef(task.Target, task.DagRunId)
 	if err := attempt.Open(ctx); err != nil {
-		return nil, fmt.Errorf("failed to open sub-attempt: %w", err)
+		return nil, &preparationFailedError{run: createdRun, root: rootRef, attemptID: attempt.ID(), err: fmt.Errorf("failed to open sub-attempt: %w", err)}
 	}
 
 	if writeErr := h.writeInitialStatus(ctx, attempt, task, task.Target, rootRef, labels); writeErr != nil {
 		closeErr := attempt.Close(context.WithoutCancel(ctx))
-		return nil, errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)
+		return nil, &preparationFailedError{run: createdRun, root: rootRef, attemptID: attempt.ID(),
+			err: errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)}
 	}
 
 	h.attemptsMu.Lock()
@@ -1233,11 +1239,9 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	// when the run has an earlier execution, otherwise marked Failed with a
 	// not-dispatched reason the record explains. Without them it keeps the
 	// plain Failed mark below.
-	isRootRun := task.GetParentDagRunId() == "" &&
-		(task.GetRootDagRunId() == "" || task.GetRootDagRunId() == task.GetDagRunId())
-	if h.dispatchTaskStore != nil && isRootRun {
+	if h.dispatchTaskStore != nil {
 		h.releasePreparedDispatchAttempt(storeCtx, dagRunID, prepared.attempt)
-		_, abandonErr := h.abandonNeverDispatchedLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId),
+		_, abandonErr := h.abandonExecutionLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId), taskRootRef(task),
 			prepared.attempt.ID(), "not dispatched: handing the task to a worker failed: "+dispatchErr.Error())
 		switch {
 		case abandonErr == nil:
@@ -1503,7 +1507,7 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 		root = ir.DAGRunRef{Name: task.GetTarget(), ID: task.GetDagRunId()}
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	if err := h.refuseAbandonedClaim(ctx, ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), root, task.GetAttemptId()); err != nil {
+	if err := h.refuseAbandonedExecution(ctx, ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
 		return err
 	}
 	return h.attemptOwnership().recordTaskClaim(ctx, task, workerID)

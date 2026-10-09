@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -592,4 +593,203 @@ func TestClaimRefusalFailsClosedOnAnUnreadableRecord(t *testing.T) {
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, errAttemptAbandoned)
 	assert.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict)
+}
+
+// evidenceGatedDispatchStore fails enqueueing, and fails the
+// outstanding-dispatch lookup while unknown is set, as an index that is
+// briefly unavailable.
+type evidenceGatedDispatchStore struct {
+	dispatch.DispatchTaskStore
+	unknown atomic.Bool
+}
+
+func (s *evidenceGatedDispatchStore) Enqueue(context.Context, *dispatch.DispatchTask) error {
+	return errors.New("disk full")
+}
+
+func (s *evidenceGatedDispatchStore) HasOutstandingAttempt(ctx context.Context, key string, stale time.Duration) (bool, error) {
+	if s.unknown.Load() {
+		return false, errors.New("dispatch index unavailable")
+	}
+	return s.DispatchTaskStore.HasOutstandingAttempt(ctx, key, stale)
+}
+
+// An attempt that Dispatch prepared, whose immediate abandonment could not
+// establish absence, stays journaled. Its initial status, written by the real
+// preparation path, has no creation time; reconciliation still finds it and
+// abandons it once the evidence can be read.
+func TestDispatchPreparationLeftBehindIsReconciled(t *testing.T) {
+	t.Parallel()
+	registerCommandExecutorCapsForCoordinatorTest()
+	dir := t.TempDir()
+	gated := &evidenceGatedDispatchStore{DispatchTaskStore: newTestDispatchTaskStore(filepath.Join(dir, "d"))}
+	gated.unknown.Store(true)
+	f := newStrandedFixture(t, gated)
+
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:   strandedRun,
+		Target:     strandedDAG,
+		Operation:  coordinatorv1.Operation_OPERATION_RETRY,
+		Definition: "name: " + strandedDAG + "\nsteps:\n  - name: step1\n    run: echo hello",
+		QueueName:  "q",
+	}})
+	require.Error(t, err)
+	prepared := f.latest(t)
+	require.NotEqual(t, f.previous, prepared, "the prepared attempt was left for review")
+	require.Equal(t, []string{prepared}, f.preparations(t))
+	attempt, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, ir.NotStarted, status.Status)
+	require.Zero(t, status.CreatedAt, "the real initial status has no creation time")
+
+	gated.unknown.Store(false)
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+	assert.Equal(t, f.previous, f.latest(t))
+	assert.Empty(t, f.preparations(t))
+	records := f.records(t)
+	require.Len(t, records, 1)
+	assert.Equal(t, prepared, records[0].AbandonedAttemptID)
+}
+
+// A successful dispatch journals its attempt while preparing it and ends the
+// entry once the task is published.
+func TestDispatchEndsItsPreparationOncePublished(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newStrandedFixture(t, nil)
+	var during []string
+	dispatchPublishHook = func(task *coordinatorv1.Task) {
+		if task.GetDagRunId() == strandedRun {
+			during = f.preparations(t)
+		}
+	}
+	t.Cleanup(func() { dispatchPublishHook = nil })
+
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:   strandedRun,
+		Target:     strandedDAG,
+		Operation:  coordinatorv1.Operation_OPERATION_RETRY,
+		Definition: "name: " + strandedDAG + "\nsteps:\n  - name: step1\n    run: echo hello",
+		QueueName:  "q",
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{f.latest(t)}, during)
+	assert.Empty(t, f.preparations(t))
+}
+
+// When handing a sub-DAG run's task to a worker fails, nothing ran: the
+// child's attempt is abandoned under its root with a record, not marked
+// Failed like an execution. The root run is untouched.
+func TestDispatchHandoffFailureAbandonsSubDAGAttempt(t *testing.T) {
+	t.Parallel()
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newStrandedFixture(t, &failingDispatchTaskStore{enqueueErr: errors.New("disk full")})
+	child := ir.NewDAGRunRef("child-dag", "child-run")
+
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:         child.ID,
+		Target:           child.Name,
+		RootDagRunName:   f.ref.Name,
+		RootDagRunId:     f.ref.ID,
+		ParentDagRunName: f.ref.Name,
+		ParentDagRunId:   f.ref.ID,
+		Definition:       "name: " + child.Name + "\nsteps:\n  - name: step1\n    run: echo hello",
+		QueueName:        "q",
+	}})
+	require.Error(t, err)
+
+	assert.Equal(t, f.previous, f.latest(t), "the root run is untouched")
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), child, f.ref)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, f.ref, records[0].RootRun)
+	assert.Contains(t, records[0].Detail, "handing the task to a worker failed")
+	assert.Empty(t, f.preparations(t))
+	latest, err := f.repository.FindSubAttempt(t.Context(), f.ref, child.ID)
+	require.NoError(t, err)
+	status, err := latest.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, status.Status)
+	assert.Contains(t, status.Error, "not dispatched")
+}
+
+// A first attempt abandoned and then retried through PrepareRetry is claimed
+// through the coordinator: the retry's task carries the new queued-at marker,
+// and the claim is accepted.
+func TestAckAcceptsRetryOfAnAbandonedFirstAttempt(t *testing.T) {
+	t.Parallel()
+	f := newFirstAttemptFixture(t, nil)
+	dag := &ir.DAG{Name: strandedDAG}
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), f.ref.ID,
+		persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(t.Context()))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = f.ref.ID
+	status.AttemptID = attempt.ID()
+	require.NoError(t, attempt.Write(t.Context(), status))
+	require.NoError(t, attempt.Close(t.Context()))
+	_, err = f.h.abandonNeverDispatched(t.Context(), f.ref, f.ref, attempt.ID(), "test")
+	require.NoError(t, err)
+	failed, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	admission, err := queue.PrepareRetry(t.Context(), f.repository, dag, failed, queue.EnqueueRetryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, admission)
+
+	key := ir.GenerateAttemptKey(strandedDAG, f.ref.ID, strandedDAG, f.ref.ID, attempt.ID())
+	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
+		Target: strandedDAG, DAGRunID: f.ref.ID, AttemptID: attempt.ID(), AttemptKey: key,
+		ExecutionMarker: admission.Status.QueuedAt,
+		Owner:           dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+	}))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: key,
+	})
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted, resp.Error)
+}
+
+// A sub-DAG attempt that Dispatch prepared and could not abandon on the spot
+// stays journaled under its root, and reconciliation abandons it later.
+func TestDispatchSubDAGPreparationLeftBehindIsReconciled(t *testing.T) {
+	t.Parallel()
+	registerCommandExecutorCapsForCoordinatorTest()
+	dir := t.TempDir()
+	gated := &evidenceGatedDispatchStore{DispatchTaskStore: newTestDispatchTaskStore(filepath.Join(dir, "d"))}
+	gated.unknown.Store(true)
+	f := newStrandedFixture(t, gated)
+	child := ir.NewDAGRunRef("child-dag", "child-run")
+
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:         child.ID,
+		Target:           child.Name,
+		RootDagRunName:   f.ref.Name,
+		RootDagRunId:     f.ref.ID,
+		ParentDagRunName: f.ref.Name,
+		ParentDagRunId:   f.ref.ID,
+		Definition:       "name: " + child.Name + "\nsteps:\n  - name: step1\n    run: echo hello",
+		QueueName:        "q",
+	}})
+	require.Error(t, err)
+	entries, err := f.repository.ListAttemptPreparations(t.Context())
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, child, entries[0].Run)
+	assert.Equal(t, f.ref, entries[0].RootRun)
+
+	gated.unknown.Store(false)
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+	assert.Empty(t, f.preparations(t))
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), child, f.ref)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, entries[0].AttemptID, records[0].AbandonedAttemptID)
 }

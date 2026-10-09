@@ -33,6 +33,12 @@ var errAttemptAbandoned = errors.New("attempt was abandoned before dispatch")
 // errEvidenceUnknown means a lookup could not establish absence.
 var errEvidenceUnknown = errors.New("dispatch evidence unknown")
 
+// canAbandonPreparations reports whether this coordinator can prove absence
+// of dispatch, and so journals the attempts it prepares for reconciliation.
+func (h *Handler) canAbandonPreparations() bool {
+	return h.dagRunRepository != nil && h.dispatchTaskStore != nil && h.dagRunLeaseStore != nil
+}
+
 // errAbandonmentUnavailable means this coordinator is not configured to
 // prove absence of dispatch at all, as without a dispatch or lease store.
 var errAbandonmentUnavailable = errors.New("abandonment requires dispatch and lease stores")
@@ -93,12 +99,6 @@ func (h *Handler) abandonNeverDispatched(ctx context.Context, run, root ir.DAGRu
 	}
 	defer h.attemptWriteLocks.lock(root)()
 	return h.abandonExecutionLocked(ctx, run, root, attemptID, detail)
-}
-
-// abandonNeverDispatchedLocked abandons a root run's attempt; the caller holds
-// the run's write lock.
-func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
-	return h.abandonExecutionLocked(ctx, run, run, attemptID, detail)
 }
 
 // abandonExecutionLocked abandons the attempt and, once its record is on
@@ -165,7 +165,7 @@ func (h *Handler) endPreparation(ctx context.Context, run, root ir.DAGRunRef, at
 // started, superseded or gone, is ended. The journal holds only preparations
 // in flight or left behind, so each pass reads it whole and none is starved.
 func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.Time) {
-	if h.dagRunRepository == nil || h.dispatchTaskStore == nil || h.dagRunLeaseStore == nil {
+	if !h.canAbandonPreparations() {
 		return
 	}
 	preparations, err := h.dagRunRepository.ListAttemptPreparations(ctx)
@@ -219,12 +219,6 @@ func (h *Handler) refuseAbandonedExecution(ctx context.Context, run, root ir.DAG
 		return errAttemptAbandoned
 	}
 	return nil
-}
-
-// refuseAbandonedClaim is the claim check's call until the handler passes
-// the task's execution marker (WIP: handler.go is frozen for TXE-3808).
-func (h *Handler) refuseAbandonedClaim(ctx context.Context, run, root ir.DAGRunRef, attemptID string) error {
-	return h.refuseAbandonedExecution(ctx, run, root, attemptID, "")
 }
 
 // preparationFailedError reports a failure after an attempt was created but
