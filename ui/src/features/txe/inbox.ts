@@ -64,13 +64,31 @@ export function buildInbox(
   for (const job of jobs) {
     if (covered.has(job.jobId)) continue;
     if (job.lifecycle === 'retired' || job.lifecycle === 'completed') continue;
-    if (job.availability === 'auth_required') {
-      items.push({ reason: 'unavailable', job, waitingOn: 'credentials' });
+    // An auth failure can be reported only as an exception: a missing
+    // credential may stop a run before any step records a status.
+    const exceptions = job.exceptions ?? [];
+    const authFailure =
+      job.availability === 'auth_required' ||
+      exceptions.some((e) => e.state === 'auth_required' || e.kind === 'auth');
+    if (authFailure) {
+      items.push({
+        reason: 'unavailable',
+        job,
+        waitingOn: 'credentials',
+        exceptions,
+      });
     } else if (
       job.availability === 'worker_offline' ||
       job.availability === 'stale'
     ) {
-      items.push({ reason: 'unavailable', job, waitingOn: 'machine' });
+      items.push({
+        reason: 'unavailable',
+        job,
+        waitingOn: 'machine',
+        exceptions,
+      });
+    } else if (exceptions.length > 0) {
+      items.push({ reason: 'exception', job, waitingOn: 'agent', exceptions });
     } else if (job.lifecycle === 'needs_human') {
       items.push({ reason: 'needs_human', job, waitingOn: 'person' });
     } else {
