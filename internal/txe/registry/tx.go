@@ -311,7 +311,9 @@ func (tx *JobTx) Observe(o Observation) error {
 		if kind == "" {
 			kind = string(o.State)
 		}
-		j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		if !tx.hasOpenException("", kind, o.State) {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		}
 	}
 	tx.touch()
 	if from == o.State {
@@ -469,6 +471,18 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	return nil
 }
 
+// hasOpenException reports whether an unresolved exception of the same
+// scope, kind and state exists: repeated observations of one condition
+// coalesce into it instead of opening another each time.
+func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState) bool {
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state {
+			return true
+		}
+	}
+	return false
+}
+
 // reviewDigest identifies what a review concluded from which evidence.
 func reviewDigest(r *Review) (string, error) {
 	b, err := CanonicalJSON(map[string]any{
@@ -517,7 +531,9 @@ func (tx *JobTx) observeReviewer(o Observation) error {
 		if kind == "" {
 			kind = "reviewer_" + string(o.State)
 		}
-		j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		if !tx.hasOpenException(ScopeReviewer, kind, o.State) {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		}
 	}
 	tx.touch()
 	if from == o.State {

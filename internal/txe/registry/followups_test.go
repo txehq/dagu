@@ -5,6 +5,7 @@ package registry
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -308,4 +309,74 @@ func TestProposalClosures(t *testing.T) {
 	closures, err := f.store.ListClosures(f.ctx, job.JobID, 0)
 	require.NoError(t, err)
 	assert.Len(t, closures, 2, "every attempt is kept")
+}
+
+// A retried run is bound to the job's immutable versions by its saved DAG
+// spec digest: a run of an older version, of no version, or of a spec that
+// versions with different packages share is refused.
+func TestRetryResolvesRunThroughVersions(t *testing.T) {
+	f := newFixture(t)
+	retry := func(jobID string, params RetryRunParams) error {
+		_, err := f.tx(jobID, person, func(tx *JobTx) error {
+			_, _, err := tx.ProposeRetry(params, "key-"+params.RunSpecSHA256+params.PackageDigest)
+			return err
+		})
+		return err
+	}
+	update := func(jobID string, expected int, v JobVersion) *Job {
+		job, err := f.store.UpdateVersion(f.ctx, jobID, f.mint(PrefixEvent), expected, v, cli)
+		require.NoError(t, err)
+		return job
+	}
+
+	// A new version with another spec and package: the old run is refused.
+	job := f.ready("k1")
+	v1Spec, v1Pkg := job.DAGSpecSHA256, job.PackageDigest
+	v2 := f.version(2)
+	v2.DAG.Spec += "  - name: report\n    run: /pkg/report.sh\n"
+	job = update(job.JobID, 1, v2)
+	require.NotEqual(t, v1Spec, job.DAGSpecSHA256)
+	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: job.PackageDigest})))
+	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: v1Pkg})))
+	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "x", RunSpecSHA256: "sha256:" + strings.Repeat("0", 64), PackageDigest: job.PackageDigest})))
+	require.NoError(t, retry(job.JobID, RetryRunParams{RunID: "new", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}))
+
+	// A new version with the same spec and another package: the spec no
+	// longer tells which package a run executed.
+	shared := f.ready("k2")
+	shared = update(shared.JobID, 1, f.version(3))
+	require.Equal(t, v1Spec, shared.DAGSpecSHA256)
+	assert.Equal(t, CodeStaleBinding, code(t, retry(shared.JobID, RetryRunParams{RunID: "r", RunSpecSHA256: shared.DAGSpecSHA256, PackageDigest: shared.PackageDigest})))
+}
+
+// Repeated observations of one condition keep one unresolved exception, for
+// the job and for its reviewer; a ready observation resolves it and a later
+// failure opens a new one.
+func TestObservationsCoalesce(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	observe := func(o Observation) *Job {
+		got, err := f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.Observe(o) })
+		require.NoError(t, err)
+		return got
+	}
+	open := func(j *Job) int {
+		n := 0
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil {
+				n++
+			}
+		}
+		return n
+	}
+	for range 3 {
+		observe(Observation{State: AvailabilityAuthRequired, Scope: ScopeReviewer})
+	}
+	got := observe(Observation{State: AvailabilityWorkerOffline})
+	got = observe(Observation{State: AvailabilityWorkerOffline})
+	assert.Equal(t, 2, open(got), "one per scope, kind and state")
+	got = observe(Observation{State: AvailabilityReady, Scope: ScopeReviewer})
+	assert.Equal(t, 1, open(got), "the reviewer's is resolved, the job's stays")
+	got = observe(Observation{State: AvailabilityAuthRequired, Scope: ScopeReviewer})
+	assert.Equal(t, 2, open(got))
 }
