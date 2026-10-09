@@ -4287,6 +4287,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/runs/{runId}/abandonments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a run's abandoned retry preparations
+         * @description Every attempt of the run that the coordinator prepared and abandoned without dispatching it, newest first, whatever happened to the run since: hidden preparations of a retry and first attempts marked failed alike. Each entry is either the trusted record (with attributable, true only when it carries a request correlation) or, for a record that cannot be trusted, the attempt and an error; such an entry is never attributable. Visible to callers who can see the job and the workspace of the run.
+         */
+        get: operations["listTxeRunAbandonments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/runs/{runId}/executions": {
         parameters: {
             query?: never;
@@ -8716,6 +8739,44 @@ export interface components {
             status_sha256: string;
             files: components["schemas"]["TxeRetainedFile"][];
             artifact_files?: components["schemas"]["TxeRetainedFile"][];
+        };
+        TxeExecutionIdentity: {
+            attempt_id: string;
+            queued_at: string;
+        };
+        /** @description One abandoned attempt: record when it can be trusted, otherwise error. */
+        TxeAbandonment: {
+            attempt_id: string;
+            /** @description True only when the record carries a full request correlation (action id, action attempt, binding digest). Without one, matching the abandoned execution to a request needs an exact admitted receipt. */
+            attributable: boolean;
+            /** @description Present when the record cannot be trusted (unreadable, malformed, of another attempt or inconsistent); never attributable. */
+            error?: string;
+            /** @enum {string} */
+            outcome?: TxeAbandonmentOutcome;
+            abandoned_execution?: components["schemas"]["TxeExecutionIdentity"];
+            expected_execution?: components["schemas"]["TxeExecutionIdentity"];
+            predecessor_absent?: boolean;
+            request_correlation?: {
+                id?: string;
+                action_id?: string;
+                action_attempt?: string;
+                binding_digest?: string;
+            };
+            reason?: string;
+            detail?: string;
+            decided_at?: string;
+            coordinator_id?: string;
+            /** @description Each lookup that proved nothing was dispatched. */
+            evidence?: {
+                dispatch_task?: string;
+                lease?: string;
+                active_run?: string;
+                worker?: string;
+                observed_at?: string;
+            };
+        };
+        TxeAbandonmentList: {
+            abandonments: components["schemas"]["TxeAbandonment"][];
         };
         TxeRetainedExecutionList: {
             executions: components["schemas"]["TxeRetainedExecution"][];
@@ -23452,6 +23513,56 @@ export interface operations {
             };
         };
     };
+    listTxeRunAbandonments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Abandonment records */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeAbandonmentList"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The run store keeps no abandonment history (details.code abandonment_history_unsupported): nothing is known about abandoned preparations, which is not the same as none */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeRunExecutions: {
         parameters: {
             query?: never;
@@ -25043,6 +25154,10 @@ export enum TxeArtifactStatus {
     upload_failed = "upload_failed",
     stored_on_machine = "stored_on_machine",
     missing = "missing"
+}
+export enum TxeAbandonmentOutcome {
+    hidden = "hidden",
+    marked_failed = "marked_failed"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",
