@@ -113,6 +113,32 @@ describe('decision follow-ups', () => {
   });
 });
 
+describe('follow-up transport failure', () => {
+  // A failed request must not leave the recovery control disabled.
+  it('keeps the follow-up button usable after a network error', async () => {
+    const replayDecision = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network timeout'))
+      .mockResolvedValueOnce({ ok: true });
+    renderAt(
+      baseApi({
+        listProposals: async () => [fixtureProposal({ state: 'decided' })],
+        listDecisions: async () => [pendingDecision],
+        replayDecision,
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    const button = await screen.findByRole('button', {
+      name: 'Complete follow-up',
+    });
+    fireEvent.click(button);
+    expect(await screen.findByText('network timeout')).toBeInTheDocument();
+    await waitFor(() => expect(button).not.toBeDisabled());
+    fireEvent.click(button);
+    await waitFor(() => expect(replayDecision).toHaveBeenCalledTimes(2));
+  });
+});
+
 describe('snooze expiry', () => {
   // The registry does not change a snoozed proposal when its expiry passes,
   // so the inbox must re-evaluate on time alone.
