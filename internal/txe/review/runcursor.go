@@ -5,6 +5,7 @@ package review
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,64 +14,78 @@ import (
 // coverage is the checkpoint's run cursor over the service's run history:
 // which results of a job's runs reviews have already been shown.
 //
-// A result is one attempt of one run. A native retry keeps the run id and
-// starts a new attempt, so a run id alone does not name a result, and the
+// A result is one execution of one run: an attempt, as queued at one time.
+// A native retry keeps the run id and either starts a new attempt or queues
+// the latest one again, so a run id alone does not name a result, and the
 // service lists runs by when they were created, not by when a result
-// arrived. Coverage is therefore kept as three bounded things:
+// arrived. Coverage is therefore kept as a few bounded things:
 //
 //   - at: every result that ended before it is covered, except those of
 //     pending runs;
 //   - frontier: the results that ended exactly at it and are covered, by
-//     run and attempt, so two results with one timestamp are told apart;
-//   - pending: the runs that were unfinished when at last moved. Their
-//     result may be reported late with an end time before at, so they stay
-//     owed, whatever their time, until a review is shown them.
+//     run and execution, so two results with one timestamp are told apart;
+//   - floor: only when more results share that one instant than the
+//     frontier may hold. Every result at it whose key is not after floor is
+//     covered. Results are shown in key order, so this is exact for
+//     everything that had ended when it was set;
+//   - pending: runs that were unfinished when at last moved. Their result
+//     may be reported late with an end time before at, so they stay owed,
+//     whatever their time, until a review is shown them.
 //
 // It relies on one thing the service does not guarantee by itself: a run
 // that starts after a checkpoint ends after that checkpoint's at. A job's
 // runs are on one machine and their times come from its clock, so this
 // holds unless that clock is set back between two runs.
+//
+// Nothing a job's history contains makes it unreviewable for good. Too many
+// results in one instant fold into floor. Too many queued runs are tracked
+// oldest first, which are the next to start, and the rest fall under the
+// assumption above. Only more runs actually executing at once than can be
+// tracked stops reviews, visibly and for as long as that lasts.
 type coverage struct {
 	at       time.Time
+	floor    string
 	frontier map[string]bool
 	pending  map[string]bool
 	// legacy is a run id, from a cursor written before coverage carried
-	// attempts: everything up to that run's place is covered.
+	// executions: everything up to that run's place is covered.
 	legacy string
 }
 
 const (
 	coverageVersion = "v2"
-	// maxCoverageSet bounds the frontier and the pending set. A job with
-	// more results in one instant, or more unfinished runs, than this is
-	// not reviewed until that is no longer so; nothing is dropped to fit.
+	// maxCoverageSet bounds the frontier and the pending set.
 	maxCoverageSet = 512
 )
 
-// runPoint is one result: the latest attempt of a run and when it ended.
+// runPoint is one result: the latest execution of a run and when it ended.
 type runPoint struct {
-	runID     string
-	attemptID string
+	runID string
+	// execution is the reference of the run's latest execution; empty when
+	// the service does not identify it.
+	execution string
 	at        time.Time
 }
 
 func (p runPoint) key() string {
-	return p.runID + "@" + p.attemptID
+	return p.runID + "@" + p.execution
 }
 
-// before orders results by end time, then run, then attempt.
+// before orders results by end time and then by key. The key order is the
+// one floor is compared in.
 func (p runPoint) before(q runPoint) bool {
 	if !p.at.Equal(q.at) {
 		return p.at.Before(q.at)
 	}
-	if p.runID != q.runID {
-		return p.runID < q.runID
-	}
-	return p.attemptID < q.attemptID
+	return p.key() < q.key()
+}
+
+func newCoverage() coverage {
+	return coverage{frontier: map[string]bool{}, pending: map[string]bool{}}
 }
 
 func parseCoverage(cursor string) (coverage, error) {
-	c := coverage{frontier: map[string]bool{}, pending: map[string]bool{}}
+	c := newCoverage()
 	if cursor == "" {
 		return c, nil
 	}
@@ -82,7 +97,7 @@ func parseCoverage(cursor string) (coverage, error) {
 		c.legacy = cursor
 		return c, nil
 	}
-	if len(parts) != 4 {
+	if len(parts) != 5 {
 		return c, fmt.Errorf("run cursor %q is not understood", cursor)
 	}
 	if parts[1] != "" {
@@ -92,12 +107,13 @@ func parseCoverage(cursor string) (coverage, error) {
 		}
 		c.at = at
 	}
-	for key := range strings.SplitSeq(parts[2], ",") {
+	c.floor = parts[2]
+	for key := range strings.SplitSeq(parts[3], ",") {
 		if key != "" {
 			c.frontier[key] = true
 		}
 	}
-	for id := range strings.SplitSeq(parts[3], ",") {
+	for id := range strings.SplitSeq(parts[4], ",") {
 		if id != "" {
 			c.pending[id] = true
 		}
@@ -110,7 +126,7 @@ func (c coverage) String() string {
 	if !c.at.IsZero() {
 		at = c.at.UTC().Format(time.RFC3339Nano)
 	}
-	return strings.Join([]string{coverageVersion, at, sortedKeys(c.frontier), sortedKeys(c.pending)}, "|")
+	return strings.Join([]string{coverageVersion, at, c.floor, sortedKeys(c.frontier), sortedKeys(c.pending)}, "|")
 }
 
 func sortedKeys(set map[string]bool) string {
@@ -124,15 +140,35 @@ func sortedKeys(set map[string]bool) string {
 
 // covered reports whether a review has already been shown this result.
 func (c coverage) covered(p runPoint) bool {
-	return c.frontier[p.key()] || (!c.pending[p.runID] && p.at.Before(c.at))
+	switch {
+	case c.frontier[p.key()]:
+		return true
+	case c.pending[p.runID]:
+		return false
+	case p.at.Before(c.at):
+		return true
+	}
+	return p.at.Equal(c.at) && c.floor != "" && p.key() <= c.floor
 }
 
-// after is the coverage once the given results have been shown as well.
-// unfinished are the runs the service lists as not finished now, and owed
-// the pending runs that have finished: an owed run that was not shown
+// inFlight is what the service lists as unfinished when a cursor is made.
+type inFlight struct {
+	// executing are the runs that have an execution under way.
+	executing []string
+	// queued are the runs waiting to start, oldest created last.
+	queued []string
+	// owed are runs whose result is known to be uncovered whatever its
+	// time: pending runs that have finished, and runs found changed while
+	// they were being listed or read.
+	owed []string
+}
+
+// after is the coverage once the given results, a prefix of the uncovered
+// ones in order, have been shown as well. An owed run that was not shown
 // stays pending.
-func (c coverage) after(shown []runPoint, unfinished, owed []string) (coverage, error) {
-	next := coverage{at: c.at, frontier: map[string]bool{}, pending: map[string]bool{}}
+func (c coverage) after(shown []runPoint, now inFlight) (coverage, error) {
+	next := newCoverage()
+	next.at = c.at
 	seen := map[string]bool{}
 	for _, p := range shown {
 		seen[p.runID] = true
@@ -141,25 +177,51 @@ func (c coverage) after(shown []runPoint, unfinished, owed []string) (coverage, 
 		}
 	}
 	if next.at.Equal(c.at) {
+		next.floor = c.floor
 		for key := range c.frontier {
 			next.frontier[key] = true
 		}
 	}
+	last := ""
 	for _, p := range shown {
 		if p.at.Equal(next.at) {
 			next.frontier[p.key()] = true
+			last = max(last, p.key())
 		}
 	}
-	for _, id := range unfinished {
-		next.pending[id] = true
+	if len(next.frontier) > maxCoverageSet && last != "" {
+		// More results share this instant than are kept one by one. They
+		// were shown in key order, so everything at it up to the last one
+		// shown is covered, and only what lies beyond stays by name.
+		next.floor = max(next.floor, last)
+		for key := range next.frontier {
+			if key <= next.floor {
+				delete(next.frontier, key)
+			}
+		}
 	}
-	for _, id := range owed {
+	if len(next.frontier) > maxCoverageSet {
+		return coverage{}, fmt.Errorf("%w: more than %d results at one instant were covered out of order", ErrRunsUntrackable, maxCoverageSet)
+	}
+	for _, id := range now.owed {
 		if !seen[id] {
 			next.pending[id] = true
 		}
 	}
-	if len(next.frontier) > maxCoverageSet || len(next.pending) > maxCoverageSet {
-		return coverage{}, fmt.Errorf("the job has more than %d results in one instant or unfinished runs; its runs cannot be tracked for review", maxCoverageSet)
+	for _, id := range now.executing {
+		next.pending[id] = true
+	}
+	if len(next.pending) > maxCoverageSet {
+		return coverage{}, fmt.Errorf("%w: more than %d of its runs are executing or owed a review at once", ErrRunsUntrackable, maxCoverageSet)
+	}
+	// Queued runs fill what room is left, oldest created first: those are
+	// the next to start. One left out is still queued, so it starts, and
+	// ends, after this cursor's time.
+	for _, id := range slices.Backward(now.queued) {
+		if len(next.pending) >= maxCoverageSet {
+			break
+		}
+		next.pending[id] = true
 	}
 	return next, nil
 }

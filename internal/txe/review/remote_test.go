@@ -220,7 +220,7 @@ func (c *runControl) LatestAttempt(ctx context.Context, job, runID string) (regi
 		return registry.RunAttempt{}, registry.ErrRunNotFound
 	}
 	return registry.RunAttempt{
-		AttemptID: state.AttemptID, SpecSHA256: c.spec, Status: state.Status,
+		AttemptID: state.AttemptID, QueuedAt: state.QueuedAt, SpecSHA256: c.spec, Status: state.Status,
 		Finished: !state.Active, Succeeded: state.Succeeded,
 	}, nil
 }
@@ -484,7 +484,8 @@ func newRunList(t *testing.T) *runList {
 	return l
 }
 
-// set replaces the listed runs; each is "id attempt status finishedAt".
+// set replaces the listed runs; each is "id attempt status finishedAt",
+// optionally followed by the time the attempt was queued.
 func (l *runList) set(runs ...string) {
 	items := make([]string, 0, len(runs))
 	for _, run := range runs {
@@ -493,8 +494,12 @@ func (l *runList) set(runs ...string) {
 		if len(f) > 3 {
 			finished = f[3]
 		}
-		items = append(items, fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"statusLabel":%q,"queuedAt":"2026-10-09T09:59:00Z","finishedAt":%q}`, f[0], f[1], f[2], finished))
-		l.stub.replies["/dag-runs/"+l.job+"/"+f[0]] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"statusLabel":%q,"nodes":[]}}`, f[1], f[2])
+		queued := "2026-10-09T09:59:00Z"
+		if len(f) > 4 {
+			queued = f[4]
+		}
+		items = append(items, fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"statusLabel":%q,"queuedAt":%q,"finishedAt":%q}`, f[0], f[1], f[2], queued, finished))
+		l.stub.replies["/dag-runs/"+l.job+"/"+f[0]] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"queuedAt":%q,"statusLabel":%q,"nodes":[]}}`, f[1], queued, f[2])
 	}
 	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[` + strings.Join(items, ",") + `]}`
 }
@@ -508,8 +513,12 @@ func (l *runList) page(next string, runs ...string) string {
 		if len(f) > 3 {
 			finished = f[3]
 		}
-		items = append(items, fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"statusLabel":%q,"queuedAt":"2026-10-09T09:59:00Z","finishedAt":%q}`, f[0], f[1], f[2], finished))
-		l.stub.replies["/dag-runs/"+l.job+"/"+f[0]] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"statusLabel":%q,"nodes":[]}}`, f[1], f[2])
+		queued := "2026-10-09T09:59:00Z"
+		if len(f) > 4 {
+			queued = f[4]
+		}
+		items = append(items, fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"statusLabel":%q,"queuedAt":%q,"finishedAt":%q}`, f[0], f[1], f[2], queued, finished))
+		l.stub.replies["/dag-runs/"+l.job+"/"+f[0]] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"queuedAt":%q,"statusLabel":%q,"nodes":[]}}`, f[1], queued, f[2])
 	}
 	cursor := ""
 	if next != "" {
@@ -556,6 +565,34 @@ func TestRemoteRunsAfterShowsARetriedRunAgain(t *testing.T) {
 	l.set("r1 a2 failed 2026-10-09T10:05:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
 	both, _ := l.after(onlyFirst)
 	assert.Equal(t, []string{"r2@b1", "r1@a2"}, both)
+}
+
+// On Dagu's queued path a retry re-runs the latest attempt under the same
+// attempt id, with a later queued time. That is another result of the run
+// and is shown again, even when it ends in the same second as the first.
+func TestRemoteRunsAfterShowsAnAttemptQueuedAgainAsANewResult(t *testing.T) {
+	l := newRunList(t)
+	l.set("r1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:00Z")
+	first, cursor := l.after("")
+	assert.Equal(t, []string{"r1@a1"}, first)
+	none, _ := l.after(cursor)
+	assert.Empty(t, none)
+
+	// Queued again: unfinished, so nothing yet.
+	l.set("r1 a1 queued - 2026-10-09T10:00:30Z")
+	none, _ = l.after(cursor)
+	assert.Empty(t, none)
+
+	// It ends, within the same second as its first execution.
+	l.set("r1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:30Z")
+	again, next := l.after(cursor)
+	assert.Equal(t, []string{"r1@a1"}, again, "the same attempt, queued again, is a new result")
+	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-10-09T10:00:30Z", runs[0].QueuedAt)
+	assert.Equal(t, review.ExecutionRef("a1", "2026-10-09T10:00:30Z"), runs[0].Execution().Ref())
+	none, _ = l.after(next)
+	assert.Empty(t, none, "and it is shown once")
 }
 
 // Two results with the same reported end time are told apart by run and
@@ -709,6 +746,92 @@ func TestRemoteRunsAfterNeverMixesTheEvidenceOfTwoAttempts(t *testing.T) {
 	l.set("r1 a2 failed 2026-10-09T10:01:30Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
 	owed, _ := l.after(cursor)
 	assert.Equal(t, []string{"r1@a2"}, owed)
+}
+
+// Nothing in a job's history may stop its reviews for good. Hundreds of
+// results in one instant, as when a whole queue is aborted at once, are
+// shown across reviews, each once, with a cursor that stays small.
+func TestRemoteRunsAfterIsNotBlockedByManyResultsInOneInstant(t *testing.T) {
+	l := newRunList(t)
+	var many []string
+	for i := range 700 {
+		many = append(many, fmt.Sprintf("m%04d a1 aborted 2026-10-09T11:00:00Z", i))
+	}
+	l.set(many...)
+	seen := map[string]bool{}
+	cursor := ""
+	for range 16 {
+		page, next := l.after(cursor)
+		for _, key := range page {
+			require.False(t, seen[key], "%s shown twice", key)
+			seen[key] = true
+		}
+		cursor = next
+	}
+	assert.Len(t, seen, 700, "every result is shown, none twice")
+	assert.Less(t, len(cursor), 4096, "the cursor does not hold them one by one")
+	none, _ := l.after(cursor)
+	assert.Empty(t, none)
+
+	// A result of a later instant is still told apart after that.
+	l.set(append(many, "z a1 failed 2026-10-09T11:00:01Z")...)
+	later, _ := l.after(cursor)
+	assert.Equal(t, []string{"z@a1"}, later)
+}
+
+// A long queue does not stop reviews either. Results are returned as usual,
+// and the runs remembered as unfinished are the oldest queued ones, which
+// are the next to start.
+func TestRemoteRunsAfterIsNotBlockedByALongQueue(t *testing.T) {
+	l := newRunList(t)
+	runs := []string{"done d1 failed 2026-10-09T10:01:00Z", "busy b1 running"}
+	// Newest created first, as the service lists them.
+	for i := 799; i >= 0; i-- {
+		runs = append(runs, fmt.Sprintf("q%04d a1 queued", i))
+	}
+	l.set(runs...)
+	shown, cursor := l.after("")
+	assert.Equal(t, []string{"done@d1"}, shown)
+	parts := strings.Split(cursor, "|")
+	require.Len(t, parts, 5)
+	pending := strings.Split(parts[4], ",")
+	assert.Len(t, pending, 512, "the remembered runs are bounded")
+	assert.Contains(t, pending, "busy", "a run that is executing is always remembered")
+	assert.Contains(t, pending, "q0000", "the oldest queued runs are kept")
+	assert.NotContains(t, pending, "q0799", "the newest queued runs are the ones left out")
+}
+
+// More runs executing at once than can be tracked is the one case that
+// stops a job's reviews. It is a typed refusal, which the reviewer raises
+// as an exception and defers, not a failing step.
+func TestRemoteRunsAfterRefusesOnlyWhatCannotBeTracked(t *testing.T) {
+	l := newRunList(t)
+	runs := []string{"done d1 failed 2026-10-09T10:01:00Z"}
+	for i := range 600 {
+		runs = append(runs, fmt.Sprintf("x%04d a1 running", i))
+	}
+	l.set(runs...)
+	_, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	require.ErrorIs(t, err, review.ErrRunsUntrackable)
+}
+
+// A history that changes too much between the two passes of a listing gives
+// no results this time and leaves the cursor alone. It is not an error.
+func TestRemoteRunsAfterWaitsOutAHistoryThatChurnsWhileListed(t *testing.T) {
+	l := newRunList(t)
+	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
+	var churn []string
+	for i := range 600 {
+		churn = append(churn, fmt.Sprintf("c%04d a1 failed 2026-10-09T10:00:30Z", i))
+	}
+	y := "y y1 succeeded 2026-10-09T10:20:00Z"
+	l.stub.seq = map[string][]string{
+		first: {l.page("p2"), l.page("p2", churn...)},
+		p2:    {l.page("", y), l.page("", y)},
+	}
+	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	require.NoError(t, err)
+	assert.Empty(t, runs)
 }
 
 // A run that ended in the queue has no finish time and is still a result.
@@ -932,7 +1055,7 @@ func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
 	}
 	require.NotEmpty(t, retry.ID)
 	assert.Equal(t, map[string]string{
-		"run_id": "run-1", "attempt_id": "att-1", "run_spec_sha256": job.DAGSpecSHA256, "package_digest": job.PackageDigest,
+		"run_id": "run-1", "attempt_id": "att-1", "queued_at": "", "run_spec_sha256": job.DAGSpecSHA256, "package_digest": job.PackageDigest,
 	}, retry.Params)
 	stored := f.job().Proposals[retry.ID]
 	require.NotNil(t, stored)
@@ -963,7 +1086,7 @@ func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out.Skipped)
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
-	assert.Equal(t, "att-2", out.Action.Receipt, "the receipt is the observed new attempt")
+	assert.Equal(t, review.ExecutionRef("att-2", ""), out.Action.Receipt, "the receipt is the observed new execution")
 	assert.Equal(t, []string{"run-1"}, service.retried)
 
 	out, err = exec.Execute(ctx, f.jobID, retry.ID, decisionID)
@@ -1016,7 +1139,7 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	assert.Empty(t, done[0].Error)
 	assert.Empty(t, done[0].Executed.Skipped)
 	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
-	assert.Equal(t, "att-2", done[0].Executed.Action.Receipt, "the receipt is the new attempt observed on the run")
+	assert.Equal(t, review.ExecutionRef("att-2", ""), done[0].Executed.Action.Receipt, "the receipt is the new execution observed on the run")
 	assert.Equal(t, []string{"run-7"}, service.retried)
 
 	again, err := f.retrying("tick-2", service).RunRequestedRetries(ctx, f.remote.MachineID)
@@ -1049,7 +1172,7 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	require.Len(t, done, 1)
 	assert.Equal(t, laterDecision.DecisionID, done[0].DecisionID)
 	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
-	assert.Equal(t, "att-3", done[0].Executed.Action.Receipt)
+	assert.Equal(t, review.ExecutionRef("att-3", ""), done[0].Executed.Action.Receipt)
 	assert.Len(t, service.retried, 2, "one retry per decided attempt")
 
 	// The old decision, replayed against the executor, does nothing.
@@ -1118,7 +1241,7 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	require.NoError(t, err)
 	require.Len(t, actions, 1)
 	assert.Equal(t, review.ActionSucceeded, actions[0].State)
-	assert.Equal(t, "att-2", actions[0].Receipt)
+	assert.Equal(t, review.ExecutionRef("att-2", ""), actions[0].Receipt)
 	assert.Len(t, service.retried, 1, "settled from the run, never by dispatching again")
 }
 
@@ -1190,6 +1313,39 @@ func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
 	third := round("reviewer-e", notify)
 	assert.Empty(t, third.Executed)
 	assert.Equal(t, 2, f.fx.count("notify"))
+}
+
+// A job whose runs cannot be tracked is not left failing in a step log. It
+// is raised as an exception on the job's reviewer, deferred by one cadence
+// and released, so the owner sees it and other jobs are not held up.
+func TestRemoteUntrackableRunsBecomeAnExceptionNotAFailingStep(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	r := f.reviewer("reviewer-a")
+	r.Registry = untrackable{f.remote}
+	prepared, err := r.Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipUnreviewable, prepared.Skipped)
+
+	job := f.job()
+	raised := false
+	for _, e := range job.Exceptions {
+		raised = raised || e.Kind == string(review.ExceptionRunsUntrackable)
+	}
+	assert.True(t, raised)
+	assert.Equal(t, registry.ClaimReleased, job.Claim.State)
+	require.NotNil(t, job.Checkpoint.NextReviewAt)
+	assert.True(t, job.Checkpoint.NextReviewAt.After(time.Now().Add(30*time.Minute)), "deferred by the job's cadence")
+	assert.Equal(t, 0, job.Checkpoint.Version, "nothing was covered")
+}
+
+// untrackable is a registry whose run history cannot be tracked.
+type untrackable struct {
+	review.Registry
+}
+
+func (u untrackable) RunsAfter(context.Context, string, string) ([]review.RunEvidence, error) {
+	return nil, fmt.Errorf("%w: more than 512 runs are executing at once", review.ErrRunsUntrackable)
 }
 
 // A reviewer that cannot run is the reviewer's problem. The registry keeps

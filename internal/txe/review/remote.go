@@ -342,6 +342,11 @@ var terminalRunStatuses = map[api.StatusLabel]bool{
 	api.StatusLabelPartiallySucceeded: true, api.StatusLabelRejected: true,
 }
 
+// queuedRunStatuses are the run states with no execution under way yet.
+var queuedRunStatuses = map[api.StatusLabel]bool{
+	api.StatusLabelQueued: true, api.StatusLabelNotStarted: true,
+}
+
 const runPageLimit = 100
 
 // walkRuns visits every run the service lists for the job, newest created
@@ -403,11 +408,20 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 	todo := uncovered{limit: maxPacketRuns + 1}
 	byKey := map[string]runSummary{}
 	owed := map[string]bool{}
-	var unfinished []string
+	var executing, queued []string
 	note := func(run runSummary) (runPoint, bool, error) {
-		if !terminalRunStatuses[run.StatusLabel] {
-			if unfinished = append(unfinished, run.DagRunID); len(unfinished) > maxCoverageSet {
-				return runPoint{}, false, fmt.Errorf("job %s has more than %d unfinished runs; its runs cannot be tracked for review", jobID, maxCoverageSet)
+		switch {
+		case queuedRunStatuses[run.StatusLabel]:
+			// The listing is newest created first, so the oldest queued
+			// runs, the next to start, are the last ones seen. Only as
+			// many as can be tracked are kept.
+			if queued = append(queued, run.DagRunID); len(queued) > 2*maxCoverageSet {
+				queued = append(queued[:0], queued[len(queued)-maxCoverageSet:]...)
+			}
+			return runPoint{}, false, nil
+		case !terminalRunStatuses[run.StatusLabel]:
+			if executing = append(executing, run.DagRunID); len(executing) > maxCoverageSet {
+				return runPoint{}, false, fmt.Errorf("%w: more than %d runs of job %s are executing at once", ErrRunsUntrackable, maxCoverageSet, jobID)
 			}
 			return runPoint{}, false, nil
 		}
@@ -447,8 +461,9 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 	}
 	if pages > 1 {
 		last := points[len(points)-1]
-		unfinished = unfinished[:0]
+		executing, queued = executing[:0], queued[:0]
 		stable := map[string]bool{}
+		churned := false
 		_, err := r.walkRuns(ctx, jobID, func(run runSummary) error {
 			point, show, err := note(run)
 			if err != nil || !show || last.before(point) {
@@ -463,12 +478,18 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 			// New or changed since the first pass, and ending no later
 			// than a result about to be returned: owed, not passed over.
 			if owed[run.DagRunID] = true; len(owed) > maxCoverageSet {
-				return fmt.Errorf("job %s changed too much while its runs were listed; its runs cannot be tracked for review now", jobID)
+				churned = true
 			}
 			return nil
 		})
 		if err != nil {
 			return nil, err
+		}
+		if churned {
+			// The history changed too much between the two passes to say
+			// what is safe to cover. Nothing is returned and the cursor
+			// stays where it is; the next review lists it again.
+			return nil, nil
 		}
 		kept := points[:0]
 		for _, p := range points {
@@ -497,12 +518,12 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 		shown = append(shown, p)
 		out = append(out, ev)
 	}
-	owedIDs := make([]string, 0, len(owed))
+	now := inFlight{executing: executing, queued: queued, owed: make([]string, 0, len(owed))}
 	for id := range owed {
-		owedIDs = append(owedIDs, id)
+		now.owed = append(now.owed, id)
 	}
 	for i := range out {
-		next, err := covered.after(shown[:i+1], unfinished, owedIDs)
+		next, err := covered.after(shown[:i+1], now)
 		if err != nil {
 			return nil, err
 		}
@@ -514,7 +535,7 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 // runEvidence reads one result's evidence. same is false when the run's
 // latest attempt is no longer the listed one once everything was read.
 func (r *Remote) runEvidence(ctx context.Context, jobID string, run runSummary) (ev RunEvidence, same bool, err error) {
-	ev = RunEvidence{RunID: run.DagRunID, Status: string(run.StatusLabel), AttemptID: run.AttemptID}
+	ev = RunEvidence{RunID: run.DagRunID, Status: string(run.StatusLabel), AttemptID: run.AttemptID, QueuedAt: run.QueuedAt}
 	ev.StartedAt, _ = time.Parse(time.RFC3339, run.StartedAt)
 	ev.FinishedAt, _ = time.Parse(time.RFC3339, run.FinishedAt)
 	base := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(run.DagRunID)
@@ -541,7 +562,7 @@ func (r *Remote) runEvidence(ctx context.Context, jobID string, run runSummary) 
 		return ev, false, fmt.Errorf("run %s after reading its evidence: %w", run.DagRunID, err)
 	}
 	now := after.DagRunDetails
-	return ev, now.AttemptID == run.AttemptID && now.StatusLabel == run.StatusLabel, nil
+	return ev, now.AttemptID == run.AttemptID && now.QueuedAt == run.QueuedAt && now.StatusLabel == run.StatusLabel, nil
 }
 
 // runSpecDigest is the digest of the DAG snapshot a run ran, computed the
@@ -836,16 +857,16 @@ func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error
 // reviewDetail is what the reviewer keeps in a review record's free-form
 // detail: the parts of a review the registry has no typed field for.
 type reviewDetail struct {
-	Episode          int       `json:"episode"`
-	CoveredRuns      []string  `json:"covered_run_ids"`
-	CoveredDecisions []string  `json:"covered_decision_ids"`
-	ActionIDs        []string  `json:"action_ids,omitempty"`
-	ProposalIDs      []string  `json:"proposal_ids,omitempty"`
-	Notes            []string  `json:"notes,omitempty"`
-	Reviewer         string    `json:"reviewer"`
-	Handoff          LocalFile `json:"handoff,omitzero"`
-	RunCursor        string    `json:"run_cursor,omitempty"`
-	CoveredAttempts  []string  `json:"covered_attempts,omitempty"`
+	Episode           int       `json:"episode"`
+	CoveredRuns       []string  `json:"covered_run_ids"`
+	CoveredDecisions  []string  `json:"covered_decision_ids"`
+	ActionIDs         []string  `json:"action_ids,omitempty"`
+	ProposalIDs       []string  `json:"proposal_ids,omitempty"`
+	Notes             []string  `json:"notes,omitempty"`
+	Reviewer          string    `json:"reviewer"`
+	Handoff           LocalFile `json:"handoff,omitzero"`
+	RunCursor         string    `json:"run_cursor,omitempty"`
+	CoveredExecutions []string  `json:"covered_executions,omitempty"`
 }
 
 // Review implements Registry.
@@ -866,7 +887,7 @@ func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, er
 		Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: int(deref(rev.PacketBytes)),
 		AgentInputTokens: int(deref(rev.AgentInputTokens)), AgentOutputTokens: int(deref(rev.AgentOutputTokens)),
 		PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
-		Handoff: detail.Handoff, RunCursor: detail.RunCursor, CoveredAttempts: detail.CoveredAttempts,
+		Handoff: detail.Handoff, RunCursor: detail.RunCursor, CoveredExecutions: detail.CoveredExecutions,
 	}, nil
 }
 
@@ -1074,7 +1095,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 	detail := reviewDetail{
 		Episode: rev.Episode, CoveredRuns: rev.CoveredRuns, CoveredDecisions: rev.CoveredDecisions,
 		ActionIDs: rev.ActionIDs, ProposalIDs: rev.ProposalIDs, Notes: rev.Notes, Reviewer: rev.Reviewer,
-		Handoff: rev.Handoff, RunCursor: rev.RunCursor, CoveredAttempts: rev.CoveredAttempts,
+		Handoff: rev.Handoff, RunCursor: rev.RunCursor, CoveredExecutions: rev.CoveredExecutions,
 	}
 	body := api.TxeReviewRequest{
 		Actor: r.actor(), ClaimId: claim.ID, Fence: int64(claim.Fence),
@@ -1250,13 +1271,22 @@ type runSummary struct {
 	FinishedAt  string          `json:"finishedAt"`
 }
 
-// point is the run's latest attempt as a result to cover. A run that ended
+// execution is the reference of the run's latest execution, or empty when
+// the service does not identify it.
+func (s runSummary) execution() string {
+	if s.AttemptID == "" {
+		return ""
+	}
+	return ExecutionRef(s.AttemptID, s.QueuedAt)
+}
+
+// point is the run's latest execution as a result to cover. A run that ended
 // before it started, such as one refused or aborted in the queue, has no
 // finish time, so the latest time the service has for it stands in.
 func (s runSummary) point() (runPoint, error) {
 	for _, raw := range []string{s.FinishedAt, s.StartedAt, s.QueuedAt} {
 		if t, err := time.Parse(time.RFC3339, raw); err == nil && !t.IsZero() {
-			return runPoint{runID: s.DagRunID, attemptID: s.AttemptID, at: t}, nil
+			return runPoint{runID: s.DagRunID, execution: s.execution(), at: t}, nil
 		}
 	}
 	return runPoint{}, fmt.Errorf("run %s is %s but the service gives it no time to order it by", s.DagRunID, s.StatusLabel)
@@ -1267,7 +1297,7 @@ func (s runSummary) point() (runPoint, error) {
 // longer has covers nothing, so every result is shown again rather than
 // any being passed over.
 func (r *Remote) legacyCoverage(ctx context.Context, jobID, runID string) (coverage, error) {
-	c := coverage{frontier: map[string]bool{}, pending: map[string]bool{}}
+	c := newCoverage()
 	var out struct {
 		DagRunDetails runSummary `json:"dagRunDetails"`
 	}
@@ -1294,7 +1324,7 @@ func (r *Remote) legacyCoverage(ctx context.Context, jobID, runID string) (cover
 
 func (s runSummary) state() RunState {
 	return RunState{
-		AttemptID: s.AttemptID, Status: string(s.StatusLabel),
+		AttemptID: s.AttemptID, QueuedAt: s.QueuedAt, Status: string(s.StatusLabel),
 		Active:    !terminalRunStatuses[s.StatusLabel],
 		Succeeded: s.StatusLabel == api.StatusLabelSucceeded,
 	}

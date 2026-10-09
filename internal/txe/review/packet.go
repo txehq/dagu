@@ -44,10 +44,6 @@ type Packet struct {
 	Job           Job       `json:"job"`
 	// NewRuns are the job's results since the last checkpoint.
 	NewRuns []RunEvidence `json:"new_runs"`
-	// RunCursor is where the checkpoint moves to once this packet's runs
-	// are covered. It is bookkeeping for the reviewer's own steps, opaque
-	// to the agent.
-	RunCursor string `json:"run_cursor,omitempty"`
 	// HumanFeedback are decisions made since the last checkpoint. Their
 	// instructions are guidance; they never widen the job's declared actions.
 	HumanFeedback []Decision `json:"human_feedback"`
@@ -103,13 +99,13 @@ func (p Packet) artifactRefs(runIDs []string) []string {
 	return refs
 }
 
-// coveredAttempts names the packet's runs with the attempt of each that it
-// shows.
-func (p Packet) coveredAttempts() []string {
+// coveredExecutions names the packet's runs with the execution of each
+// that it shows.
+func (p Packet) coveredExecutions() []string {
 	var out []string
 	for _, r := range p.NewRuns {
-		if r.AttemptID != "" {
-			out = append(out, r.RunID+"@"+r.AttemptID)
+		if e := r.Execution(); e.known() {
+			out = append(out, r.RunID+"@"+e.Ref())
 		}
 	}
 	return out
@@ -195,7 +191,6 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 	if p.RecentActions == nil {
 		p.RecentActions = []Action{}
 	}
-	p.setRunCursor()
 	p.trim()
 	// A packet that still does not fit is not sent at all. Its size comes
 	// from what the job itself registered or from one enormous record, and
@@ -226,24 +221,25 @@ func truncateOutputs(outputs map[string]string) map[string]string {
 // was shown in full and the rest are reviewed in the next episode. Only when
 // a single run is itself too large is its step output shortened, and the
 // packet then says so.
-// setRunCursor sets the cursor that covers the packet's runs and nothing
-// after them.
-func (p *Packet) setRunCursor() {
-	p.RunCursor = ""
-	if n := len(p.NewRuns); n > 0 {
-		last := p.NewRuns[n-1]
-		if p.RunCursor = last.Cursor; p.RunCursor == "" {
-			p.RunCursor = last.RunID
-		}
+// runCursor is the cursor that covers the packet's runs and nothing after
+// them, or empty when the packet shows no new run. It is read while the
+// runs still carry the cursors the registry adapter gave them, before the
+// packet is handed on.
+func (p Packet) runCursor() string {
+	n := len(p.NewRuns)
+	if n == 0 {
+		return ""
 	}
+	if last := p.NewRuns[n-1]; last.Cursor != "" {
+		return last.Cursor
+	}
+	return p.NewRuns[n-1].RunID
 }
 
 func (p *Packet) trim() {
 	for p.size() > maxPacketBytes && len(p.NewRuns) > 1 {
 		p.NewRuns = p.NewRuns[:len(p.NewRuns)-1]
 		p.MoreRunsPending = true
-		// The cursor covers exactly the runs that are left.
-		p.setRunCursor()
 	}
 	for limit := stepTailFloor * 8; p.size() > maxPacketBytes && limit >= stepTailFloor; limit /= 2 {
 		p.EvidenceTrimmed = true

@@ -148,12 +148,29 @@ func (r *runs) fail(runID, attemptID string) {
 	r.state[runID] = review.RunState{AttemptID: attemptID, Status: "failed"}
 }
 
-// start begins the run's next attempt, as a native retry does.
+// start begins the run's next attempt, as a native retry on Dagu's direct
+// path does.
 func (r *runs) start(runID string) string {
 	r.seq++
 	id := fmt.Sprintf("att-%d", r.seq)
 	r.state[runID] = review.RunState{AttemptID: id, Status: "running", Active: true}
 	return id
+}
+
+// requeue queues the run's latest attempt again under the same attempt id,
+// as a native retry on Dagu's queued path does: only the queued time moves.
+func (r *runs) requeue(runID string) review.Execution {
+	r.seq++
+	state := r.state[runID]
+	state.QueuedAt = fmt.Sprintf("2026-10-09T10:00:%02dZ", r.seq)
+	state.Status, state.Active, state.Succeeded = "queued", true, false
+	r.state[runID] = state
+	return state.Execution()
+}
+
+// ref is the reference of the run's latest execution.
+func (r *runs) ref(runID string) string {
+	return r.state[runID].Execution().Ref()
 }
 
 func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, error) {

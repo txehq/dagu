@@ -103,6 +103,10 @@ type Prepared struct {
 	Skipped SkipReason `json:"skipped,omitempty"`
 	Claim   Claim      `json:"claim,omitzero"`
 	Packet  Packet     `json:"packet,omitzero"`
+	// RunCursor is where the checkpoint moves to once the packet's runs
+	// are covered: exactly those runs and nothing after them. It is the
+	// reviewer's own bookkeeping and is not part of what the agent is shown.
+	RunCursor string `json:"run_cursor,omitempty"`
 }
 
 // Prepare claims the job, settles effects left open by earlier claims, and
@@ -127,7 +131,7 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	}
 
 	packet, err := r.prepareClaimed(ctx, claim, job)
-	if errors.Is(err, ErrPacketTooLarge) {
+	if errors.Is(err, ErrPacketTooLarge) || errors.Is(err, ErrRunsUntrackable) {
 		// A job that cannot be reviewed must not simply go quiet. It is
 		// raised as an exception and deferred, and it stays unreviewed and
 		// visible until its context is fixed.
@@ -139,7 +143,7 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, err
 	}
-	return Prepared{Claim: claim, Packet: packet}, nil
+	return Prepared{Claim: claim, Packet: packet, RunCursor: packet.runCursor()}, nil
 }
 
 const (
@@ -318,8 +322,12 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 
 // unreviewable records that a job cannot be reviewed as it is registered.
 func (r *Reviewer) unreviewable(ctx context.Context, claim Claim, job Job, cause error) (Prepared, error) {
+	kind := ExceptionContextTooLarge
+	if errors.Is(cause, ErrRunsUntrackable) {
+		kind = ExceptionRunsUntrackable
+	}
 	err := r.Registry.RaiseException(ctx, Exception{
-		JobID: job.ID, Kind: ExceptionContextTooLarge, MachineID: job.MachineID,
+		JobID: job.ID, Kind: kind, MachineID: job.MachineID,
 		Message: "the job is not being reviewed: " + cause.Error(),
 	})
 	if err != nil {
@@ -575,8 +583,8 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		Reasoning:         decision.Reasoning,
 		EvidenceRuns:      decision.EvidenceRunIDs,
 		CoveredRuns:       packet.RunIDs(),
-		CoveredAttempts:   packet.coveredAttempts(),
-		RunCursor:         packet.RunCursor,
+		CoveredExecutions: packet.coveredExecutions(),
+		RunCursor:         prepared.RunCursor,
 		CoveredDecisions:  packet.DecisionIDs(),
 		Handoff:           r.Handoff,
 		PacketArtifact:    r.PacketArtifact,
@@ -675,9 +683,9 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		if len(requested.Params) != 1 || !shown {
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q): %s", runID, requested.Reason))
 		}
-		if run.AttemptID == "" {
-			// Without the service's id of the failed attempt there is
-			// nothing to bind one retry to.
+		if !run.Execution().known() {
+			// Without the service's identity of the failed execution there
+			// is nothing to bind one retry to.
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, whose attempt the service does not identify, so it cannot be retried from here: %s", runID, requested.Reason))
 		}
 		if run.SpecSHA256 == "" || run.SpecSHA256 != job.DAGSpecSHA256 {
@@ -685,11 +693,11 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 			// or the old. The owner still sees what the reviewer wanted.
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which did not run the job's current version %d and cannot be retried: %s", runID, job.Version, requested.Reason))
 		}
-		// The proposal is bound to the failed attempt the reviewer was
+		// The proposal is bound to the failed execution the reviewer was
 		// shown, the snapshot it ran and the package of that version; the
 		// agent chooses none of them.
 		requested.Params = map[string]string{
-			RetryRunParam: runID, RetryRunAttemptParam: run.AttemptID,
+			RetryRunParam: runID, RetryRunAttemptParam: run.AttemptID, RetryRunQueuedParam: run.QueuedAt,
 			RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
 		}
 		requested.TargetID = ""
@@ -895,9 +903,11 @@ var retryRunDeclaration = DeclaredAction{Name: RetryRunAction, Idempotency: Idem
 
 // RunState is what the service reports about one run of a job.
 type RunState struct {
-	// AttemptID is the service's own id of the run's latest attempt. A
-	// native retry keeps the run id and starts a new attempt with a new id.
+	// AttemptID and QueuedAt identify the run's latest execution. A native
+	// retry keeps the run id and either starts a new attempt or queues the
+	// latest one again; one of the two always changes.
 	AttemptID string `json:"attempt_id"`
+	QueuedAt  string `json:"queued_at,omitempty"`
 	// Status is the service's status label of that attempt.
 	Status string `json:"status"`
 	// Active means the attempt is queued, running or waiting. Succeeded
@@ -907,10 +917,26 @@ type RunState struct {
 	Succeeded bool `json:"succeeded,omitempty"`
 }
 
-// retryable reports whether the run's latest attempt is the given one and
-// has finished unsuccessfully.
-func (s RunState) retryable(attemptID string) bool {
-	return attemptID != "" && s.AttemptID == attemptID && !s.Active && !s.Succeeded
+// Execution is the run's latest execution.
+func (s RunState) Execution() Execution {
+	return Execution{AttemptID: s.AttemptID, QueuedAt: s.QueuedAt}
+}
+
+// retryable reports whether the run's latest execution is the given one
+// and has finished unsuccessfully.
+func (s RunState) retryable(e Execution) bool {
+	return e.known() && s.Execution() == e && !s.Active && !s.Succeeded
+}
+
+// retriedExecution is the execution a retry decision is about. It is
+// complete only when the decision names both parts: an attempt, and that
+// attempt's queued time, which may be empty for an attempt that was never
+// queued but may not be left out. A decision that names less is never
+// completed from whatever the run's latest execution happens to be.
+func retriedExecution(params map[string]string) (e Execution, complete bool) {
+	queuedAt, named := params[RetryRunQueuedParam]
+	e = Execution{AttemptID: params[RetryRunAttemptParam], QueuedAt: queuedAt}
+	return e, e.known() && named
 }
 
 // ErrRunNotRetryable is returned by RunRetrier.RetryRun when the service
@@ -946,9 +972,10 @@ const (
 // receipt. A dispatch whose outcome was not observed is unknown; it is
 // never reported from the service's acceptance alone, and never repeated.
 func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectResult {
-	runID, bound := action.Params[RetryRunParam], action.Params[RetryRunAttemptParam]
-	if bound == "" {
-		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision names no attempt of run " + runID}
+	runID := action.Params[RetryRunParam]
+	bound, complete := retriedExecution(action.Params)
+	if !complete {
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision does not name the attempt and queued time of the execution of run " + runID + " it is about"}
 	}
 	var before RunState
 	var err error
@@ -962,7 +989,7 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 	}
 	if !before.retryable(bound) {
 		return EffectResult{Status: EffectNotApplied, Detail: fmt.Sprintf(
-			"not dispatched: the decision is about attempt %s of run %s, and the run is now at attempt %s (%s)", bound, runID, before.AttemptID, before.Status)}
+			"not dispatched: the decision is about execution %s of run %s, and the run is now at %s (%s)", bound.Ref(), runID, before.Execution().Ref(), before.Status)}
 	}
 	if err := r.Runs.RetryRun(ctx, job.ID, runID); err != nil {
 		if errors.Is(err, ErrRunNotRetryable) {
@@ -982,22 +1009,22 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		return res
 	}
 	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf(
-		"the service accepted a retry of run %s but no attempt after %s was observed", runID, bound)}
+		"the service accepted a retry of run %s but no execution after %s was observed", runID, bound.Ref())}
 }
 
-// observeRetry reads the run until an attempt other than the bound one is
+// observeRetry reads the run until an execution other than the bound one is
 // seen or the time is up. With no time to watch it reads once. The wait is
 // real time: it is spent waiting for the service, not measured against the
 // registry's clock.
-func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID, bound string, watch time.Duration) (EffectResult, bool) {
+func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound Execution, watch time.Duration) (EffectResult, bool) {
 	until := time.Now().Add(watch)
 	for {
 		state, err := r.Runs.RunState(ctx, jobID, runID)
-		if err == nil && state.AttemptID != "" && state.AttemptID != bound {
+		if now := state.Execution(); err == nil && now.known() && now != bound {
 			return EffectResult{
 				Status:  EffectApplied,
-				Receipt: state.AttemptID,
-				Detail:  fmt.Sprintf("run %s was retried as attempt %s, which was %s when observed", runID, state.AttemptID, state.Status),
+				Receipt: now.Ref(),
+				Detail:  fmt.Sprintf("run %s was retried as execution %s (attempt %s), which was %s when observed", runID, now.Ref(), now.AttemptID, state.Status),
 			}, true
 		}
 		left := time.Until(until)
@@ -1017,14 +1044,15 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID, bound string,
 // same attempt still being the latest proves nothing: the dispatch may yet
 // land, so it stays unknown and is left to the owner.
 func (r *Reviewer) probeRetry(ctx context.Context, job Job, action Action) EffectResult {
-	runID, bound := action.Params[RetryRunParam], action.Params[RetryRunAttemptParam]
-	if r.Runs == nil || bound == "" {
+	runID := action.Params[RetryRunParam]
+	bound, complete := retriedExecution(action.Params)
+	if r.Runs == nil || !complete {
 		return EffectResult{Status: EffectUnknown, Detail: "the retry of run " + runID + " cannot be checked against the run"}
 	}
 	if res, ok := r.observeRetry(ctx, job.ID, runID, bound, 0); ok {
 		return res
 	}
-	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf("no attempt of run %s after %s has been observed", runID, bound)}
+	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf("no execution of run %s after %s has been observed", runID, bound.Ref())}
 }
 
 // leaseCovers reports whether the claim outlives one full attempt of the
@@ -1199,14 +1227,18 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 		// one attempt for a later try. If the run has moved on from the
 		// attempt the decision is about, the registry would refuse the
 		// grant, so none is asked for.
-		runID, bound := proposal.Params[RetryRunParam], proposal.Params[RetryRunAttemptParam]
+		runID := proposal.Params[RetryRunParam]
+		bound, complete := retriedExecution(proposal.Params)
+		if !complete {
+			return Executed{Skipped: "the decision does not name the attempt and queued time of the execution of run " + runID + " it is about: nothing is retried"}, nil
+		}
 		state, err := r.Runs.RunState(ctx, jobID, runID)
 		if err != nil {
 			return Executed{}, fmt.Errorf("read run %s: %w", runID, err)
 		}
 		if !state.retryable(bound) {
 			return Executed{Skipped: fmt.Sprintf(
-				"the decision is about attempt %s of run %s, and the run is now at attempt %s (%s): nothing is retried", bound, runID, state.AttemptID, state.Status)}, nil
+				"the decision is about execution %s of run %s, and the run is now at %s (%s): nothing is retried", bound.Ref(), runID, state.Execution().Ref(), state.Status)}, nil
 		}
 	}
 

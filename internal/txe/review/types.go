@@ -83,11 +83,13 @@ const (
 	// either is no longer the job's current one.
 	RetryRunSpecParam    = "run_spec_sha256"
 	RetryRunPackageParam = "package_digest"
-	// RetryRunAttemptParam is the service's id of the failed attempt being
-	// retried. A native retry keeps the run id and starts a new attempt, so
-	// this is what makes one retry decision mean one attempt: the retry is
-	// dispatched only while that attempt is still the run's latest.
+	// RetryRunAttemptParam and RetryRunQueuedParam name the failed
+	// execution being retried: its attempt and when that attempt was
+	// queued. A native retry keeps the run id, so this is what makes one
+	// retry decision mean one execution: the retry is dispatched only while
+	// that execution is still the run's latest.
 	RetryRunAttemptParam = "attempt_id"
+	RetryRunQueuedParam  = "queued_at"
 	// UncertainEffectAction is the reserved action name of a proposal that
 	// asks the owner about an effect whose outcome is unknown. It is not
 	// executable.
@@ -209,8 +211,10 @@ type RunEvidence struct {
 	JobVersion int    `json:"job_version"`
 	// SpecSHA256 is the digest of the DAG snapshot the run ran.
 	SpecSHA256 string `json:"spec_sha256,omitempty"`
-	// AttemptID is the service's id of the run's latest attempt.
+	// AttemptID and QueuedAt identify the run's latest execution, the one
+	// this evidence is of.
 	AttemptID string `json:"attempt_id,omitempty"`
+	QueuedAt  string `json:"queued_at,omitempty"`
 	// Cursor is the checkpoint's run cursor once this run, and every run
 	// listed before it, has been covered. The registry adapter sets it; a
 	// run without one is its own cursor.
@@ -223,6 +227,11 @@ type RunEvidence struct {
 	Error      string            `json:"error,omitempty"` // Steps carry the end of each step's own output, which is where a
 	// script's result usually is.
 	Steps []StepEvidence `json:"steps,omitempty"`
+}
+
+// Execution is the execution of the run this evidence is of.
+func (r RunEvidence) Execution() Execution {
+	return Execution{AttemptID: r.AttemptID, QueuedAt: r.QueuedAt}
 }
 
 // StepEvidence is one step of a finished run.
@@ -391,10 +400,10 @@ type Review struct {
 	// checkpoint advances over exactly these and nothing newer.
 	CoveredRuns      []string `json:"covered_run_ids"`
 	CoveredDecisions []string `json:"covered_decision_ids"`
-	// CoveredAttempts names each covered run with the attempt of it that
-	// was shown, as "run@attempt": a retried run keeps its id, so the id
-	// alone does not say which result a review saw.
-	CoveredAttempts []string `json:"covered_attempts,omitempty"`
+	// CoveredExecutions names each covered run with the execution of it
+	// that was shown, as "run@execution": a retried run keeps its id, so
+	// the id alone does not say which result a review saw.
+	CoveredExecutions []string `json:"covered_executions,omitempty"`
 	// RunCursor is the checkpoint's run cursor after this review.
 	RunCursor   string   `json:"run_cursor,omitempty"`
 	ActionIDs   []string `json:"action_ids,omitempty"`
@@ -430,6 +439,9 @@ const (
 	// ExceptionContextTooLarge means the job's context does not fit a review
 	// packet, so it is not being reviewed.
 	ExceptionContextTooLarge ExceptionKind = "review_context_too_large"
+	// ExceptionRunsUntrackable means the job has more runs in flight at
+	// once than a review can keep track of.
+	ExceptionRunsUntrackable ExceptionKind = "review_runs_untrackable"
 	// ExceptionCleanupFailed means a superseded proposal's decision run
 	// could not be closed after repeated attempts.
 	ExceptionCleanupFailed ExceptionKind = "decision_run_cleanup_failed"

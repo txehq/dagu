@@ -4,6 +4,8 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -75,4 +77,35 @@ func UncertainProposalID(actionID string, jobVersion int) string {
 // instead of opening a second task.
 func DecisionRunID(proposalID string) string {
 	return "txe-" + strings.ToLower(strings.TrimPrefix(proposalID, "prp_"))
+}
+
+// Execution identifies one execution of a run the way the service does: by
+// the attempt and by when that attempt was last queued. A retry keeps the
+// run id. Dagu either starts a new attempt for it, or queues the latest
+// attempt again under the same attempt id with a later queued time, so
+// neither part alone names an execution.
+type Execution struct {
+	AttemptID string `json:"attempt_id"`
+	// QueuedAt is the service's stored value, byte for byte; empty for an
+	// attempt that was never queued.
+	QueuedAt string `json:"queued_at,omitempty"`
+}
+
+// known reports whether the service identified the execution at all.
+func (e Execution) known() bool {
+	return e.AttemptID != ""
+}
+
+// Ref is the portable reference to the execution: the one form used in
+// records, receipts and cursors.
+func (e Execution) Ref() string {
+	return ExecutionRef(e.AttemptID, e.QueuedAt)
+}
+
+// ExecutionRef derives the reference of an execution exactly as the
+// registry does, so a receipt the reviewer records is the one the registry
+// observes.
+func ExecutionRef(attemptID, queuedAt string) string {
+	sum := sha256.Sum256([]byte(attemptID + "\n" + queuedAt))
+	return attemptID + "-" + hex.EncodeToString(sum[:8])
 }

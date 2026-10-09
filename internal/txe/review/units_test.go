@@ -749,9 +749,18 @@ func (f *retryFixture) executor(holder string) *review.Reviewer {
 
 func newRetryFixture(t *testing.T) *retryFixture {
 	t.Helper()
+	return newRetryFixtureQueuedAt(t, "")
+}
+
+// newRetryFixtureQueuedAt is newRetryFixture for a failed execution whose
+// attempt was queued at the given time.
+func newRetryFixtureQueuedAt(t *testing.T, queuedAt string) *retryFixture {
+	t.Helper()
 	f := &retryFixture{fixture: newFixture(t), runs: newRuns()}
-	f.addRun("run-1", "failed")
-	f.runs.fail("run-1", "att-1")
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{
+		RunID: "run-1", JobVersion: 1, Status: "failed", SpecSHA256: specDigest, AttemptID: "att-1", QueuedAt: queuedAt,
+	}))
+	f.runs.state["run-1"] = review.RunState{AttemptID: "att-1", QueuedAt: queuedAt, Status: "failed"}
 	_, err := f.executor("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
 		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
 		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"}},
@@ -804,8 +813,8 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	retry, question := proposals[0], proposals[1]
 	assert.Equal(t, review.ProposalAction, retry.Kind)
 	assert.Equal(t, map[string]string{
-		"run_id": "run-1", "attempt_id": "att-1", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
-	}, retry.Params, "the retry is bound to the failed attempt, the snapshot it ran and that version's package")
+		"run_id": "run-1", "attempt_id": "att-1", "queued_at": "", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
+	}, retry.Params, "the retry is bound to the failed execution, the snapshot it ran and that version's package")
 	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
 	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
 	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
@@ -825,7 +834,7 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out.Skipped)
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
-	assert.Equal(t, "att-2", out.Action.Receipt, "the receipt is the attempt that was observed to start")
+	assert.Equal(t, review.ExecutionRef("att-2", ""), out.Action.Receipt, "the receipt is the execution that was observed to start")
 	assert.Contains(t, out.Action.Detail, "running", "and says what that attempt was doing, not that the job succeeded")
 	assert.Equal(t, []string{"run-1"}, service.retried)
 
@@ -854,7 +863,7 @@ func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {
 			f := newRetryFixture(t)
 			move(f.runs)
 			out := f.execute("executor")
-			assert.Contains(t, out.Skipped, "att-1")
+			assert.Contains(t, out.Skipped, review.ExecutionRef("att-1", ""))
 			assert.Contains(t, out.Skipped, "nothing is retried")
 			assert.Empty(t, f.state().Actions[jobID], "no effect was granted or journaled")
 			assert.Empty(t, f.runs.retried, "the service was never asked")
@@ -863,6 +872,95 @@ func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {
 			assert.Empty(t, f.runs.retried)
 		})
 	}
+}
+
+// A retry decision names the whole execution it is about: the attempt and
+// that attempt's queued time. A decision that names less is not completed
+// from the run's latest execution, and a wrong part makes it stale. An
+// empty queued time is a real value, for an attempt that was never queued.
+func TestRetryRunNeedsTheWholeExecutionTheDecisionIsAbout(t *testing.T) {
+	queued := "2026-10-09T10:00:00Z"
+	for name, tc := range map[string]struct {
+		runQueuedAt string
+		params      func(map[string]string)
+	}{
+		"missing attempt": {params: func(p map[string]string) { delete(p, "attempt_id") }},
+		"missing queued time, though the run's is empty": {params: func(p map[string]string) { delete(p, "queued_at") }},
+		"missing queued time, and the run has one":       {runQueuedAt: queued, params: func(p map[string]string) { delete(p, "queued_at") }},
+		"attempt only, the rest missing": {params: func(p map[string]string) {
+			delete(p, "queued_at")
+			delete(p, "run_spec_sha256")
+		}},
+		"right attempt, empty queued time, but the run has one": {runQueuedAt: queued, params: func(p map[string]string) { p["queued_at"] = "" }},
+		"right attempt, another queued time":                    {runQueuedAt: queued, params: func(p map[string]string) { p["queued_at"] = "2026-10-09T09:00:00Z" }},
+		"right queued time, another attempt":                    {runQueuedAt: queued, params: func(p map[string]string) { p["attempt_id"], p["queued_at"] = "att-0", queued }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			state := f.runs.state["run-1"]
+			state.QueuedAt = tc.runQueuedAt
+			f.runs.state["run-1"] = state
+			// The decision as recorded names what this case says it names.
+			require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+				for i, p := range s.Proposals[jobID] {
+					if p.ID == f.proposal.ID {
+						tc.params(p.Params)
+						s.Proposals[jobID][i] = p
+					}
+				}
+				return nil
+			}))
+			out := f.execute("executor")
+			assert.Contains(t, out.Skipped, "nothing is retried")
+			assert.Empty(t, f.runs.retried, "nothing is dispatched for a decision that does not name the run's latest execution in full")
+			assert.Empty(t, f.state().Actions[jobID], "and nothing is granted")
+		})
+	}
+
+	// The whole tuple is honoured, with an empty queued time for an attempt
+	// that was never queued and with a real one for an attempt that was.
+	for name, queuedAt := range map[string]string{
+		"empty queued time for an attempt never queued": "",
+		"the whole execution with a queued time":        queued,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixtureQueuedAt(t, queuedAt)
+			assert.Equal(t, queuedAt, f.proposal.Params["queued_at"])
+			_, named := f.proposal.Params["queued_at"]
+			assert.True(t, named, "the queued time is always named, empty or not")
+			out := f.execute("executor")
+			require.Empty(t, out.Skipped)
+			assert.Equal(t, review.ActionSucceeded, out.Action.State)
+			assert.Len(t, f.runs.retried, 1)
+		})
+	}
+}
+
+// On Dagu's queued path a retry re-runs the latest attempt under the same
+// attempt id; only its queued time changes. That is a new execution: it is
+// observed and recorded as the retry's effect, and a decision about the
+// earlier execution of that attempt no longer applies to it.
+func TestRetryRunOnTheQueuedPathIsObservedByItsQueuedTime(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(runID string) error {
+		f.runs.requeue(runID)
+		return nil
+	}
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+	assert.NotEqual(t, review.ExecutionRef("att-1", ""), out.Action.Receipt, "the same attempt id, queued again, is another execution")
+	assert.Contains(t, out.Action.Detail, "queued", "the receipt describes what was observed, not a success")
+	assert.Equal(t, "att-1", f.runs.state["run-1"].AttemptID)
+
+	// A second decision that still names the first execution of att-1 is
+	// stale once the attempt has been queued again and failed again.
+	state := f.runs.state["run-1"]
+	state.Status, state.Active = "failed", false
+	f.runs.state["run-1"] = state
+	stale := f.execute("executor")
+	assert.NotEmpty(t, stale.Skipped)
+	assert.Len(t, f.runs.retried, 1)
 }
 
 // While the service cannot be read, nothing is granted or journaled, so the
@@ -981,7 +1079,7 @@ func TestRetryRunUnobservedIsSettledWhenTheNewAttemptAppears(t *testing.T) {
 	require.NoError(t, err)
 	action := f.state().Actions[jobID][0]
 	assert.Equal(t, review.ActionSucceeded, action.State)
-	assert.Equal(t, "att-2", action.Receipt)
+	assert.Equal(t, review.ExecutionRef("att-2", ""), action.Receipt)
 	assert.Contains(t, action.Detail, "failed", "the receipt says what the new attempt was, not that the job succeeded")
 	assert.Len(t, f.runs.retried, 1)
 }

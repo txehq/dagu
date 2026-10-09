@@ -68,11 +68,17 @@ else a review step needs must be rendered into the DAG:
   never retried: a declared `reconcile` probe settles it, or the owner
   answers its escalation. Until then the same action on the same target is
   not run again, and only the answer `retry` allows it, for one attempt.
-- Retrying a run: `dagu.retry_run` is bound to the DAG snapshot the run ran
-  and to the job's package. A run of an older version is never retried. A
-  retry the reviewer proposes runs from its decision run once the owner
-  answers `retry`; one the owner requests directly is already decided and
-  is run by the next tick. Either way it runs once.
+- Retrying a run: `dagu.retry_run` is bound to one failed execution of the
+  run (attempt id and queued time), the DAG snapshot it ran and the job's
+  package. A run of an older version is never retried, and nothing is
+  dispatched once the run has moved on from that execution. A retry the
+  reviewer proposes runs from its decision run once the owner answers
+  `retry`; one the owner requests directly is already decided and is run by
+  the next tick. Either way it is dispatched at most once, and it is
+  recorded as done only when another execution is seen on the run; the
+  receipt is that execution's reference and says what it was doing, not
+  that the job succeeded. A dispatch whose result was not seen is recorded
+  as uncertain and is settled from the run later or put to the owner.
 - Leases: an action starts only if the claim outlives its timeout, and its
   process is killed when its grant ends. A process frozen between that
   check and its start can still act late; a destination that must exclude
@@ -80,27 +86,36 @@ else a review step needs must be rendered into the DAG:
 
 ## What a review is shown of the job's runs
 
-- One result per run: the latest attempt the service has for it, with that
-  attempt's id. A retry keeps the run id and starts a new attempt, and the
-  service lists only the latest. An attempt that was replaced by a retry
+- One result per run: its latest execution. An execution is an attempt as
+  queued at one time. A retry keeps the run id; Dagu either starts a new
+  attempt for it or queues the latest attempt again under the same attempt
+  id, so the pair of attempt id and queued time is what identifies it. The
+  service lists only the latest. An execution that was replaced by a retry
   between two reviews is therefore never reviewed. Each review records what
-  it covered as run and attempt (`covered_attempts`), so a review of a run
-  is never read as a review of every attempt of it.
-- A retried run is shown again when its new attempt ends. Two results with
-  the same end time are told apart by run and attempt. A result reported
-  late, with an end time before results already covered, is still shown: a
-  run seen unfinished stays owed until a review has been shown its result.
+  it covered as run and execution (`covered_executions`), so a review of a
+  run is never read as a review of every execution of it.
+- A retried run is shown again when its new execution ends, on either
+  retry path. Two results with the same end time are told apart by run and
+  execution. A result reported late, with an end time before results
+  already covered, is still shown: a run seen unfinished stays owed until a
+  review has been shown its result.
 - A listing that takes several requests is read twice, and only results
   that both passes saw finished are returned. A result whose run is retried
   while its evidence is being read is held back for the next review, so the
-  status of one attempt is never paired with the output of another.
+  status of one execution is never paired with the output of another.
 - This rests on one assumption the service does not guarantee: a run that
   starts after a checkpoint ends after everything that checkpoint covered.
   A job's runs are on one machine and their times come from its clock, so
   it fails only if that clock is set back between two runs.
-- Bounds: at most 50 runs per review; the cursor keeps at most 512
-  unfinished runs and 512 results per instant, and a job beyond that is not
-  reviewed until it is within them, rather than anything being dropped.
+- Bounds: at most 50 runs per review, and a cursor of bounded size kept
+  apart from what the agent is shown. Nothing a job's history contains
+  stops its reviews for good. More than 512 results in one instant, as when
+  a whole queue is aborted at once, are shown in order across reviews. A
+  queue longer than 512 is fine: the oldest queued runs, the next to start,
+  are the ones remembered. Only more than 512 runs executing at once, or
+  owed a review at once, cannot be tracked: the job then gets a
+  `review_runs_untrackable` exception and is deferred by one cadence until
+  that passes, instead of a step that fails quietly.
 
 ## Declared actions
 
