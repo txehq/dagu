@@ -157,7 +157,8 @@ type DAGRunAttemptAbandoner interface {
 	ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*AttemptAbandonment, error)
 	// ListAttemptAbandonmentsStrict reads every record of a run as
 	// ReadAttemptAbandonment reads one: one result per attempt that has a
-	// record, newest attempt first. A record that cannot be trusted is a
+	// record, in the store's attempt order (newest first within an attempt
+	// directory format). A record that cannot be trusted is a
 	// result with Err, never dropped and never hiding the others. The call
 	// fails only when the run cannot be found, listed or locked.
 	ListAttemptAbandonmentsStrict(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonmentResult, error)

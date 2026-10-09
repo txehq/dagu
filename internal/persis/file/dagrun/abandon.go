@@ -318,6 +318,11 @@ func readStoredAbandonment(att *Attempt, dagRun, rootDAGRun ir.DAGRunRef) (*pers
 	record, err := readAbandonmentRecord(att.file)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
+		// Absent only if nothing is at the record's name: a dangling link
+		// reads as not found, but something is there.
+		if _, lstatErr := os.Lstat(filepath.Join(filepath.Dir(att.file), AbandonmentRecordFile)); !errors.Is(lstatErr, os.ErrNotExist) {
+			return nil, true, fmt.Errorf("%w: attempt %s: unreadable %s: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), AbandonmentRecordFile, err)
+		}
 		if _, statErr := os.Stat(filepath.Dir(att.file)); statErr != nil {
 			return nil, true, fmt.Errorf("%w: attempt %s directory: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), statErr)
 		}
