@@ -92,13 +92,17 @@ export function retryStates(
   return out;
 }
 
+// The action a retry decision authorizes is the dispatch of a native retry,
+// so these labels describe the dispatch. A dispatched retry says nothing
+// about whether the retried run then succeeded; that is the run's own status.
 const LABELS: Record<RetryStatus, string> = {
-  requested: 'Retry requested; waiting for the reviewer to run it',
-  executing: 'Retry running',
-  succeeded: 'Retried',
-  failed: 'Retry failed',
-  uncertain: 'Retry outcome unknown; it will be reconciled before any repeat',
-  'not-applied': 'Retry did not take effect',
+  requested: 'Retry requested; waiting for the reviewer to dispatch it',
+  executing: 'Retry being dispatched',
+  succeeded: 'Retry dispatched',
+  failed: 'Retry dispatch failed',
+  uncertain:
+    'Retry dispatch outcome unknown; it will be reconciled before any repeat',
+  'not-applied': 'Retry was not dispatched',
   rejected: 'Retry not performed',
 };
 
