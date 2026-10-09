@@ -8,8 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagucloud/dagu/v2/internal/ir"
-	"github.com/dagucloud/dagu/v2/internal/testutil"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,10 +23,13 @@ import (
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -858,4 +860,139 @@ func TestTxeAPIRefusedGrantChangesNothing(t *testing.T) {
 	after, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "nothing was written")
+}
+
+// A run's retained executions are listed for whoever can see the job, and
+// their status and logs are read by name from the copy only.
+func TestTxeAPIRetainedExecutions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{}, filedagrun.WithLogDir(logDir))
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(ctx))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(store))
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+
+	runDAG := &ir.DAG{Name: jobID}
+	attempt, err := runs.CreateAttempt(ctx, runDAG, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	failed := ir.InitialStatus(runDAG)
+	failed.DAGRunID, failed.AttemptID, failed.Status, failed.QueuedAt = "run-1", attempt.ID(), ir.Failed, "2026-10-09T12:00:00Z"
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, failed))
+	require.NoError(t, attempt.Close(ctx))
+	logs := filepath.Join(logDir, jobID, "run-1", attempt.ID())
+	require.NoError(t, os.MkdirAll(logs, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("first execution\n"), 0o600))
+	// A queued retry's admission.
+	_, swapped, err := runs.CompareAndSwapLatestAttemptStatus(ctx, ir.NewDAGRunRef(jobID, "run-1"), attempt.ID(), ir.Failed,
+		func(s *ir.DAGRunStatus) error { s.Status = ir.Queued; return nil }, persis.DAGRunCompareAndSwapOptions{RetainBeforeSwap: true})
+	require.NoError(t, err)
+	require.True(t, swapped)
+
+	resp, err := a.ListTxeRunExecutions(ctx, apigen.ListTxeRunExecutionsRequestObject{JobId: jobID, RunId: "run-1"})
+	require.NoError(t, err)
+	list := resp.(apigen.ListTxeRunExecutions200JSONResponse).Executions
+	require.Len(t, list, 1)
+	ref := registry.ExecutionRef(attempt.ID(), "2026-10-09T12:00:00Z")
+	assert.Equal(t, ref, list[0].Execution)
+	assert.Equal(t, "failed", list[0].Status)
+	assert.False(t, list[0].LogsFinal)
+
+	read := func(name string) (string, error) {
+		resp, err := a.GetTxeRunExecutionFile(ctx, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: ref, Name: name})
+		if err != nil {
+			return "", err
+		}
+		b, err := io.ReadAll(resp.(apigen.GetTxeRunExecutionFile200ApplicationoctetStreamResponse).Body)
+		return string(b), err
+	}
+	got, err := read("run.stdout.log")
+	require.NoError(t, err)
+	assert.Equal(t, "first execution\n", got)
+	got, err = read("status.json")
+	require.NoError(t, err)
+	assert.Contains(t, got, `"dagRunId":"run-1"`)
+	_, err = read("../../manifest.json")
+	requireStatus(t, err, http.StatusNotFound)
+}
+
+// A retained execution is visible only to callers who can see the workspace
+// it ran in, read from its own saved status: after the job moves from secret
+// to ops, an ops-only caller sees the ops execution and not the secret one.
+// An execution without logs lists its files as an empty array.
+func TestTxeAPIRetainedExecutionsFollowTheRunsWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{}, filedagrun.WithLogDir(filepath.Join(dir, "logs")))
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(txeAdmin))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+
+	runDAG := &ir.DAG{Name: jobID}
+	attempt, err := runs.CreateAttempt(txeAdmin, runDAG, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	execution := func(queuedAt, workspace string) string {
+		st := ir.InitialStatus(runDAG)
+		st.DAGRunID, st.AttemptID, st.Status, st.QueuedAt = "run-1", attempt.ID(), ir.Failed, queuedAt
+		st.Labels = []string{"workspace=" + workspace}
+		require.NoError(t, attempt.Open(txeAdmin))
+		require.NoError(t, attempt.Write(txeAdmin, st))
+		require.NoError(t, attempt.Close(txeAdmin))
+		_, swapped, err := runs.CompareAndSwapLatestAttemptStatus(txeAdmin, ir.NewDAGRunRef(jobID, "run-1"), attempt.ID(), ir.Failed,
+			func(s *ir.DAGRunStatus) error { s.Status = ir.Queued; return nil }, persis.DAGRunCompareAndSwapOptions{RetainBeforeSwap: true})
+		require.NoError(t, err)
+		require.True(t, swapped)
+		return registry.ExecutionRef(attempt.ID(), queuedAt)
+	}
+	// A log of the secret execution that claims the ops workspace must not
+	// stand in for its saved status.
+	logs := filepath.Join(dir, "logs", jobID, "run-1", attempt.ID())
+	require.NoError(t, os.MkdirAll(logs, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "status.json"), []byte(`{"labels":["workspace=ops"]}`), 0o600))
+	secretRef := execution("2026-10-09T12:00:00Z", "secret")
+	require.NoError(t, os.Remove(filepath.Join(logs, "status.json")))
+	opsRef := execution("2026-10-09T12:00:01Z", "ops")
+
+	list := func(ctx context.Context) []string {
+		resp, err := a.ListTxeRunExecutions(ctx, apigen.ListTxeRunExecutionsRequestObject{JobId: jobID, RunId: "run-1"})
+		require.NoError(t, err)
+		var refs []string
+		for _, e := range resp.(apigen.ListTxeRunExecutions200JSONResponse).Executions {
+			refs = append(refs, e.Execution)
+			require.NotNil(t, e.Files)
+		}
+		return refs
+	}
+	assert.Equal(t, []string{secretRef, opsRef}, list(txeAdmin))
+	assert.Equal(t, []string{opsRef}, list(txeOps), "the run made in secret is not listed")
+
+	for _, name := range []string{"status.json", "1-status.json"} {
+		_, err := a.GetTxeRunExecutionFile(txeOps, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: secretRef, Name: name})
+		requireStatus(t, err, http.StatusNotFound)
+		_, err = a.GetTxeRunExecutionFile(txeAdmin, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: secretRef, Name: name})
+		require.NoError(t, err, "%s is there for a caller who can see secret", name)
+	}
+	_, err = a.GetTxeRunExecutionFile(txeOps, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: opsRef, Name: "status.json"})
+	require.NoError(t, err)
+
+	resp, err := a.ListTxeRunExecutions(txeOps, apigen.ListTxeRunExecutionsRequestObject{JobId: jobID, RunId: "run-1"})
+	require.NoError(t, err)
+	body, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), `"files":[]`)
 }

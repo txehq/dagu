@@ -586,6 +586,8 @@ type stubDAGRunStore struct {
 	firstErr  error
 	secondErr error
 	casCalls  int
+	// retainRequested records whether a swap asked to retain the execution.
+	retainRequested bool
 }
 
 func (s *stubDAGRunStore) CompareAndSwapLatestAttemptStatus(
@@ -593,6 +595,7 @@ func (s *stubDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	req persis.DAGRunCompareAndSwapStatusRequest,
 ) (*ir.DAGRunStatus, bool, error) {
 	s.casCalls++
+	s.retainRequested = s.retainRequested || req.RetainBeforeSwap
 	if s.casCalls == 1 && s.firstErr != nil {
 		return nil, false, s.firstErr
 	}
@@ -633,4 +636,51 @@ func cloneDAGRunStatus(status *ir.DAGRunStatus) *ir.DAGRunStatus {
 	}
 	cloned := *status
 	return &cloned
+}
+
+func (s *stubDAGRunStore) ListRetainedExecutions(context.Context, ir.DAGRunRef, ir.DAGRunRef) ([]persis.RetainedExecution, error) {
+	return nil, nil
+}
+
+func (s *stubDAGRunStore) ReadRetainedExecutionFile(context.Context, ir.DAGRunRef, ir.DAGRunRef, string, string) ([]byte, error) {
+	return nil, persis.ErrNotFound
+}
+
+// A retry is admitted for the execution the caller saw: a later execution of
+// the same attempt (a later queue marker) is refused, and admission keeps a
+// copy of the finished execution it replaces.
+func TestPrepareRetryIsBoundToTheExecution(t *testing.T) {
+	repository := testutil.NewFileDAGRunRepository(t.TempDir(), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "manual"}
+	attempt, err := repository.CreateAttempt(t.Context(), dag, time.Now(), "run", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	latest := ir.DAGRunStatus{Name: dag.Name, DAGRunID: "run", AttemptID: attempt.ID(), Status: ir.Failed,
+		QueuedAt: "2026-10-09T12:00:01.000000001Z"}
+	require.NoError(t, attempt.Open(t.Context()))
+	require.NoError(t, attempt.Write(t.Context(), latest))
+	require.NoError(t, attempt.Close(t.Context()))
+
+	stale := latest
+	stale.QueuedAt = "2026-10-09T12:00:00.000000001Z"
+	_, err = queue.PrepareRetry(t.Context(), repository, dag, &stale, queue.EnqueueRetryOptions{})
+	require.ErrorIs(t, err, queue.ErrRetryStaleLatest, "a stale view of an earlier execution")
+
+	admission, err := queue.PrepareRetry(t.Context(), repository, dag, &latest, queue.EnqueueRetryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, admission)
+	retained, err := repository.ListRetainedExecutions(t.Context(), ir.NewDAGRunRef(dag.Name, "run"))
+	require.NoError(t, err)
+	require.Len(t, retained, 1)
+	assert.Equal(t, ir.ExecutionRef(attempt.ID(), latest.QueuedAt), retained[0].Execution)
+	assert.Equal(t, "failed", retained[0].Status)
+}
+
+// Every queued retry asks the store to keep the execution it replaces.
+func TestEnqueueRetryRequestsRetention(t *testing.T) {
+	status := &ir.DAGRunStatus{Name: "manual", DAGRunID: "run", AttemptID: "a1", Status: ir.Failed}
+	backend := &stubDAGRunStore{status: cloneDAGRunStatus(status)}
+	repository := persis.NewDAGRunRepository(backend, nil, persis.DAGRunRepositoryOptions{})
+	_, err := queue.PrepareRetry(t.Context(), repository, &ir.DAG{Name: "manual"}, status, queue.EnqueueRetryOptions{})
+	require.NoError(t, err)
+	assert.True(t, backend.retainRequested)
 }
