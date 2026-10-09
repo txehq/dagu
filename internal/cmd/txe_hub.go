@@ -5,11 +5,17 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
@@ -71,7 +77,7 @@ type txeHubDAGs interface {
 	getDAGSpec(ctx context.Context, name string) (spec string, found bool, err error)
 	createDAG(ctx context.Context, name, spec string) error
 	updateDAGSpec(ctx context.Context, name, spec string) error
-	listWorkers(ctx context.Context) ([]api.Worker, error)
+	listWorkers(ctx context.Context) (workers []api.Worker, listErrors []string, err error)
 }
 
 // txeHubMachines is the registry lookup the installer verifies the machine
@@ -120,7 +126,10 @@ func runTXEHubInstall(ctx *Context, _ []string) error {
 		return err
 	}
 	cfg := txeHubProbeConfig(home, *machine, txeHubContext(ctx))
-	res, err := txeHubInstall(ctx, remote, client, *machine, cfg, dryRun)
+	res, err := txeHubInstall(ctx, remote, client, *machine, cfg, txeHubInstallOptions{
+		DryRun:   dryRun,
+		LockPath: filepath.Join(home.Root, "state", "hub-install-"+machine.MachineID+".lock"),
+	})
 	if err != nil {
 		return err
 	}
@@ -170,9 +179,23 @@ func txeHubProbeConfig(home txepkg.Home, machine txepkg.Machine, hub txeclient.H
 	}
 }
 
+// txeHubInstallLockTimeout bounds the wait for another install of this
+// machine's DAG to finish.
+const txeHubInstallLockTimeout = 2 * time.Minute
+
+// txeHubInstallOptions are an install's switches.
+type txeHubInstallOptions struct {
+	DryRun bool
+	// LockPath serializes installs of this machine's DAG. Only this
+	// machine installs it: the command refuses another machine's id. The
+	// hub's spec API has no compare-and-swap, so this is what keeps one
+	// install from writing over another's newer render.
+	LockPath string
+}
+
 // txeHubInstall verifies the machine with the registry, renders its DAG and
-// creates or updates it on the hub.
-func txeHubInstall(ctx context.Context, hub txeHubDAGs, registry txeHubMachines, machine txepkg.Machine, cfg probe.ReconcileDAGConfig, dryRun bool) (*txeHubInstallResult, error) {
+// creates or updates it on the hub, holding the machine's install lock.
+func txeHubInstall(ctx context.Context, hub txeHubDAGs, registry txeHubMachines, machine txepkg.Machine, cfg probe.ReconcileDAGConfig, opts txeHubInstallOptions) (*txeHubInstallResult, error) {
 	known, err := registry.Machine(ctx, machine.MachineID)
 	if err != nil {
 		return nil, fmt.Errorf("the hub registry does not confirm machine %s: %w", machine.MachineID, err)
@@ -185,26 +208,14 @@ func txeHubInstall(ctx context.Context, hub txeHubDAGs, registry txeHubMachines,
 	if err != nil {
 		return nil, err
 	}
-	res := &txeHubInstallResult{DAG: name, MachineID: machine.MachineID, DryRun: dryRun, Version: probe.ReconcileDAGVersion}
+	res := &txeHubInstallResult{DAG: name, MachineID: machine.MachineID, DryRun: opts.DryRun, Version: probe.ReconcileDAGVersion}
 
-	current, found, err := hub.getDAGSpec(ctx, name)
-	if err != nil {
-		return nil, fmt.Errorf("read %s from the hub: %w", name, err)
-	}
-	switch {
-	case !found:
-		res.Action = txeHubCreated
-	case current == string(spec):
-		res.Action = txeHubUnchanged
-	default:
-		installed, ok := txeHubProbeDAGVersion(current)
-		if !ok {
-			return nil, fmt.Errorf("the hub's %s was not rendered by the probe renderer; it is left alone", name)
+	if !opts.DryRun {
+		unlock, err := txeHubLock(ctx, opts.LockPath)
+		if err != nil {
+			return nil, err
 		}
-		if installed > probe.ReconcileDAGVersion {
-			return nil, fmt.Errorf("the hub's %s is txe-probe-dag-version %d, newer than this client's %d; update this client", name, installed, probe.ReconcileDAGVersion)
-		}
-		res.Action = txeHubUpdated
+		defer unlock()
 	}
 
 	worker, warning, err := txeHubMachineWorker(ctx, hub, machine.MachineID)
@@ -216,26 +227,104 @@ func txeHubInstall(ctx context.Context, hub txeHubDAGs, registry txeHubMachines,
 		res.Warnings = append(res.Warnings, warning)
 	}
 
-	if dryRun {
-		return res, nil
+	// A create that finds the DAG already there lost a race with a writer
+	// outside this machine's lock: read it again and decide once more.
+	for attempt := 0; ; attempt++ {
+		if res.Action, err = txeHubAssess(ctx, hub, name, spec); err != nil {
+			return nil, err
+		}
+		if opts.DryRun {
+			return res, nil
+		}
+		switch res.Action {
+		case txeHubCreated:
+			err = hub.createDAG(ctx, name, string(spec))
+			if txeHubRemoteStatus(err) == http.StatusConflict && attempt == 0 {
+				continue
+			}
+		case txeHubUpdated:
+			err = hub.updateDAGSpec(ctx, name, string(spec))
+		case txeHubUnchanged:
+			return res, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%s %s on the hub: %w", res.Action, name, err)
+		}
+		break
 	}
-	switch res.Action {
-	case txeHubCreated:
-		err = hub.createDAG(ctx, name, string(spec))
-	case txeHubUpdated:
-		err = hub.updateDAGSpec(ctx, name, string(spec))
-	}
+
+	// Read the write back: a hub user editing the DAG in the same moment is
+	// outside this lock, and the hub would keep whichever write came last.
+	stored, found, err := hub.getDAGSpec(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s on the hub: %w", res.Action, name, err)
+		return nil, fmt.Errorf("read %s back from the hub: %w", name, err)
+	}
+	if !found || stored != string(spec) {
+		return nil, fmt.Errorf("the hub's %s changed while it was being %s; run the install again", name, res.Action)
 	}
 	return res, nil
 }
 
+// txeHubAssess decides what installing spec as name needs: create, update or
+// nothing. A stored DAG the renderer did not write, or a newer render, is
+// refused.
+func txeHubAssess(ctx context.Context, hub txeHubDAGs, name string, spec []byte) (string, error) {
+	current, found, err := hub.getDAGSpec(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("read %s from the hub: %w", name, err)
+	}
+	switch {
+	case !found:
+		return txeHubCreated, nil
+	case current == string(spec):
+		return txeHubUnchanged, nil
+	}
+	installed, ok := txeHubProbeDAGVersion(current)
+	if !ok {
+		return "", fmt.Errorf("the hub's %s was not rendered by the probe renderer; it is left alone", name)
+	}
+	if installed > probe.ReconcileDAGVersion {
+		return "", fmt.Errorf("the hub's %s is txe-probe-dag-version %d, newer than this client's %d; update this client", name, installed, probe.ReconcileDAGVersion)
+	}
+	return txeHubUpdated, nil
+}
+
+// txeHubLock takes the machine's install lock, waiting for another install
+// to finish.
+func txeHubLock(ctx context.Context, path string) (func(), error) {
+	if path == "" {
+		return nil, errors.New("no install lock path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create the install lock directory: %w", err)
+	}
+	lock := flock.New(path)
+	lockCtx, cancel := context.WithTimeout(ctx, txeHubInstallLockTimeout)
+	defer cancel()
+	locked, err := lock.TryLockContext(lockCtx, 200*time.Millisecond)
+	if err != nil || !locked {
+		return nil, fmt.Errorf("another install of this machine's hub DAG is running (lock %s): %w", path, err)
+	}
+	return func() { _ = lock.Unlock() }, nil
+}
+
+// txeHubRemoteStatus is the HTTP status of a hub error, or 0.
+func txeHubRemoteStatus(err error) int {
+	if remoteErr, ok := errors.AsType[*remoteError](err); ok {
+		return remoteErr.StatusCode
+	}
+	return 0
+}
+
 // txeHubMachineWorker names a healthy worker labelled for the machine, or
-// returns a warning when there is none. A worker that sleeps, as a laptop
-// does, is no reason to refuse: the DAG's runs wait for it.
+// returns a warning when there is none or its health cannot be established.
+// A worker that sleeps, as a laptop does, is no reason to refuse: the DAG's
+// runs wait for it. Only a hub that refuses the request fails the install.
 func txeHubMachineWorker(ctx context.Context, hub txeHubDAGs, machineID string) (worker, warning string, err error) {
-	workers, err := hub.listWorkers(ctx)
+	workers, listErrors, err := hub.listWorkers(ctx)
+	if txeHubRemoteStatus(err) == http.StatusServiceUnavailable {
+		return "", fmt.Sprintf("the hub's coordinator is unavailable, so whether a worker for %s is connected is unknown; runs wait for one", machineID), nil
+	}
 	if err != nil {
 		return "", "", fmt.Errorf("list the hub's workers: %w", err)
 	}
@@ -249,8 +338,11 @@ func txeHubMachineWorker(ctx context.Context, hub txeHubDAGs, machineID string) 
 		}
 		seen = w.Id + " (" + string(w.HealthStatus) + ")"
 	}
-	if seen != "" {
+	switch {
+	case seen != "":
 		return "", fmt.Sprintf("worker %s for %s is not healthy; runs wait until it is", seen, machineID), nil
+	case len(listErrors) > 0:
+		return "", fmt.Sprintf("the hub could not list every worker (%s); no healthy worker for %s was seen, and runs wait for one", strings.Join(listErrors, "; "), machineID), nil
 	}
 	return "", fmt.Sprintf("no worker labelled %s=%s is connected; runs wait until it is", txeHubWorkerLabel, machineID), nil
 }
