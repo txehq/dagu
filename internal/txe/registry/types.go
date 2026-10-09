@@ -487,6 +487,15 @@ type Proposal struct {
 	Prev            string        `json:"prev,omitempty"`
 }
 
+// NativeResume is a pending completion of the Dagu human task that collected
+// a decision.
+type NativeResume struct {
+	DecisionID string     `json:"decision_id"`
+	ProposalID string     `json:"proposal_id"`
+	NativeTask NativeTask `json:"native_task"`
+	Since      time.Time  `json:"since"`
+}
+
 // Verdict is a human response to a proposal.
 type Verdict string
 
@@ -693,9 +702,13 @@ type Job struct {
 	// DecisionKeys maps decision idempotency keys to decision IDs so that a
 	// replayed decision is recognized after its proposal left the aggregate.
 	DecisionKeys map[string]string `json:"decision_keys,omitempty"`
-	Chains       Chains            `json:"chains"`
-	Created      Stamp             `json:"created"`
-	Updated      Stamp             `json:"updated"`
+	// NativeResumes tracks decisions whose Dagu human task still has to be
+	// completed, so a failed completion can be retried after its proposal
+	// left the aggregate. Entries are removed once completed.
+	NativeResumes map[string]*NativeResume `json:"native_resumes,omitempty"`
+	Chains        Chains                   `json:"chains"`
+	Created       Stamp                    `json:"created"`
+	Updated       Stamp                    `json:"updated"`
 }
 
 // Runnable reports whether Dagu may start a run of this job now.
