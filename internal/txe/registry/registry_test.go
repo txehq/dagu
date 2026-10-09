@@ -885,3 +885,24 @@ func TestReadyStaleRevisionWritesNothing(t *testing.T) {
 	_, err = f.dags.SpecSHA256(f.ctx, job.JobID)
 	assert.ErrorIs(t, err, persis.ErrNotFound)
 }
+
+// A replayed readiness of a ready job with a stale revision repairs nothing:
+// it cannot restore the DAG of a version the caller did not check.
+func TestReadyReplayStaleRevisionWritesNothing(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	require.NoError(t, os.Remove(filepath.Join(f.dagsDir, job.JobID+".yaml")))
+	v, err := f.store.GetVersion(f.ctx, job.JobID, 1)
+	require.NoError(t, err)
+	pkg := PackageEvidence{Digest: job.PackageDigest, Path: v.Package.Path, MachineID: f.machine}
+	_, err = f.store.MarkReady(f.ctx, job.JobID, job.Revision-1, pkg, cli)
+	assert.Equal(t, CodeVersionConflict, code(t, err))
+	_, err = f.dags.SpecSHA256(f.ctx, job.JobID)
+	assert.ErrorIs(t, err, persis.ErrNotFound)
+
+	_, err = f.store.MarkReady(f.ctx, job.JobID, job.Revision, pkg, cli)
+	require.NoError(t, err, "the current revision repairs the saved DAG")
+	saved, err := f.dags.SpecSHA256(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, job.DAGSpecSHA256, saved)
+}

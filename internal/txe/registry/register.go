@@ -432,14 +432,14 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 	// The lock spans publication and the ready commit, so the DAG verified is
 	// still the saved one when the job becomes ready. Only the version of
 	// the job read under the lock is published and made ready, and with an
-	// expected revision nothing is written unless that is the revision read.
+	// expected revision nothing is written, nor a receipt returned, unless
+	// that is the revision read.
 	err := s.withDAGLock(ctx, jobID, func() error {
 		job, err := s.GetJob(ctx, jobID)
 		if err != nil {
 			return err
 		}
-		alreadyReady := job.Registration.State == RegistrationReady && job.Registration.Package != nil && job.Registration.Package.Digest == pkg.Digest
-		if !alreadyReady && expectedRevision != 0 && job.Revision != expectedRevision {
+		if expectedRevision != 0 && job.Revision != expectedRevision {
 			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, expectedRevision), Current: job}
 		}
 		dedupeID := dedupePrefix + job.OwnerID + "/" + job.ProjectID + "/" + job.Registration.DedupeKey
@@ -457,7 +457,7 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 		if err != nil {
 			return err
 		}
-		if alreadyReady {
+		if job.Registration.State == RegistrationReady && job.Registration.Package != nil && job.Registration.Package.Digest == pkg.Digest {
 			receipt = receiptOf(job)
 			return nil
 		}

@@ -397,3 +397,48 @@ func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "completed", nativeResume())
 }
+
+// Registry reads follow workspace visibility: a job, its versions and its
+// history are not found by a caller who cannot see its workspace, and a
+// version from a workspace the job has left stays hidden.
+func TestTxeAPIReadsFollowWorkspaceVisibility(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	opsJob, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+	secretJob, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+
+	list, err := a.ListTxeJobs(txeOps, apigen.ListTxeJobsRequestObject{})
+	require.NoError(t, err)
+	var ids []string
+	for _, j := range list.(apigen.ListTxeJobs200JSONResponse).Jobs {
+		ids = append(ids, j.JobId)
+	}
+	assert.Equal(t, []string{opsJob}, ids)
+
+	_, err = a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: secretJob})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 1})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.ListTxeJobEvents(txeOps, apigen.ListTxeJobEventsRequestObject{JobId: secretJob})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: opsJob})
+	require.NoError(t, err)
+
+	// The admin moves the secret job to ops: its current version is visible,
+	// its secret first version is not.
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	_, err = a.UpdateTxeJobVersion(txeAdmin, apigen.UpdateTxeJobVersionRequestObject{JobId: secretJob, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 1,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+		}}})
+	require.NoError(t, err)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 2})
+	require.NoError(t, err)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 1})
+	requireStatus(t, err, http.StatusNotFound)
+}
