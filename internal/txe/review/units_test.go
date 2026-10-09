@@ -418,6 +418,79 @@ func TestExecuteStepRejectsMalformedIDs(t *testing.T) {
 	assert.Empty(t, f.state().Transitions, "no claim was taken")
 }
 
+// A job's command does not inherit what is the reviewer's own: the hub
+// client's context and credentials, the review's variables, and the agent's
+// profile and keys. It still gets the action's own variables, the marker
+// that stops a job registering work under a review, and whatever else the
+// machine provides for the job to reach its resources. The reconcile probe
+// runs the same way. An environment given explicitly is passed as it is.
+func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	reviewers := map[string]string{
+		"DAGU_HOME": "/reviewer/dagu", "DAGU_CONTEXTS_DIR": "/reviewer/contexts", "DAGU_API_KEY": "hub-key",
+		"TXE_DAGU_HOME": "/reviewer/dagu", "TXE_PACKET": `{"job":{}}`, "TXE_DECISION": "{}", "TXE_PARAM_SIZE_GB": "999",
+		"CLAUDE_CONFIG_DIR": "/reviewer/.claude", "ANTHROPIC_API_KEY": "agent-key", "CODEX_HOME": "/reviewer/.codex", "OPENAI_API_KEY": "agent-key-2",
+	}
+	for name, value := range reviewers {
+		t.Setenv(name, value)
+	}
+	t.Setenv(review.ReviewerEnv, "1")
+	t.Setenv("KUBECONFIG", "/job/kubeconfig")
+	t.Setenv("AWS_PROFILE", "job-profile")
+
+	seenBy := func(e *review.CommandEffector, run func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult) map[string]string {
+		t.Helper()
+		dir := t.TempDir()
+		job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: dir}
+		action := review.Action{ID: "act_1", Name: "a", TargetID: "t1", Params: map[string]string{"depth": "3"}}
+		declared := shellAction("env > env.txt", review.IdempotencyNone)
+		declared.Reconcile = declared.Command
+		res := run(e, job, declared, action)
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		require.NoError(t, err)
+		seen := map[string]string{}
+		for line := range strings.SplitSeq(string(raw), "\n") {
+			if name, value, ok := strings.Cut(line, "="); ok {
+				seen[name] = value
+			}
+		}
+		return seen
+	}
+	runAction := func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult {
+		return e.Run(context.Background(), job, declared, action)
+	}
+	probe := func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult {
+		return e.Probe(context.Background(), job, declared, action)
+	}
+
+	for name, run := range map[string]func(*review.CommandEffector, review.Job, review.DeclaredAction, review.Action) review.EffectResult{"action": runAction, "reconcile probe": probe} {
+		t.Run(name, func(t *testing.T) {
+			seen := seenBy(&review.CommandEffector{}, run)
+			for name := range reviewers {
+				assert.NotContains(t, seen, name, "the reviewer's own variable reached the job's command")
+			}
+			assert.Equal(t, "1", seen[review.ReviewerEnv], "a job's command still cannot register work under a review")
+			assert.Equal(t, "/job/kubeconfig", seen["KUBECONFIG"], "what the job needs to reach its resources is inherited")
+			assert.Equal(t, "job-profile", seen["AWS_PROFILE"])
+			assert.NotEmpty(t, seen["PATH"])
+			assert.Equal(t, "job_A", seen["TXE_JOB_ID"])
+			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
+			assert.Equal(t, "3", seen["TXE_PARAM_DEPTH"])
+			assert.NotContains(t, seen, "TXE_PARAM_SIZE_GB", "a variable of the review is not taken for a parameter of the action")
+		})
+	}
+	t.Run("an explicit environment is passed as given", func(t *testing.T) {
+		seen := seenBy(&review.CommandEffector{Env: []string{"PATH=" + os.Getenv("PATH"), "DAGU_HOME=/chosen/for/the/job"}}, runAction)
+		assert.Equal(t, "/chosen/for/the/job", seen["DAGU_HOME"], "a deliberate binding is preserved")
+		assert.NotContains(t, seen, "KUBECONFIG", "and nothing ambient is added to it")
+		assert.NotContains(t, seen, "CLAUDE_CONFIG_DIR")
+		assert.Equal(t, "job_A", seen["TXE_JOB_ID"])
+	})
+}
+
 // Pass 2 finding: when an action's deadline passes, its whole process group
 // is killed. A child the script started in the background must not be left
 // to perform the effect after the attempt was recorded as over.

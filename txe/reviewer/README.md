@@ -56,6 +56,24 @@ else a review step needs must be rendered into the DAG:
 | `TXE_DAGU_REVIEWER=1` | always | Marks a review. Job registration refuses to run under it, so a review cannot register work or start another reviewer. |
 | `CLAUDE_CONFIG_DIR` | `AgentConfigDir` | The reviewer profile. |
 
+A job's declared action and reconcile commands are started from the review
+step, and do not inherit what is the reviewer's own. Removed before the
+command starts: every `DAGU_*` variable (the hub client's context and the
+service's settings), every `TXE_*` variable of the review, and the agent's
+profile and keys (`CLAUDE_*`, `ANTHROPIC_*`, `CODEX_*`, `OPENAI_*`). Added
+back: `TXE_DAGU_REVIEWER=1`, so the command cannot register work either, and
+the action's own variables (`TXE_JOB_ID`, `TXE_OWNER_ID`, `TXE_ACTION_ID`,
+`TXE_ACTION_NAME`, `TXE_TARGET_ID`, `TXE_IDEMPOTENCY_KEY`,
+`TXE_PARAM_<NAME>`). Everything else the step has is inherited, so what a
+job's command needs to reach its resources (for example `KUBECONFIG`) is
+rendered into the DAG like any other variable and reaches it; a variable
+with one of the removed prefixes cannot be given to a job's command this
+way.
+
+This removes accidental inheritance. It is not isolation: the command runs
+as the same operating-system user as the reviewer and can read the same
+files.
+
 ## Bounds
 
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,

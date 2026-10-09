@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -56,7 +57,9 @@ const (
 // the process only as environment variables, never as shell text, so a model
 // cannot inject a command through a parameter value.
 type CommandEffector struct {
-	// Env is the base environment; os.Environ() when nil.
+	// Env is the base environment of the job's commands, used exactly as
+	// given. When nil it is this process's environment without what is the
+	// reviewer's own; see baseEnv.
 	Env []string
 }
 
@@ -159,11 +162,48 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	return 0, stdout.String(), fmt.Errorf("action %q ended abnormally: %v", declared.Name, err)
 }
 
+// baseEnv is the environment a job's command starts from. An environment
+// given explicitly is the caller's deliberate choice and is passed as it is.
+// Otherwise the command inherits this process's environment, which is the
+// reviewer step's, minus what belongs to the reviewer and not to the job:
+//
+//   - the hub client's and the service's own settings (DAGU_*): the context
+//     and credentials the reviewer writes to the registry with;
+//   - the review's own variables (TXE_*): the packet, the decision, and
+//     anything that would otherwise pass for one of the action's parameters.
+//     The action's own TXE_ variables are added by the caller, and the
+//     marker that stops a job from registering work under a review is kept;
+//   - the agent's profile and keys (CLAUDE_*, ANTHROPIC_*, CODEX_*,
+//     OPENAI_*): the login the review agent runs under.
+//
+// Everything else is inherited, including what a job's command needs to
+// reach its own resources (PATH, HOME, KUBECONFIG, cloud credentials the
+// machine provides). This removes accidental inheritance only. It is not
+// isolation: the command runs as the same user and can read the same files.
 func (e *CommandEffector) baseEnv() []string {
 	if e.Env != nil {
 		return append([]string(nil), e.Env...)
 	}
-	return os.Environ()
+	return jobEnv(os.Environ())
+}
+
+// reviewerEnvPrefixes are the variable name prefixes that belong to the
+// reviewer, the service it talks to, or the agent it runs.
+var reviewerEnvPrefixes = []string{"DAGU_", "TXE_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
+
+// jobEnv returns env without the reviewer's own variables.
+func jobEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		// Windows treats variable names without regard to case.
+		upper := strings.ToUpper(name)
+		if upper != ReviewerEnv && slices.ContainsFunc(reviewerEnvPrefixes, func(p string) bool { return strings.HasPrefix(upper, p) }) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func actionEnv(job Job, action Action) []string {
