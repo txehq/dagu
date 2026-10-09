@@ -568,6 +568,17 @@ func (r *Reviewer) raiseStalled(ctx context.Context, claim Claim, job Job, actio
 	return nil
 }
 
+// uncertainVerdictsFor are the answers offered about an attempt whose
+// outcome is unknown. "Retry" allows one more attempt of the same action,
+// so it is not offered about an attempt that was the last the registry
+// allows: the registry would refuse that answer.
+func uncertainVerdictsFor(action Action) []Verdict {
+	if action.MaxAttempts > 0 && action.Attempt >= action.MaxAttempts {
+		return slices.DeleteFunc(slices.Clone(uncertainVerdicts), func(v Verdict) bool { return v == VerdictRetry })
+	}
+	return uncertainVerdicts
+}
+
 func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Action, detail string) error {
 	id := UncertainProposalID(action.ID, action.Attempt, job.Version)
 	proposal, err := r.Registry.CreateProposal(ctx, claim, Proposal{
@@ -579,7 +590,7 @@ func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Ac
 		TargetID:        action.TargetID,
 		ObservedAt:      r.now(),
 		WaitingOn:       waitingOnPerson,
-		AllowedVerdicts: uncertainVerdicts,
+		AllowedVerdicts: uncertainVerdictsFor(action),
 		ActionName:      UncertainEffectAction,
 		Params:          map[string]string{UncertainEffectParam: action.ID, UncertainAttemptParam: strconv.Itoa(action.Attempt)},
 		Question:        fmt.Sprintf("Action %q on %s may or may not have taken effect (%s). Confirm its real state before it is tried again.", action.Name, action.TargetID, detail),
@@ -609,6 +620,41 @@ func (r *Reviewer) openDecision(ctx context.Context, proposal Proposal) error {
 
 func (r *Reviewer) taskLocator(proposalID string) TaskLocator {
 	return TaskLocator{DAG: r.DecideDAG, RunID: DecisionRunID(proposalID), StepID: decideStepID}
+}
+
+// executeAgain performs the one further attempt the owner allowed by
+// answering "retry" to the question about an attempt whose outcome was
+// unknown. It applies to an action that ran on a decision: that decision is
+// executed again, as it was. The registry decides whether the attempt is
+// granted: it consumes the owner's answer with the grant, binds the attempt
+// to what the original decision was about, and refuses it when that has
+// moved, so nothing is retargeted here. A routine action has no decision to
+// run again; the next review may request it.
+func (r *Reviewer) executeAgain(ctx context.Context, jobID string, question Proposal) (Executed, error) {
+	actions, err := r.Registry.Actions(ctx, jobID)
+	if err != nil {
+		return Executed{}, fmt.Errorf("read actions: %w", err)
+	}
+	for _, action := range actions {
+		if action.ID != question.RelatedAction {
+			continue
+		}
+		if action.ProposalID == "" || action.DecisionID == "" {
+			return Executed{Skipped: "the action was not run on a decision: the next review may request it again"}, nil
+		}
+		if strconv.Itoa(action.Attempt) != question.Params[UncertainAttemptParam] {
+			return Executed{Skipped: fmt.Sprintf("the answer is about attempt %s of action %s, which is now at attempt %d: nothing runs", question.Params[UncertainAttemptParam], action.ID, action.Attempt)}, nil
+		}
+		original, err := r.Registry.Proposal(ctx, jobID, action.ProposalID)
+		if err != nil {
+			return Executed{}, fmt.Errorf("read proposal %s: %w", action.ProposalID, err)
+		}
+		if original.Kind != ProposalAction {
+			return Executed{Skipped: "the action's proposal carries no executable action"}, nil
+		}
+		return r.Execute(ctx, jobID, action.ProposalID, action.DecisionID)
+	}
+	return Executed{Skipped: "the action the answer is about is not in the journal"}, nil
 }
 
 // Applied reports what one Apply did.
@@ -1377,6 +1423,9 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 		return Executed{Skipped: "decision belongs to another proposal"}, nil
 	}
 	proposal := current
+	if proposal.Kind == ProposalUncertain && decision.Verdict == VerdictRetry {
+		return r.executeAgain(ctx, jobID, proposal)
+	}
 	// An approval runs a proposed action. A retry verdict runs exactly one
 	// thing: the re-run of the one run a retry proposal names.
 	runs := decision.Verdict == VerdictApprove || (decision.Verdict == VerdictRetry && proposal.ActionName == RetryRunAction)

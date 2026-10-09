@@ -311,6 +311,9 @@ type Action struct {
 	// request as, when it names one. Only that execution is then this
 	// action's effect.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
+	// MaxAttempts is how many attempts the registry allows this action, when
+	// it says; zero when it does not.
+	MaxAttempts int `json:"max_attempts,omitempty"`
 	// AttemptStartedAt is when the registry granted the current attempt of
 	// the action, by the registry's clock.
 	AttemptStartedAt time.Time `json:"attempt_started_at,omitzero"`

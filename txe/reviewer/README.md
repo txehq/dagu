@@ -111,6 +111,12 @@ else a review step needs must be rendered into the DAG:
   as a failed request or a reviewer that died first, is not settled from
   the run, because a newer execution may be someone else's retry: it goes
   to the owner. Nothing is ever sent again because time passed.
+  When the owner answers `retry` to the question about an attempt whose
+  outcome is unknown, the question's decision run executes the original
+  decision once more: for a run retry, with the same expected execution,
+  so a run that has moved on since is refused and never retargeted. The
+  registry allows a run retry two attempts; the question about the second
+  offers no `retry`.
 - Leases: an action starts only if the claim outlives its timeout, and its
   process is killed when its grant ends. A process frozen between that
   check and its start can still act late; a destination that must exclude

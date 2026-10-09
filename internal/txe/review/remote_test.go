@@ -1701,20 +1701,20 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	assert.Len(t, resolved, 1)
 }
 
-// KNOWN DEFECT, reproduced here so that it is not forgotten; this is not
-// the intended behaviour. Against the real registry a retry of a run has
-// one attempt, and when its outcome is unknown the owner's question still
-// offers "retry", which the registry then always refuses. The owner is
-// offered an answer that cannot work. The agreed fix is the registry's:
-// either one explicitly approved further attempt, bound to the original
-// execution and refused if the run moved, or no "retry" among the verdicts.
-// When that lands, this test asserts the agreed behaviour instead.
-func TestRemoteAnOwnersRetryOfAnUnknownRunRetryIsRefusedToday(t *testing.T) {
+// Against the real registry: a retry of a run whose outcome is unknown gets
+// exactly one further attempt, and only on the owner's "retry" to the
+// question about that attempt. The second attempt is the original decision
+// executed again: it names the execution the owner decided about, never the
+// run's latest. Its reservation is timed from its own grant, not from the
+// action's creation. The question about the second attempt offers no
+// "retry", because the registry allows no third.
+func TestRemoteAnOwnersRetryAllowsOneMoreAttemptOfARunRetry(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
 	job := f.job()
 	service := f.service
 	service.fail("run-7", "att-1")
+	decidedOn := review.Execution{AttemptID: "att-1"}
 	var proposal *registry.Proposal
 	var decided *registry.Decision
 	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
@@ -1724,29 +1724,99 @@ func TestRemoteAnOwnersRetryOfAnUnknownRunRetryIsRefusedToday(t *testing.T) {
 		return err
 	})
 	require.NoError(t, err)
+	reviewAt := func(holder string, after time.Duration) {
+		t.Helper()
+		*f.ahead = after
+		r := f.retrying(holder, service)
+		r.Now = func() time.Time { return time.Now().Add(after) }
+		prepared, err := r.Prepare(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
+		_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
+		require.NoError(t, err)
+	}
+	question := func() review.Proposal {
+		t.Helper()
+		open, err := f.remote.OpenProposals(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Len(t, open, 1)
+		require.Equal(t, review.ProposalUncertain, open[0].Kind)
+		return open[0]
+	}
+	stalled := func() (out []*registry.Exception) {
+		for _, e := range f.job().Exceptions {
+			if e.Kind == string(review.ExceptionRetryStalled) && e.ResolvedAt == nil {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
 
-	// The service admits the retry without naming an execution: unknown.
+	// First attempt: the service admits the retry without naming an
+	// execution, so its outcome is unknown and the owner is asked.
 	service.unnamed = true
 	service.retry = func(string) error { return nil }
 	first, err := f.retrying("tick-1", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
 	require.NoError(t, err)
 	require.Equal(t, review.ActionUncertain, first.Action.State)
+	actionID := first.Action.ID
+	reviewAt("reviewer-a", time.Hour)
+	require.Equal(t, registry.ActionEscalated, f.job().Actions[actionID].State)
+	about1 := question()
+	assert.Contains(t, about1.AllowedVerdicts, review.VerdictRetry, "one further attempt can be allowed")
 
-	r := f.retrying("reviewer-a", service)
-	r.Now = func() time.Time { return time.Now().Add(time.Hour) }
-	prepared, err := r.Prepare(ctx, f.jobID)
+	// Nothing runs again until the owner says so.
+	again, err := f.retrying("tick-1b", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
 	require.NoError(t, err)
-	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
-	require.NoError(t, err)
-	require.Equal(t, registry.ActionEscalated, f.job().Actions[first.Action.ID].State)
-	open, err := f.remote.OpenProposals(ctx, f.jobID)
-	require.NoError(t, err)
-	require.Len(t, open, 1)
+	assert.NotEmpty(t, again.Skipped)
+	require.Len(t, service.retried, 1)
 
-	_, err = f.decide(open[0], 1, "retry")
-	require.ErrorContains(t, err, "used all 1 attempts")
-	assert.Equal(t, 1, f.job().Actions[first.Action.ID].Attempt)
-	assert.Len(t, service.retried, 1)
+	// The owner answers "retry". The question's decision run executes the
+	// answer, and that performs the second attempt of the same action.
+	answer, err := f.decide(about1, 1, "retry")
+	require.NoError(t, err)
+	*f.ahead = 5 * time.Hour
+	service.unnamed = false
+	service.retry = func(runID string) error {
+		service.state[runID] = review.RunState{AttemptID: "att-2", Status: "not_started", Active: true}
+		return nil
+	}
+	late := f.retrying("tick-2", service)
+	late.Now = func() time.Time { return time.Now().Add(5 * time.Hour) }
+	second, err := late.Execute(ctx, f.jobID, about1.ID, answer.Decision.DecisionID)
+	require.NoError(t, err)
+	require.Empty(t, second.Skipped)
+	require.Equal(t, review.ActionUncertain, second.Action.State)
+	require.Equal(t, review.ExecutionRef("att-2", ""), second.Action.AdmittedRef)
+	stored := f.job().Actions[actionID]
+	assert.Equal(t, 2, stored.Attempt, "the same action, attempted a second time")
+	require.Len(t, service.requested, 2)
+	assert.Equal(t, decidedOn, service.requested[1], "the second request names the execution the owner decided about")
+
+	// Executing the same answer again does nothing: it was about attempt 1.
+	replay, err := late.Execute(ctx, f.jobID, about1.ID, answer.Decision.DecisionID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, replay.Skipped)
+	require.Len(t, service.retried, 2)
+
+	// The action is five hours old; its second attempt is ten minutes old.
+	reviewAt("reviewer-b", 5*time.Hour+10*time.Minute)
+	assert.Empty(t, stalled(), "the reservation is timed from the grant of its own attempt")
+	reviewAt("reviewer-c", 7*time.Hour)
+	raised := stalled()
+	require.Len(t, raised, 1)
+	assert.Equal(t, 2, raised[0].Attempt)
+
+	// The second attempt also ends unknown: the run shows someone else's
+	// execution. The owner is asked, and is not offered another retry.
+	service.state["run-7"] = review.RunState{AttemptID: "att-other", Status: "running", Active: true}
+	reviewAt("reviewer-d", 9*time.Hour)
+	require.Equal(t, registry.ActionEscalated, f.job().Actions[actionID].State)
+	about2 := question()
+	assert.NotEqual(t, about1.ID, about2.ID)
+	assert.NotContains(t, about2.AllowedVerdicts, review.VerdictRetry, "the registry allows no third attempt, so none is offered")
+	assert.Empty(t, stalled(), "the exception about the attempt ended with it")
+	assert.Len(t, service.retried, 2)
 }
 
 // An effect whose outcome is unknown is escalated as the registry's typed

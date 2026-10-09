@@ -916,7 +916,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 		ID: a.ActionId, JobID: jobID, JobVersion: a.JobVersion, Name: a.Spec.Name, Params: paramsOf(a.Spec.Params),
 		ReviewID: deref(a.ReviewId), ProposalID: deref(a.ProposalId), DecisionID: deref(a.DecisionId),
 		State: ActionState(a.State), Receipt: deref(a.Receipt), ClaimID: deref(a.ClaimId),
-		StartedAt: a.Created.At, FinishedAt: a.Updated.At, Attempt: a.Attempt,
+		StartedAt: a.Created.At, FinishedAt: a.Updated.At, Attempt: a.Attempt, MaxAttempts: a.MaxAttempts,
 	}
 	// An action written before the registry recorded attempts' grants has
 	// only its creation time.

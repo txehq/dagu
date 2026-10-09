@@ -1768,8 +1768,15 @@ func TestUncertainRetryAllowsExactlyOneMoreAttempt(t *testing.T) {
 	assert.Equal(t, review.UncertainEffectAction, escalation.ActionName)
 	assert.Equal(t, map[string]string{"action_id": first.ID, "attempt": strconv.Itoa(first.Attempt)}, escalation.Params)
 	assert.Equal(t, review.UncertainProposalID(first.ID, first.Attempt, 1), escalation.ID)
-	_, err := f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
+	answer, err := f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
 	require.NoError(t, err)
+
+	// A routine action was not run on a decision, so executing the answer
+	// runs nothing: the next review may request the action again.
+	executed, err := f.reviewer("executor").Execute(context.Background(), jobID, escalation.ID, answer.ID)
+	require.NoError(t, err)
+	assert.Contains(t, executed.Skipped, "not run on a decision")
+	assert.Equal(t, 1, f.effects.count("notify"))
 
 	// The one permitted attempt also ends unknown.
 	f.clock.Advance(2 * time.Hour)
