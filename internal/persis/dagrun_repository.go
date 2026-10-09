@@ -64,13 +64,14 @@ func (r *DAGRunRepository) CreateAttempt(
 		return nil, dagrun.ErrDAGRunIDEmpty
 	}
 	attempt, err := r.store.CreateAttempt(ctx, DAGRunCreateAttemptRequest{
-		DAG:          dag,
-		RootDAGRun:   options.RootDAGRun,
-		Timestamp:    timestamp,
-		DAGRunID:     dagRunID,
-		AttemptID:    options.AttemptID,
-		Retry:        options.Retry,
-		ExpectLatest: options.ExpectLatest,
+		DAG:              dag,
+		RootDAGRun:       options.RootDAGRun,
+		Timestamp:        timestamp,
+		DAGRunID:         dagRunID,
+		AttemptID:        options.AttemptID,
+		Retry:            options.Retry,
+		ExpectLatest:     options.ExpectLatest,
+		TrackPreparation: options.TrackPreparation,
 	})
 	if err != nil {
 		return nil, err

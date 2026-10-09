@@ -29,6 +29,7 @@ type Store struct {
 	baseDir         string
 	artifactDir     string
 	logDir          string
+	preparationDir  string
 	cache           *fileutil.Cache[*ir.DAGRunStatus]
 	retryCandidates retryCandidateCache
 }
@@ -40,6 +41,7 @@ type options struct {
 	fileCache                *fileutil.Cache[*ir.DAGRunStatus]
 	artifactDir              string
 	logDir                   string
+	preparationDir           string
 	retryCandidateCacheLimit int
 }
 
@@ -57,6 +59,13 @@ func WithArtifactDir(dir string) StoreOption {
 	}
 }
 
+// WithPreparationDir sets the directory of the attempt preparation journal.
+func WithPreparationDir(dir string) StoreOption {
+	return func(o *options) {
+		o.preparationDir = dir
+	}
+}
+
 // WithRetryCandidateCacheLimit limits retained retry candidate summaries.
 func WithRetryCandidateCacheLimit(limit int) StoreOption {
 	return func(o *options) {
@@ -67,6 +76,7 @@ func WithRetryCandidateCacheLimit(limit int) StoreOption {
 func newOptions(baseDir string, opts []StoreOption) options {
 	cfg := options{
 		artifactDir:              filepath.Join(filepath.Dir(filepath.Clean(baseDir)), "artifacts"),
+		preparationDir:           defaultPreparationDir(baseDir),
 		retryCandidateCacheLimit: defaultRetryCandidateCacheLimit,
 	}
 	for _, opt := range opts {
@@ -84,6 +94,7 @@ func NewStore(baseDir string, opts ...StoreOption) *Store {
 		baseDir:         baseDir,
 		artifactDir:     cfg.artifactDir,
 		logDir:          cfg.logDir,
+		preparationDir:  cfg.preparationDir,
 		cache:           cfg.fileCache,
 		retryCandidates: retryCandidateCache{limit: cfg.retryCandidateCacheLimit},
 	}
@@ -330,7 +341,11 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 		run = r
 	}
 
-	attempt, err := run.CreateAttempt(ctx, ts, store.cache, req.AttemptID)
+	attemptID, err := store.prepareAttemptID(req, ir.DAGRunRef{Name: req.DAG.Name, ID: req.DAGRunID}, ir.DAGRunRef{})
+	if err != nil {
+		return nil, err
+	}
+	attempt, err := run.CreateAttempt(ctx, ts, store.cache, attemptID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create attempt: %w", err)
 	}
@@ -345,6 +360,27 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 	}
 
 	return attempt, nil
+}
+
+// prepareAttemptID returns the ID the attempt is created with. With
+// TrackPreparation it fixes the ID first and journals the preparation, so the
+// entry exists before the attempt directory does. The caller holds the run's
+// data-root lock.
+func (store *Store) prepareAttemptID(req persis.DAGRunCreateAttemptRequest, run, root ir.DAGRunRef) (string, error) {
+	if !req.TrackPreparation {
+		return req.AttemptID, nil
+	}
+	attemptID := req.AttemptID
+	if attemptID == "" {
+		var err error
+		if attemptID, err = genAttemptID(); err != nil {
+			return "", err
+		}
+	}
+	if _, err := store.beginPreparation(run, root, attemptID); err != nil {
+		return "", err
+	}
+	return attemptID, nil
 }
 
 func (store *Store) newChildAttempt(ctx context.Context, req persis.DAGRunCreateAttemptRequest) (dagrun.Attempt, error) {
@@ -382,7 +418,11 @@ func (store *Store) newChildAttempt(ctx context.Context, req persis.DAGRunCreate
 		run = r
 	}
 
-	attempt, err := run.CreateAttempt(ctx, ts, store.cache, req.AttemptID)
+	attemptID, err := store.prepareAttemptID(req, ir.DAGRunRef{Name: req.DAG.Name, ID: req.DAGRunID}, req.RootDAGRun)
+	if err != nil {
+		return nil, err
+	}
+	attempt, err := run.CreateAttempt(ctx, ts, store.cache, attemptID)
 	if err != nil {
 		logger.Error(ctx, "Failed to create sub dag-run attempt", tag.Error(err))
 		return nil, err

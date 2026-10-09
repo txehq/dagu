@@ -56,6 +56,47 @@ else a review step needs must be rendered into the DAG:
 | `TXE_DAGU_REVIEWER=1` | always | Marks a review. Job registration refuses to run under it, so a review cannot register work or start another reviewer. |
 | `CLAUDE_CONFIG_DIR` | `AgentConfigDir` | The reviewer profile. |
 
+A job's declared action and reconcile commands are started from the review
+step, and do not inherit what is the reviewer's own. Removed before the
+command starts: every `DAGU_*` and `TXE_DAGU_*` variable
+(the hub client's context and the service's settings; also `TXE_FIXTURE_*`,
+the bindings of the test fixture's reviewer), the review's own variables
+(`TXE_PACKET`, `TXE_DECISION`, `TXE_PROPOSAL_ID`, `TXE_DECISION_ID`, and
+every `TXE_PARAM_*`, which could otherwise pass for a parameter of the
+action), and the agent's profile and keys (`CLAUDE_*`, `ANTHROPIC_*`,
+`CODEX_*`, `OPENAI_*`). Kept: `TXE_DAGU_REVIEWER=1`, so the command cannot
+register work either. Set afresh for each command: the action's own
+variables (`TXE_JOB_ID`, `TXE_OWNER_ID`, `TXE_ACTION_ID`, `TXE_ACTION_NAME`,
+`TXE_TARGET_ID`, `TXE_IDEMPOTENCY_KEY`, `TXE_PARAM_<NAME>`). Everything else
+the step has is inherited, so what a job's command needs to reach its
+resources is rendered into the DAG like any other variable and reaches it:
+`KUBECONFIG`, and the credential references a job declares, which have
+`TXE_` names of their own (`TXE_KUBECONFIG`, `TXE_KUBE_CONTEXT`). A variable
+with one of the removed names or prefixes cannot be given to a job's command
+this way.
+
+A credential the job declares in `credential_refs` is the deliberate way a
+credential reaches its command, and it is supplied whatever its name: each
+reference is resolved on the job's machine when the command is started (a
+`file` is read as it is, an `env` variable is copied from the review step's
+environment) and set under the name the job gave it, replacing anything
+inherited under that name. A job that declares its own `OPENAI_API_KEY` gets
+the declared one, not the review agent's (unless its declaration names the
+agent's own key or file as the source, which is the owner's choice at
+registration). A reference that cannot be
+resolved stops the command before it starts, as it stops a run, and the
+record names the reference and the kind of failure: not a value, and not
+where the credential is kept. A reference cannot use a name that
+identifies the action or marks the review. The references are not part of
+what the review agent is shown. They are trusted input to the reviewer: it
+reads whatever a reference names. Whatever supplies a job to the reviewer
+from a record that can change after registration has to check the
+references against what was authorized on the job's machine first.
+
+This removes accidental inheritance. It is not isolation: the command runs
+as the same operating-system user as the reviewer and can read the same
+files.
+
 ## Bounds
 
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,
