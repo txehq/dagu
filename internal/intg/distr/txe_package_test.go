@@ -731,16 +731,11 @@ func (r *txePublishRun) retryDirect(t *testing.T, runID, fromStep string) {
 
 // retryQueued retries a run the way the hub does when the retry goes through
 // a queue. The call adds nothing while the previous execution is still being
-// released, so it is repeated until it does.
-//
-// The retry is queued only once the workers have let go of the run. The hub
-// accepts a status report by attempt alone, so a last report of the earlier
-// execution that arrives after the retry was admitted puts its status back
-// and the queued retry is dropped. That race is not these tests' subject.
-func (r *txePublishRun) retryQueued(t *testing.T, runID string) {
+// released, so it is repeated until it does; once it has added the retry, it
+// is not asked again.
+func (r *txePublishRun) retryQueued(t *testing.T) {
 	t.Helper()
 	f := r.f
-	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
 	require.Eventually(t, func() bool {
 		previous, err := f.latestStatus()
 		if err != nil {
@@ -807,7 +802,6 @@ func TestTXEPackage_RetryKeepsEveryExecution(t *testing.T) {
 	manifest, ok := run.registry.execution(first)
 	require.True(t, ok, "the first execution recorded no manifest")
 	assert.Equal(t, txeDigest(txeExecutionContent(1)), manifest.Artifacts[0].SHA256)
-	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
 
 	// The job runs again, from its step, and writes other bytes. The
 	// registry cannot be reached, so the execution fails at publish.
@@ -826,7 +820,6 @@ func TestTXEPackage_RetryKeepsEveryExecution(t *testing.T) {
 	_, ok = run.registry.execution(second)
 	assert.False(t, ok)
 	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-execution-2"), "bytes reached hub storage without a recorded manifest")
-	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
 
 	// The run is retried. The job's step succeeded, so only publish runs:
 	// a third execution that publishes what the second produced.
@@ -887,7 +880,7 @@ func TestTXEPackage_QueuedRetryKeepsEveryExecution(t *testing.T) {
 	// The job succeeds on the retry; the registry cannot be reached.
 	require.NoError(t, os.Remove(filepath.Join(control, "fail-job")))
 	run.registry.setDown(true)
-	run.retryQueued(t, runID)
+	run.retryQueued(t)
 	second := run.waitFor(t, "the second execution did not fail at publish", func(s ir.DAGRunStatus) bool {
 		return s.DAGRunID == runID && s.Status == ir.Failed && txeExecutions(t, control) == 2 &&
 			len(s.Nodes) == 2 && s.Nodes[0].Status == ir.NodeSucceeded
@@ -905,7 +898,7 @@ func TestTXEPackage_QueuedRetryKeepsEveryExecution(t *testing.T) {
 	// The publish step alone runs on the next retry: a third execution of
 	// the same attempt, publishing what the second produced.
 	run.registry.setDown(false)
-	run.retryQueued(t, runID)
+	run.retryQueued(t)
 	third := run.waitFor(t, "the third execution did not succeed", func(s ir.DAGRunStatus) bool {
 		return s.DAGRunID == runID && s.Status == ir.Succeeded && s.QueuedAt != second.QueuedAt
 	})
