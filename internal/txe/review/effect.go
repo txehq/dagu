@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
 )
 
 // EffectStatus is what is known about an attempted external effect.
@@ -121,6 +123,12 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
 	cmd.Env = append(e.baseEnv(), actionEnv(job, action)...)
+	// The action runs in its own process group and the whole group is
+	// killed when the deadline passes. Killing only the direct child would
+	// leave a script's own children free to perform the effect after the
+	// attempt was already recorded as over.
+	cmdutil.SetupCommand(cmd)
+	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
 	cmd.WaitDelay = 5 * time.Second
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout

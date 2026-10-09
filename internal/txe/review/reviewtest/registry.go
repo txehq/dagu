@@ -413,7 +413,7 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			if !declared.Routine {
 				return &review.GuardDeniedError{Reason: review.DenyNotPermitted, Detail: "action needs a human decision"}
 			}
-			if s.intentUnresolved(jobID, req.IntentKey) {
+			if s.intentUnresolved(job, req.IntentKey) {
 				return &review.GuardDeniedError{Reason: review.DenyIntentUnresolved}
 			}
 		} else if denied := s.checkDecision(job, req); denied != nil {
@@ -443,8 +443,9 @@ func grantTimeout(d time.Duration) time.Duration {
 
 // intentUnresolved reports whether the latest attempt of an intent still has
 // an unknown effect: executing, uncertain, or escalated without a retry
-// decision on its escalation.
-func (s *State) intentUnresolved(jobID, intent string) bool {
+// decision on its escalation for the job's current version.
+func (s *State) intentUnresolved(job review.Job, intent string) bool {
+	jobID := job.ID
 	actions := s.Actions[jobID]
 	for i := len(actions) - 1; i >= 0; i-- {
 		a := actions[i]
@@ -457,7 +458,9 @@ func (s *State) intentUnresolved(jobID, intent string) bool {
 		case review.ActionEscalated:
 			verdict := review.Verdict("")
 			for _, d := range s.Decisions[jobID] {
-				if d.ProposalID == review.UncertainProposalID(a.ID) {
+				// Only an answer to the question asked about this version of
+				// the job counts.
+				if d.ProposalID == review.UncertainProposalID(a.ID, job.Version) {
 					verdict = d.Verdict
 				}
 			}

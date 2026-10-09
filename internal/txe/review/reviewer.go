@@ -287,7 +287,17 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		return nil
 	}
 	// Still unknown: ask a human once, then stop probing this action.
-	id := UncertainProposalID(action.ID)
+	if err := r.escalate(ctx, claim, job, action, res.Detail); err != nil {
+		return err
+	}
+	return finish(ActionEscalated, res)
+}
+
+// escalate asks the owner how to settle an attempt whose effect is unknown.
+// The question is bound to the job's current version and filing it again is
+// a no-op.
+func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Action, detail string) error {
+	id := UncertainProposalID(action.ID, job.Version)
 	proposal, err := r.Registry.CreateProposal(ctx, claim, Proposal{
 		ID:              id,
 		JobID:           job.ID,
@@ -298,7 +308,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		ObservedAt:      r.now(),
 		WaitingOn:       waitingOnPerson,
 		AllowedVerdicts: questionVerdicts,
-		Question:        fmt.Sprintf("Action %q on %s may or may not have taken effect (%s). Confirm its real state before it is tried again.", action.Name, action.TargetID, res.Detail),
+		Question:        fmt.Sprintf("Action %q on %s may or may not have taken effect (%s). Confirm its real state before it is tried again.", action.Name, action.TargetID, detail),
 		RelatedAction:   action.ID,
 		ReviewID:        action.ReviewID,
 		NativeTask:      r.taskLocator(id),
@@ -309,7 +319,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 	if err := r.Opener.OpenDecision(ctx, proposal); err != nil {
 		return fmt.Errorf("open decision: %w", err)
 	}
-	return finish(ActionEscalated, res)
+	return nil
 }
 
 func (r *Reviewer) taskLocator(proposalID string) TaskLocator {
@@ -467,10 +477,18 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 	}
 
 	intent := IntentKey(requested.Name, requested.TargetID, requested.Params)
-	if blocking, ok := r.unresolvedAttempt(history, decisions, intent); ok {
+	if blocking, ok := unresolvedAttempt(history, decisions, intent, job.Version); ok {
 		// The effect of an earlier attempt is still unknown. Running the
 		// intent again could apply it twice, whatever the agent asks.
 		review.Notes = append(review.Notes, fmt.Sprintf("action %q not run: earlier attempt %s is %s and unresolved", requested.Name, blocking.ID, blocking.State))
+		if blocking.State == ActionEscalated {
+			// The job may have changed since the owner was first asked, in
+			// which case no answer exists for the job as it is now.
+			detail := fmt.Sprintf("it ran under job version %d and has no answer for version %d", blocking.JobVersion, job.Version)
+			if err := r.escalate(ctx, claim, job, blocking, detail); err != nil {
+				return fmt.Errorf("escalate action %s: %w", blocking.ID, err)
+			}
+		}
 		return nil
 	}
 	if !r.leaseCovers(claim, declared) {
@@ -617,8 +635,10 @@ func (r *Reviewer) leaseCovers(claim Claim, declared DeclaredAction) bool {
 
 // unresolvedAttempt returns the latest attempt of an intent when its effect
 // is still unknown: executing, uncertain, or escalated to a human who has
-// not answered "retry". Only that answer says the intent may run again.
-func (r *Reviewer) unresolvedAttempt(history []Action, decisions []Decision, intent string) (Action, bool) {
+// not answered "retry" for the job at its current version. Only that answer
+// says the intent may run again; an answer given before the job changed was
+// about a different command and unlocks nothing.
+func unresolvedAttempt(history []Action, decisions []Decision, intent string, jobVersion int) (Action, bool) {
 	for i := len(history) - 1; i >= 0; i-- {
 		a := history[i]
 		if a.IntentKey != intent {
@@ -628,7 +648,7 @@ func (r *Reviewer) unresolvedAttempt(history []Action, decisions []Decision, int
 		case ActionExecuting, ActionUncertain:
 			return a, true
 		case ActionEscalated:
-			return a, !retryDecided(decisions, UncertainProposalID(a.ID))
+			return a, !retryDecided(decisions, UncertainProposalID(a.ID, jobVersion))
 		case ActionSucceeded, ActionFailed, ActionNotApplied:
 			return Action{}, false
 		}

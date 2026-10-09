@@ -66,9 +66,12 @@ func ProposalID(reviewID string, kind ProposalKind, name, targetID string, param
 	return derivedID("prp", reviewID, string(kind), name, targetID, normalizeParams(params), question)
 }
 
-// UncertainProposalID identifies the single escalation of one action.
-func UncertainProposalID(actionID string) string {
-	return derivedID("prp", "uncertain", actionID)
+// UncertainProposalID identifies the escalation of one action as asked
+// about one version of its job. An answer is tied to the job as it was when
+// the owner gave it: after the job changes, the question has a new id and
+// the old answer no longer applies.
+func UncertainProposalID(actionID string, jobVersion int) string {
+	return derivedID("prp", "uncertain", actionID, jobVersion)
 }
 
 // DecisionRunID is the id of the native run that carries a proposal's human

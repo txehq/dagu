@@ -1024,3 +1024,63 @@ func TestReconcileDoesNotApplyANewPolicyToAnOldAttempt(t *testing.T) {
 	require.Len(t, s.Proposals[jobID], 1)
 	assert.Contains(t, s.Proposals[jobID][0].Question, "version 1")
 }
+
+// Pass 2 finding: a "retry" answer is about the job as it was when the owner
+// gave it. After the job changes, that answer unlocks nothing: the intent
+// stays blocked and the owner is asked again about the new version.
+func TestStaleRetryAnswerDoesNotUnlockAChangedJob(t *testing.T) {
+	f := newFixture(t)
+	f.effects.run = func(review.Action) (review.EffectResult, bool) {
+		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
+	}
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), notify)
+	f.effects.run = nil
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-b", f.prepare("reviewer-b"), review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "Waiting."})
+
+	first := f.state().Proposals[jobID][0]
+	require.Equal(t, review.ProposalUncertain, first.Kind)
+	_, err := f.registry.Decide(jobID, first.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+
+	// The job changes before the retry is used.
+	v2 := fixtureJob()
+	v2.Version = 2
+	v2.PackageDigest = "sha256:bbbb"
+	require.NoError(t, f.registry.PutJob(v2))
+
+	f.clock.Advance(2 * time.Hour)
+	third := f.prepare("reviewer-c")
+	// The registry guard refuses it on its own.
+	_, err = f.registry.BeginAction(context.Background(), review.BeginRequest{
+		Claim: third.Claim, ActionID: "act_direct", JobVersion: 2, Name: "notify", TargetID: targetID,
+		IntentKey: review.IntentKey("notify", targetID, nil), ReviewID: third.Packet.ReviewID,
+	})
+	var denied *review.GuardDeniedError
+	require.ErrorAs(t, err, &denied)
+	assert.Equal(t, review.DenyIntentUnresolved, denied.Reason)
+
+	applied := f.apply("reviewer-c", third, notify)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 1, f.effects.count("notify"))
+
+	// A new question, bound to version 2, is waiting for the owner.
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 2)
+	second := proposals[1]
+	assert.NotEqual(t, first.ID, second.ID)
+	assert.Equal(t, 2, second.JobVersion)
+	assert.Equal(t, review.ProposalOpen, second.State)
+	assert.Contains(t, second.Question, "version 2")
+
+	// An answer to that question is what unlocks the intent.
+	_, err = f.registry.Decide(jobID, second.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-d", f.prepare("reviewer-d"), notify)
+	assert.Equal(t, 2, f.effects.count("notify"))
+}

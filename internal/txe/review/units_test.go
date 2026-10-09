@@ -85,7 +85,7 @@ func TestDerivedIDs(t *testing.T) {
 		review.RoutineActionID(rev0, "notify", "t1", map[string]string{"b": "2", "a": "1"}))
 	assert.NotEqual(t, review.ApprovedActionID("prp_1", "dec_1"), review.ApprovedActionID("prp_1", "dec_2"))
 
-	runID := review.DecisionRunID(review.UncertainProposalID(a))
+	runID := review.DecisionRunID(review.UncertainProposalID(a, 1))
 	assert.Regexp(t, `^txe-[0-9a-z]{26}$`, runID)
 }
 
@@ -412,4 +412,24 @@ func TestExecuteStepRejectsMalformedIDs(t *testing.T) {
 	}
 	assert.Empty(t, out.String())
 	assert.Empty(t, f.state().Transitions, "no claim was taken")
+}
+
+// Pass 2 finding: when an action's deadline passes, its whole process group
+// is killed. A child the script started in the background must not be left
+// to perform the effect after the attempt was recorded as over.
+func TestCommandEffectorKillsTheActionsChildren(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	dir := t.TempDir()
+	job := review.Job{ID: "job_A", WorkingDir: dir}
+	action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
+	// The child would write its effect two seconds after the deadline.
+	script := `(sleep 3; echo late > effect.txt) & wait`
+	res := (&review.CommandEffector{}).Run(context.Background(), job, shellAction(script, review.IdempotencyNone), action)
+	assert.Equal(t, review.EffectUnknown, res.Status)
+
+	time.Sleep(4 * time.Second)
+	_, err := os.Stat(filepath.Join(dir, "effect.txt"))
+	assert.ErrorIs(t, err, os.ErrNotExist, "the background child outlived the action's deadline")
 }
