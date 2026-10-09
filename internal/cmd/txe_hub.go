@@ -66,7 +66,11 @@ updated only when the rendered spec differs; a DAG of that name the renderer
 did not write, or one from a newer renderer, is left alone.
 
 Without a healthy worker for this machine the DAG is still installed, with a
-warning: its runs wait for the worker, and overlapping ticks are skipped.`,
+warning: its runs wait for the worker, and overlapping ticks are skipped.
+
+Installs from this TXE home run one at a time. The hub cannot refuse a write
+conditionally, so an edit made to the DAG on the hub while an install runs can
+be overwritten; the installed copy is not meant to be edited.`,
 		Args: cobra.NoArgs,
 	}, []commandLineFlag{txeHubMachineFlag, txeHubDryRunFlag, txeJSONFlag}, runTXEHubInstall))
 	return command
@@ -186,10 +190,12 @@ const txeHubInstallLockTimeout = 2 * time.Minute
 // txeHubInstallOptions are an install's switches.
 type txeHubInstallOptions struct {
 	DryRun bool
-	// LockPath serializes installs of this machine's DAG. Only this
-	// machine installs it: the command refuses another machine's id. The
-	// hub's spec API has no compare-and-swap, so this is what keeps one
-	// install from writing over another's newer render.
+	// LockPath serializes installs of this machine's DAG that share this
+	// TXE home, which is where the command takes the machine id from; it
+	// refuses any other id. The hub's spec API has no compare-and-swap, so
+	// this is what keeps one install from writing over another's newer
+	// render. It does not bind a machine id to one physical machine: a copy
+	// of the home elsewhere would hold another lock.
 	LockPath string
 }
 
@@ -253,8 +259,11 @@ func txeHubInstall(ctx context.Context, hub txeHubDAGs, registry txeHubMachines,
 		break
 	}
 
-	// Read the write back: a hub user editing the DAG in the same moment is
-	// outside this lock, and the hub would keep whichever write came last.
+	// Read the write back. This catches a write by someone outside the lock,
+	// such as a hub user editing the DAG, that lands after this one. An edit
+	// that lands between the read above and this write is overwritten
+	// without notice: the spec API has no conditional write to refuse it.
+	// The rendered DAG says not to edit the installed copy.
 	stored, found, err := hub.getDAGSpec(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("read %s back from the hub: %w", name, err)
