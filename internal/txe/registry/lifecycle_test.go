@@ -28,12 +28,20 @@ type fakeRuns struct {
 	onSuspend func(dag string)
 	// finished are run IDs RunFinished reports terminal; others are active.
 	finished map[string]bool
+	// onFinished runs after RunFinished answers, outside the lock.
+	onFinished func()
+	// unsuspendErr fails writes that lift a suspension.
+	unsuspendErr error
 }
 
 func (r *fakeRuns) RunFinished(_ context.Context, _ string, run RunRef) (bool, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	done, ok := r.finished[run.RunID]
+	hook := r.onFinished
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if !ok {
 		return false, ErrRunNotFound
 	}
@@ -75,6 +83,10 @@ func (r *fakeRuns) IsSuspended(_ context.Context, dag string) (bool, error) {
 
 func (r *fakeRuns) SetSuspended(_ context.Context, dag string, suspended bool) error {
 	r.mu.Lock()
+	if !suspended && r.unsuspendErr != nil {
+		r.mu.Unlock()
+		return r.unsuspendErr
+	}
 	r.suspended[dag] = suspended
 	hook := r.onSuspend
 	r.mu.Unlock()
@@ -796,4 +808,99 @@ func TestResourceEventIDCoversWholeTarget(t *testing.T) {
 	other.DisplayName = "another name"
 	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: ev.EventID, Target: other, Observation: ResourcePresent}, agent)
 	assert.Equal(t, CodeDuplicate, code(t, err))
+}
+
+// A retry reusing a run ID refreshes its admission, so settling the earlier
+// attempt it replaced does not remove it.
+func TestRepeatedClaimSurvivesSettlement(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", RunRef{RunID: "run-1"})
+	require.NoError(t, err)
+	f.advance(admissionSettle)
+	rc.finished = map[string]bool{"run-1": true}
+	rc.onFinished = func() {
+		rc.onFinished = nil
+		_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", RunRef{RunID: "run-1"})
+		require.NoError(t, err)
+	}
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Contains(t, got.AdmittedRuns, "run-1")
+}
+
+// A writer whose stale suspend could not be undone keeps its token and the
+// registry's ownership, and the suspension is lifted after the lease.
+func TestFailedUndoKeepsWriterToken(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: OpPause}) })
+	require.NoError(t, err)
+	rc.unsuspendErr = errors.New("flag store unavailable")
+	rc.onSuspend = func(string) {
+		rc.onSuspend = nil
+		_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: OpResume}) })
+		require.NoError(t, err)
+	}
+	require.Error(t, f.store.ApplyEffects(f.ctx, job.JobID))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.True(t, got.SuspendedByRegistry)
+	assert.Len(t, got.SuspendWriters, 1)
+
+	rc.unsuspendErr = nil
+	f.advance(suspendWriteLease)
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.False(t, rc.suspended[job.JobID])
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.False(t, got.SuspendedByRegistry)
+	assert.Empty(t, got.SuspendWriters)
+}
+
+// Applied records past the limit are dropped only for complete events.
+func TestCompactAppliedKeepsIncompleteEvents(t *testing.T) {
+	f := newFixture(t)
+	save := func(complete bool) string {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-14"), Observation: ResourcePresent, Complete: complete}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		return id
+	}
+	list := []AppliedResourceEvent{{EventID: save(false)}, {EventID: save(true)}}
+	for range maxAppliedResourceEvents {
+		list = append(list, AppliedResourceEvent{EventID: save(false)})
+	}
+	out := f.store.compactApplied(f.ctx, list)
+	assert.Len(t, out, maxAppliedResourceEvents+1)
+	assert.Equal(t, list[0].EventID, out[0].EventID, "the incomplete event keeps its record")
+	assert.Equal(t, list[2].EventID, out[1].EventID, "the complete one is dropped")
+}
+
+// A job matching an event both by identity and as a replacement has both
+// applied: the identity result does not stand in for the replacement rule.
+func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-15"), target("v-16")
+	b.DisplayName = a.DisplayName
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{a, b}
+		v.RetirementRules.OnReplacement = RuleRetire
+	})
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: a, Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: a, Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	outcomes := map[string]ResourceOutcome{}
+	for _, d := range ev.Dispositions {
+		outcomes[d.Match] = d.Outcome
+	}
+	assert.Equal(t, OutcomeAvailability, outcomes[matchIdentity])
+	assert.Equal(t, OutcomeRetired, outcomes[matchReplacement])
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleRetired, got.Lifecycle)
 }

@@ -81,9 +81,8 @@ func (s *Store) AdmitClaim(ctx context.Context, dagName, specSHA256 string, run 
 		if !adm.Admit || run.RunID == "" {
 			return nil
 		}
-		if _, ok := tx.Job.AdmittedRuns[run.RunID]; ok {
-			return nil
-		}
+		// A repeated claim (a retry reuses its run ID) refreshes the
+		// admission, so settling an earlier attempt cannot remove it.
 		if tx.Job.AdmittedRuns == nil {
 			tx.Job.AdmittedRuns = map[string]AdmittedRun{}
 		}
@@ -417,28 +416,37 @@ func (s *Store) suspendOwned(ctx context.Context, jobID string) error {
 	}); err != nil || !owned {
 		return err
 	}
+	// The token stays until any stale write is undone: a writer that stops
+	// before then leaves it, and ownership, for the lease to recover.
 	writeErr := s.runs.SetSuspended(ctx, jobID, true)
-	var current *Job
-	if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
-		current = tx.Job
-		if _, ok := tx.Job.SuspendWriters[token]; ok {
-			delete(tx.Job.SuspendWriters, token)
-			tx.touch()
+	current, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return errors.Join(writeErr, err)
+	}
+	undone := false
+	if writeErr == nil && !wantsSuspension(current.Lifecycle) {
+		if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
+			return fmt.Errorf("undo stale suspension: %w", err)
 		}
+		undone = true
+	}
+	if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+		delete(tx.Job.SuspendWriters, token)
+		// Ownership is released only after this writer undid its own write
+		// and while no other writer is outstanding; otherwise it stays for
+		// reconciliation to lift whatever suspension remains.
+		if undone && !wantsSuspension(tx.Job.Lifecycle) && len(tx.Job.SuspendWriters) == 0 {
+			tx.Job.SuspendedByRegistry = false
+		}
+		tx.touch()
 		return nil
 	}); err != nil {
-		return errors.Join(writeErr, err)
+		return err
 	}
 	if writeErr != nil {
 		return fmt.Errorf("suspend DAG: %w", writeErr)
 	}
-	if wantsSuspension(current.Lifecycle) {
-		return nil
-	}
-	if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
-		return fmt.Errorf("undo stale suspension: %w", err)
-	}
-	return s.releaseSuspension(ctx, jobID)
+	return nil
 }
 
 // releaseSuspension drops the registry's ownership of the DAG's suspension
