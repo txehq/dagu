@@ -21,6 +21,12 @@ export default function TxeInboxPage(): React.ReactElement {
   const canDecide = useCanExecute();
   const api = useTxeApi();
   const { data, error, isLoading, mutate } = useInboxData();
+  // A refused decision usually removes its card on reload (the proposal was
+  // superseded or closed), so the refusal is reported at page level.
+  const [refused, setRefused] = React.useState<{
+    question: string;
+    message: string;
+  } | null>(null);
 
   React.useEffect(() => {
     appBarContext.setTitle('Job inbox');
@@ -48,6 +54,16 @@ export default function TxeInboxPage(): React.ReactElement {
         <Alert variant="destructive">
           <AlertDescription>
             {error instanceof Error ? error.message : String(error)}
+          </AlertDescription>
+        </Alert>
+      )}
+      {refused && (
+        <Alert variant="destructive" data-testid="txe-decision-refused">
+          <AlertDescription>
+            <I18nText
+              text="Your decision on “{question}” was not recorded: the proposal changed after you reviewed it ({reason}). Nothing was done; review the current proposals."
+              values={{ question: refused.question, reason: refused.message }}
+            />
           </AlertDescription>
         </Alert>
       )}
@@ -80,7 +96,15 @@ export default function TxeInboxPage(): React.ReactElement {
                   item.proposal!.proposalId,
                   request
                 );
-                if (result.ok) await mutate();
+                if (result.ok) {
+                  setRefused(null);
+                  await mutate();
+                } else if (result.status === 409) {
+                  setRefused({
+                    question: item.proposal!.question,
+                    message: result.message,
+                  });
+                }
                 return result;
               }}
               onStale={() => void mutate()}

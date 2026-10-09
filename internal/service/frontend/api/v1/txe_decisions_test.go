@@ -175,6 +175,10 @@ func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 	var list api.TxeDecisionList
 	c.Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
 	require.Len(t, list.Decisions, 1)
+	// The stored record was written pending; the listing reports the
+	// completion recorded since.
+	require.NotNil(t, list.Decisions[0].NativeResume)
+	require.Equal(t, api.TxeDecisionNativeResume("completed"), *list.Decisions[0].NativeResume)
 }
 
 // A reject closes the proposal, still completes the native task, and replaying

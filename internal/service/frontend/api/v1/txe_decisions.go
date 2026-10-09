@@ -85,6 +85,10 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 	if err != nil {
 		return nil, err
 	}
+	job, err := store.GetJob(ctx, req.JobId)
+	if err != nil {
+		return nil, txeError(err)
+	}
 	all, err := store.ListDecisions(ctx, req.JobId, 0)
 	if err != nil {
 		return nil, txeError(err)
@@ -94,7 +98,7 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 		if d.ProposalID != req.ProposalId {
 			continue
 		}
-		converted, err := txeConvert[api.TxeDecision](d)
+		converted, err := txeConvert[api.TxeDecision](withNativeResumeState(job, d))
 		if err != nil {
 			return nil, err
 		}
@@ -173,4 +177,18 @@ func (r txeRunRetrier) RetryLatest(ctx context.Context, dagName string) (string,
 		return "", err
 	}
 	return status.DAGRunID, nil
+}
+
+// withNativeResumeState reports a decision's current native-resume state. The
+// stored decision is immutable and keeps the state it was written with; the
+// job's pending list is the authority on whether completion is outstanding.
+func withNativeResumeState(job *registry.Job, d *registry.Decision) *registry.Decision {
+	out := *d
+	switch {
+	case job.NativeResumes[d.DecisionID] != nil:
+		out.NativeResume = "pending"
+	case d.NativeResume == "pending":
+		out.NativeResume = "completed"
+	}
+	return &out
 }
