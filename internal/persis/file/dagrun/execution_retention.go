@@ -80,7 +80,7 @@ func (store *Store) retainExecution(root ir.DAGRunRef, att *Attempt, status *ir.
 	artifacts := store.executionArtifacts(ref, status)
 
 	if _, err := os.Lstat(dest); err == nil {
-		return store.sameRetained(dest, statusData, logs)
+		return store.verifyRetained(dest, ref, status)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("retain execution: %w", err)
 	}
@@ -141,36 +141,32 @@ func (store *Store) retainExecution(root ir.DAGRunRef, att *Attempt, status *ir.
 	return nil
 }
 
-// sameRetained accepts an existing copy only when it is complete and holds
-// the same status and log bytes; anything else fails visibly.
-func (store *Store) sameRetained(dest string, statusData []byte, logs []executionLog) error {
+// verifyRetained accepts an existing copy of the execution when it is
+// intact: its manifest names this execution and its status and logs still
+// have the digests the manifest recorded. The first copy of an execution is
+// its evidence and stands; the live files may have changed since (a late
+// stream, a rolled-back admission), and that must not block a later retry.
+// A copy that is unreadable, of another execution, or altered fails visibly.
+func (store *Store) verifyRetained(dest, ref string, status *ir.DAGRunStatus) error {
 	data, err := os.ReadFile(filepath.Join(dest, retainedManifestFile)) //nolint:gosec // dest is the store's own copy directory; the file name is fixed
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrRetainedExecutionConflict, filepath.Base(dest), err)
+		return fmt.Errorf("%w: %s: %v", ErrRetainedExecutionConflict, ref, err)
 	}
 	var m persis.RetainedExecution
 	if err := json.Unmarshal(data, &m); err != nil || m.Schema != retainedSchema {
-		return fmt.Errorf("%w: %s: unreadable manifest", ErrRetainedExecutionConflict, filepath.Base(dest))
+		return fmt.Errorf("%w: %s: unreadable manifest", ErrRetainedExecutionConflict, ref)
+	}
+	if m.Execution != ref || m.AttemptID != status.AttemptID || m.QueuedAt != status.QueuedAt {
+		return fmt.Errorf("%w: %s: the copy is of another execution", ErrRetainedExecutionConflict, ref)
 	}
 	saved, err := os.ReadFile(filepath.Join(dest, retainedStatusFile)) //nolint:gosec // dest is the store's own copy directory; the file name is fixed
-	if err != nil || digest(saved) != m.StatusSHA256 || m.StatusSHA256 != digest(statusData) {
-		return fmt.Errorf("%w: %s: status differs", ErrRetainedExecutionConflict, m.Execution)
-	}
-	want := map[string]string{}
-	for _, l := range logs {
-		sum, _, err := fileDigest(l.src)
-		if err != nil {
-			return fmt.Errorf("retain execution: %w", err)
-		}
-		want[l.name] = sum
-	}
-	if len(want) != len(m.Files) {
-		return fmt.Errorf("%w: %s: logs differ", ErrRetainedExecutionConflict, m.Execution)
+	if err != nil || digest(saved) != m.StatusSHA256 {
+		return fmt.Errorf("%w: %s: status altered or missing", ErrRetainedExecutionConflict, ref)
 	}
 	for _, f := range m.Files {
-		got, _, err := fileDigest(filepath.Join(dest, retainedLogsDir, f.Name))
-		if err != nil || got != f.SHA256 || want[f.Name] != f.SHA256 {
-			return fmt.Errorf("%w: %s: log %s differs", ErrRetainedExecutionConflict, m.Execution, f.Name)
+		got, n, err := fileDigest(filepath.Join(dest, retainedLogsDir, f.Name))
+		if err != nil || got != f.SHA256 || n != f.Bytes {
+			return fmt.Errorf("%w: %s: log %s altered or missing", ErrRetainedExecutionConflict, ref, f.Name)
 		}
 	}
 	return nil

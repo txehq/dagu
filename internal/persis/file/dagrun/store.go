@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -242,8 +243,17 @@ func (store *Store) CompareAndSwapLatestAttemptStatus(
 	}
 
 	// The finished execution is copied before anything replaces it; a copy
-	// that cannot be made refuses the swap.
+	// that cannot be made refuses the swap. The mutation is tried on a copy
+	// of the status first, so a swap the caller refuses (a stale retry)
+	// never leaves a copy behind.
 	if req.RetainBeforeSwap && !status.Status.IsActive() && status.Status != ir.NotStarted {
+		probe, err := cloneStatus(status)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := req.Mutate(probe); err != nil {
+			return nil, false, err
+		}
 		if err := store.retainExecution(rootRef, attempt, status); err != nil {
 			return nil, false, err
 		}
@@ -541,4 +551,17 @@ func (store *Store) listRoot(_ context.Context, include string) ([]DataRoot, err
 	}
 
 	return roots, nil
+}
+
+// cloneStatus returns an independent copy of status.
+func cloneStatus(status *ir.DAGRunStatus) (*ir.DAGRunStatus, error) {
+	data, err := json.Marshal(status)
+	if err != nil {
+		return nil, fmt.Errorf("copy status: %w", err)
+	}
+	var out ir.DAGRunStatus
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("copy status: %w", err)
+	}
+	return &out, nil
 }
