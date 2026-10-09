@@ -748,7 +748,7 @@ func TestNativeResumeSurvivesClosedProposal(t *testing.T) {
 	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
 		var err error
 		p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: f.mint(PrefixProposal), Action: ActionSpec{Name: "resize"},
-			NativeTask: &NativeTask{DAG: "txe-decide-x", RunID: "r1", StepID: "decide"}})
+			NativeTask: &NativeTask{DAG: DecideTaskDAG(f.machine), RunID: "r1", StepID: "decide"}})
 		return err
 	})
 	require.NoError(t, err)

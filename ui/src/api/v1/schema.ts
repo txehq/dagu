@@ -4263,6 +4263,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/runs/{runId}/retry-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request a retry of a job's run
+         * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision.
+         */
+        post: operations["requestTxeRunRetry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/proposals/{proposalId}/decisions": {
         parameters: {
             query?: never;
@@ -8371,6 +8394,16 @@ export interface components {
             idempotency_key: string;
             actor?: components["schemas"]["TxeActor"];
         };
+        TxeRetryRequest: {
+            idempotency_key: string;
+            /** @description The job version the person saw; refused with 409 when the job moved on */
+            expected_job_version: number;
+            /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
+            run_spec_sha256?: string;
+            /** @description The run's package digest; when omitted the server reads it from the run */
+            package_digest?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
         TxeDecisionResponse: {
             decision: components["schemas"]["TxeDecision"];
             proposal?: components["schemas"]["TxeProposal"];
@@ -8480,6 +8513,7 @@ export interface components {
         TxeMachineId: string;
         TxeEventId: string;
         TxeJobId: string;
+        TxeRunId: string;
         TxeJobVersionNumber: number;
         TxeClaimId: string;
         TxeProposalId: string;
@@ -22988,6 +23022,96 @@ export interface operations {
             };
         };
     };
+    requestTxeRunRetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not implemented yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeProposalDecisions: {
         parameters: {
             query?: never;
@@ -23990,7 +24114,8 @@ export enum TxeProposalState {
     decided = "decided",
     executed = "executed",
     rejected = "rejected",
-    superseded = "superseded"
+    superseded = "superseded",
+    closed = "closed"
 }
 export enum TxeProposalInputWaiting_on {
     person = "person",
