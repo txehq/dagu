@@ -21063,6 +21063,13 @@ components:
 
     TxeRetainedExecution:
       type: object
+      description: >-
+        An immutable snapshot of one execution (attempt_id, queued_at), taken
+        at retained_at, just before a queued retry replaced it. It holds what
+        the hub had at that moment and is never updated: log bytes or
+        finalization records that arrive later are not in it, and a snapshot
+        taken with logs_final false stays false. Each file carries its own
+        size, digest and finality.
       properties:
         execution:
           type: string
@@ -21076,11 +21083,16 @@ components:
           type: boolean
         logs_final:
           type: boolean
+          description: >-
+            True only when, at retained_at, every log stream the status names
+            had arrived and was recorded finished with exactly the bytes
+            copied. False means a log may be partial.
         logs_note:
           type: string
         retained_at:
           type: string
           format: date-time
+          description: When the snapshot was taken; it reflects the hub at this time only.
         status_sha256:
           type: string
         files:

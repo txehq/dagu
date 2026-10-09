@@ -131,13 +131,22 @@ func TestRetainedExecutionIsImmutable(t *testing.T) {
 	ref := ir.ExecutionRef(f.attempt, "q1")
 	first := f.file(ref, "run.stdout.log")
 
-	// The same execution is put back (an admission rolled back) and a late
-	// chunk changes the live log.
+	// The same execution is put back (an admission rolled back), a late
+	// chunk changes the live log and the stream is then recorded final.
 	f.execution("q1", ir.Failed, "execution 1")
 	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
-	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("stdout execution 1\nlate\n"), 0o600))
+	late := "stdout execution 1\nlate\n"
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte(late), 0o600))
+	writeFinal(t, filepath.Join(logs, "run.stdout.log"), "q1", f.attempt, late)
 	require.NoError(t, f.requeue(ir.Failed, nil), "a later retry of the same execution is not blocked")
 	assert.Equal(t, first, f.file(ref, "run.stdout.log"), "the first copy stands")
+	snap, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, snap, 1)
+	assert.False(t, snap[0].LogsFinal, "the snapshot is not relabelled final by later evidence")
+	for _, file := range snap[0].Files {
+		assert.False(t, file.Final, file.Name)
+	}
 
 	// An altered copy fails visibly.
 	f.execution("q1", ir.Failed, "execution 1")
@@ -420,4 +429,29 @@ func TestRetainedExecutionWithoutLogsListsNoFiles(t *testing.T) {
 	data, err := json.Marshal(all[0])
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"files":[]`)
+}
+
+// A log cannot take the name of the copy's own files: a log named
+// status.json is kept under another name, and a read of status.json is
+// always the saved status.
+func TestRetainedLogCannotStandInForTheStatus(t *testing.T) {
+	f := newRetentionFixture(t)
+	f.execution("q1", ir.Failed, "execution 1")
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "status.json"), []byte(`{"labels":["workspace=ops"]}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "manifest.json"), []byte("not a manifest"), 0o600))
+	require.NoError(t, f.requeue(ir.Failed, nil))
+
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	var names []string
+	for _, file := range all[0].Files {
+		names = append(names, file.Name)
+	}
+	assert.NotContains(t, names, "status.json")
+	assert.NotContains(t, names, "manifest.json")
+	assert.Contains(t, names, "1-status.json")
+	assert.Contains(t, f.file(all[0].Execution, "status.json"), `"dagRunId":"`+f.runID+`"`, "the saved status")
+	assert.Equal(t, `{"labels":["workspace=ops"]}`, f.file(all[0].Execution, "1-status.json"))
 }

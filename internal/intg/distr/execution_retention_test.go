@@ -38,7 +38,7 @@ steps:
       n=$(cat %[1]s/publish 2>/dev/null || echo 0); n=$((n+1)); echo $n > %[1]s/publish
       echo "publish execution $n"
       test $n -ge 2
-`, state), withLogPersistence())
+`, state), withLogPersistence(), withIsolatedWorker())
 	defer f.cleanup()
 
 	require.NoError(t, f.enqueue())

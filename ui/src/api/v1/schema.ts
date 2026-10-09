@@ -8692,15 +8692,20 @@ export interface components {
             /** @description The log stream was proven finished for this execution */
             final?: boolean;
         };
+        /** @description An immutable snapshot of one execution (attempt_id, queued_at), taken at retained_at, just before a queued retry replaced it. It holds what the hub had at that moment and is never updated: log bytes or finalization records that arrive later are not in it, and a snapshot taken with logs_final false stays false. Each file carries its own size, digest and finality. */
         TxeRetainedExecution: {
             execution: string;
             attempt_id: string;
             queued_at: string;
             status: string;
             status_complete: boolean;
+            /** @description True only when, at retained_at, every log stream the status names had arrived and was recorded finished with exactly the bytes copied. False means a log may be partial. */
             logs_final: boolean;
             logs_note?: string;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description When the snapshot was taken; it reflects the hub at this time only.
+             */
             retained_at: string;
             status_sha256: string;
             files: components["schemas"]["TxeRetainedFile"][];

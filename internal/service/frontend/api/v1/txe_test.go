@@ -959,7 +959,13 @@ func TestTxeAPIRetainedExecutionsFollowTheRunsWorkspace(t *testing.T) {
 		require.True(t, swapped)
 		return registry.ExecutionRef(attempt.ID(), queuedAt)
 	}
+	// A log of the secret execution that claims the ops workspace must not
+	// stand in for its saved status.
+	logs := filepath.Join(dir, "logs", jobID, "run-1", attempt.ID())
+	require.NoError(t, os.MkdirAll(logs, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "status.json"), []byte(`{"labels":["workspace=ops"]}`), 0o600))
 	secretRef := execution("2026-10-09T12:00:00Z", "secret")
+	require.NoError(t, os.Remove(filepath.Join(logs, "status.json")))
 	opsRef := execution("2026-10-09T12:00:01Z", "ops")
 
 	list := func(ctx context.Context) []string {
@@ -975,12 +981,14 @@ func TestTxeAPIRetainedExecutionsFollowTheRunsWorkspace(t *testing.T) {
 	assert.Equal(t, []string{secretRef, opsRef}, list(txeAdmin))
 	assert.Equal(t, []string{opsRef}, list(txeOps), "the run made in secret is not listed")
 
-	for _, name := range []string{"status.json"} {
+	for _, name := range []string{"status.json", "1-status.json"} {
 		_, err := a.GetTxeRunExecutionFile(txeOps, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: secretRef, Name: name})
 		requireStatus(t, err, http.StatusNotFound)
-		_, err = a.GetTxeRunExecutionFile(txeOps, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: opsRef, Name: name})
-		require.NoError(t, err)
+		_, err = a.GetTxeRunExecutionFile(txeAdmin, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: secretRef, Name: name})
+		require.NoError(t, err, "%s is there for a caller who can see secret", name)
 	}
+	_, err = a.GetTxeRunExecutionFile(txeOps, apigen.GetTxeRunExecutionFileRequestObject{JobId: jobID, RunId: "run-1", ExecutionRef: opsRef, Name: "status.json"})
+	require.NoError(t, err)
 
 	resp, err := a.ListTxeRunExecutions(txeOps, apigen.ListTxeRunExecutionsRequestObject{JobId: jobID, RunId: "run-1"})
 	require.NoError(t, err)
