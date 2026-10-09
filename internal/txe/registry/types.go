@@ -694,8 +694,10 @@ type Exception struct {
 	Target string `json:"target,omitempty"`
 	// ActionID and Attempt name the action attempt an action-scope
 	// exception is about; it is resolved when that attempt ends.
-	ActionID   string     `json:"action_id,omitempty"`
-	Attempt    int        `json:"attempt,omitempty"`
+	ActionID string `json:"action_id,omitempty"`
+	Attempt  int    `json:"attempt,omitempty"`
+	// JobVersion is the version a binding-scope exception is about.
+	JobVersion int        `json:"job_version,omitempty"`
 	Detail     string     `json:"detail"`
 	Evidence   []string   `json:"evidence,omitempty"`
 	Created    Stamp      `json:"created"`
