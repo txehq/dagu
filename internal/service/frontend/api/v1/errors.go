@@ -46,6 +46,8 @@ type Error struct {
 	HTTPStatus int
 	// Message is the error message to return.
 	Message string
+	// Details is returned as the error's details object when set.
+	Details map[string]any
 }
 
 // Error returns the error message.
