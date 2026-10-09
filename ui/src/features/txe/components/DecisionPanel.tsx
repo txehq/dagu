@@ -57,9 +57,8 @@ export function verdictLabel(verdict: Verdict, action: string): string {
 // offeredVerdicts drops retry from proposals on which it has no meaning, so
 // the panel never offers a verdict the server refuses.
 export function offeredVerdicts(proposal: Proposal): Verdict[] {
-  const typed =
-    proposal.action.name === ACTION_RETRY_RUN ||
-    proposal.action.name === ACTION_UNCERTAIN_EFFECT;
+  // Run retry stays hidden until the server can authorize it.
+  const typed = proposal.action.name === ACTION_UNCERTAIN_EFFECT;
   return proposal.allowedVerdicts.filter((v) => v !== 'retry' || typed);
 }
 

@@ -185,9 +185,10 @@ describe('DecisionPanel', () => {
         now={now}
       />
     );
+    // Run retry is not offered until the server can authorize it.
     expect(
-      screen.getByRole('button', { name: 'Retry this run' })
-    ).toBeInTheDocument();
+      screen.queryByRole('button', { name: 'Retry this run' })
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByTestId('txe-uncertain-effect')
     ).not.toBeInTheDocument();
