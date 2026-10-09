@@ -118,10 +118,18 @@ type reasons map[string]string
 
 func (r reasons) reason(name string) string { return r[name] }
 
-// ReadCredentialFile reads a credential file only at an absolute, clean
-// path to a regular file this user owns that nobody else can write. The
-// checks are made on the opened file, not the path, so the file cannot be
-// swapped between the check and the read, and a symbolic link is refused.
+// ReadCredentialFile reads a credential file, at most 1 MiB, only at an
+// absolute, clean path with no "..", and only if it is a regular file.
+//
+// On Unix the file is opened without following a symbolic link and checked
+// on the open descriptor: it must be this user's and not writable by group
+// or others, so it cannot be swapped between the check and the read.
+//
+// On Windows, permissions are ACLs this function does not inspect: it
+// refuses a symbolic link with Lstat before opening (so a swap between the
+// two is possible) and checks the opened file is regular, but enforces no
+// ownership or writer restriction. Success there is not proof that another
+// user cannot change the file.
 func ReadCredentialFile(locator string) (string, error) {
 	if locator == "" || !filepath.IsAbs(locator) || filepath.Clean(locator) != locator || strings.Contains(locator, "..") {
 		return "", fmt.Errorf("locator %q is not an absolute, clean path", locator)
