@@ -51,6 +51,9 @@ func TestDispatchConditionalRetryRefusesAnotherLatestExecution(t *testing.T) {
 	heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
 	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
 	h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+	// Release the attempts it keeps open, before the temp dir is removed
+	// (Windows cannot delete an open file).
+	t.Cleanup(func() { h.Close(context.Background()) })
 	dispatchRetry := func() error {
 		_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
 			Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
@@ -132,6 +135,9 @@ func TestDispatchConditionalRetryRefusesARaceBeforeCreation(t *testing.T) {
 	heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
 	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
 	h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+	// Release the attempts it keeps open, before the temp dir is removed
+	// (Windows cannot delete an open file).
+	t.Cleanup(func() { h.Close(context.Background()) })
 	_, err = h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
 		Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
 		Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
@@ -200,6 +206,9 @@ func TestDispatchReceiptMatchesTheSavedExecution(t *testing.T) {
 			heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
 			require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
 			h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+			// Release the attempts it keeps open, before the temp dir is removed
+			// (Windows cannot delete an open file).
+			t.Cleanup(func() { h.Close(context.Background()) })
 			resp, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
 				Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
 				Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
