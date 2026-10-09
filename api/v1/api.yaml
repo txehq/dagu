@@ -19454,7 +19454,10 @@ components:
           type: string
         target:
           $ref: "#/components/schemas/TxeTarget"
-        params: {}
+        params:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
       required: [name]
 
     TxeArtifactRef:
@@ -19650,7 +19653,10 @@ components:
           $ref: "#/components/schemas/TxeGrant"
         receipt:
           type: string
-        outcome: {}
+        outcome:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
         settled_under_claim:
           type: string
         read_only:
@@ -20079,7 +20085,10 @@ components:
           $ref: "#/components/schemas/TxeActionState"
         receipt:
           type: string
-        outcome: {}
+        outcome:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [grant_id, claim_id, fence, state]

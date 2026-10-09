@@ -13,6 +13,7 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -76,16 +77,39 @@ func txeConvert[T any](v any) (T, error) {
 	return out, nil
 }
 
-// txeActor returns the request's actor. Without one, the authenticated user
-// is a human actor and an unauthenticated server is the system.
+var errTxeAPIKeyHuman = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "an API key cannot act as a human",
+}
+
+// txeActor returns the request's actor. On an authenticated request the
+// actor ID is the authenticated principal, and only a user who signed in
+// (not an API key) may act as a human; kind, session, machine and client
+// stay as the caller describes them. Without a body actor the principal is a
+// human, or an agent for an API key. An unauthenticated server records the
+// actor as sent, or the system.
 func txeActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
-	if in != nil {
-		return txeConvert[registry.Actor](in)
+	user, authed := auth.UserFromContext(ctx)
+	_, apiKey := auth.APIKeyFromContext(ctx)
+	if in == nil {
+		switch {
+		case authed && apiKey:
+			return registry.Actor{Kind: registry.ActorAgent, ID: user.Username}, nil
+		case authed:
+			return registry.Actor{Kind: registry.ActorHuman, ID: user.Username}, nil
+		}
+		return registry.Actor{Kind: registry.ActorSystem, ID: "api"}, nil
 	}
-	if user, ok := auth.UserFromContext(ctx); ok {
-		return registry.Actor{Kind: registry.ActorHuman, ID: user.Username}, nil
+	actor, err := txeConvert[registry.Actor](in)
+	if err != nil || !authed {
+		return actor, err
 	}
-	return registry.Actor{Kind: registry.ActorSystem, ID: "api"}, nil
+	if apiKey && actor.Kind == registry.ActorHuman {
+		return registry.Actor{}, errTxeAPIKeyHuman
+	}
+	actor.ID = user.Username
+	return actor, nil
 }
 
 // txeWrite prepares a write: it checks the caller may write and resolves the
@@ -100,6 +124,77 @@ func (a *API) txeWrite(ctx context.Context, in *api.TxeActor) (*registry.Store, 
 	}
 	actor, err := txeActor(ctx, in)
 	return s, actor, err
+}
+
+// txeRequireSpecWrite applies the native DAG write authorization to a job's
+// DAG: the caller must be able to write DAGs in the workspace the new spec
+// names and, when the DAG already exists, in the workspace it is in now. A
+// spec that does not parse is left to the registry to refuse.
+func (a *API) txeRequireSpecWrite(ctx context.Context, jobID, spec string) error {
+	if err := a.requireDAGWrite(ctx); err != nil {
+		return err
+	}
+	return a.txeCheckWorkspaces(ctx, jobID, spec, false, a.requireDAGWriteForWorkspace)
+}
+
+// txeRequireJobWrite checks that the caller may change a job: it needs write
+// access to the workspace of the job's current version and of its saved DAG.
+// It does not depend on DAG writes being enabled, so claims and settlements
+// keep working under a read-only Git sync.
+func (a *API) txeRequireJobWrite(ctx context.Context, s *registry.Store, jobID string) error {
+	return a.txeCheckJob(ctx, s, jobID, a.txeRequireWorkspaceWrite)
+}
+
+func (a *API) txeCheckJob(ctx context.Context, s *registry.Store, jobID string, check func(context.Context, string) error) error {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return txeError(err)
+	}
+	v, err := s.GetVersion(ctx, jobID, job.Version)
+	if err != nil {
+		return txeError(err)
+	}
+	return a.txeCheckWorkspaces(ctx, jobID, v.DAG.Spec, true, check)
+}
+
+func (a *API) txeRequireWorkspaceWrite(ctx context.Context, workspaceName string) error {
+	role, ok, err := a.effectiveRoleForWorkspace(ctx, workspaceName)
+	if err != nil {
+		return err
+	}
+	if !ok || !role.CanWrite() {
+		return errInsufficientPermissions
+	}
+	return nil
+}
+
+// txeCheckWorkspaces runs check on the workspace spec names and on the
+// workspace of the job's saved DAG, if one exists. With strict, a spec that
+// does not load is an error rather than left to the registry.
+func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict bool, check func(context.Context, string) error) error {
+	if a.dagRepository == nil {
+		return nil
+	}
+	dag, err := a.dagRepository.LoadSpec(ctx, []byte(spec), jobID, persis.DAGLoadOptions{AllowBuildErrors: true})
+	switch {
+	case err == nil:
+		if err := check(ctx, dagWorkspaceName(dag)); err != nil {
+			return err
+		}
+	case strict:
+		return fmt.Errorf("txe: load DAG spec of %s: %w", jobID, err)
+	}
+	if registry.ValidateID(registry.PrefixJob, jobID) != nil {
+		return nil
+	}
+	cur, err := a.dagRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{AllowBuildErrors: true})
+	if err != nil {
+		if errors.Is(err, persis.ErrDAGNotFound) {
+			return nil
+		}
+		return err
+	}
+	return check(ctx, dagWorkspaceName(cur))
 }
 
 func txeBody[T any](body *T) (*T, error) {
@@ -120,6 +215,9 @@ func txeLimit(limit *api.TxeLimit) int {
 func (a *API) txeTx(ctx context.Context, jobID string, in *api.TxeActor, fn func(tx *registry.JobTx) error) (api.TxeJob, error) {
 	s, actor, err := a.txeWrite(ctx, in)
 	if err != nil {
+		return api.TxeJob{}, err
+	}
+	if err := a.txeRequireJobWrite(ctx, s, jobID); err != nil {
 		return api.TxeJob{}, err
 	}
 	job, err := s.WithJobTx(ctx, jobID, actor, fn)
@@ -261,9 +359,6 @@ func (a *API) RegisterTxeJob(ctx context.Context, req api.RegisterTxeJobRequestO
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
-		return nil, err
-	}
 	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
 		return nil, err
@@ -271,6 +366,9 @@ func (a *API) RegisterTxeJob(ctx context.Context, req api.RegisterTxeJobRequestO
 	v, err := txeConvert[registry.JobVersion](body.Version)
 	if err != nil {
 		return nil, ErrInvalidRequestBody
+	}
+	if err := a.txeRequireSpecWrite(ctx, body.JobId, v.DAG.Spec); err != nil {
+		return nil, err
 	}
 	job, err := s.Register(ctx, registry.RegisterInput{
 		JobID: body.JobId, RequestID: body.RequestId, OwnerID: body.OwnerId, ProjectID: body.ProjectId,
@@ -301,8 +399,15 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 	if err != nil {
 		return nil, err
 	}
+	if err := a.requireDAGWrite(ctx); err != nil {
+		return nil, err
+	}
 	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
+		return nil, err
+	}
+	// Readiness may rewrite the job's DAG, so it needs DAG write access.
+	if err := a.txeCheckJob(ctx, s, req.JobId, a.requireDAGWriteForWorkspace); err != nil {
 		return nil, err
 	}
 	pkg, err := txeConvert[registry.PackageEvidence](body.Package)
@@ -322,9 +427,6 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
-		return nil, err
-	}
 	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
 		return nil, err
@@ -332,6 +434,9 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	v, err := txeConvert[registry.JobVersion](body.Version)
 	if err != nil {
 		return nil, ErrInvalidRequestBody
+	}
+	if err := a.txeRequireSpecWrite(ctx, req.JobId, v.DAG.Spec); err != nil {
+		return nil, err
 	}
 	job, err := s.UpdateVersion(ctx, req.JobId, body.RequestId, body.ExpectedVersion, v, actor)
 	if err != nil {
@@ -624,14 +729,7 @@ func (a *API) SettleTxeAction(ctx context.Context, req api.SettleTxeActionReques
 		return nil, err
 	}
 	settlement := registry.Settlement{ActionID: req.ActionId, GrantID: body.GrantId, ClaimID: body.ClaimId, Fence: body.Fence,
-		State: registry.ActionState(body.State), Receipt: valueOf(body.Receipt)}
-	if body.Outcome != nil {
-		raw, err := json.Marshal(body.Outcome)
-		if err != nil {
-			return nil, ErrInvalidRequestBody
-		}
-		settlement.Outcome = raw
-	}
+		State: registry.ActionState(body.State), Receipt: valueOf(body.Receipt), Outcome: body.Outcome}
 	var action *registry.Action
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
 		var err error
