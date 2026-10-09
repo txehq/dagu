@@ -21091,6 +21091,9 @@ components:
           format: int64
         sha256:
           type: string
+        final:
+          type: boolean
+          description: "The log stream was proven finished for this execution"
       required: [name, bytes, sha256]
 
     TxeRetainedExecution:

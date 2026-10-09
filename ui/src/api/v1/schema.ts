@@ -8702,6 +8702,8 @@ export interface components {
             /** Format: int64 */
             bytes: number;
             sha256: string;
+            /** @description The log stream was proven finished for this execution */
+            final?: boolean;
         };
         TxeRetainedExecution: {
             execution: string;

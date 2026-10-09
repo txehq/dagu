@@ -38,10 +38,10 @@ const (
 	// hubAttemptsDir is where a run's published copies sit in its native
 	// artifact directory, one prefix per execution (see the TXE registry).
 	hubAttemptsDir = "txe-attempts"
-	// logsNotFenced says why logs are not claimed final: a stale stream of
-	// the execution could still append until streams are fenced by
-	// execution.
-	logsNotFenced = "log streams are not fenced by execution yet; a late stream of this execution may be missing"
+	// logsNotFinal says why logs are not claimed final.
+	logsNotFinal = "not every log stream of this execution was proven finished (no matching .final record); a log may be partial"
+	// finalSuffix names the coordinator's stream finalization record.
+	finalSuffix = ".final"
 )
 
 var (
@@ -102,7 +102,7 @@ func (store *Store) retainExecution(root ir.DAGRunRef, att *Attempt, status *ir.
 	m := persis.RetainedExecution{
 		Schema: retainedSchema, Execution: ref, AttemptID: status.AttemptID, QueuedAt: status.QueuedAt,
 		Status: status.Status.String(), StatusComplete: !status.Status.IsActive() && status.Status != ir.NotStarted,
-		LogsFinal: false, LogsNote: logsNotFenced, RetainedAt: time.Now().UTC(),
+		RetainedAt:   time.Now().UTC(),
 		StatusSHA256: digest(statusData), ArtifactFiles: artifacts,
 	}
 	if err := os.WriteFile(filepath.Join(tmp, retainedStatusFile), statusData, 0o600); err != nil {
@@ -117,7 +117,15 @@ func (store *Store) retainExecution(root ir.DAGRunRef, att *Attempt, status *ir.
 			return fmt.Errorf("retain execution: copy log %s: %w", l.name, err)
 		}
 		f.Name = l.name
+		f.Final = streamFinal(l.src, status, f.Bytes)
 		m.Files = append(m.Files, f)
+	}
+	m.LogsFinal = len(m.Files) > 0
+	for _, f := range m.Files {
+		m.LogsFinal = m.LogsFinal && f.Final
+	}
+	if !m.LogsFinal {
+		m.LogsNote = logsNotFinal
 	}
 	manifest, err := json.MarshalIndent(&m, "", "  ")
 	if err != nil {
@@ -192,7 +200,7 @@ func (store *Store) executionLogs(root ir.DAGRunRef, status *ir.DAGRunStatus) []
 			return
 		}
 		info, err := os.Lstat(src)
-		if err != nil || !info.Mode().IsRegular() {
+		if err != nil || !info.Mode().IsRegular() || strings.HasSuffix(src, finalSuffix) {
 			return
 		}
 		name = retainedFileName(name)
@@ -365,6 +373,28 @@ func insideNoLinks(base, p string) bool {
 		}
 	}
 	return true
+}
+
+// streamFinal reports whether the coordinator recorded the log stream at
+// src as finished for this execution with exactly size bytes.
+func streamFinal(src string, status *ir.DAGRunStatus, size int64) bool {
+	info, err := os.Lstat(src + finalSuffix)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	data, err := os.ReadFile(src + finalSuffix) //nolint:gosec // beside a log already checked to lie inside the configured log directory
+	if err != nil {
+		return false
+	}
+	var rec struct {
+		ExecutionMarker string `json:"executionMarker"`
+		AttemptID       string `json:"attemptId"`
+		Size            int64  `json:"size"`
+	}
+	if json.Unmarshal(data, &rec) != nil {
+		return false
+	}
+	return rec.ExecutionMarker == status.QueuedAt && rec.AttemptID == status.AttemptID && rec.Size == size
 }
 
 var unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
