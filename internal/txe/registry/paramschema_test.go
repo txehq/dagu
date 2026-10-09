@@ -28,13 +28,22 @@ const restartSchema = `{
 func TestParamSchemaIsCheckedAtRegistration(t *testing.T) {
 	f := newFixture(t)
 	for name, schema := range map[string]string{
-		"not JSON":           `{`,
-		"not an object":      `"string"`,
-		"remote reference":   `{"$ref": "https://example.com/schema.json"}`,
-		"unenforced format":  `{"type": "object", "properties": {"when": {"type": "string", "format": "date-time"}}}`,
-		"unknown keyword":    `{"type": "object", "x-max-cost": 3}`,
-		"invalid constraint": `{"type": "object", "minProperties": "two"}`,
-		"nested remote $ref": `{"type": "object", "properties": {"a": {"$ref": "other.json#/x"}}}`,
+		"not JSON":            `{`,
+		"not an object":       `"string"`,
+		"remote reference":    `{"$ref": "https://example.com/schema.json"}`,
+		"unenforced format":   `{"type": "object", "properties": {"when": {"type": "string", "format": "date-time"}}}`,
+		"unknown keyword":     `{"type": "object", "x-max-cost": 3}`,
+		"invalid constraint":  `{"type": "object", "minProperties": "two"}`,
+		"nested remote $ref":  `{"type": "object", "properties": {"a": {"$ref": "other.json#/x"}}}`,
+		"draft-07":            `{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "dependentRequired": {"a": ["b"]}}`,
+		"nested dialect":      `{"type": "object", "properties": {"a": {"$schema": "https://json-schema.org/draft/2020-12/schema"}}}`,
+		"unknown type":        `{"type": "int"}`,
+		"multipleOf zero":     `{"type": "integer", "multipleOf": 0}`,
+		"negative minLength":  `{"type": "string", "minLength": -1}`,
+		"invalid pattern":     `{"type": "string", "pattern": "("}`,
+		"inexact bound":       `{"type": "integer", "maximum": 9007199254740993}`,
+		"duplicate key":       `{"type": "object", "type": "string"}`,
+		"required not unique": `{"type": "object", "required": ["a", "a"]}`,
 	} {
 		v := f.version(1)
 		v.ReviewPolicy.PermittedActions[1].ParamSchema = json.RawMessage(schema)
@@ -48,7 +57,7 @@ func TestParamSchemaIsCheckedAtRegistration(t *testing.T) {
 	jobID := f.mint(PrefixJob)
 	_, err := f.store.Register(f.ctx, RegisterInput{JobID: jobID, RequestID: "req-" + jobID, OwnerID: f.owner, ProjectID: f.project,
 		MachineID: f.machine, JobKey: "k-ok", Version: v}, cli)
-	require.NoError(t, err, "an enforceable schema with a local $defs is fine")
+	require.NoError(t, err, "an enforceable schema is fine")
 }
 
 // Every attempt of an action is granted only with parameters its
@@ -83,6 +92,9 @@ func TestActionParamsAreValidatedBeforeTheGrant(t *testing.T) {
 		"not an integer":           `{"mode": "soft", "replicas": 2.5}`,
 		"missing a required field": `{"replicas": 2}`,
 		"an undeclared field":      `{"mode": "soft", "force": true}`,
+		"beyond 2^53":              `{"mode": "soft", "replicas": 9007199254740993}`,
+		"rounds to an integer":     `{"mode": "soft", "replicas": 1.0000000000000001}`,
+		"duplicate key":            `{"mode": "medium", "mode": "soft"}`,
 		"absent params":            ``,
 	} {
 		assert.Equal(t, CodeInvalid, code(t, grant(params)), name)
@@ -116,4 +128,18 @@ func TestActionParamsAreValidatedBeforeTheGrant(t *testing.T) {
 		return err
 	})
 	assert.Equal(t, CodeInvalid, code(t, err), "an approved action outside its schema is not granted")
+}
+
+// Under draft 2020-12 a dependentRequired restriction is enforced.
+func TestParamSchemaDraft202012KeywordsAreEnforced(t *testing.T) {
+	pa := PermittedAction{Name: "deploy", ParamSchema: json.RawMessage(`{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"type": "object",
+		"properties": {"destination": {"type": "string"}, "approval": {"type": "string"}},
+		"dependentRequired": {"destination": ["approval"]}
+	}`)}
+	_, err := compileParamSchema(pa.ParamSchema)
+	require.NoError(t, err)
+	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"destination": "production"}`))))
+	require.NoError(t, checkActionParams(pa, json.RawMessage(`{"destination": "production", "approval": "cab-1"}`)))
 }
