@@ -96,21 +96,18 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 	if err != nil {
 		return nil, err
 	}
-	// A job in a workspace the caller cannot see is reported as not found,
-	// like every other registry read.
-	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
+	// Read on the snapshot that was authorized, like every registry history
+	// read: a job the caller cannot see is not found, no decision committed
+	// after the job left the caller's workspace is returned, and the
+	// projection uses a job that covers every listed decision, so an
+	// outstanding completion is never reported as done.
+	var all []*registry.Decision
+	job, err := a.txeReadHistory(ctx, store, req.JobId, func() (err error) {
+		all, err = store.ListDecisions(ctx, req.JobId, 0)
+		return err
+	})
+	if err != nil {
 		return nil, err
-	}
-	all, err := store.ListDecisions(ctx, req.JobId, 0)
-	if err != nil {
-		return nil, txeError(err)
-	}
-	// Read the job for the projection after the decisions: a decision listed
-	// here is then always covered by the pending list read, so a completion
-	// still outstanding is never reported as done.
-	job, err := store.GetJob(ctx, req.JobId)
-	if err != nil {
-		return nil, txeError(err)
 	}
 	out := api.ListTxeProposalDecisions200JSONResponse{Decisions: []api.TxeDecision{}}
 	for _, d := range all {
