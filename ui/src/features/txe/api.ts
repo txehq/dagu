@@ -6,6 +6,7 @@ import type { Client } from 'openapi-fetch';
 
 import { toDecision, toDecisionBody, toJob, toProposal } from './adapt';
 import type { DecisionSubmitResult } from './components/DecisionPanel';
+import { retryStates, type RetryState } from './retry';
 import type { Decision, DecisionRequest, Proposal, TxeJob } from './types';
 
 type ApiJob = components['schemas']['TxeJob'];
@@ -28,6 +29,16 @@ export interface TxeApi {
     jobId: string,
     decision: Decision
   ): Promise<DecisionSubmitResult>;
+  // requestRetry asks for one exact run to be retried. It records the
+  // decision only; the reviewer runs the retry through the action journal.
+  requestRetry(
+    jobId: string,
+    runId: string,
+    expectedJobVersion: number,
+    idempotencyKey: string
+  ): Promise<DecisionSubmitResult>;
+  // listRetryStates returns the newest retry of each run of the job.
+  listRetryStates(jobId: string): Promise<Map<string, RetryState>>;
 }
 
 export class TxeApiError extends Error {
@@ -138,6 +149,37 @@ export function createTxeApi(client: Client<paths>): TxeApi {
       );
     },
     decide,
+    requestRetry: async (jobId, runId, expectedJobVersion, idempotencyKey) => {
+      const res = await client.POST(
+        '/txe/jobs/{jobId}/runs/{runId}/retry-requests',
+        {
+          params: { path: { jobId, runId } },
+          body: {
+            expected_job_version: expectedJobVersion,
+            idempotency_key: idempotencyKey,
+          },
+        }
+      );
+      if (res.data) return { ok: true };
+      const err = failure(res.response, res.error);
+      return { ok: false, status: err.status, message: err.message };
+    },
+    listRetryStates: async (jobId) => {
+      const [proposals, actions] = await Promise.all([
+        client.GET('/txe/jobs/{jobId}/proposals', {
+          params: { path: { jobId } },
+        }),
+        client.GET('/txe/jobs/{jobId}/actions', {
+          params: { path: { jobId } },
+        }),
+      ]);
+      if (!proposals.data) throw failure(proposals.response, proposals.error);
+      if (!actions.data) throw failure(actions.response, actions.error);
+      return retryStates(
+        [...proposals.data.open, ...proposals.data.finished],
+        [...actions.data.in_flight, ...actions.data.archived]
+      );
+    },
     replayDecision: (jobId, d) =>
       decide(jobId, d.proposalId, {
         expectedProposalRevision: d.proposalRevision,
