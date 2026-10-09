@@ -149,7 +149,7 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 			Registry:    &review.Remote{Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient},
 			Effector:    &review.CommandEffector{},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(transport), Complete: review.RemoteComplete(transport)},
-			Retry:       review.RemoteRetry(transport),
+			Runs:        review.RemoteRuns(transport),
 			Holder:      machine + "/" + runID,
 			AgentClient: agentClient,
 			DecideDAG:   review.DecideDAGName(machine),

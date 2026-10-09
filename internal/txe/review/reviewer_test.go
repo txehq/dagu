@@ -122,6 +122,64 @@ func (o *opener) CloseDecision(_ context.Context, p review.Proposal) (review.Clo
 	return review.ClosureClosed, nil
 }
 
+// runs is a fake of the service's run API. Each run has a latest attempt;
+// a retry keeps the run id and, by default, starts the next attempt.
+type runs struct {
+	mu    sync.Mutex
+	state map[string]review.RunState
+	// retried records every retry request that reached the service.
+	retried []string
+	// retry decides what a retry request does; it starts a new attempt
+	// when nil.
+	retry func(runID string) error
+	// readErr fails reads of a run's state while set.
+	readErr error
+	seq     int
+}
+
+func newRuns() *runs {
+	return &runs{state: map[string]review.RunState{}, seq: 1}
+}
+
+// fail records a finished, unsuccessful latest attempt of the run.
+func (r *runs) fail(runID, attemptID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state[runID] = review.RunState{AttemptID: attemptID, Status: "failed"}
+}
+
+// start begins the run's next attempt, as a native retry does.
+func (r *runs) start(runID string) string {
+	r.seq++
+	id := fmt.Sprintf("att-%d", r.seq)
+	r.state[runID] = review.RunState{AttemptID: id, Status: "running", Active: true}
+	return id
+}
+
+func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readErr != nil {
+		return review.RunState{}, r.readErr
+	}
+	state, ok := r.state[runID]
+	if !ok {
+		return review.RunState{}, review.ErrNotFound
+	}
+	return state, nil
+}
+
+func (r *runs) RetryRun(_ context.Context, _, runID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.retried = append(r.retried, runID)
+	if r.retry != nil {
+		return r.retry(runID)
+	}
+	r.start(runID)
+	return nil
+}
+
 type fixture struct {
 	t        *testing.T
 	clock    *clock
@@ -186,7 +244,7 @@ func (f *fixture) reviewer(holder string) *review.Reviewer {
 func (f *fixture) addRun(id, status string) {
 	f.t.Helper()
 	require.NoError(f.t, f.registry.AddRun(jobID, review.RunEvidence{
-		RunID: id, JobVersion: 1, Status: status, SpecSHA256: specDigest,
+		RunID: id, JobVersion: 1, Status: status, SpecSHA256: specDigest, AttemptID: "att-1",
 		Outputs:   map[string]string{"free_pct": "31"},
 		Artifacts: []string{"reports/" + id + ".json"},
 	}))

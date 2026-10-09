@@ -78,6 +78,30 @@ else a review step needs must be rendered into the DAG:
   check and its start can still act late; a destination that must exclude
   this has to enforce the attempt's key itself.
 
+## What a review is shown of the job's runs
+
+- One result per run: the latest attempt the service has for it, with that
+  attempt's id. A retry keeps the run id and starts a new attempt, and the
+  service lists only the latest. An attempt that was replaced by a retry
+  between two reviews is therefore never reviewed. Each review records what
+  it covered as run and attempt (`covered_attempts`), so a review of a run
+  is never read as a review of every attempt of it.
+- A retried run is shown again when its new attempt ends. Two results with
+  the same end time are told apart by run and attempt. A result reported
+  late, with an end time before results already covered, is still shown: a
+  run seen unfinished stays owed until a review has been shown its result.
+- A listing that takes several requests is read twice, and only results
+  that both passes saw finished are returned. A result whose run is retried
+  while its evidence is being read is held back for the next review, so the
+  status of one attempt is never paired with the output of another.
+- This rests on one assumption the service does not guarantee: a run that
+  starts after a checkpoint ends after everything that checkpoint covered.
+  A job's runs are on one machine and their times come from its clock, so
+  it fails only if that clock is set back between two runs.
+- Bounds: at most 50 runs per review; the cursor keeps at most 512
+  unfinished runs and 512 results per instant, and a job beyond that is not
+  reviewed until it is within them, rather than anything being dropped.
+
 ## Declared actions
 
 An action's `command` must exit `0` only when its effect was applied and

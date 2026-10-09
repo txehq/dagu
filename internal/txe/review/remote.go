@@ -344,72 +344,204 @@ var terminalRunStatuses = map[api.StatusLabel]bool{
 
 const runPageLimit = 100
 
-// RunsAfter implements Registry from the service's run history: the job's
-// DAG has the job's id as its name.
-func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvidence, error) {
-	var finished []api.DAGRunSummary
+// walkRuns visits every run the service lists for the job, newest created
+// first, and reports how many pages that took.
+func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSummary) error) (pages int, err error) {
 	page := ""
 	for {
 		q := url.Values{"limit": {strconv.Itoa(runPageLimit)}}
 		if page != "" {
 			q.Set("cursor", page)
 		}
-		var resp api.DAGRunsPageResponse
-		if err := r.do(ctx, http.MethodGet, "/dag-runs/"+url.PathEscape(jobID)+"?"+q.Encode(), nil, &resp); err != nil {
-			return nil, err
+		var resp struct {
+			DagRuns    []runSummary `json:"dagRuns"`
+			NextCursor *string      `json:"nextCursor"`
 		}
+		if err := r.do(ctx, http.MethodGet, "/dag-runs/"+url.PathEscape(jobID)+"?"+q.Encode(), nil, &resp); err != nil {
+			return pages, err
+		}
+		pages++
 		for _, run := range resp.DagRuns {
-			if terminalRunStatuses[run.StatusLabel] {
-				finished = append(finished, run)
+			if err := visit(run); err != nil {
+				return pages, err
 			}
 		}
-		page = deref(resp.NextCursor)
-		if page == "" {
-			break
+		if page = deref(resp.NextCursor); page == "" {
+			return pages, nil
 		}
 	}
-	sort.SliceStable(finished, func(i, j int) bool {
-		if finished[i].FinishedAt != finished[j].FinishedAt {
-			return finished[i].FinishedAt < finished[j].FinishedAt
-		}
-		return finished[i].DagRunId < finished[j].DagRunId
-	})
-	start := 0
-	for i, run := range finished {
-		if run.DagRunId == cursor {
-			start = i + 1
+}
+
+// RunsAfter implements Registry from the service's run history: the job's
+// DAG has the job's id as its name. It returns the results no review has
+// been shown yet, oldest first, each with the cursor that covers it and
+// everything before it. See coverage for what the cursor holds.
+//
+// The service shows one result per run: its latest attempt. An attempt that
+// was replaced by a retry between two reviews was never listed and is not
+// reviewed; what a review covered is recorded as run and attempt.
+//
+// A listing that takes several requests is not one moment: a run can be
+// created, or retried, and end while the later pages are being read. The
+// results returned are therefore only those seen finished in a first pass
+// and unchanged in a second, and every run the second pass finds changed,
+// new or unfinished is owed. Whatever is created or retried after its own
+// second read starts after every returned result had ended. A listing of
+// one page is one moment and needs no second pass.
+func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvidence, error) {
+	covered, err := parseCoverage(cursor)
+	if err != nil {
+		return nil, err
+	}
+	if covered.legacy != "" {
+		if covered, err = r.legacyCoverage(ctx, jobID, covered.legacy); err != nil {
+			return nil, err
 		}
 	}
-	finished = finished[start:]
 	// One packet holds a bounded number of runs; one more tells it that
 	// others are waiting.
-	if len(finished) > maxPacketRuns+1 {
-		finished = finished[:maxPacketRuns+1]
+	todo := uncovered{limit: maxPacketRuns + 1}
+	byKey := map[string]runSummary{}
+	owed := map[string]bool{}
+	var unfinished []string
+	note := func(run runSummary) (runPoint, bool, error) {
+		if !terminalRunStatuses[run.StatusLabel] {
+			if unfinished = append(unfinished, run.DagRunID); len(unfinished) > maxCoverageSet {
+				return runPoint{}, false, fmt.Errorf("job %s has more than %d unfinished runs; its runs cannot be tracked for review", jobID, maxCoverageSet)
+			}
+			return runPoint{}, false, nil
+		}
+		point, err := run.point()
+		if err != nil {
+			return runPoint{}, false, err
+		}
+		if covered.pending[run.DagRunID] {
+			// Owed until shown, even when it does not fit this time.
+			owed[run.DagRunID] = true
+		}
+		return point, !covered.covered(point), nil
 	}
-	out := make([]RunEvidence, 0, len(finished))
-	for _, run := range finished {
-		ev := RunEvidence{RunID: run.DagRunId, Status: string(run.StatusLabel)}
-		ev.StartedAt, _ = time.Parse(time.RFC3339, run.StartedAt)
-		ev.FinishedAt, _ = time.Parse(time.RFC3339, run.FinishedAt)
-		var outputs api.DAGRunOutputs
-		err := r.do(ctx, http.MethodGet, "/dag-runs/"+url.PathEscape(jobID)+"/"+url.PathEscape(run.DagRunId)+"/outputs", nil, &outputs)
-		switch {
-		case err == nil:
-			ev.Outputs = outputs.Outputs
-		case errors.Is(err, ErrNotFound):
-			// A run that failed early has no outputs; its status is the evidence.
-		default:
-			return nil, fmt.Errorf("outputs of run %s: %w", run.DagRunId, err)
+	pages, err := r.walkRuns(ctx, jobID, func(run runSummary) error {
+		point, show, err := note(run)
+		if err != nil || !show {
+			return err
 		}
-		if ev.SpecSHA256, err = r.runSpecDigest(ctx, jobID, run.DagRunId); err != nil {
-			return nil, fmt.Errorf("spec of run %s: %w", run.DagRunId, err)
+		todo.add(point)
+		byKey[point.key()] = run
+		// Only what may still be returned is kept, however long the history.
+		if len(byKey) > 8*todo.limit {
+			keep := map[string]runSummary{}
+			for _, p := range todo.settle() {
+				keep[p.key()] = byKey[p.key()]
+			}
+			byKey = keep
 		}
-		if ev.Steps, err = r.stepEvidence(ctx, jobID, run.DagRunId); err != nil {
-			return nil, fmt.Errorf("steps of run %s: %w", run.DagRunId, err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	points := todo.settle()
+	if len(points) == 0 {
+		return nil, nil
+	}
+	if pages > 1 {
+		last := points[len(points)-1]
+		unfinished = unfinished[:0]
+		stable := map[string]bool{}
+		_, err := r.walkRuns(ctx, jobID, func(run runSummary) error {
+			point, show, err := note(run)
+			if err != nil || !show || last.before(point) {
+				// Not a result, covered, or ending after everything that
+				// can be returned: nothing here depends on it.
+				return err
+			}
+			if first, ok := byKey[point.key()]; ok && first == run {
+				stable[point.key()] = true
+				return nil
+			}
+			// New or changed since the first pass, and ending no later
+			// than a result about to be returned: owed, not passed over.
+			if owed[run.DagRunID] = true; len(owed) > maxCoverageSet {
+				return fmt.Errorf("job %s changed too much while its runs were listed; its runs cannot be tracked for review now", jobID)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
+		kept := points[:0]
+		for _, p := range points {
+			if stable[p.key()] {
+				kept = append(kept, p)
+			} else {
+				owed[p.runID] = true
+			}
+		}
+		points = kept
+	}
+	// Evidence is read by run id, so a retry while it is being read would
+	// pair one attempt's status with another's output. A result whose run
+	// moved on meanwhile is not returned; it is owed.
+	shown := make([]runPoint, 0, len(points))
+	out := make([]RunEvidence, 0, len(points))
+	for _, p := range points {
+		ev, same, err := r.runEvidence(ctx, jobID, byKey[p.key()])
+		if err != nil {
+			return nil, err
+		}
+		if !same {
+			owed[p.runID] = true
+			continue
+		}
+		shown = append(shown, p)
 		out = append(out, ev)
 	}
+	owedIDs := make([]string, 0, len(owed))
+	for id := range owed {
+		owedIDs = append(owedIDs, id)
+	}
+	for i := range out {
+		next, err := covered.after(shown[:i+1], unfinished, owedIDs)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Cursor = next.String()
+	}
 	return out, nil
+}
+
+// runEvidence reads one result's evidence. same is false when the run's
+// latest attempt is no longer the listed one once everything was read.
+func (r *Remote) runEvidence(ctx context.Context, jobID string, run runSummary) (ev RunEvidence, same bool, err error) {
+	ev = RunEvidence{RunID: run.DagRunID, Status: string(run.StatusLabel), AttemptID: run.AttemptID}
+	ev.StartedAt, _ = time.Parse(time.RFC3339, run.StartedAt)
+	ev.FinishedAt, _ = time.Parse(time.RFC3339, run.FinishedAt)
+	base := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(run.DagRunID)
+	var outputs api.DAGRunOutputs
+	err = r.do(ctx, http.MethodGet, base+"/outputs", nil, &outputs)
+	switch {
+	case err == nil:
+		ev.Outputs = outputs.Outputs
+	case errors.Is(err, ErrNotFound):
+		// A run that failed early has no outputs; its status is the evidence.
+	default:
+		return ev, false, fmt.Errorf("outputs of run %s: %w", run.DagRunID, err)
+	}
+	if ev.SpecSHA256, err = r.runSpecDigest(ctx, jobID, run.DagRunID); err != nil {
+		return ev, false, fmt.Errorf("spec of run %s: %w", run.DagRunID, err)
+	}
+	if ev.Steps, err = r.stepEvidence(ctx, jobID, run.DagRunID); err != nil {
+		return ev, false, fmt.Errorf("steps of run %s: %w", run.DagRunID, err)
+	}
+	var after struct {
+		DagRunDetails runSummary `json:"dagRunDetails"`
+	}
+	if err := r.do(ctx, http.MethodGet, base, nil, &after); err != nil {
+		return ev, false, fmt.Errorf("run %s after reading its evidence: %w", run.DagRunID, err)
+	}
+	now := after.DagRunDetails
+	return ev, now.AttemptID == run.AttemptID && now.StatusLabel == run.StatusLabel, nil
 }
 
 // runSpecDigest is the digest of the DAG snapshot a run ran, computed the
@@ -621,8 +753,10 @@ func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit in
 }
 
 // RequestedRetries implements Registry. A retry a person requested is a
-// decided retry proposal without a native task; one that already has a
-// journaled action was attempted and is the journal's business from then on.
+// decided retry proposal without a native task. Its latest retry decision
+// is the request; once that decision has a journaled action it was
+// attempted and is the journal's business. The key is the decision, not the
+// proposal: a later decision about the same run is a new request.
 func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error) {
 	var list api.TxeJobList
 	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
@@ -652,7 +786,7 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 		}
 		attempted := map[string]bool{}
 		for _, a := range actions {
-			attempted[a.ProposalID] = true
+			attempted[a.DecisionID] = true
 		}
 		decisions, err := r.DecisionsAfter(ctx, job.JobId, "")
 		if err != nil {
@@ -660,15 +794,12 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 		}
 		sort.Strings(decided)
 		for _, id := range decided {
-			if attempted[id] {
-				continue
-			}
 			// The latest answer to a proposal is the one that counts.
 			for _, d := range slices.Backward(decisions) {
 				if d.ProposalID != id {
 					continue
 				}
-				if d.Verdict == VerdictRetry {
+				if d.Verdict == VerdictRetry && !attempted[d.ID] {
 					out = append(out, RequestedRetry{JobID: job.JobId, ProposalID: id, DecisionID: d.ID})
 				}
 				break
@@ -713,6 +844,8 @@ type reviewDetail struct {
 	Notes            []string  `json:"notes,omitempty"`
 	Reviewer         string    `json:"reviewer"`
 	Handoff          LocalFile `json:"handoff,omitzero"`
+	RunCursor        string    `json:"run_cursor,omitempty"`
+	CoveredAttempts  []string  `json:"covered_attempts,omitempty"`
 }
 
 // Review implements Registry.
@@ -733,7 +866,7 @@ func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, er
 		Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: int(deref(rev.PacketBytes)),
 		AgentInputTokens: int(deref(rev.AgentInputTokens)), AgentOutputTokens: int(deref(rev.AgentOutputTokens)),
 		PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
-		Handoff: detail.Handoff,
+		Handoff: detail.Handoff, RunCursor: detail.RunCursor, CoveredAttempts: detail.CoveredAttempts,
 	}, nil
 }
 
@@ -941,7 +1074,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 	detail := reviewDetail{
 		Episode: rev.Episode, CoveredRuns: rev.CoveredRuns, CoveredDecisions: rev.CoveredDecisions,
 		ActionIDs: rev.ActionIDs, ProposalIDs: rev.ProposalIDs, Notes: rev.Notes, Reviewer: rev.Reviewer,
-		Handoff: rev.Handoff,
+		Handoff: rev.Handoff, RunCursor: rev.RunCursor, CoveredAttempts: rev.CoveredAttempts,
 	}
 	body := api.TxeReviewRequest{
 		Actor: r.actor(), ClaimId: claim.ID, Fence: int64(claim.Fence),
@@ -1097,19 +1230,96 @@ func RemoteComplete(t Transport) CompleteFunc {
 	}
 }
 
-// RemoteRetry returns a RetryFunc that retries one run through the service
-// and reports the service's answer as the receipt.
-func RemoteRetry(t Transport) RetryFunc {
-	return func(ctx context.Context, jobID, runID string) (string, error) {
-		var out json.RawMessage
-		path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
-		if err := t.Do(ctx, http.MethodPost, path, map[string]string{"dagRunId": runID}, &out); err != nil {
-			return "", err
+// remoteRuns reads and retries runs through the service's own run API.
+type remoteRuns struct {
+	t Transport
+}
+
+// RemoteRuns returns a RunRetrier on the service's run API.
+func RemoteRuns(t Transport) RunRetrier {
+	return remoteRuns{t: t}
+}
+
+// runSummary is the part of the service's run summary the reviewer reads.
+type runSummary struct {
+	DagRunID    string          `json:"dagRunId"`
+	AttemptID   string          `json:"attemptId"`
+	StatusLabel api.StatusLabel `json:"statusLabel"`
+	QueuedAt    string          `json:"queuedAt"`
+	StartedAt   string          `json:"startedAt"`
+	FinishedAt  string          `json:"finishedAt"`
+}
+
+// point is the run's latest attempt as a result to cover. A run that ended
+// before it started, such as one refused or aborted in the queue, has no
+// finish time, so the latest time the service has for it stands in.
+func (s runSummary) point() (runPoint, error) {
+	for _, raw := range []string{s.FinishedAt, s.StartedAt, s.QueuedAt} {
+		if t, err := time.Parse(time.RFC3339, raw); err == nil && !t.IsZero() {
+			return runPoint{runID: s.DagRunID, attemptID: s.AttemptID, at: t}, nil
 		}
-		receipt := "retry of " + runID + " accepted"
-		if len(out) > 0 && len(out) < maxReceiptLen {
-			receipt += ": " + string(out)
-		}
-		return receipt, nil
 	}
+	return runPoint{}, fmt.Errorf("run %s is %s but the service gives it no time to order it by", s.DagRunID, s.StatusLabel)
+}
+
+// legacyCoverage turns a cursor that is only a run id into coverage: that
+// run's result and everything that ended before it. A run the service no
+// longer has covers nothing, so every result is shown again rather than
+// any being passed over.
+func (r *Remote) legacyCoverage(ctx context.Context, jobID, runID string) (coverage, error) {
+	c := coverage{frontier: map[string]bool{}, pending: map[string]bool{}}
+	var out struct {
+		DagRunDetails runSummary `json:"dagRunDetails"`
+	}
+	err := r.do(ctx, http.MethodGet, "/dag-runs/"+url.PathEscape(jobID)+"/"+url.PathEscape(runID), nil, &out)
+	if errors.Is(err, ErrNotFound) {
+		return c, nil
+	}
+	if err != nil {
+		return c, err
+	}
+	run := out.DagRunDetails
+	run.DagRunID = runID
+	if !terminalRunStatuses[run.StatusLabel] {
+		return c, nil
+	}
+	point, err := run.point()
+	if err != nil {
+		return c, nil
+	}
+	c.at = point.at
+	c.frontier[point.key()] = true
+	return c, nil
+}
+
+func (s runSummary) state() RunState {
+	return RunState{
+		AttemptID: s.AttemptID, Status: string(s.StatusLabel),
+		Active:    !terminalRunStatuses[s.StatusLabel],
+		Succeeded: s.StatusLabel == api.StatusLabelSucceeded,
+	}
+}
+
+// RunState implements RunRetrier.
+func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState, error) {
+	var out struct {
+		DagRunDetails runSummary `json:"dagRunDetails"`
+	}
+	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID)
+	if err := refusal(r.t.Do(ctx, http.MethodGet, path, nil, &out)); err != nil {
+		return RunState{}, err
+	}
+	return out.DagRunDetails.state(), nil
+}
+
+// RetryRun implements RunRetrier. The service refuses to retry a run that
+// is active with a conflict; that, and a run it does not know, started
+// nothing.
+func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string) error {
+	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
+	err := r.t.Do(ctx, http.MethodPost, path, map[string]string{"dagRunId": runID}, nil)
+	if te, ok := errors.AsType[*TransportError](err); ok && (te.Status == http.StatusConflict || te.Status == http.StatusNotFound || te.Status == http.StatusBadRequest) {
+		return fmt.Errorf("%w: %s", ErrRunNotRetryable, te.Message)
+	}
+	return err
 }

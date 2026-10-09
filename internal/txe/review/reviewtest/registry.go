@@ -389,17 +389,17 @@ func (r *Registry) RequestedRetries(_ context.Context, machineID string, limit i
 			}
 			attempted := map[string]bool{}
 			for _, a := range s.Actions[jobID] {
-				attempted[a.ProposalID] = true
+				attempted[a.DecisionID] = true
 			}
 			for _, p := range s.Proposals[jobID] {
-				if p.State != review.ProposalDecided || p.ActionName != review.RetryRunAction || p.NativeTask.RunID != "" || attempted[p.ID] {
+				if p.State != review.ProposalDecided || p.ActionName != review.RetryRunAction || p.NativeTask.RunID != "" {
 					continue
 				}
 				for _, d := range slices.Backward(s.Decisions[jobID]) {
 					if d.ProposalID != p.ID {
 						continue
 					}
-					if d.Verdict == review.VerdictRetry {
+					if d.Verdict == review.VerdictRetry && !attempted[d.ID] {
 						out = append(out, review.RequestedRetry{JobID: jobID, ProposalID: p.ID, DecisionID: d.ID})
 					}
 					break

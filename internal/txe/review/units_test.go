@@ -732,20 +732,58 @@ func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
 	assert.Len(t, f.state().Proposals[jobID], 2)
 }
 
+// retryFixture is a job whose run-1 failed at attempt att-1, with a retry of
+// it proposed by the reviewer and decided "retry" by the owner.
+type retryFixture struct {
+	*fixture
+	runs     *runs
+	proposal review.Proposal
+	decision review.Decision
+}
+
+func (f *retryFixture) executor(holder string) *review.Reviewer {
+	r := f.reviewer(holder)
+	r.Runs, r.RetryObserve = f.runs, 20*time.Millisecond
+	return r
+}
+
+func newRetryFixture(t *testing.T) *retryFixture {
+	t.Helper()
+	f := &retryFixture{fixture: newFixture(t), runs: newRuns()}
+	f.addRun("run-1", "failed")
+	f.runs.fail("run-1", "att-1")
+	_, err := f.executor("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"}},
+	})
+	require.NoError(t, err)
+	f.proposal = f.state().Proposals[jobID][0]
+	f.decision, err = f.registry.Decide(jobID, f.proposal.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	return f
+}
+
+func (f *retryFixture) execute(holder string) review.Executed {
+	f.t.Helper()
+	out, err := f.executor(holder).Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.NoError(f.t, err)
+	return out
+}
+
 // The reserved retry: the reviewer proposes re-running one exact run it was
-// shown, nothing runs until the owner answers "retry", and then that run is
-// retried once through the journal with the service's receipt.
+// shown, bound to the failed attempt it saw. Nothing runs until the owner
+// answers "retry"; then that run is retried once, and the journal's receipt
+// is the new attempt the service was observed to start.
 func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	f := newFixture(t)
 	f.addRun("run-1", "failed")
-	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-old", JobVersion: 1, Status: "failed", SpecSHA256: "sha256:older"}))
-	var retried []string
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-old", JobVersion: 1, Status: "failed", SpecSHA256: "sha256:older", AttemptID: "att-1"}))
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-anon", JobVersion: 1, Status: "failed", SpecSHA256: specDigest}))
+	service := newRuns()
+	service.fail("run-1", "att-1")
 	withRetry := func(holder string) *review.Reviewer {
 		r := f.reviewer(holder)
-		r.Retry = func(_ context.Context, job, run string) (string, error) {
-			retried = append(retried, job+"/"+run)
-			return "attempt-2", nil
-		}
+		r.Runs, r.RetryObserve = service, 20*time.Millisecond
 		return r
 	}
 	prepared := f.prepare("reviewer-a")
@@ -755,24 +793,26 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"},
 			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-unknown"}, Reason: "not shown"},
 			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-old"}, Reason: "older version"},
-			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1", "package_digest": "sha256:chosen"}, Reason: "agent picks the package"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1", "attempt_id": "att-9"}, Reason: "agent picks the attempt"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-anon"}, Reason: "no attempt id"},
 		},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, retried, "a retry never runs on the agent's request")
+	assert.Empty(t, service.retried, "a retry never runs on the agent's request")
 	proposals := f.state().Proposals[jobID]
-	require.Len(t, proposals, 4)
+	require.Len(t, proposals, 5)
 	retry, question := proposals[0], proposals[1]
 	assert.Equal(t, review.ProposalAction, retry.Kind)
 	assert.Equal(t, map[string]string{
-		"run_id": "run-1", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
-	}, retry.Params, "the retry is bound to the snapshot the run ran and the package the reviewer saw")
+		"run_id": "run-1", "attempt_id": "att-1", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
+	}, retry.Params, "the retry is bound to the failed attempt, the snapshot it ran and that version's package")
 	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
 	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
 	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
 	assert.Equal(t, review.ProposalQuestion, proposals[2].Kind, "a run of an older version is never retried")
 	assert.Contains(t, proposals[2].Question, "run-old")
 	assert.Equal(t, review.ProposalQuestion, proposals[3].Kind, "the agent names the run and nothing else")
+	assert.Equal(t, review.ProposalQuestion, proposals[4].Kind, "a run whose attempt is not identified cannot be bound")
 
 	// "retry" is not an answer to an ordinary question.
 	_, err = f.registry.Decide(jobID, question.ID, review.VerdictRetry, "", "connor")
@@ -785,13 +825,14 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out.Skipped)
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
-	assert.Equal(t, "attempt-2", out.Action.Receipt)
-	assert.Equal(t, []string{jobID + "/run-1"}, retried)
+	assert.Equal(t, "att-2", out.Action.Receipt, "the receipt is the attempt that was observed to start")
+	assert.Contains(t, out.Action.Detail, "running", "and says what that attempt was doing, not that the job succeeded")
+	assert.Equal(t, []string{"run-1"}, service.retried)
 
 	out, err = withRetry("executor").Execute(ctx, jobID, retry.ID, decided.ID)
 	require.NoError(t, err)
 	assert.NotEmpty(t, out.Skipped)
-	assert.Len(t, retried, 1, "one decision retries the run once")
+	assert.Len(t, service.retried, 1, "one decision retries the run once")
 
 	// Without a way to retry configured, nothing is attempted.
 	out, err = f.reviewer("executor").Execute(ctx, jobID, retry.ID, decided.ID)
@@ -799,31 +840,118 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	assert.NotEmpty(t, out.Skipped)
 }
 
-// A retry call whose outcome is unknown is journaled uncertain, never
-// "not applied": the service may have started the run.
-func TestRetryRunWithUnknownOutcomeIsUncertain(t *testing.T) {
-	f := newFixture(t)
-	f.addRun("run-1", "failed")
-	r := f.reviewer("reviewer-a")
-	calls := 0
-	r.Retry = func(context.Context, string, string) (string, error) {
-		calls++
-		return "", errors.New("connection reset")
+// A decision is about one failed attempt. When the run has moved on since,
+// by any other retry, nothing is dispatched on its strength.
+func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {
+	for name, move := range map[string]func(*runs){
+		"another retry already started a new attempt": func(r *runs) { r.start("run-1") },
+		"a later attempt already succeeded": func(r *runs) {
+			r.state["run-1"] = review.RunState{AttemptID: "att-2", Status: "succeeded", Succeeded: true}
+		},
+		"a later attempt failed too": func(r *runs) { r.fail("run-1", "att-2") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			move(f.runs)
+			out := f.execute("executor")
+			assert.Equal(t, review.ActionFailed, out.Action.State)
+			assert.Contains(t, out.Action.Detail, "not dispatched")
+			assert.Contains(t, out.Action.Detail, "att-1")
+			assert.Empty(t, f.runs.retried, "the service was never asked")
+			// The decision is spent: replaying it does nothing either.
+			assert.NotEmpty(t, f.execute("executor").Skipped)
+			assert.Empty(t, f.runs.retried)
+		})
 	}
-	_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
-		Outcome: review.OutcomeAct, Reasoning: "retry", EvidenceRunIDs: []string{"run-1"},
-		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"}},
-	})
+}
+
+// While the service cannot be read, nothing is granted or journaled, so the
+// decision keeps its one attempt for when the service is back.
+func TestRetryRunWaitsWhileTheRunCannotBeRead(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.readErr = errors.New("hub unreachable")
+	_, err := f.executor("executor").Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.ErrorContains(t, err, "hub unreachable")
+	assert.Empty(t, f.state().Actions[jobID])
+	assert.Empty(t, f.runs.retried)
+
+	f.runs.readErr = nil
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// A refusal by the service started nothing and is recorded as such.
+func TestRetryRunRefusedByTheServiceIsNotApplied(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(string) error { return fmt.Errorf("%w: run is active", review.ErrRunNotRetryable) }
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionFailed, out.Action.State)
+	assert.Contains(t, out.Action.Detail, "not dispatched")
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// The service accepting a retry is not evidence that an attempt started.
+// With no new attempt observed the outcome is uncertain. It is never
+// dispatched again: a later look at the run settles it when a new attempt
+// is there, and otherwise the owner is asked.
+func TestRetryRunAcceptedButUnobservedIsUncertainAndNeverRedispatched(t *testing.T) {
+	for name, tc := range map[string]struct {
+		retry func(string) error
+	}{
+		"accepted, no attempt seen":  {retry: func(string) error { return nil }},
+		"the call failed in transit": {retry: func(string) error { return errors.New("connection reset") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.retry = tc.retry
+			out := f.execute("executor")
+			assert.Equal(t, review.ActionUncertain, out.Action.State)
+			assert.Empty(t, out.Action.Receipt, "no attempt is named that was not observed")
+			require.Len(t, f.runs.retried, 1)
+
+			// The next review looks at the run again. Still the same
+			// attempt: that proves nothing, so the owner is asked.
+			f.clock.Advance(2 * time.Hour)
+			r := f.executor("reviewer-b")
+			prepared, err := r.Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+			require.NoError(t, err)
+			action := f.state().Actions[jobID][0]
+			assert.Equal(t, review.ActionEscalated, action.State)
+			assert.Len(t, f.runs.retried, 1, "absence never causes another dispatch")
+			var escalation review.Proposal
+			for _, p := range f.state().Proposals[jobID] {
+				if p.Kind == review.ProposalUncertain {
+					escalation = p
+				}
+			}
+			assert.Equal(t, review.UncertainProposalID(action.ID, 1), escalation.ID)
+		})
+	}
+}
+
+// An unobserved retry is settled as soon as the run shows a later attempt.
+func TestRetryRunUnobservedIsSettledWhenTheNewAttemptAppears(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(string) error { return nil }
+	out := f.execute("executor")
+	require.Equal(t, review.ActionUncertain, out.Action.State)
+
+	// The dispatch landed after all.
+	f.runs.fail("run-1", "att-2")
+	f.clock.Advance(2 * time.Hour)
+	r := f.executor("reviewer-b")
+	prepared, err := r.Prepare(context.Background(), jobID)
 	require.NoError(t, err)
-	proposal := f.state().Proposals[jobID][0]
-	decided, err := f.registry.Decide(jobID, proposal.ID, review.VerdictRetry, "", "connor")
+	_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
 	require.NoError(t, err)
-	exec := f.reviewer("executor")
-	exec.Retry = r.Retry
-	out, err := exec.Execute(context.Background(), jobID, proposal.ID, decided.ID)
-	require.NoError(t, err)
-	assert.Equal(t, review.ActionUncertain, out.Action.State)
-	assert.Equal(t, 1, calls)
+	action := f.state().Actions[jobID][0]
+	assert.Equal(t, review.ActionSucceeded, action.State)
+	assert.Equal(t, "att-2", action.Receipt)
+	assert.Contains(t, action.Detail, "failed", "the receipt says what the new attempt was, not that the job succeeded")
+	assert.Len(t, f.runs.retried, 1)
 }
 
 // An owner's "retry" on an uncertain effect allows exactly one more attempt.

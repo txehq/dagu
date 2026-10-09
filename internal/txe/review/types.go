@@ -83,6 +83,11 @@ const (
 	// either is no longer the job's current one.
 	RetryRunSpecParam    = "run_spec_sha256"
 	RetryRunPackageParam = "package_digest"
+	// RetryRunAttemptParam is the service's id of the failed attempt being
+	// retried. A native retry keeps the run id and starts a new attempt, so
+	// this is what makes one retry decision mean one attempt: the retry is
+	// dispatched only while that attempt is still the run's latest.
+	RetryRunAttemptParam = "attempt_id"
 	// UncertainEffectAction is the reserved action name of a proposal that
 	// asks the owner about an effect whose outcome is unknown. It is not
 	// executable.
@@ -203,7 +208,13 @@ type RunEvidence struct {
 	RunID      string `json:"run_id"`
 	JobVersion int    `json:"job_version"`
 	// SpecSHA256 is the digest of the DAG snapshot the run ran.
-	SpecSHA256 string            `json:"spec_sha256,omitempty"`
+	SpecSHA256 string `json:"spec_sha256,omitempty"`
+	// AttemptID is the service's id of the run's latest attempt.
+	AttemptID string `json:"attempt_id,omitempty"`
+	// Cursor is the checkpoint's run cursor once this run, and every run
+	// listed before it, has been covered. The registry adapter sets it; a
+	// run without one is its own cursor.
+	Cursor     string            `json:"-"`
 	Status     string            `json:"status"`
 	StartedAt  time.Time         `json:"started_at,omitzero"`
 	FinishedAt time.Time         `json:"finished_at,omitzero"`
@@ -380,9 +391,15 @@ type Review struct {
 	// checkpoint advances over exactly these and nothing newer.
 	CoveredRuns      []string `json:"covered_run_ids"`
 	CoveredDecisions []string `json:"covered_decision_ids"`
-	ActionIDs        []string `json:"action_ids,omitempty"`
-	ProposalIDs      []string `json:"proposal_ids,omitempty"`
-	Notes            []string `json:"notes,omitempty"`
+	// CoveredAttempts names each covered run with the attempt of it that
+	// was shown, as "run@attempt": a retried run keeps its id, so the id
+	// alone does not say which result a review saw.
+	CoveredAttempts []string `json:"covered_attempts,omitempty"`
+	// RunCursor is the checkpoint's run cursor after this review.
+	RunCursor   string   `json:"run_cursor,omitempty"`
+	ActionIDs   []string `json:"action_ids,omitempty"`
+	ProposalIDs []string `json:"proposal_ids,omitempty"`
+	Notes       []string `json:"notes,omitempty"`
 	// Handoff locates the prepared review (claim and packet) on the machine
 	// that ran it. It is a reference to a local file, not a copy held by
 	// the service: retrieving it needs that machine.

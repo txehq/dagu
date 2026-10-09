@@ -62,8 +62,12 @@ type Reviewer struct {
 	// usage for the decision being applied.
 	AgentInputTokens  int
 	AgentOutputTokens int
-	// Retry performs the reserved retry of one run; nil disables it.
-	Retry RetryFunc
+	// Runs reads and retries the job's runs for the reserved retry action;
+	// nil disables it.
+	Runs RunRetrier
+	// RetryObserve is how long a dispatched retry is watched for its new
+	// attempt; retryObserveFor when zero.
+	RetryObserve time.Duration
 	// DecideDAG is the DAG whose runs carry proposals as native human tasks.
 	DecideDAG string
 	ClaimTTL  time.Duration
@@ -226,7 +230,7 @@ type RetryOutcome struct {
 // and left for the next tick; the registry's journal keeps a second attempt
 // from ever being granted.
 func (r *Reviewer) RunRequestedRetries(ctx context.Context, machineID string) ([]RetryOutcome, error) {
-	if r.Retry == nil {
+	if r.Runs == nil {
 		return nil, nil
 	}
 	pending, err := r.Registry.RequestedRetries(ctx, machineID, closureBatch)
@@ -358,7 +362,10 @@ func (r *Reviewer) finishInterrupted(ctx context.Context, claim Claim, cp Checkp
 		LastReviewID:   stored.ID,
 		NextReviewAt:   r.now(),
 	}
-	if n := len(stored.CoveredRuns); n > 0 {
+	switch n := len(stored.CoveredRuns); {
+	case stored.RunCursor != "":
+		next.RunCursor = stored.RunCursor
+	case n > 0:
 		next.RunCursor = stored.CoveredRuns[n-1]
 	}
 	if n := len(stored.CoveredDecisions); n > 0 {
@@ -415,6 +422,12 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 
 	declared, ok := job.Review.Action(action.Name)
 	res := EffectResult{Status: EffectUnknown, Detail: "the action is no longer declared by the job"}
+	if action.Name == RetryRunAction {
+		// The reserved retry is not a declared command: the run itself is
+		// its only evidence, whatever version the job is at now.
+		ok = false
+		res = r.probeRetry(ctx, job, action)
+	}
 	if ok && action.JobVersion != job.Version {
 		// The attempt ran under another version's declaration. The current
 		// one may name a different command, probe or idempotency class, so
@@ -437,7 +450,10 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 
 	switch res.Status {
 	case EffectApplied:
-		res.Detail = "reconciled: the effect was applied"
+		if res.Detail == "" || action.Name != RetryRunAction {
+			res.Detail = "the effect was applied"
+		}
+		res.Detail = "reconciled: " + res.Detail
 		return finish(ActionSucceeded, res)
 	case EffectNotApplied:
 		// Only an action with no external effect can be closed as not
@@ -559,6 +575,8 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		Reasoning:         decision.Reasoning,
 		EvidenceRuns:      decision.EvidenceRunIDs,
 		CoveredRuns:       packet.RunIDs(),
+		CoveredAttempts:   packet.coveredAttempts(),
+		RunCursor:         packet.RunCursor,
 		CoveredDecisions:  packet.DecisionIDs(),
 		Handoff:           r.Handoff,
 		PacketArtifact:    r.PacketArtifact,
@@ -600,8 +618,8 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		LastReviewID:   review.ID,
 		NextReviewAt:   r.nextReviewAt(job, decision, packet),
 	}
-	if n := len(packet.NewRuns); n > 0 {
-		next.RunCursor = packet.NewRuns[n-1].RunID
+	if review.RunCursor != "" {
+		next.RunCursor = review.RunCursor
 	}
 	if n := len(packet.HumanFeedback); n > 0 {
 		next.DecisionCursor = packet.HumanFeedback[n-1].ID
@@ -657,15 +675,22 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		if len(requested.Params) != 1 || !shown {
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q): %s", runID, requested.Reason))
 		}
+		if run.AttemptID == "" {
+			// Without the service's id of the failed attempt there is
+			// nothing to bind one retry to.
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, whose attempt the service does not identify, so it cannot be retried from here: %s", runID, requested.Reason))
+		}
 		if run.SpecSHA256 == "" || run.SpecSHA256 != job.DAGSpecSHA256 {
 			// A run of an older version is never retried, on the new code
 			// or the old. The owner still sees what the reviewer wanted.
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which did not run the job's current version %d and cannot be retried: %s", runID, job.Version, requested.Reason))
 		}
-		// The proposal is bound to the snapshot that run ran and to the
-		// package the reviewer saw; the agent chooses neither.
+		// The proposal is bound to the failed attempt the reviewer was
+		// shown, the snapshot it ran and the package of that version; the
+		// agent chooses none of them.
 		requested.Params = map[string]string{
-			RetryRunParam: runID, RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
+			RetryRunParam: runID, RetryRunAttemptParam: run.AttemptID,
+			RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
 		}
 		requested.TargetID = ""
 		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, requested.Reason))
@@ -868,19 +893,138 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 // retry starts a run, so an unknown outcome is uncertain, not harmless.
 var retryRunDeclaration = DeclaredAction{Name: RetryRunAction, Idempotency: IdempotencyNone, TimeoutSec: 60}
 
-// RetryFunc asks the service to retry one run of a job and returns the
-// service's receipt for it.
-type RetryFunc func(ctx context.Context, jobID, runID string) (receipt string, err error)
+// RunState is what the service reports about one run of a job.
+type RunState struct {
+	// AttemptID is the service's own id of the run's latest attempt. A
+	// native retry keeps the run id and starts a new attempt with a new id.
+	AttemptID string `json:"attempt_id"`
+	// Status is the service's status label of that attempt.
+	Status string `json:"status"`
+	// Active means the attempt is queued, running or waiting. Succeeded
+	// means it finished successfully. A run that is neither has a finished,
+	// unsuccessful latest attempt, which is the only thing a retry is for.
+	Active    bool `json:"active,omitempty"`
+	Succeeded bool `json:"succeeded,omitempty"`
+}
 
-// retryRun performs the reserved retry action. Whether the service started
-// the retry is unknown after any failure of the call, so it is never
-// reported as not applied.
+// retryable reports whether the run's latest attempt is the given one and
+// has finished unsuccessfully.
+func (s RunState) retryable(attemptID string) bool {
+	return attemptID != "" && s.AttemptID == attemptID && !s.Active && !s.Succeeded
+}
+
+// ErrRunNotRetryable is returned by RunRetrier.RetryRun when the service
+// definitely refused the retry and started nothing.
+var ErrRunNotRetryable = errors.New("txe review: the service refused to retry the run")
+
+// RunRetrier reads and retries a job's runs through the service.
+type RunRetrier interface {
+	// RunState returns the state of the run's latest attempt.
+	RunState(ctx context.Context, jobID, runID string) (RunState, error)
+	// RetryRun asks the service to retry the run. It returns
+	// ErrRunNotRetryable when the service refused; after any other error
+	// whether a retry started is unknown.
+	RetryRun(ctx context.Context, jobID, runID string) error
+}
+
+const (
+	// retryObserveFor is how long a dispatched retry is watched for its new
+	// attempt, and retryObserveEvery how often the run is read meanwhile.
+	retryObserveFor   = 20 * time.Second
+	retryObserveEvery = time.Second
+	// runReadTries bounds the reads of a run's state before a dispatch.
+	runReadTries = 3
+)
+
+// retryRun performs the reserved retry action: one native retry of one run,
+// for the one failed attempt the decision was made about.
+//
+// Nothing is dispatched unless that attempt is still the run's latest and
+// is finished and unsuccessful: a run that moved on since the decision is
+// not retried again on its strength. After a dispatch the result is applied
+// only when a new attempt is observed on the run, and its id is the
+// receipt. A dispatch whose outcome was not observed is unknown; it is
+// never reported from the service's acceptance alone, and never repeated.
 func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectResult {
-	receipt, err := r.Retry(ctx, job.ID, action.Params[RetryRunParam])
-	if err != nil {
-		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + action.Params[RetryRunParam] + ": " + err.Error()}
+	runID, bound := action.Params[RetryRunParam], action.Params[RetryRunAttemptParam]
+	if bound == "" {
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision names no attempt of run " + runID}
 	}
-	return EffectResult{Status: EffectApplied, Receipt: receipt}
+	var before RunState
+	var err error
+	for range runReadTries {
+		if before, err = r.Runs.RunState(ctx, job.ID, runID); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: run " + runID + " could not be read: " + err.Error()}
+	}
+	if !before.retryable(bound) {
+		return EffectResult{Status: EffectNotApplied, Detail: fmt.Sprintf(
+			"not dispatched: the decision is about attempt %s of run %s, and the run is now at attempt %s (%s)", bound, runID, before.AttemptID, before.Status)}
+	}
+	if err := r.Runs.RetryRun(ctx, job.ID, runID); err != nil {
+		if errors.Is(err, ErrRunNotRetryable) {
+			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: " + err.Error()}
+		}
+		// The request may have reached the service. Only the run can say.
+		if res, ok := r.observeRetry(ctx, job.ID, runID, bound, 0); ok {
+			return res
+		}
+		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + runID + ": " + err.Error()}
+	}
+	watch := r.RetryObserve
+	if watch <= 0 {
+		watch = retryObserveFor
+	}
+	if res, ok := r.observeRetry(ctx, job.ID, runID, bound, watch); ok {
+		return res
+	}
+	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf(
+		"the service accepted a retry of run %s but no attempt after %s was observed", runID, bound)}
+}
+
+// observeRetry reads the run until an attempt other than the bound one is
+// seen or the time is up. With no time to watch it reads once. The wait is
+// real time: it is spent waiting for the service, not measured against the
+// registry's clock.
+func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID, bound string, watch time.Duration) (EffectResult, bool) {
+	until := time.Now().Add(watch)
+	for {
+		state, err := r.Runs.RunState(ctx, jobID, runID)
+		if err == nil && state.AttemptID != "" && state.AttemptID != bound {
+			return EffectResult{
+				Status:  EffectApplied,
+				Receipt: state.AttemptID,
+				Detail:  fmt.Sprintf("run %s was retried as attempt %s, which was %s when observed", runID, state.AttemptID, state.Status),
+			}, true
+		}
+		left := time.Until(until)
+		if left <= 0 {
+			return EffectResult{}, false
+		}
+		select {
+		case <-ctx.Done():
+			return EffectResult{}, false
+		case <-time.After(min(left, retryObserveEvery)):
+		}
+	}
+}
+
+// probeRetry settles an interrupted or unobserved retry from the run
+// itself. An attempt after the bound one proves the retry happened. The
+// same attempt still being the latest proves nothing: the dispatch may yet
+// land, so it stays unknown and is left to the owner.
+func (r *Reviewer) probeRetry(ctx context.Context, job Job, action Action) EffectResult {
+	runID, bound := action.Params[RetryRunParam], action.Params[RetryRunAttemptParam]
+	if r.Runs == nil || bound == "" {
+		return EffectResult{Status: EffectUnknown, Detail: "the retry of run " + runID + " cannot be checked against the run"}
+	}
+	if res, ok := r.observeRetry(ctx, job.ID, runID, bound, 0); ok {
+		return res
+	}
+	return EffectResult{Status: EffectUnknown, Detail: fmt.Sprintf("no attempt of run %s after %s has been observed", runID, bound)}
 }
 
 // leaseCovers reports whether the claim outlives one full attempt of the
@@ -1044,10 +1188,18 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 	}
 	declared, ok := job.Review.Action(proposal.ActionName)
 	if proposal.ActionName == RetryRunAction {
-		declared, ok = retryRunDeclaration, r.Retry != nil && proposal.Params[RetryRunParam] != ""
+		declared, ok = retryRunDeclaration, r.Runs != nil && proposal.Params[RetryRunParam] != ""
 	}
 	if !ok {
 		return Executed{Skipped: "action is not available for this job"}, nil
+	}
+	if proposal.ActionName == RetryRunAction {
+		// The run is read before anything is granted. If the service cannot
+		// be reached now, nothing is journaled and the decision keeps its
+		// one attempt for a later try.
+		if _, err := r.Runs.RunState(ctx, jobID, proposal.Params[RetryRunParam]); err != nil {
+			return Executed{}, fmt.Errorf("read run %s: %w", proposal.Params[RetryRunParam], err)
+		}
 	}
 
 	if !job.Lifecycle.Reviewable() {
