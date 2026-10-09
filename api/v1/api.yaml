@@ -10365,6 +10365,51 @@ paths:
 
   # TXE job registry (fork extension; see internal/txe/registry).
   /txe/resource-events:
+    get:
+      summary: "List incomplete resource events"
+      description: "Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter."
+      operationId: "listTxeResourceEvents"
+      tags:
+        - "txe"
+      parameters:
+        - name: complete
+          in: query
+          required: true
+          schema:
+            type: boolean
+            enum: [false]
+        - name: reporter_machine_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          description: "The next_cursor of the previous page."
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: "Incomplete events"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEventList"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       summary: "Report a resource event"
       description: "Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
@@ -11931,7 +11976,7 @@ paths:
       - $ref: "#/components/parameters/TxeProposalId"
     post:
       summary: "Record an attempt to close a superseded proposal's Dagu human task"
-      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
+      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
       operationId: "recordTxeProposalClosure"
       tags:
         - "txe"
@@ -19274,7 +19319,8 @@ components:
     # TXE job registry (fork extension).
     TxeResourceObservation:
       type: string
-      enum: [deleted, absent, present, unreachable, auth_denied, timeout]
+      enum: [deleted, absent, present, unreachable, auth_denied, timeout, unknown]
+      description: "unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open."
 
     TxeResourceEventRequest:
       type: object
@@ -19852,7 +19898,7 @@ components:
 
     TxeAvailabilityState:
       type: string
-      enum: [ready, worker_offline, auth_required, target_unreachable, stale]
+      enum: [ready, worker_offline, auth_required, target_unreachable, target_unconfirmed, stale]
 
     TxeAvailability:
       type: object
@@ -19944,6 +19990,7 @@ components:
       properties:
         machine_id:
           type: string
+          description: "The reviewer's machine. Required to acquire a claim of any kind (review, execution, reconcile) and must equal the job's machine_id; otherwise the claim is refused with 409 not_permitted before anything is written, and a live claim held by another machine cannot be used."
         dag_run_id:
           type: string
         agent_client_version:
@@ -20192,6 +20239,10 @@ components:
           type: integer
         max_attempts:
           type: integer
+        attempt_started_at:
+          type: string
+          format: date-time
+          description: "When the current attempt was granted."
         grant:
           $ref: "#/components/schemas/TxeGrant"
         receipt:
@@ -20235,6 +20286,15 @@ components:
           description: "reviewer for a problem with the job's reviewer; absent for the job"
         state:
           $ref: "#/components/schemas/TxeAvailabilityState"
+        target:
+          type: string
+          description: "Key of the target whose resource event opened it, if one did; a present observation of that target resolves it."
+        action_id:
+          type: string
+          description: "For scope action: the action the exception is about."
+        attempt:
+          type: integer
+          description: "For scope action: the action attempt; resolved when that attempt ends."
         detail:
           type: string
         evidence:
@@ -20441,14 +20501,27 @@ components:
           description: "Exception kind, such as auth, worker_offline or reviewer_launch"
         scope:
           type: string
-          enum: [job, reviewer]
-          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; default job"
+          enum: [job, reviewer, action]
+          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action."
         detail:
           type: string
         evidence:
           type: array
           items:
             type: string
+        action_id:
+          type: string
+          description: "scope action: the action."
+        attempt:
+          type: integer
+          description: "scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state."
+        claim_id:
+          type: string
+          description: "scope action: the caller's live claim on the job."
+        fence:
+          type: integer
+          format: int64
+          description: "scope action: that claim's fence."
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [state]
@@ -20683,7 +20756,7 @@ components:
 
     TxeClosureOutcome:
       type: string
-      enum: [closed, already_answered, run_missing, locator_refused, failed]
+      enum: [closed, already_answered, run_missing, locator_refused, run_ended, failed]
 
     TxeClosureRequest:
       type: object
@@ -20735,6 +20808,18 @@ components:
         last_error:
           type: string
       required: [job_id, proposal_id, machine_id, native_task, superseded_at, failures]
+
+    TxeResourceEventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeResourceEvent"
+        next_cursor:
+          type: string
+          description: "Present when more events follow; pass it as after."
+      required: [events]
 
     TxePendingClosureList:
       type: object

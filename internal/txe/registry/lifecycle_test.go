@@ -1112,3 +1112,241 @@ func TestStaleProcessorStopsWhenJobAlreadyApplied(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleActive, got.Lifecycle)
 }
+
+// An unknown observation (a lookup that neither confirms nor denies the
+// resource) is recorded on each dependent and changes nothing; it cannot be
+// authoritative.
+func TestUnknownObservationChangesNothing(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-1")}
+		v.RetirementRules.OnTargetDeleted = RuleRetire
+	})
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Authoritative: true}, agent)
+	assert.Equal(t, CodeInvalid, code(t, err))
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Detail: "issue lookup returned null"}, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeRecorded, ev.Dispositions[0].Outcome)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, job.Lifecycle, got.Lifecycle, "not retired")
+	assert.Equal(t, job.Availability.State, got.Availability.State, "availability unchanged")
+}
+
+// Incomplete events are listed oldest first, by the reporter's machine when
+// asked, a page at a time; complete events are not listed.
+func TestIncompleteResourceEventsAreListed(t *testing.T) {
+	f := newFixture(t)
+	save := func(machine string, complete bool) string {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-1"), Observation: ResourceUnreachable,
+			ObservedAt: f.now, Reporter: Actor{Kind: ActorReconciler, ID: "rec", MachineID: machine}, Complete: complete}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		if !complete {
+			require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+id, indexEntry{}))
+		}
+		f.now = f.now.Add(time.Second)
+		return id
+	}
+	a1, b1, a2 := save("mch_a", false), save("mch_b", false), save("mch_a", false)
+	save("mch_a", true)
+
+	ids := func(evs []ResourceEvent) []string {
+		var out []string
+		for _, e := range evs {
+			out = append(out, e.EventID)
+		}
+		return out
+	}
+	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "mch_a", "", 1, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a1}, ids(page))
+	require.NotEmpty(t, next)
+	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "mch_a", next, 1, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a2}, ids(page))
+	assert.Empty(t, next)
+	all, _, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 10, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{a1, b1, a2}, ids(all))
+}
+
+// Visibility decides the page: hidden events neither fill a page nor become
+// its cursor.
+func TestIncompleteResourceEventsPageOnlyVisibleEvents(t *testing.T) {
+	f := newFixture(t)
+	var ids []string
+	for range 4 {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-1"), Observation: ResourceUnreachable,
+			ObservedAt: f.now, Reporter: Actor{Kind: ActorReconciler, ID: "rec", MachineID: "mch_a"}}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+id, indexEntry{}))
+		f.now = f.now.Add(time.Second)
+		ids = append(ids, id)
+	}
+	// Only the second and fourth are visible.
+	visible := func(ev *ResourceEvent) bool { return ev.EventID == ids[1] || ev.EventID == ids[3] }
+	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 1, visible)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, ids[1], page[0].EventID)
+	assert.Equal(t, ids[1], next, "the cursor is a visible event")
+	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "", next, 1, visible)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, ids[3], page[0].EventID)
+	assert.Empty(t, next)
+}
+
+// An unknown observation of a target checked before each run sets
+// availability target_unconfirmed (actionable, never retiring), and a later
+// present clears it; for other targets it changes nothing.
+func TestUnknownPreRunTargetIsUnconfirmed(t *testing.T) {
+	f := newFixture(t)
+	pre := target("v-1")
+	pre.ExistenceCheck = CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{pre}
+		v.RetirementRules.OnTargetDeleted = RuleRetire
+	})
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown}, agent)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnconfirmed, got.Availability.State)
+	assert.Equal(t, job.Lifecycle, got.Lifecycle)
+	assert.True(t, f.admit(job.JobID, "").Admit, "availability does not refuse runs")
+
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State)
+}
+
+// Target conditions belong to their target: a present observation of one
+// target resolves only that target's exceptions, the job stays unavailable
+// while another target's or the worker's condition is open, and becomes
+// ready only when none is.
+func TestTargetConditionsResolvePerTarget(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	report := func(tg Target, obs ResourceObservation) {
+		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		require.NoError(t, err)
+		f.now = f.now.Add(time.Second)
+	}
+	state := func() AvailabilityState {
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		return got.Availability.State
+	}
+
+	report(a, ResourceUnknown)
+	report(b, ResourceUnreachable)
+	report(b, ResourcePresent)
+	assert.Equal(t, AvailabilityTargetUnconfirmed, state(), "A is still unconfirmed")
+	report(a, ResourcePresent)
+	assert.Equal(t, AvailabilityReady, state())
+
+	// The worker goes offline, then a target is unconfirmed and recovers:
+	// the worker's condition is not resolved by the target's recovery.
+	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.Observe(Observation{State: AvailabilityWorkerOffline, Kind: "worker_offline"})
+	})
+	require.NoError(t, err)
+	f.now = f.now.Add(time.Second)
+	report(a, ResourceUnknown)
+	report(a, ResourcePresent)
+	assert.Equal(t, AvailabilityWorkerOffline, state(), "the worker is still offline")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	open := 0
+	for _, e := range got.Exceptions {
+		if e.ResolvedAt == nil {
+			open++
+			assert.Equal(t, "worker_offline", e.Kind)
+		}
+	}
+	assert.Equal(t, 1, open)
+
+	// A present of a target with no open condition changes nothing.
+	report(b, ResourcePresent)
+	assert.Equal(t, AvailabilityWorkerOffline, state())
+}
+
+// A target exception recorded before exceptions carried their target is
+// still resolved by that target's present, through the event in its
+// evidence; the reply and the replay record report the availability the job
+// ends with.
+func TestLegacyTargetExceptionAndFallbackDisposition(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	report := func(tg Target, obs ResourceObservation) *ResourceEvent {
+		ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		require.NoError(t, err)
+		f.now = f.now.Add(time.Second)
+		return ev
+	}
+	report(a, ResourceUnreachable)
+	// As recorded before this change: no target on the exception.
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		for _, e := range tx.Job.Exceptions {
+			e.Target = ""
+		}
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	report(b, ResourceUnknown)
+
+	ev := report(b, ResourcePresent)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, string(AvailabilityTargetUnreachable), ev.Dispositions[0].Detail, "A still holds the job")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnreachable, got.Availability.State)
+	applied := got.appliedResourceEvent(appliedKey(matchIdentity, b), ev.EventID)
+	require.NotNil(t, applied)
+	assert.Equal(t, string(AvailabilityTargetUnreachable), applied.Detail, "the replay record agrees")
+
+	report(a, ResourcePresent)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State, "the legacy exception was resolved by its target")
+}
+
+// A legacy exception is matched only through the event that opened it: an
+// originating event that is gone matches nothing, even when the reporter's
+// evidence names another target's event.
+func TestLegacyTargetExceptionUsesOnlyItsOrigin(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	evB, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	f.now = f.now.Add(time.Second)
+	// A legacy exception whose originating event is missing, with the
+	// reporter's evidence naming B's event.
+	_, err = f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		for _, e := range tx.Job.Exceptions {
+			e.Target = ""
+			e.Evidence = []string{"resource_event:" + f.mint(PrefixEvent), "resource_event:" + evB.EventID}
+		}
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnreachable, got.Availability.State, "B's present does not resolve an exception of unknown origin")
+}

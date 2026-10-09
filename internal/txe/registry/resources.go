@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -89,6 +90,10 @@ const (
 	ResourceUnreachable ResourceObservation = "unreachable"
 	ResourceAuthDenied  ResourceObservation = "auth_denied"
 	ResourceTimeout     ResourceObservation = "timeout"
+	// ResourceUnknown is an answer that neither confirms nor denies the
+	// resource (a lookup that returns nothing where absence cannot be
+	// proven). It is recorded and changes nothing.
+	ResourceUnknown ResourceObservation = "unknown"
 )
 
 // ResourceOutcome is what an event did to one job.
@@ -187,6 +192,10 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 	}
 	switch ev.Observation {
 	case ResourceDeleted, ResourceAbsent, ResourcePresent, ResourceUnreachable, ResourceAuthDenied, ResourceTimeout:
+	case ResourceUnknown:
+		if ev.Authoritative {
+			return nil, refuse(CodeInvalid, "an unknown observation cannot be authoritative")
+		}
 	default:
 		return nil, refuse(CodeInvalid, "unknown observation %q", ev.Observation)
 	}
@@ -536,12 +545,30 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		}
 		return s.recordOnly(ctx, job, d, "target deleted; job rule keeps it", evidence, by, c)
 	case ResourceUnreachable, ResourceTimeout:
-		return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnreachable, Kind: "target_" + string(ev.Observation), Detail: ev.Detail, Evidence: evidence}, by, c)
+		return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnreachable, Kind: "target_" + string(ev.Observation), Detail: ev.Detail, Evidence: evidence, Target: key}, by, c)
 	case ResourceAuthDenied:
-		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence}, by, c)
+		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence, Target: key}, by, c)
+	case ResourceUnknown:
+		// A target checked before each run that cannot be confirmed stops
+		// those runs; availability makes that visible and actionable. It
+		// never touches the lifecycle.
+		if slices.ContainsFunc(hits, func(t Target) bool { return t.ExistenceCheck == CheckPreRun }) {
+			return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnconfirmed, Kind: "target_unknown", Detail: ev.Detail, Evidence: evidence, Target: key}, by, c)
+		}
+		return s.recordOnly(ctx, job, d, "target could not be confirmed or denied; nothing changes", evidence, by, c)
 	case ResourcePresent:
-		if job.Availability.State == AvailabilityTargetUnreachable || job.Availability.State == AvailabilityAuthRequired {
-			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence}, by, c)
+		// Only this target's open conditions are resolved; others stay.
+		for _, e := range job.Exceptions {
+			if e.ResolvedAt != nil || e.Scope != "" {
+				continue
+			}
+			t, err := s.exceptionTarget(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if t == key {
+				return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence, Target: key}, by, c)
+			}
 		}
 		d.Outcome = OutcomeUnchanged
 		return d, nil
@@ -643,15 +670,51 @@ func (s *Store) observe(ctx context.Context, job *Job, d *ResourceDisposition, o
 		if err := inCommit(tx); err != nil {
 			return err
 		}
-		return tx.Observe(o)
+		if err := tx.Observe(o); err != nil {
+			return err
+		}
+		// The result is the availability the job ended with (another
+		// condition may still hold it), in the reply and in the record a
+		// replay reads.
+		d.Detail = string(tx.Job.Availability.State)
+		if n := len(tx.Job.AppliedResourceEvents); n > 0 {
+			if last := &tx.Job.AppliedResourceEvents[n-1]; last.EventID == c.eventID && last.Key == c.key {
+				last.Disposition.Detail = d.Detail
+			}
+		}
+		return nil
 	}); err != nil {
 		if ErrorCode(err) == CodeNotPermitted {
 			return nil, nil
 		}
 		return nil, err
 	}
-	d.Outcome, d.Detail = OutcomeAvailability, string(o.State)
 	return d, nil
+}
+
+// exceptionTarget is the key of the target whose resource event opened e, or
+// empty. Exceptions recorded before they carried their target are matched
+// through the event that opened them, which is always the first evidence
+// entry; later entries are the reporter's and are never used. A missing
+// originating event matches nothing; any other read error is returned so the
+// caller can be retried. Exceptions of other kinds (a worker, a login) never
+// belong to a target.
+func (s *Store) exceptionTarget(ctx context.Context, e *Exception) (string, error) {
+	if e.Target != "" || !strings.HasPrefix(e.Kind, "target_") || len(e.Evidence) == 0 {
+		return e.Target, nil
+	}
+	id, ok := strings.CutPrefix(e.Evidence[0], "resource_event:")
+	if !ok {
+		return "", nil
+	}
+	saved, err := s.GetResourceEvent(ctx, id)
+	switch {
+	case ErrorCode(err) == CodeNotFound:
+		return "", nil
+	case err != nil:
+		return "", err
+	}
+	return TargetKey(saved.Target), nil
 }
 
 func describeTarget(t Target) string {
@@ -672,6 +735,44 @@ func ignoreNotFound(err error) error {
 		return nil
 	}
 	return err
+}
+
+// IncompleteResourceEvents lists events not yet applied to every dependent,
+// oldest first, after the event ID after; only those a reporter on machineID
+// sent when machineID is set, and only those show accepts (it may also trim
+// what the caller sees of an event). It returns at most limit events and the
+// cursor for the next page, empty at the end; the cursor is always the ID of
+// a returned event.
+func (s *Store) IncompleteResourceEvents(ctx context.Context, machineID, after string, limit int, show func(*ResourceEvent) bool) ([]ResourceEvent, string, error) {
+	if limit <= 0 {
+		return nil, "", refuse(CodeInvalid, "limit must be positive")
+	}
+	ids, err := s.indexedJobs(ctx, resourcePendingPrefix)
+	if err != nil {
+		return nil, "", err
+	}
+	sort.Strings(ids)
+	var out []ResourceEvent
+	for _, id := range ids {
+		if id <= after {
+			continue
+		}
+		ev, err := s.GetResourceEvent(ctx, id)
+		if err != nil {
+			if ErrorCode(err) == CodeNotFound {
+				continue
+			}
+			return nil, "", err
+		}
+		if ev.Complete || (machineID != "" && ev.Reporter.MachineID != machineID) || (show != nil && !show(ev)) {
+			continue
+		}
+		if len(out) == limit {
+			return out, out[len(out)-1].EventID, nil
+		}
+		out = append(out, *ev)
+	}
+	return out, "", nil
 }
 
 // GetResourceEvent returns a recorded resource event.

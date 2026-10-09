@@ -266,12 +266,25 @@ type Observation struct {
 	// Scope is ScopeReviewer for the job's reviewer; empty or ScopeJob for
 	// the job itself.
 	Scope string
+	// Target is the key of the one target a resource event observed. Its
+	// exception belongs to that target, and a ready observation of it
+	// resolves only that target's exceptions.
+	Target string
+	// ActionID and Attempt name the action attempt of a ScopeAction
+	// observation; ClaimID and Fence are the reporter's live claim.
+	ActionID string
+	Attempt  int
+	ClaimID  string
+	Fence    int64
 }
 
 // Observation scopes.
 const (
 	ScopeJob      = "job"
 	ScopeReviewer = "reviewer"
+	// ScopeAction is a problem with one attempt of one action (a retry
+	// reservation that never started); it changes no availability.
+	ScopeAction = "action"
 )
 
 // Observe records availability. It never changes the lifecycle: an offline
@@ -279,6 +292,9 @@ const (
 // A non-ready observation opens an exception; a ready one resolves them.
 func (tx *JobTx) Observe(o Observation) error {
 	j := tx.Job
+	if o.Scope == ScopeAction {
+		return tx.observeAction(o)
+	}
 	if o.State == "" {
 		return refuse(CodeInvalid, "observation state is required")
 	}
@@ -287,19 +303,38 @@ func (tx *JobTx) Observe(o Observation) error {
 	case ScopeReviewer:
 		return tx.observeReviewer(o)
 	default:
-		return refuse(CodeInvalid, "observation scope must be job or reviewer")
+		return refuse(CodeInvalid, "observation scope must be job, reviewer or action")
 	}
 	from := j.Availability.State
 	now := tx.now
 	actor := tx.actor
 	j.Availability = Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
-	if o.State == AvailabilityReady {
+	switch {
+	case o.State == AvailabilityReady && o.Target != "":
+		// One target recovered: only its exceptions are resolved, and the
+		// job stays unavailable while any other condition is open.
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt != nil || e.State == "" || e.Scope != "" {
+				continue
+			}
+			t, err := tx.store.exceptionTarget(tx.ctx, e)
+			if err != nil {
+				return err
+			}
+			if t == o.Target {
+				e.ResolvedAt = &now
+			}
+		}
+		if open := tx.latestOpenException(); open != nil {
+			j.Availability = Availability{State: open.State, Detail: open.Detail, Evidence: open.Evidence, ObservedAt: &now, Reporter: &actor}
+		}
+	case o.State == AvailabilityReady:
 		for _, e := range j.Exceptions {
 			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" {
 				e.ResolvedAt = &now
 			}
 		}
-	} else {
+	default:
 		id, err := NewID(PrefixException, now)
 		if err != nil {
 			return err
@@ -311,15 +346,16 @@ func (tx *JobTx) Observe(o Observation) error {
 		if kind == "" {
 			kind = string(o.State)
 		}
-		if !tx.hasOpenException("", kind, o.State) {
-			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		if !tx.hasOpenException("", kind, o.State, o.Target) {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Target: o.Target, Created: Stamp{At: now, By: actor}}
 		}
 	}
 	tx.touch()
-	if from == o.State {
+	to := j.Availability.State
+	if from == to {
 		return nil
 	}
-	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(o.State), Detail: o.Detail, Evidence: o.Evidence})
+	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(to), Detail: j.Availability.Detail, Evidence: j.Availability.Evidence})
 }
 
 // ResolveException marks one exception resolved.
@@ -357,6 +393,9 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 	}
 	if ttl <= 0 {
 		return nil, refuse(CodeInvalid, "claim ttl must be positive")
+	}
+	if err := tx.checkReviewerMachine(r); err != nil {
+		return nil, err
 	}
 	if c := j.Claim; c != nil {
 		if c.State == ClaimLive {
@@ -401,12 +440,25 @@ func (tx *JobTx) interrupt(a *Action) {
 	tx.touch()
 }
 
+// checkReviewerMachine refuses a reviewer that is not on the job's machine:
+// a job's effects run only where its package and credentials are, so a
+// claim from another machine is never acquired or used.
+func (tx *JobTx) checkReviewerMachine(r Reviewer) error {
+	if r.MachineID == "" || r.MachineID != tx.Job.MachineID {
+		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("reviewer machine %q is not the job's machine %q", r.MachineID, tx.Job.MachineID)}
+	}
+	return nil
+}
+
 // CheckClaim refuses unless claimID with fence is the job's live claim and,
 // when kinds are given, of one of those kinds.
 func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) error {
 	c := tx.Job.Claim
 	if c == nil || c.ClaimID != claimID || c.Fence != fence || c.State != ClaimLive || !tx.now.Before(c.ExpiresAt) {
 		return &Error{Code: CodeClaimStale, Message: "claim " + claimID + " is not the live claim", Current: c}
+	}
+	if err := tx.checkReviewerMachine(c.Reviewer); err != nil {
+		return err
 	}
 	if len(kinds) == 0 {
 		return nil
@@ -474,13 +526,84 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 // hasOpenException reports whether an unresolved exception of the same
 // scope, kind and state exists: repeated observations of one condition
 // coalesce into it instead of opening another each time.
-func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState) bool {
+func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState, target string) bool {
 	for _, e := range tx.Job.Exceptions {
-		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state {
+		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state && e.Target == target {
 			return true
 		}
 	}
 	return false
+}
+
+// observeAction records a problem with one attempt of one action, raised by
+// the holder of the job's live claim: the attempt must be the action's
+// current one and still unresolved (executing or uncertain). It changes no
+// availability. One exception stays open per action, attempt and kind; the
+// registry resolves it when that attempt ends (see resolveActionExceptions).
+func (tx *JobTx) observeAction(o Observation) error {
+	j := tx.Job
+	if err := tx.CheckClaim(o.ClaimID, o.Fence); err != nil {
+		return err
+	}
+	if o.Kind == "" || o.ActionID == "" || o.Attempt <= 0 {
+		return refuse(CodeInvalid, "an action observation needs kind, action_id and attempt")
+	}
+	a, ok := j.Actions[o.ActionID]
+	if !ok {
+		return refuse(CodeNotFound, "action %s not found", o.ActionID)
+	}
+	if a.Attempt != o.Attempt || (a.State != ActionExecuting && a.State != ActionUncertain) {
+		return &Error{Code: CodeActionState, Message: fmt.Sprintf("action %s is at attempt %d and %s", a.ActionID, a.Attempt, a.State), Current: a}
+	}
+	for _, e := range j.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeAction && e.ActionID == o.ActionID && e.Attempt == o.Attempt && e.Kind == o.Kind {
+			return nil
+		}
+	}
+	id, err := NewID(PrefixException, tx.now)
+	if err != nil {
+		return err
+	}
+	if j.Exceptions == nil {
+		j.Exceptions = map[string]*Exception{}
+	}
+	j.Exceptions[id] = &Exception{ExceptionID: id, Kind: o.Kind, Scope: ScopeAction, Detail: o.Detail, Evidence: o.Evidence,
+		ActionID: o.ActionID, Attempt: o.Attempt, Created: Stamp{At: tx.now, By: tx.actor}}
+	tx.touch()
+	return nil
+}
+
+// resolveActionExceptions resolves the open action-scope exceptions of a
+// that no longer apply: those of an earlier attempt, and all of them once
+// the action is neither executing nor uncertain.
+func (tx *JobTx) resolveActionExceptions(a *Action) {
+	live := a.State == ActionExecuting || a.State == ActionUncertain
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.Scope != ScopeAction || e.ActionID != a.ActionID {
+			continue
+		}
+		if e.Attempt != a.Attempt || !live {
+			now := tx.now
+			e.ResolvedAt = &now
+			tx.touch()
+		}
+	}
+}
+
+// latestOpenException is the most recent unresolved availability exception
+// of the job itself, or nil.
+func (tx *JobTx) latestOpenException() *Exception {
+	var latest *Exception
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.State == "" || e.Scope != "" {
+			continue
+		}
+		if latest == nil || e.Created.At.After(latest.Created.At) ||
+			(e.Created.At.Equal(latest.Created.At) && e.ExceptionID > latest.ExceptionID) {
+			latest = e
+		}
+	}
+	return latest
 }
 
 // reviewDigest identifies what a review concluded from which evidence.
@@ -531,7 +654,7 @@ func (tx *JobTx) observeReviewer(o Observation) error {
 		if kind == "" {
 			kind = "reviewer_" + string(o.State)
 		}
-		if !tx.hasOpenException(ScopeReviewer, kind, o.State) {
+		if !tx.hasOpenException(ScopeReviewer, kind, o.State, "") {
 			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
 		}
 	}
@@ -926,6 +1049,8 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 		j.Actions[a.ActionID] = a
 	}
 	a.Attempt++
+	started := tx.now
+	a.AttemptStartedAt = &started
 	timeout := defaultActionTimeout
 	if pa, ok := v.PermittedAction(a.Spec.Name); ok && pa.TimeoutSec > 0 {
 		timeout = time.Duration(pa.TimeoutSec) * time.Second

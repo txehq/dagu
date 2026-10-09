@@ -3762,7 +3762,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List incomplete resource events
+         * @description Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter.
+         */
+        get: operations["listTxeResourceEvents"];
         put?: never;
         /**
          * Report a resource event
@@ -4367,7 +4371,7 @@ export interface paths {
         put?: never;
         /**
          * Record an attempt to close a superseded proposal's Dagu human task
-         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
+         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
          */
         post: operations["recordTxeProposalClosure"];
         delete?: never;
@@ -7822,7 +7826,10 @@ export interface components {
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
-        /** @enum {string} */
+        /**
+         * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open.
+         * @enum {string}
+         */
         TxeResourceObservation: TxeResourceObservation;
         TxeResourceEventRequest: {
             /** @description Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409 */
@@ -8147,6 +8154,7 @@ export interface components {
         /** @enum {string} */
         TxeClaimKind: TxeClaimKind;
         TxeReviewer: {
+            /** @description The reviewer's machine. Required to acquire a claim of any kind (review, execution, reconcile) and must equal the job's machine_id; otherwise the claim is refused with 409 not_permitted before anything is written, and a live claim held by another machine cannot be used. */
             machine_id?: string;
             dag_run_id?: string;
             agent_client_version?: string;
@@ -8268,6 +8276,11 @@ export interface components {
             state: components["schemas"]["TxeActionState"];
             attempt: number;
             max_attempts: number;
+            /**
+             * Format: date-time
+             * @description When the current attempt was granted.
+             */
+            attempt_started_at?: string;
             grant?: components["schemas"]["TxeGrant"];
             receipt?: string;
             /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
@@ -8287,6 +8300,12 @@ export interface components {
             /** @description reviewer for a problem with the job's reviewer; absent for the job */
             scope?: string;
             state?: components["schemas"]["TxeAvailabilityState"];
+            /** @description Key of the target whose resource event opened it, if one did; a present observation of that target resolves it. */
+            target?: string;
+            /** @description For scope action: the action the exception is about. */
+            action_id?: string;
+            /** @description For scope action: the action attempt; resolved when that attempt ends. */
+            attempt?: number;
             detail: string;
             evidence?: string[];
             created: components["schemas"]["TxeStamp"];
@@ -8391,12 +8410,23 @@ export interface components {
             /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
             kind?: string;
             /**
-             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; default job
+             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action.
              * @enum {string}
              */
             scope?: TxeObservationRequestScope;
             detail?: string;
             evidence?: string[];
+            /** @description scope action: the action. */
+            action_id?: string;
+            /** @description scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state. */
+            attempt?: number;
+            /** @description scope action: the caller's live claim on the job. */
+            claim_id?: string;
+            /**
+             * Format: int64
+             * @description scope action: that claim's fence.
+             */
+            fence?: number;
             actor?: components["schemas"]["TxeActor"];
         };
         TxeClaimRequest: {
@@ -8537,6 +8567,11 @@ export interface components {
             /** Format: date-time */
             last_attempt_at?: string;
             last_error?: string;
+        };
+        TxeResourceEventList: {
+            events: components["schemas"]["TxeResourceEvent"][];
+            /** @description Present when more events follow; pass it as after. */
+            next_cursor?: string;
         };
         TxePendingClosureList: {
             closures: components["schemas"]["TxePendingClosure"][];
@@ -21433,6 +21468,41 @@ export interface operations {
             };
         };
     };
+    listTxeResourceEvents: {
+        parameters: {
+            query: {
+                complete: false;
+                reporter_machine_id?: string;
+                /** @description The next_cursor of the previous page. */
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incomplete events */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeResourceEventList"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     recordTxeResourceEvent: {
         parameters: {
             query?: never;
@@ -24562,7 +24632,8 @@ export enum TxeResourceObservation {
     present = "present",
     unreachable = "unreachable",
     auth_denied = "auth_denied",
-    timeout = "timeout"
+    timeout = "timeout",
+    unknown = "unknown"
 }
 export enum TxeResourceDispositionMatch {
     identity = "identity",
@@ -24641,6 +24712,7 @@ export enum TxeAvailabilityState {
     worker_offline = "worker_offline",
     auth_required = "auth_required",
     target_unreachable = "target_unreachable",
+    target_unconfirmed = "target_unconfirmed",
     stale = "stale"
 }
 export enum TxeRetirementReason {
@@ -24736,7 +24808,8 @@ export enum TxeLifecycleRequestActive_run_policy {
 }
 export enum TxeObservationRequestScope {
     job = "job",
-    reviewer = "reviewer"
+    reviewer = "reviewer",
+    action = "action"
 }
 export enum TxeReviewOutcome {
     continue = "continue",
@@ -24751,6 +24824,7 @@ export enum TxeClosureOutcome {
     already_answered = "already_answered",
     run_missing = "run_missing",
     locator_refused = "locator_refused",
+    run_ended = "run_ended",
     failed = "failed"
 }
 export enum TxeArtifactRecordInputLocation {
