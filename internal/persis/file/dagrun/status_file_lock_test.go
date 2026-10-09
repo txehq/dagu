@@ -270,3 +270,38 @@ func TestStatusFileWriteIfLatestReadsOnlyTheTail(t *testing.T) {
 	assert.LessOrEqual(t, read, int64(3*statusTailChunk), "only the end of the file is read")
 	assert.Less(t, read, info.Size()/2, "the history is not read")
 }
+
+// Not parallel: the counter is package state. Rejected lines do not make the
+// reader load the same bytes again: a long suffix of blank and invalid lines
+// is read about once, not once per line.
+func TestParseLatestStatusFromTailReadsRejectedSuffixOnce(t *testing.T) {
+	data, err := json.Marshal(createTestStatus(ir.Running))
+	require.NoError(t, err)
+	file := filepath.Join(t.TempDir(), JSONLStatusFile)
+	content := string(data) + "\n" + strings.Repeat("\n{\n", 100000)
+	require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+
+	read := int64(-1)
+	statusTailBytesRead = func(n int64) { read = n }
+	t.Cleanup(func() { statusTailBytesRead = nil })
+	got, err := parseLatestStatusFromTail(context.Background(), file)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Running, got.Status)
+	assert.LessOrEqual(t, read, 2*int64(len(content)), "each byte is loaded about once")
+}
+
+// A cancelled read reports the cancellation, even on an empty file, as the
+// full parser does.
+func TestParseLatestStatusFromTailHonoursCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	file := filepath.Join(t.TempDir(), JSONLStatusFile)
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+
+	_, fullErr := parseStatusFileWithContext(ctx, file)
+	require.ErrorIs(t, fullErr, context.Canceled)
+	_, tailErr := parseLatestStatusFromTail(ctx, file)
+	require.ErrorIs(t, tailErr, context.Canceled)
+}

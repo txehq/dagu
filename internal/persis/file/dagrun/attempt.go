@@ -666,13 +666,19 @@ func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStat
 		}
 	}()
 
-	chunk := make([]byte, statusTailChunk)
+	scanner := &statusTailScanner{
+		ctx:      ctx,
+		f:        f,
+		buf:      make([]byte, statusTailChunk),
+		bufStart: info.Size(),
+		read:     &read,
+	}
 	// end is the offset of the newline that terminates the candidate line;
 	// anything after the last newline is an incomplete line and is skipped.
-	end, err := lastNewlineBefore(ctx, f, info.Size(), chunk, &read)
+	end, err := scanner.prevNewline()
 	for err == nil && end >= 0 {
 		var prev int64
-		prev, err = lastNewlineBefore(ctx, f, end, chunk, &read)
+		prev, err = scanner.prevNewline()
 		if err != nil {
 			break
 		}
@@ -694,25 +700,41 @@ func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStat
 	return nil, io.EOF
 }
 
-// lastNewlineBefore returns the offset of the last newline before pos, or -1,
-// reading backwards one chunk at a time into buf.
-func lastNewlineBefore(ctx context.Context, f *os.File, pos int64, buf []byte, read *int64) (int64, error) {
-	for pos > 0 {
-		if err := ctx.Err(); err != nil {
+// statusTailScanner yields a file's newline offsets from the end backwards.
+// It keeps the chunk it last loaded and its position in it, so each byte of
+// the file is loaded and searched once however many lines are rejected.
+type statusTailScanner struct {
+	ctx      context.Context
+	f        *os.File
+	buf      []byte
+	bufStart int64 // file offset of buf[0]
+	cursor   int   // buf[:cursor] is not yet searched
+	read     *int64
+}
+
+// prevNewline returns the offset of the last newline before the scanner's
+// position and moves the position to it, or returns -1 at the file's start.
+func (s *statusTailScanner) prevNewline() (int64, error) {
+	for {
+		if err := s.ctx.Err(); err != nil {
 			return 0, err
 		}
-		n := min(int64(len(buf)), pos)
-		start := pos - n
-		if _, err := f.ReadAt(buf[:n], start); err != nil {
+		if i := bytes.LastIndexByte(s.buf[:s.cursor], '\n'); i >= 0 {
+			s.cursor = i
+			return s.bufStart + int64(i), nil
+		}
+		if s.bufStart == 0 {
+			s.cursor = 0
+			return -1, nil
+		}
+		n := min(int64(len(s.buf)), s.bufStart)
+		s.bufStart -= n
+		if _, err := s.f.ReadAt(s.buf[:n], s.bufStart); err != nil {
 			return 0, err
 		}
-		*read += n
-		if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
-			return start + int64(i), nil
-		}
-		pos = start
+		*s.read += n
+		s.cursor = int(n)
 	}
-	return -1, nil
 }
 
 func openStatusFileWithRetry(path string) (*os.File, error) {
