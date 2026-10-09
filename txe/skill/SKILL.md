@@ -88,7 +88,7 @@ expected_outcome:
       delivery: machine        # digest recorded; bytes stay on this machine
 ```
 
-A `path` is an exact file name. Patterns, `..` and symbolic links are refused. Nothing else the script writes leaves the machine. A `machine` deliverable is recorded as stored on this machine; it cannot be fetched through the hub.
+A `path` is an exact file name: names of letters, digits, `.`, `-` and `_`, separated by `/`, each starting with a letter, digit or `_`. Spaces, patterns, `..`, hidden files and symbolic links are refused. Nothing else the script writes leaves the machine. A `machine` deliverable is recorded as stored on this machine; it cannot be fetched through the hub.
 
 ## Register
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 )
@@ -218,13 +219,16 @@ func PrepareRetry(
 		original: *originalStatus, queued: *updatedStatus}, nil
 }
 
+// nextRetryQueuedAt returns the queued-at marker for a queued retry. The marker
+// is strictly later than the previous one, so (AttemptID, QueuedAt) names each
+// queued execution of an attempt even when the clock reads the same value or has
+// moved backwards. A previous marker that cannot be parsed sets no lower bound.
 func nextRetryQueuedAt(previous string, now time.Time) string {
-	now = now.UTC()
-	queuedAt := now.Format(time.RFC3339Nano)
-	if queuedAt == previous {
-		queuedAt = now.Add(time.Nanosecond).Format(time.RFC3339Nano)
+	next := now.UTC()
+	if prev, err := stringutil.ParseTime(previous); err == nil && !prev.IsZero() && !next.After(prev) {
+		next = prev.UTC().Add(time.Nanosecond)
 	}
-	return queuedAt
+	return next.Format(time.RFC3339Nano)
 }
 
 func rollbackQueuedRetry(
