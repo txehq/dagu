@@ -99,6 +99,15 @@ type DAGRunStatusResult struct {
 type DispatchRequest struct {
 	Task                      *DispatchTask
 	AdmissionReservationToken string
+	// Admitted, when set, receives the execution the coordinator admitted.
+	Admitted *AdmittedExecution
+}
+
+// AdmittedExecution is the execution a dispatch admitted: its attempt and
+// the queued-at its statuses carry.
+type AdmittedExecution struct {
+	AttemptID string
+	QueuedAt  string
 }
 
 // Dispatcher defines distributed DAG run operations.

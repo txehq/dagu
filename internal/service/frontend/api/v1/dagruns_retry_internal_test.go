@@ -133,7 +133,7 @@ steps:
 		},
 	})
 	require.NoError(t, err)
-	_, ok := resp.(openapiv1.RetryDAGRun200Response)
+	_, ok := resp.(openapiv1.RetryDAGRun200JSONResponse)
 	require.True(t, ok)
 
 	require.Len(t, coordinatorCli.dispatched, 1)
@@ -363,7 +363,7 @@ steps:
 		DagRunId: "latest",
 	})
 	require.NoError(t, err)
-	_, ok := resp.(openapiv1.RetryDAGRun200Response)
+	_, ok := resp.(openapiv1.RetryDAGRun200JSONResponse)
 	require.True(t, ok)
 
 	require.Len(t, coordinatorCli.dispatched, 1)
@@ -448,7 +448,7 @@ func TestRetryDAGRun_TargetsPersistedChildStepFromRoot(t *testing.T) {
 
 	resp, err := apiServer.RetryDAGRun(ctx, request)
 	require.NoError(t, err)
-	_, ok := resp.(openapiv1.RetryDAGRun200Response)
+	_, ok := resp.(openapiv1.RetryDAGRun200JSONResponse)
 	require.True(t, ok)
 	require.Len(t, coordinatorCli.dispatched, 1)
 	task := coordinatorCli.dispatched[0]
@@ -616,7 +616,7 @@ steps:
 		},
 	})
 	require.NoError(t, err)
-	_, ok := resp.(openapiv1.RetryDAGRun200Response)
+	_, ok := resp.(openapiv1.RetryDAGRun200JSONResponse)
 	require.True(t, ok)
 	require.Len(t, coordinatorCli.dispatched, 1)
 	task := coordinatorCli.dispatched[0]
@@ -692,7 +692,7 @@ steps:
 		},
 	})
 	require.NoError(t, err)
-	_, ok := resp.(openapiv1.RetryDAGRun200Response)
+	_, ok := resp.(openapiv1.RetryDAGRun200JSONResponse)
 	require.True(t, ok)
 	require.Len(t, coordinatorCli.dispatched, 1)
 	task := coordinatorCli.dispatched[0]

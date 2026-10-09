@@ -570,13 +570,16 @@ func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want 
 }
 
 // claimLatest writes the conditional retry's new attempt's first status: the
-// retried execution's checkpoint, not started, under the new attempt. If the
-// retry is never dispatched, a later retry of the run still starts from that
-// checkpoint rather than from fresh steps.
+// retried execution's checkpoint and queued-at, not started, under the new
+// attempt. If the retry is never dispatched, a later retry of the run still
+// starts from that checkpoint rather than from fresh steps.
 func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus) error {
 	status := *source
 	status.AttemptID, status.AttemptKey, status.Status = attempt.ID(), "", ir.NotStarted
-	status.QueuedAt, status.WorkerID, status.PID, status.PIDStartedAt, status.LeaseAt = "", "", 0, 0, 0
+	// QueuedAt is kept: a direct retry's statuses carry the retried
+	// status's queued-at, so the claim names the execution the retry's
+	// receipt names.
+	status.WorkerID, status.PID, status.PIDStartedAt, status.LeaseAt = "", 0, 0, 0
 	// Ownership, timing and the outcome belong to the retried execution.
 	status.ClaimKey, status.StartedAt, status.FinishedAt, status.Error = "", "", "", ""
 	status.TriggerType = ir.TriggerTypeRetry

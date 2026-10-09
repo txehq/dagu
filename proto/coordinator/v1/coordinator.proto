@@ -103,7 +103,11 @@ message DispatchRequest {
 
 // Response message for dispatching a task.
 message DispatchResponse {
-  // No field
+  // The execution the dispatch admitted, when it prepared an attempt: the
+  // attempt and the queued_at its statuses carry (the retried status's for
+  // a retry, else the task's marker).
+  string attempt_id = 1;
+  string queued_at = 2;
 }
 
 // Task to process.
