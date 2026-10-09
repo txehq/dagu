@@ -1,0 +1,184 @@
+{
+  "rule": "A deliverable path is '/'-separated names. Each name matches ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$, does not end with '.', and is not a Windows device name (con, prn, aux, nul, com0-9, lpt0-9; any case; with or without an extension). The whole path is at most 1024 bytes.",
+  "accepted": [
+    "snapshot.json",
+    "raw/export.csv",
+    "notes.txt",
+    "validation-report.json",
+    "a-b_c.1/d",
+    "_private/x",
+    "A/B/C.TXT",
+    "0",
+    "a.b.c",
+    "x-",
+    "con1",
+    "console.log",
+    "nul_/a",
+    "com10.txt",
+    "lpt",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
+  "refused": [
+    {
+      "path": "",
+      "why": "empty"
+    },
+    {
+      "path": "/etc/passwd",
+      "why": "absolute"
+    },
+    {
+      "path": "~/x",
+      "why": "home expansion"
+    },
+    {
+      "path": "../x",
+      "why": "parent"
+    },
+    {
+      "path": "a/../../x",
+      "why": "parent"
+    },
+    {
+      "path": "a/./b",
+      "why": "not clean"
+    },
+    {
+      "path": "a//b",
+      "why": "empty name"
+    },
+    {
+      "path": "a/",
+      "why": "empty name"
+    },
+    {
+      "path": ".",
+      "why": "not a file name"
+    },
+    {
+      "path": "*.json",
+      "why": "pattern"
+    },
+    {
+      "path": "snap?.json",
+      "why": "pattern"
+    },
+    {
+      "path": "a[1].json",
+      "why": "pattern"
+    },
+    {
+      "path": "a{b,c}",
+      "why": "pattern"
+    },
+    {
+      "path": "a/$HOME",
+      "why": "variable"
+    },
+    {
+      "path": "a`id`",
+      "why": "command substitution"
+    },
+    {
+      "path": "a\\b",
+      "why": "backslash"
+    },
+    {
+      "path": "C:/x",
+      "why": "colon"
+    },
+    {
+      "path": "a:b",
+      "why": "colon"
+    },
+    {
+      "path": "a b.txt",
+      "why": "space"
+    },
+    {
+      "path": "a\nb",
+      "why": "control character"
+    },
+    {
+      "path": "a\tb",
+      "why": "control character"
+    },
+    {
+      "path": "a\u0000b",
+      "why": "control character"
+    },
+    {
+      "path": "caf\u00e9.txt",
+      "why": "outside ASCII"
+    },
+    {
+      "path": ".hidden",
+      "why": "leading dot"
+    },
+    {
+      "path": "raw/.env",
+      "why": "leading dot"
+    },
+    {
+      "path": ".txe-partial-1",
+      "why": "leading dot; the publish step's own temporary names"
+    },
+    {
+      "path": "raw/.txe-partial-x",
+      "why": "leading dot; the publish step's own temporary names"
+    },
+    {
+      "path": "-rf",
+      "why": "leading dash"
+    },
+    {
+      "path": "report.",
+      "why": "trailing dot"
+    },
+    {
+      "path": "raw./x",
+      "why": "trailing dot"
+    },
+    {
+      "path": "con",
+      "why": "device name"
+    },
+    {
+      "path": "CON",
+      "why": "device name"
+    },
+    {
+      "path": "raw/nul.txt",
+      "why": "device name with an extension"
+    },
+    {
+      "path": "Aux.tar.gz",
+      "why": "device name with an extension"
+    },
+    {
+      "path": "com0",
+      "why": "device name"
+    },
+    {
+      "path": "COM9.log",
+      "why": "device name with an extension"
+    },
+    {
+      "path": "lpt1/x",
+      "why": "device name as a directory"
+    },
+    {
+      "path": "prn",
+      "why": "device name"
+    },
+    {
+      "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "a name longer than 128 characters"
+    },
+    {
+      "path": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "why": "longer than 1024 bytes"
+    }
+  ]
+}

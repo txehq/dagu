@@ -5,6 +5,7 @@ package txeclient
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -349,12 +350,26 @@ func TestPublishWithoutArtifactDir(t *testing.T) {
 	assert.Empty(t, f.manifests)
 }
 
+// The CLI and the registry run the same accepted and refused paths.
 func TestCheckDeliverablePath(t *testing.T) {
-	for _, ok := range []string{"snapshot.json", "raw/export.csv", "a-b_c.1/d"} {
-		require.NoError(t, CheckDeliverablePath(ok), ok)
+	data, err := os.ReadFile(filepath.Join(fixturesDir, "deliverable-paths.json"))
+	require.NoError(t, err)
+	var cases struct {
+		Accepted []string `json:"accepted"`
+		Refused  []struct {
+			Path string `json:"path"`
+			Why  string `json:"why"`
+		} `json:"refused"`
 	}
-	for _, bad := range []string{"", "/etc/passwd", "~/x", "../x", "a/../../x", "a/./b", "a//b", "*.json", "snap?.json", "a/$HOME", "a`id`", `a\b`, "a\nb", ".txe-partial-1", "raw/.txe-partial-x"} {
-		require.Error(t, CheckDeliverablePath(bad), "%q", bad)
+	require.NoError(t, json.Unmarshal(data, &cases))
+	require.NotEmpty(t, cases.Accepted)
+	require.NotEmpty(t, cases.Refused)
+
+	for _, ok := range cases.Accepted {
+		require.NoError(t, CheckDeliverablePath(ok), "%q", ok)
+	}
+	for _, bad := range cases.Refused {
+		require.Error(t, CheckDeliverablePath(bad.Path), "%q (%s)", bad.Path, bad.Why)
 	}
 }
 

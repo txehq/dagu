@@ -135,26 +135,43 @@ func (e *MissingContextError) Error() string {
 var (
 	jobKeyPattern          = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,62}$`)
 	deliverableNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+	// deliverableSegmentPattern is one directory or file name of a
+	// deliverable's path. It cannot start with a dot, so "." and ".." and
+	// the names the publish step copies under are all outside it.
+	deliverableSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+	// deviceNamePattern is a name Windows reserves, with or without an
+	// extension. The hub may store its copies on any filesystem.
+	deviceNamePattern = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$`)
 )
 
+// maxDeliverablePath is the longest deliverable path, in bytes.
+const maxDeliverablePath = 1024
+
 // CheckDeliverablePath accepts only the exact name of a file inside the run's
-// output directory: a relative path with no parent components, no pattern
-// characters, and nothing a shell or Dagu would expand.
+// output directory. It is the registry's rule, so a spec the CLI accepts is
+// not refused by the hub for its paths: "/"-separated names of letters,
+// digits, dot, dash and underscore that start with a letter, digit or
+// underscore. The cases both sides agree on are in
+// txe/contract/fixtures/registration/deliverable-paths.json.
 func CheckDeliverablePath(path string) error {
 	switch {
 	case path == "":
 		return errors.New("a file name relative to the run's output directory is required")
-	case filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, "~"):
+	case len(path) > maxDeliverablePath:
+		return fmt.Errorf("the path is %d bytes long; the limit is %d", len(path), maxDeliverablePath)
+	case strings.HasPrefix(path, "/") || strings.HasPrefix(path, "~"):
 		return fmt.Errorf("%q must be relative to the run's output directory", path)
-	case strings.ContainsAny(path, "*?[]{}$`\\\n\r\x00"):
-		return fmt.Errorf("%q must be an exact file name: no patterns, variables or control characters", path)
 	}
 	for part := range strings.SplitSeq(path, "/") {
-		if part == "" || part == "." || part == ".." {
+		switch {
+		case part == "" || part == "." || part == "..":
 			return fmt.Errorf("%q must not contain empty, \".\" or \"..\" components", path)
-		}
-		if strings.HasPrefix(part, partialPrefix) {
-			return fmt.Errorf("%q uses the reserved prefix %q", path, partialPrefix)
+		case !deliverableSegmentPattern.MatchString(part):
+			return fmt.Errorf("%q: each name must start with a letter, digit or underscore, use only letters, digits, dot, dash and underscore, and be at most 128 characters", path)
+		case strings.HasSuffix(part, "."):
+			return fmt.Errorf("%q: a name must not end with a dot", path)
+		case deviceNamePattern.MatchString(part):
+			return fmt.Errorf("%q: %q is a reserved device name", path, part)
 		}
 	}
 	return nil

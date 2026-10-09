@@ -353,7 +353,8 @@ func hashFile(f io.Reader) (string, int64, error) {
 }
 
 // partialPrefix starts the name of a file that is still being copied into
-// the artifact directory. A deliverable may not use it.
+// the artifact directory. No deliverable can have such a name: a deliverable's
+// names never start with a dot.
 const partialPrefix = ".txe-partial-"
 
 // copyDeliverable copies one declared file into the run's artifact directory

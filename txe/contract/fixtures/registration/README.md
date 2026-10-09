@@ -25,6 +25,7 @@ more. The registry's real responses carry more; they are authoritative for their
 | `ready.request.json`, `ready.response.200.json` | `POST /api/v1/txe/jobs/{job_id}/ready`; the response is the receipt |
 | `version.request.json`, `version.response.409.version_conflict.json` | `POST /api/v1/txe/jobs/{job_id}/versions` with an outdated `expected_version` |
 | `artifacts.publish.request.json` | `POST /api/v1/txe/jobs/{job_id}/runs/{run_id}/artifacts`, sent by the job's last step |
+| `deliverable-paths.json` | no call: the deliverable paths the CLI and the registry both accept and both refuse |
 
 What the client relies on:
 
@@ -41,6 +42,9 @@ What the client relies on:
   reference is a `secrets` entry the worker resolves from its own machine.
 - **No credential value** appears in any body. `credential_refs[].locator` is a path or a variable
   name on the assigned machine.
+- **Deliverable paths.** `deliverable-paths.json` is written by hand. It states the rule and lists
+  paths on each side of it. `TestCheckDeliverablePath` runs the CLI's check over every one; the
+  registry's check is meant to run over the same file, so the two cannot drift apart unnoticed.
 - **Artifacts.** `path` is relative to the run's output directory on the machine. `location` `hub`
   means the same bytes were also placed in the run's native artifact directory for upload; the
   digest here is what the hub copy must match before it is shown as available. A deliverable the
