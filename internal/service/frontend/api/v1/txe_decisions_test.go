@@ -321,3 +321,88 @@ func TestTxeDecisionChecksWorkspace(t *testing.T) {
 	requireStatus(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictRetire, "operator-retire", nil), http.StatusForbidden)
 	require.NoError(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictApprove, "operator-approve", nil))
 }
+
+// registerTxeJobHTTP registers a ready job over HTTP and returns its ID.
+func registerTxeJobHTTP(t *testing.T, server test.Server) string {
+	t.Helper()
+	c := server.Client()
+	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
+	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
+	c.Post("/api/v1/txe/owners", map[string]any{"owner_id": owner, "display_name": "Connor", "actor": cli}).
+		ExpectStatus(http.StatusCreated).Send(t)
+	c.Post("/api/v1/txe/machines", map[string]any{"machine_id": machine, "owner_id": owner, "display_name": "laptop", "actor": cli}).
+		ExpectStatus(http.StatusCreated).Send(t)
+	var project api.TxeProject
+	c.Post("/api/v1/txe/projects", map[string]any{"owner_id": owner, "key": "github.com/txehq/fixture", "actor": cli}).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &project)
+	jobID := mint(t, registry.PrefixJob)
+	digest := fmt.Sprintf("sha256:%064x", 1)
+	c.Post("/api/v1/txe/jobs", map[string]any{
+		"job_id": jobID, "request_id": "r1", "owner_id": owner, "project_id": project.ProjectId,
+		"machine_id": machine, "job_key": "volume-monitor", "actor": cli,
+		"version": map[string]any{
+			"title": "Volume monitor", "purpose": "Watch the fixture volume",
+			"package": map[string]any{"digest": digest, "path": "/pkg", "entrypoint": "run.sh"},
+			"dag":     map[string]any{"spec": fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)},
+		},
+	}).ExpectStatus(http.StatusCreated).Send(t)
+	c.Post("/api/v1/txe/jobs/"+jobID+"/ready", map[string]any{
+		"package": map[string]any{"digest": digest, "path": "/pkg", "machine_id": machine}, "actor": cli,
+	}).ExpectStatus(http.StatusOK).Send(t)
+	return jobID
+}
+
+// seedFailedTxeRun writes a failed attempt of the job's saved DAG, as a run
+// that already happened on the worker.
+func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string) {
+	t.Helper()
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, dag.YamlData)
+	started := time.Now()
+	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.NewStatusBuilder(dag).Create(runID, ir.Failed, 0, started,
+		ir.WithAttemptID(attempt.ID()), ir.WithFinishedAt(started.Add(time.Second)), ir.WithError("probe failed"))
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, status))
+	require.NoError(t, attempt.Close(ctx))
+}
+
+// Retrying one exact failed run records a decided dagu.retry_run proposal
+// bound to that run; it is idempotent and refuses a stale snapshot or a run
+// that is not the job's.
+func TestTxeRunRetryRequest(t *testing.T) {
+	server := test.SetupServer(t)
+	c := server.Client()
+	jobID := registerTxeJobHTTP(t, server)
+	seedFailedTxeRun(t, server, jobID, "run-failed-1")
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-failed-1")
+	body := map[string]any{"idempotency_key": "dashboard-retry-1", "expected_job_version": job.Version}
+
+	var first api.TxeDecisionResponse
+	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
+	require.False(t, first.Replayed)
+	require.Equal(t, api.TxeVerdict("retry"), first.Decision.Verdict)
+	require.NotNil(t, first.Proposal)
+	require.Equal(t, api.TxeProposalState("decided"), first.Proposal.State)
+	require.Equal(t, decision.ActionRetryRun, first.Proposal.Action.Name)
+	require.Contains(t, string(first.Proposal.Action.Params), `"run_id":"run-failed-1"`)
+
+	var again api.TxeDecisionResponse
+	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &again)
+	require.True(t, again.Replayed)
+	require.Equal(t, first.Decision.DecisionId, again.Decision.DecisionId)
+
+	stale := map[string]any{"idempotency_key": "dashboard-retry-2", "expected_job_version": job.Version,
+		"run_spec_sha256": fmt.Sprintf("sha256:%064x", 9)}
+	c.Post(path, stale).ExpectStatus(http.StatusConflict).Send(t)
+
+	c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "no-such-run"),
+		map[string]any{"idempotency_key": "dashboard-retry-3", "expected_job_version": job.Version}).
+		ExpectStatus(http.StatusNotFound).Send(t)
+}

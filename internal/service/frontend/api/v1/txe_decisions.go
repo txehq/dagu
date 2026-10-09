@@ -5,14 +5,19 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -87,6 +92,112 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 		out.Proposal = &p
 	}
 	return out, nil
+}
+
+// RequestTxeRunRetry records a person's request to retry one exact run of a
+// job. The request becomes a decided dagu.retry_run proposal; the reviewer
+// performs the retry under an execution claim through the action journal, so
+// this records the decision and runs nothing.
+func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetryRequestObject) (api.RequestTxeRunRetryResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	store, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	actor, err := txeDecisionActor(ctx, body.Actor)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
+		return nil, err
+	}
+	run, err := a.txeRunFacts(ctx, req.JobId, req.RunId)
+	if err != nil {
+		return nil, err
+	}
+	// A client that saw a different snapshot of the run is acting on stale
+	// information; refuse rather than retry something else.
+	if body.RunSpecSha256 != nil && *body.RunSpecSha256 != run.specSHA256 {
+		return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: "the run's DAG snapshot differs from the one in the request",
+			Details: map[string]any{"code": string(decision.CodeRunStale)}}
+	}
+	svc := a.txeDecisionService(store)
+	res, err := svc.RequestRetry(ctx, req.JobId, decision.RetryRequest{
+		RunID:              req.RunId,
+		ExpectedJobVersion: body.ExpectedJobVersion,
+		RunSpecSHA256:      run.specSHA256,
+		RunStartedAt:       run.startedAt,
+		IdempotencyKey:     body.IdempotencyKey,
+	}, actor)
+	if err != nil {
+		if errors.Is(err, decision.ErrInvalid) {
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
+		}
+		return nil, txeError(err)
+	}
+	out := api.RequestTxeRunRetry200JSONResponse{Replayed: res.AlreadyRecorded}
+	if out.Decision, err = txeConvert[api.TxeDecision](res.Decision); err != nil {
+		return nil, err
+	}
+	job, err := txeConvert[api.TxeJob](res.Job)
+	if err != nil {
+		return nil, err
+	}
+	out.Job = &job
+	if res.Proposal != nil {
+		p, err := txeConvert[api.TxeProposal](res.Proposal)
+		if err != nil {
+			return nil, err
+		}
+		out.Proposal = &p
+	}
+	return out, nil
+}
+
+type txeRun struct {
+	specSHA256 string
+	startedAt  time.Time
+}
+
+// txeRunFacts reads the run of the job's DAG that a retry names: it must
+// exist, be finished and not succeeded, and the caller must be able to see
+// it. Its DAG snapshot digest is computed the way run admission computes it.
+func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, error) {
+	status, err := a.authorizeHumanTaskMutation(ctx, jobID, runID)
+	if err != nil {
+		return txeRun{}, err
+	}
+	if status.Name != jobID {
+		return txeRun{}, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+			Message: fmt.Sprintf("run %s is not a run of job %s", runID, jobID)}
+	}
+	if status.Status.IsActive() || status.Status.IsSuccess() {
+		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: fmt.Sprintf("run %s is %s; only a finished, unsuccessful run can be retried", runID, status.Status),
+			Details: map[string]any{"code": "run_not_retryable"}}
+	}
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
+	if err != nil {
+		return txeRun{}, err
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return txeRun{}, fmt.Errorf("read DAG snapshot of run %s: %w", runID, err)
+	}
+	if len(dag.YamlData) == 0 {
+		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: fmt.Sprintf("run %s has no DAG snapshot to compare with the job", runID),
+			Details: map[string]any{"code": string(decision.CodeRunStale)}}
+	}
+	started, err := stringutil.ParseTime(status.StartedAt)
+	if err != nil {
+		return txeRun{}, fmt.Errorf("parse start time of run %s: %w", runID, err)
+	}
+	return txeRun{specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
 }
 
 // ListTxeProposalDecisions lists every decision recorded for a proposal,

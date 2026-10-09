@@ -152,23 +152,8 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 			}
 			action = p.Action.Name
 		}
-		// Retry has a meaning only on the two typed proposals; refuse it
-		// elsewhere whatever the proposal's allowed verdicts say.
-		if req.Verdict == VerdictRetry && action != ActionRetryRun && action != ActionUncertainEffect {
-			return &registry.Error{
-				Code:    registry.CodeNotPermitted,
-				Message: fmt.Sprintf("retry applies only to %s and %s proposals, not %q", ActionRetryRun, ActionUncertainEffect, action),
-			}
-		}
-		// The registry cannot yet authorize the bound retry a dagu.retry_run
-		// decision asks for, so recording one would leave a decided proposal
-		// that can never execute. Refused until that guard exists.
-		if req.Verdict == VerdictRetry && action == ActionRetryRun {
-			return &registry.Error{
-				Code:    registry.CodeNotPermitted,
-				Message: "retrying a run is not available until the registry can authorize it",
-			}
-		}
+		// The registry refuses verdicts with no meaning on the proposal, such
+		// as retry on an ordinary action or approve on an escalation.
 		effect := EffectOf(req.Verdict, action)
 		d, err := tx.AppendDecision(registry.Decision{
 			DecisionID:       decisionID,
@@ -313,4 +298,103 @@ func (s *Service) resumeNative(ctx context.Context, job *registry.Job, pending *
 		return tx.MarkNativeResumed(pending.DecisionID)
 	})
 	return err
+}
+
+// RetryRequest asks for one exact run of a job to be retried, as a person
+// sees it from the dashboard.
+type RetryRequest struct {
+	RunID              string
+	ExpectedJobVersion int
+	// RunSpecSHA256 is the digest of the run's DAG snapshot.
+	RunSpecSHA256 string
+	// RunStartedAt is when the run started; a run that predates the job's
+	// current version is of an older version even when its DAG text is
+	// unchanged, since the package can differ.
+	RunStartedAt   time.Time
+	IdempotencyKey string
+}
+
+// CodeRunStale refuses a retry of a run that is not of the job's current
+// version.
+const CodeRunStale registry.Code = "run_stale"
+
+// RequestRetry records a person's request to retry one run as a
+// dagu.retry_run proposal decided with retry, in one commit. The reviewer
+// executes it under an execution claim through the registry's action
+// journal; nothing runs here.
+func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryRequest, actor registry.Actor) (*Result, error) {
+	if req.RunID == "" {
+		return nil, fmt.Errorf("%w: run id is required", ErrInvalid)
+	}
+	if !idempotencyKeyPattern.MatchString(req.IdempotencyKey) {
+		return nil, fmt.Errorf("%w: idempotencyKey must be 8-128 characters of [A-Za-z0-9._:-]", ErrInvalid)
+	}
+	if s.AuthorizeDecision == nil {
+		return nil, errNoAuthorizer
+	}
+	var stored *registry.Decision
+	var proposal *registry.Proposal
+	var replayID string
+	job, err := s.Registry.WithJobTx(ctx, jobID, actor, func(tx *registry.JobTx) error {
+		stored, proposal, replayID = nil, nil, ""
+		if err := s.AuthorizeDecision(ctx, tx, VerdictRetry); err != nil {
+			return err
+		}
+		if id, ok := tx.DecisionByKey(req.IdempotencyKey); ok {
+			replayID = id
+			return nil
+		}
+		j := tx.Job
+		if j.Version != req.ExpectedJobVersion {
+			return &registry.Error{Code: registry.CodeVersionConflict,
+				Message: fmt.Sprintf("job is at version %d, not %d", j.Version, req.ExpectedJobVersion), Current: j}
+		}
+		v, err := tx.CurrentVersion()
+		if err != nil {
+			return err
+		}
+		// Run start times have whole-second precision, so the version's
+		// creation is compared at the same precision.
+		if req.RunSpecSHA256 != j.DAGSpecSHA256 || req.RunStartedAt.Before(v.Created.At.Truncate(time.Second)) {
+			return &registry.Error{Code: CodeRunStale,
+				Message: fmt.Sprintf("run %s is of an earlier version of this job; retrying it would run version %d's code, so start a new run instead", req.RunID, j.Version)}
+		}
+		p, d, err := tx.ProposeRetry(registry.RetryRunParams{
+			RunID: req.RunID, RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest,
+		}, req.IdempotencyKey)
+		if err != nil {
+			return err
+		}
+		stored, proposal = d, p
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := &Result{Job: job, Proposal: proposal, Decision: stored}
+	if replayID != "" {
+		d, err := s.Registry.GetDecision(ctx, jobID, replayID)
+		if err != nil {
+			return nil, err
+		}
+		// A replay names the same run; the proposal ID derives from the run
+		// and the job version the retry was requested at.
+		p := job.Proposals[d.ProposalID]
+		sameRun := false
+		if p != nil {
+			want, err := registry.RetryProposalID(req.RunID, p.JobVersion)
+			if err != nil {
+				return nil, err
+			}
+			sameRun = d.ProposalID == want
+		}
+		if !sameRun || d.Verdict != VerdictRetry {
+			return nil, &registry.Error{Code: CodeIdempotencyMismatch,
+				Message: "idempotency key was used for a different decision", Current: d}
+		}
+		result.Decision, result.AlreadyRecorded = d, true
+		result.Proposal = job.Proposals[d.ProposalID]
+	}
+	result.Decision.NativeResume = registry.CurrentNativeResume(job, result.Decision)
+	return result, nil
 }
