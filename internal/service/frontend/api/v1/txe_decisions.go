@@ -98,11 +98,17 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 	}
 	// A job in a workspace the caller cannot see is reported as not found,
 	// like every other registry read.
-	job, err := a.txeVisibleJob(ctx, store, req.JobId)
-	if err != nil {
+	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
 		return nil, err
 	}
 	all, err := store.ListDecisions(ctx, req.JobId, 0)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	// Read the job for the projection after the decisions: a decision listed
+	// here is then always covered by the pending list read, so a completion
+	// still outstanding is never reported as done.
+	job, err := store.GetJob(ctx, req.JobId)
 	if err != nil {
 		return nil, txeError(err)
 	}
