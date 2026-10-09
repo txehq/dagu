@@ -159,7 +159,8 @@ type Handler struct {
 	dispatchPollMaxWait     time.Duration
 
 	// Optional worker runtime services.
-	dagRunRepository          *persis.DAGRunRepository           // For status persistence
+	dagRunRepository          *persis.DAGRunRepository // For status persistence
+	runAdmitter               RunAdmitter
 	logDir                    string                             // For log storage
 	artifactDir               string                             // For artifact storage
 	stateStore                dagrun.StateStore                  // For persistent DAG state shared across DAG runs
@@ -199,6 +200,10 @@ type Handler struct {
 
 // HandlerConfig holds configuration for creating a Handler.
 type HandlerConfig struct {
+	// RunAdmitter, when set, re-checks TXE registered jobs before a worker
+	// may start a claimed run.
+	RunAdmitter RunAdmitter
+
 	// DAGRunRepository provides application access to persisted DAG-run statuses.
 	// Required for worker status reporting.
 	DAGRunRepository *persis.DAGRunRepository
@@ -298,6 +303,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		openAttempts:              make(map[string]dagrun.Attempt),
 		owner:                     cfg.Owner,
 		dagRunRepository:          cfg.DAGRunRepository,
+		runAdmitter:               cfg.RunAdmitter,
 		logDir:                    cfg.LogDir,
 		artifactDir:               cfg.ArtifactDir,
 		stateStore:                cfg.StateStore,
@@ -1377,6 +1383,13 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 	}
 	if claimed.Task == nil {
 		return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "claim has no task payload"}, nil
+	}
+	refused, reason, err := h.refuseUnadmittedClaim(ctx, req.ClaimToken, claimed.Task)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if refused {
+		return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: reason}, nil
 	}
 	claimOwner := claimed.Owner
 	if claimOwner == (dispatch.CoordinatorEndpoint{}) {

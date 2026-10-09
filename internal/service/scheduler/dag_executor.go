@@ -221,6 +221,11 @@ func (e *DAGExecutor) executeDAG(
 	if err := validateDispatchOperation(operation); err != nil {
 		return err
 	}
+	if !e.shouldUseDistributedExecution(dag) {
+		if err := refuseLocalJobRun(dag); err != nil {
+			return err
+		}
+	}
 
 	triggerActor := ""
 	if previousStatus != nil {

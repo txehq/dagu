@@ -111,6 +111,7 @@ type QueueProcessor struct {
 	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
+	runAdmitter            RunAdmitter
 	queues                 sync.Map // map[string]*queue
 	wakeUpCh               chan struct{}
 	dispatchHandoffs       chan struct{}
@@ -493,6 +494,7 @@ func (p *QueueProcessor) newQueueDispatcher() *queueDispatcher {
 		workerStaleAfter:       p.workerStaleAfter,
 		dagExecutor:            p.dagExecutor,
 		isSuspended:            p.isSuspended,
+		runAdmitter:            p.runAdmitter,
 		backoffConfig:          p.backoffConfig,
 		leaseStaleThreshold:    p.leaseStaleThreshold,
 		isClosed:               p.isClosed,

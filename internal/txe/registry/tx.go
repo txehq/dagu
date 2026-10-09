@@ -81,6 +81,12 @@ type Transition struct {
 	// Affected lists runs the caller found queued or running, with what
 	// happens to each. The registry adds proposals, claims and actions.
 	Affected []Affected
+	// Authorize, when set, is checked against the job inside the same
+	// commit as the change (ChangeLifecycle only).
+	Authorize func(tx *JobTx) error
+	// DetailFor, when set, computes Detail from the job being committed
+	// (ChangeLifecycle only).
+	DetailFor func(job *Job) string
 }
 
 // Transition applies a lifecycle change. Completion and retirement are
