@@ -144,6 +144,11 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 		default:
 			return refuse(CodeInvalid, "permitted action %q idempotency must be keyed, none or read_only", a.Name)
 		}
+		if len(bytes.TrimSpace(a.ParamSchema)) > 0 {
+			if _, err := compileParamSchema(a.ParamSchema); err != nil {
+				return refuse(CodeInvalid, "permitted action %q: %v", a.Name, err)
+			}
+		}
 	}
 	r := &v.RetirementRules
 	if r.OnTargetDeleted == "" {
