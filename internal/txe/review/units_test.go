@@ -6,6 +6,7 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -416,6 +417,221 @@ func TestExecuteStepRejectsMalformedIDs(t *testing.T) {
 	}
 	assert.Empty(t, out.String())
 	assert.Empty(t, f.state().Transitions, "no claim was taken")
+}
+
+// A job's command does not inherit what is the reviewer's own: the hub
+// client's context and credentials, the review's variables, and the agent's
+// profile and keys. It still gets the action's own variables, the marker
+// that stops a job registering work under a review, and whatever else the
+// machine provides for the job to reach its resources. The reconcile probe
+// runs the same way. An environment given explicitly is passed as it is.
+func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	reviewers := map[string]string{
+		"DAGU_HOME": "/reviewer/dagu", "DAGU_CONTEXTS_DIR": "/reviewer/contexts", "DAGU_API_KEY": "hub-key",
+		"TXE_FIXTURE_REGISTRY": "/reviewer/registry.json", "TXE_FIXTURE_STATE_DIR": "/reviewer/state",
+		"TXE_DAGU_HOME": "/reviewer/dagu", "TXE_PACKET": `{"job":{}}`, "TXE_DECISION": "{}", "TXE_PARAM_SIZE_GB": "999",
+		"CLAUDE_CONFIG_DIR": "/reviewer/.claude", "ANTHROPIC_API_KEY": "agent-key", "CODEX_HOME": "/reviewer/.codex", "OPENAI_API_KEY": "agent-key-2",
+	}
+	for name, value := range reviewers {
+		t.Setenv(name, value)
+	}
+	t.Setenv(review.ReviewerEnv, "1")
+	t.Setenv("KUBECONFIG", "/job/kubeconfig")
+	t.Setenv("AWS_PROFILE", "job-profile")
+	// Credential references a job declares have TXE_ names of their own.
+	t.Setenv("TXE_KUBECONFIG", "/job/txe-kubeconfig")
+	t.Setenv("TXE_KUBE_CONTEXT", "job-context")
+	// Stale action identity from an enclosing step, and a mixed-case name.
+	t.Setenv("TXE_ACTION_ID", "act_stale")
+	t.Setenv("TXE_PROPOSAL_ID", "prp_of_the_decision_run")
+
+	seenBy := func(e *review.CommandEffector, run func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult) map[string]string {
+		t.Helper()
+		dir := t.TempDir()
+		job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: dir}
+		action := review.Action{ID: "act_1", Name: "a", TargetID: "t1", Params: map[string]string{"depth": "3"}}
+		declared := shellAction("env > env.txt", review.IdempotencyNone)
+		declared.Reconcile = declared.Command
+		res := run(e, job, declared, action)
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		require.NoError(t, err)
+		seen := map[string]string{}
+		for line := range strings.SplitSeq(string(raw), "\n") {
+			if name, value, ok := strings.Cut(line, "="); ok {
+				seen[name] = value
+			}
+		}
+		return seen
+	}
+	runAction := func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult {
+		return e.Run(context.Background(), job, declared, action)
+	}
+	probe := func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult {
+		return e.Probe(context.Background(), job, declared, action)
+	}
+
+	for name, run := range map[string]func(*review.CommandEffector, review.Job, review.DeclaredAction, review.Action) review.EffectResult{"action": runAction, "reconcile probe": probe} {
+		t.Run(name, func(t *testing.T) {
+			seen := seenBy(&review.CommandEffector{}, run)
+			for name := range reviewers {
+				assert.NotContains(t, seen, name, "the reviewer's own variable reached the job's command")
+			}
+			assert.Equal(t, "1", seen[review.ReviewerEnv], "a job's command still cannot register work under a review")
+			assert.Equal(t, "/job/kubeconfig", seen["KUBECONFIG"], "what the job needs to reach its resources is inherited")
+			assert.Equal(t, "job-profile", seen["AWS_PROFILE"])
+			assert.Equal(t, "/job/txe-kubeconfig", seen["TXE_KUBECONFIG"], "a credential reference the job declares is not the reviewer's")
+			assert.Equal(t, "job-context", seen["TXE_KUBE_CONTEXT"])
+			assert.NotContains(t, seen, "TXE_PROPOSAL_ID", "the decision run's own ids stay with the reviewer")
+			assert.NotEmpty(t, seen["PATH"])
+			assert.Equal(t, "job_A", seen["TXE_JOB_ID"])
+			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
+			assert.Equal(t, "3", seen["TXE_PARAM_DEPTH"])
+			assert.NotContains(t, seen, "TXE_PARAM_SIZE_GB", "a variable of the review is not taken for a parameter of the action")
+		})
+	}
+	t.Run("an explicit environment is passed as given", func(t *testing.T) {
+		seen := seenBy(&review.CommandEffector{Env: []string{"PATH=" + os.Getenv("PATH"), "DAGU_HOME=/chosen/for/the/job"}}, runAction)
+		assert.Equal(t, "/chosen/for/the/job", seen["DAGU_HOME"], "a deliberate binding is preserved")
+		assert.NotContains(t, seen, "KUBECONFIG", "and nothing ambient is added to it")
+		assert.NotContains(t, seen, "CLAUDE_CONFIG_DIR")
+		assert.Equal(t, "job_A", seen["TXE_JOB_ID"])
+	})
+}
+
+// A credential the job declares reaches its command deliberately, on the
+// path production uses: an effector with no environment of its own. It is
+// supplied even under a name whose inherited value is removed as the
+// reviewer's. The job declares its own OPENAI_API_KEY; its command gets that
+// one, and never the review agent's key of the same name, nor the agent's
+// other keys. A reference that cannot be resolved stops the command before
+// it starts, and what is reported names the reference, not a value.
+func TestCommandEffectorSuppliesTheJobsDeclaredCredentialsNotTheReviewers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	t.Setenv("OPENAI_API_KEY", "the-review-agents-key")
+	t.Setenv("ANTHROPIC_API_KEY", "the-review-agents-other-key")
+	t.Setenv("JOB_LINEAR_TOKEN_SOURCE", "the-jobs-linear-token")
+	secrets := t.TempDir()
+	keyFile := filepath.Join(secrets, "openai-key")
+	require.NoError(t, os.WriteFile(keyFile, []byte("the-jobs-own-key"), 0o600))
+
+	run := func(refs []review.CredentialRef, probe bool) (review.EffectResult, map[string]string) {
+		t.Helper()
+		dir := t.TempDir()
+		job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: dir, CredentialRefs: refs}
+		action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
+		declared := shellAction("env > env.txt", review.IdempotencyNone)
+		declared.Reconcile = declared.Command
+		e := &review.CommandEffector{}
+		var res review.EffectResult
+		if probe {
+			res = e.Probe(context.Background(), job, declared, action)
+		} else {
+			res = e.Run(context.Background(), job, declared, action)
+		}
+		seen := map[string]string{}
+		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		if err != nil {
+			return res, nil
+		}
+		for line := range strings.SplitSeq(string(raw), "\n") {
+			if name, value, ok := strings.Cut(line, "="); ok {
+				seen[name] = value
+			}
+		}
+		return res, seen
+	}
+	declared := []review.CredentialRef{
+		{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: keyFile},
+		{Name: "LINEAR_API_KEY", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"},
+	}
+	for name, probe := range map[string]bool{"action": false, "reconcile probe": true} {
+		t.Run(name, func(t *testing.T) {
+			res, seen := run(declared, probe)
+			require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+			assert.Equal(t, "the-jobs-own-key", seen["OPENAI_API_KEY"], "the declared credential, not the reviewer's key of the same name")
+			assert.Equal(t, "the-jobs-linear-token", seen["LINEAR_API_KEY"])
+			assert.NotContains(t, seen, "ANTHROPIC_API_KEY", "an undeclared reviewer key is not inherited")
+			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
+		})
+	}
+	t.Run("names registration accepts: lower case and a leading underscore", func(t *testing.T) {
+		res, seen := run([]review.CredentialRef{
+			{Name: "api_token", Kind: review.CredentialFile, Locator: keyFile},
+			{Name: "_TOKEN", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"},
+		}, false)
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		assert.Equal(t, "the-jobs-own-key", seen["api_token"])
+		assert.Equal(t, "the-jobs-linear-token", seen["_TOKEN"])
+	})
+	t.Run("a job read back from a registry kept on disk still has its references", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "registry.json")
+		stored := fixtureJob()
+		stored.CredentialRefs = declared
+		require.NoError(t, reviewtest.Open(path).PutJob(stored))
+		reread, err := reviewtest.Open(path).Job(context.Background(), stored.ID)
+		require.NoError(t, err)
+		require.Equal(t, declared, reread.CredentialRefs)
+
+		dir := t.TempDir()
+		reread.WorkingDir = dir
+		res := (&review.CommandEffector{}).Run(context.Background(), reread, shellAction(`printf '%s' "$OPENAI_API_KEY" > key.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		got, err := os.ReadFile(filepath.Join(dir, "key.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, "the-jobs-own-key", string(got))
+	})
+	t.Run("the review agent is not shown where the credentials are kept", func(t *testing.T) {
+		f := newFixture(t)
+		job := fixtureJob()
+		job.CredentialRefs = declared
+		require.NoError(t, f.registry.PutJob(job))
+		prepared := f.prepare("reviewer-a")
+		assert.Empty(t, prepared.Packet.Job.CredentialRefs)
+		raw, err := json.Marshal(prepared)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), keyFile)
+		assert.NotContains(t, string(raw), "JOB_LINEAR_TOKEN_SOURCE")
+		assert.NotContains(t, string(raw), "credential_refs")
+		// The registry still has them for the command that needs them.
+		kept, err := f.registry.Job(context.Background(), jobID)
+		require.NoError(t, err)
+		assert.Equal(t, declared, kept.CredentialRefs)
+	})
+	t.Run("without a declaration the reviewer's key is simply absent", func(t *testing.T) {
+		res, seen := run(nil, false)
+		require.Equal(t, review.EffectApplied, res.Status)
+		assert.NotContains(t, seen, "OPENAI_API_KEY")
+	})
+	for name, refs := range map[string][]review.CredentialRef{
+		"the file is missing":            {{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: filepath.Join(secrets, "absent")}},
+		"the path is a directory":        {{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: secrets}},
+		"the variable is not set":        {{Name: "LINEAR_API_KEY", Kind: review.CredentialEnv, Locator: "JOB_VARIABLE_THAT_IS_NOT_SET"}},
+		"an unknown kind":                {{Name: "OPENAI_API_KEY", Kind: "vault", Locator: "secret/data/the-path"}},
+		"a name reserved for the action": {{Name: "TXE_ACTION_ID", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+		"the marker of a review":         {{Name: review.ReviewerEnv, Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+		"not a variable name":            {{Name: "a=b", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			res, seen := run(refs, false)
+			assert.Equal(t, review.EffectNotApplied, res.Status, "the command is not started")
+			assert.Nil(t, seen, "nothing ran")
+			assert.Contains(t, res.Detail, "credential")
+			assert.NotContains(t, res.Detail, "the-jobs", "no value is reported")
+			assert.NotContains(t, res.Detail, "the-review-agents")
+			// The record is shown to the review agent later: it does not
+			// say where the credential is kept.
+			for _, ref := range refs {
+				assert.NotContains(t, res.Detail, ref.Locator, "the locator is not reported")
+			}
+			assert.NotContains(t, res.Detail, secrets)
+		})
+	}
 }
 
 // Pass 2 finding: when an action's deadline passes, its whole process group
