@@ -40,6 +40,7 @@ func TestParamSchemaIsCheckedAtRegistration(t *testing.T) {
 		"nested dialect":      `{"type": "object", "properties": {"a": {"$schema": "https://json-schema.org/draft/2020-12/schema"}}}`,
 		"unknown type":        `{"type": "int"}`,
 		"multipleOf zero":     `{"type": "integer", "multipleOf": 0}`,
+		"multipleOf":          `{"type": "number", "multipleOf": 0.75}`,
 		"negative minLength":  `{"type": "string", "minLength": -1}`,
 		"invalid pattern":     `{"type": "string", "pattern": "("}`,
 		"inexact bound":       `{"type": "integer", "maximum": 9007199254740993}`,
@@ -151,7 +152,7 @@ func TestParamSchemaDraft202012KeywordsAreEnforced(t *testing.T) {
 func TestParamSchemaNumbersAreExact(t *testing.T) {
 	_, err := compileParamSchema(json.RawMessage(`{"type": "number", "maximum": 0.1}`))
 	assert.Error(t, err, "0.1 is not exactly a float64")
-	pa := PermittedAction{Name: "scale", ParamSchema: json.RawMessage(`{"type": "object", "properties": {"f": {"type": "number", "maximum": 0.5, "multipleOf": 0.25}}}`)}
+	pa := PermittedAction{Name: "scale", ParamSchema: json.RawMessage(`{"type": "object", "properties": {"f": {"type": "number", "maximum": 0.5}}}`)}
 	_, err = compileParamSchema(pa.ParamSchema)
 	require.NoError(t, err)
 	require.NoError(t, checkActionParams(pa, json.RawMessage(`{"f": 0.5}`)))

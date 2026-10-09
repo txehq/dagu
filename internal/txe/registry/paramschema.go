@@ -24,13 +24,16 @@ import (
 // validator enforces, so a schema never promises a restriction (a format,
 // an unknown keyword) that nothing checks.
 
-// enforcedKeywords are the schema keywords the validator enforces or that
-// carry no restriction (annotations, identifiers, local definitions).
+// enforcedKeywords are the schema keywords the validator enforces exactly or
+// that carry no restriction (annotations, identifiers, local definitions).
+// multipleOf is not among them: the validator divides in floating point, and
+// a quotient beyond 2^53 rounds to an integer, so it is refused rather than
+// enforced inexactly.
 var enforcedKeywords = map[string]bool{
 	"$schema": true, "$id": true, "$ref": true, "$defs": true, "definitions": true, "$comment": true, "$anchor": true,
 	"title": true, "description": true, "default": true, "examples": true, "deprecated": true, "readOnly": true, "writeOnly": true,
 	"type": true, "enum": true, "const": true,
-	"multipleOf": true, "maximum": true, "exclusiveMaximum": true, "minimum": true, "exclusiveMinimum": true,
+	"maximum": true, "exclusiveMaximum": true, "minimum": true, "exclusiveMinimum": true,
 	"maxLength": true, "minLength": true, "pattern": true,
 	"maxItems": true, "minItems": true, "uniqueItems": true, "maxContains": true, "minContains": true,
 	"maxProperties": true, "minProperties": true, "required": true, "dependentRequired": true,
@@ -192,14 +195,6 @@ func checkKeywordValue(k string, v any, path string) error {
 	case "enum":
 		if list, ok := v.([]any); !ok || len(list) == 0 {
 			return bad("a non-empty array")
-		}
-	case "multipleOf":
-		n, ok := v.(json.Number)
-		if !ok {
-			return bad("a number")
-		}
-		if r, _ := new(big.Rat).SetString(n.String()); r == nil || r.Sign() <= 0 {
-			return bad("a number greater than 0")
 		}
 	case "maximum", "minimum", "exclusiveMaximum", "exclusiveMinimum":
 		if _, ok := v.(json.Number); !ok {
