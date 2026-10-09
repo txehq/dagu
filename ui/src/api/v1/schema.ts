@@ -24698,6 +24698,7 @@ export enum TxeAvailabilityState {
     worker_offline = "worker_offline",
     auth_required = "auth_required",
     target_unreachable = "target_unreachable",
+    target_unconfirmed = "target_unconfirmed",
     stale = "stale"
 }
 export enum TxeRetirementReason {

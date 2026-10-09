@@ -1200,3 +1200,29 @@ func TestIncompleteResourceEventsPageOnlyVisibleEvents(t *testing.T) {
 	assert.Equal(t, ids[3], page[0].EventID)
 	assert.Empty(t, next)
 }
+
+// An unknown observation of a target checked before each run sets
+// availability target_unconfirmed (actionable, never retiring), and a later
+// present clears it; for other targets it changes nothing.
+func TestUnknownPreRunTargetIsUnconfirmed(t *testing.T) {
+	f := newFixture(t)
+	pre := target("v-1")
+	pre.ExistenceCheck = CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{pre}
+		v.RetirementRules.OnTargetDeleted = RuleRetire
+	})
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown}, agent)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnconfirmed, got.Availability.State)
+	assert.Equal(t, job.Lifecycle, got.Lifecycle)
+	assert.True(t, f.admit(job.JobID, "").Admit, "availability does not refuse runs")
+
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State)
+}
