@@ -61,6 +61,8 @@ tags:
     description: "Runtime profile operations for managed environment variables and secrets"
   - name: "views"
     description: "Shared saved view configurations"
+  - name: "txe"
+    description: "TXE job registry: durable job context, lifecycle, review claims, proposals, decisions and effect grants"
 
 paths:
   /health:
@@ -10355,6 +10357,1937 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  # TXE job registry (fork extension; see internal/txe/registry).
+  /txe/resource-events:
+    post:
+      summary: "Report a resource event"
+      description: "Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
+      operationId: "recordTxeResourceEvent"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeResourceEventRequest"
+      responses:
+        "200":
+          description: "Event recorded with its dispositions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEvent"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/resource-events/{eventId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeEventId"
+    get:
+      summary: "Get a resource event"
+      description: "Returns a recorded resource event with the dispositions visible to the caller."
+      operationId: "getTxeResourceEvent"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Resource event"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEvent"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/installation:
+    get:
+      summary: "Get the TXE registry installation"
+      description: "Returns the registry schema version and its owners."
+      operationId: "getTxeInstallation"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Installation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeInstallation"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/owners:
+    post:
+      summary: "Create an owner"
+      description: "Creates a stable owner. The owner ID is minted by the installer; replaying an identical request returns the stored owner."
+      operationId: "createTxeOwner"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeOwnerCreateRequest"
+      responses:
+        "201":
+          description: "Owner"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeOwner"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/owners/{ownerId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeOwnerId"
+    get:
+      summary: "Get an owner"
+      description: "Returns one owner."
+      operationId: "getTxeOwner"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Owner"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeOwner"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/projects:
+    post:
+      summary: "Get or create a project by key"
+      description: "Returns the owner's project for the natural key, creating it once. Concurrent first calls return the same project."
+      operationId: "ensureTxeProject"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeProjectEnsureRequest"
+      responses:
+        "200":
+          description: "Project"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeProject"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeProjectId"
+    get:
+      summary: "Get a project"
+      description: "Returns one project."
+      operationId: "getTxeProject"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Project"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeProject"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/machines:
+    post:
+      summary: "Create a machine"
+      description: "Creates an execution machine record. The machine ID is minted by the worker installer."
+      operationId: "createTxeMachine"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeMachineCreateRequest"
+      responses:
+        "201":
+          description: "Machine"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeMachine"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/machines/{machineId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeMachineId"
+    get:
+      summary: "Get a machine"
+      description: "Returns one machine."
+      operationId: "getTxeMachine"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Machine"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeMachine"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs:
+    get:
+      summary: "List jobs"
+      description: "Lists job aggregates matching the filters, oldest first."
+      operationId: "listTxeJobs"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeOwnerFilter"
+        - $ref: "#/components/parameters/TxeProjectFilter"
+        - $ref: "#/components/parameters/TxeMachineFilter"
+        - $ref: "#/components/parameters/TxeJobKeyFilter"
+        - $ref: "#/components/parameters/TxeLifecycleFilter"
+        - $ref: "#/components/parameters/TxeReviewDueBeforeFilter"
+      responses:
+        "200":
+          description: "Jobs"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJobList"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Register a job"
+      description: "Saves a new job, its first immutable version and its DAG. The job stays incomplete and cannot run until it is marked ready. A replay with the same job_id, request_id and input returns the stored job; another job with the same job_key is refused as a duplicate."
+      operationId: "registerTxeJob"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRegisterRequest"
+      responses:
+        "201":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "Get a job"
+      description: "Returns the committed job aggregate."
+      operationId: "getTxeJob"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/ready:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Mark a job ready"
+      description: "Records the client's package evidence, verifies the saved DAG against the registered spec (rewriting it from the version when it differs) and returns the durable receipt. This is the only path to a runnable job."
+      operationId: "markTxeJobReady"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeReadyRequest"
+      responses:
+        "200":
+          description: "Receipt"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeReceipt"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/versions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Update a job"
+      description: "Records a new immutable version when expected_version is current and writes the new DAG. The job must be marked ready again; open proposals are superseded."
+      operationId: "updateTxeJobVersion"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeVersionRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/versions/{version}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeJobVersionNumber"
+    get:
+      summary: "Get a job version"
+      description: "Returns one immutable job version."
+      operationId: "getTxeJobVersion"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Version"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJobVersion"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/lifecycle:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Change a job's lifecycle"
+      description: "Pauses, resumes, completes, retires or reactivates a job. Completion and retirement supersede open proposals and list in-flight work in the same commit; only a person can reactivate."
+      operationId: "transitionTxeJob"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeLifecycleRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/events:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "List job events"
+      description: "Returns the job's history, newest first."
+      operationId: "listTxeJobEvents"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Events"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEventList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/observations:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Record availability"
+      description: "Records worker, credential or target availability. Never changes the lifecycle; a non-ready state opens an exception."
+      operationId: "observeTxeJob"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeObservationRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/claims:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Acquire the job claim"
+      description: "Grants the per-job claim slot of the requested kind. A live claim is refused; an expired one is taken over with a higher fence."
+      operationId: "acquireTxeClaim"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeClaimRequest"
+      responses:
+        "200":
+          description: "Claim"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeClaim"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/claims/{claimId}/release:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeClaimId"
+    post:
+      summary: "Release the job claim"
+      description: "Releases a live claim. Repeating the release is a no-op."
+      operationId: "releaseTxeClaim"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeFencedRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/checkpoint:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    put:
+      summary: "Advance the review checkpoint"
+      description: "Ends the current review episode under the live review claim when expected_version is current."
+      operationId: "advanceTxeCheckpoint"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeCheckpointRequest"
+      responses:
+        "200":
+          description: "Checkpoint"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeCheckpoint"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/checkpoint/defer:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Defer the next review"
+      description: "Moves only the next review time, keeping the episode and evidence cursors."
+      operationId: "deferTxeReview"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeDeferRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/reviews/{reviewId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - name: reviewId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: "Get a recorded review"
+      operationId: "getTxeReview"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Review"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeReview"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /txe/jobs/{jobId}/reviews:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "List reviews"
+      description: "Returns recorded reviews, newest first."
+      operationId: "listTxeReviews"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Reviews"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeReviewList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Record a review"
+      description: "Saves an immutable review of the current episode under the live review claim. Replaying the latest review is a no-op."
+      operationId: "recordTxeReview"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeReviewRequest"
+      responses:
+        "200":
+          description: "Job"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeJob"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/proposals:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "List proposals"
+      description: "Returns open proposals and finished proposals, newest first."
+      operationId: "listTxeProposals"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Proposals"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeProposalList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "File a proposal"
+      description: "Files a proposal under the live review claim. The registry computes its binding digest against the current version."
+      operationId: "createTxeProposal"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeProposalRequest"
+      responses:
+        "200":
+          description: "Proposal"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeProposal"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "Get a run's deliverables"
+      description: "Returns a manifest of the run, one per publishing attempt. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub."
+      operationId: "getTxeRunArtifacts"
+      tags:
+        - "txe"
+      parameters:
+        - name: execution
+          in: query
+          description: "An execution reference of the run; default the run's latest execution if it published, else the most recent"
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Record a run's deliverables"
+      description: "Sent by the run's last step, naming the attempt it runs in. A new manifest is accepted only while that attempt is the run's latest and running (a late publish is 409 stale_binding); it is written once per attempt, earlier attempts' manifests are kept. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception."
+      operationId: "recordTxeRunArtifacts"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeArtifactManifestRequest"
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/retry-requests:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    post:
+      summary: "Request a retry of a job's run"
+      description: "Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision."
+      operationId: "requestTxeRunRetry"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRetryRequest"
+      responses:
+        "200":
+          description: "Decision"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeDecisionResponse"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Not implemented yet"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /txe/proposal-closures/pending:
+    get:
+      summary: "List Dagu human tasks still to be closed"
+      description: "Superseded proposals whose Dagu human task is still waiting, on the given machine's jobs the caller can see: never-attempted first, then least recently attempted, then by proposal ID."
+      operationId: "listTxePendingClosures"
+      tags:
+        - "txe"
+      parameters:
+        - name: machine
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Pending closures"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxePendingClosureList"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/proposals/{proposalId}/closures:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeProposalId"
+    post:
+      summary: "Record an attempt to close a superseded proposal's Dagu human task"
+      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
+      operationId: "recordTxeProposalClosure"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeClosureRequest"
+      responses:
+        "200":
+          description: "Closure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeClosure"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/proposals/{proposalId}/decisions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeProposalId"
+    get:
+      summary: "List decisions on a proposal"
+      description: "Returns decisions recorded for the proposal, newest first."
+      operationId: "listTxeProposalDecisions"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Decisions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeDecisionList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Record a human decision"
+      description: "Appends an immutable decision bound to the proposal revision and binding digest the person reviewed. Refused with 409 when stale, closed, not allowed or when the lifecycle does not accept decisions."
+      operationId: "decideTxeProposal"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeDecisionRequest"
+      responses:
+        "200":
+          description: "Decision"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeDecisionResponse"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/decisions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "List job decisions"
+      description: "Returns decisions for proposals in any state. order=desc (default) lists newest first and since stops before that decision; order=asc lists oldest first and since starts after that decision, with limit applied forward from it."
+      operationId: "listTxeJobDecisions"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeSince"
+        - $ref: "#/components/parameters/TxeLimit"
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        "200":
+          description: "Decisions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeDecisionList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/effect-grants:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    post:
+      summary: "Authorize a follow-up effect"
+      description: "The pre-effect guard. In one commit it checks lifecycle, version, package, binding and claim, and records the action as executing under a bounded grant."
+      operationId: "authorizeTxeEffect"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeEffectGrantRequest"
+      responses:
+        "200":
+          description: "Grant"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeGrant"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/actions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+    get:
+      summary: "List actions"
+      description: "Returns in-flight actions and archived actions, newest first."
+      operationId: "listTxeActions"
+      tags:
+        - "txe"
+      parameters:
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Actions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeActionList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/actions/{actionId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeActionId"
+    put:
+      summary: "Settle an action"
+      description: "Records an attempt's outcome. Requires the caller's live claim and the action's current grant."
+      operationId: "settleTxeAction"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeSettleRequest"
+      responses:
+        "200":
+          description: "Action"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeAction"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     basicAuth:
@@ -10808,6 +12741,112 @@ components:
       in: path
       required: true
       description: "The unique identifier of the remote node"
+      schema:
+        type: string
+
+    TxeOwnerId:
+      name: ownerId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeMachineId:
+      name: machineId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeEventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeJobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeRunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeJobVersionNumber:
+      name: version
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    TxeClaimId:
+      name: claimId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeProposalId:
+      name: proposalId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeActionId:
+      name: actionId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeOwnerFilter:
+      name: owner
+      in: query
+      schema:
+        type: string
+    TxeProjectFilter:
+      name: project
+      in: query
+      schema:
+        type: string
+    TxeMachineFilter:
+      name: machine
+      in: query
+      schema:
+        type: string
+    TxeJobKeyFilter:
+      name: job_key
+      in: query
+      schema:
+        type: string
+    TxeLifecycleFilter:
+      name: lifecycle
+      in: query
+      schema:
+        $ref: "#/components/schemas/TxeLifecycle"
+    TxeReviewDueBeforeFilter:
+      name: review_due_before
+      in: query
+      schema:
+        type: string
+        format: date-time
+    TxeLimit:
+      name: limit
+      in: query
+      description: "Maximum number of history records; 0 or absent returns all"
+      schema:
+        type: integer
+        minimum: 0
+    TxeSince:
+      name: since
+      in: query
+      description: "Stop before this decision ID (exclusive)"
       schema:
         type: string
 
@@ -13721,6 +15760,14 @@ components:
       properties:
         dagRunId:
           $ref: "#/components/schemas/DAGRunId"
+        attemptId:
+          type: string
+          readOnly: true
+          description: "Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID"
+        executionRef:
+          type: string
+          readOnly: true
+          description: "Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference"
         name:
           $ref: "#/components/schemas/DAGName"
         workspace:
@@ -17217,6 +19264,1655 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WorkspaceResponse"
+
+    # TXE job registry (fork extension).
+    TxeResourceObservation:
+      type: string
+      enum: [deleted, absent, present, unreachable, auth_denied, timeout]
+
+    TxeResourceEventRequest:
+      type: object
+      properties:
+        event_id:
+          type: string
+          description: "Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409"
+        target:
+          $ref: "#/components/schemas/TxeTarget"
+        observation:
+          $ref: "#/components/schemas/TxeResourceObservation"
+        authoritative:
+          type: boolean
+          description: "True only when the evidence proves the stable identity no longer exists"
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        observed_at:
+          type: string
+          format: date-time
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [target, observation]
+
+    TxeResourceDisposition:
+      type: object
+      properties:
+        job_id:
+          type: string
+        match:
+          type: string
+          enum: [identity, replacement]
+        outcome:
+          type: string
+          enum: [retired, needs_human, availability, recorded, unchanged]
+        detail:
+          type: string
+      required: [job_id, match, outcome]
+
+    TxeResourceEvent:
+      type: object
+      properties:
+        schema:
+          type: integer
+        event_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/TxeTarget"
+        observation:
+          $ref: "#/components/schemas/TxeResourceObservation"
+        authoritative:
+          type: boolean
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        observed_at:
+          type: string
+          format: date-time
+        reporter:
+          $ref: "#/components/schemas/TxeActor"
+        dispositions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeResourceDisposition"
+        pending:
+          type: array
+          description: "Dependents not yet updated; the server keeps retrying them"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              match:
+                type: string
+                enum: [identity, replacement]
+            required: [job_id, match]
+        failures:
+          type: array
+          description: "Last error for each pending dependent"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              error:
+                type: string
+            required: [job_id, error]
+        complete:
+          type: boolean
+          description: "True when every dependent has been updated"
+      required: [schema, event_id, target, observation, authoritative, observed_at, reporter, dispositions, complete]
+
+    TxeActor:
+      type: object
+      description: "Who made a change. Never the owner: owner is a separate stable ID."
+      properties:
+        kind:
+          type: string
+          enum: [human, agent, reviewer, reconciler, system, cli]
+        id:
+          type: string
+        session:
+          type: string
+        machine_id:
+          type: string
+        client:
+          type: string
+      required: [kind, id]
+
+    TxeStamp:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+        by:
+          $ref: "#/components/schemas/TxeActor"
+      required: [at, by]
+
+    TxeOwner:
+      type: object
+      properties:
+        schema:
+          type: integer
+        owner_id:
+          type: string
+        display_name:
+          type: string
+        provenance:
+          type: string
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [schema, owner_id, display_name, created]
+
+    TxeOwnerCreateRequest:
+      type: object
+      properties:
+        owner_id:
+          type: string
+        display_name:
+          type: string
+        provenance:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [owner_id, display_name]
+
+    TxeInstallation:
+      type: object
+      properties:
+        schema:
+          type: integer
+        owners:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeOwner"
+      required: [schema, owners]
+
+    TxeProject:
+      type: object
+      properties:
+        schema:
+          type: integer
+        project_id:
+          type: string
+        owner_id:
+          type: string
+        key:
+          type: string
+        name:
+          type: string
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [schema, project_id, owner_id, name, created]
+
+    TxeProjectEnsureRequest:
+      type: object
+      properties:
+        owner_id:
+          type: string
+        key:
+          type: string
+          description: "Stable natural key, such as a normalized git remote"
+        name:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [owner_id, key]
+
+    TxeMachine:
+      type: object
+      properties:
+        schema:
+          type: integer
+        machine_id:
+          type: string
+        owner_id:
+          type: string
+        display_name:
+          type: string
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [schema, machine_id, owner_id, display_name, created]
+
+    TxeMachineCreateRequest:
+      type: object
+      properties:
+        machine_id:
+          type: string
+        owner_id:
+          type: string
+        display_name:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [machine_id, owner_id, display_name]
+
+    TxeTarget:
+      type: object
+      description: "External resource identified by kind and stable ID; the display name never identifies it"
+      properties:
+        kind:
+          type: string
+        environment:
+          type: string
+        stable_id:
+          type: object
+          additionalProperties:
+            type: string
+        display_name:
+          type: string
+        existence_check:
+          type: string
+          enum: [pre_run, reconcile, event_only]
+      required: [kind, stable_id]
+
+    TxeCredentialRef:
+      type: object
+      description: "A credential resolved on the assigned machine; the locator is a path or variable name, never a value"
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [file, env]
+        locator:
+          type: string
+      required: [name, kind, locator]
+
+    TxePackage:
+      type: object
+      properties:
+        digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        path:
+          type: string
+        entrypoint:
+          type: string
+        working_dir:
+          type: string
+        runtime:
+          type: array
+          items:
+            type: string
+        credential_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeCredentialRef"
+      required: [digest, path, entrypoint]
+
+    TxeDAGRef:
+      type: object
+      properties:
+        name:
+          type: string
+        spec:
+          type: string
+          description: "DAG YAML; the registry validates and writes it"
+        spec_sha256:
+          type: string
+      required: [spec]
+
+    TxeSchedule:
+      type: object
+      properties:
+        cron:
+          type: string
+        timezone:
+          type: string
+        overlap:
+          type: string
+        timeout_sec:
+          type: integer
+        retry:
+          type: integer
+        missed_run:
+          type: string
+
+    TxeDeliverable:
+      type: object
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]*$"
+        path:
+          type: string
+          description: "The exact file, relative to the run's output directory; no absolute path, parent step or pattern"
+        type:
+          type: string
+        description:
+          type: string
+        delivery:
+          type: string
+          enum: [machine, hub]
+          description: "machine (default) keeps the file on the machine; hub also uploads it as a run artifact"
+        required:
+          type: boolean
+          description: "A run that does not produce it opens a deliverable_missing exception"
+      required: [name, path]
+
+    TxeExpectedOutcome:
+      type: object
+      properties:
+        success_criteria:
+          type: array
+          items:
+            type: string
+        deliverables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeDeliverable"
+
+    TxeLifetime:
+      type: object
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+
+    TxeRetirementRules:
+      type: object
+      properties:
+        on_target_deleted:
+          type: string
+          enum: [retire, review, keep]
+        on_replacement:
+          type: string
+          enum: [retire, review, keep]
+        on_completion:
+          type: string
+          enum: [retire, review, keep]
+        active_run_policy:
+          type: string
+          enum: [finish, cancel]
+
+    TxePermittedAction:
+      type: object
+      properties:
+        name:
+          type: string
+        command:
+          type: string
+        entrypoint:
+          type: string
+        param_schema: {}
+        idempotency:
+          type: string
+          enum: [keyed, none, read_only]
+        reconcile:
+          type: string
+        timeout_sec:
+          type: integer
+          minimum: 1
+        routine:
+          type: boolean
+        max_attempts:
+          type: integer
+      required: [name, timeout_sec, routine]
+
+    TxeReviewPolicy:
+      type: object
+      properties:
+        cadence:
+          type: string
+        max_duration_sec:
+          type: integer
+        max_attempts:
+          type: integer
+        brief:
+          type: string
+        permitted_actions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxePermittedAction"
+        human_decision_conditions:
+          type: array
+          items:
+            type: string
+
+    TxeOrigin:
+      type: object
+      properties:
+        repo:
+          type: string
+        commit:
+          type: string
+        session:
+          type: string
+        worktree_path:
+          type: string
+        chat_ref:
+          type: string
+
+    TxeJobVersionInput:
+      type: object
+      description: "Context for a new job version. Immutable once saved."
+      properties:
+        title:
+          type: string
+        purpose:
+          type: string
+        origin:
+          $ref: "#/components/schemas/TxeOrigin"
+        package:
+          $ref: "#/components/schemas/TxePackage"
+        dag:
+          $ref: "#/components/schemas/TxeDAGRef"
+        schedule:
+          $ref: "#/components/schemas/TxeSchedule"
+        targets:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeTarget"
+        expected_outcome:
+          $ref: "#/components/schemas/TxeExpectedOutcome"
+        lifetime:
+          $ref: "#/components/schemas/TxeLifetime"
+        retirement_rules:
+          $ref: "#/components/schemas/TxeRetirementRules"
+        review_policy:
+          $ref: "#/components/schemas/TxeReviewPolicy"
+      required: [title, purpose, package, dag]
+
+    TxeJobVersion:
+      allOf:
+        - $ref: "#/components/schemas/TxeJobVersionInput"
+        - type: object
+          properties:
+            schema:
+              type: integer
+            job_id:
+              type: string
+            owner_id:
+              type: string
+            version:
+              type: integer
+            created:
+              $ref: "#/components/schemas/TxeStamp"
+          required: [schema, job_id, owner_id, version, created]
+
+    TxeRegisterRequest:
+      type: object
+      properties:
+        job_id:
+          type: string
+        request_id:
+          type: string
+        owner_id:
+          type: string
+        project_id:
+          type: string
+        machine_id:
+          type: string
+        job_key:
+          type: string
+          description: "Creator's name for the logical job, unique per owner and project"
+        version:
+          $ref: "#/components/schemas/TxeJobVersionInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [job_id, request_id, owner_id, project_id, machine_id, job_key, version]
+
+    TxePackageEvidence:
+      type: object
+      properties:
+        digest:
+          type: string
+        path:
+          type: string
+        machine_id:
+          type: string
+        manifest_sha256:
+          type: string
+        files:
+          type: integer
+        bytes:
+          type: integer
+          format: int64
+        asserted_at:
+          type: string
+          format: date-time
+        asserted_by:
+          $ref: "#/components/schemas/TxeActor"
+      required: [digest, path, machine_id]
+
+    TxeReadyRequest:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          format: int64
+        package:
+          $ref: "#/components/schemas/TxePackageEvidence"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [package]
+
+    TxeReceipt:
+      type: object
+      properties:
+        job_id:
+          type: string
+        owner_id:
+          type: string
+        project_id:
+          type: string
+        machine_id:
+          type: string
+        version:
+          type: integer
+        package_digest:
+          type: string
+        dag_name:
+          type: string
+        dag_spec_sha256:
+          type: string
+        registration:
+          $ref: "#/components/schemas/TxeRegistrationState"
+        revision:
+          type: integer
+          format: int64
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+        ready_at:
+          type: string
+      required: [job_id, owner_id, project_id, machine_id, version, package_digest, dag_name, dag_spec_sha256, registration, revision, created]
+
+    TxeVersionRequest:
+      type: object
+      properties:
+        request_id:
+          type: string
+        expected_version:
+          type: integer
+        version:
+          $ref: "#/components/schemas/TxeJobVersionInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [request_id, expected_version, version]
+
+    TxeLifecycle:
+      type: string
+      enum: [active, paused, needs_human, completed, retired]
+
+    TxeRegistrationState:
+      type: string
+      enum: [incomplete, ready, duplicate]
+
+    TxeAvailabilityState:
+      type: string
+      enum: [ready, worker_offline, auth_required, target_unreachable, stale]
+
+    TxeAvailability:
+      type: object
+      properties:
+        state:
+          $ref: "#/components/schemas/TxeAvailabilityState"
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        observed_at:
+          type: string
+          format: date-time
+        reporter:
+          $ref: "#/components/schemas/TxeActor"
+      required: [state]
+
+    TxeAffected:
+      type: object
+      properties:
+        run_id:
+          type: string
+        action_id:
+          type: string
+        proposal_id:
+          type: string
+        disposition:
+          type: string
+      required: [disposition]
+
+    TxeRetirement:
+      type: object
+      properties:
+        reason:
+          type: string
+          enum: [completed, expired, manual, target_deleted, replaced]
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+        at:
+          type: string
+          format: date-time
+        active_run_policy:
+          type: string
+          enum: [finish, cancel]
+        affected:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAffected"
+      required: [reason, actor, at, active_run_policy]
+
+    TxeRegistration:
+      type: object
+      properties:
+        state:
+          $ref: "#/components/schemas/TxeRegistrationState"
+        job_key:
+          type: string
+        dedupe_key:
+          type: string
+        request_id:
+          type: string
+        request_hash:
+          type: string
+        duplicate_of:
+          type: string
+        package:
+          $ref: "#/components/schemas/TxePackageEvidence"
+        dag_verified:
+          type: boolean
+        ready_at:
+          type: string
+          format: date-time
+      required: [state, job_key, dedupe_key, dag_verified]
+
+    TxeClaimKind:
+      type: string
+      enum: [review, execution, reconcile]
+
+    TxeReviewer:
+      type: object
+      properties:
+        machine_id:
+          type: string
+        dag_run_id:
+          type: string
+        agent_client_version:
+          type: string
+
+    TxeClaim:
+      type: object
+      properties:
+        claim_id:
+          type: string
+        kind:
+          $ref: "#/components/schemas/TxeClaimKind"
+        reviewer:
+          $ref: "#/components/schemas/TxeReviewer"
+        fence:
+          type: integer
+          format: int64
+        acquired_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [live, released, expired]
+      required: [claim_id, kind, reviewer, fence, acquired_at, expires_at, state]
+
+    TxeCheckpoint:
+      type: object
+      properties:
+        version:
+          type: integer
+        job_version:
+          type: integer
+        run_cursor:
+          type: string
+        decision_cursor:
+          type: string
+        last_review_id:
+          type: string
+        next_review_at:
+          type: string
+          format: date-time
+      required: [version]
+
+    TxeActionSpec:
+      type: object
+      properties:
+        name:
+          type: string
+        target:
+          $ref: "#/components/schemas/TxeTarget"
+        params:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
+      required: [name]
+
+    TxeArtifactRef:
+      type: object
+      properties:
+        dag:
+          type: string
+        run_id:
+          type: string
+        path:
+          type: string
+      required: [dag, run_id, path]
+
+    TxeProposalEvidence:
+      type: object
+      properties:
+        run_ids:
+          type: array
+          items:
+            type: string
+        artifact_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRef"
+        observed_at:
+          type: string
+          format: date-time
+
+    TxeNativeTask:
+      type: object
+      properties:
+        dag:
+          type: string
+        run_id:
+          type: string
+        step_id:
+          type: string
+      required: [dag, run_id, step_id]
+
+    TxeVerdict:
+      type: string
+      enum: [approve, reject, redirect, retry, pause, snooze, retire]
+
+    TxeDecision:
+      type: object
+      description: "Append-only human decision bound to one proposal revision and binding digest"
+      properties:
+        decision_id:
+          type: string
+        proposal_id:
+          type: string
+        proposal_revision:
+          type: integer
+        binding_digest:
+          type: string
+        verdict:
+          $ref: "#/components/schemas/TxeVerdict"
+        instructions:
+          type: string
+        snooze_until:
+          type: string
+          format: date-time
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+        decided_at:
+          type: string
+          format: date-time
+        idempotency_key:
+          type: string
+        native_resume:
+          type: string
+          enum: [pending, completed]
+      required: [decision_id, proposal_id, proposal_revision, binding_digest, verdict, actor, decided_at]
+
+    TxeProposalState:
+      type: string
+      enum: [open, snoozed, decided, executed, rejected, superseded, closed]
+
+    TxeProposalInput:
+      type: object
+      properties:
+        proposal_id:
+          type: string
+        review_id:
+          type: string
+        question:
+          type: string
+        rationale:
+          type: string
+        evidence:
+          $ref: "#/components/schemas/TxeProposalEvidence"
+        waiting_on:
+          type: string
+          enum: [person, agent, credentials, machine]
+        allowed_verdicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeVerdict"
+        action:
+          $ref: "#/components/schemas/TxeActionSpec"
+        native_task:
+          $ref: "#/components/schemas/TxeNativeTask"
+        reasoning:
+          type: string
+      required: [proposal_id, action]
+
+    TxeProposal:
+      allOf:
+        - $ref: "#/components/schemas/TxeProposalInput"
+        - type: object
+          properties:
+            job_version:
+              type: integer
+            package_digest:
+              type: string
+            binding_digest:
+              type: string
+            revision:
+              type: integer
+            state:
+              $ref: "#/components/schemas/TxeProposalState"
+            snooze_until:
+              type: string
+              format: date-time
+            decision:
+              $ref: "#/components/schemas/TxeDecision"
+            created:
+              $ref: "#/components/schemas/TxeStamp"
+            updated:
+              $ref: "#/components/schemas/TxeStamp"
+          required: [job_version, package_digest, binding_digest, revision, state, created, updated]
+
+    TxeProposalList:
+      type: object
+      properties:
+        open:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeProposal"
+        finished:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeProposal"
+      required: [open, finished]
+
+    TxeGrant:
+      type: object
+      properties:
+        grant_id:
+          type: string
+        action_id:
+          type: string
+        attempt:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+      required: [grant_id, action_id, attempt, expires_at]
+
+    TxeActionState:
+      type: string
+      enum: [executing, succeeded, failed, uncertain, not_applied, escalated]
+
+    TxeAction:
+      type: object
+      properties:
+        action_id:
+          type: string
+        kind:
+          type: string
+          enum: [routine, approved]
+        job_version:
+          type: integer
+        review_id:
+          type: string
+        claim_id:
+          type: string
+        proposal_id:
+          type: string
+        decision_id:
+          type: string
+        spec:
+          $ref: "#/components/schemas/TxeActionSpec"
+        binding_digest:
+          type: string
+        state:
+          $ref: "#/components/schemas/TxeActionState"
+        attempt:
+          type: integer
+        max_attempts:
+          type: integer
+        grant:
+          $ref: "#/components/schemas/TxeGrant"
+        receipt:
+          type: string
+        outcome:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
+        settled_under_claim:
+          type: string
+        read_only:
+          type: boolean
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+        updated:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [action_id, kind, job_version, spec, binding_digest, state, attempt, max_attempts, created, updated]
+
+    TxeActionList:
+      type: object
+      properties:
+        in_flight:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAction"
+        archived:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAction"
+      required: [in_flight, archived]
+
+    TxeException:
+      type: object
+      properties:
+        exception_id:
+          type: string
+        kind:
+          type: string
+        scope:
+          type: string
+          description: "reviewer for a problem with the job's reviewer; absent for the job"
+        state:
+          $ref: "#/components/schemas/TxeAvailabilityState"
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+        resolved_at:
+          type: string
+          format: date-time
+      required: [exception_id, kind, detail, created]
+
+    TxeNativeResume:
+      type: object
+      properties:
+        decision_id:
+          type: string
+        proposal_id:
+          type: string
+        native_task:
+          $ref: "#/components/schemas/TxeNativeTask"
+        since:
+          type: string
+          format: date-time
+      required: [decision_id, proposal_id, native_task, since]
+
+    TxeChains:
+      type: object
+      properties:
+        events:
+          type: string
+        decisions:
+          type: string
+        reviews:
+          type: string
+        actions:
+          type: string
+        proposals:
+          type: string
+
+    TxeJob:
+      type: object
+      description: "The job aggregate: every mutable fact about one job, changed only by atomic compare-and-swap"
+      properties:
+        schema:
+          type: integer
+        job_id:
+          type: string
+        owner_id:
+          type: string
+        project_id:
+          type: string
+        machine_id:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        version:
+          type: integer
+        version_refs:
+          type: array
+          items:
+            type: string
+        package_digest:
+          type: string
+        dag_spec_sha256:
+          type: string
+        registration:
+          $ref: "#/components/schemas/TxeRegistration"
+        lifecycle:
+          $ref: "#/components/schemas/TxeLifecycle"
+        lifecycle_reason:
+          type: string
+        availability:
+          $ref: "#/components/schemas/TxeAvailability"
+        reviewer_availability:
+          $ref: "#/components/schemas/TxeAvailability"
+        retirement:
+          $ref: "#/components/schemas/TxeRetirement"
+        expires_at:
+          type: string
+          format: date-time
+        proposals:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TxeProposal"
+        claim:
+          $ref: "#/components/schemas/TxeClaim"
+        fence:
+          type: integer
+          format: int64
+        checkpoint:
+          $ref: "#/components/schemas/TxeCheckpoint"
+        last_recorded_review:
+          type: string
+        actions:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TxeAction"
+        exceptions:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TxeException"
+        decision_keys:
+          type: object
+          additionalProperties:
+            type: string
+        native_resumes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TxeNativeResume"
+        chains:
+          $ref: "#/components/schemas/TxeChains"
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+        updated:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [schema, job_id, owner_id, project_id, machine_id, revision, version, package_digest, dag_spec_sha256, registration, lifecycle, availability, fence, checkpoint, chains, created, updated]
+
+    TxeJobList:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeJob"
+      required: [jobs]
+
+    TxeEvent:
+      type: object
+      properties:
+        event_id:
+          type: string
+        job_id:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum: [registered, ready, duplicate, version, lifecycle, availability, claim, effect, run_dropped, resource]
+        from:
+          type: string
+        to:
+          type: string
+        reason:
+          type: string
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        affected:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAffected"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+        at:
+          type: string
+          format: date-time
+      required: [event_id, job_id, revision, kind, actor, at]
+
+    TxeEventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeEvent"
+      required: [events]
+
+    TxeLifecycleRequest:
+      type: object
+      properties:
+        op:
+          type: string
+          enum: [pause, resume, needs_human, complete, retire, reactivate]
+        reason:
+          type: string
+          enum: [expired, manual, target_deleted, replaced]
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        active_run_policy:
+          type: string
+          enum: [finish, cancel]
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [op]
+
+    TxeObservationRequest:
+      type: object
+      properties:
+        state:
+          $ref: "#/components/schemas/TxeAvailabilityState"
+        kind:
+          type: string
+          description: "Exception kind, such as auth, worker_offline or reviewer_launch"
+        scope:
+          type: string
+          enum: [job, reviewer]
+          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; default job"
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [state]
+
+    TxeClaimRequest:
+      type: object
+      properties:
+        kind:
+          $ref: "#/components/schemas/TxeClaimKind"
+        reviewer:
+          $ref: "#/components/schemas/TxeReviewer"
+        ttl_sec:
+          type: integer
+          minimum: 1
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [kind, reviewer, ttl_sec]
+
+    TxeFencedRequest:
+      type: object
+      properties:
+        fence:
+          type: integer
+          format: int64
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [fence]
+
+    TxeCheckpointRequest:
+      type: object
+      properties:
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        expected_version:
+          type: integer
+        checkpoint:
+          $ref: "#/components/schemas/TxeCheckpoint"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [claim_id, fence, expected_version, checkpoint]
+
+    TxeDeferRequest:
+      type: object
+      properties:
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        next_review_at:
+          type: string
+          format: date-time
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [claim_id, fence, next_review_at]
+
+    TxeReview:
+      type: object
+      properties:
+        review_id:
+          type: string
+        job_version:
+          type: integer
+        checkpoint_version:
+          type: integer
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        evidence_run_ids:
+          type: array
+          items:
+            type: string
+        evidence_decision_ids:
+          type: array
+          items:
+            type: string
+        outcome:
+          type: string
+          enum: [continue, act, wait_human, pause_unavailable, complete, retire]
+        reasoning:
+          type: string
+        packet_artifact:
+          type: string
+        decision_artifact:
+          type: string
+        agent_client_version:
+          type: string
+        packet_bytes:
+          type: integer
+          format: int64
+        agent_input_tokens:
+          type: integer
+          format: int64
+        agent_output_tokens:
+          type: integer
+          format: int64
+        detail: {}
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [review_id, outcome]
+
+    TxeReviewList:
+      type: object
+      properties:
+        reviews:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeReview"
+      required: [reviews]
+
+    TxeReviewRequest:
+      type: object
+      properties:
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        review:
+          $ref: "#/components/schemas/TxeReview"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [claim_id, fence, review]
+
+    TxeProposalRequest:
+      type: object
+      properties:
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        proposal:
+          $ref: "#/components/schemas/TxeProposalInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [claim_id, fence, proposal]
+
+    TxeEffectGrantRequest:
+      type: object
+      description: "Exactly one of approved or routine"
+      properties:
+        action_id:
+          type: string
+        job_version:
+          type: integer
+        package_digest:
+          type: string
+        approved:
+          type: object
+          properties:
+            proposal_id:
+              type: string
+            decision_id:
+              type: string
+            claim_id:
+              type: string
+            fence:
+              type: integer
+              format: int64
+          required: [proposal_id, decision_id, claim_id, fence]
+        routine:
+          type: object
+          properties:
+            review_id:
+              type: string
+            claim_id:
+              type: string
+            fence:
+              type: integer
+              format: int64
+            spec:
+              $ref: "#/components/schemas/TxeActionSpec"
+          required: [review_id, claim_id, fence, spec]
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [action_id, job_version, package_digest]
+
+    TxeSettleRequest:
+      type: object
+      properties:
+        grant_id:
+          type: string
+        claim_id:
+          type: string
+        fence:
+          type: integer
+          format: int64
+        state:
+          $ref: "#/components/schemas/TxeActionState"
+        receipt:
+          type: string
+        outcome:
+          description: "Any JSON value, kept byte for byte (numbers are not rounded)."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [grant_id, claim_id, fence, state]
+
+    TxeDecisionRequest:
+      type: object
+      properties:
+        expected_proposal_revision:
+          type: integer
+          minimum: 1
+          description: "Proposal revision the person reviewed"
+        binding_digest:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        verdict:
+          $ref: "#/components/schemas/TxeVerdict"
+        instructions:
+          type: string
+          maxLength: 16384
+          description: "Required for redirect. Saved context for the next review; never expands permitted actions"
+        snooze_until:
+          type: string
+          format: date-time
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 128
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [expected_proposal_revision, binding_digest, verdict, idempotency_key]
+
+    TxeClosureOutcome:
+      type: string
+      enum: [closed, already_answered, run_missing, locator_refused, failed]
+
+    TxeClosureRequest:
+      type: object
+      properties:
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [outcome]
+
+    TxeClosure:
+      type: object
+      properties:
+        closure_id:
+          type: string
+        proposal_id:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        attempt:
+          type: integer
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [closure_id, proposal_id, outcome, attempt, created]
+
+    TxePendingClosure:
+      type: object
+      properties:
+        job_id:
+          type: string
+        proposal_id:
+          type: string
+        machine_id:
+          type: string
+        native_task:
+          $ref: "#/components/schemas/TxeNativeTask"
+        superseded_at:
+          type: string
+          format: date-time
+        failures:
+          type: integer
+        last_attempt_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+      required: [job_id, proposal_id, machine_id, native_task, superseded_at, failures]
+
+    TxePendingClosureList:
+      type: object
+      properties:
+        closures:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxePendingClosure"
+      required: [closures]
+
+    TxeArtifactRecordInput:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        location:
+          type: string
+          enum: [machine, hub]
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+      required: [deliverable, path]
+
+    TxeArtifactManifestRequest:
+      type: object
+      properties:
+        attempt_id:
+          type: string
+          description: "The run attempt publishing, from the step's own context (context.attempt.id)"
+        queued_at:
+          type: string
+          description: "The publishing execution's queue marker exactly as the hub stores it; with attempt_id it names the execution, accepted only while it is the run's latest execution and running"
+        produced_in:
+          $ref: "#/components/schemas/TxeExecutionId"
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecordInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [attempt_id, queued_at, job_version, artifacts]
+
+    TxeArtifactStatus:
+      type: string
+      enum: [pending_upload, verified, mismatch, upload_failed, stored_on_machine, missing]
+
+    TxeArtifactRecord:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        location:
+          type: string
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+        status:
+          $ref: "#/components/schemas/TxeArtifactStatus"
+        checked_at:
+          type: string
+          format: date-time
+        check_error:
+          type: string
+      required: [deliverable, path, status]
+
+    TxeArtifactManifest:
+      type: object
+      properties:
+        schema:
+          type: integer
+        job_id:
+          type: string
+        run_id:
+          type: string
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        execution:
+          type: string
+          description: "The execution's portable reference: attempt_id + '-' + 16 hex of sha256(attempt_id + newline + queued_at)"
+        produced_in:
+          $ref: "#/components/schemas/TxeExecutionId"
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecord"
+        digest:
+          type: string
+        recorded:
+          $ref: "#/components/schemas/TxeStamp"
+        executions:
+          type: array
+          description: "Executions of the run that published a manifest, oldest first (GET only)"
+          items:
+            type: string
+      required: [job_id, run_id, attempt_id, queued_at, execution, produced_in, job_version, artifacts, digest, recorded]
+
+    TxeExecutionId:
+      type: object
+      description: "One execution of a run: a direct retry starts a new attempt, a queued retry runs the same attempt under a later queue marker"
+      properties:
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        execution:
+          type: string
+          description: "Portable reference (response only)"
+      required: [attempt_id, queued_at]
+
+    TxeRetryRequest:
+      type: object
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 128
+        expected_job_version:
+          type: integer
+          description: "The job version the person saw; refused with 409 when the job moved on"
+        attempt_id:
+          type: string
+          description: "The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409"
+        queued_at:
+          type: string
+          description: "The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409"
+        run_spec_sha256:
+          type: string
+          description: "The run's DAG snapshot digest; when omitted the server reads it from the run"
+        package_digest:
+          type: string
+          description: "The run's package digest; when omitted the server reads it from the run"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [idempotency_key, expected_job_version]
+
+    TxeDecisionResponse:
+      type: object
+      properties:
+        decision:
+          $ref: "#/components/schemas/TxeDecision"
+        proposal:
+          $ref: "#/components/schemas/TxeProposal"
+        job:
+          $ref: "#/components/schemas/TxeJob"
+        replayed:
+          type: boolean
+      required: [decision, replayed]
+
+    TxeDecisionList:
+      type: object
+      properties:
+        decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeDecision"
+      required: [decisions]
 
 # Apply security requirements globally
 security:
