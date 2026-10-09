@@ -178,6 +178,10 @@ type Agent struct {
 	// initFailed is true if initialization failed before the runner could start.
 	initFailed atomic.Bool
 
+	// startupFailure classifies an initialization failure the agent can
+	// name. It is guarded by lock and reported in every later status.
+	startupFailure *ir.StartupFailure
+
 	// lastErr is the last error occurred during the dag-run.
 	lastErr error
 
@@ -907,6 +911,7 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 
 	// If there was an error resolving secrets, stop execution here
 	if secretErr != nil {
+		a.recordSecretFailure(secretErr)
 		initErr = secretErr // Stop execution if secret resolution failed
 		return initErr
 	}
@@ -1555,6 +1560,7 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 		}
 		status := ir.NewStatusBuilder(a.dag).
 			Create(a.dagRunID, runStatus, os.Getpid(), time.Time{}, statusOpts...)
+		a.applyStartupFailure(&status)
 		a.maskStatusSecrets(&status)
 		return status
 	}
@@ -1622,6 +1628,7 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 			a.plan.StartAt(),
 			opts...,
 		)
+	a.applyStartupFailure(&status)
 	a.maskStatusSecrets(&status)
 	return status
 }
@@ -1744,6 +1751,36 @@ func (a *Agent) prepareWorkspace(ctx context.Context) error {
 	a.dag.WorkingDir = a.workDir
 	a.dag.WorkingDirExplicit = true
 	return nil
+}
+
+// recordSecretFailure classifies a failure to resolve the DAG's secrets at
+// startup. Only a secret whose source was asked and gave no value is
+// classified; an invalid reference is a mistake in the DAG, not a missing
+// credential. The name of the secret is kept. The cause is not, because it can
+// say where the secret is stored.
+func (a *Agent) recordSecretFailure(err error) {
+	var unresolved *providers.ResolveError
+	if !errors.As(err, &unresolved) {
+		return
+	}
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	a.startupFailure = &ir.StartupFailure{
+		Code:     ir.StartupFailureSecretUnavailable,
+		Secret:   unresolved.Name,
+		Provider: unresolved.Provider,
+	}
+}
+
+// applyStartupFailure adds the recorded startup failure to a status. The
+// caller holds lock.
+func (a *Agent) applyStartupFailure(status *ir.DAGRunStatus) {
+	if a.startupFailure == nil {
+		return
+	}
+	failure := *a.startupFailure
+	status.StartupFailure = &failure
+	status.Error = appendDAGRunError(status.Error, errors.New(failure.Message()))
 }
 
 func appendDAGRunError(current string, err error) string {

@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/ssh"
+	"github.com/dagucloud/dagu/v2/internal/secret/providers"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -160,4 +162,47 @@ steps:
 			assert.Equal(t, tt.want, got.Bastion.Host)
 		})
 	}
+}
+
+// Only a secret whose source gave no value is classified, and only its name
+// and provider are kept.
+func TestRecordSecretFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Unresolved", func(t *testing.T) {
+		a := &Agent{}
+		cause := errors.New("secret file not found: /private/locator")
+		a.recordSecretFailure(fmt.Errorf("failed to resolve secrets: %w", &providers.ResolveError{Name: "API_TOKEN", Provider: "file", Err: cause}))
+		require.Equal(t, &ir.StartupFailure{Code: ir.StartupFailureSecretUnavailable, Secret: "API_TOKEN", Provider: "file"}, a.startupFailure)
+
+		status := ir.DAGRunStatus{Error: "earlier"}
+		a.applyStartupFailure(&status)
+		require.Equal(t, `earlier; secret "API_TOKEN" could not be resolved from provider "file"`, status.Error)
+		require.NotSame(t, a.startupFailure, status.StartupFailure)
+		require.Equal(t, a.startupFailure, status.StartupFailure)
+	})
+
+	t.Run("RegistryReference", func(t *testing.T) {
+		a := &Agent{}
+		a.recordSecretFailure(&providers.ResolveError{Name: "DB_PASSWORD", Ref: "prod/db-password", Err: errors.New("not found")})
+		require.Equal(t, &ir.StartupFailure{Code: ir.StartupFailureSecretUnavailable, Secret: "DB_PASSWORD"}, a.startupFailure)
+		require.Equal(t, `secret "DB_PASSWORD" could not be resolved`, a.startupFailure.Message())
+	})
+
+	t.Run("OtherErrors", func(t *testing.T) {
+		for _, err := range []error{
+			errors.New(`failed to resolve secrets: invalid secret reference for "API_TOKEN": key is required`),
+			errors.New("failed to resolve secrets: unknown secret provider: nope"),
+			context.Canceled,
+		} {
+			a := &Agent{}
+			a.recordSecretFailure(err)
+			require.Nil(t, a.startupFailure, "%v", err)
+
+			status := ir.DAGRunStatus{}
+			a.applyStartupFailure(&status)
+			require.Nil(t, status.StartupFailure)
+			require.Empty(t, status.Error)
+		}
+	})
 }
