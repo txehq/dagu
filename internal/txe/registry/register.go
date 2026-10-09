@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,19 @@ import (
 )
 
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+var windowsAbsPath = regexp.MustCompile(`^([A-Za-z]:[\\/]|\\\\)`)
+
+// machineAbsPath reports whether p is absolute on the machine that runs the
+// job, which need not have the hub's operating system: a POSIX path, a
+// Windows drive path or a UNC path, with no ".." segment under either
+// separator.
+func machineAbsPath(p string) bool {
+	if !strings.HasPrefix(p, "/") && !windowsAbsPath.MatchString(p) {
+		return false
+	}
+	return !slices.Contains(strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }), "..")
+}
 
 // Worker label that routes a job to its machine.
 const machineLabel = "txe.machine"
@@ -84,7 +98,7 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 		return refuse(CodeInvalid, "purpose is required")
 	case !digestPattern.MatchString(v.Package.Digest):
 		return refuse(CodeInvalid, "package.digest must be sha256:<64 hex>")
-	case !filepath.IsAbs(v.Package.Path):
+	case !machineAbsPath(v.Package.Path):
 		return refuse(CodeInvalid, "package.path must be absolute on the assigned machine")
 	case v.Package.Entrypoint == "":
 		return refuse(CodeInvalid, "package.entrypoint is required")
