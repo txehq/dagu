@@ -185,10 +185,9 @@ describe('DecisionPanel', () => {
         now={now}
       />
     );
-    // Run retry is not offered until the server can authorize it.
     expect(
-      screen.queryByRole('button', { name: 'Retry this run' })
-    ).not.toBeInTheDocument();
+      screen.getByRole('button', { name: 'Retry this run' })
+    ).toBeInTheDocument();
     expect(
       screen.queryByTestId('txe-uncertain-effect')
     ).not.toBeInTheDocument();
@@ -202,7 +201,7 @@ describe('DecisionPanel', () => {
             target: { kind: 'k8s.pv', stableId: 'pv-uid-0001' },
             params: {},
           },
-          allowedVerdicts: ['retry', 'reject'],
+          allowedVerdicts: ['approve', 'redirect', 'retry', 'reject'],
         })}
         canDecide
         onSubmit={vi.fn()}
@@ -215,6 +214,13 @@ describe('DecisionPanel', () => {
         name: 'Confirm it did not take effect and allow one retry',
       })
     ).toBeInTheDocument();
+    // An escalation is never executed: no approve or redirect.
+    expect(
+      screen.queryByRole('button', { name: 'Approve' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Redirect' })
+    ).not.toBeInTheDocument();
     expect(screen.getByTestId('txe-uncertain-effect')).toHaveTextContent(
       'It has not proved the effect is absent.'
     );

@@ -14,7 +14,8 @@ import { I18nText } from '@/i18n/I18nText';
 
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { dagRunPath } from '@/features/txe/components/InboxItemCard';
-import { useJobDetail, useTxeApi } from '@/features/txe/hooks';
+import { RunRetry } from '@/features/txe/components/RunRetry';
+import { useJobDetail, useRetryStates, useTxeApi } from '@/features/txe/hooks';
 import { isProposalActionable } from '@/features/txe/inbox';
 import type { Decision, Proposal } from '@/features/txe/types';
 
@@ -166,6 +167,8 @@ export default function TxeJobPage(): React.ReactElement {
   const appBarContext = React.useContext(AppBarContext);
   const canDecide = useCanExecute();
   const { data, error, mutate } = useJobDetail(jobId);
+  const api = useTxeApi();
+  const { data: retries, mutate: mutateRetries } = useRetryStates(jobId);
 
   React.useEffect(() => {
     appBarContext.setTitle(data?.job.title ?? 'Job');
@@ -291,6 +294,21 @@ export default function TxeJobPage(): React.ReactElement {
               {run.error && (
                 <span className="text-destructive"> {run.error}</span>
               )}
+              <RunRetry
+                runStatus={run.status}
+                state={retries?.get(run.dagRunId)}
+                canDecide={canDecide}
+                onRequest={async (key) => {
+                  const result = await api.requestRetry(
+                    job.jobId,
+                    run.dagRunId,
+                    job.version,
+                    key
+                  );
+                  await mutateRetries();
+                  return result;
+                }}
+              />
             </li>
           ))}
         </ul>

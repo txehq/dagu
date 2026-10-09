@@ -4,17 +4,26 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -164,6 +173,17 @@ func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, f.proposal.BindingDigest, stored.BindingDigest)
 	require.Equal(t, registry.ActorHuman, stored.Actor.Kind)
+	// The stored record keeps its write-time state; a fresh API over the
+	// reopened registry must still report the completion recorded since.
+	reopenedAPI := apiv1.New(persis.NewDAGRepository(dag.NewStore(f.server.Config.Paths.DAGsDir), persis.DAGRepositoryOptions{}),
+		nil, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(reopened))
+	listed, err := reopenedAPI.ListTxeProposalDecisions(t.Context(), api.ListTxeProposalDecisionsRequestObject{
+		JobId: f.jobID, ProposalId: f.proposal.ProposalId})
+	require.NoError(t, err)
+	afterRestart := listed.(api.ListTxeProposalDecisions200JSONResponse).Decisions
+	require.Len(t, afterRestart, 1)
+	require.NotNil(t, afterRestart[0].NativeResume)
+	require.Equal(t, api.TxeDecisionNativeResume("completed"), *afterRestart[0].NativeResume)
 
 	// The old revision no longer accepts a decision.
 	stale := f.body("reject", "dashboard-reject-stale")
@@ -214,4 +234,175 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 	f.server.Client().Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
 	require.Empty(t, list.Decisions)
 	require.False(t, strings.Contains(fmt.Sprint(list), "reviewer-self-approve"))
+}
+
+// newTxeDecisionAPI is a registry API whose server allows running DAGs, which
+// recording a decision requires.
+func newTxeDecisionAPI(t *testing.T) *apiv1.API {
+	t.Helper()
+	dir := t.TempDir()
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+}
+
+// fileTxeProposal files a proposal without a native task on jobID as a
+// reviewer would, and returns it.
+func fileTxeProposal(t *testing.T, f *txeFixture, ctx context.Context, jobID string) api.TxeProposal {
+	t.Helper()
+	reviewer := &api.TxeActor{Kind: api.TxeActorKindReviewer, Id: "cc5-test"}
+	claimResp, err := f.a.AcquireTxeClaim(ctx, api.AcquireTxeClaimRequestObject{JobId: jobID, Body: &api.TxeClaimRequest{
+		Kind: api.TxeClaimKindReview, Reviewer: api.TxeReviewer{MachineId: &f.machine}, TtlSec: 600, Actor: reviewer}})
+	require.NoError(t, err)
+	claim := claimResp.(api.AcquireTxeClaim200JSONResponse)
+	question := "Resize?"
+	resp, err := f.a.CreateTxeProposal(ctx, api.CreateTxeProposalRequestObject{JobId: jobID, Body: &api.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Actor: reviewer,
+		Proposal: api.TxeProposalInput{ProposalId: mint(t, registry.PrefixProposal), Question: &question,
+			Action: api.TxeActionSpec{Name: "resize"}},
+	}})
+	require.NoError(t, err)
+	return api.TxeProposal(resp.(api.CreateTxeProposal200JSONResponse))
+}
+
+func decideTxe(ctx context.Context, f *txeFixture, jobID string, p api.TxeProposal, verdict api.TxeVerdict, key string, actor *api.TxeActor) error {
+	_, err := f.a.DecideTxeProposal(ctx, api.DecideTxeProposalRequestObject{JobId: jobID, ProposalId: p.ProposalId, Body: &api.TxeDecisionRequest{
+		ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: verdict, IdempotencyKey: key, Actor: actor}})
+	return err
+}
+
+// An API key is not a person: it cannot record a human decision whatever
+// actor it claims, including none.
+func TestTxeDecisionRefusesAPIKey(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	p := fileTxeProposal(t, f, txeAdmin, jobID)
+
+	key := &auth.APIKey{ID: "k1", Name: "reviewer", Role: auth.RoleDeveloper}
+	keyCtx := auth.WithAPIKey(auth.WithUser(context.Background(), &auth.User{ID: "apikey:k1", Username: "apikey:reviewer", Role: auth.RoleDeveloper}), key)
+	for i, actor := range []*api.TxeActor{nil, {Kind: api.TxeActorKindHuman, Id: "admin"}, {Kind: api.TxeActorKindCli, Id: "cli"}} {
+		requireStatus(t, decideTxe(keyCtx, f, jobID, p, api.TxeVerdictApprove, fmt.Sprintf("apikey-key-%d", i), actor), http.StatusForbidden)
+	}
+	require.NoError(t, decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "admin-approve-1", nil))
+}
+
+// Deciding needs execute access to the job's workspace; pausing or retiring
+// the job through a decision needs write access there.
+func TestTxeDecisionChecksWorkspace(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	secretJob, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, secretJob))
+	opsJob, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, opsJob))
+
+	secret := fileTxeProposal(t, f, txeAdmin, secretJob)
+	// A job in an invisible workspace is not found for both reading and
+	// deciding, so neither reveals that it exists.
+	requireStatus(t, decideTxe(txeOps, f, secretJob, secret, api.TxeVerdictApprove, "ops-on-secret", nil), http.StatusNotFound)
+	_, err = a.ListTxeProposalDecisions(txeOps, api.ListTxeProposalDecisionsRequestObject{JobId: secretJob, ProposalId: secret.ProposalId})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: secretJob, ProposalId: secret.ProposalId})
+	require.NoError(t, err)
+
+	operator := auth.WithUser(context.Background(), &auth.User{Username: "op", Role: auth.RoleOperator, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleOperator}},
+	}})
+	ops := fileTxeProposal(t, f, txeAdmin, opsJob)
+	requireStatus(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictRetire, "operator-retire", nil), http.StatusForbidden)
+	require.NoError(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictApprove, "operator-approve", nil))
+}
+
+// registerTxeJobHTTP registers a ready job over HTTP and returns its ID.
+func registerTxeJobHTTP(t *testing.T, server test.Server) string {
+	t.Helper()
+	c := server.Client()
+	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
+	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
+	c.Post("/api/v1/txe/owners", map[string]any{"owner_id": owner, "display_name": "Connor", "actor": cli}).
+		ExpectStatus(http.StatusCreated).Send(t)
+	c.Post("/api/v1/txe/machines", map[string]any{"machine_id": machine, "owner_id": owner, "display_name": "laptop", "actor": cli}).
+		ExpectStatus(http.StatusCreated).Send(t)
+	var project api.TxeProject
+	c.Post("/api/v1/txe/projects", map[string]any{"owner_id": owner, "key": "github.com/txehq/fixture", "actor": cli}).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &project)
+	jobID := mint(t, registry.PrefixJob)
+	digest := fmt.Sprintf("sha256:%064x", 1)
+	c.Post("/api/v1/txe/jobs", map[string]any{
+		"job_id": jobID, "request_id": "r1", "owner_id": owner, "project_id": project.ProjectId,
+		"machine_id": machine, "job_key": "volume-monitor", "actor": cli,
+		"version": map[string]any{
+			"title": "Volume monitor", "purpose": "Watch the fixture volume",
+			"package": map[string]any{"digest": digest, "path": "/pkg", "entrypoint": "run.sh"},
+			"dag":     map[string]any{"spec": fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)},
+		},
+	}).ExpectStatus(http.StatusCreated).Send(t)
+	c.Post("/api/v1/txe/jobs/"+jobID+"/ready", map[string]any{
+		"package": map[string]any{"digest": digest, "path": "/pkg", "machine_id": machine}, "actor": cli,
+	}).ExpectStatus(http.StatusOK).Send(t)
+	return jobID
+}
+
+// seedFailedTxeRun writes a failed attempt of the job's saved DAG, as a run
+// that already happened on the worker.
+func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string) {
+	t.Helper()
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, dag.YamlData)
+	started := time.Now()
+	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.NewStatusBuilder(dag).Create(runID, ir.Failed, 0, started,
+		ir.WithAttemptID(attempt.ID()), ir.WithFinishedAt(started.Add(time.Second)), ir.WithError("probe failed"))
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, status))
+	require.NoError(t, attempt.Close(ctx))
+}
+
+// Retrying one exact failed run records a decided dagu.retry_run proposal
+// bound to that run; it is idempotent and refuses a stale snapshot or a run
+// that is not the job's.
+func TestTxeRunRetryRequest(t *testing.T) {
+	server := test.SetupServer(t)
+	c := server.Client()
+	jobID := registerTxeJobHTTP(t, server)
+	seedFailedTxeRun(t, server, jobID, "run-failed-1")
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-failed-1")
+	body := map[string]any{"idempotency_key": "dashboard-retry-1", "expected_job_version": job.Version}
+
+	var first api.TxeDecisionResponse
+	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
+	require.False(t, first.Replayed)
+	require.Equal(t, api.TxeVerdict("retry"), first.Decision.Verdict)
+	require.NotNil(t, first.Proposal)
+	require.Equal(t, api.TxeProposalState("decided"), first.Proposal.State)
+	require.Equal(t, decision.ActionRetryRun, first.Proposal.Action.Name)
+	require.Contains(t, string(first.Proposal.Action.Params), `"run_id":"run-failed-1"`)
+
+	var again api.TxeDecisionResponse
+	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &again)
+	require.True(t, again.Replayed)
+	require.Equal(t, first.Decision.DecisionId, again.Decision.DecisionId)
+
+	stale := map[string]any{"idempotency_key": "dashboard-retry-2", "expected_job_version": job.Version,
+		"run_spec_sha256": fmt.Sprintf("sha256:%064x", 9)}
+	c.Post(path, stale).ExpectStatus(http.StatusConflict).Send(t)
+
+	c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "no-such-run"),
+		map[string]any{"idempotency_key": "dashboard-retry-3", "expected_job_version": job.Version}).
+		ExpectStatus(http.StatusNotFound).Send(t)
 }
