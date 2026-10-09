@@ -4,14 +4,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"io"
 	"net/http"
 	"os"
@@ -20,6 +18,9 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -1363,4 +1364,50 @@ func txeArtifactDigest(archiveDir, relPath string) (string, bool, error) {
 		return "", false, err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), true, nil
+}
+
+func (a *API) ListTxeRunExecutions(ctx context.Context, req api.ListTxeRunExecutionsRequestObject) (api.ListTxeRunExecutionsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	retained, err := a.dagRunRepository.ListRetainedExecutions(ctx, ir.NewDAGRunRef(req.JobId, req.RunId))
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + req.JobId + " has no run " + req.RunId}
+		}
+		return nil, err
+	}
+	out, err := txeConvert[[]api.TxeRetainedExecution](retained)
+	if out == nil {
+		out = []api.TxeRetainedExecution{}
+	}
+	return api.ListTxeRunExecutions200JSONResponse{Executions: out}, err
+}
+
+func (a *API) GetTxeRunExecutionFile(ctx context.Context, req api.GetTxeRunExecutionFileRequestObject) (api.GetTxeRunExecutionFileResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, ir.NewDAGRunRef(req.JobId, req.RunId), req.ExecutionRef, req.Name)
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) || errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "no such retained file"}
+		}
+		return nil, err
+	}
+	return api.GetTxeRunExecutionFile200ApplicationoctetStreamResponse{Body: bytes.NewReader(data), ContentLength: int64(len(data))}, nil
 }

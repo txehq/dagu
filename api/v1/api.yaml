@@ -11750,6 +11750,101 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/runs/{runId}/executions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "List a run's retained executions"
+      description: "Executions of the run that a queued retry replaced, copied before it did: each with its whole status and the logs from the hub's log directory, oldest first. logs_final is false until stream finalization can be proven."
+      operationId: "listTxeRunExecutions"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Retained executions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeRetainedExecutionList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/executions/{executionRef}/files/{name}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+      - name: executionRef
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        required: true
+        description: "status.json or a log name listed in the execution's files"
+        schema:
+          type: string
+    get:
+      summary: "Read a file of a retained execution"
+      operationId: "getTxeRunExecutionFile"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "File content"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/runs/{runId}/artifacts:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -20950,6 +21045,59 @@ components:
           type: string
           description: "Portable reference (response only)"
       required: [attempt_id, queued_at]
+
+    TxeRetainedFile:
+      type: object
+      properties:
+        name:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+      required: [name, bytes, sha256]
+
+    TxeRetainedExecution:
+      type: object
+      properties:
+        execution:
+          type: string
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        status:
+          type: string
+        status_complete:
+          type: boolean
+        logs_final:
+          type: boolean
+        logs_note:
+          type: string
+        retained_at:
+          type: string
+          format: date-time
+        status_sha256:
+          type: string
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedFile"
+        artifact_files:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedFile"
+      required: [execution, attempt_id, queued_at, status, status_complete, logs_final, retained_at, status_sha256, files]
+
+    TxeRetainedExecutionList:
+      type: object
+      properties:
+        executions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedExecution"
+      required: [executions]
 
     TxeRetryRequest:
       type: object

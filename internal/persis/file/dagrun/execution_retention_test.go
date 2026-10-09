@@ -1,0 +1,164 @@
+// Copyright (C) 2026 TXE
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package dagrun_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
+)
+
+type retentionFixture struct {
+	t       *testing.T
+	ctx     context.Context
+	repo    *persis.DAGRunRepository
+	logDir  string
+	dag     *ir.DAG
+	runID   string
+	attempt string
+	handle  dagrun.Attempt
+}
+
+func newRetentionFixture(t *testing.T) *retentionFixture {
+	t.Helper()
+	dir := t.TempDir()
+	f := &retentionFixture{t: t, ctx: context.Background(), logDir: filepath.Join(dir, "logs"),
+		dag: &ir.DAG{Name: "job"}, runID: "run-1"}
+	f.repo = testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{},
+		filedagrun.WithLogDir(f.logDir), filedagrun.WithArtifactDir(filepath.Join(dir, "artifacts")))
+	attempt, err := f.repo.CreateAttempt(f.ctx, f.dag, time.Now(), f.runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	f.attempt, f.handle = attempt.ID(), attempt
+	return f
+}
+
+// execution writes one finished execution of the attempt: its status and
+// the logs the coordinator would have written for it.
+func (f *retentionFixture) execution(queuedAt string, st ir.Status, line string) ir.DAGRunStatus {
+	f.t.Helper()
+	attempt := f.handle
+	status := ir.InitialStatus(f.dag)
+	status.DAGRunID, status.AttemptID, status.QueuedAt, status.Status = f.runID, f.attempt, queuedAt, st
+	status.Error = line
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	require.NoError(f.t, os.MkdirAll(logs, 0o750))
+	require.NoError(f.t, os.WriteFile(filepath.Join(logs, "scheduler.log"), []byte("scheduler "+line+"\n"), 0o600))
+	require.NoError(f.t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("stdout "+line+"\n"), 0o600))
+	require.NoError(f.t, attempt.Open(f.ctx))
+	require.NoError(f.t, attempt.Write(f.ctx, status))
+	require.NoError(f.t, attempt.Close(f.ctx))
+	return status
+}
+
+// requeue swaps the finished execution to queued with retention, as a queued
+// retry's admission does.
+func (f *retentionFixture) requeue(expected ir.Status, mutateErr error) error {
+	_, _, err := f.repo.CompareAndSwapLatestAttemptStatus(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID), f.attempt, expected,
+		func(s *ir.DAGRunStatus) error {
+			if mutateErr != nil {
+				return mutateErr
+			}
+			s.Status = ir.Queued
+			return nil
+		}, persis.DAGRunCompareAndSwapOptions{RetainBeforeSwap: true})
+	return err
+}
+
+func (f *retentionFixture) file(ref, name string) string {
+	f.t.Helper()
+	b, err := f.repo.ReadRetainedExecutionFile(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID), ref, name)
+	require.NoError(f.t, err)
+	return string(b)
+}
+
+// A queued retry replaces the execution in place; each finished execution is
+// copied first, with its whole status and its own logs, and an earlier copy
+// is never changed by a later execution.
+func TestRetainExecutionsBeforeQueuedRetry(t *testing.T) {
+	f := newRetentionFixture(t)
+	q1, q2 := "2026-10-09T12:00:00.000000001Z", "2026-10-09T12:00:01.000000001Z"
+	e1 := f.execution(q1, ir.Failed, "execution 1")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	ref1 := ir.ExecutionRef(f.attempt, q1)
+	first := f.file(ref1, "run.stdout.log")
+	assert.Equal(t, "stdout execution 1\n", first)
+
+	// The retry runs the same attempt under q2, overwriting status and logs.
+	f.execution(q2, ir.Failed, "execution 2")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	ref2 := ir.ExecutionRef(f.attempt, q2)
+
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.Equal(t, []string{ref1, ref2}, []string{all[0].Execution, all[1].Execution})
+	assert.True(t, all[0].StatusComplete)
+	assert.False(t, all[0].LogsFinal, "logs are not claimed final until streams are fenced")
+	assert.NotEmpty(t, all[0].LogsNote)
+
+	assert.Equal(t, first, f.file(ref1, "run.stdout.log"), "the first copy is unchanged")
+	assert.Equal(t, "scheduler execution 1\n", f.file(ref1, "scheduler.log"))
+	assert.Equal(t, "stdout execution 2\n", f.file(ref2, "run.stdout.log"))
+	assert.Contains(t, f.file(ref1, "status.json"), `"`+e1.Error+`"`, "the whole status of execution 1")
+	assert.Contains(t, f.file(ref2, "status.json"), "execution 2")
+}
+
+// Taking the copy again is a no-op for the same execution; a copy that
+// differs or is incomplete fails visibly and refuses the swap.
+func TestRetainedExecutionIsImmutable(t *testing.T) {
+	f := newRetentionFixture(t)
+	stop := errors.New("not admitted")
+	f.execution("q1", ir.Failed, "execution 1")
+	assert.ErrorIs(t, f.requeue(ir.Failed, stop), stop, "copied, then the admission refused")
+	assert.ErrorIs(t, f.requeue(ir.Failed, stop), stop, "copying the same execution again is a no-op")
+
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("changed\n"), 0o600))
+	assert.ErrorIs(t, f.requeue(ir.Failed, nil), filedagrun.ErrRetainedExecutionConflict, "a different copy is never replaced")
+	status, err := f.repo.FindAttempt(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	got, err := status.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, got.Status, "the swap was refused")
+}
+
+// Logs are copied from the configured log directory only: a symbolic link
+// there, or a status path outside it, is not followed.
+func TestRetainedExecutionCopiesOnlyHubLogs(t *testing.T) {
+	f := newRetentionFixture(t)
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	require.NoError(t, os.WriteFile(outside, []byte("secret"), 0o600))
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	require.NoError(t, os.MkdirAll(logs, 0o750))
+	require.NoError(t, os.Symlink(outside, filepath.Join(logs, "link.log")))
+
+	attempt := f.handle
+	status := ir.InitialStatus(f.dag)
+	status.DAGRunID, status.AttemptID, status.Status, status.Log = f.runID, f.attempt, ir.Failed, outside
+	require.NoError(t, attempt.Open(f.ctx))
+	require.NoError(t, attempt.Write(f.ctx, status))
+	require.NoError(t, attempt.Close(f.ctx))
+	require.NoError(t, f.requeue(ir.Failed, nil))
+
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.Empty(t, all[0].Files, "neither the link nor the outside path is copied")
+	for _, name := range []string{"../status.json", "link.log", "secret.txt", "manifest.json"} {
+		_, err := f.repo.ReadRetainedExecutionFile(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID), all[0].Execution, name)
+		assert.ErrorIs(t, err, persis.ErrNotFound, name)
+	}
+}

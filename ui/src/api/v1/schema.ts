@@ -4287,6 +4287,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/runs/{runId}/executions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a run's retained executions
+         * @description Executions of the run that a queued retry replaced, copied before it did: each with its whole status and the logs from the hub's log directory, oldest first. logs_final is false until stream finalization can be proven.
+         */
+        get: operations["listTxeRunExecutions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/runs/{runId}/executions/{executionRef}/files/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+                executionRef: string;
+                /** @description status.json or a log name listed in the execution's files */
+                name: string;
+            };
+            cookie?: never;
+        };
+        /** Read a file of a retained execution */
+        get: operations["getTxeRunExecutionFile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/runs/{runId}/artifacts": {
         parameters: {
             query?: never;
@@ -8637,6 +8683,29 @@ export interface components {
             queued_at: string;
             /** @description Portable reference (response only) */
             execution?: string;
+        };
+        TxeRetainedFile: {
+            name: string;
+            /** Format: int64 */
+            bytes: number;
+            sha256: string;
+        };
+        TxeRetainedExecution: {
+            execution: string;
+            attempt_id: string;
+            queued_at: string;
+            status: string;
+            status_complete: boolean;
+            logs_final: boolean;
+            logs_note?: string;
+            /** Format: date-time */
+            retained_at: string;
+            status_sha256: string;
+            files: components["schemas"]["TxeRetainedFile"][];
+            artifact_files?: components["schemas"]["TxeRetainedFile"][];
+        };
+        TxeRetainedExecutionList: {
+            executions: components["schemas"]["TxeRetainedExecution"][];
         };
         TxeRetryRequest: {
             idempotency_key: string;
@@ -23346,6 +23415,127 @@ export interface operations {
             };
             /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeRunExecutions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retained executions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeRetainedExecutionList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeRunExecutionFile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+                executionRef: string;
+                /** @description status.json or a log name listed in the execution's files */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description File content */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
