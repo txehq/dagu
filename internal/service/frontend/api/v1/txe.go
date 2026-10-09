@@ -231,6 +231,30 @@ func (a *API) txeVisibleJob(ctx context.Context, s *registry.Store, jobID string
 	return job, nil
 }
 
+// txeReadHistory authorizes a job and runs read, which reads its history,
+// on the snapshot it authorized: if the job changed meanwhile, both are
+// repeated, so no record committed after the authorization is returned.
+func (a *API) txeReadHistory(ctx context.Context, s *registry.Store, jobID string, read func() error) (*registry.Job, error) {
+	for range 5 {
+		job, err := a.txeVisibleJob(ctx, s, jobID)
+		if err != nil {
+			return nil, err
+		}
+		if err := read(); err != nil {
+			return nil, txeError(err)
+		}
+		after, err := s.GetJob(ctx, jobID)
+		if err != nil {
+			return nil, txeError(err)
+		}
+		if after.Revision == job.Revision {
+			return job, nil
+		}
+	}
+	return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict, Message: "job " + jobID + " kept changing while it was read; retry",
+		Details: map[string]any{"code": string(registry.CodeVersionConflict)}}
+}
+
 // txeAlreadyReady reports whether job is ready with pkg, which readiness
 // returns as is.
 func txeAlreadyReady(job *registry.Job, pkg registry.PackageEvidence) bool {
@@ -566,12 +590,12 @@ func (a *API) ListTxeJobEvents(ctx context.Context, req api.ListTxeJobEventsRequ
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+	var events []*registry.Event
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		events, err = s.ListEvents(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	}); err != nil {
 		return nil, err
-	}
-	events, err := s.ListEvents(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
 	}
 	out, err := txeConvert[[]api.TxeEvent](events)
 	if out == nil {
@@ -657,12 +681,12 @@ func (a *API) ListTxeReviews(ctx context.Context, req api.ListTxeReviewsRequestO
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+	var reviews []*registry.Review
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		reviews, err = s.ListReviews(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	}); err != nil {
 		return nil, err
-	}
-	reviews, err := s.ListReviews(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
 	}
 	out, err := txeConvert[[]api.TxeReview](reviews)
 	if out == nil {
@@ -691,13 +715,13 @@ func (a *API) ListTxeProposals(ctx context.Context, req api.ListTxeProposalsRequ
 	if err != nil {
 		return nil, err
 	}
-	job, err := a.txeVisibleJob(ctx, s, req.JobId)
+	var finished []*registry.Proposal
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		finished, err = s.ListArchivedProposals(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
 	if err != nil {
 		return nil, err
-	}
-	finished, err := s.ListArchivedProposals(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
 	}
 	open := make([]*registry.Proposal, 0, len(job.Proposals))
 	for _, p := range job.Proposals {
@@ -740,20 +764,16 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+	var decisions []*registry.Decision
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		decisions, err = s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
+	if err != nil {
 		return nil, err
 	}
-	decisions, err := s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
-	}
 	// A decision record keeps the native_resume it was written with; report
-	// the current state. The job is read after the decisions, so a decision
-	// listed without a pending entry has had its task completed.
-	job, err := s.GetJob(ctx, req.JobId)
-	if err != nil {
-		return nil, txeError(err)
-	}
+	// the state of the job the decisions were read from.
 	for i, d := range decisions {
 		cp := *d
 		cp.NativeResume = registry.CurrentNativeResume(job, d)
@@ -807,13 +827,13 @@ func (a *API) ListTxeActions(ctx context.Context, req api.ListTxeActionsRequestO
 	if err != nil {
 		return nil, err
 	}
-	job, err := a.txeVisibleJob(ctx, s, req.JobId)
+	var archived []*registry.Action
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		archived, err = s.ListArchivedActions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
 	if err != nil {
 		return nil, err
-	}
-	archived, err := s.ListArchivedActions(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
 	}
 	inFlight := make([]*registry.Action, 0, len(job.Actions))
 	for _, act := range job.Actions {
