@@ -4,7 +4,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { fixtureJob, fixtureProposal } from '../fixtures';
-import { buildDecisionRequest, buildInbox, isProposalActionable } from '../inbox';
+import {
+  buildDecisionRequest,
+  buildInbox,
+  isProposalActionable,
+} from '../inbox';
 
 const now = new Date('2026-10-09T10:00:00Z');
 
@@ -44,10 +48,16 @@ describe('buildInbox', () => {
       fixtureJob({ jobId: 'job_offline', availability: 'worker_offline' }),
       fixtureJob({
         jobId: 'job_failed',
-        latestRuns: [{ dagName: 'job_failed', dagRunId: 'r1', status: 'failed' }],
+        latestRuns: [
+          { dagName: 'job_failed', dagRunId: 'r1', status: 'failed' },
+        ],
       }),
       fixtureJob({ jobId: 'job_ok' }),
-      fixtureJob({ jobId: 'job_retired', lifecycle: 'retired', availability: 'worker_offline' }),
+      fixtureJob({
+        jobId: 'job_retired',
+        lifecycle: 'retired',
+        availability: 'worker_offline',
+      }),
     ];
     const items = buildInbox(jobs, [], now);
     expect(items.map((item) => [item.job.jobId, item.waitingOn])).toEqual([
@@ -59,10 +69,18 @@ describe('buildInbox', () => {
 });
 
 describe('buildDecisionRequest', () => {
-  const proposal = fixtureProposal({ revision: 4, bindingDigest: 'c'.repeat(64) });
+  const proposal = fixtureProposal({
+    revision: 4,
+    bindingDigest: 'c'.repeat(64),
+  });
 
   it('binds the reviewed revision and digest', () => {
-    const result = buildDecisionRequest(proposal, { verdict: 'approve' }, 'k1', now);
+    const result = buildDecisionRequest(
+      proposal,
+      { verdict: 'approve' },
+      'k1',
+      now
+    );
     expect(result).toEqual({
       request: {
         expectedProposalRevision: 4,
@@ -75,12 +93,19 @@ describe('buildDecisionRequest', () => {
 
   it('requires instructions for redirect', () => {
     expect(
-      buildDecisionRequest(proposal, { verdict: 'redirect', instructions: '  ' }, 'k', now)
+      buildDecisionRequest(
+        proposal,
+        { verdict: 'redirect', instructions: '  ' },
+        'k',
+        now
+      )
     ).toEqual({ error: 'Redirect needs revised instructions.' });
   });
 
   it('requires a future snooze expiry within 30 days', () => {
-    expect(buildDecisionRequest(proposal, { verdict: 'snooze' }, 'k', now)).toEqual({
+    expect(
+      buildDecisionRequest(proposal, { verdict: 'snooze' }, 'k', now)
+    ).toEqual({
       error: 'Snooze needs an explicit expiry.',
     });
     expect(
@@ -105,11 +130,15 @@ describe('buildDecisionRequest', () => {
       'k',
       now
     );
-    expect(ok).toMatchObject({ request: { snoozeUntil: '2026-10-10T10:00:00.000Z' } });
+    expect(ok).toMatchObject({
+      request: { snoozeUntil: '2026-10-10T10:00:00.000Z' },
+    });
   });
 
   it('rejects a response the proposal does not allow', () => {
-    expect(buildDecisionRequest(proposal, { verdict: 'pause' }, 'k', now)).toEqual({
+    expect(
+      buildDecisionRequest(proposal, { verdict: 'pause' }, 'k', now)
+    ).toEqual({
       error: 'This proposal does not accept "pause".',
     });
   });

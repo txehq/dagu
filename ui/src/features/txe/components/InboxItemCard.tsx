@@ -19,7 +19,7 @@ const WAITING_LABELS: Record<WaitingOn, string> = {
 
 const REASON_LABELS: Record<InboxItem['reason'], string> = {
   proposal: 'Proposed action',
-  'needs_human': 'Needs a decision',
+  needs_human: 'Needs a decision',
   unavailable: 'Cannot run',
   'run-failed': 'Latest run failed',
 };
@@ -111,7 +111,9 @@ export function InboxItemCard({ item, children }: Props): React.ReactElement {
         <section className="space-y-2 rounded-md bg-muted/40 p-3">
           <p className="text-sm font-medium">{proposal.question}</p>
           {proposal.rationale && (
-            <p className="text-xs text-muted-foreground">{proposal.rationale}</p>
+            <p className="text-xs text-muted-foreground">
+              {proposal.rationale}
+            </p>
           )}
           <p className="text-xs">
             <I18nText text="Action" />: <code>{proposal.action.name}</code>{' '}

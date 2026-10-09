@@ -87,7 +87,11 @@ export type Proposal = {
   jobId: string;
   jobVersion: number;
   packageDigest: string;
-  action: { name: string; target: TargetIdentity; params: Record<string, unknown> };
+  action: {
+    name: string;
+    target: TargetIdentity;
+    params: Record<string, unknown>;
+  };
   bindingDigest: string;
   revision: number;
   state: ProposalState;
@@ -102,7 +106,11 @@ export type Proposal = {
   waitingOn: WaitingOn;
   allowedVerdicts: Verdict[];
   nativeTask?: { dagName: string; dagRunId: string; stepId: string };
-  createdBy?: { reviewerClaimId?: string; client?: string; sessionRef?: string };
+  createdBy?: {
+    reviewerClaimId?: string;
+    client?: string;
+    sessionRef?: string;
+  };
   createdAt: string;
 };
 

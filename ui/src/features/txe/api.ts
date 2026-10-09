@@ -14,7 +14,10 @@ export interface TxeApi {
   getJob(jobId: string): Promise<TxeJob>;
   listProposals(jobId: string): Promise<Proposal[]>;
   listDecisions(jobId: string): Promise<Decision[]>;
-  decide(proposalId: string, request: DecisionRequest): Promise<DecisionSubmitResult>;
+  decide(
+    proposalId: string,
+    request: DecisionRequest
+  ): Promise<DecisionSubmitResult>;
 }
 
 export class TxeApiError extends Error {
@@ -37,17 +40,23 @@ async function errorMessage(response: Response): Promise<string> {
 export function createTxeApi(apiURL: string): TxeApi {
   const base = `${apiURL.replace(/\/$/, '')}/txe`;
 
-  const request = async (path: string, init?: RequestInit): Promise<Response> => {
+  const request = async (
+    path: string,
+    init?: RequestInit
+  ): Promise<Response> => {
     const headers = new Headers(init?.headers);
     const token = getAuthToken();
     if (token) headers.set('Authorization', `Bearer ${token}`);
     if (init?.body) headers.set('Content-Type', 'application/json');
-    const response = await fetchWithTimeout(`${base}${path}`, { ...init, headers });
+    const response = await fetchWithTimeout(`${base}${path}`, {
+      ...init,
+      headers,
+    });
     handleAuthResponse(response);
     return response;
   };
 
-  const getJSON = async <T,>(path: string): Promise<T> => {
+  const getJSON = async <T>(path: string): Promise<T> => {
     const response = await request(path);
     if (!response.ok) {
       throw new TxeApiError(response.status, await errorMessage(response));
@@ -62,16 +71,25 @@ export function createTxeApi(apiURL: string): TxeApi {
       (await getJSON<{ jobs: TxeJob[] }>('/jobs')).jobs ?? [],
     getJob: (jobId) => getJSON<TxeJob>(`/jobs/${enc(jobId)}`),
     listProposals: async (jobId) =>
-      (await getJSON<{ proposals: Proposal[] }>(`/jobs/${enc(jobId)}/proposals`))
-        .proposals ?? [],
+      (
+        await getJSON<{ proposals: Proposal[] }>(
+          `/jobs/${enc(jobId)}/proposals`
+        )
+      ).proposals ?? [],
     listDecisions: async (jobId) =>
-      (await getJSON<{ decisions: Decision[] }>(`/jobs/${enc(jobId)}/decisions`))
-        .decisions ?? [],
+      (
+        await getJSON<{ decisions: Decision[] }>(
+          `/jobs/${enc(jobId)}/decisions`
+        )
+      ).decisions ?? [],
     decide: async (proposalId, body) => {
-      const response = await request(`/proposals/${enc(proposalId)}/decisions`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      });
+      const response = await request(
+        `/proposals/${enc(proposalId)}/decisions`,
+        {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }
+      );
       if (response.ok) return { ok: true };
       return {
         ok: false,
