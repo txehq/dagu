@@ -4,29 +4,20 @@
 package review
 
 import (
-	"crypto/sha256"
-	"encoding/base32"
-	"encoding/json"
 	"strings"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
-// crockford is the alphabet shared with the registry's minted ULIDs, so a
-// derived id has the same shape as a minted one.
-var crockford = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
-
-const derivedIDLen = 26
-
-// derivedID returns prefix_ plus the first 26 Crockford base32 characters of
-// the SHA-256 of the JSON array of parts. Maps marshal with sorted keys, so
-// equal params always derive equal ids.
+// derivedID derives an id with the registry's own function, so the reviewer
+// and the registry cannot disagree about an id either of them computes.
 func derivedID(prefix string, parts ...any) string {
-	b, err := json.Marshal(parts)
+	id, err := registry.DerivedID(registry.Prefix(prefix), parts...)
 	if err != nil {
 		// Only strings, ints and string maps are hashed.
 		panic(err)
 	}
-	sum := sha256.Sum256(b)
-	return prefix + "_" + crockford.EncodeToString(sum[:])[:derivedIDLen]
+	return id
 }
 
 func normalizeParams(params map[string]string) map[string]string {
