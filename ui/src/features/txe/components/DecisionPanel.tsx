@@ -37,6 +37,32 @@ const RESPONSE_LABELS: Record<Verdict, string> = {
   retire: 'Retire job',
 };
 
+// Typed actions on which retry has a meaning; the server refuses it on any
+// other proposal.
+export const ACTION_RETRY_RUN = 'dagu.retry_run';
+export const ACTION_UNCERTAIN_EFFECT = 'txe.uncertain_effect';
+
+// verdictLabel names what a verdict does for this proposal. Retry means two
+// different things, and the person must see which one they are choosing.
+export function verdictLabel(verdict: Verdict, action: string): string {
+  if (verdict === 'retry' && action === ACTION_RETRY_RUN) {
+    return 'Retry this run';
+  }
+  if (verdict === 'retry' && action === ACTION_UNCERTAIN_EFFECT) {
+    return 'Confirm it did not take effect and allow one retry';
+  }
+  return RESPONSE_LABELS[verdict];
+}
+
+// offeredVerdicts drops retry from proposals on which it has no meaning, so
+// the panel never offers a verdict the server refuses.
+export function offeredVerdicts(proposal: Proposal): Verdict[] {
+  const typed =
+    proposal.action.name === ACTION_RETRY_RUN ||
+    proposal.action.name === ACTION_UNCERTAIN_EFFECT;
+  return proposal.allowedVerdicts.filter((v) => v !== 'retry' || typed);
+}
+
 function newIdempotencyKey(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 }
@@ -124,8 +150,16 @@ export function DecisionPanel({
 
   return (
     <div className="space-y-3" data-testid="txe-decision-panel">
+      {proposal.action.name === ACTION_UNCERTAIN_EFFECT && (
+        <Alert variant="destructive" data-testid="txe-uncertain-effect">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <I18nText text="The system could not determine whether the earlier attempt took effect. It has not proved the effect is absent. Check the target before allowing one more attempt." />
+          </AlertDescription>
+        </Alert>
+      )}
       <div className="flex flex-wrap gap-2">
-        {proposal.allowedVerdicts.map((option) => (
+        {offeredVerdicts(proposal).map((option) => (
           <Button
             key={option}
             type="button"
@@ -134,7 +168,7 @@ export function DecisionPanel({
             onClick={() => choose(option)}
             aria-pressed={verdict === option}
           >
-            <I18nText text={RESPONSE_LABELS[option]} />
+            <I18nText text={verdictLabel(option, proposal.action.name)} />
           </Button>
         ))}
       </div>
