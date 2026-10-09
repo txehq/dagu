@@ -33,6 +33,11 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 	if err != nil {
 		return nil, err
 	}
+	// A job the caller cannot see is not found, not forbidden, so a decision
+	// attempt does not reveal that it exists.
+	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
+		return nil, err
+	}
 	svc := a.txeDecisionService(store)
 	res, err := svc.Decide(ctx, req.JobId, req.ProposalId, decision.Request{
 		ExpectedProposalRevision: body.ExpectedProposalRevision,
@@ -91,9 +96,11 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 	if err != nil {
 		return nil, err
 	}
-	job, err := store.GetJob(ctx, req.JobId)
+	// A job in a workspace the caller cannot see is reported as not found,
+	// like every other registry read.
+	job, err := a.txeVisibleJob(ctx, store, req.JobId)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, err
 	}
 	all, err := store.ListDecisions(ctx, req.JobId, 0)
 	if err != nil {

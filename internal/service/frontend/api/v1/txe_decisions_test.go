@@ -306,7 +306,13 @@ func TestTxeDecisionChecksWorkspace(t *testing.T) {
 	require.NoError(t, f.ready(txeAdmin, opsJob))
 
 	secret := fileTxeProposal(t, f, txeAdmin, secretJob)
-	requireStatus(t, decideTxe(txeOps, f, secretJob, secret, api.TxeVerdictApprove, "ops-on-secret", nil), http.StatusForbidden)
+	// A job in an invisible workspace is not found for both reading and
+	// deciding, so neither reveals that it exists.
+	requireStatus(t, decideTxe(txeOps, f, secretJob, secret, api.TxeVerdictApprove, "ops-on-secret", nil), http.StatusNotFound)
+	_, err = a.ListTxeProposalDecisions(txeOps, api.ListTxeProposalDecisionsRequestObject{JobId: secretJob, ProposalId: secret.ProposalId})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: secretJob, ProposalId: secret.ProposalId})
+	require.NoError(t, err)
 
 	operator := auth.WithUser(context.Background(), &auth.User{Username: "op", Role: auth.RoleOperator, WorkspaceAccess: &auth.WorkspaceAccess{
 		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleOperator}},
