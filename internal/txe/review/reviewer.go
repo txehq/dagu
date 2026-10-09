@@ -131,7 +131,7 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	}
 
 	packet, err := r.prepareClaimed(ctx, claim, job)
-	if errors.Is(err, ErrPacketTooLarge) || errors.Is(err, ErrRunsUntrackable) {
+	if errors.Is(err, ErrPacketTooLarge) {
 		// A job that cannot be reviewed must not simply go quiet. It is
 		// raised as an exception and deferred, and it stays unreviewed and
 		// visible until its context is fixed.
@@ -322,12 +322,8 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 
 // unreviewable records that a job cannot be reviewed as it is registered.
 func (r *Reviewer) unreviewable(ctx context.Context, claim Claim, job Job, cause error) (Prepared, error) {
-	kind := ExceptionContextTooLarge
-	if errors.Is(cause, ErrRunsUntrackable) {
-		kind = ExceptionRunsUntrackable
-	}
 	err := r.Registry.RaiseException(ctx, Exception{
-		JobID: job.ID, Kind: kind, MachineID: job.MachineID,
+		JobID: job.ID, Kind: ExceptionContextTooLarge, MachineID: job.MachineID,
 		Message: "the job is not being reviewed: " + cause.Error(),
 	})
 	if err != nil {

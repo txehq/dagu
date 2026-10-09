@@ -441,7 +441,17 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	}}
 	remote := &review.Remote{Transport: stub}
 
-	runs, err := remote.RunsAfter(context.Background(), job, "r1")
+	// No review recorded yet: every finished run is returned, oldest first.
+	stub.replies["/txe/jobs/"+job+"/reviews"] = `{"reviews":[]}`
+	all, err := remote.RunsAfter(context.Background(), job, "")
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	assert.Equal(t, "r1", all[0].RunID)
+
+	// A recorded review covered r1. The service does not identify these
+	// runs' executions, so a run is recorded under its id alone.
+	stub.replies["/txe/jobs/"+job+"/reviews"] = `{"reviews":[{"review_id":"rev_1","detail":{"covered_executions":["r1@"]}}]}`
+	runs, err := remote.RunsAfter(context.Background(), job, "")
 	require.NoError(t, err)
 	require.Len(t, runs, 2)
 	assert.Equal(t, "r2", runs[0].RunID)
@@ -458,50 +468,44 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("steps:\n  - name: measure\n"))), runs[0].SpecSHA256)
 	assert.Empty(t, runs[1].SpecSHA256)
 
-	all, err := remote.RunsAfter(context.Background(), job, "")
-	require.NoError(t, err)
-	require.Len(t, all, 3)
-	assert.Equal(t, "r1", all[0].RunID)
-
 	// A failure to read outputs that is not "none exist" fails the read:
 	// evidence is not silently dropped.
 	stub.fail = map[string]*review.TransportError{
 		"/dag-runs/" + job + "/r2/outputs": {Status: http.StatusBadGateway, Message: "hub unreachable"},
 	}
-	_, err = remote.RunsAfter(context.Background(), job, "r1")
+	_, err = remote.RunsAfter(context.Background(), job, "")
 	require.ErrorContains(t, err, "outputs of run r2")
+
+	// So does a failure to read what earlier reviews covered: without it
+	// nothing can be said to be new, and nothing is returned.
+	stub.fail = map[string]*review.TransportError{
+		"/txe/jobs/" + job + "/reviews": {Status: http.StatusBadGateway, Message: "hub unreachable"},
+	}
+	got, err := remote.RunsAfter(context.Background(), job, "")
+	require.ErrorContains(t, err, "earlier reviews covered")
+	assert.Empty(t, got)
 }
 
-// runList is a stub of the service's run list for one job.
+// runList is a stub of the service for one job: its run list, and the
+// reviews recorded for it, which are the record of what has been covered.
 type runList struct {
 	job  string
 	stub *stubTransport
+	// reviews are the covered_executions of each recorded review.
+	reviews [][]string
 }
 
 func newRunList(t *testing.T) *runList {
 	l := &runList{job: "job_01HZX0000000000000000000AA", stub: &stubTransport{t: t, replies: map[string]string{}}}
 	l.set()
+	l.record()
 	return l
 }
 
 // set replaces the listed runs; each is "id attempt status finishedAt",
 // optionally followed by the time the attempt was queued.
 func (l *runList) set(runs ...string) {
-	items := make([]string, 0, len(runs))
-	for _, run := range runs {
-		f := strings.Fields(run)
-		finished := ""
-		if len(f) > 3 {
-			finished = f[3]
-		}
-		queued := "2026-10-09T09:59:00Z"
-		if len(f) > 4 {
-			queued = f[4]
-		}
-		items = append(items, fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"statusLabel":%q,"queuedAt":%q,"finishedAt":%q}`, f[0], f[1], f[2], queued, finished))
-		l.stub.replies["/dag-runs/"+l.job+"/"+f[0]] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"queuedAt":%q,"statusLabel":%q,"nodes":[]}}`, f[1], queued, f[2])
-	}
-	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[` + strings.Join(items, ",") + `]}`
+	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = l.page("", runs...)
 }
 
 // page is one page of the run list as the service returns it.
@@ -510,7 +514,7 @@ func (l *runList) page(next string, runs ...string) string {
 	for _, run := range runs {
 		f := strings.Fields(run)
 		finished := ""
-		if len(f) > 3 {
+		if len(f) > 3 && f[3] != "-" {
 			finished = f[3]
 		}
 		queued := "2026-10-09T09:59:00Z"
@@ -527,361 +531,285 @@ func (l *runList) page(next string, runs ...string) string {
 	return `{"dagRuns":[` + strings.Join(items, ",") + `]` + cursor + `}`
 }
 
-// after returns the uncovered results as "run@attempt", and the cursor that
-// covers all of them.
-func (l *runList) after(cursor string) ([]string, string) {
-	l.stub.t.Helper()
-	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
-	require.NoError(l.stub.t, err)
-	keys := make([]string, 0, len(runs))
-	for _, run := range runs {
-		keys = append(keys, run.RunID+"@"+run.AttemptID)
-		cursor = run.Cursor
+// record adds one recorded review that covered the given results, as the
+// reviewer records them, and republishes the job's reviews.
+func (l *runList) record(covered ...review.RunEvidence) {
+	if len(covered) > 0 {
+		names := make([]string, 0, len(covered))
+		for _, run := range covered {
+			names = append(names, run.RunID+"@"+run.Execution().Ref())
+		}
+		l.reviews = append(l.reviews, names)
 	}
-	return keys, cursor
+	items := make([]string, 0, len(l.reviews))
+	for i, names := range l.reviews {
+		raw, err := json.Marshal(names)
+		require.NoError(l.stub.t, err)
+		items = append(items, fmt.Sprintf(`{"review_id":"rev_%d","detail":{"covered_executions":%s}}`, i, raw))
+	}
+	l.stub.replies["/txe/jobs/"+l.job+"/reviews"] = `{"reviews":[` + strings.Join(items, ",") + `]}`
 }
 
-// Coverage is by run and attempt. A native retry keeps the run id, so the
-// retried run's new result is shown again, and a run that finished between
-// its two attempts is not passed over.
-func TestRemoteRunsAfterShowsARetriedRunAgain(t *testing.T) {
+// uncovered returns the results no recorded review covers.
+func (l *runList) uncovered() []review.RunEvidence {
+	l.stub.t.Helper()
+	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	require.NoError(l.stub.t, err)
+	return runs
+}
+
+// names is the results as "run@attempt", for reading in assertions.
+func names(runs []review.RunEvidence) []string {
+	out := make([]string, 0, len(runs))
+	for _, run := range runs {
+		out = append(out, run.RunID+"@"+run.AttemptID)
+	}
+	return out
+}
+
+// review lists the uncovered results and records a review that covered all
+// of them, as one review episode does.
+func (l *runList) review() []string {
+	l.stub.t.Helper()
+	runs := l.uncovered()
+	l.record(runs...)
+	return names(runs)
+}
+
+// A result is covered exactly when a recorded review names it. Listing it
+// covers nothing, and neither does a review that was shown it but was not
+// recorded: it is returned again until one is.
+func TestRemoteRunsAfterCoversOnlyWhatARecordedReviewNames(t *testing.T) {
 	l := newRunList(t)
 	l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
-	first, cursor := l.after("")
-	assert.Equal(t, []string{"r1@a1", "r2@b1"}, first)
-	none, _ := l.after(cursor)
-	assert.Empty(t, none)
+	assert.Equal(t, []string{"r1@a1", "r2@b1"}, names(l.uncovered()))
+	assert.Equal(t, []string{"r1@a1", "r2@b1"}, names(l.uncovered()), "shown but not recorded: shown again")
 
-	// r1 is retried and fails again, after r2.
-	l.set("r1 a2 failed 2026-10-09T10:05:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
-	again, cursor := l.after(cursor)
-	assert.Equal(t, []string{"r1@a2"}, again)
-	none, _ = l.after(cursor)
-	assert.Empty(t, none)
-
-	// With only r1's first result covered, both later results are owed.
-	l.set("r1 a1 failed 2026-10-09T10:01:00Z")
-	_, onlyFirst := l.after("")
-	l.set("r1 a2 failed 2026-10-09T10:05:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
-	both, _ := l.after(onlyFirst)
-	assert.Equal(t, []string{"r2@b1", "r1@a2"}, both)
+	// A review that covered only the first is recorded.
+	l.record(l.uncovered()[0])
+	assert.Equal(t, []string{"r2@b1"}, names(l.uncovered()))
+	assert.Equal(t, []string{"r2@b1"}, l.review())
+	assert.Empty(t, l.uncovered())
 }
 
-// On Dagu's queued path a retry re-runs the latest attempt under the same
-// attempt id, with a later queued time. That is another result of the run
-// and is shown again, even when it ends in the same second as the first.
-func TestRemoteRunsAfterShowsAnAttemptQueuedAgainAsANewResult(t *testing.T) {
+// A native retry keeps the run id. On the direct path it starts a new
+// attempt, on the queued path it runs the latest attempt again under a
+// later queue marker. Either way the run's new execution is in no review
+// and is returned again, and a run that finished between two executions is
+// not passed over.
+func TestRemoteRunsAfterShowsARetriedRunAgain(t *testing.T) {
 	l := newRunList(t)
 	l.set("r1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:00Z")
-	first, cursor := l.after("")
-	assert.Equal(t, []string{"r1@a1"}, first)
-	none, _ := l.after(cursor)
-	assert.Empty(t, none)
+	assert.Equal(t, []string{"r1@a1"}, l.review())
+	assert.Empty(t, l.uncovered())
 
-	// Queued again: unfinished, so nothing yet.
-	l.set("r1 a1 queued - 2026-10-09T10:00:30Z")
-	none, _ = l.after(cursor)
-	assert.Empty(t, none)
+	// Direct path: a new attempt, which fails after r2 finished.
+	l.set("r1 a2 failed 2026-10-09T10:05:00Z 2026-10-09T10:00:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+	assert.Equal(t, []string{"r2@b1", "r1@a2"}, l.review())
+	assert.Empty(t, l.uncovered())
 
-	// It ends, within the same second as its first execution.
-	l.set("r1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:30Z")
-	again, next := l.after(cursor)
-	assert.Equal(t, []string{"r1@a1"}, again, "the same attempt, queued again, is a new result")
-	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
-	require.NoError(t, err)
-	assert.Equal(t, "2026-10-09T10:00:30Z", runs[0].QueuedAt)
-	assert.Equal(t, review.ExecutionRef("a1", "2026-10-09T10:00:30Z"), runs[0].Execution().Ref())
-	none, _ = l.after(next)
-	assert.Empty(t, none, "and it is shown once")
+	// Queued path: the same attempt id queued again. Unfinished: nothing.
+	l.set("r1 a2 queued - 2026-10-09T10:06:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+	assert.Empty(t, l.uncovered())
+	// It ends, reporting the very end time of its earlier execution.
+	l.set("r1 a2 failed 2026-10-09T10:05:00Z 2026-10-09T10:06:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+	again := l.uncovered()
+	require.Equal(t, []string{"r1@a2"}, names(again), "the same attempt, queued again, is a new result")
+	assert.Equal(t, "2026-10-09T10:06:00Z", again[0].QueuedAt)
+	assert.Equal(t, review.ExecutionRef("a2", "2026-10-09T10:06:00Z"), again[0].Execution().Ref())
+	l.record(again...)
+	assert.Empty(t, l.uncovered(), "and it is shown once")
 }
 
-// Two results with the same reported end time are told apart by run and
-// attempt: covering one never covers the other, in either order, and a
-// second attempt that ends in the same second as the first is still new.
-func TestRemoteRunsAfterTellsApartResultsWithOneTimestamp(t *testing.T) {
+// Whether a result is covered never depends on when it ended. A result that
+// is reported late, with an end time before results already covered, a
+// result sharing its end time with covered ones and sorting before them,
+// and a run created while the history was being listed are all in no
+// review, so each is returned.
+func TestRemoteRunsAfterDoesNotDependOnEndTimesOrListingOrder(t *testing.T) {
 	l := newRunList(t)
-	l.set("r2 b1 failed 2026-10-09T10:01:00Z")
-	first, cursor := l.after("")
-	assert.Equal(t, []string{"r2@b1"}, first)
-
-	// Another run, sorting before the covered one, reports the same time.
-	l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 failed 2026-10-09T10:01:00Z")
-	second, cursor := l.after(cursor)
-	assert.Equal(t, []string{"r1@a1"}, second)
-
-	// r2 is retried and its new attempt ends within the same second.
-	l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b2 succeeded 2026-10-09T10:01:00Z")
-	third, cursor := l.after(cursor)
-	assert.Equal(t, []string{"r2@b2"}, third)
-	none, _ := l.after(cursor)
-	assert.Empty(t, none)
-}
-
-// A result can be reported late: the run was still unfinished when a later
-// result was covered, and then turns out to have ended before it. It is
-// owed from the moment it was seen unfinished and is shown once, whatever
-// its time.
-func TestRemoteRunsAfterShowsALateResultThatEndedBeforeTheCursor(t *testing.T) {
-	l := newRunList(t)
+	// r1 is still running when r2, which ended later, is covered.
 	l.set("r1 a1 running", "r2 b1 succeeded 2026-10-09T10:05:00Z")
-	first, cursor := l.after("")
-	assert.Equal(t, []string{"r2@b1"}, first)
-	still, _ := l.after(cursor)
-	assert.Empty(t, still, "an unfinished run is not a result yet")
+	assert.Equal(t, []string{"r2@b1"}, l.review())
+	assert.Empty(t, l.uncovered(), "an unfinished run is not a result yet")
 
-	// r1's result arrives with an end time before what is already covered.
+	// r1's result arrives with an end time before what is covered.
 	l.set("r1 a1 failed 2026-10-09T10:03:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z")
-	late, next := l.after(cursor)
-	assert.Equal(t, []string{"r1@a1"}, late)
-	none, _ := l.after(next)
-	assert.Empty(t, none, "and it is shown once")
+	assert.Equal(t, []string{"r1@a1"}, l.review())
 
-	// Until a review has been shown it, it stays owed: a checkpoint that
-	// did not cover it does not lose it.
-	l.set("r1 a1 failed 2026-10-09T10:03:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z", "r3 c1 succeeded 2026-10-09T10:06:00Z")
-	owed, _ := l.after(cursor)
-	assert.Equal(t, []string{"r1@a1", "r3@c1"}, owed)
-	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
-	require.NoError(t, err)
-	onlyLate := runs[0].Cursor
-	rest, _ := l.after(onlyLate)
-	assert.Equal(t, []string{"r3@c1"}, rest, "covering the late result alone leaves the newer one owed")
+	// A run created later ends in the same second as a covered result and
+	// sorts before it.
+	l.set("a0 x1 failed 2026-10-09T10:05:00Z", "r1 a1 failed 2026-10-09T10:03:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z")
+	assert.Equal(t, []string{"a0@x1"}, l.review())
 
-	// The same holds for a retry: the run was queued again when the
-	// cursor moved, and its new attempt reports an earlier end.
-	l.set("r1 a2 queued", "r2 b1 succeeded 2026-10-09T10:05:00Z", "r3 c1 succeeded 2026-10-09T10:06:00Z")
-	_, moved := l.after(next)
-	l.set("r1 a2 failed 2026-10-09T10:04:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z", "r3 c1 succeeded 2026-10-09T10:06:00Z")
-	retried, _ := l.after(moved)
-	assert.Equal(t, []string{"r1@a2"}, retried)
+	// A run that was queued when the others were covered ends with a time
+	// before all of them.
+	l.set("a0 x1 failed 2026-10-09T10:05:00Z", "q9 z1 queued", "r1 a1 failed 2026-10-09T10:03:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z")
+	assert.Empty(t, l.uncovered())
+	l.set("a0 x1 failed 2026-10-09T10:05:00Z", "q9 z1 failed 2026-10-09T10:00:00Z", "r1 a1 failed 2026-10-09T10:03:00Z", "r2 b1 succeeded 2026-10-09T10:05:00Z")
+	assert.Equal(t, []string{"q9@z1"}, l.review())
+	assert.Empty(t, l.uncovered())
 }
 
-// A listing of several pages is not one moment. A run created after the
-// first page was read can end before an older run that is seen finished on
-// a later page. Returning that older run alone would move the cursor past
-// the new run's end without the new run ever having been listed. The
-// second pass finds it, and it is owed. The clocks here are normal.
+// A listing of several pages is not one moment: a run can be created after
+// the first page was read and end before an older run seen finished on a
+// later page. The run that was never listed is in no review, so the next
+// listing returns it. The clocks here are normal.
 func TestRemoteRunsAfterDoesNotLoseARunCreatedBetweenPages(t *testing.T) {
-	for name, tc := range map[string]struct {
-		secondPass, later string
-		want              []string
-	}{
-		"created and finished while the pages were read": {
-			secondPass: "x x1 failed 2026-10-09T10:15:00Z", later: "x x1 failed 2026-10-09T10:15:00Z", want: []string{"x@x1"},
-		},
-		"created and still running at the second pass": {
-			secondPass: "x x1 running", later: "x x1 failed 2026-10-09T10:15:00Z", want: []string{"x@x1"},
-		},
-		"an already covered run retried between pages": {
-			secondPass: "old o2 failed 2026-10-09T10:15:00Z", later: "old o2 failed 2026-10-09T10:15:00Z", want: []string{"old@o2"},
-		},
+	l := newRunList(t)
+	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
+	y := "y y1 succeeded 2026-10-09T10:20:00Z"
+	// Page one is read before x exists; by page two, y has ended.
+	l.stub.seq = map[string][]string{first: {l.page("p2", "old o1 failed 2026-10-09T10:00:00Z")}}
+	l.stub.replies[p2] = l.page("", y)
+	assert.Equal(t, []string{"old@o1", "y@y1"}, l.review())
+
+	// x was created and ended in between, before y did.
+	l.stub.replies[first] = l.page("p2", "x x1 failed 2026-10-09T10:15:00Z", "old o1 failed 2026-10-09T10:00:00Z")
+	assert.Equal(t, []string{"x@x1"}, l.review())
+	assert.Empty(t, l.uncovered())
+}
+
+// Evidence is read by run id. When the run is retried while its evidence is
+// being read, the status of one execution is never paired with the output
+// of another: the result is not returned, and since no review names it, the
+// run's execution is met again by the next listing.
+func TestRemoteRunsAfterNeverMixesTheEvidenceOfTwoExecutions(t *testing.T) {
+	for name, after := range map[string]string{
+		"a new attempt started":         `{"dagRunDetails":{"attemptId":"a2","queuedAt":"2026-10-09T09:59:00Z","statusLabel":"running","nodes":[]}}`,
+		"the same attempt queued again": `{"dagRunDetails":{"attemptId":"a1","queuedAt":"2026-10-09T10:01:30Z","statusLabel":"queued","nodes":[]}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			l := newRunList(t)
-			// "old" was covered earlier; y is still running then.
-			l.set("old o1 failed 2026-10-09T10:00:00Z", "y y1 running")
-			_, cursor := l.after("")
-			first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
-			// First pass: page one before the new run exists; by the time
-			// page two is read, y has ended at 10:20.
-			y := "y y1 succeeded 2026-10-09T10:20:00Z"
-			secondFirst := []string{tc.secondPass}
-			if !strings.HasPrefix(tc.secondPass, "old ") {
-				secondFirst = append(secondFirst, "old o1 failed 2026-10-09T10:00:00Z")
-			}
-			l.stub.seq = map[string][]string{
-				first: {l.page("p2", "old o1 failed 2026-10-09T10:00:00Z"), l.page("p2", secondFirst...)},
-				p2:    {l.page("", y), l.page("", y)},
-			}
-			shown, next := l.after(cursor)
-			assert.Equal(t, []string{"y@y1"}, shown, "only what both passes saw finished is returned")
-			assert.Empty(t, l.stub.seq[first], "the listing was read twice")
+			l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+			// r1 is retried between the first and the last read of its evidence.
+			detail := "/dag-runs/" + l.job + "/r1"
+			l.stub.seq = map[string][]string{detail: {
+				`{"dagRunDetails":{"attemptId":"a1","queuedAt":"2026-10-09T09:59:00Z","statusLabel":"failed","nodes":[]}}`,
+				after,
+			}}
+			assert.Equal(t, []string{"r2@b1"}, l.review())
 
-			// The run that appeared in between is owed, though it ended
-			// before the cursor.
-			rest := []string{tc.later, y}
-			if !strings.HasPrefix(tc.later, "old ") {
-				rest = append(rest, "old o1 failed 2026-10-09T10:00:00Z")
-			}
-			l.set(rest...)
-			owed, done := l.after(next)
-			assert.Equal(t, tc.want, owed)
-			none, _ := l.after(done)
-			assert.Empty(t, none)
+			l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+			assert.Equal(t, []string{"r1@a1"}, l.review(), "it is returned once its evidence can be read whole")
 		})
 	}
 }
 
-// A result returned in the first pass that the second pass no longer finds
-// as it was is not returned: its run is owed instead.
-func TestRemoteRunsAfterHoldsBackAResultThatChangedBetweenPasses(t *testing.T) {
+// Nothing in a job's history can stop its reviews. Hundreds of results in
+// one instant, as when a whole queue is aborted at once, and a queue of any
+// length are both read like any other history: every result is returned
+// across reviews, each once, a bounded number at a time.
+func TestRemoteRunsAfterIsNeverBlockedByTheShapeOfTheHistory(t *testing.T) {
 	l := newRunList(t)
-	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
-	l.stub.seq = map[string][]string{
-		first: {l.page("p2", "a a1 failed 2026-10-09T10:01:00Z"), l.page("p2", "a a2 queued")},
-		p2:    {l.page("", "b b1 succeeded 2026-10-09T10:02:00Z"), l.page("", "b b1 succeeded 2026-10-09T10:02:00Z")},
-	}
-	shown, cursor := l.after("")
-	assert.Equal(t, []string{"b@b1"}, shown)
-	l.set("a a2 failed 2026-10-09T10:01:30Z", "b b1 succeeded 2026-10-09T10:02:00Z")
-	owed, _ := l.after(cursor)
-	assert.Equal(t, []string{"a@a2"}, owed, "the retried run's result is shown although it ended before the cursor")
-}
-
-// Evidence is read by run id. When the run is retried while its evidence is
-// being read, the status of one attempt is never paired with the output of
-// another: the result is held back and owed.
-func TestRemoteRunsAfterNeverMixesTheEvidenceOfTwoAttempts(t *testing.T) {
-	l := newRunList(t)
-	l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
-	// r1 is retried between the first and the last read of its evidence.
-	detail := "/dag-runs/" + l.job + "/r1"
-	l.stub.seq = map[string][]string{detail: {
-		`{"dagRunDetails":{"attemptId":"a1","statusLabel":"failed","nodes":[]}}`,
-		`{"dagRunDetails":{"attemptId":"a2","statusLabel":"running","nodes":[]}}`,
-	}}
-	shown, cursor := l.after("")
-	assert.Equal(t, []string{"r2@b1"}, shown)
-
-	l.set("r1 a2 failed 2026-10-09T10:01:30Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
-	owed, _ := l.after(cursor)
-	assert.Equal(t, []string{"r1@a2"}, owed)
-}
-
-// The supported bound on results sharing one end timestamp is exact. Up to
-// it, each result is named and shown once. Beyond it the job is refused
-// with a typed error and its coverage is left as it was: nothing is folded
-// into an order, so a result that turns up at that same timestamp with a
-// key sorting before the covered ones is never taken for covered.
-func TestRemoteRunsAfterRefusesMoreResultsAtOneTimestampThanItCanName(t *testing.T) {
-	l := newRunList(t)
-	remote := &review.Remote{Transport: l.stub}
-	ctx := context.Background()
-	var many []string
+	runs := []string{"busy b1 running"}
 	for i := range 700 {
-		many = append(many, fmt.Sprintf("m%04d a1 aborted 2026-10-09T11:00:00Z", i))
+		runs = append(runs, fmt.Sprintf("m%04d a1 aborted 2026-10-09T11:00:00Z", i))
 	}
-	l.set(many...)
-	seen := map[string]bool{}
-	cursor := ""
-	for {
-		runs, err := remote.RunsAfter(ctx, l.job, cursor)
-		if err != nil {
-			require.ErrorIs(t, err, review.ErrRunsUntrackable)
-			require.ErrorContains(t, err, "512")
-			break
-		}
-		require.NotEmpty(t, runs)
-		for _, run := range runs {
-			require.False(t, seen[run.RunID], "%s shown twice", run.RunID)
-			seen[run.RunID] = true
-			cursor = run.Cursor
-		}
-	}
-	assert.Len(t, seen, 512, "exactly as many as the bound are covered, each once")
-
-	// A result at that same timestamp whose key sorts before every covered
-	// one, as a run created later can have, is not silently covered: with
-	// the bound reached it is refused, and the coverage does not move.
-	l.set(append([]string{"a0000 a1 failed 2026-10-09T11:00:00Z"}, many[:512]...)...)
-	_, err := remote.RunsAfter(ctx, l.job, cursor)
-	require.ErrorIs(t, err, review.ErrRunsUntrackable)
-
-	// Below the bound the same late, lower-sorting result is simply shown.
-	l.set(many[:10]...)
-	_, few := l.after("")
-	l.set(append([]string{"a0000 a1 failed 2026-10-09T11:00:00Z"}, many[:10]...)...)
-	late, next := l.after(few)
-	assert.Equal(t, []string{"a0000@a1"}, late)
-	none, _ := l.after(next)
-	assert.Empty(t, none)
-}
-
-// Every unfinished run is remembered, queued ones too: none is left out to
-// make room. A queued run can end before the next listing with an end time
-// before what is already covered, and it is still shown. A job with more
-// unfinished runs than can be remembered is refused, with its coverage
-// unchanged, rather than reviewed with some of them forgotten.
-func TestRemoteRunsAfterRemembersEveryQueuedRunOrRefuses(t *testing.T) {
-	l := newRunList(t)
-	runs := []string{"done d1 failed 2026-10-09T10:05:00Z", "busy b1 running"}
-	// Newest created first, as the service lists them.
-	for i := 499; i >= 0; i-- {
+	for i := range 800 {
 		runs = append(runs, fmt.Sprintf("q%04d a1 queued", i))
 	}
 	l.set(runs...)
-	shown, cursor := l.after("")
-	assert.Equal(t, []string{"done@d1"}, shown)
-	parts := strings.Split(cursor, "|")
-	require.Len(t, parts, 4)
-	pending := strings.Split(parts[3], ",")
-	assert.Len(t, pending, 501, "the running run and all 500 queued runs")
-	assert.Contains(t, pending, "q0499", "the newest queued run is remembered like the oldest")
-
-	// The newest queued run ends, reporting a time before the cursor's.
-	runs[2] = "q0499 a1 failed 2026-10-09T10:04:00Z"
-	l.set(runs...)
-	late, _ := l.after(cursor)
-	assert.Equal(t, []string{"q0499@a1"}, late)
-
-	// More unfinished runs than can be remembered: refused, nothing
-	// returned, no cursor handed out.
-	for i := 500; i < 520; i++ {
-		runs = append(runs, fmt.Sprintf("q%04d a1 queued", i))
-	}
-	l.set(runs...)
-	got, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
-	require.ErrorIs(t, err, review.ErrRunsUntrackable)
-	assert.Empty(t, got)
-}
-
-// A history that changes more than can be tracked between the two passes of
-// a listing is refused the same way: typed, and with nothing covered.
-func TestRemoteRunsAfterRefusesAHistoryThatChurnsWhileListed(t *testing.T) {
-	l := newRunList(t)
-	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
-	var churn []string
-	for i := range 600 {
-		churn = append(churn, fmt.Sprintf("c%04d a1 failed 2026-10-09T10:00:30Z", i))
-	}
-	y := "y y1 succeeded 2026-10-09T10:20:00Z"
-	l.stub.seq = map[string][]string{
-		first: {l.page("p2"), l.page("p2", churn...)},
-		p2:    {l.page("", y), l.page("", y)},
-	}
-	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
-	require.ErrorIs(t, err, review.ErrRunsUntrackable)
-	assert.Empty(t, runs)
-}
-
-// A run that ended in the queue has no finish time and is still a result.
-// One page of results is bounded, and what it leaves is returned next.
-func TestRemoteRunsAfterIsBoundedAndKeepsRunsWithoutAFinishTime(t *testing.T) {
-	l := newRunList(t)
-	l.set("r1 a1 rejected")
-	first, cursor := l.after("")
-	assert.Equal(t, []string{"r1@a1"}, first, "ordered by the latest time the service has for it")
-	none, _ := l.after(cursor)
-	assert.Empty(t, none)
-
-	var many []string
-	for i := range 120 {
-		many = append(many, fmt.Sprintf("m%03d a1 succeeded 2026-10-09T11:%02d:%02dZ", i, i/60, i%60))
-	}
-	l.set(many...)
 	seen := map[string]bool{}
-	cursor = ""
-	for range 4 {
-		page, next := l.after(cursor)
-		require.LessOrEqual(t, len(page), 51)
+	for range 20 {
+		page := l.review()
+		require.LessOrEqual(t, len(page), 51, "one review is shown a bounded number of runs")
 		for _, key := range page {
 			require.False(t, seen[key], "%s shown twice", key)
 			seen[key] = true
 		}
-		cursor = next
 	}
-	assert.Len(t, seen, 120, "every result is returned across pages")
-	assert.Less(t, len(cursor), 200, "the cursor does not grow with the history")
+	assert.Len(t, seen, 700, "every result is returned, none twice, none refused")
+	assert.Empty(t, l.uncovered())
+
+	// A queued run that ends later is returned like any other.
+	runs[701] = "q0000 a1 failed 2026-10-09T10:00:00Z"
+	l.set(runs...)
+	assert.Equal(t, []string{"q0000@a1"}, l.review())
+}
+
+// A run that ended in the queue has no finish time and is still a result,
+// ordered by the latest time the service has for it.
+func TestRemoteRunsAfterKeepsRunsWithoutAFinishTime(t *testing.T) {
+	l := newRunList(t)
+	l.set("r2 b1 succeeded 2026-10-09T10:02:00Z", "r1 a1 rejected - 2026-10-09T10:01:00Z")
+	assert.Equal(t, []string{"r1@a1", "r2@b1"}, l.review())
+	assert.Empty(t, l.uncovered())
+}
+
+// splitTransport sends the service's own run API to a stub and everything
+// else, the registry among it, to the real handlers.
+type splitTransport struct {
+	runs review.Transport
+	rest review.Transport
+}
+
+func (s splitTransport) Do(ctx context.Context, method, path string, in, out any) error {
+	if strings.HasPrefix(path, "/dag-runs/") {
+		return s.runs.Do(ctx, method, path, in, out)
+	}
+	return s.rest.Do(ctx, method, path, in, out)
+}
+
+// Against the real registry: what a review covered is what its record says,
+// and the next listing reads that record back. A result is returned again
+// until a review that was shown it has been recorded, and a retried run's
+// new execution is returned although its run id is in an earlier review.
+func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	l := newRunList(t)
+	l.job = f.jobID
+	l.set("run-1 a1 failed 2026-10-09T10:01:00Z")
+	remote := &review.Remote{
+		Transport: splitTransport{runs: l.stub, rest: f.remote.Transport},
+		MachineID: f.remote.MachineID, RunID: "tick-1", AgentClient: "fixture-agent 1.0",
+	}
+	reviewer := func(holder string) *review.Reviewer {
+		r := f.reviewer(holder)
+		r.Registry = remote
+		return r
+	}
+	first := review.ExecutionRef("a1", "2026-10-09T09:59:00Z")
+
+	// A reviewer is shown the result and dies before recording a review.
+	// Nothing is covered: the next reviewer is shown it again.
+	lost, err := reviewer("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"run-1"}, lost.Packet.RunIDs())
+	require.NoError(t, remote.ReleaseClaim(ctx, lost.Claim))
+
+	prepared, err := reviewer("reviewer-b").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"run-1"}, prepared.Packet.RunIDs(), "shown, not recorded: shown again")
+	_, err = reviewer("reviewer-b").Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "it failed", EvidenceRunIDs: []string{"run-1"}})
+	require.NoError(t, err)
+
+	// The registry's own record of that review names the execution.
+	stored, err := f.store.GetReview(ctx, f.jobID, prepared.Packet.ReviewID)
+	require.NoError(t, err)
+	assert.Contains(t, string(stored.Detail), `"covered_executions":["run-1@`+first+`"]`)
+	back, err := remote.Review(ctx, f.jobID, prepared.Packet.ReviewID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"run-1@" + first}, back.CoveredExecutions)
+
+	// Read back from the registry, the result is covered.
+	runs, err := remote.RunsAfter(ctx, f.jobID, "")
+	require.NoError(t, err)
+	assert.Empty(t, runs)
+
+	// The run is retried on the queued path: same attempt id, later queue
+	// marker. It is another execution, in no review, and is shown again.
+	l.set("run-1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:30Z")
+	again, err := reviewer("reviewer-c").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"run-1"}, again.Packet.RunIDs())
+	assert.Equal(t, "2026-10-09T10:00:30Z", again.Packet.NewRuns[0].QueuedAt)
+	_, err = reviewer("reviewer-c").Apply(ctx, again, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "again", EvidenceRunIDs: []string{"run-1"}})
+	require.NoError(t, err)
+	runs, err = remote.RunsAfter(ctx, f.jobID, "")
+	require.NoError(t, err)
+	assert.Empty(t, runs)
 }
 
 // Opening a decision enqueues one run with the derived run id, and a
@@ -1408,39 +1336,6 @@ func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
 	third := round("reviewer-e", notify)
 	assert.Empty(t, third.Executed)
 	assert.Equal(t, 2, f.fx.count("notify"))
-}
-
-// A job whose runs cannot be tracked is not left failing in a step log. It
-// is raised as an exception on the job's reviewer, deferred by one cadence
-// and released, so the owner sees it and other jobs are not held up.
-func TestRemoteUntrackableRunsBecomeAnExceptionNotAFailingStep(t *testing.T) {
-	f := newRemoteFixture(t)
-	ctx := context.Background()
-	r := f.reviewer("reviewer-a")
-	r.Registry = untrackable{f.remote}
-	prepared, err := r.Prepare(ctx, f.jobID)
-	require.NoError(t, err)
-	assert.Equal(t, review.SkipUnreviewable, prepared.Skipped)
-
-	job := f.job()
-	raised := false
-	for _, e := range job.Exceptions {
-		raised = raised || e.Kind == string(review.ExceptionRunsUntrackable)
-	}
-	assert.True(t, raised)
-	assert.Equal(t, registry.ClaimReleased, job.Claim.State)
-	require.NotNil(t, job.Checkpoint.NextReviewAt)
-	assert.True(t, job.Checkpoint.NextReviewAt.After(time.Now().Add(30*time.Minute)), "deferred by the job's cadence")
-	assert.Equal(t, 0, job.Checkpoint.Version, "nothing was covered")
-}
-
-// untrackable is a registry whose run history cannot be tracked.
-type untrackable struct {
-	review.Registry
-}
-
-func (u untrackable) RunsAfter(context.Context, string, string) ([]review.RunEvidence, error) {
-	return nil, fmt.Errorf("%w: more than 512 runs are executing at once", review.ErrRunsUntrackable)
 }
 
 // A reviewer that cannot run is the reviewer's problem. The registry keeps

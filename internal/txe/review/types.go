@@ -216,8 +216,9 @@ type RunEvidence struct {
 	AttemptID string `json:"attempt_id,omitempty"`
 	QueuedAt  string `json:"queued_at,omitempty"`
 	// Cursor is the checkpoint's run cursor once this run, and every run
-	// listed before it, has been covered. The registry adapter sets it; a
-	// run without one is its own cursor.
+	// listed before it, has been covered, for a registry that keeps its
+	// place in the run history that way. A run without one is its own
+	// cursor.
 	Cursor     string            `json:"-"`
 	Status     string            `json:"status"`
 	StartedAt  time.Time         `json:"started_at,omitzero"`
@@ -402,7 +403,9 @@ type Review struct {
 	CoveredDecisions []string `json:"covered_decision_ids"`
 	// CoveredExecutions names each covered run with the execution of it
 	// that was shown, as "run@execution": a retried run keeps its id, so
-	// the id alone does not say which result a review saw.
+	// the id alone does not say which result a review saw. These names, in
+	// the job's recorded reviews, are the record of what has been covered:
+	// a result is shown to a review until a recorded review names it.
 	CoveredExecutions []string `json:"covered_executions,omitempty"`
 	// RunCursor is the checkpoint's run cursor after this review.
 	RunCursor   string   `json:"run_cursor,omitempty"`
@@ -439,9 +442,6 @@ const (
 	// ExceptionContextTooLarge means the job's context does not fit a review
 	// packet, so it is not being reviewed.
 	ExceptionContextTooLarge ExceptionKind = "review_context_too_large"
-	// ExceptionRunsUntrackable means the job has more runs in flight at
-	// once than a review can keep track of.
-	ExceptionRunsUntrackable ExceptionKind = "review_runs_untrackable"
 	// ExceptionCleanupFailed means a superseded proposal's decision run
 	// could not be closed after repeated attempts.
 	ExceptionCleanupFailed ExceptionKind = "decision_run_cleanup_failed"

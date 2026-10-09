@@ -11,10 +11,6 @@ import (
 )
 
 var (
-	// ErrRunsUntrackable means the job's run history cannot be covered
-	// within the reviewer's bounds as it is now. The job is raised as an
-	// exception and deferred, never left failing quietly.
-	ErrRunsUntrackable = errors.New("txe review: the job's runs cannot be tracked for review")
 	// ErrClaimHeld means another live claim owns the job.
 	ErrClaimHeld = errors.New("txe review: job is claimed by another holder")
 	// ErrStaleFence means the write came from a claim that is no longer the

@@ -89,34 +89,36 @@ else a review step needs must be rendered into the DAG:
 - One result per run: its latest execution. An execution is an attempt as
   queued at one time. A retry keeps the run id; Dagu either starts a new
   attempt for it or queues the latest attempt again under the same attempt
-  id, so the pair of attempt id and queued time is what identifies it. The
+  id, so the pair of attempt id and queue marker is what identifies it. The
   service lists only the latest. An execution that was replaced by a retry
-  between two reviews is therefore never reviewed. Each review records what
-  it covered as run and execution (`covered_executions`), so a review of a
-  run is never read as a review of every execution of it.
-- A retried run is shown again when its new execution ends, on either
-  retry path. Two results with the same end time are told apart by run and
-  execution. A result reported late, with an end time before results
-  already covered, is still shown: a run seen unfinished stays owed until a
-  review has been shown its result.
-- A listing that takes several requests is read twice, and only results
-  that both passes saw finished are returned. A result whose run is retried
-  while its evidence is being read is held back for the next review, so the
-  status of one execution is never paired with the output of another.
-- This rests on one assumption the service does not guarantee: a run that
-  starts after a checkpoint ends after everything that checkpoint covered.
-  A job's runs are on one machine and their times come from its clock, so
-  it fails only if that clock is set back between two runs.
-- Bounds: at most 50 runs per review, and a cursor of bounded size kept
-  apart from what the agent is shown. The supported bound is exact: at most
-  512 results of one job sharing one end timestamp, and at most 512 of its
-  runs queued, executing or owed a review at once. Nothing is dropped or
-  approximated to fit. A job beyond either gets a `review_runs_untrackable`
-  exception saying which bound and by how much, its review is deferred by
-  one cadence and its coverage is left exactly as it was, so no result is
-  passed over. Reviews resume when the job is within the bound again; a
-  job that stays beyond it stays unreviewed and visible. Raising the bound
-  is capacity work, not part of this phase.
+  between two reviews is therefore never reviewed, and nothing here claims
+  otherwise.
+- What has been covered is what the job's recorded reviews say they
+  covered. Each review records the results it was shown by run and
+  execution (`covered_executions`), and a result is shown to reviews until
+  a recorded review names it. There is no cursor that could move past a
+  result: a result is covered only once the review that was shown it has
+  been persisted, and a crash, a failed read or a review that was never
+  recorded covers nothing.
+- So a retried run is shown again when its new execution ends, on either
+  retry path; results with the same end time are separate results; a
+  result reported late, a run created while the history was being listed
+  and a queued run that ends later are all returned, whatever their times.
+  End times only order what one review is shown.
+- A result whose run is retried while its evidence is being read is not
+  returned that time, so the status of one execution is never paired with
+  the output of another. No review names it, so the next review meets the
+  run's latest execution.
+- Bounds: at most 50 runs per review, oldest first; the rest wait for the
+  next one. No number of results, unfinished runs or queued runs stops a
+  job's reviews.
+- Cost: every review reads the job's whole review history and run list.
+  The registry's review list has no paging yet. This is the plain, exact
+  form; making it cheaper is capacity work and must keep the same meaning
+  of covered.
+- On a service that does not identify executions (no attempt id), a run is
+  recorded under its run id alone and a retry of it would not be shown
+  again. The hubs this runs on identify them.
 
 ## Declared actions
 
