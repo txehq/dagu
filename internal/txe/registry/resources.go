@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -273,35 +274,83 @@ func (s *Store) resourceCandidates(ctx context.Context, t Target, obs ResourceOb
 	return out, nil
 }
 
-// applyPending applies the event to each pending dependent, saves the
-// event, and removes its pending marker once every dependent is applied. The
-// caller's event changes only after the new state is saved, so a failed save
-// never reports progress that is not stored.
+// maxProgressRounds bounds how often an event's progress is re-read when
+// another processor saved it first.
+const maxProgressRounds = 5
+
+// applyPending applies the event to each dependent still pending in its
+// saved state, then saves the progress with a compare-and-swap against the
+// state it read. Completion is final: a saved complete event is never
+// processed or overwritten again, and a job commit refuses an event that is
+// already complete, so a slower processor of the same event stops instead
+// of applying it again. The caller's event changes only after progress is
+// saved, so a failed save never reports progress that is not stored.
 func (s *Store) applyPending(ctx context.Context, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) error {
-	next := *ev
-	next.Dispositions = append([]ResourceDisposition(nil), ev.Dispositions...)
-	var still []ResourceDependent
-	var failures []ResourceFailure
-	for _, p := range ev.Pending {
-		d, err := s.applyDependent(ctx, p, ev, by, permitted)
+	incomplete := &Error{Code: CodeIncomplete, Message: "resource event " + ev.EventID + " progress could not be saved; send it again with this event_id", Current: ev.EventID}
+	for range maxProgressRounds {
+		rec, err := s.col.Get(ctx, resourceEventsPrefix+ev.EventID)
 		if err != nil {
-			still = append(still, p)
-			failures = append(failures, ResourceFailure{JobID: p.JobID, Error: err.Error()})
+			return incomplete
+		}
+		var cur ResourceEvent
+		if err := json.Unmarshal(rec.Data, &cur); err != nil {
+			return fmt.Errorf("registry: decode event %s: %w", ev.EventID, err)
+		}
+		if cur.Complete {
+			*ev = cur
+			return s.dropPendingMarker(ctx, ev.EventID)
+		}
+		next := cur
+		next.Dispositions = append([]ResourceDisposition(nil), cur.Dispositions...)
+		var still []ResourceDependent
+		var failures []ResourceFailure
+		completedElsewhere := false
+		for _, p := range cur.Pending {
+			if completedElsewhere {
+				still = append(still, p)
+				continue
+			}
+			d, err := s.applyDependent(ctx, p, &cur, by, permitted)
+			if ErrorCode(err) == CodeEventComplete {
+				completedElsewhere = true
+				still = append(still, p)
+				continue
+			}
+			if err != nil {
+				still = append(still, p)
+				failures = append(failures, ResourceFailure{JobID: p.JobID, Error: err.Error()})
+				continue
+			}
+			if d != nil {
+				next.Dispositions = append(next.Dispositions, *d)
+			}
+		}
+		if completedElsewhere {
 			continue
 		}
-		if d != nil {
-			next.Dispositions = append(next.Dispositions, *d)
-		}
-	}
-	next.Pending, next.Failures, next.Complete = still, failures, len(still) == 0
-	if err := s.putJSON(ctx, resourceEventsPrefix+ev.EventID, &next); err != nil {
-		return &Error{Code: CodeIncomplete, Message: "resource event " + ev.EventID + " progress could not be saved; send it again with this event_id", Current: ev}
-	}
-	*ev = next
-	if ev.Complete {
-		if err := s.col.Delete(ctx, resourcePendingPrefix+ev.EventID); err != nil {
+		next.Pending, next.Failures, next.Complete = still, failures, len(still) == 0
+		data, err := json.Marshal(&next)
+		if err != nil {
 			return err
 		}
+		if err := s.col.CompareAndSwap(ctx, resourceEventsPrefix+ev.EventID, rec.Data, data); err != nil {
+			if errors.Is(err, persis.ErrConflict) {
+				continue
+			}
+			return incomplete
+		}
+		*ev = next
+		if ev.Complete {
+			return s.dropPendingMarker(ctx, ev.EventID)
+		}
+		return nil
+	}
+	return incomplete
+}
+
+func (s *Store) dropPendingMarker(ctx context.Context, eventID string) error {
+	if err := s.col.Delete(ctx, resourcePendingPrefix+eventID); err != nil && !errors.Is(err, persis.ErrNotFound) {
+		return err
 	}
 	return nil
 }
@@ -637,6 +686,9 @@ func (s *Store) GetResourceEvent(ctx context.Context, eventID string) (*Resource
 	return &ev, nil
 }
 
+// errEventComplete stops applying an event another processor completed.
+var errEventComplete = refuse(CodeEventComplete, "resource event is already complete")
+
 // errVersionChanged marks a job that moved to another version after the
 // event was evaluated against it; the caller evaluates it again.
 var errVersionChanged = refuse(CodeVersionConflict, "job version changed while the event was applied")
@@ -661,9 +713,15 @@ func atVersion(version int, permitted ResourceJobFilter) jobCheck {
 
 // recheck runs check inside the commit, so authorization and the evaluated
 // version hold for the state committed.
-// maxAppliedResourceEvents is how many applied events a job keeps per
-// target and match before dropping those whose event is complete.
-const maxAppliedResourceEvents = 20
+// A job keeps up to maxAppliedResourceEvents applied-event records, over all
+// targets, before dropping the oldest whose event is complete. Records of
+// incomplete events are kept up to hardMaxAppliedResourceEvents; beyond it
+// the oldest go regardless, so reports cannot grow a job record without
+// bound.
+const (
+	maxAppliedResourceEvents     = 50
+	hardMaxAppliedResourceEvents = 500
+)
 
 // eventCommit is the in-commit part of applying a resource event to a job:
 // the authorization and version check, and the record that the event was
@@ -686,11 +744,16 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 			// Applied by a concurrent replay; re-read its result.
 			return errVersionChanged
 		}
-		if tx.Job.AppliedResourceEvents == nil {
-			tx.Job.AppliedResourceEvents = map[string][]AppliedResourceEvent{}
+		// A processor of an event another one completed stops here. The
+		// check shares this job's commit with the compaction that drops
+		// complete events' records, so a dropped record is never reapplied.
+		if saved, err := c.s.GetResourceEvent(ctx, c.eventID); err != nil {
+			return err
+		} else if saved.Complete {
+			return errEventComplete
 		}
-		list := append(tx.Job.AppliedResourceEvents[c.key], AppliedResourceEvent{EventID: c.eventID, At: tx.now, Disposition: *c.d})
-		tx.Job.AppliedResourceEvents[c.key] = c.s.compactApplied(ctx, list)
+		list := append(tx.Job.AppliedResourceEvents, AppliedResourceEvent{Key: c.key, EventID: c.eventID, At: tx.now, Disposition: *c.d})
+		tx.Job.AppliedResourceEvents = c.s.compactApplied(ctx, list)
 		tx.touch()
 		return nil
 	}
@@ -701,6 +764,9 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 // returns the saved event and never reaches the job, while an incomplete
 // one still needs its record.
 func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent) []AppliedResourceEvent {
+	if over := len(list) - hardMaxAppliedResourceEvents; over > 0 {
+		list = list[over:]
+	}
 	excess := len(list) - maxAppliedResourceEvents
 	if excess <= 0 {
 		return list
@@ -727,8 +793,8 @@ func appliedKey(match string, t Target) string {
 // appliedResourceEvent returns the recorded result of an event already
 // applied to the job, or nil.
 func (j *Job) appliedResourceEvent(key, eventID string) *ResourceDisposition {
-	for _, a := range j.AppliedResourceEvents[key] {
-		if a.EventID == eventID {
+	for _, a := range j.AppliedResourceEvents {
+		if a.Key == key && a.EventID == eventID {
 			d := a.Disposition
 			return &d
 		}
