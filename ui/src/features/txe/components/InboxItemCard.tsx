@@ -23,6 +23,7 @@ const REASON_LABELS: Record<InboxItem['reason'], string> = {
   unavailable: 'Cannot run',
   'run-failed': 'Latest run failed',
   exception: 'Problem reported',
+  'follow-up': 'Decision follow-up pending',
 };
 
 export function dagRunPath(dagName: string, dagRunId: string): string {
