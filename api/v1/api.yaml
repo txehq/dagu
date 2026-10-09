@@ -11760,6 +11760,36 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/runs/{runId}/abandonments:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "List a run's abandoned retry preparations"
+      description: "Every attempt of the run that the coordinator prepared and abandoned without dispatching it, newest first, whatever happened to the run since: hidden preparations of a retry and first attempts marked failed alike. Each entry is either the trusted record (with attributable, true only when it carries a request correlation) or, for a record that cannot be trusted, the attempt and an error; such an entry is never attributable. Visible to callers who can see the job and the workspace of the run."
+      operationId: "listTxeRunAbandonments"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Abandonment records"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeAbandonmentList"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/runs/{runId}/executions:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -21125,6 +21155,80 @@ components:
           items:
             $ref: "#/components/schemas/TxeRetainedFile"
       required: [execution, attempt_id, queued_at, status, status_complete, logs_final, retained_at, status_sha256, files]
+
+    TxeExecutionIdentity:
+      type: object
+      properties:
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+      required: [attempt_id, queued_at]
+
+    TxeAbandonment:
+      type: object
+      description: "One abandoned attempt: record when it can be trusted, otherwise error."
+      properties:
+        attempt_id:
+          type: string
+        attributable:
+          type: boolean
+          description: "True only when the record carries a full request correlation (action id, action attempt, binding digest). Without one, matching the abandoned execution to a request needs an exact admitted receipt."
+        error:
+          type: string
+          description: "Present when the record cannot be trusted (unreadable, malformed, of another attempt or inconsistent); never attributable."
+        outcome:
+          type: string
+          enum: [hidden, marked_failed]
+        abandoned_execution:
+          $ref: "#/components/schemas/TxeExecutionIdentity"
+        expected_execution:
+          $ref: "#/components/schemas/TxeExecutionIdentity"
+        predecessor_absent:
+          type: boolean
+        request_correlation:
+          type: object
+          properties:
+            id:
+              type: string
+            action_id:
+              type: string
+            action_attempt:
+              type: string
+            binding_digest:
+              type: string
+        reason:
+          type: string
+        detail:
+          type: string
+        decided_at:
+          type: string
+        coordinator_id:
+          type: string
+        evidence:
+          type: object
+          description: "Each lookup that proved nothing was dispatched."
+          properties:
+            dispatch_task:
+              type: string
+            lease:
+              type: string
+            active_run:
+              type: string
+            worker:
+              type: string
+            observed_at:
+              type: string
+      required: [attempt_id, attributable]
+
+    TxeAbandonmentList:
+      type: object
+      properties:
+        abandonments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAbandonment"
+      required: [abandonments]
 
     TxeRetainedExecutionList:
       type: object

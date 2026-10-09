@@ -996,3 +996,97 @@ func TestTxeAPIRetainedExecutionsFollowTheRunsWorkspace(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(body), `"files":[]`)
 }
+
+// A run's abandoned retry preparations are listed from the store's strict
+// history: a hidden preparation and a first attempt marked failed, still
+// after a later retry; a record that cannot be trusted is an error entry,
+// never dropped and never attributable; callers who cannot see the run's
+// workspace get nothing.
+func TestTxeAPIRunAbandonments(t *testing.T) {
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(txeAdmin))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+	runDAG := &ir.DAG{Name: jobID}
+
+	attempt := func(runID string, retry bool, st ir.Status) string {
+		at, err := runs.CreateAttempt(txeAdmin, runDAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{Retry: retry})
+		require.NoError(t, err)
+		s := ir.InitialStatus(runDAG)
+		s.DAGRunID, s.AttemptID, s.Status, s.Labels = runID, at.ID(), st, []string{"workspace=ops"}
+		require.NoError(t, at.Open(txeAdmin))
+		require.NoError(t, at.Write(txeAdmin, s))
+		require.NoError(t, at.Close(txeAdmin))
+		return at.ID()
+	}
+	abandon := func(runID, attemptID string, expected *persis.ExecutionIdentity) {
+		ref := ir.NewDAGRunRef(jobID, runID)
+		_, err := runs.AbandonAttempt(txeAdmin, persis.AbandonAttemptRequest{DAGRun: ref, Record: persis.AttemptAbandonment{
+			Schema: persis.AttemptAbandonmentSchema, Run: ref, RootRun: ref, AbandonedAttemptID: attemptID,
+			AbandonedExecution: persis.ExecutionIdentity{AttemptID: attemptID}, ExpectedExecution: expected,
+			Reason: persis.AbandonedRetryPreparation, DecidedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Evidence: persis.AbandonmentEvidence{DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+				ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+		}})
+		require.NoError(t, err)
+	}
+	list := func(ctx context.Context, runID string) ([]apigen.TxeAbandonment, error) {
+		resp, err := a.ListTxeRunAbandonments(ctx, apigen.ListTxeRunAbandonmentsRequestObject{JobId: jobID, RunId: runID})
+		if err != nil {
+			return nil, err
+		}
+		return resp.(apigen.ListTxeRunAbandonments200JSONResponse).Abandonments, nil
+	}
+
+	// run-1: a failed attempt, its retry's preparation abandoned (hidden),
+	// then a later retry.
+	first := attempt("run-1", false, ir.Failed)
+	prep := attempt("run-1", true, ir.NotStarted)
+	abandon("run-1", prep, &persis.ExecutionIdentity{AttemptID: first})
+	attempt("run-1", true, ir.Failed)
+	got, err := list(txeOps, "run-1")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, prep, got[0].AttemptId)
+	assert.Equal(t, apigen.TxeAbandonmentOutcome("hidden"), *got[0].Outcome)
+	assert.Equal(t, first, got[0].ExpectedExecution.AttemptId)
+	assert.False(t, got[0].Attributable, "no correlation yet")
+	assert.Nil(t, got[0].Error)
+
+	// run-2: a first attempt never dispatched is marked failed, visibly.
+	only := attempt("run-2", false, ir.NotStarted)
+	abandon("run-2", only, nil)
+	got, err = list(txeOps, "run-2")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, apigen.TxeAbandonmentOutcome("marked_failed"), *got[0].Outcome)
+	assert.True(t, *got[0].PredecessorAbsent)
+
+	// A record that cannot be trusted is reported, not dropped.
+	records, err := filepath.Glob(filepath.Join(dir, "runs", "*", "dag-runs", "*", "*", "*", "dag-run_*", ".*", filedagrun.AbandonmentRecordFile))
+	require.NoError(t, err)
+	require.NotEmpty(t, records)
+	require.NoError(t, os.WriteFile(records[0], []byte("{not json"), 0o600))
+	got, err = list(txeOps, "run-1")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.NotNil(t, got[0].Error)
+	assert.False(t, got[0].Attributable)
+	assert.Nil(t, got[0].Outcome)
+
+	// Someone who cannot see the ops workspace cannot see the run's history.
+	secretOnly := auth.WithUser(context.Background(), &auth.User{Username: "sec", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "secret", Role: auth.RoleDeveloper}},
+	}})
+	_, err = list(secretOnly, "run-1")
+	requireStatus(t, err, http.StatusNotFound)
+}
