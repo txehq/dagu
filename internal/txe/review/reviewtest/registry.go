@@ -265,7 +265,7 @@ func (r *Registry) AcquireClaim(_ context.Context, req review.ClaimRequest) (rev
 			Kind:      req.Kind,
 			Holder:    req.Holder,
 			Fence:     s.Fences[req.JobID],
-			ExpiresAt: now.Add(req.TTL),
+			ExpiresAt: now.Add(req.TTL), AcquiredAt: now,
 		}
 		s.Claims[req.JobID] = claim
 		s.Transitions = append(s.Transitions, fmt.Sprintf("claim %s fence %d granted to %s (%s)", claim.ID, claim.Fence, claim.Holder, claim.Kind))
@@ -544,7 +544,7 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			Name: req.Name, TargetID: req.TargetID, Params: req.Params,
 			IntentKey: req.IntentKey, ReviewID: req.ReviewID,
 			ProposalID: req.ProposalID, DecisionID: req.DecisionID,
-			State: review.ActionExecuting, ClaimID: req.Claim.ID, StartedAt: now,
+			State: review.ActionExecuting, ClaimID: req.Claim.ID, StartedAt: now, AttemptStartedAt: now,
 			GrantID:        s.nextID("grt"),
 			GrantExpiresAt: now.Add(grantTimeout(req.Timeout)),
 		}
@@ -680,7 +680,7 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 			}
 			actions[i].Receipt = req.Receipt
 			actions[i].Detail = req.Detail
-			actions[i].Admitted, actions[i].AdmittedRef, actions[i].AdmittedAt = req.Admitted, req.AdmittedRef, req.AdmittedAt
+			actions[i].Admitted, actions[i].AdmittedRef = req.Admitted, req.AdmittedRef
 			actions[i].FinishedAt = now
 			return nil
 		}

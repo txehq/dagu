@@ -320,8 +320,8 @@ var (
 	// ErrTaskEnded means the task can no longer be answered because its
 	// run or its step ended without the step completing: nobody answered.
 	ErrTaskEnded = errors.New("txe review: task ended before it was answered")
-	// ErrTaskOver means the task's step completed and the service records
-	// nobody as having completed it. That is not proof that nobody
+	// ErrTaskOver means the task's step finished in a state it can hold an
+	// answer in and the service records nobody as having completed it. That is not proof that nobody
 	// answered: a service that does not record who completed a task shows
 	// an answered one the same way.
 	ErrTaskOver = errors.New("txe review: task is over with no completion on record")

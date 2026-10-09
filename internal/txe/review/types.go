@@ -199,6 +199,8 @@ type Claim struct {
 	Holder    string    `json:"holder"`
 	Fence     int       `json:"fence"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// AcquiredAt is when the registry gave the claim, by its own clock.
+	AcquiredAt time.Time `json:"acquired_at,omitzero"`
 }
 
 // Checkpoint records how far reviews of a job have durably progressed.
@@ -309,9 +311,9 @@ type Action struct {
 	// request as, when it names one. Only that execution is then this
 	// action's effect.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
-	// AdmittedAt is when, by the registry's clock, the destination
-	// admitted the request of this attempt of the action.
-	AdmittedAt time.Time `json:"admitted_at,omitzero"`
+	// AttemptStartedAt is when the registry granted the current attempt of
+	// the action, by the registry's clock.
+	AttemptStartedAt time.Time `json:"attempt_started_at,omitzero"`
 	// Attempt is the registry's count of attempts of this action. An
 	// owner's answer about an unknown outcome is about one attempt.
 	Attempt int `json:"attempt,omitempty"`

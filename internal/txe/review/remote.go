@@ -319,7 +319,7 @@ func (r *Remote) AcquireClaim(ctx context.Context, req ClaimRequest) (Claim, err
 	}
 	return Claim{
 		ID: out.ClaimId, JobID: req.JobID, Kind: ClaimKind(out.Kind), Holder: req.Holder,
-		Fence: int(out.Fence), ExpiresAt: out.ExpiresAt,
+		Fence: int(out.Fence), ExpiresAt: out.ExpiresAt, AcquiredAt: out.AcquiredAt,
 	}, nil
 }
 
@@ -827,7 +827,7 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 // endedDetail and overDetail are what the registry is told about a decision
 // run that was already over when the reviewer came to close it.
 const (
-	endedDetail = "the decision run ended before its task was answered: the task's step never completed. The reviewer completed nothing."
+	endedDetail = "the decision run ended before its task was answered: the task's step was aborted or never finished. The reviewer completed nothing."
 	overDetail  = "the decision run's task was already over and the service records no completion for it; whether it had been answered is not known from the run. The reviewer completed nothing."
 )
 
@@ -918,6 +918,12 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 		State: ActionState(a.State), Receipt: deref(a.Receipt), ClaimID: deref(a.ClaimId),
 		StartedAt: a.Created.At, FinishedAt: a.Updated.At, Attempt: a.Attempt,
 	}
+	// An action written before the registry recorded attempts' grants has
+	// only its creation time.
+	out.AttemptStartedAt = a.Created.At
+	if a.AttemptStartedAt != nil {
+		out.AttemptStartedAt = *a.AttemptStartedAt
+	}
 	if t := a.Spec.Target; t != nil {
 		out.TargetID = targetKey(*t)
 	}
@@ -927,7 +933,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 	}
 	var outcome actionOutcome
 	if len(a.Outcome) > 0 && json.Unmarshal(a.Outcome, &outcome) == nil {
-		out.Detail, out.Admitted, out.AdmittedRef, out.AdmittedAt = outcome.Detail, outcome.Admitted, outcome.AdmittedRef, outcome.AdmittedAt
+		out.Detail, out.Admitted, out.AdmittedRef = outcome.Detail, outcome.Admitted, outcome.AdmittedRef
 	}
 	// The registry's first state for an authorized attempt is one the
 	// reviewer treats the same as executing: the effect may have begun.
@@ -1057,8 +1063,6 @@ type actionOutcome struct {
 	Admitted bool `json:"admitted,omitempty"`
 	// AdmittedRef: the execution the destination named for the request.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
-	// AdmittedAt: when it accepted the request, by the registry's clock.
-	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
 // FinishAction implements Registry.
@@ -1071,7 +1075,7 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 		body.Receipt = &req.Receipt
 	}
 	if req.Detail != "" || req.Admitted {
-		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef, AdmittedAt: req.AdmittedAt})
+		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }
@@ -1346,8 +1350,9 @@ func RemoteComplete(t Transport) CompleteFunc {
 				stepOver, stepStatus = finishedStepStatuses[node.StatusLabel], node.StatusLabel
 			}
 			switch {
-			case completedStepStatuses[stepStatus]:
-				// The step completed, and nobody is recorded for it.
+			case answerableStepStatuses[stepStatus]:
+				// The step is in a state it can hold an answer in, and
+				// nobody is recorded for it.
 				return fmt.Errorf("%w: its run is %s and its step is %s", ErrTaskOver, run.StatusLabel, stepStatus)
 			case stepOver || terminalRunStatuses[run.StatusLabel]:
 				// The step never completed and no longer can.
@@ -1361,9 +1366,15 @@ func RemoteComplete(t Transport) CompleteFunc {
 
 // finishedStepStatuses are the step states after which a human task can no
 // longer be answered.
-// completedStepStatuses are the ways a human task's step ends when someone
-// completed it, with an answer or a rejection.
-var completedStepStatuses = map[string]bool{"succeeded": true, "partially_succeeded": true, "rejected": true}
+// answerableStepStatuses are the finished states a human task's step can
+// be in while holding an answer: completed or rejected by someone, and also
+// skipped or failed, because the service carries a completed task's input
+// over into a step it then skips (selected-step runs, edit and retry). Only
+// a step that was aborted, or never finished in a run that is over, is
+// taken to have ended unanswered.
+var answerableStepStatuses = map[string]bool{
+	"succeeded": true, "partially_succeeded": true, "rejected": true, "skipped": true, "failed": true,
+}
 
 var finishedStepStatuses = map[string]bool{
 	"succeeded": true, "failed": true, "aborted": true, "skipped": true, "rejected": true, "partially_succeeded": true,

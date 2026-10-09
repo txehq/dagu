@@ -92,8 +92,11 @@ else a review step needs must be rendered into the DAG:
   started is a reservation, not a retry: the action stays uncertain and
   is looked at again by every review, however long a worker takes, and
   the owner is not asked meanwhile, because an action put to the owner is
-  not probed again. A reservation still not started 30 minutes after its
-  admission is reported once as the exception `retry_reservation_stalled`
+  not probed again. A reservation still not started 30 minutes after the
+  registry granted that attempt (both ends of the time are the
+  registry's: the grant and the review's claim; the reviewer host's
+  clock is not used, and the time only decides when the owner is told)
+  is reported once as the exception `retry_reservation_stalled`
   about that attempt of the action, naming the execution and the machine:
   check that a worker for the job is connected and can take queued work.
   It asks for no decision and allows no retry; do not retry the run by

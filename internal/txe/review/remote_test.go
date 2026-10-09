@@ -95,6 +95,9 @@ type remoteFixture struct {
 	// service is the fake of Dagu's run history that the registry's run
 	// control and the reviewer both read.
 	service *runs
+	// ahead is how far the registry's clock runs ahead of real time. Tests
+	// move the registry's time with it; nothing sleeps.
+	ahead *time.Duration
 }
 
 // runsRemote supplies run evidence, which the real service reads from its
@@ -121,7 +124,9 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
 	service := newRuns()
 	control := &runControl{runs: service}
-	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)), registry.WithRunControl(control))
+	ahead := new(time.Duration)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)), registry.WithRunControl(control),
+		registry.WithClock(func() time.Time { return time.Now().Add(*ahead) }))
 	require.NoError(t, err)
 	cfg := &config.Config{}
 	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
@@ -195,7 +200,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 		},
 		runs: []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
-	f := &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}, service: service}
+	f := &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}, service: service, ahead: ahead}
 	control.spec = f.job().DAGSpecSHA256
 	return f
 }
@@ -1006,8 +1011,16 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 			detail: `{"dagRunDetails":{"statusLabel":"failed","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
 			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
 		},
-		"step skipped, never completed": {
+		"step skipped: the service carries a completed task's answer into a step it skips": {
 			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"skipped"}]}}`,
+			want:   review.ErrTaskOver, closed: review.ClosureOver,
+		},
+		"step failed with nobody on record": {
+			detail: `{"dagRunDetails":{"statusLabel":"failed","nodes":[{"step":{"name":"decide"},"statusLabel":"failed"}]}}`,
+			want:   review.ErrTaskOver, closed: review.ClosureOver,
+		},
+		"run aborted while the task was still waiting": {
+			detail: `{"dagRunDetails":{"statusLabel":"aborted","nodes":[{"step":{"name":"decide"},"statusLabel":"waiting"}]}}`,
 			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
 		},
 		"step completed with nobody on record: answered or not is unknown": {
@@ -1626,8 +1639,12 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	}
 	reviewAt := func(holder string, after time.Duration) {
 		t.Helper()
+		// The registry's clock moves; the half hour is measured on it. The
+		// reviewer's own clock is three hours fast throughout, and that
+		// changes nothing about when the exception is raised.
+		*f.ahead = after
 		r := f.retrying(holder, service)
-		r.Now = func() time.Time { return time.Now().Add(after) }
+		r.Now = func() time.Time { return time.Now().Add(after + 3*time.Hour) }
 		prepared, err := r.Prepare(ctx, f.jobID)
 		require.NoError(t, err)
 		require.Empty(t, prepared.Skipped)

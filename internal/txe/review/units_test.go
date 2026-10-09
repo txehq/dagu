@@ -1404,8 +1404,9 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 	})
 }
 
-// The half hour after which a reservation is reported runs from the
-// admission of the attempt that made it. An action can be attempted again
+// The half hour after which a reservation is reported runs from the grant
+// of the attempt that made it, by the registry's clock, to the registry's
+// time of the review's claim. An action can be attempted again
 // on the owner's word, long after it was created: its new reservation is
 // not stalled from its first minute.
 func TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt(t *testing.T) {
@@ -1416,6 +1417,7 @@ func TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt(t *testing.T) {
 		r := f.executor(holder)
 		prepared, err := r.Prepare(context.Background(), jobID)
 		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
 		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
 		require.NoError(t, err)
 	}
@@ -1444,7 +1446,7 @@ func TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt(t *testing.T) {
 		s.Actions[jobID][0].StartedAt = s.Actions[jobID][0].StartedAt.Add(-5 * time.Hour)
 		return nil
 	}))
-	require.Equal(t, f.clock.Now(), f.state().Actions[jobID][0].AdmittedAt, "the admission time is journaled with the attempt")
+	require.Equal(t, f.clock.Now(), f.state().Actions[jobID][0].AttemptStartedAt, "the registry records when it granted the attempt")
 
 	review1("reviewer-b", 10*time.Minute)
 	assert.Empty(t, stalled(), "ten minutes after this attempt's admission, whatever the action's age")

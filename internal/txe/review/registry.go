@@ -99,8 +99,6 @@ type FinishRequest struct {
 	// named for it, if it named one.
 	Admitted    bool
 	AdmittedRef string
-	// AdmittedAt is when the destination admitted the request.
-	AdmittedAt time.Time
 }
 
 // Registry is the part of the TXE job registry the reviewer consumes. The
@@ -193,11 +191,11 @@ const (
 	// real answer, which the registry refuses for a superseded proposal.
 	ClosureAnswered ClosureOutcome = "already_answered"
 	// ClosureEnded means the task's run ended before anyone answered: the
-	// run is over or the step failed, was aborted or skipped, and the step
-	// never completed. Nothing is waiting and nothing was completed.
+	// step was aborted, or never finished in a run that is over. Nothing is
+	// waiting and nothing was completed.
 	ClosureEnded ClosureOutcome = "run_ended"
-	// ClosureOver means the task's step completed and the service records
-	// nobody as having completed it. Nothing is waiting. Whether a person
+	// ClosureOver means the task's step finished in a state it can hold an
+	// answer in and the service records nobody as having completed it. Nothing is waiting. Whether a person
 	// answered is not known from the run, and is not claimed either way:
 	// the registry is told "closed" with a detail that says so.
 	ClosureOver ClosureOutcome = "over_unattributed"
