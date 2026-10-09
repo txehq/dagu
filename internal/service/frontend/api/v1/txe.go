@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
@@ -57,7 +58,7 @@ func txeError(err error) error {
 	case registry.CodeVersionConflict, registry.CodeDuplicate, registry.CodeNotReady, registry.CodeLifecycle,
 		registry.CodeTransition, registry.CodeClaimHeld, registry.CodeClaimStale, registry.CodeNotPermitted,
 		registry.CodeStaleBinding, registry.CodeProposalState, registry.CodeActionExists, registry.CodeActionState,
-		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved:
+		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved, registry.CodeReviewConflict:
 		// Refused against current state: 409 with the record to re-read.
 	}
 	if re.Current != nil {
@@ -622,6 +623,9 @@ func (a *API) ObserveTxeJob(ctx context.Context, req api.ObserveTxeJobRequestObj
 		return nil, err
 	}
 	o := registry.Observation{State: registry.AvailabilityState(body.State), Kind: valueOf(body.Kind), Detail: valueOf(body.Detail), Evidence: derefSlice(body.Evidence)}
+	if body.Scope != nil {
+		o.Scope = string(*body.Scope)
+	}
 	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Observe(o) })
 	return api.ObserveTxeJob200JSONResponse(job), err
 }
@@ -707,6 +711,22 @@ func (a *API) ListTxeReviews(ctx context.Context, req api.ListTxeReviewsRequestO
 	return api.ListTxeReviews200JSONResponse{Reviews: out}, err
 }
 
+func (a *API) GetTxeReview(ctx context.Context, req api.GetTxeReviewRequestObject) (api.GetTxeReviewResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var review *registry.Review
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		review, err = s.GetReview(ctx, req.JobId, req.ReviewId)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeReview](review)
+	return api.GetTxeReview200JSONResponse(out), err
+}
+
 func (a *API) RecordTxeReview(ctx context.Context, req api.RecordTxeReviewRequestObject) (api.RecordTxeReviewResponseObject, error) {
 	body, err := txeBody(req.Body)
 	if err != nil {
@@ -776,9 +796,16 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 	if err != nil {
 		return nil, err
 	}
+	asc := req.Params.Order != nil && *req.Params.Order == api.ListTxeJobDecisionsParamsOrderAsc
+	readLimit := txeLimit(req.Params.Limit)
+	if asc {
+		// Ascending pages start after the cursor, so the newest-first chain
+		// is read in full and the limit applied forward from it.
+		readLimit = 0
+	}
 	var decisions []*registry.Decision
 	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
-		decisions, err = s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		decisions, err = s.ListDecisions(ctx, req.JobId, readLimit)
 		return err
 	})
 	if err != nil {
@@ -797,6 +824,12 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 				decisions = decisions[:i]
 				break
 			}
+		}
+	}
+	if asc {
+		slices.Reverse(decisions)
+		if limit := txeLimit(req.Params.Limit); limit > 0 && len(decisions) > limit {
+			decisions = decisions[:limit]
 		}
 	}
 	out, err := txeConvert[[]api.TxeDecision](decisions)

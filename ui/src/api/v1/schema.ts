@@ -4211,6 +4211,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a recorded review */
+        get: operations["getTxeReview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/reviews": {
         parameters: {
             query?: never;
@@ -4324,7 +4344,7 @@ export interface paths {
         };
         /**
          * List job decisions
-         * @description Returns decisions for proposals in any state, newest first; since stops at that decision ID.
+         * @description Returns decisions for proposals in any state. order=desc (default) lists newest first and since stops before that decision; order=asc lists oldest first and since starts after that decision, with limit applied forward from it.
          */
         get: operations["listTxeJobDecisions"];
         put?: never;
@@ -8181,6 +8201,8 @@ export interface components {
         TxeException: {
             exception_id: string;
             kind: string;
+            /** @description reviewer for a problem with the job's reviewer; absent for the job */
+            scope?: string;
             state?: components["schemas"]["TxeAvailabilityState"];
             detail: string;
             evidence?: string[];
@@ -8219,6 +8241,7 @@ export interface components {
             lifecycle: components["schemas"]["TxeLifecycle"];
             lifecycle_reason?: string;
             availability: components["schemas"]["TxeAvailability"];
+            reviewer_availability?: components["schemas"]["TxeAvailability"];
             retirement?: components["schemas"]["TxeRetirement"];
             /** Format: date-time */
             expires_at?: string;
@@ -8284,6 +8307,11 @@ export interface components {
             state: components["schemas"]["TxeAvailabilityState"];
             /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
             kind?: string;
+            /**
+             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; default job
+             * @enum {string}
+             */
+            scope?: TxeObservationRequestScope;
             detail?: string;
             evidence?: string[];
             actor?: components["schemas"]["TxeActor"];
@@ -8330,6 +8358,12 @@ export interface components {
             packet_artifact?: string;
             decision_artifact?: string;
             agent_client_version?: string;
+            /** Format: int64 */
+            packet_bytes?: number;
+            /** Format: int64 */
+            agent_input_tokens?: number;
+            /** Format: int64 */
+            agent_output_tokens?: number;
             detail?: unknown;
             created?: components["schemas"]["TxeStamp"];
         };
@@ -22740,6 +22774,65 @@ export interface operations {
             };
         };
     };
+    getTxeReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Review */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeReview"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeReviews: {
         parameters: {
             query?: {
@@ -23259,6 +23352,7 @@ export interface operations {
                 since?: components["parameters"]["TxeSince"];
                 /** @description Maximum number of history records; 0 or absent returns all */
                 limit?: components["parameters"]["TxeLimit"];
+                order?: PathsTxeJobsJobIdDecisionsGetParametersQueryOrder;
             };
             header?: never;
             path: {
@@ -23552,6 +23646,10 @@ export enum PathsWikiGetParametersQuerySort {
     mtime = "mtime"
 }
 export enum PathsWikiGetParametersQueryOrder {
+    asc = "asc",
+    desc = "desc"
+}
+export enum PathsTxeJobsJobIdDecisionsGetParametersQueryOrder {
     asc = "asc",
     desc = "desc"
 }
@@ -24164,6 +24262,10 @@ export enum TxeLifecycleRequestReason {
 export enum TxeLifecycleRequestActive_run_policy {
     finish = "finish",
     cancel = "cancel"
+}
+export enum TxeObservationRequestScope {
+    job = "job",
+    reviewer = "reviewer"
 }
 export enum TxeReviewOutcome {
     continue = "continue",

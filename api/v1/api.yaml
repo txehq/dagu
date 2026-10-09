@@ -11465,6 +11465,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/reviews/{reviewId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - name: reviewId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: "Get a recorded review"
+      operationId: "getTxeReview"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Review"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeReview"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /txe/jobs/{jobId}/reviews:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -11828,13 +11872,19 @@ paths:
       - $ref: "#/components/parameters/TxeJobId"
     get:
       summary: "List job decisions"
-      description: "Returns decisions for proposals in any state, newest first; since stops at that decision ID."
+      description: "Returns decisions for proposals in any state. order=desc (default) lists newest first and since stops before that decision; order=asc lists oldest first and since starts after that decision, with limit applied forward from it."
       operationId: "listTxeJobDecisions"
       tags:
         - "txe"
       parameters:
         - $ref: "#/components/parameters/TxeSince"
         - $ref: "#/components/parameters/TxeLimit"
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
       responses:
         "200":
           description: "Decisions"
@@ -19945,6 +19995,9 @@ components:
           type: string
         kind:
           type: string
+        scope:
+          type: string
+          description: "reviewer for a problem with the job's reviewer; absent for the job"
         state:
           $ref: "#/components/schemas/TxeAvailabilityState"
         detail:
@@ -20022,6 +20075,8 @@ components:
         lifecycle_reason:
           type: string
         availability:
+          $ref: "#/components/schemas/TxeAvailability"
+        reviewer_availability:
           $ref: "#/components/schemas/TxeAvailability"
         retirement:
           $ref: "#/components/schemas/TxeRetirement"
@@ -20149,6 +20204,10 @@ components:
         kind:
           type: string
           description: "Exception kind, such as auth, worker_offline or reviewer_launch"
+        scope:
+          type: string
+          enum: [job, reviewer]
+          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; default job"
         detail:
           type: string
         evidence:
@@ -20247,6 +20306,15 @@ components:
           type: string
         agent_client_version:
           type: string
+        packet_bytes:
+          type: integer
+          format: int64
+        agent_input_tokens:
+          type: integer
+          format: int64
+        agent_output_tokens:
+          type: integer
+          format: int64
         detail: {}
         created:
           $ref: "#/components/schemas/TxeStamp"
