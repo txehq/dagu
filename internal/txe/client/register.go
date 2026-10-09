@@ -334,8 +334,10 @@ func (r *Registrar) checkMachine(ctx context.Context, spec *JobSpec) error {
 
 // HasTXECommands asks the dagu binary at the given path whether it has each
 // "dagu txe" command, by reading the command's own help. A dagu without the
-// command prints the help of the nearest command it does have, which does
-// not name the full command, so the exit status alone says nothing.
+// command prints the help of the nearest command it does have and exits
+// zero, so the exit status says nothing. What is read is the usage line: it
+// names the command that answered, word for word. A mention of the command
+// anywhere else in the text, or a longer command name, does not count.
 func HasTXECommands(ctx context.Context, dagu string, commands [][]string) error {
 	for _, words := range commands {
 		name := "txe " + strings.Join(words, " ")
@@ -348,11 +350,38 @@ func HasTXECommands(ctx context.Context, dagu string, commands [][]string) error
 		if err != nil {
 			return fmt.Errorf("asking it for %q failed: %w", "dagu "+name, err)
 		}
-		if !strings.Contains(string(out), " "+name) {
+		if !usageNames(string(out), append([]string{"txe"}, words...)) {
 			return fmt.Errorf("it has no %q command", "dagu "+name)
 		}
 	}
 	return nil
+}
+
+// usageNames reports whether a help text's usage block has a line for
+// exactly the command path given: the program's name, the path's words, and
+// then nothing or a bracketed placeholder such as "[flags]".
+func usageNames(help string, path []string) bool {
+	inUsage := false
+	for line := range strings.SplitSeq(help, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "Usage:":
+			inUsage = true
+			continue
+		case !inUsage:
+			continue
+		case trimmed == "":
+			return false // the usage block has ended
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 1+len(path) || !slices.Equal(fields[1:1+len(path)], path) {
+			continue
+		}
+		if rest := fields[1+len(path):]; len(rest) == 0 || strings.HasPrefix(rest[0], "[") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) (*txepkg.Staged, error) {
