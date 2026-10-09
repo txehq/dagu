@@ -120,7 +120,7 @@ export function toProposal(
 
 export function toDecision(
   d: ApiDecision,
-  job: Pick<ApiJob, 'job_id' | 'owner_id'>,
+  job: Pick<ApiJob, 'job_id' | 'owner_id' | 'native_resumes'>,
   jobVersion: number
 ): Decision {
   return {
@@ -138,7 +138,14 @@ export function toDecision(
     client: d.actor.client === 'cli' ? 'cli' : 'dashboard',
     idempotencyKey: d.idempotency_key ?? '',
     createdAt: d.decided_at,
-    nativeResume: d.native_resume ?? 'none',
+    // The stored decision keeps the state it was written with; the job's
+    // pending list says whether native completion is still outstanding.
+    nativeResume:
+      job.native_resumes?.[d.decision_id] !== undefined
+        ? 'pending'
+        : d.native_resume === 'pending'
+          ? 'completed'
+          : (d.native_resume ?? 'none'),
   };
 }
 
