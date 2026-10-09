@@ -124,3 +124,15 @@ func TestTxeArtifactDigest(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found, "a path outside the run's directory is never read")
 }
+
+// Run summaries and details carry Dagu's attempt identity, so a client can
+// see that a retry started a new attempt of the same run.
+func TestRunAttemptIDIsExposed(t *testing.T) {
+	s := ir.DAGRunStatus{Name: "job", DAGRunID: "run-1", AttemptID: "a2", Status: ir.Queued}
+	require.NotNil(t, toDAGRunSummary(s).AttemptId)
+	assert.Equal(t, "a2", *toDAGRunSummary(s).AttemptId)
+	require.NotNil(t, ToDAGRunDetails(s).AttemptId)
+	assert.Equal(t, "a2", *ToDAGRunDetails(s).AttemptId)
+	s.AttemptID = ""
+	assert.Nil(t, toDAGRunSummary(s).AttemptId)
+}

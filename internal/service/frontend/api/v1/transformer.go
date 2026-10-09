@@ -359,6 +359,7 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 	return api.DAGRunSummary{
 		Name:               s.Name,
 		DagRunId:           s.DAGRunID,
+		AttemptId:          optionalString(s.AttemptID),
 		Workspace:          workspaceResponseNameFromLabelStrings(s.Labels),
 		Params:             ptrOf(s.Params),
 		ProfileName:        toRuntimeProfileName(s.ProfileName),
@@ -443,6 +444,7 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		Log:                    s.Log,
 		Name:                   s.Name,
 		Params:                 ptrOf(s.Params),
+		AttemptId:              optionalString(s.AttemptID),
 		DagRunId:               s.DAGRunID,
 		Workspace:              workspaceResponseNameFromLabelStrings(s.Labels),
 		Error:                  runError,

@@ -5,7 +5,6 @@ package registry
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 	"time"
 
@@ -55,59 +54,6 @@ func TestRetryVerdictOnlyWhereItHasAMeaning(t *testing.T) {
 	p := propose(t, f, job, c)
 	_, err := decide(f, job.JobID, p, VerdictRetry, ProposalDecided, "k1")
 	assert.Equal(t, CodeNotPermitted, code(t, err))
-}
-
-// A person's retry of a run is a decided dagu.retry_run proposal, executed
-// once under an execution claim; a run of another version is refused.
-func TestProposeRetry(t *testing.T) {
-	f := newFixture(t)
-	rc := withRuns(f)
-	job := f.ready("k")
-	rc.specs = map[string]string{"run-1": job.DAGSpecSHA256}
-	propose := func(params RetryRunParams, key string) (*Proposal, *Decision, error) {
-		var p *Proposal
-		var d *Decision
-		_, err := f.tx(job.JobID, person, func(tx *JobTx) error {
-			var err error
-			p, d, err = tx.ProposeRetry(params, key)
-			return err
-		})
-		return p, d, err
-	}
-	_, _, err := propose(RetryRunParams{RunID: "run-1", RunSpecSHA256: "sha256:old", PackageDigest: job.PackageDigest}, "k1")
-	assert.Equal(t, CodeStaleBinding, code(t, err), "a run of another version is not retried")
-
-	params := RetryRunParams{RunID: "run-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}
-	p, d, err := propose(params, "k1")
-	require.NoError(t, err)
-	assert.Equal(t, ProposalDecided, p.State)
-	assert.Equal(t, VerdictRetry, d.Verdict)
-	_, _, err = propose(params, "k1")
-	assert.Equal(t, CodeDuplicate, code(t, err))
-
-	actionID, err := ApprovedActionID(p.ProposalID, d.DecisionID)
-	require.NoError(t, err)
-	ec := acquire(t, f, job.JobID, ClaimExecution, time.Minute)
-	authorize := func() (*Grant, error) {
-		var g *Grant
-		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
-			var err error
-			g, err = tx.Authorize(EffectRequest{ActionID: actionID, JobVersion: job.Version, PackageDigest: job.PackageDigest,
-				Approved: &ApprovedEffect{ProposalID: p.ProposalID, DecisionID: d.DecisionID, ClaimID: ec.ClaimID, Fence: ec.Fence}})
-			return err
-		})
-		return g, err
-	}
-	g, err := authorize()
-	require.NoError(t, err)
-	_, err = authorize()
-	assert.Equal(t, CodeActionExists, code(t, err), "one retry decision, one new attempt")
-	got, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
-		_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: ec.ClaimID, Fence: ec.Fence, State: ActionSucceeded, Receipt: "run-1/attempt-2"})
-		return err
-	})
-	require.NoError(t, err)
-	assert.Empty(t, got.Proposals)
 }
 
 // An action whose outcome is unresolved blocks its intent in later episodes
@@ -241,7 +187,7 @@ func TestDecisionsArePersonOnly(t *testing.T) {
 	assert.Equal(t, person, got.Proposals[p.ProposalID].Decision.Actor)
 
 	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
-		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}, "k1")
+		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", AttemptID: "a1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}, "k1")
 		return err
 	})
 	assert.Equal(t, CodeNotPermitted, code(t, err), "an agent cannot request a retry")
@@ -313,56 +259,6 @@ func TestProposalClosures(t *testing.T) {
 	assert.Len(t, closures, 2, "every attempt is kept")
 }
 
-// A retried run is bound to the job's immutable versions by its saved DAG
-// spec digest: a run of an older version, of no version, or of a spec that
-// versions with different packages share is refused.
-func TestRetryResolvesRunThroughVersions(t *testing.T) {
-	f := newFixture(t)
-	rc := withRuns(f)
-	rc.specs = map[string]string{}
-	retry := func(jobID string, params RetryRunParams) error {
-		_, err := f.tx(jobID, person, func(tx *JobTx) error {
-			_, _, err := tx.ProposeRetry(params, "key-"+params.RunID+params.RunSpecSHA256+params.PackageDigest)
-			return err
-		})
-		return err
-	}
-	update := func(jobID string, expected int, v JobVersion) *Job {
-		job, err := f.store.UpdateVersion(f.ctx, jobID, f.mint(PrefixEvent), expected, v, cli)
-		require.NoError(t, err)
-		return job
-	}
-
-	// A new version with another spec and package: the old run is refused.
-	job := f.ready("k1")
-	v1Spec, v1Pkg := job.DAGSpecSHA256, job.PackageDigest
-	rc.specs["old"] = v1Spec
-	v2 := f.version(2)
-	v2.DAG.Spec += "  - name: report\n    run: /pkg/report.sh\n"
-	job = update(job.JobID, 1, v2)
-	require.NotEqual(t, v1Spec, job.DAGSpecSHA256)
-	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: job.PackageDigest})))
-	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: v1Pkg})))
-	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "x", RunSpecSHA256: "sha256:" + strings.Repeat("0", 64), PackageDigest: job.PackageDigest})))
-	rc.specs["x"] = "sha256:" + strings.Repeat("0", 64)
-	rc.specs["new"] = job.DAGSpecSHA256
-	require.NoError(t, retry(job.JobID, RetryRunParams{RunID: "new", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}))
-
-	// The digest is the run's own: an old run named with the current digest,
-	// or a run the job does not have, is refused.
-	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest})),
-		"a forged digest for an old run")
-	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "ghost", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest})))
-
-	// A new version with the same spec and another package: the spec no
-	// longer tells which package a run executed.
-	shared := f.ready("k2")
-	shared = update(shared.JobID, 1, f.version(3))
-	require.Equal(t, v1Spec, shared.DAGSpecSHA256)
-	rc.specs["r"] = shared.DAGSpecSHA256
-	assert.Equal(t, CodeStaleBinding, code(t, retry(shared.JobID, RetryRunParams{RunID: "r", RunSpecSHA256: shared.DAGSpecSHA256, PackageDigest: shared.PackageDigest})))
-}
-
 // Repeated observations of one condition keep one unresolved exception, for
 // the job and for its reviewer; a ready observation resolves it and a later
 // failure opens a new one.
@@ -395,14 +291,158 @@ func TestObservationsCoalesce(t *testing.T) {
 	assert.Equal(t, 2, open(got))
 }
 
-// Without run history the registry cannot read a run's own digest, so it
-// refuses to bind the retry rather than trust the caller's.
-func TestRetryNeedsRunHistory(t *testing.T) {
+// retryFixture drives person retries of runs of one job.
+type retryFixture struct {
+	f   *fixture
+	rc  *fakeRuns
+	job *Job
+}
+
+func newRetryFixture(t *testing.T) *retryFixture {
 	f := newFixture(t)
-	job := f.ready("k")
-	_, err := f.tx(job.JobID, person, func(tx *JobTx) error {
-		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}, "k1")
+	rc := withRuns(f)
+	rc.attempts = map[string]RunAttempt{}
+	return &retryFixture{f: f, rc: rc, job: f.ready("k")}
+}
+
+func (r *retryFixture) params(run, attempt string) RetryRunParams {
+	return RetryRunParams{RunID: run, AttemptID: attempt, RunSpecSHA256: r.job.DAGSpecSHA256, PackageDigest: r.job.PackageDigest}
+}
+
+func (r *retryFixture) propose(params RetryRunParams, key string) (*Proposal, *Decision, error) {
+	var p *Proposal
+	var d *Decision
+	_, err := r.f.tx(r.job.JobID, person, func(tx *JobTx) error {
+		var err error
+		p, d, err = tx.ProposeRetry(params, key)
 		return err
 	})
-	assert.Equal(t, CodeNotReady, code(t, err))
+	return p, d, err
+}
+
+func (r *retryFixture) authorize(p *Proposal, d *Decision, ec *Claim) (string, *Grant, error) {
+	actionID, err := ApprovedActionID(p.ProposalID, d.DecisionID)
+	require.NoError(r.f.t, err)
+	var g *Grant
+	_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+		var err error
+		g, err = tx.Authorize(EffectRequest{ActionID: actionID, JobVersion: r.job.Version, PackageDigest: r.job.PackageDigest,
+			Approved: &ApprovedEffect{ProposalID: p.ProposalID, DecisionID: d.DecisionID, ClaimID: ec.ClaimID, Fence: ec.Fence}})
+		return err
+	})
+	return actionID, g, err
+}
+
+func (r *retryFixture) settle(actionID string, g *Grant, ec *Claim, state ActionState, receipt string) error {
+	_, err := r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+		_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: ec.ClaimID, Fence: ec.Fence, State: state, Receipt: receipt})
+		return err
+	})
+	return err
+}
+
+// A person retries a failed attempt once; when that retry's attempt fails
+// too, a fresh decision may retry it once more, while replaying the first
+// decision changes nothing. The receipt is the observed new attempt.
+func TestRetryIsBoundToTheFailedAttempt(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+
+	p1, d1, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	assert.Equal(t, ProposalDecided, p1.State)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	act1, g1, err := r.authorize(p1, d1, ec)
+	require.NoError(t, err)
+
+	// The native retry is accepted; until a new attempt is observed there is
+	// no receipt.
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a1")), "the retried attempt is no receipt")
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a9")), "an attempt not observed is no receipt")
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "queued"}
+	require.NoError(t, r.settle(act1, g1, ec, ActionSucceeded, "a2"))
+
+	// Replaying the first decision changes nothing.
+	_, _, err = r.propose(r.params("run-1", "a1"), "key-1")
+	assert.Equal(t, CodeDuplicate, code(t, err))
+	_, _, err = r.authorize(p1, d1, ec)
+	assert.Error(t, err, "the first decision authorizes nothing more")
+
+	// While the new attempt runs, or after it succeeds, it is not retried.
+	_, _, err = r.propose(r.params("run-1", "a2"), "key-2")
+	assert.Equal(t, CodeStaleBinding, code(t, err), "a queued attempt is not retried")
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "succeeded", Finished: true, Succeeded: true}
+	_, _, err = r.propose(r.params("run-1", "a2"), "key-2")
+	assert.Equal(t, CodeStaleBinding, code(t, err), "a succeeded attempt is not retried")
+
+	// It fails: a fresh decision on that attempt is a new proposal.
+	r.rc.attempts["run-1"] = failedAttempt("a2", r.job.DAGSpecSHA256)
+	_, _, err = r.propose(r.params("run-1", "a1"), "key-3")
+	assert.Equal(t, CodeStaleBinding, code(t, err), "the earlier attempt is no longer the run's")
+	p2, d2, err := r.propose(r.params("run-1", "a2"), "key-3")
+	require.NoError(t, err)
+	assert.NotEqual(t, p1.ProposalID, p2.ProposalID)
+	_, _, err = r.authorize(p2, d2, ec)
+	require.NoError(t, err, "one further retry within policy")
+}
+
+// The decision binds the attempt the person saw: if the run moved on before
+// the executor acts, the grant is refused.
+func TestRetryRefusedWhenTheRunMovedOn(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	_, _, err = r.authorize(p, d, ec)
+	assert.Equal(t, CodeStaleBinding, code(t, err))
+}
+
+// The attempt and its digest are the run's own: a forged digest or attempt,
+// a run the job does not have, or a run of an older version is refused, and
+// without run history nothing is bound.
+func TestRetryRejectsForgedOrStaleRuns(t *testing.T) {
+	r := newRetryFixture(t)
+	v1Spec, v1Pkg := r.job.DAGSpecSHA256, r.job.PackageDigest
+	r.rc.attempts["old"] = failedAttempt("o1", v1Spec)
+	v2 := r.f.version(2)
+	v2.DAG.Spec += "  - name: report\n    run: /pkg/report.sh\n"
+	job, err := r.f.store.UpdateVersion(r.f.ctx, r.job.JobID, r.f.mint(PrefixEvent), 1, v2, cli)
+	require.NoError(t, err)
+	r.job = job
+	r.rc.attempts["new"] = failedAttempt("n1", job.DAGSpecSHA256)
+
+	for name, params := range map[string]RetryRunParams{
+		"old run, current digest":  {RunID: "old", AttemptID: "o1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest},
+		"old run, its own digest":  {RunID: "old", AttemptID: "o1", RunSpecSHA256: v1Spec, PackageDigest: v1Pkg},
+		"forged attempt":           {RunID: "new", AttemptID: "n0", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest},
+		"unknown run":              {RunID: "ghost", AttemptID: "g1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest},
+		"current run, old package": {RunID: "new", AttemptID: "n1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: v1Pkg},
+	} {
+		_, _, err := r.propose(params, "key-"+name)
+		assert.Equal(t, CodeStaleBinding, code(t, err), name)
+	}
+	_, _, err = r.propose(r.params("new", "n1"), "key-ok")
+	require.NoError(t, err)
+
+	// A spec two versions share with different packages names no package.
+	shared := r.f.ready("k2")
+	shared, err = r.f.store.UpdateVersion(r.f.ctx, shared.JobID, r.f.mint(PrefixEvent), 1, r.f.version(3), cli)
+	require.NoError(t, err)
+	require.Equal(t, v1Spec, shared.DAGSpecSHA256)
+	r.rc.attempts["s"] = failedAttempt("s1", shared.DAGSpecSHA256)
+	_, err = r.f.tx(shared.JobID, person, func(tx *JobTx) error {
+		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "s", AttemptID: "s1", RunSpecSHA256: shared.DAGSpecSHA256, PackageDigest: shared.PackageDigest}, "k")
+		return err
+	})
+	assert.Equal(t, CodeStaleBinding, code(t, err))
+
+	bare := newFixture(t)
+	j := bare.ready("k")
+	_, err = bare.tx(j.JobID, person, func(tx *JobTx) error {
+		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", AttemptID: "a1", RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest}, "k1")
+		return err
+	})
+	assert.Equal(t, CodeNotReady, code(t, err), "without run history nothing is bound")
 }

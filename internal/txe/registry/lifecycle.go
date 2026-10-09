@@ -219,9 +219,21 @@ type RunControl interface {
 	// RunFinished reports whether a run reached a terminal status, or
 	// ErrRunNotFound when Dagu has no record of it.
 	RunFinished(ctx context.Context, dagName string, run RunRef) (bool, error)
-	// RunSpecSHA256 returns the digest of a root run's saved DAG, in the form
-	// recorded for a version's spec, or ErrRunNotFound.
-	RunSpecSHA256(ctx context.Context, dagName, runID string) (string, error)
+	// LatestAttempt returns a root run's latest attempt as Dagu stored it,
+	// or ErrRunNotFound.
+	LatestAttempt(ctx context.Context, dagName, runID string) (RunAttempt, error)
+}
+
+// RunAttempt is one attempt of a run as Dagu stored it. A native retry keeps
+// the run ID and starts a new attempt with a new AttemptID.
+type RunAttempt struct {
+	AttemptID string
+	// SpecSHA256 is the digest of the attempt's saved DAG, in the form
+	// recorded for a version's spec.
+	SpecSHA256 string
+	Status     string
+	Finished   bool
+	Succeeded  bool
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.
