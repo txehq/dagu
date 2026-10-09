@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -238,12 +239,16 @@ func jobEnv(env []string) []string {
 // cannot be resolved stops the command before it starts, as it stops a run:
 // the error names the reference and never a value. A reference cannot name
 // one of the variables that identify the action or mark the review.
+// credentialNamePattern is the rule a job's registration applies to the
+// name of a credential reference.
+var credentialNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 func credentialEnv(job Job) ([]string, error) {
 	env := make([]string, 0, len(job.CredentialRefs))
 	for _, ref := range job.CredentialRefs {
 		upper := strings.ToUpper(ref.Name)
 		switch {
-		case !envNamePattern.MatchString(ref.Name):
+		case !credentialNamePattern.MatchString(ref.Name):
 			return nil, fmt.Errorf("credential reference %q is not a variable name", ref.Name)
 		case upper == ReviewerEnv || reviewerEnvNames[upper] || strings.HasPrefix(upper, "TXE_PARAM_"):
 			return nil, fmt.Errorf("credential reference %s uses a name reserved for the action", ref.Name)

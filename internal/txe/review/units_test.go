@@ -6,6 +6,7 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -559,6 +560,49 @@ func TestCommandEffectorSuppliesTheJobsDeclaredCredentialsNotTheReviewers(t *tes
 			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
 		})
 	}
+	t.Run("names registration accepts: lower case and a leading underscore", func(t *testing.T) {
+		res, seen := run([]review.CredentialRef{
+			{Name: "api_token", Kind: review.CredentialFile, Locator: keyFile},
+			{Name: "_TOKEN", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"},
+		}, false)
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		assert.Equal(t, "the-jobs-own-key", seen["api_token"])
+		assert.Equal(t, "the-jobs-linear-token", seen["_TOKEN"])
+	})
+	t.Run("a job read back from a registry kept on disk still has its references", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "registry.json")
+		stored := fixtureJob()
+		stored.CredentialRefs = declared
+		require.NoError(t, reviewtest.Open(path).PutJob(stored))
+		reread, err := reviewtest.Open(path).Job(context.Background(), stored.ID)
+		require.NoError(t, err)
+		require.Equal(t, declared, reread.CredentialRefs)
+
+		dir := t.TempDir()
+		reread.WorkingDir = dir
+		res := (&review.CommandEffector{}).Run(context.Background(), reread, shellAction(`printf '%s' "$OPENAI_API_KEY" > key.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
+		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+		got, err := os.ReadFile(filepath.Join(dir, "key.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, "the-jobs-own-key", string(got))
+	})
+	t.Run("the review agent is not shown where the credentials are kept", func(t *testing.T) {
+		f := newFixture(t)
+		job := fixtureJob()
+		job.CredentialRefs = declared
+		require.NoError(t, f.registry.PutJob(job))
+		prepared := f.prepare("reviewer-a")
+		assert.Empty(t, prepared.Packet.Job.CredentialRefs)
+		raw, err := json.Marshal(prepared)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), keyFile)
+		assert.NotContains(t, string(raw), "JOB_LINEAR_TOKEN_SOURCE")
+		assert.NotContains(t, string(raw), "credential_refs")
+		// The registry still has them for the command that needs them.
+		kept, err := f.registry.Job(context.Background(), jobID)
+		require.NoError(t, err)
+		assert.Equal(t, declared, kept.CredentialRefs)
+	})
 	t.Run("without a declaration the reviewer's key is simply absent", func(t *testing.T) {
 		res, seen := run(nil, false)
 		require.Equal(t, review.EffectApplied, res.Status)

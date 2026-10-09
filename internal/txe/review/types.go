@@ -123,19 +123,20 @@ type Job struct {
 	// CredentialRefs are the credentials the job declares: where each is
 	// found on the job's machine and the variable its commands read it
 	// from. They are resolved on that machine when a command of the job is
-	// started, and are never part of what the review agent is shown.
-	CredentialRefs []CredentialRef `json:"-"`
+	// started. They are removed from the copy of the job that goes into the
+	// packet, so they are never part of what the review agent is shown.
+	CredentialRefs []CredentialRef `json:"credential_refs,omitempty"`
 }
 
 // CredentialRef names a credential a job declares. The locator is a path or
 // a variable name on the job's machine, never a value.
 type CredentialRef struct {
 	// Name is the variable the job's command reads the credential from.
-	Name string
+	Name string `json:"name"`
 	// Kind is CredentialFile or CredentialEnv.
-	Kind string
+	Kind string `json:"kind"`
 	// Locator is the file's path, or the name of the variable to copy.
-	Locator string
+	Locator string `json:"locator"`
 }
 
 // The kinds of credential reference.

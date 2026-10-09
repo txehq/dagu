@@ -81,7 +81,9 @@ reference is resolved on the job's machine when the command is started (a
 `file` is read as it is, an `env` variable is copied from the review step's
 environment) and set under the name the job gave it, replacing anything
 inherited under that name. A job that declares its own `OPENAI_API_KEY` gets
-the declared one, never the review agent's. A reference that cannot be
+the declared one, not the review agent's (unless its declaration names the
+agent's own key or file as the source, which is the owner's choice at
+registration). A reference that cannot be
 resolved stops the command before it starts, as it stops a run, and the
 record names the reference, not a value. A reference cannot use a name that
 identifies the action or marks the review. The references are not part of
