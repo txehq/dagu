@@ -130,7 +130,6 @@ func skipOnWindows(t *testing.T) {
 
 func newHubFixture(t *testing.T) hubFixture {
 	t.Helper()
-	skipOnWindows(t)
 	home := txepkg.Home{Root: "/Users/someone/.local/share/txe-dagu"}
 	machine := txepkg.Machine{MachineID: txeTestMachine, OwnerID: txeTestOwner}
 	hub := &fakeHub{specs: map[string]string{}, workers: []api.Worker{{
@@ -166,6 +165,7 @@ func TestTXEHubProbeConfig(t *testing.T) {
 // Absent, it is created; installed again, nothing is written; a stored copy
 // from an older render is updated.
 func TestTXEHubInstallCreatesThenLeavesUnchanged(t *testing.T) {
+	skipOnWindows(t)
 	f := newHubFixture(t)
 	hub, machines, machine, cfg := f.hub, f.machines, f.machine, f.cfg
 	name := probe.ReconcileDAGName(txeTestMachine)
@@ -194,6 +194,7 @@ func TestTXEHubInstallCreatesThenLeavesUnchanged(t *testing.T) {
 
 // A dry run reports the action and writes nothing.
 func TestTXEHubInstallDryRun(t *testing.T) {
+	skipOnWindows(t)
 	f := newHubFixture(t)
 	hub, machines, machine, cfg := f.hub, f.machines, f.machine, f.cfg
 	res, err := txeHubInstall(t.Context(), hub, machines, machine, cfg, txeHubInstallOptions{DryRun: true})
@@ -207,6 +208,7 @@ func TestTXEHubInstallDryRun(t *testing.T) {
 // A DAG of that name the renderer did not write, or one from a newer
 // renderer, is left alone.
 func TestTXEHubInstallLeavesForeignAndNewerDAGs(t *testing.T) {
+	skipOnWindows(t)
 	name := probe.ReconcileDAGName(txeTestMachine)
 	for label, stored := range map[string]string{
 		"not rendered": "steps:\n  - command: echo hand-written\n",
@@ -247,6 +249,7 @@ func TestTXEHubInstallVerifiesTheMachineWithTheRegistry(t *testing.T) {
 // No healthy worker for the machine warns and still installs: a sleeping
 // laptop's runs wait for it.
 func TestTXEHubInstallWarnsWithoutAHealthyWorker(t *testing.T) {
+	skipOnWindows(t)
 	for label, workers := range map[string][]api.Worker{
 		"none":        nil,
 		"other label": {{Id: "w", HealthStatus: api.WorkerHealthStatusHealthy, Labels: map[string]string{txeHubWorkerLabel: "mch_01JTXE0000000000000000OTHR"}}},
@@ -269,6 +272,7 @@ func TestTXEHubInstallWarnsWithoutAHealthyWorker(t *testing.T) {
 
 // A hub error, or a spec the hub could not load, fails the install.
 func TestTXEHubInstallReportsHubFailures(t *testing.T) {
+	skipOnWindows(t)
 	name := probe.ReconcileDAGName(txeTestMachine)
 	t.Run("read", func(t *testing.T) {
 		f := newHubFixture(t)
@@ -313,6 +317,7 @@ func TestTXEHubInstallCommandRefusesAnotherMachine(t *testing.T) {
 // the first's lock before it reaches the hub, so neither writes over the
 // other's render.
 func TestTXEHubInstallsAreSerialized(t *testing.T) {
+	skipOnWindows(t)
 	f := newHubFixture(t)
 	firstIn := make(chan struct{})
 	release := make(chan struct{})
@@ -352,6 +357,7 @@ func TestTXEHubInstallsAreSerialized(t *testing.T) {
 // A create that loses a race with another writer reads the DAG again: the
 // same render is unchanged, and a foreign DAG is refused.
 func TestTXEHubInstallRereadsAfterACreateConflict(t *testing.T) {
+	skipOnWindows(t)
 	name := probe.ReconcileDAGName(txeTestMachine)
 	t.Run("same render", func(t *testing.T) {
 		f := newHubFixture(t)
@@ -382,6 +388,7 @@ func TestTXEHubInstallRereadsAfterACreateConflict(t *testing.T) {
 
 // A write that another writer replaced at once is reported, not claimed.
 func TestTXEHubInstallReadsItsWriteBack(t *testing.T) {
+	skipOnWindows(t)
 	f := newHubFixture(t)
 	f.hub.afterWrite = func(h *fakeHub, n string) { h.specs[n] = "# txe-probe-dag-version: 1\nedited\n" }
 	_, err := txeHubInstall(t.Context(), f.hub, f.machines, f.machine, f.cfg, f.opts)
@@ -391,6 +398,7 @@ func TestTXEHubInstallReadsItsWriteBack(t *testing.T) {
 // Worker health is advisory: a coordinator the hub cannot reach, or a
 // partial list, warns and installs. A hub that refuses the request fails.
 func TestTXEHubInstallWorkerHealthIsAdvisory(t *testing.T) {
+	skipOnWindows(t)
 	t.Run("coordinator unavailable", func(t *testing.T) {
 		f := newHubFixture(t)
 		f.hub.workersErr = &remoteError{StatusCode: http.StatusServiceUnavailable, Message: "coordinator unavailable"}
