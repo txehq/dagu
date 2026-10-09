@@ -155,6 +155,21 @@ type DAGRunAttemptAbandoner interface {
 	// another attempt, is an error, so a caller deciding whether to authorize
 	// an execution fails closed.
 	ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*AttemptAbandonment, error)
+	// ListAttemptAbandonmentsStrict reads every record of a run as
+	// ReadAttemptAbandonment reads one: one result per attempt that has a
+	// record, newest attempt first. A record that cannot be trusted is a
+	// result with Err, never dropped and never hiding the others. The call
+	// fails only when the run cannot be found, listed or locked.
+	ListAttemptAbandonmentsStrict(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonmentResult, error)
+}
+
+// AttemptAbandonmentResult is one attempt's record from a strict listing:
+// Record when it is trusted, otherwise Err, which wraps
+// ErrAttemptAbandonmentConflict.
+type AttemptAbandonmentResult struct {
+	AttemptID string
+	Record    *AttemptAbandonment
+	Err       error
 }
 
 // AbandonAttempt records and hides a never-dispatched attempt.
@@ -179,6 +194,19 @@ func (r *DAGRunRepository) ReadAttemptAbandonment(ctx context.Context, dagRun, r
 		rootDAGRun = dagRun
 	}
 	return abandoner.ReadAttemptAbandonment(ctx, dagRun, rootDAGRun, attemptID)
+}
+
+// ListAttemptAbandonmentsStrict lists a run's abandonment records, reporting
+// each one that cannot be trusted instead of skipping it.
+func (r *DAGRunRepository) ListAttemptAbandonmentsStrict(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonmentResult, error) {
+	abandoner, ok := r.store.(DAGRunAttemptAbandoner)
+	if !ok {
+		return nil, ErrAttemptAbandonmentUnsupported
+	}
+	if rootDAGRun.Zero() {
+		rootDAGRun = dagRun
+	}
+	return abandoner.ListAttemptAbandonmentsStrict(ctx, dagRun, rootDAGRun)
 }
 
 // ListAttemptAbandonments lists a run's abandonment records.
