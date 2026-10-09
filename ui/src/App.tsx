@@ -60,6 +60,8 @@ const AuditLogsPage = React.lazy(() => import('./pages/audit-logs'));
 const BaseConfigPage = React.lazy(() => import('./pages/base-config'));
 const DAGRuns = React.lazy(() => import('./pages/dag-runs'));
 const DAGRunDetails = React.lazy(() => import('./pages/dag-runs/dag-run'));
+const TxeInboxPage = React.lazy(() => import('./pages/txe'));
+const TxeJobPage = React.lazy(() => import('./pages/txe/job'));
 const DAGs = React.lazy(() => import('./pages/dags'));
 const DAGDetails = React.lazy(() => import('./pages/dags/dag'));
 const WikiPage = React.lazy(() => import('./pages/wiki'));
@@ -759,6 +761,14 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                       <Route
                                         path="/dag-runs/:name/:dagRunId"
                                         element={<DAGRunDetails />}
+                                      />
+                                      <Route
+                                        path="/txe"
+                                        element={<TxeInboxPage />}
+                                      />
+                                      <Route
+                                        path="/txe/jobs/:jobId"
+                                        element={<TxeJobPage />}
                                       />
                                       <Route
                                         path="/system-status"
