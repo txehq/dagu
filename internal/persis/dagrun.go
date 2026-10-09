@@ -223,6 +223,10 @@ type RetainedFile struct {
 	Name   string `json:"name"`
 	Bytes  int64  `json:"bytes"`
 	SHA256 string `json:"sha256"`
+	// Final is true for a log whose stream was proven finished for this
+	// execution: the coordinator's <log>.final record names the execution's
+	// queue marker and attempt and the copied size.
+	Final bool `json:"final,omitempty"`
 }
 
 // DAGRunRetentionOptions configures retention cleanup.

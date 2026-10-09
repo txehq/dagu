@@ -6,6 +6,7 @@ package dagrun_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -161,4 +162,30 @@ func TestRetainedExecutionCopiesOnlyHubLogs(t *testing.T) {
 		_, err := f.repo.ReadRetainedExecutionFile(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID), all[0].Execution, name)
 		assert.ErrorIs(t, err, persis.ErrNotFound, name)
 	}
+}
+
+// A log is final only when the coordinator's .final record names this
+// execution and the copied size; the record itself is not copied as a log.
+func TestRetainedLogsAreFinalOnlyWhenRecorded(t *testing.T) {
+	f := newRetentionFixture(t)
+	status := f.execution("q1", ir.Failed, "execution 1")
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	write := func(name, marker string, size int) {
+		rec := fmt.Sprintf(`{"executionMarker":%q,"attemptId":%q,"size":%d}`, marker, status.AttemptID, size)
+		require.NoError(t, os.WriteFile(filepath.Join(logs, name+".final"), []byte(rec), 0o600))
+	}
+	write("scheduler.log", "q1", len("scheduler execution 1\n"))
+	write("run.stdout.log", "q0", len("stdout execution 1\n"))
+	require.NoError(t, f.requeue(ir.Failed, nil))
+
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	final := map[string]bool{}
+	for _, file := range all[0].Files {
+		final[file.Name] = file.Final
+	}
+	assert.Equal(t, map[string]bool{"scheduler.log": true, "run.stdout.log": false}, final, "a record of another execution proves nothing")
+	assert.False(t, all[0].LogsFinal)
+	assert.NotEmpty(t, all[0].LogsNote)
 }
