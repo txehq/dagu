@@ -108,7 +108,8 @@ export function retryLabel(state: RetryState): string {
 
 // canRequestRetry reports whether the dashboard offers a retry of a run: it
 // must have finished without success (the server counts a partial success
-// as success), and no retry of it may be pending or running.
+// as success) and have no retry yet. A run gets one retry request per job
+// version: the registry refuses a second one, whatever became of the first.
 export function canRequestRetry(
   runStatus: string,
   state: RetryState | undefined
@@ -117,11 +118,5 @@ export function canRequestRetry(
     runStatus === 'failed' ||
     runStatus === 'aborted' ||
     runStatus === 'rejected';
-  if (!finishedUnsuccessfully) return false;
-  if (!state) return true;
-  return (
-    state.status === 'failed' ||
-    state.status === 'not-applied' ||
-    state.status === 'rejected'
-  );
+  return finishedUnsuccessfully && !state;
 }

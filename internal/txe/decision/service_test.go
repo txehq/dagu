@@ -663,6 +663,14 @@ func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	if _, _, err := grant(); registry.ErrorCode(err) == "" {
 		t.Fatalf("second grant err = %v, want a refusal", err)
 	}
+	// After the retry ran, an identical request still returns its decision.
+	again, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0042", "key-retry-run-1"), f.human)
+	if err != nil {
+		t.Fatalf("replay after settlement: %v", err)
+	}
+	if !again.AlreadyRecorded || again.Decision.DecisionID != res.Decision.DecisionID {
+		t.Fatalf("replay after settlement = %+v", again.Decision)
+	}
 }
 
 func TestRequestRetryRefusesStaleRuns(t *testing.T) {
@@ -679,20 +687,20 @@ func TestRequestRetryRefusesStaleRuns(t *testing.T) {
 	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, early, f.human); registry.ErrorCode(err) != CodeRunStale {
 		t.Fatalf("earlier run err = %v, want run_stale", err)
 	}
-	// A run recorded in the version's creation second, at whole-second
-	// precision, is of this version.
+	// A run recorded in the version's creation second may be of the
+	// previous version, so it is refused rather than guessed.
 	sameSecond := f.retryRequest("run-0040", "key-same-second")
 	sameSecond.RunStartedAt = f.now.Truncate(time.Second)
-	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, sameSecond, f.human); err != nil {
-		t.Fatalf("run in the version's second: %v", err)
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, sameSecond, f.human); registry.ErrorCode(err) != CodeRunStale {
+		t.Fatalf("run in the version's second: err = %v, want run_stale", err)
 	}
 	moved := f.retryRequest("run-0042", "key-stale-version")
 	moved.ExpectedJobVersion++
 	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, moved, f.human); registry.ErrorCode(err) != registry.CodeVersionConflict {
 		t.Fatalf("version err = %v, want version_conflict", err)
 	}
-	if n := len(f.decisions()); n != 1 {
-		t.Fatalf("decisions = %d, want only the same-second retry", n)
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
 	}
 }
 
