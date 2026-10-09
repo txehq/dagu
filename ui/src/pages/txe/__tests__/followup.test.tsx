@@ -50,6 +50,8 @@ function baseApi(overrides: Partial<TxeApi> = {}): TxeApi {
     listDecisions: async () => [],
     decide: vi.fn(),
     replayDecision: vi.fn(),
+    requestRetry: vi.fn(),
+    listRetryStates: async () => new Map(),
     ...overrides,
   };
 }
@@ -156,5 +158,60 @@ describe('snooze expiry', () => {
     expect(
       await screen.findByText('Usage is at 92%. Resize the volume to 20Gi?')
     ).toBeInTheDocument();
+  });
+});
+
+describe('run retry', () => {
+  const failedJob = fixtureJob({
+    latestRuns: [
+      { dagName: 'job_volume_monitor', dagRunId: 'run-0003', status: 'failed' },
+    ],
+  });
+
+  it('asks for a retry of the exact failed run at the job version', async () => {
+    const requestRetry = vi.fn().mockResolvedValue({ ok: true });
+    renderAt(
+      baseApi({ getJob: async () => failedJob, requestRetry }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Retry this run' })
+    );
+    await waitFor(() => expect(requestRetry).toHaveBeenCalledTimes(1));
+    expect(requestRetry.mock.calls[0]?.slice(0, 3)).toEqual([
+      'job_volume_monitor',
+      'run-0003',
+      failedJob.version,
+    ]);
+  });
+
+  // A recorded request is not a retry: it waits for the reviewer, and the
+  // run is not offered again meanwhile.
+  it('shows a requested retry as waiting, not done', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () => failedJob,
+        listRetryStates: async () =>
+          new Map([
+            [
+              'run-0003',
+              {
+                runId: 'run-0003',
+                proposalId: 'prp_r',
+                status: 'requested' as const,
+              },
+            ],
+          ]),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    expect(
+      await screen.findByText(
+        'Retry requested; waiting for the reviewer to run it'
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Retry this run' })
+    ).not.toBeInTheDocument();
   });
 });

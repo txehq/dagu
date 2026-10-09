@@ -26,7 +26,10 @@ export type ProposalState =
   | 'decided'
   | 'superseded'
   | 'executed'
-  | 'rejected';
+  | 'rejected'
+  // Closed by the system, for example when a superseded proposal's decide
+  // task is released; never a person's decision.
+  | 'closed';
 
 export type Verdict =
   | 'approve'

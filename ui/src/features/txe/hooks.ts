@@ -41,6 +41,15 @@ export function useInboxData() {
   );
 }
 
+export function useRetryStates(jobId: string | undefined) {
+  const api = useTxeApi();
+  return useSWR(
+    jobId ? ['txe', 'retries', jobId] : null,
+    () => api.listRetryStates(jobId as string),
+    { refreshInterval: REFRESH_MS }
+  );
+}
+
 export type JobDetailData = {
   job: TxeJob;
   proposals: Proposal[];
