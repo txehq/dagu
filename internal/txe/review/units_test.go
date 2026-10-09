@@ -455,7 +455,10 @@ func TestHelperRunAction(t *testing.T) {
 	action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
 	declared := review.DeclaredAction{
 		Name: "a", Idempotency: review.IdempotencyNone, TimeoutSec: 60,
-		Command: []string{"/bin/sh", "-c", `echo started > started.txt; (sleep 3; echo late > effect.txt) & wait`},
+		// The short pause lets the launcher finish installing its parent-exit
+		// watcher, which happens just after the process starts. A reviewer
+		// killed inside that instant is the residual the README names.
+		Command: []string{"/bin/sh", "-c", `sleep 1; echo started > started.txt; (sleep 3; echo late > effect.txt) & wait`},
 	}
 	(&review.CommandEffector{}).Run(context.Background(), job, declared, action)
 }

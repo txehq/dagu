@@ -387,7 +387,12 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 		"/dag-runs/" + job + "?cursor=p2&limit=100": `{"dagRuns":[` +
 			run("r2", "succeeded", "2026-10-09T10:02:00Z") + "," +
 			run("r-queued", "queued", "") + `]}`,
-		"/dag-runs/" + job + "/r2/outputs": `{"metadata":{},"outputs":{"free_pct":"31"}}`,
+		"/dag-runs/" + job + "/r2/outputs":                                 `{"metadata":{},"outputs":{"free_pct":"31"}}`,
+		"/dag-runs/" + job + "/r1":                                         `{"dagRunDetails":{"nodes":[]}}`,
+		"/dag-runs/" + job + "/r2":                                         `{"dagRunDetails":{"nodes":[{"step":{"name":"measure"},"statusLabel":"succeeded"}]}}`,
+		"/dag-runs/" + job + "/r3":                                         `{"dagRunDetails":{"nodes":[{"step":{"name":"measure"},"statusLabel":"failed"}]}}`,
+		"/dag-runs/" + job + "/r2/steps/measure/log?stream=stdout&tail=40": `{"content":"31"}`,
+		"/dag-runs/" + job + "/r3/steps/measure/log?stream=stderr&tail=40": `{"content":"df: permission denied"}`,
 	}}
 	remote := &review.Remote{Transport: stub}
 
@@ -399,6 +404,9 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	assert.Equal(t, "r3", runs[1].RunID)
 	assert.Equal(t, "failed", runs[1].Status)
 	assert.Empty(t, runs[1].Outputs, "a run with no outputs is still evidence")
+	// Each step's own output is part of the evidence.
+	assert.Equal(t, []review.StepEvidence{{Name: "measure", Status: "succeeded", Stdout: "31"}}, runs[0].Steps)
+	assert.Equal(t, []review.StepEvidence{{Name: "measure", Status: "failed", Stderr: "df: permission denied"}}, runs[1].Steps)
 	assert.False(t, runs[0].FinishedAt.IsZero())
 
 	all, err := remote.RunsAfter(context.Background(), job, "")

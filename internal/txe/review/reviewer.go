@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 )
@@ -759,6 +760,25 @@ func retryDecided(decisions []Decision, proposalID string) bool {
 	return verdict == VerdictRetry
 }
 
+// verifyGranted compares the action the registry journaled for an approval
+// with the proposal the reviewer is about to act on.
+func (r *Reviewer) verifyGranted(ctx context.Context, jobID string, action Action, proposal Proposal) error {
+	stored, err := r.Registry.Actions(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("read granted action: %w", err)
+	}
+	for _, a := range slices.Backward(stored) {
+		if a.ID != action.ID {
+			continue
+		}
+		if a.Name != proposal.ActionName || a.TargetID != proposal.TargetID || !maps.Equal(normalizeParams(a.Params), normalizeParams(proposal.Params)) {
+			return errors.New("the granted action is not the action of the approved proposal")
+		}
+		return nil
+	}
+	return errors.New("the granted action is not in the journal")
+}
+
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
 	for name := range params {
 		found := slices.Contains(declared.Params, name)
@@ -910,6 +930,19 @@ func (r *Reviewer) executeClaimed(ctx context.Context, claim Claim, job Job, dec
 		return Executed{Skipped: "denied by the guard: " + string(denied.Reason)}, nil
 	case err != nil:
 		return Executed{}, fmt.Errorf("begin action: %w", err)
+	}
+	// What runs is what the registry granted, not what this process read
+	// earlier. If the journaled action differs from the proposal as read,
+	// nothing runs and the attempt is closed as not applied.
+	if err := r.verifyGranted(ctx, job.ID, action, proposal); err != nil {
+		finishErr := r.Registry.FinishAction(ctx, FinishRequest{
+			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
+			State: ActionFailed, Detail: err.Error(),
+		})
+		if finishErr != nil {
+			return Executed{}, fmt.Errorf("record refused action %s: %w", action.ID, finishErr)
+		}
+		return Executed{Skipped: err.Error()}, nil
 	}
 	finished, err := r.runJournaled(ctx, claim, job, declared, action)
 	if err != nil {

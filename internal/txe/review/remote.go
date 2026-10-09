@@ -401,9 +401,66 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 		default:
 			return nil, fmt.Errorf("outputs of run %s: %w", run.DagRunId, err)
 		}
+		if ev.Steps, err = r.stepEvidence(ctx, jobID, run.DagRunId); err != nil {
+			return nil, fmt.Errorf("steps of run %s: %w", run.DagRunId, err)
+		}
 		out = append(out, ev)
 	}
 	return out, nil
+}
+
+const (
+	stepLogTailLines = 40
+	stepLogTailBytes = 2048
+)
+
+// stepEvidence reads the end of each step's output from the service. A
+// script's result is in its output whichever way it also publishes values.
+func (r *Remote) stepEvidence(ctx context.Context, jobID, runID string) ([]StepEvidence, error) {
+	var detail struct {
+		DagRunDetails struct {
+			Nodes []struct {
+				Step struct {
+					Name string `json:"name"`
+				} `json:"step"`
+				StatusLabel string `json:"statusLabel"`
+			} `json:"nodes"`
+		} `json:"dagRunDetails"`
+	}
+	base := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID)
+	if err := r.do(ctx, http.MethodGet, base, nil, &detail); err != nil {
+		return nil, err
+	}
+	steps := make([]StepEvidence, 0, len(detail.DagRunDetails.Nodes))
+	for _, node := range detail.DagRunDetails.Nodes {
+		step := StepEvidence{Name: node.Step.Name, Status: node.StatusLabel}
+		for stream, into := range map[string]*string{"stdout": &step.Stdout, "stderr": &step.Stderr} {
+			// The stream parameter is always sent: the service fails a
+			// step-log request that omits it.
+			q := url.Values{"stream": {stream}, "tail": {strconv.Itoa(stepLogTailLines)}}
+			var log struct {
+				Content string `json:"content"`
+			}
+			err := r.do(ctx, http.MethodGet, base+"/steps/"+url.PathEscape(step.Name)+"/log?"+q.Encode(), nil, &log)
+			switch {
+			case err == nil:
+				*into = tailBytes(log.Content, stepLogTailBytes)
+			case errors.Is(err, ErrNotFound):
+				// The step wrote nothing to this stream.
+			default:
+				return nil, fmt.Errorf("%s of step %s: %w", stream, step.Name, err)
+			}
+		}
+		steps = append(steps, step)
+	}
+	return steps, nil
+}
+
+func tailBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 func decisionOf(jobID string, d api.TxeDecision) Decision {
@@ -555,8 +612,13 @@ func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit in
 }
 
 // RecordClosure implements Registry. Without a registry record for closures
-// the result is kept only in the run's log; no failure count is available.
-func (r *Remote) RecordClosure(context.Context, Closure) (int, error) {
+// the result is kept only in the run's log and failures cannot be counted.
+// A failure is therefore reported as already past the limit, so it surfaces
+// as an exception at once instead of never.
+func (r *Remote) RecordClosure(_ context.Context, closure Closure) (int, error) {
+	if closure.Outcome == ClosureFailed {
+		return closureAttemptsBeforeException, nil
+	}
 	return 0, nil
 }
 

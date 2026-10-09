@@ -178,7 +178,17 @@ type RunEvidence struct {
 	FinishedAt time.Time         `json:"finished_at,omitzero"`
 	Outputs    map[string]string `json:"outputs,omitempty"`
 	Artifacts  []string          `json:"artifacts,omitempty"`
-	Error      string            `json:"error,omitempty"`
+	Error      string            `json:"error,omitempty"` // Steps carry the end of each step's own output, which is where a
+	// script's result usually is.
+	Steps []StepEvidence `json:"steps,omitempty"`
+}
+
+// StepEvidence is one step of a finished run.
+type StepEvidence struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Stdout string `json:"stdout_tail,omitempty"`
+	Stderr string `json:"stderr_tail,omitempty"`
 }
 
 // ActionState is the journal state of one follow-up action.
