@@ -1,0 +1,59 @@
+# Periodic reviewer for TXE jobs on machine {{.MachineID}}.
+# Rendered by `dagu txe review render`; do not edit the installed copy.
+#
+# Each tick reviews at most one due job. The schedule is only a tick: how
+# often a job is reviewed is its own review_policy.cadence, so a tick with
+# nothing due starts no agent.
+description: Fresh periodic review of registered TXE jobs on {{.MachineID}}
+schedule: {{yaml .Schedule}}
+overlap_policy: skip
+max_active_runs: 1
+timeout_sec: {{.TimeoutSec}}
+working_dir: {{yaml .StateDir}}
+worker_selector:
+  txe.machine: {{yaml .MachineID}}
+env:
+{{- range .Vars}}
+  - {{.Name}}: {{yaml .Value}}
+{{- end}}
+steps:
+  - id: prepare
+    run: {{.ReviewCommand}} prepare --machine {{.MachineID}} --run-id ${DAG_RUN_ID}
+    output: TXE_PACKET
+
+  - id: agent
+    depends: prepare
+    preconditions:
+      - condition: "${TXE_PACKET}"
+        expected: "re:^\\{"
+    action: harness.run
+    timeout_sec: {{.AgentTimeoutSec}}
+    continue_on:
+      failure: true
+    with:
+      provider: {{yaml .Provider}}
+      prompt: {{yaml .Prompt}}
+      stdin: ${TXE_PACKET}
+      output-format: json
+      json-schema: {{yaml .Schema}}
+      # The agent only reads the packet and answers. It gets no tools, no MCP
+      # servers, no user settings or hooks, and leaves no resumable session.
+      # These two are one-element lists on purpose: harness.run drops an
+      # option whose value is an empty string, which would leave the agent
+      # with its default tools and the profile's settings and hooks.
+      tools: [""]
+      strict-mcp-config: true
+      setting-sources: [""]
+      no-session-persistence: true
+{{- if .AgentModel}}
+      model: {{yaml .AgentModel}}
+{{- end}}
+    output: TXE_DECISION
+
+  - id: apply
+    depends: agent
+    preconditions:
+      - condition: "${TXE_PACKET}"
+        expected: "re:^\\{"
+    # A failed agent leaves no stdout; the harness logs why on its stderr.
+    run: printf '%s' "$TXE_DECISION" | {{.ReviewCommand}} apply --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}"{{if .AuthCheck}} --auth-check "{{.AuthCheck}}"{{end}}
