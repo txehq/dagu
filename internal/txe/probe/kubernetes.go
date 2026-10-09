@@ -14,16 +14,14 @@ import (
 	"io"
 	"maps"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -230,26 +228,11 @@ func applyExecCredential(ctx context.Context, cfg *rest.Config) error {
 	ec := cfg.ExecProvider
 	spec := map[string]any{"interactive": false}
 	if ec.ProvideClusterInfo {
-		// The plugin asked for the cluster it authenticates to, as client-go
-		// would pass it.
-		caData := cfg.CAData
-		if len(caData) == 0 && cfg.CAFile != "" {
-			caData, _ = os.ReadFile(filepath.Clean(cfg.CAFile))
-		}
-		cluster := map[string]any{"server": cfg.Host}
-		if cfg.ServerName != "" {
-			cluster["tls-server-name"] = cfg.ServerName
-		}
-		if cfg.Insecure {
-			cluster["insecure-skip-tls-verify"] = true
-		}
-		if len(caData) > 0 {
-			cluster["certificate-authority-data"] = caData
-		}
-		if cfg.Proxy != nil {
-			if u, err := cfg.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "kubernetes"}}); err == nil && u != nil {
-				cluster["proxy-url"] = u.String()
-			}
+		// The plugin asked for the cluster it authenticates to: send it as
+		// client-go would, including the cluster's exec extension.
+		cluster, err := execCluster(cfg)
+		if err != nil {
+			return fmt.Errorf("%w: the cluster information for the credential plugin could not be read", errNoCredential)
 		}
 		spec["cluster"] = cluster
 	}
@@ -291,6 +274,48 @@ func applyExecCredential(ctx context.Context, cfg *rest.Config) error {
 	}
 	cfg.ExecProvider = nil
 	return nil
+}
+
+// execCluster is the spec.cluster client-go sends an exec plugin that asks
+// for cluster information, in the plugin API's JSON field names.
+func execCluster(cfg *rest.Config) (map[string]any, error) {
+	c, err := rest.ConfigToExecCluster(cfg)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{"server": c.Server}
+	if c.TLSServerName != "" {
+		out["tls-server-name"] = c.TLSServerName
+	}
+	if c.InsecureSkipTLSVerify {
+		out["insecure-skip-tls-verify"] = true
+	}
+	if len(c.CertificateAuthorityData) > 0 {
+		out["certificate-authority-data"] = c.CertificateAuthorityData
+	}
+	if c.ProxyURL != "" {
+		out["proxy-url"] = c.ProxyURL
+	}
+	if c.DisableCompression {
+		out["disable-compression"] = true
+	}
+	if c.Config != nil {
+		raw, err := extensionJSON(c.Config)
+		if err != nil {
+			return nil, err
+		}
+		out["config"] = raw
+	}
+	return out, nil
+}
+
+// extensionJSON is a kubeconfig extension object as raw JSON.
+func extensionJSON(obj runtime.Object) (json.RawMessage, error) {
+	if u, ok := obj.(*runtime.Unknown); ok {
+		return json.RawMessage(u.Raw), nil
+	}
+	b, err := json.Marshal(obj)
+	return json.RawMessage(b), err
 }
 
 // limitedWriter keeps at most n bytes and drops the rest.
