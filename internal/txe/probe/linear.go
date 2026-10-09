@@ -12,15 +12,15 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
-// KindLinearIssue is a Linear issue target; KeyLinearIssueID its stable id.
+// Linear target constants, as package target defines them.
 const (
-	KindLinearIssue  = "linear.issue"
-	KeyLinearIssueID = "id"
-	// LinearCredential names the credential reference holding the API key,
-	// the name job authors already declare for their own scripts.
-	LinearCredential = "LINEAR_API_KEY" //nolint:gosec // A credential reference name, not a credential.
+	KindLinearIssue  = target.KindLinearIssue
+	KeyLinearIssueID = target.KeyLinearIssueID
+	LinearCredential = target.LinearCredential
 	// LinearEndpoint is Linear's GraphQL API.
 	LinearEndpoint = "https://api.linear.app/graphql"
 )
@@ -57,7 +57,7 @@ type linearResponse struct {
 }
 
 func (l Linear) Probe(ctx context.Context, t Target, creds Credentials) Result {
-	id := trimmed(t.StableID[KeyLinearIssueID])
+	id := t.StableID[KeyLinearIssueID]
 	if id == "" {
 		return Result{Outcome: Unknown, Detail: "target has no Linear issue id"}
 	}
@@ -86,12 +86,14 @@ func (l Linear) Probe(ctx context.Context, t Target, creds Credentials) Result {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return Result{Outcome: classify(ctx, err), Detail: "Linear request: " + redact(err.Error(), key)}
+		outcome := classify(ctx, err)
+		return Result{Outcome: outcome, Detail: "Linear request: " + transportCategory(outcome, err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return Result{Outcome: classify(ctx, err), Detail: "read Linear response: " + err.Error()}
+		outcome := classify(ctx, err)
+		return Result{Outcome: outcome, Detail: "read Linear response: " + transportCategory(outcome, err)}
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -139,12 +141,4 @@ func credentialValue(c Credential) (string, error) {
 	}
 	line, _, _ := strings.Cut(string(b), "\n")
 	return trimmed(line), nil
-}
-
-// redact removes the secret from a message that might echo it.
-func redact(msg, secret string) string {
-	if secret == "" {
-		return msg
-	}
-	return strings.ReplaceAll(msg, secret, "[redacted]")
 }

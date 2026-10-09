@@ -4,6 +4,7 @@
 package probe
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,56 +15,86 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
-// Journal is a check's local memory between runs: the reports it could not
-// deliver, resent unchanged under their event id, and when each target was
-// last observed, so a periodic check starts with the targets it has waited
-// longest to see and a slow target cannot starve the rest.
+// Journal is the machine's local memory between checks: the reports the
+// registry has not acknowledged, resent unchanged under their event id, and
+// when each target was last observed, so a periodic check starts with the
+// targets it has waited longest to see. One journal serves every check on
+// the machine, pre-run and periodic, and every change is a locked
+// read-modify-write, so concurrent checks never lose each other's reports.
 type Journal struct {
-	path  string
-	state journalState
+	path string
+	lock *flock.Flock
+}
+
+// pendingReport is a report the registry has not acknowledged.
+type pendingReport struct {
+	// JobID is the job a pre-run report was made for; empty for periodic.
+	JobID string `json:"job_id,omitempty"`
+	// Key is the requested target's key, for scheduling.
+	Key   string `json:"key"`
+	Event Event  `json:"event"`
 }
 
 type journalState struct {
-	// Undelivered holds reports the registry has not acknowledged, by
-	// target key. Resending one keeps its event id, which the registry
-	// treats as the same report.
-	Undelivered map[string]Event `json:"undelivered,omitempty"`
-	// Checked is when each target was last observed and reported.
+	// Undelivered holds unacknowledged reports by event id.
+	Undelivered map[string]pendingReport `json:"undelivered,omitempty"`
+	// Checked is when each requested target was last observed and reported.
 	Checked map[string]time.Time `json:"checked,omitempty"`
 }
 
-// OpenJournal reads the journal at path; a missing file is an empty one.
+// lockWait bounds how long a check waits for another to finish a journal
+// change; changes are small, so a longer wait means something is stuck.
+const lockWait = 10 * time.Second
+
+// OpenJournal returns the journal at path; the file is created on first
+// change.
 func OpenJournal(path string) (*Journal, error) {
-	j := &Journal{path: path}
-	b, err := os.ReadFile(filepath.Clean(path))
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return nil, fmt.Errorf("probe: read journal: %w", err)
-	default:
-		if err := json.Unmarshal(b, &j.state); err != nil {
-			return nil, fmt.Errorf("probe: journal %s is unreadable: %w", path, err)
-		}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("probe: journal directory: %w", err)
 	}
-	if j.state.Undelivered == nil {
-		j.state.Undelivered = map[string]Event{}
-	}
-	if j.state.Checked == nil {
-		j.state.Checked = map[string]time.Time{}
-	}
-	return j, nil
+	return &Journal{path: path, lock: flock.New(path + ".lock")}, nil
 }
 
-// Save writes the journal atomically.
-func (j *Journal) Save() error {
-	b, err := json.MarshalIndent(j.state, "", "  ")
+func (j *Journal) locked(ctx context.Context, fn func() error) error {
+	lctx, cancel := context.WithTimeout(ctx, lockWait)
+	defer cancel()
+	ok, err := j.lock.TryLockContext(lctx, 20*time.Millisecond)
+	if err != nil || !ok {
+		return fmt.Errorf("probe: journal is locked by another check: %w", errors.Join(err, lctx.Err()))
+	}
+	defer func() { _ = j.lock.Unlock() }()
+	return fn()
+}
+
+func (j *Journal) load() (journalState, error) {
+	st := journalState{Undelivered: map[string]pendingReport{}, Checked: map[string]time.Time{}}
+	b, err := os.ReadFile(filepath.Clean(j.path))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return st, nil
+	case err != nil:
+		return st, fmt.Errorf("probe: read journal: %w", err)
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return st, fmt.Errorf("probe: journal %s is unreadable: %w", j.path, err)
+	}
+	if st.Undelivered == nil {
+		st.Undelivered = map[string]pendingReport{}
+	}
+	if st.Checked == nil {
+		st.Checked = map[string]time.Time{}
+	}
+	return st, nil
+}
+
+func (j *Journal) save(st journalState) error {
+	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(j.path), 0o700); err != nil {
-		return fmt.Errorf("probe: journal directory: %w", err)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(j.path), ".journal-*")
 	if err != nil {
@@ -74,39 +105,71 @@ func (j *Journal) Save() error {
 		_ = tmp.Close()
 		return fmt.Errorf("probe: write journal: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("probe: write journal: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("probe: write journal: %w", err)
 	}
 	return os.Rename(tmp.Name(), j.path)
 }
 
-// Undelivered returns the reports still to deliver, in a stable order.
-func (j *Journal) Undelivered() []Event {
-	keys := make([]string, 0, len(j.state.Undelivered))
-	for k := range j.state.Undelivered {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]Event, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, j.state.Undelivered[k])
-	}
-	return out
+func (j *Journal) update(ctx context.Context, fn func(*journalState)) error {
+	return j.locked(ctx, func() error {
+		st, err := j.load()
+		if err != nil {
+			return err
+		}
+		fn(&st)
+		return j.save(st)
+	})
 }
 
-func (j *Journal) hold(ev Event)      { j.state.Undelivered[TargetKey(ev.Target)] = ev }
-func (j *Journal) delivered(ev Event) { delete(j.state.Undelivered, TargetKey(ev.Target)) }
-
-// pending reports whether a report about t is still undelivered.
-func (j *Journal) pending(t Target) (Event, bool) {
-	ev, ok := j.state.Undelivered[TargetKey(t)]
-	return ev, ok
+// hold records a report before it is sent.
+func (j *Journal) hold(ctx context.Context, r pendingReport) error {
+	return j.update(ctx, func(st *journalState) { st.Undelivered[r.Event.EventID] = r })
 }
 
-func (j *Journal) checked(t Target, at time.Time) { j.state.Checked[TargetKey(t)] = at }
+// delivered drops an acknowledged report and records when its requested
+// target was observed.
+func (j *Journal) delivered(ctx context.Context, r pendingReport, at time.Time) error {
+	return j.update(ctx, func(st *journalState) {
+		delete(st.Undelivered, r.Event.EventID)
+		st.Checked[r.Key] = at
+	})
+}
 
-// LastChecked is when t was last observed and reported; zero if never.
-func (j *Journal) LastChecked(t Target) time.Time { return j.state.Checked[TargetKey(t)] }
+// pending returns the unacknowledged reports, oldest event first; with a
+// job id, only that job's pre-run reports.
+func (j *Journal) pending(ctx context.Context, jobID string) ([]pendingReport, error) {
+	var out []pendingReport
+	err := j.locked(ctx, func() error {
+		st, err := j.load()
+		if err != nil {
+			return err
+		}
+		for _, r := range st.Undelivered {
+			if jobID == "" || r.JobID == jobID {
+				out = append(out, r)
+			}
+		}
+		return nil
+	})
+	sort.Slice(out, func(a, b int) bool { return out[a].Event.EventID < out[b].Event.EventID })
+	return out, err
+}
+
+// lastChecked returns when each requested target was last observed.
+func (j *Journal) lastChecked(ctx context.Context) (map[string]time.Time, error) {
+	var out map[string]time.Time
+	err := j.locked(ctx, func() error {
+		st, err := j.load()
+		out = st.Checked
+		return err
+	})
+	return out, err
+}
 
 // TargetKey identifies a target by kind and stable identity, the way the
 // registry does; the display name is not part of it.
@@ -121,6 +184,14 @@ func TargetKey(t Target) string {
 		pairs = append(pairs, [2]string{k, t.StableID[k]})
 	}
 	b, _ := json.Marshal([]any{t.Kind, pairs})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// nameKey identifies the place a target lives, the way the registry matches
+// replacements: kind, environment and display name.
+func nameKey(t Target) string {
+	b, _ := json.Marshal([]string{t.Kind, t.Environment, t.DisplayName})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

@@ -15,6 +15,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
 // Outcome is what a probe observed of one target. The values match the
@@ -41,14 +43,12 @@ const (
 	Timeout Outcome = "timeout"
 )
 
-// Target is an external resource as a job version declares it: a kind and a
-// stable identity. The display name never identifies it.
-type Target struct {
-	Kind        string            `json:"kind"`
-	Environment string            `json:"environment,omitempty"`
-	StableID    map[string]string `json:"stable_id"`
-	DisplayName string            `json:"display_name,omitempty"`
-}
+// Target is an external resource as a job version declares it; the rules
+// for its shape are in package target, shared with registration.
+type Target = target.Target
+
+// CredentialRef is a credential reference a job version declares.
+type CredentialRef = target.CredentialRef
 
 // Result is one observation of one target.
 type Result struct {
@@ -92,10 +92,17 @@ const (
 	requestTimeout = 15 * time.Second
 )
 
-// Probe observes t within TargetTimeout. A kind no prober supports is
-// reported unreachable: nothing could look, which says nothing about the
-// target.
+// Probe observes t within TargetTimeout. A target whose identity or locator
+// does not meet the contract is not looked up and is reported unknown, so a
+// padded or extra identity field never reaches an authoritative report. A
+// kind no prober supports is reported unreachable: nothing could look,
+// which says nothing about the target.
 func (ps Probes) Probe(ctx context.Context, t Target, creds Credentials) Result {
+	if err := target.ValidateShape(t); err != nil {
+		if _, ok := target.LookupKube(t.Kind); ok || t.Kind == target.KindLinearIssue {
+			return Result{Outcome: Unknown, Detail: "target does not meet the target contract: " + err.Error()}
+		}
+	}
 	for _, p := range ps {
 		if p.Supports(t.Kind) {
 			ctx, cancel := context.WithTimeout(ctx, TargetTimeout)

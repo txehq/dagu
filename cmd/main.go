@@ -30,11 +30,8 @@ func main() {
 	if err := rootCmd.Execute(); err != nil {
 		// A command may choose its exit code, as `dagu txe resource check`
 		// does so a DAG step can tell "do not run" from "could not check".
-		if coded, ok := errors.AsType[interface {
-			error
-			ExitCode() int
-		}](err); ok {
-			os.Exit(coded.ExitCode())
+		if coded, ok := errors.AsType[*cmd.ExitCodeError](err); ok {
+			os.Exit(coded.Code)
 		}
 		os.Exit(1)
 	}
