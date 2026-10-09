@@ -398,8 +398,9 @@ func TestAbandonAttemptRecordsAbandonedExecution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, persis.ExecutionIdentity{AttemptID: only.ID(), QueuedAt: "2026-10-10T02:00:00Z"}, got.AbandonedExecution)
 	assert.True(t, got.Covers(only.ID(), "2026-10-10T02:00:00Z"))
+	assert.True(t, got.Covers(only.ID(), ""), "a new attempt's task carries no marker")
 	assert.False(t, got.Covers(only.ID(), "2026-10-10T03:00:00Z"), "a re-queued execution is another one")
-	assert.False(t, got.Covers(only.ID(), ""))
+	assert.False(t, got.Covers("other", ""))
 }
 
 // The strict read returns the attempt's record, nothing for an attempt

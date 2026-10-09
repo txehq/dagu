@@ -114,10 +114,15 @@ func (a AttemptAbandonment) Attributable() bool {
 	return c != nil && c.ID != "" && c.ActionID != "" && c.ActionAttempt != "" && c.BindingDigest != ""
 }
 
-// Covers reports whether the record abandons the execution of its attempt
-// that carries executionMarker, the queued-at marker a dispatched task names.
+// Covers reports whether a claim of attemptID whose task carries
+// executionMarker claims the abandoned execution. Only a newly created
+// attempt is ever abandoned, and its task's marker is empty, even when its
+// status inherits the queued-at of the execution it retries; the recorded
+// queued-at names it too. A retry that re-queues the attempt afterwards has a
+// marker strictly later than any before it, so it is another execution.
 func (a AttemptAbandonment) Covers(attemptID, executionMarker string) bool {
-	return a.AbandonedAttemptID == attemptID && a.AbandonedExecution.QueuedAt == executionMarker
+	return a.AbandonedAttemptID == attemptID &&
+		(executionMarker == "" || executionMarker == a.AbandonedExecution.QueuedAt)
 }
 
 // AbandonAttemptRequest asks the store to record and hide the run's latest
