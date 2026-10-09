@@ -1666,19 +1666,26 @@ func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 // The marker comes from a stored status, and on a worker that status arrives
 // from the coordinator, which stores what workers report. A step may put the
 // value into a shell command, so only a marker that is an RFC3339 timestamp
-// is handed to steps; such a string holds digits, "T", "Z", and ".", ":", "+"
-// and "-" and nothing a shell acts on. Any other marker is withheld, and a
-// reference to it is left as written.
+// written with digits, "T", "Z", ".", ":", "+" and "-" is handed to steps:
+// nothing a shell acts on. Parsing alone does not ensure that, because the
+// parser also takes a comma before the fraction. Any other marker is
+// withheld, and a reference to it is left as written.
 func (a *Agent) contextQueuedAt() (string, bool) {
 	source := a.statusSourceTarget()
 	if source == nil || source.QueuedAt == "" {
 		return "", true
+	}
+	if !queueMarkerPattern.MatchString(source.QueuedAt) {
+		return "", false
 	}
 	if _, err := time.Parse(time.RFC3339Nano, source.QueuedAt); err != nil {
 		return "", false
 	}
 	return source.QueuedAt, true
 }
+
+// queueMarkerPattern holds the characters of an RFC3339 timestamp.
+var queueMarkerPattern = regexp.MustCompile(`^[0-9TZ.:+-]+$`)
 
 func (a *Agent) contextScheduleTime() string {
 	var raw string

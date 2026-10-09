@@ -2639,11 +2639,15 @@ steps:
 	// would reach a shell. The command here runs only because the reference
 	// stays inside single quotes, where it is text.
 	t.Run("NotATimestamp", func(t *testing.T) {
+		injected := filepath.Join(t.TempDir(), "injected")
 		for _, marker := range []string{
-			"$(touch " + filepath.Join(os.TempDir(), "txe-marker-injected") + ")",
+			"$(touch '" + injected + "')",
 			"2026-10-09T15:48:58Z; echo injected",
 			"`id`",
 			"2026-10-09 15:48:58",
+			// The parser takes a comma before the fraction; a shell that
+			// splits arguments on commas must never see one.
+			"2026-10-09T15:48:58,5Z",
 			"not-a-time",
 		} {
 			th := test.Setup(t)
@@ -2673,6 +2677,6 @@ steps:
 			require.NoError(t, err)
 			require.Equal(t, reference, string(seen), "marker %q reached the step", marker)
 		}
-		require.NoFileExists(t, filepath.Join(os.TempDir(), "txe-marker-injected"))
+		require.NoFileExists(t, injected)
 	})
 }
