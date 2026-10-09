@@ -81,7 +81,9 @@ func (s *Stream) decide(final bool) []byte {
 			out = append(out, s.buf[i])
 		}
 	}
-	s.buf = append(s.buf[:0], s.buf[i:]...)
+	// Re-slicing keeps a write from copying the held text; the copy happens
+	// only when the slice next has to grow.
+	s.buf = s.buf[i:]
 	s.covered = max(s.covered-i, 0)
 	return out
 }

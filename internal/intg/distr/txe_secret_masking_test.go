@@ -6,6 +6,7 @@ package distr_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -22,25 +23,57 @@ import (
 
 // hubFilesContaining returns every file in the coordinator's own storage that
 // contains needle. The worker in these tests is isolated, so its directories
-// are not searched: only what reached the hub is.
+// are not searched: only what reached the hub is. A file that cannot be read
+// fails the test, because an unread file proves nothing about its content.
 func hubFilesContaining(t *testing.T, f *testFixture, needle string) []string {
 	t.Helper()
 	paths := f.coord.Config.Paths
 	var found []string
 	for _, root := range []string{paths.DataDir, paths.LogDir, paths.ArtifactDir, paths.DAGsDir} {
 		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil //nolint:nilerr // an unreadable entry cannot hold the value
+			// A storage directory the run never created holds nothing.
+			if p == root && errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !d.Type().IsRegular() {
+				return nil
 			}
 			data, err := os.ReadFile(p) //nolint:gosec // test directory
-			if err == nil && bytes.Contains(data, []byte(needle)) {
+			if err != nil {
+				return err
+			}
+			if bytes.Contains(data, []byte(needle)) {
 				found = append(found, p)
 			}
 			return nil
 		})
-		require.NoError(t, err)
+		require.NoError(t, err, "scan hub storage under %s", root)
 	}
 	return found
+}
+
+// hubLog returns the hub's copy of one log of the run: a step's "stdout" or
+// "stderr" log, or the run's scheduler log when step is empty.
+func hubLog(t *testing.T, f *testFixture, status ir.DAGRunStatus, step, stream string) string {
+	t.Helper()
+	name := "scheduler.log"
+	if step != "" {
+		name = fmt.Sprintf("%s.%s.log", step, stream)
+	}
+	var content string
+	found := false
+	err := filepath.WalkDir(filepath.Join(f.logDir(), status.Name, status.DAGRunID), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Name() == name {
+			content, found = getLogContent(t, p), true
+		}
+		return err
+	})
+	require.NoError(t, err)
+	require.True(t, found, "the hub has no %s for the run", name)
+	return content
 }
 
 // A secret the worker resolves from its own disk is masked in everything it
@@ -92,7 +125,9 @@ steps:
       token="$(printf '%%s' "$FIXTURE_TOKEN")"
       test "$token" = "$(cat "$TOKEN_FILE")" && echo match > "$PROOF_FILE"
       echo "line=$token end"
+      echo "multi-begin"
       printf '%%s\n' "$FIXTURE_MULTILINE"
+      echo "multi-end"
       printf 'stderr=%%s' "$token" >&2
       printf 'unterminated=%%s' "$token"
   - name: fail
@@ -116,10 +151,22 @@ steps:
 	require.NoError(t, err)
 	assert.Equal(t, "match\n", string(got))
 
-	// The output arrived, masked, including the line with no newline.
-	stdout := getLogContent(t, assertLogExists(t, f.logDir(), status.Name, status.DAGRunID, "print"))
+	// Every stream arrived on the hub, masked: stdout with its unterminated
+	// last line and the multi-line value, stderr, the failing step's stderr,
+	// and the copy of the step output in the scheduler log. Without these, a
+	// run that lost its output would pass the search below.
+	stdout := hubLog(t, f, status, "print", "stdout")
 	assert.Contains(t, stdout, "line=******* end\n")
+	assert.Contains(t, stdout, "multi-begin\n*******\nmulti-end\n")
 	assert.True(t, strings.HasSuffix(stdout, "unterminated=*******"), "stdout ends %q", stdout)
+	assert.Equal(t, "stderr=*******", hubLog(t, f, status, "print", "stderr"))
+	assert.Contains(t, hubLog(t, f, status, "fail", "stderr"), "about to fail with *******")
+	schedulerLog := hubLog(t, f, status, "", "")
+	assert.Contains(t, schedulerLog, "line=******* end")
+	assert.Contains(t, schedulerLog, "about to fail with *******")
+
+	// The search reads the hub's files: it finds the masked text it should.
+	assert.NotEmpty(t, hubFilesContaining(t, f, "line=******* end"))
 
 	// Nothing the hub stores holds any of the values.
 	statusJSON, err := json.Marshal(status)
