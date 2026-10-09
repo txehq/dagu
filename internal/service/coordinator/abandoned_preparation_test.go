@@ -64,6 +64,9 @@ func newStrandedFixture(t *testing.T, dispatches dispatch.DispatchTaskStore) *st
 		ref:        ir.NewDAGRunRef(strandedDAG, strandedRun),
 		runsDir:    filepath.Join(dir, "dag-runs"),
 	}
+	// A successful dispatch keeps its attempt open; close it before the
+	// temporary directory is removed, which Windows refuses while it is open.
+	t.Cleanup(func() { f.h.Close(context.Background()) })
 	f.previous = f.writeAttempt(t, false, ir.Failed, "worker-1")
 	return f
 }
