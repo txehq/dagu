@@ -1228,25 +1228,24 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	}
 
 	storeCtx := context.WithoutCancel(ctx)
-	// Nothing was handed to a worker. With a dispatch store the attempt can
-	// be proven never dispatched and abandoned: recorded and hidden, so the
-	// previous execution is the latest again. Marking it Failed would make
-	// it look like an execution that ran. A run's first attempt has no
-	// execution to restore and keeps the Failed mark below.
+	// Nothing was handed to a worker. With dispatch and lease stores the
+	// attempt is proven never dispatched and abandoned with a record: hidden
+	// when the run has an earlier execution, otherwise marked Failed with a
+	// not-dispatched reason the record explains. Without them it keeps the
+	// plain Failed mark below.
 	isRootRun := task.GetParentDagRunId() == "" &&
 		(task.GetRootDagRunId() == "" || task.GetRootDagRunId() == task.GetDagRunId())
 	if h.dispatchTaskStore != nil && isRootRun {
 		h.releasePreparedDispatchAttempt(storeCtx, dagRunID, prepared.attempt)
 		_, abandonErr := h.abandonNeverDispatchedLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId),
-			prepared.attempt.ID(), "not dispatched: handing the task to a worker failed: "+dispatchErr.Error(), false)
+			prepared.attempt.ID(), "not dispatched: handing the task to a worker failed: "+dispatchErr.Error())
 		switch {
 		case abandonErr == nil:
 			return
-		case errors.Is(abandonErr, persis.ErrAttemptHasNoPredecessor),
-			errors.Is(abandonErr, errAbandonmentUnavailable),
+		case errors.Is(abandonErr, errAbandonmentUnavailable),
 			errors.Is(abandonErr, persis.ErrAttemptAbandonmentUnsupported):
 			// Mark it Failed below, as before. The attempt was closed for
-			// the hide, so reopen it for that write.
+			// the abandonment, so reopen it for that write.
 			if err := prepared.attempt.Open(storeCtx); err != nil {
 				logger.Warn(ctx, "Failed to reopen prepared attempt after dispatch handoff failure",
 					tag.RunID(task.DagRunId), tag.Error(err))

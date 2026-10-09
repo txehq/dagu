@@ -87,16 +87,17 @@ func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey string
 // of any dispatch is proven. It holds the run's write lock, which Dispatch
 // holds from preparing an attempt to publishing its task and AckTaskClaim
 // holds while recording a claim, so neither can interleave. detail says why,
-// for the record. allowFirst permits abandoning a run's only execution.
-func (h *Handler) abandonNeverDispatched(ctx context.Context, run ir.DAGRunRef, attemptID, detail string, allowFirst bool) (*persis.AttemptAbandonment, error) {
+// for the record. The store hides the attempt when the run has an earlier
+// execution, and otherwise keeps it visible, marked Failed with detail.
+func (h *Handler) abandonNeverDispatched(ctx context.Context, run ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
 	if h.dagRunRepository == nil {
 		return nil, persis.ErrAttemptAbandonmentUnsupported
 	}
 	defer h.attemptWriteLocks.lock(run)()
-	return h.abandonNeverDispatchedLocked(ctx, run, attemptID, detail, allowFirst)
+	return h.abandonNeverDispatchedLocked(ctx, run, attemptID, detail)
 }
 
-func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRunRef, attemptID, detail string, allowFirst bool) (*persis.AttemptAbandonment, error) {
+func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
 	ctx = context.WithoutCancel(ctx)
 	h.closeCachedAttemptForRun(ctx, ctx, run.ID, attemptID)
 
@@ -122,11 +123,7 @@ func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRu
 		CoordinatorID:      h.owner.ID,
 		Evidence:           evidence,
 	}
-	return h.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{
-		DAGRun:                  run,
-		Record:                  record,
-		AllowWithoutPredecessor: allowFirst,
-	})
+	return h.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: record})
 }
 
 // reconcileAbandonedPreparations finds root runs whose latest attempt is
@@ -157,7 +154,7 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 			continue
 		}
 		record, err := h.abandonNeverDispatched(ctx, status.DAGRun(), status.AttemptID,
-			"not dispatched: no dispatch task, claim, lease or worker after the coordinator stopped", false)
+			"not dispatched: no dispatch task, claim, lease or worker after the coordinator stopped")
 		if err != nil {
 			logger.Warn(ctx, "Left a not-started attempt for review",
 				tag.RunID(status.DAGRunID), tag.AttemptID(status.AttemptID), tag.Error(err))
@@ -209,7 +206,7 @@ func (h *Handler) abandonFailedPreparation(ctx context.Context, prepErr error) {
 		return
 	}
 	if _, err := h.abandonNeverDispatchedLocked(ctx, failed.run, failed.attemptID,
-		"not dispatched: preparing the attempt failed: "+failed.err.Error(), false); err != nil {
+		"not dispatched: preparing the attempt failed: "+failed.err.Error()); err != nil {
 		logger.Warn(ctx, "Left an attempt whose preparation failed for review",
 			tag.RunID(failed.run.ID), tag.AttemptID(failed.attemptID), tag.Error(err))
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -100,8 +101,8 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 	existing, err := readAbandonmentRecord(latest.file)
 	switch {
 	case err == nil:
-		// A crash after the record and before the hide: the record must be
-		// this abandonment's, intact, to complete it.
+		// A crash after the record and before its outcome was applied: the
+		// record must be this abandonment's, intact, to complete it.
 		if err := sameAbandonment(*existing, record); err != nil {
 			return nil, err
 		}
@@ -124,10 +125,15 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 		if err != nil {
 			return nil, err
 		}
-		if predecessor == nil && !req.AllowWithoutPredecessor {
-			return nil, fmt.Errorf("%w: attempt %s", persis.ErrAttemptHasNoPredecessor, latest.ID())
+		if predecessor != nil {
+			record.Outcome = persis.AbandonmentHidden
+			record.ExpectedExecution = predecessor
+			record.PredecessorAbsent = false
+		} else {
+			record.Outcome = persis.AbandonmentMarkedFailed
+			record.ExpectedExecution = nil
+			record.PredecessorAbsent = true
 		}
-		record.ExpectedExecution = predecessor
 		if err := writeRecordExclusive(recordPath, record); err != nil {
 			return nil, err
 		}
@@ -135,10 +141,61 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 		return nil, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, latest.ID(), err)
 	}
 
-	if err := latest.Hide(ctx); err != nil {
-		return nil, fmt.Errorf("failed to hide abandoned attempt %s: %w", latest.ID(), err)
+	switch record.Outcome {
+	case persis.AbandonmentHidden:
+		if err := latest.Hide(ctx); err != nil {
+			return nil, fmt.Errorf("failed to hide abandoned attempt %s: %w", latest.ID(), err)
+		}
+	case persis.AbandonmentMarkedFailed:
+		if err := markNotDispatched(ctx, latest, record); err != nil {
+			return nil, err
+		}
 	}
 	return &record, nil
+}
+
+// markNotDispatched marks a run's only, never-dispatched attempt Failed with
+// the record's reason, so the run stays visible. A status already Failed was
+// marked by an earlier, interrupted call.
+func markNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptAbandonment) error {
+	next := ir.DAGRunStatus{
+		Name:      record.Run.Name,
+		DAGRunID:  record.Run.ID,
+		AttemptID: record.AbandonedAttemptID,
+		CreatedAt: time.Now().UnixMilli(),
+	}
+	if record.RootRun != record.Run {
+		next.Root = record.RootRun
+	}
+	if att.Exists() {
+		status, err := att.ReadStatus(ctx)
+		switch {
+		case errors.Is(err, dagrun.ErrNoStatusData) || errors.Is(err, io.EOF):
+		case err != nil:
+			return fmt.Errorf("read abandoned attempt status: %w", err)
+		case status.Status == ir.Failed:
+			return nil
+		case status.Status != ir.NotStarted:
+			return fmt.Errorf("%w: attempt %s became %s", persis.ErrAttemptAbandonmentConflict, att.ID(), status.Status)
+		default:
+			next = *status
+		}
+	}
+	next.Status = ir.Failed
+	next.FinishedAt = stringutil.FormatTime(time.Now())
+	next.Error = record.Detail
+	if next.Error == "" {
+		next.Error = "not dispatched"
+	}
+	if err := att.Open(ctx); err != nil {
+		return fmt.Errorf("open abandoned attempt: %w", err)
+	}
+	writeErr := att.Write(ctx, next)
+	closeErr := att.Close(ctx)
+	if writeErr != nil {
+		return fmt.Errorf("mark abandoned attempt failed: %w", writeErr)
+	}
+	return closeErr
 }
 
 // ListAttemptAbandonments implements persis.DAGRunAttemptAbandoner.
@@ -294,6 +351,12 @@ func sameAbandonment(existing, want persis.AttemptAbandonment) error {
 	}
 	if existing.RootRun != want.RootRun || existing.Reason != want.Reason {
 		return fmt.Errorf("%w: existing record describes another abandonment", persis.ErrAttemptAbandonmentConflict)
+	}
+	switch {
+	case existing.Outcome == persis.AbandonmentHidden && existing.ExpectedExecution != nil && !existing.PredecessorAbsent:
+	case existing.Outcome == persis.AbandonmentMarkedFailed && existing.ExpectedExecution == nil && existing.PredecessorAbsent:
+	default:
+		return fmt.Errorf("%w: existing record has an inconsistent outcome %q", persis.ErrAttemptAbandonmentConflict, existing.Outcome)
 	}
 	return nil
 }

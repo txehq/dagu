@@ -83,6 +83,8 @@ func TestAbandonAttemptRecordsThenHides(t *testing.T) {
 	got, err := abandon(th, abandonRecord(dag, placeholder.ID(), expected))
 	require.NoError(t, err)
 	assert.Equal(t, placeholder.ID(), got.AbandonedAttemptID)
+	assert.Equal(t, persis.AbandonmentHidden, got.Outcome)
+	assert.False(t, got.PredecessorAbsent)
 	assert.Equal(t, previous.ID(), latestAttemptID(t, th, dag), "the previous execution is the latest again")
 
 	records, err := th.Repository.ListAttemptAbandonments(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID), ir.DAGRunRef{})
@@ -177,7 +179,8 @@ func TestAbandonAttemptCompletesOnlyMatchingRecord(t *testing.T) {
 		dag := th.DAG("abandon_dag").DAG
 		previous := createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
 		placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
-		record := abandonRecord(dag, placeholder.ID(), nil)
+		record := abandonRecord(dag, placeholder.ID(), &persis.ExecutionIdentity{AttemptID: previous.ID()})
+		record.Outcome = persis.AbandonmentHidden
 		require.NoError(t, writeRecordExclusive(filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile), record))
 
 		got, err := abandon(th, abandonRecord(dag, placeholder.ID(), nil))
@@ -199,7 +202,8 @@ func TestAbandonAttemptCompletesOnlyMatchingRecord(t *testing.T) {
 			placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
 			path := filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile)
 			if content == "" {
-				bad := abandonRecord(dag, placeholder.ID(), nil)
+				bad := abandonRecord(dag, placeholder.ID(), &persis.ExecutionIdentity{AttemptID: "x"})
+				bad.Outcome = persis.AbandonmentHidden
 				bad.Evidence.DispatchTask = "unknown"
 				require.NoError(t, writeRecordExclusive(path, bad))
 			} else {
@@ -221,24 +225,62 @@ func TestAbandonAttemptUnsupportedStore(t *testing.T) {
 	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentUnsupported)
 }
 
-// A run's only execution has nothing to fall back to: it is refused unless the
-// caller explicitly allows leaving the run with no visible attempt.
-func TestAbandonAttemptWithoutPredecessor(t *testing.T) {
+// A run's only execution has nothing to fall back to: it stays visible,
+// marked Failed with the not-dispatched reason, and the record says so with
+// the predecessor explicitly absent. A later successful retry keeps the
+// record discoverable.
+func TestAbandonAttemptFirstAttemptStaysVisibleFailed(t *testing.T) {
 	t.Parallel()
 	th := setupTestRepository(t)
 	dag := th.DAG("abandon_dag").DAG
 	only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+	record := abandonRecord(dag, only.ID(), nil)
+	record.Detail = "not dispatched: handing the task to a worker failed"
+
+	got, err := abandon(th, record)
+	require.NoError(t, err)
+	assert.Equal(t, persis.AbandonmentMarkedFailed, got.Outcome)
+	assert.True(t, got.PredecessorAbsent)
+	assert.Nil(t, got.ExpectedExecution)
+
+	require.Equal(t, only.ID(), latestAttemptID(t, th, dag), "the run stays visible")
+	latest, err := th.Repository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID))
+	require.NoError(t, err)
+	status, err := latest.ReadStatus(th.Context)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, status.Status)
+	assert.Equal(t, record.Detail, status.Error)
+
+	later := createRunAttempt(t, th, dag, true, ir.Succeeded, "", "worker-1")
+	require.Equal(t, later.ID(), latestAttemptID(t, th, dag))
+	records, err := th.Repository.ListAttemptAbandonments(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID), ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, persis.AbandonmentMarkedFailed, records[0].Outcome)
+	assert.Equal(t, only.ID(), records[0].AbandonedAttemptID)
+}
+
+// A crash after the first attempt's record and before its status: the next
+// call marks it Failed from the record.
+func TestAbandonAttemptFirstAttemptCompletesStatusFromRecord(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+	stored := abandonRecord(dag, only.ID(), nil)
+	stored.Outcome = persis.AbandonmentMarkedFailed
+	stored.PredecessorAbsent = true
+	stored.Detail = "not dispatched: coordinator stopped"
+	require.NoError(t, writeRecordExclusive(filepath.Join(filepath.Dir(only.file), AbandonmentRecordFile), stored))
 
 	_, err := abandon(th, abandonRecord(dag, only.ID(), nil))
-	require.ErrorIs(t, err, persis.ErrAttemptNotAbandonable)
-	assert.Equal(t, only.ID(), latestAttemptID(t, th, dag))
-
-	record := abandonRecord(dag, only.ID(), nil)
-	got, err := th.Repository.AbandonAttempt(th.Context, persis.AbandonAttemptRequest{
-		DAGRun: record.Run, Record: record, AllowWithoutPredecessor: true,
-	})
 	require.NoError(t, err)
-	assert.Nil(t, got.ExpectedExecution)
+	latest, err := th.Repository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID))
+	require.NoError(t, err)
+	status, err := latest.ReadStatus(th.Context)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, status.Status)
+	assert.Equal(t, stored.Detail, status.Error, "the stored record decides, not the retry")
 }
 
 // An attempt whose status was never written, because its first Open or write
@@ -258,4 +300,33 @@ func TestAbandonAttemptWithoutStatus(t *testing.T) {
 	require.NotNil(t, got.ExpectedExecution)
 	assert.Equal(t, previous.ID(), got.ExpectedExecution.AttemptID)
 	assert.Equal(t, previous.ID(), latestAttemptID(t, th, dag))
+}
+
+// A record whose outcome contradicts its predecessor fields is not this
+// abandonment's and never authorizes the hide or the Failed mark.
+func TestAbandonAttemptRefusesInconsistentOutcome(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*persis.AttemptAbandonment){
+		"hidden without an expected execution": func(r *persis.AttemptAbandonment) { r.Outcome = persis.AbandonmentHidden },
+		"marked failed with an expected execution": func(r *persis.AttemptAbandonment) {
+			r.Outcome = persis.AbandonmentMarkedFailed
+			r.ExpectedExecution = &persis.ExecutionIdentity{AttemptID: "x"}
+		},
+		"unknown outcome": func(r *persis.AttemptAbandonment) { r.Outcome = "deleted" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			th := setupTestRepository(t)
+			dag := th.DAG("abandon_dag").DAG
+			createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+			placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+			stored := abandonRecord(dag, placeholder.ID(), nil)
+			mutate(&stored)
+			require.NoError(t, writeRecordExclusive(filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile), stored))
+
+			_, err := abandon(th, abandonRecord(dag, placeholder.ID(), nil))
+			require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict)
+			assert.Equal(t, placeholder.ID(), latestAttemptID(t, th, dag))
+		})
+	}
 }

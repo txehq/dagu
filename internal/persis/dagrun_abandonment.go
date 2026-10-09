@@ -6,7 +6,6 @@ package persis
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 )
@@ -22,6 +21,17 @@ const (
 	AbandonedRetryPreparation = "retry_preparation_abandoned"
 )
 
+// Abandonment outcomes.
+const (
+	// AbandonmentHidden: the attempt was hidden and the execution before it
+	// is the latest again.
+	AbandonmentHidden = "hidden"
+	// AbandonmentMarkedFailed: the run had no earlier execution, so the
+	// attempt stays visible, marked Failed with a not-dispatched reason. The
+	// record, not the status, says nothing ran.
+	AbandonmentMarkedFailed = "marked_failed"
+)
+
 // Evidence values for each authoritative lookup an abandonment rests on.
 const (
 	EvidenceAbsent = "absent"
@@ -35,10 +45,6 @@ var (
 	// not the named, never-dispatched attempt, so nothing is recorded or
 	// hidden.
 	ErrAttemptNotAbandonable = errors.New("attempt is not an abandonable never-dispatched attempt")
-	// ErrAttemptHasNoPredecessor is returned, wrapping ErrAttemptNotAbandonable,
-	// when the attempt is the run's only execution and the request does not
-	// allow leaving the run without a visible attempt.
-	ErrAttemptHasNoPredecessor = fmt.Errorf("%w: no earlier execution to restore", ErrAttemptNotAbandonable)
 	// ErrAttemptAbandonmentConflict is returned when an existing record for
 	// the attempt is unreadable or describes something else; it never
 	// authorizes a hide.
@@ -75,11 +81,17 @@ type AbandonmentEvidence struct {
 // directory before the attempt is hidden. It keeps the abandoned preparation
 // and its proof together, and is read back through the run's history.
 type AttemptAbandonment struct {
-	Schema             int                 `json:"schema"`
-	Run                ir.DAGRunRef        `json:"run"`
-	RootRun            ir.DAGRunRef        `json:"rootRun"`
-	AbandonedAttemptID string              `json:"abandonedAttemptId"`
+	Schema             int          `json:"schema"`
+	Run                ir.DAGRunRef `json:"run"`
+	RootRun            ir.DAGRunRef `json:"rootRun"`
+	AbandonedAttemptID string       `json:"abandonedAttemptId"`
+	// Outcome is AbandonmentHidden or AbandonmentMarkedFailed.
+	Outcome string `json:"outcome"`
+	// ExpectedExecution is the execution that is the latest again after a
+	// hide. PredecessorAbsent is true, and ExpectedExecution nil, when the
+	// run had none.
 	ExpectedExecution  *ExecutionIdentity  `json:"expectedExecution,omitempty"`
+	PredecessorAbsent  bool                `json:"predecessorAbsent"`
 	RequestCorrelation *RequestCorrelation `json:"requestCorrelation,omitempty"`
 	Reason             string              `json:"reason"`
 	Detail             string              `json:"detail,omitempty"`
@@ -101,12 +113,9 @@ func (a AttemptAbandonment) Attributable() bool {
 type AbandonAttemptRequest struct {
 	DAGRun     ir.DAGRunRef
 	RootDAGRun ir.DAGRunRef
-	// Record is written as given, except ExpectedExecution: the store sets it
-	// to the execution that becomes the latest again, read under its lock.
+	// Record is written as given, except Outcome, ExpectedExecution and
+	// PredecessorAbsent, which the store sets from the run under its lock.
 	Record AttemptAbandonment
-	// AllowWithoutPredecessor permits abandoning a run's only execution,
-	// which leaves the run with no visible attempt.
-	AllowWithoutPredecessor bool
 }
 
 // DAGRunAttemptAbandoner is implemented by stores that can record and hide an
@@ -114,9 +123,11 @@ type AbandonAttemptRequest struct {
 type DAGRunAttemptAbandoner interface {
 	// AbandonAttempt, under the store's lock for the run, checks that the
 	// latest attempt is req.Record.AbandonedAttemptID, not started and
-	// without a worker; writes the record into that attempt's directory if
-	// it is not there yet, or verifies the one that is; then hides the
-	// attempt. It returns the record now on disk.
+	// without a worker, and writes the record into that attempt's directory,
+	// or verifies the one already there. Then it applies the outcome: with an
+	// earlier execution it hides the attempt; without one it marks the
+	// attempt Failed with the record's detail, keeping the run visible. It
+	// returns the record now on disk.
 	AbandonAttempt(ctx context.Context, req AbandonAttemptRequest) (*AttemptAbandonment, error)
 	// ListAttemptAbandonments returns the records of a run's abandoned
 	// attempts, hidden or not, newest attempt first.

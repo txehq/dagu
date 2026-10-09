@@ -200,7 +200,7 @@ func TestReconcileWaitsForAnInFlightDispatch(t *testing.T) {
 		}
 		prepared = task.GetAttemptId()
 		go func() {
-			_, err := f.h.abandonNeverDispatched(context.Background(), f.ref, prepared, "test", false)
+			_, err := f.h.abandonNeverDispatched(context.Background(), f.ref, prepared, "test")
 			reconciled <- err
 		}()
 		select {
@@ -236,7 +236,7 @@ func TestAckRefusesAbandonedAttempt(t *testing.T) {
 	t.Parallel()
 	f := newStrandedFixture(t, nil)
 	placeholder := f.writeAttempt(t, true, ir.NotStarted, "", time.Now().Add(-time.Hour))
-	_, err := f.h.abandonNeverDispatched(t.Context(), f.ref, placeholder, "test", false)
+	_, err := f.h.abandonNeverDispatched(t.Context(), f.ref, placeholder, "test")
 	require.NoError(t, err)
 
 	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
@@ -277,4 +277,73 @@ func TestDispatchHandoffFailureAbandonsRetryAttempt(t *testing.T) {
 	records := f.records(t)
 	require.Len(t, records, 1)
 	assert.Contains(t, records[0].Detail, "handing the task to a worker failed")
+}
+
+// newFirstAttemptFixture is a fixture whose run has no earlier execution.
+func newFirstAttemptFixture(t *testing.T, dispatches dispatch.DispatchTaskStore) *strandedFixture {
+	t.Helper()
+	f := newStrandedFixture(t, dispatches)
+	f.ref = ir.NewDAGRunRef(strandedDAG, "first-run")
+	return f
+}
+
+// A brand-new run whose task could not be handed to a worker stays visible,
+// marked Failed with the not-dispatched reason, and its record says the
+// predecessor is absent.
+func TestDispatchHandoffFailureKeepsFirstAttemptVisible(t *testing.T) {
+	t.Parallel()
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newFirstAttemptFixture(t, &failingDispatchTaskStore{enqueueErr: errors.New("disk full")})
+
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:   f.ref.ID,
+		Target:     strandedDAG,
+		Definition: "name: " + strandedDAG + "\nsteps:\n  - name: step1\n    run: echo hello",
+		QueueName:  "q",
+	}})
+	require.Error(t, err)
+
+	attempt, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err, "the run stays visible")
+	status, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, status.Status)
+	assert.Contains(t, status.Error, "not dispatched")
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), f.ref, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, persis.AbandonmentMarkedFailed, records[0].Outcome)
+	assert.True(t, records[0].PredecessorAbsent)
+	assert.Nil(t, records[0].ExpectedExecution)
+}
+
+// A stranded first attempt found by reconciliation is likewise kept visible
+// and marked Failed with its record.
+func TestReconcileKeepsStrandedFirstAttemptVisible(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	first := ir.NewDAGRunRef(strandedDAG, "first-run")
+	dag := &ir.DAG{Name: strandedDAG}
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), first.ID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(t.Context()))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = first.ID
+	status.AttemptID = attempt.ID()
+	status.CreatedAt = time.Now().Add(-time.Hour).UnixMilli()
+	require.NoError(t, attempt.Write(t.Context(), status))
+	require.NoError(t, attempt.Close(t.Context()))
+
+	f.h.detectAndCleanupZombies(t.Context())
+
+	latest, err := f.repository.FindAttempt(t.Context(), first)
+	require.NoError(t, err)
+	assert.Equal(t, attempt.ID(), latest.ID())
+	got, err := latest.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, got.Status)
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), first, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, persis.AbandonmentMarkedFailed, records[0].Outcome)
 }
