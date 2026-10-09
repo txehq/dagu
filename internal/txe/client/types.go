@@ -112,11 +112,25 @@ type Schedule struct {
 	MissedRun  string `json:"missed_run,omitempty"`
 }
 
-// Deliverable is an expected output of the job.
+// Deliveries say where a deliverable's bytes are kept.
+const (
+	// DeliveryMachine keeps the file on the machine that ran the job. The hub
+	// records its digest and that it is stored there, not that it can be fetched.
+	DeliveryMachine = "machine"
+	// DeliveryHub also uploads the file to the hub as a run artifact.
+	DeliveryHub = "hub"
+)
+
+// Deliverable is one file a run is expected to produce. Only files named here
+// are ever published; nothing else a script writes leaves the machine.
 type Deliverable struct {
-	Path        string `json:"path,omitempty" yaml:"path"`
+	Name string `json:"name" yaml:"name"`
+	// Path is the file's exact name relative to the run's output directory.
+	Path        string `json:"path" yaml:"path"`
 	Type        string `json:"type,omitempty" yaml:"type"`
 	Description string `json:"description,omitempty" yaml:"description"`
+	Delivery    string `json:"delivery,omitempty" yaml:"delivery"`
+	Required    bool   `json:"required,omitempty" yaml:"required"`
 }
 
 // ExpectedOutcome states what success means.
@@ -309,4 +323,25 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 type Health struct {
 	Status  string `json:"status"`
 	Version string `json:"version"`
+}
+
+// ArtifactRecord is one deliverable of one run: what was produced, its
+// digest, and where the bytes are.
+type ArtifactRecord struct {
+	Deliverable string `json:"deliverable"`
+	Path        string `json:"path"`
+	// Missing is set when the run did not produce the file.
+	Missing    bool   `json:"missing,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	Location   string `json:"location,omitempty"`
+	MachineID  string `json:"machine_id,omitempty"`
+	RecordedAt string `json:"recorded_at,omitempty"`
+}
+
+// ArtifactManifest is the body of POST /txe/jobs/{job}/runs/{run}/artifacts.
+type ArtifactManifest struct {
+	JobVersion int              `json:"job_version"`
+	Artifacts  []ArtifactRecord `json:"artifacts"`
+	Actor      Actor            `json:"actor"`
 }

@@ -78,7 +78,8 @@ func runTXERegister(ctx *Context, _ []string) error {
 			if n := len(plan.Manifest.Provenance.Uncommitted); n > 0 {
 				p.f("%d packaged file(s) are not in the commit: %v\n", n, plan.Manifest.Provenance.Uncommitted)
 			}
-			p.f("\nDAG:\n%s", plan.DAGSpec)
+			p.f("\nDAG:\n")
+			p.block(plan.DAGSpec)
 		})
 	}
 

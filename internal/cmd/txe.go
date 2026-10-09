@@ -209,14 +209,57 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 }
 
 // txePrinter writes human-readable output and keeps the first write error.
+//
+// Every value it formats is cleaned first. Much of what these commands show
+// was stored by another session, and none of it may reach the terminal as
+// control characters or pass for a line of the command's own output.
 type txePrinter struct {
 	w   io.Writer
 	err error
 }
 
+// f formats like fmt.Fprintf, with every argument cleaned. The format string
+// is the command's own text.
 func (p *txePrinter) f(format string, args ...any) {
+	if p.err != nil {
+		return
+	}
+	for i, arg := range args {
+		args[i] = txeCleanValue(arg)
+	}
+	_, p.err = fmt.Fprintf(p.w, format, args...)
+}
+
+// block prints text the command laid out itself, such as a rendered DAG:
+// line breaks are kept, anything else unsafe is still escaped.
+func (p *txePrinter) block(text string) {
 	if p.err == nil {
-		_, p.err = fmt.Fprintf(p.w, format, args...)
+		_, p.err = io.WriteString(p.w, txeclient.CleanText(text, true))
+	}
+}
+
+func txeCleanValue(v any) any {
+	switch value := v.(type) {
+	case string:
+		return txeclient.CleanText(value, false)
+	case []string:
+		out := make([]string, len(value))
+		for i, s := range value {
+			out[i] = txeclient.CleanText(s, false)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(value))
+		for k, s := range value {
+			out[txeclient.CleanText(k, false)] = txeclient.CleanText(s, false)
+		}
+		return out
+	case error:
+		return txeclient.CleanText(value.Error(), false)
+	case fmt.Stringer:
+		return txeclient.CleanText(value.String(), false)
+	default:
+		return v
 	}
 }
 
