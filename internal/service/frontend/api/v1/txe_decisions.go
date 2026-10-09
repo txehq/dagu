@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -50,13 +52,25 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 		}
 		return nil, txeError(err)
 	}
-	if res.NativeErr != nil {
-		logger.Warn(ctx, "TXE decision stored; native human-task completion pending",
-			tag.Error(res.NativeErr), tag.DAG(req.JobId))
-	}
-	if res.RetryErr != nil {
-		logger.Warn(ctx, "TXE retry decision stored; native retry failed",
-			tag.Error(res.RetryErr), tag.DAG(req.JobId))
+	if res.FollowUpPending() {
+		// The decision is stored; say so, and that replaying this same
+		// request completes what is still outstanding.
+		cause := res.NativeErr
+		if cause == nil {
+			cause = res.RetryErr
+		}
+		logger.Warn(ctx, "TXE decision stored; follow-up pending", tag.Error(cause), tag.DAG(req.JobId))
+		return nil, &Error{
+			HTTPStatus: http.StatusServiceUnavailable,
+			Code:       api.ErrorCodeInternalError,
+			Message:    "decision recorded, but its follow-up did not complete; repeat the same request to retry it: " + cause.Error(),
+			Details: map[string]any{
+				"code":          "follow_up_pending",
+				"decision_id":   res.Decision.DecisionID,
+				"native_resume": res.Decision.NativeResume,
+				"retry_pending": res.RetryErr != nil,
+			},
+		}
 	}
 
 	out := api.DecideTxeProposal200JSONResponse{Replayed: res.AlreadyRecorded}
@@ -98,7 +112,9 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 		if d.ProposalID != req.ProposalId {
 			continue
 		}
-		converted, err := txeConvert[api.TxeDecision](withNativeResumeState(job, d))
+		current := *d
+		current.NativeResume = decision.CurrentNativeResume(job, d)
+		converted, err := txeConvert[api.TxeDecision](&current)
 		if err != nil {
 			return nil, err
 		}
@@ -107,10 +123,20 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 	return out, nil
 }
 
+var errTxeDecisionNotHuman = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "a human decision must be made by a signed-in person, not an API key, agent or reviewer",
+}
+
 // txeDecisionActor attributes a decision to the authenticated person. A
-// request cannot name another person or decide as an agent: a client-supplied
-// actor contributes only its session, machine and client details.
+// request cannot name another person or decide as an agent: an API key is
+// refused whatever actor it claims, and a client-supplied actor contributes
+// only its session, machine and client details.
 func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
+	if _, apiKey := auth.APIKeyFromContext(ctx); apiKey {
+		return registry.Actor{}, errTxeDecisionNotHuman
+	}
 	actor := registry.Actor{Kind: registry.ActorHuman, ID: "unauthenticated", Client: "dashboard"}
 	if in != nil {
 		claimed, err := txeConvert[registry.Actor](in)
@@ -118,11 +144,7 @@ func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, er
 			return registry.Actor{}, err
 		}
 		if claimed.Kind != "" && claimed.Kind != registry.ActorHuman && claimed.Kind != registry.ActorCLI {
-			return registry.Actor{}, &Error{
-				HTTPStatus: http.StatusForbidden,
-				Code:       api.ErrorCodeForbidden,
-				Message:    fmt.Sprintf("a %s cannot record a human decision", claimed.Kind),
-			}
+			return registry.Actor{}, errTxeDecisionNotHuman
 		}
 		actor.Session, actor.MachineID = claimed.Session, claimed.MachineID
 		if claimed.Client != "" {
@@ -143,11 +165,23 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 		Registry: store,
 		Tasks:    a.humanTaskService(),
 		Retrier:  txeRunRetrier{a: a},
-		AuthorizeDecision: func(ctx context.Context, _ *registry.Job) error {
+		// Deciding is executing in the job's workspace; pausing or retiring
+		// the job changes it, so those verdicts need write access there.
+		AuthorizeDecision: func(ctx context.Context, tx *registry.JobTx, verdict registry.Verdict) error {
 			if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 				return err
 			}
-			return a.requireDeveloperOrAbove(ctx)
+			switch verdict {
+			case registry.VerdictPause, registry.VerdictRetire:
+				return a.txeRequireJobWrite(ctx, tx)
+			case registry.VerdictApprove, registry.VerdictReject, registry.VerdictRedirect,
+				registry.VerdictRetry, registry.VerdictSnooze:
+			}
+			v, err := tx.CurrentVersion()
+			if err != nil {
+				return err
+			}
+			return a.txeCheckWorkspaces(ctx, tx.Job.JobID, v.DAG.Spec, true, a.requireExecuteForWorkspace)
 		},
 		// The same checks as completing the task through the native
 		// human-task endpoint.
@@ -164,31 +198,31 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 // txeRunRetrier retries a job's latest run through the native retry path.
 type txeRunRetrier struct{ a *API }
 
-func (r txeRunRetrier) RetryLatest(ctx context.Context, dagName string) (string, error) {
+// RetryLatest retries the latest run only while it is finished and started
+// before the decision, so a replayed retry decision cannot retry twice.
+func (r txeRunRetrier) RetryLatest(ctx context.Context, dagName string, decidedAt time.Time) (string, bool, error) {
 	attempt, err := r.a.dagRunRepository.LatestAttempt(ctx, dagName, persis.DAGRunLatestAttemptOptions{})
 	if err != nil {
-		return "", fmt.Errorf("find latest run of %s: %w", dagName, err)
+		return "", false, fmt.Errorf("find latest run of %s: %w", dagName, err)
 	}
 	status, err := attempt.ReadStatus(ctx)
 	if err != nil {
-		return "", fmt.Errorf("read latest run of %s: %w", dagName, err)
+		return "", false, fmt.Errorf("read latest run of %s: %w", dagName, err)
+	}
+	if status.Status.IsActive() {
+		return status.DAGRunID, false, nil
+	}
+	started, err := stringutil.ParseTime(status.StartedAt)
+	if err != nil {
+		return status.DAGRunID, false, fmt.Errorf("cannot tell whether run %s was already retried: %w", status.DAGRunID, err)
+	}
+	// Run times have whole-second precision: an attempt started in the
+	// decision's second counts as the retry.
+	if !started.IsZero() && !started.Before(decidedAt.Truncate(time.Second)) {
+		return status.DAGRunID, false, nil
 	}
 	if _, err := r.a.retryDAGRun(ctx, dagName, status.DAGRunID, "", "", "", false, false); err != nil {
-		return "", err
+		return status.DAGRunID, false, err
 	}
-	return status.DAGRunID, nil
-}
-
-// withNativeResumeState reports a decision's current native-resume state. The
-// stored decision is immutable and keeps the state it was written with; the
-// job's pending list is the authority on whether completion is outstanding.
-func withNativeResumeState(job *registry.Job, d *registry.Decision) *registry.Decision {
-	out := *d
-	switch {
-	case job.NativeResumes[d.DecisionID] != nil:
-		out.NativeResume = "pending"
-	case d.NativeResume == "pending":
-		out.NativeResume = "completed"
-	}
-	return &out
+	return status.DAGRunID, true, nil
 }
