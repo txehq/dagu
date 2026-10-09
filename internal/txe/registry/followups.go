@@ -58,8 +58,12 @@ type RetryRunParams struct {
 }
 
 // UncertainEffectParams are the parameters of txe.uncertain_effect.
+// Attempt is the attempt whose outcome is unresolved: each escalation of an
+// action is about one attempt, and a decision on it is never valid for a
+// later one.
 type UncertainEffectParams struct {
 	ActionID string `json:"action_id"`
+	Attempt  int    `json:"attempt"`
 }
 
 // UncertainResolution is a person's retry verdict on an action whose outcome
@@ -86,9 +90,9 @@ type IntentRecord struct {
 }
 
 // EscalationProposalID is the ID of the proposal that asks about the
-// unresolved outcome of actionID at jobVersion.
-func EscalationProposalID(actionID string, jobVersion int) (string, error) {
-	return DerivedID(PrefixProposal, "uncertain", actionID, jobVersion)
+// unresolved outcome of attempt of actionID at jobVersion.
+func EscalationProposalID(actionID string, attempt, jobVersion int) (string, error) {
+	return DerivedID(PrefixProposal, "uncertain", actionID, attempt, jobVersion)
 }
 
 // RetryProposalID is the ID of the proposal to retry the execution
@@ -145,11 +149,18 @@ func (tx *JobTx) noteIntent(a *Action) {
 		j.Intents = map[string]*IntentRecord{}
 	}
 	key := intentKey(a.Spec)
-	if cur, ok := j.Intents[key]; ok && cur.ActionID != a.ActionID && !unresolved(a.State) && unresolved(cur.State) {
-		// Settling an older attempt never clears a newer unresolved one.
+	cur, ok := j.Intents[key]
+	switch {
+	case unresolved(a.State):
+		j.Intents[key] = &IntentRecord{ActionID: a.ActionID, State: a.State, Updated: tx.now}
+	case ok && cur.ActionID == a.ActionID:
+		// Only unresolved intents are kept: the index guards against
+		// starting an intent again, and a settled one needs no guard.
+		delete(j.Intents, key)
+	default:
+		// Settling an older action never touches a newer unresolved one.
 		return
 	}
-	j.Intents[key] = &IntentRecord{ActionID: a.ActionID, State: a.State, Updated: tx.now}
 	tx.touch()
 }
 
@@ -187,16 +198,19 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		if err := decodeParams(p.Action.Params, &up); err != nil {
 			return err
 		}
-		want, err := EscalationProposalID(up.ActionID, j.Version)
+		want, err := EscalationProposalID(up.ActionID, up.Attempt, j.Version)
 		if err != nil {
 			return err
 		}
 		if p.ProposalID != want {
-			return refuse(CodeInvalid, "the escalation proposal for action %s at version %d is %s", up.ActionID, j.Version, want)
+			return refuse(CodeInvalid, "the escalation proposal for attempt %d of action %s at version %d is %s", up.Attempt, up.ActionID, j.Version, want)
 		}
 		a, ok := j.Actions[up.ActionID]
 		if !ok || (a.State != ActionUncertain && a.State != ActionEscalated) {
 			return refuse(CodeActionState, "action %s has no unresolved outcome", up.ActionID)
+		}
+		if a.Attempt != up.Attempt {
+			return &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("action %s is at attempt %d, not %d", up.ActionID, a.Attempt, up.Attempt), Current: a}
 		}
 	default:
 		if IsReservedAction(p.Action.Name) {
@@ -378,6 +392,9 @@ func (tx *JobTx) resolveUncertain(p *Proposal, d *Decision) error {
 	a, ok := j.Actions[up.ActionID]
 	if !ok || (a.State != ActionUncertain && a.State != ActionEscalated) {
 		return refuse(CodeActionState, "action %s has no unresolved outcome", up.ActionID)
+	}
+	if a.Attempt != up.Attempt {
+		return &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("the escalation is about attempt %d of action %s, which is now at attempt %d", up.Attempt, a.ActionID, a.Attempt), Current: a}
 	}
 	if a.Attempt >= a.MaxAttempts {
 		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("action %s used all %d attempts its policy allows", a.ActionID, a.MaxAttempts), Current: a}
