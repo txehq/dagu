@@ -41,9 +41,16 @@ func admittedResponse(task *coordinatorv1.Task, prepared *preparedDispatchAttemp
 	if prepared == nil || prepared.attempt == nil {
 		return &coordinatorv1.DispatchResponse{}
 	}
-	queuedAt := ""
+	return &coordinatorv1.DispatchResponse{AttemptId: prepared.attempt.ID(), QueuedAt: admittedQueuedAt(task)}
+}
+
+// admittedQueuedAt is the queued-at every status of the task's execution
+// carries, the coordinator's initial one included: the retried status's
+// (a direct retry of a queued run inherits it), else none on this base (on
+// main: the task's execution marker, as the worker's taskQueuedAt).
+func admittedQueuedAt(task *coordinatorv1.Task) string {
 	if prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus); err == nil && prev != nil {
-		queuedAt = prev.QueuedAt
+		return prev.QueuedAt
 	}
-	return &coordinatorv1.DispatchResponse{AttemptId: prepared.attempt.ID(), QueuedAt: queuedAt}
+	return ""
 }
