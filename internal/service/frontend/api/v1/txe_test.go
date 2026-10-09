@@ -859,3 +859,30 @@ func TestTxeAPIRefusedGrantChangesNothing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "nothing was written")
 }
+
+// A param_schema reaches the registry byte for byte from the request body:
+// duplicate keys and numbers that are not exactly float64 are refused, not
+// silently resolved or rounded by decoding.
+func TestTxeAPIParamSchemaKeepsItsBytes(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	register := func(schema string) error {
+		jobID := mint(t, registry.PrefixJob)
+		body := fmt.Sprintf(`{"job_id":%q,"request_id":"r1","owner_id":%q,"project_id":%q,"machine_id":%q,"job_key":"key:%s",
+			"version":{"title":"t","purpose":"p","package":{"digest":"sha256:%064x","path":"/pkg","entrypoint":"run.sh"},
+			"dag":{"spec":%q},
+			"review_policy":{"permitted_actions":[{"name":"restart","timeout_sec":60,"routine":true,"param_schema":%s}]}},
+			"actor":{"kind":"cli","id":"cc3-test"}}`,
+			jobID, f.owner, f.project, f.machine, jobID, 7,
+			fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine), schema)
+		// Decoded exactly as the server decodes a request body.
+		var req apigen.TxeRegisterRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &req))
+		_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &req})
+		return err
+	}
+	requireStatus(t, register(`{"type":"object","type":"string"}`), http.StatusBadRequest)
+	requireStatus(t, register(`{"type":"number","maximum":0.49999999999999999}`), http.StatusBadRequest)
+	require.NoError(t, register(`{"type":"object","properties":{"n":{"type":"integer","maximum":5}}}`))
+}
