@@ -104,7 +104,6 @@ steps:
 		// finished execution is proven complete when it is copied.
 		assert.True(t, r.LogsFinal, "every stream of the retained execution was recorded final: %s", r.LogsNote)
 		for _, file := range r.Files {
-			t.Logf("retained %s: %s bytes=%d final=%v", r.Execution, file.Name, file.Bytes, file.Final)
 			assert.True(t, file.Final, "%s of %s", file.Name, r.Execution)
 		}
 	}
