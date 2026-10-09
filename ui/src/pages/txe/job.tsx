@@ -305,6 +305,8 @@ export default function TxeJobPage(): React.ReactElement {
                   const result = await api.requestRetry(
                     job.jobId,
                     run.dagRunId,
+                    // The button is offered only for a run with a known attempt.
+                    run.attemptId ?? '',
                     job.version,
                     key
                   );

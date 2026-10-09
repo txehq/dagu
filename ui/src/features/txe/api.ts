@@ -31,9 +31,12 @@ export interface TxeApi {
   ): Promise<DecisionSubmitResult>;
   // requestRetry asks for one exact run to be retried. It records the
   // decision only; the reviewer runs the retry through the action journal.
+  // attemptId is the run attempt the person reviewed; the server refuses the
+  // request if the run has since moved to another attempt.
   requestRetry(
     jobId: string,
     runId: string,
+    attemptId: string,
     expectedJobVersion: number,
     idempotencyKey: string
   ): Promise<DecisionSubmitResult>;
@@ -149,12 +152,19 @@ export function createTxeApi(client: Client<paths>): TxeApi {
       );
     },
     decide,
-    requestRetry: async (jobId, runId, expectedJobVersion, idempotencyKey) => {
+    requestRetry: async (
+      jobId,
+      runId,
+      attemptId,
+      expectedJobVersion,
+      idempotencyKey
+    ) => {
       const res = await client.POST(
         '/txe/jobs/{jobId}/runs/{runId}/retry-requests',
         {
           params: { path: { jobId, runId } },
           body: {
+            attempt_id: attemptId,
             expected_job_version: expectedJobVersion,
             idempotency_key: idempotencyKey,
           },
