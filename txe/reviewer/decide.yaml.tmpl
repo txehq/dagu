@@ -1,0 +1,45 @@
+# One run of this DAG carries one proposal as a native human task.
+# Rendered by `dagu txe review render`; do not edit the installed copy.
+#
+# The run id is derived from the proposal, so opening a proposal twice is
+# refused instead of creating a second task. Waiting holds no process and no
+# worker slot, and unanswered proposals do not block each other.
+description: Human decision for one TXE proposal on {{.MachineID}}
+working_dir: {{yaml .StateDir}}
+worker_selector:
+  txe.machine: {{yaml .MachineID}}
+env:
+{{- range .Vars}}
+  - {{.Name}}: {{yaml .Value}}
+{{- end}}
+params:
+  - JOB_ID: ""
+  - PROPOSAL_ID: ""
+steps:
+  - id: decide
+    action: human.task
+    with:
+      prompt: "Decide TXE proposal ${PROPOSAL_ID} of job ${JOB_ID} in the TXE inbox."
+      form:
+        type: object
+        properties:
+          decision_id:
+            type: string
+          verdict:
+            type: string
+            enum: [approve, reject, redirect, retry, pause, snooze, retire]
+        required: [decision_id, verdict]
+
+  # The task input only points at the decision. The registry's own record of
+  # that decision decides whether anything runs: every verdict but approve
+  # exits without an effect, and an approval is rechecked against the job as
+  # it is now.
+  - id: execute
+    depends: decide
+    timeout_sec: {{.TimeoutSec}}
+    retry_policy:
+      limit: 5
+      interval_sec: 60
+    env:
+      - TXE_DECISION_ID: ${steps.decide.outputs.decision_id}
+    run: {{.ReviewCommand}} execute --job ${JOB_ID} --proposal ${PROPOSAL_ID} --decision "$TXE_DECISION_ID"

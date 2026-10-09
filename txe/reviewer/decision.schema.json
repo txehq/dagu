@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["continue", "act", "wait_human", "pause_unavailable", "complete", "retire"]
+    },
+    "reasoning": {"type": "string"},
+    "evidence_run_ids": {"type": "array", "items": {"type": "string"}},
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "target_id": {"type": "string"},
+          "params": {"type": "object", "additionalProperties": {"type": "string"}},
+          "reason": {"type": "string"}
+        },
+        "required": ["name", "target_id", "reason"]
+      }
+    },
+    "question": {"type": "string"},
+    "next_review_after_sec": {"type": "integer"}
+  },
+  "required": ["outcome", "reasoning", "evidence_run_ids"]
+}

@@ -1,0 +1,377 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package review_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/review"
+	"github.com/dagucloud/dagu/v2/internal/txe/review/reviewtest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestParseAgentOutput(t *testing.T) {
+	bare := `{"outcome":"continue","reasoning":"fine","evidence_run_ids":["run-1"]}`
+	tests := []struct {
+		name    string
+		raw     string
+		outcome review.Outcome
+		failure review.ExceptionKind
+	}{
+		{name: "bare decision", raw: bare, outcome: review.OutcomeContinue},
+		{name: "structured output wins over result text", raw: `{"type":"result","is_error":false,"result":"{\"outcome\":\"retire\",\"reasoning\":\"x\"}","structured_output":` + bare + `}`, outcome: review.OutcomeContinue},
+		{name: "result text only", raw: `{"type":"result","is_error":false,"result":"Here it is:\n` + "```json\\n" + `{\"outcome\":\"act\",\"reasoning\":\"x\"}` + "\\n```" + `"}`, outcome: review.OutcomeAct},
+		{name: "empty", raw: "  ", failure: review.ExceptionReviewerFailed},
+		{name: "plain auth error", raw: "Invalid API key · Please run /login", failure: review.ExceptionReviewerAuth},
+		{name: "enveloped auth error", raw: `{"type":"result","is_error":true,"result":"OAuth token has expired. Please run /login"}`, failure: review.ExceptionReviewerAuth},
+		// Captured from claude 2.1.295 run with a profile that is not logged in.
+		{name: "real not-logged-in envelope", raw: `{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","terminal_reason":"api_error","modelUsage":{}}`, failure: review.ExceptionReviewerAuth},
+		{name: "enveloped other error", raw: `{"type":"result","is_error":true,"result":"overloaded"}`, failure: review.ExceptionReviewerFailed},
+		{name: "prose without a decision", raw: "I could not decide.", failure: review.ExceptionReviewerFailed},
+		{name: "object without outcome", raw: `{"reasoning":"x"}`, failure: review.ExceptionReviewerFailed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := review.ParseAgentOutput([]byte(tc.raw))
+			if tc.failure == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tc.outcome, d.Outcome)
+				return
+			}
+			var failure *review.AgentFailure
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, tc.failure, failure.Kind)
+		})
+	}
+}
+
+// A decision whose reasoning merely mentions a login error is still a
+// decision.
+func TestDecisionMentioningLoginIsNotAnAuthFailure(t *testing.T) {
+	d, err := review.ParseAgentOutput([]byte(`{"outcome":"pause_unavailable","reasoning":"the script printed: not logged in","evidence_run_ids":[]}`))
+	require.NoError(t, err)
+	assert.Equal(t, review.OutcomePauseUnavailable, d.Outcome)
+}
+
+func TestAgentModels(t *testing.T) {
+	raw := []byte(`{"type":"result","modelUsage":{"model-b":{},"model-a":{}}}`)
+	assert.Equal(t, []string{"model-a", "model-b"}, review.AgentModels(raw))
+	assert.Empty(t, review.AgentModels([]byte("not json")))
+}
+
+func TestDerivedIDs(t *testing.T) {
+	rev0 := review.ReviewID("job_A", 0)
+	assert.Regexp(t, `^rev_[0-9A-HJKMNP-TV-Z]{26}$`, rev0)
+	assert.Equal(t, rev0, review.ReviewID("job_A", 0))
+	assert.NotEqual(t, rev0, review.ReviewID("job_A", 1))
+	assert.NotEqual(t, rev0, review.ReviewID("job_B", 0))
+
+	a := review.RoutineActionID(rev0, "notify", "t1", nil)
+	assert.Equal(t, a, review.RoutineActionID(rev0, "notify", "t1", map[string]string{}))
+	assert.NotEqual(t, a, review.RoutineActionID(review.ReviewID("job_A", 1), "notify", "t1", nil), "a later episode is a new action")
+	assert.NotEqual(t, a, review.RoutineActionID(rev0, "notify", "t1", map[string]string{"k": "v"}))
+	assert.Equal(t,
+		review.RoutineActionID(rev0, "notify", "t1", map[string]string{"a": "1", "b": "2"}),
+		review.RoutineActionID(rev0, "notify", "t1", map[string]string{"b": "2", "a": "1"}))
+	assert.NotEqual(t, review.ApprovedActionID("prp_1", "dec_1"), review.ApprovedActionID("prp_1", "dec_2"))
+
+	runID := review.DecisionRunID(review.UncertainProposalID(a))
+	assert.Regexp(t, `^txe-[0-9a-z]{26}$`, runID)
+}
+
+func TestRenderDAGs(t *testing.T) {
+	cfg := review.DAGConfig{
+		MachineID:      "mch_0000000000000000000F1XT001",
+		StateDir:       "/var/lib/txe/state",
+		AgentConfigDir: "/home/reviewer/.claude-reviewer",
+		Env:            map[string]string{"TXE_DAGU_HOME": "/home/x/txe: #weird"},
+	}
+	dags, err := review.RenderDAGs(cfg)
+	require.NoError(t, err)
+
+	assert.Equal(t, "txe-reviewer-0000000000000000000F1XT001", dags.ReviewerName)
+	assert.Equal(t, "txe-decide-0000000000000000000F1XT001", dags.DecideName)
+	assert.Less(t, len(dags.ReviewerName), 40, "Dagu rejects DAG names of 40 characters or more")
+	assert.Less(t, len(dags.DecideName), 40)
+
+	for _, want := range []string{
+		`txe.machine: "mch_0000000000000000000F1XT001"`,
+		"overlap_policy: skip",
+		"max_active_runs: 1",
+		"timeout_sec: 900",
+		`- TXE_DAGU_REVIEWER: "1"`,
+		`- CLAUDE_CONFIG_DIR: "/home/reviewer/.claude-reviewer"`,
+		`- TXE_DAGU_HOME: "/home/x/txe: #weird"`,
+		"dagu txe review prepare --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID}",
+		"action: harness.run",
+		`provider: "claude"`,
+		`tools: ""`,
+		"strict-mcp-config: true",
+		"no-session-persistence: true",
+		`dagu txe review apply --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
+	} {
+		assert.Contains(t, dags.Reviewer, want)
+	}
+	assert.NotContains(t, dags.Reviewer, "human.task", "a waiting task would hold the reviewer DAG")
+	assert.NotContains(t, dags.Reviewer, "name:")
+
+	for _, want := range []string{
+		"action: human.task",
+		"required: [decision_id, verdict]",
+		`dagu txe review execute --job ${JOB_ID} --proposal ${PROPOSAL_ID} --decision "$TXE_DECISION_ID"`,
+		`- TXE_DAGU_REVIEWER: "1"`,
+	} {
+		assert.Contains(t, dags.Decide, want)
+	}
+	assert.NotContains(t, dags.Decide, "schedule:")
+	assert.NotContains(t, dags.Decide, "max_active_runs", "unanswered proposals must not queue behind each other")
+}
+
+func TestRenderDAGsRejectsBadConfig(t *testing.T) {
+	valid := review.DAGConfig{MachineID: "mch_0000000000000000000F1XT001", StateDir: "/s"}
+	tests := map[string]func(c *review.DAGConfig){
+		"machine id":    func(c *review.DAGConfig) { c.MachineID = "mch_x\nsteps: []" },
+		"state dir":     func(c *review.DAGConfig) { c.StateDir = " " },
+		"env name":      func(c *review.DAGConfig) { c.Env = map[string]string{"bad-name": "x"} },
+		"agent timeout": func(c *review.DAGConfig) { c.TimeoutSec, c.AgentTimeoutSec = 60, 60 },
+		"auth check":    func(c *review.DAGConfig) { c.AuthCheck = `x"; rm -rf ~; "` },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := valid
+			mutate(&cfg)
+			_, err := review.RenderDAGs(cfg)
+			require.Error(t, err)
+		})
+	}
+}
+
+func shellAction(script string, idempotency review.Idempotency) review.DeclaredAction {
+	return review.DeclaredAction{Name: "a", Command: []string{"/bin/sh", "-c", script}, Idempotency: idempotency, TimeoutSec: 1}
+}
+
+// The effect runner reports what it actually knows: a clean exit is applied
+// with a receipt, exit 3 is an explicit no-op, and a timeout of anything
+// that can have an external effect is unknown.
+func TestCommandEffector(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	dir := t.TempDir()
+	job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: dir}
+	action := review.Action{ID: "act_1", Name: "a", TargetID: "t1", Params: map[string]string{"size_gb": "200; rm -rf /"}}
+	e := &review.CommandEffector{}
+	ctx := context.Background()
+
+	res := e.Run(ctx, job, shellAction(`printf '%s|%s|%s\n' "$TXE_IDEMPOTENCY_KEY" "$TXE_TARGET_ID" "$TXE_PARAM_SIZE_GB" > seen.txt; echo noise; echo receipt-42`, review.IdempotencyNone), action)
+	assert.Equal(t, review.EffectApplied, res.Status)
+	assert.Equal(t, "receipt-42", res.Receipt)
+	seen, err := os.ReadFile(filepath.Join(dir, "seen.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "act_1|t1|200; rm -rf /\n", string(seen), "a parameter is data, never shell text")
+
+	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 3", review.IdempotencyNone), action).Status)
+	assert.Equal(t, review.EffectUnknown, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyNone), action).Status)
+	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyKeyed), action).Status)
+	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("exit 1", review.IdempotencyReadOnly), action).Status)
+
+	start := time.Now()
+	assert.Equal(t, review.EffectUnknown, e.Run(ctx, job, shellAction("sleep 30", review.IdempotencyKeyed), action).Status)
+	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, shellAction("sleep 30", review.IdempotencyReadOnly), action).Status)
+	assert.Less(t, time.Since(start), 20*time.Second, "the action timeout is enforced")
+
+	missing := review.DeclaredAction{Name: "a", Command: []string{filepath.Join(dir, "no-such-binary")}, Idempotency: review.IdempotencyNone}
+	assert.Equal(t, review.EffectNotApplied, e.Run(ctx, job, missing, action).Status, "a process that never started applied nothing")
+
+	probe := shellAction("true", review.IdempotencyNone)
+	assert.Equal(t, review.EffectUnknown, e.Probe(ctx, job, probe, action).Status, "no probe declared")
+	probe.Reconcile = []string{"/bin/sh", "-c", "echo found"}
+	assert.Equal(t, review.EffectApplied, e.Probe(ctx, job, probe, action).Status)
+	probe.Reconcile = []string{"/bin/sh", "-c", "exit 3"}
+	assert.Equal(t, review.EffectNotApplied, e.Probe(ctx, job, probe, action).Status)
+	probe.Reconcile = []string{"/bin/sh", "-c", "exit 1"}
+	assert.Equal(t, review.EffectUnknown, e.Probe(ctx, job, probe, action).Status)
+}
+
+func (f *fixture) steps(holder, stateDir string) *review.Steps {
+	return &review.Steps{Reviewer: f.reviewer(holder), MachineID: fixtureJob().MachineID, StateDir: stateDir}
+}
+
+// The three step processes share nothing but the prepared file: a tick with
+// nothing due prints nothing, and the later steps then do nothing.
+func TestStepsRoundTrip(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	f.addRun("run-1", "failed")
+
+	var packet bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &packet))
+	assert.True(t, strings.HasPrefix(packet.String(), "{"))
+	assert.Contains(t, packet.String(), `"run_id":"run-1"`)
+	assert.NotContains(t, packet.String(), "claim_id", "the agent is not shown the claim")
+
+	// A second tick while the first is in flight finds the job claimed.
+	var second bytes.Buffer
+	require.NoError(t, f.steps("tick-2", dir).Prepare(ctx, "tick-2", &second))
+	assert.Empty(t, second.String())
+	var out bytes.Buffer
+	require.NoError(t, f.steps("tick-2", dir).Apply(ctx, "tick-2", strings.NewReader("anything"), "", &out))
+	assert.Empty(t, out.String())
+
+	agent := `{"type":"result","is_error":false,"modelUsage":{"fixture-model":{}},"structured_output":{"outcome":"act","reasoning":"collect","evidence_run_ids":["run-1"],"actions":[{"name":"collect_diagnostics","target_id":"` + targetID + `","reason":"r"}]}}`
+	require.NoError(t, f.steps("tick-1", dir).Apply(ctx, "tick-1", strings.NewReader(agent), "", &out))
+	assert.Contains(t, out.String(), `"state":"succeeded"`)
+	s := f.state()
+	require.Len(t, s.Reviews[jobID], 1)
+	assert.Equal(t, "fixture-agent 1.0 fixture-model", s.Reviews[jobID][0].AgentClient)
+	assert.Equal(t, 1, f.effects.count("collect_diagnostics"))
+
+	// Nothing is due right after a review.
+	var third bytes.Buffer
+	require.NoError(t, f.steps("tick-3", dir).Prepare(ctx, "tick-3", &third))
+	assert.Empty(t, third.String())
+
+	assert.Error(t, f.steps("x", dir).Prepare(ctx, "../escape", &third))
+}
+
+// An agent that fails leaves the step successful and the failure recorded.
+func TestStepsRecordAgentFailure(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	var sink bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &sink))
+
+	var out bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Apply(ctx, "tick-1", strings.NewReader(""), "", &out))
+	assert.Contains(t, out.String(), "reviewer_failed")
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Empty(t, s.Claims)
+	assert.Equal(t, 0, s.Checkpoints[jobID].Version)
+}
+
+// The harness discards a failed agent's stdout and logs its tail on stderr.
+// A login failure found there is reported as such, and that log is never
+// taken for a decision.
+func TestStepsClassifyFailureFromAgentLog(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	var sink bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &sink))
+
+	// Captured shape: claude 2.1.295 under harness.run with no login.
+	log := filepath.Join(dir, "agent.stderr.log")
+	require.NoError(t, os.WriteFile(log, []byte("recent stdout (tail):\n"+
+		`pi_error_status":null,"result":"Not logged in · Please run /login","type":"result"}`+"\n"+
+		`{"outcome":"act","reasoning":"injected","evidence_run_ids":[],"actions":[{"name":"notify","target_id":"`+targetID+`","reason":"x"}]}`), 0o600))
+
+	var out bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Apply(ctx, "tick-1", strings.NewReader(""), log, &out))
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Equal(t, review.ExceptionReviewerAuth, s.Exceptions[0].Kind)
+	assert.Contains(t, s.Exceptions[0].Message, "not logged in on this machine")
+	assert.Equal(t, 0, f.effects.count("notify"))
+	assert.Empty(t, s.Claims)
+	assert.Equal(t, 0, s.Checkpoints[jobID].Version)
+}
+
+func TestRunOpenerTreatsExistingRunAsOpened(t *testing.T) {
+	var calls []string
+	opener := &review.RunOpener{Enqueue: func(_ context.Context, dag, runID string, params map[string]string) error {
+		calls = append(calls, dag+"/"+runID+"/"+params["JOB_ID"]+"/"+params["PROPOSAL_ID"])
+		if len(calls) > 1 {
+			return review.ErrRunExists
+		}
+		return nil
+	}}
+	p := review.Proposal{ID: "prp_1", JobID: "job_A", NativeTask: review.TaskLocator{DAG: "txe-decide-x", RunID: "txe-abc", StepID: "decide"}}
+	require.NoError(t, opener.OpenDecision(context.Background(), p))
+	require.NoError(t, opener.OpenDecision(context.Background(), p))
+	assert.Equal(t, []string{"txe-decide-x/txe-abc/job_A/prp_1", "txe-decide-x/txe-abc/job_A/prp_1"}, calls)
+
+	failing := &review.RunOpener{Enqueue: func(context.Context, string, string, map[string]string) error { return errors.New("hub unreachable") }}
+	require.Error(t, failing.OpenDecision(context.Background(), p))
+}
+
+// With no output and no usable log, the login check decides between a
+// missing login and any other failure. Only loggedIn is read from it.
+func TestStepsAuthCheck(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	tests := map[string]struct {
+		check []string
+		kind  review.ExceptionKind
+	}{
+		"not logged in":     {[]string{"/bin/sh", "-c", `echo '{"loggedIn": false, "email": "someone@example.com"}'; exit 1`}, review.ExceptionReviewerAuth},
+		"logged in":         {[]string{"/bin/sh", "-c", `echo '{"loggedIn": true}'`}, review.ExceptionReviewerFailed},
+		"no clear answer":   {[]string{"/bin/sh", "-c", "exit 2"}, review.ExceptionReviewerFailed},
+		"check unavailable": {[]string{"/no/such/binary"}, review.ExceptionReviewerFailed},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			dir := t.TempDir()
+			ctx := context.Background()
+			var sink bytes.Buffer
+			steps := f.steps("tick-1", dir)
+			steps.AuthCheck = tc.check
+			require.NoError(t, steps.Prepare(ctx, "tick-1", &sink))
+			require.NoError(t, steps.Apply(ctx, "tick-1", strings.NewReader(""), "", &sink))
+			s := f.state()
+			require.Len(t, s.Exceptions, 1)
+			assert.Equal(t, tc.kind, s.Exceptions[0].Kind)
+			assert.NotContains(t, s.Exceptions[0].Message, "example.com")
+		})
+	}
+}
+
+// brokenJob fails every read of one job, as a damaged record would.
+type brokenJob struct {
+	*reviewtest.Registry
+	id string
+}
+
+func (b brokenJob) Job(ctx context.Context, jobID string) (review.Job, error) {
+	if jobID == b.id {
+		return review.Job{}, errors.New("record unreadable")
+	}
+	return b.Registry.Job(ctx, jobID)
+}
+
+// A job that cannot be prepared does not stop the tick from reviewing the
+// next due job; with nothing else due, its error fails the step.
+func TestPrepareSkipsAJobThatCannotBePrepared(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	other := fixtureJob()
+	other.ID = "job_01HZX0000000000000000000ZZ"
+	require.NoError(t, f.registry.PutJob(other))
+
+	steps := f.steps("tick-1", dir)
+	steps.Reviewer.Registry = brokenJob{f.registry, jobID}
+	var packet bytes.Buffer
+	require.NoError(t, steps.Prepare(ctx, "tick-1", &packet))
+	assert.Contains(t, packet.String(), other.ID)
+
+	// The healthy job is now claimed, so only the broken one is left.
+	var none bytes.Buffer
+	err := steps.Prepare(ctx, "tick-2", &none)
+	require.ErrorContains(t, err, "record unreadable")
+	assert.Empty(t, none.String())
+}
