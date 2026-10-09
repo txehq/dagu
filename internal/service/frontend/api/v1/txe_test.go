@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -274,4 +275,25 @@ func TestTxeAPIKeepsParamsExact(t *testing.T) {
 	got := resp.(apigen.CreateTxeProposal200JSONResponse)
 	assert.JSONEq(t, `{"n":9007199254740993,"x":1.0}`, string(got.Action.Params))
 	assert.Contains(t, string(got.Action.Params), "9007199254740993")
+}
+
+// A version update is authorized against the committed version it replaces,
+// so a job whose DAG file is missing cannot be moved into another workspace.
+func TestTxeAPIUpdateChecksCommittedVersion(t *testing.T) {
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(dir, "dags", jobID+".yaml")))
+
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	_, err = a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: jobID, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 1,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+		}}})
+	requireStatus(t, err, http.StatusForbidden)
 }

@@ -137,21 +137,29 @@ func (a *API) txeRequireSpecWrite(ctx context.Context, jobID, spec string) error
 	return a.txeCheckWorkspaces(ctx, jobID, spec, false, a.requireDAGWriteForWorkspace)
 }
 
-// txeRequireJobWrite checks that the caller may change a job: it needs write
-// access to the workspace of the job's current version and of its saved DAG.
-// It does not depend on DAG writes being enabled, so claims and settlements
-// keep working under a read-only Git sync.
-func (a *API) txeRequireJobWrite(ctx context.Context, s *registry.Store, jobID string) error {
-	return a.txeCheckJob(ctx, s, jobID, a.txeRequireWorkspaceWrite)
+// txeRequireJobWrite checks, inside the job transaction, that the caller may
+// change the job as it is in that transaction: it needs write access to the
+// workspace of the job's current version and of its saved DAG. It runs on
+// every compare-and-swap attempt, so a concurrent move to another workspace
+// is seen. It does not depend on DAG writes being enabled, so claims and
+// settlements keep working under a read-only Git sync.
+func (a *API) txeRequireJobWrite(ctx context.Context, tx *registry.JobTx) error {
+	v, err := tx.CurrentVersion()
+	if err != nil {
+		return err
+	}
+	return a.txeCheckWorkspaces(ctx, tx.Job.JobID, v.DAG.Spec, true, a.txeRequireWorkspaceWrite)
 }
 
-func (a *API) txeCheckJob(ctx context.Context, s *registry.Store, jobID string, check func(context.Context, string) error) error {
-	job, err := s.GetJob(ctx, jobID)
+// txeCheckVersion runs check on the workspaces of one committed version of
+// a job and of its saved DAG. A version that does not exist is left to the
+// registry to refuse.
+func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, jobID string, version int, check func(context.Context, string) error) error {
+	v, err := s.GetVersion(ctx, jobID, version)
 	if err != nil {
-		return txeError(err)
-	}
-	v, err := s.GetVersion(ctx, jobID, job.Version)
-	if err != nil {
+		if registry.ErrorCode(err) == registry.CodeNotFound {
+			return nil
+		}
 		return txeError(err)
 	}
 	return a.txeCheckWorkspaces(ctx, jobID, v.DAG.Spec, true, check)
@@ -217,10 +225,12 @@ func (a *API) txeTx(ctx context.Context, jobID string, in *api.TxeActor, fn func
 	if err != nil {
 		return api.TxeJob{}, err
 	}
-	if err := a.txeRequireJobWrite(ctx, s, jobID); err != nil {
-		return api.TxeJob{}, err
-	}
-	job, err := s.WithJobTx(ctx, jobID, actor, fn)
+	job, err := s.WithJobTx(ctx, jobID, actor, func(tx *registry.JobTx) error {
+		if err := a.txeRequireJobWrite(ctx, tx); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 	if err != nil {
 		return api.TxeJob{}, txeError(err)
 	}
@@ -406,17 +416,33 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 	if err != nil {
 		return nil, err
 	}
-	// Readiness may rewrite the job's DAG, so it needs DAG write access.
-	if err := a.txeCheckJob(ctx, s, req.JobId, a.requireDAGWriteForWorkspace); err != nil {
-		return nil, err
-	}
 	pkg, err := txeConvert[registry.PackageEvidence](body.Package)
 	if err != nil {
 		return nil, ErrInvalidRequestBody
 	}
-	receipt, err := s.MarkReady(ctx, req.JobId, valueOf(body.ExpectedRevision), pkg, actor)
-	if err != nil {
-		return nil, txeError(err)
+	// Readiness may rewrite the job's DAG, so it needs DAG write access to
+	// the job's workspace. The check is bound to the revision it read: the
+	// registry makes only that state's version ready.
+	var receipt *registry.Receipt
+	for attempt := 0; ; attempt++ {
+		job, err := s.GetJob(ctx, req.JobId)
+		if err != nil {
+			return nil, txeError(err)
+		}
+		if err := a.txeCheckVersion(ctx, s, req.JobId, job.Version, a.requireDAGWriteForWorkspace); err != nil {
+			return nil, err
+		}
+		expected := valueOf(body.ExpectedRevision)
+		if expected == 0 {
+			expected = job.Revision
+		}
+		receipt, err = s.MarkReady(ctx, req.JobId, expected, pkg, actor)
+		if err == nil {
+			break
+		}
+		if valueOf(body.ExpectedRevision) != 0 || registry.ErrorCode(err) != registry.CodeVersionConflict || attempt == 4 {
+			return nil, txeError(err)
+		}
 	}
 	out, err := txeConvert[api.TxeReceipt](receipt)
 	return api.MarkTxeJobReady200JSONResponse(out), err
@@ -436,6 +462,11 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 		return nil, ErrInvalidRequestBody
 	}
 	if err := a.txeRequireSpecWrite(ctx, req.JobId, v.DAG.Spec); err != nil {
+		return nil, err
+	}
+	// The update is accepted only against expected_version, so that is the
+	// committed version the caller must be able to write.
+	if err := a.txeCheckVersion(ctx, s, req.JobId, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
 		return nil, err
 	}
 	job, err := s.UpdateVersion(ctx, req.JobId, body.RequestId, body.ExpectedVersion, v, actor)

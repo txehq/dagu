@@ -871,3 +871,36 @@ func TestReleaseInterruptsExecutingActions(t *testing.T) {
 	assert.Equal(t, ActionUncertain, got.Actions[restartID].State)
 	assert.Equal(t, ActionFailed, got.Actions[diagID].State, "read-only actions are failed, not uncertain")
 }
+
+// A writer that lost the publication lock (a stalled process whose lock went
+// stale) writes the newer version again after its late write.
+func TestStaleDAGWriterConverges(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	versionWith := func(b byte) JobVersion {
+		v := f.version(b)
+		v.DAG.Spec = f.spec(f.machine) + fmt.Sprintf("# v%d\n", b)
+		return v
+	}
+	slow := &slowDAGStore{DAGStore: f.dags, pause: "# v2", writing: make(chan struct{}), release: make(chan struct{})}
+	other, err := NewFileStore(filepath.Join(filepath.Dir(f.dagsDir), "data"), WithClock(f.clock), WithDAGStore(slow))
+	require.NoError(t, err)
+	other.lockDir = "" // the lock this writer held has been taken over
+
+	errA := make(chan error, 1)
+	go func() {
+		_, err := other.UpdateVersion(f.ctx, job.JobID, "u2", 1, versionWith(2), cli)
+		errA <- err
+	}()
+	<-slow.writing
+	_, err = f.store.UpdateVersion(f.ctx, job.JobID, "u3", 2, versionWith(3), cli)
+	require.NoError(t, err)
+	close(slow.release)
+	require.NoError(t, <-errA)
+
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	saved, err := f.dags.SpecSHA256(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, got.DAGSpecSHA256, saved, "the late writer restores the newest version")
+}
