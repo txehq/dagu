@@ -727,3 +727,92 @@ func TestArchivedActionResolvesItsExceptions(t *testing.T) {
 		}
 	}
 }
+
+// A run retry whose outcome is uncertain may be attempted once more, only on
+// a person's retry of that uncertain outcome, and only while the run is still
+// at the execution the person decided on; a failed run retry is never
+// attempted again, and a third attempt is never allowed.
+func TestUncertainRunRetryGetsOneApprovedExtraAttempt(t *testing.T) {
+	setup := func(t *testing.T) (*retryFixture, *Proposal, *Decision, string) {
+		r := newRetryFixture(t)
+		r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+		p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+		require.NoError(t, err)
+		ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+		actionID, g, err := r.authorize(p, d, ec)
+		require.NoError(t, err)
+		// The hub admitted the retry without naming an execution.
+		require.NoError(t, r.settle(actionID, g, ec, ActionUncertain, ""))
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error { return tx.ReleaseClaim(ec.ClaimID, ec.Fence) })
+		require.NoError(t, err)
+		return r, p, d, actionID
+	}
+	resolve := func(t *testing.T, r *retryFixture, actionID string, attempt int) {
+		rc := acquire(t, r.f, r.job.JobID, ClaimReview, time.Hour)
+		escalation, err := EscalationProposalID(actionID, attempt, r.job.Version)
+		require.NoError(t, err)
+		var p *Proposal
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			p, err = tx.PutProposal(rc.ClaimID, rc.Fence, Proposal{ProposalID: escalation,
+				Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(fmt.Sprintf(`{"action_id":%q,"attempt":%d}`, actionID, attempt))}})
+			return err
+		})
+		require.NoError(t, err)
+		_, err = decide(r.f, r.job.JobID, p, VerdictRetry, ProposalDecided, fmt.Sprintf("r-%d", attempt))
+		require.NoError(t, err, "the person's retry of the uncertain outcome is accepted")
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error { return tx.ReleaseClaim(rc.ClaimID, rc.Fence) })
+		require.NoError(t, err)
+	}
+
+	t.Run("the run is still at the decided execution", func(t *testing.T) {
+		r, p, d, actionID := setup(t)
+		ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+		_, _, err := r.authorize(p, d, ec)
+		require.Error(t, err, "no second attempt without a person's retry")
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error { return tx.ReleaseClaim(ec.ClaimID, ec.Fence) })
+		require.NoError(t, err)
+
+		resolve(t, r, actionID, 1)
+		ec = acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+		_, g, err := r.authorize(p, d, ec)
+		require.NoError(t, err, "one more attempt, bound to the same execution")
+		assert.Equal(t, 2, g.Attempt)
+		require.NoError(t, r.settle(actionID, g, ec, ActionUncertain, ""))
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error { return tx.ReleaseClaim(ec.ClaimID, ec.Fence) })
+		require.NoError(t, err)
+		rc := acquire(t, r.f, r.job.JobID, ClaimReview, time.Hour)
+		escalation, err := EscalationProposalID(actionID, 2, r.job.Version)
+		require.NoError(t, err)
+		var esc *Proposal
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			esc, err = tx.PutProposal(rc.ClaimID, rc.Fence, Proposal{ProposalID: escalation,
+				Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(fmt.Sprintf(`{"action_id":%q,"attempt":2}`, actionID))}})
+			return err
+		})
+		require.NoError(t, err)
+		_, err = decide(r.f, r.job.JobID, esc, VerdictRetry, ProposalDecided, "r-2")
+		assert.Equal(t, CodeNotPermitted, code(t, err), "never a third attempt")
+	})
+	t.Run("the first attempt took effect", func(t *testing.T) {
+		r, p, d, actionID := setup(t)
+		resolve(t, r, actionID, 1)
+		r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+		ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+		_, _, err := r.authorize(p, d, ec)
+		assert.Equal(t, CodeStaleBinding, code(t, err), "the run moved on: never retargeted to a later execution")
+	})
+	t.Run("a failed run retry is not attempted again", func(t *testing.T) {
+		r := newRetryFixture(t)
+		r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+		p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+		require.NoError(t, err)
+		ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+		actionID, g, err := r.authorize(p, d, ec)
+		require.NoError(t, err)
+		require.NoError(t, r.settle(actionID, g, ec, ActionFailed, ""))
+		_, _, err = r.authorize(p, d, ec)
+		assert.Equal(t, CodeActionExists, code(t, err))
+	})
+}
