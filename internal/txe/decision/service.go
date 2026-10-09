@@ -80,8 +80,11 @@ type Service struct {
 	Registry Registry
 	Tasks    TaskCompleter
 	Retrier  RunRetrier
-	// AuthorizeTask, when set, must allow completing the native task before
-	// any decision is recorded.
+	// AuthorizeDecision must allow the caller to decide on the job. It is
+	// required: without it every decision is refused.
+	AuthorizeDecision func(ctx context.Context, job *registry.Job) error
+	// AuthorizeTask must allow completing the native task before any
+	// decision is recorded. It is required for proposals with a native task.
 	AuthorizeTask TaskAuthorizer
 	Now           func() time.Time
 }
@@ -121,7 +124,7 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		return nil, err
 	}
 	effect := EffectOf(req.Verdict)
-	if err := s.preflightNative(ctx, jobID, proposalID); err != nil {
+	if err := s.preflight(ctx, jobID, proposalID); err != nil {
 		return nil, err
 	}
 
@@ -196,11 +199,20 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 	return result, nil
 }
 
-// preflightNative checks the proposal's native task and the caller's right to
-// complete it before anything is recorded.
-func (s *Service) preflightNative(ctx context.Context, jobID, proposalID string) error {
+// errNoAuthorizer refuses work when the caller wired no authorization.
+var errNoAuthorizer = errors.New("decision: authorization is not configured")
+
+// preflight checks the caller's right to decide on the job, the proposal's
+// native task and the right to complete it, before anything is recorded.
+func (s *Service) preflight(ctx context.Context, jobID, proposalID string) error {
 	job, err := s.Registry.GetJob(ctx, jobID)
 	if err != nil {
+		return err
+	}
+	if s.AuthorizeDecision == nil {
+		return errNoAuthorizer
+	}
+	if err := s.AuthorizeDecision(ctx, job); err != nil {
 		return err
 	}
 	p := job.Proposals[proposalID]
@@ -214,10 +226,10 @@ func (s *Service) authorizeNative(ctx context.Context, job *registry.Job, task *
 	if err := checkNativeTask(job, task); err != nil {
 		return err
 	}
-	if s.AuthorizeTask != nil {
-		return s.AuthorizeTask(ctx, task.DAG, task.RunID)
+	if s.AuthorizeTask == nil {
+		return errNoAuthorizer
 	}
-	return nil
+	return s.AuthorizeTask(ctx, task.DAG, task.RunID)
 }
 
 func applyLifecycle(tx *registry.JobTx, op LifecycleOp, decisionID string) error {
