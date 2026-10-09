@@ -567,22 +567,37 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		return nil, err
 	}
 
+	// From creating the attempt to publishing its task, hold the run's write
+	// lock: reconciliation of never-dispatched attempts takes it too, so it
+	// can never abandon an attempt whose task is about to be published.
+	unlockRun := h.attemptWriteLocks.lock(taskRootRef(req.Task))
 	prepared, err := h.prepareAttemptForDispatch(ctx, req.Task)
 	if err != nil {
+		h.abandonFailedPreparation(ctx, err)
+		unlockRun()
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(prepareAttemptErrorCode(err), "failed to prepare attempt: "+err.Error())
+	}
+	if dispatchPublishHook != nil {
+		dispatchPublishHook(req.Task)
 	}
 	dispatchTask, err := convert.ProtoToDispatchTask(req.Task)
 	if err != nil {
 		h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
+		unlockRun()
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(codes.Internal, "failed to encode task: "+err.Error())
 	}
 	if err := h.enqueueOrBindDispatchTask(ctx, admissionToken, dispatchTask); err != nil {
 		h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
+		unlockRun()
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
+	if prepared != nil && prepared.newlyCreated {
+		h.endPreparation(ctx, ir.NewDAGRunRef(req.Task.GetTarget(), req.Task.GetDagRunId()), taskRootRef(req.Task), req.Task.GetAttemptId())
+	}
+	unlockRun()
 	h.notifyDispatchAvailable()
 	return &coordinatorv1.DispatchResponse{}, nil
 }
@@ -922,7 +937,7 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 
 	// Create new attempt (either first attempt or retry)
 	isRetry := task.Operation == coordinatorv1.Operation_OPERATION_RETRY || findErr == nil
-	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry}
+	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, TrackPreparation: h.canAbandonPreparations()}
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, opts)
 	if err != nil {
@@ -934,13 +949,15 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 	// A new attempt's initial status has no queued-at marker.
 	task.ExecutionMarker = ""
 
+	createdRun := ir.NewDAGRunRef(task.Target, task.DagRunId)
 	if err := attempt.Open(ctx); err != nil {
-		return nil, fmt.Errorf("failed to open attempt: %w", err)
+		return nil, &preparationFailedError{run: createdRun, attemptID: attempt.ID(), err: fmt.Errorf("failed to open attempt: %w", err)}
 	}
 
 	if writeErr := h.writeInitialStatus(ctx, attempt, task, dag.Name, ir.DAGRunRef{}, labels); writeErr != nil {
 		closeErr := attempt.Close(context.WithoutCancel(ctx))
-		return nil, errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)
+		return nil, &preparationFailedError{run: createdRun, attemptID: attempt.ID(),
+			err: errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)}
 	}
 
 	h.attemptsMu.Lock()
@@ -1015,7 +1032,8 @@ func (h *Handler) createSubAttemptForTask(ctx context.Context, task *coordinator
 	task.Labels = strings.Join(labels, ",")
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, persis.DAGRunCreateAttemptOptions{
-		RootDAGRun: rootRef,
+		RootDAGRun:       rootRef,
+		TrackPreparation: h.canAbandonPreparations(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sub-attempt: %w", err)
@@ -1027,13 +1045,15 @@ func (h *Handler) createSubAttemptForTask(ctx context.Context, task *coordinator
 		task.Target, task.DagRunId, attempt.ID(),
 	)
 
+	createdRun := ir.NewDAGRunRef(task.Target, task.DagRunId)
 	if err := attempt.Open(ctx); err != nil {
-		return nil, fmt.Errorf("failed to open sub-attempt: %w", err)
+		return nil, &preparationFailedError{run: createdRun, root: rootRef, attemptID: attempt.ID(), err: fmt.Errorf("failed to open sub-attempt: %w", err)}
 	}
 
 	if writeErr := h.writeInitialStatus(ctx, attempt, task, task.Target, rootRef, labels); writeErr != nil {
 		closeErr := attempt.Close(context.WithoutCancel(ctx))
-		return nil, errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)
+		return nil, &preparationFailedError{run: createdRun, root: rootRef, attemptID: attempt.ID(),
+			err: errors.Join(fmt.Errorf("failed to write initial status: %w", writeErr), closeErr)}
 	}
 
 	h.attemptsMu.Lock()
@@ -1214,6 +1234,34 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	}
 
 	storeCtx := context.WithoutCancel(ctx)
+	// Nothing was handed to a worker. With dispatch and lease stores the
+	// attempt is proven never dispatched and abandoned with a record: hidden
+	// when the run has an earlier execution, otherwise marked Failed with a
+	// not-dispatched reason the record explains. Without them it keeps the
+	// plain Failed mark below.
+	if h.dispatchTaskStore != nil {
+		h.releasePreparedDispatchAttempt(storeCtx, dagRunID, prepared.attempt)
+		_, abandonErr := h.abandonExecutionLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId), taskRootRef(task),
+			prepared.attempt.ID(), "not dispatched: handing the task to a worker failed: "+dispatchErr.Error())
+		switch {
+		case abandonErr == nil:
+			return
+		case errors.Is(abandonErr, errAbandonmentUnavailable),
+			errors.Is(abandonErr, persis.ErrAttemptAbandonmentUnsupported):
+			// Mark it Failed below, as before. The attempt was closed for
+			// the abandonment, so reopen it for that write.
+			if err := prepared.attempt.Open(storeCtx); err != nil {
+				logger.Warn(ctx, "Failed to reopen prepared attempt after dispatch handoff failure",
+					tag.RunID(task.DagRunId), tag.Error(err))
+				return
+			}
+		default:
+			logger.Warn(ctx, "Left an attempt whose dispatch handoff failed for review",
+				tag.RunID(task.DagRunId), tag.AttemptID(prepared.attempt.ID()), tag.Error(abandonErr))
+			return
+		}
+	}
+
 	runStatus, err := prepared.attempt.ReadStatus(storeCtx)
 	if err != nil {
 		logger.Warn(ctx, "Failed to read prepared attempt after dispatch handoff failure",
@@ -1438,6 +1486,9 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 		if errors.Is(err, dispatch.ErrDAGRunLeaseConflict) {
 			return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "attempt claim conflicts with the active lease"}, nil
 		}
+		if errors.Is(err, errAttemptAbandoned) {
+			return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: errAttemptAbandoned.Error()}, nil
+		}
 		return nil, status.Error(codes.Internal, "failed to create run lease: "+err.Error())
 	}
 	if err := h.dispatchTaskStore.DeleteClaim(ctx, req.ClaimToken); err != nil {
@@ -1456,6 +1507,9 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 		root = ir.DAGRunRef{Name: task.GetTarget(), ID: task.GetDagRunId()}
 	}
 	defer h.attemptWriteLocks.lock(root)()
+	if err := h.refuseAbandonedExecution(ctx, ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
+		return err
+	}
 	return h.attemptOwnership().recordTaskClaim(ctx, task, workerID)
 }
 
@@ -2908,6 +2962,9 @@ func (h *Handler) detectAndCleanupZombies(ctx context.Context) {
 	// stopped reporting owner-bound run heartbeats, including after coordinator
 	// restarts or owner coordinator loss.
 	h.detectStaleLeases(ctx)
+
+	// Pass 3: attempts a coordinator created but stopped before dispatching.
+	h.reconcileAbandonedPreparations(ctx, time.Now())
 }
 
 func (h *Handler) cleanupWorkspaceBundles(ctx context.Context, now time.Time) {

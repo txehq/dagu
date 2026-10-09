@@ -40,6 +40,7 @@ func setupTestRepository(t *testing.T) RepositoryTest {
 
 	t.Cleanup(func() {
 		_ = os.RemoveAll(th.TmpDir)
+		_ = os.RemoveAll(defaultPreparationDir(th.TmpDir))
 	})
 	return th
 }
