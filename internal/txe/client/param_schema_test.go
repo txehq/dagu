@@ -63,6 +63,7 @@ func sentActions(t *testing.T, body []byte) []map[string]any {
 // An action that declares none sends none.
 func TestParamSchemaIsSentAsDeclared(t *testing.T) {
 	f := newFakeRegistry(t)
+	f.capabilities = []string{CapabilityParamSchema}
 	home := machineHome(t, f)
 	spec, err := LoadJobSpec(specWithActions(t, boundedAction+unboundedAction))
 	require.NoError(t, err)
@@ -102,6 +103,67 @@ func TestParamSchemaIsSentAsDeclared(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(filed, &entry))
 	check("the request filed", sentActions(t, entry.Request))
+}
+
+// A registry that does not say it enforces parameter schemas would store a
+// declared bound and check nothing against it. Registering, planning and
+// updating a spec that declares one are refused before anything is built or
+// sent; the same job without the schema registers.
+func TestParamSchemaNeedsARegistryThatEnforcesIt(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	bounded, err := LoadJobSpec(specWithActions(t, boundedAction+unboundedAction))
+	require.NoError(t, err)
+	unbounded, err := LoadJobSpec(specWithActions(t, unboundedAction))
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	untouched := func(what string) {
+		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs"), what)
+		assert.Empty(t, pendingSteps(t, cc1.Journal), what)
+		staged, _ := filepath.Glob(filepath.Join(home.PackagesDir(), "*", "*"))
+		assert.Empty(t, staged, what)
+	}
+	_, err = cc1.Register(ctx, bounded)
+	require.ErrorIs(t, err, ErrParamSchemaUnenforced)
+	assert.ErrorContains(t, err, "reopen-ticket")
+	assert.NotContains(t, err.Error(), "recount")
+	untouched("after a refused registration")
+	_, err = cc1.Plan(ctx, bounded)
+	require.ErrorIs(t, err, ErrParamSchemaUnenforced)
+	untouched("after a refused plan")
+
+	out, err := cc1.Register(ctx, unbounded)
+	require.NoError(t, err)
+	_, err = cc1.Update(ctx, out.Receipt.JobID, 1, bounded)
+	require.ErrorIs(t, err, ErrParamSchemaUnenforced)
+	assert.Equal(t, 1, f.job(out.Receipt.JobID).Version)
+	assert.Empty(t, pendingSteps(t, cc1.Journal))
+
+	// Once the registry says it enforces schemas, the same update goes through.
+	f.mu.Lock()
+	f.capabilities = []string{CapabilityParamSchema}
+	f.mu.Unlock()
+	_, err = cc1.Update(ctx, out.Receipt.JobID, 1, bounded)
+	require.NoError(t, err)
+	assert.Equal(t, 2, f.job(out.Receipt.JobID).Version)
+}
+
+// A hub that cannot be asked is not taken to enforce anything.
+func TestParamSchemaHubThatCannotBeAsked(t *testing.T) {
+	f := newFakeRegistry(t)
+	f.capabilities = []string{CapabilityParamSchema}
+	home := machineHome(t, f)
+	spec, err := LoadJobSpec(specWithActions(t, boundedAction))
+	require.NoError(t, err)
+	f.mu.Lock()
+	f.fail["GET /txe/installation"] = 1
+	f.mu.Unlock()
+
+	_, err = newSession(f, home, "cc1-s000001").Register(context.Background(), spec)
+	require.ErrorContains(t, err, "ask the hub whether its registry checks action parameters")
+	assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs"))
 }
 
 // A param_schema that is not a mapping is refused with its action named,
