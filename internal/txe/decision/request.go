@@ -14,19 +14,21 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
 // Verdict is a person's response to a proposal.
-type Verdict string
+type Verdict = registry.Verdict
 
 const (
-	VerdictApprove  Verdict = "approve"
-	VerdictReject   Verdict = "reject"
-	VerdictRedirect Verdict = "redirect"
-	VerdictRetry    Verdict = "retry"
-	VerdictPause    Verdict = "pause"
-	VerdictSnooze   Verdict = "snooze"
-	VerdictRetire   Verdict = "retire"
+	VerdictApprove  = registry.VerdictApprove
+	VerdictReject   = registry.VerdictReject
+	VerdictRedirect = registry.VerdictRedirect
+	VerdictRetry    = registry.VerdictRetry
+	VerdictPause    = registry.VerdictPause
+	VerdictSnooze   = registry.VerdictSnooze
+	VerdictRetire   = registry.VerdictRetire
 )
 
 // Verdicts lists every verdict in display order.
@@ -115,15 +117,6 @@ func (r *Request) SameAs(other *Request) bool {
 	return r.SnoozeUntil == nil || r.SnoozeUntil.Equal(*other.SnoozeUntil)
 }
 
-// ProposalOutcome is the proposal state a verdict leaves behind.
-type ProposalOutcome string
-
-const (
-	OutcomeDecided  ProposalOutcome = "decided"
-	OutcomeRejected ProposalOutcome = "rejected"
-	OutcomeSnoozed  ProposalOutcome = "snoozed"
-)
-
 // LifecycleOp names a job lifecycle transition a verdict requests in the same
 // commit as the decision.
 type LifecycleOp string
@@ -134,11 +127,12 @@ const (
 	LifecycleRetire LifecycleOp = "retire"
 )
 
-// Effect describes what recording a verdict changes. Only approve can lead to
-// an action, and only through the pre-effect guard; redirect saves
-// instructions for the next review and grants nothing.
+// Effect describes what recording a verdict changes. Only approve leaves the
+// proposal executable, and only through the pre-effect guard. Every other
+// verdict except snooze closes the proposal; redirect saves instructions for
+// the next review and grants nothing.
 type Effect struct {
-	Proposal  ProposalOutcome
+	Proposal  registry.ProposalState
 	Lifecycle LifecycleOp
 	// RetryRun asks for a native retry of the job's latest run after commit.
 	RetryRun bool
@@ -147,18 +141,18 @@ type Effect struct {
 // EffectOf maps a verdict to its effect.
 func EffectOf(v Verdict) Effect {
 	switch v {
-	case VerdictReject:
-		return Effect{Proposal: OutcomeRejected}
+	case VerdictApprove:
+		return Effect{Proposal: registry.ProposalDecided}
 	case VerdictSnooze:
-		return Effect{Proposal: OutcomeSnoozed}
+		return Effect{Proposal: registry.ProposalSnoozed}
 	case VerdictPause:
-		return Effect{Proposal: OutcomeDecided, Lifecycle: LifecyclePause}
+		return Effect{Proposal: registry.ProposalRejected, Lifecycle: LifecyclePause}
 	case VerdictRetire:
-		return Effect{Proposal: OutcomeDecided, Lifecycle: LifecycleRetire}
+		return Effect{Proposal: registry.ProposalRejected, Lifecycle: LifecycleRetire}
 	case VerdictRetry:
-		return Effect{Proposal: OutcomeDecided, RetryRun: true}
-	case VerdictApprove, VerdictRedirect:
-		return Effect{Proposal: OutcomeDecided}
+		return Effect{Proposal: registry.ProposalRejected, RetryRun: true}
+	case VerdictReject, VerdictRedirect:
+		return Effect{Proposal: registry.ProposalRejected}
 	}
-	return Effect{Proposal: OutcomeDecided}
+	return Effect{Proposal: registry.ProposalRejected}
 }
