@@ -6,13 +6,17 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/testutil"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
@@ -31,6 +35,7 @@ type strandedFixture struct {
 	leases     dispatch.DAGRunLeaseStore
 	ref        ir.DAGRunRef
 	previous   string
+	runsDir    string
 }
 
 func newStrandedFixture(t *testing.T, dispatches dispatch.DispatchTaskStore) *strandedFixture {
@@ -56,17 +61,30 @@ func newStrandedFixture(t *testing.T, dispatches dispatch.DispatchTaskStore) *st
 		dispatches: dispatches,
 		leases:     leases,
 		ref:        ir.NewDAGRunRef(strandedDAG, strandedRun),
+		runsDir:    filepath.Join(dir, "dag-runs"),
 	}
-	f.previous = f.writeAttempt(t, false, ir.Failed, "worker-1", time.Now().Add(-2*time.Hour))
+	f.previous = f.writeAttempt(t, false, ir.Failed, "worker-1")
 	return f
 }
 
-// writeAttempt adds an attempt to the run with the given status, worker and
-// creation time, as a coordinator that created it would have left it.
-func (f *strandedFixture) writeAttempt(t *testing.T, retry bool, st ir.Status, worker string, createdAt time.Time) string {
+// later is a reconciliation time past the bound for any preparation journaled
+// before it.
+func later() time.Time { return time.Now().Add(abandonedPreparationMinAge + time.Minute) }
+
+// writeAttempt adds an attempt to the run with the given status and worker,
+// as a coordinator that created it would have left it. A not-started attempt
+// is journaled as a preparation, and its status has no creation time, as the
+// initial status Dispatch writes has none.
+func (f *strandedFixture) writeAttempt(t *testing.T, retry bool, st ir.Status, worker string) string {
+	t.Helper()
+	return f.writeAttemptAt(t, time.Now(), retry, st, worker)
+}
+
+func (f *strandedFixture) writeAttemptAt(t *testing.T, ts time.Time, retry bool, st ir.Status, worker string) string {
 	t.Helper()
 	dag := &ir.DAG{Name: strandedDAG}
-	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), strandedRun, persis.DAGRunCreateAttemptOptions{Retry: retry})
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, ts, strandedRun,
+		persis.DAGRunCreateAttemptOptions{Retry: retry, TrackPreparation: st == ir.NotStarted})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(t.Context()))
 	status := ir.InitialStatus(dag)
@@ -75,10 +93,21 @@ func (f *strandedFixture) writeAttempt(t *testing.T, retry bool, st ir.Status, w
 	status.AttemptKey = ir.GenerateAttemptKey(strandedDAG, strandedRun, strandedDAG, strandedRun, attempt.ID())
 	status.Status = st
 	status.WorkerID = worker
-	status.CreatedAt = createdAt.UnixMilli()
 	require.NoError(t, attempt.Write(t.Context(), status))
 	require.NoError(t, attempt.Close(t.Context()))
 	return attempt.ID()
+}
+
+// preparations lists the attempts still in the preparation journal.
+func (f *strandedFixture) preparations(t *testing.T) []string {
+	t.Helper()
+	entries, err := f.repository.ListAttemptPreparations(t.Context())
+	require.NoError(t, err)
+	var ids []string
+	for _, e := range entries {
+		ids = append(ids, e.AttemptID)
+	}
+	return ids
 }
 
 func (f *strandedFixture) latest(t *testing.T) string {
@@ -100,16 +129,19 @@ func (f *strandedFixture) attemptKey(attemptID string) string {
 }
 
 // A coordinator stopped after creating a retry's attempt and before
-// publishing its task. Reconciliation proves nothing was dispatched, records
-// that, and hides the attempt, so the previous execution is the latest again.
+// publishing its task. Reconciliation finds it in the preparation journal,
+// though its status has no creation time, proves nothing was dispatched,
+// records that, and hides the attempt, so the previous execution is the
+// latest again. The journal entry is ended.
 func TestReconcileAbandonsStrandedPlaceholder(t *testing.T) {
 	t.Parallel()
 	f := newStrandedFixture(t, nil)
-	placeholder := f.writeAttempt(t, true, ir.NotStarted, "", time.Now().Add(-time.Hour))
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.Equal(t, []string{placeholder}, f.preparations(t))
 
-	// Reconciliation runs in the coordinator's periodic zombie pass.
-	f.h.detectAndCleanupZombies(t.Context())
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
 
+	assert.Empty(t, f.preparations(t))
 	assert.Equal(t, f.previous, f.latest(t))
 	records := f.records(t)
 	require.Len(t, records, 1)
@@ -148,15 +180,15 @@ func TestReconcileLeavesPossiblyDispatchedPlaceholder(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newStrandedFixture(t, nil)
-			now := time.Now()
-			placeholder := f.writeAttempt(t, true, ir.NotStarted, "", now.Add(-tc.age))
+			placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
 			if tc.arrange != nil {
 				tc.arrange(t, f, placeholder)
 			}
 
-			f.h.reconcileAbandonedPreparations(t.Context(), now)
+			f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(tc.age))
 			assert.Equal(t, placeholder, f.latest(t), "the attempt stays visible")
 			assert.Empty(t, f.records(t), "no record is written")
+			assert.Equal(t, []string{placeholder}, f.preparations(t), "the preparation stays journaled")
 		})
 	}
 }
@@ -175,12 +207,13 @@ func TestReconcileTreatsLookupErrorAsUnknown(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	f := newStrandedFixture(t, erroringDispatchStore{DispatchTaskStore: newTestDispatchTaskStore(filepath.Join(dir, "d"))})
-	placeholder := f.writeAttempt(t, true, ir.NotStarted, "", time.Now().Add(-time.Hour))
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
 
-	f.h.reconcileAbandonedPreparations(t.Context(), time.Now())
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
 
 	assert.Equal(t, placeholder, f.latest(t))
 	assert.Empty(t, f.records(t))
+	assert.Equal(t, []string{placeholder}, f.preparations(t))
 }
 
 // Not parallel: the hook is package state. Dispatch pauses after preparing a
@@ -200,7 +233,7 @@ func TestReconcileWaitsForAnInFlightDispatch(t *testing.T) {
 		}
 		prepared = task.GetAttemptId()
 		go func() {
-			_, err := f.h.abandonNeverDispatched(context.Background(), f.ref, prepared, "test")
+			_, err := f.h.abandonNeverDispatched(context.Background(), f.ref, f.ref, prepared, "test")
 			reconciled <- err
 		}()
 		select {
@@ -235,8 +268,8 @@ func TestReconcileWaitsForAnInFlightDispatch(t *testing.T) {
 func TestAckRefusesAbandonedAttempt(t *testing.T) {
 	t.Parallel()
 	f := newStrandedFixture(t, nil)
-	placeholder := f.writeAttempt(t, true, ir.NotStarted, "", time.Now().Add(-time.Hour))
-	_, err := f.h.abandonNeverDispatched(t.Context(), f.ref, placeholder, "test")
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
+	_, err := f.h.abandonNeverDispatched(t.Context(), f.ref, f.ref, placeholder, "test")
 	require.NoError(t, err)
 
 	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
@@ -324,17 +357,16 @@ func TestReconcileKeepsStrandedFirstAttemptVisible(t *testing.T) {
 	f := newStrandedFixture(t, nil)
 	first := ir.NewDAGRunRef(strandedDAG, "first-run")
 	dag := &ir.DAG{Name: strandedDAG}
-	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), first.ID, persis.DAGRunCreateAttemptOptions{})
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), first.ID, persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
 	require.NoError(t, err)
 	require.NoError(t, attempt.Open(t.Context()))
 	status := ir.InitialStatus(dag)
 	status.DAGRunID = first.ID
 	status.AttemptID = attempt.ID()
-	status.CreatedAt = time.Now().Add(-time.Hour).UnixMilli()
 	require.NoError(t, attempt.Write(t.Context(), status))
 	require.NoError(t, attempt.Close(t.Context()))
 
-	f.h.detectAndCleanupZombies(t.Context())
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
 
 	latest, err := f.repository.FindAttempt(t.Context(), first)
 	require.NoError(t, err)
@@ -346,4 +378,218 @@ func TestReconcileKeepsStrandedFirstAttemptVisible(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	assert.Equal(t, persis.AbandonmentMarkedFailed, records[0].Outcome)
+}
+
+// A coordinator can stop before an attempt's status is ever written: right
+// after creating it, or after Open created an empty status file. The journal
+// still names the attempt, and reconciliation abandons it.
+func TestReconcileAbandonsStatusLessPreparation(t *testing.T) {
+	t.Parallel()
+	for name, open := range map[string]bool{"before Open": false, "empty status file": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newStrandedFixture(t, nil)
+			attempt, err := f.repository.CreateAttempt(t.Context(), &ir.DAG{Name: strandedDAG}, time.Now(), strandedRun,
+				persis.DAGRunCreateAttemptOptions{Retry: true, TrackPreparation: true})
+			require.NoError(t, err)
+			if open {
+				require.NoError(t, attempt.Open(t.Context()))
+				require.NoError(t, attempt.Close(t.Context()))
+			}
+
+			f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+			assert.Empty(t, f.preparations(t))
+			assert.Equal(t, f.previous, f.latest(t))
+			records := f.records(t)
+			require.Len(t, records, 1)
+			assert.Equal(t, attempt.ID(), records[0].AbandonedAttemptID)
+		})
+	}
+}
+
+// A retry of a run created long ago is judged by when the retry was prepared,
+// not by the run's age.
+func TestReconcileAbandonsStrandedRetryOfAnOldRun(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	f.ref = ir.NewDAGRunRef(strandedDAG, strandedRun)
+	old := ir.NewDAGRunRef(strandedDAG, "old-run")
+	dag := &ir.DAG{Name: strandedDAG}
+	write := func(retry bool, st ir.Status, worker string) string {
+		attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now().AddDate(0, -2, 0), old.ID,
+			persis.DAGRunCreateAttemptOptions{Retry: retry, TrackPreparation: st == ir.NotStarted})
+		require.NoError(t, err)
+		require.NoError(t, attempt.Open(t.Context()))
+		status := ir.InitialStatus(dag)
+		status.DAGRunID = old.ID
+		status.AttemptID = attempt.ID()
+		status.Status = st
+		status.WorkerID = worker
+		require.NoError(t, attempt.Write(t.Context(), status))
+		require.NoError(t, attempt.Close(t.Context()))
+		return attempt.ID()
+	}
+	previous := write(false, ir.Failed, "worker-1")
+	placeholder := write(true, ir.NotStarted, "")
+
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+	latest, err := f.repository.FindAttempt(t.Context(), old)
+	require.NoError(t, err)
+	assert.Equal(t, previous, latest.ID())
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), old, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, placeholder, records[0].AbandonedAttemptID)
+}
+
+// A journaled attempt that a worker started, or whose run is gone, is settled:
+// its entry is ended and nothing is recorded. One that remains possibly
+// dispatched stays journaled without holding the others back.
+func TestReconcileEndsSettledPreparations(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	dag := &ir.DAG{Name: strandedDAG}
+
+	started, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), "started-run",
+		persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, started.Open(t.Context()))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = "started-run"
+	status.AttemptID = started.ID()
+	status.Status = ir.Running
+	status.WorkerID = "worker-1"
+	require.NoError(t, started.Write(t.Context(), status))
+	require.NoError(t, started.Close(t.Context()))
+
+	gone, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), "gone-run",
+		persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, f.repository.RemoveDAGRun(t.Context(), ir.NewDAGRunRef(strandedDAG, "gone-run"), persis.DAGRunRemoveOptions{}))
+
+	pending := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
+		Target: strandedDAG, DAGRunID: strandedRun, AttemptID: pending, AttemptKey: f.attemptKey(pending),
+	}))
+	require.ElementsMatch(t, []string{started.ID(), gone.ID(), pending}, f.preparations(t))
+
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+	assert.Equal(t, []string{pending}, f.preparations(t))
+	assert.Empty(t, f.records(t))
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), ir.NewDAGRunRef(strandedDAG, "started-run"), ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+// A sub-DAG run's attempt that was prepared and never dispatched is abandoned
+// under its root, with the child's attempt key as the evidence key. The root
+// run is untouched.
+func TestReconcileAbandonsStrandedSubDAGPreparation(t *testing.T) {
+	t.Parallel()
+	for name, pending := range map[string]bool{"never dispatched": false, "task pending": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newStrandedFixture(t, nil)
+			child := ir.NewDAGRunRef("child-dag", "child-run")
+			attempt, err := f.repository.CreateAttempt(t.Context(), &ir.DAG{Name: child.Name}, time.Now(), child.ID,
+				persis.DAGRunCreateAttemptOptions{RootDAGRun: f.ref, TrackPreparation: true})
+			require.NoError(t, err)
+			require.NoError(t, attempt.Open(t.Context()))
+			status := ir.InitialStatus(&ir.DAG{Name: child.Name})
+			status.DAGRunID = child.ID
+			status.AttemptID = attempt.ID()
+			status.Root = f.ref
+			status.Parent = f.ref
+			require.NoError(t, attempt.Write(t.Context(), status))
+			require.NoError(t, attempt.Close(t.Context()))
+			key := ir.GenerateAttemptKey(f.ref.Name, f.ref.ID, child.Name, child.ID, attempt.ID())
+			if pending {
+				require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
+					Target: child.Name, DAGRunID: child.ID, AttemptID: attempt.ID(), AttemptKey: key,
+					RootDAGRunName: f.ref.Name, RootDAGRunID: f.ref.ID, ParentDAGRunName: f.ref.Name, ParentDAGRunID: f.ref.ID,
+				}))
+			}
+
+			f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+			assert.Equal(t, f.previous, f.latest(t), "the root run is untouched")
+			records, err := f.repository.ListAttemptAbandonments(t.Context(), child, f.ref)
+			require.NoError(t, err)
+			if pending {
+				assert.Empty(t, records)
+				assert.Equal(t, []string{attempt.ID()}, f.preparations(t))
+				return
+			}
+			require.Len(t, records, 1)
+			assert.Equal(t, f.ref, records[0].RootRun)
+			assert.Equal(t, child, records[0].Run)
+			assert.Equal(t, persis.AbandonmentMarkedFailed, records[0].Outcome)
+			assert.Empty(t, f.preparations(t))
+			latest, err := f.repository.FindSubAttempt(t.Context(), f.ref, child.ID)
+			require.NoError(t, err)
+			got, err := latest.ReadStatus(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, ir.Failed, got.Status)
+		})
+	}
+}
+
+// A first attempt abandoned and marked Failed can be retried: the retry
+// re-queues the same attempt under a new queued-at marker. Its claim is a
+// different execution and is not refused; a late claim of the abandoned
+// execution still is.
+func TestClaimRefusalIsScopedToTheAbandonedExecution(t *testing.T) {
+	t.Parallel()
+	f := newFirstAttemptFixture(t, nil)
+	dag := &ir.DAG{Name: strandedDAG}
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), f.ref.ID,
+		persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(t.Context()))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = f.ref.ID
+	status.AttemptID = attempt.ID()
+	require.NoError(t, attempt.Write(t.Context(), status))
+	require.NoError(t, attempt.Close(t.Context()))
+	record, err := f.h.abandonNeverDispatched(t.Context(), f.ref, f.ref, attempt.ID(), "test")
+	require.NoError(t, err)
+	require.Equal(t, persis.AbandonmentMarkedFailed, record.Outcome)
+
+	failed, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	admission, err := queue.PrepareRetry(t.Context(), f.repository, dag, failed, queue.EnqueueRetryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, admission)
+	require.Equal(t, attempt.ID(), admission.Status.AttemptID, "the retry re-queues the same attempt")
+	require.NotEmpty(t, admission.Status.QueuedAt)
+
+	assert.NoError(t, f.h.refuseAbandonedExecution(t.Context(), f.ref, f.ref, attempt.ID(), admission.Status.QueuedAt))
+	assert.ErrorIs(t, f.h.refuseAbandonedExecution(t.Context(), f.ref, f.ref, attempt.ID(), ""), errAttemptAbandoned)
+}
+
+// A record that cannot be read refuses the claim rather than letting it pass
+// as though the attempt had none.
+func TestClaimRefusalFailsClosedOnAnUnreadableRecord(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
+	_, err := f.h.abandonNeverDispatched(t.Context(), f.ref, f.ref, placeholder, "test")
+	require.NoError(t, err)
+	var record string
+	require.NoError(t, filepath.WalkDir(f.runsDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.Name() == "abandonment.json" && strings.HasSuffix(filepath.Dir(path), placeholder) {
+			record = path
+		}
+		return err
+	}))
+	require.NotEmpty(t, record)
+	require.NoError(t, os.WriteFile(record, []byte("{"), 0600))
+
+	err = f.h.refuseAbandonedExecution(t.Context(), f.ref, f.ref, placeholder, "")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, errAttemptAbandoned)
+	assert.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict)
 }

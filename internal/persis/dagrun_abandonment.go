@@ -41,9 +41,10 @@ var (
 	// ErrAttemptAbandonmentUnsupported is returned when the store cannot
 	// record and hide an abandoned attempt.
 	ErrAttemptAbandonmentUnsupported = errors.New("attempt abandonment is not supported by this store")
-	// ErrAttemptNotAbandonable is returned when the run's latest attempt is
-	// not the named, never-dispatched attempt, so nothing is recorded or
-	// hidden.
+	// ErrAttemptNotAbandonable is returned when the attempt is settled as not
+	// one to abandon: it is not the run's latest, it is gone, or its status
+	// shows it started or was claimed. Nothing is recorded or hidden. A read
+	// that failed is a different error, since the attempt may yet be one.
 	ErrAttemptNotAbandonable = errors.New("attempt is not an abandonable never-dispatched attempt")
 	// ErrAttemptAbandonmentConflict is returned when an existing record for
 	// the attempt is unreadable or describes something else; it never
@@ -85,6 +86,11 @@ type AttemptAbandonment struct {
 	Run                ir.DAGRunRef `json:"run"`
 	RootRun            ir.DAGRunRef `json:"rootRun"`
 	AbandonedAttemptID string       `json:"abandonedAttemptId"`
+	// AbandonedExecution is the execution that was abandoned: the attempt and
+	// the queued-at marker its status carried, empty for a new attempt. The
+	// store sets it. A later retry that re-queues the same attempt is a
+	// different execution, which the record does not cover.
+	AbandonedExecution ExecutionIdentity `json:"abandonedExecution"`
 	// Outcome is AbandonmentHidden or AbandonmentMarkedFailed.
 	Outcome string `json:"outcome"`
 	// ExpectedExecution is the execution that is the latest again after a
@@ -106,6 +112,12 @@ type AttemptAbandonment struct {
 func (a AttemptAbandonment) Attributable() bool {
 	c := a.RequestCorrelation
 	return c != nil && c.ID != "" && c.ActionID != "" && c.ActionAttempt != "" && c.BindingDigest != ""
+}
+
+// Covers reports whether the record abandons the execution of its attempt
+// that carries executionMarker, the queued-at marker a dispatched task names.
+func (a AttemptAbandonment) Covers(attemptID, executionMarker string) bool {
+	return a.AbandonedAttemptID == attemptID && a.AbandonedExecution.QueuedAt == executionMarker
 }
 
 // AbandonAttemptRequest asks the store to record and hide the run's latest
@@ -130,8 +142,14 @@ type DAGRunAttemptAbandoner interface {
 	// returns the record now on disk.
 	AbandonAttempt(ctx context.Context, req AbandonAttemptRequest) (*AttemptAbandonment, error)
 	// ListAttemptAbandonments returns the records of a run's abandoned
-	// attempts, hidden or not, newest attempt first.
+	// attempts, hidden or not, newest attempt first. It skips a record it
+	// cannot read, so it serves history, never authorization.
 	ListAttemptAbandonments(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonment, error)
+	// ReadAttemptAbandonment returns the record of one attempt, or nil when the
+	// attempt has none. A record that exists but cannot be read, or names
+	// another attempt, is an error, so a caller deciding whether to authorize
+	// an execution fails closed.
+	ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*AttemptAbandonment, error)
 }
 
 // AbandonAttempt records and hides a never-dispatched attempt.
@@ -146,6 +164,18 @@ func (r *DAGRunRepository) AbandonAttempt(ctx context.Context, req AbandonAttemp
 	return abandoner.AbandonAttempt(ctx, req)
 }
 
+// ReadAttemptAbandonment reads one attempt's abandonment record.
+func (r *DAGRunRepository) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*AttemptAbandonment, error) {
+	abandoner, ok := r.store.(DAGRunAttemptAbandoner)
+	if !ok {
+		return nil, ErrAttemptAbandonmentUnsupported
+	}
+	if rootDAGRun.Zero() {
+		rootDAGRun = dagRun
+	}
+	return abandoner.ReadAttemptAbandonment(ctx, dagRun, rootDAGRun, attemptID)
+}
+
 // ListAttemptAbandonments lists a run's abandonment records.
 func (r *DAGRunRepository) ListAttemptAbandonments(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonment, error) {
 	abandoner, ok := r.store.(DAGRunAttemptAbandoner)
@@ -156,4 +186,50 @@ func (r *DAGRunRepository) ListAttemptAbandonments(ctx context.Context, dagRun, 
 		rootDAGRun = dagRun
 	}
 	return abandoner.ListAttemptAbandonments(ctx, dagRun, rootDAGRun)
+}
+
+// AttemptPreparationSchema is the version of AttemptPreparation entries this
+// build writes and reads.
+const AttemptPreparationSchema = 1
+
+// AttemptPreparation is a preparation journal entry: an attempt created to be
+// handed to a worker, recorded before the attempt itself. An entry that
+// outlives its preparation names an attempt that may never have been
+// dispatched, whether or not its status was ever written.
+type AttemptPreparation struct {
+	Schema    int          `json:"schema"`
+	Run       ir.DAGRunRef `json:"run"`
+	RootRun   ir.DAGRunRef `json:"rootRun"`
+	AttemptID string       `json:"attemptId"`
+	// PreparedAt is when the entry was written, RFC 3339 in UTC.
+	PreparedAt string `json:"preparedAt"`
+}
+
+// DAGRunPreparationJournal is implemented by stores that journal attempts
+// created with TrackPreparation.
+type DAGRunPreparationJournal interface {
+	// ListAttemptPreparations returns every entry still in the journal,
+	// oldest first. It skips, with a warning, an entry it cannot read.
+	ListAttemptPreparations(ctx context.Context) ([]AttemptPreparation, error)
+	// EndAttemptPreparation removes the entry; removing a missing one is not
+	// an error.
+	EndAttemptPreparation(ctx context.Context, preparation AttemptPreparation) error
+}
+
+// ListAttemptPreparations lists the preparation journal.
+func (r *DAGRunRepository) ListAttemptPreparations(ctx context.Context) ([]AttemptPreparation, error) {
+	journal, ok := r.store.(DAGRunPreparationJournal)
+	if !ok {
+		return nil, ErrAttemptAbandonmentUnsupported
+	}
+	return journal.ListAttemptPreparations(ctx)
+}
+
+// EndAttemptPreparation removes a preparation journal entry.
+func (r *DAGRunRepository) EndAttemptPreparation(ctx context.Context, preparation AttemptPreparation) error {
+	journal, ok := r.store.(DAGRunPreparationJournal)
+	if !ok {
+		return ErrAttemptAbandonmentUnsupported
+	}
+	return journal.EndAttemptPreparation(ctx, preparation)
 }

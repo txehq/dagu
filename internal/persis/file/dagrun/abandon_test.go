@@ -330,3 +330,116 @@ func TestAbandonAttemptRefusesInconsistentOutcome(t *testing.T) {
 		})
 	}
 }
+
+// A status file that Open created and no write ever filled is a status never
+// written: the attempt is abandoned, and a first attempt is marked Failed.
+func TestAbandonAttemptWithEmptyStatusFile(t *testing.T) {
+	t.Parallel()
+	for name, withPrevious := range map[string]bool{"retry": true, "first attempt": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			th := setupTestRepository(t)
+			dag := th.DAG("abandon_dag").DAG
+			if withPrevious {
+				createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+			}
+			opened, err := th.Backend.CreateAttempt(th.Context, persis.DAGRunCreateAttemptRequest{
+				DAG: dag, Timestamp: time.Now(), DAGRunID: abandonRunID, Retry: withPrevious,
+			})
+			require.NoError(t, err)
+			require.NoError(t, opened.Open(th.Context))
+			require.NoError(t, opened.Close(th.Context))
+			concrete, ok := opened.(*Attempt)
+			require.True(t, ok)
+			info, err := os.Stat(concrete.file)
+			require.NoError(t, err, "Open leaves a status file")
+			require.Zero(t, info.Size())
+
+			got, err := abandon(th, abandonRecord(dag, opened.ID(), nil))
+			require.NoError(t, err)
+			assert.Equal(t, withPrevious, got.Outcome == persis.AbandonmentHidden)
+			if !withPrevious {
+				latest, err := th.Repository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID))
+				require.NoError(t, err)
+				status, err := latest.ReadStatus(th.Context)
+				require.NoError(t, err)
+				assert.Equal(t, ir.Failed, status.Status)
+			}
+		})
+	}
+}
+
+// Status data that exists but does not parse may describe a run: nothing is
+// recorded, and the refusal is not the settled kind.
+func TestAbandonAttemptRefusesUnreadableStatus(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	require.NoError(t, os.WriteFile(placeholder.file, []byte("{not json\n"), 0600))
+
+	_, err := abandon(th, abandonRecord(dag, placeholder.ID(), nil))
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, persis.ErrAttemptNotAbandonable)
+	_, statErr := os.Stat(filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile))
+	assert.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+// The record names the execution it abandons, with the queued-at marker its
+// status carried.
+func TestAbandonAttemptRecordsAbandonedExecution(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	only := createRunAttempt(t, th, dag, false, ir.NotStarted, "2026-10-10T02:00:00Z", "")
+
+	got, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+	require.NoError(t, err)
+	assert.Equal(t, persis.ExecutionIdentity{AttemptID: only.ID(), QueuedAt: "2026-10-10T02:00:00Z"}, got.AbandonedExecution)
+	assert.True(t, got.Covers(only.ID(), "2026-10-10T02:00:00Z"))
+	assert.False(t, got.Covers(only.ID(), "2026-10-10T03:00:00Z"), "a re-queued execution is another one")
+	assert.False(t, got.Covers(only.ID(), ""))
+}
+
+// The strict read returns the attempt's record, nothing for an attempt
+// without one, and an error for a record it cannot trust.
+func TestReadAttemptAbandonment(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	previous := createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	_, err := abandon(th, abandonRecord(dag, placeholder.ID(), nil))
+	require.NoError(t, err)
+
+	got, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, placeholder.ID())
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, placeholder.ID(), got.AbandonedAttemptID)
+
+	none, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, previous.ID())
+	require.NoError(t, err)
+	assert.Nil(t, none)
+
+	// The placeholder was hidden, which renamed its directory.
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(filepath.Dir(placeholder.file)), "*"+placeholder.ID(), AbandonmentRecordFile))
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	recordPath := matches[0]
+	for name, data := range map[string]string{
+		"malformed":          "{",
+		"another attempt":    `{"schema":1,"run":{"name":"abandon_dag","id":"abandon-run"},"abandonedAttemptId":"other"}`,
+		"unsupported schema": `{"schema":99}`,
+	} {
+		require.NoError(t, os.WriteFile(recordPath, []byte(data), 0600))
+		_, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, placeholder.ID())
+		require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, name)
+	}
+	require.NoError(t, os.Chmod(recordPath, 0))
+	if _, err := os.ReadFile(recordPath); err != nil { //nolint:gosec // test path
+		_, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, placeholder.ID())
+		require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, "unreadable")
+	}
+}

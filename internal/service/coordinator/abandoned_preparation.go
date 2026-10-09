@@ -18,20 +18,13 @@ import (
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
-// abandonedPreparationMinAge is how old a not-started attempt must be before
-// reconciliation considers it. It is not why an attempt is abandoned; the
-// absence evidence is. It keeps reconciliation away from a preparation that
-// another coordinator, for example one draining during a rolling replacement,
-// may still be about to publish. The claim check below refuses such a
-// publication anyway.
+// abandonedPreparationMinAge is how old a preparation journal entry must be
+// before reconciliation considers its attempt. It is not why an attempt is
+// abandoned; the absence evidence is. It keeps reconciliation away from a
+// preparation that another coordinator, for example one draining during a
+// rolling replacement, may still be about to publish. The claim check below
+// refuses such a publication anyway.
 const abandonedPreparationMinAge = 10 * time.Minute
-
-// abandonedPreparationLookback is how far back reconciliation looks for runs
-// left not started.
-const abandonedPreparationLookback = 7 * 24 * time.Hour
-
-// abandonedPreparationScanLimit bounds one reconciliation pass.
-const abandonedPreparationScanLimit = 200
 
 // errAttemptAbandoned refuses a claim of an attempt that has an abandonment
 // record: it was proven never dispatched and is hidden.
@@ -52,7 +45,8 @@ func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey string
 		return evidence, errAbandonmentUnavailable
 	}
 	if status != nil && (status.WorkerID != "" || status.Status != ir.NotStarted) {
-		return evidence, fmt.Errorf("attempt is %s with worker %q", status.Status, status.WorkerID)
+		return evidence, fmt.Errorf("%w: attempt is %s with worker %q",
+			persis.ErrAttemptNotAbandonable, status.Status, status.WorkerID)
 	}
 	outstanding, err := h.dispatchTaskStore.HasOutstandingAttempt(ctx, attemptKey, h.staleLeaseThreshold)
 	if err != nil {
@@ -83,31 +77,44 @@ func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey string
 	return evidence, nil
 }
 
-// abandonNeverDispatched records and hides a root run's attempt once absence
-// of any dispatch is proven. It holds the run's write lock, which Dispatch
-// holds from preparing an attempt to publishing its task and AckTaskClaim
-// holds while recording a claim, so neither can interleave. detail says why,
-// for the record. The store hides the attempt when the run has an earlier
-// execution, and otherwise keeps it visible, marked Failed with detail.
-func (h *Handler) abandonNeverDispatched(ctx context.Context, run ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
+// abandonNeverDispatched records an attempt of a root run or of one of its
+// sub-DAG runs once absence of any dispatch is proven. It holds the root
+// run's write lock, which Dispatch holds from preparing an attempt to
+// publishing its task and AckTaskClaim holds while recording a claim, so
+// neither can interleave. detail says why, for the record. The store hides
+// the attempt when the run has an earlier execution, and otherwise keeps it
+// visible, marked Failed with detail.
+func (h *Handler) abandonNeverDispatched(ctx context.Context, run, root ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
 	if h.dagRunRepository == nil {
 		return nil, persis.ErrAttemptAbandonmentUnsupported
 	}
-	defer h.attemptWriteLocks.lock(run)()
-	return h.abandonNeverDispatchedLocked(ctx, run, attemptID, detail)
+	if root.Zero() {
+		root = run
+	}
+	defer h.attemptWriteLocks.lock(root)()
+	return h.abandonExecutionLocked(ctx, run, root, attemptID, detail)
 }
 
+// abandonNeverDispatchedLocked abandons a root run's attempt; the caller holds
+// the run's write lock.
 func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
+	return h.abandonExecutionLocked(ctx, run, run, attemptID, detail)
+}
+
+// abandonExecutionLocked abandons the attempt and, once its record is on
+// disk, ends its preparation journal entry. The caller holds the root run's
+// write lock.
+func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
 	ctx = context.WithoutCancel(ctx)
 	h.closeCachedAttemptForRun(ctx, ctx, run.ID, attemptID)
 
 	var status *ir.DAGRunStatus
-	if attempt, err := h.dagRunRepository.FindAttempt(ctx, run); err == nil && attempt.ID() == attemptID {
+	if attempt, err := h.findRunAttempt(ctx, run, root); err == nil && attempt.ID() == attemptID {
 		if st, err := attempt.ReadStatus(ctx); err == nil {
 			status = st
 		}
 	}
-	attemptKey := ir.GenerateAttemptKey(run.Name, run.ID, run.Name, run.ID, attemptID)
+	attemptKey := ir.GenerateAttemptKey(root.Name, root.ID, run.Name, run.ID, attemptID)
 	evidence, err := h.neverDispatchedEvidence(ctx, attemptKey, status)
 	if err != nil {
 		return nil, err
@@ -115,7 +122,7 @@ func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRu
 	record := persis.AttemptAbandonment{
 		Schema:             persis.AttemptAbandonmentSchema,
 		Run:                run,
-		RootRun:            run,
+		RootRun:            root,
 		AbandonedAttemptID: attemptID,
 		Reason:             persis.AbandonedRetryPreparation,
 		Detail:             detail,
@@ -123,74 +130,109 @@ func (h *Handler) abandonNeverDispatchedLocked(ctx context.Context, run ir.DAGRu
 		CoordinatorID:      h.owner.ID,
 		Evidence:           evidence,
 	}
-	return h.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: record})
+	abandoned, err := h.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, RootDAGRun: root, Record: record})
+	if err != nil {
+		return nil, err
+	}
+	h.endPreparation(ctx, run, root, attemptID)
+	return abandoned, nil
 }
 
-// reconcileAbandonedPreparations finds root runs whose latest attempt is
-// not started, has no worker and is older than the bound, and abandons each
-// one whose absence of dispatch is proven. A coordinator that stopped between
-// creating an attempt and publishing its task leaves exactly this behind.
+// findRunAttempt finds the latest attempt of a root run or of a sub-DAG run.
+func (h *Handler) findRunAttempt(ctx context.Context, run, root ir.DAGRunRef) (dagrun.Attempt, error) {
+	if run == root {
+		return h.dagRunRepository.FindAttempt(ctx, run)
+	}
+	return h.dagRunRepository.FindSubAttempt(ctx, root, run.ID)
+}
+
+// endPreparation removes the attempt's preparation journal entry once the
+// attempt was handed to a worker or abandoned. An entry left behind is
+// re-examined by reconciliation, which ends it when the attempt is settled.
+func (h *Handler) endPreparation(ctx context.Context, run, root ir.DAGRunRef, attemptID string) {
+	err := h.dagRunRepository.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: root, AttemptID: attemptID})
+	if err != nil && !errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+		logger.Warn(ctx, "Failed to end an attempt preparation",
+			tag.RunID(run.ID), tag.AttemptID(attemptID), tag.Error(err))
+	}
+}
+
+// reconcileAbandonedPreparations reads the preparation journal and, for each
+// entry older than the bound, abandons its attempt if absence of dispatch is
+// proven. A coordinator that stopped between creating an attempt and
+// publishing its task leaves exactly such an entry, whether or not the
+// attempt's status was ever written. An entry whose attempt is settled, as
+// started, superseded or gone, is ended. The journal holds only preparations
+// in flight or left behind, so each pass reads it whole and none is starved.
 func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.Time) {
 	if h.dagRunRepository == nil || h.dispatchTaskStore == nil || h.dagRunLeaseStore == nil {
 		return
 	}
-	page, err := h.dagRunRepository.ListStatusesPage(ctx, persis.DAGRunListOptions{
-		Statuses: []ir.Status{ir.NotStarted},
-		From:     persis.NewUTC(now.Add(-abandonedPreparationLookback)),
-		Limit:    abandonedPreparationScanLimit,
-	})
+	preparations, err := h.dagRunRepository.ListAttemptPreparations(ctx)
 	if err != nil {
-		logger.Warn(ctx, "Failed to list not-started runs for reconciliation", tag.Error(err))
+		if !errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+			logger.Warn(ctx, "Failed to read the attempt preparation journal", tag.Error(err))
+		}
 		return
 	}
-	for _, status := range page.Items {
+	for _, p := range preparations {
 		if ctx.Err() != nil {
 			return
 		}
-		if status == nil || isSubDAGStatus(status) || status.WorkerID != "" || status.AttemptID == "" {
+		preparedAt, err := time.Parse(time.RFC3339Nano, p.PreparedAt)
+		if err != nil || now.Sub(preparedAt) < abandonedPreparationMinAge {
 			continue
 		}
-		if status.CreatedAt == 0 || now.Sub(time.UnixMilli(status.CreatedAt)) < abandonedPreparationMinAge {
-			continue
-		}
-		record, err := h.abandonNeverDispatched(ctx, status.DAGRun(), status.AttemptID,
+		record, err := h.abandonNeverDispatched(ctx, p.Run, p.RootRun, p.AttemptID,
 			"not dispatched: no dispatch task, claim, lease or worker after the coordinator stopped")
-		if err != nil {
-			logger.Warn(ctx, "Left a not-started attempt for review",
-				tag.RunID(status.DAGRunID), tag.AttemptID(status.AttemptID), tag.Error(err))
-			continue
+		switch {
+		case err == nil:
+			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
+				tag.RunID(p.Run.ID), tag.AttemptID(record.AbandonedAttemptID))
+		case errors.Is(err, persis.ErrAttemptNotAbandonable), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+			// Settled: nothing of this preparation is left to abandon.
+			h.endPreparation(ctx, p.Run, p.RootRun, p.AttemptID)
+		default:
+			logger.Warn(ctx, "Left a prepared attempt for review",
+				tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
 		}
-		logger.Warn(ctx, "Abandoned a never-dispatched attempt",
-			tag.RunID(status.DAGRunID), tag.AttemptID(record.AbandonedAttemptID))
 	}
 }
 
-// refuseAbandonedClaim refuses a claim of an attempt that was abandoned. A
-// coordinator that published a task after another coordinator had proven its
-// absence cannot then have it executed. The caller holds the run's write lock.
-func (h *Handler) refuseAbandonedClaim(ctx context.Context, run ir.DAGRunRef, root ir.DAGRunRef, attemptID string) error {
+// refuseAbandonedClaim refuses a claim of an attempt's execution that was
+// abandoned. A coordinator that published a task after another coordinator
+// had proven its absence cannot then have it executed. A later execution of
+// the same attempt, re-queued by a retry, carries another marker and is not
+// refused. A record that cannot be read refuses the claim. The caller holds
+// the run's write lock.
+func (h *Handler) refuseAbandonedExecution(ctx context.Context, run, root ir.DAGRunRef, attemptID, executionMarker string) error {
 	if h.dagRunRepository == nil {
 		return nil
 	}
-	records, err := h.dagRunRepository.ListAttemptAbandonments(ctx, run, root)
+	record, err := h.dagRunRepository.ReadAttemptAbandonment(ctx, run, root, attemptID)
 	switch {
 	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
 		return nil
 	case err != nil:
-		return fmt.Errorf("read abandonment records: %w", err)
-	}
-	for _, record := range records {
-		if record.AbandonedAttemptID == attemptID {
-			return errAttemptAbandoned
-		}
+		return fmt.Errorf("read abandonment record: %w", err)
+	case record != nil && record.Covers(attemptID, executionMarker):
+		return errAttemptAbandoned
 	}
 	return nil
+}
+
+// refuseAbandonedClaim is the claim check's call until the handler passes
+// the task's execution marker (WIP: handler.go is frozen for TXE-3808).
+func (h *Handler) refuseAbandonedClaim(ctx context.Context, run, root ir.DAGRunRef, attemptID string) error {
+	return h.refuseAbandonedExecution(ctx, run, root, attemptID, "")
 }
 
 // preparationFailedError reports a failure after an attempt was created but
 // before its status was written, so the attempt was never dispatched.
 type preparationFailedError struct {
-	run       ir.DAGRunRef
+	run ir.DAGRunRef
+	// root is the run's root; zero for a root run.
+	root      ir.DAGRunRef
 	attemptID string
 	err       error
 }
@@ -205,7 +247,11 @@ func (h *Handler) abandonFailedPreparation(ctx context.Context, prepErr error) {
 	if !errors.As(prepErr, &failed) {
 		return
 	}
-	if _, err := h.abandonNeverDispatchedLocked(ctx, failed.run, failed.attemptID,
+	root := failed.root
+	if root.Zero() {
+		root = failed.run
+	}
+	if _, err := h.abandonExecutionLocked(ctx, failed.run, root, failed.attemptID,
 		"not dispatched: preparing the attempt failed: "+failed.err.Error()); err != nil {
 		logger.Warn(ctx, "Left an attempt whose preparation failed for review",
 			tag.RunID(failed.run.ID), tag.AttemptID(failed.attemptID), tag.Error(err))

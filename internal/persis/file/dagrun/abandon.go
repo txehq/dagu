@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -110,17 +109,20 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 	case errors.Is(err, os.ErrNotExist):
 		// An attempt whose status was never written (its first Open or write
 		// failed) was never dispatched either.
-		if latest.Exists() {
-			status, err := latest.ReadStatus(ctx)
-			switch {
-			case errors.Is(err, dagrun.ErrNoStatusData) || errors.Is(err, io.EOF):
-			case err != nil:
-				return nil, fmt.Errorf("%w: read attempt status: %v", persis.ErrAttemptNotAbandonable, err)
-			case status.Status != ir.NotStarted || status.WorkerID != "":
-				return nil, fmt.Errorf("%w: attempt %s is %s with worker %q",
-					persis.ErrAttemptNotAbandonable, latest.ID(), status.Status, status.WorkerID)
-			}
+		status, err := readWrittenStatus(ctx, latest)
+		switch {
+		case err != nil:
+			// Unreadable is not settled: the attempt may still be one to
+			// abandon once its status can be read.
+			return nil, fmt.Errorf("read attempt %s status: %w", latest.ID(), err)
+		case status == nil:
+		case status.Status != ir.NotStarted || status.WorkerID != "":
+			return nil, fmt.Errorf("%w: attempt %s is %s with worker %q",
+				persis.ErrAttemptNotAbandonable, latest.ID(), status.Status, status.WorkerID)
+		default:
+			record.AbandonedExecution.QueuedAt = status.QueuedAt
 		}
+		record.AbandonedExecution.AttemptID = latest.ID()
 		predecessor, err := store.predecessorLocked(ctx, run, dirs, latest.ID())
 		if err != nil {
 			return nil, err
@@ -167,19 +169,17 @@ func markNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptA
 	if record.RootRun != record.Run {
 		next.Root = record.RootRun
 	}
-	if att.Exists() {
-		status, err := att.ReadStatus(ctx)
-		switch {
-		case errors.Is(err, dagrun.ErrNoStatusData) || errors.Is(err, io.EOF):
-		case err != nil:
-			return fmt.Errorf("read abandoned attempt status: %w", err)
-		case status.Status == ir.Failed:
-			return nil
-		case status.Status != ir.NotStarted:
-			return fmt.Errorf("%w: attempt %s became %s", persis.ErrAttemptAbandonmentConflict, att.ID(), status.Status)
-		default:
-			next = *status
-		}
+	status, err := readWrittenStatus(ctx, att)
+	switch {
+	case err != nil:
+		return fmt.Errorf("read abandoned attempt status: %w", err)
+	case status == nil:
+	case status.Status == ir.Failed:
+		return nil
+	case status.Status != ir.NotStarted:
+		return fmt.Errorf("%w: attempt %s became %s", persis.ErrAttemptAbandonmentConflict, att.ID(), status.Status)
+	default:
+		next = *status
 	}
 	next.Status = ir.Failed
 	next.FinishedAt = stringutil.FormatTime(time.Now())
@@ -196,6 +196,66 @@ func markNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptA
 		return fmt.Errorf("mark abandoned attempt failed: %w", writeErr)
 	}
 	return closeErr
+}
+
+// readWrittenStatus reads an attempt's status for an abandonment decision. It
+// returns nil when no status was ever written: there is no status file, or it
+// is empty, as when Open succeeded and the first write did not. Status data
+// that exists but cannot be read is an error, since it may describe a run.
+func readWrittenStatus(ctx context.Context, att *Attempt) (*ir.DAGRunStatus, error) {
+	info, err := os.Stat(att.file)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	case info.Size() == 0:
+		return nil, nil
+	}
+	status, err := att.ReadStatusUncached(ctx)
+	if errors.Is(err, dagrun.ErrNoStatusData) {
+		return nil, nil
+	}
+	return status, err
+}
+
+// ReadAttemptAbandonment implements persis.DAGRunAttemptAbandoner. It reads
+// without the run's lock: a record is written whole and never changes.
+func (store *Store) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*persis.AttemptAbandonment, error) {
+	if rootDAGRun.Zero() {
+		rootDAGRun = dagRun
+	}
+	run, err := store.findRunLocked(ctx, store.dataRoot(rootDAGRun.Name), rootDAGRun, dagRun)
+	if err != nil {
+		return nil, err
+	}
+	dirs, err := run.listAttemptDirs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attempts: %w", err)
+	}
+	for _, dir := range dirs {
+		att, err := run.AttemptByDir(dir, nil)
+		if err != nil {
+			// An attempt directory this build cannot open may be the one
+			// asked about; refuse to say it has no record.
+			return nil, fmt.Errorf("%w: attempt directory %s: %v", persis.ErrAttemptAbandonmentConflict, dir, err)
+		}
+		if att.ID() != attemptID {
+			continue
+		}
+		record, err := readAbandonmentRecord(att.file)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return nil, nil
+		case err != nil:
+			return nil, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, attemptID, err)
+		case record.AbandonedAttemptID != attemptID || record.Run != dagRun:
+			return nil, fmt.Errorf("%w: attempt %s holds a record for %s attempt %s",
+				persis.ErrAttemptAbandonmentConflict, attemptID, record.Run.String(), record.AbandonedAttemptID)
+		}
+		return record, nil
+	}
+	return nil, nil
 }
 
 // ListAttemptAbandonments implements persis.DAGRunAttemptAbandoner.
@@ -255,7 +315,7 @@ func (store *Store) predecessorLocked(ctx context.Context, run *DAGRun, dirs []s
 		}
 		status, err := att.ReadStatus(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("%w: read earlier attempt %s: %v", persis.ErrAttemptNotAbandonable, att.ID(), err)
+			return nil, fmt.Errorf("read earlier attempt %s: %w", att.ID(), err)
 		}
 		return &persis.ExecutionIdentity{AttemptID: status.AttemptID, QueuedAt: status.QueuedAt}, nil
 	}
