@@ -39,6 +39,10 @@ type indexEntry struct {
 	JobID string `json:"job_id"`
 }
 
+type indexReady struct {
+	At time.Time `json:"at"`
+}
+
 // indexTargets records which resources a job version depends on.
 func (s *Store) indexTargets(ctx context.Context, jobID string, targets []Target) error {
 	for _, t := range targets {
@@ -147,7 +151,9 @@ const (
 	// resourcePendingPrefix marks events not yet completely applied; the
 	// marker is operational state and is removed once the event completes.
 	resourcePendingPrefix = "resource_events_pending/"
-	maxReevaluations      = 3
+	// resourceIndexReady records that the index covers every job.
+	resourceIndexReady = "resource_index_ready"
+	maxReevaluations   = 3
 )
 
 // ResourceJobFilter decides whether a resource event may affect a job, for
@@ -183,12 +189,31 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 	default:
 		return nil, refuse(CodeInvalid, "unknown observation %q", ev.Observation)
 	}
-	id, err := NewID(PrefixEvent, s.clock())
-	if err != nil {
+	if err := s.requireIndexReady(ctx); err != nil {
 		return nil, err
 	}
+	// A client-minted event ID makes the report resumable: sending it again
+	// continues the saved event instead of starting another.
+	if ev.EventID != "" {
+		if err := ValidateID(PrefixEvent, ev.EventID); err != nil {
+			return nil, err
+		}
+		saved, err := s.GetResourceEvent(ctx, ev.EventID)
+		switch {
+		case err == nil:
+			return s.resumeResourceEvent(ctx, saved, ev, by, permitted)
+		case ErrorCode(err) != CodeNotFound:
+			return nil, err
+		}
+	} else {
+		id, err := NewID(PrefixEvent, s.clock())
+		if err != nil {
+			return nil, err
+		}
+		ev.EventID = id
+	}
+	id := ev.EventID
 	ev.Schema = SchemaVersion
-	ev.EventID = id
 	ev.Reporter = by
 	if ev.ObservedAt.IsZero() {
 		ev.ObservedAt = s.clock()
@@ -213,6 +238,9 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 		}
 	}
 	if err := s.createJSON(ctx, resourceEventsPrefix+id, &ev); err != nil {
+		if errors.Is(err, persis.ErrConflict) {
+			return nil, refuse(CodeDuplicate, "resource event %s was created concurrently; send it again", id)
+		}
 		return nil, err
 	}
 	if err := s.createJSON(ctx, resourcePendingPrefix+id, indexEntry{}); err != nil && !errors.Is(err, persis.ErrConflict) {
@@ -246,8 +274,12 @@ func (s *Store) resourceCandidates(ctx context.Context, t Target, obs ResourceOb
 }
 
 // applyPending applies the event to each pending dependent, saves the
-// event, and removes its pending marker once every dependent is applied.
+// event, and removes its pending marker once every dependent is applied. The
+// caller's event changes only after the new state is saved, so a failed save
+// never reports progress that is not stored.
 func (s *Store) applyPending(ctx context.Context, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) error {
+	next := *ev
+	next.Dispositions = append([]ResourceDisposition(nil), ev.Dispositions...)
 	var still []ResourceDependent
 	var failures []ResourceFailure
 	for _, p := range ev.Pending {
@@ -258,19 +290,44 @@ func (s *Store) applyPending(ctx context.Context, ev *ResourceEvent, by Actor, p
 			continue
 		}
 		if d != nil {
-			ev.Dispositions = append(ev.Dispositions, *d)
+			next.Dispositions = append(next.Dispositions, *d)
 		}
 	}
-	ev.Pending, ev.Failures, ev.Complete = still, failures, len(still) == 0
-	if err := s.putJSON(ctx, resourceEventsPrefix+ev.EventID, ev); err != nil {
-		return err
+	next.Pending, next.Failures, next.Complete = still, failures, len(still) == 0
+	if err := s.putJSON(ctx, resourceEventsPrefix+ev.EventID, &next); err != nil {
+		return &Error{Code: CodeIncomplete, Message: "resource event " + ev.EventID + " progress could not be saved; send it again with this event_id", Current: ev}
 	}
+	*ev = next
 	if ev.Complete {
 		if err := s.col.Delete(ctx, resourcePendingPrefix+ev.EventID); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// resumeResourceEvent continues a saved event re-sent under its own ID by
+// the same reporter with the same report. The caller's current permission is
+// checked again for every dependent still pending.
+func (s *Store) resumeResourceEvent(ctx context.Context, saved *ResourceEvent, sent ResourceEvent, by Actor, permitted ResourceJobFilter) (*ResourceEvent, error) {
+	if saved.Reporter.ID != by.ID || !sameReport(saved, &sent) {
+		return nil, &Error{Code: CodeDuplicate, Message: "event " + saved.EventID + " was reported differently", Current: saved.EventID}
+	}
+	if saved.Complete {
+		return saved, nil
+	}
+	if err := s.applyPending(ctx, saved, by, permitted); err != nil {
+		return saved, err
+	}
+	return saved, nil
+}
+
+func sameReport(a, b *ResourceEvent) bool {
+	digest := func(e *ResourceEvent) string {
+		bs, _ := CanonicalJSON([]any{TargetKey(e.Target), e.Observation, e.Authoritative, e.Detail, e.Evidence})
+		return sha256Hex(bs)
+	}
+	return digest(a) == digest(b)
 }
 
 // applyDependent applies the event to one job, evaluating it again from the
@@ -350,7 +407,24 @@ func (s *Store) RebuildResourceIndex(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	return s.putJSON(ctx, resourceIndexReady, indexReady{At: s.clock()})
+}
+
+// requireIndexReady refuses resource events until every job registered
+// before the index existed has been indexed, so an incomplete index is
+// never taken as proof that a resource has no dependents.
+func (s *Store) requireIndexReady(ctx context.Context) error {
+	var ready indexReady
+	if err := s.getJSON(ctx, resourceIndexReady, &ready); err != nil {
+		if ErrorCode(err) == CodeNotFound {
+			return refuse(CodeNotReady, "the resource index is being built; retry shortly")
+		}
+		return err
+	}
+	return nil
 }
 
 // currentTargets returns the targets of the job's current version that

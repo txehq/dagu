@@ -3766,7 +3766,7 @@ export interface paths {
         put?: never;
         /**
          * Report a resource event
-         * @description The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved.
+         * @description Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved.
          */
         post: operations["recordTxeResourceEvent"];
         delete?: never;
@@ -7708,6 +7708,8 @@ export interface components {
         /** @enum {string} */
         TxeResourceObservation: TxeResourceObservation;
         TxeResourceEventRequest: {
+            /** @description Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409 */
+            event_id?: string;
             target: components["schemas"]["TxeTarget"];
             observation: components["schemas"]["TxeResourceObservation"];
             /** @description True only when the evidence proves the stable identity no longer exists */

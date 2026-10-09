@@ -95,6 +95,11 @@ func (d *queueDispatcher) admitQueuedRun(
 		logger.Error(ctx, "Failed to check TXE job admission; leaving queued run pending", tag.Error(err))
 		return false
 	}
+	if adm.Admit && d.dagExecutor != nil && !d.dagExecutor.IsDistributed(dag) {
+		// Registered jobs run only through their machine's worker, where the
+		// claim is admitted and recorded against retirement.
+		adm = registry.Admission{JobID: adm.JobID, Code: registry.AdmitNotOnWorker, Reason: "registered jobs run only on their machine's worker"}
+	}
 	if adm.Admit {
 		return true
 	}
@@ -120,12 +125,17 @@ func (s *Scheduler) startTxeReconciler(ctx context.Context) {
 	if s.runAdmitter == nil {
 		return
 	}
-	if err := s.runAdmitter.RebuildResourceIndex(ctx); err != nil {
-		logger.Warn(ctx, "TXE resource index rebuild incomplete", tag.Error(err))
-	}
+	indexed := false
 	ticker := time.NewTicker(txeReconcileInterval)
 	defer ticker.Stop()
 	for {
+		if !indexed {
+			if err := s.runAdmitter.RebuildResourceIndex(ctx); err != nil {
+				logger.Warn(ctx, "TXE resource index rebuild incomplete; retrying next interval", tag.Error(err))
+			} else {
+				indexed = true
+			}
+		}
 		retired, err := s.runAdmitter.ReconcileExpired(ctx)
 		if err != nil {
 			logger.Warn(ctx, "TXE expiry reconciliation incomplete", tag.Error(err))

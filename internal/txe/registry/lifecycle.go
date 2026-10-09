@@ -24,6 +24,9 @@ const (
 	AdmitDuplicate         AdmitCode = "duplicate"
 	AdmitSupersededVersion AdmitCode = "superseded_version"
 	AdmitUnregistered      AdmitCode = "unregistered"
+	// AdmitNotOnWorker refuses executing a job anywhere but through its
+	// machine's worker, where the claim is admitted and recorded.
+	AdmitNotOnWorker AdmitCode = "not_on_worker"
 )
 
 // Admission is the registry's answer to "may this run of DAG start now?".
@@ -49,8 +52,8 @@ const maxAdmittedRuns = 200
 // after an update. A lifetime that has ended retires the job here, before
 // any run can use it. Callers must treat an error as "do not run".
 //
-// AdmitRun only reads. Where a run is handed to a worker, AdmitClaim records
-// the admission so that it is ordered against retirement.
+// AdmitRun only reads. Registered jobs execute only through a worker claim,
+// and AdmitClaim records that admission so it is ordered against retirement.
 func (s *Store) AdmitRun(ctx context.Context, dagName, specSHA256 string) (Admission, error) {
 	if !IsJobDAG(dagName) {
 		return Admission{Admit: true}, nil
@@ -59,14 +62,15 @@ func (s *Store) AdmitRun(ctx context.Context, dagName, specSHA256 string) (Admis
 	if err != nil || job == nil {
 		return refuseRun(dagName, AdmitUnregistered, "job is not registered"), err
 	}
-	return admissionFor(job, specSHA256), nil
+	return admissionFor(job, specSHA256, s.clock()), nil
 }
 
 // AdmitClaim admits a run at the moment a worker takes it, and records the
-// run on the job in the same commit. A retirement committed before it makes
-// it refuse; one committed after it finds the run on the job and applies the
-// job's active-run policy to it, even if Dagu does not yet report it running.
-func (s *Store) AdmitClaim(ctx context.Context, dagName, specSHA256, runID string) (Admission, error) {
+// run on the job in the same commit, which also re-checks the lifetime. A
+// retirement committed before it makes it refuse; one committed after it
+// finds the run on the job and applies the job's active-run policy to it,
+// even if Dagu does not yet report it running.
+func (s *Store) AdmitClaim(ctx context.Context, dagName, specSHA256 string, run RunRef) (Admission, error) {
 	if !IsJobDAG(dagName) {
 		return Admission{Admit: true}, nil
 	}
@@ -76,17 +80,17 @@ func (s *Store) AdmitClaim(ctx context.Context, dagName, specSHA256, runID strin
 	}
 	var adm Admission
 	_, err = s.WithJobTx(ctx, dagName, reconcilerActor, func(tx *JobTx) error {
-		adm = admissionFor(tx.Job, specSHA256)
-		if !adm.Admit || runID == "" {
+		adm = admissionFor(tx.Job, specSHA256, tx.now)
+		if !adm.Admit || run.RunID == "" {
 			return nil
 		}
-		if _, ok := tx.Job.AdmittedRuns[runID]; ok {
+		if _, ok := tx.Job.AdmittedRuns[run.RunID]; ok {
 			return nil
 		}
 		if tx.Job.AdmittedRuns == nil {
-			tx.Job.AdmittedRuns = map[string]time.Time{}
+			tx.Job.AdmittedRuns = map[string]AdmittedRun{}
 		}
-		tx.Job.AdmittedRuns[runID] = tx.now
+		tx.Job.AdmittedRuns[run.RunID] = AdmittedRun{At: tx.now, RootName: run.RootName, RootRunID: run.RootRunID}
 		pruneAdmitted(tx.Job.AdmittedRuns)
 		tx.touch()
 		return nil
@@ -112,7 +116,7 @@ func (s *Store) currentForAdmission(ctx context.Context, jobID string) (*Job, er
 	return job, nil
 }
 
-func admissionFor(job *Job, specSHA256 string) Admission {
+func admissionFor(job *Job, specSHA256 string, now time.Time) Admission {
 	switch {
 	case job.Lifecycle == LifecycleRetired:
 		code := AdmitRetired
@@ -122,6 +126,8 @@ func admissionFor(job *Job, specSHA256 string) Admission {
 		return refuseRun(job.JobID, code, retirementReason(job))
 	case job.Lifecycle == LifecycleCompleted:
 		return refuseRun(job.JobID, AdmitCompleted, retirementReason(job))
+	case expired(job, now):
+		return refuseRun(job.JobID, AdmitExpired, "lifetime ended at "+job.ExpiresAt.UTC().Format(time.RFC3339))
 	case job.Registration.State == RegistrationDuplicate:
 		return refuseRun(job.JobID, AdmitDuplicate, "job duplicates another registration")
 	case job.Registration.State != RegistrationReady:
@@ -134,7 +140,7 @@ func admissionFor(job *Job, specSHA256 string) Admission {
 	return Admission{Admit: true, JobID: job.JobID}
 }
 
-func pruneAdmitted(m map[string]time.Time) {
+func pruneAdmitted(m map[string]AdmittedRun) {
 	if len(m) <= maxAdmittedRuns {
 		return
 	}
@@ -142,7 +148,7 @@ func pruneAdmitted(m map[string]time.Time) {
 	for id := range m {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, k int) bool { return m[ids[i]].Before(m[ids[k]]) })
+	sort.Slice(ids, func(i, k int) bool { return m[ids[i]].At.Before(m[ids[k]].At) })
 	for _, id := range ids[:len(ids)-maxAdmittedRuns] {
 		delete(m, id)
 	}
@@ -217,20 +223,14 @@ func (s *Store) ReconcileExpired(ctx context.Context) ([]string, error) {
 	return retired, errors.Join(errs...)
 }
 
-// RunRef is a queued or running run of a job's DAG.
-type RunRef struct {
-	RunID   string
-	Running bool
-}
-
 // RunControl applies lifecycle changes to Dagu itself. The committed
 // lifecycle, enforced by admission, is the authority; RunControl brings
 // Dagu's own state in line with it.
 type RunControl interface {
 	// ActiveRuns lists queued and running runs of the DAG.
 	ActiveRuns(ctx context.Context, dagName string) ([]RunRef, error)
-	// StopRun asks Dagu to stop a run.
-	StopRun(ctx context.Context, dagName, runID string) error
+	// StopRun asks Dagu to stop a run, a child run when run names its root.
+	StopRun(ctx context.Context, dagName string, run RunRef) error
 	// IsSuspended reports Dagu's own suspend flag for the DAG.
 	IsSuspended(ctx context.Context, dagName string) (bool, error)
 	// SetSuspended sets Dagu's own suspend flag for the DAG.
@@ -284,8 +284,9 @@ func (s *Store) ChangeLifecycle(ctx context.Context, jobID string, t Transition,
 			if listErr != nil {
 				tt.Detail = strings.TrimSpace(tt.Detail + " (active runs could not be listed: " + listErr.Error() + ")")
 			}
-			if len(stops) > 0 {
-				tx.Job.PendingEffects = &PendingEffects{Revision: tx.Job.Revision + 1, StopRuns: stops, Since: tx.now}
+			discover := listErr != nil && policy == ActiveRunCancel
+			if len(stops) > 0 || discover {
+				tx.Job.PendingEffects = &PendingEffects{Revision: tx.Job.Revision + 1, StopRuns: stops, DiscoverRuns: discover, Since: tx.now}
 			}
 		}
 		return tx.Transition(tt)
@@ -303,9 +304,9 @@ func (s *Store) ChangeLifecycle(ctx context.Context, jobID string, t Transition,
 // runDispositions lists what happens to each known run and which runs must
 // be stopped under the cancel policy. Admitted runs Dagu does not list yet
 // are included: a worker may be about to start them.
-func runDispositions(runs []RunRef, admitted map[string]time.Time, policy ActiveRunPolicy) ([]Affected, []string) {
+func runDispositions(runs []RunRef, admitted map[string]AdmittedRun, policy ActiveRunPolicy) ([]Affected, []RunRef) {
 	var out []Affected
-	var stops []string
+	var stops []RunRef
 	seen := map[string]bool{}
 	running := DispositionAllowedToFinish
 	if policy == ActiveRunCancel {
@@ -313,19 +314,19 @@ func runDispositions(runs []RunRef, admitted map[string]time.Time, policy Active
 	}
 	for _, r := range runs {
 		seen[r.RunID] = true
+		a, wasAdmitted := admitted[r.RunID]
 		switch {
 		case r.Running:
 			out = append(out, Affected{RunID: r.RunID, Disposition: running})
-			if policy == ActiveRunCancel {
-				stops = append(stops, r.RunID)
-			}
-		case admitted[r.RunID] != time.Time{}:
+		case wasAdmitted:
 			out = append(out, Affected{RunID: r.RunID, Disposition: DispositionAdmittedBeforeEnd})
-			if policy == ActiveRunCancel {
-				stops = append(stops, r.RunID)
-			}
+			r.RootName, r.RootRunID = a.RootName, a.RootRunID
 		default:
 			out = append(out, Affected{RunID: r.RunID, Disposition: DispositionQueuedDropped})
+			continue
+		}
+		if policy == ActiveRunCancel {
+			stops = append(stops, r)
 		}
 	}
 	ids := make([]string, 0, len(admitted))
@@ -338,7 +339,8 @@ func runDispositions(runs []RunRef, admitted map[string]time.Time, policy Active
 	for _, id := range ids {
 		out = append(out, Affected{RunID: id, Disposition: DispositionAdmittedBeforeEnd})
 		if policy == ActiveRunCancel {
-			stops = append(stops, id)
+			a := admitted[id]
+			stops = append(stops, RunRef{RunID: id, RootName: a.RootName, RootRunID: a.RootRunID})
 		}
 	}
 	return out, stops
@@ -351,63 +353,133 @@ func wantsSuspension(l Lifecycle) bool {
 
 // ApplyEffects brings Dagu in line with the job's current state: the DAG is
 // suspended while the job is paused, completed or retired, the registry's
-// own suspension is lifted when the job is active again (a person's
-// suspension is left alone), and pending stops are attempted. Because the
-// desired state is read from the job, an older transition applied late
-// cannot undo a newer one. Failed stops stay pending, and become an
-// exception after a bounded number of attempts.
+// own suspension is lifted when the job is active again (a suspension it did
+// not make is left alone), and pending stops are attempted. Failed stops stay
+// pending and become an exception after a bounded number of attempts.
 func (s *Store) ApplyEffects(ctx context.Context, jobID string) error {
 	if s.runs == nil {
 		return errors.New("registry: no run control to apply effects")
 	}
+	return errors.Join(s.reconcileSuspension(ctx, jobID), s.applyPendingStops(ctx, jobID))
+}
+
+// reconcileSuspension owns a suspension only when it makes it: ownership is
+// recorded before the write, and refused if the job no longer wants to be
+// suspended; after the write the job is read again and a write made stale by
+// a newer transition is undone. Whatever interleaving remains is corrected
+// by the next reconciliation, which compares the job with Dagu again.
+func (s *Store) reconcileSuspension(ctx context.Context, jobID string) error {
 	job, err := s.GetJob(ctx, jobID)
 	if err != nil {
 		return err
 	}
-	var errs []error
+	suspended, err := s.runs.IsSuspended(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("read suspension: %w", err)
+	}
 	want := wantsSuspension(job.Lifecycle)
-	if want || job.SuspendedByRegistry {
-		suspended, err := s.runs.IsSuspended(ctx, jobID)
-		switch {
-		case err != nil:
-			errs = append(errs, fmt.Errorf("read suspension: %w", err))
-		case want && !suspended:
-			if err := s.runs.SetSuspended(ctx, jobID, true); err != nil {
-				errs = append(errs, fmt.Errorf("suspend DAG: %w", err))
+	switch {
+	case want && !suspended:
+		owned := false
+		if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+			owned = wantsSuspension(tx.Job.Lifecycle)
+			if owned && !tx.Job.SuspendedByRegistry {
+				tx.Job.SuspendedByRegistry = true
+				tx.touch()
 			}
-		case !want && suspended:
-			if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
-				errs = append(errs, fmt.Errorf("unsuspend DAG: %w", err))
-			}
+			return nil
+		}); err != nil || !owned {
+			return err
 		}
-	}
-	var stopped []Affected
-	var failed []string
-	var stopErrs []string
-	if pe := job.PendingEffects; pe != nil {
-		for _, runID := range pe.StopRuns {
-			if err := s.runs.StopRun(ctx, jobID, runID); err != nil {
-				failed = append(failed, runID)
-				stopErrs = append(stopErrs, runID+": "+err.Error())
-				stopped = append(stopped, Affected{RunID: runID, Disposition: DispositionStopFailed})
-				continue
-			}
-			stopped = append(stopped, Affected{RunID: runID, Disposition: DispositionStopRequested})
+		if err := s.runs.SetSuspended(ctx, jobID, true); err != nil {
+			return fmt.Errorf("suspend DAG: %w", err)
 		}
-	}
-	_, err = s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
-		j := tx.Job
-		if wantsSuspension(j.Lifecycle) == want && j.SuspendedByRegistry != want && len(errs) == 0 {
-			j.SuspendedByRegistry = want
-			tx.touch()
+		current, err := s.GetJob(ctx, jobID)
+		if err != nil {
+			return err
 		}
-		pe := job.PendingEffects
-		if pe == nil || j.PendingEffects == nil || j.PendingEffects.Revision != pe.Revision {
+		if wantsSuspension(current.Lifecycle) {
 			return nil
 		}
-		detail := strings.Join(stopErrs, "; ")
+		if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
+			return fmt.Errorf("undo stale suspension: %w", err)
+		}
+		return s.releaseSuspension(ctx, jobID)
+	case !want && job.SuspendedByRegistry:
+		if suspended {
+			if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
+				return fmt.Errorf("unsuspend DAG: %w", err)
+			}
+		}
+		return s.releaseSuspension(ctx, jobID)
+	}
+	return nil
+}
+
+// releaseSuspension drops the registry's ownership of the DAG's suspension
+// while the job is active.
+func (s *Store) releaseSuspension(ctx context.Context, jobID string) error {
+	_, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+		if !wantsSuspension(tx.Job.Lifecycle) && tx.Job.SuspendedByRegistry {
+			tx.Job.SuspendedByRegistry = false
+			tx.touch()
+		}
+		return nil
+	})
+	return err
+}
+
+// applyPendingStops stops the runs a completed or retired job still owes
+// under the cancel policy, listing them first when that failed at the time.
+func (s *Store) applyPendingStops(ctx context.Context, jobID string) error {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	pe := job.PendingEffects
+	if pe == nil {
+		return nil
+	}
+	stops := append([]RunRef(nil), pe.StopRuns...)
+	discovered := false
+	var errs []string
+	if pe.DiscoverRuns {
+		runs, err := s.runs.ActiveRuns(ctx, jobID)
+		if err != nil {
+			errs = append(errs, "list runs: "+err.Error())
+		} else {
+			discovered = true
+			have := map[string]bool{}
+			for _, r := range stops {
+				have[r.RunID] = true
+			}
+			for _, r := range runs {
+				if r.Running && !have[r.RunID] {
+					stops = append(stops, r)
+				}
+			}
+		}
+	}
+	var affected []Affected
+	var failed []RunRef
+	for _, r := range stops {
+		if err := s.runs.StopRun(ctx, jobID, r); err != nil {
+			failed = append(failed, r)
+			errs = append(errs, r.RunID+": "+err.Error())
+			affected = append(affected, Affected{RunID: r.RunID, Disposition: DispositionStopFailed})
+			continue
+		}
+		affected = append(affected, Affected{RunID: r.RunID, Disposition: DispositionStopRequested})
+	}
+	detail := strings.Join(errs, "; ")
+	_, err = s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+		j := tx.Job
+		if j.PendingEffects == nil || j.PendingEffects.Revision != pe.Revision {
+			return nil
+		}
+		discover := pe.DiscoverRuns && !discovered
 		switch {
-		case len(failed) == 0:
+		case len(failed) == 0 && !discover:
 			j.PendingEffects = nil
 		case j.PendingEffects.Attempts+1 >= maxEffectAttempts:
 			j.PendingEffects = nil
@@ -418,21 +490,31 @@ func (s *Store) ApplyEffects(ctx context.Context, jobID string) error {
 			if j.Exceptions == nil {
 				j.Exceptions = map[string]*Exception{}
 			}
-			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: "stop_failed", Detail: "runs could not be stopped after retirement: " + detail,
-				Evidence: failed, Created: Stamp{At: tx.now, By: reconcilerActor}}
+			evidence := make([]string, 0, len(failed))
+			for _, r := range failed {
+				evidence = append(evidence, r.RunID)
+			}
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: "stop_failed", Detail: "runs could not be stopped after the job ended: " + detail,
+				Evidence: evidence, Created: Stamp{At: tx.now, By: reconcilerActor}}
 		default:
 			j.PendingEffects.Attempts++
 			j.PendingEffects.StopRuns = failed
+			j.PendingEffects.DiscoverRuns = discover
 			j.PendingEffects.LastError = detail
 		}
 		tx.touch()
-		return tx.event(Event{Kind: EventEffect, Reason: "stop_runs", Detail: detail, Affected: stopped})
+		if len(affected) == 0 && detail == "" {
+			return nil
+		}
+		return tx.event(Event{Kind: EventEffect, Reason: "stop_runs", Detail: detail, Affected: affected})
 	})
-	errs = append(errs, err)
-	if len(failed) > 0 {
-		errs = append(errs, fmt.Errorf("stop runs: %s", strings.Join(stopErrs, "; ")))
+	if err != nil {
+		return err
 	}
-	return errors.Join(errs...)
+	if detail != "" {
+		return fmt.Errorf("stop runs: %s", detail)
+	}
+	return nil
 }
 
 // ReconcileEffects applies pending or missing lifecycle effects for every

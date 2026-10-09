@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -51,24 +52,34 @@ func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.Ru
 	return out, nil
 }
 
-// StopRun stops a running run the way the API's terminate operation does:
-// through the coordinator for a distributed run, locally otherwise.
-func (c *Control) StopRun(ctx context.Context, dagName, runID string) error {
-	attempt, err := c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, runID))
+// StopRun stops a run the way the API's terminate operation does: through
+// the coordinator for a distributed run, locally otherwise. A child run is
+// found under its root run, and the root is passed with the cancellation.
+func (c *Control) StopRun(ctx context.Context, dagName string, run registry.RunRef) error {
+	var root *ir.DAGRunRef
+	var attempt dagrun.Attempt
+	var err error
+	if run.RootRunID != "" {
+		ref := ir.NewDAGRunRef(run.RootName, run.RootRunID)
+		root = &ref
+		attempt, err = c.Runs.FindSubAttempt(ctx, ref, run.RunID)
+	} else {
+		attempt, err = c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, run.RunID))
+	}
 	if err != nil {
 		return err
 	}
 	dag, err := attempt.ReadDAG(ctx)
 	if err != nil {
-		return fmt.Errorf("read DAG of run %s: %w", runID, err)
+		return fmt.Errorf("read DAG of run %s: %w", run.RunID, err)
 	}
 	if dispatch.ShouldDispatchToCoordinator(dag, c.Coordinator != nil, c.ExecMode) {
-		return c.Coordinator.RequestCancel(ctx, dagName, runID, nil)
+		return c.Coordinator.RequestCancel(ctx, dagName, run.RunID, root)
 	}
 	if c.Manager == nil {
-		return fmt.Errorf("no local run manager to stop run %s", runID)
+		return fmt.Errorf("no local run manager to stop run %s", run.RunID)
 	}
-	return c.Manager.Stop(ctx, dag, runID)
+	return c.Manager.Stop(ctx, dag, run.RunID)
 }
 
 // IsSuspended reports Dagu's suspend flag for the DAG.

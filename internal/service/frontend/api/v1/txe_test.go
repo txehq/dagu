@@ -38,6 +38,7 @@ func newTxeTestAPIAt(t *testing.T, dir string, writeDAGs bool, opts ...apiv1.API
 	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
 	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
 	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(context.Background()))
 	cfg := &config.Config{}
 	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: writeDAGs, config.PermissionRunDAGs: true}
 	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, append([]apiv1.APIOption{apiv1.WithTxeRegistry(store)}, opts...)...)
@@ -513,6 +514,10 @@ func TestTxeAPIResourceEventAndRunGuard(t *testing.T) {
 	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: opsJob})
 	requireStatus(t, err, http.StatusConflict)
 	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: opsJob + ".yaml"})
+	requireStatus(t, err, http.StatusConflict)
+	// An admitted job still never runs in the API process: with no
+	// coordinator to dispatch to its worker, the start is refused.
+	_, err = a.ExecuteDAG(txeAdmin, apigen.ExecuteDAGRequestObject{FileName: secretJob})
 	requireStatus(t, err, http.StatusConflict)
 	other := "renamed-run"
 	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: secretJob, Body: &apigen.EnqueueDAGDAGRunJSONRequestBody{DagName: &other}})

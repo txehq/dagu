@@ -22,6 +22,9 @@ type fakeRuns struct {
 	stopped   []string
 	suspended map[string]bool
 	stopErr   error
+	listErr   error
+	// onSuspend runs after a suspend write, outside the lock.
+	onSuspend func(dag string)
 }
 
 func newFakeRuns() *fakeRuns {
@@ -31,16 +34,23 @@ func newFakeRuns() *fakeRuns {
 func (r *fakeRuns) ActiveRuns(_ context.Context, dag string) ([]RunRef, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
 	return append([]RunRef(nil), r.runs[dag]...), nil
 }
 
-func (r *fakeRuns) StopRun(_ context.Context, dag, runID string) error {
+func (r *fakeRuns) StopRun(_ context.Context, dag string, run RunRef) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopErr != nil {
 		return r.stopErr
 	}
-	r.stopped = append(r.stopped, dag+"/"+runID)
+	name := dag + "/" + run.RunID
+	if run.RootRunID != "" {
+		name = run.RootName + "/" + run.RootRunID + ">" + name
+	}
+	r.stopped = append(r.stopped, name)
 	return nil
 }
 
@@ -52,8 +62,12 @@ func (r *fakeRuns) IsSuspended(_ context.Context, dag string) (bool, error) {
 
 func (r *fakeRuns) SetSuspended(_ context.Context, dag string, suspended bool) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.suspended[dag] = suspended
+	hook := r.onSuspend
+	r.mu.Unlock()
+	if suspended && hook != nil {
+		hook(dag)
+	}
 	return nil
 }
 
@@ -338,7 +352,7 @@ func TestAdmitClaimOrdersAgainstRetirement(t *testing.T) {
 	rc := withRuns(f)
 	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
 
-	adm, err := f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, "run-1")
+	adm, err := f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, RunRef{RunID: "run-1"})
 	require.NoError(t, err)
 	require.True(t, adm.Admit)
 	got, err := f.store.GetJob(f.ctx, job.JobID)
@@ -351,7 +365,7 @@ func TestAdmitClaimOrdersAgainstRetirement(t *testing.T) {
 	assert.Equal(t, []string{job.JobID + "/run-1"}, rc.stopped, "the admitted run is stopped although Dagu listed nothing")
 	assert.Nil(t, retired.PendingEffects)
 
-	adm, err = f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, "run-2")
+	adm, err = f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, RunRef{RunID: "run-2"})
 	require.NoError(t, err)
 	assert.Equal(t, AdmitRetired, adm.Code)
 }
@@ -379,12 +393,12 @@ func TestExpiryRecheckedAtCommit(t *testing.T) {
 func TestPendingEffectsAreReconciled(t *testing.T) {
 	f := newFixture(t)
 	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
-	_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", "run-1")
+	_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", RunRef{RunID: "run-1"})
 	require.NoError(t, err)
 	got, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
 	require.NoError(t, err)
 	require.NotNil(t, got.PendingEffects)
-	assert.Equal(t, []string{"run-1"}, got.PendingEffects.StopRuns)
+	assert.Equal(t, []RunRef{{RunID: "run-1"}}, got.PendingEffects.StopRuns)
 
 	rc := withRuns(f)
 	require.NoError(t, f.store.ReconcileEffects(f.ctx))
@@ -524,4 +538,125 @@ func TestReconcileResourceEventsRechecksReporter(t *testing.T) {
 	stored, err := f.store.GetResourceEvent(f.ctx, ev.EventID)
 	require.NoError(t, err)
 	assert.Empty(t, stored.Dispositions)
+}
+
+func TestAdmissionChecksExpiry(t *testing.T) {
+	f := newFixture(t)
+	past := f.now.Add(-time.Minute)
+	job := f.ready("k")
+	job.ExpiresAt = &past
+	adm := admissionFor(job, "", f.now)
+	assert.Equal(t, AdmitExpired, adm.Code, "the in-commit predicate refuses an ended lifetime")
+}
+
+// An admitted child run of a retired job is stopped through its root.
+func TestPendingStopsKeepChildRoot(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
+	_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", RunRef{RunID: "child-1", RootName: "parent", RootRunID: "root-1"})
+	require.NoError(t, err)
+	_, err = f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"parent/root-1>" + job.JobID + "/child-1"}, rc.stopped)
+}
+
+// Runs that could not be listed when a cancel-policy job retired are listed
+// and stopped later; the obligation is not lost.
+func TestFailedRunDiscoveryIsRetried(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
+	rc.listErr = errors.New("run store unavailable")
+	got, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
+	require.NoError(t, err)
+	require.NotNil(t, got.PendingEffects)
+	assert.True(t, got.PendingEffects.DiscoverRuns)
+
+	rc.listErr = nil
+	rc.runs[job.JobID] = []RunRef{{RunID: "r-local", Running: true}}
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.Equal(t, []string{job.JobID + "/r-local"}, rc.stopped)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Nil(t, got.PendingEffects)
+}
+
+// A suspension the registry did not make is never taken over: pausing and
+// resuming a manually suspended job leaves it suspended.
+func TestManualSuspensionIsNotTakenOver(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	rc.suspended[job.JobID] = true
+	_, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpPause}, person)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.False(t, got.SuspendedByRegistry)
+	_, err = f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpResume}, person)
+	require.NoError(t, err)
+	assert.True(t, rc.suspended[job.JobID])
+}
+
+// A suspend write made stale by a resume committed while it ran is undone.
+func TestStaleSuspendWriteIsUndone(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: OpPause}) })
+	require.NoError(t, err)
+	rc.onSuspend = func(string) {
+		rc.onSuspend = nil
+		_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: OpResume}) })
+		require.NoError(t, err)
+	}
+	require.NoError(t, f.store.ApplyEffects(f.ctx, job.JobID))
+	assert.False(t, rc.suspended[job.JobID])
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
+	assert.False(t, got.SuspendedByRegistry)
+}
+
+func TestRegisterRefusesDeclaredName(t *testing.T) {
+	f := newFixture(t)
+	v := f.version(1)
+	v.DAG.Spec = "name: monitor\n" + v.DAG.Spec
+	_, err := f.store.Register(f.ctx, RegisterInput{JobID: f.mint(PrefixJob), RequestID: "r", OwnerID: f.owner, ProjectID: f.project,
+		MachineID: f.machine, JobKey: "named", Version: v}, cli)
+	assert.Equal(t, CodeInvalid, code(t, err))
+}
+
+func TestResourceEventsWaitForIndex(t *testing.T) {
+	f := newFixture(t)
+	require.NoError(t, f.store.col.Delete(f.ctx, resourceIndexReady))
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourcePresent}, agent)
+	assert.Equal(t, CodeNotReady, code(t, err))
+	require.NoError(t, f.store.RebuildResourceIndex(f.ctx))
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+}
+
+// Sending a saved, incomplete event again under its ID resumes it; a
+// different report under that ID is refused.
+func TestResourceEventResumesByID(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-11")} })
+	id := f.mint(PrefixEvent)
+	saved := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-11"), Observation: ResourceDeleted, Authoritative: true,
+		ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &saved))
+	require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+id, indexEntry{}))
+
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: id, Target: target("v-11"), Observation: ResourceAbsent}, agent)
+	assert.Equal(t, CodeDuplicate, code(t, err))
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: id, Target: target("v-11"), Observation: ResourceDeleted, Authoritative: true}, person)
+	assert.Equal(t, CodeDuplicate, code(t, err), "only the reporter can resume")
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: id, Target: target("v-11"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.True(t, ev.Complete)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeRetired, ev.Dispositions[0].Outcome)
 }

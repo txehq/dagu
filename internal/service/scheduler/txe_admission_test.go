@@ -133,3 +133,25 @@ func TestWithRunAdmission(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, suspended, "Dagu's own suspension still applies")
 }
+
+// An admitted job run the scheduler would execute locally is dropped: jobs
+// run only through their machine's worker, where the claim is recorded.
+func TestQueueProcessor_TxeLocalJobRunIsDropped(t *testing.T) {
+	jobID := mintJobID(t)
+	admitter := &fakeAdmitter{adm: registry.Admission{Admit: true, JobID: jobID}}
+	f := newQueueFixture(t).
+		withDAG(jobID, 1).
+		withProcessor(config.Queues{}, WithRunAdmitter(admitter)).
+		simulateQueue(1, false)
+	f.enqueueRunWithTrigger("run-1", ir.TriggerTypeManual)
+
+	f.processor.ProcessQueueItems(f.ctx, jobID)
+
+	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, ir.NewDAGRunRef(jobID, "run-1"))
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Aborted, status.Status)
+	assert.Contains(t, status.Error, string(registry.AdmitNotOnWorker))
+	assert.Equal(t, []string{jobID + "/run-1"}, admitter.dropped)
+}

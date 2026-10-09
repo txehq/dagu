@@ -61,6 +61,7 @@ func newFixture(t *testing.T) *fixture {
 	p, err := s.EnsureProject(f.ctx, f.owner, "github.com/txehq/txe", "txe", cli)
 	require.NoError(t, err)
 	f.project = p.ProjectID
+	require.NoError(t, s.RebuildResourceIndex(f.ctx))
 	return f
 }
 

@@ -1017,6 +1017,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
 		return nil, err
 	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return nil, err
+	}
 
 	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
 		return nil, err
@@ -1146,6 +1149,9 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 		return nil, err
 	}
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return nil, err
+	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
 		return nil, err
 	}
 
