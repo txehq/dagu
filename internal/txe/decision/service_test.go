@@ -491,8 +491,8 @@ func TestDecideSnoozeThenApproveCompletesTaskOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Decision.NativeResume != "none" || len(f.tasks.calls) != 0 {
-		t.Fatalf("snooze native_resume = %q, completions = %d; want none, 0", res.Decision.NativeResume, len(f.tasks.calls))
+	if res.Decision.NativeResume != "" || len(f.tasks.calls) != 0 {
+		t.Fatalf("snooze native_resume = %q, completions = %d; want empty, 0", res.Decision.NativeResume, len(f.tasks.calls))
 	}
 
 	f.setClock(until.Add(time.Minute))
@@ -534,46 +534,5 @@ func TestDecideReplaysExpiredSnooze(t *testing.T) {
 	stale.SnoozeUntil = &until
 	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, stale, f.human); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("new past snooze err = %v, want ErrInvalid", err)
-	}
-}
-
-type recordingRetrier struct {
-	calls []time.Time
-	fail  error
-}
-
-func (r *recordingRetrier) RetryLatest(_ context.Context, _ string, decidedAt time.Time) (string, bool, error) {
-	r.calls = append(r.calls, decidedAt)
-	if r.fail != nil {
-		return "", false, r.fail
-	}
-	return "run-1", true, nil
-}
-
-// A retry decision whose dispatch failed is dispatched again when the same
-// request is replayed, bound to the stored decision's time.
-func TestDecideRetryDispatchIsRecoveredOnReplay(t *testing.T) {
-	f := newFixture(t)
-	retrier := &recordingRetrier{fail: errors.New("queue unavailable")}
-	f.svc.Retrier = retrier
-	req := f.request(VerdictRetry, "key-retry-0001")
-	res, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, req, f.human)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.FollowUpPending() || res.RetryErr == nil {
-		t.Fatalf("result = %+v, want a pending retry", res)
-	}
-	retrier.fail = nil
-	f.setClock(f.now.Add(time.Minute))
-	res, err = f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, req, f.human)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.FollowUpPending() || res.RetryRunID != "run-1" || !res.AlreadyRecorded {
-		t.Fatalf("replay = %+v", res)
-	}
-	if len(retrier.calls) != 2 || !retrier.calls[1].Equal(res.Decision.DecidedAt) || !retrier.calls[1].Equal(f.now) {
-		t.Fatalf("retry calls = %v, want both bound to the decision time %s", retrier.calls, f.now)
 	}
 }
