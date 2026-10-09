@@ -4306,6 +4306,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/proposal-closures/pending": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Dagu human tasks still to be closed
+         * @description Superseded proposals whose Dagu human task is still waiting, on the given machine's jobs the caller can see: never-attempted first, then least recently attempted, then by proposal ID.
+         */
+        get: operations["listTxePendingClosures"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/proposals/{proposalId}/closures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record an attempt to close a superseded proposal's Dagu human task
+         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
+         */
+        post: operations["recordTxeProposalClosure"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/proposals/{proposalId}/decisions": {
         parameters: {
             query?: never;
@@ -8427,6 +8470,36 @@ export interface components {
             snooze_until?: string;
             idempotency_key: string;
             actor?: components["schemas"]["TxeActor"];
+        };
+        /** @enum {string} */
+        TxeClosureOutcome: TxeClosureOutcome;
+        TxeClosureRequest: {
+            outcome: components["schemas"]["TxeClosureOutcome"];
+            detail?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeClosure: {
+            closure_id: string;
+            proposal_id: string;
+            outcome: components["schemas"]["TxeClosureOutcome"];
+            detail?: string;
+            attempt: number;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxePendingClosure: {
+            job_id: string;
+            proposal_id: string;
+            machine_id: string;
+            native_task: components["schemas"]["TxeNativeTask"];
+            /** Format: date-time */
+            superseded_at: string;
+            failures: number;
+            /** Format: date-time */
+            last_attempt_at?: string;
+            last_error?: string;
+        };
+        TxePendingClosureList: {
+            closures: components["schemas"]["TxePendingClosure"][];
         };
         TxeRetryRequest: {
             idempotency_key: string;
@@ -23205,6 +23278,147 @@ export interface operations {
             };
         };
     };
+    listTxePendingClosures: {
+        parameters: {
+            query: {
+                machine: string;
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pending closures */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxePendingClosureList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    recordTxeProposalClosure: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeClosureRequest"];
+            };
+        };
+        responses: {
+            /** @description Closure */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeClosure"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeProposalDecisions: {
         parameters: {
             query?: never;
@@ -24274,6 +24488,13 @@ export enum TxeReviewOutcome {
     pause_unavailable = "pause_unavailable",
     complete = "complete",
     retire = "retire"
+}
+export enum TxeClosureOutcome {
+    closed = "closed",
+    already_answered = "already_answered",
+    run_missing = "run_missing",
+    locator_refused = "locator_refused",
+    failed = "failed"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

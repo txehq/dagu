@@ -618,3 +618,50 @@ func TestTxeAPIReviewsObservationsAndDecisionOrder(t *testing.T) {
 	assert.Equal(t, ids, list(asc, "", 0))
 	assert.Equal(t, []string{ids[1]}, list(asc, ids[0], 1), "the limit applies forward from the cursor")
 }
+
+// A retired job's superseded proposal with a Dagu human task is listed for
+// its machine until a closure with a final outcome is recorded.
+func TestTxeAPIProposalClosures(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
+			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
+			NativeTask: &apigen.TxeNativeTask{Dag: registry.DecideTaskDAG(f.machine), RunId: "run-1", StepId: registry.DecideTaskStep},
+		}}})
+	require.NoError(t, err)
+	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
+	_, err = store.WithJobTx(ctx, jobID, registry.Actor{Kind: registry.ActorHuman, ID: "connor"}, func(tx *registry.JobTx) error {
+		return tx.Transition(registry.Transition{Op: registry.OpRetire, Reason: registry.RetireManual})
+	})
+	require.NoError(t, err)
+
+	pending := func() []apigen.TxePendingClosure {
+		t.Helper()
+		resp, err := a.ListTxePendingClosures(ctx, apigen.ListTxePendingClosuresRequestObject{Params: apigen.ListTxePendingClosuresParams{Machine: f.machine}})
+		require.NoError(t, err)
+		return resp.(apigen.ListTxePendingClosures200JSONResponse).Closures
+	}
+	require.Len(t, pending(), 1)
+	assert.Equal(t, p.ProposalId, pending()[0].ProposalId)
+
+	closure, err := a.RecordTxeProposalClosure(ctx, apigen.RecordTxeProposalClosureRequestObject{JobId: jobID, ProposalId: p.ProposalId,
+		Body: &apigen.TxeClosureRequest{Outcome: apigen.TxeClosureOutcomeAlreadyAnswered}})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeClosureOutcomeAlreadyAnswered, closure.(apigen.RecordTxeProposalClosure200JSONResponse).Outcome)
+	assert.Empty(t, pending())
+	_, err = a.RecordTxeProposalClosure(ctx, apigen.RecordTxeProposalClosureRequestObject{JobId: jobID, ProposalId: p.ProposalId,
+		Body: &apigen.TxeClosureRequest{Outcome: apigen.TxeClosureOutcomeClosed}})
+	requireStatus(t, err, http.StatusConflict)
+}
