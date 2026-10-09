@@ -125,7 +125,14 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// #nosec G204 -- argv comes from the job's registered policy, not from the agent.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
-	cmd.Env = append(e.baseEnv(), actionEnv(job, action)...)
+	credentials, err := credentialEnv(job)
+	if err != nil {
+		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
+	}
+	// Order matters: later entries win. The job's declared credentials
+	// replace anything of the same name that was inherited, and the action's
+	// own variables come last.
+	cmd.Env = append(append(e.baseEnv(), credentials...), actionEnv(job, action)...)
 	// The action runs as a managed process: in its own process group, which
 	// is killed as a whole when the deadline passes and also when this
 	// process dies. Killing only the direct child, or only while the
@@ -217,6 +224,54 @@ func jobEnv(env []string) []string {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// credentialEnv resolves the credentials the job declares, on this machine,
+// into the variables its command reads them from. This is the deliberate way
+// a credential reaches a job's command: a declared credential is supplied
+// even under a name whose inherited value is removed as the reviewer's own
+// (a job may declare its own OPENAI_API_KEY; it gets the declared one, never
+// the review agent's).
+//
+// A file is read as it is, as the service reads it for the job's own runs.
+// A variable is copied from this process's environment. A credential that
+// cannot be resolved stops the command before it starts, as it stops a run:
+// the error names the reference and never a value. A reference cannot name
+// one of the variables that identify the action or mark the review.
+func credentialEnv(job Job) ([]string, error) {
+	env := make([]string, 0, len(job.CredentialRefs))
+	for _, ref := range job.CredentialRefs {
+		upper := strings.ToUpper(ref.Name)
+		switch {
+		case !envNamePattern.MatchString(ref.Name):
+			return nil, fmt.Errorf("credential reference %q is not a variable name", ref.Name)
+		case upper == ReviewerEnv || reviewerEnvNames[upper] || strings.HasPrefix(upper, "TXE_PARAM_"):
+			return nil, fmt.Errorf("credential reference %s uses a name reserved for the action", ref.Name)
+		}
+		var value string
+		switch ref.Kind {
+		case CredentialFile:
+			// #nosec G304 -- the path is the job's registered credential locator on its own machine.
+			raw, err := os.ReadFile(ref.Locator)
+			if err != nil {
+				return nil, fmt.Errorf("credential %s: its file could not be read: %v", ref.Name, err)
+			}
+			value = string(raw)
+		case CredentialEnv:
+			found, ok := os.LookupEnv(ref.Locator)
+			if !ok {
+				return nil, fmt.Errorf("credential %s: variable %s is not set where the reviewer runs", ref.Name, ref.Locator)
+			}
+			value = found
+		default:
+			return nil, fmt.Errorf("credential %s: unknown kind %q", ref.Name, ref.Kind)
+		}
+		if strings.ContainsRune(value, 0) {
+			return nil, fmt.Errorf("credential %s: its value cannot be passed in a variable", ref.Name)
+		}
+		env = append(env, ref.Name+"="+value)
+	}
+	return env, nil
 }
 
 func actionEnv(job Job, action Action) []string {

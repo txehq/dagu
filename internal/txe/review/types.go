@@ -120,7 +120,29 @@ type Job struct {
 	Lifecycle        Lifecycle    `json:"lifecycle"`
 	Availability     Availability `json:"availability"`
 	Review           ReviewPolicy `json:"review"`
+	// CredentialRefs are the credentials the job declares: where each is
+	// found on the job's machine and the variable its commands read it
+	// from. They are resolved on that machine when a command of the job is
+	// started, and are never part of what the review agent is shown.
+	CredentialRefs []CredentialRef `json:"-"`
 }
+
+// CredentialRef names a credential a job declares. The locator is a path or
+// a variable name on the job's machine, never a value.
+type CredentialRef struct {
+	// Name is the variable the job's command reads the credential from.
+	Name string
+	// Kind is CredentialFile or CredentialEnv.
+	Kind string
+	// Locator is the file's path, or the name of the variable to copy.
+	Locator string
+}
+
+// The kinds of credential reference.
+const (
+	CredentialFile = "file"
+	CredentialEnv  = "env"
+)
 
 // HasTarget reports whether the job depends on the given stable identity.
 func (j Job) HasTarget(stableID string) bool {

@@ -75,6 +75,18 @@ resources is rendered into the DAG like any other variable and reaches it:
 with one of the removed names or prefixes cannot be given to a job's command
 this way.
 
+A credential the job declares in `credential_refs` is the deliberate way a
+credential reaches its command, and it is supplied whatever its name: each
+reference is resolved on the job's machine when the command is started (a
+`file` is read as it is, an `env` variable is copied from the review step's
+environment) and set under the name the job gave it, replacing anything
+inherited under that name. A job that declares its own `OPENAI_API_KEY` gets
+the declared one, never the review agent's. A reference that cannot be
+resolved stops the command before it starts, as it stops a run, and the
+record names the reference, not a value. A reference cannot use a name that
+identifies the action or marks the review. The references are not part of
+what the review agent is shown.
+
 This removes accidental inheritance. It is not isolation: the command runs
 as the same operating-system user as the reviewer and can read the same
 files.

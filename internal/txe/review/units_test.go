@@ -501,6 +501,88 @@ func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
 	})
 }
 
+// A credential the job declares reaches its command deliberately, on the
+// path production uses: an effector with no environment of its own. It is
+// supplied even under a name whose inherited value is removed as the
+// reviewer's. The job declares its own OPENAI_API_KEY; its command gets that
+// one, and never the review agent's key of the same name, nor the agent's
+// other keys. A reference that cannot be resolved stops the command before
+// it starts, and what is reported names the reference, not a value.
+func TestCommandEffectorSuppliesTheJobsDeclaredCredentialsNotTheReviewers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	t.Setenv("OPENAI_API_KEY", "the-review-agents-key")
+	t.Setenv("ANTHROPIC_API_KEY", "the-review-agents-other-key")
+	t.Setenv("JOB_LINEAR_TOKEN_SOURCE", "the-jobs-linear-token")
+	secrets := t.TempDir()
+	keyFile := filepath.Join(secrets, "openai-key")
+	require.NoError(t, os.WriteFile(keyFile, []byte("the-jobs-own-key"), 0o600))
+
+	run := func(refs []review.CredentialRef, probe bool) (review.EffectResult, map[string]string) {
+		t.Helper()
+		dir := t.TempDir()
+		job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: dir, CredentialRefs: refs}
+		action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
+		declared := shellAction("env > env.txt", review.IdempotencyNone)
+		declared.Reconcile = declared.Command
+		e := &review.CommandEffector{}
+		var res review.EffectResult
+		if probe {
+			res = e.Probe(context.Background(), job, declared, action)
+		} else {
+			res = e.Run(context.Background(), job, declared, action)
+		}
+		seen := map[string]string{}
+		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		if err != nil {
+			return res, nil
+		}
+		for line := range strings.SplitSeq(string(raw), "\n") {
+			if name, value, ok := strings.Cut(line, "="); ok {
+				seen[name] = value
+			}
+		}
+		return res, seen
+	}
+	declared := []review.CredentialRef{
+		{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: keyFile},
+		{Name: "LINEAR_API_KEY", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"},
+	}
+	for name, probe := range map[string]bool{"action": false, "reconcile probe": true} {
+		t.Run(name, func(t *testing.T) {
+			res, seen := run(declared, probe)
+			require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+			assert.Equal(t, "the-jobs-own-key", seen["OPENAI_API_KEY"], "the declared credential, not the reviewer's key of the same name")
+			assert.Equal(t, "the-jobs-linear-token", seen["LINEAR_API_KEY"])
+			assert.NotContains(t, seen, "ANTHROPIC_API_KEY", "an undeclared reviewer key is not inherited")
+			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
+		})
+	}
+	t.Run("without a declaration the reviewer's key is simply absent", func(t *testing.T) {
+		res, seen := run(nil, false)
+		require.Equal(t, review.EffectApplied, res.Status)
+		assert.NotContains(t, seen, "OPENAI_API_KEY")
+	})
+	for name, refs := range map[string][]review.CredentialRef{
+		"the file is missing":            {{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: filepath.Join(secrets, "absent")}},
+		"the variable is not set":        {{Name: "LINEAR_API_KEY", Kind: review.CredentialEnv, Locator: "JOB_VARIABLE_THAT_IS_NOT_SET"}},
+		"an unknown kind":                {{Name: "OPENAI_API_KEY", Kind: "vault", Locator: "x"}},
+		"a name reserved for the action": {{Name: "TXE_ACTION_ID", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+		"the marker of a review":         {{Name: review.ReviewerEnv, Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+		"not a variable name":            {{Name: "a=b", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			res, seen := run(refs, false)
+			assert.Equal(t, review.EffectNotApplied, res.Status, "the command is not started")
+			assert.Nil(t, seen, "nothing ran")
+			assert.Contains(t, res.Detail, "credential")
+			assert.NotContains(t, res.Detail, "the-jobs", "no value is reported")
+			assert.NotContains(t, res.Detail, "the-review-agents")
+		})
+	}
+}
+
 // Pass 2 finding: when an action's deadline passes, its whole process group
 // is killed. A child the script started in the background must not be left
 // to perform the effect after the attempt was recorded as over.
