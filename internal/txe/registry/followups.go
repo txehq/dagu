@@ -176,7 +176,7 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		if rp.RunID == "" {
 			return refuse(CodeInvalid, "dagu.retry_run needs run_id")
 		}
-		if err := tx.checkRunBinding(rp); err != nil {
+		if err := tx.checkRunBinding(rp, true); err != nil {
 			return err
 		}
 		if p.Action.Target != nil {
@@ -213,7 +213,10 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 // spec that matches no version, or versions with different packages, is
 // refused: the run's package is then unknown, and an unknown binding is
 // never retried.
-func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
+//
+// retain keeps the verified terminal status as the retry's evidence; it is
+// set where a retry is decided (proposal), not where it is executed.
+func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 	j := tx.Job
 	stale := func(msg string) error {
 		return &Error{Code: CodeStaleBinding, Message: "run " + rp.RunID + " " + msg + "; it is not retried", Current: j}
@@ -240,8 +243,10 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
 	case latest.SpecSHA256 != rp.RunSpecSHA256:
 		return stale("ran another DAG than the one named")
 	}
-	if err := tx.store.retainExecution(tx.ctx, j.JobID, rp.RunID, latest); err != nil {
-		return err
+	if retain {
+		if err := tx.store.retainExecution(tx.ctx, j.JobID, rp.RunID, latest, EvidenceRetry); err != nil {
+			return err
+		}
 	}
 	packages := map[string]bool{}
 	current := false
@@ -294,14 +299,29 @@ func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 // executionsPrefix holds immutable copies of executions' stored status.
 const executionsPrefix = "executions/"
 
+// Evidence purposes: each is kept once per execution, separately, because
+// they are taken at different stages of the execution.
+const (
+	// EvidenceRetry is the terminal status a retry was decided on.
+	EvidenceRetry = "retry"
+	// EvidencePublication is the status observed while the execution
+	// published its deliverables; it is not the execution's final state.
+	EvidencePublication = "publication"
+)
+
+func evidenceKey(jobID, runID, executionRef, purpose string) string {
+	return executionsPrefix + jobID + "/" + runID + "/" + executionRef + "/" + purpose
+}
+
 // retainExecution keeps the stored status of an execution the registry
-// acts on, once: a queued retry overwrites it in place, and the evidence of
-// what was retried must survive that.
-func (s *Store) retainExecution(ctx context.Context, jobID, runID string, e RunAttempt) error {
+// acts on, once per purpose: a queued retry overwrites it in place, and the
+// evidence of what was decided or published must survive that. The first
+// copy for a purpose stands.
+func (s *Store) retainExecution(ctx context.Context, jobID, runID string, e RunAttempt, purpose string) error {
 	if len(e.Snapshot) == 0 {
 		return nil
 	}
-	err := s.col.Create(ctx, &persis.Record{ID: executionsPrefix + jobID + "/" + runID + "/" + e.Ref(), Data: e.Snapshot,
+	err := s.col.Create(ctx, &persis.Record{ID: evidenceKey(jobID, runID, e.Ref(), purpose), Data: e.Snapshot,
 		CreatedAt: s.clock(), UpdatedAt: s.clock()})
 	if errors.Is(err, persis.ErrConflict) {
 		return nil
@@ -310,12 +330,12 @@ func (s *Store) retainExecution(ctx context.Context, jobID, runID string, e RunA
 }
 
 // GetRetainedExecution returns the stored status the registry kept for an
-// execution of a run.
-func (s *Store) GetRetainedExecution(ctx context.Context, jobID, runID, executionRef string) (json.RawMessage, error) {
-	rec, err := s.col.Get(ctx, executionsPrefix+jobID+"/"+runID+"/"+executionRef)
+// execution of a run, for one purpose.
+func (s *Store) GetRetainedExecution(ctx context.Context, jobID, runID, executionRef, purpose string) (json.RawMessage, error) {
+	rec, err := s.col.Get(ctx, evidenceKey(jobID, runID, executionRef, purpose))
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return nil, refuse(CodeNotFound, "execution %s of run %s is not retained", executionRef, runID)
+			return nil, refuse(CodeNotFound, "execution %s of run %s has no %s evidence", executionRef, runID, purpose)
 		}
 		return nil, err
 	}

@@ -1034,7 +1034,7 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		if err := decodeParams(p.Action.Params, &rp); err != nil {
 			return nil, err
 		}
-		if err := tx.checkRunBinding(rp); err != nil {
+		if err := tx.checkRunBinding(rp, false); err != nil {
 			return nil, err
 		}
 		attempts = 1

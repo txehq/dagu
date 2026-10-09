@@ -232,7 +232,7 @@ func TestArtifactsPerExecution(t *testing.T) {
 	e1.Snapshot = json.RawMessage(`{"attemptId":"a1","queuedAt":"` + q1 + `"}`)
 	first, err := record(e1, report("a1", q1, ExecutionID{}, shaA))
 	require.NoError(t, err)
-	kept, err := f.store.GetRetainedExecution(f.ctx, job.JobID, "run-1", e1.Ref())
+	kept, err := f.store.GetRetainedExecution(f.ctx, job.JobID, "run-1", e1.Ref(), EvidencePublication)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(e1.Snapshot), string(kept), "the publishing execution's status is kept")
 	assert.Equal(t, ExecutionRef("a1", q1), first.Execution)

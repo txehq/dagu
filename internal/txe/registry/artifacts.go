@@ -287,7 +287,7 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 		}
 		// The execution's stored status is kept with its manifest: a queued
 		// retry overwrites it in place.
-		if err := s.retainExecution(ctx, j.JobID, runID, latest); err != nil {
+		if err := s.retainExecution(ctx, j.JobID, runID, latest, EvidencePublication); err != nil {
 			return nil, err
 		}
 		if err := s.createJSON(ctx, key, &m); err != nil {
