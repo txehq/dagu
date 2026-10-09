@@ -13,6 +13,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/txe/reviewer"
 )
 
@@ -79,7 +80,7 @@ func ReviewerDAGName(machineID string) string {
 
 // DecideDAGName is the name of the DAG whose runs carry a machine's proposals.
 func DecideDAGName(machineID string) string {
-	return "txe-decide-" + strings.TrimPrefix(machineID, machineIDPrefix)
+	return registry.DecideTaskDAG(machineID)
 }
 
 func (c DAGConfig) withDefaults() (DAGConfig, error) {

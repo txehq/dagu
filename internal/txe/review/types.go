@@ -11,7 +11,11 @@
 // human decision.
 package review
 
-import "time"
+import (
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+)
 
 // Lifecycle is the registry's job lifecycle state.
 type Lifecycle string
@@ -65,6 +69,35 @@ const (
 	IdempotencyNone Idempotency = "none"
 )
 
+const (
+	// RetryRunAction is the reserved action that re-runs one exact run of
+	// the job through the service. It is never routine and never declared by
+	// a job: only the owner's decision on a proposal carrying it runs it.
+	RetryRunAction = registry.ActionRetryRun
+	// RetryRunParam names the run to retry. It is the only parameter the
+	// agent gives; the reviewer adds the other two from what it was shown.
+	RetryRunParam = "run_id"
+	// RetryRunSpecParam is the digest of the DAG snapshot the run ran, and
+	// RetryRunPackageParam the package the job had when the reviewer looked.
+	// The registry refuses the proposal, and later its execution, when
+	// either is no longer the job's current one.
+	RetryRunSpecParam    = "run_spec_sha256"
+	RetryRunPackageParam = "package_digest"
+	// RetryRunAttemptParam and RetryRunQueuedParam name the failed
+	// execution being retried: its attempt and when that attempt was
+	// queued. A native retry keeps the run id, so this is what makes one
+	// retry decision mean one execution: the retry is dispatched only while
+	// that execution is still the run's latest.
+	RetryRunAttemptParam = "attempt_id"
+	RetryRunQueuedParam  = "queued_at"
+	// UncertainEffectAction is the reserved action name of a proposal that
+	// asks the owner about an effect whose outcome is unknown. It is not
+	// executable.
+	UncertainEffectAction = registry.ActionUncertainEffect
+	// UncertainEffectParam names the journaled action in question.
+	UncertainEffectParam = "action_id"
+)
+
 // DeclaredAction is an executable follow-up saved with the job. The reviewer
 // runs nothing that is not declared here.
 type DeclaredAction struct {
@@ -104,12 +137,15 @@ func (p ReviewPolicy) Action(name string) (DeclaredAction, bool) {
 
 // Job is the reviewer's read view of a registered job.
 type Job struct {
-	ID               string       `json:"job_id"`
-	OwnerID          string       `json:"owner_id"`
-	ProjectID        string       `json:"project_id"`
-	MachineID        string       `json:"machine_id"`
-	Version          int          `json:"version"`
-	PackageDigest    string       `json:"package_digest"`
+	ID            string `json:"job_id"`
+	OwnerID       string `json:"owner_id"`
+	ProjectID     string `json:"project_id"`
+	MachineID     string `json:"machine_id"`
+	Version       int    `json:"version"`
+	PackageDigest string `json:"package_digest"`
+	// DAGSpecSHA256 is the digest of the job's current DAG. A run with
+	// another digest ran an older version.
+	DAGSpecSHA256    string       `json:"dag_spec_sha256,omitempty"`
 	WorkingDir       string       `json:"working_dir"`
 	Title            string       `json:"title"`
 	Purpose          string       `json:"purpose"`
@@ -171,14 +207,40 @@ type Checkpoint struct {
 
 // RunEvidence is one finished run of the job's own script.
 type RunEvidence struct {
-	RunID      string            `json:"run_id"`
-	JobVersion int               `json:"job_version"`
+	RunID      string `json:"run_id"`
+	JobVersion int    `json:"job_version"`
+	// SpecSHA256 is the digest of the DAG snapshot the run ran.
+	SpecSHA256 string `json:"spec_sha256,omitempty"`
+	// AttemptID and QueuedAt identify the run's latest execution, the one
+	// this evidence is of.
+	AttemptID string `json:"attempt_id,omitempty"`
+	QueuedAt  string `json:"queued_at,omitempty"`
+	// Cursor is the checkpoint's run cursor once this run, and every run
+	// listed before it, has been covered, for a registry that keeps its
+	// place in the run history that way. A run without one is its own
+	// cursor.
+	Cursor     string            `json:"-"`
 	Status     string            `json:"status"`
 	StartedAt  time.Time         `json:"started_at,omitzero"`
 	FinishedAt time.Time         `json:"finished_at,omitzero"`
 	Outputs    map[string]string `json:"outputs,omitempty"`
 	Artifacts  []string          `json:"artifacts,omitempty"`
-	Error      string            `json:"error,omitempty"`
+	Error      string            `json:"error,omitempty"` // Steps carry the end of each step's own output, which is where a
+	// script's result usually is.
+	Steps []StepEvidence `json:"steps,omitempty"`
+}
+
+// Execution is the execution of the run this evidence is of.
+func (r RunEvidence) Execution() Execution {
+	return Execution{AttemptID: r.AttemptID, QueuedAt: r.QueuedAt}
+}
+
+// StepEvidence is one step of a finished run.
+type StepEvidence struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Stdout string `json:"stdout_tail,omitempty"`
+	Stderr string `json:"stderr_tail,omitempty"`
 }
 
 // ActionState is the journal state of one follow-up action.
@@ -339,9 +401,25 @@ type Review struct {
 	// checkpoint advances over exactly these and nothing newer.
 	CoveredRuns      []string `json:"covered_run_ids"`
 	CoveredDecisions []string `json:"covered_decision_ids"`
-	ActionIDs        []string `json:"action_ids,omitempty"`
-	ProposalIDs      []string `json:"proposal_ids,omitempty"`
-	Notes            []string `json:"notes,omitempty"`
+	// CoveredExecutions names each covered run with the execution of it
+	// that was shown, as "run@execution": a retried run keeps its id, so
+	// the id alone does not say which result a review saw. These names, in
+	// the job's recorded reviews, are the record of what has been covered:
+	// a result is shown to a review until a recorded review names it.
+	CoveredExecutions []string `json:"covered_executions,omitempty"`
+	// RunCursor is the checkpoint's run cursor after this review.
+	RunCursor   string   `json:"run_cursor,omitempty"`
+	ActionIDs   []string `json:"action_ids,omitempty"`
+	ProposalIDs []string `json:"proposal_ids,omitempty"`
+	Notes       []string `json:"notes,omitempty"`
+	// Handoff locates the prepared review (claim and packet) on the machine
+	// that ran it. It is a reference to a local file, not a copy held by
+	// the service: retrieving it needs that machine.
+	Handoff LocalFile `json:"handoff,omitzero"`
+	// PacketArtifact and DecisionArtifact name the run artifacts holding
+	// the context the agent was given and the decision it returned.
+	PacketArtifact   string `json:"packet_artifact,omitempty"`
+	DecisionArtifact string `json:"decision_artifact,omitempty"`
 	// PacketBytes is the size of the context the agent was given.
 	PacketBytes int `json:"packet_bytes"`
 	// AgentInputTokens and AgentOutputTokens are what the agent CLI reports
@@ -361,6 +439,12 @@ const (
 	ExceptionReviewerAuth ExceptionKind = "reviewer_authentication_required"
 	// ExceptionReviewerFailed means the agent ran but produced no usable decision.
 	ExceptionReviewerFailed ExceptionKind = "reviewer_failed"
+	// ExceptionContextTooLarge means the job's context does not fit a review
+	// packet, so it is not being reviewed.
+	ExceptionContextTooLarge ExceptionKind = "review_context_too_large"
+	// ExceptionCleanupFailed means a superseded proposal's decision run
+	// could not be closed after repeated attempts.
+	ExceptionCleanupFailed ExceptionKind = "decision_run_cleanup_failed"
 	// ExceptionUnavailable means the reviewer judged the job's target or
 	// credentials unavailable. It is not a retirement.
 	ExceptionUnavailable ExceptionKind = "target_unavailable"
@@ -373,4 +457,12 @@ type Exception struct {
 	MachineID string        `json:"machine_id"`
 	Message   string        `json:"message"`
 	ReviewID  string        `json:"review_id,omitempty"`
+}
+
+// LocalFile is a reference to a file kept on one machine. The digest lets a
+// later inventory tell the same bytes from a different file at the path.
+type LocalFile struct {
+	MachineID string `json:"machine_id"`
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256"`
 }

@@ -67,11 +67,61 @@ else a review step needs must be rendered into the DAG:
   proposed instead of tried again. An action whose outcome is unknown is
   never retried: a declared `reconcile` probe settles it, or the owner
   answers its escalation. Until then the same action on the same target is
-  not run again, and only the answer `retry` allows it.
+  not run again, and only the answer `retry` allows it, for one attempt.
+- Retrying a run: `dagu.retry_run` is bound to one failed execution of the
+  run (attempt id and queued time), the DAG snapshot it ran and the job's
+  package. A run of an older version is never retried, and nothing is
+  dispatched once the run has moved on from that execution. A retry the
+  reviewer proposes runs from its decision run once the owner answers
+  `retry`; one the owner requests directly is already decided and is run by
+  the next tick. Either way it is dispatched at most once, and it is
+  recorded as done only when another execution is seen on the run; the
+  receipt is that execution's reference and says what it was doing, not
+  that the job succeeded. A dispatch whose result was not seen is recorded
+  as uncertain and is settled from the run later or put to the owner.
 - Leases: an action starts only if the claim outlives its timeout, and its
   process is killed when its grant ends. A process frozen between that
   check and its start can still act late; a destination that must exclude
   this has to enforce the attempt's key itself.
+
+## What a review is shown of the job's runs
+
+- One result per run: its latest execution. An execution is an attempt as
+  queued at one time. A retry keeps the run id; Dagu either starts a new
+  attempt for it or queues the latest attempt again under the same attempt
+  id, so the pair of attempt id and queue marker is what identifies it. The
+  service lists only the latest. An execution that was replaced by a retry
+  between two reviews is therefore never reviewed, and nothing here claims
+  otherwise.
+- What has been covered is what the job's recorded reviews say they
+  covered. Each review records the results it was shown by run and
+  execution (`covered_executions`), and a result is shown to reviews until
+  a recorded review names it. There is no cursor that could move past a
+  result: a result is covered only once the review that was shown it has
+  been persisted, and a crash, a failed read or a review that was never
+  recorded covers nothing.
+- So a retried run is shown again when its new execution ends, on either
+  retry path; results with the same end time are separate results; a
+  result reported late, a run created while the history was being listed
+  and a queued run that ends later are all returned, whatever their times.
+  End times only order what one review is shown.
+- A result whose run is retried while its evidence is being read is not
+  returned that time, so the status of one execution is never paired with
+  the output of another. No review names it, so the next review meets the
+  run's latest execution.
+- Bounds: at most 50 runs per review, oldest first; the rest wait for the
+  next one. No number of results, unfinished runs or queued runs stops a
+  job's reviews.
+- Cost: every review reads the job's whole review history and run list.
+  The registry's review list has no paging yet. This is the plain, exact
+  form; making it cheaper is capacity work and must keep the same meaning
+  of covered.
+- The service must identify executions. A finished run reported without
+  an attempt id fails the review step with an explicit error naming the
+  run; it is never recorded under its run id alone, which would pass off a
+  later retry of it as already reviewed. A review recorded before coverage
+  was by execution names no executions and covers nothing: its runs are
+  shown again, not taken for covered.
 
 ## Declared actions
 

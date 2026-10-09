@@ -38,6 +38,12 @@ type State struct {
 	Actions     map[string][]review.Action
 	Reviews     map[string][]review.Review
 	Exceptions  []review.Exception
+	// ConsumedResolutions are escalation answers already used by a grant.
+	ConsumedResolutions map[string]bool
+	// Closures are the recorded attempts to close superseded proposals'
+	// decision runs, by proposal id.
+	Closures         map[string][]review.Closure
+	ClosureAttempted map[string]time.Time
 	// Transitions records every claim and checkpoint change in order.
 	Transitions []string
 	Seq         int
@@ -373,6 +379,104 @@ func (r *Registry) Review(_ context.Context, jobID, reviewID string) (review.Rev
 	return out, err
 }
 
+// RequestedRetries implements review.Registry.
+func (r *Registry) RequestedRetries(_ context.Context, machineID string, limit int) ([]review.RequestedRetry, error) {
+	var out []review.RequestedRetry
+	err := r.Update(func(s *State) error {
+		for jobID, job := range s.Jobs {
+			if job.MachineID != machineID || !job.Lifecycle.Reviewable() {
+				continue
+			}
+			attempted := map[string]bool{}
+			for _, a := range s.Actions[jobID] {
+				attempted[a.DecisionID] = true
+			}
+			for _, p := range s.Proposals[jobID] {
+				if p.State != review.ProposalDecided || p.ActionName != review.RetryRunAction || p.NativeTask.RunID != "" {
+					continue
+				}
+				for _, d := range slices.Backward(s.Decisions[jobID]) {
+					if d.ProposalID != p.ID {
+						continue
+					}
+					if d.Verdict == review.VerdictRetry && !attempted[d.ID] {
+						out = append(out, review.RequestedRetry{JobID: jobID, ProposalID: p.ID, DecisionID: d.ID})
+					}
+					break
+				}
+			}
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].ProposalID < out[j].ProposalID })
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return nil
+	})
+	return out, err
+}
+
+// PendingClosures implements review.Registry.
+func (r *Registry) PendingClosures(_ context.Context, machineID string, limit int) ([]review.Proposal, error) {
+	var out []review.Proposal
+	err := r.Update(func(s *State) error {
+		for jobID, job := range s.Jobs {
+			if job.MachineID != machineID {
+				continue
+			}
+			for _, p := range s.Proposals[jobID] {
+				if p.State == review.ProposalSuperseded && p.NativeTask.RunID != "" && !s.closed(p.ID) {
+					out = append(out, p)
+				}
+			}
+		}
+		// Least recently attempted first, so a failing one moves to the
+		// back instead of holding up the rest.
+		sort.SliceStable(out, func(i, j int) bool {
+			a, b := s.ClosureAttempted[out[i].ID], s.ClosureAttempted[out[j].ID]
+			if !a.Equal(b) {
+				return a.Before(b)
+			}
+			return out[i].ID < out[j].ID
+		})
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (s *State) closed(proposalID string) bool {
+	for _, c := range s.Closures[proposalID] {
+		if c.Outcome != review.ClosureFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordClosure implements review.Registry.
+func (r *Registry) RecordClosure(_ context.Context, closure review.Closure) (int, error) {
+	failed := 0
+	err := r.Update(func(s *State) error {
+		if s.Closures == nil {
+			s.Closures = map[string][]review.Closure{}
+		}
+		if s.ClosureAttempted == nil {
+			s.ClosureAttempted = map[string]time.Time{}
+		}
+		s.Closures[closure.ProposalID] = append(s.Closures[closure.ProposalID], closure)
+		s.ClosureAttempted[closure.ProposalID] = r.now()
+		for _, c := range s.Closures[closure.ProposalID] {
+			if c.Outcome == review.ClosureFailed {
+				failed++
+			}
+		}
+		return nil
+	})
+	return failed, err
+}
+
 // Actions implements review.Registry.
 func (r *Registry) Actions(_ context.Context, jobID string) ([]review.Action, error) {
 	var out []review.Action
@@ -407,6 +511,11 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			return &review.GuardDeniedError{Reason: review.DenyVersionChanged}
 		}
 		declared, ok := job.Review.Action(req.Name)
+		// The reserved retry is not a job action. It exists only as an
+		// approved effect, never as a routine one.
+		if req.Name == review.RetryRunAction && req.DecisionID != "" {
+			ok = true
+		}
 		if !ok {
 			return &review.GuardDeniedError{Reason: review.DenyNotPermitted, Detail: "action is not declared"}
 		}
@@ -424,6 +533,9 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			if s.intentUnresolved(job, req.IntentKey) {
 				return &review.GuardDeniedError{Reason: review.DenyIntentUnresolved}
 			}
+			// An owner's "retry" on an escalation permits one more attempt.
+			// It is used up by this grant, so a replay cannot use it again.
+			s.consumeResolution(job, req.IntentKey)
 		} else if denied := s.checkDecision(job, req); denied != nil {
 			return denied
 		}
@@ -440,6 +552,24 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 		return nil
 	})
 	return out, err
+}
+
+// consumeResolution marks the retry answer for an intent's escalated attempt
+// as used.
+func (s *State) consumeResolution(job review.Job, intent string) {
+	actions := s.Actions[job.ID]
+	for _, action := range slices.Backward(actions) {
+		if action.IntentKey != intent {
+			continue
+		}
+		if action.State == review.ActionEscalated {
+			if s.ConsumedResolutions == nil {
+				s.ConsumedResolutions = map[string]bool{}
+			}
+			s.ConsumedResolutions[review.UncertainProposalID(action.ID, job.Version)] = true
+		}
+		return
+	}
 }
 
 func grantTimeout(d time.Duration) time.Duration {
@@ -463,6 +593,9 @@ func (s *State) intentUnresolved(job review.Job, intent string) bool {
 		case review.ActionExecuting, review.ActionUncertain:
 			return true
 		case review.ActionEscalated:
+			if s.ConsumedResolutions[review.UncertainProposalID(a.ID, job.Version)] {
+				return true
+			}
 			verdict := review.Verdict("")
 			for _, d := range s.Decisions[jobID] {
 				// Only an answer to the question asked about this version of
@@ -497,7 +630,9 @@ func (s *State) checkDecision(job review.Job, req review.BeginRequest) *review.G
 			latest = &s.Decisions[job.ID][i]
 		}
 	}
-	if latest == nil || latest.ID != req.DecisionID || latest.Verdict != review.VerdictApprove {
+	authorizes := latest != nil && (latest.Verdict == review.VerdictApprove ||
+		(latest.Verdict == review.VerdictRetry && proposal.ActionName == review.RetryRunAction))
+	if latest == nil || latest.ID != req.DecisionID || !authorizes {
 		return &review.GuardDeniedError{Reason: review.DenyNotApproved}
 	}
 	current := BindingDigest(job, proposal.ActionName, proposal.TargetID, proposal.Params)
@@ -658,6 +793,10 @@ func (r *Registry) AddRun(jobID string, run review.RunEvidence) error {
 	})
 }
 
+// ErrVerdictNotAllowed is returned by Decide for a verdict the proposal does
+// not accept.
+var ErrVerdictNotAllowed = errors.New("reviewtest: verdict not allowed")
+
 // ErrStaleBinding is returned by Decide when the human answered a proposal
 // that has changed since it was shown.
 var ErrStaleBinding = errors.New("reviewtest: stale binding")
@@ -680,6 +819,11 @@ func (r *Registry) Decide(jobID, proposalID string, verdict review.Verdict, inst
 			if p.BindingDigest != BindingDigest(job, p.ActionName, p.TargetID, p.Params) {
 				return ErrStaleBinding
 			}
+			// A verdict the proposal does not allow is refused: "retry" in
+			// particular is valid on two kinds of proposal only.
+			if len(p.AllowedVerdicts) > 0 && !slices.Contains(p.AllowedVerdicts, verdict) {
+				return fmt.Errorf("%w: %s is not an allowed verdict for proposal %s", ErrVerdictNotAllowed, verdict, p.ID)
+			}
 			out = review.Decision{
 				ID: s.nextID("dec"), ProposalID: proposalID, JobID: jobID,
 				BindingDigest: p.BindingDigest, Verdict: verdict,
@@ -687,6 +831,12 @@ func (r *Registry) Decide(jobID, proposalID string, verdict review.Verdict, inst
 			}
 			s.Decisions[jobID] = append(s.Decisions[jobID], out)
 			// Only an approval leaves the proposal executable.
+			switch {
+			case verdict == review.VerdictRetry && p.ActionName == review.RetryRunAction:
+				// The one case where "retry" leaves a proposal executable.
+				p.State = review.ProposalDecided
+				return nil
+			}
 			switch verdict {
 			case review.VerdictApprove:
 				p.State = review.ProposalDecided

@@ -11,6 +11,11 @@ import (
 )
 
 var (
+	// ErrUnidentifiedExecution means the service reported a finished run
+	// without the attempt id that identifies its execution. Coverage is by
+	// execution, so such a service is not one this reviewer can run on: a
+	// retried run would be indistinguishable from the run already reviewed.
+	ErrUnidentifiedExecution = errors.New("txe review: the service does not identify a run's execution")
 	// ErrClaimHeld means another live claim owns the job.
 	ErrClaimHeld = errors.New("txe review: job is claimed by another holder")
 	// ErrStaleFence means the write came from a claim that is no longer the
@@ -117,6 +122,21 @@ type Registry interface {
 	Decision(ctx context.Context, jobID, decisionID string) (Decision, error)
 	Proposal(ctx context.Context, jobID, proposalID string) (Proposal, error)
 	OpenProposals(ctx context.Context, jobID string) ([]Proposal, error)
+	// PendingClosures lists superseded proposals of the machine's jobs,
+	// whatever a job's lifecycle, whose decision run has no recorded final
+	// closure yet. It returns at most limit, least recently attempted
+	// first, so every one of them is eventually reached and a failing one
+	// does not hold up the rest.
+	PendingClosures(ctx context.Context, machineID string, limit int) ([]Proposal, error)
+	// RecordClosure records what closing a superseded proposal's decision
+	// run found and returns how many attempts have failed so far. Any
+	// outcome but ClosureFailed is final.
+	RecordClosure(ctx context.Context, closure Closure) (failedAttempts int, err error)
+	// RequestedRetries lists the retries a person requested directly for
+	// the machine's reviewable jobs and that nothing has attempted yet:
+	// decided retry proposals with no decision run of their own to execute
+	// them. It returns at most limit.
+	RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error)
 	// Review returns a recorded review, or ErrNotFound.
 	Review(ctx context.Context, jobID, reviewID string) (Review, error)
 	// Actions returns the job's journaled actions, oldest first.
@@ -148,4 +168,38 @@ type Registry interface {
 // alive. Opening the same proposal twice must be a no-op.
 type DecisionOpener interface {
 	OpenDecision(ctx context.Context, proposal Proposal) error
+	// CloseDecision ends the wait of a proposal that can no longer be
+	// answered and says what it found there.
+	CloseDecision(ctx context.Context, proposal Proposal) (ClosureOutcome, error)
+}
+
+// ClosureOutcome is what closing a superseded proposal's decision run found.
+type ClosureOutcome string
+
+const (
+	// ClosureClosed means the waiting task was completed by the system
+	// with no decision.
+	ClosureClosed ClosureOutcome = "closed"
+	// ClosureAnswered means the task had already been completed with a
+	// real answer, which the registry refuses for a superseded proposal.
+	ClosureAnswered ClosureOutcome = "already_answered"
+	// ClosureMissing means the service knows no such run. That is recorded
+	// as missing; it is not evidence that a wait was ever completed.
+	ClosureMissing ClosureOutcome = "run_missing"
+	// ClosureRefused means the stored locator is not the proposal's own
+	// decision run, so nothing was touched.
+	ClosureRefused ClosureOutcome = "locator_refused"
+	// ClosureFailed means the attempt failed and will be retried.
+	ClosureFailed ClosureOutcome = "failed"
+)
+
+// Closure is the recorded result of one attempt to close a superseded
+// proposal's decision run. It is a system record, never a human decision.
+type Closure struct {
+	JobID      string         `json:"job_id"`
+	ProposalID string         `json:"proposal_id"`
+	Outcome    ClosureOutcome `json:"outcome"`
+	Reason     string         `json:"reason"`
+	Detail     string         `json:"detail,omitempty"`
+	By         string         `json:"by"`
 }

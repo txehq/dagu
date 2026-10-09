@@ -6,7 +6,11 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,6 +114,7 @@ func TestRenderDAGs(t *testing.T) {
 		`txe.machine: "mch_0000000000000000000F1XT001"`,
 		"overlap_policy: skip",
 		"max_active_runs: 1",
+		"artifacts:\n  enabled: true",
 		"timeout_sec: 900",
 		`- TXE_DAGU_REVIEWER: "1"`,
 		`- CLAUDE_CONFIG_DIR: "/home/reviewer/.claude-reviewer"`,
@@ -122,7 +127,7 @@ func TestRenderDAGs(t *testing.T) {
 		`setting-sources: [""]`,
 		"strict-mcp-config: true",
 		"no-session-persistence: true",
-		`dagu txe review apply --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
+		`dagu txe review apply --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
 	} {
 		assert.Contains(t, dags.Reviewer, want)
 	}
@@ -132,7 +137,8 @@ func TestRenderDAGs(t *testing.T) {
 	for _, want := range []string{
 		"action: human.task",
 		"required: [decision_id, verdict]",
-		`dagu txe review execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
+		"enum: [approve, reject, redirect, retry, pause, snooze, retire, superseded]",
+		`dagu txe review execute --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID} --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
 		`- TXE_DAGU_REVIEWER: "1"`,
 	} {
 		assert.Contains(t, dags.Decide, want)
@@ -517,4 +523,601 @@ func TestPrepareTakesTheLongestOverdueJob(t *testing.T) {
 	}
 	assert.Positive(t, reviewed[slow.ID], "the slower job was never reviewed")
 	assert.Positive(t, reviewed[jobID])
+}
+
+// With an artifact directory, the packet and the decision are written there
+// by the step itself and the review record points at them.
+func TestStepsSaveReviewArtifacts(t *testing.T) {
+	f := newFixture(t)
+	dir, artifacts := t.TempDir(), t.TempDir()
+	ctx := context.Background()
+	f.addRun("run-1", "succeeded")
+	steps := f.steps("tick-1", dir)
+	steps.ArtifactDir = artifacts
+
+	var packet, out bytes.Buffer
+	require.NoError(t, steps.Prepare(ctx, "tick-1", &packet))
+	saved, err := os.ReadFile(filepath.Join(artifacts, "txe-review", "packet.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(saved), `"run_id": "run-1"`)
+	assert.NotContains(t, string(saved), "claim_id", "the artifact holds the packet, not the claim")
+
+	require.NoError(t, steps.Apply(ctx, "tick-1", strings.NewReader(`{"outcome":"continue","reasoning":"fine","evidence_run_ids":["run-1"]}`), "", &out))
+	saved, err = os.ReadFile(filepath.Join(artifacts, "txe-review", "decision.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(saved), `"outcome": "continue"`)
+
+	rev := f.state().Reviews[jobID][0]
+	// The local hand-off is recorded as a reference to a file on this
+	// machine, with the digest of the bytes the decision was made from.
+	handoff, err := os.ReadFile(filepath.Join(dir, "reviews", "tick-1", "prepared.json"))
+	require.NoError(t, err)
+	sum := sha256.Sum256(handoff)
+	assert.Equal(t, review.LocalFile{
+		MachineID: fixtureJob().MachineID,
+		Path:      filepath.Join(dir, "reviews", "tick-1", "prepared.json"),
+		SHA256:    hex.EncodeToString(sum[:]),
+	}, rev.Handoff)
+	assert.Equal(t, "txe-review/packet.json", rev.PacketArtifact)
+	assert.Equal(t, "txe-review/decision.json", rev.DecisionArtifact)
+}
+
+// Closing completes the run's task with a system marker, never a human
+// verdict, and reports what the service said about the task.
+func TestRunOpenerClosesWithASystemMarker(t *testing.T) {
+	var calls []string
+	result := error(nil)
+	o := &review.RunOpener{Complete: func(_ context.Context, task review.TaskLocator, input map[string]string) error {
+		calls = append(calls, task.DAG+"/"+task.RunID+"/"+task.StepID+" "+input["decision_id"]+" "+input["verdict"])
+		return result
+	}}
+	p := review.Proposal{ID: "prp_1", NativeTask: review.TaskLocator{DAG: "txe-decide-x", RunID: "txe-abc", StepID: "decide"}}
+	outcome, err := o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureClosed, outcome)
+	assert.Equal(t, []string{"txe-decide-x/txe-abc/decide dec_superseded superseded"}, calls)
+
+	result = review.ErrTaskAnswered
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureAnswered, outcome)
+
+	result = review.ErrRunMissing
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureMissing, outcome, "an unknown run is recorded as missing, not as closed")
+
+	result = errors.New("hub unreachable")
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.Error(t, err)
+	assert.Equal(t, review.ClosureFailed, outcome)
+
+	_, err = (&review.RunOpener{}).CloseDecision(context.Background(), p)
+	require.Error(t, err)
+}
+
+// A job whose scripts print a lot cannot blow up the packet, and cannot use
+// volume to hide results either: runs that do not fit are left for the next
+// review instead of being covered without their output.
+func TestPacketIsBoundedWithoutHidingEvidence(t *testing.T) {
+	f := newFixture(t)
+	big := strings.Repeat("x", 2048)
+	for i := range 40 {
+		steps := make([]review.StepEvidence, 0, 20)
+		for j := range 20 {
+			steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("step-%d", j), Status: "succeeded", Stdout: big, Stderr: big})
+		}
+		require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: fmt.Sprintf("run-%02d", i), Status: "succeeded", Steps: steps}))
+	}
+	prepared := f.prepare("reviewer-a")
+	packet := prepared.Packet
+	raw, err := json.Marshal(packet)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), 256<<10)
+	require.NotEmpty(t, packet.NewRuns)
+	assert.Less(t, len(packet.NewRuns), 40)
+	assert.True(t, packet.MoreRunsPending)
+	assert.Equal(t, "run-00", packet.NewRuns[0].RunID, "the oldest runs are reviewed first")
+	for _, run := range packet.NewRuns {
+		require.Len(t, run.Steps, 12, "at most the last steps of a run are kept")
+		assert.Equal(t, "step-19", run.Steps[11].Name)
+		assert.Len(t, run.Steps[11].Stdout, 2048, "a run in the packet keeps its step output")
+	}
+
+	// The checkpoint advances only over the runs that were shown, and the
+	// rest are due again at once.
+	last := packet.NewRuns[len(packet.NewRuns)-1].RunID
+	f.apply("reviewer-a", prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "ok"})
+	cp := f.state().Checkpoints[jobID]
+	assert.Equal(t, last, cp.RunCursor)
+	assert.Equal(t, f.clock.Now().Add(time.Minute), cp.NextReviewAt)
+	f.clock.Advance(time.Minute)
+	next := f.prepare("reviewer-b").Packet
+	assert.Greater(t, next.NewRuns[0].RunID, last)
+}
+
+// One run that is alone too large has its step output shortened to its
+// ends, and the packet says so.
+func TestOversizedSingleRunIsShortenedAndFlagged(t *testing.T) {
+	f := newFixture(t)
+	huge := strings.Repeat("y", 200<<10)
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-big", Status: "failed", Steps: []review.StepEvidence{
+		{Name: "a", Status: "failed", Stdout: huge + "END-A", Stderr: huge + "END-ERR"},
+	}}))
+	packet := f.prepare("reviewer-a").Packet
+	raw, err := json.Marshal(packet)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), 256<<10)
+	assert.True(t, packet.EvidenceTrimmed)
+	require.Len(t, packet.NewRuns, 1)
+	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stdout, "END-A"), "the end of the output is what is kept")
+	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stderr, "END-ERR"))
+}
+
+// Every list in the packet is bounded. Human feedback beyond the bound is
+// not skipped: it stays after the cursor and comes in the next review.
+func TestPacketListsAreBoundedAndFeedbackIsNotSkipped(t *testing.T) {
+	f := newFixture(t)
+	// 60 questions, each answered by the owner.
+	for round := range 3 {
+		prepared := f.prepare(fmt.Sprintf("reviewer-%d", round))
+		var actions []review.AgentAction
+		for i := range 20 {
+			actions = append(actions, act("expand_volume", map[string]string{"size_gb": fmt.Sprint(round*100 + i)}))
+		}
+		f.apply("r", prepared, review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "ask", Actions: actions})
+		f.clock.Advance(2 * time.Hour)
+	}
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 60)
+	for _, p := range proposals {
+		_, err := f.registry.Decide(jobID, p.ID, review.VerdictReject, "", "connor")
+		require.NoError(t, err)
+	}
+
+	first := f.prepare("reviewer-x")
+	require.Len(t, first.Packet.HumanFeedback, 50)
+	assert.True(t, first.Packet.MoreRunsPending, "more feedback is waiting")
+	f.apply("reviewer-x", first, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "read 50"})
+	f.clock.Advance(time.Minute)
+	second := f.prepare("reviewer-y")
+	require.Len(t, second.Packet.HumanFeedback, 10, "the rest arrives next, none skipped")
+	assert.NotEqual(t, first.Packet.HumanFeedback[49].ID, second.Packet.HumanFeedback[0].ID)
+}
+
+// A job whose own registered context is larger than the packet limit is not
+// reviewed from a cut-down version of it, and does not go quiet either: it
+// is raised as an exception, deferred, and its claim released.
+func TestOversizedJobContextIsRaisedNotSilentlySkipped(t *testing.T) {
+	f := newFixture(t)
+	job := fixtureJob()
+	job.Purpose = strings.Repeat("p", 300<<10)
+	require.NoError(t, f.registry.PutJob(job))
+	prepared, err := f.reviewer("reviewer-a").Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipUnreviewable, prepared.Skipped)
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Equal(t, review.ExceptionContextTooLarge, s.Exceptions[0].Kind)
+	assert.Empty(t, s.Claims, "the claim is released")
+	assert.Equal(t, f.clock.Now().Add(time.Hour), s.Checkpoints[jobID].NextReviewAt, "it is not retried on every tick")
+	assert.Equal(t, 0, s.Checkpoints[jobID].Version)
+}
+
+// An action already in front of the owner is not proposed again by a later
+// review, even when the agent could not see the earlier proposal.
+func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
+	f := newFixture(t)
+	ask := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), ask)
+	require.Len(t, f.state().Proposals[jobID], 1)
+
+	first := f.state().Proposals[jobID][0]
+	f.clock.Advance(2 * time.Hour)
+	applied := f.apply("reviewer-b", f.prepare("reviewer-b"), ask)
+	assert.Len(t, f.state().Proposals[jobID], 1)
+	assert.Contains(t, applied.Review.Notes[0], "already proposed")
+	// Its decision run is opened again, which repairs a proposal whose
+	// first review died before the run was enqueued.
+	assert.Equal(t, 2, f.opener.opened[first.NativeTask.RunID])
+
+	// A different size is a different request.
+	f.clock.Advance(2 * time.Hour)
+	other := ask
+	other.Actions = []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "400"})}
+	f.apply("reviewer-c", f.prepare("reviewer-c"), other)
+	assert.Len(t, f.state().Proposals[jobID], 2)
+}
+
+// retryFixture is a job whose run-1 failed at attempt att-1, with a retry of
+// it proposed by the reviewer and decided "retry" by the owner.
+type retryFixture struct {
+	*fixture
+	runs     *runs
+	proposal review.Proposal
+	decision review.Decision
+}
+
+func (f *retryFixture) executor(holder string) *review.Reviewer {
+	r := f.reviewer(holder)
+	r.Runs, r.RetryObserve = f.runs, 20*time.Millisecond
+	return r
+}
+
+func newRetryFixture(t *testing.T) *retryFixture {
+	t.Helper()
+	return newRetryFixtureQueuedAt(t, "")
+}
+
+// newRetryFixtureQueuedAt is newRetryFixture for a failed execution whose
+// attempt was queued at the given time.
+func newRetryFixtureQueuedAt(t *testing.T, queuedAt string) *retryFixture {
+	t.Helper()
+	f := &retryFixture{fixture: newFixture(t), runs: newRuns()}
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{
+		RunID: "run-1", JobVersion: 1, Status: "failed", SpecSHA256: specDigest, AttemptID: "att-1", QueuedAt: queuedAt,
+	}))
+	f.runs.state["run-1"] = review.RunState{AttemptID: "att-1", QueuedAt: queuedAt, Status: "failed"}
+	_, err := f.executor("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"}},
+	})
+	require.NoError(t, err)
+	f.proposal = f.state().Proposals[jobID][0]
+	f.decision, err = f.registry.Decide(jobID, f.proposal.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	return f
+}
+
+func (f *retryFixture) execute(holder string) review.Executed {
+	f.t.Helper()
+	out, err := f.executor(holder).Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.NoError(f.t, err)
+	return out
+}
+
+// The reserved retry: the reviewer proposes re-running one exact run it was
+// shown, bound to the failed attempt it saw. Nothing runs until the owner
+// answers "retry"; then that run is retried once, and the journal's receipt
+// is the new attempt the service was observed to start.
+func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "failed")
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-old", JobVersion: 1, Status: "failed", SpecSHA256: "sha256:older", AttemptID: "att-1"}))
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-anon", JobVersion: 1, Status: "failed", SpecSHA256: specDigest}))
+	service := newRuns()
+	service.fail("run-1", "att-1")
+	withRetry := func(holder string) *review.Reviewer {
+		r := f.reviewer(holder)
+		r.Runs, r.RetryObserve = service, 20*time.Millisecond
+		return r
+	}
+	prepared := f.prepare("reviewer-a")
+	_, err := withRetry("reviewer-a").Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-unknown"}, Reason: "not shown"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-old"}, Reason: "older version"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1", "attempt_id": "att-9"}, Reason: "agent picks the attempt"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-anon"}, Reason: "no attempt id"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, service.retried, "a retry never runs on the agent's request")
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 5)
+	retry, question := proposals[0], proposals[1]
+	assert.Equal(t, review.ProposalAction, retry.Kind)
+	assert.Equal(t, map[string]string{
+		"run_id": "run-1", "attempt_id": "att-1", "queued_at": "", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
+	}, retry.Params, "the retry is bound to the failed execution, the snapshot it ran and that version's package")
+	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
+	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
+	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
+	assert.Equal(t, review.ProposalQuestion, proposals[2].Kind, "a run of an older version is never retried")
+	assert.Contains(t, proposals[2].Question, "run-old")
+	assert.Equal(t, review.ProposalQuestion, proposals[3].Kind, "the agent names the run and nothing else")
+	assert.Equal(t, review.ProposalQuestion, proposals[4].Kind, "a run whose attempt is not identified cannot be bound")
+
+	// "retry" is not an answer to an ordinary question.
+	_, err = f.registry.Decide(jobID, question.ID, review.VerdictRetry, "", "connor")
+	require.ErrorIs(t, err, reviewtest.ErrVerdictNotAllowed)
+
+	decided, err := f.registry.Decide(jobID, retry.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	ctx := context.Background()
+	out, err := withRetry("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, review.ExecutionRef("att-2", ""), out.Action.Receipt, "the receipt is the execution that was observed to start")
+	assert.Contains(t, out.Action.Detail, "running", "and says what that attempt was doing, not that the job succeeded")
+	assert.Equal(t, []string{"run-1"}, service.retried)
+
+	out, err = withRetry("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+	assert.Len(t, service.retried, 1, "one decision retries the run once")
+
+	// Without a way to retry configured, nothing is attempted.
+	out, err = f.reviewer("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+}
+
+// A decision is about one failed attempt. When the run has moved on since,
+// by any other retry, nothing is dispatched on its strength.
+func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {
+	for name, move := range map[string]func(*runs){
+		"another retry already started a new attempt": func(r *runs) { r.start("run-1") },
+		"a later attempt already succeeded": func(r *runs) {
+			r.state["run-1"] = review.RunState{AttemptID: "att-2", Status: "succeeded", Succeeded: true}
+		},
+		"a later attempt failed too": func(r *runs) { r.fail("run-1", "att-2") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			move(f.runs)
+			out := f.execute("executor")
+			assert.Contains(t, out.Skipped, review.ExecutionRef("att-1", ""))
+			assert.Contains(t, out.Skipped, "nothing is retried")
+			assert.Empty(t, f.state().Actions[jobID], "no effect was granted or journaled")
+			assert.Empty(t, f.runs.retried, "the service was never asked")
+			// Asking again changes nothing.
+			assert.NotEmpty(t, f.execute("executor").Skipped)
+			assert.Empty(t, f.runs.retried)
+		})
+	}
+}
+
+// A retry decision names the whole execution it is about: the attempt and
+// that attempt's queued time. A decision that names less is not completed
+// from the run's latest execution, and a wrong part makes it stale. An
+// empty queued time is a real value, for an attempt that was never queued.
+func TestRetryRunNeedsTheWholeExecutionTheDecisionIsAbout(t *testing.T) {
+	queued := "2026-10-09T10:00:00Z"
+	for name, tc := range map[string]struct {
+		runQueuedAt string
+		params      func(map[string]string)
+	}{
+		"missing attempt": {params: func(p map[string]string) { delete(p, "attempt_id") }},
+		"missing queued time, though the run's is empty": {params: func(p map[string]string) { delete(p, "queued_at") }},
+		"missing queued time, and the run has one":       {runQueuedAt: queued, params: func(p map[string]string) { delete(p, "queued_at") }},
+		"attempt only, the rest missing": {params: func(p map[string]string) {
+			delete(p, "queued_at")
+			delete(p, "run_spec_sha256")
+		}},
+		"right attempt, empty queued time, but the run has one": {runQueuedAt: queued, params: func(p map[string]string) { p["queued_at"] = "" }},
+		"right attempt, another queued time":                    {runQueuedAt: queued, params: func(p map[string]string) { p["queued_at"] = "2026-10-09T09:00:00Z" }},
+		"right queued time, another attempt":                    {runQueuedAt: queued, params: func(p map[string]string) { p["attempt_id"], p["queued_at"] = "att-0", queued }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			state := f.runs.state["run-1"]
+			state.QueuedAt = tc.runQueuedAt
+			f.runs.state["run-1"] = state
+			// The decision as recorded names what this case says it names.
+			require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+				for i, p := range s.Proposals[jobID] {
+					if p.ID == f.proposal.ID {
+						tc.params(p.Params)
+						s.Proposals[jobID][i] = p
+					}
+				}
+				return nil
+			}))
+			out := f.execute("executor")
+			assert.Contains(t, out.Skipped, "nothing is retried")
+			assert.Empty(t, f.runs.retried, "nothing is dispatched for a decision that does not name the run's latest execution in full")
+			assert.Empty(t, f.state().Actions[jobID], "and nothing is granted")
+		})
+	}
+
+	// The whole tuple is honoured, with an empty queued time for an attempt
+	// that was never queued and with a real one for an attempt that was.
+	for name, queuedAt := range map[string]string{
+		"empty queued time for an attempt never queued": "",
+		"the whole execution with a queued time":        queued,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixtureQueuedAt(t, queuedAt)
+			assert.Equal(t, queuedAt, f.proposal.Params["queued_at"])
+			_, named := f.proposal.Params["queued_at"]
+			assert.True(t, named, "the queued time is always named, empty or not")
+			out := f.execute("executor")
+			require.Empty(t, out.Skipped)
+			assert.Equal(t, review.ActionSucceeded, out.Action.State)
+			assert.Len(t, f.runs.retried, 1)
+		})
+	}
+}
+
+// On Dagu's queued path a retry re-runs the latest attempt under the same
+// attempt id; only its queued time changes. That is a new execution: it is
+// observed and recorded as the retry's effect, and a decision about the
+// earlier execution of that attempt no longer applies to it.
+func TestRetryRunOnTheQueuedPathIsObservedByItsQueuedTime(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(runID string) error {
+		f.runs.requeue(runID)
+		return nil
+	}
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+	assert.NotEqual(t, review.ExecutionRef("att-1", ""), out.Action.Receipt, "the same attempt id, queued again, is another execution")
+	assert.Contains(t, out.Action.Detail, "queued", "the receipt describes what was observed, not a success")
+	assert.Equal(t, "att-1", f.runs.state["run-1"].AttemptID)
+
+	// A second decision that still names the first execution of att-1 is
+	// stale once the attempt has been queued again and failed again.
+	state := f.runs.state["run-1"]
+	state.Status, state.Active = "failed", false
+	f.runs.state["run-1"] = state
+	stale := f.execute("executor")
+	assert.NotEmpty(t, stale.Skipped)
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// While the service cannot be read, nothing is granted or journaled, so the
+// decision keeps its one attempt for when the service is back.
+func TestRetryRunWaitsWhileTheRunCannotBeRead(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.readErr = errors.New("hub unreachable")
+	_, err := f.executor("executor").Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.ErrorContains(t, err, "hub unreachable")
+	assert.Empty(t, f.state().Actions[jobID])
+	assert.Empty(t, f.runs.retried)
+
+	f.runs.readErr = nil
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// The run can move on between the check and the dispatch, after the effect
+// was granted. Nothing is dispatched then either, and the journal says so.
+func TestRetryRunGrantedForAnAttemptThatThenMovedOnIsNotDispatched(t *testing.T) {
+	f := newRetryFixture(t)
+	reads := 0
+	moving := &movingRuns{runs: f.runs, onRead: func() {
+		// The first read is the executor's check; the run is retried by
+		// someone else before the second, which follows the grant.
+		if reads++; reads == 2 {
+			f.runs.start("run-1")
+		}
+	}}
+	r := f.reviewer("executor")
+	r.Runs, r.RetryObserve = moving, 20*time.Millisecond
+	out, err := r.Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.ActionFailed, out.Action.State)
+	assert.Contains(t, out.Action.Detail, "not dispatched")
+	assert.Empty(t, f.runs.retried)
+}
+
+// movingRuns calls onRead before every read of a run's state.
+type movingRuns struct {
+	*runs
+	onRead func()
+}
+
+func (m *movingRuns) RunState(ctx context.Context, job, run string) (review.RunState, error) {
+	m.onRead()
+	return m.runs.RunState(ctx, job, run)
+}
+
+// A refusal by the service started nothing and is recorded as such.
+func TestRetryRunRefusedByTheServiceIsNotApplied(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(string) error { return fmt.Errorf("%w: run is active", review.ErrRunNotRetryable) }
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionFailed, out.Action.State)
+	assert.Contains(t, out.Action.Detail, "not dispatched")
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// The service accepting a retry is not evidence that an attempt started.
+// With no new attempt observed the outcome is uncertain. It is never
+// dispatched again: a later look at the run settles it when a new attempt
+// is there, and otherwise the owner is asked.
+func TestRetryRunAcceptedButUnobservedIsUncertainAndNeverRedispatched(t *testing.T) {
+	for name, tc := range map[string]struct {
+		retry func(string) error
+	}{
+		"accepted, no attempt seen":  {retry: func(string) error { return nil }},
+		"the call failed in transit": {retry: func(string) error { return errors.New("connection reset") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.retry = tc.retry
+			out := f.execute("executor")
+			assert.Equal(t, review.ActionUncertain, out.Action.State)
+			assert.Empty(t, out.Action.Receipt, "no attempt is named that was not observed")
+			require.Len(t, f.runs.retried, 1)
+
+			// The next review looks at the run again. Still the same
+			// attempt: that proves nothing, so the owner is asked.
+			f.clock.Advance(2 * time.Hour)
+			r := f.executor("reviewer-b")
+			prepared, err := r.Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+			require.NoError(t, err)
+			action := f.state().Actions[jobID][0]
+			assert.Equal(t, review.ActionEscalated, action.State)
+			assert.Len(t, f.runs.retried, 1, "absence never causes another dispatch")
+			var escalation review.Proposal
+			for _, p := range f.state().Proposals[jobID] {
+				if p.Kind == review.ProposalUncertain {
+					escalation = p
+				}
+			}
+			assert.Equal(t, review.UncertainProposalID(action.ID, 1), escalation.ID)
+		})
+	}
+}
+
+// An unobserved retry is settled as soon as the run shows a later attempt.
+func TestRetryRunUnobservedIsSettledWhenTheNewAttemptAppears(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(string) error { return nil }
+	out := f.execute("executor")
+	require.Equal(t, review.ActionUncertain, out.Action.State)
+
+	// The dispatch landed after all.
+	f.runs.fail("run-1", "att-2")
+	f.clock.Advance(2 * time.Hour)
+	r := f.executor("reviewer-b")
+	prepared, err := r.Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+	require.NoError(t, err)
+	action := f.state().Actions[jobID][0]
+	assert.Equal(t, review.ActionSucceeded, action.State)
+	assert.Equal(t, review.ExecutionRef("att-2", ""), action.Receipt)
+	assert.Contains(t, action.Detail, "failed", "the receipt says what the new attempt was, not that the job succeeded")
+	assert.Len(t, f.runs.retried, 1)
+}
+
+// An owner's "retry" on an uncertain effect allows exactly one more attempt.
+// The escalation carries the reserved action name and the journaled action.
+func TestUncertainRetryAllowsExactlyOneMoreAttempt(t *testing.T) {
+	f := newFixture(t)
+	f.effects.run = func(review.Action) (review.EffectResult, bool) {
+		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
+	}
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), notify)
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-b", f.prepare("reviewer-b"), review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+
+	escalation := f.state().Proposals[jobID][0]
+	first := f.state().Actions[jobID][0]
+	assert.Equal(t, review.UncertainEffectAction, escalation.ActionName)
+	assert.Equal(t, map[string]string{"action_id": first.ID}, escalation.Params)
+	assert.Equal(t, review.UncertainProposalID(first.ID, 1), escalation.ID)
+	_, err := f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
+	require.NoError(t, err)
+
+	// The one permitted attempt also ends unknown.
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-c", f.prepare("reviewer-c"), notify)
+	assert.Equal(t, 2, f.effects.count("notify"))
+
+	// The old answer is used up: the intent is blocked again, by the new
+	// attempt and independently in the registry.
+	f.clock.Advance(2 * time.Hour)
+	next := f.prepare("reviewer-d")
+	applied := f.apply("reviewer-d", next, notify)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 2, f.effects.count("notify"))
+	assert.True(t, f.state().ConsumedResolutions[escalation.ID])
 }
