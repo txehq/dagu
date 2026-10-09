@@ -6,6 +6,7 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -384,10 +385,8 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	if len(kinds) == 0 {
 		return nil
 	}
-	for _, k := range kinds {
-		if c.Kind == k {
-			return nil
-		}
+	if slices.Contains(kinds, c.Kind) {
+		return nil
 	}
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }

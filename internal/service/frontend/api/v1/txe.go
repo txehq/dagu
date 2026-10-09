@@ -152,17 +152,18 @@ func (a *API) txeRequireJobWrite(ctx context.Context, tx *registry.JobTx) error 
 }
 
 // txeCheckVersion runs check on the workspaces of one committed version of
-// a job and of its saved DAG. A version that does not exist is left to the
-// registry to refuse.
-func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, jobID string, version int, check func(context.Context, string) error) error {
-	v, err := s.GetVersion(ctx, jobID, version)
+// a job and of its saved DAG. A version that does not exist yet is refused
+// as a version conflict: it was not authorized, even if it is committed
+// before the change is.
+func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, job *registry.Job, version int, check func(context.Context, string) error) error {
+	if version < 1 || version > job.Version {
+		return txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at version %d, not %d", job.Version, version), Current: job})
+	}
+	v, err := s.GetVersion(ctx, job.JobID, version)
 	if err != nil {
-		if registry.ErrorCode(err) == registry.CodeNotFound {
-			return nil
-		}
 		return txeError(err)
 	}
-	return a.txeCheckWorkspaces(ctx, jobID, v.DAG.Spec, true, check)
+	return a.txeCheckWorkspaces(ctx, job.JobID, v.DAG.Spec, true, check)
 }
 
 func (a *API) txeRequireWorkspaceWrite(ctx context.Context, workspaceName string) error {
@@ -203,6 +204,13 @@ func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict
 		return err
 	}
 	return check(ctx, dagWorkspaceName(cur))
+}
+
+// txeAlreadyReady reports whether job is ready with pkg, which readiness
+// returns as is.
+func txeAlreadyReady(job *registry.Job, pkg registry.PackageEvidence) bool {
+	r := job.Registration
+	return r.State == registry.RegistrationReady && r.Package != nil && r.Package.Digest == pkg.Digest
 }
 
 func txeBody[T any](body *T) (*T, error) {
@@ -429,14 +437,14 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 		if err != nil {
 			return nil, txeError(err)
 		}
-		if err := a.txeCheckVersion(ctx, s, req.JobId, job.Version, a.requireDAGWriteForWorkspace); err != nil {
+		if err := a.txeCheckVersion(ctx, s, job, job.Version, a.requireDAGWriteForWorkspace); err != nil {
 			return nil, err
 		}
 		expected := valueOf(body.ExpectedRevision)
-		if expected == 0 {
-			expected = job.Revision
+		if expected != 0 && expected != job.Revision && !txeAlreadyReady(job, pkg) {
+			return nil, txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, expected), Current: job})
 		}
-		receipt, err = s.MarkReady(ctx, req.JobId, expected, pkg, actor)
+		receipt, err = s.MarkReady(ctx, req.JobId, job.Revision, pkg, actor)
 		if err == nil {
 			break
 		}
@@ -466,7 +474,11 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	}
 	// The update is accepted only against expected_version, so that is the
 	// committed version the caller must be able to write.
-	if err := a.txeCheckVersion(ctx, s, req.JobId, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
+	cur, err := s.GetJob(ctx, req.JobId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	if err := a.txeCheckVersion(ctx, s, cur, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
 		return nil, err
 	}
 	job, err := s.UpdateVersion(ctx, req.JobId, body.RequestId, body.ExpectedVersion, v, actor)
@@ -682,6 +694,24 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 	decisions, err := s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
 	if err != nil {
 		return nil, txeError(err)
+	}
+	// A decision record keeps the native_resume it was written with; report
+	// the current state. The job is read after the decisions, so a decision
+	// listed without a pending entry has had its task completed.
+	job, err := s.GetJob(ctx, req.JobId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	for i, d := range decisions {
+		if d.NativeResume == "" {
+			continue
+		}
+		cp := *d
+		cp.NativeResume = "completed"
+		if _, pending := job.NativeResumes[d.DecisionID]; pending {
+			cp.NativeResume = "pending"
+		}
+		decisions[i] = &cp
 	}
 	if since := valueOf(req.Params.Since); since != "" {
 		for i, d := range decisions {

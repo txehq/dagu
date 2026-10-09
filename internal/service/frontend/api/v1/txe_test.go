@@ -296,4 +296,104 @@ func TestTxeAPIUpdateChecksCommittedVersion(t *testing.T) {
 			Dag:     apigen.TxeDAGRef{Spec: spec},
 		}}})
 	requireStatus(t, err, http.StatusForbidden)
+
+	// A version that does not exist yet was not authorized: it is a conflict,
+	// whatever is committed after the check.
+	opsJob, err := f.register(txeOps, "ops")
+	require.NoError(t, err)
+	_, err = a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: opsJob, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 2,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+		}}})
+	requireStatus(t, err, http.StatusConflict)
+}
+
+// Only a signed-in person reactivates a retired job. An API key cannot claim
+// to be human, and the descriptive actor fields never make it one.
+func TestTxeAPIReactivateNeedsHumanPrincipal(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	reason := apigen.TxeLifecycleRequestReasonManual
+	_, err = a.TransitionTxeJob(txeAdmin, apigen.TransitionTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeLifecycleRequest{
+		Op: apigen.TxeLifecycleRequestOpRetire, Reason: &reason}})
+	require.NoError(t, err)
+
+	key := &auth.APIKey{ID: "k1", Name: "reviewer", Role: auth.RoleDeveloper}
+	keyCtx := auth.WithAPIKey(auth.WithUser(context.Background(), &auth.User{ID: "apikey:k1", Username: "apikey:reviewer", Role: auth.RoleDeveloper}), key)
+	reactivate := func(ctx context.Context, actor *apigen.TxeActor) error {
+		_, err := a.TransitionTxeJob(ctx, apigen.TransitionTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeLifecycleRequest{
+			Op: apigen.TxeLifecycleRequestOpReactivate, Actor: actor}})
+		return err
+	}
+	requireStatus(t, reactivate(keyCtx, &apigen.TxeActor{Kind: apigen.TxeActorKindHuman, Id: "admin"}), http.StatusForbidden)
+
+	human, machine, client := "human", "human", "human"
+	requireStatus(t, reactivate(keyCtx, &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "admin", Session: &human, MachineId: &machine, Client: &client}), http.StatusConflict)
+	requireStatus(t, reactivate(keyCtx, nil), http.StatusConflict)
+
+	got, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeLifecycleRetired, got.(apigen.GetTxeJob200JSONResponse).Lifecycle, "the job stays retired")
+
+	require.NoError(t, reactivate(txeAdmin, nil))
+	got, err = a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	job := got.(apigen.GetTxeJob200JSONResponse)
+	assert.Equal(t, apigen.TxeLifecycleActive, job.Lifecycle)
+	assert.Equal(t, apigen.TxeActorKindHuman, job.Updated.By.Kind)
+	assert.Equal(t, "admin", job.Updated.By.Id)
+}
+
+// The decision list reports whether each decision's Dagu task is still to be
+// completed now, not the state the immutable record was written with.
+func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
+			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
+			NativeTask: &apigen.TxeNativeTask{Dag: jobID, RunId: "run-1", StepId: "approve"},
+		}}})
+	require.NoError(t, err)
+	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
+
+	decisionID := mint(t, registry.PrefixDecision)
+	person := registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
+	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
+		_, err := tx.AppendDecision(registry.Decision{DecisionID: decisionID, ProposalID: p.ProposalId, ProposalRevision: p.Revision,
+			BindingDigest: p.BindingDigest, Verdict: registry.VerdictReject}, registry.ProposalRejected)
+		return err
+	})
+	require.NoError(t, err)
+
+	nativeResume := func() string {
+		t.Helper()
+		resp, err := a.ListTxeJobDecisions(ctx, apigen.ListTxeJobDecisionsRequestObject{JobId: jobID})
+		require.NoError(t, err)
+		decisions := resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions
+		require.Len(t, decisions, 1)
+		require.NotNil(t, decisions[0].NativeResume)
+		return string(*decisions[0].NativeResume)
+	}
+	assert.Equal(t, "pending", nativeResume())
+	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error { return tx.MarkNativeResumed(decisionID) })
+	require.NoError(t, err)
+	assert.Equal(t, "completed", nativeResume())
 }
