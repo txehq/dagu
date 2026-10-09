@@ -1279,3 +1279,46 @@ func TestTargetConditionsResolvePerTarget(t *testing.T) {
 	report(b, ResourcePresent)
 	assert.Equal(t, AvailabilityWorkerOffline, state())
 }
+
+// A target exception recorded before exceptions carried their target is
+// still resolved by that target's present, through the event in its
+// evidence; the reply and the replay record report the availability the job
+// ends with.
+func TestLegacyTargetExceptionAndFallbackDisposition(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	report := func(tg Target, obs ResourceObservation) *ResourceEvent {
+		ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		require.NoError(t, err)
+		f.now = f.now.Add(time.Second)
+		return ev
+	}
+	report(a, ResourceUnreachable)
+	// As recorded before this change: no target on the exception.
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		for _, e := range tx.Job.Exceptions {
+			e.Target = ""
+		}
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	report(b, ResourceUnknown)
+
+	ev := report(b, ResourcePresent)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, string(AvailabilityTargetUnreachable), ev.Dispositions[0].Detail, "A still holds the job")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnreachable, got.Availability.State)
+	applied := got.appliedResourceEvent(appliedKey(matchIdentity, b), ev.EventID)
+	require.NotNil(t, applied)
+	assert.Equal(t, string(AvailabilityTargetUnreachable), applied.Detail, "the replay record agrees")
+
+	report(a, ResourcePresent)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State, "the legacy exception was resolved by its target")
+}
