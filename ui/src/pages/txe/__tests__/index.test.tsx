@@ -20,6 +20,12 @@ vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
 
+// The hub signs people in individually, so decisions are offered.
+const authMode = vi.hoisted(() => ({ value: 'builtin' }));
+vi.mock('@/contexts/ConfigContext', () => ({
+  useConfig: () => ({ authMode: authMode.value }),
+}));
+
 // fakeApi keeps proposals in memory and applies the server's revision check,
 // so the page is exercised against the same refusal it gets in production.
 function fakeApi(initial: Proposal[]) {
@@ -113,5 +119,42 @@ describe('TxeInboxPage refused decisions', () => {
     expect(screen.getByTestId('txe-decision-refused')).toHaveTextContent(
       'Usage is at 92%. Resize the volume to 20Gi?'
     );
+  });
+});
+
+// With no authentication or basic auth, the hub cannot tell a person from a
+// reviewer holding the same access: the inbox says why decisions are
+// unavailable and offers none, while the context stays readable.
+describe('TxeInboxPage without person authentication', () => {
+  it.each(['none', 'basic'])(
+    'offers no decision under %s auth',
+    async (mode) => {
+      authMode.value = mode;
+      try {
+        const { api, decide } = fakeApi([fixtureProposal()]);
+        renderPage(api);
+        expect(
+          await screen.findByText('Usage is at 92%. Resize the volume to 20Gi?')
+        ).toBeInTheDocument();
+        expect(
+          screen.getByTestId('txe-decision-auth-notice')
+        ).toBeInTheDocument();
+        expect(
+          screen.queryByRole('button', { name: 'Record decision' })
+        ).not.toBeInTheDocument();
+        expect(decide).not.toHaveBeenCalled();
+      } finally {
+        authMode.value = 'builtin';
+      }
+    }
+  );
+
+  it('shows no notice under builtin auth', async () => {
+    const { api } = fakeApi([fixtureProposal()]);
+    renderPage(api);
+    await screen.findByText('Usage is at 92%. Resize the volume to 20Gi?');
+    expect(
+      screen.queryByTestId('txe-decision-auth-notice')
+    ).not.toBeInTheDocument();
   });
 });

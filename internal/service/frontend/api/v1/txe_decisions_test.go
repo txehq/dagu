@@ -52,7 +52,7 @@ const decideSpec = `steps:
 type txeDecisionFixture struct {
 	server   test.Server
 	jobID    string
-	client   txeAuthedClient
+	client   txeHTTPClient
 	decide   string
 	runID    string
 	proposal api.TxeProposal
@@ -63,7 +63,13 @@ type txeDecisionFixture struct {
 func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 	t.Helper()
 	server := builtinServer(t)
-	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	return newTxeDecisionFixtureOn(t, server, txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")})
+}
+
+// newTxeDecisionFixtureOn builds the fixture on server, every request made
+// through c.
+func newTxeDecisionFixtureOn(t *testing.T, server test.Server, c txeHTTPClient) *txeDecisionFixture {
+	t.Helper()
 	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
 
 	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
@@ -124,6 +130,32 @@ func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 
 	return &txeDecisionFixture{server: server, client: c, jobID: jobID, decide: decideDAG, runID: started.DagRunId, proposal: proposal}
 }
+
+// txeHTTPClient makes the fixture's requests with some credential.
+type txeHTTPClient interface {
+	Get(path string) *test.Request
+	Post(path string, body any) *test.Request
+}
+
+// txeBasicClient sends every request with the hub's one basic credential.
+type txeBasicClient struct {
+	c          *test.APIClient
+	user, pass string
+}
+
+func (b txeBasicClient) Get(path string) *test.Request {
+	return b.c.Get(path).WithBasicAuth(b.user, b.pass)
+}
+func (b txeBasicClient) Post(path string, body any) *test.Request {
+	return b.c.Post(path, body).WithBasicAuth(b.user, b.pass)
+}
+
+// txeNoAuthClient sends requests with no credential, as on a hub without
+// authentication.
+type txeNoAuthClient struct{ c *test.APIClient }
+
+func (n txeNoAuthClient) Get(path string) *test.Request            { return n.c.Get(path) }
+func (n txeNoAuthClient) Post(path string, body any) *test.Request { return n.c.Post(path, body) }
 
 // txeAuthedClient sends every request as a signed-in person: a decision is
 // accepted only from one.
@@ -386,4 +418,43 @@ func TestTxeDecisionActorIsTheSignedInUser(t *testing.T) {
 	require.Equal(t, user.Username, decisions[0].Actor.Id)
 	// No signed-in user at all is refused.
 	requireStatus(t, decideTxe(context.Background(), f, jobID, p, api.TxeVerdictApprove, "nobody-1", nil), http.StatusForbidden)
+}
+
+// Reproduces the reported attack on the real routes. On a hub with no
+// authentication, or with basic auth where one shared credential is held by
+// the person and the reviewer alike, the reviewer files a proposal and then
+// approves it while claiming to be a person. The approval is refused, no
+// decision is recorded, and the job's native human task keeps waiting.
+func TestTxeDecisionSelfApprovalOutsideBuiltinAuth(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) (test.Server, txeHTTPClient){
+		"none": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) { cfg.Server.Auth.Mode = config.AuthModeNone }))
+			return server, txeNoAuthClient{c: server.Client()}
+		},
+		"basic": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
+				cfg.Server.Auth.Mode = config.AuthModeBasic
+				cfg.Server.Auth.Basic.Username, cfg.Server.Auth.Basic.Password = "shared", "secret"
+			}))
+			return server, txeBasicClient{c: server.Client(), user: "shared", pass: "secret"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, c := setup(t)
+			f := newTxeDecisionFixtureOn(t, server, c)
+			body := f.body("approve", "self-approve-"+name)
+			body["actor"] = map[string]any{"kind": "human", "id": "connor"}
+			var apiErr api.Error
+			c.Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t).Unmarshal(t, &apiErr)
+			require.NotNil(t, apiErr.Details)
+			require.Equal(t, "person_auth_required", (*apiErr.Details)["code"])
+			var list api.TxeDecisionList
+			c.Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
+			require.Empty(t, list.Decisions)
+			status := waitForStoredDAGRunStatus(t, server, f.decide, f.runID, 5*time.Second, func(s *ir.DAGRunStatus) bool {
+				return s.Status == ir.Waiting
+			})
+			require.True(t, hasNodeWithStatus(status, "decide", ir.NodeWaiting))
+		})
+	}
 }
