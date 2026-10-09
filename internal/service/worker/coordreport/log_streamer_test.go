@@ -2116,3 +2116,41 @@ func TestLogStreamer_RaceDetector(t *testing.T) {
 	wg.Wait()
 	assert.Greater(t, ops, int64(0))
 }
+
+// With log streaming not configured, the coordinator ends the stream before
+// the final chunk is sent, so Send reports io.EOF and the status comes from
+// CloseAndRecv. An empty log is then a disabled log, not a failure to retry.
+func TestEmptyStreamFinalWhenStreamingNotConfigured(t *testing.T) {
+	t.Parallel()
+
+	notConfigured := status.Error(codes.FailedPrecondition, "log streaming not configured: logDir is empty")
+	newClient := func(opened *atomic.Int32) *logStreamerMockClient {
+		return &logStreamerMockClient{
+			streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+				opened.Add(1)
+				return &mockStreamLogsClient{sendErr: io.EOF, closeErr: notConfigured}, nil
+			},
+		}
+	}
+
+	t.Run("step", func(t *testing.T) {
+		t.Parallel()
+		var opened atomic.Int32
+		streamer := coordreport.NewLogStreamer(newClient(&opened), "w", "r", "d", "a", ir.DAGRunRef{})
+		writer := streamer.NewStepWriter(context.Background(), "step", runctx.StreamTypeStdout)
+		require.NoError(t, writer.Close())
+		assert.Equal(t, int32(1), opened.Load(), "a disabled log is not retried")
+	})
+
+	t.Run("scheduler", func(t *testing.T) {
+		t.Parallel()
+		var opened atomic.Int32
+		streamer := coordreport.NewLogStreamer(newClient(&opened), "w", "r", "d", "a", ir.DAGRunRef{})
+		localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+		require.NoError(t, err)
+		defer func() { _ = localFile.Close() }()
+		scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+		require.NoError(t, scheduler.Close())
+		assert.Equal(t, int32(1), opened.Load(), "a disabled log is not retried")
+	})
+}

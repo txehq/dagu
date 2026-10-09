@@ -5,6 +5,7 @@ package coordreport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -44,6 +45,20 @@ func isLogStreamingNotConfigured(err error) bool {
 	return ok &&
 		st.Code() == codes.FailedPrecondition &&
 		strings.Contains(st.Message(), "log streaming not configured")
+}
+
+// streamEndStatus resolves a Send failure. A server that has already ended
+// the stream, for example because log streaming is not configured, makes
+// Send return io.EOF; the server's status is then available only from
+// CloseAndRecv. Any other error is returned as is.
+func streamEndStatus(stream coordinatorv1.CoordinatorService_StreamLogsClient, sendErr error) error {
+	if !errors.Is(sendErr, io.EOF) {
+		return sendErr
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return err
+	}
+	return sendErr
 }
 
 var _ runctx.LogWriterFactory = (*LogStreamer)(nil)
@@ -577,6 +592,7 @@ func (w *stepLogWriter) finishLocked() error {
 	finalChunk.IsFinal = true
 	finalChunk.SetByteOffset(w.byteOffset + uint64(len(w.remoteBuffer))) // #nosec G115 -- buffer length is non-negative
 	if err := w.withOperationTimeout(func() error { return w.stream.Send(finalChunk) }); err != nil {
+		err = w.withOperationTimeout(func() error { return streamEndStatus(w.stream, err) })
 		w.handleStreamFailureLocked(err)
 		if isLogStreamingNotConfigured(err) {
 			return nil
@@ -974,6 +990,7 @@ func (w *schedulerLogWriter) close(ctx context.Context) error {
 		finalChunk.IsFinal = true
 		finalChunk.SetByteOffset(uint64(localBytes)) // #nosec G115 -- localBytes is non-negative
 		if err := w.withOperationTimeout(func() error { return w.stream.Send(finalChunk) }); err != nil {
+			err = w.withOperationTimeout(func() error { return streamEndStatus(w.stream, err) })
 			if isLogStreamingNotConfigured(err) {
 				w.streamInitFailed = true
 				return nil
