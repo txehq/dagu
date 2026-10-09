@@ -58,11 +58,13 @@ func hubAttempts(t *testing.T, f *testFixture, runID string) []observedAttempt {
 		}
 		var st struct {
 			AttemptID  string `json:"attemptId"`
+			StartedAt  string `json:"startedAt"`
+			QueuedAt   string `json:"queuedAt"`
 			Status     any    `json:"status"`
 			ArchiveDir string `json:"archiveDir"`
 		}
 		_ = json.Unmarshal([]byte(last), &st)
-		o.id, o.status, o.archive = st.AttemptID, fmt.Sprint(st.Status), st.ArchiveDir
+		o.id, o.status, o.archive = st.AttemptID, fmt.Sprint(st.Status)+" startedAt="+st.StartedAt+" queuedAt="+st.QueuedAt, st.ArchiveDir
 		if st.ArchiveDir != "" {
 			_ = filepath.WalkDir(st.ArchiveDir, func(ap string, ad fs.DirEntry, err error) error {
 				if err == nil && !ad.IsDir() {
@@ -101,7 +103,7 @@ func observeRetries(t *testing.T, queued bool) {
 # $1 step, $2 attempt id from the command template
 n=$(ls "$OBS" | grep -c "^$1\.[0-9]*$")
 n=$((n+1))
-printf 'env=%s arg=%s artifacts=%s\n' "$TXE_ATTEMPT_ID" "$2" "$(ls "$DAG_RUN_ARTIFACTS_DIR" | tr '\n' ',')" > "$OBS/$1.$n"
+printf 'env=%s arg=%s started=%s artifacts=%s\n' "$TXE_ATTEMPT_ID" "$2" "$3" "$(ls "$DAG_RUN_ARTIFACTS_DIR" | tr '\n' ',')" > "$OBS/$1.$n"
 if [ "$1" = run ]; then
   printf 'bytes-%s\n' "$n" > "$DAG_RUN_ARTIFACTS_DIR/out.txt"
   printf 'only-%s\n' "$n" > "$DAG_RUN_ARTIFACTS_DIR/only-$n.txt"
@@ -130,9 +132,9 @@ env:
   - OBS: `+obs+`
 steps:
   - name: run
-    command: `+obs+`/step.sh run ${context.attempt.id}
+    command: `+obs+`/step.sh run ${context.attempt.id} ${context.attempt.started_at}
   - name: publish
-    command: `+obs+`/step.sh publish ${context.attempt.id}
+    command: `+obs+`/step.sh publish ${context.attempt.id} ${context.attempt.started_at}
 `, opts...)
 	defer f.cleanup()
 
