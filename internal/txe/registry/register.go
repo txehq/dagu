@@ -629,6 +629,7 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 		j.Registration.Package = nil
 		j.Registration.DAGVerified = false
 		j.Registration.ReadyAt = nil
+		tx.resolveStaleBindings()
 		affected, err := tx.supersedeProposals("job version changed")
 		if err != nil {
 			return err
