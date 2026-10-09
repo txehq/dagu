@@ -338,7 +338,8 @@ func TestExecPluginClusterInfoAndBothCredentials(t *testing.T) {
 	plugin := writePlugin(t, `printf '%s' "$KUBERNETES_EXEC_INFO" > `+seen+`
 echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"tok","clientCertificateData":"CERT","clientKeyData":"KEY"}}'`)
 	cfg := &rest.Config{Host: "https://10.0.0.1:6443", TLSClientConfig: rest.TLSClientConfig{CAData: []byte("CA"), ServerName: "api.dev"},
-		ExecProvider: &clientcmdapi.ExecConfig{Command: plugin, APIVersion: "client.authentication.k8s.io/v1", ProvideClusterInfo: true}}
+		ExecProvider: &clientcmdapi.ExecConfig{Command: plugin, APIVersion: "client.authentication.k8s.io/v1", ProvideClusterInfo: true,
+			Config: &runtime.Unknown{Raw: []byte(`{"audience":"dev-cluster"}`)}}}
 	if err := applyExecCredential(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +357,9 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
 				Server string `json:"server"`
 				Name   string `json:"tls-server-name"`
 				CAData []byte `json:"certificate-authority-data"`
+				Config struct {
+					Audience string `json:"audience"`
+				} `json:"config"`
 			} `json:"cluster"`
 		} `json:"spec"`
 	}
@@ -363,7 +367,7 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
 		t.Fatalf("exec info %s: %v", b, err)
 	}
 	if info.Spec.Interactive || info.Spec.Cluster == nil || info.Spec.Cluster.Server != "https://10.0.0.1:6443" ||
-		info.Spec.Cluster.Name != "api.dev" || string(info.Spec.Cluster.CAData) != "CA" {
+		info.Spec.Cluster.Name != "api.dev" || string(info.Spec.Cluster.CAData) != "CA" || info.Spec.Cluster.Config.Audience != "dev-cluster" {
 		t.Fatalf("exec info = %s", b)
 	}
 	// Without provideClusterInfo no cluster is sent.
