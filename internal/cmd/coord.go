@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/secret"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/healthcheck"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -208,8 +209,18 @@ func newCoordinator(
 		return nil, nil, fmt.Errorf("failed to create listener on %s: %w", addr, err)
 	}
 
+	var runAdmitter coordinator.RunAdmitter
+	if cfg.Paths.DataDir != "" {
+		guard, err := registry.NewFileStore(cfg.Paths.DataDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to open TXE job registry: %w", err)
+		}
+		runAdmitter = guard
+	}
+
 	// Create the handler with DAG-run status persistence and streamed log storage.
 	handler := coordinator.NewHandler(coordinator.HandlerConfig{
+		RunAdmitter:               runAdmitter,
 		DAGRunRepository:          persistence.DAGRunRepository,
 		StateStore:                persistence.StateStore,
 		LogDir:                    cfg.Paths.LogDir,

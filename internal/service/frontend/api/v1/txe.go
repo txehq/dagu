@@ -13,6 +13,8 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -581,7 +583,16 @@ func (a *API) TransitionTxeJob(ctx context.Context, req api.TransitionTxeJobRequ
 	if body.ActiveRunPolicy != nil {
 		t.ActiveRunPolicy = registry.ActiveRunPolicy(*body.ActiveRunPolicy)
 	}
-	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Transition(t) })
+	s, actor, err := a.txeWrite(ctx, body.Actor)
+	if err != nil {
+		return nil, err
+	}
+	t.Authorize = func(tx *registry.JobTx) error { return a.txeRequireJobWrite(ctx, tx) }
+	committed, err := s.ChangeLifecycle(ctx, req.JobId, t, actor)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	job, err := txeConvert[api.TxeJob](committed)
 	return api.TransitionTxeJob200JSONResponse(job), err
 }
 
@@ -874,4 +885,98 @@ func derefSlice[T any](p *[]T) []T {
 		return nil
 	}
 	return *p
+}
+
+// txeAdmitRun refuses a direct start, enqueue or retry of a registered job's
+// DAG unless the registry admits a run now. Other DAGs are unaffected; queued
+// runs are re-checked again at dispatch.
+func (a *API) txeAdmitRun(ctx context.Context, dagName string) error {
+	if !registry.IsJobDAG(dagName) {
+		return nil
+	}
+	s, err := a.txeStore()
+	if err != nil {
+		return err
+	}
+	adm, err := s.AdmitRun(ctx, dagName, "")
+	if err != nil {
+		return err
+	}
+	if adm.Admit {
+		return nil
+	}
+	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+		Message: fmt.Sprintf("job %s does not accept runs: %s", dagName, adm.Reason),
+		Details: map[string]any{"code": "run_refused", "admission": string(adm.Code)}}
+}
+
+// txeRefuseInlineJobDAG refuses an inline spec that names itself as a
+// registered job: only the registry writes job DAGs.
+func txeRefuseInlineJobDAG(name string) error {
+	if !registry.IsJobDAG(name) {
+		return nil
+	}
+	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+		Message: "inline specs cannot use a registered job's name " + name,
+		Details: map[string]any{"code": "run_refused", "admission": string(registry.AdmitUnregistered)}}
+}
+
+func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResourceEventRequestObject) (api.RecordTxeResourceEventResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	s, actor, err := a.txeWrite(ctx, body.Actor)
+	if err != nil {
+		return nil, err
+	}
+	target, err := txeConvert[registry.Target](body.Target)
+	if err != nil {
+		return nil, ErrInvalidRequestBody
+	}
+	ev := registry.ResourceEvent{
+		Target:        target,
+		Observation:   registry.ResourceObservation(body.Observation),
+		Authoritative: valueOf(body.Authoritative),
+		Detail:        valueOf(body.Detail),
+		Evidence:      derefSlice(body.Evidence),
+	}
+	if body.ObservedAt != nil {
+		ev.ObservedAt = *body.ObservedAt
+	}
+	// The event affects, and reports, only jobs the caller may write.
+	writable := func(ctx context.Context, job *registry.Job) bool {
+		return a.txeCheckVersion(ctx, s, job, job.Version, a.txeRequireWorkspaceWrite) == nil
+	}
+	recorded, err := s.RecordResourceEvent(ctx, ev, actor, writable)
+	if recorded == nil {
+		return nil, txeError(err)
+	}
+	if err != nil {
+		// Recorded, but some dependents could not be updated; the record
+		// lists the ones that were.
+		logger.Warn(ctx, "TXE resource event partially applied", tag.Error(err))
+	}
+	out, err := txeConvert[api.TxeResourceEvent](recorded)
+	return api.RecordTxeResourceEvent200JSONResponse(out), err
+}
+
+func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEventRequestObject) (api.GetTxeResourceEventResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	ev, err := s.GetResourceEvent(ctx, req.EventId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	visible := ev.Dispositions[:0]
+	for _, d := range ev.Dispositions {
+		if _, err := a.txeVisibleJob(ctx, s, d.JobID); err == nil {
+			visible = append(visible, d)
+		}
+	}
+	ev.Dispositions = visible
+	out, err := txeConvert[api.TxeResourceEvent](ev)
+	return api.GetTxeResourceEvent200JSONResponse(out), err
 }

@@ -1003,6 +1003,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
+		return nil, err
+	}
 	dag, err := a.dagRepository.GetDetails(ctx, request.FileName, persis.DAGLoadOptions{AllowBuildErrors: true})
 	if err != nil {
 		return nil, &Error{
@@ -1113,6 +1116,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 // It returns the full DAGRunDetails including all node statuses.
 func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequestObject) (api.ExecuteDAGSyncResponseObject, error) {
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
 		return nil, err
 	}
 
@@ -1682,6 +1688,9 @@ func fileMissing(path string) bool {
 
 func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRunRequestObject) (api.EnqueueDAGDAGRunResponseObject, error) {
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
 		return nil, err
 	}
 

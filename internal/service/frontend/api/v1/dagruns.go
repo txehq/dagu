@@ -232,6 +232,10 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 	if err != nil {
 		return nil, err
 	}
+	if err := txeRefuseInlineJobDAG(dag.Name); err != nil {
+		cleanup()
+		return nil, err
+	}
 	cleanupOnReturn := true
 	defer func() {
 		if cleanupOnReturn {
@@ -351,6 +355,10 @@ func (a *API) EnqueueDAGRunFromSpec(ctx context.Context, request api.EnqueueDAGR
 	}
 	dag, cleanup, err := a.loadInlineDAG(ctx, request.Body.Spec, request.Body.Name, dagRunId)
 	if err != nil {
+		return nil, err
+	}
+	if err := txeRefuseInlineJobDAG(dag.Name); err != nil {
+		cleanup()
 		return nil, err
 	}
 	defer cleanup()
@@ -2940,6 +2948,9 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitRun(ctx, request.Name); err != nil {
+		return nil, err
+	}
 
 	retryDagRunID := request.DagRunId
 	stepName := ""
@@ -3475,6 +3486,9 @@ func (a *API) DequeueDAGRun(ctx context.Context, request api.DequeueDAGRunReques
 
 func (a *API) RescheduleDAGRun(ctx context.Context, request api.RescheduleDAGRunRequestObject) (api.RescheduleDAGRunResponseObject, error) {
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	if err := a.txeAdmitRun(ctx, request.Name); err != nil {
 		return nil, err
 	}
 

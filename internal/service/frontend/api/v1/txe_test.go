@@ -39,7 +39,7 @@ func newTxeTestAPIAt(t *testing.T, dir string, writeDAGs bool, opts ...apiv1.API
 	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
 	require.NoError(t, err)
 	cfg := &config.Config{}
-	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: writeDAGs}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: writeDAGs, config.PermissionRunDAGs: true}
 	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, append([]apiv1.APIOption{apiv1.WithTxeRegistry(store)}, opts...)...)
 }
 
@@ -143,6 +143,11 @@ func newTxeFixture(t *testing.T, a *apiv1.API, ctx context.Context) *txeFixture 
 // register registers a job whose DAG is labelled with workspace (none when
 // empty) and returns its ID and the registration error.
 func (f *txeFixture) register(ctx context.Context, workspace string) (string, error) {
+	return f.registerTargets(ctx, workspace)
+}
+
+// registerTargets is register for a job that depends on targets.
+func (f *txeFixture) registerTargets(ctx context.Context, workspace string, targets ...apigen.TxeTarget) (string, error) {
 	labels := ""
 	if workspace != "" {
 		labels = fmt.Sprintf("labels:\n  - workspace=%s\n", workspace)
@@ -155,6 +160,7 @@ func (f *txeFixture) register(ctx context.Context, workspace string) (string, er
 			Title: "t", Purpose: "p",
 			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
 			Dag:     apigen.TxeDAGRef{Spec: spec},
+			Targets: &targets,
 		},
 		Actor: &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "cc3-test"},
 	}})
@@ -468,4 +474,42 @@ func TestTxeAPIReadsFollowWorkspaceVisibility(t *testing.T) {
 	require.NoError(t, err)
 	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 1})
 	requireStatus(t, err, http.StatusNotFound)
+}
+
+func txeVolume(uid string) apigen.TxeTarget {
+	name := "pvc-" + uid
+	return apigen.TxeTarget{Kind: "kubernetes.volume", StableId: map[string]string{"cluster_uid": "c-1", "uid": uid}, DisplayName: &name}
+}
+
+// A resource event affects only dependents the reporter may write, and a
+// retired job's runs are refused by the REST start path.
+func TestTxeAPIResourceEventAndRunGuard(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	opsJob, err := f.registerTargets(txeAdmin, "ops", txeVolume("v-1"))
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, opsJob))
+	secretJob, err := f.registerTargets(txeAdmin, "secret", txeVolume("v-1"))
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, secretJob))
+
+	authoritative := true
+	resp, err := a.RecordTxeResourceEvent(txeOps, apigen.RecordTxeResourceEventRequestObject{Body: &apigen.TxeResourceEventRequest{
+		Target: txeVolume("v-1"), Observation: apigen.TxeResourceObservationDeleted, Authoritative: &authoritative}})
+	require.NoError(t, err)
+	ev := apigen.TxeResourceEvent(resp.(apigen.RecordTxeResourceEvent200JSONResponse))
+	require.Len(t, ev.Dispositions, 1, "the job in a workspace the reporter cannot write is neither changed nor disclosed")
+	assert.Equal(t, opsJob, ev.Dispositions[0].JobId)
+	assert.Equal(t, apigen.TxeResourceDispositionOutcomeRetired, ev.Dispositions[0].Outcome)
+
+	got, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: secretJob})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeLifecycleActive, got.(apigen.GetTxeJob200JSONResponse).Lifecycle)
+
+	read, err := a.GetTxeResourceEvent(txeOps, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
+	require.NoError(t, err)
+	assert.Len(t, read.(apigen.GetTxeResourceEvent200JSONResponse).Dispositions, 1)
+
+	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: opsJob})
+	requireStatus(t, err, http.StatusConflict)
 }
