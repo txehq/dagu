@@ -63,15 +63,6 @@ type Remote struct {
 	MachineID   string
 	RunID       string
 	AgentClient string
-	// Now is the clock; time.Now when nil.
-	Now func() time.Time
-}
-
-func (r *Remote) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
-	}
-	return time.Now()
 }
 
 var _ Registry = (*Remote)(nil)
@@ -257,12 +248,20 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	}
 	job := Job{
 		ID: doc.JobId, OwnerID: doc.OwnerId, ProjectID: doc.ProjectId, MachineID: doc.MachineId,
-		Version: doc.Version, PackageDigest: doc.PackageDigest, DAGSpecSHA256: doc.DagSpecSha256,
+		Version: doc.Version, PackageDigest: doc.PackageDigest,
 		WorkingDir: deref(v.Package.WorkingDir), Title: v.Title, Purpose: v.Purpose,
 		Lifecycle: Lifecycle(doc.Lifecycle), Availability: Availability(doc.Availability.State),
 	}
 	if job.WorkingDir == "" {
 		job.WorkingDir = v.Package.Path
+	}
+	// The DAG a version runs and the package it runs from are bound by the
+	// version's immutable record. The job's digest is given only when that
+	// record and the job agree on both, so a run whose snapshot matches it
+	// is known to have run this package. Otherwise it is left unknown, and
+	// nothing that depends on the binding is proposed.
+	if spec := deref(v.Dag.SpecSha256); spec != "" && spec == doc.DagSpecSha256 && v.Package.Digest == doc.PackageDigest {
+		job.DAGSpecSHA256 = spec
 	}
 	for _, t := range deref(v.Targets) {
 		job.Targets = append(job.Targets, Target{Kind: t.Kind, StableID: targetKey(t.StableId), Environment: deref(t.Environment)})
@@ -599,38 +598,24 @@ func (r *Remote) OpenProposals(ctx context.Context, jobID string) ([]Proposal, e
 	return out, nil
 }
 
-// PendingClosures implements Registry.
-//
-// The registry does not yet record closures, so this cannot ask it which
-// superseded proposals are still pending. Until it does, every superseded
-// proposal with a decision run counts as pending and a window of them is
-// returned that moves with the clock, so repeated ticks cover all of them.
-// Completing an already closed task again is a no-op at the service.
+// PendingClosures implements Registry from the registry's own list of
+// superseded proposals whose decision run is still to be closed: never
+// attempted first, then least recently attempted.
 func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit int) ([]Proposal, error) {
-	var list api.TxeJobList
-	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
+	q := url.Values{"machine": {machineID}}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var list api.TxePendingClosureList
+	if err := r.do(ctx, http.MethodGet, "/txe/proposal-closures/pending?"+q.Encode(), nil, &list); err != nil {
 		return nil, err
 	}
-	var all []Proposal
-	for _, job := range list.Jobs {
-		proposals, err := r.proposals(ctx, job.JobId)
-		if err != nil {
-			return nil, err
-		}
-		for _, p := range append(proposals.Open, proposals.Finished...) {
-			if p.State == api.TxeProposalState(ProposalSuperseded) && p.NativeTask != nil {
-				all = append(all, r.proposalOf(job.JobId, p))
-			}
-		}
-	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].ID < all[j].ID })
-	if limit <= 0 || len(all) <= limit {
-		return all, nil
-	}
-	start := int(r.now().Unix()/60) % len(all)
-	out := make([]Proposal, 0, limit)
-	for i := range limit {
-		out = append(out, all[(start+i)%len(all)])
+	out := make([]Proposal, 0, len(list.Closures))
+	for _, c := range list.Closures {
+		out = append(out, Proposal{
+			ID: c.ProposalId, JobID: c.JobId, State: ProposalSuperseded,
+			NativeTask: TaskLocator{DAG: c.NativeTask.Dag, RunID: c.NativeTask.RunId, StepID: c.NativeTask.StepId},
+		})
 	}
 	return out, nil
 }
@@ -696,15 +681,25 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 	return out, nil
 }
 
-// RecordClosure implements Registry. Without a registry record for closures
-// the result is kept only in the run's log and failures cannot be counted.
-// A failure is therefore reported as already past the limit, so it surfaces
-// as an exception at once instead of never.
-func (r *Remote) RecordClosure(_ context.Context, closure Closure) (int, error) {
-	if closure.Outcome == ClosureFailed {
-		return closureAttemptsBeforeException, nil
+// RecordClosure implements Registry. The registry keeps every attempt and
+// counts the failed ones; any other outcome is final and takes the proposal
+// off its pending list.
+func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error) {
+	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: api.TxeClosureOutcome(closure.Outcome), Detail: optional(closure.Detail)}
+	var out api.TxeClosure
+	err := r.do(ctx, http.MethodPost, jobPath(closure.JobID, "proposals", closure.ProposalID, "closures"), body, &out)
+	if denied, ok := errors.AsType[*GuardDeniedError](err); ok && denied.Reason == DenyDecisionStale {
+		// Another final outcome is already recorded for this proposal. The
+		// record stands and there is nothing left to close.
+		return 0, nil
 	}
-	return 0, nil
+	if err != nil {
+		return 0, err
+	}
+	if closure.Outcome != ClosureFailed {
+		return 0, nil
+	}
+	return out.Attempt, nil
 }
 
 // reviewDetail is what the reviewer keeps in a review record's free-form

@@ -833,3 +833,77 @@ func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Positive(t, stored.PacketBytes)
 }
+
+// Superseded proposals leave their decision runs waiting. The registry
+// lists them as pending closures; the reviewer closes each, the registry
+// records the outcome, and one that keeps failing stays pending, is counted
+// and becomes an exception without holding up the rest.
+func TestRemoteSupersededDecisionRunsAreClosedAndRecorded(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	targetID := "cluster_uid=c-1,uid=vol-1"
+	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "grow", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{
+			{Name: "expand_volume", TargetID: targetID, Params: map[string]string{"size_gb": "200"}, Reason: "grow"},
+			{Name: "expand_volume", TargetID: targetID, Params: map[string]string{"size_gb": "400"}, Reason: "grow more"},
+		},
+	})
+	require.NoError(t, err)
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 2)
+
+	none, err := f.reviewer("tick-0").CloseSuperseded(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, none, "an open proposal's run is left waiting for its answer")
+
+	// Retiring the job supersedes both proposals.
+	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		return tx.Transition(registry.Transition{Op: registry.OpRetire, Reason: registry.RetireManual})
+	})
+	require.NoError(t, err)
+	pending, err := f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+	stuck := pending[1]
+	assert.Equal(t, review.DecisionRunID(stuck.ID), stuck.NativeTask.RunID)
+
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		if p.ID == stuck.ID {
+			return "", errors.New("hub unreachable")
+		}
+		return review.ClosureClosed, nil
+	}
+	first, err := f.reviewer("tick-1").CloseSuperseded(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	pending, err = f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "a closed run leaves the list; a failed one stays")
+	assert.Equal(t, stuck.ID, pending[0].ID)
+
+	for _, tick := range []string{"tick-2", "tick-3"} {
+		_, err = f.reviewer(tick).CloseSuperseded(ctx, f.remote.MachineID)
+		require.NoError(t, err)
+	}
+	job := f.job()
+	require.Contains(t, job.PendingClosures, stuck.ID)
+	assert.Equal(t, 3, job.PendingClosures[stuck.ID].Failures)
+	raised := false
+	for _, e := range job.Exceptions {
+		raised = raised || e.Kind == string(review.ExceptionCleanupFailed)
+	}
+	assert.True(t, raised, "three failed attempts surface as an exception")
+	assert.Equal(t, registry.LifecycleRetired, job.Lifecycle, "closing a run never changes the job")
+
+	// Once the run can be closed, it is, and nothing is pending.
+	f.opener.close = nil
+	_, err = f.reviewer("tick-4").CloseSuperseded(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	pending, err = f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
