@@ -152,3 +152,18 @@ export function canRequestRetry(
     state.queuedAt !== execution.queuedAt
   );
 }
+
+// sameRetryStates reports whether two loads of retry states are the same, so
+// a refresh re-renders exactly when a retry changed.
+export function sameRetryStates(
+  a: Map<string, RetryState> | undefined,
+  b: Map<string, RetryState> | undefined
+): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.size !== b.size) return false;
+  for (const [runId, state] of a) {
+    const other = b.get(runId);
+    if (!other || JSON.stringify(state) !== JSON.stringify(other)) return false;
+  }
+  return true;
+}

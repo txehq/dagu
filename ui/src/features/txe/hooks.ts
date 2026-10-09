@@ -7,6 +7,7 @@ import useSWR from 'swr';
 import { useClient } from '@/hooks/api';
 
 import { createTxeApi, type TxeApi } from './api';
+import { sameRetryStates } from './retry';
 import type { Decision, Proposal, TxeJob } from './types';
 
 const REFRESH_MS = 10_000;
@@ -46,7 +47,9 @@ export function useRetryStates(jobId: string | undefined) {
   return useSWR(
     jobId ? ['txe', 'retries', jobId] : null,
     () => api.listRetryStates(jobId as string),
-    { refreshInterval: REFRESH_MS }
+    // SWR's default comparison sees every two Maps as equal, which would
+    // keep the first retry states loaded on screen for good.
+    { refreshInterval: REFRESH_MS, compare: sameRetryStates }
   );
 }
 

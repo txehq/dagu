@@ -9,6 +9,7 @@ import {
   canRequestRetry,
   retryLabel,
   retryStates,
+  sameRetryStates,
   type RetryState,
 } from '../retry';
 
@@ -157,5 +158,32 @@ describe('canRequestRetry', () => {
     expect(canRequestRetry('failed', exec('a1', q2), bound('succeeded'))).toBe(
       true
     );
+  });
+});
+
+describe('sameRetryStates', () => {
+  const st = (status: RetryState['status']): RetryState => ({
+    runId: 'r',
+    proposalId: 'p',
+    attemptId: 'a1',
+    queuedAt: '',
+    status,
+  });
+  it('compares the states, not the Map objects', () => {
+    expect(sameRetryStates(new Map(), new Map([['r', st('requested')]]))).toBe(
+      false
+    );
+    expect(
+      sameRetryStates(
+        new Map([['r', st('requested')]]),
+        new Map([['r', st('succeeded')]])
+      )
+    ).toBe(false);
+    expect(
+      sameRetryStates(
+        new Map([['r', st('requested')]]),
+        new Map([['r', st('requested')]])
+      )
+    ).toBe(true);
   });
 });
