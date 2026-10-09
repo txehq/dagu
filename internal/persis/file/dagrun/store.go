@@ -281,15 +281,18 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 	}()
 
 	var run *DAGRun
+	var claimFrom *ir.DAGRunStatus
 	if req.Retry {
 		r, err := dataRoot.FindByDAGRunID(ctx, req.DAGRunID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find execution: %w", err)
 		}
 		if req.ExpectLatest != nil {
-			if err := store.checkLatestExecution(ctx, r, *req.ExpectLatest); err != nil {
+			source, err := store.checkLatestExecution(ctx, r, *req.ExpectLatest)
+			if err != nil {
 				return nil, err
 			}
+			claimFrom = source
 		}
 		run = r
 	} else {
@@ -311,6 +314,14 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 		return nil, fmt.Errorf("failed to create attempt: %w", err)
 	}
 	attempt.SetDAG(req.DAG)
+	if req.ExpectLatest != nil {
+		// The new attempt becomes the latest before the lock is released, so
+		// every later admission (another conditional retry, a queued retry's
+		// compare-and-swap) sees that the expected execution was consumed.
+		if err := claimLatest(ctx, attempt, claimFrom); err != nil {
+			return nil, err
+		}
+	}
 
 	return attempt, nil
 }
@@ -540,20 +551,46 @@ func (store *Store) listRoot(_ context.Context, include string) ([]DataRoot, err
 // checkLatestExecution refuses unless the run's latest execution is want and
 // has finished. It runs under the run's lock, with the attempt creation it
 // guards.
-func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want persis.ExpectedExecution) error {
+func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want persis.ExpectedExecution) (*ir.DAGRunStatus, error) {
 	attempt, err := run.LatestAttempt(ctx, store.cache)
 	if err != nil {
-		return fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
+		return nil, fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
 	}
 	status, err := attempt.ReadStatus(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
+		return nil, fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
 	}
 	if status.AttemptID != want.AttemptID || status.QueuedAt != want.QueuedAt {
-		return fmt.Errorf("%w: latest is attempt %s queued at %q", persis.ErrLatestExecutionChanged, status.AttemptID, status.QueuedAt)
+		return nil, fmt.Errorf("%w: latest is attempt %s queued at %q", persis.ErrLatestExecutionChanged, status.AttemptID, status.QueuedAt)
 	}
 	if status.Status.IsActive() || status.Status == ir.NotStarted {
-		return fmt.Errorf("%w: latest is %s", persis.ErrLatestExecutionChanged, status.Status)
+		return nil, fmt.Errorf("%w: latest is %s", persis.ErrLatestExecutionChanged, status.Status)
+	}
+	return status, nil
+}
+
+// claimLatest writes the conditional retry's new attempt's first status: the
+// retried execution's checkpoint, not started, under the new attempt. If the
+// retry is never dispatched, a later retry of the run still starts from that
+// checkpoint rather than from fresh steps.
+func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus) error {
+	status := *source
+	status.AttemptID, status.AttemptKey, status.Status = attempt.ID(), "", ir.NotStarted
+	status.QueuedAt, status.WorkerID, status.PID, status.PIDStartedAt, status.LeaseAt = "", "", 0, 0, 0
+	// Ownership, timing and the outcome belong to the retried execution.
+	status.ClaimKey, status.StartedAt, status.FinishedAt, status.Error = "", "", "", ""
+	status.TriggerType = ir.TriggerTypeRetry
+	if err := attempt.Open(ctx); err != nil {
+		return fmt.Errorf("claim retry attempt: %w", err)
+	}
+	if err := attempt.Write(ctx, status); err != nil {
+		_ = attempt.Close(ctx)
+		return fmt.Errorf("claim retry attempt: %w", err)
+	}
+	// The claim is durable once written; a failure to close (compact) the
+	// file does not undo it, so the attempt is returned to its creator.
+	if err := attempt.Close(ctx); err != nil {
+		logger.Warn(ctx, "Failed to close a claimed retry attempt", tag.Error(err))
 	}
 	return nil
 }
