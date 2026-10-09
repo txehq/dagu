@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -592,4 +594,29 @@ func TestRunOpenerClosesWithASystemMarker(t *testing.T) {
 
 	_, err = (&review.RunOpener{}).CloseDecision(context.Background(), p)
 	require.Error(t, err)
+}
+
+// A job whose scripts print a lot cannot blow up the packet: step output is
+// dropped from the oldest runs first, every run stays listed, and the packet
+// says that it was trimmed.
+func TestPacketIsBoundedWhateverScriptsPrint(t *testing.T) {
+	f := newFixture(t)
+	big := strings.Repeat("x", 2048)
+	for i := range 40 {
+		steps := make([]review.StepEvidence, 0, 20)
+		for j := range 20 {
+			steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("step-%d", j), Status: "succeeded", Stdout: big, Stderr: big})
+		}
+		require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: fmt.Sprintf("run-%02d", i), Status: "succeeded", Steps: steps}))
+	}
+	packet := f.prepare("reviewer-a").Packet
+	raw, err := json.Marshal(packet)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), 256<<10)
+	assert.True(t, packet.EvidenceTrimmed)
+	require.Len(t, packet.NewRuns, 40, "no run is dropped from the review")
+	assert.Empty(t, packet.NewRuns[0].Steps, "the oldest run lost its step output first")
+	last := packet.NewRuns[39]
+	require.Len(t, last.Steps, 12, "at most the last steps of a run are kept")
+	assert.Equal(t, "step-19", last.Steps[11].Name)
 }
