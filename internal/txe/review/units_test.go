@@ -738,6 +738,7 @@ func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
 func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	f := newFixture(t)
 	f.addRun("run-1", "failed")
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-old", JobVersion: 1, Status: "failed", SpecSHA256: "sha256:older"}))
 	var retried []string
 	withRetry := func(holder string) *review.Reviewer {
 		r := f.reviewer(holder)
@@ -753,18 +754,25 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 		Actions: []review.AgentAction{
 			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"},
 			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-unknown"}, Reason: "not shown"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-old"}, Reason: "older version"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1", "package_digest": "sha256:chosen"}, Reason: "agent picks the package"},
 		},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, retried, "a retry never runs on the agent's request")
 	proposals := f.state().Proposals[jobID]
-	require.Len(t, proposals, 2)
+	require.Len(t, proposals, 4)
 	retry, question := proposals[0], proposals[1]
 	assert.Equal(t, review.ProposalAction, retry.Kind)
-	assert.Equal(t, map[string]string{"run_id": "run-1"}, retry.Params)
+	assert.Equal(t, map[string]string{
+		"run_id": "run-1", "run_spec_sha256": specDigest, "package_digest": f.state().Jobs[jobID].PackageDigest,
+	}, retry.Params, "the retry is bound to the snapshot the run ran and the package the reviewer saw")
 	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
 	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
 	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
+	assert.Equal(t, review.ProposalQuestion, proposals[2].Kind, "a run of an older version is never retried")
+	assert.Contains(t, proposals[2].Question, "run-old")
+	assert.Equal(t, review.ProposalQuestion, proposals[3].Kind, "the agent names the run and nothing else")
 
 	// "retry" is not an answer to an ordinary question.
 	_, err = f.registry.Decide(jobID, question.ID, review.VerdictRetry, "", "connor")

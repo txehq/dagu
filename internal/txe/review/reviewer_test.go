@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	jobID    = "job_01HZX0000000000000000000AA"
-	targetID = "volume-uid-1111"
+	// specDigest is the digest of the job's current DAG in these tests.
+	specDigest = "sha256:5pec"
+	jobID      = "job_01HZX0000000000000000000AA"
+	targetID   = "volume-uid-1111"
 )
 
 // clock is a controllable time source shared by the registry and reviewer.
@@ -136,6 +138,7 @@ func fixtureJob() review.Job {
 		MachineID:        "mch_01HZX0000000000000000000AA",
 		Version:          1,
 		PackageDigest:    "sha256:aaaa",
+		DAGSpecSHA256:    specDigest,
 		Title:            "Volume monitor",
 		Purpose:          "Watch free space on the data volume until the migration is done.",
 		Targets:          []review.Target{{Kind: "k8s.pv", StableID: targetID, Environment: "development"}},
@@ -183,7 +186,7 @@ func (f *fixture) reviewer(holder string) *review.Reviewer {
 func (f *fixture) addRun(id, status string) {
 	f.t.Helper()
 	require.NoError(f.t, f.registry.AddRun(jobID, review.RunEvidence{
-		RunID: id, JobVersion: 1, Status: status,
+		RunID: id, JobVersion: 1, Status: status, SpecSHA256: specDigest,
 		Outputs:   map[string]string{"free_pct": "31"},
 		Artifacts: []string{"reports/" + id + ".json"},
 	}))

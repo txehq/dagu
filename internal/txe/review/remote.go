@@ -5,6 +5,7 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -256,7 +257,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	}
 	job := Job{
 		ID: doc.JobId, OwnerID: doc.OwnerId, ProjectID: doc.ProjectId, MachineID: doc.MachineId,
-		Version: doc.Version, PackageDigest: doc.PackageDigest,
+		Version: doc.Version, PackageDigest: doc.PackageDigest, DAGSpecSHA256: doc.DagSpecSha256,
 		WorkingDir: deref(v.Package.WorkingDir), Title: v.Title, Purpose: v.Purpose,
 		Lifecycle: Lifecycle(doc.Lifecycle), Availability: Availability(doc.Availability.State),
 	}
@@ -401,12 +402,33 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 		default:
 			return nil, fmt.Errorf("outputs of run %s: %w", run.DagRunId, err)
 		}
+		if ev.SpecSHA256, err = r.runSpecDigest(ctx, jobID, run.DagRunId); err != nil {
+			return nil, fmt.Errorf("spec of run %s: %w", run.DagRunId, err)
+		}
 		if ev.Steps, err = r.stepEvidence(ctx, jobID, run.DagRunId); err != nil {
 			return nil, fmt.Errorf("steps of run %s: %w", run.DagRunId, err)
 		}
 		out = append(out, ev)
 	}
 	return out, nil
+}
+
+// runSpecDigest is the digest of the DAG snapshot a run ran, computed the
+// way the registry computes a job's: over the snapshot's YAML as stored. A
+// run whose snapshot the service no longer has gets no digest, and nothing
+// that needs one is proposed for it.
+func (r *Remote) runSpecDigest(ctx context.Context, jobID, runID string) (string, error) {
+	var out struct {
+		Spec string `json:"spec"`
+	}
+	err := r.do(ctx, http.MethodGet, "/dag-runs/"+url.PathEscape(jobID)+"/"+url.PathEscape(runID)+"/spec", nil, &out)
+	if errors.Is(err, ErrNotFound) || (err == nil && out.Spec == "") {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(out.Spec))), nil
 }
 
 const (
@@ -472,19 +494,18 @@ func decisionOf(jobID string, d api.TxeDecision) Decision {
 
 // DecisionsAfter implements Registry.
 func (r *Remote) DecisionsAfter(ctx context.Context, jobID, cursor string) ([]Decision, error) {
-	path := jobPath(jobID, "decisions")
+	// Oldest first: the last one is the reviewer's cursor, and the latest
+	// answer to a proposal is the one that counts.
+	q := url.Values{"order": {"asc"}}
 	if cursor != "" {
-		path += "?" + url.Values{"since": {cursor}}.Encode()
+		q.Set("since", cursor)
 	}
 	var list api.TxeDecisionList
-	if err := r.do(ctx, http.MethodGet, path, nil, &list); err != nil {
+	if err := r.do(ctx, http.MethodGet, jobPath(jobID, "decisions")+"?"+q.Encode(), nil, &list); err != nil {
 		return nil, err
 	}
-	// The registry lists decisions newest first. The reviewer needs them in
-	// the order they were made: the last one is its cursor, and the latest
-	// answer to a proposal is the one that counts.
 	out := make([]Decision, 0, len(list.Decisions))
-	for _, d := range slices.Backward(list.Decisions) {
+	for _, d := range list.Decisions {
 		out = append(out, decisionOf(jobID, d))
 	}
 	return out, nil
@@ -614,6 +635,67 @@ func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit in
 	return out, nil
 }
 
+// RequestedRetries implements Registry. A retry a person requested is a
+// decided retry proposal without a native task; one that already has a
+// journaled action was attempted and is the journal's business from then on.
+func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error) {
+	var list api.TxeJobList
+	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
+		return nil, err
+	}
+	var out []RequestedRetry
+	for _, job := range list.Jobs {
+		if !Lifecycle(job.Lifecycle).Reviewable() {
+			continue
+		}
+		proposals, err := r.proposals(ctx, job.JobId)
+		if err != nil {
+			return nil, err
+		}
+		var decided []string
+		for _, p := range append(proposals.Open, proposals.Finished...) {
+			if p.State == api.TxeProposalState(ProposalDecided) && p.Action.Name == RetryRunAction && p.NativeTask == nil {
+				decided = append(decided, p.ProposalId)
+			}
+		}
+		if len(decided) == 0 {
+			continue
+		}
+		actions, err := r.Actions(ctx, job.JobId)
+		if err != nil {
+			return nil, err
+		}
+		attempted := map[string]bool{}
+		for _, a := range actions {
+			attempted[a.ProposalID] = true
+		}
+		decisions, err := r.DecisionsAfter(ctx, job.JobId, "")
+		if err != nil {
+			return nil, err
+		}
+		sort.Strings(decided)
+		for _, id := range decided {
+			if attempted[id] {
+				continue
+			}
+			// The latest answer to a proposal is the one that counts.
+			for _, d := range slices.Backward(decisions) {
+				if d.ProposalID != id {
+					continue
+				}
+				if d.Verdict == VerdictRetry {
+					out = append(out, RequestedRetry{JobID: job.JobId, ProposalID: id, DecisionID: d.ID})
+				}
+				break
+			}
+			if limit > 0 && len(out) >= limit {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
 // RecordClosure implements Registry. Without a registry record for closures
 // the result is kept only in the run's log and failures cannot be counted.
 // A failure is therefore reported as already past the limit, so it surfaces
@@ -626,46 +708,38 @@ func (r *Remote) RecordClosure(_ context.Context, closure Closure) (int, error) 
 }
 
 // reviewDetail is what the reviewer keeps in a review record's free-form
-// detail until the registry has typed fields for it.
+// detail: the parts of a review the registry has no typed field for.
 type reviewDetail struct {
-	Episode           int       `json:"episode"`
-	CoveredRuns       []string  `json:"covered_run_ids"`
-	CoveredDecisions  []string  `json:"covered_decision_ids"`
-	ActionIDs         []string  `json:"action_ids,omitempty"`
-	ProposalIDs       []string  `json:"proposal_ids,omitempty"`
-	Notes             []string  `json:"notes,omitempty"`
-	Reviewer          string    `json:"reviewer"`
-	Handoff           LocalFile `json:"handoff,omitzero"`
-	PacketBytes       int       `json:"packet_bytes"`
-	AgentInputTokens  int       `json:"agent_input_tokens,omitempty"`
-	AgentOutputTokens int       `json:"agent_output_tokens,omitempty"`
+	Episode          int       `json:"episode"`
+	CoveredRuns      []string  `json:"covered_run_ids"`
+	CoveredDecisions []string  `json:"covered_decision_ids"`
+	ActionIDs        []string  `json:"action_ids,omitempty"`
+	ProposalIDs      []string  `json:"proposal_ids,omitempty"`
+	Notes            []string  `json:"notes,omitempty"`
+	Reviewer         string    `json:"reviewer"`
+	Handoff          LocalFile `json:"handoff,omitzero"`
 }
 
 // Review implements Registry.
 func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, error) {
-	var list api.TxeReviewList
-	if err := r.do(ctx, http.MethodGet, jobPath(jobID, "reviews"), nil, &list); err != nil {
+	var rev api.TxeReview
+	if err := r.do(ctx, http.MethodGet, jobPath(jobID, "reviews", reviewID), nil, &rev); err != nil {
 		return Review{}, err
 	}
-	for _, rev := range list.Reviews {
-		if rev.ReviewId != reviewID {
-			continue
-		}
-		var detail reviewDetail
-		if raw, err := json.Marshal(rev.Detail); err == nil {
-			_ = json.Unmarshal(raw, &detail)
-		}
-		return Review{
-			ID: rev.ReviewId, JobID: jobID, JobVersion: deref(rev.JobVersion), Episode: detail.Episode,
-			Outcome: Outcome(rev.Outcome), Reasoning: deref(rev.Reasoning), EvidenceRuns: deref(rev.EvidenceRunIds),
-			CoveredRuns: detail.CoveredRuns, CoveredDecisions: detail.CoveredDecisions,
-			ActionIDs: detail.ActionIDs, ProposalIDs: detail.ProposalIDs, Notes: detail.Notes,
-			Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: detail.PacketBytes,
-			PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
-			Handoff: detail.Handoff,
-		}, nil
+	var detail reviewDetail
+	if raw, err := json.Marshal(rev.Detail); err == nil {
+		_ = json.Unmarshal(raw, &detail)
 	}
-	return Review{}, ErrNotFound
+	return Review{
+		ID: rev.ReviewId, JobID: jobID, JobVersion: deref(rev.JobVersion), Episode: detail.Episode,
+		Outcome: Outcome(rev.Outcome), Reasoning: deref(rev.Reasoning), EvidenceRuns: deref(rev.EvidenceRunIds),
+		CoveredRuns: detail.CoveredRuns, CoveredDecisions: detail.CoveredDecisions,
+		ActionIDs: detail.ActionIDs, ProposalIDs: detail.ProposalIDs, Notes: detail.Notes,
+		Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: int(deref(rev.PacketBytes)),
+		AgentInputTokens: int(deref(rev.AgentInputTokens)), AgentOutputTokens: int(deref(rev.AgentOutputTokens)),
+		PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
+		Handoff: detail.Handoff,
+	}, nil
 }
 
 func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
@@ -872,7 +946,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 	detail := reviewDetail{
 		Episode: rev.Episode, CoveredRuns: rev.CoveredRuns, CoveredDecisions: rev.CoveredDecisions,
 		ActionIDs: rev.ActionIDs, ProposalIDs: rev.ProposalIDs, Notes: rev.Notes, Reviewer: rev.Reviewer,
-		Handoff: rev.Handoff, PacketBytes: rev.PacketBytes, AgentInputTokens: rev.AgentInputTokens, AgentOutputTokens: rev.AgentOutputTokens,
+		Handoff: rev.Handoff,
 	}
 	body := api.TxeReviewRequest{
 		Actor: r.actor(), ClaimId: claim.ID, Fence: int64(claim.Fence),
@@ -881,9 +955,40 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 			EvidenceRunIds: &rev.EvidenceRuns, EvidenceDecisionIds: &rev.CoveredDecisions,
 			AgentClientVersion: &rev.AgentClient, Detail: detail,
 			PacketArtifact: optional(rev.PacketArtifact), DecisionArtifact: optional(rev.DecisionArtifact),
+			PacketBytes: count(rev.PacketBytes), AgentInputTokens: count(rev.AgentInputTokens), AgentOutputTokens: count(rev.AgentOutputTokens),
 		},
 	}
-	return r.do(ctx, http.MethodPost, jobPath(rev.JobID, "reviews"), body, nil)
+	if err := r.do(ctx, http.MethodPost, jobPath(rev.JobID, "reviews"), body, nil); err != nil {
+		return err
+	}
+	return r.reviewerRecovered(ctx, rev.JobID)
+}
+
+// count returns nil for zero, so an unknown count is omitted.
+func count(n int) *int64 {
+	if n == 0 {
+		return nil
+	}
+	v := int64(n)
+	return &v
+}
+
+// reviewerRecovered tells the registry the reviewer works again, once a
+// review was recorded for a job whose reviewer it had as unavailable. That
+// resolves the reviewer's open exceptions; the job's own availability is
+// not touched.
+func (r *Remote) reviewerRecovered(ctx context.Context, jobID string) error {
+	doc, err := r.jobDoc(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if av := doc.ReviewerAvailability; av == nil || av.State == api.TxeAvailabilityState(registry.AvailabilityReady) {
+		return nil
+	}
+	scope := api.TxeObservationRequestScopeReviewer
+	detail := "a review was recorded"
+	body := api.TxeObservationRequest{Actor: r.actor(), State: api.TxeAvailabilityState(registry.AvailabilityReady), Scope: &scope, Detail: &detail}
+	return r.do(ctx, http.MethodPost, jobPath(jobID, "observations"), body, nil)
 }
 
 // AdvanceCheckpoint implements Registry.
@@ -921,12 +1026,21 @@ var exceptionStates = map[ExceptionKind]api.TxeAvailabilityState{
 	ExceptionUnavailable:    "target_unreachable",
 }
 
+// jobExceptions are the exceptions about the job itself. Every other one is
+// a problem of the reviewer, which the registry keeps apart: a reviewer
+// that cannot run does not make the job unavailable.
+var jobExceptions = map[ExceptionKind]bool{ExceptionUnavailable: true}
+
 // RaiseException implements Registry.
 func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 	kind := string(exc.Kind)
 	body := api.TxeObservationRequest{Actor: r.actor(), State: exceptionStates[exc.Kind], Kind: &kind, Detail: &exc.Message}
 	if body.State == "" {
 		body.State = "stale"
+	}
+	if !jobExceptions[exc.Kind] {
+		scope := api.TxeObservationRequestScopeReviewer
+		body.Scope = &scope
 	}
 	return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
 }

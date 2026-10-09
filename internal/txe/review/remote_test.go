@@ -6,6 +6,7 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -171,6 +172,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 				PermittedActions: &[]apigen.TxePermittedAction{
 					{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30},
 					{Name: "expand_volume", Routine: false, Command: new("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
+					{Name: "notify", Routine: true, Command: new("true"), Idempotency: &none, TimeoutSec: 30},
 				},
 			},
 		},
@@ -232,7 +234,7 @@ func TestRemoteReviewEpisodeAgainstTheRealRegistry(t *testing.T) {
 	assert.Equal(t, "Watch free space on the data volume.", packet.Job.Purpose)
 	require.Len(t, packet.Job.Targets, 1)
 	assert.Equal(t, targetID, packet.Job.Targets[0].StableID)
-	require.Len(t, packet.Job.Review.Actions, 2)
+	require.Len(t, packet.Job.Review.Actions, 3)
 	assert.Equal(t, []string{"size_gb"}, packet.Job.Review.Actions[1].Params)
 	assert.Equal(t, 3600, packet.Job.Review.CadenceSec)
 	assert.Equal(t, []string{"run-1"}, packet.RunIDs())
@@ -388,6 +390,7 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 			run("r2", "succeeded", "2026-10-09T10:02:00Z") + "," +
 			run("r-queued", "queued", "") + `]}`,
 		"/dag-runs/" + job + "/r2/outputs":                                 `{"metadata":{},"outputs":{"free_pct":"31"}}`,
+		"/dag-runs/" + job + "/r2/spec":                                    `{"spec":"steps:\n  - name: measure\n"}`,
 		"/dag-runs/" + job + "/r1":                                         `{"dagRunDetails":{"nodes":[]}}`,
 		"/dag-runs/" + job + "/r2":                                         `{"dagRunDetails":{"nodes":[{"step":{"name":"measure"},"statusLabel":"succeeded"}]}}`,
 		"/dag-runs/" + job + "/r3":                                         `{"dagRunDetails":{"nodes":[{"step":{"name":"measure"},"statusLabel":"failed"}]}}`,
@@ -408,6 +411,10 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	assert.Equal(t, []review.StepEvidence{{Name: "measure", Status: "succeeded", Stdout: "31"}}, runs[0].Steps)
 	assert.Equal(t, []review.StepEvidence{{Name: "measure", Status: "failed", Stderr: "df: permission denied"}}, runs[1].Steps)
 	assert.False(t, runs[0].FinishedAt.IsZero())
+	// A run carries the digest of the snapshot it ran, as the registry
+	// computes a job's; a run whose snapshot is gone carries none.
+	assert.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("steps:\n  - name: measure\n"))), runs[0].SpecSHA256)
+	assert.Empty(t, runs[1].SpecSHA256)
 
 	all, err := remote.RunsAfter(context.Background(), job, "")
 	require.NoError(t, err)
@@ -561,4 +568,264 @@ func TestRemoteApprovedProposalExecutesOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, after, 1)
 	assert.Equal(t, decisions[1].ID, after[0].ID)
+}
+
+// human is the person who decides in these tests.
+var human = registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
+
+// retrying returns a reviewer that can retry runs, recording each call.
+func (f *remoteFixture) retrying(holder string, retried *[]string) *review.Reviewer {
+	r := f.reviewer(holder)
+	r.Retry = func(_ context.Context, job, run string) (string, error) {
+		*retried = append(*retried, job+"/"+run)
+		return "attempt-2 of " + run, nil
+	}
+	return r
+}
+
+// A retry the reviewer proposes is the registry's typed dagu.retry_run,
+// bound to the snapshot the run ran and the package the reviewer saw. The
+// registry accepts it only for a run of the current version, a person's
+// retry verdict makes it executable, and it runs once.
+func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	f.remote.runs = []review.RunEvidence{
+		{RunID: "run-1", Status: "failed", SpecSHA256: job.DAGSpecSHA256},
+		{RunID: "run-old", Status: "failed", SpecSHA256: "sha256:older"},
+	}
+	var retried []string
+	prepared, err := f.retrying("reviewer-a", &retried).Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	assert.Equal(t, job.DAGSpecSHA256, prepared.Packet.Job.DAGSpecSHA256)
+	_, err = f.retrying("reviewer-a", &retried).Apply(ctx, prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "both failed", EvidenceRunIDs: []string{"run-1", "run-old"},
+		Actions: []review.AgentAction{
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-old"}, Reason: "older"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, retried)
+
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 2)
+	var retry review.Proposal
+	for _, p := range open {
+		if p.Kind == review.ProposalAction {
+			retry = p
+		} else {
+			assert.Contains(t, p.Question, "run-old", "a run of an older version becomes a question, not a retry")
+		}
+	}
+	require.NotEmpty(t, retry.ID)
+	assert.Equal(t, map[string]string{
+		"run_id": "run-1", "run_spec_sha256": job.DAGSpecSHA256, "package_digest": job.PackageDigest,
+	}, retry.Params)
+	stored := f.job().Proposals[retry.ID]
+	require.NotNil(t, stored)
+	assert.Equal(t, registry.ActionRetryRun, stored.Action.Name)
+	assert.Nil(t, stored.Action.Target)
+
+	// The decision service does not record a retry of a run yet, so the
+	// person's verdict is written through the registry itself.
+	decisionID, err := registry.NewID(registry.PrefixDecision, time.Now())
+	require.NoError(t, err)
+	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		_, err := tx.AppendDecision(registry.Decision{
+			DecisionID: decisionID, ProposalID: retry.ID, ProposalRevision: 1, Verdict: registry.VerdictRetry,
+			BindingDigest: retry.BindingDigest, IdempotencyKey: "retry-run-1",
+		}, registry.ProposalDecided)
+		return err
+	})
+	require.NoError(t, err)
+
+	// The reviewer filed this proposal with a decision run, which executes
+	// it; the per-tick sweep leaves it alone.
+	swept, err := f.retrying("tick", &retried).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, swept)
+
+	exec := f.retrying("executor", &retried)
+	out, err := exec.Execute(ctx, f.jobID, retry.ID, decisionID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, []string{f.jobID + "/run-1"}, retried)
+
+	out, err = exec.Execute(ctx, f.jobID, retry.ID, decisionID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+	assert.Len(t, retried, 1, "one retry verdict retries the run once")
+	after, err := f.remote.Proposal(ctx, f.jobID, retry.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.ProposalState(registry.ProposalExecuted), after.State)
+}
+
+// A retry a person requests directly is already decided and has no decision
+// run. The reviewer's tick executes it once, and never lists it again.
+func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	var proposal *registry.Proposal
+	var decided *registry.Decision
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+		proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "run-7", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-run-7")
+		return err
+	})
+	require.NoError(t, err)
+
+	var retried []string
+	// A reviewer that cannot retry runs leaves the request where it is.
+	none, err := f.reviewer("tick-0").RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+
+	pending, err := f.remote.RequestedRetries(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []review.RequestedRetry{{JobID: f.jobID, ProposalID: proposal.ProposalID, DecisionID: decided.DecisionID}}, pending)
+
+	done, err := f.retrying("tick-1", &retried).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Empty(t, done[0].Error)
+	assert.Empty(t, done[0].Executed.Skipped)
+	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	assert.Equal(t, []string{f.jobID + "/run-7"}, retried)
+
+	again, err := f.retrying("tick-2", &retried).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, again)
+	assert.Len(t, retried, 1)
+
+	// The same request for a run of another version is refused outright.
+	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		_, _, err := tx.ProposeRetry(registry.RetryRunParams{RunID: "run-8", RunSpecSHA256: "sha256:older", PackageDigest: job.PackageDigest}, "retry-run-8")
+		return err
+	})
+	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
+}
+
+// An effect whose outcome is unknown is escalated as the registry's typed
+// txe.uncertain_effect. A person's retry verdict allows exactly one more
+// attempt of that intent: the registry consumes it with the grant, and
+// refuses the attempt after that until a person decides again.
+func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	targetID := "cluster_uid=c-1,uid=vol-1"
+	f.fx.run = func(review.Action) (review.EffectResult, bool) {
+		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
+	}
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Tell the owner.",
+		Actions: []review.AgentAction{{Name: "notify", TargetID: targetID, Reason: "low space"}},
+	}
+	round := func(holder string, d review.AgentDecision) review.Applied {
+		t.Helper()
+		prepared, err := f.reviewer(holder).Prepare(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
+		applied, err := f.reviewer(holder).Apply(ctx, prepared, d)
+		require.NoError(t, err)
+		return applied
+	}
+	waiting := review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"}
+
+	first := round("reviewer-a", notify)
+	require.Len(t, first.Executed, 1)
+	assert.Equal(t, review.ActionUncertain, first.Executed[0].State)
+	actionID := first.Executed[0].ID
+
+	// The next review cannot settle it and asks the owner, once.
+	round("reviewer-b", waiting)
+	want, err := registry.EscalationProposalID(actionID, 1)
+	require.NoError(t, err)
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	escalation := open[0]
+	assert.Equal(t, want, escalation.ID)
+	assert.Equal(t, review.ProposalUncertain, escalation.Kind)
+	assert.Equal(t, map[string]string{"action_id": actionID}, escalation.Params)
+	assert.NotContains(t, escalation.AllowedVerdicts, review.VerdictApprove)
+	assert.NotContains(t, escalation.AllowedVerdicts, review.VerdictRedirect)
+	assert.Equal(t, registry.ActionEscalated, f.job().Actions[actionID].State)
+
+	// Until the owner answers, the same intent is not attempted again.
+	blocked := round("reviewer-c", notify)
+	assert.Empty(t, blocked.Executed)
+	assert.Equal(t, 1, f.fx.count("notify"))
+
+	// An escalation is never executed, so it cannot be approved.
+	_, err = f.decide(escalation, 1, "approve")
+	require.Error(t, err)
+	_, err = f.decide(escalation, 1, "retry")
+	require.NoError(t, err)
+	require.Contains(t, f.job().UncertainResolutions, actionID)
+
+	// The one attempt the owner allowed runs, and uses the answer up.
+	second := round("reviewer-d", notify)
+	require.Len(t, second.Executed, 1)
+	assert.Equal(t, 2, f.fx.count("notify"))
+	assert.Empty(t, f.job().UncertainResolutions, "the grant consumed the owner's answer")
+
+	// That attempt ended unknown too. Nothing runs a third time.
+	third := round("reviewer-e", notify)
+	assert.Empty(t, third.Executed)
+	assert.Equal(t, 2, f.fx.count("notify"))
+}
+
+// A reviewer that cannot run is the reviewer's problem. The registry keeps
+// it apart from the job's availability, and a recorded review clears it.
+func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	before := f.job().Availability.State
+
+	require.NoError(t, f.remote.RaiseException(ctx, review.Exception{
+		JobID: f.jobID, Kind: review.ExceptionReviewerAuth, MachineID: f.remote.MachineID, Message: "the agent is not logged in",
+	}))
+	job := f.job()
+	assert.Equal(t, before, job.Availability.State, "the job's availability is untouched")
+	require.NotNil(t, job.ReviewerAvailability)
+	assert.Equal(t, registry.AvailabilityState("auth_required"), job.ReviewerAvailability.State)
+	open := 0
+	for _, e := range job.Exceptions {
+		if e.ResolvedAt == nil {
+			open++
+			assert.Equal(t, registry.ScopeReviewer, e.Scope)
+			assert.Equal(t, string(review.ExceptionReviewerAuth), e.Kind)
+		}
+	}
+	assert.Equal(t, 1, open)
+
+	// A problem with the job's target is the job's.
+	require.NoError(t, f.remote.RaiseException(ctx, review.Exception{
+		JobID: f.jobID, Kind: review.ExceptionUnavailable, MachineID: f.remote.MachineID, Message: "the volume is gone",
+	}))
+	assert.Equal(t, registry.AvailabilityState("target_unreachable"), f.job().Availability.State)
+
+	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "fine", EvidenceRunIDs: []string{"run-1"}})
+	require.NoError(t, err)
+	job = f.job()
+	assert.Equal(t, registry.AvailabilityReady, job.ReviewerAvailability.State)
+	for _, e := range job.Exceptions {
+		if e.Scope == registry.ScopeReviewer {
+			assert.NotNil(t, e.ResolvedAt, "a recorded review resolves the reviewer's exceptions")
+		}
+	}
+	assert.Equal(t, registry.AvailabilityState("target_unreachable"), job.Availability.State, "and leaves the job's own state alone")
+
+	// The review's cost is kept in the registry's typed fields.
+	stored, err := f.store.GetReview(ctx, f.jobID, prepared.Packet.ReviewID)
+	require.NoError(t, err)
+	assert.Positive(t, stored.PacketBytes)
 }

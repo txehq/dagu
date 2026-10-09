@@ -67,7 +67,12 @@ else a review step needs must be rendered into the DAG:
   proposed instead of tried again. An action whose outcome is unknown is
   never retried: a declared `reconcile` probe settles it, or the owner
   answers its escalation. Until then the same action on the same target is
-  not run again, and only the answer `retry` allows it.
+  not run again, and only the answer `retry` allows it, for one attempt.
+- Retrying a run: `dagu.retry_run` is bound to the DAG snapshot the run ran
+  and to the job's package. A run of an older version is never retried. A
+  retry the reviewer proposes runs from its decision run once the owner
+  answers `retry`; one the owner requests directly is already decided and
+  is run by the next tick. Either way it runs once.
 - Leases: an action starts only if the claim outlives its timeout, and its
   process is killed when its grant ends. A process frozen between that
   check and its start can still act late; a destination that must exclude

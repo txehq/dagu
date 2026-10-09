@@ -11,7 +11,11 @@
 // human decision.
 package review
 
-import "time"
+import (
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+)
 
 // Lifecycle is the registry's job lifecycle state.
 type Lifecycle string
@@ -69,13 +73,20 @@ const (
 	// RetryRunAction is the reserved action that re-runs one exact run of
 	// the job through the service. It is never routine and never declared by
 	// a job: only the owner's decision on a proposal carrying it runs it.
-	RetryRunAction = "dagu.retry_run"
-	// RetryRunParam names the run to retry.
+	RetryRunAction = registry.ActionRetryRun
+	// RetryRunParam names the run to retry. It is the only parameter the
+	// agent gives; the reviewer adds the other two from what it was shown.
 	RetryRunParam = "run_id"
+	// RetryRunSpecParam is the digest of the DAG snapshot the run ran, and
+	// RetryRunPackageParam the package the job had when the reviewer looked.
+	// The registry refuses the proposal, and later its execution, when
+	// either is no longer the job's current one.
+	RetryRunSpecParam    = "run_spec_sha256"
+	RetryRunPackageParam = "package_digest"
 	// UncertainEffectAction is the reserved action name of a proposal that
 	// asks the owner about an effect whose outcome is unknown. It is not
 	// executable.
-	UncertainEffectAction = "txe.uncertain_effect"
+	UncertainEffectAction = registry.ActionUncertainEffect
 	// UncertainEffectParam names the journaled action in question.
 	UncertainEffectParam = "action_id"
 )
@@ -119,12 +130,15 @@ func (p ReviewPolicy) Action(name string) (DeclaredAction, bool) {
 
 // Job is the reviewer's read view of a registered job.
 type Job struct {
-	ID               string       `json:"job_id"`
-	OwnerID          string       `json:"owner_id"`
-	ProjectID        string       `json:"project_id"`
-	MachineID        string       `json:"machine_id"`
-	Version          int          `json:"version"`
-	PackageDigest    string       `json:"package_digest"`
+	ID            string `json:"job_id"`
+	OwnerID       string `json:"owner_id"`
+	ProjectID     string `json:"project_id"`
+	MachineID     string `json:"machine_id"`
+	Version       int    `json:"version"`
+	PackageDigest string `json:"package_digest"`
+	// DAGSpecSHA256 is the digest of the job's current DAG. A run with
+	// another digest ran an older version.
+	DAGSpecSHA256    string       `json:"dag_spec_sha256,omitempty"`
 	WorkingDir       string       `json:"working_dir"`
 	Title            string       `json:"title"`
 	Purpose          string       `json:"purpose"`
@@ -186,8 +200,10 @@ type Checkpoint struct {
 
 // RunEvidence is one finished run of the job's own script.
 type RunEvidence struct {
-	RunID      string            `json:"run_id"`
-	JobVersion int               `json:"job_version"`
+	RunID      string `json:"run_id"`
+	JobVersion int    `json:"job_version"`
+	// SpecSHA256 is the digest of the DAG snapshot the run ran.
+	SpecSHA256 string            `json:"spec_sha256,omitempty"`
 	Status     string            `json:"status"`
 	StartedAt  time.Time         `json:"started_at,omitzero"`
 	FinishedAt time.Time         `json:"finished_at,omitzero"`

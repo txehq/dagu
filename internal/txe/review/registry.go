@@ -127,6 +127,11 @@ type Registry interface {
 	// run found and returns how many attempts have failed so far. Any
 	// outcome but ClosureFailed is final.
 	RecordClosure(ctx context.Context, closure Closure) (failedAttempts int, err error)
+	// RequestedRetries lists the retries a person requested directly for
+	// the machine's reviewable jobs and that nothing has attempted yet:
+	// decided retry proposals with no decision run of their own to execute
+	// them. It returns at most limit.
+	RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error)
 	// Review returns a recorded review, or ErrNotFound.
 	Review(ctx context.Context, jobID, reviewID string) (Review, error)
 	// Actions returns the job's journaled actions, oldest first.

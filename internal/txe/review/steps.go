@@ -72,6 +72,16 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 	if closeErr != nil {
 		fmt.Fprintln(os.Stderr, "txe review: closing superseded proposals:", closeErr)
 	}
+	// Retries a person requested directly have no run of their own to
+	// execute them, so the tick does. A failure here does not stop reviews
+	// either: an unattempted retry is listed again on the next tick.
+	retries, retryErr := s.Reviewer.RunRequestedRetries(ctx, s.MachineID)
+	for _, rt := range retries {
+		fmt.Fprintf(os.Stderr, "txe review: requested retry %s of %s: state=%s skipped=%q error=%q\n", rt.ProposalID, rt.JobID, rt.Executed.Action.State, rt.Executed.Skipped, rt.Error)
+	}
+	if retryErr != nil {
+		fmt.Fprintln(os.Stderr, "txe review: executing requested retries:", retryErr)
+	}
 	due, err := s.Reviewer.Registry.DueJobs(ctx, s.MachineID, s.Reviewer.now())
 	if err != nil {
 		return fmt.Errorf("list due jobs: %w", err)

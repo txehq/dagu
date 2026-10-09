@@ -62,7 +62,12 @@ func ProposalID(reviewID string, kind ProposalKind, name, targetID string, param
 // the owner gave it: after the job changes, the question has a new id and
 // the old answer no longer applies.
 func UncertainProposalID(actionID string, jobVersion int) string {
-	return derivedID("prp", "uncertain", actionID, jobVersion)
+	id, err := registry.EscalationProposalID(actionID, jobVersion)
+	if err != nil {
+		// Only a string and an int are hashed.
+		panic(err)
+	}
+	return id
 }
 
 // DecisionRunID is the id of the native run that carries a proposal's human

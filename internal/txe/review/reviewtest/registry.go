@@ -379,6 +379,42 @@ func (r *Registry) Review(_ context.Context, jobID, reviewID string) (review.Rev
 	return out, err
 }
 
+// RequestedRetries implements review.Registry.
+func (r *Registry) RequestedRetries(_ context.Context, machineID string, limit int) ([]review.RequestedRetry, error) {
+	var out []review.RequestedRetry
+	err := r.Update(func(s *State) error {
+		for jobID, job := range s.Jobs {
+			if job.MachineID != machineID || !job.Lifecycle.Reviewable() {
+				continue
+			}
+			attempted := map[string]bool{}
+			for _, a := range s.Actions[jobID] {
+				attempted[a.ProposalID] = true
+			}
+			for _, p := range s.Proposals[jobID] {
+				if p.State != review.ProposalDecided || p.ActionName != review.RetryRunAction || p.NativeTask.RunID != "" || attempted[p.ID] {
+					continue
+				}
+				for _, d := range slices.Backward(s.Decisions[jobID]) {
+					if d.ProposalID != p.ID {
+						continue
+					}
+					if d.Verdict == review.VerdictRetry {
+						out = append(out, review.RequestedRetry{JobID: jobID, ProposalID: p.ID, DecisionID: d.ID})
+					}
+					break
+				}
+			}
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].ProposalID < out[j].ProposalID })
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return nil
+	})
+	return out, err
+}
+
 // PendingClosures implements review.Registry.
 func (r *Registry) PendingClosures(_ context.Context, machineID string, limit int) ([]review.Proposal, error) {
 	var out []review.Proposal

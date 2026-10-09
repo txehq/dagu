@@ -36,7 +36,9 @@ var (
 	// uncertainVerdicts are the answers to an effect whose outcome is
 	// unknown. Retry here means the owner confirms it did not take effect
 	// and allows one more attempt of that same action.
-	uncertainVerdicts = []Verdict{VerdictRetry, VerdictReject, VerdictRedirect, VerdictPause, VerdictSnooze, VerdictRetire}
+	// Redirect is absent: the registry never executes an escalation, so it
+	// refuses approve and redirect on one.
+	uncertainVerdicts = []Verdict{VerdictRetry, VerdictReject, VerdictPause, VerdictSnooze, VerdictRetire}
 )
 
 // Reviewer drives one job's review against the registry. It holds no state
@@ -198,6 +200,50 @@ func (r *Reviewer) closeOne(ctx context.Context, proposal Proposal) Closure {
 	}
 	closure.Outcome = outcome
 	return closure
+}
+
+// RequestedRetry is a retry of one run that a person asked for and decided
+// in one step, without a decision run.
+type RequestedRetry struct {
+	JobID      string `json:"job_id"`
+	ProposalID string `json:"proposal_id"`
+	DecisionID string `json:"decision_id"`
+}
+
+// RetryOutcome is what executing one requested retry came to.
+type RetryOutcome struct {
+	RequestedRetry
+	Executed Executed `json:"executed,omitzero"`
+	Error    string   `json:"error,omitempty"`
+}
+
+// RunRequestedRetries executes the retries a person requested directly. A
+// proposal the reviewer files is executed by its own decision run; a retry
+// requested from the dashboard or CLI is already decided and has no such
+// run, so each tick carries out a bounded batch of them through the same
+// executor: a fresh execution claim, the registry's grant, one attempt.
+// One that cannot run now, such as a job whose claim is held, is reported
+// and left for the next tick; the registry's journal keeps a second attempt
+// from ever being granted.
+func (r *Reviewer) RunRequestedRetries(ctx context.Context, machineID string) ([]RetryOutcome, error) {
+	if r.Retry == nil {
+		return nil, nil
+	}
+	pending, err := r.Registry.RequestedRetries(ctx, machineID, closureBatch)
+	if err != nil {
+		return nil, fmt.Errorf("list requested retries: %w", err)
+	}
+	out := make([]RetryOutcome, 0, len(pending))
+	for _, req := range pending {
+		res := RetryOutcome{RequestedRetry: req}
+		executed, err := r.Execute(ctx, req.JobID, req.ProposalID, req.DecisionID)
+		if err != nil {
+			res.Error = err.Error()
+		}
+		res.Executed = executed
+		out = append(out, res)
+	}
+	return out, nil
 }
 
 // settleTerminal settles effects left open on a job that completed or
@@ -607,8 +653,19 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		// A retry is proposed only for a run the reviewer was shown, and it
 		// names that run exactly. It runs when the owner says so.
 		runID := requested.Params[RetryRunParam]
-		if len(requested.Params) != 1 || !packet.hasRun(runID) {
+		run, shown := packet.run(runID)
+		if len(requested.Params) != 1 || !shown {
 			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q): %s", runID, requested.Reason))
+		}
+		if run.SpecSHA256 == "" || run.SpecSHA256 != job.DAGSpecSHA256 {
+			// A run of an older version is never retried, on the new code
+			// or the old. The owner still sees what the reviewer wanted.
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which did not run the job's current version %d and cannot be retried: %s", runID, job.Version, requested.Reason))
+		}
+		// The proposal is bound to the snapshot that run ran and to the
+		// package the reviewer saw; the agent chooses neither.
+		requested.Params = map[string]string{
+			RetryRunParam: runID, RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
 		}
 		requested.TargetID = ""
 		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, requested.Reason))

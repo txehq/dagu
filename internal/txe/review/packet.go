@@ -99,13 +99,14 @@ func (p Packet) artifactRefs(runIDs []string) []string {
 	return refs
 }
 
-func (p Packet) hasRun(id string) bool {
+// run returns the finished run with this id that the packet shows.
+func (p Packet) run(id string) (RunEvidence, bool) {
 	for _, r := range p.NewRuns {
 		if r.RunID == id {
-			return true
+			return r, true
 		}
 	}
-	return false
+	return RunEvidence{}, false
 }
 
 func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, decisions []Decision, proposals []Proposal, actions []Action) (Packet, error) {
