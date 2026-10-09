@@ -51,13 +51,13 @@ Run it again after an upgrade. It rewrites the hub's copy only when the rendered
 
 The installer manages that DAG: it restores its own rendered spec, so do not edit the hub's copy.
 
-It also has limits. Installs from this machine's TXE home run one at a time, and each install
-reads its write back. Neither step protects against:
+It also has limits. Installs from this machine's TXE home run one at a time. The lock does not
+cover a copy of the home on another machine, or another API client writing the DAG.
 
-- a copy of the home on another machine;
-- another API client writing the DAG;
-- an edit made on the hub while an install runs. The hub's spec API has no conditional write, so
-  such an edit is overwritten without notice.
+After it creates or updates the DAG, the installer reads it back. That catches a different write
+landing after the installer's own write: the install then reports an error. An edit landing between
+the installer's first read and its write is overwritten without notice, because the hub's spec API
+has no conditional write.
 
 Keep one owner for installs and updates of this machine's hub DAG. Nothing here prevents
 conflicting writes atomically.
