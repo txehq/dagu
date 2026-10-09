@@ -135,10 +135,15 @@ function DAGDetails() {
     if (params.tab === 'docs' && fileName) {
       navigate(buildUrl(`/dags/${fileName}/wiki`), { replace: true });
     }
+    // The fork does not offer incidents; the DAG's status tab takes their
+    // place, keeping whatever run the URL selected.
     if (!INCIDENTS_ENABLED && params.tab === 'incidents' && fileName) {
-      navigate(buildUrl(`/dags/${fileName}`), { replace: true });
+      const query = searchParams.toString();
+      navigate(buildUrl(`/dags/${fileName}${query ? `?${query}` : ''}`), {
+        replace: true,
+      });
     }
-  }, [buildUrl, fileName, navigate, params.tab]);
+  }, [buildUrl, fileName, navigate, params.tab, searchParams]);
 
   // Fetch DAG details — SWR is the single source of truth, refreshed by live invalidations
   const { data: dagData, mutate: mutateDag } = useQuery(
