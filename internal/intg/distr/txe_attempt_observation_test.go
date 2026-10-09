@@ -82,8 +82,42 @@ func hubAttempts(t *testing.T, f *testFixture, runID string) []observedAttempt {
 	return out
 }
 
+// keepEvidence copies what the hub holds for the run, status files and logs,
+// into TXE_EVIDENCE_DIR/<test>/<label>/ when that variable is set.
+func keepEvidence(t *testing.T, label string, f *testFixture, runID, obs string) {
+	t.Helper()
+	base := os.Getenv("TXE_EVIDENCE_DIR")
+	if base == "" {
+		return
+	}
+	dst := filepath.Join(base, strings.TrimPrefix(t.Name(), "TestTXEObserveRetry_"), strings.NewReplacer(" ", "-", "(", "", ")", "", ",", "").Replace(label))
+	for name, root := range map[string]string{"hub-run-store": f.coord.Config.Paths.DAGRunsDir, "hub-logs": f.logDir(), "hub-artifacts": f.coord.Config.Paths.ArtifactDir, "step-records": obs} {
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, p)
+			if name != "step-records" && !strings.Contains(p, runID) && name != "hub-artifacts" {
+				return nil
+			}
+			if name == "step-records" && !strings.HasPrefix(d.Name(), "run.") && !strings.HasPrefix(d.Name(), "publish.") {
+				return nil
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			out := filepath.Join(dst, name, rel)
+			require.NoError(t, os.MkdirAll(filepath.Dir(out), 0o755))
+			require.NoError(t, os.WriteFile(out, data, 0o644))
+			return nil
+		})
+	}
+}
+
 func logObservation(t *testing.T, label string, f *testFixture, runID, obs string) {
 	t.Helper()
+	keepEvidence(t, label, f, runID, obs)
 	t.Logf("=== %s", label)
 	for _, a := range hubAttempts(t, f, runID) {
 		t.Logf("hub attempt dir=%s id=%s status=%s archive=%s files=%v", a.dir, a.id, a.status, filepath.Base(a.archive), a.files)
