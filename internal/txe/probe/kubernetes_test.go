@@ -48,7 +48,7 @@ func kubeSystem(uid string) *unstructured.Unstructured {
 
 func configMapTarget() Target {
 	return Target{Kind: "kubernetes.configmap", DisplayName: "probe-ns/settings",
-		StableID: map[string]string{KeyClusterUID: clusterUID, KeyUID: cmUID, KeyNamespace: "probe-ns", KeyName: "settings"}}
+		StableID: map[string]string{KeyClusterUID: clusterUID, KeyUID: cmUID}}
 }
 
 // fakeKube returns a probe whose client is a fake cluster holding objs, and
@@ -62,8 +62,8 @@ func fakeKube(t *testing.T, objs ...runtime.Object) (Kubernetes, *dynamicfake.Fa
 	}
 	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, lists, objs...)
 	var gotPath string
-	k := Kubernetes{NewClient: func(path, _ string) (dynamic.Interface, error) {
-		gotPath = path
+	k := Kubernetes{NewClient: func(cred Credential, _ string) (dynamic.Interface, error) {
+		gotPath = cred.Path
 		return client, nil
 	}}
 	t.Cleanup(func() {
@@ -156,20 +156,30 @@ func TestKubernetesWithoutCredentialOrIdentity(t *testing.T) {
 	}
 	noCluster := configMapTarget()
 	delete(noCluster.StableID, KeyClusterUID)
-	if r := k.Probe(context.Background(), noCluster, kubeCreds); r.Outcome != Unreachable || r.Authoritative {
-		t.Fatalf("no cluster uid: %+v, want unreachable", r)
+	if r := k.Probe(context.Background(), noCluster, kubeCreds); r.Outcome != Unknown || r.Authoritative {
+		t.Fatalf("no cluster uid: %+v, want unknown", r)
 	}
 }
 
-// The display name "namespace/name" locates an object whose stable id
-// carries only the UIDs.
-func TestKubernetesNameFromDisplayName(t *testing.T) {
-	k, _ := fakeKube(t, kubeSystem(clusterUID), object("v1", "ConfigMap", "probe-ns", "settings", cmUID))
-	target := configMapTarget()
-	delete(target.StableID, KeyNamespace)
-	delete(target.StableID, KeyName)
-	if r := k.Probe(context.Background(), target, kubeCreds); r.Outcome != Present {
-		t.Fatalf("result = %+v, want present", r)
+// The display name is the locator and must be exactly "namespace/name" for
+// a namespaced kind or "name" for a cluster-scoped one; any other shape is
+// unknown, never guessed into a lookup that could come back NotFound.
+func TestKubernetesLocatorIsStrict(t *testing.T) {
+	k, _ := fakeKube(t, kubeSystem(clusterUID))
+	for _, display := range []string{"", "settings", "probe-ns/settings/extra", "/settings", "probe-ns/", " probe-ns/settings"} {
+		target := configMapTarget()
+		target.DisplayName = display
+		if r := k.Probe(context.Background(), target, kubeCreds); r.Outcome != Unknown || r.Authoritative {
+			t.Errorf("display name %q: %+v, want unknown", display, r)
+		}
+	}
+	ns := Target{Kind: "kubernetes.namespace", DisplayName: "probe-ns", StableID: map[string]string{KeyClusterUID: clusterUID, KeyUID: "ns-uid"}}
+	if r := k.Probe(context.Background(), ns, kubeCreds); r.Outcome != Absent || !r.Authoritative {
+		t.Fatalf("cluster-scoped %q: %+v, want authoritative absent", ns.DisplayName, r)
+	}
+	ns.DisplayName = "x/probe-ns"
+	if r := k.Probe(context.Background(), ns, kubeCreds); r.Outcome != Unknown {
+		t.Fatalf("cluster-scoped with a namespace: %+v, want unknown", r)
 	}
 }
 
@@ -187,5 +197,32 @@ func TestReconcileDAGName(t *testing.T) {
 	name := ReconcileDAGName("mch_01JTXE0000000000000000F1X3")
 	if name != "txe-probe-01JTXE0000000000000000F1X3" || len(name) > 40 {
 		t.Fatalf("name = %q (%d characters)", name, len(name))
+	}
+}
+
+// A kubeconfig arriving as a resolved secret's content builds a client for
+// that cluster without touching the filesystem.
+func TestKubeconfigClientFromContent(t *testing.T) {
+	const kubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: dev
+  cluster: {server: "https://127.0.0.1:6443"}
+users:
+- name: probe
+  user: {token: "not-a-real-token"}
+contexts:
+- name: dev
+  context: {cluster: dev, user: probe}
+current-context: dev
+`
+	if _, err := kubeconfigClient(Credential{Value: kubeconfig}, ""); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	if _, err := kubeconfigClient(Credential{Value: kubeconfig}, "dev"); err != nil {
+		t.Fatalf("named context: %v", err)
+	}
+	if _, err := kubeconfigClient(Credential{Value: "not yaml: ["}, ""); err == nil {
+		t.Fatal("garbage kubeconfig built a client")
 	}
 }
