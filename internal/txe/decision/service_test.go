@@ -228,7 +228,7 @@ func (f *fixture) fileProposalWithID(id string, p registry.Proposal) *registry.P
 	p.ProposalID = id
 	var filed *registry.Proposal
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
-		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: f.machineID}, time.Hour)
 		if err != nil {
 			return err
 		}
@@ -253,7 +253,7 @@ func (f *fixture) fileProposal(action string, native bool) *registry.Proposal {
 	}
 	var filed *registry.Proposal
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, reviewer, func(tx *registry.JobTx) error {
-		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: f.machineID}, time.Hour)
 		if err != nil {
 			return err
 		}
