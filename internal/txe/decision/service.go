@@ -183,14 +183,6 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		if err != nil {
 			return err
 		}
-		// A snooze keeps the native task open for the decision that follows
-		// it, so it has nothing to complete.
-		if effect.Proposal == registry.ProposalSnoozed {
-			if err := tx.MarkNativeResumed(decisionID); err != nil {
-				return err
-			}
-			d.NativeResume = ""
-		}
 		if err := applyLifecycle(tx, effect.Lifecycle, decisionID); err != nil {
 			return err
 		}
@@ -228,25 +220,9 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 			result.Decision.NativeResume = "completed"
 		}
 	} else {
-		result.Decision.NativeResume = CurrentNativeResume(job, result.Decision)
+		result.Decision.NativeResume = registry.CurrentNativeResume(job, result.Decision)
 	}
 	return result, nil
-}
-
-// CurrentNativeResume is a decision's native-completion state now. The stored
-// decision is immutable and keeps the state it was written with; the job's
-// pending list is the authority on whether completion is outstanding, and a
-// snooze never completes its task.
-func CurrentNativeResume(job *registry.Job, d *registry.Decision) string {
-	switch {
-	case job.NativeResumes[d.DecisionID] != nil:
-		return "pending"
-	case d.Verdict == VerdictSnooze:
-		return ""
-	case d.NativeResume == "pending":
-		return "completed"
-	}
-	return d.NativeResume
 }
 
 // errNoAuthorizer refuses work when the caller wired no authorization.
