@@ -560,7 +560,7 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 	case ResourcePresent:
 		// Only this target's open conditions are resolved; others stay.
 		if slices.ContainsFunc(slices.Collect(maps.Values(job.Exceptions)), func(e *Exception) bool {
-			return e.ResolvedAt == nil && e.Scope == "" && e.Target == key
+			return e.ResolvedAt == nil && e.Scope == "" && s.exceptionTarget(ctx, e) == key
 		}) {
 			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence, Target: key}, by, c)
 		}
@@ -664,15 +664,46 @@ func (s *Store) observe(ctx context.Context, job *Job, d *ResourceDisposition, o
 		if err := inCommit(tx); err != nil {
 			return err
 		}
-		return tx.Observe(o)
+		if err := tx.Observe(o); err != nil {
+			return err
+		}
+		// The result is the availability the job ended with (another
+		// condition may still hold it), in the reply and in the record a
+		// replay reads.
+		d.Detail = string(tx.Job.Availability.State)
+		if n := len(tx.Job.AppliedResourceEvents); n > 0 {
+			if last := &tx.Job.AppliedResourceEvents[n-1]; last.EventID == c.eventID && last.Key == c.key {
+				last.Disposition.Detail = d.Detail
+			}
+		}
+		return nil
 	}); err != nil {
 		if ErrorCode(err) == CodeNotPermitted {
 			return nil, nil
 		}
 		return nil, err
 	}
-	d.Outcome, d.Detail = OutcomeAvailability, string(o.State)
 	return d, nil
+}
+
+// exceptionTarget is the key of the target whose resource event opened e, or
+// empty. Exceptions recorded before they carried their target are matched
+// through the resource event named in their evidence; exceptions of other
+// kinds (a worker, a login) never belong to a target.
+func (s *Store) exceptionTarget(ctx context.Context, e *Exception) string {
+	if e.Target != "" || !strings.HasPrefix(e.Kind, "target_") {
+		return e.Target
+	}
+	for _, ev := range e.Evidence {
+		id, ok := strings.CutPrefix(ev, "resource_event:")
+		if !ok {
+			continue
+		}
+		if saved, err := s.GetResourceEvent(ctx, id); err == nil {
+			return TargetKey(saved.Target)
+		}
+	}
+	return ""
 }
 
 func describeTarget(t Target) string {

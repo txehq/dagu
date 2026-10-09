@@ -302,7 +302,7 @@ func (tx *JobTx) Observe(o Observation) error {
 		// One target recovered: only its exceptions are resolved, and the
 		// job stays unavailable while any other condition is open.
 		for _, e := range j.Exceptions {
-			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" && e.Target == o.Target {
+			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" && tx.store.exceptionTarget(tx.ctx, e) == o.Target {
 				e.ResolvedAt = &now
 			}
 		}
