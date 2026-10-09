@@ -114,6 +114,16 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
 		return nil, err
 	}
+	svc := a.txeDecisionService(store)
+	// An identical replay returns the stored decision before the run's
+	// current state is checked: after the retry ran, the run is no longer
+	// retryable, but a client recovering a lost response must still get it.
+	if res, found, err := svc.ReplayRetry(ctx, req.JobId, req.RunId, body.IdempotencyKey, actor); found || err != nil {
+		if err != nil {
+			return nil, txeError(err)
+		}
+		return txeRetryResponse(res)
+	}
 	run, err := a.txeRunFacts(ctx, req.JobId, req.RunId)
 	if err != nil {
 		return nil, err
@@ -125,7 +135,6 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 			Message: "the run's DAG snapshot differs from the one in the request",
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
-	svc := a.txeDecisionService(store)
 	res, err := svc.RequestRetry(ctx, req.JobId, decision.RetryRequest{
 		RunID:              req.RunId,
 		ExpectedJobVersion: body.ExpectedJobVersion,
@@ -139,7 +148,12 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 		}
 		return nil, txeError(err)
 	}
+	return txeRetryResponse(res)
+}
+
+func txeRetryResponse(res *decision.Result) (api.RequestTxeRunRetryResponseObject, error) {
 	out := api.RequestTxeRunRetry200JSONResponse{Replayed: res.AlreadyRecorded}
+	var err error
 	if out.Decision, err = txeConvert[api.TxeDecision](res.Decision); err != nil {
 		return nil, err
 	}
