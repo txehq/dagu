@@ -21,6 +21,10 @@ import (
 
 // queuedAtFixture runs a DAG on a worker whose step records the attempt ID
 // and the queue marker it sees, and fails until told otherwise.
+//
+// The worker is isolated: it has its own directories and no handle on the
+// hub's stores, as a worker on another machine has. What its steps see can
+// only have come with the task the coordinator dispatched.
 type queuedAtFixture struct {
 	f   *testFixture
 	dir string
@@ -47,7 +51,7 @@ env:
 steps:
   - name: record
     command: `+dir+`/record.sh ${context.attempt.id} ${context.attempt.queued_at}
-`)
+`, withIsolatedWorker())
 	t.Cleanup(f.cleanup)
 	require.NoError(t, f.enqueue())
 	f.waitForQueued()
@@ -110,15 +114,9 @@ func TestAttemptQueuedAt_QueuedRetry(t *testing.T) {
 	assert.Equal(t, first.stored.QueuedAt, first.inCommand, "the step's command saw another marker than the hub stores")
 	assert.Equal(t, first.stored.QueuedAt, first.inEnv, "the DAG's env saw another marker than the hub stores")
 
-	// The same attempt is queued again and executes with a new marker.
-	//
-	// The retry is queued only once the workers have let go of the run. The
-	// hub accepts a status report by attempt alone, so a last report of the
-	// failed execution that arrives after the retry was admitted puts the
-	// failed status back and the queued retry is dropped. Waiting here keeps
-	// that race, which is not this test's subject, out of it.
+	// The same attempt is queued again and executes with a new marker. The
+	// request is repeated only until the hub admits it, and never after.
 	require.NoError(t, os.WriteFile(filepath.Join(q.dir, "succeed"), nil, 0o600))
-	f.waitForRunReleasedFromWorkers(first.stored.DAGRunID, distrTestTimeout(20*time.Second))
 	require.Eventually(t, func() bool {
 		previous, err := f.latestStatus()
 		if err != nil {
