@@ -132,7 +132,10 @@ func mergeDAGRunLease(current, incoming dispatch.DAGRunLease) (dispatch.DAGRunLe
 		(current.WorkerID != "" && incoming.WorkerID != "" && current.WorkerID != incoming.WorkerID) ||
 		(current.ProfileName != "" && incoming.ProfileName != "" && current.ProfileName != incoming.ProfileName) ||
 		(current.ClaimToken != "" && incoming.ClaimToken != "" && current.ClaimToken != incoming.ClaimToken) ||
-		(current.WorkspaceBundleDigest != "" && incoming.WorkspaceBundleDigest != "" && current.WorkspaceBundleDigest != incoming.WorkspaceBundleDigest) {
+		(current.WorkspaceBundleDigest != "" && incoming.WorkspaceBundleDigest != "" && current.WorkspaceBundleDigest != incoming.WorkspaceBundleDigest) ||
+		// An empty marker names a direct-start execution, so markers are
+		// compared even when empty: a lease never changes execution in place.
+		current.ExecutionMarker != incoming.ExecutionMarker {
 		return dispatch.DAGRunLease{}, dispatch.ErrDAGRunLeaseConflict
 	}
 	if current.DAGRun == (ir.DAGRunRef{}) {

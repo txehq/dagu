@@ -64,13 +64,14 @@ func (r *DAGRunRepository) CreateAttempt(
 		return nil, dagrun.ErrDAGRunIDEmpty
 	}
 	attempt, err := r.store.CreateAttempt(ctx, DAGRunCreateAttemptRequest{
-		DAG:          dag,
-		RootDAGRun:   options.RootDAGRun,
-		Timestamp:    timestamp,
-		DAGRunID:     dagRunID,
-		AttemptID:    options.AttemptID,
-		Retry:        options.Retry,
-		ExpectLatest: options.ExpectLatest,
+		DAG:              dag,
+		RootDAGRun:       options.RootDAGRun,
+		Timestamp:        timestamp,
+		DAGRunID:         dagRunID,
+		AttemptID:        options.AttemptID,
+		Retry:            options.Retry,
+		ExpectLatest:     options.ExpectLatest,
+		TrackPreparation: options.TrackPreparation,
 	})
 	if err != nil {
 		return nil, err
@@ -174,13 +175,21 @@ func (r *DAGRunRepository) CompareAndSwapLatestAttemptStatus(
 		return nil, false, dagrun.ErrDAGRunIDEmpty
 	}
 
+	// A store that cannot retain refuses the swap when it would replace a
+	// finished execution; a waiting or running one has nothing to keep yet.
+	_, retains := r.store.(ExecutionRetainingStore)
+	retainUnsupported := options.RetainBeforeSwap && !retains
 	status, swapped, err := r.store.CompareAndSwapLatestAttemptStatus(ctx, DAGRunCompareAndSwapStatusRequest{
+		RetainBeforeSwap:   options.RetainBeforeSwap && retains,
 		DAGRun:             dagRun,
 		RootDAGRun:         root,
 		ExpectedAttemptID:  expectedAttemptID,
 		ExpectedAttemptKey: options.ExpectedAttemptKey,
 		ExpectedStatus:     expectedStatus,
 		Mutate: func(status *ir.DAGRunStatus) error {
+			if retainUnsupported && !status.Status.IsActive() && status.Status != ir.NotStarted {
+				return ErrExecutionRetentionUnsupported
+			}
 			if err := mutate(status); err != nil {
 				return err
 			}
@@ -196,6 +205,26 @@ func (r *DAGRunRepository) CompareAndSwapLatestAttemptStatus(
 }
 
 // FindAttempt finds the latest visible attempt for a DAG run.
+// ListRetainedExecutions lists the executions of a root run that were
+// retained before a queued retry replaced them, oldest first.
+func (r *DAGRunRepository) ListRetainedExecutions(ctx context.Context, ref ir.DAGRunRef) ([]RetainedExecution, error) {
+	store, ok := r.store.(ExecutionRetainingStore)
+	if !ok {
+		return nil, ErrExecutionRetentionUnsupported
+	}
+	return store.ListRetainedExecutions(ctx, ref, ref)
+}
+
+// ReadRetainedExecutionFile reads one file of a retained execution of a
+// root run: "status.json" or a log name listed in its files.
+func (r *DAGRunRepository) ReadRetainedExecutionFile(ctx context.Context, ref ir.DAGRunRef, executionRef, name string) ([]byte, error) {
+	store, ok := r.store.(ExecutionRetainingStore)
+	if !ok {
+		return nil, ErrExecutionRetentionUnsupported
+	}
+	return store.ReadRetainedExecutionFile(ctx, ref, ref, executionRef, name)
+}
+
 func (r *DAGRunRepository) FindAttempt(ctx context.Context, ref ir.DAGRunRef) (dagrun.Attempt, error) {
 	if ref.ID == "" {
 		return nil, dagrun.ErrDAGRunIDEmpty

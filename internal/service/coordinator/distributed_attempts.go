@@ -207,14 +207,17 @@ func (o *attemptOwnership) leaseInactive(ctx context.Context, attemptKey string)
 	}
 }
 
+// syncFromStatus records an accepted report. executionMarker is the reporting
+// execution's marker, used only when no lease or active-run record holds one.
 func (o *attemptOwnership) syncFromStatus(
 	ctx context.Context,
 	workerID string,
 	status *ir.DAGRunStatus,
 	fallbackAttemptID string,
+	executionMarker string,
 ) {
-	o.syncLeaseFromStatus(ctx, workerID, status, fallbackAttemptID)
-	o.syncActiveRunFromStatus(ctx, workerID, status, fallbackAttemptID)
+	o.syncLeaseFromStatus(ctx, workerID, status, fallbackAttemptID, executionMarker)
+	o.syncActiveRunFromStatus(ctx, workerID, status, fallbackAttemptID, executionMarker)
 }
 
 func (o *attemptOwnership) syncLeaseFromStatus(
@@ -222,6 +225,7 @@ func (o *attemptOwnership) syncLeaseFromStatus(
 	workerID string,
 	status *ir.DAGRunStatus,
 	fallbackAttemptID string,
+	executionMarker string,
 ) {
 	if o.leaseStore == nil || status == nil {
 		return
@@ -229,7 +233,7 @@ func (o *attemptOwnership) syncLeaseFromStatus(
 
 	switch status.Status {
 	case ir.Running, ir.NotStarted, ir.Queued:
-		o.upsertLeaseFromStatus(ctx, workerID, status, fallbackAttemptID)
+		o.upsertLeaseFromStatus(ctx, workerID, status, fallbackAttemptID, executionMarker)
 	case ir.Failed, ir.Aborted, ir.Succeeded,
 		ir.PartiallySucceeded, ir.Waiting, ir.Rejected:
 		attemptKey := dispatch.AttemptKeyForStatus(status, fallbackAttemptID)
@@ -250,6 +254,7 @@ func (o *attemptOwnership) upsertLeaseFromStatus(
 	workerID string,
 	status *ir.DAGRunStatus,
 	fallbackAttemptID string,
+	fallbackMarker string,
 ) {
 	if o.leaseStore == nil || status == nil {
 		return
@@ -296,6 +301,7 @@ func (o *attemptOwnership) upsertLeaseFromStatus(
 		QueueName:       queueName,
 		WorkerID:        workerID,
 		Owner:           o.owner,
+		ExecutionMarker: o.executionMarker(ctx, attemptKey, fallbackMarker),
 		ClaimedAt:       now.UnixMilli(),
 		LastHeartbeatAt: now.UnixMilli(),
 	}
@@ -320,6 +326,25 @@ func (o *attemptOwnership) upsertLeaseFromStatus(
 	}
 }
 
+// executionMarker returns the execution marker recorded for an attempt key: the
+// lease's, else the active-run record's, both written from the claimed task. A
+// status carries no trustworthy marker of its own (a direct retry echoes the
+// previous attempt's queued-at), so fallback is used only when neither record
+// exists, and a wrong fallback can only refuse later writes, never admit them.
+func (o *attemptOwnership) executionMarker(ctx context.Context, attemptKey, fallback string) string {
+	if o.leaseStore != nil {
+		if lease, err := o.leaseStore.Get(ctx, attemptKey); err == nil && lease != nil {
+			return lease.ExecutionMarker
+		}
+	}
+	if o.activeRunStore != nil {
+		if record, err := o.activeRunStore.Get(ctx, attemptKey); err == nil && record != nil {
+			return record.ExecutionMarker
+		}
+	}
+	return fallback
+}
+
 func (o *attemptOwnership) restoreConfirmedFromStatus(
 	ctx context.Context,
 	workerID string,
@@ -330,10 +355,12 @@ func (o *attemptOwnership) restoreConfirmedFromStatus(
 		return
 	}
 
+	// No request names the execution here. A queued dispatch's status echoes
+	// its queued-at, which is that execution's marker.
 	switch status.Status {
 	case ir.Running, ir.NotStarted, ir.Queued:
-		o.upsertLeaseFromStatus(ctx, workerID, status, fallbackAttemptID)
-		o.upsertActiveFromStatus(ctx, status, workerID, fallbackAttemptID)
+		o.upsertLeaseFromStatus(ctx, workerID, status, fallbackAttemptID, status.QueuedAt)
+		o.upsertActiveFromStatus(ctx, status, workerID, fallbackAttemptID, status.QueuedAt)
 	case ir.Failed, ir.Aborted, ir.Succeeded,
 		ir.PartiallySucceeded, ir.Waiting, ir.Rejected:
 	}
@@ -344,6 +371,7 @@ func (o *attemptOwnership) syncActiveRunFromStatus(
 	workerID string,
 	status *ir.DAGRunStatus,
 	fallbackAttemptID string,
+	executionMarker string,
 ) {
 	if o.activeRunStore == nil || status == nil {
 		return
@@ -356,7 +384,7 @@ func (o *attemptOwnership) syncActiveRunFromStatus(
 
 	switch status.Status {
 	case ir.Running, ir.NotStarted, ir.Queued:
-		o.upsertActiveFromStatus(ctx, status, workerID, fallbackAttemptID)
+		o.upsertActiveFromStatus(ctx, status, workerID, fallbackAttemptID, executionMarker)
 	case ir.Failed, ir.Aborted, ir.Succeeded,
 		ir.PartiallySucceeded, ir.Waiting, ir.Rejected:
 		if err := o.activeRunStore.Delete(ctx, attemptKey); err != nil {
@@ -374,6 +402,7 @@ func (o *attemptOwnership) upsertActiveFromStatus(
 	runStatus *ir.DAGRunStatus,
 	workerID string,
 	fallbackAttemptID string,
+	fallbackMarker string,
 ) {
 	if o.activeRunStore == nil || runStatus == nil {
 		return
@@ -396,13 +425,14 @@ func (o *attemptOwnership) upsertActiveFromStatus(
 	}
 
 	record := dispatch.ActiveDistributedRun{
-		AttemptKey: attemptKey,
-		DAGRun:     runStatus.DAGRun(),
-		Root:       runStatus.Root,
-		AttemptID:  attemptID,
-		WorkerID:   workerID,
-		Status:     runStatus.Status,
-		UpdatedAt:  o.now().UnixMilli(),
+		AttemptKey:      attemptKey,
+		DAGRun:          runStatus.DAGRun(),
+		Root:            runStatus.Root,
+		AttemptID:       attemptID,
+		WorkerID:        workerID,
+		Status:          runStatus.Status,
+		ExecutionMarker: o.executionMarker(ctx, attemptKey, fallbackMarker),
+		UpdatedAt:       o.now().UnixMilli(),
 	}
 	if err := o.activeRunStore.Upsert(ctx, record); err != nil {
 		logger.Warn(ctx, "Failed to upsert active distributed run",
@@ -450,11 +480,12 @@ func (o *attemptOwnership) upsertActiveFromTask(
 			Name: task.Target,
 			ID:   task.DagRunId,
 		},
-		Root:      root,
-		AttemptID: task.AttemptId,
-		WorkerID:  workerID,
-		Status:    ir.Queued,
-		UpdatedAt: now.UnixMilli(),
+		Root:            root,
+		AttemptID:       task.AttemptId,
+		WorkerID:        workerID,
+		Status:          ir.Queued,
+		ExecutionMarker: task.ExecutionMarker,
+		UpdatedAt:       now.UnixMilli(),
 	}
 	if err := o.activeRunStore.Upsert(ctx, record); err != nil {
 		logger.Warn(ctx, "Failed to upsert active distributed run from task claim",
@@ -500,6 +531,7 @@ func (o *attemptOwnership) leaseFromTask(
 		Owner:                 owner,
 		ClaimToken:            task.ClaimToken,
 		WorkspaceBundleDigest: task.WorkspaceBundleDigest,
+		ExecutionMarker:       task.ExecutionMarker,
 		ClaimedAt:             now.UnixMilli(),
 		LastHeartbeatAt:       now.UnixMilli(),
 	}

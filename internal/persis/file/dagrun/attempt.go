@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/artifact"
+	"github.com/gofrs/flock"
 )
 
 // Error definitions for common issues
@@ -187,7 +189,7 @@ func (att *Attempt) Open(ctx context.Context) error {
 	logger.Debug(ctx, "Initializing status file",
 		tag.File(att.file))
 
-	writer := NewWriter(att.file)
+	writer := NewWriter(att.file, withFileLock(statusLockPath(att.file)))
 
 	if err := writer.Open(); err != nil {
 		return fmt.Errorf("failed to open writer: %w", err)
@@ -218,6 +220,57 @@ func (att *Attempt) Write(ctx context.Context, status ir.DAGRunStatus) error {
 		return fmt.Errorf("%w: %w", ErrWriteFailed, writeErr)
 	}
 
+	att.afterWriteLocked(ctx, status)
+	return nil
+}
+
+// WriteIfLatest implements dagrun.ConditionalWriter. The latest status is read
+// from the file under the status file's lock, which every append and every
+// compaction of the file holds, so no other write can land between the check
+// and the append.
+func (att *Attempt) WriteIfLatest(
+	ctx context.Context,
+	status ir.DAGRunStatus,
+	check func(latest *ir.DAGRunStatus) error,
+) error {
+	if att.isClosing.Load() {
+		return fmt.Errorf("cannot write while file is closing: %w", ErrStatusFileNotOpen)
+	}
+
+	att.mu.Lock()
+	defer att.mu.Unlock()
+
+	if att.writer == nil {
+		return fmt.Errorf("status file not open: %w", ErrStatusFileNotOpen)
+	}
+
+	ir.NormalizeDAGRunConditions(&status)
+
+	var checkErr error
+	writeErr := att.writer.writeIf(status, func() error {
+		latest, err := parseLatestStatusFromTail(ctx, att.file)
+		if err != nil {
+			return fmt.Errorf("%w: read latest status: %w", ErrWriteFailed, err)
+		}
+		checkErr = check(latest)
+		return checkErr
+	})
+	if checkErr != nil {
+		return checkErr
+	}
+	if writeErr != nil {
+		if errors.Is(writeErr, ErrWriteFailed) {
+			return writeErr
+		}
+		return fmt.Errorf("%w: %w", ErrWriteFailed, writeErr)
+	}
+
+	att.afterWriteLocked(ctx, status)
+	return nil
+}
+
+// afterWriteLocked updates what a successful status append makes stale.
+func (att *Attempt) afterWriteLocked(ctx context.Context, status ir.DAGRunStatus) {
 	// Invalidate cache after successful write
 	if att.cache != nil {
 		att.cache.Invalidate(att.file)
@@ -237,8 +290,6 @@ func (att *Attempt) Write(ctx context.Context, status ir.DAGRunStatus) error {
 	if err := att.updateArtifactIndex(status); err != nil {
 		logger.Warn(ctx, "Failed to update DAG-run artifact index", tag.Error(err))
 	}
-
-	return nil
 }
 
 // updateArtifactIndex records a finished run in the artifact index.
@@ -346,7 +397,22 @@ func (att *Attempt) compactLocked(ctx context.Context) (retErr error) {
 		}()
 	}
 
+	// Hold the status file's lock from the read to the rename, the lock every
+	// append also holds, so no append from another handle or process can land
+	// in between and be dropped by the rename.
+	fileLock := flock.New(statusLockPath(att.file))
+	if err := fileLock.Lock(); err != nil {
+		return fmt.Errorf("%w: lock %s: %v", ErrCompactFailed, att.file, err)
+	}
+	defer func() {
+		_ = fileLock.Unlock()
+		_ = fileLock.Close()
+	}()
+
 	status, shouldCompact, err := att.statusForCompactionLocked(ctx)
+	if compactionReadHook != nil {
+		compactionReadHook(att.file)
+	}
 	if err == io.EOF {
 		return nil // Empty file, nothing to compact
 	}
@@ -409,6 +475,18 @@ func (att *Attempt) compactLocked(ctx context.Context) (retErr error) {
 	success = true
 	return nil
 }
+
+// statusLockSuffix names the lock file beside a status file. Appends and
+// compaction of the status file hold it exclusively.
+const statusLockSuffix = ".lock"
+
+func statusLockPath(statusFile string) string {
+	return statusFile + statusLockSuffix
+}
+
+// compactionReadHook, when set by a test, runs after compaction has read the
+// status file and before it replaces it.
+var compactionReadHook func(statusFile string)
 
 // statusForCompactionLocked reads the current file and reports whether a
 // replacement would change its compacted contents.
@@ -551,6 +629,111 @@ func parseStatusFileWithContext(ctx context.Context, file string) (*ir.DAGRunSta
 				result = status
 			}
 		}
+	}
+}
+
+// statusTailChunk is how much of a status file parseLatestStatusFromTail reads
+// at a time, backwards from the end.
+const statusTailChunk = 64 << 10
+
+// statusTailBytesRead, when set by a test, receives the number of bytes
+// parseLatestStatusFromTail read.
+var statusTailBytesRead func(n int64)
+
+// parseLatestStatusFromTail returns the last valid status in the file, as
+// parseStatusFileWithContext does, reading backwards from the end so that its
+// cost does not grow with the file's history. A final line without a newline
+// is incomplete and skipped, as are lines that do not decode. Each byte is
+// examined at most twice, once to find line boundaries and once to read a
+// candidate line, and only one candidate line is held in memory.
+func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStatus, error) {
+	f, err := openStatusFileWithRetry(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+
+	var read int64
+	defer func() {
+		if statusTailBytesRead != nil {
+			statusTailBytesRead(read)
+		}
+	}()
+
+	scanner := &statusTailScanner{
+		ctx:      ctx,
+		f:        f,
+		buf:      make([]byte, statusTailChunk),
+		bufStart: info.Size(),
+		read:     &read,
+	}
+	// end is the offset of the newline that terminates the candidate line;
+	// anything after the last newline is an incomplete line and is skipped.
+	end, err := scanner.prevNewline()
+	for err == nil && end >= 0 {
+		var prev int64
+		prev, err = scanner.prevNewline()
+		if err != nil {
+			break
+		}
+		if n := end - (prev + 1); n > 0 {
+			line := make([]byte, n)
+			if _, err = f.ReadAt(line, prev+1); err != nil {
+				break
+			}
+			read += n
+			if status, decodeErr := ir.StatusFromJSON(string(line)); decodeErr == nil {
+				return status, nil
+			}
+		}
+		end = prev
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+	return nil, io.EOF
+}
+
+// statusTailScanner yields a file's newline offsets from the end backwards.
+// It keeps the chunk it last loaded and its position in it, so each byte of
+// the file is loaded and searched once however many lines are rejected.
+type statusTailScanner struct {
+	ctx      context.Context
+	f        *os.File
+	buf      []byte
+	bufStart int64 // file offset of buf[0]
+	cursor   int   // buf[:cursor] is not yet searched
+	read     *int64
+}
+
+// prevNewline returns the offset of the last newline before the scanner's
+// position and moves the position to it, or returns -1 at the file's start.
+func (s *statusTailScanner) prevNewline() (int64, error) {
+	for {
+		if err := s.ctx.Err(); err != nil {
+			return 0, err
+		}
+		if i := bytes.LastIndexByte(s.buf[:s.cursor], '\n'); i >= 0 {
+			s.cursor = i
+			return s.bufStart + int64(i), nil
+		}
+		if s.bufStart == 0 {
+			s.cursor = 0
+			return -1, nil
+		}
+		n := min(int64(len(s.buf)), s.bufStart)
+		s.bufStart -= n
+		if _, err := s.f.ReadAt(s.buf[:n], s.bufStart); err != nil {
+			return 0, err
+		}
+		*s.read += n
+		s.cursor = int(n)
 	}
 }
 

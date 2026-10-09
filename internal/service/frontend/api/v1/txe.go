@@ -4,14 +4,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"io"
 	"net/http"
 	"os"
@@ -20,6 +18,9 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -1363,4 +1364,192 @@ func txeArtifactDigest(archiveDir, relPath string) (string, bool, error) {
 		return "", false, err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), true, nil
+}
+
+func (a *API) ListTxeRunExecutions(ctx context.Context, req api.ListTxeRunExecutionsRequestObject) (api.ListTxeRunExecutionsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	retained, err := a.dagRunRepository.ListRetainedExecutions(ctx, ir.NewDAGRunRef(req.JobId, req.RunId))
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + req.JobId + " has no run " + req.RunId}
+		}
+		return nil, err
+	}
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	visible := make([]persis.RetainedExecution, 0, len(retained))
+	for _, e := range retained {
+		ok, err := a.txeRetainedVisible(ctx, run, e.Execution)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			visible = append(visible, e)
+		}
+	}
+	out, err := txeConvert[[]api.TxeRetainedExecution](visible)
+	if out == nil {
+		out = []api.TxeRetainedExecution{}
+	}
+	for i := range out {
+		if out[i].Files == nil {
+			out[i].Files = []api.TxeRetainedFile{}
+		}
+	}
+	return api.ListTxeRunExecutions200JSONResponse{Executions: out}, err
+}
+
+// txeRetainedVisible reports whether the caller can see the workspace a
+// retained execution ran in, read from that execution's own saved status
+// (as the native run endpoints do): a job that moved to another workspace
+// does not expose the runs it made in the one it left.
+func (a *API) txeRetainedVisible(ctx context.Context, run ir.DAGRunRef, executionRef string) (bool, error) {
+	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, run, executionRef, "status.json")
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	var status ir.DAGRunStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return false, nil
+	}
+	if err := a.requireDAGRunStatusVisible(ctx, &status); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (a *API) GetTxeRunExecutionFile(ctx context.Context, req api.GetTxeRunExecutionFileRequestObject) (api.GetTxeRunExecutionFileResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "no such retained file"}
+	switch ok, err := a.txeRetainedVisible(ctx, run, req.ExecutionRef); {
+	case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return nil, notFound
+	case err != nil:
+		return nil, err
+	case !ok:
+		return nil, notFound
+	}
+	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, run, req.ExecutionRef, req.Name)
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) || errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "no such retained file"}
+		}
+		return nil, err
+	}
+	return api.GetTxeRunExecutionFile200ApplicationoctetStreamResponse{Body: bytes.NewReader(data), ContentLength: int64(len(data))}, nil
+}
+
+func (a *API) ListTxeRunAbandonments(ctx context.Context, req api.ListTxeRunAbandonmentsRequestObject) (api.ListTxeRunAbandonmentsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + req.JobId + " has no run " + req.RunId}
+	// The run's own saved status decides its workspace, as for the run's
+	// other history.
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, run)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	results, err := a.dagRunRepository.ListAttemptAbandonmentsStrict(ctx, run, run)
+	switch {
+	case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return nil, notFound
+	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		// Not an empty history: without the capability nothing is known
+		// about abandoned preparations, so consumers must not infer one.
+		return nil, &Error{HTTPStatus: http.StatusNotImplemented, Code: api.ErrorCodeInternalError,
+			Message: "this hub's run store keeps no abandonment history; abandoned preparations are unknown",
+			Details: map[string]any{"code": "abandonment_history_unsupported"}}
+	case err != nil:
+		return nil, err
+	}
+	out := make([]api.TxeAbandonment, 0, len(results))
+	for _, r := range results {
+		entry, err := txeAbandonment(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entry)
+	}
+	return api.ListTxeRunAbandonments200JSONResponse{Abandonments: out}, nil
+}
+
+// txeAbandonment is one strict-listing result in the API's shape: the trusted
+// record, or the attempt and an error, never attributable.
+func txeAbandonment(r persis.AttemptAbandonmentResult) (api.TxeAbandonment, error) {
+	if r.Err != nil || r.Record == nil {
+		msg := "the abandonment record cannot be trusted"
+		if r.Err != nil {
+			msg += ": " + r.Err.Error()
+		}
+		return api.TxeAbandonment{AttemptId: r.AttemptID, Attributable: false, Error: &msg}, nil
+	}
+	rec := r.Record
+	identity := func(e *persis.ExecutionIdentity) map[string]any {
+		if e == nil {
+			return nil
+		}
+		return map[string]any{"attempt_id": e.AttemptID, "queued_at": e.QueuedAt}
+	}
+	m := map[string]any{
+		"attempt_id": r.AttemptID, "attributable": rec.Attributable(), "outcome": rec.Outcome,
+		"abandoned_execution": identity(&rec.AbandonedExecution), "predecessor_absent": rec.PredecessorAbsent,
+		"reason": rec.Reason, "detail": rec.Detail, "decided_at": rec.DecidedAt, "coordinator_id": rec.CoordinatorID,
+		"evidence": map[string]any{"dispatch_task": rec.Evidence.DispatchTask, "lease": rec.Evidence.Lease,
+			"active_run": rec.Evidence.ActiveRun, "worker": rec.Evidence.Worker, "observed_at": rec.Evidence.ObservedAt},
+	}
+	if rec.ExpectedExecution != nil {
+		m["expected_execution"] = identity(rec.ExpectedExecution)
+	}
+	if c := rec.RequestCorrelation; c != nil {
+		m["request_correlation"] = map[string]any{"id": c.ID, "action_id": c.ActionID, "action_attempt": c.ActionAttempt, "binding_digest": c.BindingDigest}
+	}
+	return txeConvert[api.TxeAbandonment](m)
 }
