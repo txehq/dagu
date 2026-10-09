@@ -8,6 +8,7 @@ package runcontrol
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -97,8 +98,14 @@ func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (reg
 	if id == "" {
 		id = attempt.ID()
 	}
+	snapshot, err := json.Marshal(status)
+	if err != nil {
+		return registry.RunAttempt{}, err
+	}
 	return registry.RunAttempt{
 		AttemptID:  id,
+		QueuedAt:   status.QueuedAt,
+		Snapshot:   snapshot,
 		SpecSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)),
 		Status:     status.Status.String(),
 		Finished:   !status.Status.IsActive() && status.Status != ir.NotStarted,

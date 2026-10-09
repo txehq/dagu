@@ -711,11 +711,14 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 	require.NoError(t, err)
 	runStatus := ir.InitialStatus(runDAG)
 	runStatus.DAGRunID, runStatus.AttemptID, runStatus.Status = "run-1", attempt.ID(), ir.Running
+	runStatus.QueuedAt = "2026-10-09T12:00:00.000000001Z"
 	require.NoError(t, attempt.Open(ctx))
 	require.NoError(t, attempt.Write(ctx, runStatus))
 	require.NoError(t, attempt.Close(ctx))
 
 	fixture := strings.ReplaceAll(`{
+  "attempt_id": "ATTEMPT",
+  "queued_at": "2026-10-09T12:00:00.000000001Z",
   "job_version": 1,
   "artifacts": [
     {"deliverable": "snapshot", "path": "snapshot.json",
@@ -728,6 +731,7 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
   ],
   "actor": {"kind": "cli", "id": "publish", "machine_id": "MACHINE", "client": "dagu test"}
 }`, "MACHINE", f.machine)
+	fixture = strings.ReplaceAll(fixture, "ATTEMPT", attempt.ID())
 	var body apigen.TxeArtifactManifestRequest
 	require.NoError(t, json.Unmarshal([]byte(fixture), &body))
 	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-2", Body: &body})
@@ -751,8 +755,20 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 
 	got, err := a.GetTxeRunArtifacts(ctx, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
 	require.NoError(t, err)
-	assert.Equal(t, apigen.TxeArtifactStatusPendingUpload, got.(apigen.GetTxeRunArtifacts200JSONResponse).Artifacts[0].Status,
-		"a run the hub does not know is left unchecked, not failed")
+	read := got.(apigen.GetTxeRunArtifacts200JSONResponse)
+	assert.Equal(t, apigen.TxeArtifactStatusPendingUpload, read.Artifacts[0].Status,
+		"a running attempt's hub copy that has not arrived stays pending")
+	assert.Equal(t, attempt.ID(), read.AttemptId)
+	execution := registry.ExecutionRef(attempt.ID(), "2026-10-09T12:00:00.000000001Z")
+	assert.Equal(t, execution, read.Execution)
+	require.NotNil(t, read.Executions)
+	assert.Equal(t, []string{execution}, *read.Executions)
+
+	// A publish naming an earlier execution of the run is late and refused.
+	late := body
+	late.QueuedAt = "2026-10-09T11:00:00Z"
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &late})
+	requireStatus(t, err, http.StatusConflict)
 	job, err := a.GetTxeJob(ctx, apigen.GetTxeJobRequestObject{JobId: jobID})
 	require.NoError(t, err)
 	exceptions := job.(apigen.GetTxeJob200JSONResponse).Exceptions
