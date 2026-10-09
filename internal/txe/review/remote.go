@@ -70,11 +70,12 @@ func (r *Remote) actor() *api.TxeActor {
 }
 
 func jobPath(jobID string, rest ...string) string {
-	p := "/txe/jobs/" + url.PathEscape(jobID)
+	var p strings.Builder
+	p.WriteString("/txe/jobs/" + url.PathEscape(jobID))
 	for _, part := range rest {
-		p += "/" + url.PathEscape(part)
+		p.WriteString("/" + url.PathEscape(part))
 	}
-	return p
+	return p.String()
 }
 
 // refusal maps the registry's reason for a refusal onto the reviewer's
@@ -814,7 +815,9 @@ func RemoteEnqueue(t Transport) EnqueueFunc {
 		body := map[string]any{"dagRunId": runID, "params": joined}
 		err := t.Do(ctx, http.MethodPost, "/dags/"+url.PathEscape(dag)+"/enqueue", body, nil)
 		var te *TransportError
-		if errors.As(err, &te) && te.Status == http.StatusConflict {
+		// The service reports a taken run id as a conflict or, on some
+		// paths, as a plain error whose message says so.
+		if errors.As(err, &te) && (te.Status == http.StatusConflict || strings.Contains(te.Message, "already exists")) {
 			return ErrRunExists
 		}
 		return err

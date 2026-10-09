@@ -105,8 +105,6 @@ func (r *runsRemote) RunsAfter(_ context.Context, _ string, cursor string) ([]re
 	return r.runs[start:], nil
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func newRemoteFixture(t *testing.T) *remoteFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -158,10 +156,10 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 			Dag:     apigen.TxeDAGRef{Spec: spec},
 			Targets: &[]apigen.TxeTarget{target},
 			ReviewPolicy: &apigen.TxeReviewPolicy{
-				Brief: ptr("Check usage."), Cadence: ptr("1h"), MaxAttempts: ptr(2),
+				Brief: new("Check usage."), Cadence: new("1h"), MaxAttempts: new(2),
 				PermittedActions: &[]apigen.TxePermittedAction{
-					{Name: "collect_diagnostics", Routine: true, Command: ptr("true"), Idempotency: &readOnly, TimeoutSec: 30},
-					{Name: "expand_volume", Routine: false, Command: ptr("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
+					{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30},
+					{Name: "expand_volume", Routine: false, Command: new("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
 				},
 			},
 		},
@@ -180,8 +178,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 
 func writeAPIError(w http.ResponseWriter, _ *http.Request, err error) {
 	status, body := http.StatusInternalServerError, map[string]any{"message": err.Error()}
-	var apiErr *apiv1.Error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*apiv1.Error](err); ok {
 		status = apiErr.HTTPStatus
 		body["code"], body["message"], body["details"] = apiErr.Code, apiErr.Message, apiErr.Details
 	}
@@ -338,4 +335,89 @@ func TestRemoteCrashLeavesTheActionInFlight(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, actions, 1)
 	assert.Equal(t, review.ActionExecuting, actions[0].State)
+}
+
+// stubTransport answers GET requests from canned JSON by path prefix.
+type stubTransport struct {
+	t       *testing.T
+	replies map[string]string
+	calls   []string
+	fail    map[string]*review.TransportError
+}
+
+func (s *stubTransport) Do(_ context.Context, method, path string, _, out any) error {
+	s.calls = append(s.calls, method+" "+path)
+	if e, ok := s.fail[path]; ok {
+		return e
+	}
+	raw, ok := s.replies[path]
+	if !ok {
+		return &review.TransportError{Status: http.StatusNotFound, Message: "no stub for " + path}
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal([]byte(raw), out)
+}
+
+// Run evidence comes from the service's run history: only finished runs
+// count, oldest finish first, across pages, starting after the cursor, with
+// outputs attached and a run without outputs kept on its status alone.
+func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
+	job := "job_01HZX0000000000000000000AA"
+	run := func(id, status, finished string) string {
+		return fmt.Sprintf(`{"dagRunId":%q,"name":%q,"statusLabel":%q,"status":0,"startedAt":"2026-10-09T10:00:00Z","finishedAt":%q,"artifactsAvailable":false,"autoRetryCount":0}`, id, job, status, finished)
+	}
+	stub := &stubTransport{t: t, replies: map[string]string{
+		"/dag-runs/" + job + "?limit=100": `{"dagRuns":[` +
+			run("r3", "failed", "2026-10-09T10:03:00Z") + "," +
+			run("r-running", "running", "") + "," +
+			run("r1", "succeeded", "2026-10-09T10:01:00Z") + `],"nextCursor":"p2"}`,
+		"/dag-runs/" + job + "?cursor=p2&limit=100": `{"dagRuns":[` +
+			run("r2", "succeeded", "2026-10-09T10:02:00Z") + "," +
+			run("r-queued", "queued", "") + `]}`,
+		"/dag-runs/" + job + "/r2/outputs": `{"metadata":{},"outputs":{"free_pct":"31"}}`,
+	}}
+	remote := &review.Remote{Transport: stub}
+
+	runs, err := remote.RunsAfter(context.Background(), job, "r1")
+	require.NoError(t, err)
+	require.Len(t, runs, 2)
+	assert.Equal(t, "r2", runs[0].RunID)
+	assert.Equal(t, map[string]string{"free_pct": "31"}, runs[0].Outputs)
+	assert.Equal(t, "r3", runs[1].RunID)
+	assert.Equal(t, "failed", runs[1].Status)
+	assert.Empty(t, runs[1].Outputs, "a run with no outputs is still evidence")
+	assert.False(t, runs[0].FinishedAt.IsZero())
+
+	all, err := remote.RunsAfter(context.Background(), job, "")
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	assert.Equal(t, "r1", all[0].RunID)
+
+	// A failure to read outputs that is not "none exist" fails the read:
+	// evidence is not silently dropped.
+	stub.fail = map[string]*review.TransportError{
+		"/dag-runs/" + job + "/r2/outputs": {Status: http.StatusBadGateway, Message: "hub unreachable"},
+	}
+	_, err = remote.RunsAfter(context.Background(), job, "r1")
+	require.ErrorContains(t, err, "outputs of run r2")
+}
+
+// Opening a decision enqueues one run with the derived run id, and a
+// conflict on that id means it was already opened.
+func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
+	stub := &stubTransport{t: t, replies: map[string]string{"/dags/txe-decide-X/enqueue": `{}`}}
+	enqueue := review.RemoteEnqueue(stub)
+	require.NoError(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", map[string]string{"PROPOSAL_ID": "prp_1", "JOB_ID": "job_A"}))
+	assert.Equal(t, []string{"POST /dags/txe-decide-X/enqueue"}, stub.calls)
+
+	stub.fail = map[string]*review.TransportError{"/dags/txe-decide-X/enqueue": {Status: http.StatusConflict}}
+	require.ErrorIs(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil), review.ErrRunExists)
+
+	stub.fail = map[string]*review.TransportError{"/dags/txe-decide-X/enqueue": {Status: http.StatusInternalServerError, Message: `DAG "txe-decide-X" with ID "txe-abc" already exists`}}
+	require.ErrorIs(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil), review.ErrRunExists)
+
+	stub.fail = map[string]*review.TransportError{"/dags/txe-decide-X/enqueue": {Status: http.StatusBadGateway}}
+	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
