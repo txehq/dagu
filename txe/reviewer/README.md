@@ -58,17 +58,21 @@ else a review step needs must be rendered into the DAG:
 
 A job's declared action and reconcile commands are started from the review
 step, and do not inherit what is the reviewer's own. Removed before the
-command starts: every `DAGU_*` variable (the hub client's context and the
-service's settings), every `TXE_*` variable of the review, and the agent's
-profile and keys (`CLAUDE_*`, `ANTHROPIC_*`, `CODEX_*`, `OPENAI_*`). Added
-back: `TXE_DAGU_REVIEWER=1`, so the command cannot register work either, and
-the action's own variables (`TXE_JOB_ID`, `TXE_OWNER_ID`, `TXE_ACTION_ID`,
-`TXE_ACTION_NAME`, `TXE_TARGET_ID`, `TXE_IDEMPOTENCY_KEY`,
-`TXE_PARAM_<NAME>`). Everything else the step has is inherited, so what a
-job's command needs to reach its resources (for example `KUBECONFIG`) is
-rendered into the DAG like any other variable and reaches it; a variable
-with one of the removed prefixes cannot be given to a job's command this
-way.
+command starts: every `DAGU_*` and `TXE_DAGU_*` variable (the hub client's
+context and the service's settings), the review's own variables
+(`TXE_PACKET`, `TXE_DECISION`, `TXE_PROPOSAL_ID`, `TXE_DECISION_ID`, and
+every `TXE_PARAM_*`, which could otherwise pass for a parameter of the
+action), and the agent's profile and keys (`CLAUDE_*`, `ANTHROPIC_*`,
+`CODEX_*`, `OPENAI_*`). Kept: `TXE_DAGU_REVIEWER=1`, so the command cannot
+register work either. Set afresh for each command: the action's own
+variables (`TXE_JOB_ID`, `TXE_OWNER_ID`, `TXE_ACTION_ID`, `TXE_ACTION_NAME`,
+`TXE_TARGET_ID`, `TXE_IDEMPOTENCY_KEY`, `TXE_PARAM_<NAME>`). Everything else
+the step has is inherited, so what a job's command needs to reach its
+resources is rendered into the DAG like any other variable and reaches it:
+`KUBECONFIG`, and the credential references a job declares, which have
+`TXE_` names of their own (`TXE_KUBECONFIG`, `TXE_KUBE_CONTEXT`). A variable
+with one of the removed names or prefixes cannot be given to a job's command
+this way.
 
 This removes accidental inheritance. It is not isolation: the command runs
 as the same operating-system user as the reviewer and can read the same

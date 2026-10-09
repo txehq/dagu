@@ -167,19 +167,23 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 // Otherwise the command inherits this process's environment, which is the
 // reviewer step's, minus what belongs to the reviewer and not to the job:
 //
-//   - the hub client's and the service's own settings (DAGU_*): the context
-//     and credentials the reviewer writes to the registry with;
-//   - the review's own variables (TXE_*): the packet, the decision, and
-//     anything that would otherwise pass for one of the action's parameters.
-//     The action's own TXE_ variables are added by the caller, and the
-//     marker that stops a job from registering work under a review is kept;
+//   - the hub client's and the service's own settings (DAGU_* and
+//     TXE_DAGU_*): the context and credentials the reviewer writes to the
+//     registry with. The marker that stops a job from registering work
+//     under a review is kept;
+//   - the review's own variables: the packet, the decision, the ids the
+//     decision run passes to its step, and anything named like a parameter
+//     of an action (TXE_PARAM_*), which would otherwise pass for one. The
+//     action's own variables are added by the caller;
 //   - the agent's profile and keys (CLAUDE_*, ANTHROPIC_*, CODEX_*,
 //     OPENAI_*): the login the review agent runs under.
 //
-// Everything else is inherited, including what a job's command needs to
-// reach its own resources (PATH, HOME, KUBECONFIG, cloud credentials the
-// machine provides). This removes accidental inheritance only. It is not
-// isolation: the command runs as the same user and can read the same files.
+// Everything else is inherited. That includes what a job's command needs to
+// reach its own resources, among it the credential references a job
+// declares, which have TXE_ names of their own (TXE_KUBECONFIG,
+// TXE_KUBE_CONTEXT): the TXE_ prefix as a whole is deliberately not removed.
+// This removes accidental inheritance only. It is not isolation: the
+// command runs as the same user and can read the same files.
 func (e *CommandEffector) baseEnv() []string {
 	if e.Env != nil {
 		return append([]string(nil), e.Env...)
@@ -188,8 +192,17 @@ func (e *CommandEffector) baseEnv() []string {
 }
 
 // reviewerEnvPrefixes are the variable name prefixes that belong to the
-// reviewer, the service it talks to, or the agent it runs.
-var reviewerEnvPrefixes = []string{"DAGU_", "TXE_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
+// reviewer, the service it talks to, the agent it runs, or the review.
+var reviewerEnvPrefixes = []string{"DAGU_", "TXE_DAGU_", "TXE_PARAM_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
+
+// reviewerEnvNames are the review's own variables that have no prefix of
+// their own: what the rendered DAGs hand from one step to the next, and the
+// action's identity, which the caller sets afresh for each command.
+var reviewerEnvNames = map[string]bool{
+	"TXE_PACKET": true, "TXE_DECISION": true, "TXE_PROPOSAL_ID": true, "TXE_DECISION_ID": true,
+	"TXE_JOB_ID": true, "TXE_OWNER_ID": true, "TXE_ACTION_ID": true, "TXE_ACTION_NAME": true,
+	"TXE_TARGET_ID": true, "TXE_IDEMPOTENCY_KEY": true,
+}
 
 // jobEnv returns env without the reviewer's own variables.
 func jobEnv(env []string) []string {
@@ -198,7 +211,7 @@ func jobEnv(env []string) []string {
 		name, _, _ := strings.Cut(entry, "=")
 		// Windows treats variable names without regard to case.
 		upper := strings.ToUpper(name)
-		if upper != ReviewerEnv && slices.ContainsFunc(reviewerEnvPrefixes, func(p string) bool { return strings.HasPrefix(upper, p) }) {
+		if upper != ReviewerEnv && (reviewerEnvNames[upper] || slices.ContainsFunc(reviewerEnvPrefixes, func(p string) bool { return strings.HasPrefix(upper, p) })) {
 			continue
 		}
 		out = append(out, entry)

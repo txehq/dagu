@@ -439,6 +439,12 @@ func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
 	t.Setenv(review.ReviewerEnv, "1")
 	t.Setenv("KUBECONFIG", "/job/kubeconfig")
 	t.Setenv("AWS_PROFILE", "job-profile")
+	// Credential references a job declares have TXE_ names of their own.
+	t.Setenv("TXE_KUBECONFIG", "/job/txe-kubeconfig")
+	t.Setenv("TXE_KUBE_CONTEXT", "job-context")
+	// Stale action identity from an enclosing step, and a mixed-case name.
+	t.Setenv("TXE_ACTION_ID", "act_stale")
+	t.Setenv("TXE_PROPOSAL_ID", "prp_of_the_decision_run")
 
 	seenBy := func(e *review.CommandEffector, run func(e *review.CommandEffector, job review.Job, declared review.DeclaredAction, action review.Action) review.EffectResult) map[string]string {
 		t.Helper()
@@ -475,6 +481,9 @@ func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
 			assert.Equal(t, "1", seen[review.ReviewerEnv], "a job's command still cannot register work under a review")
 			assert.Equal(t, "/job/kubeconfig", seen["KUBECONFIG"], "what the job needs to reach its resources is inherited")
 			assert.Equal(t, "job-profile", seen["AWS_PROFILE"])
+			assert.Equal(t, "/job/txe-kubeconfig", seen["TXE_KUBECONFIG"], "a credential reference the job declares is not the reviewer's")
+			assert.Equal(t, "job-context", seen["TXE_KUBE_CONTEXT"])
+			assert.NotContains(t, seen, "TXE_PROPOSAL_ID", "the decision run's own ids stay with the reviewer")
 			assert.NotEmpty(t, seen["PATH"])
 			assert.Equal(t, "job_A", seen["TXE_JOB_ID"])
 			assert.Equal(t, "act_1", seen["TXE_ACTION_ID"])
