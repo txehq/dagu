@@ -218,6 +218,10 @@ type RunEvidence struct {
 	// EvidenceTrimmed is true when this run's evidence was shortened to fit
 	// the packet: steps left out, or step output cut to its end.
 	EvidenceTrimmed bool `json:"evidence_trimmed,omitempty"`
+	// OmittedSteps counts, by status, the steps of this run that are not in
+	// Steps. What was left out is always stated, so a step that did not
+	// succeed is never missing without the evidence saying so.
+	OmittedSteps map[string]int `json:"omitted_steps,omitempty"`
 	// Cursor is the checkpoint's run cursor once this run, and every run
 	// listed before it, has been covered, for a registry that keeps its
 	// place in the run history that way. A run without one is its own

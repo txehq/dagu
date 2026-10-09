@@ -115,8 +115,10 @@ else a review step needs must be rendered into the DAG:
   the output of another. No review names it, so the next review meets the
   run's latest execution.
 - Evidence that does not fit is shortened, never dropped silently: a run
-  with more than 12 steps keeps the steps that did not succeed first and
-  then its last ones, and step output is cut to its end only when one run
+  with more than 12 steps keeps failed, aborted and rejected steps first
+  (the earliest of them always), then any other status that is not a plain
+  success, then steps that did not run, and successes last, and it states
+  by status how many steps it left out (`omitted_steps`), and step output is cut to its end only when one run
   alone is too large. Such a run is marked `evidence_trimmed`, the agent is
   told not to pass it on what it cannot see, and the review that covers it
   records it in `trimmed_executions`.

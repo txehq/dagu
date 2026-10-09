@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -164,7 +165,7 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 	for _, r := range runs {
 		r.Outputs = truncateOutputs(r.Outputs)
 		if len(r.Steps) > maxRunSteps {
-			r.Steps = boundSteps(r.Steps)
+			r.Steps, r.OmittedSteps = boundSteps(r.Steps)
 			r.EvidenceTrimmed, p.EvidenceTrimmed = true, true
 		}
 		p.NewRuns = append(p.NewRuns, r)
@@ -269,33 +270,72 @@ func (p *Packet) trim() {
 	}
 }
 
-// boundSteps keeps at most maxRunSteps of a run's steps, in their order.
-// Steps that did not succeed are kept first, the latest of them if there
-// are too many: a failure is never the evidence that is left out to make
-// room for steps that went well. The rest are the last steps of the run,
-// which are where it ended.
-func boundSteps(steps []StepEvidence) []StepEvidence {
+// boundSteps keeps at most maxRunSteps of a run's steps, in their order,
+// and counts by status the ones it leaves out.
+//
+// What is kept is chosen by what a review most needs to see, never by
+// position alone, so a job cannot push a failure out of view by adding
+// steps around it: failed, aborted and rejected steps first, the earliest
+// of them always, since that is usually where the run went wrong, then the
+// latest; next every status that is neither a plain success nor a step
+// that did not run, which includes any status this code does not know;
+// then steps that did not run; and steps that succeeded last. Within a
+// class the latest steps are kept, which are where the run ended.
+func boundSteps(steps []StepEvidence) (kept []StepEvidence, omitted map[string]int) {
 	keep := make([]bool, len(steps))
 	left := maxRunSteps
-	for _, wantFailed := range []bool{true, false} {
-		for i := len(steps) - 1; i >= 0 && left > 0; i-- {
-			if !keep[i] && (steps[i].Status != stepSucceeded) == wantFailed {
-				keep[i] = true
-				left--
+	take := func(i int) {
+		if left > 0 && !keep[i] {
+			keep[i] = true
+			left--
+		}
+	}
+	for i, step := range steps {
+		if stepRank(step.Status) == 0 {
+			take(i)
+			break
+		}
+	}
+	for rank := 0; rank <= stepRankSucceeded; rank++ {
+		for i, step := range slices.Backward(steps) {
+			if stepRank(step.Status) == rank {
+				take(i)
 			}
 		}
 	}
-	out := make([]StepEvidence, 0, maxRunSteps)
+	kept = make([]StepEvidence, 0, maxRunSteps)
 	for i, step := range steps {
 		if keep[i] {
-			out = append(out, step)
+			kept = append(kept, step)
+			continue
 		}
+		if omitted == nil {
+			omitted = map[string]int{}
+		}
+		omitted[step.Status]++
 	}
-	return out
+	return kept, omitted
 }
 
-// stepSucceeded is the service's status of a step that went well.
-const stepSucceeded = "succeeded"
+// stepRankSucceeded is the rank of a step that simply succeeded: the last
+// to be kept.
+const stepRankSucceeded = 3
+
+// stepRank orders step statuses by how much a review needs to see them;
+// lower is kept first. A status that is not listed is ranked with the ones
+// that need attention, not with the harmless ones.
+func stepRank(status string) int {
+	switch status {
+	case "failed", "aborted", "rejected":
+		return 0
+	case "skipped", "not_started":
+		return 2
+	case "succeeded":
+		return stepRankSucceeded
+	default:
+		return 1
+	}
+}
 
 // stepTailFloor is the least step output kept per stream when one run alone
 // exceeds the packet limit.

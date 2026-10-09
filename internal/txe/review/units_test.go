@@ -662,6 +662,7 @@ func TestTrimmedEvidenceKeepsFailuresAndIsOnTheRecord(t *testing.T) {
 	assert.Equal(t, []string{"step-01", "step-04"}, kept[:2], "the early failures are kept, in order")
 	assert.Equal(t, "step-29", kept[11], "the rest are the end of the run")
 	assert.True(t, run.EvidenceTrimmed)
+	assert.Equal(t, map[string]int{"succeeded": 18}, run.OmittedSteps, "what was left out is stated, by status")
 	assert.False(t, prepared.Packet.NewRuns[1].EvidenceTrimmed, "a run shown whole is not marked")
 	assert.True(t, prepared.Packet.EvidenceTrimmed)
 
@@ -670,6 +671,56 @@ func TestTrimmedEvidenceKeepsFailuresAndIsOnTheRecord(t *testing.T) {
 	first := "run-1@" + review.ExecutionRef("att-1", "")
 	assert.Contains(t, recorded.CoveredExecutions, first)
 	assert.Equal(t, []string{first}, recorded.TrimmedExecutions, "the record says which result was reviewed on part of its evidence")
+}
+
+// A job cannot bury a failure by surrounding it with steps of other
+// statuses. Steps that did not run, and steps with a status the reviewer
+// does not know, do not push a failed step out; with more failures than
+// fit, the first one stays and the count of the rest is stated.
+func TestTrimmedEvidenceCannotBeUsedToBuryAFailure(t *testing.T) {
+	names := func(steps []review.StepEvidence) []string {
+		var out []string
+		for _, s := range steps {
+			out = append(out, s.Name+":"+s.Status)
+		}
+		return out
+	}
+	packetRun := func(steps []review.StepEvidence) review.RunEvidence {
+		f := newFixture(t)
+		require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-1", Status: "failed", AttemptID: "att-1", Steps: steps}))
+		return f.prepare("reviewer-a").Packet.NewRuns[0]
+	}
+
+	// One early failure, then far more skipped and unknown-status steps
+	// than a packet carries.
+	steps := []review.StepEvidence{{Name: "root-cause", Status: "failed", Stderr: "disk full"}}
+	for i := range 20 {
+		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("skip-%02d", i), Status: "skipped"})
+	}
+	for i := range 20 {
+		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("odd-%02d", i), Status: "some_new_status"})
+	}
+	run := packetRun(steps)
+	require.Len(t, run.Steps, 12)
+	assert.Equal(t, "root-cause:failed", names(run.Steps)[0], "the failure is kept whatever follows it")
+	assert.Equal(t, "disk full", run.Steps[0].Stderr)
+	assert.Equal(t, map[string]int{"skipped": 20, "some_new_status": 9}, run.OmittedSteps,
+		"a status the reviewer does not know is kept before steps that did not run")
+
+	// More failures than fit: the first is kept, then the latest, and the
+	// evidence says how many failed steps it does not show.
+	steps = steps[:0]
+	for i := range 30 {
+		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("f-%02d", i), Status: "failed"})
+	}
+	steps = append(steps, review.StepEvidence{Name: "cleanup", Status: "succeeded"})
+	run = packetRun(steps)
+	got := names(run.Steps)
+	require.Len(t, got, 12)
+	assert.Equal(t, "f-00:failed", got[0], "the earliest failure, where the run first went wrong")
+	assert.Equal(t, "f-29:failed", got[11])
+	assert.Equal(t, map[string]int{"failed": 18, "succeeded": 1}, run.OmittedSteps)
+	assert.True(t, run.EvidenceTrimmed)
 }
 
 // A job whose scripts print a lot cannot blow up the packet, and cannot use
