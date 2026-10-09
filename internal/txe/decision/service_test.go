@@ -70,16 +70,17 @@ func (r *recordingTasks) Complete(_ context.Context, req humantask.CompleteReque
 }
 
 type fixture struct {
-	t        *testing.T
-	ctx      context.Context
-	store    *registry.Store
-	tasks    *recordingTasks
-	svc      *Service
-	now      time.Time
-	jobID    string
-	version  registry.JobVersion
-	proposal *registry.Proposal
-	human    registry.Actor
+	t         *testing.T
+	ctx       context.Context
+	store     *registry.Store
+	tasks     *recordingTasks
+	svc       *Service
+	now       time.Time
+	jobID     string
+	machineID string
+	version   registry.JobVersion
+	proposal  *registry.Proposal
+	human     registry.Actor
 }
 
 var (
@@ -140,7 +141,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	f := &fixture{
-		t: t, ctx: ctx, store: store, now: now, jobID: jobID, version: version,
+		t: t, ctx: ctx, store: store, now: now, jobID: jobID, machineID: machineID, version: version,
 		tasks: &recordingTasks{},
 		human: registry.Actor{Kind: registry.ActorHuman, ID: "connor", Client: "dashboard"},
 	}
@@ -179,7 +180,7 @@ func (f *fixture) fileProposal(action string, native bool) *registry.Proposal {
 			},
 		}
 		if native {
-			p.NativeTask = &registry.NativeTask{DAG: "txe-decide-m", RunID: "run-" + proposalID, StepID: "decide"}
+			p.NativeTask = &registry.NativeTask{DAG: DecideDAGName(f.machineID), RunID: "run-" + proposalID, StepID: DecideStepID}
 		}
 		filed, err = tx.PutProposal(claim.ClaimID, claim.Fence, p)
 		if err != nil {
@@ -377,5 +378,59 @@ func TestDecideSnooze(t *testing.T) {
 	if res.Proposal == nil || res.Proposal.State != registry.ProposalSnoozed ||
 		res.Proposal.SnoozeUntil == nil || !res.Proposal.SnoozeUntil.Equal(until) {
 		t.Fatalf("proposal = %+v, want snoozed until %s", res.Proposal, until)
+	}
+}
+
+// A reviewer-written locator must not let a decision complete another DAG's
+// human task with the deciding person's authority.
+func TestDecideRefusesForeignNativeTask(t *testing.T) {
+	f := newFixture(t)
+	for _, task := range []registry.NativeTask{
+		{DAG: "prod-release", RunID: "r1", StepID: DecideStepID},
+		{DAG: DecideDAGName(f.machineID), RunID: "r1", StepID: "approve_release"},
+	} {
+		f.setNativeTask(task)
+		_, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-foreign-"+task.StepID), f.human)
+		if registry.ErrorCode(err) != CodeNativeTaskRefused {
+			t.Fatalf("task %+v: err = %v, want native_task_refused", task, err)
+		}
+	}
+	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
+		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
+	}
+}
+
+func TestDecideRequiresTaskAuthorization(t *testing.T) {
+	f := newFixture(t)
+	denied := errors.New("no execute permission for the decide run")
+	var asked string
+	f.svc.AuthorizeTask = func(_ context.Context, dag, run string) error {
+		asked = dag + "/" + run
+		return denied
+	}
+	_, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-authz-01"), f.human)
+	if !errors.Is(err, denied) {
+		t.Fatalf("err = %v, want authorization error", err)
+	}
+	if want := f.proposal.NativeTask.DAG + "/" + f.proposal.NativeTask.RunID; asked != want {
+		t.Fatalf("authorized %q, want %q", asked, want)
+	}
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
+	}
+}
+
+// setNativeTask rewrites the proposal locator directly, as a faulty or
+// compromised reviewer could.
+func (f *fixture) setNativeTask(task registry.NativeTask) {
+	f.t.Helper()
+	_, err := f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
+		p := tx.Proposal(f.proposal.ProposalID)
+		p.NativeTask = &task
+		tx.Job.Proposals[p.ProposalID] = p
+		return nil
+	})
+	if err != nil {
+		f.t.Fatal(err)
 	}
 }

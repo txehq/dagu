@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/humantask"
@@ -21,6 +22,7 @@ const CodeIdempotencyMismatch registry.Code = "idempotency_mismatch"
 // Registry is the part of the TXE registry the service uses.
 type Registry interface {
 	WithJobTx(ctx context.Context, jobID string, actor registry.Actor, fn func(tx *registry.JobTx) error) (*registry.Job, error)
+	GetJob(ctx context.Context, jobID string) (*registry.Job, error)
 	ListDecisions(ctx context.Context, jobID string, limit int) ([]*registry.Decision, error)
 	ListArchivedProposals(ctx context.Context, jobID string, limit int) ([]*registry.Proposal, error)
 }
@@ -36,6 +38,41 @@ type RunRetrier interface {
 	RetryLatest(ctx context.Context, dagName string) (string, error)
 }
 
+// TaskAuthorizer applies the native authorization for completing the human
+// task of one DAG-run on behalf of the caller.
+type TaskAuthorizer func(ctx context.Context, dagName, dagRunID string) error
+
+// DecideStepID is the step of the per-proposal decide DAG that collects the
+// decision.
+const DecideStepID = "decide"
+
+// CodeNativeTaskRefused refuses a decision whose proposal points at a human
+// task other than its job's decide task.
+const CodeNativeTaskRefused registry.Code = "native_task_refused"
+
+// DecideDAGName is the decide DAG of a machine. Dagu limits DAG names to 39
+// characters, so the machine ID is used without its prefix.
+func DecideDAGName(machineID string) string {
+	return "txe-decide-" + strings.TrimPrefix(machineID, string(registry.PrefixMachine)+"_")
+}
+
+// checkNativeTask refuses a locator that does not name the job machine's
+// decide task. The locator is written by a reviewer, and completing it uses
+// the deciding person's authority, so it must never reach another DAG's
+// human task.
+func checkNativeTask(job *registry.Job, task *registry.NativeTask) error {
+	if task == nil {
+		return nil
+	}
+	if task.DAG != DecideDAGName(job.MachineID) || task.StepID != DecideStepID || task.RunID == "" {
+		return &registry.Error{
+			Code:    CodeNativeTaskRefused,
+			Message: fmt.Sprintf("native task %s/%s/%s is not the decide task of job %s", task.DAG, task.RunID, task.StepID, job.JobID),
+		}
+	}
+	return nil
+}
+
 // Service records decisions. The decision commit is authoritative: the native
 // human task is completed only after it, so a completed task always has a
 // durable decision, and a failed completion is retried by replaying the same
@@ -44,7 +81,10 @@ type Service struct {
 	Registry Registry
 	Tasks    TaskCompleter
 	Retrier  RunRetrier
-	Now      func() time.Time
+	// AuthorizeTask, when set, must allow completing the native task before
+	// any decision is recorded.
+	AuthorizeTask TaskAuthorizer
+	Now           func() time.Time
 }
 
 // Result is the outcome of one decision request.
@@ -82,6 +122,9 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		return nil, err
 	}
 	effect := EffectOf(req.Verdict)
+	if err := s.preflightNative(ctx, jobID, proposalID); err != nil {
+		return nil, err
+	}
 
 	var stored *registry.Decision
 	var replayID string
@@ -90,6 +133,11 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		if id, ok := tx.DecisionByKey(req.IdempotencyKey); ok {
 			replayID = id
 			return nil
+		}
+		if p := tx.Proposal(proposalID); p != nil {
+			if err := checkNativeTask(tx.Job, p.NativeTask); err != nil {
+				return err
+			}
 		}
 		d, err := tx.AppendDecision(registry.Decision{
 			DecisionID:       decisionID,
@@ -142,6 +190,26 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		}
 	}
 	return result, nil
+}
+
+// preflightNative checks the proposal's native task and the caller's right to
+// complete it before anything is recorded.
+func (s *Service) preflightNative(ctx context.Context, jobID, proposalID string) error {
+	job, err := s.Registry.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	task, err := s.nativeTask(ctx, job, proposalID)
+	if err != nil || task == nil {
+		return err
+	}
+	if err := checkNativeTask(job, task); err != nil {
+		return err
+	}
+	if s.AuthorizeTask != nil {
+		return s.AuthorizeTask(ctx, task.DAG, task.RunID)
+	}
+	return nil
 }
 
 func applyLifecycle(tx *registry.JobTx, op LifecycleOp, decisionID string) error {
@@ -213,6 +281,9 @@ func (s *Service) resumeNative(ctx context.Context, job *registry.Job, d *regist
 	}
 	if task == nil {
 		return fmt.Errorf("decision: proposal %s has no native task", d.ProposalID)
+	}
+	if err := checkNativeTask(job, task); err != nil {
+		return err
 	}
 	raw, err := json.Marshal(map[string]string{"decision_id": d.DecisionID, "verdict": string(d.Verdict)})
 	if err != nil {
