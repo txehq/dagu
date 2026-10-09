@@ -47,28 +47,39 @@ type ReconcileDAGConfig struct {
 var (
 	machineIDPattern = regexp.MustCompile(`^mch_[0-9A-HJKMNP-TV-Z]{26}$`)
 	envNamePattern   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-	// wordPattern keeps the binary and flags plain words, so they cannot
-	// carry shell syntax into the rendered command.
-	wordPattern     = regexp.MustCompile(`^[A-Za-z0-9_./=:@+-]+$`)
-	schedulePattern = regexp.MustCompile(`^[0-9*/,\- ]+$`)
+	schedulePattern  = regexp.MustCompile(`^[0-9*/,\- ]+$`)
 	// secretPattern matches names and values that look like credentials.
 	// The rendered DAG is stored on the hub in plain text, so only
 	// references and paths may enter it; a caller's mistake fails closed.
 	secretPattern = regexp.MustCompile(`(?i)token|secret|passw|credential|api[_-]?key|bearer`)
 	// keyPrefixPattern matches values that start like a known API key.
 	keyPrefixPattern = regexp.MustCompile(`(?i)^(dagu_|lin_api_|(sk|ghp|gho|xox[abp])[-_])`)
-	// pathPattern is a plain absolute or home-relative path.
-	pathPattern = regexp.MustCompile(`^[A-Za-z0-9_./~-]+$`)
+	// pathPattern is a plain absolute path.
+	pathPattern = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
+	// shortWordPattern is a short identifier such as a context name.
+	shortWordPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
+	// flagNamePattern is a long flag name, with no value attached.
+	flagNamePattern = regexp.MustCompile(`^--[a-z][a-z0-9-]*$`)
 )
 
-// looksSecret reports whether a value could be a credential rather than a
-// path or a plain word: a credential-like word, a known key prefix, or a
-// long run without separators.
+// looksSecret reports whether a value could be a credential: a
+// credential-like word or a known key prefix.
 func looksSecret(s string) bool {
-	if secretPattern.MatchString(s) || keyPrefixPattern.MatchString(s) {
+	return secretPattern.MatchString(s) || keyPrefixPattern.MatchString(s)
+}
+
+// plainValue reports whether s may enter the hub-stored DAG as a value: an
+// absolute path, or a short identifier. Anything longer that is not a path
+// could be a token (a JWT has dots, dashes and underscores), so it is
+// refused rather than judged by its shape.
+func plainValue(s string) bool {
+	if looksSecret(s) {
+		return false
+	}
+	if pathPattern.MatchString(s) && !strings.Contains(s, "..") {
 		return true
 	}
-	return len(s) >= 32 && !strings.ContainsAny(s, "/.")
+	return shortWordPattern.MatchString(s)
 }
 
 const reconcileTemplate = `# Periodic target reconciliation for TXE jobs on machine {{.MachineID}}.
@@ -105,15 +116,12 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 	if !machineIDPattern.MatchString(cfg.MachineID) {
 		return "", nil, fmt.Errorf("probe: machine id %q is not a registry machine id", cfg.MachineID)
 	}
-	if !wordPattern.MatchString(cfg.DaguBin) {
+	if !pathPattern.MatchString(cfg.DaguBin) || strings.Contains(cfg.DaguBin, "..") {
 		return "", nil, fmt.Errorf("probe: dagu binary %q must be a plain path", cfg.DaguBin)
 	}
 	for _, f := range cfg.StoreFlags {
-		if !wordPattern.MatchString(f) {
-			return "", nil, fmt.Errorf("probe: store flag %q must be a plain word", f)
-		}
-		if looksSecret(f) {
-			return "", nil, fmt.Errorf("probe: store flag %q looks like a credential; only references may enter the DAG", f)
+		if !flagNamePattern.MatchString(f) && !plainValue(f) {
+			return "", nil, fmt.Errorf("probe: store flag %q must be a flag name, an absolute path or a short name; only references may enter the DAG", f)
 		}
 	}
 	schedule := cfg.Schedule
@@ -135,7 +143,7 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 		if !envNamePattern.MatchString(name) {
 			return "", nil, fmt.Errorf("probe: env name %q is not an environment variable name", name)
 		}
-		if secretPattern.MatchString(name) || looksSecret(value) || !pathPattern.MatchString(value) {
+		if secretPattern.MatchString(name) || looksSecret(value) || !pathPattern.MatchString(value) || strings.Contains(value, "..") {
 			return "", nil, fmt.Errorf("probe: env %s must be a plain path, never a credential; the DAG is stored on the hub", name)
 		}
 		vars = append(vars, reconcileVar{name, value})

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -203,7 +204,8 @@ func TestPreRunLifecycle(t *testing.T) {
 	if code := f.preRun(t, 2); code != ExitOK {
 		t.Fatalf("needs_human: exit = %d, want 0", code)
 	}
-	for _, l := range []string{"retired", "completed"} {
+	// The gate is an allowlist: paused, ended or unknown states stop.
+	for _, l := range []string{"retired", "completed", "paused", "", "some_future_state"} {
 		f.reg.jobs[jobA].Lifecycle = l
 		if code := f.preRun(t, 2); code != ExitStop {
 			t.Fatalf("%s: exit = %d, want 3", l, code)
@@ -332,17 +334,59 @@ func TestPeriodicSlowTargetDoesNotStarveTheRest(t *testing.T) {
 // Environment credential references are not available to the periodic
 // check; it says so instead of reporting the target missing.
 func TestPeriodicEnvCredentialIsExplained(t *testing.T) {
+	kubeconfig := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(kubeconfig, []byte("apiVersion: v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	v := &txeclient.JobVersion{Package: txeclient.Package{CredentialRefs: []txeclient.CredentialRef{
-		{Name: KubernetesCredential, Kind: "file", Locator: "/home/me/.kube/config"},
+		{Name: KubernetesCredential, Kind: "file", Locator: kubeconfig},
 		{Name: LinearCredential, Kind: "env", Locator: "LINEAR_KEY"},
 	}}}
 	creds := FileCredentialsOf(v)
-	if c, ok := creds.Lookup(KubernetesCredential); !ok || c.Path != "/home/me/.kube/config" {
+	if c, ok := creds.Lookup(KubernetesCredential); !ok || c.Path != kubeconfig {
 		t.Fatalf("file ref = %+v %v", c, ok)
 	}
 	r := (Linear{}).Probe(context.Background(), linearTarget("uuid-1"), creds)
 	if r.Outcome != AuthDenied || !strings.Contains(r.Detail, "periodic check does not receive") {
 		t.Fatalf("env ref: %+v", r)
+	}
+}
+
+// File locators come from the registry, so the periodic check reads only an
+// absolute, clean path to a regular file this user owns and others cannot
+// write; any other locator is a missing credential with its reason.
+func TestFileCredentialLocatorsAreChecked(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "config")
+	shared := filepath.Join(dir, "shared")
+	for path, mode := range map[string]os.FileMode{good: 0o600, shared: 0o666} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for locator, ok := range map[string]bool{
+		good:     true,
+		"config": false, // relative
+		dir + "/../" + filepath.Base(dir) + "/config": false, // not clean
+		filepath.Join(dir, "absent"):                  false,
+		dir:                                           false, // a directory
+		shared:                                        false, // writable by others
+	} {
+		creds := FileCredentialsOf(&txeclient.JobVersion{Package: txeclient.Package{CredentialRefs: []txeclient.CredentialRef{
+			{Name: KubernetesCredential, Kind: "file", Locator: locator}}}})
+		_, got := creds.Lookup(KubernetesCredential)
+		if got != ok {
+			t.Errorf("locator %q accepted = %v, want %v", locator, got, ok)
+		}
+		if !ok {
+			r := (Kubernetes{}).Probe(context.Background(), configMapTarget(), creds)
+			if r.Outcome != AuthDenied || !strings.Contains(r.Detail, "credential reference kubernetes") {
+				t.Errorf("locator %q: %+v, want auth_denied with the reason", locator, r)
+			}
+		}
 	}
 }
 
