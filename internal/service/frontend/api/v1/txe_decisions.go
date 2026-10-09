@@ -34,7 +34,7 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 	if err != nil {
 		return nil, err
 	}
-	actor, err := txeDecisionActor(ctx, body.Actor)
+	actor, err := a.txeDecisionActor(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +107,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil {
 		return nil, err
 	}
-	actor, err := txeDecisionActor(ctx, body.Actor)
+	actor, err := a.txeDecisionActor(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
@@ -293,11 +293,35 @@ var errTxeDecisionNotHuman = &Error{
 // request cannot name another person or decide as an agent: an API key is
 // refused whatever actor it claims, and a client-supplied actor contributes
 // only its session, machine and client details.
-func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
+// errTxePersonAuthRequired refuses a decision on a hub that cannot tell a
+// person from a process: basic auth shares one credential, and with no auth
+// there is no identity at all.
+var errTxePersonAuthRequired = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "a human decision needs a signed-in person; this hub's authentication cannot identify one (use builtin auth)",
+	Details:    map[string]any{"code": "person_auth_required"},
+}
+
+// txeDecisionActor returns the person a decision is made by. Only an
+// individually signed-in person may decide: under builtin auth, a user from
+// a session, never an API key. Basic auth, one shared credential, and no
+// auth cannot tell a person from a reviewer or a job script holding the hub
+// context, so a decision there is refused. The actor id is always the
+// signed-in user's; the request body may add the client and session it came
+// from, never the identity.
+func (a *API) txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
+	if a.config == nil || a.config.Server.Auth.Mode != config.AuthModeBuiltin {
+		return registry.Actor{}, errTxePersonAuthRequired
+	}
 	if _, apiKey := auth.APIKeyFromContext(ctx); apiKey {
 		return registry.Actor{}, errTxeDecisionNotHuman
 	}
-	actor := registry.Actor{Kind: registry.ActorHuman, ID: "unauthenticated", Client: "dashboard"}
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user == nil || user.Username == "" {
+		return registry.Actor{}, errTxePersonAuthRequired
+	}
+	actor := registry.Actor{Kind: registry.ActorHuman, ID: user.Username, Client: "dashboard"}
 	if in != nil {
 		claimed, err := txeConvert[registry.Actor](in)
 		if err != nil {
@@ -310,12 +334,6 @@ func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, er
 		if claimed.Client != "" {
 			actor.Client = claimed.Client
 		}
-		if claimed.ID != "" {
-			actor.ID = claimed.ID
-		}
-	}
-	if user, ok := auth.UserFromContext(ctx); ok && user != nil {
-		actor.ID = user.Username
 	}
 	return actor, nil
 }
