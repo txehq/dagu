@@ -7,7 +7,13 @@ import type { Client } from 'openapi-fetch';
 import { toDecision, toDecisionBody, toJob, toProposal } from './adapt';
 import type { DecisionSubmitResult } from './components/DecisionPanel';
 import { retryStates, type RetryState } from './retry';
-import type { Decision, DecisionRequest, Proposal, TxeJob } from './types';
+import type {
+  Decision,
+  DecisionRequest,
+  Execution,
+  Proposal,
+  TxeJob,
+} from './types';
 
 type ApiJob = components['schemas']['TxeJob'];
 
@@ -31,12 +37,12 @@ export interface TxeApi {
   ): Promise<DecisionSubmitResult>;
   // requestRetry asks for one exact run to be retried. It records the
   // decision only; the reviewer runs the retry through the action journal.
-  // attemptId is the run attempt the person reviewed; the server refuses the
-  // request if the run has since moved to another attempt.
+  // execution is the run execution the person reviewed; the server refuses
+  // the request if the run has since moved to another execution.
   requestRetry(
     jobId: string,
     runId: string,
-    attemptId: string,
+    execution: Execution,
     expectedJobVersion: number,
     idempotencyKey: string
   ): Promise<DecisionSubmitResult>;
@@ -155,7 +161,7 @@ export function createTxeApi(client: Client<paths>): TxeApi {
     requestRetry: async (
       jobId,
       runId,
-      attemptId,
+      execution,
       expectedJobVersion,
       idempotencyKey
     ) => {
@@ -164,7 +170,8 @@ export function createTxeApi(client: Client<paths>): TxeApi {
         {
           params: { path: { jobId, runId } },
           body: {
-            attempt_id: attemptId,
+            attempt_id: execution.attemptId,
+            queued_at: execution.queuedAt,
             expected_job_version: expectedJobVersion,
             idempotency_key: idempotencyKey,
           },

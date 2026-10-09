@@ -10,13 +10,14 @@ import { I18nText } from '@/i18n/I18nText';
 
 import type { DecisionSubmitResult } from './DecisionPanel';
 import { canRequestRetry, retryLabel, type RetryState } from '../retry';
+import type { Execution } from '../types';
 import { dagRunPath } from './InboxItemCard';
 
 type Props = {
   dagName: string;
   runId: string;
   runStatus: string;
-  runAttemptId?: string;
+  execution?: Execution;
   state?: RetryState;
   canDecide: boolean;
   onRequest: (idempotencyKey: string) => Promise<DecisionSubmitResult>;
@@ -29,13 +30,13 @@ function newKey(): string {
 // RunRetry offers "Retry this run" for a finished, unsuccessful run and shows
 // the state of its newest retry. A request is a recorded decision: the
 // reviewer dispatches it, and it reads as dispatched only once the action
-// journal records the dispatch with the new attempt the registry observed;
+// journal records the dispatch with the new execution the registry observed;
 // the run's own status, linked beside it, says how the retried run went.
 export function RunRetry({
   dagName,
   runId,
   runStatus,
-  runAttemptId,
+  execution,
   state,
   canDecide,
   onRequest,
@@ -46,7 +47,7 @@ export function RunRetry({
   // same request instead of asking twice.
   const keyRef = React.useRef(newKey());
 
-  const offer = canDecide && canRequestRetry(runStatus, runAttemptId, state);
+  const offer = canDecide && canRequestRetry(runStatus, execution, state);
   if (!offer && !state) return null;
 
   return (
@@ -55,13 +56,13 @@ export function RunRetry({
         <span className="text-muted-foreground">
           <I18nText text={retryLabel(state)} />
           {/* The registry accepts a successful dispatch only with the new
-              attempt it observed, so this receipt is a real attempt. */}
+              execution it observed, so this receipt is a real execution. */}
           {state.status === 'succeeded' && state.receipt && (
             <>
               {' '}
               <I18nText
-                text="as attempt {attempt}"
-                values={{ attempt: state.receipt }}
+                text="as execution {execution}"
+                values={{ execution: state.receipt }}
               />
             </>
           )}

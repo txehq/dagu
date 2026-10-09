@@ -48,7 +48,14 @@ export function toRun(r: ApiRun): RunRef {
     dagName: r.name,
     dagRunId: r.dagRunId,
     status: r.statusLabel,
-    attemptId: r.attemptId,
+    // The hub omits an empty queue marker, so absent means never queued.
+    execution: r.attemptId
+      ? {
+          attemptId: r.attemptId,
+          queuedAt: r.queuedAt ?? '',
+          ref: r.executionRef,
+        }
+      : undefined,
     startedAt: r.startedAt || undefined,
     finishedAt: r.finishedAt || undefined,
   };
