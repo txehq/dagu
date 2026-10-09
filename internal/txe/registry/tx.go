@@ -1109,6 +1109,9 @@ func (tx *JobTx) routineAction(v *JobVersion, req EffectRequest) (*Action, error
 	if !ok || !pa.Routine {
 		return nil, refuse(CodeNotPermitted, "action %q is not a routine action of version %d", r.Spec.Name, v.Version)
 	}
+	if err := checkActionParams(pa, r.Spec.Params); err != nil {
+		return nil, err
+	}
 	want, err := RoutineActionID(r.ReviewID, r.Spec)
 	if err != nil {
 		return nil, err
@@ -1162,7 +1165,14 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 	if req.ActionID != want {
 		return nil, refuse(CodeInvalid, "approved action id must be %s", want)
 	}
-	pa, _ := v.PermittedAction(p.Action.Name)
+	pa, permitted := v.PermittedAction(p.Action.Name)
+	if permitted {
+		// Checked on every attempt, against the version the attempt runs
+		// under.
+		if err := checkActionParams(pa, p.Action.Params); err != nil {
+			return nil, err
+		}
+	}
 	attempts := maxAttempts(v, pa)
 	if p.Action.Name == ActionRetryRun {
 		// A native retry is not idempotent. It is attempted once, plus at
