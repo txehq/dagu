@@ -5,6 +5,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -66,4 +67,20 @@ func TestTaskQueuedAt(t *testing.T) {
 	assert.Equal(t, "2026-10-10T01:05:00Z", taskQueuedAt(&coordinatorv1.Task{PreviousStatus: previous, ExecutionMarker: "other"}))
 	assert.Equal(t, "2026-10-10T01:05:00Z", taskQueuedAt(&coordinatorv1.Task{ExecutionMarker: "2026-10-10T01:05:00Z"}))
 	assert.Equal(t, "", taskQueuedAt(&coordinatorv1.Task{}))
+}
+
+// Both reports sent before the agent starts carry the execution's queued-at.
+func TestFailureReportsCarryQueuedAt(t *testing.T) {
+	t.Parallel()
+
+	task := &coordinatorv1.Task{
+		Target: "dag", DagRunId: "run-1", AttemptId: "attempt-1", ExecutionMarker: "2026-10-10T01:05:00Z",
+	}
+	root := ir.NewDAGRunRef("dag", "run-1")
+	loaded, err := ReportTaskLoadFailureStatusForTest(context.Background(), task, root, ir.DAGRunRef{}, errors.New("load failed"), "")
+	require.NoError(t, err)
+	assert.Equal(t, "2026-10-10T01:05:00Z", loaded.QueuedAt)
+	initialized, err := ReportTaskInitFailureStatusForTest(context.Background(), task, root, ir.DAGRunRef{}, errors.New("init failed"), "")
+	require.NoError(t, err)
+	assert.Equal(t, "2026-10-10T01:05:00Z", initialized.QueuedAt)
 }
