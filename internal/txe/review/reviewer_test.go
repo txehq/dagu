@@ -136,7 +136,13 @@ type runs struct {
 	readErr error
 	// unreadable fails reads of single runs.
 	unreadable map[string]error
-	seq        int
+	// requested records the execution every retry request named, admitted
+	// or not; retried records only the admitted ones.
+	requested []review.Execution
+	// beforeAdmission runs as a retry request arrives, before the service
+	// compares the run's latest execution with the one the request names.
+	beforeAdmission func(runID string)
+	seq             int
 }
 
 func newRuns() *runs {
@@ -191,9 +197,21 @@ func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, er
 	return state, nil
 }
 
-func (r *runs) RetryRun(_ context.Context, _, runID string) error {
+// RetryRun is the service's conditional retry: it is admitted only while
+// expected is the run's latest execution, and that is checked here, at the
+// service, at the moment of admission.
+func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Execution) error {
+	// The hook runs before the lock is taken: it changes the run through
+	// the fake's own methods, which lock.
+	if r.beforeAdmission != nil {
+		r.beforeAdmission(runID)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.requested = append(r.requested, expected)
+	if now := r.state[runID].Execution(); now != expected {
+		return fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
+	}
 	r.retried = append(r.retried, runID)
 	if r.retry != nil {
 		return r.retry(runID)

@@ -57,14 +57,15 @@ func ProposalID(reviewID string, kind ProposalKind, name, targetID string, param
 	return derivedID("prp", reviewID, string(kind), name, targetID, normalizeParams(params), question)
 }
 
-// UncertainProposalID identifies the escalation of one action as asked
-// about one version of its job. An answer is tied to the job as it was when
-// the owner gave it: after the job changes, the question has a new id and
-// the old answer no longer applies.
-func UncertainProposalID(actionID string, jobVersion int) string {
-	id, err := registry.EscalationProposalID(actionID, jobVersion)
+// UncertainProposalID identifies the escalation of one attempt of an action
+// as asked about one version of its job. An answer is tied to the attempt
+// it was given about and to the job as it was then: after another attempt,
+// or after the job changes, the question has a new id and the old answer no
+// longer applies.
+func UncertainProposalID(actionID string, attempt, jobVersion int) string {
+	id, err := registry.EscalationProposalID(actionID, attempt, jobVersion)
 	if err != nil {
-		// Only a string and an int are hashed.
+		// Only a string and ints are hashed.
 		panic(err)
 	}
 	return id

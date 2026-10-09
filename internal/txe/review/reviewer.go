@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"time"
 )
 
@@ -505,7 +506,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 // The question is bound to the job's current version and filing it again is
 // a no-op.
 func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Action, detail string) error {
-	id := UncertainProposalID(action.ID, job.Version)
+	id := UncertainProposalID(action.ID, action.Attempt, job.Version)
 	proposal, err := r.Registry.CreateProposal(ctx, claim, Proposal{
 		ID:              id,
 		JobID:           job.ID,
@@ -517,7 +518,7 @@ func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Ac
 		WaitingOn:       waitingOnPerson,
 		AllowedVerdicts: uncertainVerdicts,
 		ActionName:      UncertainEffectAction,
-		Params:          map[string]string{UncertainEffectParam: action.ID},
+		Params:          map[string]string{UncertainEffectParam: action.ID, UncertainAttemptParam: strconv.Itoa(action.Attempt)},
 		Question:        fmt.Sprintf("Action %q on %s may or may not have taken effect (%s). Confirm its real state before it is tried again.", action.Name, action.TargetID, detail),
 		RelatedAction:   action.ID,
 		ReviewID:        action.ReviewID,
@@ -964,10 +965,13 @@ var ErrRunNotRetryable = errors.New("txe review: the service refused to retry th
 type RunRetrier interface {
 	// RunState returns the state of the run's latest attempt.
 	RunState(ctx context.Context, jobID, runID string) (RunState, error)
-	// RetryRun asks the service to retry the run. It returns
-	// ErrRunNotRetryable when the service refused; after any other error
-	// whether a retry started is unknown.
-	RetryRun(ctx context.Context, jobID, runID string) error
+	// RetryRun asks the service to retry the run, on the condition that
+	// expected is still the run's latest execution. The service checks that
+	// together with admitting the retry, so a run that moved on between
+	// this caller's own read and its request is refused, not retried again.
+	// It returns ErrRunNotRetryable when the service refused; after any
+	// other error whether a retry started is unknown.
+	RetryRun(ctx context.Context, jobID, runID string, expected Execution) error
 }
 
 const (
@@ -984,7 +988,10 @@ const (
 //
 // Nothing is dispatched unless that attempt is still the run's latest and
 // is finished and unsuccessful: a run that moved on since the decision is
-// not retried again on its strength. After a dispatch the result is applied
+// not retried again on its strength. The check here only spares a request
+// that would be refused; what binds the retry to the execution is the
+// service, which is given the execution and compares it as it admits the
+// retry. After a dispatch the result is applied
 // only when a new attempt is observed on the run, and its id is the
 // receipt. A dispatch whose outcome was not observed is unknown; it is
 // never reported from the service's acceptance alone, and never repeated.
@@ -1008,7 +1015,7 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		return EffectResult{Status: EffectNotApplied, Detail: fmt.Sprintf(
 			"not dispatched: the decision is about execution %s of run %s, and the run is now at %s (%s)", bound.Ref(), runID, before.Execution().Ref(), before.Status)}
 	}
-	if err := r.Runs.RetryRun(ctx, job.ID, runID); err != nil {
+	if err := r.Runs.RetryRun(ctx, job.ID, runID, bound); err != nil {
 		if errors.Is(err, ErrRunNotRetryable) {
 			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: " + err.Error()}
 		}
@@ -1092,7 +1099,7 @@ func unresolvedAttempt(history []Action, decisions []Decision, intent string, jo
 		case ActionExecuting, ActionUncertain:
 			return a, true
 		case ActionEscalated:
-			return a, !retryDecided(decisions, UncertainProposalID(a.ID, jobVersion))
+			return a, !retryDecided(decisions, UncertainProposalID(a.ID, a.Attempt, jobVersion))
 		case ActionSucceeded, ActionFailed, ActionNotApplied:
 			return Action{}, false
 		}

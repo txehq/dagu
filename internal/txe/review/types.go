@@ -100,8 +100,10 @@ const (
 	// asks the owner about an effect whose outcome is unknown. It is not
 	// executable.
 	UncertainEffectAction = registry.ActionUncertainEffect
-	// UncertainEffectParam names the journaled action in question.
-	UncertainEffectParam = "action_id"
+	// UncertainEffectParam names the journaled action in question, and
+	// UncertainAttemptParam the attempt of it whose outcome is unknown.
+	UncertainEffectParam  = "action_id"
+	UncertainAttemptParam = "attempt"
 )
 
 // DeclaredAction is an executable follow-up saved with the job. The reviewer
@@ -300,6 +302,9 @@ type Action struct {
 	Name       string            `json:"name"`
 	TargetID   string            `json:"target_id"`
 	Params     map[string]string `json:"params,omitempty"`
+	// Attempt is the registry's count of attempts of this action. An
+	// owner's answer about an unknown outcome is about one attempt.
+	Attempt int `json:"attempt,omitempty"`
 	// IntentKey identifies the same intent across review episodes.
 	IntentKey  string      `json:"intent_key"`
 	ReviewID   string      `json:"review_id,omitempty"`

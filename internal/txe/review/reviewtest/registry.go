@@ -566,7 +566,7 @@ func (s *State) consumeResolution(job review.Job, intent string) {
 			if s.ConsumedResolutions == nil {
 				s.ConsumedResolutions = map[string]bool{}
 			}
-			s.ConsumedResolutions[review.UncertainProposalID(action.ID, job.Version)] = true
+			s.ConsumedResolutions[review.UncertainProposalID(action.ID, action.Attempt, job.Version)] = true
 		}
 		return
 	}
@@ -593,14 +593,14 @@ func (s *State) intentUnresolved(job review.Job, intent string) bool {
 		case review.ActionExecuting, review.ActionUncertain:
 			return true
 		case review.ActionEscalated:
-			if s.ConsumedResolutions[review.UncertainProposalID(a.ID, job.Version)] {
+			if s.ConsumedResolutions[review.UncertainProposalID(a.ID, a.Attempt, job.Version)] {
 				return true
 			}
 			verdict := review.Verdict("")
 			for _, d := range s.Decisions[jobID] {
 				// Only an answer to the question asked about this version of
 				// the job counts.
-				if d.ProposalID == review.UncertainProposalID(a.ID, job.Version) {
+				if d.ProposalID == review.UncertainProposalID(a.ID, a.Attempt, job.Version) {
 					verdict = d.Verdict
 				}
 			}

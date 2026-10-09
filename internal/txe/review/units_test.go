@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -90,7 +91,7 @@ func TestDerivedIDs(t *testing.T) {
 		review.RoutineActionID(rev0, "notify", "t1", map[string]string{"b": "2", "a": "1"}))
 	assert.NotEqual(t, review.ApprovedActionID("prp_1", "dec_1"), review.ApprovedActionID("prp_1", "dec_2"))
 
-	runID := review.DecisionRunID(review.UncertainProposalID(a, 1))
+	runID := review.DecisionRunID(review.UncertainProposalID(a, 0, 1))
 	assert.Regexp(t, `^txe-[0-9a-z]{26}$`, runID)
 }
 
@@ -1233,6 +1234,37 @@ func (m *movingRuns) RunState(ctx context.Context, job, run string) (review.RunS
 	return m.runs.RunState(ctx, job, run)
 }
 
+// The binding of a retry to an execution is the service's, not the
+// reviewer's own read. The run moves on after the reviewer last looked and
+// before its request is admitted: the request names the execution the
+// decision is about, the service compares it at admission and refuses, and
+// nothing is retried on a decision about an earlier execution.
+func TestRetryRunIsRefusedByTheServiceWhenTheRunMovesBeforeAdmission(t *testing.T) {
+	f := newRetryFixture(t)
+	moved := false
+	f.runs.beforeAdmission = func(runID string) {
+		// Another caller's retry lands between the reviewer's last read
+		// and the admission of its request, and that execution fails too.
+		if !moved {
+			moved = true
+			f.runs.fail(runID, "att-other")
+		}
+	}
+	out := f.execute("executor")
+	require.Len(t, f.runs.requested, 1)
+	assert.Equal(t, review.Execution{AttemptID: "att-1"}, f.runs.requested[0], "the request names the execution the decision is about")
+	assert.Empty(t, f.runs.retried, "the service admitted nothing")
+	assert.Equal(t, review.ActionFailed, out.Action.State)
+	assert.Contains(t, out.Action.Detail, "not dispatched")
+	assert.Contains(t, out.Action.Detail, "execution_changed")
+	assert.Equal(t, "att-other", f.runs.state["run-1"].AttemptID, "the later execution was not retried")
+
+	// The decision is spent and stale: replaying it asks for nothing.
+	again := f.execute("executor")
+	assert.NotEmpty(t, again.Skipped)
+	assert.Len(t, f.runs.requested, 1)
+}
+
 // A refusal by the service started nothing and is recorded as such.
 func TestRetryRunRefusedByTheServiceIsNotApplied(t *testing.T) {
 	f := newRetryFixture(t)
@@ -1279,7 +1311,7 @@ func TestRetryRunAcceptedButUnobservedIsUncertainAndNeverRedispatched(t *testing
 					escalation = p
 				}
 			}
-			assert.Equal(t, review.UncertainProposalID(action.ID, 1), escalation.ID)
+			assert.Equal(t, review.UncertainProposalID(action.ID, action.Attempt, 1), escalation.ID)
 		})
 	}
 }
@@ -1324,8 +1356,8 @@ func TestUncertainRetryAllowsExactlyOneMoreAttempt(t *testing.T) {
 	escalation := f.state().Proposals[jobID][0]
 	first := f.state().Actions[jobID][0]
 	assert.Equal(t, review.UncertainEffectAction, escalation.ActionName)
-	assert.Equal(t, map[string]string{"action_id": first.ID}, escalation.Params)
-	assert.Equal(t, review.UncertainProposalID(first.ID, 1), escalation.ID)
+	assert.Equal(t, map[string]string{"action_id": first.ID, "attempt": strconv.Itoa(first.Attempt)}, escalation.Params)
+	assert.Equal(t, review.UncertainProposalID(first.ID, first.Attempt, 1), escalation.ID)
 	_, err := f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
 	require.NoError(t, err)
 

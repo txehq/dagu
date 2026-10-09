@@ -905,7 +905,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 		ID: a.ActionId, JobID: jobID, JobVersion: a.JobVersion, Name: a.Spec.Name, Params: paramsOf(a.Spec.Params),
 		ReviewID: deref(a.ReviewId), ProposalID: deref(a.ProposalId), DecisionID: deref(a.DecisionId),
 		State: ActionState(a.State), Receipt: deref(a.Receipt), ClaimID: deref(a.ClaimId),
-		StartedAt: a.Created.At, FinishedAt: a.Updated.At,
+		StartedAt: a.Created.At, FinishedAt: a.Updated.At, Attempt: a.Attempt,
 	}
 	if t := a.Spec.Target; t != nil {
 		out.TargetID = targetKey(*t)
@@ -1081,8 +1081,18 @@ func (r *Remote) CreateProposal(ctx context.Context, claim Claim, draft Proposal
 	}
 	in.AllowedVerdicts = &verdicts
 	if draft.Kind == ProposalUncertain {
-		// A reserved, non-executable action naming the journaled action.
-		in.Action = api.TxeActionSpec{Name: UncertainEffectAction, Params: paramsValue(draft.Params)}
+		// A reserved, non-executable action naming the journaled action
+		// and the attempt of it in question. The registry takes the
+		// attempt as a number.
+		attempt, err := strconv.Atoi(draft.Params[UncertainAttemptParam])
+		if err != nil {
+			return Proposal{}, fmt.Errorf("escalation of action %s names no attempt: %w", draft.Params[UncertainEffectParam], err)
+		}
+		params, err := json.Marshal(registry.UncertainEffectParams{ActionID: draft.Params[UncertainEffectParam], Attempt: attempt})
+		if err != nil {
+			return Proposal{}, err
+		}
+		in.Action = api.TxeActionSpec{Name: UncertainEffectAction, Params: params}
 	}
 	if draft.Kind == ProposalAction {
 		spec, err := r.specOf(ctx, draft.JobID, draft.ActionName, draft.TargetID, draft.Params)
@@ -1373,14 +1383,19 @@ func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState
 	return out.DagRunDetails.state(), nil
 }
 
-// RetryRun implements RunRetrier. The service refuses to retry a run that
-// is active with a conflict; that, and a run it does not know, started
-// nothing.
-func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string) error {
+// RetryRun implements RunRetrier. The request names the execution the retry
+// is for, and the service admits it only while that is the run's latest
+// execution, checking it together with the admission. Its refusals all
+// started nothing: the run moved on (409 execution_changed), the retry
+// would run outside the queue and the workers (409
+// conditional_retry_unsupported), the run is active, or the service does
+// not know the run.
+func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) error {
 	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
-	err := r.t.Do(ctx, http.MethodPost, path, map[string]string{"dagRunId": runID}, nil)
+	body := map[string]string{"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt}
+	err := r.t.Do(ctx, http.MethodPost, path, body, nil)
 	if te, ok := errors.AsType[*TransportError](err); ok && (te.Status == http.StatusConflict || te.Status == http.StatusNotFound || te.Status == http.StatusBadRequest) {
-		return fmt.Errorf("%w: %s", ErrRunNotRetryable, te.Message)
+		return fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
 	return err
 }

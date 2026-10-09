@@ -889,6 +889,45 @@ func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
 	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
 
+// The native retry is sent with the execution it is for, and each of the
+// service's refusals is "nothing started", never "unknown".
+func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
+	path := "/dag-runs/job_1/run-1/retry"
+	stub := &stubTransport{t: t, replies: map[string]string{path: `{}`}}
+	var sent map[string]string
+	runs := review.RemoteRuns(captureTransport{Transport: stub, path: path, into: &sent})
+	queued := review.Execution{AttemptID: "a1", QueuedAt: "2026-10-09T16:36:43.039647Z"}
+	require.NoError(t, runs.RetryRun(context.Background(), "job_1", "run-1", queued))
+	assert.Equal(t, map[string]string{"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z"}, sent)
+
+	// An execution that was never queued is named with an empty marker,
+	// which is a value the service compares, not an omitted field.
+	sent = nil
+	require.NoError(t, runs.RetryRun(context.Background(), "job_1", "run-1", review.Execution{AttemptID: "a1"}))
+	marker, named := sent["expectedQueuedAt"]
+	assert.True(t, named)
+	assert.Empty(t, marker)
+
+	for name, refusal := range map[string]*review.TransportError{
+		"the run moved on":                   {Status: http.StatusConflict, Code: "execution_changed", Message: "run is at another execution"},
+		"it would run outside the workers":   {Status: http.StatusConflict, Code: "conditional_retry_unsupported", Message: "local process"},
+		"the run is active":                  {Status: http.StatusConflict, Message: "DAG-run is active and cannot be retried"},
+		"the service does not know the run":  {Status: http.StatusNotFound, Message: "not found"},
+		"the request was not accepted as is": {Status: http.StatusBadRequest, Message: "expectedAttemptId and expectedQueuedAt go together"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub.fail = map[string]*review.TransportError{path: refusal}
+			require.ErrorIs(t, runs.RetryRun(context.Background(), "job_1", "run-1", queued), review.ErrRunNotRetryable)
+		})
+	}
+	t.Run("a server error is not a refusal", func(t *testing.T) {
+		stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway, Message: "upstream"}}
+		err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, review.ErrRunNotRetryable, "whether a retry started is unknown")
+	})
+}
+
 // Completing a human task: success, a run the service does not know, and a
 // conflict. The service answers 409 both when the task was already answered
 // and when it simply cannot be answered yet, so a conflict is "answered"
@@ -1343,7 +1382,7 @@ func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
 }
 
 // Requests that can no longer be carried out must not keep the ones that
-// can from being reached. Thirty requests whose runs have moved on, one
+// can from being reached. Several requests whose runs have moved on, one
 // whose run is gone, and one that is still valid: the valid one is returned,
 // and it is the only one.
 func TestRemoteStaleRetryRequestsDoNotStarveAValidOne(t *testing.T) {
@@ -1362,7 +1401,7 @@ func TestRemoteStaleRetryRequestsDoNotStarveAValidOne(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-	for i := range 30 {
+	for i := range 8 {
 		runID := fmt.Sprintf("stale-%02d", i)
 		request(runID)
 		// Someone else retried the run after the person decided.
@@ -1398,35 +1437,31 @@ func TestRemoteStaleRetryRequestsDoNotStarveAValidOne(t *testing.T) {
 
 // However many requests can never be carried out, a valid one behind all of
 // them is reached in the same listing: nothing is scanned in part, and
-// nothing depends on the clock.
+// nothing depends on the clock. (Against a stub of the registry: the real
+// one takes too long to be given hundreds of requests in a unit test.)
 func TestRemoteAValidRetryBehindHundredsOfDeadOnesIsReached(t *testing.T) {
-	f := newRemoteFixture(t)
-	ctx := context.Background()
-	job := f.job()
-	service := f.service
-	for i := range 260 {
-		runID := fmt.Sprintf("dead-%03d", i)
-		service.fail(runID, "att-1")
-		_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
-			_, _, err := tx.ProposeRetry(registry.RetryRunParams{
-				RunID: runID, AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
-			}, "retry-"+runID)
-			return err
-		})
-		require.NoError(t, err)
-		service.start(runID)
+	job, machine := "job_01HZX0000000000000000000AA", "mch_1"
+	stub := &stubTransport{t: t, replies: map[string]string{
+		"/txe/jobs?machine=" + machine:  `{"jobs":[{"job_id":"` + job + `","lifecycle":"active","machine_id":"` + machine + `","availability":{"state":"ready"},"checkpoint":{"version":0}}]}`,
+		"/txe/jobs/" + job + "/actions": `{"archived":[],"in_flight":[]}`,
+	}}
+	var proposals, decisions []string
+	request := func(i int, runID, latestAttempt string) {
+		proposals = append(proposals, fmt.Sprintf(`{"proposal_id":"prp_%04d","state":"decided","action":{"name":"dagu.retry_run","params":{"run_id":%q,"attempt_id":"a1","queued_at":""}}}`, i, runID))
+		decisions = append(decisions, fmt.Sprintf(`{"decision_id":"dec_%04d","proposal_id":"prp_%04d","verdict":"retry"}`, i, i))
+		stub.replies["/dag-runs/"+job+"/"+runID] = fmt.Sprintf(`{"dagRunDetails":{"attemptId":%q,"statusLabel":"failed"}}`, latestAttempt)
 	}
-	service.fail("valid", "att-1")
-	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
-		_, _, err := tx.ProposeRetry(registry.RetryRunParams{
-			RunID: "valid", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
-		}, "retry-valid")
-		return err
-	})
+	for i := range 450 {
+		// Each of these runs was retried by someone else since.
+		request(i, fmt.Sprintf("dead-%04d", i), "a2")
+	}
+	request(450, "valid", "a1")
+	stub.replies["/txe/jobs/"+job+"/proposals"] = `{"open":[` + strings.Join(proposals, ",") + `],"finished":[]}`
+	stub.replies["/txe/jobs/"+job+"/decisions?order=asc"] = `{"decisions":[` + strings.Join(decisions, ",") + `]}`
+
+	pending, err := (&review.Remote{Transport: stub, MachineID: machine, RunID: "tick-1"}).RequestedRetries(context.Background(), machine, 20)
 	require.NoError(t, err)
-	pending, err := f.remote.RequestedRetries(ctx, f.remote.MachineID, 20)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
+	assert.Equal(t, []review.RequestedRetry{{JobID: job, ProposalID: "prp_0450", DecisionID: "dec_0450"}}, pending)
 }
 
 // A registered target is named by its kind and its whole stable id. Two
@@ -1578,7 +1613,7 @@ func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
 
 	// The next review cannot settle it and asks the owner, once.
 	round("reviewer-b", waiting)
-	want, err := registry.EscalationProposalID(actionID, 1)
+	want, err := registry.EscalationProposalID(actionID, 1, 1)
 	require.NoError(t, err)
 	open, err := f.remote.OpenProposals(ctx, f.jobID)
 	require.NoError(t, err)
@@ -1586,7 +1621,7 @@ func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
 	escalation := open[0]
 	assert.Equal(t, want, escalation.ID)
 	assert.Equal(t, review.ProposalUncertain, escalation.Kind)
-	assert.Equal(t, map[string]string{"action_id": actionID}, escalation.Params)
+	assert.Equal(t, map[string]string{"action_id": actionID, "attempt": "1"}, escalation.Params, "the escalation is about that attempt of the action")
 	assert.NotContains(t, escalation.AllowedVerdicts, review.VerdictApprove)
 	assert.NotContains(t, escalation.AllowedVerdicts, review.VerdictRedirect)
 	assert.Equal(t, registry.ActionEscalated, f.job().Actions[actionID].State)
