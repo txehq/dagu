@@ -178,23 +178,28 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 		"label":{"type":"string","maxLength":8}}}`)
 	sizeSchema := json.RawMessage(`{"type":"object","properties":{"size_gb":{"type":"string"}}}`)
 	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)
-	post("/txe/jobs", apigen.TxeRegisterRequest{
-		JobId: jobID, RequestId: "r1", OwnerId: owner, ProjectId: project.ProjectId, MachineId: machine, JobKey: "volume:vol-1",
-		Version: apigen.TxeJobVersionInput{
-			Title: "Volume monitor", Purpose: "Watch free space on the data volume.",
-			Package: apigen.TxePackage{Digest: digest, Path: dir, Entrypoint: "run.sh"},
-			Dag:     apigen.TxeDAGRef{Spec: spec},
-			Targets: &[]apigen.TxeTarget{target},
-			ReviewPolicy: &apigen.TxeReviewPolicy{
-				Brief: new("Check usage."), Cadence: new("1h"), MaxAttempts: new(2),
-				PermittedActions: &[]apigen.TxePermittedAction{
-					{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30, ParamSchema: depthSchema},
-					{Name: "expand_volume", Routine: false, Command: new("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
-					{Name: "notify", Routine: true, Command: new("true"), Idempotency: &none, TimeoutSec: 30},
-				},
+	// The job declares a credential, as a registered job that needs one
+	// does. Nothing in these tests reads it: the effects are a fake.
+	registered := apigen.TxeJobVersionInput{
+		Title: "Volume monitor", Purpose: "Watch free space on the data volume.",
+		Package: apigen.TxePackage{Digest: digest, Path: dir, Entrypoint: "run.sh", CredentialRefs: &[]apigen.TxeCredentialRef{
+			{Name: "JOB_TOKEN", Kind: apigen.TxeCredentialRefKind("file"), Locator: filepath.Join(dir, "job-token")},
+		}},
+		Dag:     apigen.TxeDAGRef{Spec: spec},
+		Targets: &[]apigen.TxeTarget{target},
+		ReviewPolicy: &apigen.TxeReviewPolicy{
+			Brief: new("Check usage."), Cadence: new("1h"), MaxAttempts: new(2),
+			PermittedActions: &[]apigen.TxePermittedAction{
+				{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30, ParamSchema: depthSchema},
+				{Name: "expand_volume", Routine: false, Command: new("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
+				{Name: "notify", Routine: true, Command: new("true"), Idempotency: &none, TimeoutSec: 30},
 			},
 		},
-		Actor: actor,
+	}
+	post("/txe/jobs", apigen.TxeRegisterRequest{
+		JobId: jobID, RequestId: "r1", OwnerId: owner, ProjectId: project.ProjectId, MachineId: machine, JobKey: "volume:vol-1",
+		Version: registered,
+		Actor:   actor,
 	}, nil)
 	post("/txe/jobs/"+jobID+"/ready", apigen.TxeReadyRequest{
 		Package: apigen.TxePackageEvidence{Digest: digest, Path: dir, MachineId: machine}, Actor: actor,
@@ -204,6 +209,13 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 		Remote: &review.Remote{
 			Transport: splitTransport{runs: runsTransport{runs: service}, rest: transport},
 			MachineID: machine, RunID: "tick-1", AgentClient: "fixture-agent 1.0",
+			// This machine's record of the registration: the version it sent.
+			LocalVersion: func(id string, version int) (json.RawMessage, error) {
+				if id != jobID || version != 1 {
+					return nil, errors.New("not registered from this machine")
+				}
+				return json.Marshal(registered)
+			},
 		},
 		runs: []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
@@ -846,56 +858,127 @@ func TestRemoteFailedRunEvidenceSaysWhetherItWasEverDispatched(t *testing.T) {
 	}
 }
 
-// A registered job's credential references are the ones this machine
-// recorded when it registered the version, and only when the registry's
-// copy still says the same. The registry's record can be changed after
-// registration; a changed name, kind or locator, an added or removed
-// reference, or a missing local record gives the job no references and
-// stops every one of its commands, and nothing is read: not the file the
-// registry now points at, and not a credential of the reviewer.
-func TestRemoteJobCredentialsComeFromTheLocalRegistrationAndMustMatchTheRegistry(t *testing.T) {
+// Against the real registry: what it stores and returns for a version is, in
+// everything that reaches execution, exactly what was registered. So a job
+// that declares credentials and was registered from this machine is not
+// refused: its references are the local ones, and they stay out of the
+// packet.
+func TestRemoteARegisteredJobMatchesItsLocalRegistration(t *testing.T) {
+	f := newRemoteFixture(t)
+	job, err := f.remote.Job(context.Background(), f.jobID)
+	require.NoError(t, err)
+	assert.Empty(t, job.CommandsRefused)
+	require.Len(t, job.CredentialRefs, 1)
+	assert.Equal(t, "JOB_TOKEN", job.CredentialRefs[0].Name)
+	assert.Equal(t, review.CredentialFile, job.CredentialRefs[0].Kind)
+
+	prepared, err := f.reviewer("reviewer-a").Prepare(context.Background(), f.jobID)
+	require.NoError(t, err)
+	raw, err := json.Marshal(prepared)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "job-token")
+	assert.NotContains(t, string(raw), "JOB_TOKEN")
+}
+
+// A job that declares credentials runs its commands only when the registry's
+// current version says exactly what this machine registered, in everything
+// that reaches execution: the credential references, each permitted action's
+// command and reconcile lines, the flag that lets it run unasked, its
+// idempotency class, timeout, attempt limit and parameter schema, and the
+// package it runs from. The registry's record can be changed after
+// registration. If the references are left alone and the command they are
+// handed to is rewritten, the credential would go to a command nobody
+// registered; so any difference stops every command of the job, and nothing
+// is read: not the registered credential, not a file the registry now
+// points at, and not a credential of the reviewer.
+func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("uses /bin/sh")
 	}
 	t.Setenv("OPENAI_API_KEY", "the-review-agents-key")
 	secrets := t.TempDir()
-	registered := filepath.Join(secrets, "job-key")
+	keyFile := filepath.Join(secrets, "job-key")
 	planted := filepath.Join(secrets, "planted")
-	require.NoError(t, os.WriteFile(registered, []byte("the-jobs-own-key"), 0o600))
+	require.NoError(t, os.WriteFile(keyFile, []byte("the-jobs-own-key"), 0o600))
 	require.NoError(t, os.WriteFile(planted, []byte("something-else-on-this-machine"), 0o600))
-	local := []review.CredentialRef{{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: registered}}
-	ref := func(name, kind, locator string) string {
-		return fmt.Sprintf(`{"name":%q,"kind":%q,"locator":%q}`, name, kind, locator)
+	dir := t.TempDir()
+	command := `printf '%s' "$OPENAI_API_KEY" > key.txt`
+
+	// version builds a version record; edit changes it after "registration".
+	version := func(edit func(v map[string]any)) json.RawMessage {
+		v := map[string]any{
+			"title": "t", "purpose": "p", "dag": map[string]any{},
+			"package": map[string]any{
+				"digest": "sha256:aa", "path": dir, "entrypoint": "run.sh",
+				"credential_refs": []any{map[string]any{"name": "OPENAI_API_KEY", "kind": "file", "locator": keyFile}},
+			},
+			"review_policy": map[string]any{"permitted_actions": []any{map[string]any{
+				"name": "a", "command": command, "reconcile": "true", "routine": false, "idempotency": "none",
+				"timeout_sec": 5, "max_attempts": 1, "param_schema": map[string]any{"type": "object"},
+			}}},
+		}
+		if edit != nil {
+			edit(v)
+		}
+		raw, err := json.Marshal(v)
+		require.NoError(t, err)
+		return raw
 	}
-	same := ref("OPENAI_API_KEY", "file", registered)
+	pkg := func(v map[string]any) map[string]any { return v["package"].(map[string]any) }
+	act := func(v map[string]any) map[string]any {
+		return v["review_policy"].(map[string]any)["permitted_actions"].([]any)[0].(map[string]any)
+	}
+	ref := func(v map[string]any) map[string]any { return pkg(v)["credential_refs"].([]any)[0].(map[string]any) }
+	registered := version(nil)
 
 	for name, tc := range map[string]struct {
-		remote  string
-		local   func(string, int) ([]review.CredentialRef, error)
-		noLocal bool
-		runs    bool
+		remote json.RawMessage
+		local  func(string, int) (json.RawMessage, error)
+		runs   bool
 	}{
-		"the registry still says what was registered":    {remote: same, runs: true},
-		"the locator was changed after registration":     {remote: ref("OPENAI_API_KEY", "file", planted)},
-		"the name was changed after registration":        {remote: ref("ANTHROPIC_API_KEY", "file", registered)},
-		"the kind was changed after registration":        {remote: ref("OPENAI_API_KEY", "env", registered)},
-		"a reference was added after registration":       {remote: same + "," + ref("EXTRA", "file", planted)},
-		"the reference was removed after registration":   {remote: ""},
-		"this machine has no record of the registration": {remote: same, local: func(string, int) ([]review.CredentialRef, error) { return nil, errors.New("no receipt") }},
-		"the reviewer was given no local record to read": {remote: same, noLocal: true},
+		"the registry still says what was registered": {remote: registered, runs: true},
+		"the same schema written with other spacing":  {remote: bytes.ReplaceAll(registered, []byte(`{"type":"object"}`), []byte(`{ "type" : "object" }`)), runs: true},
+
+		"the credential's locator was changed": {remote: version(func(v map[string]any) { ref(v)["locator"] = planted })},
+		"the credential's name was changed":    {remote: version(func(v map[string]any) { ref(v)["name"] = "ANTHROPIC_API_KEY" })},
+		"the credential's kind was changed":    {remote: version(func(v map[string]any) { ref(v)["kind"] = "env" })},
+		"a credential was added": {remote: version(func(v map[string]any) {
+			pkg(v)["credential_refs"] = append(pkg(v)["credential_refs"].([]any), map[string]any{"name": "EXTRA", "kind": "file", "locator": planted})
+		})},
+		"the credential was removed": {remote: version(func(v map[string]any) { delete(pkg(v), "credential_refs") })},
+
+		// The references are untouched; what they would be handed to is not.
+		"the command was rewritten":         {remote: version(func(v map[string]any) { act(v)["command"] = `printf '%s' "$OPENAI_API_KEY" > /tmp/stolen` })},
+		"the reconcile line was rewritten":  {remote: version(func(v map[string]any) { act(v)["reconcile"] = `cat "$OPENAI_API_KEY"` })},
+		"the action was made routine":       {remote: version(func(v map[string]any) { act(v)["routine"] = true })},
+		"the idempotency class was changed": {remote: version(func(v map[string]any) { act(v)["idempotency"] = "read_only" })},
+		"the timeout was changed":           {remote: version(func(v map[string]any) { act(v)["timeout_sec"] = 3600 })},
+		"the attempt limit was changed":     {remote: version(func(v map[string]any) { act(v)["max_attempts"] = 9 })},
+		"the parameter schema was changed":  {remote: version(func(v map[string]any) { act(v)["param_schema"] = map[string]any{"type": "string"} })},
+		"an action was added": {remote: version(func(v map[string]any) {
+			pa := v["review_policy"].(map[string]any)
+			pa["permitted_actions"] = append(pa["permitted_actions"].([]any), map[string]any{"name": "b", "command": "true", "routine": true, "timeout_sec": 5})
+		})},
+		"the package path was changed":       {remote: version(func(v map[string]any) { pkg(v)["path"] = secrets })},
+		"a working directory was set":        {remote: version(func(v map[string]any) { pkg(v)["working_dir"] = secrets })},
+		"the package digest was changed":     {remote: version(func(v map[string]any) { pkg(v)["digest"] = "sha256:bb" })},
+		"the package entrypoint was changed": {remote: version(func(v map[string]any) { pkg(v)["entrypoint"] = "other.sh" })},
+
+		"this machine has no record of the registration": {remote: registered, local: func(string, int) (json.RawMessage, error) { return nil, errors.New("no receipt") }},
+		"this machine's record cannot be read":           {remote: registered, local: func(string, int) (json.RawMessage, error) { return json.RawMessage(`{"package":`), nil }},
 	} {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
+			require.NoError(t, os.RemoveAll(filepath.Join(dir, "key.txt")))
 			stub := &stubTransport{t: t, replies: map[string]string{
 				"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
-				"/txe/jobs/job_1/versions/3": fmt.Sprintf(`{"title":"t","purpose":"p","package":{"digest":"sha256:aa","path":%q,"entrypoint":"run.sh","credential_refs":[%s]},"dag":{}}`, dir, tc.remote),
+				"/txe/jobs/job_1/versions/3": string(tc.remote),
 			}}
-			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalCredentials: tc.local}
-			if tc.local == nil && !tc.noLocal {
-				remote.LocalCredentials = func(jobID string, version int) ([]review.CredentialRef, error) {
+			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local}
+			if tc.local == nil {
+				remote.LocalVersion = func(jobID string, version int) (json.RawMessage, error) {
 					require.Equal(t, "job_1", jobID)
 					require.Equal(t, 3, version)
-					return local, nil
+					return registered, nil
 				}
 			}
 			job, err := remote.Job(context.Background(), "job_1")
@@ -907,46 +990,177 @@ func TestRemoteJobCredentialsComeFromTheLocalRegistrationAndMustMatchTheRegistry
 				raw, err := os.ReadFile(locator)
 				return string(raw), err
 			}}
-			res := effector.Run(context.Background(), job, shellAction(`printf '%s' "$OPENAI_API_KEY" > key.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
+			// Whatever the registry now says the action is, is what would run.
+			declared, _ := job.Review.Action("a")
+			res := effector.Run(context.Background(), job, declared, review.Action{ID: "act_1", Name: "a"})
 			got, readErr := os.ReadFile(filepath.Join(dir, "key.txt"))
 			if tc.runs {
 				require.Equal(t, review.EffectApplied, res.Status, res.Detail)
-				assert.Equal(t, local, job.CredentialRefs)
-				assert.Equal(t, []string{registered}, read)
+				assert.Empty(t, job.CommandsRefused)
+				assert.Equal(t, []review.CredentialRef{{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: keyFile}}, job.CredentialRefs)
+				assert.Equal(t, []string{keyFile}, read)
 				assert.Equal(t, "the-jobs-own-key", string(got))
 				return
 			}
 			assert.Empty(t, job.CredentialRefs)
-			assert.NotEmpty(t, job.CredentialsRefused)
+			assert.NotEmpty(t, job.CommandsRefused)
 			assert.Equal(t, review.EffectNotApplied, res.Status, "the command is not started")
 			assert.ErrorIs(t, readErr, os.ErrNotExist, "nothing ran")
-			assert.Empty(t, read, "no file is read: not the registered one and not the one the registry points at")
-			for _, text := range []string{job.CredentialsRefused, res.Detail} {
+			assert.Empty(t, read, "no file is read: not the registered one and not one the registry points at")
+			probe := effector.Probe(context.Background(), job, declared, review.Action{ID: "act_1", Name: "a"})
+			assert.NotEqual(t, review.EffectApplied, probe.Status, "nor is the reconcile line run")
+			assert.Empty(t, read)
+			for _, text := range []string{job.CommandsRefused, res.Detail, probe.Detail} {
 				assert.NotContains(t, text, secrets, "the reason does not say where a credential is kept")
+				assert.NotContains(t, text, "printf", "nor repeat a command line")
 				assert.NotContains(t, text, "the-jobs-own-key")
 				assert.NotContains(t, text, "the-review-agents-key")
 			}
 		})
 	}
 
-	// A job that declares no credentials, on a machine with no record of
-	// it, runs its commands: there is nothing to read and nothing to check.
-	t.Run("no references anywhere", func(t *testing.T) {
-		dir := t.TempDir()
-		stub := &stubTransport{t: t, replies: map[string]string{
-			"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
-			"/txe/jobs/job_1/versions/3": fmt.Sprintf(`{"title":"t","purpose":"p","package":{"digest":"sha256:aa","path":%q,"entrypoint":"run.sh"},"dag":{}}`, dir),
-		}}
-		remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalCredentials: func(string, int) ([]review.CredentialRef, error) { return nil, errors.New("no receipt") }}
-		job, err := remote.Job(context.Background(), "job_1")
+	// The same holds for a job that declares no credentials: a command is
+	// started on this machine either way. It runs only what this machine
+	// registered, and without a record of the registration it runs nothing.
+	plain := func(edit func(v map[string]any)) json.RawMessage {
+		return version(func(v map[string]any) {
+			delete(pkg(v), "credential_refs")
+			act(v)["command"] = "env > env.txt"
+			if edit != nil {
+				edit(v)
+			}
+		})
+	}
+	for name, tc := range map[string]struct {
+		remote json.RawMessage
+		local  func(string, int) (json.RawMessage, error)
+		runs   bool
+	}{
+		"no credentials, as registered":             {remote: plain(nil), local: func(string, int) (json.RawMessage, error) { return plain(nil), nil }, runs: true},
+		"no credentials, the command was rewritten": {remote: plain(func(v map[string]any) { act(v)["command"] = "env > env.txt; id" }), local: func(string, int) (json.RawMessage, error) { return plain(nil), nil }},
+		"no credentials, no record on this machine": {remote: plain(nil), local: func(string, int) (json.RawMessage, error) { return nil, errors.New("no receipt") }},
+		"no credentials, no local record to read":   {remote: plain(nil)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, os.RemoveAll(filepath.Join(dir, "env.txt")))
+			stub := &stubTransport{t: t, replies: map[string]string{
+				"/txe/jobs/job_1":            `{"job_id":"job_1","version":3,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"}}`,
+				"/txe/jobs/job_1/versions/3": string(tc.remote),
+			}}
+			remote := &review.Remote{Transport: stub, MachineID: "mch_1", LocalVersion: tc.local}
+			job, err := remote.Job(context.Background(), "job_1")
+			require.NoError(t, err)
+			declared, _ := job.Review.Action("a")
+			res := (&review.CommandEffector{}).Run(context.Background(), job, declared, review.Action{ID: "act_1", Name: "a"})
+			raw, readErr := os.ReadFile(filepath.Join(dir, "env.txt"))
+			if tc.runs {
+				require.Equal(t, review.EffectApplied, res.Status, res.Detail)
+				assert.Empty(t, job.CommandsRefused)
+				assert.NotContains(t, string(raw), "the-review-agents-key")
+				return
+			}
+			assert.NotEmpty(t, job.CommandsRefused)
+			assert.Equal(t, review.EffectNotApplied, res.Status)
+			assert.ErrorIs(t, readErr, os.ErrNotExist, "nothing ran")
+		})
+	}
+}
+
+// Against the real registry: a job whose record no longer says what this
+// machine registered is still reviewed, and none of its commands is started.
+// A routine action is not run and nothing is journaled for it, an approved
+// action is not executed and keeps its decision, the owner is told once by
+// an exception that a recorded review does not clear, and when the job is
+// bound again the exception ends and its commands run.
+func TestRemoteAnUnboundJobIsReviewedAndRunsNoCommand(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	targetID := f.targetID()
+	bound := f.remote.LocalVersion
+	// This machine's record says something else than the registry does: the
+	// registry's copy of a command was rewritten after registration.
+	f.remote.LocalVersion = func(id string, version int) (json.RawMessage, error) {
+		raw, err := bound(id, version)
+		if err != nil {
+			return nil, err
+		}
+		return bytes.Replace(raw, []byte(`"command":"true"`), []byte(`"command":"./registered.sh"`), 1), nil
+	}
+	job, err := f.remote.Job(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Contains(t, job.CommandsRefused, "permitted actions")
+
+	unbound := func() (open, resolved int) {
+		for _, e := range f.job().Exceptions {
+			if e.Kind != string(review.ExceptionCommandsUnbound) {
+				continue
+			}
+			if e.ResolvedAt == nil {
+				open++
+			} else {
+				resolved++
+			}
+		}
+		return open, resolved
+	}
+	round := func(holder string, d review.AgentDecision) review.Applied {
+		t.Helper()
+		*f.ahead += 2 * time.Hour
+		r := f.reviewer(holder)
+		r.Now = func() time.Time { return time.Now().Add(*f.ahead) }
+		prepared, err := r.Prepare(ctx, f.jobID)
 		require.NoError(t, err)
-		assert.Empty(t, job.CredentialsRefused)
-		res := (&review.CommandEffector{}).Run(context.Background(), job, shellAction(`env > env.txt`, review.IdempotencyNone), review.Action{ID: "act_1", Name: "a"})
-		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
-		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		require.Empty(t, prepared.Skipped, "the job is still reviewed")
+		d.EvidenceRunIDs = prepared.Packet.RunIDs()
+		applied, err := r.Apply(ctx, prepared, d)
 		require.NoError(t, err)
-		assert.NotContains(t, string(raw), "the-review-agents-key")
-	})
+		return applied
+	}
+	act := review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "look and grow", Actions: []review.AgentAction{
+		{Name: "collect_diagnostics", TargetID: targetID, Reason: "look"},
+		{Name: "expand_volume", TargetID: targetID, Params: map[string]string{"size_gb": "200"}, Reason: "grow"},
+	}}
+
+	first := round("reviewer-a", act)
+	assert.Empty(t, first.Executed, "the routine action is not run")
+	assert.Equal(t, 0, f.fx.count("collect_diagnostics"))
+	actions, err := f.remote.Actions(ctx, f.jobID)
+	require.NoError(t, err)
+	assert.Empty(t, actions, "and nothing is journaled for it")
+	require.NotEmpty(t, first.Review.Notes)
+	assert.Contains(t, strings.Join(first.Review.Notes, "\n"), `action "collect_diagnostics" not run: `)
+	require.Len(t, first.Proposals, 1, "a question to the owner can still be asked")
+	open, _ := unbound()
+	assert.Equal(t, 1, open, "the owner is told")
+
+	// The owner approves the other action. It is not executed, and the
+	// decision is not used up.
+	proposals, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, proposals, 1)
+	answer, err := f.decide(proposals[0], 1, "approve")
+	require.NoError(t, err)
+	executed, err := f.reviewer("executor").Execute(ctx, f.jobID, proposals[0].ID, answer.Decision.DecisionID)
+	require.NoError(t, err)
+	assert.Contains(t, executed.Skipped, "not run: ")
+	assert.Equal(t, 0, f.fx.count("expand_volume"))
+
+	// Another review is recorded. That does not end the exception.
+	round("reviewer-b", review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+	open, resolved := unbound()
+	assert.Equal(t, 1, open, "still one, and still open")
+	assert.Equal(t, 0, resolved)
+
+	// The job is bound again: its commands run, and the exception ends.
+	f.remote.LocalVersion = bound
+	executed, err = f.reviewer("executor").Execute(ctx, f.jobID, proposals[0].ID, answer.Decision.DecisionID)
+	require.NoError(t, err)
+	assert.Empty(t, executed.Skipped)
+	assert.Equal(t, 1, f.fx.count("expand_volume"), "the approval was kept for when the job could run it")
+	round("reviewer-c", review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "fine"})
+	open, resolved = unbound()
+	assert.Equal(t, 0, open)
+	assert.Equal(t, 1, resolved)
 }
 
 // A run that ended in the queue has no finish time and is still a result,

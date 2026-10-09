@@ -95,15 +95,35 @@ record names the reference and the kind of failure: not a value, and not
 where the credential is kept. A reference cannot use a name that
 identifies the action or marks the review. The references are not part of
 what the review agent is shown. They are trusted input to the reviewer: it
-reads whatever a reference names. So `dagu txe review` does not take them
-from the registry, whose record can be changed after registration. It
-takes them from this machine's own record of the registration (the request
-`dagu txe register` filed beside the version's receipt), and only when the
-registry's copy still lists the same names, kinds and locators. If the
-copies differ in any way, or this machine has no record of the version
-while the registry lists references, none of the job's commands is
-started and nothing is read; the record says so without naming a
-locator. A job's credential files are read with the checks this machine
+reads whatever a reference names.
+
+So what a job's commands are, and what they are given, is not taken on the
+registry's word. The registry's record of a version can be changed after
+registration by whoever can write to it. `dagu txe review` reads this
+machine's own record of the registration (the request `dagu txe register`
+filed beside the version's receipt) and starts a job's commands only when
+the registry's current version says exactly the same in everything that
+reaches execution: the package (digest, path, working directory,
+entrypoint), every permitted action (command and reconcile lines, the
+`routine` flag, idempotency class, timeout, attempt limits, parameter
+schema) and the credential references. This holds for every job, with or
+without credentials. The references used are the local ones.
+
+If this machine has no usable record of the version, or anything differs,
+none of the job's commands is started: no routine action, no approved
+action (its decision is kept for later), no reconcile probe. Nothing is
+read. The job is still reviewed and questions still reach the owner, and
+the exception `job_commands_unbound` says what differs, without a locator
+or a command line. A recorded review does not clear it; it ends when the
+job is bound again. Registering the job again from that machine with
+`dagu txe register` binds it; that keeps the job and its history. A retry
+of a run is the service's own operation and is not affected.
+
+This protects a job registered from its machine against a changed
+registry record. It is not isolation from the service that dispatches work
+to the machine, nor from other code running as the same user.
+
+A job's credential files are read with the checks this machine
 applies to them elsewhere (an absolute, clean path to a regular file that
 is not a symbolic link and that only its owner can write). On Windows that
 read inspects no ownership or access list and its symbolic-link check can

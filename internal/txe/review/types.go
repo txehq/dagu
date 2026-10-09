@@ -176,11 +176,13 @@ type Job struct {
 	// on the job's machine when the job was registered, and leave out, or
 	// refuse the job over, any that differ. The effector does not check.
 	CredentialRefs []CredentialRef `json:"credential_refs,omitempty"`
-	// CredentialsRefused is set, with the reason, when the job's credential
-	// references could not be established as the ones authorized on its
-	// machine. No command of the job is started while it is set. It never
-	// says where a credential is kept.
-	CredentialsRefused string `json:"credentials_refused,omitempty"`
+	// CommandsRefused is set, with the reason, when what the registry says
+	// the job's commands are could not be established as what was
+	// registered on the job's machine. While it is set none of the job's
+	// commands is started: no action and no reconcile probe. Reviews,
+	// questions and proposals go on. It never says where a credential is
+	// kept or repeats a command line.
+	CommandsRefused string `json:"commands_refused,omitempty"`
 }
 
 // CredentialRef names a credential a job declares. The locator is a path or
@@ -552,6 +554,10 @@ const (
 	// being probed; the registry resolves the exception when that attempt
 	// is settled.
 	ExceptionRetryStalled ExceptionKind = "retry_reservation_stalled"
+	// ExceptionCommandsUnbound means the registry's record of the job's
+	// commands is not what this machine registered, or this machine has no
+	// record of the registration, so none of the job's commands is started.
+	ExceptionCommandsUnbound ExceptionKind = "job_commands_unbound"
 )
 
 // Exception is an actionable condition surfaced on the dashboard.

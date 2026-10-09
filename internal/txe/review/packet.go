@@ -198,7 +198,7 @@ func (p Packet) run(id string) (RunEvidence, bool) {
 func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, decisions []Decision, proposals []Proposal, actions []Action) (Packet, error) {
 	// Where the job's credentials are kept is for the machine that starts
 	// its commands, not for the agent: the packet's copy of the job has none.
-	job.CredentialRefs, job.CredentialsRefused = nil, ""
+	job.CredentialRefs, job.CommandsRefused = nil, ""
 	p := Packet{
 		SchemaVersion: PacketSchemaVersion,
 		ReviewID:      ReviewID(job.ID, cp.Version),

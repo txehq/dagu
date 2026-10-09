@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/dagucloud/dagu/v2/internal/txe/probe"
@@ -112,19 +113,39 @@ func (t txeReviewTransport) Do(ctx context.Context, method, path string, in, out
 	return err
 }
 
-// localCredentials adapts this machine's record of what it registered to
-// the reviewer: the credential references of a version of a job.
-func localCredentials(local probe.LocalCredentials) func(string, int) ([]review.CredentialRef, error) {
-	return func(jobID string, version int) ([]review.CredentialRef, error) {
-		refs, err := local.Refs(jobID, version)
+// localVersion reads what this machine registered as a version of a job:
+// the "version" object of the request `dagu txe register` filed beside the
+// version's receipt. It is the reviewer's only source for what a job's
+// commands may be given, and the record the registry's copy is checked
+// against. A version this machine did not register has none.
+func localVersion(home txepkg.Home) func(string, int) (json.RawMessage, error) {
+	return func(jobID string, version int) (json.RawMessage, error) {
+		receipt, err := txepkg.NewJournal(home).Receipt(jobID, version)
 		if err != nil {
 			return nil, err
 		}
-		out := make([]review.CredentialRef, len(refs))
-		for i, ref := range refs {
-			out[i] = review.CredentialRef{Name: ref.Name, Kind: ref.Kind, Locator: ref.Locator}
+		if receipt.RequestID == "" || strings.ContainsAny(receipt.RequestID, `/\.`) {
+			return nil, fmt.Errorf("receipt names request %q", receipt.RequestID)
 		}
-		return out, nil
+		path := filepath.Join(home.ReceiptsDir(), jobID, "requests", receipt.RequestID+".json")
+		raw, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return nil, fmt.Errorf("read registration request: %w", err)
+		}
+		var entry txepkg.Entry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return nil, fmt.Errorf("parse registration record: %w", err)
+		}
+		if entry.JobID != jobID || entry.Version != version {
+			return nil, fmt.Errorf("registration record is for %s v%d", entry.JobID, entry.Version)
+		}
+		var request struct {
+			Version json.RawMessage `json:"version"`
+		}
+		if err := json.Unmarshal(entry.Request, &request); err != nil || len(request.Version) == 0 {
+			return nil, fmt.Errorf("registration request has no version (%v)", err)
+		}
+		return request.Version, nil
 	}
 }
 
@@ -170,7 +191,7 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 			MachineID: machine,
 			Registry: &review.Remote{
 				Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient,
-				LocalCredentials: localCredentials(probe.LocalCredentials{Home: txeHome}),
+				LocalVersion: localVersion(txeHome),
 			},
 			// A job's file credentials are read with the checks this
 			// machine applies to them everywhere else. On Windows that read

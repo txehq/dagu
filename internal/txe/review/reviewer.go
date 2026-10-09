@@ -151,6 +151,19 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		return Prepared{}, fmt.Errorf("acquire claim: %w", err)
 	}
 
+	if job.CommandsRefused != "" {
+		// The owner is told, in the place exceptions are read: the job is
+		// still reviewed, and none of its commands will be started until it
+		// is registered from this machine again. Telling must not stop the
+		// review; an exception that could not be raised is raised again by
+		// the next one.
+		if err := r.Registry.RaiseException(ctx, Exception{
+			JobID: job.ID, Kind: ExceptionCommandsUnbound, MachineID: job.MachineID,
+			Message: CommandsUnboundMessage(job),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "txe review: job %s: raise exception: %v; the review goes on\n", job.ID, err)
+		}
+	}
 	packet, err := r.prepareClaimed(ctx, claim, job)
 	if errors.Is(err, ErrPacketTooLarge) {
 		// A job that cannot be reviewed must not simply go quiet. It is
@@ -502,6 +515,9 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 	}
 	if ok {
 		switch {
+		case len(declared.Reconcile) > 0 && job.CommandsRefused != "":
+			// The probe is one of the job's commands too.
+			res = EffectResult{Status: EffectUnknown, Detail: "the reconcile probe was not run: " + job.CommandsRefused}
 		case len(declared.Reconcile) > 0:
 			res = r.Effector.Probe(ctx, job, declared, action)
 		case declared.Idempotency == IdempotencyReadOnly:
@@ -850,6 +866,12 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		return propose(ProposalAction, fmt.Sprintf("Approve %q on %s? %s", requested.Name, requested.TargetID, agentReason(requested.Reason)))
 	}
 
+	if job.CommandsRefused != "" {
+		// Nothing is granted or journaled for a command that will not be
+		// started; the review says why.
+		review.Notes = append(review.Notes, fmt.Sprintf("action %q not run: %s", requested.Name, job.CommandsRefused))
+		return nil
+	}
 	intent := IntentKey(requested.Name, requested.TargetID, requested.Params)
 	if blocking, ok := unresolvedAttempt(history, decisions, intent, job.Version); ok {
 		// The effect of an earlier attempt is still unknown. Running the
@@ -1425,6 +1447,15 @@ func deniedText(denied *GuardDeniedError) string {
 	return string(denied.Reason)
 }
 
+// CommandsUnboundMessage is the exception raised for a job none of whose
+// commands is started: what is wrong, on which machine, and what to do.
+func CommandsUnboundMessage(job Job) string {
+	return commandsUnboundPrefix + "On machine " + job.MachineID + ": " + job.CommandsRefused +
+		". Reviews and questions go on; routine actions, approved actions and reconcile probes of this job do not run. " +
+		"If the job was changed on purpose, register it again from that machine with `dagu txe register`, which keeps the job and its history and records the new version there. " +
+		"If nobody changed it, the registry's record of the job was altered: look at who wrote to it before registering again."
+}
+
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
 	for name := range params {
 		found := slices.Contains(declared.Params, name)
@@ -1566,6 +1597,13 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 
 	if !job.Lifecycle.Reviewable() {
 		return Executed{Skipped: "job lifecycle is " + string(job.Lifecycle)}, nil
+	}
+	if job.CommandsRefused != "" && proposal.ActionName != RetryRunAction {
+		// An approval does not make an unregistered command the registered
+		// one. Nothing is granted, so the decision keeps its attempt for
+		// when the job is bound again. A retry of a run is the service's
+		// own operation, not a command of the job started here.
+		return Executed{Skipped: "not run: " + job.CommandsRefused}, nil
 	}
 
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimExecution, Holder: r.Holder, TTL: r.claimTTL()})

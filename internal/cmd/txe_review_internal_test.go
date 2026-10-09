@@ -17,7 +17,6 @@ import (
 
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
-	"github.com/dagucloud/dagu/v2/internal/txe/probe"
 	"github.com/dagucloud/dagu/v2/internal/txe/review"
 )
 
@@ -67,11 +66,11 @@ func TestTXEReviewCommandIsRegistered(t *testing.T) {
 	assert.Equal(t, map[string]bool{"prepare": true, "apply": true, "execute": true, "render": true}, steps)
 }
 
-// The reviewer's local credential references are read from this machine's
-// own record of the registration, the one `dagu txe register` leaves: a
-// version it registered gives its references, and a version it did not
+// What a job's commands may be is read from this machine's own record of the
+// registration, the one `dagu txe register` leaves: a version it registered
+// gives the version object of the request it sent, and a version it did not
 // register gives an error, never the registry's copy.
-func TestTXEReviewLocalCredentialsReadTheRegistrationRecord(t *testing.T) {
+func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	const jobID = "job_01JTXE00000000000000000AAA"
 	home := txepkg.Home{Root: t.TempDir()}
 	dir := filepath.Join(home.ReceiptsDir(), jobID)
@@ -79,18 +78,25 @@ func TestTXEReviewLocalCredentialsReadTheRegistrationRecord(t *testing.T) {
 	receipt, err := json.Marshal(txepkg.Receipt{Schema: 1, JobID: jobID, Version: 2, RequestID: "req_1"})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "v2.json"), receipt, 0o600))
-	request := json.RawMessage(`{"version":{"package":{"credential_refs":[{"name":"LINEAR_API_KEY","kind":"file","locator":"/home/me/.config/txe/linear"}]}}}`)
-	entry, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 2, Request: request})
+	version := `{"package":{"digest":"sha256:aa","path":"/pkg","entrypoint":"run.sh","credential_refs":[{"name":"LINEAR_API_KEY","kind":"file","locator":"/home/me/.config/txe/linear"}]},"review_policy":{"permitted_actions":[{"name":"restart","command":"./restart.sh","routine":true,"timeout_sec":60}]}}`
+	entry, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 2, Request: json.RawMessage(`{"job_id":"` + jobID + `","version":` + version + `}`)})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), entry, 0o600))
 
-	local := localCredentials(probe.LocalCredentials{Home: home})
-	refs, err := local(jobID, 2)
+	local := localVersion(home)
+	got, err := local(jobID, 2)
 	require.NoError(t, err)
-	assert.Equal(t, []review.CredentialRef{{Name: "LINEAR_API_KEY", Kind: review.CredentialFile, Locator: "/home/me/.config/txe/linear"}}, refs)
+	assert.JSONEq(t, version, string(got))
 
 	_, err = local(jobID, 3)
-	require.Error(t, err, "a version this machine did not register has no references")
+	require.Error(t, err, "a version this machine did not register has no record")
 	_, err = local("job_01JTXE00000000000000000BBB", 2)
+	require.Error(t, err)
+
+	// A record filed for another job or version is not this one's.
+	other, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 7, Request: json.RawMessage(`{"version":` + version + `}`)})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), other, 0o600))
+	_, err = local(jobID, 2)
 	require.Error(t, err)
 }

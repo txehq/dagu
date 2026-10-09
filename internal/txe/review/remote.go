@@ -5,6 +5,7 @@ package review
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,14 +67,10 @@ type Remote struct {
 	MachineID   string
 	RunID       string
 	AgentClient string
-	// LocalCredentials returns the credential references this machine
-	// itself registered for a version of a job, from its own record of the
-	// registration. They are the only references a job's commands are given.
-	// The registry's copy is never used for that: it is compared with the
-	// local one, and a job whose copies differ gets none of its commands
-	// started. Without LocalCredentials no job with references runs a
-	// command.
-	LocalCredentials func(jobID string, version int) ([]CredentialRef, error)
+	// LocalVersion returns what this machine itself registered as a version
+	// of a job: the "version" object of the registration request it sent,
+	// from its own record of the registration. See localBinding.
+	LocalVersion func(jobID string, version int) (json.RawMessage, error)
 }
 
 var _ Registry = (*Remote)(nil)
@@ -80,46 +79,119 @@ func (r *Remote) actor() *api.TxeActor {
 	return &api.TxeActor{Kind: api.TxeActorKindReviewer, Id: r.MachineID + "/" + r.RunID, MachineId: &r.MachineID}
 }
 
-// credentialRefs establishes the references a job's commands are given. The
-// registry's record of them can be changed by whoever can write to the
-// registry, after the job was registered; what was authorized is what this
-// machine recorded when it registered the version. So the references come
-// from that local record only, and the registry's copy must say the same:
-// the same names, kinds and locators. If the local record is missing or
-// unreadable, or the two differ in any way, no reference is used and the
-// reason is returned, which stops every command of the job. The reason
-// names no locator.
-func (r *Remote) credentialRefs(jobID string, version int, remote []api.TxeCredentialRef) ([]CredentialRef, string) {
-	if r.LocalCredentials == nil {
-		if len(remote) == 0 {
-			return nil, ""
+// executed is everything in a job version that decides what one of the
+// job's commands is and what it is given: where it runs, each permitted
+// action's command lines and the properties that govern running them, and
+// the credential references.
+type executed struct {
+	Digest         string                 `json:"digest"`
+	Path           string                 `json:"path"`
+	WorkingDir     string                 `json:"working_dir"`
+	Entrypoint     string                 `json:"entrypoint"`
+	CredentialRefs []api.TxeCredentialRef `json:"credential_refs"`
+	// MaxAttempts is the policy's limit on attempts of an action.
+	MaxAttempts int              `json:"max_attempts"`
+	Actions     []executedAction `json:"actions"`
+}
+
+type executedAction struct {
+	Name        string `json:"name"`
+	Command     string `json:"command"`
+	Reconcile   string `json:"reconcile"`
+	Entrypoint  string `json:"entrypoint"`
+	Routine     bool   `json:"routine"`
+	Idempotency string `json:"idempotency"`
+	TimeoutSec  int    `json:"timeout_sec"`
+	MaxAttempts int    `json:"max_attempts"`
+	ParamSchema string `json:"param_schema"`
+}
+
+// executedOf puts the executed part of a version into one comparable form.
+func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy) executed {
+	out := executed{
+		Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint,
+		CredentialRefs: slices.Clone(deref(pkg.CredentialRefs)),
+	}
+	slices.SortFunc(out.CredentialRefs, func(a, b api.TxeCredentialRef) int {
+		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Locator, b.Locator))
+	})
+	if policy != nil {
+		out.MaxAttempts = deref(policy.MaxAttempts)
+		for _, pa := range deref(policy.PermittedActions) {
+			schema := ""
+			if len(pa.ParamSchema) > 0 {
+				// The same schema, whatever its spacing.
+				var buf bytes.Buffer
+				if json.Compact(&buf, pa.ParamSchema) == nil {
+					schema = buf.String()
+				} else {
+					schema = string(pa.ParamSchema)
+				}
+			}
+			out.Actions = append(out.Actions, executedAction{
+				Name: pa.Name, Command: deref(pa.Command), Reconcile: deref(pa.Reconcile), Entrypoint: deref(pa.Entrypoint),
+				Routine: pa.Routine, Idempotency: string(deref(pa.Idempotency)), TimeoutSec: pa.TimeoutSec,
+				MaxAttempts: deref(pa.MaxAttempts), ParamSchema: schema,
+			})
 		}
-		return nil, "the job declares credentials and this reviewer has no local registration record to check them against: none of the job's commands is started"
 	}
-	local, err := r.LocalCredentials(jobID, version)
-	if err != nil {
-		if len(remote) == 0 {
-			// Nothing is declared and nothing would be read. A job
-			// registered from another machine has no record here.
-			return nil, ""
-		}
-		return nil, fmt.Sprintf("version %d of the job has no usable registration record on this machine, so its credential references cannot be checked: none of the job's commands is started", version)
+	slices.SortFunc(out.Actions, func(a, b executedAction) int { return cmp.Compare(a.Name, b.Name) })
+	return out
+}
+
+// localBinding establishes whether the job's commands may be started, and
+// with which credential references.
+//
+// The registry's record of a version can be changed, after the job was
+// registered, by whoever can write to the registry. What was authorized is
+// what this machine recorded when it registered the version. The reviewer
+// starts a job's commands on this machine, as its own user, and hands them
+// the job's credentials, so the commands have to be the registered ones: it
+// is not enough that the credential references are unchanged if the command
+// line they are given to, the flag that lets it run unasked, or the
+// directory it runs in was rewritten. And a job with no credentials at all
+// still gets a command started on this machine.
+//
+// So for every job the registry's current version must say exactly what
+// this machine registered in everything that reaches execution (see
+// executed), and the credential references used are the local ones. If
+// this machine has no usable record of the version, or anything differs,
+// the reason is returned: no command of the job is started and nothing is
+// read. The reason names the part that differs, and never a locator or a
+// command line.
+//
+// This protects the path of a job registered from this machine. It is not
+// isolation from the service that dispatches work to this machine, nor from
+// other code running as the same user.
+func (r *Remote) localBinding(jobID string, version int, v api.TxeJobVersion) ([]CredentialRef, string) {
+	refuse := func(why string) ([]CredentialRef, string) {
+		return nil, why + ": none of the job's commands is started"
 	}
-	if len(local) != len(remote) {
-		return nil, fmt.Sprintf("the registry lists %d credential reference(s) for version %d of the job and this machine registered %d: none of the job's commands is started", len(remote), version, len(local))
+	if r.LocalVersion == nil {
+		return refuse("this reviewer was given no local registration record to check the job against")
 	}
-	seen := make(map[CredentialRef]int, len(local))
-	for _, ref := range local {
-		seen[ref]++
+	raw, err := r.LocalVersion(jobID, version)
+	var registered struct {
+		Package      api.TxePackage       `json:"package"`
+		ReviewPolicy *api.TxeReviewPolicy `json:"review_policy"`
 	}
-	for _, ref := range remote {
-		key := CredentialRef{Name: ref.Name, Kind: string(ref.Kind), Locator: ref.Locator}
-		if seen[key] == 0 {
-			return nil, fmt.Sprintf("the registry's credential reference %s for version %d of the job is not the one this machine registered: none of the job's commands is started", agentText(ref.Name), version)
-		}
-		seen[key]--
+	if err != nil || json.Unmarshal(raw, &registered) != nil {
+		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	return local, ""
+	local, remote := executedOf(registered.Package, registered.ReviewPolicy), executedOf(v.Package, v.ReviewPolicy)
+	switch {
+	case !reflect.DeepEqual(local.CredentialRefs, remote.CredentialRefs):
+		return refuse(fmt.Sprintf("the registry's credential references for version %d of the job are not the ones this machine registered", version))
+	case local.Digest != remote.Digest || local.Path != remote.Path || local.WorkingDir != remote.WorkingDir || local.Entrypoint != remote.Entrypoint:
+		return refuse(fmt.Sprintf("the registry's package for version %d of the job is not the one this machine registered", version))
+	case local.MaxAttempts != remote.MaxAttempts || !reflect.DeepEqual(local.Actions, remote.Actions):
+		return refuse(fmt.Sprintf("the registry's permitted actions for version %d of the job are not the ones this machine registered", version))
+	}
+	refs := make([]CredentialRef, len(local.CredentialRefs))
+	for i, ref := range local.CredentialRefs {
+		refs[i] = CredentialRef{Name: ref.Name, Kind: string(ref.Kind), Locator: ref.Locator}
+	}
+	return refs, ""
 }
 
 func jobPath(jobID string, rest ...string) string {
@@ -366,7 +438,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	if job.WorkingDir == "" {
 		job.WorkingDir = v.Package.Path
 	}
-	job.CredentialRefs, job.CredentialsRefused = r.credentialRefs(jobID, doc.Version, deref(v.Package.CredentialRefs))
+	job.CredentialRefs, job.CommandsRefused = r.localBinding(jobID, doc.Version, v)
 	// The DAG a version runs and the package it runs from are bound by the
 	// version's immutable record. The job's digest is given only when that
 	// record and the job agree on both, so a run whose snapshot matches it
@@ -1314,6 +1386,11 @@ func count(n int) *int64 {
 	return &v
 }
 
+// commandsUnboundPrefix starts the message of the exception about a job
+// whose commands are not started. It is how that exception is told from the
+// reviewer's own failures, which a recorded review resolves.
+const commandsUnboundPrefix = "The job's commands are not started. "
+
 // reviewerRecovered tells the registry the reviewer works again, once a
 // review was recorded for a job whose reviewer it had as unavailable. That
 // resolves the reviewer's open exceptions; the job's own availability is
@@ -1323,8 +1400,16 @@ func (r *Remote) reviewerRecovered(ctx context.Context, jobID string) error {
 	if err != nil {
 		return err
 	}
-	if av := doc.ReviewerAvailability; av == nil || av.State == api.TxeAvailabilityState(registry.AvailabilityReady) {
+	av := doc.ReviewerAvailability
+	if av == nil || av.State == api.TxeAvailabilityState(registry.AvailabilityReady) {
 		return nil
+	}
+	if strings.HasPrefix(deref(av.Detail), commandsUnboundPrefix) {
+		// A recorded review does not mean the job's commands may run
+		// again. That exception ends only when the job is bound again.
+		if job, err := r.Job(ctx, jobID); err != nil || job.CommandsRefused != "" {
+			return err
+		}
 	}
 	scope := api.TxeObservationRequestScopeReviewer
 	detail := "a review was recorded"
@@ -1362,9 +1447,10 @@ func (r *Remote) DeferReview(ctx context.Context, claim Claim, until time.Time) 
 // exceptionStates maps a reviewer exception onto the availability state the
 // registry files it under. None of them is a lifecycle change.
 var exceptionStates = map[ExceptionKind]api.TxeAvailabilityState{
-	ExceptionReviewerAuth:   "auth_required",
-	ExceptionReviewerFailed: "stale",
-	ExceptionUnavailable:    "target_unreachable",
+	ExceptionReviewerAuth:    "auth_required",
+	ExceptionReviewerFailed:  "stale",
+	ExceptionCommandsUnbound: "stale",
+	ExceptionUnavailable:     "target_unreachable",
 }
 
 // jobExceptions are the exceptions about the job itself. Every other one is

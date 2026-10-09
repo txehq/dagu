@@ -140,8 +140,8 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// #nosec G204 -- argv comes from the job's registered policy, not from the agent.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
-	if job.CredentialsRefused != "" {
-		return 0, "", fmt.Errorf("%w: %s", errNotStarted, job.CredentialsRefused)
+	if job.CommandsRefused != "" {
+		return 0, "", fmt.Errorf("%w: %s", errNotStarted, job.CommandsRefused)
 	}
 	credentials, err := credentialEnv(job, e.ReadCredentialFile)
 	if err != nil {
