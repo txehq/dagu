@@ -36,6 +36,7 @@ type queueDispatchDeps struct {
 	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
+	runAdmitter            RunAdmitter
 	backoffConfig          BackoffConfig
 	leaseStaleThreshold    time.Duration
 	isClosed               func() bool
@@ -55,6 +56,7 @@ type queueDispatcher struct {
 	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
+	runAdmitter            RunAdmitter
 	backoffConfig          BackoffConfig
 	leaseStaleThreshold    time.Duration
 	isClosed               func() bool
@@ -361,6 +363,7 @@ func newQueueDispatcher(deps queueDispatchDeps) *queueDispatcher {
 		workerStaleAfter:       deps.workerStaleAfter,
 		dagExecutor:            deps.dagExecutor,
 		isSuspended:            deps.isSuspended,
+		runAdmitter:            deps.runAdmitter,
 		backoffConfig:          deps.backoffConfig,
 		leaseStaleThreshold:    deps.leaseStaleThreshold,
 		isClosed:               deps.isClosed,
@@ -760,6 +763,10 @@ func (d *queueDispatcher) dispatchQueuedItem(
 		return false
 	}
 
+	if !d.admitQueuedRun(ctx, queueName, runRef, item.ID(), attempt.ID(), status, dag) {
+		return false
+	}
+
 	if isSchedulerManagedTriggerType(status.TriggerType) {
 		suspended, err := isSuspendedDAG(ctx, d.isSuspended, status, dag, "")
 		if err != nil {
@@ -840,6 +847,20 @@ func (d *queueDispatcher) dropSuspendedQueuedRun(
 	attemptID string,
 	status *ir.DAGRunStatus,
 ) error {
+	return d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, suspendedQueueDropReason)
+}
+
+// dropQueuedRun finalizes a queued attempt as aborted with reason and
+// removes its queue item. The run's history is kept.
+func (d *queueDispatcher) dropQueuedRun(
+	ctx context.Context,
+	queueName string,
+	runRef ir.DAGRunRef,
+	itemID string,
+	attemptID string,
+	status *ir.DAGRunStatus,
+	reason string,
+) error {
 	if itemID == "" {
 		return errors.New("delete suspended DAG run queue item: missing queue item ID")
 	}
@@ -855,7 +876,7 @@ func (d *queueDispatcher) dropSuspendedQueuedRun(
 			}
 			latest.Status = ir.Aborted
 			latest.FinishedAt = finishedAt
-			latest.Error = suspendedQueueDropReason
+			latest.Error = reason
 			latest.WorkerID = ""
 			latest.PID = 0
 			latest.PIDStartedAt = 0
