@@ -1196,9 +1196,17 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 	if proposal.ActionName == RetryRunAction {
 		// The run is read before anything is granted. If the service cannot
 		// be reached now, nothing is journaled and the decision keeps its
-		// one attempt for a later try.
-		if _, err := r.Runs.RunState(ctx, jobID, proposal.Params[RetryRunParam]); err != nil {
-			return Executed{}, fmt.Errorf("read run %s: %w", proposal.Params[RetryRunParam], err)
+		// one attempt for a later try. If the run has moved on from the
+		// attempt the decision is about, the registry would refuse the
+		// grant, so none is asked for.
+		runID, bound := proposal.Params[RetryRunParam], proposal.Params[RetryRunAttemptParam]
+		state, err := r.Runs.RunState(ctx, jobID, runID)
+		if err != nil {
+			return Executed{}, fmt.Errorf("read run %s: %w", runID, err)
+		}
+		if !state.retryable(bound) {
+			return Executed{Skipped: fmt.Sprintf(
+				"the decision is about attempt %s of run %s, and the run is now at attempt %s (%s): nothing is retried", bound, runID, state.AttemptID, state.Status)}, nil
 		}
 	}
 

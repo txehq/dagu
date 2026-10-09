@@ -854,11 +854,11 @@ func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {
 			f := newRetryFixture(t)
 			move(f.runs)
 			out := f.execute("executor")
-			assert.Equal(t, review.ActionFailed, out.Action.State)
-			assert.Contains(t, out.Action.Detail, "not dispatched")
-			assert.Contains(t, out.Action.Detail, "att-1")
+			assert.Contains(t, out.Skipped, "att-1")
+			assert.Contains(t, out.Skipped, "nothing is retried")
+			assert.Empty(t, f.state().Actions[jobID], "no effect was granted or journaled")
 			assert.Empty(t, f.runs.retried, "the service was never asked")
-			// The decision is spent: replaying it does nothing either.
+			// Asking again changes nothing.
 			assert.NotEmpty(t, f.execute("executor").Skipped)
 			assert.Empty(t, f.runs.retried)
 		})
@@ -879,6 +879,38 @@ func TestRetryRunWaitsWhileTheRunCannotBeRead(t *testing.T) {
 	out := f.execute("executor")
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
 	assert.Len(t, f.runs.retried, 1)
+}
+
+// The run can move on between the check and the dispatch, after the effect
+// was granted. Nothing is dispatched then either, and the journal says so.
+func TestRetryRunGrantedForAnAttemptThatThenMovedOnIsNotDispatched(t *testing.T) {
+	f := newRetryFixture(t)
+	reads := 0
+	moving := &movingRuns{runs: f.runs, onRead: func() {
+		// The first read is the executor's check; the run is retried by
+		// someone else before the second, which follows the grant.
+		if reads++; reads == 2 {
+			f.runs.start("run-1")
+		}
+	}}
+	r := f.reviewer("executor")
+	r.Runs, r.RetryObserve = moving, 20*time.Millisecond
+	out, err := r.Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.ActionFailed, out.Action.State)
+	assert.Contains(t, out.Action.Detail, "not dispatched")
+	assert.Empty(t, f.runs.retried)
+}
+
+// movingRuns calls onRead before every read of a run's state.
+type movingRuns struct {
+	*runs
+	onRead func()
+}
+
+func (m *movingRuns) RunState(ctx context.Context, job, run string) (review.RunState, error) {
+	m.onRead()
+	return m.runs.RunState(ctx, job, run)
 }
 
 // A refusal by the service started nothing and is recorded as such.

@@ -92,6 +92,9 @@ type remoteFixture struct {
 	fx     *effects
 	opener *opener
 	tasks  *taskRecorder
+	// service is the fake of Dagu's run history that the registry's run
+	// control and the reviewer both read.
+	service *runs
 }
 
 // runsRemote supplies run evidence, which the real service reads from its
@@ -116,7 +119,9 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	ctx := context.Background()
 	dir := t.TempDir()
 	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
-	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	service := newRuns()
+	control := &runControl{runs: service}
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)), registry.WithRunControl(control))
 	require.NoError(t, err)
 	cfg := &config.Config{}
 	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
@@ -187,7 +192,37 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 		Remote: &review.Remote{Transport: transport, MachineID: machine, RunID: "tick-1", AgentClient: "fixture-agent 1.0"},
 		runs:   []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
-	return &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}}
+	f := &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}, service: service}
+	control.spec = f.job().DAGSpecSHA256
+	return f
+}
+
+// runControl is the registry's view of Dagu's runs in these tests: the
+// same fake of the service's run API the reviewer reads and retries
+// through, so both see one run history.
+type runControl struct {
+	runs *runs
+	// spec is the digest of the DAG every run in the fake ran.
+	spec string
+}
+
+func (c *runControl) ActiveRuns(context.Context, string) ([]registry.RunRef, error) { return nil, nil }
+func (c *runControl) StopRun(context.Context, string, registry.RunRef) error        { return nil }
+func (c *runControl) IsSuspended(context.Context, string) (bool, error)             { return false, nil }
+func (c *runControl) SetSuspended(context.Context, string, bool) error              { return nil }
+func (c *runControl) RunFinished(context.Context, string, registry.RunRef) (bool, error) {
+	return true, nil
+}
+
+func (c *runControl) LatestAttempt(ctx context.Context, job, runID string) (registry.RunAttempt, error) {
+	state, err := c.runs.RunState(ctx, job, runID)
+	if err != nil {
+		return registry.RunAttempt{}, registry.ErrRunNotFound
+	}
+	return registry.RunAttempt{
+		AttemptID: state.AttemptID, SpecSHA256: c.spec, Status: state.Status,
+		Finished: !state.Active, Succeeded: state.Succeeded,
+	}, nil
 }
 
 func writeAPIError(w http.ResponseWriter, _ *http.Request, err error) {
@@ -869,7 +904,7 @@ func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
 		{RunID: "run-1", Status: "failed", SpecSHA256: job.DAGSpecSHA256, AttemptID: "att-1"},
 		{RunID: "run-old", Status: "failed", SpecSHA256: "sha256:older", AttemptID: "att-1"},
 	}
-	service := newRuns()
+	service := f.service
 	service.fail("run-1", "att-1")
 	prepared, err := f.retrying("reviewer-a", service).Prepare(ctx, f.jobID)
 	require.NoError(t, err)
@@ -941,23 +976,31 @@ func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
 }
 
 // A retry a person requests directly is already decided and has no decision
-// run. The reviewer's tick executes it once, and never lists it again.
+// run. The reviewer's tick executes it once, and never lists it again. The
+// decision is about one failed attempt: when the retried attempt fails too,
+// a fresh decision about that attempt allows one more retry, while the old
+// decision, a second request for the same attempt and a request naming an
+// attempt that is no longer the latest all run nothing.
 func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
 	job := f.job()
-	var proposal *registry.Proposal
-	var decided *registry.Decision
-	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
-		proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
-			RunID: "run-7", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
-		}, "retry-run-7")
-		return err
-	})
+	service := f.service
+	service.fail("run-7", "att-1")
+	request := func(attempt, key string) (*registry.Proposal, *registry.Decision, error) {
+		var proposal *registry.Proposal
+		var decided *registry.Decision
+		_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+			proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+				RunID: "run-7", AttemptID: attempt, RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+			}, key)
+			return err
+		})
+		return proposal, decided, err
+	}
+	proposal, decided, err := request("att-1", "retry-run-7")
 	require.NoError(t, err)
 
-	service := newRuns()
-	service.fail("run-7", "att-1")
 	// A reviewer that cannot retry runs leaves the request where it is.
 	none, err := f.reviewer("tick-0").RunRequestedRetries(ctx, f.remote.MachineID)
 	require.NoError(t, err)
@@ -973,6 +1016,7 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	assert.Empty(t, done[0].Error)
 	assert.Empty(t, done[0].Executed.Skipped)
 	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	assert.Equal(t, "att-2", done[0].Executed.Action.Receipt, "the receipt is the new attempt observed on the run")
 	assert.Equal(t, []string{"run-7"}, service.retried)
 
 	again, err := f.retrying("tick-2", service).RunRequestedRetries(ctx, f.remote.MachineID)
@@ -980,12 +1024,102 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	assert.Empty(t, again)
 	assert.Len(t, service.retried, 1)
 
-	// The same request for a run of another version is refused outright.
+	// While the new attempt runs, the run cannot be asked for again.
+	_, _, err = request("att-2", "retry-run-7-early")
+	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
+
+	// The retried attempt fails too. A fresh decision about that attempt
+	// is a new proposal and allows exactly one more retry.
+	service.fail("run-7", "att-2")
+	later, laterDecision, err := request("att-2", "retry-run-7-again")
+	require.NoError(t, err)
+	assert.NotEqual(t, proposal.ProposalID, later.ProposalID, "each failed attempt is decided separately")
+	// Replaying the first request returns nothing new and authorizes nothing.
+	_, _, err = request("att-1", "retry-run-7")
+	assert.Equal(t, registry.CodeDuplicate, registry.ErrorCode(err))
+	// A second request for the attempt just decided is refused.
+	_, _, err = request("att-2", "retry-run-7-twice")
+	assert.Equal(t, registry.CodeProposalState, registry.ErrorCode(err))
+	// So is one naming an attempt that is no longer the run's latest.
+	_, _, err = request("att-1", "retry-run-7-stale")
+	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
+
+	done, err = f.retrying("tick-3", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, laterDecision.DecisionID, done[0].DecisionID)
+	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	assert.Equal(t, "att-3", done[0].Executed.Action.Receipt)
+	assert.Len(t, service.retried, 2, "one retry per decided attempt")
+
+	// The old decision, replayed against the executor, does nothing.
+	out, err := f.retrying("old", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+	// Nor does the later one, replayed after it ran.
+	out, err = f.retrying("old", service).Execute(ctx, f.jobID, later.ProposalID, laterDecision.DecisionID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+	assert.Len(t, service.retried, 2)
+
+	// A request for a run of another version is refused outright.
+	service.fail("run-8", "att-1")
 	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
-		_, _, err := tx.ProposeRetry(registry.RetryRunParams{RunID: "run-8", RunSpecSHA256: "sha256:older", PackageDigest: job.PackageDigest}, "retry-run-8")
+		_, _, err := tx.ProposeRetry(registry.RetryRunParams{RunID: "run-8", AttemptID: "att-1", RunSpecSHA256: "sha256:older", PackageDigest: job.PackageDigest}, "retry-run-8")
 		return err
 	})
 	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
+}
+
+// A retry whose dispatch was accepted but whose new attempt was not seen is
+// uncertain in the real registry too, and the registry itself refuses to
+// record it as succeeded on anything but the run's observed new attempt.
+func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	service.fail("run-7", "att-1")
+	var proposal *registry.Proposal
+	var decided *registry.Decision
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+		proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "run-7", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-run-7")
+		return err
+	})
+	require.NoError(t, err)
+
+	// The service accepts the request and shows no new attempt.
+	service.retry = func(string) error { return nil }
+	out, err := f.retrying("tick-1", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
+	require.NoError(t, err)
+	assert.Equal(t, review.ActionUncertain, out.Action.State)
+	assert.Empty(t, out.Action.Receipt)
+	stored := f.job().Actions[out.Action.ID]
+	require.NotNil(t, stored)
+	assert.Equal(t, registry.ActionUncertain, stored.State)
+
+	// The tick does not dispatch it again.
+	again, err := f.retrying("tick-2", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, again)
+	assert.Len(t, service.retried, 1)
+
+	// The dispatch landed after all: the next review of the job sees the
+	// new attempt on the run and settles the action with it.
+	service.start("run-7")
+	r := f.retrying("reviewer-b", service)
+	prepared, err := r.Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: []string{"run-1"}})
+	require.NoError(t, err)
+	actions, err := f.remote.Actions(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, actions, 1)
+	assert.Equal(t, review.ActionSucceeded, actions[0].State)
+	assert.Equal(t, "att-2", actions[0].Receipt)
+	assert.Len(t, service.retried, 1, "settled from the run, never by dispatching again")
 }
 
 // An effect whose outcome is unknown is escalated as the registry's typed
