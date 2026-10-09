@@ -873,6 +873,9 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 	if existingStatus != nil && existingStatus.Status == ir.Queued {
 		task.AttemptId = existingAttempt.ID()
 		task.AttemptKey = generateRootAttemptKey(task)
+		// A queued retry reuses this attempt and its key; the persisted queued-at
+		// marker is what distinguishes this execution from the earlier ones.
+		task.ExecutionMarker = existingStatus.QueuedAt
 
 		if err := existingAttempt.Open(ctx); err != nil {
 			return nil, fmt.Errorf("failed to open existing attempt: %w", err)
@@ -902,6 +905,8 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 
 	task.AttemptId = attempt.ID()
 	task.AttemptKey = generateRootAttemptKey(task)
+	// A new attempt's initial status has no queued-at marker.
+	task.ExecutionMarker = ""
 
 	if err := attempt.Open(ctx); err != nil {
 		return nil, fmt.Errorf("failed to open attempt: %w", err)
@@ -1495,19 +1500,19 @@ func (h *Handler) RunHeartbeat(ctx context.Context, req *coordinatorv1.RunHeartb
 		}
 		identity, identityErr := runningTaskIdentity(req.WorkerId, task)
 		if identityErr != nil {
-			cancelledRuns = appendCancelledRunIfMissing(cancelledRuns, task.AttemptKey)
+			cancelledRuns = appendCancelledExecutionIfMissing(cancelledRuns, task)
 			continue
 		}
 		if err := h.validateAttempt(ctx, identity); err != nil {
 			if status.Code(err) == codes.FailedPrecondition {
-				cancelledRuns = appendCancelledRunIfMissing(cancelledRuns, task.AttemptKey)
+				cancelledRuns = appendCancelledExecutionIfMissing(cancelledRuns, task)
 				continue
 			}
 			return nil, err
 		}
 		if err := h.refreshRunLease(ctx, task.AttemptKey, observedAt); err != nil {
 			if errors.Is(err, dispatch.ErrDAGRunLeaseNotFound) || errors.Is(err, persis.ErrCorrupt) {
-				cancelledRuns = appendCancelledRunIfMissing(cancelledRuns, task.AttemptKey)
+				cancelledRuns = appendCancelledExecutionIfMissing(cancelledRuns, task)
 				continue
 			}
 			return nil, status.Error(codes.Internal, "failed to refresh run lease: "+err.Error())
@@ -1603,7 +1608,7 @@ func (h *Handler) repairStaleLeaseFailureFromRunHeartbeat(
 		return
 	}
 
-	h.attemptOwnership().upsertActiveFromStatus(repairCtx, repairedStatus, workerID, lease.AttemptID)
+	h.attemptOwnership().upsertActiveFromStatus(repairCtx, repairedStatus, workerID, lease.AttemptID, lease.ExecutionMarker)
 	logger.Info(ctx, "Repaired stale distributed run failure from fresh heartbeat",
 		tag.DAG(lease.DAGRun.Name),
 		tag.RunID(lease.DAGRun.ID),
@@ -1844,6 +1849,22 @@ func appendCancelledRuns(dst []*coordinatorv1.CancelledRun, src []*coordinatorv1
 	return dst
 }
 
+// appendCancelledExecutionIfMissing cancels one refused execution of a running
+// task. It names the execution's marker so the worker does not cancel a newer
+// execution of the same attempt that shares its key.
+func appendCancelledExecutionIfMissing(cancelledRuns []*coordinatorv1.CancelledRun, task *coordinatorv1.RunningTask) []*coordinatorv1.CancelledRun {
+	if task == nil || task.AttemptKey == "" {
+		return cancelledRuns
+	}
+	for _, cancelled := range cancelledRuns {
+		if cancelled != nil && cancelled.AttemptKey == task.AttemptKey {
+			return cancelledRuns
+		}
+	}
+	marker := task.ExecutionMarker
+	return append(cancelledRuns, &coordinatorv1.CancelledRun{AttemptKey: task.AttemptKey, ExecutionMarker: &marker})
+}
+
 func appendCancelledRunIfMissing(cancelledRuns []*coordinatorv1.CancelledRun, attemptKey string) []*coordinatorv1.CancelledRun {
 	if attemptKey == "" {
 		return cancelledRuns
@@ -1932,7 +1953,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	leaseMissing := false
 	if h.dagRunLeaseStore != nil {
 		var validationErr error
-		activeLease, leaseMissing, validationErr = h.validateStatusLease(ctx, req.WorkerId, dagRunStatus)
+		activeLease, leaseMissing, validationErr = h.validateStatusLease(ctx, req.WorkerId, dagRunStatus, req.ExecutionMarker)
 		if validationErr != nil {
 			if status.Code(validationErr) == codes.FailedPrecondition {
 				return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: status.Convert(validationErr).Message()}, nil
@@ -1982,7 +2003,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			ownership := h.attemptOwnership()
 			// Live tracking must complete after the status write even if the
 			// reporting worker disconnects.
-			ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, bootstrappedAttempt.ID())
+			ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, bootstrappedAttempt.ID(), req.ExecutionMarker)
 			h.finalizeAdmissionForStatus(ctx, dagRunStatus, bootstrappedAttempt.ID())
 			h.closeCachedInactiveAttempt(ctx, dagRunStatus, bootstrappedAttempt)
 
@@ -2010,6 +2031,13 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	}
 	if profileErr != nil {
 		return nil, status.Error(codes.Internal, "failed to reconcile runtime profile: "+profileErr.Error())
+	}
+	// While the attempt waits in the queue again, only its next execution may
+	// report: an earlier execution whose lease outlived the re-queue would
+	// otherwise overwrite the queued status and its marker.
+	if !isSubDAGStatus(dagRunStatus) && latestStatus.Status == ir.Queued && req.ExecutionMarker != latestStatus.QueuedAt {
+		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
+		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
 	}
 	accepted, rejectReason := ownership.statusDecision(ctx, latestStatus, dagRunStatus, statusDecisionOptions{
 		CancellationRequested: h.sameAttemptCancellationRequested(ctx, latestAttempt, latestStatus, dagRunStatus),
@@ -2079,7 +2107,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 
 	// Live tracking must complete after the status write even if the reporting
 	// worker disconnects.
-	ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, attempt.ID())
+	ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, attempt.ID(), req.ExecutionMarker)
 	h.finalizeAdmissionForStatus(ctx, dagRunStatus, attempt.ID())
 	h.closeCachedInactiveAttempt(ctx, dagRunStatus, attempt)
 
@@ -2890,7 +2918,12 @@ func (h *Handler) reconcileLease(ctx context.Context, lease dispatch.DAGRunLease
 	}
 
 	workerID, ok := remoteWorkerID(runStatus, lease.WorkerID)
-	if !ok || !dispatch.LeaseIdentityMatchesStatus(&lease, runStatus, attemptID) {
+	// A re-queued attempt reuses its key. The only lease it can have is the
+	// one its next execution records at claim, carrying the queued marker; any
+	// other is an earlier execution's, and must neither fail the queued run as
+	// stale nor block its claim.
+	supersededByQueue := !isSubDAGStatus(runStatus) && runStatus.Status == ir.Queued && lease.ExecutionMarker != runStatus.QueuedAt
+	if !ok || !dispatch.LeaseIdentityMatchesStatus(&lease, runStatus, attemptID) || supersededByQueue {
 		ownership.deleteTracking(ctx, context.WithoutCancel(ctx), lease.DAGRun, lease.AttemptKey,
 			"Failed to delete superseded distributed lease",
 			"Failed to delete superseded active distributed run",
@@ -2901,7 +2934,7 @@ func (h *Handler) reconcileLease(ctx context.Context, lease dispatch.DAGRunLease
 	switch runStatus.Status {
 	case ir.Running, ir.NotStarted, ir.Queued:
 		if lease.MatchesClaim(runStatus.EffectiveClaimKey(), workerID) && lease.IsFresh(now, h.staleLeaseThreshold) {
-			ownership.upsertActiveFromStatus(ctx, runStatus, workerID, attemptID)
+			ownership.upsertActiveFromStatus(ctx, runStatus, workerID, attemptID, lease.ExecutionMarker)
 			return
 		}
 	case ir.Failed, ir.Aborted, ir.Succeeded, ir.PartiallySucceeded, ir.Waiting, ir.Rejected:
@@ -3110,7 +3143,7 @@ func (h *Handler) reconcileActiveRuns(ctx context.Context, now time.Time) {
 		}
 
 		if lease.MatchesClaim(claimKey, workerID) && lease.IsFresh(now, h.staleLeaseThreshold) {
-			ownership.upsertActiveFromStatus(ctx, runStatus, workerID, record.AttemptID)
+			ownership.upsertActiveFromStatus(ctx, runStatus, workerID, record.AttemptID, record.ExecutionMarker)
 			continue
 		}
 

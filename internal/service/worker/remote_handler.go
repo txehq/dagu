@@ -432,6 +432,7 @@ func (h *remoteTaskHandler) createRemoteHandlers(run remoteRun, dagName string) 
 		},
 		run.owner,
 	)
+	reporter.executionMarker = task.ExecutionMarker
 	return runHandlers{
 		status:    statusPusher,
 		logs:      reporter,

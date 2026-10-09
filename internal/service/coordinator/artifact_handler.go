@@ -127,6 +127,15 @@ func (h *artifactHandler) handleStream(stream coordinatorv1.CoordinatorService_S
 		}
 
 		if chunk.IsFinal {
+			// Commit replaces a visible file in the attempt's archive, which a
+			// queued retry reuses. Revalidate first so an earlier execution's
+			// upload cannot replace a file the current execution owns.
+			if validatedIdentity != nil {
+				if err := h.attemptValidator(ctx, *validatedIdentity); err != nil {
+					_ = h.closeWriter(activeWriters, key, false)
+					return err
+				}
+			}
 			if _, err := h.archiveDir(ctx, chunk); err != nil {
 				_ = h.closeWriter(activeWriters, key, false)
 				return fmt.Errorf("failed to validate artifact finalization: %w", err)

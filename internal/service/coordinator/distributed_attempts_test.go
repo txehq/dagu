@@ -155,7 +155,7 @@ func TestAttemptOwnershipSyncFromStatus(t *testing.T) {
 		ProfileName: "prod",
 	}
 	activeUpdatedLowerBound := time.Now().UTC().UnixMilli()
-	ownership.syncFromStatus(ctx, "", status, "")
+	ownership.syncFromStatus(ctx, "", status, "", "")
 	activeUpdatedUpperBound := time.Now().UTC().UnixMilli()
 
 	lease, err := leaseStore.Get(ctx, "attempt-key-1")
@@ -179,7 +179,7 @@ func TestAttemptOwnershipSyncFromStatus(t *testing.T) {
 
 	status.Status = ir.Queued
 	activeUpdatedLowerBound = time.Now().UTC().UnixMilli()
-	ownership.syncFromStatus(ctx, "worker-1", status, "")
+	ownership.syncFromStatus(ctx, "worker-1", status, "", "")
 	activeUpdatedUpperBound = time.Now().UTC().UnixMilli()
 
 	lease, err = leaseStore.Get(ctx, "attempt-key-1")
@@ -210,13 +210,13 @@ func TestAttemptOwnershipSyncFromStatus(t *testing.T) {
 		Status:      ir.Running,
 		WorkerID:    "worker-1",
 		ProfileName: "prod",
-	}, "")
+	}, "", "")
 	legacyLease, err := leaseStore.Get(ctx, "attempt-key-2")
 	require.NoError(t, err)
 	assert.Equal(t, "prod", legacyLease.ProfileName)
 
 	status.Status = ir.Succeeded
-	ownership.syncFromStatus(ctx, "worker-1", status, "")
+	ownership.syncFromStatus(ctx, "worker-1", status, "", "")
 
 	_, err = leaseStore.Get(ctx, "attempt-key-1")
 	assert.ErrorIs(t, err, dispatch.ErrDAGRunLeaseNotFound)
@@ -242,7 +242,7 @@ func TestAttemptOwnershipSyncFromStatusPersistsUnsetRoot(t *testing.T) {
 		AttemptKey: "root-claim",
 		Status:     ir.Running,
 		WorkerID:   "worker-1",
-	}, "")
+	}, "", "")
 
 	lease, err := leaseStore.Get(ctx, "root-claim")
 	require.NoError(t, err)
@@ -276,7 +276,7 @@ func TestInlineRunSharesClaimLease(t *testing.T) {
 		Status:     ir.Running,
 	}
 
-	ownership.syncFromStatus(ctx, "worker-1", status, "")
+	ownership.syncFromStatus(ctx, "worker-1", status, "", "")
 
 	lease, err := leaseStore.Get(ctx, "claim-key")
 	require.NoError(t, err)

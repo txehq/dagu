@@ -40,15 +40,19 @@ type DispatchTask struct {
 	ParentDAGRunName string
 	ParentDAGRunID   string
 
-	Operation    DispatchOperation
-	DAGRunID     string
-	Target       string
-	Definition   string
-	AttemptID    string
-	AttemptKey   string
-	Step         string
-	Params       string
-	ParallelItem string
+	Operation  DispatchOperation
+	DAGRunID   string
+	Target     string
+	Definition string
+	AttemptID  string
+	AttemptKey string
+	// ExecutionMarker tells executions of one attempt apart: the attempt's
+	// persisted queued-at marker when dispatched, empty for a direct start. A
+	// queued retry reuses the attempt and its key, so the key alone cannot.
+	ExecutionMarker string
+	Step            string
+	Params          string
+	ParallelItem    string
 	// PassedEnv carries resolved "KEY=value" pairs the parent opted to share
 	// with the child run via the step's pass_env field.
 	PassedEnv      []string

@@ -60,6 +60,8 @@ type LogStreamer struct {
 	rootRef   ir.DAGRunRef
 	owner     serviceregistry.HostInfo
 	mu        sync.RWMutex
+	// executionMarker is the claimed task's execution marker.
+	executionMarker string
 
 	schedulerMu     sync.RWMutex
 	schedulerWriter *schedulerLogWriter
@@ -104,6 +106,14 @@ func (s *LogStreamer) SetClaimKey(claimKey string) {
 	s.claimKey = claimKey
 }
 
+// SetExecutionMarker binds streamed logs to one execution of the attempt, so
+// the coordinator can refuse log writes of an earlier execution.
+func (s *LogStreamer) SetExecutionMarker(marker string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.executionMarker = marker
+}
+
 // getAttemptID returns the current attemptID
 func (s *LogStreamer) getAttemptID() string {
 	s.mu.RLock()
@@ -138,6 +148,7 @@ func (s *LogStreamer) newChunk(
 		AttemptId:          s.attemptID,
 		OwnerCoordinatorId: s.owner.ID,
 		AttemptKey:         attemptKey,
+		ExecutionMarker:    s.executionMarker,
 	}
 }
 

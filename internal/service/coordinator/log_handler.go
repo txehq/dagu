@@ -5,6 +5,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -21,10 +23,28 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// logStreamRevalidateInterval bounds how long a stream keeps writing on one
+// validation. A queued retry reuses the attempt's log files, so a stream of an
+// earlier execution must stop once the attempt is claimed again.
+const logStreamRevalidateInterval = time.Second
+
+// logFinalRecordSuffix names the record written beside a log file when its
+// final chunk is accepted. A log without a record matching an execution's
+// marker was not finalized by that execution.
+const logFinalRecordSuffix = ".final"
+
+// logFinalRecord is the content of a log file's finalization record.
+type logFinalRecord struct {
+	ExecutionMarker string `json:"executionMarker"`
+	AttemptID       string `json:"attemptId"`
+	Size            int64  `json:"size"`
+}
+
 // logHandler handles log streaming from workers
 type logHandler struct {
 	logDir           string
 	attemptValidator func(context.Context, attemptIdentity) error
+	now              func() time.Time
 
 	// Active writers: streamKey -> writer
 	writers   map[string]*streamLogWriter
@@ -94,6 +114,7 @@ func (w *streamLogWriter) close(finalSize *uint64) error {
 func newLogHandler(logDir string) *logHandler {
 	return &logHandler{
 		logDir:  logDir,
+		now:     time.Now,
 		writers: make(map[string]*streamLogWriter),
 	}
 }
@@ -104,6 +125,7 @@ func (h *logHandler) handleStream(stream coordinatorv1.CoordinatorService_Stream
 	var chunksReceived uint64
 	var bytesWritten uint64
 	var validatedIdentity *attemptIdentity
+	var lastValidated time.Time
 
 	for {
 		chunk, err := stream.Recv()
@@ -125,22 +147,36 @@ func (h *logHandler) handleStream(stream coordinatorv1.CoordinatorService_Stream
 			if identityErr != nil {
 				return status.Error(codes.InvalidArgument, identityErr.Error())
 			}
-			if validatedIdentity != nil {
-				if identity != *validatedIdentity {
-					return status.Error(codes.FailedPrecondition, "log stream attempt identity changed")
-				}
-			} else {
+			if validatedIdentity != nil && identity != *validatedIdentity {
+				return status.Error(codes.FailedPrecondition, "log stream attempt identity changed")
+			}
+			// Validate before a file is opened or truncated, and at least every
+			// interval while data flows, so a stream of an earlier execution
+			// cannot keep writing once the attempt has been claimed again.
+			if validatedIdentity == nil || chunk.IsFinal || !h.hasWriter(chunk) ||
+				h.now().Sub(lastValidated) >= logStreamRevalidateInterval {
 				if err := h.attemptValidator(ctx, identity); err != nil {
 					return err
 				}
 				validatedIdentity = &identity
+				lastValidated = h.now()
 			}
 		}
 
 		// Handle final marker
 		if chunk.IsFinal {
-			if err := h.closeWriter(chunk); err != nil {
+			size, finalized, err := h.closeWriter(chunk)
+			if err != nil {
 				return fmt.Errorf("failed to finalize log file: %w", err)
+			}
+			if finalized {
+				if err := writeLogFinalRecord(h.logFilePath(chunk), logFinalRecord{
+					ExecutionMarker: chunk.ExecutionMarker,
+					AttemptID:       chunk.AttemptId,
+					Size:            size,
+				}); err != nil {
+					return fmt.Errorf("failed to record log finalization: %w", err)
+				}
 			}
 			continue
 		}
@@ -179,6 +215,23 @@ func (h *logHandler) streamKey(chunk *coordinatorv1.LogChunk) string {
 	)
 }
 
+// hasWriter reports whether a writer is already open for the chunk's stream.
+func (h *logHandler) hasWriter(chunk *coordinatorv1.LogChunk) bool {
+	h.writersMu.Lock()
+	defer h.writersMu.Unlock()
+	_, ok := h.writers[h.streamKey(chunk)]
+	return ok
+}
+
+// writeLogFinalRecord atomically records that a log file was finalized.
+func writeLogFinalRecord(logPath string, record logFinalRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return fileutil.WriteFileAtomic(logPath+logFinalRecordSuffix, data, 0o600)
+}
+
 // getOrCreateWriter returns an existing writer or creates a new one
 func (h *logHandler) getOrCreateWriter(chunk *coordinatorv1.LogChunk) (*streamLogWriter, error) {
 	key := h.streamKey(chunk)
@@ -201,6 +254,12 @@ func (h *logHandler) getOrCreateWriter(chunk *coordinatorv1.LogChunk) (*streamLo
 	dir := filepath.Dir(logPath)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	// The file is about to be written again, so an earlier execution's
+	// finalization record no longer describes it.
+	if err := os.Remove(logPath + logFinalRecordSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to clear log finalization record: %w", err)
 	}
 
 	var file *os.File
@@ -231,7 +290,9 @@ func (h *logHandler) getOrCreateWriter(chunk *coordinatorv1.LogChunk) (*streamLo
 }
 
 // closeWriter closes and removes a writer.
-func (h *logHandler) closeWriter(chunk *coordinatorv1.LogChunk) error {
+// closeWriter finalizes the chunk's stream and returns the file's final size.
+// finalized is false when no writer was open for the stream.
+func (h *logHandler) closeWriter(chunk *coordinatorv1.LogChunk) (size int64, finalized bool, err error) {
 	key := h.streamKey(chunk)
 
 	h.writersMu.Lock()
@@ -241,13 +302,18 @@ func (h *logHandler) closeWriter(chunk *coordinatorv1.LogChunk) error {
 	}
 	h.writersMu.Unlock()
 	if !ok {
-		return nil
+		return 0, false, nil
 	}
 	if !w.positioned {
-		return w.close(nil)
+		err = w.close(nil)
+	} else {
+		finalSize := chunk.GetByteOffset()
+		err = w.close(&finalSize)
 	}
-	finalSize := chunk.GetByteOffset()
-	return w.close(&finalSize)
+	if err != nil {
+		return 0, false, err
+	}
+	return w.size, true, nil
 }
 
 // logFilePath generates the log file path following the existing pattern.

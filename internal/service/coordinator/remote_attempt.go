@@ -24,6 +24,10 @@ type attemptIdentity struct {
 	dagRun     ir.DAGRunRef
 	root       ir.DAGRunRef
 	attemptID  string
+	// executionMarker is the Task.execution_marker the writer claims to belong
+	// to. A queued retry reuses the attempt id and key, so only the marker
+	// separates a delayed write of an earlier execution from the current one.
+	executionMarker string
 }
 
 func newAttemptIdentity(
@@ -32,6 +36,7 @@ func newAttemptIdentity(
 	dagRun ir.DAGRunRef,
 	root ir.DAGRunRef,
 	attemptID string,
+	executionMarker string,
 ) (attemptIdentity, error) {
 	if workerID == "" || dagRun.Zero() || attemptID == "" {
 		return attemptIdentity{}, fmt.Errorf("worker, DAG run, and attempt identity are required")
@@ -48,12 +53,13 @@ func newAttemptIdentity(
 		claimKey = derivedKey
 	}
 	return attemptIdentity{
-		attemptKey: derivedKey,
-		claimKey:   claimKey,
-		workerID:   workerID,
-		dagRun:     dagRun,
-		root:       root,
-		attemptID:  attemptID,
+		attemptKey:      derivedKey,
+		claimKey:        claimKey,
+		workerID:        workerID,
+		dagRun:          dagRun,
+		root:            root,
+		attemptID:       attemptID,
+		executionMarker: executionMarker,
 	}, nil
 }
 
@@ -67,6 +73,7 @@ func logChunkIdentity(chunk *coordinatorv1.LogChunk) (attemptIdentity, error) {
 		ir.NewDAGRunRef(chunk.DagName, chunk.DagRunId),
 		ir.NewDAGRunRef(chunk.RootDagRunName, chunk.RootDagRunId),
 		chunk.AttemptId,
+		chunk.ExecutionMarker,
 	)
 }
 
@@ -80,10 +87,11 @@ func artifactChunkIdentity(chunk *coordinatorv1.ArtifactChunk) (attemptIdentity,
 		ir.NewDAGRunRef(chunk.DagName, chunk.DagRunId),
 		ir.NewDAGRunRef(chunk.RootDagRunName, chunk.RootDagRunId),
 		chunk.AttemptId,
+		chunk.ExecutionMarker,
 	)
 }
 
-func statusIdentity(workerID string, runStatus *ir.DAGRunStatus) (attemptIdentity, error) {
+func statusIdentity(workerID string, runStatus *ir.DAGRunStatus, executionMarker string) (attemptIdentity, error) {
 	if runStatus == nil {
 		return attemptIdentity{}, fmt.Errorf("status is required")
 	}
@@ -103,12 +111,13 @@ func statusIdentity(workerID string, runStatus *ir.DAGRunStatus) (attemptIdentit
 		claimKey = attemptKey
 	}
 	return attemptIdentity{
-		attemptKey: attemptKey,
-		claimKey:   claimKey,
-		workerID:   workerID,
-		dagRun:     runStatus.DAGRun(),
-		root:       root,
-		attemptID:  runStatus.AttemptID,
+		attemptKey:      attemptKey,
+		claimKey:        claimKey,
+		workerID:        workerID,
+		dagRun:          runStatus.DAGRun(),
+		root:            root,
+		attemptID:       runStatus.AttemptID,
+		executionMarker: executionMarker,
 	}, nil
 }
 
@@ -116,12 +125,13 @@ func (h *Handler) validateStatusLease(
 	ctx context.Context,
 	workerID string,
 	runStatus *ir.DAGRunStatus,
+	executionMarker string,
 ) (*dispatch.DAGRunLease, bool, error) {
 	if workerID == "" {
 		return nil, false, status.Error(codes.InvalidArgument, "worker, DAG run, and attempt identity are required")
 	}
 
-	identity, identityErr := statusIdentity(workerID, runStatus)
+	identity, identityErr := statusIdentity(workerID, runStatus, executionMarker)
 	if identityErr == nil {
 		lease, err := h.dagRunLeaseStore.Get(ctx, identity.claimKey)
 		switch {
@@ -142,7 +152,7 @@ func (h *Handler) validateStatusLease(
 		return nil, false, status.Error(codes.FailedPrecondition, remoteAttemptRejectedLeaseInactive)
 	}
 
-	claimKey, lease, err := h.validateSubDAGRootLease(ctx, workerID, runStatus.Root)
+	claimKey, lease, err := h.validateSubDAGRootLease(ctx, workerID, runStatus.Root, executionMarker)
 	if err != nil {
 		return nil, false, err
 	}
@@ -154,6 +164,7 @@ func (h *Handler) validateSubDAGRootLease(
 	ctx context.Context,
 	workerID string,
 	rootRef ir.DAGRunRef,
+	executionMarker string,
 ) (string, *dispatch.DAGRunLease, error) {
 	rootAttempt, err := h.dagRunRepository.FindAttempt(ctx, rootRef)
 	if err != nil {
@@ -186,12 +197,13 @@ func (h *Handler) validateSubDAGRootLease(
 		return "", nil, status.Error(codes.FailedPrecondition, remoteAttemptRejectedLeaseInactive)
 	}
 	identity := attemptIdentity{
-		attemptKey: attemptKey,
-		claimKey:   claimKey,
-		workerID:   workerID,
-		dagRun:     rootRef,
-		root:       rootRef,
-		attemptID:  attemptID,
+		attemptKey:      attemptKey,
+		claimKey:        claimKey,
+		workerID:        workerID,
+		dagRun:          rootRef,
+		root:            rootRef,
+		attemptID:       attemptID,
+		executionMarker: executionMarker,
 	}
 	lease, err := h.attemptLease(ctx, identity)
 	if err != nil {
@@ -214,11 +226,12 @@ func runningTaskIdentity(workerID string, task *coordinatorv1.RunningTask) (atte
 		root = dagRun
 	}
 	return attemptIdentity{
-		attemptKey: task.AttemptKey,
-		claimKey:   task.AttemptKey,
-		workerID:   workerID,
-		dagRun:     dagRun,
-		root:       root,
+		attemptKey:      task.AttemptKey,
+		claimKey:        task.AttemptKey,
+		workerID:        workerID,
+		dagRun:          dagRun,
+		root:            root,
+		executionMarker: task.ExecutionMarker,
 	}, nil
 }
 
@@ -246,6 +259,13 @@ func (h *Handler) attemptLease(ctx context.Context, identity attemptIdentity) (*
 
 func (h *Handler) validateAttemptLease(lease *dispatch.DAGRunLease, identity attemptIdentity) error {
 	if !lease.MatchesClaim(identity.claimKey, identity.workerID) {
+		return status.Error(codes.FailedPrecondition, remoteAttemptRejectedSuperseded)
+	}
+	// The lease records the claimed task's marker. An empty marker matches only
+	// an empty one, so a delayed write of a direct-start execution is refused
+	// once the attempt has been queued and claimed again. This also covers
+	// inline descendants, which write under their ancestor's claim.
+	if lease.ExecutionMarker != identity.executionMarker {
 		return status.Error(codes.FailedPrecondition, remoteAttemptRejectedSuperseded)
 	}
 	leaseRoot := lease.Root
