@@ -4,7 +4,6 @@
 package review
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -130,7 +129,10 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// the effect after the attempt was recorded as over.
 	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
 	cmd.WaitDelay = 5 * time.Second
-	var stdout bytes.Buffer
+	// Only the end of what the action prints is kept: the receipt is its
+	// last line, and a job's command must not be able to fill the
+	// reviewer's memory with what comes before it.
+	stdout := tailBuffer{limit: maxActionOutput}
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
 
@@ -203,4 +205,32 @@ func (a DeclaredAction) Timeout() time.Duration {
 		return time.Duration(a.TimeoutSec) * time.Second
 	}
 	return defaultActionTimeout
+}
+
+// maxActionOutput bounds what is kept of an action's standard output.
+const maxActionOutput = 64 << 10
+
+// tailBuffer keeps the last limit bytes written to it and discards what
+// came before, always reporting the whole write as done so the writer is
+// never blocked or failed by it.
+type tailBuffer struct {
+	buf   []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	// Trimmed only once it has doubled, so a stream of small writes does
+	// not copy the kept tail on every one of them.
+	if len(b.buf) > 2*b.limit {
+		b.buf = append(b.buf[:0], b.buf[len(b.buf)-b.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	if len(b.buf) > b.limit {
+		return string(b.buf[len(b.buf)-b.limit:])
+	}
+	return string(b.buf)
 }

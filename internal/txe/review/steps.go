@@ -164,6 +164,7 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 	decision, err := ParseAgentOutput(raw)
 	if err == nil && s.ArtifactDir != "" {
 		if saveErr := s.saveArtifact(decisionArtifact, decision); saveErr != nil {
+			s.release(ctx, prepared.Claim)
 			return fmt.Errorf("save decision artifact: %w", saveErr)
 		}
 		reviewer.PacketArtifact, reviewer.DecisionArtifact = packetArtifact, decisionArtifact
@@ -187,12 +188,35 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 		}
 		result.Failure = failure.Error()
 	case err != nil:
+		// Nothing retries this step, so the claim would otherwise hold the
+		// job until it expired. What was done is in the journal and the
+		// checkpoint has not moved: the next review takes the same episode
+		// up again and repeats nothing.
+		s.release(ctx, prepared.Claim)
 		return err
 	default:
 		result.Applied = &applied
 	}
 	return json.NewEncoder(stdout).Encode(result)
 }
+
+// release gives up the claim of a review that cannot be completed in this
+// step. It is given its own short time, so it still happens when the step's
+// context is already over, and a failure to release only means the claim
+// runs out by itself.
+func (s *Steps) release(ctx context.Context, claim Claim) {
+	if claim.ID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if err := s.Reviewer.Registry.ReleaseClaim(ctx, claim); err != nil {
+		fmt.Fprintf(os.Stderr, "txe review: releasing the claim on %s: %v\n", claim.JobID, err)
+	}
+}
+
+// releaseTimeout bounds giving up a claim after a failed step.
+const releaseTimeout = 15 * time.Second
 
 // Execute runs the single effect an approve decision authorizes.
 func (s *Steps) Execute(ctx context.Context, jobID, proposalID, decisionID string, stdout io.Writer) error {

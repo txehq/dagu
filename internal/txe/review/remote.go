@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,19 +117,13 @@ func (r *Remote) do(ctx context.Context, method, path string, in, out any) error
 	return refusal(r.Transport.Do(ctx, method, path, in, out))
 }
 
-// targetKey is the reviewer's single-string form of a target's stable
-// identity: its fields in key order.
-func targetKey(stable map[string]string) string {
-	keys := make([]string, 0, len(stable))
-	for k := range stable {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+stable[k])
-	}
-	return strings.Join(parts, ",")
+// targetKey is the reviewer's single-string form of a registered target. It
+// is the registry's own canonical identity, over the target's kind and its
+// whole stable id, so two targets never share one: not two kinds with the
+// same id, and not two ids that only read alike once their fields are
+// joined.
+func targetKey(t api.TxeTarget) string {
+	return registry.TargetKey(registry.Target{Kind: t.Kind, StableID: t.StableId})
 }
 
 // optional returns nil for an empty string, so an absent value is omitted.
@@ -264,7 +257,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 		job.DAGSpecSHA256 = spec
 	}
 	for _, t := range deref(v.Targets) {
-		job.Targets = append(job.Targets, Target{Kind: t.Kind, StableID: targetKey(t.StableId), Environment: deref(t.Environment)})
+		job.Targets = append(job.Targets, Target{Kind: t.Kind, StableID: targetKey(t), Identity: t.StableId, Environment: deref(t.Environment)})
 	}
 	if eo := v.ExpectedOutcome; eo != nil {
 		job.ExpectedOutcomes = deref(eo.SuccessCriteria)
@@ -653,7 +646,7 @@ func (r *Remote) proposalOf(jobID string, p api.TxeProposal) Proposal {
 		out.RelatedAction = out.Params[UncertainEffectParam]
 	}
 	if t := p.Action.Target; t != nil {
-		out.TargetID = targetKey(t.StableId)
+		out.TargetID = targetKey(*t)
 	}
 	return out
 }
@@ -715,17 +708,33 @@ func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit in
 	return out, nil
 }
 
+// retryScan bounds how many requested retries one listing looks at.
+const retryScan = 200
+
 // RequestedRetries implements Registry. A retry a person requested is a
 // decided retry proposal without a native task. Its latest retry decision
 // is the request; once that decision has a journaled action it was
 // attempted and is the journal's business. The key is the decision, not the
 // proposal: a later decision about the same run is a new request.
+//
+// A request whose run has moved on from the execution it names can never be
+// carried out, and nothing in the registry ends it. Such a request must not
+// take a place in the batch, or enough of them would keep every valid one
+// waiting for good. So each request is checked against its run, only the
+// ones that can still be carried out are returned, and when there are more
+// requests than one listing looks at, the place it starts from moves on
+// with time so that every request is reached.
 func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error) {
 	var list api.TxeJobList
 	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
 		return nil, err
 	}
-	var out []RequestedRetry
+	type request struct {
+		RequestedRetry
+		runID string
+		bound Execution
+	}
+	var all []request
 	for _, job := range list.Jobs {
 		if !Lifecycle(job.Lifecycle).Reviewable() {
 			continue
@@ -734,10 +743,10 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 		if err != nil {
 			return nil, err
 		}
-		var decided []string
+		decided := map[string]api.TxeProposal{}
 		for _, p := range append(proposals.Open, proposals.Finished...) {
 			if p.State == api.TxeProposalState(ProposalDecided) && p.Action.Name == RetryRunAction && p.NativeTask == nil {
-				decided = append(decided, p.ProposalId)
+				decided[p.ProposalId] = p
 			}
 		}
 		if len(decided) == 0 {
@@ -755,21 +764,46 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 		if err != nil {
 			return nil, err
 		}
-		sort.Strings(decided)
-		for _, id := range decided {
+		latest := map[string]Decision{}
+		for _, d := range decisions {
 			// The latest answer to a proposal is the one that counts.
-			for _, d := range slices.Backward(decisions) {
-				if d.ProposalID != id {
-					continue
-				}
-				if d.Verdict == VerdictRetry && !attempted[d.ID] {
-					out = append(out, RequestedRetry{JobID: job.JobId, ProposalID: id, DecisionID: d.ID})
-				}
-				break
+			latest[d.ProposalID] = d
+		}
+		for id, p := range decided {
+			d, ok := latest[id]
+			if !ok || d.Verdict != VerdictRetry || attempted[d.ID] {
+				continue
 			}
-			if limit > 0 && len(out) >= limit {
-				return out, nil
+			params := paramsOf(p.Action.Params)
+			bound, complete := retriedExecution(params)
+			if !complete {
+				continue
 			}
+			all = append(all, request{
+				RequestedRetry: RequestedRetry{JobID: job.JobId, ProposalID: id, DecisionID: d.ID},
+				runID:          params[RetryRunParam], bound: bound,
+			})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].DecisionID < all[j].DecisionID })
+	start := 0
+	if len(all) > retryScan {
+		start = int(time.Now().Unix()/60) % len(all)
+	}
+	runs := remoteRuns{t: r.Transport}
+	var out []RequestedRetry
+	for i := 0; i < min(len(all), retryScan) && (limit <= 0 || len(out) < limit); i++ {
+		req := all[(start+i)%len(all)]
+		state, err := runs.RunState(ctx, req.JobID, req.runID)
+		if errors.Is(err, ErrNotFound) {
+			// The service no longer has the run: nothing can be retried.
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read run %s of job %s: %w", req.runID, req.JobID, err)
+		}
+		if state.retryable(req.bound) {
+			out = append(out, req.RequestedRetry)
 		}
 	}
 	return out, nil
@@ -842,7 +876,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 		StartedAt: a.Created.At, FinishedAt: a.Updated.At,
 	}
 	if t := a.Spec.Target; t != nil {
-		out.TargetID = targetKey(t.StableId)
+		out.TargetID = targetKey(*t)
 	}
 	out.IntentKey = IntentKey(out.Name, out.TargetID, out.Params)
 	if g := a.Grant; g != nil {
@@ -891,7 +925,7 @@ func (r *Remote) specOf(ctx context.Context, jobID, name, targetID string, param
 		return spec, err
 	}
 	for _, t := range deref(v.Targets) {
-		if targetKey(t.StableId) == targetID {
+		if targetKey(t) == targetID {
 			target := t
 			spec.Target = &target
 			return spec, nil
@@ -1174,24 +1208,59 @@ func RemoteEnqueue(t Transport) EnqueueFunc {
 
 // RemoteComplete returns a CompleteFunc that completes a human task through
 // the service.
+//
+// The service answers 409 both when the task was completed with another
+// input and when it simply cannot be completed yet: the run has not reached
+// the task, is still being finalized, or changed underneath the request.
+// Only the first means the task was answered. So a conflict is checked
+// against the run itself: answered only when the task's step, or the whole
+// run, is over. Anything else is returned as an error, which leaves the
+// task to be tried again and is never recorded as a final outcome.
 func RemoteComplete(t Transport) CompleteFunc {
 	return func(ctx context.Context, task TaskLocator, input map[string]string) error {
-		path := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID) +
-			"/human-tasks/" + url.PathEscape(task.StepID) + "/complete"
-		err := t.Do(ctx, http.MethodPost, path, input, nil)
-		// 409: the task was already completed with another input. 404: the
-		// service knows no such run. An identical earlier completion is a
-		// plain success.
-		if te, ok := errors.AsType[*TransportError](err); ok {
-			switch te.Status {
-			case http.StatusConflict:
-				return ErrTaskAnswered
-			case http.StatusNotFound:
-				return ErrRunMissing
+		base := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID)
+		err := t.Do(ctx, http.MethodPost, base+"/human-tasks/"+url.PathEscape(task.StepID)+"/complete", input, nil)
+		te, refused := errors.AsType[*TransportError](err)
+		if !refused {
+			return err
+		}
+		switch te.Status {
+		case http.StatusNotFound:
+			return ErrRunMissing
+		case http.StatusConflict:
+			var detail struct {
+				DagRunDetails struct {
+					StatusLabel api.StatusLabel `json:"statusLabel"`
+					Nodes       []struct {
+						Step struct {
+							Name string `json:"name"`
+						} `json:"step"`
+						StatusLabel string `json:"statusLabel"`
+					} `json:"nodes"`
+				} `json:"dagRunDetails"`
 			}
+			if readErr := t.Do(ctx, http.MethodGet, base, nil, &detail); readErr != nil {
+				return fmt.Errorf("the task could not be completed (%s) and its run could not be read: %w", te.Message, readErr)
+			}
+			run := detail.DagRunDetails
+			if terminalRunStatuses[run.StatusLabel] {
+				return ErrTaskAnswered
+			}
+			for _, node := range run.Nodes {
+				if node.Step.Name == task.StepID && finishedStepStatuses[node.StatusLabel] {
+					return ErrTaskAnswered
+				}
+			}
+			return fmt.Errorf("the task cannot be completed yet: %s (run is %s)", te.Message, run.StatusLabel)
 		}
 		return err
 	}
+}
+
+// finishedStepStatuses are the step states after which a human task can no
+// longer be answered.
+var finishedStepStatuses = map[string]bool{
+	"succeeded": true, "failed": true, "aborted": true, "skipped": true, "rejected": true, "partially_succeeded": true,
 }
 
 // remoteRuns reads and retries runs through the service's own run API.

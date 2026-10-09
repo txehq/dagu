@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -124,6 +125,29 @@ func (p Packet) trimmedExecutions() []string {
 		}
 	}
 	return out
+}
+
+// trimmedCaveat is what a recommendation to end a job must tell the owner
+// when the review behind it was shown runs with part of their evidence left
+// out. Evidence nobody saw cannot support the conclusion that a job is done
+// or should stop, so the owner is told which runs to look at themselves.
+// It is empty when every run was shown whole.
+func (p Packet) trimmedCaveat() string {
+	var ids []string
+	for _, r := range p.NewRuns {
+		if r.EvidenceTrimmed {
+			ids = append(ids, r.RunID)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	const shown = 5
+	list := strings.Join(ids[:min(len(ids), shown)], ", ")
+	if len(ids) > shown {
+		list += fmt.Sprintf(" and %d more", len(ids)-shown)
+	}
+	return fmt.Sprintf(" This review was shown %d run(s) with part of their evidence left out to fit (%s). What was left out is not evidence for this recommendation: check those runs yourself before deciding.", len(ids), list)
 }
 
 // run returns the finished run with this id that the packet shows.

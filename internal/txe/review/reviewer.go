@@ -895,9 +895,9 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomeWaitHuman:
 		return ask(decision.Question)
 	case OutcomeComplete:
-		return ask("The reviewer finds this job's purpose fulfilled and recommends completing it.")
+		return ask("The reviewer finds this job's purpose fulfilled and recommends completing it." + packet.trimmedCaveat())
 	case OutcomeRetire:
-		return ask("The reviewer recommends retiring this job.")
+		return ask("The reviewer recommends retiring this job." + packet.trimmedCaveat())
 	case OutcomePauseUnavailable:
 		err := r.Registry.RaiseException(ctx, Exception{
 			JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,

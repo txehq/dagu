@@ -189,8 +189,11 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	}, nil)
 
 	remote := &runsRemote{
-		Remote: &review.Remote{Transport: transport, MachineID: machine, RunID: "tick-1", AgentClient: "fixture-agent 1.0"},
-		runs:   []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
+		Remote: &review.Remote{
+			Transport: splitTransport{runs: runsTransport{runs: service}, rest: transport},
+			MachineID: machine, RunID: "tick-1", AgentClient: "fixture-agent 1.0",
+		},
+		runs: []review.RunEvidence{{RunID: "run-1", Status: "failed", Outputs: map[string]string{"free_pct": "12"}}},
 	}
 	f := &remoteFixture{t: t, store: store, remote: remote, jobID: jobID, target: target, fx: newEffects(), opener: &opener{}, tasks: &taskRecorder{}, service: service}
 	control.spec = f.job().DAGSpecSHA256
@@ -243,6 +246,12 @@ func (f *remoteFixture) reviewer(holder string) *review.Reviewer {
 	}
 }
 
+// targetID is the reviewer's id of the fixture job's target: the registry's
+// canonical identity of it.
+func (f *remoteFixture) targetID() string {
+	return registry.TargetKey(registry.Target{Kind: f.target.Kind, StableID: f.target.StableId})
+}
+
 func (f *remoteFixture) job() *registry.Job {
 	f.t.Helper()
 	job, err := f.store.GetJob(context.Background(), f.jobID)
@@ -257,7 +266,7 @@ func (f *remoteFixture) job() *registry.Job {
 func TestRemoteReviewEpisodeAgainstTheRealRegistry(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
-	targetID := "cluster_uid=c-1,uid=vol-1"
+	targetID := f.targetID()
 
 	due, err := f.remote.DueJobs(ctx, f.remote.MachineID, time.Now().Add(time.Minute))
 	require.NoError(t, err)
@@ -344,7 +353,7 @@ func TestRemoteReviewEpisodeAgainstTheRealRegistry(t *testing.T) {
 func TestRemoteCrashLeavesTheActionInFlight(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
-	targetID := "cluster_uid=c-1,uid=vol-1"
+	targetID := f.targetID()
 	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
 	require.NoError(t, err)
 
@@ -760,6 +769,30 @@ func TestRemoteRunsAfterKeepsRunsWithoutAFinishTime(t *testing.T) {
 	assert.Empty(t, l.uncovered())
 }
 
+// runsTransport serves the part of the service's run API the adapter reads
+// a run's state from, out of the fake run history.
+type runsTransport struct {
+	runs *runs
+}
+
+func (t runsTransport) Do(ctx context.Context, method, path string, _, out any) error {
+	parts := strings.Split(strings.TrimPrefix(path, "/dag-runs/"), "/")
+	if method != http.MethodGet || len(parts) != 2 {
+		return &review.TransportError{Status: http.StatusNotFound, Message: "no fake for " + method + " " + path}
+	}
+	state, err := t.runs.RunState(ctx, parts[0], parts[1])
+	if err != nil {
+		return &review.TransportError{Status: http.StatusNotFound, Code: "not_found", Message: "run " + parts[1] + " not found"}
+	}
+	raw, err := json.Marshal(map[string]any{"dagRunDetails": map[string]any{
+		"attemptId": state.AttemptID, "queuedAt": state.QueuedAt, "statusLabel": state.Status,
+	}})
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, out)
+}
+
 // splitTransport sends the service's own run API to a stub and everything
 // else, the registry among it, to the real handlers.
 type splitTransport struct {
@@ -785,7 +818,7 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	l.job = f.jobID
 	l.set("run-1 a1 failed 2026-10-09T10:01:00Z")
 	remote := &review.Remote{
-		Transport: splitTransport{runs: l.stub, rest: f.remote.Transport},
+		Transport: splitTransport{runs: l.stub, rest: f.remote.Transport.(splitTransport).rest},
 		MachineID: f.remote.MachineID, RunID: "tick-1", AgentClient: "fixture-agent 1.0",
 	}
 	reviewer := func(holder string) *review.Reviewer {
@@ -853,18 +886,21 @@ func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
 	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
 
-// Completing a task through the service reports an answered task and an
-// unknown run as distinct results.
+// Completing a human task: success, a run the service does not know, and a
+// conflict. The service answers 409 both when the task was already answered
+// and when it simply cannot be answered yet, so a conflict is "answered"
+// only when the run shows the task's step, or the whole run, to be over.
+// A run still on its way to the task is an error to try again, never a
+// final outcome.
 func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
-	path := "/dag-runs/txe-decide-X/txe-abc/human-tasks/decide/complete"
+	run := "/dag-runs/txe-decide-X/txe-abc"
+	path := run + "/human-tasks/decide/complete"
 	stub := &stubTransport{t: t, replies: map[string]string{path: `{"alreadyCompleted":false}`}}
 	complete := review.RemoteComplete(stub)
 	task := review.TaskLocator{DAG: "txe-decide-X", RunID: "txe-abc", StepID: "decide"}
 	require.NoError(t, complete(context.Background(), task, map[string]string{"decision_id": review.NoDecisionID, "verdict": review.VerdictSuperseded}))
 	assert.Equal(t, []string{"POST " + path}, stub.calls)
 
-	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict}}
-	require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrTaskAnswered)
 	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusNotFound}}
 	require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrRunMissing)
 	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway}}
@@ -872,6 +908,51 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, review.ErrTaskAnswered)
 	require.NotErrorIs(t, err, review.ErrRunMissing)
+
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict, Message: "conflict"}}
+	for name, tc := range map[string]struct {
+		detail   string
+		answered bool
+	}{
+		"the step was completed with another input": {
+			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"succeeded"}]}}`, answered: true,
+		},
+		"the run is over": {
+			detail: `{"dagRunDetails":{"statusLabel":"aborted","nodes":[{"step":{"name":"decide"},"statusLabel":"aborted"}]}}`, answered: true,
+		},
+		"the run has not reached the task yet": {
+			detail: `{"dagRunDetails":{"statusLabel":"queued","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
+		},
+		"the run is waiting but changed under the request": {
+			detail: `{"dagRunDetails":{"statusLabel":"waiting","nodes":[{"step":{"name":"decide"},"statusLabel":"waiting"}]}}`,
+		},
+		"another step finished, not the task": {
+			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"other"},"statusLabel":"succeeded"},{"step":{"name":"decide"},"statusLabel":"running"}]}}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub.replies[run] = tc.detail
+			err := complete(context.Background(), task, nil)
+			if tc.answered {
+				require.ErrorIs(t, err, review.ErrTaskAnswered)
+				return
+			}
+			require.Error(t, err)
+			require.NotErrorIs(t, err, review.ErrTaskAnswered, "a task that cannot be answered yet was not answered")
+			// Closing the decision run on it is a failure to retry, not a
+			// final closure.
+			opener := &review.RunOpener{Complete: complete}
+			outcome, closeErr := opener.CloseDecision(context.Background(), review.Proposal{NativeTask: task})
+			require.Error(t, closeErr)
+			assert.Equal(t, review.ClosureFailed, outcome)
+		})
+	}
+	t.Run("the run cannot be read", func(t *testing.T) {
+		delete(stub.replies, run)
+		err := complete(context.Background(), task, nil)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, review.ErrTaskAnswered)
+	})
 }
 
 // taskRecorder stands in for the service's human-task backend and records
@@ -908,7 +989,7 @@ func (f *remoteFixture) decide(p review.Proposal, revision int, verdict string) 
 func TestRemoteApprovedProposalExecutesOnce(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
-	targetID := "cluster_uid=c-1,uid=vol-1"
+	targetID := f.targetID()
 	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
 	require.NoError(t, err)
 	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{
@@ -1240,6 +1321,111 @@ func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
 	assert.Len(t, service.retried, 2)
 }
 
+// Requests that can no longer be carried out must not keep the ones that
+// can from being reached. Thirty requests whose runs have moved on, one
+// whose run is gone, and one that is still valid: the valid one is returned,
+// and it is the only one.
+func TestRemoteStaleRetryRequestsDoNotStarveAValidOne(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	request := func(runID string) {
+		t.Helper()
+		service.fail(runID, "att-1")
+		_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+			_, _, err := tx.ProposeRetry(registry.RetryRunParams{
+				RunID: runID, AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+			}, "retry-"+runID)
+			return err
+		})
+		require.NoError(t, err)
+	}
+	for i := range 30 {
+		runID := fmt.Sprintf("stale-%02d", i)
+		request(runID)
+		// Someone else retried the run after the person decided.
+		service.start(runID)
+	}
+	request("gone")
+	delete(service.state, "gone")
+	request("valid")
+
+	pending, err := f.remote.RequestedRetries(ctx, f.remote.MachineID, 20)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "only a request that can still be carried out takes a place")
+	done, err := f.retrying("tick-1", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	assert.Equal(t, []string{"valid"}, service.retried)
+}
+
+// A registered target is named by its kind and its whole stable id. Two
+// kinds with the same id, and two ids that read alike once their fields are
+// joined, are different targets with different names, and an action on one
+// is filed against that one.
+func TestRemoteTargetsAreNeverConfusedWithEachOther(t *testing.T) {
+	job := "job_01HZX0000000000000000000AA"
+	targets := []apigen.TxeTarget{
+		{Kind: "fixture.volume", StableId: map[string]string{"uid": "123"}},
+		{Kind: "fixture.bucket", StableId: map[string]string{"uid": "123"}},
+		{Kind: "fixture.volume", StableId: map[string]string{"a": "x,b=y"}},
+		{Kind: "fixture.volume", StableId: map[string]string{"a": "x", "b": "y"}},
+	}
+	version, err := json.Marshal(map[string]any{"version": 1, "title": "t", "purpose": "p", "targets": targets,
+		"package": map[string]any{"digest": "sha256:aa", "path": "/pkg", "entrypoint": "run.sh"}, "dag": map[string]any{"spec": "steps: []"}})
+	require.NoError(t, err)
+	stub := &stubTransport{t: t, replies: map[string]string{
+		"/txe/jobs/" + job:                 `{"job_id":"` + job + `","version":1,"machine_id":"mch_1","lifecycle":"active","availability":{"state":"ready"},"checkpoint":{"version":0}}`,
+		"/txe/jobs/" + job + "/versions/1": string(version),
+	}}
+	remote := &review.Remote{Transport: stub, MachineID: "mch_1", RunID: "tick-1"}
+	got, err := remote.Job(context.Background(), job)
+	require.NoError(t, err)
+	require.Len(t, got.Targets, 4)
+	ids := map[string]bool{}
+	for i, target := range got.Targets {
+		assert.False(t, ids[target.StableID], "target %d shares its id with another", i)
+		ids[target.StableID] = true
+		assert.Equal(t, targets[i].StableId, target.Identity, "the registered identity is kept for reading")
+		assert.Equal(t, registry.TargetKey(registry.Target{Kind: targets[i].Kind, StableID: targets[i].StableId}), target.StableID)
+	}
+
+	// An action on the bucket is filed against the bucket, not the volume
+	// with the same uid.
+	var sent apigen.TxeProposalRequest
+	capture := captureTransport{Transport: stub, path: "/txe/jobs/" + job + "/proposals", into: &sent}
+	remote.Transport = capture
+	stub.replies["/txe/jobs/"+job+"/proposals"] = `{"proposal_id":"prp_1","state":"open","action":{"name":"expand"}}`
+	_, err = remote.CreateProposal(context.Background(), review.Claim{ID: "clm_1", JobID: job}, review.Proposal{
+		ID: "prp_1", JobID: job, Kind: review.ProposalAction, ActionName: "expand", TargetID: got.Targets[1].StableID,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sent.Proposal.Action.Target)
+	assert.Equal(t, "fixture.bucket", sent.Proposal.Action.Target.Kind)
+}
+
+// captureTransport records the body of one request path.
+type captureTransport struct {
+	review.Transport
+	path string
+	into any
+}
+
+func (c captureTransport) Do(ctx context.Context, method, path string, in, out any) error {
+	if path == c.path && in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, c.into); err != nil {
+			return err
+		}
+	}
+	return c.Transport.Do(ctx, method, path, in, out)
+}
+
 // A retry whose dispatch was accepted but whose new attempt was not seen is
 // uncertain in the real registry too, and the registry itself refuses to
 // record it as succeeded on anything but the run's observed new attempt.
@@ -1298,7 +1484,7 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 func TestRemoteUncertainRetryAllowsOneMoreAttempt(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
-	targetID := "cluster_uid=c-1,uid=vol-1"
+	targetID := f.targetID()
 	f.fx.run = func(review.Action) (review.EffectResult, bool) {
 		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
 	}
@@ -1421,7 +1607,7 @@ func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
 func TestRemoteSupersededDecisionRunsAreClosedAndRecorded(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
-	targetID := "cluster_uid=c-1,uid=vol-1"
+	targetID := f.targetID()
 	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
 	require.NoError(t, err)
 	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{

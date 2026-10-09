@@ -264,6 +264,52 @@ func TestStepsRoundTrip(t *testing.T) {
 	assert.Error(t, f.steps("x", dir).Prepare(ctx, "../escape", &third))
 }
 
+// Nothing retries the apply step, so when it cannot finish, the claim it was
+// handed must not hold the job until it runs out. A failure to write the
+// decision artifact, which happens before anything is applied, releases the
+// claim, and the next tick takes the same episode up again.
+func TestStepsReleaseTheClaimWhenApplyCannotFinish(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	f.addRun("run-1", "failed")
+	var packet bytes.Buffer
+	require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &packet))
+	require.NotEmpty(t, packet.String())
+
+	// The artifact directory is a file: nothing can be written into it.
+	blocked := filepath.Join(dir, "not-a-directory")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+	apply := f.steps("tick-1", dir)
+	apply.ArtifactDir = blocked
+	agent := `{"type":"result","is_error":false,"structured_output":{"outcome":"continue","reasoning":"seen","evidence_run_ids":["run-1"],"actions":[]}}`
+	var out bytes.Buffer
+	err := apply.Apply(ctx, "tick-1", strings.NewReader(agent), "", &out)
+	require.ErrorContains(t, err, "save decision artifact")
+	assert.Empty(t, f.state().Reviews[jobID], "nothing was applied")
+
+	// The job is free at once: another reviewer is shown the same run.
+	var again bytes.Buffer
+	require.NoError(t, f.steps("tick-2", dir).Prepare(ctx, "tick-2", &again))
+	assert.Contains(t, again.String(), `"run_id":"run-1"`, "the claim was released, not left to expire")
+}
+
+// A job's command cannot fill the reviewer's memory with what it prints:
+// only the end of its output is kept, which is where its receipt is, and
+// the action still completes.
+func TestActionOutputIsBounded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	job := fixtureJob()
+	job.WorkingDir = t.TempDir()
+	action := review.Action{ID: "act_out", JobID: job.ID, Name: "noisy", TargetID: targetID}
+	res := (&review.CommandEffector{}).Run(context.Background(), job,
+		shellAction("head -c 4000000 /dev/zero | tr '\\000' x; echo; echo receipt-last", review.IdempotencyNone), action)
+	assert.Equal(t, review.EffectApplied, res.Status)
+	assert.Equal(t, "receipt-last", res.Receipt, "the receipt is the last line, however much was printed before it")
+}
+
 // An agent that fails leaves the step successful and the failure recorded.
 func TestStepsRecordAgentFailure(t *testing.T) {
 	f := newFixture(t)
@@ -671,6 +717,36 @@ func TestTrimmedEvidenceKeepsFailuresAndIsOnTheRecord(t *testing.T) {
 	first := "run-1@" + review.ExecutionRef("att-1", "")
 	assert.Contains(t, recorded.CoveredExecutions, first)
 	assert.Equal(t, []string{first}, recorded.TrimmedExecutions, "the record says which result was reviewed on part of its evidence")
+}
+
+// Evidence that was left out cannot support the conclusion that a job is
+// done. When the reviewer recommends completing or retiring a job after
+// being shown runs with trimmed evidence, the question put to the owner
+// says so and names the runs; with every run shown whole it says nothing.
+func TestARecommendationToEndAJobSaysWhenItsEvidenceWasTrimmed(t *testing.T) {
+	steps := make([]review.StepEvidence, 0, 30)
+	for j := range 30 {
+		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("step-%02d", j), Status: "succeeded"})
+	}
+	for _, outcome := range []review.Outcome{review.OutcomeComplete, review.OutcomeRetire} {
+		t.Run(string(outcome)+" on trimmed evidence", func(t *testing.T) {
+			f := newFixture(t)
+			require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-long", Status: "succeeded", AttemptID: "att-1", Steps: steps}))
+			f.addRun("run-short", "succeeded")
+			f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: outcome, Reasoning: "done", EvidenceRunIDs: []string{"run-long"}})
+			question := f.state().Proposals[jobID][0].Question
+			assert.Contains(t, question, "1 run(s) with part of their evidence left out")
+			assert.Contains(t, question, "run-long")
+			assert.NotContains(t, question, "run-short")
+			assert.Contains(t, question, "check those runs yourself")
+		})
+	}
+	t.Run("complete on whole evidence", func(t *testing.T) {
+		f := newFixture(t)
+		f.addRun("run-short", "succeeded")
+		f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: review.OutcomeComplete, Reasoning: "done", EvidenceRunIDs: []string{"run-short"}})
+		assert.NotContains(t, f.state().Proposals[jobID][0].Question, "left out")
+	})
 }
 
 // A job cannot bury a failure by surrounding it with steps of other

@@ -48,9 +48,15 @@ const (
 
 // Target is an external resource a job depends on, named by stable identity.
 type Target struct {
-	Kind        string `json:"kind"`
-	StableID    string `json:"stable_id"`
-	Environment string `json:"environment,omitempty"`
+	Kind string `json:"kind"`
+	// StableID is the one string that names this target: what an action
+	// gives as its target_id. It is opaque, and distinct for every
+	// registered target.
+	StableID string `json:"stable_id"`
+	// Identity is the target's stable identity as it was registered, for
+	// reading. It is never matched against.
+	Identity    map[string]string `json:"identity,omitempty"`
+	Environment string            `json:"environment,omitempty"`
 }
 
 // Idempotency describes what the action's destination guarantees.
