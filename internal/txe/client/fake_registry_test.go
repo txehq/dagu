@@ -33,8 +33,14 @@ type fakeRegistry struct {
 	jobs     map[string]*fakeJob
 	byKey    map[string]string // project + "/" + job key -> job id
 	requests []recordedRequest
-	// manifests holds the artifact manifests recorded per job and run.
-	manifests map[string]ArtifactManifest
+	// manifests holds the manifest last accepted per job and run;
+	// executions holds every accepted manifest, per job, run and execution
+	// reference.
+	manifests  map[string]ArtifactManifest
+	executions map[string]ArtifactManifest
+	// latest is the execution a run is in, as the hub knows it. A run not
+	// listed accepts any execution.
+	latest map[string]Execution
 
 	// beforeList, when set, runs before a job listing is answered.
 	beforeList func()
@@ -95,6 +101,8 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 		jobs:         map[string]*fakeJob{},
 		byKey:        map[string]string{},
 		manifests:    map[string]ArtifactManifest{},
+		executions:   map[string]ArtifactManifest{},
+		latest:       map[string]Execution{},
 		loseResponse: map[string]int{},
 		fail:         map[string]int{},
 	}
@@ -428,6 +436,17 @@ func (f *fakeRegistry) ready(w http.ResponseWriter, jobID string, body []byte) {
 
 // recordArtifacts stores a run's manifest. The same manifest again is a
 // no-op; a different digest for a path already recorded is refused.
+// setLatest says which execution of a run the hub holds as running.
+func (f *fakeRegistry) setLatest(jobID, runID string, e Execution) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.latest[jobID+"/"+runID] = e
+}
+
+// recordArtifacts keeps one manifest per execution of a run. It accepts one
+// only from the run's latest execution, attempt and queue marker both, takes
+// the same report again, and refuses another report for an execution it
+// already holds.
 func (f *fakeRegistry) recordArtifacts(w http.ResponseWriter, jobAndRun string, body []byte) {
 	jobID, runID, _ := strings.Cut(jobAndRun, "/runs/")
 	var in ArtifactManifest
@@ -435,6 +454,8 @@ func (f *fakeRegistry) recordArtifacts(w http.ResponseWriter, jobAndRun string, 
 		refuse(w, 400, "invalid", "bad body", nil)
 		return
 	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(body, &fields)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	j, ok := f.jobs[jobID]
@@ -442,17 +463,33 @@ func (f *fakeRegistry) recordArtifacts(w http.ResponseWriter, jobAndRun string, 
 		refuse(w, 404, "not_found", "no such job version", nil)
 		return
 	}
-	key := jobID + "/" + runID
-	if previous, ok := f.manifests[key]; ok {
-		for _, old := range previous.Artifacts {
-			for _, now := range in.Artifacts {
-				if old.Path == now.Path && old.SHA256 != now.SHA256 {
-					refuse(w, 409, "artifact_conflict", "a different digest is recorded for "+now.Path, nil)
-					return
-				}
-			}
-		}
+	if _, sent := fields["queued_at"]; in.AttemptID == "" || !sent {
+		refuse(w, 400, "invalid", "attempt_id and queued_at are required", nil)
+		return
 	}
+	key := jobID + "/" + runID
+	if latest, ok := f.latest[key]; ok && latest != in.Execution {
+		refuse(w, 409, "stale_binding", "execution "+in.Ref()+" is not the run's latest execution "+latest.Ref(), nil)
+		return
+	}
+	// The time a file was recorded is not part of what was reported.
+	reported := func(m ArtifactManifest) string {
+		m.Artifacts = slices.Clone(m.Artifacts)
+		for i := range m.Artifacts {
+			m.Artifacts[i].RecordedAt = ""
+		}
+		data, _ := json.Marshal(m)
+		return string(data)
+	}
+	if previous, ok := f.executions[key+"/"+in.Ref()]; ok {
+		if reported(previous) != reported(in) {
+			refuse(w, 409, "artifact_conflict", "execution "+in.Ref()+" already reported other deliverables", nil)
+			return
+		}
+		answer(w, 200, previous)
+		return
+	}
+	f.executions[key+"/"+in.Ref()] = in
 	f.manifests[key] = in
 	answer(w, 200, in)
 }

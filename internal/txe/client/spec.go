@@ -162,6 +162,9 @@ func CheckDeliverablePath(path string) error {
 	case strings.HasPrefix(path, "/") || strings.HasPrefix(path, "~"):
 		return fmt.Errorf("%q must be relative to the run's output directory", path)
 	}
+	if first, _, _ := strings.Cut(path, "/"); strings.EqualFold(first, HubAttemptsDir) {
+		return fmt.Errorf("%q: the name %q is reserved for the hub's copies", path, HubAttemptsDir)
+	}
 	for part := range strings.SplitSeq(path, "/") {
 		switch {
 		case part == "" || part == "." || part == "..":

@@ -43,7 +43,7 @@ The script runs on this machine, started by the worker, not by a shell you have 
 
 - **The package is read-only.** Write nothing beside the script. Use the directories the job is given:
   - `TXE_OUTPUT_DIR`: state the job keeps between runs.
-  - `TXE_RUN_OUTPUT_DIR`: this run's own results. Deliverables are read from here.
+  - `TXE_RUN_OUTPUT_DIR`: where this execution writes its results. Deliverables are taken from here. For a job with deliverables the directory exists and is empty when the script starts.
 - **The environment is nearly empty.** The script gets `PATH`, `HOME` and little else. A variable exported in your shell is not there. Pass settings through `env` in the spec, and credentials through `credential_refs`.
 - **Nobody is logged in.** A browser session, a connector or an interactive `kubectl` or `gh` login in your terminal proves nothing about the worker. Test the access the job needs as described under "Credentials".
 
@@ -88,7 +88,9 @@ expected_outcome:
       delivery: machine        # digest recorded; bytes stay on this machine
 ```
 
-A `path` is an exact file name: names of letters, digits, `.`, `-` and `_`, separated by `/`, each starting with a letter, digit or `_`. Spaces, patterns, `..`, hidden files and symbolic links are refused. Nothing else the script writes leaves the machine. A `machine` deliverable is recorded as stored on this machine; it cannot be fetched through the hub.
+A `path` is an exact file name: names of letters, digits, `.`, `-` and `_`, separated by `/`, each starting with a letter, digit or `_`. Spaces, patterns, `..`, hidden files and symbolic links are refused, and so is a path that starts with `txe-attempts`. Nothing else the script writes leaves the machine. A `machine` deliverable is recorded as stored on this machine; it cannot be fetched through the hub.
+
+A retried run keeps its run id, and every execution of the script starts with an empty `TXE_RUN_OUTPUT_DIR`. What an earlier execution wrote stays on the machine and is never written over, so do not expect to find a previous try's files there; keep anything a retry should pick up under `TXE_OUTPUT_DIR`. When the script succeeds, its results are sealed: the directory is moved to `runs/<run id>/executions/<reference>/` under `TXE_OUTPUT_DIR` and the digest of every file is recorded. The publish step publishes sealed files only and refuses one that was changed afterwards, so do not leave a process running that keeps writing there. A retry that only repeats the publish step publishes the same sealed files.
 
 ## Register
 

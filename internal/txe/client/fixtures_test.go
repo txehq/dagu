@@ -61,11 +61,15 @@ func TestContractFixtures(t *testing.T) {
 	_, err = cc2.Update(context.Background(), out.Receipt.JobID, 7, spec)
 	require.Error(t, err)
 
-	run := PublishInput{JobID: out.Receipt.JobID, JobVersion: 1, RunID: "034cuGtOyTL7YCuMha4uBd", ArtifactDir: filepath.Join(t.TempDir(), "artifacts")}
-	runDir := filepath.Join(home.OutputDir(run.JobID), "runs", run.RunID)
+	run := PublishInput{JobID: out.Receipt.JobID, JobVersion: 1, RunID: "034cuGtOyTL7YCuMha4uBd", Execution: testExecution, ArtifactDir: filepath.Join(t.TempDir(), "artifacts")}
+	outputs := Outputs{Home: home}
+	runDir, err := outputs.Begin(run.JobID, run.RunID, run.Execution)
+	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "raw"), 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(runDir, "snapshot.json"), []byte(`{"files":2}`), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(runDir, "raw", "export.csv"), []byte("a,b\n1,2\n"), 0o600))
+	_, err = outputs.Seal(run.JobID, run.RunID, run.Execution)
+	require.NoError(t, err)
 	publisher := &Publisher{Client: f.client(), Home: home, Now: func() time.Time { return time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC) },
 		Actor: Actor{Kind: ActorKindCLI, ID: "publish", MachineID: testMachine, Client: "dagu test"}}
 	_, err = publisher.Publish(context.Background(), run)

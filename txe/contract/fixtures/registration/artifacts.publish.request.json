@@ -1,5 +1,11 @@
 {
   "job_version": 1,
+  "attempt_id": "4f6f15",
+  "queued_at": "2026-10-09T23:48:55+08:00",
+  "produced_in": {
+    "attempt_id": "4f6f15",
+    "queued_at": "2026-10-09T23:48:55+08:00"
+  },
   "artifacts": [
     {
       "deliverable": "snapshot",

@@ -61,7 +61,9 @@ env:
   - TXE_JOB_ID: "job_01K7A5ZQ8M3N4P5R6S7T8V9W0X"
   - TXE_JOB_VERSION: "2"
   - TXE_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X"
-  - TXE_RUN_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X/runs/${DAG_RUN_ID}"
+  - TXE_ATTEMPT_ID: "${context.attempt.id}"
+  - TXE_QUEUED_AT: "${context.attempt.queued_at}"
+  - TXE_RUN_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X/runs/${DAG_RUN_ID}/attempts/${context.attempt.id}"
   - MAX_AGE_SEC: "600"
   - TARGET_ID: "vol-uid-1"
 secrets:
@@ -166,10 +168,27 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	assert.Contains(t, text, `  - TXE_DAGU_HOME: "/Users/x/.local/share/txe-dagu"`)
 	assert.Contains(t, text, "  - name: publish\n    command: \"/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts publish --dagu-home /Users/x/.local/share/txe-dagu/client\"\n")
 
+	// The job's command runs between begin and seal, in one step: a failed
+	// command stops the step, so the attempt is sealed only if the job's
+	// command succeeded, and a retry of the step runs all three again.
+	assert.Contains(t, text, `  - name: run
+    command:
+      - "/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts begin --dagu-home /Users/x/.local/share/txe-dagu/client"
+      - "./check.sh --label 'it'\\''s a test'"
+      - "/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts seal --dagu-home /Users/x/.local/share/txe-dagu/client"
+    retry_policy:
+`)
+
 	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
 	require.NoError(t, err)
 	require.Len(t, dag.Steps, 2)
+	require.Len(t, dag.Steps[0].Commands, 3)
+	home := []string{"--dagu-home", "/Users/x/.local/share/txe-dagu/client"}
+	assert.Equal(t, append([]string{"txe", "artifacts", "begin"}, home...), dag.Steps[0].Commands[0].Args)
+	assert.Equal(t, "./check.sh", dag.Steps[0].Commands[1].Command)
+	assert.Equal(t, append([]string{"txe", "artifacts", "seal"}, home...), dag.Steps[0].Commands[2].Args)
 	assert.Equal(t, "publish", dag.Steps[1].Name)
+	require.Len(t, dag.Steps[1].Commands, 1)
 	// The publish step waits for the job's step: the DAG is a chain, and the
 	// loader records the dependency.
 	assert.Equal(t, "chain", dag.Type)
@@ -188,6 +207,10 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	s.Publish.Command = []string{"dagu", "txe", "artifacts", "publish"}
 	_, err = RenderDAG(s)
 	require.ErrorContains(t, err, "absolute path of the dagu binary")
+
+	s.Publish.Command = []string{"/usr/local/bin/dagu", "txe", "artifacts"}
+	_, err = RenderDAG(s)
+	require.ErrorContains(t, err, `must be "txe artifacts publish"`)
 }
 
 func TestRenderDAGRefusals(t *testing.T) {

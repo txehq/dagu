@@ -23,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/stretchr/testify/assert"
@@ -300,12 +303,36 @@ steps:
 }
 
 // txeFakeRegistry answers the two registry calls the publish step makes, and
-// keeps the manifests it is sent.
+// keeps the manifests it is sent: the last one per run, and each one per run
+// and execution reference.
 type txeFakeRegistry struct {
-	mu        sync.Mutex
-	version   string // JSON of the job version, served for any version number
-	manifests map[string]txeclient.ArtifactManifest
-	unknown   []string
+	mu         sync.Mutex
+	version    string // JSON of the job version, served for any version number
+	manifests  map[string]txeclient.ArtifactManifest
+	executions map[string]txeclient.ArtifactManifest
+	unknown    []string
+	// down makes the registry refuse manifests, as an unreachable hub would.
+	down bool
+}
+
+func (r *txeFakeRegistry) setDown(down bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.down = down
+}
+
+// execution returns the manifest the execution a status describes published.
+func (r *txeFakeRegistry) execution(status ir.DAGRunStatus) (txeclient.ArtifactManifest, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	manifest, ok := r.executions[status.DAGRunID+"/"+txeExecution(status).Ref()]
+	return manifest, ok
+}
+
+// txeExecution is the execution a stored status describes: its attempt and
+// the queue marker the hub holds for it.
+func txeExecution(status ir.DAGRunStatus) txeclient.Execution {
+	return txeclient.Execution{AttemptID: status.AttemptID, QueuedAt: status.QueuedAt}
 }
 
 func (r *txeFakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -318,6 +345,9 @@ func (r *txeFakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		_, _ = io.WriteString(w, `{"code":"unauthorized","message":"bad key"}`)
 	case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/versions/"):
 		_, _ = io.WriteString(w, r.version)
+	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/artifacts") && r.down:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"code":"unavailable","message":"the registry is down"}`)
 	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/artifacts"):
 		var manifest txeclient.ArtifactManifest
 		if err := json.NewDecoder(req.Body).Decode(&manifest); err != nil {
@@ -326,6 +356,7 @@ func (r *txeFakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		run := strings.TrimSuffix(req.URL.Path[strings.Index(req.URL.Path, "/runs/")+len("/runs/"):], "/artifacts")
 		r.manifests[run] = manifest
+		r.executions[run+"/"+manifest.Ref()] = manifest
 		_ = json.NewEncoder(w).Encode(manifest)
 	default:
 		r.unknown = append(r.unknown, req.Method+" "+req.URL.Path)
@@ -360,11 +391,9 @@ type txePublishStore struct {
 	dir string
 }
 
-// txeStartPublishRun renders the job's DAG, with the publish step bound to a
-// context store by the flags bind returns, and starts it.
-func txeStartPublishRun(t *testing.T, bind func(home txepkg.Home, workerHome string) []string, stores ...txePublishStore) *txePublishRun {
-	t.Helper()
-	pkg := txeCommitPackage(t, map[string]string{"collect.sh": `#!/bin/sh
+// txeCollectScript is the fixture job: it writes one deliverable for the hub,
+// one for the machine and a file nobody declared.
+const txeCollectScript = `#!/bin/sh
 set -eu
 mkdir -p "$TXE_RUN_OUTPUT_DIR/raw"
 printf '%s' '` + txeHubContent + `' > "$TXE_RUN_OUTPUT_DIR/snapshot.json"
@@ -372,7 +401,32 @@ printf 'txe-marker-machine-only\n' > "$TXE_RUN_OUTPUT_DIR/raw/export.csv"
 printf 'txe-marker-undeclared\n' > "$TXE_RUN_OUTPUT_DIR/debug.log"
 printf '%s' "${DAGU_HOME:-}" > "$TXE_RUN_OUTPUT_DIR/inherited-dagu-home"
 echo "collected into $TXE_RUN_OUTPUT_DIR"
-`}, []string{"collect.sh"}, []string{"./collect.sh"})
+`
+
+// txeStartPublishRun renders the job's DAG, with the publish step bound to a
+// context store by the flags bind returns, and starts it.
+func txeStartPublishRun(t *testing.T, bind func(home txepkg.Home, workerHome string) []string, stores ...txePublishStore) *txePublishRun {
+	t.Helper()
+	return txeStartPublishJob(t, txeCollectScript, nil, bind, stores...)
+}
+
+// txeStartPublishJob is txeStartPublishRun for a job script and settings of
+// the caller's choosing.
+func txeStartPublishJob(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, stores ...txePublishStore) *txePublishRun {
+	t.Helper()
+	// Queued, then run by the scheduler: the way a job's schedule runs it.
+	return txeStartPublishJobWith(t, script, env, bind, func(f *testFixture) {
+		require.NoError(t, f.enqueue())
+		f.waitForQueued()
+		f.startScheduler(30 * time.Second)
+	}, stores...)
+}
+
+// txeStartPublishJobWith is txeStartPublishJob with the caller deciding how
+// the run is started.
+func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, start func(*testFixture), stores ...txePublishStore) *txePublishRun {
+	t.Helper()
+	pkg := txeCommitPackage(t, map[string]string{"collect.sh": script}, []string{"collect.sh"}, []string{"./collect.sh"})
 
 	// The TXE home of the worker's machine: identity, outputs, and the
 	// context store the publish step's CLI uses.
@@ -381,7 +435,7 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 	identity := fmt.Sprintf(`{"schema":1,"machine_id":%q,"owner_id":"own_01K7A5ZQ8M3N4P5R6S7T8V9W0A"}`, txeTestMachine)
 	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "machine.json"), []byte(identity), 0o600))
 
-	registry := &txeFakeRegistry{manifests: map[string]txeclient.ArtifactManifest{}, version: `{
+	registry := &txeFakeRegistry{manifests: map[string]txeclient.ArtifactManifest{}, executions: map[string]txeclient.ArtifactManifest{}, version: `{
 		"title": "Collect", "purpose": "fixture",
 		"expected_outcome": {"deliverables": [
 			{"name": "snapshot", "path": "snapshot.json", "delivery": "hub", "required": true},
@@ -397,9 +451,10 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 		PackageDigest: pkg.Digest, WorkDir: pkg.WorkDir(), OutputDir: home.OutputDir(txeTestJob),
 		Entrypoint: pkg.Manifest.Entrypoint,
 		Schedule:   txepkg.Schedule{Cron: "0 2 * * *", Timezone: "Australia/Perth", TimeoutSec: 120},
+		Env:        env,
 		Publish: &txepkg.Publish{
 			// Filled in below, once the fixture has built the binary.
-			Command:      []string{"/placeholder"},
+			Command:      []string{"/placeholder", "txe", "artifacts", "publish"},
 			HomeRoot:     home.Root,
 			HubArtifacts: true,
 		},
@@ -435,16 +490,26 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 
 	run := &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome}
 
-	require.NoError(t, f.enqueue())
-	f.waitForQueued()
-	f.startScheduler(30 * time.Second)
+	start(f)
 	return run
 }
 
+// outputDir is where the results of the execution a status describes are
+// kept on the machine once it has sealed them.
+func (r *txePublishRun) outputDir(status ir.DAGRunStatus) string {
+	return txepkg.ExecutionOutputDir(r.home.OutputDir(txeTestJob), status.DAGRunID, txeExecution(status).Ref())
+}
+
+// hubCopies is where the hub keeps the copies the execution a status
+// describes published, given the artifact directory of its attempt.
+func txeHubCopies(archiveDir string, status ir.DAGRunStatus) string {
+	return filepath.Join(archiveDir, txeclient.HubAttemptsDir, txeExecution(status).Ref())
+}
+
 // inheritedHome is the DAGU_HOME the job's own step saw.
-func (r *txePublishRun) inheritedHome(t *testing.T, runID string) string {
+func (r *txePublishRun) inheritedHome(t *testing.T, status ir.DAGRunStatus) string {
 	t.Helper()
-	seen, err := os.ReadFile(filepath.Join(r.home.OutputDir(txeTestJob), "runs", runID, "inherited-dagu-home"))
+	seen, err := os.ReadFile(filepath.Join(r.outputDir(status), "inherited-dagu-home"))
 	require.NoError(t, err)
 	return string(seen)
 }
@@ -474,7 +539,7 @@ func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
 	f.assertWorkerID(status, "worker-1")
 	require.Len(t, status.Nodes, 2)
 	f.assertAllNodesSucceeded(status)
-	inherited := run.inheritedHome(t, status.DAGRunID)
+	inherited := run.inheritedHome(t, status)
 	assert.Equal(t, run.workerHome, inherited, "the step did not inherit the worker's DAGU_HOME; the test proves nothing about it")
 	assert.NotEqual(t, home.ClientDir(), inherited)
 
@@ -482,6 +547,12 @@ func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
 	manifest, ok, unknown := run.manifest(status.DAGRunID)
 	require.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
 	assert.Empty(t, unknown)
+	// The publish step named the execution the hub holds for the run: Dagu
+	// gave the step its own attempt ID and queue marker.
+	require.NotEmpty(t, status.AttemptID)
+	require.NotEmpty(t, status.QueuedAt, "an enqueued run has no queue marker")
+	assert.Equal(t, txeExecution(status), manifest.Execution)
+	assert.Equal(t, txeExecution(status), manifest.ProducedIn)
 	byName := map[string]txeclient.ArtifactRecord{}
 	for _, a := range manifest.Artifacts {
 		byName[a.Deliverable] = a
@@ -497,7 +568,7 @@ func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
 	// the run's output.
 	require.NotEmpty(t, status.ArchiveDir)
 	assertArtifactDirInTree(t, f, status.ArchiveDir)
-	onHub, err := os.ReadFile(filepath.Join(status.ArchiveDir, "snapshot.json"))
+	onHub, err := os.ReadFile(filepath.Join(txeHubCopies(status.ArchiveDir, status), "snapshot.json"))
 	require.NoError(t, err)
 	gotSum := sha256.Sum256(onHub)
 	assert.Equal(t, wantSum, gotSum, "the hub copy differs from the recorded digest")
@@ -507,8 +578,12 @@ func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
 	// The key is in the client store, not in anything the hub holds.
 	assert.Empty(t, hubFilesContaining(t, f, "dagu_test_key"), "the registry key reached hub storage")
 
-	// All three files are still on the machine, in the run's own directory.
-	runDir := filepath.Join(home.OutputDir(txeTestJob), "runs", status.DAGRunID)
+	// All three files are still on the machine, under the execution's
+	// reference, and the execution is the one sealed as the run's result.
+	runDir := run.outputDir(status)
+	seal, err := txeclient.Outputs{Home: home}.Sealed(txeTestJob, status.DAGRunID)
+	require.NoError(t, err)
+	assert.Equal(t, txeExecution(status), seal.Execution)
 	for name, content := range map[string]string{"snapshot.json": txeHubContent, "raw/export.csv": txeMachineContent, "debug.log": txeStrayContent} {
 		local, err := os.ReadFile(filepath.Join(runDir, filepath.FromSlash(name)))
 		require.NoError(t, err)
@@ -523,17 +598,19 @@ func TestTXEPackage_PublishIgnoresWorkerHome(t *testing.T) {
 
 	status := run.f.waitForStatus(ir.Succeeded, executionStatusTimeout())
 	run.f.assertAllNodesSucceeded(status)
-	assert.Equal(t, run.workerHome, run.inheritedHome(t, status.DAGRunID))
+	assert.Equal(t, run.workerHome, run.inheritedHome(t, status))
 	_, ok, unknown := run.manifest(status.DAGRunID)
 	assert.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
 	assert.Empty(t, unknown)
 }
 
 // The store the flags name is the one that is read. Bound to the worker's own
-// Dagu home, which has no "txe" context, the publish step fails: the run is
-// failed on the hub, the hub's log says which context is missing, and nothing
-// is recorded or uploaded. This is what an unbound step did when it took its
-// store from the worker's environment.
+// Dagu home, which has no "txe" context, the run fails at the first command
+// of the job's step, before the job's own command: the job does not execute
+// when what it produces could not be recorded. The run is failed on the hub,
+// the hub's log says which context is missing, and nothing is recorded or
+// uploaded. This is what an unbound step did when it took its store from the
+// worker's environment.
 func TestTXEPackage_PublishFailsWithoutContext(t *testing.T) {
 	run := txeStartPublishRun(t, func(_ txepkg.Home, workerHome string) []string {
 		return []string{"--dagu-home", workerHome}
@@ -542,8 +619,10 @@ func TestTXEPackage_PublishFailsWithoutContext(t *testing.T) {
 
 	status := f.waitForStatus(ir.Failed, executionStatusTimeout())
 	require.Len(t, status.Nodes, 2)
-	assert.Equal(t, "publish", status.Nodes[1].Step.Name)
-	assert.Contains(t, hubLog(t, f, status, "publish", "stderr"), `context "txe"`)
+	assert.Equal(t, "run", status.Nodes[0].Step.Name)
+	assert.Equal(t, ir.NodeFailed, status.Nodes[0].Status)
+	assert.Contains(t, hubLog(t, f, status, "run", "stderr"), `context "txe"`)
+	assert.NoDirExists(t, filepath.Join(run.home.OutputDir(txeTestJob), "runs"), "the job ran without its context")
 
 	_, ok, _ := run.manifest(status.DAGRunID)
 	assert.False(t, ok, "a manifest was recorded without the job's context")
@@ -577,4 +656,292 @@ func TestTXEPackage_PublishUsesResolvedStore(t *testing.T) {
 	_, ok, unknown := run.manifest(status.DAGRunID)
 	assert.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
 	assert.Empty(t, unknown)
+}
+
+// txeRetryScript writes a snapshot that differs with every execution of the
+// job's step, and fails while the control directory says so. It does not
+// create its output directory: the step's first command does.
+const txeRetryScript = `#!/bin/sh
+set -eu
+n=$(ls "$TXE_FIXTURE_CONTROL" | grep -c '^executed\.' || true)
+n=$((n+1))
+: > "$TXE_FIXTURE_CONTROL/executed.$n"
+printf '{"collected":"txe-marker-execution-%s"}' "$n" > "$TXE_RUN_OUTPUT_DIR/snapshot.json"
+if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
+`
+
+func txeExecutionContent(n int) string {
+	return fmt.Sprintf(`{"collected":"txe-marker-execution-%d"}`, n)
+}
+
+func txeDigest(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// txeHubAttempt is one attempt of a run as the hub stores it.
+type txeHubAttempt struct {
+	id, queuedAt, archiveDir string
+}
+
+// txeHubAttempts reads every attempt the hub keeps for a run from the hub's
+// own run store, oldest first.
+func txeHubAttempts(t *testing.T, f *testFixture, runID string) []txeHubAttempt {
+	t.Helper()
+	var dirs []string
+	require.NoError(t, filepath.WalkDir(f.coord.Config.Paths.DAGRunsDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && strings.HasPrefix(d.Name(), "a_") && strings.Contains(filepath.Base(filepath.Dir(p)), runID) {
+			dirs = append(dirs, p)
+		}
+		return nil
+	}))
+	slices.Sort(dirs)
+	attempts := make([]txeHubAttempt, 0, len(dirs))
+	for _, dir := range dirs {
+		data, err := os.ReadFile(filepath.Join(dir, "status.jsonl"))
+		require.NoError(t, err)
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		var status struct {
+			AttemptID  string `json:"attemptId"`
+			QueuedAt   string `json:"queuedAt"`
+			ArchiveDir string `json:"archiveDir"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(lines[len(lines)-1]), &status))
+		attempts = append(attempts, txeHubAttempt{id: status.AttemptID, queuedAt: status.QueuedAt, archiveDir: status.ArchiveDir})
+	}
+	return attempts
+}
+
+// retryDirect retries a run the way the hub's API does for a job a worker
+// runs: a retry task dispatched to the coordinator. With fromStep, that step
+// and everything after it run again; without, only what failed.
+func (r *txePublishRun) retryDirect(t *testing.T, runID, fromStep string) {
+	t.Helper()
+	f := r.f
+	previous, err := f.latestStatus()
+	require.NoError(t, err)
+	dag := f.dagWrapper.DAG
+	opts := []executor.TaskOption{executor.WithWorkerSelector(dag.WorkerSelector), executor.WithPreviousStatus(&previous)}
+	if fromStep != "" {
+		opts = append(opts, executor.WithStep(fromStep), executor.WithIncludeDownstream(true))
+	}
+	task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, runID, opts...)
+	require.NoError(t, f.coord.GetCoordinatorClient(t).Dispatch(f.coord.Context, dispatch.DispatchRequest{Task: task}))
+}
+
+// retryQueued retries a run the way the hub does when the retry goes through
+// a queue. The call adds nothing while the previous execution is still being
+// released, so it is repeated until it does.
+//
+// The retry is queued only once the workers have let go of the run. The hub
+// accepts a status report by attempt alone, so a last report of the earlier
+// execution that arrives after the retry was admitted puts its status back
+// and the queued retry is dropped. That race is not these tests' subject.
+func (r *txePublishRun) retryQueued(t *testing.T, runID string) {
+	t.Helper()
+	f := r.f
+	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
+	require.Eventually(t, func() bool {
+		previous, err := f.latestStatus()
+		if err != nil {
+			return false
+		}
+		added, err := queue.EnqueueRetry(f.coord.Context, f.coord.DAGRunRepository, f.coord.QueueStore, f.dagWrapper.DAG, &previous,
+			queue.EnqueueRetryOptions{Processes: f.coord.ProcRepository})
+		return err == nil && added
+	}, distrTestTimeout(20*time.Second), 200*time.Millisecond, "the retry was not queued")
+}
+
+// waitFor waits until the run's latest status on the hub satisfies done.
+func (r *txePublishRun) waitFor(t *testing.T, what string, done func(ir.DAGRunStatus) bool) ir.DAGRunStatus {
+	t.Helper()
+	var status ir.DAGRunStatus
+	require.Eventually(t, func() bool {
+		latest, err := r.f.latestStatus()
+		if err != nil {
+			return false
+		}
+		status = latest
+		return done(latest)
+	}, distrTestTimeout(40*time.Second), 200*time.Millisecond, what)
+	return status
+}
+
+func txeExecutions(t *testing.T, control string) int {
+	t.Helper()
+	entries, err := os.ReadDir(control)
+	require.NoError(t, err)
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "executed.") {
+			n++
+		}
+	}
+	return n
+}
+
+func txeReadFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(parts...))
+	require.NoError(t, err)
+	return string(data)
+}
+
+// A retry keeps the run ID. When it goes to the coordinator directly, each
+// retry is a new attempt, and every execution keeps what it produced: on the
+// machine, in the hub's storage, and as its own manifest.
+//
+// Three executions of one run: the job succeeds and publishes; the job is run
+// again from its step, writes other bytes, and cannot reach the registry; the
+// run is retried and only the publish step runs.
+func TestTXEPackage_RetryKeepsEveryExecution(t *testing.T) {
+	control := t.TempDir()
+	run := txeStartPublishJob(t, txeRetryScript, map[string]string{"TXE_FIXTURE_CONTROL": control},
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} })
+	f, home := run.f, run.home
+	outputs := txeclient.Outputs{Home: home}
+
+	first := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	runID := first.DAGRunID
+	require.Equal(t, 1, txeExecutions(t, control))
+	manifest, ok := run.registry.execution(first)
+	require.True(t, ok, "the first execution recorded no manifest")
+	assert.Equal(t, txeDigest(txeExecutionContent(1)), manifest.Artifacts[0].SHA256)
+	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
+
+	// The job runs again, from its step, and writes other bytes. The
+	// registry cannot be reached, so the execution fails at publish.
+	run.registry.setDown(true)
+	run.retryDirect(t, runID, "run")
+	second := run.waitFor(t, "the second execution did not fail", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != first.AttemptID && s.Status == ir.Failed
+	})
+	require.Equal(t, 2, txeExecutions(t, control))
+	require.NotEqual(t, txeExecution(first).Ref(), txeExecution(second).Ref())
+	assert.Equal(t, txeExecutionContent(1), txeReadFile(t, run.outputDir(first), "snapshot.json"), "the retry wrote over the first execution's output")
+	assert.Equal(t, txeExecutionContent(2), txeReadFile(t, run.outputDir(second), "snapshot.json"))
+	seal, err := outputs.Sealed(txeTestJob, runID)
+	require.NoError(t, err)
+	assert.Equal(t, txeExecution(second), seal.Execution)
+	_, ok = run.registry.execution(second)
+	assert.False(t, ok)
+	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-execution-2"), "bytes reached hub storage without a recorded manifest")
+	f.waitForRunReleasedFromWorkers(runID, distrTestTimeout(20*time.Second))
+
+	// The run is retried. The job's step succeeded, so only publish runs:
+	// a third execution that publishes what the second produced.
+	run.registry.setDown(false)
+	run.retryDirect(t, runID, "")
+	third := run.waitFor(t, "the third execution did not succeed", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != second.AttemptID && s.Status == ir.Succeeded
+	})
+	require.Equal(t, 2, txeExecutions(t, control), "a retry of the publish step ran the job again")
+	assert.NoDirExists(t, run.outputDir(third))
+	manifest, ok = run.registry.execution(third)
+	require.True(t, ok, "the third execution recorded no manifest")
+	assert.Equal(t, txeExecution(third), manifest.Execution)
+	assert.Equal(t, txeExecution(second), manifest.ProducedIn)
+	assert.Equal(t, txeDigest(txeExecutionContent(2)), manifest.Artifacts[0].SHA256)
+
+	// The hub keeps three attempts of the run. The first and the third each
+	// hold their own copy; the first execution's bytes and manifest are as
+	// they were.
+	attempts := txeHubAttempts(t, f, runID)
+	require.Len(t, attempts, 3)
+	archive := map[string]string{}
+	for _, a := range attempts {
+		archive[a.id] = a.archiveDir
+	}
+	require.Contains(t, archive, first.AttemptID)
+	require.Contains(t, archive, third.AttemptID)
+	assert.Equal(t, txeExecutionContent(1), txeReadFile(t, txeHubCopies(archive[first.AttemptID], first), "snapshot.json"))
+	assert.Equal(t, txeExecutionContent(2), txeReadFile(t, txeHubCopies(archive[third.AttemptID], third), "snapshot.json"))
+	kept, ok := run.registry.execution(first)
+	require.True(t, ok)
+	assert.Equal(t, txeDigest(txeExecutionContent(1)), kept.Artifacts[0].SHA256)
+	assert.Equal(t, txeExecutionContent(1), txeReadFile(t, run.outputDir(first), "snapshot.json"))
+}
+
+// A retry that goes through a queue executes again under the SAME attempt
+// ID with a later queue marker, and the hub keeps one attempt for the run.
+// Each execution is still its own: its files are kept under its own
+// reference, and it publishes under its own reference.
+//
+// Three executions of one run and one attempt: the job fails; it succeeds
+// and publish cannot reach the registry; publish alone runs and succeeds.
+func TestTXEPackage_QueuedRetryKeepsEveryExecution(t *testing.T) {
+	control := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(control, "fail-job"), nil, 0o600))
+	run := txeStartPublishJob(t, txeRetryScript, map[string]string{"TXE_FIXTURE_CONTROL": control},
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} })
+	f, home := run.f, run.home
+	outputs := txeclient.Outputs{Home: home}
+	runRoot := filepath.Join(home.OutputDir(txeTestJob), "runs")
+
+	first := f.waitForStatus(ir.Failed, executionStatusTimeout())
+	runID := first.DAGRunID
+	require.Equal(t, 1, txeExecutions(t, control))
+	_, err := outputs.Sealed(txeTestJob, runID)
+	require.ErrorIs(t, err, txeclient.ErrNotSealed, "a failed job step sealed its outputs")
+
+	// The job succeeds on the retry; the registry cannot be reached.
+	require.NoError(t, os.Remove(filepath.Join(control, "fail-job")))
+	run.registry.setDown(true)
+	run.retryQueued(t, runID)
+	second := run.waitFor(t, "the second execution did not fail at publish", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.Status == ir.Failed && txeExecutions(t, control) == 2 &&
+			len(s.Nodes) == 2 && s.Nodes[0].Status == ir.NodeSucceeded
+	})
+	require.Equal(t, first.AttemptID, second.AttemptID, "a queued retry got a new attempt; the test's premise is gone")
+	require.NotEqual(t, first.QueuedAt, second.QueuedAt, "a queued retry kept the queue marker")
+	seal, err := outputs.Sealed(txeTestJob, runID)
+	require.NoError(t, err)
+	assert.Equal(t, txeExecution(second), seal.Execution)
+	assert.Equal(t, txeExecutionContent(2), txeReadFile(t, run.outputDir(second), "snapshot.json"))
+	// What the failed execution had written is kept, set aside.
+	assert.Equal(t, txeExecutionContent(1), txeReadFile(t, runRoot, runID, "unsealed", first.AttemptID+".1", "snapshot.json"))
+	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-execution-2"), "bytes reached hub storage without a recorded manifest")
+
+	// The publish step alone runs on the next retry: a third execution of
+	// the same attempt, publishing what the second produced.
+	run.registry.setDown(false)
+	run.retryQueued(t, runID)
+	third := run.waitFor(t, "the third execution did not succeed", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.Status == ir.Succeeded && s.QueuedAt != second.QueuedAt
+	})
+	require.Equal(t, first.AttemptID, third.AttemptID)
+	require.Equal(t, 2, txeExecutions(t, control), "a retry of the publish step ran the job again")
+	manifest, ok := run.registry.execution(third)
+	require.True(t, ok, "no manifest was recorded")
+	assert.Equal(t, txeExecution(third), manifest.Execution)
+	assert.Equal(t, txeExecution(second), manifest.ProducedIn)
+	assert.Equal(t, txeDigest(txeExecutionContent(2)), manifest.Artifacts[0].SHA256)
+
+	attempts := txeHubAttempts(t, f, runID)
+	require.Len(t, attempts, 1, "the hub keeps one attempt for a run retried through the queue")
+	archiveDir := attempts[0].archiveDir
+	assert.Equal(t, txeExecutionContent(2), txeReadFile(t, txeHubCopies(archiveDir, third), "snapshot.json"))
+}
+
+// A run that was started without being queued has an empty queue marker.
+// Its steps receive the empty marker, not an unresolved reference, and the
+// job seals and publishes under the reference of (attempt, empty marker).
+func TestTXEPackage_UnqueuedRunPublishes(t *testing.T) {
+	run := txeStartPublishJobWith(t, txeCollectScript, nil,
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} },
+		func(f *testFixture) { require.NoError(t, f.start()) })
+	f := run.f
+
+	status := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	f.assertAllNodesSucceeded(status)
+	require.Empty(t, status.QueuedAt, "the run was queued; the test proves nothing about a run that was not")
+	execution := txeExecution(status)
+
+	manifest, ok := run.registry.execution(status)
+	require.True(t, ok, "no manifest was recorded for the unqueued run")
+	assert.Equal(t, execution, manifest.Execution)
+	assert.Empty(t, manifest.QueuedAt)
+	assert.Equal(t, execution, manifest.ProducedIn)
+	assert.Equal(t, txeHubContent, txeReadFile(t, run.outputDir(status), "snapshot.json"))
+	assert.Equal(t, txeHubContent, txeReadFile(t, txeHubCopies(status.ArchiveDir, status), "snapshot.json"))
 }
