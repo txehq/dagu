@@ -13,8 +13,7 @@ import (
 // in; it plays no part in deciding whether one has been covered.
 type runPoint struct {
 	runID string
-	// execution is the reference of the run's latest execution; empty when
-	// the service does not identify it.
+	// execution is the reference of the run's latest execution.
 	execution string
 	// at is when the execution ended, or the latest time the service has
 	// for it; zero when it has none.

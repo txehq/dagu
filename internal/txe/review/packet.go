@@ -104,13 +104,11 @@ func (p Packet) artifactRefs(runIDs []string) []string {
 func (p Packet) coveredExecutions() []string {
 	var out []string
 	for _, r := range p.NewRuns {
-		// A run whose execution the service does not identify is recorded
-		// under its run id alone, the name the listing gives it too.
-		ref := ""
+		// Only an identified execution is named. A run is never recorded
+		// under its id alone: that would cover its later executions too.
 		if e := r.Execution(); e.known() {
-			ref = e.Ref()
+			out = append(out, coveredKey(r.RunID, e.Ref()))
 		}
-		out = append(out, coveredKey(r.RunID, ref))
 	}
 	return out
 }

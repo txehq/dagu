@@ -421,7 +421,7 @@ func (s *stubTransport) Do(_ context.Context, method, path string, _, out any) e
 func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	job := "job_01HZX0000000000000000000AA"
 	run := func(id, status, finished string) string {
-		return fmt.Sprintf(`{"dagRunId":%q,"name":%q,"statusLabel":%q,"status":0,"startedAt":"2026-10-09T10:00:00Z","finishedAt":%q,"artifactsAvailable":false,"autoRetryCount":0}`, id, job, status, finished)
+		return fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"name":%q,"statusLabel":%q,"status":0,"startedAt":"2026-10-09T10:00:00Z","finishedAt":%q,"artifactsAvailable":false,"autoRetryCount":0}`, id, "a-"+id, job, status, finished)
 	}
 	stub := &stubTransport{t: t, replies: map[string]string{
 		"/dag-runs/" + job + "?limit=100": `{"dagRuns":[` +
@@ -433,9 +433,9 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 			run("r-queued", "queued", "") + `]}`,
 		"/dag-runs/" + job + "/r2/outputs":                                 `{"metadata":{},"outputs":{"free_pct":"31"}}`,
 		"/dag-runs/" + job + "/r2/spec":                                    `{"spec":"steps:\n  - name: measure\n"}`,
-		"/dag-runs/" + job + "/r1":                                         `{"dagRunDetails":{"statusLabel":"succeeded","finishedAt":"2026-10-09T10:01:00Z","nodes":[]}}`,
-		"/dag-runs/" + job + "/r2":                                         `{"dagRunDetails":{"statusLabel":"succeeded","nodes":[{"step":{"name":"measure"},"statusLabel":"succeeded"}]}}`,
-		"/dag-runs/" + job + "/r3":                                         `{"dagRunDetails":{"statusLabel":"failed","nodes":[{"step":{"name":"measure"},"statusLabel":"failed"}]}}`,
+		"/dag-runs/" + job + "/r1":                                         `{"dagRunDetails":{"attemptId":"a-r1","statusLabel":"succeeded","finishedAt":"2026-10-09T10:01:00Z","nodes":[]}}`,
+		"/dag-runs/" + job + "/r2":                                         `{"dagRunDetails":{"attemptId":"a-r2","statusLabel":"succeeded","nodes":[{"step":{"name":"measure"},"statusLabel":"succeeded"}]}}`,
+		"/dag-runs/" + job + "/r3":                                         `{"dagRunDetails":{"attemptId":"a-r3","statusLabel":"failed","nodes":[{"step":{"name":"measure"},"statusLabel":"failed"}]}}`,
 		"/dag-runs/" + job + "/r2/steps/measure/log?stream=stdout&tail=40": `{"content":"31"}`,
 		"/dag-runs/" + job + "/r3/steps/measure/log?stream=stderr&tail=40": `{"content":"df: permission denied"}`,
 	}}
@@ -448,9 +448,11 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	require.Len(t, all, 3)
 	assert.Equal(t, "r1", all[0].RunID)
 
-	// A recorded review covered r1. The service does not identify these
-	// runs' executions, so a run is recorded under its id alone.
-	stub.replies["/txe/jobs/"+job+"/reviews"] = `{"reviews":[{"review_id":"rev_1","detail":{"covered_executions":["r1@"]}}]}`
+	// A recorded review covered r1's execution. An older review that
+	// names runs but no executions covers nothing: r2 and r3 are still new.
+	stub.replies["/txe/jobs/"+job+"/reviews"] = `{"reviews":[` +
+		`{"review_id":"rev_2","detail":{"covered_executions":["r1@` + review.ExecutionRef("a-r1", "") + `"]}},` +
+		`{"review_id":"rev_1","detail":{"covered_run_ids":["r2","r3"]}}]}`
 	runs, err := remote.RunsAfter(context.Background(), job, "")
 	require.NoError(t, err)
 	require.Len(t, runs, 2)
@@ -726,6 +728,27 @@ func TestRemoteRunsAfterIsNeverBlockedByTheShapeOfTheHistory(t *testing.T) {
 	runs[701] = "q0000 a1 failed 2026-10-09T10:00:00Z"
 	l.set(runs...)
 	assert.Equal(t, []string{"q0000@a1"}, l.review())
+}
+
+// Coverage is by execution, so a service that reports a finished run with
+// no attempt id is one this reviewer cannot run on. That is an explicit
+// failure naming the run. The run is never recorded under its id alone,
+// which would pass off every later retry of it as already reviewed.
+func TestRemoteRunsAfterFailsOnARunTheServiceDoesNotIdentify(t *testing.T) {
+	l := newRunList(t)
+	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[` +
+		`{"dagRunId":"r1","statusLabel":"failed","finishedAt":"2026-10-09T10:01:00Z"},` +
+		`{"dagRunId":"r2","attemptId":"b1","statusLabel":"succeeded","finishedAt":"2026-10-09T10:02:00Z"}]}`
+	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	require.ErrorIs(t, err, review.ErrUnidentifiedExecution)
+	require.ErrorContains(t, err, "r1")
+	assert.Empty(t, runs, "nothing is returned, so nothing can be covered")
+
+	// An unfinished run without one is not a result yet and is no failure.
+	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[{"dagRunId":"r1","statusLabel":"queued"}]}`
+	runs, err = (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	require.NoError(t, err)
+	assert.Empty(t, runs)
 }
 
 // A run that ended in the queue has no finish time and is still a result,

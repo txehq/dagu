@@ -116,9 +116,12 @@ else a review step needs must be rendered into the DAG:
   The registry's review list has no paging yet. This is the plain, exact
   form; making it cheaper is capacity work and must keep the same meaning
   of covered.
-- On a service that does not identify executions (no attempt id), a run is
-  recorded under its run id alone and a retry of it would not be shown
-  again. The hubs this runs on identify them.
+- The service must identify executions. A finished run reported without
+  an attempt id fails the review step with an explicit error naming the
+  run; it is never recorded under its run id alone, which would pass off a
+  later retry of it as already reviewed. A review recorded before coverage
+  was by execution names no executions and covers nothing: its runs are
+  shown again, not taken for covered.
 
 ## Declared actions
 

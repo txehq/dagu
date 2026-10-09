@@ -11,6 +11,11 @@ import (
 )
 
 var (
+	// ErrUnidentifiedExecution means the service reported a finished run
+	// without the attempt id that identifies its execution. Coverage is by
+	// execution, so such a service is not one this reviewer can run on: a
+	// retried run would be indistinguishable from the run already reviewed.
+	ErrUnidentifiedExecution = errors.New("txe review: the service does not identify a run's execution")
 	// ErrClaimHeld means another live claim owns the job.
 	ErrClaimHeld = errors.New("txe review: job is claimed by another holder")
 	// ErrStaleFence means the write came from a claim that is no longer the

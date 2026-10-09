@@ -387,6 +387,11 @@ func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSumma
 // that was replaced by a retry between two reviews was never listed and is
 // not reviewed.
 //
+// A review that names no executions, as one recorded before coverage was
+// by execution, covers nothing here: its runs are shown again rather than
+// taken for covered. A finished run the service gives no attempt id for
+// fails the listing with ErrUnidentifiedExecution.
+//
 // The cost is a read of the job's whole review and run history on every
 // review. That is the price of exactness without an index; making it
 // cheaper is capacity work and must not change what counts as covered.
@@ -404,6 +409,11 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence,
 			// Not a result yet. Nothing has to be remembered about it:
 			// when it ends, its execution is in no review and is returned.
 			return nil
+		}
+		if run.AttemptID == "" {
+			// Never recorded under the run id alone: that would cover every
+			// later execution of the run without anyone having seen it.
+			return fmt.Errorf("%w: run %s of job %s is %s and has no attempt id", ErrUnidentifiedExecution, run.DagRunID, jobID, run.StatusLabel)
 		}
 		point := run.point()
 		if covered[point.key()] {
@@ -1203,12 +1213,8 @@ type runSummary struct {
 	FinishedAt  string          `json:"finishedAt"`
 }
 
-// execution is the reference of the run's latest execution, or empty when
-// the service does not identify it.
+// execution is the reference of the run's latest execution.
 func (s runSummary) execution() string {
-	if s.AttemptID == "" {
-		return ""
-	}
 	return ExecutionRef(s.AttemptID, s.QueuedAt)
 }
 
