@@ -56,16 +56,24 @@ else
   [ -n "$owner_id" ] || die "first install needs --owner-id own_<ULID>"
   machine_id="$("$here/mint-id.sh" mch)"
   python3 -I - "$machine" "$machine_id" "$owner_id" "$(scutil --get ComputerName 2>/dev/null || hostname)" <<'PY'
-import datetime, json, os, sys
+import datetime, json, os, sys, tempfile
 path, machine_id, owner_id, display = sys.argv[1:]
 record = {"schema": 1, "machine_id": machine_id, "owner_id": owner_id,
           "display_name": display,
           "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-tmp = path + ".tmp"
-with open(tmp, "x") as f:
-    json.dump(record, f, indent=2)
-    f.write("\n")
-os.rename(tmp, path)
+# A uniquely named temporary file, so an interrupted install leaves nothing that
+# blocks the next one; os.link publishes it only if machine.json does not exist
+# yet, so a concurrent installer can never overwrite an identity.
+fd, tmp = tempfile.mkstemp(prefix=".machine.", suffix=".tmp", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.link(tmp, path)
+finally:
+    os.unlink(tmp)
 PY
 fi
 

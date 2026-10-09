@@ -44,6 +44,11 @@ ca="$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name==\"$cluster\")]
 umask 077
 mkdir -p "$TXE_DAGU_HOME/tunnel"
 out="$TXE_DAGU_HOME/tunnel/kubeconfig"
+# The new credential is written to a private candidate and checked there. Only a
+# candidate that passes replaces the live kubeconfig, so a refused renewal leaves
+# the tunnel on the credential it already had.
+cand="$(mktemp "$out.XXXXXX")"
+trap 'rm -f "$cand" "$cand.expires"' EXIT
 
 # The token goes straight from kubectl into the file through python's stdin; it is
 # never in an argument, an environment variable or the terminal.
@@ -66,20 +71,20 @@ config = {
                   "context": {"cluster": "txe-dagu", "user": "dagu-tunnel", "namespace": ns}}],
     "current-context": "txe-dagu-tunnel",
 }
-tmp = out + ".tmp"
-with open(tmp, "w") as f:
+os.chmod(out, 0o600)
+with open(out, "w") as f:
     json.dump(config, f)
-os.chmod(tmp, 0o600)
-os.replace(tmp, out)
 with open(out + ".expires", "w") as f:
     f.write(str(claims.get("exp", "")) + "\n")
-' "$out" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
+' "$cand" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
 
 # Prove the credential does what the tunnel needs, and no more than that.
-kubectl --kubeconfig "$out" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --subresource=portforward >/dev/null \
-  || die "the new credential cannot port-forward in $TXE_DAGU_NAMESPACE"
-if kubectl --kubeconfig "$out" -n "$TXE_DAGU_NAMESPACE" auth can-i get secrets >/dev/null 2>&1; then
-  die "the new credential can read Secrets; the dagu-tunnel Role is wider than intended"
+kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --subresource=portforward >/dev/null \
+  || die "the new credential cannot port-forward in $TXE_DAGU_NAMESPACE; kept the previous one"
+if kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i get secrets >/dev/null 2>&1; then
+  die "the new credential can read Secrets; the dagu-tunnel Role is wider than intended; kept the previous one"
 fi
+mv -f "$cand" "$out"
+mv -f "$cand.expires" "$out.expires"
 printf 'wrote %s (expires %s)\n' "$out" \
   "$(date -r "$(cat "$out.expires")" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
