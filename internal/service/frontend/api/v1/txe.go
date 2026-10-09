@@ -1384,11 +1384,53 @@ func (a *API) ListTxeRunExecutions(ctx context.Context, req api.ListTxeRunExecut
 		}
 		return nil, err
 	}
-	out, err := txeConvert[[]api.TxeRetainedExecution](retained)
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	visible := make([]persis.RetainedExecution, 0, len(retained))
+	for _, e := range retained {
+		ok, err := a.txeRetainedVisible(ctx, run, e.Execution)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			visible = append(visible, e)
+		}
+	}
+	out, err := txeConvert[[]api.TxeRetainedExecution](visible)
 	if out == nil {
 		out = []api.TxeRetainedExecution{}
 	}
+	for i := range out {
+		if out[i].Files == nil {
+			out[i].Files = []api.TxeRetainedFile{}
+		}
+	}
 	return api.ListTxeRunExecutions200JSONResponse{Executions: out}, err
+}
+
+// txeRetainedVisible reports whether the caller can see the workspace a
+// retained execution ran in, read from that execution's own saved status
+// (as the native run endpoints do): a job that moved to another workspace
+// does not expose the runs it made in the one it left.
+func (a *API) txeRetainedVisible(ctx context.Context, run ir.DAGRunRef, executionRef string) (bool, error) {
+	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, run, executionRef, "status.json")
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	var status ir.DAGRunStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return false, nil
+	}
+	if err := a.requireDAGRunStatusVisible(ctx, &status); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (a *API) GetTxeRunExecutionFile(ctx context.Context, req api.GetTxeRunExecutionFileRequestObject) (api.GetTxeRunExecutionFileResponseObject, error) {
@@ -1402,7 +1444,17 @@ func (a *API) GetTxeRunExecutionFile(ctx context.Context, req api.GetTxeRunExecu
 	if a.dagRunRepository == nil {
 		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
 	}
-	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, ir.NewDAGRunRef(req.JobId, req.RunId), req.ExecutionRef, req.Name)
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "no such retained file"}
+	switch ok, err := a.txeRetainedVisible(ctx, run, req.ExecutionRef); {
+	case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return nil, notFound
+	case err != nil:
+		return nil, err
+	case !ok:
+		return nil, notFound
+	}
+	data, err := a.dagRunRepository.ReadRetainedExecutionFile(ctx, run, req.ExecutionRef, req.Name)
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) || errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 			return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "no such retained file"}
