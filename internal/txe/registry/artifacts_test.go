@@ -34,6 +34,13 @@ func TestDeliverablesAreChecked(t *testing.T) {
 		{Name: "escape", Path: "../x"},
 		{Name: "unclean", Path: "a/./b"},
 		{Name: "delivery", Path: "a.txt", Delivery: "email"},
+		{Name: "stream", Path: "report.txt:hidden"},
+		{Name: "hidden", Path: ".txe-partial-a"},
+		{Name: "device", Path: "out/con.txt"},
+		{Name: "trailing", Path: "notes."},
+		{Name: "space", Path: "my notes.txt"},
+		{Name: "control", Path: "a\x00b"},
+		{Name: "backslash", Path: `a\b.txt`},
 	} {
 		v := f.version(1)
 		v.ExpectedOutcome.Deliverables = []Deliverable{d}
@@ -54,7 +61,7 @@ func TestRecordArtifacts(t *testing.T) {
 		var out *ArtifactManifest
 		_, err := f.tx(job.JobID, cli, func(tx *JobTx) error {
 			var err error
-			out, err = tx.RecordArtifacts(f.ctx, f.store, "run-1", m)
+			out, err = tx.RecordArtifacts(f.ctx, f.store, "run-1", job.DAGSpecSHA256, m)
 			return err
 		})
 		return out, err
@@ -108,6 +115,17 @@ func TestRecordArtifacts(t *testing.T) {
 	assert.Len(t, j.Exceptions, 1, "and opens no second exception")
 	_, err = record(bad(func(a *ArtifactRecord) { a.SHA256 = shaB }))
 	assert.Equal(t, CodeArtifactConflict, code(t, err))
+
+	// Only the run itself can claim its deliverables: a manifest for a run
+	// whose saved DAG is not the reported version's, or no run at all, is
+	// refused.
+	for _, spec := range []string{"", "sha256:" + strings.Repeat("0", 64)} {
+		_, err = f.tx(job.JobID, cli, func(tx *JobTx) error {
+			_, err := tx.RecordArtifacts(f.ctx, f.store, "run-2", spec, manifest)
+			return err
+		})
+		assert.Equal(t, CodeStaleBinding, code(t, err))
+	}
 }
 
 func TestCheckHubArtifacts(t *testing.T) {
@@ -120,7 +138,7 @@ func TestCheckHubArtifacts(t *testing.T) {
 		}
 	})
 	_, err := f.tx(job.JobID, cli, func(tx *JobTx) error {
-		_, err := tx.RecordArtifacts(f.ctx, f.store, "run-1", ArtifactManifest{JobVersion: 1, Artifacts: []ArtifactRecord{
+		_, err := tx.RecordArtifacts(f.ctx, f.store, "run-1", job.DAGSpecSHA256, ArtifactManifest{JobVersion: 1, Artifacts: []ArtifactRecord{
 			{Deliverable: "good", Path: "good.json", SHA256: shaA, Location: DeliveryHub, MachineID: f.machine},
 			{Deliverable: "bad", Path: "bad.json", SHA256: shaA, Location: DeliveryHub, MachineID: f.machine},
 			{Deliverable: "late", Path: "late.json", SHA256: shaA, Location: DeliveryHub, MachineID: f.machine},
