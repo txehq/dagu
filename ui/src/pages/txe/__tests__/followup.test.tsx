@@ -173,7 +173,7 @@ describe('run retry', () => {
     ],
   });
 
-  it('asks for a retry of the exact failed run at the job version', async () => {
+  it('asks for a retry of the exact failed attempt at the job version', async () => {
     const requestRetry = vi.fn().mockResolvedValue({ ok: true });
     renderAt(
       baseApi({ getJob: async () => failedJob, requestRetry }),
@@ -183,9 +183,11 @@ describe('run retry', () => {
       await screen.findByRole('button', { name: 'Retry this run' })
     );
     await waitFor(() => expect(requestRetry).toHaveBeenCalledTimes(1));
-    expect(requestRetry.mock.calls[0]?.slice(0, 3)).toEqual([
+    // The attempt the person reviewed is sent so a moved run is refused.
+    expect(requestRetry.mock.calls[0]?.slice(0, 4)).toEqual([
       'job_volume_monitor',
       'run-0003',
+      'run-0003-a1',
       failedJob.version,
     ]);
   });

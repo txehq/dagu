@@ -128,6 +128,14 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil {
 		return nil, err
 	}
+	// The person decided on the attempt they saw. If the run has moved on to
+	// another attempt since, retrying the latest would retry one they never
+	// reviewed, so refuse and let them look again.
+	if body.AttemptId != nil && *body.AttemptId != run.attemptID {
+		return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: fmt.Sprintf("run %s is now at attempt %s, not the attempt %s you reviewed; review it again", req.RunId, run.attemptID, *body.AttemptId),
+			Details: map[string]any{"code": string(decision.CodeRunStale)}}
+	}
 	// A client that saw a different snapshot of the run is acting on stale
 	// information; refuse rather than retry something else.
 	if body.RunSpecSha256 != nil && *body.RunSpecSha256 != run.specSHA256 {
