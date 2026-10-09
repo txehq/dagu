@@ -700,3 +700,30 @@ func TestActionScopeExceptionsFollowTheAttempt(t *testing.T) {
 	require.NoError(t, r.settle(actionID, g, ec, ActionFailed, ""))
 	assert.Empty(t, open())
 }
+
+// An action that leaves the aggregate (archived, e.g. replaced by a later
+// episode after its uncertainty was resolved) takes its open action-scope
+// exceptions with it.
+func TestArchivedActionResolvesItsExceptions(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	actionID, _, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.Observe(Observation{Scope: ScopeAction, Kind: "stalled", ActionID: actionID, Attempt: 1, ClaimID: c.ClaimID, Fence: c.Fence})
+	})
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		tx.touch()
+		return tx.archiveAction(tx.Job.Actions[actionID])
+	})
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	for _, e := range got.Exceptions {
+		if e.Scope == ScopeAction {
+			assert.NotNil(t, e.ResolvedAt, "resolved with its archived action")
+		}
+	}
+}
