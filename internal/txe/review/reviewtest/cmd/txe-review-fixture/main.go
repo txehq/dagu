@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string) error {
 		Reviewer: &review.Reviewer{
 			Registry:    reg,
 			Effector:    &review.CommandEffector{},
-			Opener:      &review.RunOpener{Enqueue: enqueue(o.dagu)},
+			Opener:      &review.RunOpener{Enqueue: enqueue(o.dagu), Complete: complete(o.dagu)},
 			Holder:      fmt.Sprintf("%s/%s", o.machine, o.runID),
 			AgentClient: o.agentClient,
 			DecideDAG:   review.DecideDAGName(o.machine),
@@ -155,6 +155,36 @@ func readJSON(path string, v any) error {
 		return err
 	}
 	return json.Unmarshal(data, v)
+}
+
+// complete completes a waiting human task through the dagu CLI of the
+// fixture home.
+func complete(dagu string) review.CompleteFunc {
+	return func(ctx context.Context, task review.TaskLocator, input map[string]string) error {
+		if dagu == "" {
+			return nil
+		}
+		args := []string{"human-task", "complete", "--run-id", task.RunID, "--step", task.StepID}
+		names := make([]string, 0, len(input))
+		for name := range input {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			args = append(args, "--input", name+"="+input[name])
+		}
+		args = append(args, task.DAG)
+		// #nosec G204 -- fixture tooling; the binary path is the operator's.
+		out, err := exec.CommandContext(ctx, dagu, args...).CombinedOutput()
+		if err != nil {
+			text := string(out)
+			if strings.Contains(text, "different input") || strings.Contains(text, "not found") || strings.Contains(text, "not waiting") {
+				return review.ErrRunNotActive
+			}
+			return fmt.Errorf("dagu human-task complete: %w: %s", err, out)
+		}
+		return nil
+	}
 }
 
 // enqueue opens a decision run through the dagu CLI of the fixture home.

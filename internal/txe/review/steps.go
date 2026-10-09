@@ -5,6 +5,8 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,6 +87,9 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save packet artifact: %w", err)
 		}
+		for _, w := range prepared.Warnings {
+			fmt.Fprintln(os.Stderr, "txe review: warning:", w)
+		}
 		return json.NewEncoder(stdout).Encode(prepared.Packet)
 	}
 	return failed
@@ -127,6 +132,8 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 
 	result := StepResult{JobID: prepared.Packet.Job.ID, ReviewID: prepared.Packet.ReviewID}
 	reviewer := *s.Reviewer
+	sum := sha256.Sum256(data)
+	reviewer.Handoff = LocalFile{MachineID: s.MachineID, Path: path, SHA256: hex.EncodeToString(sum[:])}
 	if models := AgentModels(raw); len(models) > 0 {
 		reviewer.AgentClient = strings.TrimSpace(reviewer.AgentClient + " " + strings.Join(models, ","))
 	}
@@ -255,10 +262,24 @@ type EnqueueFunc func(ctx context.Context, dag, runID string, params map[string]
 // an earlier attempt.
 var ErrRunExists = errors.New("txe review: run already exists")
 
+// CompleteFunc completes a waiting human task of one run with the given
+// input. It must return ErrRunNotActive when that task is not waiting any
+// more or the run does not exist.
+type CompleteFunc func(ctx context.Context, task TaskLocator, input map[string]string) error
+
+// ErrRunNotActive means nothing is waiting, so there is nothing to close.
+var ErrRunNotActive = errors.New("txe review: run is not waiting")
+
+// NoDecisionID is the decision pointer given to a decision run that is being
+// closed without an answer. It names no decision in the registry, so the
+// run's execute step finds nothing to act on and ends.
+const NoDecisionID = "dec_superseded"
+
 // RunOpener makes a proposal answerable by enqueueing its own run of the
 // decision DAG. The run stops at a native human task and holds no process.
 type RunOpener struct {
-	Enqueue EnqueueFunc
+	Enqueue  EnqueueFunc
+	Complete CompleteFunc
 }
 
 var _ DecisionOpener = (*RunOpener)(nil)
@@ -271,6 +292,25 @@ func (o *RunOpener) OpenDecision(ctx context.Context, proposal Proposal) error {
 		"PROPOSAL_ID": proposal.ID,
 	})
 	if errors.Is(err, ErrRunExists) {
+		return nil
+	}
+	return err
+}
+
+// CloseDecision implements DecisionOpener. A run waiting at a human task has
+// no process to stop and the service cannot abort it, so the wait is ended
+// the only way there is: the task is completed with a pointer to no
+// decision. The registry, not the task input, decides what may run, and it
+// has no such decision, so the run ends without an effect.
+func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) error {
+	if o.Complete == nil {
+		return nil
+	}
+	err := o.Complete(ctx, proposal.NativeTask, map[string]string{
+		"decision_id": NoDecisionID,
+		"verdict":     string(VerdictReject),
+	})
+	if errors.Is(err, ErrRunNotActive) {
 		return nil
 	}
 	return err

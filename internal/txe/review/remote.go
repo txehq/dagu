@@ -507,19 +507,41 @@ func (r *Remote) OpenProposals(ctx context.Context, jobID string) ([]Proposal, e
 	return out, nil
 }
 
+// maxSuperseded bounds how many superseded proposals one review revisits.
+const maxSuperseded = 20
+
+// SupersededProposals implements Registry.
+func (r *Remote) SupersededProposals(ctx context.Context, jobID string) ([]Proposal, error) {
+	list, err := r.proposals(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	var out []Proposal
+	for _, p := range append(list.Open, list.Finished...) {
+		if p.State == api.TxeProposalState(ProposalSuperseded) {
+			out = append(out, r.proposalOf(jobID, p))
+		}
+	}
+	if len(out) > maxSuperseded {
+		out = out[len(out)-maxSuperseded:]
+	}
+	return out, nil
+}
+
 // reviewDetail is what the reviewer keeps in a review record's free-form
 // detail until the registry has typed fields for it.
 type reviewDetail struct {
-	Episode           int      `json:"episode"`
-	CoveredRuns       []string `json:"covered_run_ids"`
-	CoveredDecisions  []string `json:"covered_decision_ids"`
-	ActionIDs         []string `json:"action_ids,omitempty"`
-	ProposalIDs       []string `json:"proposal_ids,omitempty"`
-	Notes             []string `json:"notes,omitempty"`
-	Reviewer          string   `json:"reviewer"`
-	PacketBytes       int      `json:"packet_bytes"`
-	AgentInputTokens  int      `json:"agent_input_tokens,omitempty"`
-	AgentOutputTokens int      `json:"agent_output_tokens,omitempty"`
+	Episode           int       `json:"episode"`
+	CoveredRuns       []string  `json:"covered_run_ids"`
+	CoveredDecisions  []string  `json:"covered_decision_ids"`
+	ActionIDs         []string  `json:"action_ids,omitempty"`
+	ProposalIDs       []string  `json:"proposal_ids,omitempty"`
+	Notes             []string  `json:"notes,omitempty"`
+	Reviewer          string    `json:"reviewer"`
+	Handoff           LocalFile `json:"handoff,omitzero"`
+	PacketBytes       int       `json:"packet_bytes"`
+	AgentInputTokens  int       `json:"agent_input_tokens,omitempty"`
+	AgentOutputTokens int       `json:"agent_output_tokens,omitempty"`
 }
 
 // Review implements Registry.
@@ -543,6 +565,7 @@ func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, er
 			ActionIDs: detail.ActionIDs, ProposalIDs: detail.ProposalIDs, Notes: detail.Notes,
 			Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: detail.PacketBytes,
 			PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
+			Handoff: detail.Handoff,
 		}, nil
 	}
 	return Review{}, ErrNotFound
@@ -749,7 +772,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 	detail := reviewDetail{
 		Episode: rev.Episode, CoveredRuns: rev.CoveredRuns, CoveredDecisions: rev.CoveredDecisions,
 		ActionIDs: rev.ActionIDs, ProposalIDs: rev.ProposalIDs, Notes: rev.Notes, Reviewer: rev.Reviewer,
-		PacketBytes: rev.PacketBytes, AgentInputTokens: rev.AgentInputTokens, AgentOutputTokens: rev.AgentOutputTokens,
+		Handoff: rev.Handoff, PacketBytes: rev.PacketBytes, AgentInputTokens: rev.AgentInputTokens, AgentOutputTokens: rev.AgentOutputTokens,
 	}
 	body := api.TxeReviewRequest{
 		Actor: r.actor(), ClaimId: claim.ID, Fence: int64(claim.Fence),
@@ -829,6 +852,23 @@ func RemoteEnqueue(t Transport) EnqueueFunc {
 		// paths, as a plain error whose message says so.
 		if errors.As(err, &te) && (te.Status == http.StatusConflict || strings.Contains(te.Message, "already exists")) {
 			return ErrRunExists
+		}
+		return err
+	}
+}
+
+// RemoteComplete returns a CompleteFunc that completes a human task through
+// the service.
+func RemoteComplete(t Transport) CompleteFunc {
+	return func(ctx context.Context, task TaskLocator, input map[string]string) error {
+		path := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID) +
+			"/human-tasks/" + url.PathEscape(task.StepID) + "/complete"
+		err := t.Do(ctx, http.MethodPost, path, input, nil)
+		// The service answers 404 for a run it does not know and 409 for a
+		// task already completed with another input. Either way nothing is
+		// waiting. An identical earlier completion is a plain success.
+		if te, ok := errors.AsType[*TransportError](err); ok && (te.Status == http.StatusNotFound || te.Status == http.StatusConflict) {
+			return ErrRunNotActive
 		}
 		return err
 	}

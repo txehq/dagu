@@ -6,6 +6,8 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -540,6 +542,50 @@ func TestStepsSaveReviewArtifacts(t *testing.T) {
 	assert.Contains(t, string(saved), `"outcome": "continue"`)
 
 	rev := f.state().Reviews[jobID][0]
+	// The local hand-off is recorded as a reference to a file on this
+	// machine, with the digest of the bytes the decision was made from.
+	handoff, err := os.ReadFile(filepath.Join(dir, "reviews", "tick-1", "prepared.json"))
+	require.NoError(t, err)
+	sum := sha256.Sum256(handoff)
+	assert.Equal(t, review.LocalFile{
+		MachineID: fixtureJob().MachineID,
+		Path:      filepath.Join(dir, "reviews", "tick-1", "prepared.json"),
+		SHA256:    hex.EncodeToString(sum[:]),
+	}, rev.Handoff)
 	assert.Equal(t, "txe-review/packet.json", rev.PacketArtifact)
 	assert.Equal(t, "txe-review/decision.json", rev.DecisionArtifact)
+}
+
+func TestRunOpenerClosesByCompletingWithNoDecision(t *testing.T) {
+	var calls []string
+	result := error(nil)
+	o := &review.RunOpener{Complete: func(_ context.Context, task review.TaskLocator, input map[string]string) error {
+		calls = append(calls, task.DAG+"/"+task.RunID+"/"+task.StepID+" "+input["decision_id"]+" "+input["verdict"])
+		return result
+	}}
+	p := review.Proposal{ID: "prp_1", NativeTask: review.TaskLocator{DAG: "txe-decide-x", RunID: "txe-abc", StepID: "decide"}}
+	require.NoError(t, o.CloseDecision(context.Background(), p))
+	assert.Equal(t, []string{"txe-decide-x/txe-abc/decide dec_superseded reject"}, calls)
+	result = review.ErrRunNotActive
+	require.NoError(t, o.CloseDecision(context.Background(), p), "a task that is not waiting needs no closing")
+	result = errors.New("hub unreachable")
+	require.Error(t, o.CloseDecision(context.Background(), p))
+
+	require.NoError(t, (&review.RunOpener{}).CloseDecision(context.Background(), p))
+}
+
+// The pointer used to close a run names no decision, so the execute step
+// that the closed run resumes into does nothing.
+func TestClosedDecisionRunExecutesNothing(t *testing.T) {
+	f := newFixture(t)
+	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	proposal := f.state().Proposals[jobID][0]
+	var out bytes.Buffer
+	require.NoError(t, f.steps("exec", t.TempDir()).Execute(context.Background(), jobID, proposal.ID, review.NoDecisionID, &out))
+	assert.Contains(t, out.String(), "no recorded decision")
+	assert.Equal(t, 0, f.effects.count("expand_volume"))
+	assert.Empty(t, f.state().Actions[jobID])
 }

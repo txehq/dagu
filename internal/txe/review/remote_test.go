@@ -421,3 +421,22 @@ func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
 	stub.fail = map[string]*review.TransportError{"/dags/txe-decide-X/enqueue": {Status: http.StatusBadGateway}}
 	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
+
+// Closing a decision run completes its task with a pointer to no decision;
+// a task answered otherwise or a run the service does not know is already
+// closed.
+func TestRemoteCompleteClosesAWaitingTask(t *testing.T) {
+	path := "/dag-runs/txe-decide-X/txe-abc/human-tasks/decide/complete"
+	stub := &stubTransport{t: t, replies: map[string]string{path: `{"alreadyCompleted":false}`}}
+	complete := review.RemoteComplete(stub)
+	task := review.TaskLocator{DAG: "txe-decide-X", RunID: "txe-abc", StepID: "decide"}
+	require.NoError(t, complete(context.Background(), task, map[string]string{"decision_id": review.NoDecisionID, "verdict": "reject"}))
+	assert.Equal(t, []string{"POST " + path}, stub.calls)
+
+	for _, status := range []int{http.StatusConflict, http.StatusNotFound} {
+		stub.fail = map[string]*review.TransportError{path: {Status: status}}
+		require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrRunNotActive)
+	}
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway}}
+	require.Error(t, complete(context.Background(), task, nil))
+}

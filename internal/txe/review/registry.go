@@ -117,6 +117,10 @@ type Registry interface {
 	Decision(ctx context.Context, jobID, decisionID string) (Decision, error)
 	Proposal(ctx context.Context, jobID, proposalID string) (Proposal, error)
 	OpenProposals(ctx context.Context, jobID string) ([]Proposal, error)
+	// SupersededProposals returns the job's most recently superseded
+	// proposals. Nobody can answer them any more, so the runs that carry
+	// them have to be closed.
+	SupersededProposals(ctx context.Context, jobID string) ([]Proposal, error)
 	// Review returns a recorded review, or ErrNotFound.
 	Review(ctx context.Context, jobID, reviewID string) (Review, error)
 	// Actions returns the job's journaled actions, oldest first.
@@ -148,4 +152,7 @@ type Registry interface {
 // alive. Opening the same proposal twice must be a no-op.
 type DecisionOpener interface {
 	OpenDecision(ctx context.Context, proposal Proposal) error
+	// CloseDecision ends the wait of a proposal that can no longer be
+	// answered. It must be a no-op when nothing is waiting.
+	CloseDecision(ctx context.Context, proposal Proposal) error
 }

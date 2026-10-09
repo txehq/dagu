@@ -41,6 +41,9 @@ type Reviewer struct {
 	Holder string
 	// AgentClient is the agent CLI name and version actually used.
 	AgentClient string
+	// Handoff is recorded on the review as the local location of the
+	// prepared review this decision was made from.
+	Handoff LocalFile
 	// PacketArtifact and DecisionArtifact are recorded on the review when
 	// the step saved them as run artifacts.
 	PacketArtifact   string
@@ -82,6 +85,8 @@ type Prepared struct {
 	Skipped SkipReason `json:"skipped,omitempty"`
 	Claim   Claim      `json:"claim,omitzero"`
 	Packet  Packet     `json:"packet,omitzero"`
+	// Warnings are problems that did not stop the review.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Prepare claims the job, settles effects left open by earlier claims, and
@@ -91,15 +96,18 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	if err != nil {
 		return Prepared{}, fmt.Errorf("read job: %w", err)
 	}
+	// Closing dead waits needs no claim and applies to a retired job too,
+	// since retiring supersedes its proposals.
+	warnings := r.closeSuperseded(ctx, jobID)
 	if !job.Lifecycle.Reviewable() {
 		if err := r.settleTerminal(ctx, job); err != nil {
 			return Prepared{}, fmt.Errorf("reconcile open actions: %w", err)
 		}
-		return Prepared{Skipped: SkipNotReviewable}, nil
+		return Prepared{Skipped: SkipNotReviewable, Warnings: warnings}, nil
 	}
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimReview, Holder: r.Holder, TTL: r.claimTTL()})
 	if errors.Is(err, ErrClaimHeld) {
-		return Prepared{Skipped: SkipClaimHeld}, nil
+		return Prepared{Skipped: SkipClaimHeld, Warnings: warnings}, nil
 	}
 	if err != nil {
 		return Prepared{}, fmt.Errorf("acquire claim: %w", err)
@@ -112,7 +120,28 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, err
 	}
-	return Prepared{Claim: claim, Packet: packet}, nil
+	return Prepared{Claim: claim, Packet: packet, Warnings: warnings}, nil
+}
+
+// closeSuperseded ends the wait of every proposal that was superseded, for
+// example by a change to the job. Its run would otherwise wait for an answer
+// the registry will never accept. A failure here is reported and does not
+// stop the review: the wait is closed again on the next one.
+func (r *Reviewer) closeSuperseded(ctx context.Context, jobID string) []string {
+	proposals, err := r.Registry.SupersededProposals(ctx, jobID)
+	if err != nil {
+		return []string{"list superseded proposals: " + err.Error()}
+	}
+	var warnings []string
+	for _, proposal := range proposals {
+		if proposal.NativeTask.RunID == "" {
+			continue
+		}
+		if err := r.Opener.CloseDecision(ctx, proposal); err != nil {
+			warnings = append(warnings, fmt.Sprintf("close decision run of proposal %s: %v", proposal.ID, err))
+		}
+	}
+	return warnings
 }
 
 // settleTerminal settles effects left open on a job that completed or
@@ -392,6 +421,7 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		EvidenceRuns:      decision.EvidenceRunIDs,
 		CoveredRuns:       packet.RunIDs(),
 		CoveredDecisions:  packet.DecisionIDs(),
+		Handoff:           r.Handoff,
 		PacketArtifact:    r.PacketArtifact,
 		DecisionArtifact:  r.DecisionArtifact,
 		PacketBytes:       packet.size(),

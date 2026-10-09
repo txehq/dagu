@@ -90,6 +90,7 @@ func (e *effects) count(name string) int {
 type opener struct {
 	mu     sync.Mutex
 	opened map[string]int
+	closed map[string]int
 }
 
 func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
@@ -99,6 +100,16 @@ func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
 		o.opened = map[string]int{}
 	}
 	o.opened[p.NativeTask.RunID]++
+	return nil
+}
+
+func (o *opener) CloseDecision(_ context.Context, p review.Proposal) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed == nil {
+		o.closed = map[string]int{}
+	}
+	o.closed[p.NativeTask.RunID]++
 	return nil
 }
 
@@ -1124,4 +1135,43 @@ func TestStaleRetryAnswerDoesNotUnlockAChangedJob(t *testing.T) {
 	f.clock.Advance(2 * time.Hour)
 	f.apply("reviewer-d", f.prepare("reviewer-d"), notify)
 	assert.Equal(t, 2, f.effects.count("notify"))
+}
+
+// CC4 finding: a proposal superseded by a job change can never be answered,
+// so the run that carries it is closed instead of waiting forever. This also
+// happens for a job that has retired.
+func TestSupersededProposalsHaveTheirDecisionRunsClosed(t *testing.T) {
+	f := newFixture(t)
+	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	proposal := f.state().Proposals[jobID][0]
+	require.Equal(t, 1, f.opener.opened[proposal.NativeTask.RunID])
+	assert.Empty(t, f.opener.closed)
+
+	changed := fixtureJob()
+	changed.Version = 2
+	changed.PackageDigest = "sha256:bbbb"
+	require.NoError(t, f.registry.PutJob(changed))
+	require.Equal(t, review.ProposalSuperseded, f.state().Proposals[jobID][0].State)
+
+	f.clock.Advance(2 * time.Hour)
+	prepared := f.prepare("reviewer-b")
+	assert.Equal(t, 1, f.opener.closed[proposal.NativeTask.RunID])
+	assert.Empty(t, prepared.Warnings)
+	assert.Empty(t, prepared.Packet.OpenProposals)
+
+	// A retired job is not reviewed, but its dead waits are still closed.
+	f.apply("reviewer-b", prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Still needed.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	second := f.state().Proposals[jobID][1]
+	retired := changed
+	retired.Version = 3
+	retired.Lifecycle = review.LifecycleRetired
+	require.NoError(t, f.registry.PutJob(retired))
+	assert.Equal(t, review.SkipNotReviewable, f.prepare("reviewer-c").Skipped)
+	assert.Equal(t, 1, f.opener.closed[second.NativeTask.RunID])
 }

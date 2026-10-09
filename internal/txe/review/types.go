@@ -342,6 +342,10 @@ type Review struct {
 	ActionIDs        []string `json:"action_ids,omitempty"`
 	ProposalIDs      []string `json:"proposal_ids,omitempty"`
 	Notes            []string `json:"notes,omitempty"`
+	// Handoff locates the prepared review (claim and packet) on the machine
+	// that ran it. It is a reference to a local file, not a copy held by
+	// the service: retrieving it needs that machine.
+	Handoff LocalFile `json:"handoff,omitzero"`
 	// PacketArtifact and DecisionArtifact name the run artifacts holding
 	// the context the agent was given and the decision it returned.
 	PacketArtifact   string `json:"packet_artifact,omitempty"`
@@ -377,4 +381,12 @@ type Exception struct {
 	MachineID string        `json:"machine_id"`
 	Message   string        `json:"message"`
 	ReviewID  string        `json:"review_id,omitempty"`
+}
+
+// LocalFile is a reference to a file kept on one machine. The digest lets a
+// later inventory tell the same bytes from a different file at the path.
+type LocalFile struct {
+	MachineID string `json:"machine_id"`
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256"`
 }

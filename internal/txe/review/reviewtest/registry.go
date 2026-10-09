@@ -373,6 +373,20 @@ func (r *Registry) Review(_ context.Context, jobID, reviewID string) (review.Rev
 	return out, err
 }
 
+// SupersededProposals implements review.Registry.
+func (r *Registry) SupersededProposals(_ context.Context, jobID string) ([]review.Proposal, error) {
+	var out []review.Proposal
+	err := r.Update(func(s *State) error {
+		for _, p := range s.Proposals[jobID] {
+			if p.State == review.ProposalSuperseded {
+				out = append(out, p)
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // Actions implements review.Registry.
 func (r *Registry) Actions(_ context.Context, jobID string) ([]review.Action, error) {
 	var out []review.Action
