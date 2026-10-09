@@ -52,13 +52,15 @@ func (l LocalCredentials) For(jobID string, version int) Credentials {
 	return explained{out, reasons(missing)}
 }
 
-// Refs returns the credential references this machine itself registered for
-// version of jobID: those of the exact request `dagu txe register` filed
-// beside the version's receipt. Anything that acts on a job's credentials
-// on this machine reads them here, never from the registry's copy, which a
-// hub record could change. An error means the version has no local
-// registration record, and no reference may be used.
-func (l LocalCredentials) Refs(jobID string, version int) ([]CredentialRef, error) {
+// Version returns the job version object this machine itself registered for
+// version of jobID, exactly as sent: the "version" of the request `dagu txe
+// register` filed beside the version's receipt. It is the trusted local copy
+// of what was registered here; anything on this machine that executes a
+// job's package, actions or credentials compares with or reads from it,
+// never the registry's copy, which a hub record could change. An error means
+// the version has no local registration record, and nothing of it may be
+// used.
+func (l LocalCredentials) Version(jobID string, version int) (json.RawMessage, error) {
 	receipt, err := txepkg.NewJournal(l.Home).Receipt(jobID, version)
 	if err != nil {
 		return nil, err
@@ -79,16 +81,35 @@ func (l LocalCredentials) Refs(jobID string, version int) ([]CredentialRef, erro
 		return nil, fmt.Errorf("registration record is for %s v%d", entry.JobID, entry.Version)
 	}
 	var req struct {
-		Version struct {
-			Package struct {
-				CredentialRefs []CredentialRef `json:"credential_refs"`
-			} `json:"package"`
-		} `json:"version"`
+		Version json.RawMessage `json:"version"`
 	}
 	if err := json.Unmarshal(entry.Request, &req); err != nil {
 		return nil, fmt.Errorf("parse registration request: %w", err)
 	}
-	return req.Version.Package.CredentialRefs, nil
+	if len(req.Version) == 0 || string(req.Version) == "null" {
+		return nil, fmt.Errorf("registration request of %s v%d has no version", jobID, version)
+	}
+	return req.Version, nil
+}
+
+// Refs returns the credential references this machine itself registered for
+// version of jobID, read from Version. Anything that acts on a job's
+// credentials on this machine reads them here, never from the registry's
+// copy. An error means no reference may be used.
+func (l LocalCredentials) Refs(jobID string, version int) ([]CredentialRef, error) {
+	raw, err := l.Version(jobID, version)
+	if err != nil {
+		return nil, err
+	}
+	var v struct {
+		Package struct {
+			CredentialRefs []CredentialRef `json:"credential_refs"`
+		} `json:"package"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("parse registration request: %w", err)
+	}
+	return v.Package.CredentialRefs, nil
 }
 
 // everyName explains a missing reference whatever its name.
