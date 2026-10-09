@@ -27,7 +27,9 @@ steps:
             type: string
           verdict:
             type: string
-            enum: [approve, reject, redirect, retry, pause, snooze, retire]
+            # superseded is written only by the system when it closes the run
+            # of a proposal nobody can answer any more. It is not a verdict.
+            enum: [approve, reject, redirect, retry, pause, snooze, retire, superseded]
         required: [decision_id, verdict]
 
   # The task input only points at the decision. The registry's own record of

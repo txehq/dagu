@@ -178,8 +178,11 @@ func complete(dagu string) review.CompleteFunc {
 		out, err := exec.CommandContext(ctx, dagu, args...).CombinedOutput()
 		if err != nil {
 			text := string(out)
-			if strings.Contains(text, "different input") || strings.Contains(text, "not found") || strings.Contains(text, "not waiting") {
-				return review.ErrRunNotActive
+			if strings.Contains(text, "different input") {
+				return review.ErrTaskAnswered
+			}
+			if strings.Contains(text, "not found") {
+				return review.ErrRunMissing
 			}
 			return fmt.Errorf("dagu human-task complete: %w: %s", err, out)
 		}

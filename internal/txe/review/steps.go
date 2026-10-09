@@ -62,6 +62,16 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 	if err != nil {
 		return err
 	}
+	// Dead waits are closed on every tick, due job or not. A failure is
+	// logged for the run and does not stop reviews: the pending list keeps
+	// what was not closed.
+	closures, closeErr := s.Reviewer.CloseSuperseded(ctx, s.MachineID)
+	for _, c := range closures {
+		fmt.Fprintf(os.Stderr, "txe review: superseded proposal %s of %s: %s %s\n", c.ProposalID, c.JobID, c.Outcome, c.Detail)
+	}
+	if closeErr != nil {
+		fmt.Fprintln(os.Stderr, "txe review: closing superseded proposals:", closeErr)
+	}
 	due, err := s.Reviewer.Registry.DueJobs(ctx, s.MachineID, s.Reviewer.now())
 	if err != nil {
 		return fmt.Errorf("list due jobs: %w", err)
@@ -86,9 +96,6 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 		if err := s.saveArtifact(packetArtifact, prepared.Packet); err != nil {
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save packet artifact: %w", err)
-		}
-		for _, w := range prepared.Warnings {
-			fmt.Fprintln(os.Stderr, "txe review: warning:", w)
 		}
 		return json.NewEncoder(stdout).Encode(prepared.Packet)
 	}
@@ -263,17 +270,26 @@ type EnqueueFunc func(ctx context.Context, dag, runID string, params map[string]
 var ErrRunExists = errors.New("txe review: run already exists")
 
 // CompleteFunc completes a waiting human task of one run with the given
-// input. It must return ErrRunNotActive when that task is not waiting any
-// more or the run does not exist.
+// input. It returns ErrTaskAnswered when the task was already completed with
+// another input and ErrRunMissing when the service knows no such run. An
+// identical earlier completion is a success.
 type CompleteFunc func(ctx context.Context, task TaskLocator, input map[string]string) error
 
-// ErrRunNotActive means nothing is waiting, so there is nothing to close.
-var ErrRunNotActive = errors.New("txe review: run is not waiting")
+var (
+	// ErrTaskAnswered means the task already holds a different answer.
+	ErrTaskAnswered = errors.New("txe review: task already answered")
+	// ErrRunMissing means the service has no such run.
+	ErrRunMissing = errors.New("txe review: run not found")
+)
 
-// NoDecisionID is the decision pointer given to a decision run that is being
-// closed without an answer. It names no decision in the registry, so the
-// run's execute step finds nothing to act on and ends.
-const NoDecisionID = "dec_superseded"
+const (
+	// NoDecisionID is the decision pointer given to a decision run that the
+	// system closes. It names no decision in the registry.
+	NoDecisionID = "dec_superseded"
+	// VerdictSuperseded is the task input the system uses when it closes a
+	// run. It is not a human verdict and no Decision record carries it.
+	VerdictSuperseded = "superseded"
+)
 
 // RunOpener makes a proposal answerable by enqueueing its own run of the
 // decision DAG. The run stops at a native human task and holds no process.
@@ -297,21 +313,26 @@ func (o *RunOpener) OpenDecision(ctx context.Context, proposal Proposal) error {
 	return err
 }
 
-// CloseDecision implements DecisionOpener. A run waiting at a human task has
-// no process to stop and the service cannot abort it, so the wait is ended
-// the only way there is: the task is completed with a pointer to no
-// decision. The registry, not the task input, decides what may run, and it
-// has no such decision, so the run ends without an effect.
-func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) error {
+// CloseDecision implements DecisionOpener. The wait is ended the only way
+// the service offers: the task is completed, with a system marker in place of
+// a decision. What may run is decided by the registry's record of the
+// proposal, which is superseded, so the run ends without an effect.
+func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) (ClosureOutcome, error) {
 	if o.Complete == nil {
-		return nil
+		return ClosureFailed, errors.New("no way to complete a task is configured")
 	}
 	err := o.Complete(ctx, proposal.NativeTask, map[string]string{
 		"decision_id": NoDecisionID,
-		"verdict":     string(VerdictReject),
+		"verdict":     VerdictSuperseded,
 	})
-	if errors.Is(err, ErrRunNotActive) {
-		return nil
+	switch {
+	case err == nil:
+		return ClosureClosed, nil
+	case errors.Is(err, ErrTaskAnswered):
+		return ClosureAnswered, nil
+	case errors.Is(err, ErrRunMissing):
+		return ClosureMissing, nil
+	default:
+		return ClosureFailed, err
 	}
-	return err
 }

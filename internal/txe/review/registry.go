@@ -117,10 +117,16 @@ type Registry interface {
 	Decision(ctx context.Context, jobID, decisionID string) (Decision, error)
 	Proposal(ctx context.Context, jobID, proposalID string) (Proposal, error)
 	OpenProposals(ctx context.Context, jobID string) ([]Proposal, error)
-	// SupersededProposals returns the job's most recently superseded
-	// proposals. Nobody can answer them any more, so the runs that carry
-	// them have to be closed.
-	SupersededProposals(ctx context.Context, jobID string) ([]Proposal, error)
+	// PendingClosures lists superseded proposals of the machine's jobs,
+	// whatever a job's lifecycle, whose decision run has no recorded final
+	// closure yet. It returns at most limit, least recently attempted
+	// first, so every one of them is eventually reached and a failing one
+	// does not hold up the rest.
+	PendingClosures(ctx context.Context, machineID string, limit int) ([]Proposal, error)
+	// RecordClosure records what closing a superseded proposal's decision
+	// run found and returns how many attempts have failed so far. Any
+	// outcome but ClosureFailed is final.
+	RecordClosure(ctx context.Context, closure Closure) (failedAttempts int, err error)
 	// Review returns a recorded review, or ErrNotFound.
 	Review(ctx context.Context, jobID, reviewID string) (Review, error)
 	// Actions returns the job's journaled actions, oldest first.
@@ -153,6 +159,37 @@ type Registry interface {
 type DecisionOpener interface {
 	OpenDecision(ctx context.Context, proposal Proposal) error
 	// CloseDecision ends the wait of a proposal that can no longer be
-	// answered. It must be a no-op when nothing is waiting.
-	CloseDecision(ctx context.Context, proposal Proposal) error
+	// answered and says what it found there.
+	CloseDecision(ctx context.Context, proposal Proposal) (ClosureOutcome, error)
+}
+
+// ClosureOutcome is what closing a superseded proposal's decision run found.
+type ClosureOutcome string
+
+const (
+	// ClosureClosed means the waiting task was completed by the system
+	// with no decision.
+	ClosureClosed ClosureOutcome = "closed"
+	// ClosureAnswered means the task had already been completed with a
+	// real answer, which the registry refuses for a superseded proposal.
+	ClosureAnswered ClosureOutcome = "already_answered"
+	// ClosureMissing means the service knows no such run. That is recorded
+	// as missing; it is not evidence that a wait was ever completed.
+	ClosureMissing ClosureOutcome = "run_missing"
+	// ClosureRefused means the stored locator is not the proposal's own
+	// decision run, so nothing was touched.
+	ClosureRefused ClosureOutcome = "locator_refused"
+	// ClosureFailed means the attempt failed and will be retried.
+	ClosureFailed ClosureOutcome = "failed"
+)
+
+// Closure is the recorded result of one attempt to close a superseded
+// proposal's decision run. It is a system record, never a human decision.
+type Closure struct {
+	JobID      string         `json:"job_id"`
+	ProposalID string         `json:"proposal_id"`
+	Outcome    ClosureOutcome `json:"outcome"`
+	Reason     string         `json:"reason"`
+	Detail     string         `json:"detail,omitempty"`
+	By         string         `json:"by"`
 }

@@ -85,8 +85,6 @@ type Prepared struct {
 	Skipped SkipReason `json:"skipped,omitempty"`
 	Claim   Claim      `json:"claim,omitzero"`
 	Packet  Packet     `json:"packet,omitzero"`
-	// Warnings are problems that did not stop the review.
-	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Prepare claims the job, settles effects left open by earlier claims, and
@@ -96,18 +94,15 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	if err != nil {
 		return Prepared{}, fmt.Errorf("read job: %w", err)
 	}
-	// Closing dead waits needs no claim and applies to a retired job too,
-	// since retiring supersedes its proposals.
-	warnings := r.closeSuperseded(ctx, jobID)
 	if !job.Lifecycle.Reviewable() {
 		if err := r.settleTerminal(ctx, job); err != nil {
 			return Prepared{}, fmt.Errorf("reconcile open actions: %w", err)
 		}
-		return Prepared{Skipped: SkipNotReviewable, Warnings: warnings}, nil
+		return Prepared{Skipped: SkipNotReviewable}, nil
 	}
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimReview, Holder: r.Holder, TTL: r.claimTTL()})
 	if errors.Is(err, ErrClaimHeld) {
-		return Prepared{Skipped: SkipClaimHeld, Warnings: warnings}, nil
+		return Prepared{Skipped: SkipClaimHeld}, nil
 	}
 	if err != nil {
 		return Prepared{}, fmt.Errorf("acquire claim: %w", err)
@@ -120,36 +115,71 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, err
 	}
-	return Prepared{Claim: claim, Packet: packet, Warnings: warnings}, nil
+	return Prepared{Claim: claim, Packet: packet}, nil
 }
 
-// closeSuperseded ends the wait of every proposal that was superseded, for
-// example by a change to the job. Its run would otherwise wait for an answer
-// the registry will never accept. A failure here is reported and does not
-// stop the review: the wait is closed again on the next one.
-func (r *Reviewer) closeSuperseded(ctx context.Context, jobID string) []string {
-	proposals, err := r.Registry.SupersededProposals(ctx, jobID)
+const (
+	// closureBatch bounds the superseded proposals one tick closes.
+	closureBatch = 20
+	// closureAttemptsBeforeException is how many failed attempts on one
+	// proposal turn into an exception someone has to look at.
+	closureAttemptsBeforeException = 3
+	closureReason                  = "the proposal was superseded and can no longer be answered"
+)
+
+// CloseSuperseded closes the decision runs of superseded proposals on a
+// machine. A run waiting at a human task has no process and the service
+// cannot abort it, so without this it would wait for an answer the registry
+// will never accept.
+//
+// It works through a bounded batch of the registry's pending list, least
+// recently attempted first, so repeated ticks reach every proposal and a
+// failing one is retried without blocking the others. Each result is
+// recorded as a system closure. No human decision is ever created.
+func (r *Reviewer) CloseSuperseded(ctx context.Context, machineID string) ([]Closure, error) {
+	pending, err := r.Registry.PendingClosures(ctx, machineID, closureBatch)
 	if err != nil {
-		return []string{"list superseded proposals: " + err.Error()}
+		return nil, fmt.Errorf("list superseded proposals: %w", err)
 	}
-	var warnings []string
-	for _, proposal := range proposals {
-		if proposal.NativeTask.RunID == "" {
+	var done []Closure
+	for _, proposal := range pending {
+		closure := r.closeOne(ctx, proposal)
+		failed, err := r.Registry.RecordClosure(ctx, closure)
+		if err != nil {
+			return done, fmt.Errorf("record closure of proposal %s: %w", proposal.ID, err)
+		}
+		done = append(done, closure)
+		if closure.Outcome != ClosureFailed || failed < closureAttemptsBeforeException {
 			continue
 		}
-		// The reviewer completes a human task here with its own credential,
-		// so it only ever touches the task it would itself have opened for
-		// this proposal. A stored locator pointing anywhere else, such as
-		// another workflow's approval, is left alone and reported.
-		if proposal.NativeTask != r.taskLocator(proposal.ID) {
-			warnings = append(warnings, fmt.Sprintf("proposal %s names a task that is not its decision run; not closed", proposal.ID))
-			continue
-		}
-		if err := r.Opener.CloseDecision(ctx, proposal); err != nil {
-			warnings = append(warnings, fmt.Sprintf("close decision run of proposal %s: %v", proposal.ID, err))
+		err = r.Registry.RaiseException(ctx, Exception{
+			JobID: proposal.JobID, Kind: ExceptionCleanupFailed, MachineID: machineID,
+			Message: fmt.Sprintf("the decision run of superseded proposal %s could not be closed after %d attempts: %s", proposal.ID, failed, closure.Detail),
+		})
+		if err != nil {
+			return done, fmt.Errorf("raise exception: %w", err)
 		}
 	}
-	return warnings
+	return done, nil
+}
+
+func (r *Reviewer) closeOne(ctx context.Context, proposal Proposal) Closure {
+	closure := Closure{JobID: proposal.JobID, ProposalID: proposal.ID, Reason: closureReason, By: r.Holder}
+	// The reviewer completes a human task here with its own credential, so
+	// it touches only the task it would itself have opened for this
+	// proposal of this job. A stored locator pointing anywhere else, such
+	// as another workflow's approval, is refused.
+	if proposal.NativeTask != r.taskLocator(proposal.ID) {
+		closure.Outcome, closure.Detail = ClosureRefused, "the stored task locator is not this proposal's decision run"
+		return closure
+	}
+	outcome, err := r.Opener.CloseDecision(ctx, proposal)
+	if err != nil {
+		closure.Outcome, closure.Detail = ClosureFailed, err.Error()
+		return closure
+	}
+	closure.Outcome = outcome
+	return closure
 }
 
 // settleTerminal settles effects left open on a job that completed or
@@ -366,10 +396,21 @@ func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Ac
 	if err != nil {
 		return fmt.Errorf("escalate: %w", err)
 	}
-	if err := r.Opener.OpenDecision(ctx, proposal); err != nil {
+	if err := r.openDecision(ctx, proposal); err != nil {
 		return fmt.Errorf("open decision: %w", err)
 	}
 	return nil
+}
+
+// openDecision enqueues the proposal's decision run. The registry returns
+// the stored proposal when one with this id already exists, so its locator
+// is checked first: the reviewer enqueues, with its own credential, only the
+// run it derives for this proposal, never a run a stored record names.
+func (r *Reviewer) openDecision(ctx context.Context, proposal Proposal) error {
+	if proposal.NativeTask != r.taskLocator(proposal.ID) {
+		return fmt.Errorf("proposal %s is stored with a task locator that is not its decision run", proposal.ID)
+	}
+	return r.Opener.OpenDecision(ctx, proposal)
 }
 
 func (r *Reviewer) taskLocator(proposalID string) TaskLocator {
@@ -646,7 +687,7 @@ func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Pac
 	if err != nil {
 		return fmt.Errorf("create proposal: %w", err)
 	}
-	if err := r.Opener.OpenDecision(ctx, proposal); err != nil {
+	if err := r.openDecision(ctx, proposal); err != nil {
 		return fmt.Errorf("open decision for proposal %s: %w", proposal.ID, err)
 	}
 	review.ProposalIDs = append(review.ProposalIDs, proposal.ID)
@@ -787,6 +828,15 @@ type Executed struct {
 // execution claim. The registry's decision record is the authority: the
 // task's input is only a pointer to it.
 func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID string) (Executed, error) {
+	// The registry's current view of the proposal comes first: a proposal
+	// that was superseded runs nothing, whatever the task was given.
+	current, err := r.Registry.Proposal(ctx, jobID, proposalID)
+	if err != nil {
+		return Executed{}, fmt.Errorf("read proposal: %w", err)
+	}
+	if current.State == ProposalSuperseded {
+		return Executed{Skipped: "proposal is superseded: no answer to it authorizes anything and nothing runs"}, nil
+	}
 	decision, err := r.Registry.Decision(ctx, jobID, decisionID)
 	if errors.Is(err, ErrNotFound) {
 		return Executed{Skipped: "no recorded decision " + decisionID}, nil

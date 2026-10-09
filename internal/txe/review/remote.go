@@ -62,6 +62,15 @@ type Remote struct {
 	MachineID   string
 	RunID       string
 	AgentClient string
+	// Now is the clock; time.Now when nil.
+	Now func() time.Time
+}
+
+func (r *Remote) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 var _ Registry = (*Remote)(nil)
@@ -509,25 +518,46 @@ func (r *Remote) OpenProposals(ctx context.Context, jobID string) ([]Proposal, e
 	return out, nil
 }
 
-// maxSuperseded bounds how many superseded proposals one review revisits.
-const maxSuperseded = 20
-
-// SupersededProposals implements Registry.
-func (r *Remote) SupersededProposals(ctx context.Context, jobID string) ([]Proposal, error) {
-	list, err := r.proposals(ctx, jobID)
-	if err != nil {
+// PendingClosures implements Registry.
+//
+// The registry does not yet record closures, so this cannot ask it which
+// superseded proposals are still pending. Until it does, every superseded
+// proposal with a decision run counts as pending and a window of them is
+// returned that moves with the clock, so repeated ticks cover all of them.
+// Completing an already closed task again is a no-op at the service.
+func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit int) ([]Proposal, error) {
+	var list api.TxeJobList
+	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
 		return nil, err
 	}
-	var out []Proposal
-	for _, p := range append(list.Open, list.Finished...) {
-		if p.State == api.TxeProposalState(ProposalSuperseded) {
-			out = append(out, r.proposalOf(jobID, p))
+	var all []Proposal
+	for _, job := range list.Jobs {
+		proposals, err := r.proposals(ctx, job.JobId)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range append(proposals.Open, proposals.Finished...) {
+			if p.State == api.TxeProposalState(ProposalSuperseded) && p.NativeTask != nil {
+				all = append(all, r.proposalOf(job.JobId, p))
+			}
 		}
 	}
-	if len(out) > maxSuperseded {
-		out = out[len(out)-maxSuperseded:]
+	sort.SliceStable(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	if limit <= 0 || len(all) <= limit {
+		return all, nil
+	}
+	start := int(r.now().Unix()/60) % len(all)
+	out := make([]Proposal, 0, limit)
+	for i := range limit {
+		out = append(out, all[(start+i)%len(all)])
 	}
 	return out, nil
+}
+
+// RecordClosure implements Registry. Without a registry record for closures
+// the result is kept only in the run's log; no failure count is available.
+func (r *Remote) RecordClosure(context.Context, Closure) (int, error) {
+	return 0, nil
 }
 
 // reviewDetail is what the reviewer keeps in a review record's free-form
@@ -869,11 +899,16 @@ func RemoteComplete(t Transport) CompleteFunc {
 		path := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID) +
 			"/human-tasks/" + url.PathEscape(task.StepID) + "/complete"
 		err := t.Do(ctx, http.MethodPost, path, input, nil)
-		// The service answers 404 for a run it does not know and 409 for a
-		// task already completed with another input. Either way nothing is
-		// waiting. An identical earlier completion is a plain success.
-		if te, ok := errors.AsType[*TransportError](err); ok && (te.Status == http.StatusNotFound || te.Status == http.StatusConflict) {
-			return ErrRunNotActive
+		// 409: the task was already completed with another input. 404: the
+		// service knows no such run. An identical earlier completion is a
+		// plain success.
+		if te, ok := errors.AsType[*TransportError](err); ok {
+			switch te.Status {
+			case http.StatusConflict:
+				return ErrTaskAnswered
+			case http.StatusNotFound:
+				return ErrRunMissing
+			}
 		}
 		return err
 	}

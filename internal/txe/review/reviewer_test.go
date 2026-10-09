@@ -4,8 +4,10 @@
 package review_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -91,6 +93,8 @@ type opener struct {
 	mu     sync.Mutex
 	opened map[string]int
 	closed map[string]int
+	// close decides what closing a proposal's run finds; closed when nil.
+	close func(p review.Proposal) (review.ClosureOutcome, error)
 }
 
 func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
@@ -103,14 +107,17 @@ func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
 	return nil
 }
 
-func (o *opener) CloseDecision(_ context.Context, p review.Proposal) error {
+func (o *opener) CloseDecision(_ context.Context, p review.Proposal) (review.ClosureOutcome, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.closed == nil {
 		o.closed = map[string]int{}
 	}
 	o.closed[p.NativeTask.RunID]++
-	return nil
+	if o.close != nil {
+		return o.close(p)
+	}
+	return review.ClosureClosed, nil
 }
 
 type fixture struct {
@@ -400,7 +407,7 @@ func TestStaleApprovalAuthorizesNothing(t *testing.T) {
 
 	out, err := f.reviewer("executor").Execute(context.Background(), jobID, proposal.ID, approved.ID)
 	require.NoError(t, err)
-	assert.Equal(t, "denied by the guard: decision_stale", out.Skipped)
+	assert.Contains(t, out.Skipped, "proposal is superseded")
 	assert.Equal(t, 0, f.effects.count("expand_volume"))
 	assert.Empty(t, f.state().Actions[jobID])
 	assert.Equal(t, review.ProposalSuperseded, f.state().Proposals[jobID][0].State)
@@ -1137,64 +1144,184 @@ func TestStaleRetryAnswerDoesNotUnlockAChangedJob(t *testing.T) {
 	assert.Equal(t, 2, f.effects.count("notify"))
 }
 
-// CC4 finding: a proposal superseded by a job change can never be answered,
-// so the run that carries it is closed instead of waiting forever. This also
-// happens for a job that has retired.
-func TestSupersededProposalsHaveTheirDecisionRunsClosed(t *testing.T) {
-	f := newFixture(t)
-	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
-		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
-		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
-	})
-	proposal := f.state().Proposals[jobID][0]
-	require.Equal(t, 1, f.opener.opened[proposal.NativeTask.RunID])
-	assert.Empty(t, f.opener.closed)
-
+// supersede files n approval proposals and then changes the job, which
+// supersedes all of them.
+func (f *fixture) supersede(n int) []review.Proposal {
+	f.t.Helper()
+	var actions []review.AgentAction
+	for i := range n {
+		actions = append(actions, act("expand_volume", map[string]string{"size_gb": fmt.Sprint(100 + i)}))
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: actions})
 	changed := fixtureJob()
 	changed.Version = 2
 	changed.PackageDigest = "sha256:bbbb"
-	require.NoError(t, f.registry.PutJob(changed))
-	require.Equal(t, review.ProposalSuperseded, f.state().Proposals[jobID][0].State)
+	require.NoError(f.t, f.registry.PutJob(changed))
+	proposals := f.state().Proposals[jobID]
+	require.Len(f.t, proposals, n)
+	for _, p := range proposals {
+		require.Equal(f.t, review.ProposalSuperseded, p.State)
+	}
+	return proposals
+}
 
-	f.clock.Advance(2 * time.Hour)
-	prepared := f.prepare("reviewer-b")
-	assert.Equal(t, 1, f.opener.closed[proposal.NativeTask.RunID])
-	assert.Empty(t, prepared.Warnings)
-	assert.Empty(t, prepared.Packet.OpenProposals)
+// CC4 finding: a superseded proposal can never be answered, so its decision
+// run is closed by the system instead of waiting forever. The closure is a
+// recorded system event with its reason, no human decision is created, and
+// more proposals than one batch are all reached over successive ticks.
+func TestSupersededProposalsAreClosedInBoundedBatches(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(45)
+	machine := fixtureJob().MachineID
+	ctx := context.Background()
 
-	// A retired job is not reviewed, but its dead waits are still closed.
-	f.apply("reviewer-b", prepared, review.AgentDecision{
-		Outcome: review.OutcomeAct, Reasoning: "Still needed.",
-		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
-	})
-	second := f.state().Proposals[jobID][1]
-	retired := changed
+	for tick, want := range []int{20, 20, 5, 0} {
+		done, err := f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+		require.NoError(t, err)
+		assert.Len(t, done, want, "tick %d", tick)
+	}
+	s := f.state()
+	for _, p := range proposals {
+		assert.Equal(t, 1, f.opener.closed[p.NativeTask.RunID], "each run is closed exactly once")
+		require.Len(t, s.Closures[p.ID], 1)
+		c := s.Closures[p.ID][0]
+		assert.Equal(t, review.ClosureClosed, c.Outcome)
+		assert.Equal(t, "sweeper", c.By)
+		assert.Contains(t, c.Reason, "superseded")
+	}
+	assert.Empty(t, s.Decisions[jobID], "a system closure is not a decision by anyone")
+
+	// The closed run resumes into the execute step, which runs nothing
+	// because the registry says the proposal is superseded.
+	out, err := f.reviewer("executor").Execute(ctx, jobID, proposals[0].ID, review.NoDecisionID)
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "superseded")
+	assert.Equal(t, 0, f.effects.count("expand_volume"))
+}
+
+// It also covers a retired job, which is never due for review.
+func TestSupersededProposalsOfARetiredJobAreClosed(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(1)
+	retired := fixtureJob()
 	retired.Version = 3
 	retired.Lifecycle = review.LifecycleRetired
 	require.NoError(t, f.registry.PutJob(retired))
-	assert.Equal(t, review.SkipNotReviewable, f.prepare("reviewer-c").Skipped)
-	assert.Equal(t, 1, f.opener.closed[second.NativeTask.RunID])
+
+	// A tick with nothing due still closes it.
+	var packet bytes.Buffer
+	require.NoError(t, f.steps("tick-1", t.TempDir()).Prepare(context.Background(), "tick-1", &packet))
+	assert.Empty(t, packet.String())
+	assert.Equal(t, 1, f.opener.closed[proposals[0].NativeTask.RunID])
 }
 
-// Security finding: closing a superseded proposal completes a human task
-// with the reviewer's credential. A proposal whose stored locator points at
-// any task other than its own decision run is not acted on.
-func TestCloseIgnoresALocatorThatIsNotTheProposalsOwnRun(t *testing.T) {
+// A failing closure is retried without blocking the others, and after
+// repeated failures it becomes an exception instead of a silent warning.
+func TestFailingClosureIsRetriedThenRaised(t *testing.T) {
 	f := newFixture(t)
-	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
+	proposals := f.supersede(3)
+	stuck := proposals[1]
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		if p.ID == stuck.ID {
+			return review.ClosureFailed, errors.New("hub unreachable")
+		}
+		return review.ClosureClosed, nil
+	}
+	machine := fixtureJob().MachineID
+	ctx := context.Background()
+
+	done, err := f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	require.Len(t, done, 3)
+	assert.Empty(t, f.state().Exceptions)
+
+	for range 2 {
+		f.clock.Advance(10 * time.Minute)
+		done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+		require.NoError(t, err)
+		require.Len(t, done, 1, "only the failing one is still pending")
+		assert.Equal(t, stuck.ID, done[0].ProposalID)
+	}
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Equal(t, review.ExceptionCleanupFailed, s.Exceptions[0].Kind)
+	assert.Contains(t, s.Exceptions[0].Message, stuck.ID)
+	assert.Len(t, s.Closures[stuck.ID], 3)
+
+	// Once it can be closed, it is, and it leaves the pending list.
+	f.opener.close = nil
+	f.clock.Advance(10 * time.Minute)
+	done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, review.ClosureClosed, done[0].Outcome)
+	done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	assert.Empty(t, done)
+}
+
+// A real answer that raced the supersession, a run the service does not
+// know, and a locator that is not the proposal's own run are each recorded
+// as what they are. None is treated as a completed wait or as a decision,
+// and a foreign task is never touched.
+func TestClosureRecordsWhatItActuallyFound(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(3)
+	answered, missing, foreign := proposals[0], proposals[1], proposals[2]
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		s.Proposals[jobID][2].NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+		return nil
+	}))
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		switch p.ID {
+		case answered.ID:
+			return review.ClosureAnswered, nil
+		case missing.ID:
+			return review.ClosureMissing, nil
+		}
+		return review.ClosureClosed, nil
+	}
+	_, err := f.reviewer("sweeper").CloseSuperseded(context.Background(), fixtureJob().MachineID)
+	require.NoError(t, err)
+
+	s := f.state()
+	assert.Equal(t, review.ClosureAnswered, s.Closures[answered.ID][0].Outcome)
+	assert.Equal(t, review.ClosureMissing, s.Closures[missing.ID][0].Outcome)
+	assert.Equal(t, review.ClosureRefused, s.Closures[foreign.ID][0].Outcome)
+	assert.Zero(t, f.opener.closed["release-42"], "a foreign task was completed with the reviewer's credential")
+
+	// The raced answer authorizes nothing: the proposal is superseded.
+	out, err := f.reviewer("executor").Execute(context.Background(), jobID, answered.ID, "dec_raced")
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "superseded")
+	assert.Equal(t, 0, f.effects.count("expand_volume"))
+}
+
+// Security finding: the registry returns the stored proposal when its id
+// already exists. If that stored record names another run, the reviewer does
+// not enqueue it with its own credential.
+func TestOpenRefusesAStoredLocatorThatIsNotTheProposalsOwnRun(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	tampering := f.reviewer("reviewer-a")
+	tampering.Registry = foreignLocator{f.registry}
+	_, err := tampering.Apply(context.Background(), prepared, review.AgentDecision{
 		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
 		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
 	})
-	// The stored proposal is altered to point at another workflow's task.
-	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
-		s.Proposals[jobID][0].NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
-		s.Proposals[jobID][0].State = review.ProposalSuperseded
-		return nil
-	}))
+	require.ErrorContains(t, err, "not its decision run")
+	assert.Empty(t, f.opener.opened, "a run named by a stored record was enqueued")
+	assert.Equal(t, 0, f.state().Checkpoints[jobID].Version)
+}
 
-	f.clock.Advance(2 * time.Hour)
-	prepared := f.prepare("reviewer-b")
-	assert.Empty(t, f.opener.closed, "a foreign task was completed with the reviewer's credential")
-	require.Len(t, prepared.Warnings, 1)
-	assert.Contains(t, prepared.Warnings[0], "not its decision run")
+// foreignLocator returns proposals as if the stored record pointed at
+// another workflow's run.
+type foreignLocator struct {
+	*reviewtest.Registry
+}
+
+func (r foreignLocator) CreateProposal(ctx context.Context, claim review.Claim, draft review.Proposal) (review.Proposal, error) {
+	stored, err := r.Registry.CreateProposal(ctx, claim, draft)
+	stored.NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+	return stored, err
 }

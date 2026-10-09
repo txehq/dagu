@@ -369,6 +369,9 @@ const (
 	ExceptionReviewerAuth ExceptionKind = "reviewer_authentication_required"
 	// ExceptionReviewerFailed means the agent ran but produced no usable decision.
 	ExceptionReviewerFailed ExceptionKind = "reviewer_failed"
+	// ExceptionCleanupFailed means a superseded proposal's decision run
+	// could not be closed after repeated attempts.
+	ExceptionCleanupFailed ExceptionKind = "decision_run_cleanup_failed"
 	// ExceptionUnavailable means the reviewer judged the job's target or
 	// credentials unavailable. It is not a retirement.
 	ExceptionUnavailable ExceptionKind = "target_unavailable"

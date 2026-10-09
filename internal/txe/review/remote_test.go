@@ -433,23 +433,25 @@ func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
 	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
 
-// Closing a decision run completes its task with a pointer to no decision;
-// a task answered otherwise or a run the service does not know is already
-// closed.
-func TestRemoteCompleteClosesAWaitingTask(t *testing.T) {
+// Completing a task through the service reports an answered task and an
+// unknown run as distinct results.
+func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 	path := "/dag-runs/txe-decide-X/txe-abc/human-tasks/decide/complete"
 	stub := &stubTransport{t: t, replies: map[string]string{path: `{"alreadyCompleted":false}`}}
 	complete := review.RemoteComplete(stub)
 	task := review.TaskLocator{DAG: "txe-decide-X", RunID: "txe-abc", StepID: "decide"}
-	require.NoError(t, complete(context.Background(), task, map[string]string{"decision_id": review.NoDecisionID, "verdict": "reject"}))
+	require.NoError(t, complete(context.Background(), task, map[string]string{"decision_id": review.NoDecisionID, "verdict": review.VerdictSuperseded}))
 	assert.Equal(t, []string{"POST " + path}, stub.calls)
 
-	for _, status := range []int{http.StatusConflict, http.StatusNotFound} {
-		stub.fail = map[string]*review.TransportError{path: {Status: status}}
-		require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrRunNotActive)
-	}
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict}}
+	require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrTaskAnswered)
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusNotFound}}
+	require.ErrorIs(t, complete(context.Background(), task, nil), review.ErrRunMissing)
 	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway}}
-	require.Error(t, complete(context.Background(), task, nil))
+	err := complete(context.Background(), task, nil)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, review.ErrTaskAnswered)
+	require.NotErrorIs(t, err, review.ErrRunMissing)
 }
 
 // taskRecorder stands in for the service's human-task backend and records
@@ -530,7 +532,7 @@ func TestRemoteApprovedProposalExecutesOnce(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "verdict is reject", out.Skipped)
 
-	out, err = exec.Execute(ctx, f.jobID, open[0].ID, review.NoDecisionID)
+	out, err = exec.Execute(ctx, f.jobID, open[1].ID, review.NoDecisionID)
 	require.NoError(t, err)
 	assert.Contains(t, out.Skipped, "no recorded decision")
 	assert.Equal(t, 1, f.fx.count("expand_volume"))

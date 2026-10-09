@@ -135,6 +135,7 @@ func TestRenderDAGs(t *testing.T) {
 	for _, want := range []string{
 		"action: human.task",
 		"required: [decision_id, verdict]",
+		"enum: [approve, reject, redirect, retry, pause, snooze, retire, superseded]",
 		`dagu txe review execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
 		`- TXE_DAGU_REVIEWER: "1"`,
 	} {
@@ -556,7 +557,9 @@ func TestStepsSaveReviewArtifacts(t *testing.T) {
 	assert.Equal(t, "txe-review/decision.json", rev.DecisionArtifact)
 }
 
-func TestRunOpenerClosesByCompletingWithNoDecision(t *testing.T) {
+// Closing completes the run's task with a system marker, never a human
+// verdict, and reports what the service said about the task.
+func TestRunOpenerClosesWithASystemMarker(t *testing.T) {
 	var calls []string
 	result := error(nil)
 	o := &review.RunOpener{Complete: func(_ context.Context, task review.TaskLocator, input map[string]string) error {
@@ -564,28 +567,26 @@ func TestRunOpenerClosesByCompletingWithNoDecision(t *testing.T) {
 		return result
 	}}
 	p := review.Proposal{ID: "prp_1", NativeTask: review.TaskLocator{DAG: "txe-decide-x", RunID: "txe-abc", StepID: "decide"}}
-	require.NoError(t, o.CloseDecision(context.Background(), p))
-	assert.Equal(t, []string{"txe-decide-x/txe-abc/decide dec_superseded reject"}, calls)
-	result = review.ErrRunNotActive
-	require.NoError(t, o.CloseDecision(context.Background(), p), "a task that is not waiting needs no closing")
+	outcome, err := o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureClosed, outcome)
+	assert.Equal(t, []string{"txe-decide-x/txe-abc/decide dec_superseded superseded"}, calls)
+
+	result = review.ErrTaskAnswered
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureAnswered, outcome)
+
+	result = review.ErrRunMissing
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.NoError(t, err)
+	assert.Equal(t, review.ClosureMissing, outcome, "an unknown run is recorded as missing, not as closed")
+
 	result = errors.New("hub unreachable")
-	require.Error(t, o.CloseDecision(context.Background(), p))
+	outcome, err = o.CloseDecision(context.Background(), p)
+	require.Error(t, err)
+	assert.Equal(t, review.ClosureFailed, outcome)
 
-	require.NoError(t, (&review.RunOpener{}).CloseDecision(context.Background(), p))
-}
-
-// The pointer used to close a run names no decision, so the execute step
-// that the closed run resumes into does nothing.
-func TestClosedDecisionRunExecutesNothing(t *testing.T) {
-	f := newFixture(t)
-	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{
-		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
-		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
-	})
-	proposal := f.state().Proposals[jobID][0]
-	var out bytes.Buffer
-	require.NoError(t, f.steps("exec", t.TempDir()).Execute(context.Background(), jobID, proposal.ID, review.NoDecisionID, &out))
-	assert.Contains(t, out.String(), "no recorded decision")
-	assert.Equal(t, 0, f.effects.count("expand_volume"))
-	assert.Empty(t, f.state().Actions[jobID])
+	_, err = (&review.RunOpener{}).CloseDecision(context.Background(), p)
+	require.Error(t, err)
 }

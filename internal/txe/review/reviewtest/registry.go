@@ -38,6 +38,10 @@ type State struct {
 	Actions     map[string][]review.Action
 	Reviews     map[string][]review.Review
 	Exceptions  []review.Exception
+	// Closures are the recorded attempts to close superseded proposals'
+	// decision runs, by proposal id.
+	Closures         map[string][]review.Closure
+	ClosureAttempted map[string]time.Time
 	// Transitions records every claim and checkpoint change in order.
 	Transitions []string
 	Seq         int
@@ -373,18 +377,66 @@ func (r *Registry) Review(_ context.Context, jobID, reviewID string) (review.Rev
 	return out, err
 }
 
-// SupersededProposals implements review.Registry.
-func (r *Registry) SupersededProposals(_ context.Context, jobID string) ([]review.Proposal, error) {
+// PendingClosures implements review.Registry.
+func (r *Registry) PendingClosures(_ context.Context, machineID string, limit int) ([]review.Proposal, error) {
 	var out []review.Proposal
 	err := r.Update(func(s *State) error {
-		for _, p := range s.Proposals[jobID] {
-			if p.State == review.ProposalSuperseded {
-				out = append(out, p)
+		for jobID, job := range s.Jobs {
+			if job.MachineID != machineID {
+				continue
 			}
+			for _, p := range s.Proposals[jobID] {
+				if p.State == review.ProposalSuperseded && p.NativeTask.RunID != "" && !s.closed(p.ID) {
+					out = append(out, p)
+				}
+			}
+		}
+		// Least recently attempted first, so a failing one moves to the
+		// back instead of holding up the rest.
+		sort.SliceStable(out, func(i, j int) bool {
+			a, b := s.ClosureAttempted[out[i].ID], s.ClosureAttempted[out[j].ID]
+			if !a.Equal(b) {
+				return a.Before(b)
+			}
+			return out[i].ID < out[j].ID
+		})
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
 		}
 		return nil
 	})
 	return out, err
+}
+
+func (s *State) closed(proposalID string) bool {
+	for _, c := range s.Closures[proposalID] {
+		if c.Outcome != review.ClosureFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordClosure implements review.Registry.
+func (r *Registry) RecordClosure(_ context.Context, closure review.Closure) (int, error) {
+	failed := 0
+	err := r.Update(func(s *State) error {
+		if s.Closures == nil {
+			s.Closures = map[string][]review.Closure{}
+		}
+		if s.ClosureAttempted == nil {
+			s.ClosureAttempted = map[string]time.Time{}
+		}
+		s.Closures[closure.ProposalID] = append(s.Closures[closure.ProposalID], closure)
+		s.ClosureAttempted[closure.ProposalID] = r.now()
+		for _, c := range s.Closures[closure.ProposalID] {
+			if c.Outcome == review.ClosureFailed {
+				failed++
+			}
+		}
+		return nil
+	})
+	return failed, err
 }
 
 // Actions implements review.Registry.
