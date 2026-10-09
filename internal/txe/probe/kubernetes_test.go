@@ -5,6 +5,7 @@ package probe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -20,7 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 const (
@@ -324,5 +327,51 @@ current-context: dev
 	r = kubeError(context.Background(), errors.New(`Get "http://user:hunter2@host": dial tcp: connection refused`), "GET x")
 	if strings.Contains(r.Detail, "hunter2") {
 		t.Fatalf("transport detail %q", r.Detail)
+	}
+}
+
+// A plugin that asks for cluster information gets the cluster it
+// authenticates to, and a plugin returning a token and a client certificate
+// has both used.
+func TestExecPluginClusterInfoAndBothCredentials(t *testing.T) {
+	seen := filepath.Join(t.TempDir(), "exec-info.json")
+	plugin := writePlugin(t, `printf '%s' "$KUBERNETES_EXEC_INFO" > `+seen+`
+echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"tok","clientCertificateData":"CERT","clientKeyData":"KEY"}}'`)
+	cfg := &rest.Config{Host: "https://10.0.0.1:6443", TLSClientConfig: rest.TLSClientConfig{CAData: []byte("CA"), ServerName: "api.dev"},
+		ExecProvider: &clientcmdapi.ExecConfig{Command: plugin, APIVersion: "client.authentication.k8s.io/v1", ProvideClusterInfo: true}}
+	if err := applyExecCredential(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BearerToken != "tok" || string(cfg.CertData) != "CERT" || string(cfg.KeyData) != "KEY" || cfg.ExecProvider != nil {
+		t.Fatalf("config = token %q cert %q key %q exec %v", cfg.BearerToken, cfg.CertData, cfg.KeyData, cfg.ExecProvider)
+	}
+	b, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		Spec struct {
+			Interactive bool `json:"interactive"`
+			Cluster     *struct {
+				Server string `json:"server"`
+				Name   string `json:"tls-server-name"`
+				CAData []byte `json:"certificate-authority-data"`
+			} `json:"cluster"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(b, &info); err != nil {
+		t.Fatalf("exec info %s: %v", b, err)
+	}
+	if info.Spec.Interactive || info.Spec.Cluster == nil || info.Spec.Cluster.Server != "https://10.0.0.1:6443" ||
+		info.Spec.Cluster.Name != "api.dev" || string(info.Spec.Cluster.CAData) != "CA" {
+		t.Fatalf("exec info = %s", b)
+	}
+	// Without provideClusterInfo no cluster is sent.
+	cfg.ExecProvider = &clientcmdapi.ExecConfig{Command: plugin, APIVersion: "client.authentication.k8s.io/v1"}
+	if err := applyExecCredential(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(seen); strings.Contains(string(b), "cluster") {
+		t.Fatalf("cluster sent without being asked: %s", b)
 	}
 }

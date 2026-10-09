@@ -14,8 +14,11 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -225,9 +228,32 @@ type execCredential struct {
 // credential it prints into cfg in place of the plugin.
 func applyExecCredential(ctx context.Context, cfg *rest.Config) error {
 	ec := cfg.ExecProvider
-	info, _ := json.Marshal(map[string]any{
-		"apiVersion": ec.APIVersion, "kind": "ExecCredential", "spec": map[string]any{"interactive": false},
-	})
+	spec := map[string]any{"interactive": false}
+	if ec.ProvideClusterInfo {
+		// The plugin asked for the cluster it authenticates to, as client-go
+		// would pass it.
+		caData := cfg.CAData
+		if len(caData) == 0 && cfg.CAFile != "" {
+			caData, _ = os.ReadFile(filepath.Clean(cfg.CAFile))
+		}
+		cluster := map[string]any{"server": cfg.Host}
+		if cfg.ServerName != "" {
+			cluster["tls-server-name"] = cfg.ServerName
+		}
+		if cfg.Insecure {
+			cluster["insecure-skip-tls-verify"] = true
+		}
+		if len(caData) > 0 {
+			cluster["certificate-authority-data"] = caData
+		}
+		if cfg.Proxy != nil {
+			if u, err := cfg.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "kubernetes"}}); err == nil && u != nil {
+				cluster["proxy-url"] = u.String()
+			}
+		}
+		spec["cluster"] = cluster
+	}
+	info, _ := json.Marshal(map[string]any{"apiVersion": ec.APIVersion, "kind": "ExecCredential", "spec": spec})
 	cmd := exec.CommandContext(ctx, ec.Command, ec.Args...) //nolint:gosec // the plugin the machine's own kubeconfig names
 	cmd.Env = append(os.Environ(), "KUBERNETES_EXEC_INFO="+string(info))
 	for _, e := range ec.Env {
@@ -251,13 +277,17 @@ func applyExecCredential(ctx context.Context, cfg *rest.Config) error {
 	if err := json.Unmarshal(out.Bytes(), &cred); err != nil || cred.Status == nil {
 		return fmt.Errorf("%w: the credential plugin printed no credential", errNoCredential)
 	}
-	switch {
-	case cred.Status.Token != "":
-		cfg.BearerToken = cred.Status.Token
-	case cred.Status.ClientCertificateData != "" && cred.Status.ClientKeyData != "":
-		cfg.CertData, cfg.KeyData = []byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData)
-	default:
+	// A plugin may return a token, a client certificate, or both, as
+	// client-go allows; both are used when both are given.
+	hasCert := cred.Status.ClientCertificateData != "" && cred.Status.ClientKeyData != ""
+	if cred.Status.Token == "" && !hasCert {
 		return fmt.Errorf("%w: the credential plugin printed no token or certificate", errNoCredential)
+	}
+	if cred.Status.Token != "" {
+		cfg.BearerToken = cred.Status.Token
+	}
+	if hasCert {
+		cfg.CertData, cfg.KeyData = []byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData)
 	}
 	cfg.ExecProvider = nil
 	return nil
