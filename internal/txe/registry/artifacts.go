@@ -47,6 +47,10 @@ var (
 	deliverableName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 	artifactDigest  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	runIDPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	// pathSegment is what every operating system and the CLI read the same
+	// way: no control or separator characters, no colon, no leading dot.
+	pathSegment   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+	windowsDevice = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)`)
 )
 
 // checkDeliverables validates a version's deliverables: unique names, an
@@ -74,17 +78,21 @@ func checkDeliverables(ds []Deliverable) error {
 }
 
 // checkDeliverablePath requires an exact file relative to the run's output
-// directory: no absolute path, no parent step, no pattern.
+// directory, spelled so that every system reads it the same way: segments
+// of letters, digits, '.', '_' and '-' that do not start with a dot or end
+// with one, and are no Windows device name. That excludes absolute paths,
+// parent steps, patterns, hidden and partial files and alternate streams.
 func checkDeliverablePath(p string) error {
-	switch {
-	case p == "":
+	if p == "" {
 		return errors.New("path is required")
-	case strings.HasPrefix(p, "/") || strings.Contains(p, `\`) || (len(p) > 1 && p[1] == ':'):
-		return errors.New("path must be relative")
-	case strings.ContainsAny(p, "*?[]{}"):
-		return errors.New("path must name one file, not a pattern")
-	case path.Clean(p) != p || p == "." || strings.HasPrefix(p, "../") || p == "..":
-		return errors.New("path must be clean and stay inside the run's output directory")
+	}
+	if len(p) > 1024 || path.Clean(p) != p {
+		return errors.New("path must be a clean relative path of at most 1024 bytes")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if !pathSegment.MatchString(seg) || strings.HasSuffix(seg, ".") || windowsDevice.MatchString(seg) {
+			return fmt.Errorf("path segment %q must use letters, digits, '.', '_' and '-', not start or end with a dot, and not be a device name", seg)
+		}
 	}
 	return nil
 }
@@ -133,7 +141,12 @@ type ArtifactLookup func(path string) (sha256 string, found bool, err error)
 // not produce. The manifest is created once; an identical report again
 // returns it (and repairs a missing exception), a different one is 409
 // artifact_conflict.
-func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, in ArtifactManifest) (*ArtifactManifest, error) {
+//
+// runSpecSHA256 is the digest of the run's saved DAG, read by the caller from
+// the run itself: the manifest is accepted only for the version that run
+// executed, so no one can record deliverables for a run that does not exist
+// or under another version.
+func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSHA256 string, in ArtifactManifest) (*ArtifactManifest, error) {
 	j := tx.Job
 	if !runIDPattern.MatchString(runID) {
 		return nil, refuse(CodeInvalid, "run id %q is not valid", runID)
@@ -144,6 +157,9 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, in
 			return nil, refuse(CodeInvalid, "job %s has no version %d", j.JobID, in.JobVersion)
 		}
 		return nil, err
+	}
+	if runSpecSHA256 == "" || runSpecSHA256 != v.DAG.SpecSHA256 {
+		return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
 	}
 	declared := map[string]Deliverable{}
 	for _, d := range v.ExpectedOutcome.Deliverables {
@@ -234,8 +250,16 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, in
 	return &m, nil
 }
 
+// manifestDigest identifies what a run reported. recorded_at is the
+// reporter's clock, not part of the report: a retried publish of the same
+// files sends a new one and must still be recognized as a replay.
 func manifestDigest(version int, artifacts []ArtifactRecord) (string, error) {
-	b, err := json.Marshal(map[string]any{"job_version": version, "artifacts": artifacts})
+	report := make([]ArtifactRecord, len(artifacts))
+	for i, a := range artifacts {
+		a.RecordedAt = ""
+		report[i] = a
+	}
+	b, err := json.Marshal(map[string]any{"job_version": version, "artifacts": report})
 	if err != nil {
 		return "", err
 	}
@@ -308,7 +332,9 @@ func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, look
 			sha, found, err := lookup(a.Path)
 			switch {
 			case err != nil:
-				a.CheckError, a.CheckedAt = err.Error(), &now
+				// The cause stays with the caller's logs; it can name paths
+				// on the hub.
+				a.CheckError, a.CheckedAt = "the hub copy could not be read; it is checked again on the next read", &now
 			case found && "sha256:"+strings.TrimPrefix(sha, "sha256:") == a.SHA256:
 				a.Status, a.CheckError, a.CheckedAt = ArtifactVerified, "", &now
 			case found:

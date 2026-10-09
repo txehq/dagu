@@ -15754,6 +15754,10 @@ components:
       properties:
         dagRunId:
           $ref: "#/components/schemas/DAGRunId"
+        attemptId:
+          type: string
+          readOnly: true
+          description: "Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID"
         name:
           $ref: "#/components/schemas/DAGName"
         workspace:

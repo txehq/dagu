@@ -6072,6 +6072,8 @@ export interface components {
         /** @description Current status of a DAG-run */
         DAGRunSummary: {
             dagRunId: components["schemas"]["DAGRunId"];
+            /** @description Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID */
+            readonly attemptId?: string;
             name: components["schemas"]["DAGName"];
             /** @description Workspace label value for the DAG-run. Omitted for default DAG-runs and invalid workspace labels. */
             workspace?: string;

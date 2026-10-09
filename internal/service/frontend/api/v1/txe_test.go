@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -674,12 +676,20 @@ func TestTxeAPIProposalClosures(t *testing.T) {
 // person, and a different report for the same run is refused.
 func TestTxeAPIRunArtifacts(t *testing.T) {
 	ctx := context.Background()
-	a := newTxeTestAPI(t)
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(ctx))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(store))
 	f := newTxeFixture(t, a, ctx)
 	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
 	jobID := mint(t, registry.PrefixJob)
 	hub, required := apigen.TxeDeliverableDeliveryHub, true
-	_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+	_, err = a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
 		JobId: jobID, RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: "key:" + jobID,
 		Version: apigen.TxeJobVersionInput{
 			Title: "t", Purpose: "p",
@@ -695,6 +705,15 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
+	// The run whose last step reports, with the DAG the registry saved.
+	runDAG := &ir.DAG{Name: jobID, YamlData: []byte(spec)}
+	attempt, err := runs.CreateAttempt(ctx, runDAG, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	runStatus := ir.InitialStatus(runDAG)
+	runStatus.DAGRunID, runStatus.AttemptID, runStatus.Status = "run-1", attempt.ID(), ir.Running
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, runStatus))
+	require.NoError(t, attempt.Close(ctx))
 
 	fixture := strings.ReplaceAll(`{
   "job_version": 1,
@@ -711,6 +730,8 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 }`, "MACHINE", f.machine)
 	var body apigen.TxeArtifactManifestRequest
 	require.NoError(t, json.Unmarshal([]byte(fixture), &body))
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-2", Body: &body})
+	requireStatus(t, err, http.StatusNotFound)
 	resp, err := a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
 	require.NoError(t, err)
 	status := map[string]apigen.TxeArtifactStatus{}
@@ -741,4 +762,23 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 		kinds = append(kinds, e.Kind)
 	}
 	assert.Equal(t, []string{"deliverable_missing"}, kinds)
+}
+
+// A caller who cannot write a job learns nothing about its runs from the
+// artifacts endpoint: the write check comes before the run lookup.
+func TestTxeAPIRunArtifactsAuthorizeFirst(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	outsider := auth.WithUser(context.Background(), &auth.User{Username: "out", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleDeveloper}},
+	}})
+	for _, run := range []string{"run-1", "no-such-run"} {
+		_, err := a.RecordTxeRunArtifacts(outsider, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: run,
+			Body: &apigen.TxeArtifactManifestRequest{JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.HTTPStatus, "refused by the write check, the same for every run")
+	}
 }

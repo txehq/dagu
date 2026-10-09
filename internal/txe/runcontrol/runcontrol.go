@@ -7,6 +7,7 @@ package runcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -69,6 +70,40 @@ func (c *Control) RunFinished(ctx context.Context, dagName string, run registry.
 		return false, err
 	}
 	return status != nil && !status.Status.IsActive() && status.Status != ir.NotStarted, nil
+}
+
+// LatestAttempt returns the run's latest attempt: its ID, the digest of its
+// saved DAG, and whether it finished and succeeded.
+func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (registry.RunAttempt, error) {
+	attempt, err := c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, runID))
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+		return registry.RunAttempt{}, registry.ErrRunNotFound
+	}
+	if err != nil {
+		return registry.RunAttempt{}, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return registry.RunAttempt{}, err
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return registry.RunAttempt{}, err
+	}
+	if len(dag.YamlData) == 0 {
+		return registry.RunAttempt{}, fmt.Errorf("run %s has no saved DAG", runID)
+	}
+	id := status.AttemptID
+	if id == "" {
+		id = attempt.ID()
+	}
+	return registry.RunAttempt{
+		AttemptID:  id,
+		SpecSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)),
+		Status:     status.Status.String(),
+		Finished:   !status.Status.IsActive() && status.Status != ir.NotStarted,
+		Succeeded:  status.Status.IsSuccess(),
+	}, nil
 }
 
 func (c *Control) findAttempt(ctx context.Context, dagName string, run registry.RunRef) (dagrun.Attempt, error) {

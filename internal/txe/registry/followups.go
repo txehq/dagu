@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -39,8 +40,13 @@ func IsReservedAction(name string) bool {
 // RetryRunParams are the parameters of dagu.retry_run. The run's DAG
 // snapshot and package must be the job's current ones: a run of an older
 // version is never retried silently on the new code, or the old.
+//
+// AttemptID is the attempt being retried, Dagu's own attempt identity: a
+// native retry keeps the run ID and starts a new attempt, so the attempt is
+// what a person decided on, and each failed attempt is decided separately.
 type RetryRunParams struct {
 	RunID         string `json:"run_id"`
+	AttemptID     string `json:"attempt_id"`
 	RunSpecSHA256 string `json:"run_spec_sha256"`
 	PackageDigest string `json:"package_digest"`
 }
@@ -79,9 +85,10 @@ func EscalationProposalID(actionID string, jobVersion int) (string, error) {
 	return DerivedID(PrefixProposal, "uncertain", actionID, jobVersion)
 }
 
-// RetryProposalID is the ID of the proposal to retry runID at jobVersion.
-func RetryProposalID(runID string, jobVersion int) (string, error) {
-	return DerivedID(PrefixProposal, "retry", runID, jobVersion)
+// RetryProposalID is the ID of the proposal to retry attemptID of runID at
+// jobVersion.
+func RetryProposalID(runID, attemptID string, jobVersion int) (string, error) {
+	return DerivedID(PrefixProposal, "retry", runID, attemptID, jobVersion)
 }
 
 // DecideTaskDAG is the name of the DAG that holds a machine's decision tasks.
@@ -192,8 +199,27 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
 	stale := func(msg string) error {
 		return &Error{Code: CodeStaleBinding, Message: "run " + rp.RunID + " " + msg + "; it is not retried", Current: j}
 	}
-	if rp.RunSpecSHA256 == "" || rp.PackageDigest == "" {
-		return refuse(CodeInvalid, "dagu.retry_run needs run_spec_sha256 and package_digest")
+	if rp.AttemptID == "" || rp.RunSpecSHA256 == "" || rp.PackageDigest == "" {
+		return refuse(CodeInvalid, "dagu.retry_run needs attempt_id, run_spec_sha256 and package_digest")
+	}
+	// The attempt and its digest are the run's own, read from what Dagu
+	// stored, never taken from the caller: a current digest cannot be paired
+	// with an old run, and a run that moved on is not retried again.
+	if tx.store.runs == nil {
+		return refuse(CodeNotReady, "run history is not available to bind run %s", rp.RunID)
+	}
+	latest, err := tx.store.runs.LatestAttempt(tx.ctx, j.JobID, rp.RunID)
+	switch {
+	case errors.Is(err, ErrRunNotFound):
+		return stale("is not a run of this job")
+	case err != nil:
+		return err
+	case latest.AttemptID != rp.AttemptID:
+		return stale("is now at attempt " + latest.AttemptID + ", not " + rp.AttemptID)
+	case !latest.Finished || latest.Succeeded:
+		return stale("attempt " + latest.AttemptID + " is " + latest.Status + ", not finished unsuccessfully")
+	case latest.SpecSHA256 != rp.RunSpecSHA256:
+		return stale("ran another DAG than the one named")
 	}
 	packages := map[string]bool{}
 	current := false
@@ -217,6 +243,27 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
 		return stale(fmt.Sprintf("is of an older version, not the current version %d", j.Version))
 	case !packages[j.PackageDigest] || rp.PackageDigest != j.PackageDigest:
 		return stale("ran another package than the current one")
+	}
+	return nil
+}
+
+// checkRetryReceipt allows a retry to succeed only with the new attempt Dagu
+// was observed to start: the run's latest attempt, and not the retried one.
+// The receipt names that attempt; an accepted request alone is no receipt.
+func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
+	var rp RetryRunParams
+	if err := decodeParams(a.Spec.Params, &rp); err != nil {
+		return err
+	}
+	if tx.store.runs == nil {
+		return refuse(CodeNotReady, "run history is not available to check the retry of run %s", rp.RunID)
+	}
+	latest, err := tx.store.runs.LatestAttempt(tx.ctx, tx.Job.JobID, rp.RunID)
+	if err != nil {
+		return err
+	}
+	if receipt == rp.AttemptID || receipt != latest.AttemptID {
+		return refuse(CodeInvalid, "a retry of run %s succeeds only with the new attempt observed on it (latest is %s, retried %s)", rp.RunID, latest.AttemptID, rp.AttemptID)
 	}
 	return nil
 }
@@ -317,7 +364,7 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	if err != nil {
 		return nil, nil, err
 	}
-	id, err := RetryProposalID(params.RunID, j.Version)
+	id, err := RetryProposalID(params.RunID, params.AttemptID, j.Version)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -327,7 +374,7 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 		return nil, nil, err
 	}
 	if cur, ok := j.Proposals[id]; ok && cur.State != ProposalOpen && cur.State != ProposalSnoozed {
-		return nil, nil, &Error{Code: CodeProposalState, Message: "a retry of run " + params.RunID + " is already " + string(cur.State), Current: cur}
+		return nil, nil, &Error{Code: CodeProposalState, Message: "the retry of attempt " + params.AttemptID + " of run " + params.RunID + " is already " + string(cur.State), Current: cur}
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {

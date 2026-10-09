@@ -1026,6 +1026,19 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		return nil, refuse(CodeInvalid, "approved action id must be %s", want)
 	}
 	pa, _ := v.PermittedAction(p.Action.Name)
+	attempts := maxAttempts(v, pa)
+	if p.Action.Name == ActionRetryRun {
+		// The run may have moved on since the person decided; a native retry
+		// is not idempotent, so it is attempted once.
+		var rp RetryRunParams
+		if err := decodeParams(p.Action.Params, &rp); err != nil {
+			return nil, err
+		}
+		if err := tx.checkRunBinding(rp); err != nil {
+			return nil, err
+		}
+		attempts = 1
+	}
 	return &Action{
 		ActionID:      want,
 		Kind:          ActionApproved,
@@ -1037,7 +1050,7 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		DecisionID:    d.DecisionID,
 		Spec:          p.Action,
 		BindingDigest: current,
-		MaxAttempts:   maxAttempts(v, pa),
+		MaxAttempts:   attempts,
 	}, nil
 }
 
@@ -1091,6 +1104,11 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	}
 	if s.State == ActionSucceeded && s.Receipt == "" {
 		return nil, refuse(CodeInvalid, "succeeded needs a receipt")
+	}
+	if s.State == ActionSucceeded && a.Spec.Name == ActionRetryRun {
+		if err := tx.checkRetryReceipt(a, s.Receipt); err != nil {
+			return nil, err
+		}
 	}
 	a.State = s.State
 	a.Receipt = s.Receipt

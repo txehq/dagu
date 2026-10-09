@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"io"
 	"net/http"
 	"os"
@@ -1164,8 +1167,13 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	}
 	var m *registry.ArtifactManifest
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
-		var err error
-		m, err = tx.RecordArtifacts(ctx, s, req.RunId, in)
+		// The run is looked up only after txeTx checked that the caller may
+		// write this job, so its existence is never disclosed to others.
+		runSpec, err := a.txeRunSpecDigest(ctx, req.JobId, req.RunId)
+		if err != nil {
+			return err
+		}
+		m, err = tx.RecordArtifacts(ctx, s, req.RunId, runSpec, in)
 		return err
 	}); err != nil {
 		return nil, err
@@ -1195,7 +1203,11 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 		case err == nil:
 			ended := !status.Status.IsActive() && status.Status != ir.NotStarted
 			m, err = s.CheckHubArtifacts(ctx, req.JobId, req.RunId, func(p string) (string, bool, error) {
-				return txeArtifactDigest(status.ArchiveDir, p)
+				sha, found, err := txeArtifactDigest(status.ArchiveDir, p)
+				if err != nil {
+					logger.Warn(ctx, "TXE hub artifact could not be read", tag.RunID(req.RunId), tag.Error(err))
+				}
+				return sha, found, err
 			}, ended)
 			if err != nil {
 				return nil, txeError(err)
@@ -1206,6 +1218,31 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 	}
 	out, err := txeConvert[api.TxeArtifactManifest](m)
 	return api.GetTxeRunArtifacts200JSONResponse(out), err
+}
+
+// txeRunSpecDigest returns the digest of the saved DAG of a run of the job,
+// in the form the registry records for a version's spec. A run the hub has
+// no record of is 404: deliverables are recorded only for real runs.
+func (a *API) txeRunSpecDigest(ctx context.Context, jobID, runID string) (string, error) {
+	if a.dagRunRepository == nil {
+		return "", &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return "", &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + jobID + " has no run " + runID}
+		}
+		return "", err
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(dag.YamlData) == 0 {
+		return "", &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict, Message: "run " + runID + " has no saved DAG to bind its deliverables to",
+			Details: map[string]any{"code": string(registry.CodeStaleBinding)}}
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), nil
 }
 
 // txeArtifactDigest returns the sha256 of the file at relPath in a run's
