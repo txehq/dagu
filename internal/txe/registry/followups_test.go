@@ -474,7 +474,35 @@ func TestQueuedRetryIsANewExecution(t *testing.T) {
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, failed.Ref())), "the retried execution is no receipt")
 	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a1", "2026-10-09T12:00:00.000000002Z")))
 
-	kept, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref())
+	kept, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref(), EvidenceRetry)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(failed.Snapshot), string(kept), "the retried execution's status is kept")
+}
+
+// Evidence is kept per purpose: a status observed while the execution
+// published does not stand in for the terminal status a retry was decided
+// on.
+func TestRetryEvidenceIsTheTerminalStatus(t *testing.T) {
+	r := newRetryFixture(t)
+	spec := r.job.DAGSpecSHA256
+	// The execution publishes while running...
+	publishing := RunAttempt{AttemptID: "a1", QueuedAt: "q1", SpecSHA256: spec, Status: "running",
+		Snapshot: json.RawMessage(`{"attemptId":"a1","status":1,"nodes":[{"status":1}]}`)}
+	require.NoError(t, r.f.store.retainExecution(r.f.ctx, r.job.JobID, "run-1", publishing, EvidencePublication))
+	// ...then fails, and a person retries it.
+	failed := failedAttempt("a1", spec)
+	failed.QueuedAt = "q1"
+	failed.Snapshot = json.RawMessage(`{"attemptId":"a1","status":3,"nodes":[{"status":3}]}`)
+	r.rc.attempts["run-1"] = failed
+	params := r.params("run-1", "a1")
+	params.QueuedAt = "q1"
+	_, _, err := r.propose(params, "key-1")
+	require.NoError(t, err)
+
+	retry, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref(), EvidenceRetry)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(failed.Snapshot), string(retry), "the retry's evidence is the terminal failed status with its final nodes")
+	published, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref(), EvidencePublication)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(publishing.Snapshot), string(published), "the publication observation is kept apart")
 }
