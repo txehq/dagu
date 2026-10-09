@@ -138,6 +138,15 @@ export default function TxeJobPage(): React.ReactElement {
   }
 
   const { job, proposals, decisions } = data;
+  // The newest of the job's own observation and any proposal's evidence, so
+  // the job page and the inbox report the same freshness.
+  const lastObservation = [
+    job.lastObservationAt,
+    ...proposals.map((p) => p.evidence.observedAt),
+  ]
+    .filter((at): at is string => Boolean(at))
+    .sort()
+    .pop();
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4" data-testid="txe-job">
       <header className="space-y-1">
@@ -198,7 +207,7 @@ export default function TxeJobPage(): React.ReactElement {
           <I18nText text="Last observation" />
         </dt>
         <dd>
-          <RelativeTime timestamp={job.lastObservationAt} fallback="never" />
+          <RelativeTime timestamp={lastObservation} fallback="never" />
         </dd>
         {job.retirement && (
           <>
