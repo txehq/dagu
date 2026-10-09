@@ -30,6 +30,8 @@ func TestValidateBuiltInRunContextNotices(t *testing.T) {
 	result.ExpectStderrNotContains(
 		"${unrelated.context}",
 		"reason=namespace_unavailable",
+		// A field the spec defines is not reported as unknown.
+		"${context.attempt.queued_at}",
 	)
 
 	verbose := dagu.Run("validate", "--show-unresolved", "validation_notices.yaml")
@@ -37,6 +39,7 @@ func TestValidateBuiltInRunContextNotices(t *testing.T) {
 	verbose.ExpectStderrContains(
 		"${context.run.id}",
 		"${context.attempt.id}",
+		"${context.attempt.queued_at}",
 		"${context.run.status}",
 		"${context.trigger.actor}",
 		"${context.profile.name}",

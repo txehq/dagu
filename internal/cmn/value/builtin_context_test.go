@@ -25,6 +25,7 @@ func TestBuiltinContextReferencesResolveExactFields(t *testing.T) {
 				"context.attempt.started_at":            "2026-03-13T10:00:01Z",
 				"context.run.scheduled_at":              "2026-03-13T10:00:00Z",
 				"context.attempt.id":                    "attempt-1",
+				"context.attempt.queued_at":             "2026-03-13T09:59:58.5Z",
 				"context.step.name":                     "build",
 				"context.paths.wiki_dir":                "/tmp/wiki/daily",
 				"context.paths.step_stdout_file":        "/tmp/stdout.log",
@@ -35,11 +36,11 @@ func TestBuiltinContextReferencesResolveExactFields(t *testing.T) {
 
 	got, err := resolver.String(
 		context.Background(),
-		"${context.dag.name} ${context.run.id} ${context.attempt.started_at} ${context.run.scheduled_at} ${context.attempt.id} ${context.step.name} ${context.paths.wiki_dir} ${context.paths.step_stdout_file} ${context.pushback.previous_stdout_file} ${params.run}",
+		"${context.dag.name} ${context.run.id} ${context.attempt.started_at} ${context.run.scheduled_at} ${context.attempt.id} ${context.attempt.queued_at} ${context.step.name} ${context.paths.wiki_dir} ${context.paths.step_stdout_file} ${context.pushback.previous_stdout_file} ${params.run}",
 		value.WorkflowField("run"),
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "daily run-1 2026-03-13T10:00:01Z 2026-03-13T10:00:00Z attempt-1 build /tmp/wiki/daily /tmp/stdout.log /tmp/previous.log param-run", got)
+	assert.Equal(t, "daily run-1 2026-03-13T10:00:01Z 2026-03-13T10:00:00Z attempt-1 2026-03-13T09:59:58.5Z build /tmp/wiki/daily /tmp/stdout.log /tmp/previous.log param-run", got)
 }
 
 func TestBuiltinContextLegacyAliasesResolveFrozenFields(t *testing.T) {

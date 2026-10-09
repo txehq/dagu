@@ -31,6 +31,7 @@ var supportedBuiltinContextBindings = map[string]struct{}{
 	"context.run.root_id":                   {},
 	"context.attempt.id":                    {},
 	"context.attempt.started_at":            {},
+	"context.attempt.queued_at":             {},
 	"context.step.id":                       {},
 	"context.step.name":                     {},
 	"context.trigger.type":                  {},
