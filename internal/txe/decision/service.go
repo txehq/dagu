@@ -160,6 +160,15 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 				Message: fmt.Sprintf("retry applies only to %s and %s proposals, not %q", ActionRetryRun, ActionUncertainEffect, action),
 			}
 		}
+		// The registry cannot yet authorize the bound retry a dagu.retry_run
+		// decision asks for, so recording one would leave a decided proposal
+		// that can never execute. Refused until that guard exists.
+		if req.Verdict == VerdictRetry && action == ActionRetryRun {
+			return &registry.Error{
+				Code:    registry.CodeNotPermitted,
+				Message: "retrying a run is not available until the registry can authorize it",
+			}
+		}
 		effect := EffectOf(req.Verdict, action)
 		d, err := tx.AppendDecision(registry.Decision{
 			DecisionID:       decisionID,
