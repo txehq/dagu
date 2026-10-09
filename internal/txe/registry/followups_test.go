@@ -357,10 +357,11 @@ func TestRetryIsBoundToTheFailedAttempt(t *testing.T) {
 
 	// The native retry is accepted; until a new attempt is observed there is
 	// no receipt.
-	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a1")), "the retried attempt is no receipt")
-	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a9")), "an attempt not observed is no receipt")
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a1", ""))), "the retried execution is no receipt")
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a9", ""))), "an execution not observed is no receipt")
 	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "queued"}
-	require.NoError(t, r.settle(act1, g1, ec, ActionSucceeded, "a2"))
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a2")), "the receipt is the execution reference")
+	require.NoError(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a2", "")))
 
 	// Replaying the first decision changes nothing.
 	_, _, err = r.propose(r.params("run-1", "a1"), "key-1")
@@ -445,4 +446,35 @@ func TestRetryRejectsForgedOrStaleRuns(t *testing.T) {
 		return err
 	})
 	assert.Equal(t, CodeNotReady, code(t, err), "without run history nothing is bound")
+}
+
+// On the queued path Dagu runs the same attempt again under a later queue
+// marker: that is a new execution, the receipt names it, and the stored
+// status of the execution that was retried is retained before Dagu
+// overwrites it in place.
+func TestQueuedRetryIsANewExecution(t *testing.T) {
+	r := newRetryFixture(t)
+	failed := failedAttempt("a1", r.job.DAGSpecSHA256)
+	failed.QueuedAt = "2026-10-09T12:00:00.000000001Z"
+	failed.Snapshot = json.RawMessage(`{"attemptId":"a1","status":3}`)
+	r.rc.attempts["run-1"] = failed
+	params := r.params("run-1", "a1")
+	params.QueuedAt = failed.QueuedAt
+
+	_, _, err := r.propose(r.params("run-1", "a1"), "key-0")
+	assert.Equal(t, CodeStaleBinding, code(t, err), "the attempt alone does not name the execution")
+	p, d, err := r.propose(params, "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	act, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+
+	// Dagu re-queues a1 in place.
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a1", QueuedAt: "2026-10-09T12:00:00.000000002Z", SpecSHA256: r.job.DAGSpecSHA256, Status: "queued"}
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, failed.Ref())), "the retried execution is no receipt")
+	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a1", "2026-10-09T12:00:00.000000002Z")))
+
+	kept, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref())
+	require.NoError(t, err)
+	assert.JSONEq(t, string(failed.Snapshot), string(kept), "the retried execution's status is kept")
 }

@@ -1155,9 +1155,12 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 		return nil, err
 	}
 	in, err := txeConvert[registry.ArtifactManifest](struct {
+		AttemptID  string                       `json:"attempt_id"`
+		QueuedAt   string                       `json:"queued_at"`
+		ProducedIn *api.TxeExecutionId          `json:"produced_in,omitempty"`
 		JobVersion int                          `json:"job_version"`
 		Artifacts  []api.TxeArtifactRecordInput `json:"artifacts"`
-	}{body.JobVersion, body.Artifacts})
+	}{body.AttemptId, body.QueuedAt, body.ProducedIn, body.JobVersion, body.Artifacts})
 	if err != nil {
 		return nil, ErrInvalidRequestBody
 	}
@@ -1169,11 +1172,11 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
 		// The run is looked up only after txeTx checked that the caller may
 		// write this job, so its existence is never disclosed to others.
-		runSpec, err := a.txeRunSpecDigest(ctx, req.JobId, req.RunId)
+		latest, _, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
 		if err != nil {
 			return err
 		}
-		m, err = tx.RecordArtifacts(ctx, s, req.RunId, runSpec, in)
+		m, err = tx.RecordArtifacts(ctx, s, req.RunId, latest, in)
 		return err
 	}); err != nil {
 		return nil, err
@@ -1190,20 +1193,40 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
 		return nil, err
 	}
-	m, err := s.GetArtifacts(ctx, req.JobId, req.RunId)
+	// The run's latest attempt chooses the default manifest and tells which
+	// attempt's native artifact directory is current. A run the hub does not
+	// know is read without checking hub copies.
+	var latest registry.RunAttempt
+	var status *ir.DAGRunStatus
+	if a.dagRunRepository != nil {
+		latest, status, err = a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
+		var apiErr *Error
+		if err != nil && (!errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusNotFound) {
+			return nil, err
+		}
+	}
+	preferred := ""
+	if latest.AttemptID != "" {
+		preferred = latest.Ref()
+	}
+	m, err := s.GetArtifacts(ctx, req.JobId, req.RunId, valueOf(req.Params.Execution), preferred)
 	if err != nil {
 		return nil, txeError(err)
 	}
 	pending := slices.ContainsFunc(m.Artifacts, func(r registry.ArtifactRecord) bool { return r.Status == registry.ArtifactPendingUpload })
-	if pending && a.dagRunRepository != nil {
-		// The run's native artifact directory holds the hub copies. A run the
-		// hub does not know yet is left unchecked rather than failed.
-		status, err := a.getDAGRunArtifactStatus(ctx, req.JobId, req.RunId)
-		switch {
-		case err == nil:
-			ended := !status.Status.IsActive() && status.Status != ir.NotStarted
-			m, err = s.CheckHubArtifacts(ctx, req.JobId, req.RunId, func(p string) (string, bool, error) {
-				sha, found, err := txeArtifactDigest(status.ArchiveDir, p)
+	if pending && status != nil {
+		dir, ended, known := m.ArchiveDir, true, m.ArchiveDir != ""
+		if m.Execution == preferred {
+			// The current attempt: its directory is the run's, and its copies
+			// count as failed only once it has ended.
+			dir, ended, known = status.ArchiveDir, latest.Finished, true
+		}
+		if known {
+			m, err = s.CheckHubArtifacts(ctx, req.JobId, req.RunId, m.Execution, dir, func(p string) (string, bool, error) {
+				if dir == "" {
+					return "", false, nil
+				}
+				sha, found, err := txeArtifactDigest(dir, p)
 				if err != nil {
 					logger.Warn(ctx, "TXE hub artifact could not be read", tag.RunID(req.RunId), tag.Error(err))
 				}
@@ -1212,37 +1235,52 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 			if err != nil {
 				return nil, txeError(err)
 			}
-		case !isArtifactStatusNotFound(err):
-			return nil, err
 		}
 	}
+	all, err := s.ListArtifacts(ctx, req.JobId, req.RunId)
+	if err != nil {
+		return nil, txeError(err)
+	}
 	out, err := txeConvert[api.TxeArtifactManifest](m)
+	executions := make([]string, 0, len(all))
+	for _, x := range all {
+		executions = append(executions, x.Execution)
+	}
+	out.Executions = &executions
 	return api.GetTxeRunArtifacts200JSONResponse(out), err
 }
 
-// txeRunSpecDigest returns the digest of the saved DAG of a run of the job,
-// in the form the registry records for a version's spec. A run the hub has
-// no record of is 404: deliverables are recorded only for real runs.
-func (a *API) txeRunSpecDigest(ctx context.Context, jobID, runID string) (string, error) {
+// txeLatestRunAttempt returns the latest attempt of a run of the job as
+// Dagu stored it, with its status. A run the hub has no record of is 404:
+// deliverables are recorded only for real runs.
+func (a *API) txeLatestRunAttempt(ctx context.Context, jobID, runID string) (registry.RunAttempt, *ir.DAGRunStatus, error) {
 	if a.dagRunRepository == nil {
-		return "", &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+		return registry.RunAttempt{}, nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
 	}
 	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
 	if err != nil {
 		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
-			return "", &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + jobID + " has no run " + runID}
+			return registry.RunAttempt{}, nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + jobID + " has no run " + runID}
 		}
-		return "", err
+		return registry.RunAttempt{}, nil, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return registry.RunAttempt{}, nil, err
 	}
 	dag, err := attempt.ReadDAG(ctx)
 	if err != nil {
-		return "", err
+		return registry.RunAttempt{}, nil, err
 	}
-	if len(dag.YamlData) == 0 {
-		return "", &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict, Message: "run " + runID + " has no saved DAG to bind its deliverables to",
-			Details: map[string]any{"code": string(registry.CodeStaleBinding)}}
+	out := registry.RunAttempt{AttemptID: status.AttemptID, QueuedAt: status.QueuedAt, Status: status.Status.String(),
+		Finished: !status.Status.IsActive() && status.Status != ir.NotStarted, Succeeded: status.Status.IsSuccess()}
+	if out.AttemptID == "" {
+		out.AttemptID = attempt.ID()
 	}
-	return fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), nil
+	if len(dag.YamlData) > 0 {
+		out.SpecSHA256 = fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData))
+	}
+	return out, status, nil
 }
 
 // txeArtifactDigest returns the sha256 of the file at relPath in a run's

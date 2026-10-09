@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -224,10 +225,17 @@ type RunControl interface {
 	LatestAttempt(ctx context.Context, dagName, runID string) (RunAttempt, error)
 }
 
-// RunAttempt is one attempt of a run as Dagu stored it. A native retry keeps
-// the run ID and starts a new attempt with a new AttemptID.
+// RunAttempt is the latest execution of a run as Dagu stored it. A direct
+// retry starts a new attempt; a queued retry runs the same attempt again with
+// a later QueuedAt, so an execution is the pair (AttemptID, QueuedAt).
 type RunAttempt struct {
 	AttemptID string
+	// QueuedAt is the stored queue marker, byte for byte; empty when the run
+	// was never queued.
+	QueuedAt string
+	// Snapshot is the stored status, kept as evidence when Dagu is about to
+	// overwrite it.
+	Snapshot json.RawMessage
 	// SpecSHA256 is the digest of the attempt's saved DAG, in the form
 	// recorded for a version's spec.
 	SpecSHA256 string
