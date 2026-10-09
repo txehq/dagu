@@ -29,7 +29,7 @@ type LocalCredentials struct {
 
 // For returns the credentials of version of jobID.
 func (l LocalCredentials) For(jobID string, version int) Credentials {
-	refs, err := l.refs(jobID, version)
+	refs, err := l.Refs(jobID, version)
 	if err != nil {
 		reason := fmt.Sprintf("version %d of job %s has no registration record on this machine (%v); credential references are read only from it", version, jobID, err)
 		return explained{FileCredentials{}, everyName(reason)}
@@ -39,7 +39,7 @@ func (l LocalCredentials) For(jobID string, version int) Credentials {
 	for _, ref := range refs {
 		switch ref.Kind {
 		case "file":
-			value, err := readCredentialFile(ref.Locator)
+			value, err := ReadCredentialFile(ref.Locator)
 			if err != nil {
 				missing[ref.Name] = "credential reference " + ref.Name + ": " + err.Error()
 				continue
@@ -52,9 +52,13 @@ func (l LocalCredentials) For(jobID string, version int) Credentials {
 	return explained{out, reasons(missing)}
 }
 
-// refs reads the credential references of the request that registered the
-// version from this machine.
-func (l LocalCredentials) refs(jobID string, version int) ([]CredentialRef, error) {
+// Refs returns the credential references this machine itself registered for
+// version of jobID: those of the exact request `dagu txe register` filed
+// beside the version's receipt. Anything that acts on a job's credentials
+// on this machine reads them here, never from the registry's copy, which a
+// hub record could change. An error means the version has no local
+// registration record, and no reference may be used.
+func (l LocalCredentials) Refs(jobID string, version int) ([]CredentialRef, error) {
 	receipt, err := txepkg.NewJournal(l.Home).Receipt(jobID, version)
 	if err != nil {
 		return nil, err
@@ -114,11 +118,11 @@ type reasons map[string]string
 
 func (r reasons) reason(name string) string { return r[name] }
 
-// readCredentialFile reads a credential file only at an absolute, clean
+// ReadCredentialFile reads a credential file only at an absolute, clean
 // path to a regular file this user owns that nobody else can write. The
 // checks are made on the opened file, not the path, so the file cannot be
 // swapped between the check and the read, and a symbolic link is refused.
-func readCredentialFile(locator string) (string, error) {
+func ReadCredentialFile(locator string) (string, error) {
 	if locator == "" || !filepath.IsAbs(locator) || filepath.Clean(locator) != locator || strings.Contains(locator, "..") {
 		return "", fmt.Errorf("locator %q is not an absolute, clean path", locator)
 	}

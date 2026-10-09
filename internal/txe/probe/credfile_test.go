@@ -102,9 +102,23 @@ func TestCredentialFileChecks(t *testing.T) {
 		cases[shared] = false // writable by others
 	}
 	for locator, ok := range cases {
-		_, err := readCredentialFile(locator)
+		_, err := ReadCredentialFile(locator)
 		if (err == nil) != ok {
 			t.Errorf("locator %q: err = %v, want accepted = %v", locator, err, ok)
 		}
+	}
+}
+
+// Refs returns exactly the references this machine registered, and nothing
+// for a version it did not register.
+func TestLocalRefsAreTheRegisteredOnes(t *testing.T) {
+	want := []CredentialRef{{Name: KubernetesCredential, Kind: "file", Locator: "/Users/me/.kube/config"}}
+	home := localHome(t, want)
+	got, err := LocalCredentials{Home: home}.Refs(credJob, 2)
+	if err != nil || len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("refs = %+v, %v", got, err)
+	}
+	if _, err := (LocalCredentials{Home: home}).Refs(credJob, 3); err == nil {
+		t.Fatal("a version this machine did not register returned references")
 	}
 }
