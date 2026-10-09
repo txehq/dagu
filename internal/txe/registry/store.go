@@ -71,7 +71,11 @@ type DAGStore interface {
 type Store struct {
 	col  persis.Collection
 	dags DAGStore
+	runs RunControl
 	now  func() time.Time
+	// reauthorize re-checks a resource event reporter's permission when an
+	// incomplete event is reconciled.
+	reauthorize ResourceReauthorizer
 	// dagLocks serializes DAG publication per job in this process; lockDir,
 	// when set, extends that across processes sharing the data directory.
 	dagLocks sync.Map // job ID -> *sync.Mutex
@@ -141,6 +145,16 @@ func (s *Store) createJSON(ctx context.Context, id string, v any) error {
 	}
 	now := s.clock()
 	return s.col.Create(ctx, &persis.Record{ID: id, Data: data, CreatedAt: now, UpdatedAt: now})
+}
+
+// putJSON replaces an operational record that the registry itself owns.
+func (s *Store) putJSON(ctx context.Context, id string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	now := s.clock()
+	return s.col.Put(ctx, &persis.Record{ID: id, Data: data, CreatedAt: now, UpdatedAt: now})
 }
 
 // CreateOwner saves a new owner. The owner ID is minted by the installer.

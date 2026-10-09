@@ -3755,6 +3755,48 @@ export interface paths {
         patch: operations["updateWorkspace"];
         trace?: never;
     };
+    "/txe/resource-events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report a resource event
+         * @description Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved.
+         */
+        post: operations["recordTxeResourceEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/resource-events/{eventId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                eventId: components["parameters"]["TxeEventId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a resource event
+         * @description Returns a recorded resource event with the dispositions visible to the caller.
+         */
+        get: operations["getTxeResourceEvent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/installation": {
         parameters: {
             query?: never;
@@ -4215,6 +4257,29 @@ export interface paths {
          * @description Files a proposal under the live review claim. The registry computes its binding digest against the current version.
          */
         post: operations["createTxeProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/runs/{runId}/retry-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request a retry of a job's run
+         * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision.
+         */
+        post: operations["requestTxeRunRetry"];
         delete?: never;
         options?: never;
         head?: never;
@@ -7663,6 +7728,55 @@ export interface components {
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
+        /** @enum {string} */
+        TxeResourceObservation: TxeResourceObservation;
+        TxeResourceEventRequest: {
+            /** @description Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409 */
+            event_id?: string;
+            target: components["schemas"]["TxeTarget"];
+            observation: components["schemas"]["TxeResourceObservation"];
+            /** @description True only when the evidence proves the stable identity no longer exists */
+            authoritative?: boolean;
+            detail?: string;
+            evidence?: string[];
+            /** Format: date-time */
+            observed_at?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeResourceDisposition: {
+            job_id: string;
+            /** @enum {string} */
+            match: TxeResourceDispositionMatch;
+            /** @enum {string} */
+            outcome: TxeResourceDispositionOutcome;
+            detail?: string;
+        };
+        TxeResourceEvent: {
+            schema: number;
+            event_id: string;
+            target: components["schemas"]["TxeTarget"];
+            observation: components["schemas"]["TxeResourceObservation"];
+            authoritative: boolean;
+            detail?: string;
+            evidence?: string[];
+            /** Format: date-time */
+            observed_at: string;
+            reporter: components["schemas"]["TxeActor"];
+            dispositions: components["schemas"]["TxeResourceDisposition"][];
+            /** @description Dependents not yet updated; the server keeps retrying them */
+            pending?: {
+                job_id: string;
+                /** @enum {string} */
+                match: TxeResourceEventPendingMatch;
+            }[];
+            /** @description Last error for each pending dependent */
+            failures?: {
+                job_id: string;
+                error: string;
+            }[];
+            /** @description True when every dependent has been updated */
+            complete: boolean;
+        };
         /** @description Who made a change. Never the owner: owner is a separate stable ID. */
         TxeActor: {
             /** @enum {string} */
@@ -8280,6 +8394,16 @@ export interface components {
             idempotency_key: string;
             actor?: components["schemas"]["TxeActor"];
         };
+        TxeRetryRequest: {
+            idempotency_key: string;
+            /** @description The job version the person saw; refused with 409 when the job moved on */
+            expected_job_version: number;
+            /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
+            run_spec_sha256?: string;
+            /** @description The run's package digest; when omitted the server reads it from the run */
+            package_digest?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
         TxeDecisionResponse: {
             decision: components["schemas"]["TxeDecision"];
             proposal?: components["schemas"]["TxeProposal"];
@@ -8387,7 +8511,9 @@ export interface components {
         TxeOwnerId: string;
         TxeProjectId: string;
         TxeMachineId: string;
+        TxeEventId: string;
         TxeJobId: string;
+        TxeRunId: string;
         TxeJobVersionNumber: number;
         TxeClaimId: string;
         TxeProposalId: string;
@@ -21090,6 +21216,115 @@ export interface operations {
             };
         };
     };
+    recordTxeResourceEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeResourceEventRequest"];
+            };
+        };
+        responses: {
+            /** @description Event recorded with its dispositions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeResourceEvent"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeResourceEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                eventId: components["parameters"]["TxeEventId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resource event */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeResourceEvent"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getTxeInstallation: {
         parameters: {
             query?: never;
@@ -22787,6 +23022,96 @@ export interface operations {
             };
         };
     };
+    requestTxeRunRetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not implemented yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeProposalDecisions: {
         parameters: {
             query?: never;
@@ -23666,6 +23991,29 @@ export enum ViewSpecType {
     run = "run",
     artifact = "artifact"
 }
+export enum TxeResourceObservation {
+    deleted = "deleted",
+    absent = "absent",
+    present = "present",
+    unreachable = "unreachable",
+    auth_denied = "auth_denied",
+    timeout = "timeout"
+}
+export enum TxeResourceDispositionMatch {
+    identity = "identity",
+    replacement = "replacement"
+}
+export enum TxeResourceDispositionOutcome {
+    retired = "retired",
+    needs_human = "needs_human",
+    availability = "availability",
+    recorded = "recorded",
+    unchanged = "unchanged"
+}
+export enum TxeResourceEventPendingMatch {
+    identity = "identity",
+    replacement = "replacement"
+}
 export enum TxeActorKind {
     human = "human",
     agent = "agent",
@@ -23766,7 +24114,8 @@ export enum TxeProposalState {
     decided = "decided",
     executed = "executed",
     rejected = "rejected",
-    superseded = "superseded"
+    superseded = "superseded",
+    closed = "closed"
 }
 export enum TxeProposalInputWaiting_on {
     person = "person",
@@ -23793,7 +24142,10 @@ export enum TxeEventKind {
     version = "version",
     lifecycle = "lifecycle",
     availability = "availability",
-    claim = "claim"
+    claim = "claim",
+    effect = "effect",
+    run_dropped = "run_dropped",
+    resource = "resource"
 }
 export enum TxeLifecycleRequestOp {
     pause = "pause",

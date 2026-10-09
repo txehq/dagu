@@ -17,6 +17,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
@@ -78,4 +79,31 @@ func TestTxeReadHistoryRechecksMovedJob(t *testing.T) {
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, http.StatusNotFound, apiErr.HTTPStatus)
 	assert.Equal(t, 1, reads, "the moved job is not read again")
+}
+
+// A job file keeps its identity whatever name its YAML declares, and no
+// other DAG can take a job's name.
+func TestTxeJobIdentity(t *testing.T) {
+	job := "job_01HZY0000000000000000000AA"
+	cases := []struct {
+		name, file, declared, want string
+		refused                    bool
+	}{
+		{name: "job file", file: job + ".yaml", declared: job, want: job},
+		{name: "job file without declared name", file: job + ".yaml", want: job},
+		{name: "job file declaring an ordinary name", file: job + ".yaml", declared: "monitor", refused: true},
+		{name: "ordinary file declaring a job name", file: "monitor.yaml", declared: job, refused: true},
+		{name: "ordinary DAG", file: "monitor.yaml", declared: "monitor"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := txeJobIdentity(&ir.DAG{Location: filepath.Join("/dags", tc.file), Name: tc.declared})
+			if tc.refused {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

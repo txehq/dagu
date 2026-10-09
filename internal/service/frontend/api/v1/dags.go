@@ -1014,6 +1014,12 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return nil, err
+	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return nil, err
+	}
 
 	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
 		return nil, err
@@ -1036,6 +1042,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 
 	if err := validateDAGRunID(dagRunId); err != nil {
 		return nil, err
@@ -1139,11 +1148,20 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return nil, err
+	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return nil, err
+	}
 
 	dagRunId := valueOf(request.Body.DagRunId)
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 	timeout := request.Body.Timeout
 
 	if err := validateDAGRunID(dagRunId); err != nil {
@@ -1603,6 +1621,9 @@ func (a *API) startPreparedDAGRunWithOptions(
 		}
 		return nil, a.dispatchStartToCoordinator(ctx, dag, opts, dispatchParams, timeout)
 	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return nil, err
+	}
 
 	// Only pass trigger type if it's a known value (not TriggerTypeUnknown)
 	triggerTypeStr := ""
@@ -1696,6 +1717,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return nil, err
+	}
 
 	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
 		return nil, err
@@ -1714,6 +1738,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}
 
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 	if nameOverride != "" {
 		if err := ir.ValidateDAGName(nameOverride); err != nil {
 			return nil, &Error{

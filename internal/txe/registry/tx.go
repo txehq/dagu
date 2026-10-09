@@ -81,6 +81,12 @@ type Transition struct {
 	// Affected lists runs the caller found queued or running, with what
 	// happens to each. The registry adds proposals, claims and actions.
 	Affected []Affected
+	// Authorize, when set, is checked against the job inside the same
+	// commit as the change (ChangeLifecycle only).
+	Authorize func(tx *JobTx) error
+	// DetailFor, when set, computes Detail from the job being committed
+	// (ChangeLifecycle only).
+	DetailFor func(job *Job) string
 }
 
 // Transition applies a lifecycle change. Completion and retirement are
@@ -372,6 +378,7 @@ func (tx *JobTx) interrupt(a *Action) {
 		a.State = ActionFailed
 	}
 	a.Updated = Stamp{At: tx.now, By: Actor{Kind: ActorSystem, ID: "registry"}}
+	tx.noteIntent(a)
 	tx.touch()
 }
 
@@ -449,7 +456,7 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("checkpoint is at %d, not %d", j.Checkpoint.Version, expectedVersion), Current: j.Checkpoint}
 	}
 	for _, a := range sortedActions(j.Actions) {
-		if a.Kind == ActionRoutine && a.State != ActionExecuting && a.State != ActionUncertain {
+		if a.Kind == ActionRoutine && !unresolved(a.State) {
 			if err := tx.archiveAction(a); err != nil {
 				return nil, err
 			}
@@ -486,6 +493,12 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	}
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
+	}
+	if err := tx.checkReservedProposal(&p); err != nil {
+		return nil, err
+	}
+	if err := tx.checkNativeTask(&p); err != nil {
+		return nil, err
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {
@@ -582,6 +595,9 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 			return nil, &Error{Code: CodeNotPermitted, Message: "verdict " + string(d.Verdict) + " is not allowed for this proposal", Current: p}
 		}
 	}
+	if err := checkRetryVerdict(p, d.Verdict); err != nil {
+		return nil, err
+	}
 	switch next {
 	case ProposalDecided, ProposalSnoozed, ProposalRejected:
 	case ProposalOpen, ProposalExecuted, ProposalSuperseded:
@@ -604,6 +620,12 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	}
 	if j.Lifecycle.Terminal() {
 		return nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
+	}
+	closes := d.Verdict == VerdictRetry && p.Action.Name == ActionUncertainEffect
+	if closes {
+		if err := tx.resolveUncertain(p, &d); err != nil {
+			return nil, err
+		}
 	}
 	d.DecidedAt = tx.now
 	if d.Actor.Kind == "" {
@@ -636,7 +658,10 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 		}
 		j.DecisionKeys[d.IdempotencyKey] = d.DecisionID
 	}
-	if next == ProposalRejected {
+	if closes {
+		p.State = ProposalClosed
+	}
+	if next == ProposalRejected || closes {
 		if err := tx.archiveProposal(p); err != nil {
 			return nil, err
 		}
@@ -755,8 +780,30 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 		return nil, err
 	}
 
+	if req.Routine != nil {
+		// An intent whose last effect is unresolved is not started again
+		// by a later episode unless a person decided to retry it.
+		if rec := j.Intents[intentKey(a.Spec)]; rec != nil && rec.ActionID != a.ActionID && unresolved(rec.State) {
+			if rec.State == ActionExecuting {
+				return nil, &Error{Code: CodeIntentUnresolved, Message: "action " + rec.ActionID + " with the same intent is still executing", Current: rec}
+			}
+			if err := tx.takeResolution(rec.ActionID, a); err != nil {
+				return nil, err
+			}
+			if prior, ok := j.Actions[rec.ActionID]; ok {
+				if err := tx.archiveAction(prior); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 	if cur, ok := j.Actions[a.ActionID]; ok {
-		if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts {
+		retryUnresolved := cur.State == ActionUncertain || cur.State == ActionEscalated
+		if retryUnresolved && cur.Attempt < cur.MaxAttempts {
+			if err := tx.takeResolution(cur.ActionID, a); err != nil {
+				return nil, err
+			}
+		} else if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts {
 			return nil, &Error{Code: CodeActionExists, Message: "action " + a.ActionID + " is " + string(cur.State), Current: cur}
 		}
 		// A retry keeps the version, binding and policy of the first attempt;
@@ -787,6 +834,7 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 	a.Receipt = ""
 	a.Outcome = nil
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
+	tx.noteIntent(a)
 	tx.touch()
 	g := *a.Grant
 	return &g, nil
@@ -854,7 +902,8 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		return nil, refuse(CodeProposalState, "proposal %s is not open", ap.ProposalID)
 	}
 	d := p.Decision
-	if p.State != ProposalDecided || d == nil || d.Verdict != VerdictApprove || d.DecisionID != ap.DecisionID {
+	executable := d != nil && (d.Verdict == VerdictApprove || (d.Verdict == VerdictRetry && p.Action.Name == ActionRetryRun))
+	if p.State != ProposalDecided || !executable || d.DecisionID != ap.DecisionID {
 		return nil, &Error{Code: CodeStaleBinding, Message: "decision " + ap.DecisionID + " is not the approval of this proposal", Current: p}
 	}
 	current, err := BindingDigest(j, p.Action)
@@ -943,6 +992,7 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	a.Outcome = s.Outcome
 	a.SettledUnderClaim = s.ClaimID
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
+	tx.noteIntent(a)
 	out := *a
 	if a.Kind == ActionApproved && a.State == ActionSucceeded {
 		if p := j.Proposals[a.ProposalID]; p != nil {

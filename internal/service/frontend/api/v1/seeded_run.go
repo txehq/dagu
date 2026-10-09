@@ -37,6 +37,14 @@ type seededRun struct {
 func (a *API) launchSeededDAGRun(ctx context.Context, run seededRun) (queued bool, err error) {
 	queueConfigured := run.enqueue && a.config.FindQueueConfig(run.dag.ProcGroup()) != nil
 	shouldDispatch := !queueConfigured && dispatch.ShouldDispatchToCoordinator(run.dag, a.coordinatorCli != nil, a.defaultExecMode)
+	if err := a.txeAdmitDAG(ctx, run.dag); err != nil {
+		return false, err
+	}
+	if !queueConfigured {
+		if err := a.txeRefuseLocalJobRun(run.dag); err != nil {
+			return false, err
+		}
+	}
 	if shouldDispatch && run.dag.Type == ir.TypeBuild {
 		return false, buildRequiresLocalAPIError()
 	}
