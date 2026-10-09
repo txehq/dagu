@@ -6090,6 +6090,12 @@ export interface components {
             abort?: components["schemas"]["Step"];
             exit?: components["schemas"]["Step"];
         };
+        /** @description The execution a conditional retry admitted: the queued execution, or the new attempt of a distributed retry, with the queuedAt its statuses carry (a direct retry keeps the retried status's queuedAt; empty when never queued). executionRef is derived from the two exactly as run details derive it. */
+        RetryDAGRunAdmission: {
+            attemptId?: string;
+            queuedAt?: string;
+            executionRef?: string;
+        };
         /** @description Type-keyed current-state runtime condition for a DAG-run. Each condition is the latest observation for its type, not a historical event. */
         DAGRunCondition: {
             /** @description Condition type */
@@ -12225,16 +12231,22 @@ export interface operations {
                     /** @description Optional. When true, skip step precondition evaluation for the steps reset by this retry. Requires stepName. DAG-level preconditions and lifecycle handlers still apply. */
                     bypassPreconditions?: boolean;
                     subDAGRunId?: components["schemas"]["DAGRunId"] & unknown;
+                    /** @description Optional, with expectedQueuedAt. Makes the retry conditional: it is admitted only if the run's latest execution is this attempt under expectedQueuedAt and has finished, checked atomically with the retry's admission. Otherwise (another execution is the latest, or the expected one has not finished) 409 with details.code execution_changed and nothing is queued or created. A retry that would run in a local process is refused with details.code conditional_retry_unsupported. A distributed conditional retry is sent to the coordinator once and never repeated; if that call fails without the coordinator's refusal, the response is 503 with details.code dispatch_uncertain: the retry may or may not have been dispatched. */
+                    expectedAttemptId?: string;
+                    /** @description Optional, with expectedAttemptId. The queue marker (queuedAt) of the expected execution; empty for an execution that was never queued. */
+                    expectedQueuedAt?: string;
                 };
             };
         };
         responses: {
-            /** @description A successful response */
+            /** @description The retry was admitted. A conditional request (expectedAttemptId/expectedQueuedAt) names the exact execution it admitted when the server knows it; other requests return an empty object. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["RetryDAGRunAdmission"];
+                };
             };
             /** @description Generic error response */
             default: {

@@ -78,6 +78,10 @@ type DispatchTask struct {
 	IncludeDownstream   bool
 	BypassPreconditions bool
 	RetryPath           string
+	// RequireLatestIsPrevious makes a retry conditional: the coordinator
+	// creates its attempt only if the run's latest execution is
+	// PreviousStatus's (AttemptID, QueuedAt) and has finished.
+	RequireLatestIsPrevious bool
 
 	WorkspaceBundleDigest      string
 	WorkspaceBundleSize        int64
@@ -99,6 +103,15 @@ type DAGRunStatusResult struct {
 type DispatchRequest struct {
 	Task                      *DispatchTask
 	AdmissionReservationToken string
+	// Admitted, when set, receives the execution the coordinator admitted.
+	Admitted *AdmittedExecution
+}
+
+// AdmittedExecution is the execution a dispatch admitted: its attempt and
+// the queued-at its statuses carry.
+type AdmittedExecution struct {
+	AttemptID string
+	QueuedAt  string
 }
 
 // Dispatcher defines distributed DAG run operations.

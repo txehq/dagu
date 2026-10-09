@@ -100,7 +100,13 @@ steps:
 	for _, r := range retained {
 		assert.Equal(t, "failed", r.Status)
 		assert.True(t, r.StatusComplete)
-		assert.False(t, r.LogsFinal, "logs are not claimed final until streams are fenced")
+		// With the coordinator's .final records (TXE-3772) every stream of a
+		// finished execution is proven complete when it is copied.
+		assert.True(t, r.LogsFinal, "every stream of the retained execution was recorded final: %s", r.LogsNote)
+		for _, file := range r.Files {
+			t.Logf("retained %s: %s bytes=%d final=%v", r.Execution, file.Name, file.Bytes, file.Final)
+			assert.True(t, file.Final, "%s of %s", file.Name, r.Execution)
+		}
 	}
 
 	assert.Contains(t, e1Stdout, "run execution 1")

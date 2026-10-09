@@ -46,6 +46,8 @@ type RunProcesses interface {
 
 // EnqueueRetryOptions configure a retry enqueue.
 type EnqueueRetryOptions struct {
+	// Admitted, when set, receives the execution the call queued.
+	Admitted *persis.ExpectedExecution
 	// AutoRetry marks scheduler-issued DAG auto-retries. These consume the
 	// DAG-level retry budget at enqueue time.
 	AutoRetry bool
@@ -136,6 +138,9 @@ func EnqueueRetry(
 		enqueueErr = queueStore.Enqueue(ctx, procGroup, QueuePriorityLow, admission.Status.DAGRun())
 	}
 	if enqueueErr == nil {
+		if opts.Admitted != nil {
+			*opts.Admitted = persis.ExpectedExecution{AttemptID: admission.Status.AttemptID, QueuedAt: admission.Status.QueuedAt}
+		}
 		return true, nil
 	}
 	if rollbackErr := admission.Rollback(ctx); rollbackErr != nil {
