@@ -8013,6 +8013,7 @@ export interface components {
             name: string;
             command?: string;
             entrypoint?: string;
+            /** @description Optional JSON Schema (draft 2020-12 only) the registry enforces on the params of every attempt of this action before granting it; a refusal is 400 invalid. Admitted: strict JSON (no duplicate keys, nesting up to 64), only keywords enforced exactly (multipleOf, format and unknown keywords are refused), no remote $ref, and numbers that are exactly float64 values (integers within 2^53, binary fractions such as 0.5). pattern and patternProperties use Go RE2 syntax and semantics, not ECMA-262: \s, \d and \w are ASCII-only. */
             param_schema?: unknown;
             /** @enum {string} */
             idempotency?: TxePermittedActionIdempotency;
