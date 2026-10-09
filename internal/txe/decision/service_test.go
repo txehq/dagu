@@ -27,7 +27,7 @@ type memDAGs struct {
 }
 
 func (m *memDAGs) CheckSpec(_ context.Context, _ string, spec []byte) (registry.DAGFacts, error) {
-	for _, line := range strings.Split(string(spec), "\n") {
+	for line := range strings.SplitSeq(string(spec), "\n") {
 		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "txe.machine:"); ok {
 			return registry.DAGFacts{WorkerSelector: map[string]string{"txe.machine": strings.TrimSpace(v)}}, nil
 		}
