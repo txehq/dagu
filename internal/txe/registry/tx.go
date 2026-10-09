@@ -332,16 +332,14 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 	if ttl <= 0 {
 		return nil, refuse(CodeInvalid, "claim ttl must be positive")
 	}
-	if c := j.Claim; c != nil && c.State == ClaimLive {
-		if tx.now.Before(c.ExpiresAt) {
-			return nil, &Error{Code: CodeClaimHeld, Message: "claim " + c.ClaimID + " is live", Current: c}
-		}
-		c.State = ClaimExpired
-		for _, a := range j.Actions {
-			if a.ClaimID == c.ClaimID && a.State == ActionExecuting {
-				tx.interrupt(a)
+	if c := j.Claim; c != nil {
+		if c.State == ClaimLive {
+			if tx.now.Before(c.ExpiresAt) {
+				return nil, &Error{Code: CodeClaimHeld, Message: "claim " + c.ClaimID + " is live", Current: c}
 			}
+			c.State = ClaimExpired
 		}
+		tx.interruptClaim(c.ClaimID)
 	}
 	id, err := NewID(PrefixClaim, tx.now)
 	if err != nil {
@@ -353,6 +351,16 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 	tx.touch()
 	cp := *claim
 	return &cp, nil
+}
+
+// interruptClaim interrupts the actions claimID left executing. Once its
+// claim is gone no holder can settle them, so they are reconciled instead.
+func (tx *JobTx) interruptClaim(claimID string) {
+	for _, a := range tx.Job.Actions {
+		if a.ClaimID == claimID && a.State == ActionExecuting {
+			tx.interrupt(a)
+		}
+	}
 }
 
 // interrupt marks an executing action whose holder is gone. Its effect may
@@ -384,8 +392,9 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }
 
-// ReleaseClaim ends a live claim. Releasing an already released claim with
-// the same fence is a no-op.
+// ReleaseClaim ends a live claim and interrupts the actions it left
+// executing. Releasing an already released claim with the same fence is a
+// no-op.
 func (tx *JobTx) ReleaseClaim(claimID string, fence int64) error {
 	c := tx.Job.Claim
 	if c != nil && c.ClaimID == claimID && c.Fence == fence && c.State == ClaimReleased {
@@ -395,6 +404,7 @@ func (tx *JobTx) ReleaseClaim(claimID string, fence int64) error {
 		return err
 	}
 	c.State = ClaimReleased
+	tx.interruptClaim(claimID)
 	tx.touch()
 	return nil
 }
@@ -732,6 +742,11 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 	if cur, ok := j.Actions[a.ActionID]; ok {
 		if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts {
 			return nil, &Error{Code: CodeActionExists, Message: "action " + a.ActionID + " is " + string(cur.State), Current: cur}
+		}
+		// A retry keeps the version, binding and policy of the first attempt;
+		// the same intent under another version is a new episode.
+		if cur.JobVersion != a.JobVersion || cur.BindingDigest != a.BindingDigest {
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("action %s was attempted under version %d; start a new episode", a.ActionID, cur.JobVersion), Current: cur}
 		}
 		a = cur
 		a.ClaimID = claimOf(req)

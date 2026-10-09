@@ -9,10 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
@@ -227,11 +231,96 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 		}
 	}
 	if job.Registration.State == RegistrationIncomplete {
-		if err := s.dags.WriteSpec(ctx, in.JobID, []byte(in.Version.DAG.Spec)); err != nil {
-			return nil, fmt.Errorf("registry: write DAG %s: %w", in.JobID, err)
+		if err := s.withDAGLock(ctx, in.JobID, func() error {
+			_, _, err := s.publishDAG(ctx, in.JobID)
+			return err
+		}); err != nil {
+			return nil, err
 		}
 	}
 	return job, nil
+}
+
+// dagLockStale is how long a silent cross-process DAG lock is honoured;
+// a holder renews it every third of that.
+const dagLockStale = 30 * time.Second
+
+// withDAGLock runs fn while holding the job's DAG publication lock. Every
+// write of a job's DAG happens under it, so an older request does not
+// replace the DAG a newer one published. If a stalled holder loses the
+// cross-process lock anyway, publishDAG converges back to the current
+// version after its write.
+func (s *Store) withDAGLock(ctx context.Context, jobID string, fn func() error) error {
+	m, _ := s.dagLocks.LoadOrStore(jobID, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	if s.lockDir == "" {
+		return fn()
+	}
+	dir := filepath.Join(s.lockDir, jobID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("registry: DAG lock %s: %w", jobID, err)
+	}
+	lock := dirlock.New(dir, &dirlock.LockOptions{StaleThreshold: dagLockStale, RetryInterval: 20 * time.Millisecond})
+	if err := lock.Lock(ctx); err != nil {
+		return fmt.Errorf("registry: DAG lock %s: %w", jobID, err)
+	}
+	done := make(chan struct{})
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		t := time.NewTicker(dagLockStale / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				_ = lock.Heartbeat(ctx)
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		<-renewed
+		_ = lock.Unlock()
+	}()
+	return fn()
+}
+
+// publishDAG makes the saved DAG match the job's committed current version.
+// It never writes the version a caller started from, only the one committed
+// now, and after writing it re-reads both, so a writer that raced a newer
+// publication writes the newer version again. It must run under withDAGLock
+// and returns the job it published for and the saved spec digest.
+func (s *Store) publishDAG(ctx context.Context, jobID string) (*Job, string, error) {
+	for attempt := 0; ; attempt++ {
+		job, err := s.GetJob(ctx, jobID)
+		if err != nil {
+			return nil, "", err
+		}
+		if job.Registration.State == RegistrationDuplicate {
+			return job, "", nil
+		}
+		v, err := s.versionOf(ctx, job, job.Version)
+		if err != nil {
+			return nil, "", err
+		}
+		specSHA, err := s.dags.SpecSHA256(ctx, jobID)
+		if err != nil && !errors.Is(err, persis.ErrNotFound) {
+			return nil, "", err
+		}
+		if specSHA == v.DAG.SpecSHA256 {
+			return job, specSHA, nil
+		}
+		if attempt == 5 {
+			return nil, "", fmt.Errorf("registry: DAG %s keeps changing during publication", jobID)
+		}
+		if err := s.dags.WriteSpec(ctx, jobID, []byte(v.DAG.Spec)); err != nil {
+			return nil, "", fmt.Errorf("registry: write DAG %s: %w", jobID, err)
+		}
+	}
 }
 
 func (s *Store) markDuplicate(ctx context.Context, jobID, winnerID string, by Actor) error {
@@ -353,79 +442,87 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 	if s.dags == nil {
 		return nil, refuse(CodeNotReady, "DAG store is not configured")
 	}
-	job, err := s.GetJob(ctx, jobID)
-	if err != nil {
+	if err := ValidateID(PrefixJob, jobID); err != nil {
 		return nil, err
 	}
-	if job.Registration.State == RegistrationReady && job.Registration.Package != nil && job.Registration.Package.Digest == pkg.Digest {
-		return receiptOf(job), nil
-	}
-	if expectedRevision != 0 && job.Revision != expectedRevision {
-		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, expectedRevision), Current: job}
-	}
-	dedupeID := dedupePrefix + job.OwnerID + "/" + job.ProjectID + "/" + job.Registration.DedupeKey
-	var winner dedupeRecord
-	if err := s.getJSON(ctx, dedupeID, &winner); err != nil {
-		if ErrorCode(err) == CodeNotFound {
-			return nil, refuse(CodeNotReady, "registration of %s is incomplete; repeat the registration request", jobID)
+	var receipt *Receipt
+	// The lock spans publication and the ready commit, so the DAG verified is
+	// still the saved one when the job becomes ready.
+	err := s.withDAGLock(ctx, jobID, func() error {
+		job, err := s.GetJob(ctx, jobID)
+		if err != nil {
+			return err
 		}
-		return nil, err
-	}
-	if winner.JobID != jobID {
-		return nil, refuse(CodeDuplicate, "job key is registered as %s", winner.JobID)
-	}
-	v, err := s.versionOf(ctx, job, job.Version)
-	if err != nil {
-		return nil, err
-	}
-	specSHA, err := s.dags.SpecSHA256(ctx, jobID)
-	if err != nil && !errors.Is(err, persis.ErrNotFound) {
-		return nil, err
-	}
-	if specSHA != v.DAG.SpecSHA256 {
-		if err := s.dags.WriteSpec(ctx, jobID, []byte(v.DAG.Spec)); err != nil {
-			return nil, fmt.Errorf("registry: write DAG %s: %w", jobID, err)
+		dedupeID := dedupePrefix + job.OwnerID + "/" + job.ProjectID + "/" + job.Registration.DedupeKey
+		var winner dedupeRecord
+		if err := s.getJSON(ctx, dedupeID, &winner); err != nil {
+			if ErrorCode(err) == CodeNotFound {
+				return refuse(CodeNotReady, "registration of %s is incomplete; repeat the registration request", jobID)
+			}
+			return err
 		}
-		if specSHA, err = s.dags.SpecSHA256(ctx, jobID); err != nil {
-			return nil, err
+		if winner.JobID != jobID {
+			return refuse(CodeDuplicate, "job key is registered as %s", winner.JobID)
 		}
-	}
-	committed, err := s.WithJobTx(ctx, jobID, by, func(tx *JobTx) error {
-		j := tx.Job
-		switch j.Registration.State {
-		case RegistrationReady:
+		published, specSHA, err := s.publishDAG(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if published.Registration.State == RegistrationReady && published.Registration.Package != nil && published.Registration.Package.Digest == pkg.Digest {
+			receipt = receiptOf(published)
 			return nil
-		case RegistrationDuplicate:
-			return refuse(CodeDuplicate, "job is a duplicate of %s", j.Registration.DuplicateOf)
-		case RegistrationIncomplete:
 		}
-		if j.Version != v.Version {
-			return &Error{Code: CodeVersionConflict, Message: "job version changed during readiness check", Current: j}
+		// The revision names the job state the caller checked; only the
+		// version of that state is made ready.
+		if expectedRevision != 0 && published.Revision != expectedRevision {
+			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", published.Revision, expectedRevision), Current: published}
 		}
-		if specSHA != j.DAGSpecSHA256 {
-			return &Error{Code: CodeDAGMismatch, Message: fmt.Sprintf("saved DAG spec %s does not match registered %s", specSHA, j.DAGSpecSHA256), Current: j}
+		committed, err := s.WithJobTx(ctx, jobID, by, func(tx *JobTx) error {
+			j := tx.Job
+			switch j.Registration.State {
+			case RegistrationReady:
+				return nil
+			case RegistrationDuplicate:
+				return refuse(CodeDuplicate, "job is a duplicate of %s", j.Registration.DuplicateOf)
+			case RegistrationIncomplete:
+			}
+			if j.Version != published.Version {
+				return &Error{Code: CodeVersionConflict, Message: "job version changed during readiness check", Current: j}
+			}
+			if specSHA != j.DAGSpecSHA256 {
+				return &Error{Code: CodeDAGMismatch, Message: fmt.Sprintf("saved DAG spec %s does not match registered %s", specSHA, j.DAGSpecSHA256), Current: j}
+			}
+			v, err := tx.CurrentVersion()
+			if err != nil {
+				return err
+			}
+			switch {
+			case pkg.Digest != j.PackageDigest:
+				return refuse(CodeInvalid, "package evidence digest %s does not match %s", pkg.Digest, j.PackageDigest)
+			case pkg.MachineID != j.MachineID:
+				return refuse(CodeInvalid, "package asserted on %s, job runs on %s", pkg.MachineID, j.MachineID)
+			case pkg.Path != v.Package.Path:
+				return refuse(CodeInvalid, "package asserted at %s, registered at %s", pkg.Path, v.Package.Path)
+			}
+			pkg.AssertedAt = tx.now
+			pkg.AssertedBy = by
+			now := tx.now
+			j.Registration.State = RegistrationReady
+			j.Registration.Package = &pkg
+			j.Registration.DAGVerified = true
+			j.Registration.ReadyAt = &now
+			return tx.event(Event{Kind: EventReady, From: string(RegistrationIncomplete), To: string(RegistrationReady), Evidence: []string{pkg.Digest, specSHA}})
+		})
+		if err != nil {
+			return err
 		}
-		switch {
-		case pkg.Digest != j.PackageDigest:
-			return refuse(CodeInvalid, "package evidence digest %s does not match %s", pkg.Digest, j.PackageDigest)
-		case pkg.MachineID != j.MachineID:
-			return refuse(CodeInvalid, "package asserted on %s, job runs on %s", pkg.MachineID, j.MachineID)
-		case pkg.Path != v.Package.Path:
-			return refuse(CodeInvalid, "package asserted at %s, registered at %s", pkg.Path, v.Package.Path)
-		}
-		pkg.AssertedAt = tx.now
-		pkg.AssertedBy = by
-		now := tx.now
-		j.Registration.State = RegistrationReady
-		j.Registration.Package = &pkg
-		j.Registration.DAGVerified = true
-		j.Registration.ReadyAt = &now
-		return tx.event(Event{Kind: EventReady, From: string(RegistrationIncomplete), To: string(RegistrationReady), Evidence: []string{pkg.Digest, specSHA}})
+		receipt = receiptOf(committed)
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return receiptOf(committed), nil
+	return receipt, nil
 }
 
 // UpdateVersion records a new immutable version when expectedVersion is
@@ -495,8 +592,11 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 	if err != nil {
 		return nil, err
 	}
-	if err := s.dags.WriteSpec(ctx, jobID, []byte(v.DAG.Spec)); err != nil {
-		return nil, fmt.Errorf("registry: write DAG %s: %w", jobID, err)
+	if err := s.withDAGLock(ctx, jobID, func() error {
+		_, _, err := s.publishDAG(ctx, jobID)
+		return err
+	}); err != nil {
+		return nil, err
 	}
 	return committed, nil
 }

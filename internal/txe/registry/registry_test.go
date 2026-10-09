@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -765,4 +766,141 @@ func TestNativeResumeSurvivesClosedProposal(t *testing.T) {
 	stored, err := f.store.GetDecision(f.ctx, job.JobID, d.DecisionID)
 	require.NoError(t, err)
 	assert.Equal(t, VerdictReject, stored.Verdict)
+}
+
+// slowDAGStore pauses the write of a spec carrying pause until release closes.
+type slowDAGStore struct {
+	DAGStore
+	pause   string
+	writing chan struct{}
+	release chan struct{}
+}
+
+func (d *slowDAGStore) WriteSpec(ctx context.Context, name string, spec []byte) error {
+	if strings.Contains(string(spec), d.pause) {
+		close(d.writing)
+		<-d.release
+	}
+	return d.DAGStore.WriteSpec(ctx, name, spec)
+}
+
+// A version update whose DAG write is delayed cannot replace the DAG of a
+// newer version committed meanwhile, even from another registry instance.
+func TestDelayedDAGWriteCannotReplaceNewerVersion(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	versionWith := func(b byte) JobVersion {
+		v := f.version(b)
+		v.DAG.Spec = f.spec(f.machine) + fmt.Sprintf("# v%d\n", b)
+		return v
+	}
+	slow := &slowDAGStore{DAGStore: f.dags, pause: "# v2", writing: make(chan struct{}), release: make(chan struct{})}
+	other, err := NewFileStore(filepath.Join(filepath.Dir(f.dagsDir), "data"), WithClock(f.clock), WithDAGStore(slow))
+	require.NoError(t, err)
+
+	errA := make(chan error, 1)
+	go func() {
+		_, err := other.UpdateVersion(f.ctx, job.JobID, "u2", 1, versionWith(2), cli)
+		errA <- err
+	}()
+	<-slow.writing
+	errB := make(chan error, 1)
+	go func() {
+		_, err := f.store.UpdateVersion(f.ctx, job.JobID, "u3", 2, versionWith(3), cli)
+		errB <- err
+	}()
+	require.Eventually(t, func() bool {
+		j, err := f.store.GetJob(f.ctx, job.JobID)
+		return err == nil && j.Version == 3
+	}, 5*time.Second, 5*time.Millisecond)
+	// Let B publish if it can; it must instead wait for A's write to finish.
+	select {
+	case err := <-errB:
+		errB <- err
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(slow.release)
+	require.NoError(t, <-errA)
+	require.NoError(t, <-errB)
+
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	saved, err := f.dags.SpecSHA256(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, got.DAGSpecSHA256, saved, "the saved DAG is the newest version's")
+}
+
+// An effect attempted under one version is not retried under another: the
+// retry would inherit the old version's binding and safety policy.
+func TestRoutineRetryNeedsSameVersion(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	actionID, g, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID, Fence: c.Fence, State: ActionFailed})
+		return err
+	})
+	require.NoError(t, err)
+
+	v2 := f.version(2)
+	_, err = f.store.UpdateVersion(f.ctx, job.JobID, "u2", 1, v2, cli)
+	require.NoError(t, err)
+	_, err = f.store.MarkReady(f.ctx, job.JobID, 0, PackageEvidence{Digest: v2.Package.Digest, Path: v2.Package.Path, MachineID: f.machine}, cli)
+	require.NoError(t, err)
+	updated, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+
+	_, _, err = routine(t, f, updated, c, "restart")
+	assert.Equal(t, CodeStaleBinding, code(t, err))
+}
+
+// Releasing a claim interrupts the actions it left executing, so the next
+// holder reconciles them instead of settling them as failed and re-running.
+func TestReleaseInterruptsExecutingActions(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	restartID, _, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	diagID, _, err := routine(t, f, job, c, "diagnose")
+	require.NoError(t, err)
+	got, err := f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.ReleaseClaim(c.ClaimID, c.Fence) })
+	require.NoError(t, err)
+	assert.Equal(t, ActionUncertain, got.Actions[restartID].State)
+	assert.Equal(t, ActionFailed, got.Actions[diagID].State, "read-only actions are failed, not uncertain")
+}
+
+// A writer that lost the publication lock (a stalled process whose lock went
+// stale) writes the newer version again after its late write.
+func TestStaleDAGWriterConverges(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	versionWith := func(b byte) JobVersion {
+		v := f.version(b)
+		v.DAG.Spec = f.spec(f.machine) + fmt.Sprintf("# v%d\n", b)
+		return v
+	}
+	slow := &slowDAGStore{DAGStore: f.dags, pause: "# v2", writing: make(chan struct{}), release: make(chan struct{})}
+	other, err := NewFileStore(filepath.Join(filepath.Dir(f.dagsDir), "data"), WithClock(f.clock), WithDAGStore(slow))
+	require.NoError(t, err)
+	other.lockDir = "" // the lock this writer held has been taken over
+
+	errA := make(chan error, 1)
+	go func() {
+		_, err := other.UpdateVersion(f.ctx, job.JobID, "u2", 1, versionWith(2), cli)
+		errA <- err
+	}()
+	<-slow.writing
+	_, err = f.store.UpdateVersion(f.ctx, job.JobID, "u3", 2, versionWith(3), cli)
+	require.NoError(t, err)
+	close(slow.release)
+	require.NoError(t, <-errA)
+
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	saved, err := f.dags.SpecSHA256(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, got.DAGSpecSHA256, saved, "the late writer restores the newest version")
 }
