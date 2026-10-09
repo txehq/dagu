@@ -73,19 +73,15 @@ var scpRemote = regexp.MustCompile(`^[^@/]+@([^:/]+):(.+)$`)
 // they use.
 func NormalizeRepository(remote string) string {
 	remote = strings.TrimSpace(remote)
-	if m := scpRemote.FindStringSubmatch(remote); m != nil && !strings.Contains(remote, "://") {
+	if _, rest, ok := strings.Cut(remote, "://"); ok {
+		host, path, _ := strings.Cut(rest, "/")
+		if i := strings.LastIndex(host, "@"); i >= 0 {
+			host = host[i+1:]
+		}
+		host, _, _ = strings.Cut(host, ":")
+		remote = host + "/" + path
+	} else if m := scpRemote.FindStringSubmatch(remote); m != nil {
 		remote = m[1] + "/" + m[2]
-	} else if _, rest, ok := strings.Cut(remote, "://"); ok {
-		remote = rest
-		if _, host, ok := strings.Cut(remote, "@"); ok && !strings.Contains(remote[:strings.Index(remote, "@")], "/") {
-			remote = host
-		}
-		if host, path, ok := strings.Cut(remote, "/"); ok {
-			if name, _, hasPort := strings.Cut(host, ":"); hasPort {
-				host = name
-			}
-			remote = host + "/" + path
-		}
 	}
 	remote = strings.TrimSuffix(strings.TrimSuffix(remote, "/"), ".git")
 	return strings.ToLower(remote)
