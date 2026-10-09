@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -66,7 +68,9 @@ const (
 // the process only as environment variables, never as shell text, so a model
 // cannot inject a command through a parameter value.
 type CommandEffector struct {
-	// Env is the base environment; os.Environ() when nil.
+	// Env is the base environment of the job's commands, used exactly as
+	// given. When nil it is this process's environment without what is the
+	// reviewer's own; see baseEnv.
 	Env []string
 }
 
@@ -132,7 +136,14 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// #nosec G204 -- argv comes from the job's registered policy, not from the agent.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
-	cmd.Env = append(e.baseEnv(), actionEnv(job, action)...)
+	credentials, err := credentialEnv(job)
+	if err != nil {
+		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
+	}
+	// Order matters: later entries win. The job's declared credentials
+	// replace anything of the same name that was inherited, and the action's
+	// own variables come last.
+	cmd.Env = append(append(e.baseEnv(), credentials...), actionEnv(job, action)...)
 	// The action runs as a managed process: in its own process group, which
 	// is killed as a whole when the deadline passes and also when this
 	// process dies. Killing only the direct child, or only while the
@@ -172,11 +183,131 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	return 0, stdout.String(), fmt.Errorf("action %q ended abnormally: %v", declared.Name, err)
 }
 
+// baseEnv is the environment a job's command starts from. An environment
+// given explicitly is the caller's deliberate choice and is passed as it is.
+// Otherwise the command inherits this process's environment, which is the
+// reviewer step's, minus what belongs to the reviewer and not to the job:
+//
+//   - the hub client's and the service's own settings (DAGU_*, TXE_DAGU_*, and
+//     the bindings of the reviewer fixture, TXE_FIXTURE_*): the context and credentials the reviewer writes to
+//     the registry with, and which registry that is. The marker that stops a job from registering work
+//     under a review is kept;
+//   - the review's own variables: the packet, the decision, the ids the
+//     decision run passes to its step, and anything named like a parameter
+//     of an action (TXE_PARAM_*), which would otherwise pass for one. The
+//     action's own variables are added by the caller;
+//   - the agent's profile and keys (CLAUDE_*, ANTHROPIC_*, CODEX_*,
+//     OPENAI_*): the login the review agent runs under.
+//
+// Everything else is inherited. That includes what a job's command needs to
+// reach its own resources, among it the credential references a job
+// declares, which have TXE_ names of their own (TXE_KUBECONFIG,
+// TXE_KUBE_CONTEXT): the TXE_ prefix as a whole is deliberately not removed.
+// This removes accidental inheritance only. It is not isolation: the
+// command runs as the same user and can read the same files.
 func (e *CommandEffector) baseEnv() []string {
 	if e.Env != nil {
 		return append([]string(nil), e.Env...)
 	}
-	return os.Environ()
+	return jobEnv(os.Environ())
+}
+
+// reviewerEnvPrefixes are the variable name prefixes that belong to the
+// reviewer, the service it talks to, the agent it runs, or the review.
+var reviewerEnvPrefixes = []string{"DAGU_", "TXE_DAGU_", "TXE_FIXTURE_", "TXE_PARAM_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
+
+// reviewerEnvNames are the review's own variables that have no prefix of
+// their own: what the rendered DAGs hand from one step to the next, and the
+// action's identity, which the caller sets afresh for each command.
+var reviewerEnvNames = map[string]bool{
+	"TXE_PACKET": true, "TXE_DECISION": true, "TXE_PROPOSAL_ID": true, "TXE_DECISION_ID": true,
+	"TXE_JOB_ID": true, "TXE_OWNER_ID": true, "TXE_ACTION_ID": true, "TXE_ACTION_NAME": true,
+	"TXE_TARGET_ID": true, "TXE_IDEMPOTENCY_KEY": true,
+}
+
+// jobEnv returns env without the reviewer's own variables.
+func jobEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		// Windows treats variable names without regard to case.
+		upper := strings.ToUpper(name)
+		if upper != ReviewerEnv && (reviewerEnvNames[upper] || slices.ContainsFunc(reviewerEnvPrefixes, func(p string) bool { return strings.HasPrefix(upper, p) })) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// credentialEnv resolves the credentials the job declares, on this machine,
+// into the variables its command reads them from. This is the deliberate way
+// a credential reaches a job's command: a declared credential is supplied
+// even under a name whose inherited value is removed as the reviewer's own
+// (a job may declare its own OPENAI_API_KEY; it gets the declared one, never
+// the review agent's).
+//
+// What is reported of a failure is recorded on the action and shown to the
+// review agent at later reviews, so it names the reference and the kind of
+// failure only: never a value, and never the locator, which says where the
+// credential is kept.
+//
+// A file is read as it is, as the service reads it for the job's own runs.
+// A variable is copied from this process's environment. A credential that
+// cannot be resolved stops the command before it starts, as it stops a run:
+// the error names the reference and never a value. A reference cannot name
+// one of the variables that identify the action or mark the review.
+// credentialNamePattern is the rule a job's registration applies to the
+// name of a credential reference.
+var credentialNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func credentialEnv(job Job) ([]string, error) {
+	env := make([]string, 0, len(job.CredentialRefs))
+	for _, ref := range job.CredentialRefs {
+		upper := strings.ToUpper(ref.Name)
+		switch {
+		case !credentialNamePattern.MatchString(ref.Name):
+			return nil, fmt.Errorf("credential reference %q is not a variable name", ref.Name)
+		case upper == ReviewerEnv || reviewerEnvNames[upper] || strings.HasPrefix(upper, "TXE_PARAM_"):
+			return nil, fmt.Errorf("credential reference %s uses a name reserved for the action", ref.Name)
+		}
+		var value string
+		switch ref.Kind {
+		case CredentialFile:
+			// #nosec G304 -- the path is the job's registered credential locator on its own machine.
+			raw, err := os.ReadFile(ref.Locator)
+			if err != nil {
+				return nil, fmt.Errorf("credential %s: its file %s", ref.Name, unreadable(err))
+			}
+			value = string(raw)
+		case CredentialEnv:
+			found, ok := os.LookupEnv(ref.Locator)
+			if !ok {
+				return nil, fmt.Errorf("credential %s: the variable it is copied from is not set where the reviewer runs", ref.Name)
+			}
+			value = found
+		default:
+			return nil, fmt.Errorf("credential %s: unknown kind %q", ref.Name, ref.Kind)
+		}
+		if strings.ContainsRune(value, 0) {
+			return nil, fmt.Errorf("credential %s: its value cannot be passed in a variable", ref.Name)
+		}
+		env = append(env, ref.Name+"="+value)
+	}
+	return env, nil
+}
+
+// unreadable says why a credential's file could not be read, without the
+// path the system's error carries.
+func unreadable(err error) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "does not exist"
+	case errors.Is(err, os.ErrPermission):
+		return "cannot be read: permission denied"
+	default:
+		return "cannot be read"
+	}
 }
 
 func actionEnv(job Job, action Action) []string {

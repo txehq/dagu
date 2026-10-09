@@ -1,0 +1,40 @@
+{
+  "rule": "execution = attempt_id + '-' + lowercase hex of the first 8 bytes of SHA-256 over attempt_id, one newline (0x0a), queued_at. queued_at is the run status's queuedAt byte for byte; it is the empty string for a run that was never queued.",
+  "cases": [
+    {
+      "attempt_id": "4f6f15",
+      "queued_at": "2026-10-09T23:48:55+08:00",
+      "execution": "4f6f15-670dc368e41b2a89"
+    },
+    {
+      "attempt_id": "4f6f15",
+      "queued_at": "2026-10-09T15:48:58.155644Z",
+      "execution": "4f6f15-b8abf4224e8b2d32"
+    },
+    {
+      "attempt_id": "4f6f15",
+      "queued_at": "2026-10-09T15:48:55.000000001Z",
+      "execution": "4f6f15-a96e0ed97f534e8d"
+    },
+    {
+      "attempt_id": "4f6f15",
+      "queued_at": "",
+      "execution": "4f6f15-f6cff920719848c7"
+    },
+    {
+      "attempt_id": "45642f",
+      "queued_at": "2026-10-09T23:48:55+08:00",
+      "execution": "45642f-55ca3bf9eabffd70"
+    },
+    {
+      "attempt_id": "45642f",
+      "queued_at": "",
+      "execution": "45642f-973f46e3334e26ff"
+    },
+    {
+      "attempt_id": "0193f2a4-7c1e-7d3b-9a55-6f0c2b7e1d44",
+      "queued_at": "2026-10-09T15:48:58Z",
+      "execution": "0193f2a4-7c1e-7d3b-9a55-6f0c2b7e1d44-3dbb3822c978c511"
+    }
+  ]
+}

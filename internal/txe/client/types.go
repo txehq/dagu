@@ -368,7 +368,14 @@ type ArtifactRecord struct {
 
 // ArtifactManifest is the body of POST /txe/jobs/{job}/runs/{run}/artifacts.
 type ArtifactManifest struct {
-	JobVersion int              `json:"job_version"`
+	JobVersion int `json:"job_version"`
+	// Execution is the execution that publishes: attempt_id and queued_at.
+	// A run has one manifest per execution.
+	Execution
+	// ProducedIn is the execution whose run of the job wrote the files. It
+	// differs from the publishing one only when that is a retry that ran
+	// the publish step alone.
+	ProducedIn Execution        `json:"produced_in"`
 	Artifacts  []ArtifactRecord `json:"artifacts"`
 	Actor      Actor            `json:"actor"`
 }

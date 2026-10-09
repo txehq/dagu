@@ -138,7 +138,10 @@ type mockDAGRunStore struct {
 	attemptWriteErr     error
 	listStatusesCalls   int
 	compareAndSwapCalls int
-	mu                  sync.Mutex
+	// beforeCompareAndSwap, when set, runs before a compare-and-swap takes
+	// the store lock, so a test can change the stored status in between.
+	beforeCompareAndSwap func()
+	mu                   sync.Mutex
 }
 
 func newMockDAGRunStore() *mockDAGRunStore {
@@ -334,6 +337,31 @@ func (m *mockDAGRunStore) CompareAndSwapCallCount() int {
 	return m.compareAndSwapCalls
 }
 
+func (m *mockDAGRunStore) pauseAttemptWrite(req persis.DAGRunCompareAndSwapStatusRequest) {
+	m.mu.Lock()
+	root := req.RootDAGRun
+	var attempt *mockAttempt
+	if root.ID != "" && (root.ID != req.DAGRun.ID || root.Name != req.DAGRun.Name) {
+		attempt = m.subAttempts[root.ID+":"+req.DAGRun.ID]
+	} else {
+		attempt = m.attempts[req.DAGRun.ID]
+	}
+	m.mu.Unlock()
+	if attempt == nil {
+		return
+	}
+	attempt.mu.Lock()
+	writeStarted, releaseWrite := attempt.writeStarted, attempt.releaseWrite
+	attempt.writeStarted = nil
+	attempt.mu.Unlock()
+	if writeStarted != nil {
+		close(writeStarted)
+		if releaseWrite != nil {
+			<-releaseWrite
+		}
+	}
+}
+
 func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	ctx context.Context,
 	req persis.DAGRunCompareAndSwapStatusRequest,
@@ -341,6 +369,12 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	if m.beforeCompareAndSwap != nil {
+		m.beforeCompareAndSwap()
+	}
+	// A compare-and-swap is a status write: honour the same pause hooks as
+	// mockAttempt.Write, outside the store lock.
+	m.pauseAttemptWrite(req)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -359,7 +393,13 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	} else {
 		attempt, ok = m.attempts[req.DAGRun.ID]
 	}
-	if !ok || attempt.status == nil {
+	if !ok {
+		return nil, false, nil
+	}
+	// The attempt's own fields are guarded by its mutex, as in its methods.
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.status == nil {
 		return nil, false, nil
 	}
 
@@ -375,6 +415,9 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	}
 	if err := req.Mutate(&current); err != nil {
 		return nil, false, err
+	}
+	if attempt.writeError != nil {
+		return nil, false, attempt.writeError
 	}
 	attempt.status = &current
 	attempt.written = true
@@ -3840,6 +3883,13 @@ func TestHandler_ReportStatus(t *testing.T) {
 			AttemptID: "attempt-1",
 			Status:    ir.Running,
 		})
+		// Seed the coordinator's cache with the attempt open, as a dispatch
+		// does, so the test still checks that the cached handle is closed
+		// now that root writes go through the store (TXE-3772).
+		require.NoError(t, attempt.Open(ctx))
+		h.attemptsMu.Lock()
+		h.openAttempts[ref.ID] = attempt
+		h.attemptsMu.Unlock()
 		runningProto, convErr := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
 			Name:      ref.Name,
 			DAGRunID:  ref.ID,
@@ -3864,7 +3914,9 @@ func TestHandler_ReportStatus(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, resp.Accepted)
 		assert.True(t, attempt.WasClosed())
-		assert.Equal(t, 1, store.CompareAndSwapCallCount())
+		// Both root writes, Running and Waiting, go through the store's
+		// compare-and-swap (TXE-3772).
+		assert.Equal(t, 2, store.CompareAndSwapCallCount())
 
 		h.attemptsMu.RLock()
 		_, cached := h.openAttempts[ref.ID]
@@ -4747,6 +4799,13 @@ func TestHandler_ReportStatus(t *testing.T) {
 			WorkerID:   "worker-1",
 			Status:     ir.Failed,
 		})
+		// Seed the coordinator's cache with the attempt open, as a dispatch
+		// does, so the test still checks that the cached handle is closed
+		// now that root writes go through the store (TXE-3772).
+		require.NoError(t, attempt.Open(ctx))
+		h.attemptsMu.Lock()
+		h.openAttempts[ref.ID] = attempt
+		h.attemptsMu.Unlock()
 		require.NoError(t, leaseStore.Upsert(ctx, dispatch.DAGRunLease{
 			AttemptKey:      "attempt-key-1",
 			DAGRun:          ref,
@@ -4832,6 +4891,13 @@ func TestHandler_ReportStatus(t *testing.T) {
 			AttemptKey: "attempt-key-1",
 			Status:     ir.Running,
 		})
+		// Seed the coordinator's cache with the attempt open, as a dispatch
+		// does, so the test still checks that the cached handle is closed
+		// now that root writes go through the store (TXE-3772).
+		require.NoError(t, attempt.Open(ctx))
+		h.attemptsMu.Lock()
+		h.openAttempts[ref.ID] = attempt
+		h.attemptsMu.Unlock()
 		attempt.writeError = errors.New("status write failed")
 		incoming, convErr := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
 			Name:       ref.Name,
@@ -5373,6 +5439,13 @@ func TestHandler_ReportStatus(t *testing.T) {
 			Status:     ir.NotStarted,
 			WorkerID:   "worker-1",
 		})
+		// Seed the coordinator's cache with the attempt open, as a dispatch
+		// does, so the test still checks that the cached handle is closed
+		// now that root writes go through the store (TXE-3772).
+		require.NoError(t, attempt.Open(ctx))
+		h.attemptsMu.Lock()
+		h.openAttempts[ref.ID] = attempt
+		h.attemptsMu.Unlock()
 
 		runningProto, convErr := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
 			Name:       "test-dag",

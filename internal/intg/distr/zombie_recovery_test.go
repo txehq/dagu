@@ -316,6 +316,8 @@ steps:
 			DagRunId:   initialStatus.DAGRunID,
 			DagName:    initialStatus.Name,
 			AttemptKey: initialStatus.AttemptKey,
+			// A worker reports the execution marker its task carries.
+			ExecutionMarker: initialLease.ExecutionMarker,
 		}},
 	})
 	require.NoError(t, err)

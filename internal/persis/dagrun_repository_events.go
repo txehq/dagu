@@ -74,6 +74,38 @@ func (a *eventingAttempt) Write(ctx context.Context, status ir.DAGRunStatus) err
 	return nil
 }
 
+// WriteIfLatest forwards a conditional write to the wrapped attempt and emits
+// the same events as Write when it succeeds. A wrapped attempt that cannot
+// write conditionally yields dagrun.ErrConditionalWriteUnsupported and writes
+// nothing.
+func (a *eventingAttempt) WriteIfLatest(
+	ctx context.Context,
+	status ir.DAGRunStatus,
+	check func(latest *ir.DAGRunStatus) error,
+) error {
+	writer, ok := a.Attempt.(dagrun.ConditionalWriter)
+	if !ok {
+		return dagrun.ErrConditionalWriteUnsupported
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err := writer.WriteIfLatest(ctx, status, check); err != nil {
+		return err
+	}
+	if _, _, ok := eventstore.FromContext(ctx); !ok {
+		return nil
+	}
+	a.lastEmittedEventType = emitStatusEvent(
+		ctx,
+		a.lastEmittedEventType,
+		&status,
+		a.eventData(ctx),
+	)
+	return nil
+}
+
 func (a *eventingAttempt) Close(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

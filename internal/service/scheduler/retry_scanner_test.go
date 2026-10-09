@@ -1042,3 +1042,11 @@ func mustRetryMetadataFromDAG(t *testing.T, dag *ir.DAG) dagRetryMetadata {
 	require.True(t, ok)
 	return metadata
 }
+
+func (s *retryScannerStore) ListRetainedExecutions(context.Context, ir.DAGRunRef, ir.DAGRunRef) ([]persis.RetainedExecution, error) {
+	return nil, nil
+}
+
+func (s *retryScannerStore) ReadRetainedExecutionFile(context.Context, ir.DAGRunRef, ir.DAGRunRef, string, string) ([]byte, error) {
+	return nil, persis.ErrNotFound
+}

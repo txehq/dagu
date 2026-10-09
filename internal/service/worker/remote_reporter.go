@@ -80,6 +80,9 @@ type remoteRunReporter struct {
 	logs      map[string]*coordreport.LogStreamer
 	artifacts map[string]*coordreport.ArtifactUploader
 	finalizer *schedulerLogFinalizer
+	// executionMarker is the claimed task's execution marker. Inline
+	// descendants write under the same claim, so they carry it too.
+	executionMarker string
 }
 
 func newRemoteRunReporter(
@@ -275,6 +278,7 @@ func (r *remoteRunReporter) logStreamerLocked(meta remoteRunMetadata) *coordrepo
 			r.owner,
 		)
 		streamer.SetClaimKey(meta.claimKey)
+		streamer.SetExecutionMarker(r.executionMarker)
 		r.logs[key] = streamer
 		return streamer
 	}
@@ -313,6 +317,7 @@ func (r *remoteRunReporter) artifactUploaderFor(meta remoteRunMetadata) *coordre
 			r.owner,
 		)
 		uploader.SetClaimKey(meta.claimKey)
+		uploader.SetExecutionMarker(r.executionMarker)
 		r.artifacts[key] = uploader
 		return uploader
 	}

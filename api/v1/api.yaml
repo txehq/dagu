@@ -11760,6 +11760,137 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/runs/{runId}/abandonments:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "List a run's abandoned retry preparations"
+      description: "Every attempt of the run that the coordinator prepared and abandoned without dispatching it, newest first, whatever happened to the run since: hidden preparations of a retry and first attempts marked failed alike. Each entry is either the trusted record (with attributable, true only when it carries a request correlation) or, for a record that cannot be trusted, the attempt and an error; such an entry is never attributable. Visible to callers who can see the job and the workspace of the run."
+      operationId: "listTxeRunAbandonments"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Abandonment records"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeAbandonmentList"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "The run store keeps no abandonment history (details.code abandonment_history_unsupported): nothing is known about abandoned preparations, which is not the same as none"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/executions:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "List a run's retained executions"
+      description: "Executions of the run that a queued retry replaced, copied before it did: each with its whole status and the logs from the hub's log directory, oldest first. logs_final is false until stream finalization can be proven."
+      operationId: "listTxeRunExecutions"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Retained executions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeRetainedExecutionList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/executions/{executionRef}/files/{name}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+      - name: executionRef
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        required: true
+        description: "status.json or a log name listed in the execution's files"
+        schema:
+          type: string
+    get:
+      summary: "Read a file of a retained execution"
+      operationId: "getTxeRunExecutionFile"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "File content"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/runs/{runId}/artifacts:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -20974,6 +21105,148 @@ components:
           type: string
           description: "Portable reference (response only)"
       required: [attempt_id, queued_at]
+
+    TxeRetainedFile:
+      type: object
+      properties:
+        name:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+        final:
+          type: boolean
+          description: "The log stream was proven finished for this execution"
+      required: [name, bytes, sha256]
+
+    TxeRetainedExecution:
+      type: object
+      description: >-
+        An immutable snapshot of one execution (attempt_id, queued_at), taken
+        at retained_at, just before a queued retry replaced it. It holds what
+        the hub had at that moment and is never updated: log bytes or
+        finalization records that arrive later are not in it, and a snapshot
+        taken with logs_final false stays false. Each file carries its own
+        size, digest and finality.
+      properties:
+        execution:
+          type: string
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        status:
+          type: string
+        status_complete:
+          type: boolean
+        logs_final:
+          type: boolean
+          description: >-
+            True only when, at retained_at, every log stream the status names
+            had arrived and was recorded finished with exactly the bytes
+            copied. False means a log may be partial.
+        logs_note:
+          type: string
+        retained_at:
+          type: string
+          format: date-time
+          description: When the snapshot was taken; it reflects the hub at this time only.
+        status_sha256:
+          type: string
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedFile"
+        artifact_files:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedFile"
+      required: [execution, attempt_id, queued_at, status, status_complete, logs_final, retained_at, status_sha256, files]
+
+    TxeExecutionIdentity:
+      type: object
+      properties:
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+      required: [attempt_id, queued_at]
+
+    TxeAbandonment:
+      type: object
+      description: "One abandoned attempt: record when it can be trusted, otherwise error."
+      properties:
+        attempt_id:
+          type: string
+        attributable:
+          type: boolean
+          description: "True only when the record carries a full request correlation (action id, action attempt, binding digest). Without one, matching the abandoned execution to a request needs an exact admitted receipt."
+        error:
+          type: string
+          description: "Present when the record cannot be trusted (unreadable, malformed, of another attempt or inconsistent); never attributable."
+        outcome:
+          type: string
+          enum: [hidden, marked_failed]
+        abandoned_execution:
+          $ref: "#/components/schemas/TxeExecutionIdentity"
+        expected_execution:
+          $ref: "#/components/schemas/TxeExecutionIdentity"
+        predecessor_absent:
+          type: boolean
+        request_correlation:
+          type: object
+          properties:
+            id:
+              type: string
+            action_id:
+              type: string
+            action_attempt:
+              type: string
+            binding_digest:
+              type: string
+        reason:
+          type: string
+        detail:
+          type: string
+        decided_at:
+          type: string
+        coordinator_id:
+          type: string
+        evidence:
+          type: object
+          description: "Each lookup that proved nothing was dispatched."
+          properties:
+            dispatch_task:
+              type: string
+            lease:
+              type: string
+            active_run:
+              type: string
+            worker:
+              type: string
+            observed_at:
+              type: string
+      required: [attempt_id, attributable]
+
+    TxeAbandonmentList:
+      type: object
+      properties:
+        abandonments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAbandonment"
+      required: [abandonments]
+
+    TxeRetainedExecutionList:
+      type: object
+      properties:
+        executions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeRetainedExecution"
+      required: [executions]
 
     TxeRetryRequest:
       type: object

@@ -5,15 +5,15 @@ package registry
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/dagucloud/dagu/v2/internal/persis"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 // Reserved action names. The registry gives them their meaning; a job's
@@ -107,8 +107,7 @@ func RetryProposalID(runID, executionRef string, jobVersion int) (string, error)
 // the attempt ID alone does not name an execution. The reference is the only
 // form used as a path segment, a proposal input and a receipt.
 func ExecutionRef(attemptID, queuedAt string) string {
-	sum := sha256.Sum256([]byte(attemptID + "\n" + queuedAt))
-	return attemptID + "-" + hex.EncodeToString(sum[:8])
+	return ir.ExecutionRef(attemptID, queuedAt)
 }
 
 // Ref is the execution's portable reference.

@@ -517,6 +517,7 @@ func (t *trackingHandler) Handle(ctx context.Context, task *coordinatorv1.Task) 
 		ParentDagRunName: task.ParentDagRunName,
 		ParentDagRunId:   task.ParentDagRunId,
 		AttemptKey:       attemptKey,
+		ExecutionMarker:  task.ExecutionMarker,
 	}
 
 	if task.AttemptKey != "" && owner.Host != "" {
@@ -848,6 +849,14 @@ func (w *Worker) processCancellations(ctx context.Context, cancelledRuns []*coor
 	defer w.pollersMu.Unlock()
 
 	for _, run := range cancelledRuns {
+		// A directive naming an execution marker targets one execution only; a
+		// newer execution of the same attempt key must keep running.
+		if run.ExecutionMarker != nil {
+			if state, ok := w.runningTasks[run.AttemptKey]; ok && state != nil && state.task != nil &&
+				state.task.ExecutionMarker != run.GetExecutionMarker() {
+				continue
+			}
+		}
 		if cancelFunc, exists := w.cancelFuncs[run.AttemptKey]; exists {
 			logger.Info(ctx, "Cancelling task per coordinator directive",
 				tag.WorkerID(w.id),

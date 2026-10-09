@@ -134,6 +134,7 @@ type RunningTask struct {
 	ParentDAGRunName string `json:"parentDagRunName,omitempty"`
 	ParentDAGRunID   string `json:"parentDagRunId,omitempty"`
 	AttemptKey       string `json:"attemptKey,omitempty"`
+	ExecutionMarker  string `json:"executionMarker,omitempty"`
 }
 
 // LastHeartbeatTime returns the last heartbeat as a time.
@@ -186,8 +187,11 @@ type DAGRunLease struct {
 	Owner                 CoordinatorEndpoint `json:"owner"`
 	ClaimToken            string              `json:"claimToken,omitempty"`
 	WorkspaceBundleDigest string              `json:"workspaceBundleDigest,omitempty"`
-	ClaimedAt             int64               `json:"claimedAt"`
-	LastHeartbeatAt       int64               `json:"lastHeartbeatAt"`
+	// ExecutionMarker is the claimed task's execution marker. Writes from any
+	// other execution of the same attempt are refused.
+	ExecutionMarker string `json:"executionMarker,omitempty"`
+	ClaimedAt       int64  `json:"claimedAt"`
+	LastHeartbeatAt int64  `json:"lastHeartbeatAt"`
 }
 
 // MatchesClaim reports whether the lease identifies the worker claim.
@@ -230,7 +234,10 @@ type ActiveDistributedRun struct {
 	AttemptID  string       `json:"attemptId"`
 	WorkerID   string       `json:"workerId"`
 	Status     ir.Status    `json:"status"`
-	UpdatedAt  int64        `json:"updatedAt"`
+	// ExecutionMarker is the claimed task's execution marker, kept so a lease
+	// rebuilt during reconciliation carries the same marker.
+	ExecutionMarker string `json:"executionMarker,omitempty"`
+	UpdatedAt       int64  `json:"updatedAt"`
 }
 
 // ActiveDistributedRunStore persists the coordinator-owned active distributed

@@ -260,6 +260,7 @@ func (h *remoteTaskHandler) reportTaskLoadFailure(ctx context.Context, run remot
 		Status:       ir.Failed,
 		FinishedAt:   finishedAt,
 		Error:        sanitizeTaskLoadError(task.Target, loadErr),
+		QueuedAt:     taskQueuedAt(task),
 		Params:       task.Params,
 		ParallelItem: task.ParallelItem,
 		ProfileName:  run.profileName,
@@ -316,6 +317,7 @@ func (h *remoteTaskHandler) reportDAGRunInitFailure(
 		Status:       ir.Failed,
 		FinishedAt:   finishedAt,
 		Error:        initErr.Error(),
+		QueuedAt:     taskQueuedAt(task),
 		Params:       params,
 		ProfileName:  run.profileName,
 		DefinitionID: task.DefinitionId,
@@ -432,6 +434,7 @@ func (h *remoteTaskHandler) createRemoteHandlers(run remoteRun, dagName string) 
 		},
 		run.owner,
 	)
+	reporter.executionMarker = task.ExecutionMarker
 	return runHandlers{
 		status:    statusPusher,
 		logs:      reporter,
@@ -902,6 +905,20 @@ func (h *remoteTaskHandler) dagToolsBasePath() string {
 		}
 	}
 	return os.Getenv("PATH")
+}
+
+// taskQueuedAt is the queued-at a status of this task's execution carries: the
+// value the agent echoes from the retried status, else the task's execution
+// marker. A failure reported before the agent starts must carry it too, or the
+// coordinator cannot tell this execution's terminal status from an earlier
+// one's once the lease has retired.
+func taskQueuedAt(task *coordinatorv1.Task) string {
+	if task.PreviousStatus != nil {
+		if status, err := convert.ProtoToDAGRunStatus(task.PreviousStatus); err == nil && status != nil && status.QueuedAt != "" {
+			return status.QueuedAt
+		}
+	}
+	return task.ExecutionMarker
 }
 
 func previousStatusParams(task *coordinatorv1.Task) ([]string, error) {
