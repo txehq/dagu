@@ -897,13 +897,16 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	var sent map[string]string
 	runs := review.RemoteRuns(captureTransport{Transport: stub, path: path, into: &sent})
 	queued := review.Execution{AttemptID: "a1", QueuedAt: "2026-10-09T16:36:43.039647Z"}
-	require.NoError(t, runs.RetryRun(context.Background(), "job_1", "run-1", queued))
+	admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+	require.NoError(t, err)
+	assert.Equal(t, review.Execution{}, admitted, "the service's answer names no execution")
 	assert.Equal(t, map[string]string{"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z"}, sent)
 
 	// An execution that was never queued is named with an empty marker,
 	// which is a value the service compares, not an omitted field.
 	sent = nil
-	require.NoError(t, runs.RetryRun(context.Background(), "job_1", "run-1", review.Execution{AttemptID: "a1"}))
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", review.Execution{AttemptID: "a1"})
+	require.NoError(t, err)
 	marker, named := sent["expectedQueuedAt"]
 	assert.True(t, named)
 	assert.Empty(t, marker)
@@ -916,7 +919,8 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.fail = map[string]*review.TransportError{path: refusal}
-			require.ErrorIs(t, runs.RetryRun(context.Background(), "job_1", "run-1", queued), review.ErrRunNotRetryable)
+			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+			require.ErrorIs(t, err, review.ErrRunNotRetryable)
 		})
 	}
 	// Everything else leaves the outcome unknown: the service saying so
@@ -932,7 +936,7 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.fail = map[string]*review.TransportError{path: failure}
-			err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
 			require.Error(t, err)
 			require.NotErrorIs(t, err, review.ErrRunNotRetryable, "whether a retry started is unknown")
 		})

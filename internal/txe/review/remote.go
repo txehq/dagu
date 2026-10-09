@@ -916,7 +916,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 	}
 	var outcome actionOutcome
 	if len(a.Outcome) > 0 && json.Unmarshal(a.Outcome, &outcome) == nil {
-		out.Detail, out.Admitted = outcome.Detail, outcome.Admitted
+		out.Detail, out.Admitted, out.AdmittedRef = outcome.Detail, outcome.Admitted, outcome.AdmittedRef
 	}
 	// The registry's first state for an authorized attempt is one the
 	// reviewer treats the same as executing: the effect may have begun.
@@ -1044,6 +1044,8 @@ type actionOutcome struct {
 	// Admitted: the destination accepted the request; only its result was
 	// not seen.
 	Admitted bool `json:"admitted,omitempty"`
+	// AdmittedRef: the execution the destination named for the request.
+	AdmittedRef string `json:"admitted_execution,omitempty"`
 }
 
 // FinishAction implements Registry.
@@ -1056,7 +1058,7 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 		body.Receipt = &req.Receipt
 	}
 	if req.Detail != "" || req.Admitted {
-		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted})
+		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }
@@ -1402,14 +1404,16 @@ func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState
 // the service says itself that the retry may have been dispatched, any
 // other status, and a failure of the transport. An unknown outcome is
 // settled by looking at the run, never by assuming.
-func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) error {
+func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) (Execution, error) {
 	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
 	body := map[string]string{"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt}
 	err := r.t.Do(ctx, http.MethodPost, path, body, nil)
 	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusConflict && retryRefusedBeforeEffect[te.Code] {
-		return fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
+		return Execution{}, fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
-	return err
+	// The service's answer to an admitted retry has no body: it does not
+	// name the execution it admitted, so none is returned.
+	return Execution{}, err
 }
 
 // retryRefusedBeforeEffect are the service's codes for a conditional retry

@@ -90,7 +90,15 @@ else a review step needs must be rendered into the DAG:
   `conditional_retry_unsupported`); uncertain for everything else. An
   attempt that was created but is not started is a reservation, not a
   retry. An uncertain retry the service had admitted is settled from the
-  run when its execution shows up. One whose answer was never known, such
+  run when its execution shows up; while the run shows only the
+  reservation it stays uncertain and is looked at again by every review,
+  however long a worker takes, and the owner is not asked, because an
+  action put to the owner is not probed again. The service does not name
+  the execution it admits, so the receipt is the first execution seen
+  after the retried one and the record says so: if that execution has
+  already finished and been retried by someone else, the receipt names
+  the later one (open, needs the service to name the admitted execution).
+  One whose answer was never known, such
   as a failed request or a reviewer that died first, is not settled from
   the run, because a newer execution may be someone else's retry: it goes
   to the owner. Nothing is ever sent again because time passed.

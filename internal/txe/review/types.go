@@ -305,6 +305,10 @@ type Action struct {
 	// Admitted is true when the destination accepted the request for this
 	// action's effect and only the result was not seen.
 	Admitted bool `json:"admitted,omitempty"`
+	// AdmittedRef is the execution the destination said it admitted the
+	// request as, when it names one. Only that execution is then this
+	// action's effect.
+	AdmittedRef string `json:"admitted_execution,omitempty"`
 	// Attempt is the registry's count of attempts of this action. An
 	// owner's answer about an unknown outcome is about one attempt.
 	Attempt int `json:"attempt,omitempty"`

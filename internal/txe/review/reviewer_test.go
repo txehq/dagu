@@ -142,7 +142,13 @@ type runs struct {
 	// beforeAdmission runs as a retry request arrives, before the service
 	// compares the run's latest execution with the one the request names.
 	beforeAdmission func(runID string)
-	seq             int
+	// names makes the service answer an admitted retry with the execution
+	// it admitted it as. The service of today names none.
+	names bool
+	// afterAdmission runs once a retry is admitted, before its answer
+	// reaches the caller, with the fake's lock held.
+	afterAdmission func(runID string)
+	seq            int
 }
 
 func newRuns() *runs {
@@ -200,7 +206,7 @@ func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, er
 // RetryRun is the service's conditional retry: it is admitted only while
 // expected is the run's latest execution, and that is checked here, at the
 // service, at the moment of admission.
-func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Execution) error {
+func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Execution) (review.Execution, error) {
 	// The hook runs before the lock is taken: it changes the run through
 	// the fake's own methods, which lock.
 	if r.beforeAdmission != nil {
@@ -210,14 +216,24 @@ func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Exec
 	defer r.mu.Unlock()
 	r.requested = append(r.requested, expected)
 	if now := r.state[runID].Execution(); now != expected {
-		return fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
+		return review.Execution{}, fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
 	}
 	r.retried = append(r.retried, runID)
 	if r.retry != nil {
-		return r.retry(runID)
+		if err := r.retry(runID); err != nil {
+			return review.Execution{}, err
+		}
+	} else {
+		r.start(runID)
 	}
-	r.start(runID)
-	return nil
+	var admitted review.Execution
+	if r.names {
+		admitted = r.state[runID].Execution()
+	}
+	if r.afterAdmission != nil {
+		r.afterAdmission(runID)
+	}
+	return admitted, nil
 }
 
 type fixture struct {

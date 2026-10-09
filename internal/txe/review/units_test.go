@@ -1309,18 +1309,34 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		return f.state().Actions[jobID][0]
 	}
 
-	t.Run("stranded: the attempt never starts", func(t *testing.T) {
+	t.Run("the attempt has not started by the next review, and starts later", func(t *testing.T) {
 		f := newRetryFixture(t)
 		f.runs.retry = reserve(f)
 		out := f.execute("executor")
 		assert.Equal(t, review.ActionUncertain, out.Action.State, "accepted by the service, but nothing was seen dispatched")
 		assert.Empty(t, out.Action.Receipt, "a reservation is not a receipt")
+		assert.True(t, out.Action.Admitted)
 		assert.Contains(t, out.Action.Detail, review.ExecutionRef("att-reserved", ""))
 		assert.Contains(t, out.Action.Detail, "not seen queued or started")
 
+		// A busy worker has not taken the attempt by the next review, nor
+		// by the one after. The owner is not asked: that would end the
+		// action, and it could then never be settled by its own execution.
+		for range 2 {
+			action := nextReview(f)
+			assert.Equal(t, review.ActionUncertain, action.State, "still only reserved: it stays open to be settled")
+			assert.True(t, action.Admitted, "what is known about the admission survives the review")
+			assert.Empty(t, action.Receipt)
+		}
+		for _, p := range f.state().Proposals[jobID] {
+			assert.NotEqual(t, review.UncertainEffectAction, p.ActionName, "no question is put to the owner while the retry may still start")
+		}
+
+		// The worker takes it, and the review after that records the retry.
+		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "failed"}
 		action := nextReview(f)
-		assert.Equal(t, review.ActionEscalated, action.State, "still only reserved: the owner is asked")
-		assert.Empty(t, action.Receipt)
+		assert.Equal(t, review.ActionSucceeded, action.State)
+		assert.Equal(t, review.ExecutionRef("att-reserved", ""), action.Receipt)
 		assert.Len(t, f.runs.requested, 1, "nothing is dispatched again because time passed")
 	})
 	t.Run("the reserved attempt is then handed to a worker", func(t *testing.T) {
@@ -1354,6 +1370,84 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		assert.Equal(t, review.ActionSucceeded, out.Action.State)
 		assert.Equal(t, review.ExecutionRef("att-reserved", ""), out.Action.Receipt)
 	})
+}
+
+// A service that names the execution it admitted a retry as makes that
+// execution the only receipt. The admitted execution can finish and be
+// retried by another caller before this reviewer looks at the run; the
+// run's latest execution is then the other caller's. It is not recorded as
+// this retry's: the outcome is unknown, names both, and goes to the owner,
+// since the run's latest execution will not turn back into the admitted
+// one.
+func TestRetryRunALaterExecutionIsNotTheAdmittedOne(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.names = true
+	var admitted, later string
+	f.runs.afterAdmission = func(runID string) {
+		// E2 is admitted. Before the answer reaches the reviewer, E2
+		// finishes and someone else retries it: the run is at E3.
+		admitted = f.runs.ref(runID)
+		f.runs.start(runID)
+		later = f.runs.ref(runID)
+	}
+	out := f.execute("executor")
+	require.NotEqual(t, admitted, later)
+	assert.Equal(t, review.ActionUncertain, out.Action.State, "the latest execution is someone else's retry")
+	assert.Empty(t, out.Action.Receipt)
+	assert.Equal(t, admitted, out.Action.AdmittedRef, "the admitted execution is journaled")
+	assert.Contains(t, out.Action.Detail, admitted)
+	assert.Contains(t, out.Action.Detail, later)
+
+	// The next review does not take the latest execution either.
+	f.clock.Advance(2 * time.Hour)
+	r := f.executor("reviewer-b")
+	prepared, err := r.Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+	require.NoError(t, err)
+	action := f.state().Actions[jobID][0]
+	assert.Equal(t, review.ActionEscalated, action.State, "the owner is asked")
+	assert.Empty(t, action.Receipt)
+	assert.Equal(t, admitted, action.AdmittedRef)
+	assert.Len(t, f.runs.requested, 1)
+}
+
+// With a service that names the admitted execution, that execution is the
+// receipt, once it is seen queued, running or over.
+func TestRetryRunTheAdmittedExecutionIsTheReceipt(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.names = true
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+	assert.Equal(t, out.Action.Receipt, out.Action.AdmittedRef)
+	assert.NotContains(t, out.Action.Detail, "did not name")
+}
+
+// OPEN GAP, kept visible on purpose. The service of today answers an
+// admitted retry without naming its execution, so the reviewer has only the
+// run to go by and records the first execution it sees after the retried
+// one. In the sequence below that is another caller's retry of this
+// retry's execution: the action is rightly recorded as done, because this
+// retry was admitted and its execution ran, but the receipt names the wrong
+// execution. It cannot be told apart from the run alone. The record says
+// that the service did not name the execution, so the receipt is not read
+// as exact. Once the service names it, this sequence is the one in
+// TestRetryRunALaterExecutionIsNotTheAdmittedOne.
+func TestRetryRunWithoutANamedAdmissionTheReceiptIsTheFirstExecutionSeen(t *testing.T) {
+	f := newRetryFixture(t)
+	var admitted, later string
+	f.runs.afterAdmission = func(runID string) {
+		admitted = f.runs.ref(runID)
+		f.runs.start(runID)
+		later = f.runs.ref(runID)
+	}
+	out := f.execute("executor")
+	require.NotEqual(t, admitted, later)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, later, out.Action.Receipt, "the known gap: the receipt is the later execution, not the admitted one")
+	assert.Empty(t, out.Action.AdmittedRef)
+	assert.Contains(t, out.Action.Detail, "did not name the execution it admitted")
 }
 
 // When the service's answer says nothing about whether it started the

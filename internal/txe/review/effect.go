@@ -38,6 +38,12 @@ type EffectResult struct {
 	// effect to be recognised when it shows up: without it, something that
 	// looks like the effect may be someone else's doing.
 	Admitted bool
+	// AdmittedRef is the execution the destination named for the admitted
+	// request, when it names one.
+	AdmittedRef string
+	// Pending is true for an unknown outcome that later looks can still
+	// settle: the admitted effect has not shown up yet and still may.
+	Pending bool
 }
 
 // Effector performs declared actions on the local machine.
