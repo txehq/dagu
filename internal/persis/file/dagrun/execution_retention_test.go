@@ -119,23 +119,50 @@ func TestRetainExecutionsBeforeQueuedRetry(t *testing.T) {
 	assert.Contains(t, f.file(ref2, "status.json"), "execution 2")
 }
 
-// Taking the copy again is a no-op for the same execution; a copy that
-// differs or is incomplete fails visibly and refuses the swap.
+// The first intact copy of an execution is its evidence: copying the same
+// execution again keeps it even if the live files changed since (a late
+// stream, a rolled-back admission), while a copy that was altered or is
+// incomplete fails visibly and refuses the swap.
 func TestRetainedExecutionIsImmutable(t *testing.T) {
 	f := newRetentionFixture(t)
-	stop := errors.New("not admitted")
 	f.execution("q1", ir.Failed, "execution 1")
-	assert.ErrorIs(t, f.requeue(ir.Failed, stop), stop, "copied, then the admission refused")
-	assert.ErrorIs(t, f.requeue(ir.Failed, stop), stop, "copying the same execution again is a no-op")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	ref := ir.ExecutionRef(f.attempt, "q1")
+	first := f.file(ref, "run.stdout.log")
 
+	// The same execution is put back (an admission rolled back) and a late
+	// chunk changes the live log.
+	f.execution("q1", ir.Failed, "execution 1")
 	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
-	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("changed\n"), 0o600))
-	assert.ErrorIs(t, f.requeue(ir.Failed, nil), filedagrun.ErrRetainedExecutionConflict, "a different copy is never replaced")
-	status, err := f.repo.FindAttempt(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("stdout execution 1\nlate\n"), 0o600))
+	require.NoError(t, f.requeue(ir.Failed, nil), "a later retry of the same execution is not blocked")
+	assert.Equal(t, first, f.file(ref, "run.stdout.log"), "the first copy stands")
+
+	// An altered copy fails visibly.
+	f.execution("q1", ir.Failed, "execution 1")
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
 	require.NoError(t, err)
-	got, err := status.ReadStatus(f.ctx)
+	require.Len(t, all, 1)
+	copyDir := retainedCopyDir(t, f, ref)
+	require.NoError(t, os.WriteFile(filepath.Join(copyDir, "logs", "run.stdout.log"), []byte("tampered\n"), 0o600))
+	assert.ErrorIs(t, f.requeue(ir.Failed, nil), filedagrun.ErrRetainedExecutionConflict)
+	got, err := f.handle.ReadStatus(f.ctx)
 	require.NoError(t, err)
 	assert.Equal(t, ir.Failed, got.Status, "the swap was refused")
+}
+
+// retainedCopyDir finds the directory holding the copy of ref.
+func retainedCopyDir(t *testing.T, f *retentionFixture, ref string) string {
+	t.Helper()
+	var found string
+	require.NoError(t, filepath.WalkDir(filepath.Dir(filepath.Dir(f.logDir)), func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && d.Name() == ref && filepath.Base(filepath.Dir(p)) == "executions" {
+			found = p
+		}
+		return nil
+	}))
+	require.NotEmpty(t, found)
+	return found
 }
 
 // Logs are copied from the configured log directory only: a symbolic link
@@ -233,4 +260,20 @@ func TestRetainedCopyIgnoresLateWrites(t *testing.T) {
 	for _, file := range all[0].Files {
 		assert.False(t, file.Final, "%s: finality is decided when the copy is taken", file.Name)
 	}
+}
+
+// A swap the caller refuses (a stale retry) leaves no copy, so late bytes
+// written afterwards cannot make the valid retry of that execution fail.
+func TestRefusedSwapRetainsNothing(t *testing.T) {
+	f := newRetentionFixture(t)
+	f.execution("q1", ir.Failed, "execution 1")
+	stale := errors.New("stale")
+	assert.ErrorIs(t, f.requeue(ir.Failed, stale), stale)
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	assert.Empty(t, all, "the refused swap kept nothing")
+
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("stdout execution 1\nlate\n"), 0o600))
+	require.NoError(t, f.requeue(ir.Failed, nil), "the valid retry is not blocked by an earlier copy")
 }
