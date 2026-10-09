@@ -48,4 +48,4 @@ steps:
       - TXE_JOB_ID: ${JOB_ID}
       - TXE_PROPOSAL_ID: ${PROPOSAL_ID}
       - TXE_DECISION_ID: ${steps.decide.outputs.decision_id}
-    run: {{.ReviewCommand}} execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"
+    run: {{.ReviewCommand}} execute --machine {{.MachineID}} --run-id ${DAG_RUN_ID} --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"

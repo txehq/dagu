@@ -127,7 +127,7 @@ func TestRenderDAGs(t *testing.T) {
 		`setting-sources: [""]`,
 		"strict-mcp-config: true",
 		"no-session-persistence: true",
-		`dagu txe review apply --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
+		`dagu txe review apply --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID} --agent-log "${agent.stderr}" --auth-check "claude auth status"`,
 	} {
 		assert.Contains(t, dags.Reviewer, want)
 	}
@@ -138,7 +138,7 @@ func TestRenderDAGs(t *testing.T) {
 		"action: human.task",
 		"required: [decision_id, verdict]",
 		"enum: [approve, reject, redirect, retry, pause, snooze, retire, superseded]",
-		`dagu txe review execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
+		`dagu txe review execute --machine mch_0000000000000000000F1XT001 --run-id ${DAG_RUN_ID} --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"`,
 		`- TXE_DAGU_REVIEWER: "1"`,
 	} {
 		assert.Contains(t, dags.Decide, want)
