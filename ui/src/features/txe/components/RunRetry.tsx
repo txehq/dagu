@@ -43,9 +43,17 @@ export function RunRetry({
 }: Props): React.ReactElement | null {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  // One key per offered retry: a resubmission after a failure replays the
-  // same request instead of asking twice.
-  const keyRef = React.useRef(newKey());
+  // One key per offered retry of one execution: a resubmission after a
+  // failure or a lost response replays the same request instead of asking
+  // twice, while a retry of a later execution is a new request with a key of
+  // its own (the server refuses a key reused for another execution).
+  const executionKey = execution
+    ? `${execution.attemptId}\n${execution.queuedAt}`
+    : '';
+  const keyRef = React.useRef({ execution: executionKey, key: newKey() });
+  if (keyRef.current.execution !== executionKey) {
+    keyRef.current = { execution: executionKey, key: newKey() };
+  }
 
   const offer = canDecide && canRequestRetry(runStatus, execution, state);
   if (!offer && !state) return null;
@@ -90,9 +98,12 @@ export function RunRetry({
             setBusy(true);
             setError(null);
             try {
-              const result = await onRequest(keyRef.current);
-              if (result.ok) keyRef.current = newKey();
-              else setError(result.message);
+              const sent = keyRef.current;
+              const result = await onRequest(sent.key);
+              if (!result.ok) setError(result.message);
+              else if (keyRef.current === sent) {
+                keyRef.current = { execution: sent.execution, key: newKey() };
+              }
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
             } finally {

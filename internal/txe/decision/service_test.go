@@ -989,3 +989,31 @@ func TestRetryRequestShape(t *testing.T) {
 		t.Fatalf("replay with short key err = %v, want ErrInvalid", err)
 	}
 }
+
+// A stored retry that does not record its queue marker, as one recorded
+// before markers were bound, cannot be shown to be the execution a request
+// names: replaying its key with an empty marker is refused, not aliased.
+func TestReplayRetryRefusesUnmarkedExecution(t *testing.T) {
+	f := newFixture(t)
+	j := f.job()
+	f.runs.add("run-0095", j.DAGSpecSHA256)
+	attempt := f.runs.latest("run-0095").AttemptID
+	params := json.RawMessage(fmt.Sprintf(`{"run_id":"run-0095","attempt_id":%q,"run_spec_sha256":%q,"package_digest":%q}`,
+		attempt, j.DAGSpecSHA256, j.PackageDigest))
+	id, err := registry.RetryProposalID("run-0095", registry.ExecutionRef(attempt, ""), j.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.fileProposalWithID(id, registry.Proposal{
+		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: params},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-unmarked-1"}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); err != nil {
+		t.Fatal(err)
+	}
+	replay := RetryRequest{RunID: "run-0095", AttemptID: attempt, QueuedAt: "", ExpectedJobVersion: j.Version, IdempotencyKey: "key-unmarked-1"}
+	if _, found, err := f.svc.ReplayRetry(f.ctx, f.jobID, replay, f.human); !found || registry.ErrorCode(err) != CodeIdempotencyMismatch {
+		t.Fatalf("replay found=%v err=%v, want idempotency_mismatch", found, err)
+	}
+}

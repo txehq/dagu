@@ -437,15 +437,22 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID string, req RetryReques
 		return nil, true, err
 	}
 	// The run may have moved on since, so the stored proposal's own
-	// parameters, not the run's latest execution, are the reference.
+	// parameters, not the run's latest execution, are the reference. A
+	// stored retry that does not record its queue marker cannot be shown to
+	// be the execution the request names, so it matches no request; an
+	// absent marker is not read as an empty one.
 	same := false
 	if p != nil && d.Verdict == VerdictRetry && p.Action.Name == ActionRetryRun {
-		var params registry.RetryRunParams
+		var params struct {
+			RunID     string  `json:"run_id"`
+			AttemptID string  `json:"attempt_id"`
+			QueuedAt  *string `json:"queued_at"`
+		}
 		if err := json.Unmarshal(p.Action.Params, &params); err != nil {
 			return nil, true, fmt.Errorf("decision: retry proposal %s params: %w", p.ProposalID, err)
 		}
 		same = params.RunID == req.RunID && params.AttemptID == req.AttemptID &&
-			params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion
+			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion
 	}
 	if !same {
 		return nil, true, &registry.Error{Code: CodeIdempotencyMismatch,
