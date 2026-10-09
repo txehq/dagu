@@ -192,11 +192,15 @@ const (
 	// ClosureAnswered means the task had already been completed with a
 	// real answer, which the registry refuses for a superseded proposal.
 	ClosureAnswered ClosureOutcome = "already_answered"
-	// ClosureEnded means the task's step or run was already over and the
-	// service records no completion for it: a run aborted before anyone
-	// decided, for one. Nothing is waiting. Whether it had been answered is
-	// not known from the run, and is not claimed either way.
+	// ClosureEnded means the task's run ended before anyone answered: the
+	// run is over or the step failed, was aborted or skipped, and the step
+	// never completed. Nothing is waiting and nothing was completed.
 	ClosureEnded ClosureOutcome = "run_ended"
+	// ClosureOver means the task's step completed and the service records
+	// nobody as having completed it. Nothing is waiting. Whether a person
+	// answered is not known from the run, and is not claimed either way:
+	// the registry is told "closed" with a detail that says so.
+	ClosureOver ClosureOutcome = "over_unattributed"
 	// ClosureMissing means the service knows no such run. That is recorded
 	// as missing; it is not evidence that a wait was ever completed.
 	ClosureMissing ClosureOutcome = "run_missing"

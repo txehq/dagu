@@ -1006,9 +1006,17 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 			detail: `{"dagRunDetails":{"statusLabel":"failed","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
 			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
 		},
-		"step over with no completion on record": {
+		"step skipped, never completed": {
 			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"skipped"}]}}`,
 			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
+		},
+		"step completed with nobody on record: answered or not is unknown": {
+			detail: `{"dagRunDetails":{"statusLabel":"succeeded","nodes":[{"step":{"name":"decide"},"statusLabel":"succeeded"}]}}`,
+			want:   review.ErrTaskOver, closed: review.ClosureOver,
+		},
+		"step rejected with nobody on record": {
+			detail: `{"dagRunDetails":{"statusLabel":"rejected","nodes":[{"step":{"name":"decide"},"statusLabel":"rejected"}]}}`,
+			want:   review.ErrTaskOver, closed: review.ClosureOver,
 		},
 		"the run has not reached the task yet": {
 			detail: `{"dagRunDetails":{"statusLabel":"queued","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
@@ -1034,6 +1042,7 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 			require.Error(t, err)
 			require.NotErrorIs(t, err, review.ErrTaskAnswered, "a task that cannot be answered yet was not answered")
 			require.NotErrorIs(t, err, review.ErrTaskEnded, "and it has not ended")
+			require.NotErrorIs(t, err, review.ErrTaskOver)
 			// Closing the decision run on it is a failure to retry, not a
 			// final closure.
 			require.Error(t, closeErr)
@@ -1675,13 +1684,15 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	assert.Len(t, resolved, 1)
 }
 
-// Against the real registry: a retry of a run has one attempt. When its
-// outcome is unknown and the owner is asked, an answer of "retry" is
-// refused, so the action never gets a second attempt whose reservation
-// could be timed from the first one's start. (The time a stalled
-// reservation is reported after is taken from the attempt's own admission
-// in any case; TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt.)
-func TestRemoteARetryOfARunIsNeverAttemptedTwice(t *testing.T) {
+// KNOWN DEFECT, reproduced here so that it is not forgotten; this is not
+// the intended behaviour. Against the real registry a retry of a run has
+// one attempt, and when its outcome is unknown the owner's question still
+// offers "retry", which the registry then always refuses. The owner is
+// offered an answer that cannot work. The agreed fix is the registry's:
+// either one explicitly approved further attempt, bound to the original
+// execution and refused if the run moved, or no "retry" among the verdicts.
+// When that lands, this test asserts the agreed behaviour instead.
+func TestRemoteAnOwnersRetryOfAnUnknownRunRetryIsRefusedToday(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
 	job := f.job()
@@ -1844,11 +1855,27 @@ func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
 	assert.Positive(t, stored.PacketBytes)
 }
 
-// A decision run that ended before anyone answered is not recorded as
-// answered. The registry has no outcome of its own for it, so it is
-// recorded as closed with a detail that says the reviewer completed
-// nothing, and it leaves the pending list.
+// A decision run that was already over is recorded as what the run showed.
+// One whose task never completed ended before anyone answered: the
+// registry's run_ended. One whose task completed with nobody on record is
+// recorded as closed with a detail that neither claims an answer nor denies
+// one. Neither is recorded as answered, and both leave the pending list.
 func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
+	for name, tc := range map[string]struct {
+		closed  review.ClosureOutcome
+		stored  registry.ClosureOutcome
+		says    string
+		saysNot string
+	}{
+		"the task never completed":                 {review.ClosureEnded, registry.ClosureRunEnded, "ended before its task was answered", "is not known"},
+		"the task completed with nobody on record": {review.ClosureOver, registry.ClosureClosed, "is not known from the run", "before its task was answered"},
+	} {
+		t.Run(name, func(t *testing.T) { endedDecisionRun(t, tc.closed, tc.stored, tc.says, tc.saysNot) })
+	}
+}
+
+func endedDecisionRun(t *testing.T, closed review.ClosureOutcome, stored registry.ClosureOutcome, says, saysNot string) {
+	t.Helper()
 	f := newRemoteFixture(t)
 	ctx := context.Background()
 	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
@@ -1866,11 +1893,11 @@ func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 
-	f.opener.close = func(review.Proposal) (review.ClosureOutcome, error) { return review.ClosureEnded, nil }
+	f.opener.close = func(review.Proposal) (review.ClosureOutcome, error) { return closed, nil }
 	done, err := f.reviewer("tick-1").CloseSuperseded(ctx, f.remote.MachineID)
 	require.NoError(t, err)
 	require.Len(t, done, 1)
-	assert.Equal(t, review.ClosureEnded, done[0].Outcome)
+	assert.Equal(t, closed, done[0].Outcome)
 
 	pending, err = f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
 	require.NoError(t, err)
@@ -1881,10 +1908,10 @@ func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
 	closures, err := f.store.ListClosures(ctx, f.jobID, 0)
 	require.NoError(t, err)
 	require.Len(t, closures, 1)
-	assert.Equal(t, registry.ClosureRunEnded, closures[0].Outcome)
-	assert.Contains(t, closures[0].Detail, "records no completion")
-	assert.Contains(t, closures[0].Detail, "is not known from the run", "the record does not claim that nobody answered")
-	assert.NotContains(t, closures[0].Detail, "without an answer")
+	assert.Equal(t, stored, closures[0].Outcome)
+	assert.Contains(t, closures[0].Detail, says)
+	assert.NotContains(t, closures[0].Detail, saysNot, "the record claims only what the run showed")
+	assert.Contains(t, closures[0].Detail, "The reviewer completed nothing")
 }
 
 // Superseded proposals leave their decision runs waiting. The registry

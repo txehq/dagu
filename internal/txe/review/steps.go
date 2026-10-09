@@ -318,10 +318,13 @@ var (
 	// ErrTaskAnswered means the task already holds a different answer.
 	ErrTaskAnswered = errors.New("txe review: task already answered")
 	// ErrTaskEnded means the task can no longer be answered because its
-	// step or its run is over, and the service records no completion for
-	// it. That is not proof that nobody answered: a service that does not
-	// record who completed a task shows an answered one the same way.
-	ErrTaskEnded = errors.New("txe review: task is over with no completion on record")
+	// run or its step ended without the step completing: nobody answered.
+	ErrTaskEnded = errors.New("txe review: task ended before it was answered")
+	// ErrTaskOver means the task's step completed and the service records
+	// nobody as having completed it. That is not proof that nobody
+	// answered: a service that does not record who completed a task shows
+	// an answered one the same way.
+	ErrTaskOver = errors.New("txe review: task is over with no completion on record")
 	// ErrRunMissing means the service has no such run.
 	ErrRunMissing = errors.New("txe review: run not found")
 )
@@ -376,6 +379,8 @@ func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) (Closu
 		return ClosureAnswered, nil
 	case errors.Is(err, ErrTaskEnded):
 		return ClosureEnded, nil
+	case errors.Is(err, ErrTaskOver):
+		return ClosureOver, nil
 	case errors.Is(err, ErrRunMissing):
 		return ClosureMissing, nil
 	default:

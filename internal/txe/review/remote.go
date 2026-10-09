@@ -824,9 +824,12 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 	return out, nil
 }
 
-// endedDetail is what the registry is told about a decision run that was
-// already over when the reviewer came to close it.
-const endedDetail = "the decision run's task was already over and the service records no completion for it; whether it had been answered is not known from the run. The reviewer completed nothing."
+// endedDetail and overDetail are what the registry is told about a decision
+// run that was already over when the reviewer came to close it.
+const (
+	endedDetail = "the decision run ended before its task was answered: the task's step never completed. The reviewer completed nothing."
+	overDetail  = "the decision run's task was already over and the service records no completion for it; whether it had been answered is not known from the run. The reviewer completed nothing."
+)
 
 // maxUnreadReported bounds how many unreadable runs one listing names.
 const maxUnreadReported = 10
@@ -836,13 +839,22 @@ const maxUnreadReported = 10
 // off its pending list.
 func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error) {
 	outcome, detail := api.TxeClosureOutcome(closure.Outcome), closure.Detail
-	if closure.Outcome == ClosureEnded {
-		// The registry's outcome for a task that was already over with no
-		// completion on record. The detail says exactly what is known: the
-		// task was over, the service shows no completion, the reviewer
-		// completed nothing. It neither claims an answer nor denies one.
+	switch closure.Outcome {
+	case ClosureEnded:
+		// The registry's outcome for a task whose run ended before anyone
+		// answered, which is what the run showed: the step never completed.
 		outcome = api.TxeClosureOutcomeRunEnded
 		detail = strings.TrimSpace(endedDetail + " " + detail)
+	case ClosureOver:
+		// The registry has no outcome for a completed task with nobody on
+		// record. It is recorded as closed, with a detail that says exactly
+		// what is known: the task was over, the service shows no
+		// completion, the reviewer completed nothing. It neither claims an
+		// answer nor denies one.
+		outcome = api.TxeClosureOutcomeClosed
+		detail = strings.TrimSpace(overDetail + " " + detail)
+	case ClosureClosed, ClosureAnswered, ClosureMissing, ClosureRefused, ClosureFailed:
+		// Recorded under the registry's outcome of the same name.
 	}
 	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: outcome, Detail: optional(detail)}
 	var out api.TxeClosure
@@ -1333,7 +1345,12 @@ func RemoteComplete(t Transport) CompleteFunc {
 				}
 				stepOver, stepStatus = finishedStepStatuses[node.StatusLabel], node.StatusLabel
 			}
-			if stepOver || terminalRunStatuses[run.StatusLabel] {
+			switch {
+			case completedStepStatuses[stepStatus]:
+				// The step completed, and nobody is recorded for it.
+				return fmt.Errorf("%w: its run is %s and its step is %s", ErrTaskOver, run.StatusLabel, stepStatus)
+			case stepOver || terminalRunStatuses[run.StatusLabel]:
+				// The step never completed and no longer can.
 				return fmt.Errorf("%w: its run is %s and its step is %s", ErrTaskEnded, run.StatusLabel, stepStatus)
 			}
 			return fmt.Errorf("the task cannot be completed yet: %s (run is %s)", te.Message, run.StatusLabel)
@@ -1344,6 +1361,10 @@ func RemoteComplete(t Transport) CompleteFunc {
 
 // finishedStepStatuses are the step states after which a human task can no
 // longer be answered.
+// completedStepStatuses are the ways a human task's step ends when someone
+// completed it, with an answer or a rejection.
+var completedStepStatuses = map[string]bool{"succeeded": true, "partially_succeeded": true, "rejected": true}
+
 var finishedStepStatuses = map[string]bool{
 	"succeeded": true, "failed": true, "aborted": true, "skipped": true, "rejected": true, "partially_succeeded": true,
 }
