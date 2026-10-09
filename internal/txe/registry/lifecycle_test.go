@@ -32,6 +32,8 @@ type fakeRuns struct {
 	onFinished func()
 	// unsuspendErr fails writes that lift a suspension.
 	unsuspendErr error
+	// onUnsuspend runs after a write lifting a suspension, outside the lock.
+	onUnsuspend func(dag string)
 }
 
 func (r *fakeRuns) RunFinished(_ context.Context, _ string, run RunRef) (bool, error) {
@@ -89,8 +91,11 @@ func (r *fakeRuns) SetSuspended(_ context.Context, dag string, suspended bool) e
 	}
 	r.suspended[dag] = suspended
 	hook := r.onSuspend
+	if !suspended {
+		hook = r.onUnsuspend
+	}
 	r.mu.Unlock()
-	if suspended && hook != nil {
+	if hook != nil {
 		hook(dag)
 	}
 	return nil
@@ -903,4 +908,93 @@ func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
 	got, err := f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleRetired, got.Lifecycle)
+}
+
+// Reports cannot grow a job record without bound: past the hard limit the
+// oldest records go, even for incomplete events.
+func TestCompactAppliedHardLimit(t *testing.T) {
+	f := newFixture(t)
+	list := make([]AppliedResourceEvent, hardMaxAppliedResourceEvents+5)
+	for i := range list {
+		list[i] = AppliedResourceEvent{EventID: fmt.Sprintf("missing-%d", i)}
+	}
+	out := f.store.compactApplied(f.ctx, list)
+	assert.Len(t, out, hardMaxAppliedResourceEvents)
+	assert.Equal(t, "missing-5", out[0].EventID)
+}
+
+// An older writer's undo does not release ownership of a suspension a newer
+// writer made after it: the newer suspension is still lifted on resume.
+func TestOldUndoDoesNotReleaseNewerSuspension(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	transition := func(op LifecycleOp) {
+		_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error { return tx.Transition(Transition{Op: op}) })
+		require.NoError(t, err)
+	}
+	transition(OpPause)
+	rc.onSuspend = func(string) {
+		rc.onSuspend = nil
+		transition(OpResume) // writer A's write is now stale
+	}
+	rc.onUnsuspend = func(string) {
+		rc.onUnsuspend = nil
+		// After A undid its write: a new pause, writer B suspends and
+		// finishes, then a resume whose effect has not run yet.
+		transition(OpPause)
+		require.NoError(t, f.store.ApplyEffects(f.ctx, job.JobID))
+		transition(OpResume)
+	}
+	require.NoError(t, f.store.ApplyEffects(f.ctx, job.JobID))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.True(t, rc.suspended[job.JobID], "writer B's suspension is in place")
+	assert.True(t, got.SuspendedByRegistry, "A's undo did not release B's suspension")
+
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.False(t, rc.suspended[job.JobID])
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.False(t, got.SuspendedByRegistry)
+}
+
+// A processor holding a stale copy of an event another processor completed
+// neither applies it again nor reverses its completion, even after the
+// job's applied record was compacted away.
+func TestStaleEventProcessorStops(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-17")}
+		v.RetirementRules.OnTargetDeleted = RuleReview
+	})
+	id := f.mint(PrefixEvent)
+	saved := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-17"), Observation: ResourceDeleted, Authoritative: true,
+		ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &saved))
+	stale := saved
+
+	done := saved
+	require.NoError(t, f.store.applyPending(f.ctx, &done, agent, func(context.Context, *Job) bool { return true }))
+	require.True(t, done.Complete)
+	_, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpResume}, person)
+	require.NoError(t, err)
+	_, err = f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		tx.Job.AppliedResourceEvents = nil // compacted
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = f.store.applyDependent(f.ctx, stale.Pending[0], &stale, agent, func(context.Context, *Job) bool { return true })
+	assert.Equal(t, CodeEventComplete, code(t, err))
+	require.NoError(t, f.store.applyPending(f.ctx, &stale, agent, func(context.Context, *Job) bool { return true }))
+	assert.True(t, stale.Complete)
+
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
+	read, err := f.store.GetResourceEvent(f.ctx, id)
+	require.NoError(t, err)
+	assert.True(t, read.Complete)
 }

@@ -501,6 +501,7 @@ type RunRef struct {
 
 // AppliedResourceEvent is a resource event's result on one job.
 type AppliedResourceEvent struct {
+	Key         string              `json:"key"`
 	EventID     string              `json:"event_id"`
 	At          time.Time           `json:"at"`
 	Disposition ResourceDisposition `json:"disposition"`
@@ -755,10 +756,13 @@ type Job struct {
 	// SuspendWriters are suspend writes in progress, by token, with when each
 	// started. Ownership of the suspension is not released while one is live.
 	SuspendWriters map[string]time.Time `json:"suspend_writers,omitempty"`
-	// AppliedResourceEvents are the resource events applied to the job, by
-	// target key, with their results, so a replayed event is not applied
-	// twice.
-	AppliedResourceEvents map[string][]AppliedResourceEvent `json:"applied_resource_events,omitempty"`
+	// SuspendGen counts the registry's suspend writes. Releasing ownership is
+	// fenced by it, so reconciling an older write never releases a newer one.
+	SuspendGen int64 `json:"suspend_gen,omitempty"`
+	// AppliedResourceEvents are the resource events applied to the job, oldest
+	// first, keyed by match and target, with their results, so a replayed
+	// event is not applied twice.
+	AppliedResourceEvents []AppliedResourceEvent `json:"applied_resource_events,omitempty"`
 	// PendingEffects are lifecycle effects on Dagu committed with the
 	// transition and not yet confirmed applied.
 	PendingEffects *PendingEffects `json:"pending_effects,omitempty"`

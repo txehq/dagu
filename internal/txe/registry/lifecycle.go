@@ -388,9 +388,9 @@ func (s *Store) reconcileSuspension(ctx context.Context, jobID string) error {
 				return fmt.Errorf("unsuspend DAG: %w", err)
 			}
 		}
-		return s.releaseSuspension(ctx, jobID)
+		return s.releaseSuspension(ctx, jobID, job.SuspendGen)
 	case len(job.SuspendWriters) > 0:
-		return s.releaseSuspension(ctx, jobID)
+		return s.releaseSuspension(ctx, jobID, job.SuspendGen)
 	}
 	return nil
 }
@@ -401,11 +401,14 @@ func (s *Store) suspendOwned(ctx context.Context, jobID string) error {
 		return err
 	}
 	owned := false
+	var gen int64
 	if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
 		owned = wantsSuspension(tx.Job.Lifecycle)
 		if !owned {
 			return nil
 		}
+		tx.Job.SuspendGen++
+		gen = tx.Job.SuspendGen
 		tx.Job.SuspendedByRegistry = true
 		if tx.Job.SuspendWriters == nil {
 			tx.Job.SuspendWriters = map[string]time.Time{}
@@ -435,7 +438,7 @@ func (s *Store) suspendOwned(ctx context.Context, jobID string) error {
 		// Ownership is released only after this writer undid its own write
 		// and while no other writer is outstanding; otherwise it stays for
 		// reconciliation to lift whatever suspension remains.
-		if undone && !wantsSuspension(tx.Job.Lifecycle) && len(tx.Job.SuspendWriters) == 0 {
+		if undone && tx.Job.SuspendGen == gen && !wantsSuspension(tx.Job.Lifecycle) && len(tx.Job.SuspendWriters) == 0 {
 			tx.Job.SuspendedByRegistry = false
 		}
 		tx.touch()
@@ -450,9 +453,10 @@ func (s *Store) suspendOwned(ctx context.Context, jobID string) error {
 }
 
 // releaseSuspension drops the registry's ownership of the DAG's suspension
-// while the job is active and no suspend write is outstanding. Writers past
-// their lease are dropped first.
-func (s *Store) releaseSuspension(ctx context.Context, jobID string) error {
+// while the job is active, no suspend write is outstanding, and no suspend
+// write began since gen, the generation whose external state the caller
+// reconciled. Writers past their lease are dropped first.
+func (s *Store) releaseSuspension(ctx context.Context, jobID string, gen int64) error {
 	_, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
 		changed := false
 		for token, at := range tx.Job.SuspendWriters {
@@ -461,7 +465,7 @@ func (s *Store) releaseSuspension(ctx context.Context, jobID string) error {
 				changed = true
 			}
 		}
-		if !wantsSuspension(tx.Job.Lifecycle) && tx.Job.SuspendedByRegistry && len(tx.Job.SuspendWriters) == 0 {
+		if tx.Job.SuspendGen == gen && !wantsSuspension(tx.Job.Lifecycle) && tx.Job.SuspendedByRegistry && len(tx.Job.SuspendWriters) == 0 {
 			tx.Job.SuspendedByRegistry = false
 			changed = true
 		}
