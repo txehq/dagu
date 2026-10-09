@@ -380,6 +380,25 @@ func (s *Store) GetDecision(ctx context.Context, jobID, decisionID string) (*Dec
 }
 
 // ListReviews returns reviews, newest first.
+// GetReview returns a recorded review of the job.
+func (s *Store) GetReview(ctx context.Context, jobID, reviewID string) (*Review, error) {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	for id := job.Chains.Reviews; id != ""; {
+		var r Review
+		if err := s.getJSON(ctx, id, &r); err != nil {
+			return nil, fmt.Errorf("registry: history %s: %w", id, err)
+		}
+		if r.ReviewID == reviewID {
+			return &r, nil
+		}
+		id = r.Prev
+	}
+	return nil, refuse(CodeNotFound, "review %s not found", reviewID)
+}
+
 func (s *Store) ListReviews(ctx context.Context, jobID string, limit int) ([]*Review, error) {
 	return walkChain[Review](ctx, s, jobID, func(c Chains) string { return c.Reviews }, func(r *Review) string { return r.Prev }, limit)
 }

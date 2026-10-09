@@ -213,3 +213,33 @@ func TestUncertainResolutionRespectsMaxAttempts(t *testing.T) {
 	_, err = decide(f, job.JobID, p, VerdictRetry, ProposalDecided, "r1")
 	assert.Equal(t, CodeNotPermitted, code(t, err))
 }
+
+// Only a person decides or requests a retry, and a decision is attributed
+// to the person making it.
+func TestDecisionsArePersonOnly(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	p := propose(t, f, job, c, VerdictApprove)
+	decideAs := func(actor Actor, named Actor) error {
+		_, err := f.tx(job.JobID, actor, func(tx *JobTx) error {
+			cur := tx.Job.Proposals[p.ProposalID]
+			_, err := tx.AppendDecision(Decision{DecisionID: f.mint(PrefixDecision), ProposalID: p.ProposalID, ProposalRevision: cur.Revision,
+				BindingDigest: cur.BindingDigest, Verdict: VerdictApprove, Actor: named}, ProposalDecided)
+			return err
+		})
+		return err
+	}
+	assert.Equal(t, CodeNotPermitted, code(t, decideAs(agent, Actor{})), "an agent cannot approve")
+	assert.Equal(t, CodeInvalid, code(t, decideAs(person, Actor{Kind: ActorHuman, ID: "someone-else"})))
+	require.NoError(t, decideAs(person, Actor{}))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, person, got.Proposals[p.ProposalID].Decision.Actor)
+
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}, "k1")
+		return err
+	})
+	assert.Equal(t, CodeNotPermitted, code(t, err), "an agent cannot request a retry")
+}

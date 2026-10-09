@@ -647,33 +647,40 @@ const (
 
 // Review is an immutable record of one review run.
 type Review struct {
-	ReviewID           string          `json:"review_id"`
-	JobVersion         int             `json:"job_version"`
-	CheckpointVersion  int             `json:"checkpoint_version"`
-	ClaimID            string          `json:"claim_id"`
-	Fence              int64           `json:"fence"`
-	EvidenceRunIDs     []string        `json:"evidence_run_ids,omitempty"`
-	EvidenceDecisions  []string        `json:"evidence_decision_ids,omitempty"`
-	Outcome            ReviewOutcome   `json:"outcome"`
-	Reasoning          string          `json:"reasoning,omitempty"`
-	PacketArtifact     string          `json:"packet_artifact,omitempty"`
-	DecisionArtifact   string          `json:"decision_artifact,omitempty"`
-	AgentClientVersion string          `json:"agent_client_version,omitempty"`
-	Detail             json.RawMessage `json:"detail,omitempty"`
-	Created            Stamp           `json:"created"`
-	Prev               string          `json:"prev,omitempty"`
+	ReviewID           string        `json:"review_id"`
+	JobVersion         int           `json:"job_version"`
+	CheckpointVersion  int           `json:"checkpoint_version"`
+	ClaimID            string        `json:"claim_id"`
+	Fence              int64         `json:"fence"`
+	EvidenceRunIDs     []string      `json:"evidence_run_ids,omitempty"`
+	EvidenceDecisions  []string      `json:"evidence_decision_ids,omitempty"`
+	Outcome            ReviewOutcome `json:"outcome"`
+	Reasoning          string        `json:"reasoning,omitempty"`
+	PacketArtifact     string        `json:"packet_artifact,omitempty"`
+	DecisionArtifact   string        `json:"decision_artifact,omitempty"`
+	AgentClientVersion string        `json:"agent_client_version,omitempty"`
+	// PacketBytes and the token counts are what the review cost.
+	PacketBytes       int64           `json:"packet_bytes,omitempty"`
+	AgentInputTokens  int64           `json:"agent_input_tokens,omitempty"`
+	AgentOutputTokens int64           `json:"agent_output_tokens,omitempty"`
+	Detail            json.RawMessage `json:"detail,omitempty"`
+	Created           Stamp           `json:"created"`
+	Prev              string          `json:"prev,omitempty"`
 }
 
 // Exception is an actionable item for a person: a failure that needs local
 // action, never a retirement.
 type Exception struct {
-	ExceptionID string            `json:"exception_id"`
-	Kind        string            `json:"kind"`
-	State       AvailabilityState `json:"state,omitempty"`
-	Detail      string            `json:"detail"`
-	Evidence    []string          `json:"evidence,omitempty"`
-	Created     Stamp             `json:"created"`
-	ResolvedAt  *time.Time        `json:"resolved_at,omitempty"`
+	ExceptionID string `json:"exception_id"`
+	Kind        string `json:"kind"`
+	// Scope is "reviewer" for a problem with the job's reviewer, which never
+	// changes the job's own availability; empty for the job.
+	Scope      string            `json:"scope,omitempty"`
+	State      AvailabilityState `json:"state,omitempty"`
+	Detail     string            `json:"detail"`
+	Evidence   []string          `json:"evidence,omitempty"`
+	Created    Stamp             `json:"created"`
+	ResolvedAt *time.Time        `json:"resolved_at,omitempty"`
 }
 
 // EventKind classifies a job history event.
@@ -743,9 +750,15 @@ type Job struct {
 	Fence           int64                `json:"fence"`
 	Checkpoint      Checkpoint           `json:"checkpoint"`
 	// LastRecordedReview makes replaying the latest review a no-op.
-	LastRecordedReview string                `json:"last_recorded_review,omitempty"`
-	Actions            map[string]*Action    `json:"actions,omitempty"`
-	Exceptions         map[string]*Exception `json:"exceptions,omitempty"`
+	LastRecordedReview string `json:"last_recorded_review,omitempty"`
+	// LastRecordedReviewDigest is the latest review's evidence and outcome,
+	// so a replay that differs is refused instead of ignored.
+	LastRecordedReviewDigest string `json:"last_recorded_review_digest,omitempty"`
+	// ReviewerAvailability is the reviewer's availability, kept apart from
+	// the job's: a reviewer that cannot run does not make the job unavailable.
+	ReviewerAvailability *Availability         `json:"reviewer_availability,omitempty"`
+	Actions              map[string]*Action    `json:"actions,omitempty"`
+	Exceptions           map[string]*Exception `json:"exceptions,omitempty"`
 	// DecisionKeys maps decision idempotency keys to decision IDs so that a
 	// replayed decision is recognized after its proposal left the aggregate.
 	DecisionKeys map[string]string `json:"decision_keys,omitempty"`

@@ -262,7 +262,16 @@ type Observation struct {
 	Kind     string // exception kind, e.g. "auth", "worker_offline", "reviewer_launch"
 	Detail   string
 	Evidence []string
+	// Scope is ScopeReviewer for the job's reviewer; empty or ScopeJob for
+	// the job itself.
+	Scope string
 }
+
+// Observation scopes.
+const (
+	ScopeJob      = "job"
+	ScopeReviewer = "reviewer"
+)
 
 // Observe records availability. It never changes the lifecycle: an offline
 // machine, an expired login or an unreachable target is not a retirement.
@@ -272,13 +281,20 @@ func (tx *JobTx) Observe(o Observation) error {
 	if o.State == "" {
 		return refuse(CodeInvalid, "observation state is required")
 	}
+	switch o.Scope {
+	case "", ScopeJob:
+	case ScopeReviewer:
+		return tx.observeReviewer(o)
+	default:
+		return refuse(CodeInvalid, "observation scope must be job or reviewer")
+	}
 	from := j.Availability.State
 	now := tx.now
 	actor := tx.actor
 	j.Availability = Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
 	if o.State == AvailabilityReady {
 		for _, e := range j.Exceptions {
-			if e.ResolvedAt == nil && e.State != "" {
+			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" {
 				e.ResolvedAt = &now
 			}
 		}
@@ -419,7 +435,14 @@ func (tx *JobTx) ReleaseClaim(claimID string, fence int64) error {
 // most recently recorded review is a no-op.
 func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	j := tx.Job
+	digest, err := reviewDigest(&r)
+	if err != nil {
+		return err
+	}
 	if r.ReviewID != "" && r.ReviewID == j.LastRecordedReview {
+		if j.LastRecordedReviewDigest != "" && j.LastRecordedReviewDigest != digest {
+			return &Error{Code: CodeReviewConflict, Message: "review " + r.ReviewID + " was recorded with other evidence or outcome", Current: r.ReviewID}
+		}
 		return nil
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
@@ -441,7 +464,65 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 		return err
 	}
 	j.LastRecordedReview = r.ReviewID
+	j.LastRecordedReviewDigest = digest
 	return nil
+}
+
+// reviewDigest identifies what a review concluded from which evidence.
+func reviewDigest(r *Review) (string, error) {
+	b, err := CanonicalJSON(map[string]any{
+		"evidence_run_ids": nonNil(r.EvidenceRunIDs), "evidence_decision_ids": nonNil(r.EvidenceDecisions), "outcome": r.Outcome,
+	})
+	if err != nil {
+		return "", fmt.Errorf("registry: review digest: %w", err)
+	}
+	return sha256Hex(b), nil
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// observeReviewer records the reviewer's availability. It opens a reviewer
+// exception when the reviewer cannot run and resolves them when it can; the
+// job's own availability is left alone.
+func (tx *JobTx) observeReviewer(o Observation) error {
+	j := tx.Job
+	now := tx.now
+	actor := tx.actor
+	from := AvailabilityState("")
+	if j.ReviewerAvailability != nil {
+		from = j.ReviewerAvailability.State
+	}
+	j.ReviewerAvailability = &Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
+	if o.State == AvailabilityReady {
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.Scope == ScopeReviewer {
+				e.ResolvedAt = &now
+			}
+		}
+	} else {
+		id, err := NewID(PrefixException, now)
+		if err != nil {
+			return err
+		}
+		if j.Exceptions == nil {
+			j.Exceptions = map[string]*Exception{}
+		}
+		kind := o.Kind
+		if kind == "" {
+			kind = "reviewer_" + string(o.State)
+		}
+		j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+	}
+	tx.touch()
+	if from == o.State {
+		return nil
+	}
+	return tx.event(Event{Kind: EventAvailability, Reason: ScopeReviewer, From: string(from), To: string(o.State), Detail: o.Detail, Evidence: o.Evidence})
 }
 
 // AdvanceCheckpoint ends the current review episode. expectedVersion must be
@@ -571,6 +652,16 @@ func (tx *JobTx) DecisionByKey(idempotencyKey string) (string, bool) {
 // decision ID, so the caller can return the stored decision.
 func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, error) {
 	j := tx.Job
+	// Only a person decides: an approval or retry verdict makes an effect
+	// executable, so no agent or tool may record one, and the decision is
+	// attributed to the actor of this transaction, never to one it names.
+	if tx.actor.Kind != ActorHuman {
+		return nil, refuse(CodeNotPermitted, "decisions are made by a person, not %s", tx.actor.Kind)
+	}
+	if d.Actor.Kind != "" && d.Actor != tx.actor {
+		return nil, refuse(CodeInvalid, "decision actor must be the person deciding")
+	}
+	d.Actor = tx.actor
 	if d.IdempotencyKey != "" {
 		if id, ok := j.DecisionKeys[d.IdempotencyKey]; ok {
 			return nil, &Error{Code: CodeDuplicate, Message: "idempotency key already decided", Current: id}
@@ -600,7 +691,7 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	}
 	switch next {
 	case ProposalDecided, ProposalSnoozed, ProposalRejected:
-	case ProposalOpen, ProposalExecuted, ProposalSuperseded:
+	case ProposalOpen, ProposalExecuted, ProposalSuperseded, ProposalClosed:
 		return nil, refuse(CodeInvalid, "a decision moves a proposal to decided, snoozed or rejected, not %s", next)
 	default:
 		return nil, refuse(CodeInvalid, "unknown proposal state %q", next)
@@ -628,9 +719,6 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 		}
 	}
 	d.DecidedAt = tx.now
-	if d.Actor.Kind == "" {
-		d.Actor = tx.actor
-	}
 	// A snooze leaves the Dagu human task waiting, so there is nothing to
 	// resume yet.
 	if p.NativeTask != nil && next != ProposalSnoozed {

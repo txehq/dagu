@@ -531,3 +531,90 @@ func TestTxeAPIResourceEventAndRunGuard(t *testing.T) {
 	_, err = a.GetTxeResourceEvent(secretOnly, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
 	requireStatus(t, err, http.StatusNotFound)
 }
+
+// Reviews are read back by ID, a replay that differs is refused, reviewer
+// trouble is kept apart from the job's availability, and decisions page
+// forward in ascending order.
+func TestTxeAPIReviewsObservationsAndDecisionOrder(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+
+	reviewID, err := registry.ReviewID(jobID, 0)
+	require.NoError(t, err)
+	record := func(outcome apigen.TxeReviewOutcome) error {
+		_, err := a.RecordTxeReview(ctx, apigen.RecordTxeReviewRequestObject{JobId: jobID, Body: &apigen.TxeReviewRequest{
+			ClaimId: claim.ClaimId, Fence: claim.Fence, Review: apigen.TxeReview{ReviewId: reviewID, Outcome: outcome,
+				EvidenceRunIds: &[]string{"run-1"}, PacketBytes: new(int64(2048)), AgentInputTokens: new(int64(900))}}})
+		return err
+	}
+	require.NoError(t, record(apigen.TxeReviewOutcomeContinue))
+	require.NoError(t, record(apigen.TxeReviewOutcomeContinue), "an identical replay is a no-op")
+	requireStatus(t, record(apigen.TxeReviewOutcomeAct), http.StatusConflict)
+	got, err := a.GetTxeReview(ctx, apigen.GetTxeReviewRequestObject{JobId: jobID, ReviewId: reviewID})
+	require.NoError(t, err)
+	review := got.(apigen.GetTxeReview200JSONResponse)
+	assert.Equal(t, int64(2048), *review.PacketBytes)
+	assert.Equal(t, int64(900), *review.AgentInputTokens)
+	_, err = a.GetTxeReview(ctx, apigen.GetTxeReviewRequestObject{JobId: jobID, ReviewId: mint(t, registry.PrefixReview)})
+	requireStatus(t, err, http.StatusNotFound)
+
+	reviewer := apigen.TxeObservationRequestScopeReviewer
+	observed, err := a.ObserveTxeJob(ctx, apigen.ObserveTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeObservationRequest{
+		State: apigen.TxeAvailabilityStateAuthRequired, Scope: &reviewer, Detail: new("reviewer login expired")}})
+	require.NoError(t, err)
+	job := observed.(apigen.ObserveTxeJob200JSONResponse)
+	assert.Equal(t, apigen.TxeAvailabilityStateReady, job.Availability.State, "the job itself is still available")
+	require.NotNil(t, job.ReviewerAvailability)
+	assert.Equal(t, apigen.TxeAvailabilityStateAuthRequired, job.ReviewerAvailability.State)
+
+	person := registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
+	var ids []string
+	for range 3 {
+		var p *registry.Proposal
+		_, err := store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
+			var err error
+			p, err = tx.PutProposal(claim.ClaimId, claim.Fence, registry.Proposal{ProposalID: mint(t, registry.PrefixProposal), Action: registry.ActionSpec{Name: "resize"}})
+			if err != nil {
+				return err
+			}
+			id := mint(t, registry.PrefixDecision)
+			ids = append(ids, id)
+			_, err = tx.AppendDecision(registry.Decision{DecisionID: id, ProposalID: p.ProposalID, ProposalRevision: p.Revision,
+				BindingDigest: p.BindingDigest, Verdict: registry.VerdictReject}, registry.ProposalRejected)
+			return err
+		})
+		require.NoError(t, err)
+	}
+	list := func(order apigen.ListTxeJobDecisionsParamsOrder, since string, limit int) []string {
+		t.Helper()
+		params := apigen.ListTxeJobDecisionsParams{Order: &order}
+		if since != "" {
+			params.Since = &since
+		}
+		if limit > 0 {
+			params.Limit = &limit
+		}
+		resp, err := a.ListTxeJobDecisions(ctx, apigen.ListTxeJobDecisionsRequestObject{JobId: jobID, Params: params})
+		require.NoError(t, err)
+		var out []string
+		for _, d := range resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions {
+			out = append(out, d.DecisionId)
+		}
+		return out
+	}
+	asc, desc := apigen.ListTxeJobDecisionsParamsOrderAsc, apigen.ListTxeJobDecisionsParamsOrderDesc
+	assert.Equal(t, []string{ids[2], ids[1], ids[0]}, list(desc, "", 0))
+	assert.Equal(t, ids, list(asc, "", 0))
+	assert.Equal(t, []string{ids[1]}, list(asc, ids[0], 1), "the limit applies forward from the cursor")
+}
