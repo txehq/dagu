@@ -255,4 +255,3 @@ func TestConditionalRetryNamesTheAdmittedExecution(t *testing.T) {
 		assert.Nil(t, body.AttemptId)
 	})
 }
-
