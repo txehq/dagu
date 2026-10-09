@@ -11,7 +11,9 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -808,17 +810,17 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		runID := requested.Params[RetryRunParam]
 		run, shown := packet.run(runID)
 		if len(requested.Params) != 1 || !shown {
-			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q): %s", runID, requested.Reason))
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q). %s", runID, agentReason(requested.Reason)))
 		}
 		if !run.Execution().known() {
 			// Without the service's identity of the failed execution there
 			// is nothing to bind one retry to.
-			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, whose attempt the service does not identify, so it cannot be retried from here: %s", runID, requested.Reason))
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, whose attempt the service does not identify, so it cannot be retried from here. %s", runID, agentReason(requested.Reason)))
 		}
 		if run.SpecSHA256 == "" || run.SpecSHA256 != job.DAGSpecSHA256 {
 			// A run of an older version is never retried, on the new code
 			// or the old. The owner still sees what the reviewer wanted.
-			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which did not run the job's current version %d and cannot be retried: %s", runID, job.Version, requested.Reason))
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which did not run the job's current version %d and cannot be retried. %s", runID, job.Version, agentReason(requested.Reason)))
 		}
 		// The proposal is bound to the failed execution the reviewer was
 		// shown, the snapshot it ran and the package of that version; the
@@ -832,11 +834,11 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 	}
 	switch {
 	case !isDeclared:
-		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s, which this job does not declare: %s", requested.Name, requested.TargetID, requested.Reason))
+		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s, which this job does not declare. %s", requested.Name, agentText(requested.TargetID), agentReason(requested.Reason)))
 	case !job.HasTarget(requested.TargetID):
-		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s, which is not a registered target of this job: %s", requested.Name, requested.TargetID, requested.Reason))
+		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s (the target as the agent wrote it), which is not a registered target of this job. %s", requested.Name, agentText(requested.TargetID), agentReason(requested.Reason)))
 	case !paramsDeclared(declared, requested.Params):
-		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q with parameters the job does not declare: %s", requested.Name, requested.Reason))
+		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q with parameters the job does not declare. %s", requested.Name, agentReason(requested.Reason)))
 	case !declared.Routine:
 		return propose(ProposalAction, fmt.Sprintf("Approve %q on %s? %s", requested.Name, requested.TargetID, agentReason(requested.Reason)))
 	}
@@ -861,7 +863,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		return nil
 	}
 	if failures := trailingFailures(history, intent); failures >= maxAttempts(job) {
-		return propose(ProposalQuestion, fmt.Sprintf("Routine action %q on %s failed %d times in a row and was not tried again: %s", requested.Name, requested.TargetID, failures, requested.Reason))
+		return propose(ProposalQuestion, fmt.Sprintf("Routine action %q on %s failed %d times in a row and was not tried again. %s", requested.Name, requested.TargetID, failures, agentReason(requested.Reason)))
 	}
 
 	action, err := r.Registry.BeginAction(ctx, BeginRequest{
@@ -1007,7 +1009,7 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	}
 	switch decision.Outcome {
 	case OutcomeWaitHuman:
-		return ask(decision.Question)
+		return ask("The review agent asks, in its own words (not checked): " + agentText(decision.Question))
 	case OutcomeComplete:
 		return ask("The reviewer finds this job's purpose fulfilled and recommends completing it." + packet.trimmedCaveat())
 	case OutcomeRetire:
@@ -1334,12 +1336,30 @@ func (r *Reviewer) verifyGranted(ctx context.Context, jobID string, action Actio
 	return errors.New("the granted action is not in the journal")
 }
 
+// maxAgentText bounds how much of the agent's own text a question carries.
+const maxAgentText = 600
+
+// agentText renders text the agent wrote for a question the owner reads.
+// The agent read the job's output, which can contain anything a script
+// printed, so its words are shown as a quotation and never as part of the
+// reviewer's own statement: line breaks and other control characters are
+// folded into spaces, the length is bounded, and the result is quoted with
+// its own quotation marks escaped, so the text cannot end the quotation or
+// start what looks like a new section of the question.
+func agentText(text string) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	}), " ")
+	if runes := []rune(text); len(runes) > maxAgentText {
+		text = string(runes[:maxAgentText]) + " [cut]"
+	}
+	return strconv.Quote(text)
+}
+
 // agentReason marks the agent's own words in a question the owner is asked
-// to approve. The agent read the job's output, which can contain anything a
-// script printed; its reason is offered as its opinion, not as a fact the
-// reviewer checked.
+// to answer: offered as its opinion, not as a fact the reviewer checked.
 func agentReason(reason string) string {
-	return "The review agent's reason, in its own words (not checked): " + reason
+	return "The review agent's reason, in its own words (not checked): " + agentText(reason)
 }
 
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
