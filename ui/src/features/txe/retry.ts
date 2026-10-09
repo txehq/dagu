@@ -23,15 +23,23 @@ export type RetryStatus =
 
 export type RetryState = {
   runId: string;
+  // attemptId is the failed attempt this retry was bound to.
+  attemptId?: string;
   proposalId: string;
   status: RetryStatus;
   receipt?: string;
   attempt?: number;
 };
 
-function runIdOf(p: ApiProposal): string | undefined {
-  const params = p.action.params as { run_id?: unknown } | undefined;
-  return typeof params?.run_id === 'string' ? params.run_id : undefined;
+function paramsOf(p: ApiProposal): { runId?: string; attemptId?: string } {
+  const params = p.action.params as
+    | { run_id?: unknown; attempt_id?: unknown }
+    | undefined;
+  return {
+    runId: typeof params?.run_id === 'string' ? params.run_id : undefined,
+    attemptId:
+      typeof params?.attempt_id === 'string' ? params.attempt_id : undefined,
+  };
 }
 
 function statusOf(a: ApiAction): RetryStatus {
@@ -69,7 +77,7 @@ export function retryStates(
   );
   for (const p of newestFirst) {
     if (p.action.name !== ACTION_RETRY_RUN) continue;
-    const runId = runIdOf(p);
+    const { runId, attemptId } = paramsOf(p);
     if (!runId || out.has(runId)) continue;
     const action = byProposal.get(p.proposal_id);
     let status: RetryStatus = 'requested';
@@ -83,6 +91,7 @@ export function retryStates(
     }
     out.set(runId, {
       runId,
+      attemptId,
       proposalId: p.proposal_id,
       status,
       receipt: action?.receipt,
@@ -110,17 +119,20 @@ export function retryLabel(state: RetryState): string {
   return LABELS[state.status];
 }
 
-// canRequestRetry reports whether the dashboard offers a retry of a run: it
-// must have finished without success (the server counts a partial success
-// as success) and have no retry yet. A run gets one retry request per job
-// version: the registry refuses a second one, whatever became of the first.
+// canRequestRetry reports whether the dashboard offers a retry of a run: its
+// latest attempt must have finished without success (the server counts a
+// partial success as success) and no retry may be bound to that attempt yet.
+// A native retry adds an attempt, so once a retried attempt has failed too,
+// the run may be retried again; the registry allows one retry per attempt.
 export function canRequestRetry(
   runStatus: string,
+  runAttemptId: string | undefined,
   state: RetryState | undefined
 ): boolean {
   const finishedUnsuccessfully =
     runStatus === 'failed' ||
     runStatus === 'aborted' ||
     runStatus === 'rejected';
-  return finishedUnsuccessfully && !state;
+  if (!finishedUnsuccessfully || !runAttemptId) return false;
+  return !state || state.attemptId !== runAttemptId;
 }

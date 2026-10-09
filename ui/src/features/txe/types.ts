@@ -52,6 +52,9 @@ export type RunRef = {
   dagName: string;
   dagRunId: string;
   status: string;
+  // attemptId is Dagu's identity of the run's latest attempt; a native retry
+  // keeps the run ID and adds an attempt.
+  attemptId?: string;
   startedAt?: string;
   finishedAt?: string;
   error?: string;
