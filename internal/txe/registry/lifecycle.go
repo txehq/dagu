@@ -240,8 +240,14 @@ type RunAttempt struct {
 	// recorded for a version's spec.
 	SpecSHA256 string
 	Status     string
-	Finished   bool
-	Succeeded  bool
+	// Running is true while the execution runs (not queued, not started,
+	// waiting or finished).
+	Running   bool
+	Finished  bool
+	Succeeded bool
+	// ArchiveDir is the execution's native artifact directory on the hub,
+	// when Dagu has assigned one.
+	ArchiveDir string
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.

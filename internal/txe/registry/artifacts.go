@@ -255,6 +255,11 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 	}
 	m := ArtifactManifest{Schema: SchemaVersion, JobID: j.JobID, RunID: runID, AttemptID: in.AttemptID, QueuedAt: in.QueuedAt, Execution: in.Execution,
 		ProducedIn: in.ProducedIn, JobVersion: in.JobVersion, Digest: digest, Recorded: Stamp{At: tx.now, By: tx.actor}}
+	// The execution's native artifact directory, when Dagu has assigned it,
+	// so its hub copies stay checkable after a later execution of the run.
+	if latest.AttemptID == in.AttemptID && latest.QueuedAt == in.QueuedAt {
+		m.ArchiveDir = latest.ArchiveDir
+	}
 	for _, a := range sent {
 		switch {
 		case a.Missing:
@@ -280,8 +285,8 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 		switch {
 		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
 			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
-		case latest.Finished:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s has finished; a late publish is not recorded", in.Execution, runID)}
+		case !latest.Running:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s is %s, not running; only the running execution publishes", in.Execution, runID, latest.Status)}
 		case latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256:
 			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
 		}
