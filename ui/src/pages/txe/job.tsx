@@ -295,6 +295,8 @@ export default function TxeJobPage(): React.ReactElement {
                 <span className="text-destructive"> {run.error}</span>
               )}
               <RunRetry
+                dagName={run.dagName}
+                runId={run.dagRunId}
                 runStatus={run.status}
                 state={retries?.get(run.dagRunId)}
                 canDecide={canDecide}
