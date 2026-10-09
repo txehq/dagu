@@ -146,18 +146,28 @@ const (
 	LifecycleRetire LifecycleOp = "retire"
 )
 
-// Effect describes what recording a verdict changes. Only approve leaves the
-// proposal executable, and only through the pre-effect guard. Every other
-// verdict except snooze closes the proposal. Redirect and retry are recorded
-// for the next review, which performs any re-run through the action journal;
-// neither grants a permission or causes an effect here.
+// Effect describes what recording a verdict changes. Only approve, and retry
+// on a bound native-retry proposal, leave the proposal executable, and only
+// through the pre-effect guard. Every other verdict except snooze closes the
+// proposal. Nothing here causes an effect: the reviewer executes decided
+// proposals through the registry's action journal.
 type Effect struct {
 	Proposal  registry.ProposalState
 	Lifecycle LifecycleOp
 }
 
-// EffectOf maps a verdict to its effect.
-func EffectOf(v Verdict) Effect {
+// Typed actions on which a retry verdict has a meaning. The registry refuses
+// retry on any other proposal.
+const (
+	// ActionRetryRun retries one exact, bound native run.
+	ActionRetryRun = "dagu.retry_run"
+	// ActionUncertainEffect is an escalation of an action whose effect is
+	// unknown; retry there resolves it and allows one more attempt.
+	ActionUncertainEffect = "txe.uncertain_effect"
+)
+
+// EffectOf maps a verdict on a proposal for action to its effect.
+func EffectOf(v Verdict, action string) Effect {
 	switch v {
 	case VerdictApprove:
 		return Effect{Proposal: registry.ProposalDecided}
@@ -168,6 +178,11 @@ func EffectOf(v Verdict) Effect {
 	case VerdictRetire:
 		return Effect{Proposal: registry.ProposalRejected, Lifecycle: LifecycleRetire}
 	case VerdictRetry:
+		// Executable only as the bound native retry; on an uncertain-effect
+		// escalation it records the resolution and closes the escalation.
+		if action == ActionRetryRun {
+			return Effect{Proposal: registry.ProposalDecided}
+		}
 		return Effect{Proposal: registry.ProposalRejected}
 	case VerdictReject, VerdictRedirect:
 		return Effect{Proposal: registry.ProposalRejected}
