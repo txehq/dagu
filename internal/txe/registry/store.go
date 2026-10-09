@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -71,6 +72,10 @@ type Store struct {
 	col  persis.Collection
 	dags DAGStore
 	now  func() time.Time
+	// dagLocks serializes DAG publication per job in this process; lockDir,
+	// when set, extends that across processes sharing the data directory.
+	dagLocks sync.Map // job ID -> *sync.Mutex
+	lockDir  string
 }
 
 // Option configures a Store.
@@ -103,7 +108,12 @@ func NewFileStore(dataDir string, opts ...Option) (*Store, error) {
 	if dataDir == "" {
 		return nil, errors.New("registry: data directory is required")
 	}
-	return New(persisfile.NewCollection(Dir(dataDir), persisfile.WithIndentedJSON()), opts...)
+	s, err := New(persisfile.NewCollection(Dir(dataDir), persisfile.WithIndentedJSON()), opts...)
+	if err != nil {
+		return nil, err
+	}
+	s.lockDir = filepath.Join(dataDir, "txe", "locks")
+	return s, nil
 }
 
 func (s *Store) clock() time.Time { return s.now().UTC() }

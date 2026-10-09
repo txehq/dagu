@@ -7959,6 +7959,7 @@ export interface components {
         TxeActionSpec: {
             name: string;
             target?: components["schemas"]["TxeTarget"];
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
             params?: unknown;
         };
         TxeArtifactRef: {
@@ -8052,6 +8053,7 @@ export interface components {
             max_attempts: number;
             grant?: components["schemas"]["TxeGrant"];
             receipt?: string;
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
             outcome?: unknown;
             settled_under_claim?: string;
             read_only?: boolean;
@@ -8262,6 +8264,7 @@ export interface components {
             fence: number;
             state: components["schemas"]["TxeActionState"];
             receipt?: string;
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
             outcome?: unknown;
             actor?: components["schemas"]["TxeActor"];
         };
