@@ -269,6 +269,64 @@ func TestNode_MaskedLogFinalLine(t *testing.T) {
 	assert.Equal(t, "first\nlast *******", string(content))
 }
 
+// A run that streams its step output to the coordinator masks declared
+// secrets before the bytes leave the worker, as a local run does. The value is
+// masked when it is split across writes and when the last line has no newline.
+func TestNode_MaskedRemoteLog(t *testing.T) {
+	executorType := registerOutputTestExecutor(t, func(_ context.Context, exec *outputTestExecutor) error {
+		for _, chunk := range []string{"first s3cr3t\n", "split s3c", "r3t\n", "last s3cr3t"} {
+			if _, err := io.WriteString(exec.stdout, chunk); err != nil {
+				return err
+			}
+		}
+		_, err := io.WriteString(exec.stderr, "warn s3cr3t")
+		return err
+	})
+	step := ir.Step{
+		Name:           "masked-remote",
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
+	}
+
+	remote := newMockLogWriterFactory()
+	node := NewNode(step, NodeState{})
+	ctx := NewContext(context.Background(), &ir.DAG{Name: "test"}, "masked-remote", "test.log",
+		runctx.WithSecrets([]string{"TOKEN=s3cr3t"}),
+		runctx.WithLogWriterFactory(remote))
+	require.NoError(t, node.Prepare(ctx, t.TempDir(), "masked-remote"))
+
+	require.NoError(t, node.Execute(ctx))
+	require.NoError(t, node.Teardown())
+
+	assert.Equal(t, "first *******\nsplit *******\nlast *******", remote.stdoutWriter.buf.String())
+	assert.Equal(t, "warn *******", remote.stderrWriter.buf.String())
+	assert.True(t, remote.stdoutWriter.closed)
+	assert.True(t, remote.stderrWriter.closed)
+}
+
+// Without declared secrets the remote writers are used as they are.
+func TestNode_UnmaskedRemoteLog(t *testing.T) {
+	executorType := registerOutputTestExecutor(t, func(_ context.Context, exec *outputTestExecutor) error {
+		_, err := io.WriteString(exec.stdout, "plain s3cr3t")
+		return err
+	})
+	step := ir.Step{
+		Name:           "plain-remote",
+		ExecutorConfig: ir.ExecutorConfig{Type: executorType},
+	}
+
+	remote := newMockLogWriterFactory()
+	node := NewNode(step, NodeState{})
+	ctx := NewContext(context.Background(), &ir.DAG{Name: "test"}, "plain-remote", "test.log",
+		runctx.WithLogWriterFactory(remote))
+	require.NoError(t, node.Prepare(ctx, t.TempDir(), "plain-remote"))
+
+	require.NoError(t, node.Execute(ctx))
+	require.NoError(t, node.Teardown())
+
+	assert.Equal(t, "plain s3cr3t", remote.stdoutWriter.buf.String())
+	assert.True(t, remote.stdoutWriter.closed)
+}
+
 func TestNode_OutputExceedsLimit(t *testing.T) {
 	executorType := registerOutputTestExecutor(t, func(ctx context.Context, exec *outputTestExecutor) error {
 		return writeRepeatedX(ctx, exec.stdout, 2*1024*1024)

@@ -5,6 +5,7 @@ package masking
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -15,6 +16,10 @@ const (
 // SourcedEnvVars groups environment variables by their source
 type SourcedEnvVars struct {
 	Secrets []string // Environment variables from secrets
+	// MinDerivedLen is the fewest characters a value's stripped form may have
+	// to be masked as well. A caller that refuses short values, because they
+	// would match ordinary text, sets it to the same limit.
+	MinDerivedLen int
 }
 
 // Masker provides masking functionality for sensitive data
@@ -22,7 +27,11 @@ type Masker struct {
 	sensitiveVals map[string]bool // Set of values to mask
 }
 
-// NewMasker creates a masker from sourced environment variables
+// NewMasker creates a masker from sourced environment variables.
+//
+// A value is also masked with its surrounding whitespace removed. A secret
+// read from a file usually ends with a newline, and a script strips it before
+// using the value, so the stripped form is the one that appears in output.
 func NewMasker(sources SourcedEnvVars) *Masker {
 	sensitiveVals := make(map[string]bool)
 
@@ -32,6 +41,9 @@ func NewMasker(sources SourcedEnvVars) *Masker {
 		// (strings.ReplaceAll with empty string would insert mask between every character)
 		if val != "" {
 			sensitiveVals[val] = true
+		}
+		if trimmed := strings.TrimSpace(val); trimmed != "" && utf8.RuneCountInString(trimmed) >= sources.MinDerivedLen {
+			sensitiveVals[trimmed] = true
 		}
 	}
 

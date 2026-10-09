@@ -90,5 +90,6 @@ func NewMasker(secrets, answers map[string]string) *masking.Masker {
 			}
 		}
 	}
-	return masking.NewMasker(masking.SourcedEnvVars{Secrets: pairs})
+	// A padded value's stripped form is held to the same limit as the value.
+	return masking.NewMasker(masking.SourcedEnvVars{Secrets: pairs, MinDerivedLen: minSecretLength})
 }
