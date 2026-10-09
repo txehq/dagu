@@ -923,7 +923,7 @@ export const mainListItems = React.forwardRef<
             icon={<History size={18} />}
             label={t('navigation.executions')}
             isOpen={isOpen}
-            basePath={['/dag-runs', '/queues', '/artifacts']}
+            basePath={['/dag-runs', '/queues', '/artifacts', '/txe']}
             to="/dag-runs"
             onClick={onNavItemClick}
             customColor={customColor}
@@ -939,6 +939,13 @@ export const mainListItems = React.forwardRef<
             <NavItem
               to="/artifacts"
               text={t('navigation.artifacts')}
+              isOpen={isOpen}
+              onClick={onNavItemClick}
+              customColor={customColor}
+            />
+            <NavItem
+              to="/txe"
+              text="Job inbox"
               isOpen={isOpen}
               onClick={onNavItemClick}
               customColor={customColor}
