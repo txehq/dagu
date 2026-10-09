@@ -148,13 +148,12 @@ const (
 
 // Effect describes what recording a verdict changes. Only approve leaves the
 // proposal executable, and only through the pre-effect guard. Every other
-// verdict except snooze closes the proposal; redirect saves instructions for
-// the next review and grants nothing.
+// verdict except snooze closes the proposal. Redirect and retry are recorded
+// for the next review, which performs any re-run through the action journal;
+// neither grants a permission or causes an effect here.
 type Effect struct {
 	Proposal  registry.ProposalState
 	Lifecycle LifecycleOp
-	// RetryRun asks for a native retry of the job's latest run after commit.
-	RetryRun bool
 }
 
 // EffectOf maps a verdict to its effect.
@@ -169,7 +168,7 @@ func EffectOf(v Verdict) Effect {
 	case VerdictRetire:
 		return Effect{Proposal: registry.ProposalRejected, Lifecycle: LifecycleRetire}
 	case VerdictRetry:
-		return Effect{Proposal: registry.ProposalRejected, RetryRun: true}
+		return Effect{Proposal: registry.ProposalRejected}
 	case VerdictReject, VerdictRedirect:
 		return Effect{Proposal: registry.ProposalRejected}
 	}
