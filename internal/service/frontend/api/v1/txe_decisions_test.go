@@ -173,6 +173,17 @@ func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, f.proposal.BindingDigest, stored.BindingDigest)
 	require.Equal(t, registry.ActorHuman, stored.Actor.Kind)
+	// The stored record keeps its write-time state; a fresh API over the
+	// reopened registry must still report the completion recorded since.
+	reopenedAPI := apiv1.New(persis.NewDAGRepository(dag.NewStore(f.server.Config.Paths.DAGsDir), persis.DAGRepositoryOptions{}),
+		nil, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(reopened))
+	listed, err := reopenedAPI.ListTxeProposalDecisions(t.Context(), api.ListTxeProposalDecisionsRequestObject{
+		JobId: f.jobID, ProposalId: f.proposal.ProposalId})
+	require.NoError(t, err)
+	afterRestart := listed.(api.ListTxeProposalDecisions200JSONResponse).Decisions
+	require.Len(t, afterRestart, 1)
+	require.NotNil(t, afterRestart[0].NativeResume)
+	require.Equal(t, api.TxeDecisionNativeResume("completed"), *afterRestart[0].NativeResume)
 
 	// The old revision no longer accepts a decision.
 	stale := f.body("reject", "dashboard-reject-stale")
