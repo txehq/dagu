@@ -423,3 +423,56 @@ func TestTxeRunRetryRequest(t *testing.T) {
 		map[string]any{"idempotency_key": "dashboard-retry-3", "expected_job_version": job.Version}).
 		ExpectStatus(http.StatusNotFound).Send(t)
 }
+
+// seedRetriedTxeAttempt adds a newer attempt with status to a run, as a
+// native retry does, and returns its attempt ID.
+func seedRetriedTxeAttempt(t *testing.T, server test.Server, jobID, runID string, status ir.Status) string {
+	t.Helper()
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	started := time.Now().Add(3 * time.Second)
+	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, runID, persis.DAGRunCreateAttemptOptions{Retry: true})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, ir.NewStatusBuilder(dag).Create(runID, status, 0, started,
+		ir.WithAttemptID(attempt.ID()), ir.WithFinishedAt(started.Add(time.Second)))))
+	require.NoError(t, attempt.Close(ctx))
+	return attempt.ID()
+}
+
+// The person decides on the attempt they saw. If the run has moved on to
+// another failed attempt before the click arrives, the click is refused and
+// records nothing; a request for the new attempt is a decision of its own.
+func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
+	server := test.SetupServer(t)
+	c := server.Client()
+	jobID := registerTxeJobHTTP(t, server)
+	seedFailedTxeRun(t, server, jobID, "run-moved-1")
+
+	var details api.GetDAGRunDetails200JSONResponse
+	c.Get(fmt.Sprintf("/api/v1/dag-runs/%s/%s", jobID, "run-moved-1")).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &details)
+	require.NotNil(t, details.DagRunDetails.AttemptId)
+	seen := *details.DagRunDetails.AttemptId
+
+	next := seedRetriedTxeAttempt(t, server, jobID, "run-moved-1", ir.Failed)
+	require.NotEqual(t, seen, next)
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-moved-1")
+	var apiErr api.Error
+	c.Post(path, map[string]any{"idempotency_key": "dashboard-moved-1", "expected_job_version": job.Version, "attempt_id": seen}).
+		ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &apiErr)
+	require.NotNil(t, apiErr.Details)
+	require.Equal(t, string(decision.CodeRunStale), (*apiErr.Details)["code"])
+	var decisions api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &decisions)
+	require.Empty(t, decisions.Decisions)
+
+	var res api.TxeDecisionResponse
+	c.Post(path, map[string]any{"idempotency_key": "dashboard-moved-2", "expected_job_version": job.Version, "attempt_id": next}).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
+	require.NotNil(t, res.Proposal)
+	require.Contains(t, string(res.Proposal.Action.Params), `"attempt_id":"`+next+`"`)
+}
