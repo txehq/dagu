@@ -152,6 +152,14 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 			}
 			action = p.Action.Name
 		}
+		// Retry has a meaning only on the two typed proposals; refuse it
+		// elsewhere whatever the proposal's allowed verdicts say.
+		if req.Verdict == VerdictRetry && action != ActionRetryRun && action != ActionUncertainEffect {
+			return &registry.Error{
+				Code:    registry.CodeNotPermitted,
+				Message: fmt.Sprintf("retry applies only to %s and %s proposals, not %q", ActionRetryRun, ActionUncertainEffect, action),
+			}
+		}
 		effect := EffectOf(req.Verdict, action)
 		d, err := tx.AppendDecision(registry.Decision{
 			DecisionID:       decisionID,
