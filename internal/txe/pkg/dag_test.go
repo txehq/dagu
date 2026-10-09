@@ -38,7 +38,8 @@ func testDAGSpec() DAGSpec {
 	}
 }
 
-const wantDAG = `description: "Watch the dagu hub volume"
+const wantDAG = `type: chain
+description: "Watch the dagu hub volume"
 group: "txehq/txe"
 labels:
   - "txe.schema=1"
@@ -169,6 +170,10 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, dag.Steps, 2)
 	assert.Equal(t, "publish", dag.Steps[1].Name)
+	// The publish step waits for the job's step: the DAG is a chain, and the
+	// loader records the dependency.
+	assert.Equal(t, "chain", dag.Type)
+	assert.Equal(t, []string{"run"}, dag.Steps[1].Depends)
 	assert.True(t, dag.ArtifactsEnabled())
 	// Still no redirect of step output.
 	for _, step := range dag.Steps {

@@ -5,16 +5,25 @@ package distr_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -280,4 +289,167 @@ steps:
 
 	// The script never ran without its credential.
 	assert.NoFileExists(t, filepath.Join(outputs, "ran"))
+}
+
+// txeFakeRegistry answers the two registry calls the publish step makes, and
+// keeps the manifests it is sent.
+type txeFakeRegistry struct {
+	mu        sync.Mutex
+	version   string // JSON of the job version, served for any version number
+	manifests map[string]txeclient.ArtifactManifest
+	unknown   []string
+}
+
+func (r *txeFakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case req.Header.Get("Authorization") != "Bearer dagu_test_key":
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"code":"unauthorized","message":"bad key"}`)
+	case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/versions/"):
+		_, _ = io.WriteString(w, r.version)
+	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/artifacts"):
+		var manifest txeclient.ArtifactManifest
+		if err := json.NewDecoder(req.Body).Decode(&manifest); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		run := strings.TrimSuffix(req.URL.Path[strings.Index(req.URL.Path, "/runs/")+len("/runs/"):], "/artifacts")
+		r.manifests[run] = manifest
+		_ = json.NewEncoder(w).Encode(manifest)
+	default:
+		r.unknown = append(r.unknown, req.Method+" "+req.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// A job's rendered DAG, run on a real worker, publishes exactly the files the
+// job declares. The file declared for the hub arrives there with the digest
+// the manifest records; the file declared for the machine and a file nobody
+// declared stay on the machine and never reach hub storage.
+func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
+	const (
+		hubContent     = `{"collected":"txe-marker-hub-deliverable"}`
+		machineContent = "txe-marker-machine-only\n"
+		strayContent   = "txe-marker-undeclared\n"
+	)
+	pkg := txeCommitPackage(t, map[string]string{"collect.sh": `#!/bin/sh
+set -eu
+mkdir -p "$TXE_RUN_OUTPUT_DIR/raw"
+printf '%s' '` + hubContent + `' > "$TXE_RUN_OUTPUT_DIR/snapshot.json"
+printf 'txe-marker-machine-only\n' > "$TXE_RUN_OUTPUT_DIR/raw/export.csv"
+printf 'txe-marker-undeclared\n' > "$TXE_RUN_OUTPUT_DIR/debug.log"
+echo "collected into $TXE_RUN_OUTPUT_DIR"
+`}, []string{"collect.sh"}, []string{"./collect.sh"})
+
+	// The TXE home of the worker's machine: identity, outputs, and the
+	// context store the publish step's CLI uses.
+	home := txepkg.Home{Root: filepath.Join(t.TempDir(), "txe-home")}
+	require.NoError(t, os.MkdirAll(home.Root, 0o700))
+	identity := fmt.Sprintf(`{"schema":1,"machine_id":%q,"owner_id":"own_01K7A5ZQ8M3N4P5R6S7T8V9W0A"}`, txeTestMachine)
+	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "machine.json"), []byte(identity), 0o600))
+
+	registry := &txeFakeRegistry{manifests: map[string]txeclient.ArtifactManifest{}, version: `{
+		"title": "Collect", "purpose": "fixture",
+		"expected_outcome": {"deliverables": [
+			{"name": "snapshot", "path": "snapshot.json", "delivery": "hub", "required": true},
+			{"name": "raw", "path": "raw/export.csv", "delivery": "machine"},
+			{"name": "notes", "path": "notes.txt"}
+		]}}`}
+	server := httptest.NewServer(registry)
+	defer server.Close()
+
+	rendered, err := txepkg.RenderDAG(txepkg.DAGSpec{
+		Title: "Collect", JobID: txeTestJob, OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
+		ProjectID: "prj_01K7A5ZQ8M3N4P5R6S7T8V9W0B", MachineID: txeTestMachine, Version: 1,
+		PackageDigest: pkg.Digest, WorkDir: pkg.WorkDir(), OutputDir: home.OutputDir(txeTestJob),
+		Entrypoint: pkg.Manifest.Entrypoint,
+		Schedule:   txepkg.Schedule{Cron: "0 2 * * *", Timezone: "Australia/Perth", TimeoutSec: 120},
+		Publish: &txepkg.Publish{
+			// Filled in below, once the fixture has built the binary.
+			Command:      []string{"/placeholder"},
+			HomeRoot:     home.Root,
+			HubArtifacts: true,
+		},
+	})
+	require.NoError(t, err)
+
+	f := newTestFixture(t, string(rendered),
+		withLabels(map[string]string{"txe.machine": txeTestMachine}),
+		withLogPersistence(), withArtifactPersistence(), withIsolatedWorker(),
+	)
+	defer f.cleanup()
+
+	// The publish step runs the dagu binary built from this tree, whose path
+	// is known only now. Render again with it and run that DAG.
+	executable := f.coord.Config.Paths.Executable
+	spec := txepkg.DAGSpec{
+		Title: "Collect", JobID: txeTestJob, OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
+		ProjectID: "prj_01K7A5ZQ8M3N4P5R6S7T8V9W0B", MachineID: txeTestMachine, Version: 1,
+		PackageDigest: pkg.Digest, WorkDir: pkg.WorkDir(), OutputDir: home.OutputDir(txeTestJob),
+		Entrypoint: pkg.Manifest.Entrypoint,
+		Schedule:   txepkg.Schedule{Cron: "0 2 * * *", Timezone: "Australia/Perth", TimeoutSec: 120},
+		Publish: &txepkg.Publish{
+			Command:      []string{executable, "txe", "artifacts", "publish", "--dagu-home", home.ClientDir()},
+			HomeRoot:     home.Root,
+			HubArtifacts: true,
+		},
+	}
+	rendered, err = txepkg.RenderDAG(spec)
+	require.NoError(t, err)
+	f.dagWrapper = new(f.coord.DAG(t, string(rendered)))
+
+	// The CLI's context, created the way an installer would.
+	add := exec.Command(executable, "context", "add", "txe", "--server", server.URL, "--api-key", "dagu_test_key", "--dagu-home", home.ClientDir()) //nolint:gosec // the binary built by the test harness
+	out, err := add.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(30 * time.Second)
+
+	status := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	f.assertWorkerID(status, "worker-1")
+	require.Len(t, status.Nodes, 2)
+	f.assertAllNodesSucceeded(status)
+
+	// The registry was told what the run produced, with digests.
+	registry.mu.Lock()
+	manifest, ok := registry.manifests[status.DAGRunID]
+	unknown := registry.unknown
+	registry.mu.Unlock()
+	require.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
+	assert.Empty(t, unknown)
+	byName := map[string]txeclient.ArtifactRecord{}
+	for _, a := range manifest.Artifacts {
+		byName[a.Deliverable] = a
+	}
+	wantSum := sha256.Sum256([]byte(hubContent))
+	assert.Equal(t, "hub", byName["snapshot"].Location)
+	assert.Equal(t, "sha256:"+hex.EncodeToString(wantSum[:]), byName["snapshot"].SHA256)
+	assert.Equal(t, "machine", byName["raw"].Location)
+	assert.Equal(t, txeTestMachine, byName["raw"].MachineID)
+	assert.True(t, byName["notes"].Missing)
+
+	// The hub holds the selected file, byte for byte, and nothing else of
+	// the run's output.
+	require.NotEmpty(t, status.ArchiveDir)
+	assertArtifactDirInTree(t, f, status.ArchiveDir)
+	onHub, err := os.ReadFile(filepath.Join(status.ArchiveDir, "snapshot.json"))
+	require.NoError(t, err)
+	gotSum := sha256.Sum256(onHub)
+	assert.Equal(t, wantSum, gotSum, "the hub copy differs from the recorded digest")
+	assert.NotEmpty(t, hubFilesContaining(t, f, "txe-marker-hub-deliverable"))
+	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-machine-only"), "a machine-only deliverable reached hub storage")
+	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-undeclared"), "an undeclared file reached hub storage")
+
+	// All three files are still on the machine, in the run's own directory.
+	runDir := filepath.Join(home.OutputDir(txeTestJob), "runs", status.DAGRunID)
+	for name, content := range map[string]string{"snapshot.json": hubContent, "raw/export.csv": machineContent, "debug.log": strayContent} {
+		local, err := os.ReadFile(filepath.Join(runDir, filepath.FromSlash(name)))
+		require.NoError(t, err)
+		assert.Equal(t, content, string(local))
+	}
 }
