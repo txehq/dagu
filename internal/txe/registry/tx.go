@@ -1040,7 +1040,10 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 			if err := tx.takeResolution(cur.ActionID, a); err != nil {
 				return nil, err
 			}
-		} else if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts {
+		} else if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts ||
+			cur.Spec.Name == ActionRetryRun {
+			// A run retry is attempted again only on a person's retry of its
+			// uncertain outcome, never because an attempt failed.
 			return nil, &Error{Code: CodeActionExists, Message: "action " + a.ActionID + " is " + string(cur.State), Current: cur}
 		}
 		// A retry keeps the version, binding and policy of the first attempt;
@@ -1162,8 +1165,12 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 	pa, _ := v.PermittedAction(p.Action.Name)
 	attempts := maxAttempts(v, pa)
 	if p.Action.Name == ActionRetryRun {
-		// The run may have moved on since the person decided; a native retry
-		// is not idempotent, so it is attempted once.
+		// A native retry is not idempotent. It is attempted once, plus at
+		// most one more attempt that only a person's explicit retry of its
+		// uncertain outcome allows (see Authorize). Every attempt binds the
+		// execution the person decided on: the run must still be at that
+		// execution, so an attempt that did take effect makes the next one
+		// stale instead of retrying a later execution.
 		var rp RetryRunParams
 		if err := decodeParams(p.Action.Params, &rp); err != nil {
 			return nil, err
@@ -1171,7 +1178,7 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		if err := tx.checkRunBinding(rp, false); err != nil {
 			return nil, err
 		}
-		attempts = 1
+		attempts = 2
 	}
 	return &Action{
 		ActionID:      want,
