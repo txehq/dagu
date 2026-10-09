@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -276,4 +277,147 @@ func TestRefusedSwapRetainsNothing(t *testing.T) {
 	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
 	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte("stdout execution 1\nlate\n"), 0o600))
 	require.NoError(t, f.requeue(ir.Failed, nil), "the valid retry is not blocked by an earlier copy")
+}
+
+// A symbolic link anywhere below the attempt directory never redirects a
+// copy's write or read outside it.
+func TestRetainedCopiesStayInsideTheAttempt(t *testing.T) {
+	f := newRetentionFixture(t)
+	f.execution("q1", ir.Failed, "execution 1")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	ref1 := ir.ExecutionRef(f.attempt, "q1")
+	copyDir := retainedCopyDir(t, f, ref1)
+	execDir := filepath.Dir(copyDir)
+	run := ir.NewDAGRunRef(f.dag.Name, f.runID)
+
+	// Reading: a copy's logs directory replaced by a link to elsewhere.
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "run.stdout.log"), []byte("secret"), 0o600))
+	require.NoError(t, os.RemoveAll(filepath.Join(copyDir, "logs")))
+	require.NoError(t, os.Symlink(outside, filepath.Join(copyDir, "logs")))
+	_, err := f.repo.ReadRetainedExecutionFile(f.ctx, run, ref1, "run.stdout.log")
+	assert.ErrorIs(t, err, persis.ErrNotFound, "a linked logs directory is not read")
+
+	// Writing: the executions directory replaced by a link to elsewhere.
+	target := t.TempDir()
+	require.NoError(t, os.RemoveAll(execDir))
+	require.NoError(t, os.Symlink(target, execDir))
+	f.execution("q2", ir.Failed, "execution 2")
+	require.Error(t, f.requeue(ir.Failed, nil), "the swap is refused")
+	entries, err := os.ReadDir(target)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "nothing is written through the link")
+	all, err := f.repo.ListRetainedExecutions(f.ctx, run)
+	require.NoError(t, err)
+	assert.Empty(t, all, "a linked executions directory is not listed")
+}
+
+// A symbolic link at any level of the log directory is not followed when
+// logs are collected.
+func TestRetainedLogsIgnoreLinkedDirectories(t *testing.T) {
+	f := newRetentionFixture(t)
+	outside := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(outside, f.attempt), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(outside, f.attempt, "secret.log"), []byte("secret"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(f.logDir, f.dag.Name), 0o750))
+	require.NoError(t, os.Symlink(outside, filepath.Join(f.logDir, f.dag.Name, f.runID)))
+
+	status := ir.InitialStatus(f.dag)
+	status.DAGRunID, status.AttemptID, status.QueuedAt, status.Status = f.runID, f.attempt, "q1", ir.Failed
+	status.Log = filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt, "secret.log")
+	require.NoError(t, f.handle.Open(f.ctx))
+	require.NoError(t, f.handle.Write(f.ctx, status))
+	require.NoError(t, f.handle.Close(f.ctx))
+	require.NoError(t, f.requeue(ir.Failed, nil))
+
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.Empty(t, all[0].Files, "nothing behind the linked run directory is copied")
+	assert.False(t, all[0].LogsFinal)
+}
+
+// writeFinal writes the coordinator's .final record for the log at p.
+func writeFinal(t *testing.T, p, marker, attempt, content string) {
+	t.Helper()
+	rec := fmt.Sprintf(`{"executionMarker":%q,"attemptId":%q,"size":%d,"sha256":%q}`, marker, attempt, len(content), sha256Of(content))
+	require.NoError(t, os.WriteFile(p+".final", []byte(rec), 0o600))
+}
+
+// The logs of an execution are final only when every stream the status says
+// it produced arrived and was recorded final: a finalized stdout next to a
+// stderr that never arrived is not enough. Handler logs are retained too.
+func TestRetainedLogsAreFinalOnlyWhenEveryStreamArrived(t *testing.T) {
+	f := newRetentionFixture(t)
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	runner := filepath.Join(f.logDir, f.dag.Name, f.runID, "20261009_120000_runner")
+	require.NoError(t, os.MkdirAll(logs, 0o750))
+	require.NoError(t, os.MkdirAll(runner, 0o750))
+
+	put := func(dir, name, marker, content string, final bool) {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
+		if final {
+			writeFinal(t, p, marker, f.attempt, content)
+		}
+	}
+	execution := func(marker string) {
+		status := ir.InitialStatus(f.dag)
+		status.DAGRunID, status.AttemptID, status.QueuedAt, status.Status = f.runID, f.attempt, marker, ir.Failed
+		// The worker's own paths: the coordinator stores the streams under
+		// the attempt's directory.
+		status.Log = "/worker/logs/scheduler.log"
+		status.Nodes = []*ir.Node{{Step: ir.Step{Name: "build"}, Status: ir.NodeFailed,
+			Stdout: "/worker/logs/build.stdout.log", Stderr: "/worker/logs/build.stderr.log"}}
+		// A local failure handler writes inside the log directory itself.
+		status.OnFailure = &ir.Node{Step: ir.Step{Name: "onFailure"}, Status: ir.NodeSucceeded,
+			Stdout: filepath.Join(runner, "onFailure.stdout.log")}
+		require.NoError(t, f.handle.Open(f.ctx))
+		require.NoError(t, f.handle.Write(f.ctx, status))
+		require.NoError(t, f.handle.Close(f.ctx))
+	}
+	run := ir.NewDAGRunRef(f.dag.Name, f.runID)
+
+	put(logs, "scheduler.log", "q1", "sched 1\n", true)
+	put(logs, "build.stdout.log", "q1", "out 1\n", true)
+	put(runner, "onFailure.stdout.log", "q1", "handler 1\n", true)
+	execution("q1")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	all, err := f.repo.ListRetainedExecutions(f.ctx, run)
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.Equal(t, "handler 1\n", f.file(all[0].Execution, "onFailure.stdout.log"), "the handler's log is retained")
+	for _, file := range all[0].Files {
+		assert.True(t, file.Final, file.Name)
+	}
+	assert.False(t, all[0].LogsFinal, "stderr never arrived")
+
+	put(logs, "scheduler.log", "q2", "sched 2\n", true)
+	put(logs, "build.stdout.log", "q2", "out 2\n", true)
+	put(logs, "build.stderr.log", "q2", "err 2\n", true)
+	put(runner, "onFailure.stdout.log", "q2", "handler 2\n", true)
+	execution("q2")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	all, err = f.repo.ListRetainedExecutions(f.ctx, run)
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.True(t, all[1].LogsFinal, "every stream arrived and was recorded final")
+	assert.Empty(t, all[1].LogsNote)
+}
+
+// A retained execution with no logs lists its files as an empty array.
+func TestRetainedExecutionWithoutLogsListsNoFiles(t *testing.T) {
+	f := newRetentionFixture(t)
+	status := ir.InitialStatus(f.dag)
+	status.DAGRunID, status.AttemptID, status.QueuedAt, status.Status = f.runID, f.attempt, "q1", ir.Failed
+	require.NoError(t, f.handle.Open(f.ctx))
+	require.NoError(t, f.handle.Write(f.ctx, status))
+	require.NoError(t, f.handle.Close(f.ctx))
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	data, err := json.Marshal(all[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"files":[]`)
 }
