@@ -910,17 +910,55 @@ func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
 	assert.Equal(t, LifecycleRetired, got.Lifecycle)
 }
 
-// Reports cannot grow a job record without bound: past the hard limit the
-// oldest records go, even for incomplete events.
-func TestCompactAppliedHardLimit(t *testing.T) {
+// A job holding the maximum of incomplete-event records refuses new events
+// instead of dropping any of them, and replaying one of the old incomplete
+// events still returns its recorded result without changing the job again.
+func TestAppliedRecordsAtHardLimitRefuseNewEvents(t *testing.T) {
 	f := newFixture(t)
-	list := make([]AppliedResourceEvent, hardMaxAppliedResourceEvents+5)
-	for i := range list {
-		list[i] = AppliedResourceEvent{EventID: fmt.Sprintf("missing-%d", i)}
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-18")}
+		v.RetirementRules.OnTargetDeleted = RuleReview
+	})
+	// The oldest incomplete event put the job in needs_human, then a person
+	// reactivated it.
+	oldID := f.mint(PrefixEvent)
+	old := ResourceEvent{Schema: SchemaVersion, EventID: oldID, Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true,
+		ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+oldID, &old))
+	key := appliedKey(matchIdentity, target("v-18"))
+	records := []AppliedResourceEvent{{Key: key, EventID: oldID, At: f.now,
+		Disposition: ResourceDisposition{JobID: job.JobID, Match: matchIdentity, Outcome: OutcomeNeedsHuman}}}
+	for range hardMaxAppliedResourceEvents - 1 {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-18"), Observation: ResourceUnreachable, Reporter: agent}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		records = append(records, AppliedResourceEvent{Key: key, EventID: id, At: f.now})
 	}
-	out := f.store.compactApplied(f.ctx, list)
-	assert.Len(t, out, hardMaxAppliedResourceEvents)
-	assert.Equal(t, "missing-5", out[0].EventID)
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		tx.Job.AppliedResourceEvents = records
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.False(t, ev.Complete)
+	require.Len(t, ev.Failures, 1)
+	assert.Contains(t, ev.Failures[0].Error, "send them again")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the refused event changed nothing")
+	assert.Len(t, got.AppliedResourceEvents, hardMaxAppliedResourceEvents, "no incomplete record was dropped")
+
+	replayed, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: oldID, Target: target("v-18"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.True(t, replayed.Complete)
+	require.Len(t, replayed.Dispositions, 1)
+	assert.Equal(t, OutcomeNeedsHuman, replayed.Dispositions[0].Outcome, "the recorded result is returned")
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the old event is not applied again")
 }
 
 // An older writer's undo does not release ownership of a suspension a newer

@@ -714,10 +714,11 @@ func atVersion(version int, permitted ResourceJobFilter) jobCheck {
 // recheck runs check inside the commit, so authorization and the evaluated
 // version hold for the state committed.
 // A job keeps up to maxAppliedResourceEvents applied-event records, over all
-// targets, before dropping the oldest whose event is complete. Records of
-// incomplete events are kept up to hardMaxAppliedResourceEvents; beyond it
-// the oldest go regardless, so reports cannot grow a job record without
-// bound.
+// targets, before dropping the oldest whose event is complete. A record of
+// an incomplete event is never dropped: it is what stops a replay applying
+// the event twice. When hardMaxAppliedResourceEvents records remain after
+// compaction, new events are refused for the job until the incomplete ones
+// are finished, so reports cannot grow a job record without bound.
 const (
 	maxAppliedResourceEvents     = 50
 	hardMaxAppliedResourceEvents = 500
@@ -752,28 +753,29 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 		} else if saved.Complete {
 			return errEventComplete
 		}
-		list := append(tx.Job.AppliedResourceEvents, AppliedResourceEvent{Key: c.key, EventID: c.eventID, At: tx.now, Disposition: *c.d})
-		tx.Job.AppliedResourceEvents = c.s.compactApplied(ctx, list)
+		list := c.s.compactApplied(ctx, tx.Job.AppliedResourceEvents)
+		if len(list) >= hardMaxAppliedResourceEvents {
+			return refuse(CodeNotReady, "job %s holds %d resource events that are not complete; send them again with their event_id before new events apply",
+				tx.Job.JobID, len(list))
+		}
+		tx.Job.AppliedResourceEvents = append(list, AppliedResourceEvent{Key: c.key, EventID: c.eventID, At: tx.now, Disposition: *c.d})
 		tx.touch()
 		return nil
 	}
 }
 
-// compactApplied drops the oldest applied records beyond the limit, but only
-// those whose event is recorded complete: a replay of a complete event
-// returns the saved event and never reaches the job, while an incomplete
-// one still needs its record.
+// compactApplied drops the oldest records beyond maxAppliedResourceEvents
+// whose event is recorded complete. A record whose event is incomplete, or
+// cannot be read, is kept: a replay of a complete event returns the saved
+// event and never reaches the job, while an incomplete one still needs it.
 func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent) []AppliedResourceEvent {
-	if over := len(list) - hardMaxAppliedResourceEvents; over > 0 {
-		list = list[over:]
-	}
 	excess := len(list) - maxAppliedResourceEvents
 	if excess <= 0 {
 		return list
 	}
 	out := make([]AppliedResourceEvent, 0, len(list))
-	for i, a := range list {
-		if excess > 0 && i < len(list)-1 {
+	for _, a := range list {
+		if excess > 0 {
 			if ev, err := s.GetResourceEvent(ctx, a.EventID); err == nil && ev.Complete {
 				excess--
 				continue
