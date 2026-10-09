@@ -145,7 +145,13 @@ func newFixture(t *testing.T) *fixture {
 		tasks: &recordingTasks{},
 		human: registry.Actor{Kind: registry.ActorHuman, ID: "connor", Client: "dashboard"},
 	}
-	f.svc = &Service{Registry: store, Tasks: f.tasks, Now: clock}
+	f.svc = &Service{
+		Registry:          store,
+		Tasks:             f.tasks,
+		Now:               clock,
+		AuthorizeDecision: func(context.Context, *registry.Job) error { return nil },
+		AuthorizeTask:     func(context.Context, string, string) error { return nil },
+	}
 	f.proposal = f.fileProposal("resize", true)
 	return f
 }
@@ -432,5 +438,39 @@ func (f *fixture) setNativeTask(task registry.NativeTask) {
 	})
 	if err != nil {
 		f.t.Fatal(err)
+	}
+}
+
+// Missing authorization wiring must refuse, never allow.
+func TestDecideFailsClosedWithoutAuthorizers(t *testing.T) {
+	f := newFixture(t)
+	f.svc.AuthorizeDecision = nil
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-noauth-1"), f.human); !errors.Is(err, errNoAuthorizer) {
+		t.Fatalf("without decision authorizer err = %v", err)
+	}
+	f.svc.AuthorizeDecision = func(context.Context, *registry.Job) error { return nil }
+	f.svc.AuthorizeTask = nil
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-noauth-2"), f.human); !errors.Is(err, errNoAuthorizer) {
+		t.Fatalf("without task authorizer err = %v", err)
+	}
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
+	}
+}
+
+func TestDecideRequiresDecisionAuthorization(t *testing.T) {
+	f := newFixture(t)
+	denied := errors.New("not the job owner")
+	f.svc.AuthorizeDecision = func(_ context.Context, job *registry.Job) error {
+		if job.JobID != f.jobID {
+			t.Fatalf("authorized job %s", job.JobID)
+		}
+		return denied
+	}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictReject, "key-owner-01"), f.human); !errors.Is(err, denied) {
+		t.Fatalf("err = %v, want denial", err)
+	}
+	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
+		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
 	}
 }
