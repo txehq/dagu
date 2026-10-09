@@ -1160,15 +1160,43 @@ func TestIncompleteResourceEventsAreListed(t *testing.T) {
 		}
 		return out
 	}
-	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "mch_a", "", 1)
+	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "mch_a", "", 1, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{a1}, ids(page))
 	require.NotEmpty(t, next)
-	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "mch_a", next, 1)
+	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "mch_a", next, 1, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{a2}, ids(page))
 	assert.Empty(t, next)
-	all, _, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 10)
+	all, _, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 10, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{a1, b1, a2}, ids(all))
+}
+
+// Visibility decides the page: hidden events neither fill a page nor become
+// its cursor.
+func TestIncompleteResourceEventsPageOnlyVisibleEvents(t *testing.T) {
+	f := newFixture(t)
+	var ids []string
+	for range 4 {
+		id := f.mint(PrefixEvent)
+		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-1"), Observation: ResourceUnreachable,
+			ObservedAt: f.now, Reporter: Actor{Kind: ActorReconciler, ID: "rec", MachineID: "mch_a"}}
+		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
+		require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+id, indexEntry{}))
+		f.now = f.now.Add(time.Second)
+		ids = append(ids, id)
+	}
+	// Only the second and fourth are visible.
+	visible := func(ev *ResourceEvent) bool { return ev.EventID == ids[1] || ev.EventID == ids[3] }
+	page, next, err := f.store.IncompleteResourceEvents(f.ctx, "", "", 1, visible)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, ids[1], page[0].EventID)
+	assert.Equal(t, ids[1], next, "the cursor is a visible event")
+	page, next, err = f.store.IncompleteResourceEvents(f.ctx, "", next, 1, visible)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, ids[3], page[0].EventID)
+	assert.Empty(t, next)
 }
