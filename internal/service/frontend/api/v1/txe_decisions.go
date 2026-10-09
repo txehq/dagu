@@ -105,7 +105,7 @@ func (a *API) ListTxeProposalDecisions(ctx context.Context, req api.ListTxePropo
 			continue
 		}
 		current := *d
-		current.NativeResume = decision.CurrentNativeResume(job, d)
+		current.NativeResume = registry.CurrentNativeResume(job, d)
 		converted, err := txeConvert[api.TxeDecision](&current)
 		if err != nil {
 			return nil, err
