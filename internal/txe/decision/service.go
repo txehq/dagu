@@ -127,7 +127,6 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 	if err != nil {
 		return nil, err
 	}
-	effect := EffectOf(req.Verdict)
 	if err := s.preflight(ctx, jobID, proposalID); err != nil {
 		return nil, err
 	}
@@ -146,11 +145,14 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		if err := req.ValidateNew(tx.Now()); err != nil {
 			return err
 		}
+		action := ""
 		if p := tx.Proposal(proposalID); p != nil {
 			if err := checkNativeTask(tx.Job, p.NativeTask); err != nil {
 				return err
 			}
+			action = p.Action.Name
 		}
+		effect := EffectOf(req.Verdict, action)
 		d, err := tx.AppendDecision(registry.Decision{
 			DecisionID:       decisionID,
 			ProposalID:       proposalID,
