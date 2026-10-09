@@ -315,6 +315,8 @@ const (
 	DispositionQueuedDropped     = "queued_dropped"
 	DispositionAllowedToFinish   = "allowed_to_finish"
 	DispositionCancelRequested   = "cancel_requested"
+	DispositionStopRequested     = "stop_requested"
+	DispositionStopFailed        = "stop_failed"
 )
 
 // Retirement is the recorded end of a job.
@@ -643,6 +645,9 @@ const (
 	EventLifecycle    EventKind = "lifecycle"
 	EventAvailability EventKind = "availability"
 	EventClaim        EventKind = "claim"
+	EventEffect       EventKind = "effect"
+	EventRunDropped   EventKind = "run_dropped"
+	EventResource     EventKind = "resource"
 )
 
 // Event is one immutable entry in a job's history.
