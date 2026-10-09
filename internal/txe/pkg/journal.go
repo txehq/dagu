@@ -90,8 +90,13 @@ type Receipt struct {
 	RequestID     string `json:"request_id"`
 	Session       string `json:"session,omitempty"`
 	// Service is the registry's own receipt, kept verbatim.
-	Service   json.RawMessage `json:"service"`
-	WrittenAt time.Time       `json:"written_at"`
+	Service json.RawMessage `json:"service"`
+	// Recovered is set when the registry's answer to the ready request was
+	// lost and the job had moved on before it could be asked again. It names
+	// the entry in the registry's history that records this version becoming
+	// ready, and Service holds that entry instead of a receipt.
+	Recovered string    `json:"recovered,omitempty"`
+	WrittenAt time.Time `json:"written_at"`
 }
 
 // ErrReceiptConflict reports a receipt for the same job version that came

@@ -153,6 +153,9 @@ func CheckDeliverablePath(path string) error {
 		if part == "" || part == "." || part == ".." {
 			return fmt.Errorf("%q must not contain empty, \".\" or \"..\" components", path)
 		}
+		if strings.HasPrefix(part, partialPrefix) {
+			return fmt.Errorf("%q uses the reserved prefix %q", path, partialPrefix)
+		}
 	}
 	return nil
 }

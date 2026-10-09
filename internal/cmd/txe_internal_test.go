@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -67,6 +69,50 @@ func TestTXEOutputIsCleaned(t *testing.T) {
 		assert.Equal(t, "caf\u00e9 \U0001f600", back["name"])
 		assert.Equal(t, map[string]any{"reason": "a\u009bb"}, back["raw"])
 	})
+}
+
+// A txe command takes its context store from its flags. DAGU_* variables,
+// which a job's step inherits from the worker, are dropped before the
+// configuration is read, and the default store is the TXE home's own.
+func TestTXEDefaultsIgnoreInheritedEnvironment(t *testing.T) {
+	txeHome := filepath.Join(t.TempDir(), "txe-home")
+	worker := filepath.Join(t.TempDir(), "worker-home")
+	t.Setenv("TXE_DAGU_HOME", txeHome)
+	inherited := []string{"DAGU_HOME", "DAGU_CONTEXTS_DIR", "DAGU_DATA_DIR", "DAGU_ENCRYPTION_KEY", "DAGU_CONFIG", "DAGU__DATA"}
+	for _, name := range inherited {
+		t.Setenv(name, filepath.Join(worker, name))
+	}
+	t.Setenv("DAG_RUN_ID", "run-1")
+
+	command := func() *cobra.Command {
+		c := &cobra.Command{Use: "publish"}
+		c.Flags().String("dagu-home", "", "")
+		c.Flags().String("context", "", "")
+		return c
+	}
+
+	c := command()
+	require.NoError(t, txeDefaults(c, nil))
+	for _, name := range inherited {
+		_, set := os.LookupEnv(name)
+		assert.False(t, set, "%s survived", name)
+	}
+	assert.Equal(t, "run-1", os.Getenv("DAG_RUN_ID"), "a run's own variables are kept")
+	assert.Equal(t, txeHome, os.Getenv("TXE_DAGU_HOME"))
+	home, _ := c.Flags().GetString("dagu-home")
+	assert.Equal(t, filepath.Join(txeHome, "client"), home)
+	name, _ := c.Flags().GetString("context")
+	assert.Equal(t, txeContextName, name)
+
+	// A store named by flag is kept.
+	c = command()
+	require.NoError(t, c.Flags().Set("dagu-home", "/srv/other-store"))
+	require.NoError(t, c.Flags().Set("context", "staging"))
+	require.NoError(t, txeDefaults(c, nil))
+	home, _ = c.Flags().GetString("dagu-home")
+	assert.Equal(t, "/srv/other-store", home)
+	name, _ = c.Flags().GetString("context")
+	assert.Equal(t, "staging", name)
 }
 
 // The session a change is attributed to is derived for a Claude Code session

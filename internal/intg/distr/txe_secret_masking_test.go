@@ -24,15 +24,16 @@ import (
 // hubFilesContaining returns every file in the coordinator's own storage that
 // contains needle. The worker in these tests is isolated, so its directories
 // are not searched: only what reached the hub is. A file that cannot be read
-// fails the test, because an unread file proves nothing about its content.
+// fails the test, because an unread file proves nothing about its content. A
+// file the coordinator removes while the scan runs, as it does a lease, is no
+// longer in storage and is passed over.
 func hubFilesContaining(t *testing.T, f *testFixture, needle string) []string {
 	t.Helper()
 	paths := f.coord.Config.Paths
 	var found []string
 	for _, root := range []string{paths.DataDir, paths.LogDir, paths.ArtifactDir, paths.DAGsDir} {
 		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			// A storage directory the run never created holds nothing.
-			if p == root && errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, fs.ErrNotExist) {
 				return nil
 			}
 			if err != nil {
@@ -42,6 +43,9 @@ func hubFilesContaining(t *testing.T, f *testFixture, needle string) []string {
 				return nil
 			}
 			data, err := os.ReadFile(p) //nolint:gosec // test directory
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}

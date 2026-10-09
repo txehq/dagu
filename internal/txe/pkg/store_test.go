@@ -329,6 +329,62 @@ func TestStageRefusesReferencedCredential(t *testing.T) {
 	})
 }
 
+// A file that looks like a credential is refused under any name a link gives
+// it: a link named in the spec, a link found by walking a directory, a chain
+// of links, and a link reached through a linked directory.
+func TestStageRefusesLinkedCredentialName(t *testing.T) {
+	stage := func(t *testing.T, root string, include ...string) error {
+		t.Helper()
+		_, err := newStore(t).Stage("req-1", BuildOptions{
+			SourceRoot: root, Include: append([]string{"run.sh"}, include...), Entrypoint: []string{"./run.sh"},
+		})
+		return err
+	}
+	source := func(t *testing.T) string {
+		t.Helper()
+		return writeSource(t, map[string]string{"run.sh+x": "#!/bin/sh\n", ".env": "TOKEN=abc\n", "conf/keep.txt": "x\n"})
+	}
+
+	t.Run("NamedLink", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "alias.txt"), ErrCredentialFile)
+	})
+	t.Run("WalkedLink", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("../.env", filepath.Join(root, "conf", "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "conf"), ErrCredentialFile)
+	})
+	t.Run("Chain", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "middle.txt")))
+		require.NoError(t, os.Symlink("middle.txt", filepath.Join(root, "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "alias.txt"), ErrCredentialFile)
+	})
+	t.Run("ThroughLinkedDirectory", func(t *testing.T) {
+		// conf/deep is reached as "d"; "d/x" points one level up from the
+		// real directory, which is conf, not the source root.
+		root := writeSource(t, map[string]string{
+			"run.sh+x": "#!/bin/sh\n", "y": "harmless\n", "conf/deep/keep.txt": "x\n", "conf/.env": "TOKEN=abc\n",
+		})
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "conf", "y")))
+		require.NoError(t, os.Symlink("../y", filepath.Join(root, "conf", "deep", "x")))
+		require.NoError(t, os.Symlink("conf/deep", filepath.Join(root, "d")))
+		require.ErrorIs(t, stage(t, root, "d/x"), ErrCredentialFile)
+	})
+	t.Run("HarmlessLinkStillPackaged", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("conf/keep.txt", filepath.Join(root, "alias.txt")))
+		require.NoError(t, stage(t, root, "alias.txt"))
+	})
+	t.Run("LinkLoop", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("b.txt", filepath.Join(root, "a.txt")))
+		require.NoError(t, os.Symlink("a.txt", filepath.Join(root, "b.txt")))
+		require.Error(t, stage(t, root, "a.txt"))
+	})
+}
+
 // The size limit counts the bytes copied, not what a file looked like earlier.
 func TestStageSizeLimit(t *testing.T) {
 	store := newStore(t)

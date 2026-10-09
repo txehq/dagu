@@ -326,7 +326,7 @@ func (s *Store) copySources(root, dst string, opts BuildOptions) ([]File, error)
 			if len(seen) > maxFiles {
 				return fmt.Errorf("package has more than %d files; name the needed files instead of a whole tree", maxFiles)
 			}
-			f, err := s.copyOne(source, rel, d, filepath.Join(dst, filepath.FromSlash(rel)), credentials, remaining)
+			f, err := s.copyOne(source, rel, filepath.Join(dst, filepath.FromSlash(rel)), credentials, remaining)
 			if err != nil {
 				if errors.Is(err, errTooLarge) {
 					return fmt.Errorf("package is larger than %d bytes", limit)
@@ -350,14 +350,12 @@ var errTooLarge = errors.New("package size limit exceeded")
 
 // copyOne opens rel beneath the source root, checks the opened file, and
 // copies at most budget bytes of it to dst.
-func (s *Store) copyOne(source *os.Root, rel string, d fs.DirEntry, dst string, credentials []fs.FileInfo, budget int64) (File, error) {
-	names := []string{d.Name()}
-	if d.Type()&fs.ModeSymlink != 0 {
-		// A link is packaged as the file it points to; that file's own name
-		// is judged as well.
-		if target, err := source.Readlink(filepath.FromSlash(rel)); err == nil {
-			names = append(names, filepath.Base(target))
-		}
+func (s *Store) copyOne(source *os.Root, rel string, dst string, credentials []fs.FileInfo, budget int64) (File, error) {
+	// A link is packaged as the file it points to, so every name on the way
+	// to that file is judged, not only the one the spec used.
+	names, err := linkNames(source, rel)
+	if err != nil {
+		return File{}, err
 	}
 	if slices.ContainsFunc(names, looksLikeCredentialName) {
 		return File{}, fmt.Errorf("%w: %s; reference it with a credential reference instead of packaging it", ErrCredentialFile, rel)
@@ -423,6 +421,65 @@ func (s *Store) copyOne(source *os.Root, rel string, d fs.DirEntry, dst string, 
 		return File{}, fmt.Errorf("copy %s: %w", rel, err)
 	}
 	return File{Size: size, SHA256: hex.EncodeToString(hash.Sum(nil)), Executable: executable}, nil
+}
+
+// maxLinkHops bounds a chain of links, as the operating system does.
+const maxLinkHops = 40
+
+// linkNames returns the names a packaged path goes by: its own base name, the
+// base name of every link that stands for it, and the name of the file it
+// finally is. It resolves the path the way the operating system does, one
+// component at a time, asking the root about each. A directory walk reports
+// its starting path by what it points to, so the walk's own entry cannot be
+// trusted to say whether the path is a link.
+func linkNames(source *os.Root, rel string) ([]string, error) {
+	pending := strings.Split(path.Clean(filepath.ToSlash(rel)), "/")
+	names := []string{pending[len(pending)-1]}
+	var resolved []string
+	hops := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return nil, fmt.Errorf("%s is a link that leaves the source root", rel)
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+		candidate := filepath.Join(filepath.Join(resolved...), part)
+		info, err := source.Lstat(candidate)
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", rel, err)
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			resolved = append(resolved, part)
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return nil, fmt.Errorf("%s is a chain of more than %d links", rel, maxLinkHops)
+		}
+		target, err := source.Readlink(candidate)
+		if err != nil {
+			return nil, fmt.Errorf("read link %s: %w", rel, err)
+		}
+		target = filepath.ToSlash(target)
+		if path.IsAbs(target) {
+			return nil, fmt.Errorf("%s is a link to an absolute path; a link is packaged only when it is relative and stays inside the source root", rel)
+		}
+		if len(pending) == 0 {
+			// This link stands for the file itself, not a directory on the way.
+			names = append(names, path.Base(target))
+		}
+		pending = append(strings.Split(target, "/"), pending...)
+	}
+	if len(resolved) > 0 {
+		names = append(names, resolved[len(resolved)-1])
+	}
+	return names, nil
 }
 
 // checkEntrypoint validates the command. A first element naming a packaged

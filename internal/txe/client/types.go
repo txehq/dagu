@@ -309,6 +309,33 @@ type Receipt struct {
 	Raw json.RawMessage `json:"-"`
 }
 
+// EventReady is the kind of the event the registry writes when a version is
+// marked ready. Its evidence names the package digest and the DAG's hash.
+const EventReady = "ready"
+
+// Event is one entry of a job's history in the registry. Entries are never
+// changed or removed.
+type Event struct {
+	EventID  string   `json:"event_id"`
+	JobID    string   `json:"job_id"`
+	Revision int64    `json:"revision"`
+	Kind     string   `json:"kind"`
+	Evidence []string `json:"evidence,omitempty"`
+	At       string   `json:"at"`
+
+	Raw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON keeps the whole event as the registry sent it.
+func (e *Event) UnmarshalJSON(data []byte) error {
+	type plain Event
+	if err := json.Unmarshal(data, (*plain)(e)); err != nil {
+		return err
+	}
+	e.Raw = append(e.Raw[:0], data...)
+	return nil
+}
+
 // UnmarshalJSON keeps the whole receipt as the registry sent it.
 func (r *Receipt) UnmarshalJSON(data []byte) error {
 	type plain Receipt

@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -325,22 +326,35 @@ func (r *txeFakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// A job's rendered DAG, run on a real worker, publishes exactly the files the
-// job declares. The file declared for the hub arrives there with the digest
-// the manifest records; the file declared for the machine and a file nobody
-// declared stay on the machine and never reach hub storage.
-func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
-	const (
-		hubContent     = `{"collected":"txe-marker-hub-deliverable"}`
-		machineContent = "txe-marker-machine-only\n"
-		strayContent   = "txe-marker-undeclared\n"
-	)
+const (
+	txeHubContent     = `{"collected":"txe-marker-hub-deliverable"}`
+	txeMachineContent = "txe-marker-machine-only\n"
+	txeStrayContent   = "txe-marker-undeclared\n"
+)
+
+// txePublishRun is a job with deliverables, rendered and queued on a real
+// coordinator with one isolated worker.
+type txePublishRun struct {
+	f        *testFixture
+	home     txepkg.Home
+	registry *txeFakeRegistry
+	// workerHome is the Dagu home of the process that runs the steps. Every
+	// step inherits it as DAGU_HOME. It is not the store the job was
+	// registered with and holds no "txe" context.
+	workerHome string
+}
+
+// txeStartPublishRun renders the job's DAG, with the publish step bound to a
+// context store by the flags bind returns, and starts it.
+func txeStartPublishRun(t *testing.T, bind func(home txepkg.Home, workerHome string) []string) *txePublishRun {
+	t.Helper()
 	pkg := txeCommitPackage(t, map[string]string{"collect.sh": `#!/bin/sh
 set -eu
 mkdir -p "$TXE_RUN_OUTPUT_DIR/raw"
-printf '%s' '` + hubContent + `' > "$TXE_RUN_OUTPUT_DIR/snapshot.json"
+printf '%s' '` + txeHubContent + `' > "$TXE_RUN_OUTPUT_DIR/snapshot.json"
 printf 'txe-marker-machine-only\n' > "$TXE_RUN_OUTPUT_DIR/raw/export.csv"
 printf 'txe-marker-undeclared\n' > "$TXE_RUN_OUTPUT_DIR/debug.log"
+printf '%s' "${DAGU_HOME:-}" > "$TXE_RUN_OUTPUT_DIR/inherited-dagu-home"
 echo "collected into $TXE_RUN_OUTPUT_DIR"
 `}, []string{"collect.sh"}, []string{"./collect.sh"})
 
@@ -359,9 +373,9 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 			{"name": "notes", "path": "notes.txt"}
 		]}}`}
 	server := httptest.NewServer(registry)
-	defer server.Close()
+	t.Cleanup(server.Close)
 
-	rendered, err := txepkg.RenderDAG(txepkg.DAGSpec{
+	spec := txepkg.DAGSpec{
 		Title: "Collect", JobID: txeTestJob, OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
 		ProjectID: "prj_01K7A5ZQ8M3N4P5R6S7T8V9W0B", MachineID: txeTestMachine, Version: 1,
 		PackageDigest: pkg.Digest, WorkDir: pkg.WorkDir(), OutputDir: home.OutputDir(txeTestJob),
@@ -373,60 +387,85 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 			HomeRoot:     home.Root,
 			HubArtifacts: true,
 		},
-	})
+	}
+	rendered, err := txepkg.RenderDAG(spec)
 	require.NoError(t, err)
 
 	f := newTestFixture(t, string(rendered),
 		withLabels(map[string]string{"txe.machine": txeTestMachine}),
 		withLogPersistence(), withArtifactPersistence(), withIsolatedWorker(),
 	)
-	defer f.cleanup()
+	t.Cleanup(f.cleanup)
 
 	// The publish step runs the dagu binary built from this tree, whose path
 	// is known only now. Render again with it and run that DAG.
 	executable := f.coord.Config.Paths.Executable
-	spec := txepkg.DAGSpec{
-		Title: "Collect", JobID: txeTestJob, OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
-		ProjectID: "prj_01K7A5ZQ8M3N4P5R6S7T8V9W0B", MachineID: txeTestMachine, Version: 1,
-		PackageDigest: pkg.Digest, WorkDir: pkg.WorkDir(), OutputDir: home.OutputDir(txeTestJob),
-		Entrypoint: pkg.Manifest.Entrypoint,
-		Schedule:   txepkg.Schedule{Cron: "0 2 * * *", Timezone: "Australia/Perth", TimeoutSec: 120},
-		Publish: &txepkg.Publish{
-			Command:      []string{executable, "txe", "artifacts", "publish", "--dagu-home", home.ClientDir()},
-			HomeRoot:     home.Root,
-			HubArtifacts: true,
-		},
-	}
+	workerHome := filepath.Dir(f.coord.Config.Paths.DataDir)
+	spec.Publish.Command = append([]string{executable, "txe", "artifacts", "publish"}, bind(home, workerHome)...)
 	rendered, err = txepkg.RenderDAG(spec)
 	require.NoError(t, err)
 	f.dagWrapper = new(f.coord.DAG(t, string(rendered)))
 
-	// The CLI's context, created the way an installer would.
+	// The CLI's context, created the way an installer would: a synthetic key
+	// in the TXE home's own store, and nowhere else.
 	add := exec.Command(executable, "context", "add", "txe", "--server", server.URL, "--api-key", "dagu_test_key", "--dagu-home", home.ClientDir()) //nolint:gosec // the binary built by the test harness
 	out, err := add.CombinedOutput()
 	require.NoError(t, err, string(out))
 
+	run := &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome}
+
 	require.NoError(t, f.enqueue())
 	f.waitForQueued()
 	f.startScheduler(30 * time.Second)
+	return run
+}
+
+// inheritedHome is the DAGU_HOME the job's own step saw.
+func (r *txePublishRun) inheritedHome(t *testing.T, runID string) string {
+	t.Helper()
+	seen, err := os.ReadFile(filepath.Join(r.home.OutputDir(txeTestJob), "runs", runID, "inherited-dagu-home"))
+	require.NoError(t, err)
+	return string(seen)
+}
+
+func (r *txePublishRun) manifest(runID string) (txeclient.ArtifactManifest, bool, []string) {
+	r.registry.mu.Lock()
+	defer r.registry.mu.Unlock()
+	manifest, ok := r.registry.manifests[runID]
+	return manifest, ok, slices.Clone(r.registry.unknown)
+}
+
+// A job's rendered DAG, run on a real worker, publishes exactly the files the
+// job declares. The file declared for the hub arrives there with the digest
+// the manifest records; the file declared for the machine and a file nobody
+// declared stay on the machine and never reach hub storage.
+//
+// The steps inherit the worker's own DAGU_HOME, which holds no "txe" context.
+// The publish step still reaches the registry, because the store it reads is
+// named by its flags.
+func TestTXEPackage_PublishesSelectedDeliverables(t *testing.T) {
+	run := txeStartPublishRun(t, func(home txepkg.Home, _ string) []string {
+		return []string{"--dagu-home", home.ClientDir()}
+	})
+	f, home := run.f, run.home
 
 	status := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
 	f.assertWorkerID(status, "worker-1")
 	require.Len(t, status.Nodes, 2)
 	f.assertAllNodesSucceeded(status)
+	inherited := run.inheritedHome(t, status.DAGRunID)
+	assert.Equal(t, run.workerHome, inherited, "the step did not inherit the worker's DAGU_HOME; the test proves nothing about it")
+	assert.NotEqual(t, home.ClientDir(), inherited)
 
 	// The registry was told what the run produced, with digests.
-	registry.mu.Lock()
-	manifest, ok := registry.manifests[status.DAGRunID]
-	unknown := registry.unknown
-	registry.mu.Unlock()
+	manifest, ok, unknown := run.manifest(status.DAGRunID)
 	require.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
 	assert.Empty(t, unknown)
 	byName := map[string]txeclient.ArtifactRecord{}
 	for _, a := range manifest.Artifacts {
 		byName[a.Deliverable] = a
 	}
-	wantSum := sha256.Sum256([]byte(hubContent))
+	wantSum := sha256.Sum256([]byte(txeHubContent))
 	assert.Equal(t, "hub", byName["snapshot"].Location)
 	assert.Equal(t, "sha256:"+hex.EncodeToString(wantSum[:]), byName["snapshot"].SHA256)
 	assert.Equal(t, "machine", byName["raw"].Location)
@@ -444,12 +483,48 @@ echo "collected into $TXE_RUN_OUTPUT_DIR"
 	assert.NotEmpty(t, hubFilesContaining(t, f, "txe-marker-hub-deliverable"))
 	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-machine-only"), "a machine-only deliverable reached hub storage")
 	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-undeclared"), "an undeclared file reached hub storage")
+	// The key is in the client store, not in anything the hub holds.
+	assert.Empty(t, hubFilesContaining(t, f, "dagu_test_key"), "the registry key reached hub storage")
 
 	// All three files are still on the machine, in the run's own directory.
 	runDir := filepath.Join(home.OutputDir(txeTestJob), "runs", status.DAGRunID)
-	for name, content := range map[string]string{"snapshot.json": hubContent, "raw/export.csv": machineContent, "debug.log": strayContent} {
+	for name, content := range map[string]string{"snapshot.json": txeHubContent, "raw/export.csv": txeMachineContent, "debug.log": txeStrayContent} {
 		local, err := os.ReadFile(filepath.Join(runDir, filepath.FromSlash(name)))
 		require.NoError(t, err)
 		assert.Equal(t, content, string(local))
 	}
+}
+
+// With no store named at all, the publish step uses the TXE home's own, which
+// the DAG names in TXE_DAGU_HOME. The worker's DAGU_HOME is not consulted.
+func TestTXEPackage_PublishIgnoresWorkerHome(t *testing.T) {
+	run := txeStartPublishRun(t, func(txepkg.Home, string) []string { return nil })
+
+	status := run.f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	run.f.assertAllNodesSucceeded(status)
+	assert.Equal(t, run.workerHome, run.inheritedHome(t, status.DAGRunID))
+	_, ok, unknown := run.manifest(status.DAGRunID)
+	assert.True(t, ok, "no manifest was recorded for run %s", status.DAGRunID)
+	assert.Empty(t, unknown)
+}
+
+// The store the flags name is the one that is read. Bound to the worker's own
+// Dagu home, which has no "txe" context, the publish step fails: the run is
+// failed on the hub, the hub's log says which context is missing, and nothing
+// is recorded or uploaded. This is what an unbound step did when it took its
+// store from the worker's environment.
+func TestTXEPackage_PublishFailsWithoutContext(t *testing.T) {
+	run := txeStartPublishRun(t, func(_ txepkg.Home, workerHome string) []string {
+		return []string{"--dagu-home", workerHome}
+	})
+	f := run.f
+
+	status := f.waitForStatus(ir.Failed, executionStatusTimeout())
+	require.Len(t, status.Nodes, 2)
+	assert.Equal(t, "publish", status.Nodes[1].Step.Name)
+	assert.Contains(t, hubLog(t, f, status, "publish", "stderr"), `context "txe"`)
+
+	_, ok, _ := run.manifest(status.DAGRunID)
+	assert.False(t, ok, "a manifest was recorded without the job's context")
+	assert.Empty(t, hubFilesContaining(t, f, "txe-marker-hub-deliverable"), "a deliverable was uploaded without a recorded manifest")
 }
