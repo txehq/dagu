@@ -92,6 +92,12 @@ func TestRenderReconcileDAGRefusesUnsafeInput(t *testing.T) {
 		},
 		"env dots": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"X": "/a/../../etc"} },
 		"relative": func(c *ReconcileDAGConfig) { c.DaguBin = "dagu" },
+		// Only the store flags, each with its value, may enter the DAG.
+		"unknown flag":  func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--api-key", "abc123"} },
+		"odd flags":     func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--context"} },
+		"repeated flag": func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--context", "a", "--context", "b"} },
+		"relative home": func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--dagu-home", "home"} },
+		"path context":  func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--context", "/etc/passwd"} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := reconcileConfig()

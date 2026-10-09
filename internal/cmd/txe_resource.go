@@ -176,7 +176,7 @@ func runTXEResourceCheck(ctx *Context, _ []string) error {
 		code, err := check.PreRun(runCtx, jobID, version, probe.EnvCredentials{})
 		return txeExit(code, err)
 	}
-	res, code, err := check.Periodic(runCtx, deadline, probe.FileCredentialsOf)
+	res, code, err := check.Periodic(runCtx, deadline, probe.LocalCredentials{Home: home}.For)
 	if code != probe.ExitOK && err == nil {
 		err = fmt.Errorf("%d targets not reached and %d not reported; they go first next time", res.Unfinished, res.Failed)
 	}
