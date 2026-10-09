@@ -55,12 +55,20 @@ function DecisionHistory({
                 disabled={replaying === decision.decisionId}
                 onClick={async () => {
                   setReplaying(decision.decisionId);
-                  const message = await onReplay(decision);
+                  let message: string | null;
+                  try {
+                    message = await onReplay(decision);
+                  } catch (error) {
+                    // A transport failure must leave the control usable.
+                    message =
+                      error instanceof Error ? error.message : String(error);
+                  } finally {
+                    setReplaying(null);
+                  }
                   setOutcome((o) => ({
                     ...o,
                     [decision.decisionId]: message ?? 'Follow-up completed.',
                   }));
-                  setReplaying(null);
                 }}
               >
                 <I18nText text="Complete follow-up" />
