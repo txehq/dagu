@@ -71,6 +71,29 @@ credential_refs:
 The three names are fixed: they are what the probe looks up. A reference's name is also the variable your script receives, holding the file's content for a `file` reference. So `TXE_KUBECONFIG` holds the kubeconfig's text, not a path: if your script runs `kubectl`, point it at the file with a setting of your own under `env`, such as `KUBECONFIG: /Users/you/.kube/config`.
 
 A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
+||||||| parent of fa7e90c73 (feat(txe): TXE-3850 a job spec can declare a permitted action's param_schema)
+### Bound what a reviewer may pass to an action
+
+A permitted action that takes parameters should say which ones. Give the action a `param_schema`: a JSON Schema, written as a YAML mapping.
+
+```yaml
+review_policy:
+  permitted_actions:
+    - name: reopen-ticket
+      command: ./reopen.sh
+      timeout_sec: 60
+      param_schema:
+        type: object
+        properties:
+          reason: {type: string, maxLength: 200}
+        required: [reason]
+        additionalProperties: false
+```
+
+- The registry checks a reviewer's parameters against the schema before it grants an attempt of the action, and refuses parameters that do not match. An action with no `param_schema` has its parameters checked by nothing.
+- Parameters reach the command as variables named `TXE_PARAM_<NAME>`, each a string. Declare each one as `type: string`, and set `additionalProperties: false` so that nothing undeclared is passed.
+- The registry admits JSON Schema draft 2020-12 and only the keywords it enforces exactly. It refuses `format`, `multipleOf`, unknown keywords and references to other documents. `pattern` is read as RE2.
+- A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read.
 
 ## Write the script for an unattended worker
 

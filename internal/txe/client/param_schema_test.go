@@ -1,0 +1,168 @@
+// Copyright (C) 2026 TXE
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package txeclient
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// specWithActions writes the collector's worktree with permitted actions
+// added to its review policy and returns the path of the spec.
+func specWithActions(t *testing.T, actions string) string {
+	t.Helper()
+	_, dir := worktree(t, credentialFile(t))
+	path := filepath.Join(dir, "job.yaml")
+	data, err := os.ReadFile(path) //nolint:gosec // test file
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(data, []byte("  permitted_actions:\n"+actions)...), 0o644)) //nolint:gosec // test file
+	return path
+}
+
+const boundedAction = `    - name: reopen-ticket
+      command: ./reopen.sh
+      timeout_sec: 60
+      param_schema:
+        type: object
+        properties:
+          reason: {type: string, maxLength: 200, pattern: "^[a-z <&]+$"}
+        required: [reason]
+        additionalProperties: false
+`
+
+const unboundedAction = `    - name: recount
+      command: ./recount.sh
+      timeout_sec: 30
+`
+
+// sentActions returns the permitted actions of the version in a request body.
+func sentActions(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var sent struct {
+		Version struct {
+			ReviewPolicy struct {
+				PermittedActions []map[string]any `json:"permitted_actions"`
+			} `json:"review_policy"`
+		} `json:"version"`
+	}
+	require.NoError(t, json.Unmarshal(body, &sent))
+	return sent.Version.ReviewPolicy.PermittedActions
+}
+
+// A parameter schema a job spec declares reaches the registry with the value
+// the spec gave it, and the request filed beside the receipt holds the same.
+// An action that declares none sends none.
+func TestParamSchemaIsSentAsDeclared(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	spec, err := LoadJobSpec(specWithActions(t, boundedAction+unboundedAction))
+	require.NoError(t, err)
+
+	out, err := newSession(f, home, "cc1-s000001").Register(context.Background(), spec)
+	require.NoError(t, err)
+
+	want := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"reason": map[string]any{"type": "string", "maxLength": float64(200), "pattern": "^[a-z <&]+$"},
+		},
+		"required":             []any{"reason"},
+		"additionalProperties": false,
+	}
+	check := func(where string, actions []map[string]any) {
+		require.Len(t, actions, 2, where)
+		assert.Equal(t, "reopen-ticket", actions[0]["name"], where)
+		assert.Equal(t, want, actions[0]["param_schema"], where)
+		assert.Equal(t, "recount", actions[1]["name"], where)
+		assert.NotContains(t, actions[1], "param_schema", where)
+	}
+
+	var sent []byte
+	for _, r := range f.requests {
+		if r.Method == http.MethodPost && r.Path == "/txe/jobs" {
+			sent = r.Body
+		}
+	}
+	require.NotNil(t, sent, "no registration was sent")
+	check("the request sent", sentActions(t, sent))
+
+	filed, err := os.ReadFile(filepath.Join(home.ReceiptsDir(), out.Receipt.JobID, "requests", out.Receipt.RequestID+".json")) //nolint:gosec // test directory
+	require.NoError(t, err)
+	var entry struct {
+		Request json.RawMessage `json:"request"`
+	}
+	require.NoError(t, json.Unmarshal(filed, &entry))
+	check("the request filed", sentActions(t, entry.Request))
+}
+
+// A param_schema that is not a mapping is refused with its action named,
+// whether it is a list, a scalar, or a key left with no value. The last
+// would otherwise register an action with no bounds on its parameters.
+func TestParamSchemaMustBeAMapping(t *testing.T) {
+	for name, value := range map[string]string{
+		"a list":        " [reason]",
+		"a scalar":      " reason",
+		"no value":      "",
+		"explicit null": " null",
+		"a tilde":       " ~",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := specWithActions(t, unboundedAction+"    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:"+value+"\n")
+			_, err := LoadJobSpec(path)
+			var missing *MissingContextError
+			require.ErrorAs(t, err, &missing)
+			assert.Equal(t, []string{"review_policy.permitted_actions[1].param_schema must be a mapping (a JSON Schema)"}, missing.Problems)
+		})
+	}
+
+	// An empty mapping is a schema: the one that admits any parameters.
+	spec, err := LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema: {}\n"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{}`, string(spec.ReviewPolicy.PermittedActions[0].ParamSchema))
+}
+
+// What YAML can say and JSON cannot is refused when the spec is read, not
+// sent as something else.
+func TestParamSchemaRefusesWhatJSONCannotHold(t *testing.T) {
+	for name, tc := range map[string]struct{ schema, want string }{
+		"a number that is not one": {"        maximum: .nan\n", "param_schema cannot be written as JSON"},
+		"a keyword given twice":    {"        type: object\n        type: string\n", `"type" already defined`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+tc.schema)
+			_, err := LoadJobSpec(path)
+			require.ErrorContains(t, err, tc.want)
+			var missing *MissingContextError
+			assert.NotErrorAs(t, err, &missing)
+		})
+	}
+}
+
+// A schema the registry answers is kept as it was answered, and a version
+// with none reads and writes none.
+func TestParamSchemaJSON(t *testing.T) {
+	var action PermittedAction
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"a","timeout_sec":1,"routine":false,"param_schema":{"type":"object","maximum":1.50}}`), &action))
+	assert.Equal(t, `{"type":"object","maximum":1.50}`, string(action.ParamSchema))
+	out, err := json.Marshal(action)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"param_schema":{"type":"object","maximum":1.50}`)
+
+	for _, body := range []string{`{"name":"a","timeout_sec":1,"routine":false}`, `{"name":"a","timeout_sec":1,"routine":false,"param_schema":null}`} {
+		var none PermittedAction
+		require.NoError(t, json.Unmarshal([]byte(body), &none))
+		assert.Empty(t, none.ParamSchema)
+		out, err := json.Marshal(none)
+		require.NoError(t, err)
+		assert.False(t, strings.Contains(string(out), "param_schema"), "%s", out)
+	}
+}
