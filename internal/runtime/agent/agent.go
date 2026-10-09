@@ -1772,10 +1772,11 @@ func (a *Agent) recordSecretFailure(err error) {
 	}
 }
 
-// applyStartupFailure adds the recorded startup failure to a status. The
-// caller holds lock.
+// applyStartupFailure adds the recorded startup failure to a status. A
+// startup that was aborted is reported as aborted and nothing more: the run
+// was stopped, whatever else had gone wrong by then. The caller holds lock.
 func (a *Agent) applyStartupFailure(status *ir.DAGRunStatus) {
-	if a.startupFailure == nil {
+	if a.startupFailure == nil || !a.startupFinishedAt.IsZero() {
 		return
 	}
 	failure := *a.startupFailure

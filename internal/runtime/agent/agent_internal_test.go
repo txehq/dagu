@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/mailer/oauthconfig"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -180,6 +181,18 @@ func TestRecordSecretFailure(t *testing.T) {
 		require.Equal(t, `earlier; secret "API_TOKEN" could not be resolved from provider "file"`, status.Error)
 		require.NotSame(t, a.startupFailure, status.StartupFailure)
 		require.Equal(t, a.startupFailure, status.StartupFailure)
+	})
+
+	t.Run("AbortedStartup", func(t *testing.T) {
+		a := &Agent{}
+		a.recordSecretFailure(&providers.ResolveError{Name: "API_TOKEN", Provider: "file", Err: errors.New("not found")})
+		// The run was stopped while it was starting.
+		a.startupFinishedAt = time.Now()
+
+		status := ir.DAGRunStatus{Status: ir.Aborted}
+		a.applyStartupFailure(&status)
+		require.Nil(t, status.StartupFailure)
+		require.Empty(t, status.Error)
 	})
 
 	t.Run("RegistryReference", func(t *testing.T) {
