@@ -122,3 +122,25 @@ func TestLocalRefsAreTheRegisteredOnes(t *testing.T) {
 		t.Fatal("a version this machine did not register returned references")
 	}
 }
+
+// Version returns the registered version object exactly as sent, and Refs
+// is read from it.
+func TestLocalVersionIsTheRegisteredRequest(t *testing.T) {
+	refs := []CredentialRef{{Name: LinearCredential, Kind: "env", Locator: "LINEAR_API_KEY"}}
+	home := localHome(t, refs)
+	raw, err := LocalCredentials{Home: home}.Version(credJob, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Package struct {
+			CredentialRefs []CredentialRef `json:"credential_refs"`
+		} `json:"package"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil || len(v.Package.CredentialRefs) != 1 || v.Package.CredentialRefs[0] != refs[0] {
+		t.Fatalf("version = %s, %v", raw, err)
+	}
+	if _, err := (LocalCredentials{Home: home}).Version(credJob, 3); err == nil {
+		t.Fatal("a version this machine did not register was returned")
+	}
+}
