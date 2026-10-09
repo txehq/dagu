@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
 var testNow = time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
@@ -96,16 +98,19 @@ func TestRequestSameAs(t *testing.T) {
 }
 
 func TestEffectOf(t *testing.T) {
-	if got := EffectOf(VerdictReject); got.Proposal != OutcomeRejected || got.Lifecycle != LifecycleNone {
+	if got := EffectOf(VerdictReject); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone {
 		t.Fatalf("reject = %+v", got)
 	}
 	if got := EffectOf(VerdictRetire); got.Lifecycle != LifecycleRetire {
 		t.Fatalf("retire = %+v", got)
 	}
-	if got := EffectOf(VerdictRedirect); got.Lifecycle != LifecycleNone || got.RetryRun {
+	if got := EffectOf(VerdictApprove); got.Proposal != registry.ProposalDecided {
+		t.Fatalf("approve = %+v", got)
+	}
+	if got := EffectOf(VerdictRedirect); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone || got.RetryRun {
 		t.Fatalf("redirect must grant nothing beyond a decided proposal: %+v", got)
 	}
-	if got := EffectOf(VerdictSnooze); got.Proposal != OutcomeSnoozed {
+	if got := EffectOf(VerdictSnooze); got.Proposal != registry.ProposalSnoozed {
 		t.Fatalf("snooze = %+v", got)
 	}
 }
