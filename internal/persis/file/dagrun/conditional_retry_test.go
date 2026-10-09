@@ -56,3 +56,41 @@ func TestCreateAttemptExpectsTheLatestExecution(t *testing.T) {
 	require.NoError(t, err, "the expected execution is retried")
 	assert.NotEqual(t, first.ID(), next.ID())
 }
+
+// A conditional retry's attempt is the run's latest as soon as it is
+// created, before its creator writes anything: a second conditional retry
+// through another store on the same directory, and a queued retry of the old
+// execution, both see that the expected execution was consumed.
+func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "runs")
+	repo := testutil.NewFileDAGRunRepository(dir, persis.DAGRunRepositoryOptions{})
+	other := testutil.NewFileDAGRunRepository(dir, persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "job"}
+	first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.InitialStatus(dag)
+	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", first.ID(), ir.Failed, "q1"
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, status))
+	require.NoError(t, first.Close(ctx))
+	want := &persis.ExpectedExecution{AttemptID: first.ID(), QueuedAt: "q1"}
+
+	// The first admission creates its attempt and pauses before writing.
+	next, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{Retry: true, ExpectLatest: want})
+	require.NoError(t, err)
+
+	_, err = other.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{Retry: true, ExpectLatest: want})
+	assert.ErrorIs(t, err, persis.ErrLatestExecutionChanged, "a second conditional retry of the same execution")
+	_, swapped, err := other.CompareAndSwapLatestAttemptStatus(ctx, ir.NewDAGRunRef(dag.Name, "run-1"), first.ID(), ir.Failed,
+		func(s *ir.DAGRunStatus) error { s.Status = ir.Queued; return nil }, persis.DAGRunCompareAndSwapOptions{})
+	require.NoError(t, err)
+	assert.False(t, swapped, "a queued retry of the consumed execution")
+
+	latest, err := other.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-1"))
+	require.NoError(t, err)
+	assert.Equal(t, next.ID(), latest.ID())
+	got, err := latest.ReadStatus(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.NotStarted, got.Status)
+}

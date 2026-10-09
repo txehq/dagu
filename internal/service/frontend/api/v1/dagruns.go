@@ -3073,7 +3073,10 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if prevStatus == nil {
 		return retryDAGRunResult{}, fmt.Errorf("error reading status: status data is nil")
 	}
-	if expect != nil && (prevStatus.AttemptID != expect.AttemptID || prevStatus.QueuedAt != expect.QueuedAt) {
+	// A conditional retry needs the expected execution to be the latest and
+	// finished; the admission below checks it again atomically.
+	if expect != nil && (prevStatus.AttemptID != expect.AttemptID || prevStatus.QueuedAt != expect.QueuedAt ||
+		prevStatus.Status.IsActive() || prevStatus.Status == ir.NotStarted) {
 		return retryDAGRunResult{}, executionChangedError(expect, prevStatus)
 	}
 	if prevStatus.Status.IsActive() {
@@ -3184,6 +3187,12 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
 			if expect != nil && errors.Is(err, persis.ErrLatestExecutionChanged) {
 				return retryDAGRunResult{}, executionChangedError(expect, nil)
+			}
+			if expect != nil {
+				// Only the coordinator's refusal proves nothing was retried.
+				return retryDAGRunResult{}, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
+					Message: "the conditional retry was sent and its outcome is unknown: " + err.Error(),
+					Details: map[string]any{"code": "dispatch_uncertain"}}
 			}
 			return retryDAGRunResult{}, fmt.Errorf("error dispatching retry to coordinator: %w", err)
 		}

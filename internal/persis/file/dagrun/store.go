@@ -311,6 +311,14 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 		return nil, fmt.Errorf("failed to create attempt: %w", err)
 	}
 	attempt.SetDAG(req.DAG)
+	if req.ExpectLatest != nil {
+		// The new attempt becomes the latest before the lock is released, so
+		// every later admission (another conditional retry, a queued retry's
+		// compare-and-swap) sees that the expected execution was consumed.
+		if err := claimLatest(ctx, attempt, req); err != nil {
+			return nil, err
+		}
+	}
 
 	return attempt, nil
 }
@@ -556,4 +564,18 @@ func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want 
 		return fmt.Errorf("%w: latest is %s", persis.ErrLatestExecutionChanged, status.Status)
 	}
 	return nil
+}
+
+// claimLatest writes the conditional retry's new attempt's first status.
+func claimLatest(ctx context.Context, attempt *Attempt, req persis.DAGRunCreateAttemptRequest) error {
+	status := ir.InitialStatus(req.DAG)
+	status.DAGRunID, status.AttemptID, status.Status = req.DAGRunID, attempt.ID(), ir.NotStarted
+	if err := attempt.Open(ctx); err != nil {
+		return fmt.Errorf("claim retry attempt: %w", err)
+	}
+	if err := attempt.Write(ctx, status); err != nil {
+		_ = attempt.Close(ctx)
+		return fmt.Errorf("claim retry attempt: %w", err)
+	}
+	return attempt.Close(ctx)
 }
