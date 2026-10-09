@@ -405,9 +405,11 @@ func (b0 DispatchRequest_builder) Build() *DispatchRequest {
 
 // Response message for dispatching a task.
 type DispatchResponse struct {
-	state         protoimpl.MessageState `protogen:"opaque.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_AttemptId string                 `protobuf:"bytes,1,opt,name=attempt_id,json=attemptId,proto3"`
+	xxx_hidden_QueuedAt  string                 `protobuf:"bytes,2,opt,name=queued_at,json=queuedAt,proto3"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *DispatchResponse) Reset() {
@@ -435,15 +437,44 @@ func (x *DispatchResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *DispatchResponse) GetAttemptId() string {
+	if x != nil {
+		return x.xxx_hidden_AttemptId
+	}
+	return ""
+}
+
+func (x *DispatchResponse) GetQueuedAt() string {
+	if x != nil {
+		return x.xxx_hidden_QueuedAt
+	}
+	return ""
+}
+
+func (x *DispatchResponse) SetAttemptId(v string) {
+	x.xxx_hidden_AttemptId = v
+}
+
+func (x *DispatchResponse) SetQueuedAt(v string) {
+	x.xxx_hidden_QueuedAt = v
+}
+
 type DispatchResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	// The execution the dispatch admitted, when it prepared an attempt: the
+	// attempt and the queued_at its statuses carry (the retried status's for
+	// a retry, else the task's marker).
+	AttemptId string
+	QueuedAt  string
 }
 
 func (b0 DispatchResponse_builder) Build() *DispatchResponse {
 	m0 := &DispatchResponse{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.xxx_hidden_AttemptId = b.AttemptId
+	x.xxx_hidden_QueuedAt = b.QueuedAt
 	return m0
 }
 
@@ -6033,8 +6064,11 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x04task\x18\x01 \x01(\v2\x14.coordinator.v1.TaskR\x04task\"{\n" +
 	"\x0fDispatchRequest\x12(\n" +
 	"\x04task\x18\x01 \x01(\v2\x14.coordinator.v1.TaskR\x04task\x12>\n" +
-	"\x1badmission_reservation_token\x18\x02 \x01(\tR\x19admissionReservationToken\"\x12\n" +
-	"\x10DispatchResponse\"\xd4\x0e\n" +
+	"\x1badmission_reservation_token\x18\x02 \x01(\tR\x19admissionReservationToken\"N\n" +
+	"\x10DispatchResponse\x12\x1d\n" +
+	"\n" +
+	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12\x1b\n" +
+	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\xd4\x0e\n" +
 	"\x04Task\x127\n" +
 	"\toperation\x18\x06 \x01(\x0e2\x19.coordinator.v1.OperationR\toperation\x12)\n" +
 	"\x11root_dag_run_name\x18\x01 \x01(\tR\x0erootDagRunName\x12%\n" +
