@@ -6,17 +6,13 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
-	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
-	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -56,9 +52,6 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 		// The decision is stored; say so, and that replaying this same
 		// request completes what is still outstanding.
 		cause := res.NativeErr
-		if cause == nil {
-			cause = res.RetryErr
-		}
 		logger.Warn(ctx, "TXE decision stored; follow-up pending", tag.Error(cause), tag.DAG(req.JobId))
 		return nil, &Error{
 			HTTPStatus: http.StatusServiceUnavailable,
@@ -68,7 +61,6 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 				"code":          "follow_up_pending",
 				"decision_id":   res.Decision.DecisionID,
 				"native_resume": res.Decision.NativeResume,
-				"retry_pending": res.RetryErr != nil,
 			},
 		}
 	}
@@ -164,7 +156,6 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 	return &decision.Service{
 		Registry: store,
 		Tasks:    a.humanTaskService(),
-		Retrier:  txeRunRetrier{a: a},
 		// Deciding is executing in the job's workspace; pausing or retiring
 		// the job changes it, so those verdicts need write access there.
 		AuthorizeDecision: func(ctx context.Context, tx *registry.JobTx, verdict registry.Verdict) error {
@@ -193,36 +184,4 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 			return a.requireDAGRunStatusExecute(ctx, status)
 		},
 	}
-}
-
-// txeRunRetrier retries a job's latest run through the native retry path.
-type txeRunRetrier struct{ a *API }
-
-// RetryLatest retries the latest run only while it is finished and started
-// before the decision, so a replayed retry decision cannot retry twice.
-func (r txeRunRetrier) RetryLatest(ctx context.Context, dagName string, decidedAt time.Time) (string, bool, error) {
-	attempt, err := r.a.dagRunRepository.LatestAttempt(ctx, dagName, persis.DAGRunLatestAttemptOptions{})
-	if err != nil {
-		return "", false, fmt.Errorf("find latest run of %s: %w", dagName, err)
-	}
-	status, err := attempt.ReadStatus(ctx)
-	if err != nil {
-		return "", false, fmt.Errorf("read latest run of %s: %w", dagName, err)
-	}
-	if status.Status.IsActive() {
-		return status.DAGRunID, false, nil
-	}
-	started, err := stringutil.ParseTime(status.StartedAt)
-	if err != nil {
-		return status.DAGRunID, false, fmt.Errorf("cannot tell whether run %s was already retried: %w", status.DAGRunID, err)
-	}
-	// Run times have whole-second precision: an attempt started in the
-	// decision's second counts as the retry.
-	if !started.IsZero() && !started.Before(decidedAt.Truncate(time.Second)) {
-		return status.DAGRunID, false, nil
-	}
-	if _, err := r.a.retryDAGRun(ctx, dagName, status.DAGRunID, "", "", "", false, false); err != nil {
-		return status.DAGRunID, false, err
-	}
-	return status.DAGRunID, true, nil
 }

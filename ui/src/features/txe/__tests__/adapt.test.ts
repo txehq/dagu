@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { components } from '@/api/v1/schema';
 
-import { toDecisionBody, toJob, toProposal } from '../adapt';
+import { toDecision, toDecisionBody, toJob, toProposal } from '../adapt';
 import { buildInbox } from '../inbox';
 
 type ApiJob = components['schemas']['TxeJob'];
@@ -81,6 +81,37 @@ describe('toJob', () => {
     ).toMatchObject({
       waitingOn: 'credentials',
     });
+  });
+});
+
+describe('toDecision native resume', () => {
+  const record = {
+    decision_id: 'dec_1',
+    proposal_id: 'prp_1',
+    proposal_revision: 1,
+    binding_digest: 'sha256:' + 'b'.repeat(64),
+    actor: { kind: 'human', id: 'connor' },
+    decided_at: '2026-10-09T10:00:00Z',
+    native_resume: 'pending',
+  } as unknown as components['schemas']['TxeDecision'];
+
+  it('reads pending only from the job pending list', () => {
+    const job = { job_id: 'job_1', owner_id: 'own_1' };
+    expect(
+      toDecision(
+        { ...record, verdict: 'approve' } as never,
+        { ...job, native_resumes: { dec_1: {} } } as never,
+        1
+      ).nativeResume
+    ).toBe('pending');
+    expect(
+      toDecision({ ...record, verdict: 'approve' } as never, job as never, 1)
+        .nativeResume
+    ).toBe('completed');
+    expect(
+      toDecision({ ...record, verdict: 'snooze' } as never, job as never, 1)
+        .nativeResume
+    ).toBe('none');
   });
 });
 

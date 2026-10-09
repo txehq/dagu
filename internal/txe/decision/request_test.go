@@ -107,8 +107,12 @@ func TestEffectOf(t *testing.T) {
 	if got := EffectOf(VerdictApprove); got.Proposal != registry.ProposalDecided {
 		t.Fatalf("approve = %+v", got)
 	}
-	if got := EffectOf(VerdictRedirect); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone || got.RetryRun {
+	if got := EffectOf(VerdictRedirect); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone {
 		t.Fatalf("redirect must grant nothing beyond a decided proposal: %+v", got)
+	}
+	// Retry is an instruction for the next review, not an effect here.
+	if got := EffectOf(VerdictRetry); got != (Effect{Proposal: registry.ProposalRejected}) {
+		t.Fatalf("retry = %+v", got)
 	}
 	if got := EffectOf(VerdictSnooze); got.Proposal != registry.ProposalSnoozed {
 		t.Fatalf("snooze = %+v", got)
