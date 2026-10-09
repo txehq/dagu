@@ -23,8 +23,7 @@ const CodeIdempotencyMismatch registry.Code = "idempotency_mismatch"
 type Registry interface {
 	WithJobTx(ctx context.Context, jobID string, actor registry.Actor, fn func(tx *registry.JobTx) error) (*registry.Job, error)
 	GetJob(ctx context.Context, jobID string) (*registry.Job, error)
-	ListDecisions(ctx context.Context, jobID string, limit int) ([]*registry.Decision, error)
-	ListArchivedProposals(ctx context.Context, jobID string, limit int) ([]*registry.Proposal, error)
+	GetDecision(ctx context.Context, jobID, decisionID string) (*registry.Decision, error)
 }
 
 // TaskCompleter completes a native Dagu human task.
@@ -164,7 +163,7 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 
 	result := &Result{Job: job, Proposal: job.Proposals[proposalID]}
 	if replayID != "" {
-		d, err := s.storedDecision(ctx, jobID, replayID)
+		d, err := s.Registry.GetDecision(ctx, jobID, replayID)
 		if err != nil {
 			return nil, err
 		}
@@ -183,11 +182,16 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		}
 	}
 
-	if result.Decision.NativeResume == "pending" {
-		result.NativeErr = s.resumeNative(ctx, job, result.Decision, actor)
+	// The registry tracks a pending native completion per decision; the
+	// immutable decision record keeps the state it was stored with.
+	if pending := job.NativeResumes[result.Decision.DecisionID]; pending != nil {
+		result.Decision.NativeResume = "pending"
+		result.NativeErr = s.resumeNative(ctx, job, pending, result.Decision.Verdict, actor)
 		if result.NativeErr == nil {
 			result.Decision.NativeResume = "completed"
 		}
+	} else if result.Decision.NativeResume == "pending" {
+		result.Decision.NativeResume = "completed"
 	}
 	return result, nil
 }
@@ -199,10 +203,14 @@ func (s *Service) preflightNative(ctx context.Context, jobID, proposalID string)
 	if err != nil {
 		return err
 	}
-	task, err := s.nativeTask(ctx, job, proposalID)
-	if err != nil || task == nil {
-		return err
+	p := job.Proposals[proposalID]
+	if p == nil || p.NativeTask == nil {
+		return nil
 	}
+	return s.authorizeNative(ctx, job, p.NativeTask)
+}
+
+func (s *Service) authorizeNative(ctx context.Context, job *registry.Job, task *registry.NativeTask) error {
 	if err := checkNativeTask(job, task); err != nil {
 		return err
 	}
@@ -238,54 +246,18 @@ func requestOf(d *registry.Decision) *Request {
 	}
 }
 
-func (s *Service) storedDecision(ctx context.Context, jobID, decisionID string) (*registry.Decision, error) {
-	decisions, err := s.Registry.ListDecisions(ctx, jobID, 0)
-	if err != nil {
-		return nil, err
-	}
-	for _, d := range decisions {
-		if d.DecisionID == decisionID {
-			return d, nil
-		}
-	}
-	return nil, fmt.Errorf("decision: %s is indexed but not in the decision history", decisionID)
-}
-
-// nativeTask finds the native task of a proposal, open or archived.
-func (s *Service) nativeTask(ctx context.Context, job *registry.Job, proposalID string) (*registry.NativeTask, error) {
-	if p := job.Proposals[proposalID]; p != nil {
-		return p.NativeTask, nil
-	}
-	archived, err := s.Registry.ListArchivedProposals(ctx, job.JobID, 0)
-	if err != nil {
-		return nil, err
-	}
-	for _, p := range archived {
-		if p.ProposalID == proposalID {
-			return p.NativeTask, nil
-		}
-	}
-	return nil, nil
-}
-
 // errNoTaskCompleter reports that native completion is not configured.
 var errNoTaskCompleter = errors.New("decision: native human-task completion is not configured")
 
-func (s *Service) resumeNative(ctx context.Context, job *registry.Job, d *registry.Decision, actor registry.Actor) error {
+func (s *Service) resumeNative(ctx context.Context, job *registry.Job, pending *registry.NativeResume, verdict Verdict, actor registry.Actor) error {
 	if s.Tasks == nil {
 		return errNoTaskCompleter
 	}
-	task, err := s.nativeTask(ctx, job, d.ProposalID)
-	if err != nil {
+	task := pending.NativeTask
+	if err := s.authorizeNative(ctx, job, &task); err != nil {
 		return err
 	}
-	if task == nil {
-		return fmt.Errorf("decision: proposal %s has no native task", d.ProposalID)
-	}
-	if err := checkNativeTask(job, task); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(map[string]string{"decision_id": d.DecisionID, "verdict": string(d.Verdict)})
+	raw, err := json.Marshal(map[string]string{"decision_id": pending.DecisionID, "verdict": string(verdict)})
 	if err != nil {
 		return err
 	}
@@ -304,7 +276,7 @@ func (s *Service) resumeNative(ctx context.Context, job *registry.Job, d *regist
 		return err
 	}
 	_, err = s.Registry.WithJobTx(ctx, job.JobID, actor, func(tx *registry.JobTx) error {
-		return tx.MarkNativeResumed(d.ProposalID, d.DecisionID)
+		return tx.MarkNativeResumed(pending.DecisionID)
 	})
 	return err
 }
