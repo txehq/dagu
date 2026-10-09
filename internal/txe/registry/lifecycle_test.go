@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
 type fakeRuns struct {
@@ -40,6 +42,12 @@ func (r *fakeRuns) StopRun(_ context.Context, dag, runID string) error {
 	}
 	r.stopped = append(r.stopped, dag+"/"+runID)
 	return nil
+}
+
+func (r *fakeRuns) IsSuspended(_ context.Context, dag string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.suspended[dag], nil
 }
 
 func (r *fakeRuns) SetSuspended(_ context.Context, dag string, suspended bool) error {
@@ -301,4 +309,219 @@ func TestRecordDroppedRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, EventRunDropped, events[0].Kind)
 	assert.Equal(t, string(AdmitRetired), events[0].Reason)
+}
+
+// A reporter's permission is re-checked in the commit that changes the job:
+// losing it between evaluation and commit leaves the job untouched.
+func TestResourceEventRechecksPermissionAtCommit(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("monitor", func(v *JobVersion) { v.Targets = []Target{target("v-5")} })
+	calls := 0
+	flips := func(context.Context, *Job) bool {
+		calls++
+		return calls == 1
+	}
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-5"), Observation: ResourceDeleted, Authoritative: true}, agent, flips)
+	require.NoError(t, err)
+	assert.Empty(t, ev.Dispositions)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
+	assert.Greater(t, calls, 1, "the filter ran again inside the commit")
+}
+
+// A run admitted to a worker is recorded on the job, so a retirement that
+// commits afterwards knows it and, under the cancel policy, stops it even
+// though Dagu does not report it running. Retirement first refuses the claim.
+func TestAdmitClaimOrdersAgainstRetirement(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
+
+	adm, err := f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, "run-1")
+	require.NoError(t, err)
+	require.True(t, adm.Admit)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Contains(t, got.AdmittedRuns, "run-1")
+
+	retired, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
+	require.NoError(t, err)
+	assert.Contains(t, retired.Retirement.Affected, Affected{RunID: "run-1", Disposition: DispositionAdmittedBeforeEnd})
+	assert.Equal(t, []string{job.JobID + "/run-1"}, rc.stopped, "the admitted run is stopped although Dagu listed nothing")
+	assert.Nil(t, retired.PendingEffects)
+
+	adm, err = f.store.AdmitClaim(f.ctx, job.JobID, job.DAGSpecSHA256, "run-2")
+	require.NoError(t, err)
+	assert.Equal(t, AdmitRetired, adm.Code)
+}
+
+// Expiry is decided inside the retirement commit: a lifetime extended after
+// the job was seen as expired wins.
+func TestExpiryRecheckedAtCommit(t *testing.T) {
+	f := newFixture(t)
+	soon := f.now.Add(time.Minute)
+	job := f.readyWith("k", func(v *JobVersion) { v.Lifetime.ExpiresAt = &soon })
+	f.advance(2 * time.Minute)
+	later := f.now.Add(24 * time.Hour)
+	v := f.version(2)
+	v.Lifetime.ExpiresAt = &later
+	_, err := f.store.UpdateVersion(f.ctx, job.JobID, "extend", 1, v, cli)
+	require.NoError(t, err)
+
+	got, err := f.store.retireExpired(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
+}
+
+// Effects a store without run control could not apply are left pending and
+// applied by a reconciling store.
+func TestPendingEffectsAreReconciled(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
+	_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", "run-1")
+	require.NoError(t, err)
+	got, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
+	require.NoError(t, err)
+	require.NotNil(t, got.PendingEffects)
+	assert.Equal(t, []string{"run-1"}, got.PendingEffects.StopRuns)
+
+	rc := withRuns(f)
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.Equal(t, []string{job.JobID + "/run-1"}, rc.stopped)
+	assert.True(t, rc.suspended[job.JobID])
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Nil(t, got.PendingEffects)
+	assert.True(t, got.SuspendedByRegistry)
+
+	rc.stopped = nil
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.Empty(t, rc.stopped, "applied effects are not repeated")
+}
+
+// The registry lifts only its own suspension: a stale suspension it applied
+// to a job that is active again is undone, a person's suspension is kept.
+func TestSuspensionFollowsCurrentLifecycle(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	_, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpPause}, person)
+	require.NoError(t, err)
+	assert.True(t, rc.suspended[job.JobID])
+	_, err = f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpResume}, person)
+	require.NoError(t, err)
+	assert.False(t, rc.suspended[job.JobID])
+
+	// A late pause effect suspends the DAG again; the job is active.
+	rc.suspended[job.JobID] = true
+	_, err = f.store.WithJobTx(f.ctx, job.JobID, agent, func(tx *JobTx) error {
+		tx.Job.SuspendedByRegistry = true
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.False(t, rc.suspended[job.JobID])
+
+	human := f.ready("human-suspended")
+	rc.suspended[human.JobID] = true
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.True(t, rc.suspended[human.JobID], "a person's suspension of an active job is kept")
+}
+
+// Jobs registered before the resource index existed are found after a rebuild.
+func TestRebuildResourceIndex(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-7")} })
+	ids, err := f.store.indexedJobs(f.ctx, resourceIDsPrefix)
+	require.NoError(t, err)
+	page, err := f.store.col.List(f.ctx, persis.ListQuery{Prefix: resourceIDsPrefix})
+	require.NoError(t, err)
+	for _, rec := range page.Records {
+		require.NoError(t, f.store.col.Delete(f.ctx, rec.ID))
+	}
+	require.NotEmpty(t, ids)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-7"), Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	assert.Empty(t, ev.Dispositions)
+
+	require.NoError(t, f.store.RebuildResourceIndex(f.ctx))
+	ev, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-7"), Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, job.JobID, ev.Dispositions[0].JobID)
+}
+
+// A version change between evaluation and commit makes the event be
+// evaluated again on the new version, which no longer has the target.
+func TestResourceEventReevaluatesChangedVersion(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-8")} })
+	calls := 0
+	moveAway := func(ctx context.Context, j *Job) bool {
+		calls++
+		if calls == 2 {
+			v := f.version(3)
+			v.Targets = []Target{target("v-other")}
+			_, err := f.store.UpdateVersion(ctx, j.JobID, "move", 1, v, cli)
+			require.NoError(t, err)
+		}
+		return true
+	}
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-8"), Observation: ResourceDeleted, Authoritative: true}, agent, moveAway)
+	require.NoError(t, err)
+	assert.Empty(t, ev.Dispositions)
+	assert.True(t, ev.Complete)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the decision for the old version is not applied to the new one")
+}
+
+// An event saved but not completely applied is completed by reconciliation.
+func TestReconcileResourceEvents(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-9")} })
+	ev := ResourceEvent{Schema: SchemaVersion, EventID: f.mint(PrefixEvent), Target: target("v-9"), Observation: ResourceDeleted,
+		Authoritative: true, ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+ev.EventID, &ev))
+	require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+ev.EventID, indexEntry{}))
+
+	// Without a way to re-check the reporter's permission nothing is applied.
+	require.NoError(t, f.store.ReconcileResourceEvents(f.ctx))
+	untouched, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, untouched.Lifecycle)
+
+	f.store.reauthorize = func(_ context.Context, reporter Actor, _ *Job) bool { return reporter.ID == agent.ID }
+	require.NoError(t, f.store.ReconcileResourceEvents(f.ctx))
+	stored, err := f.store.GetResourceEvent(f.ctx, ev.EventID)
+	require.NoError(t, err)
+	assert.True(t, stored.Complete)
+	require.Len(t, stored.Dispositions, 1)
+	assert.Equal(t, OutcomeRetired, stored.Dispositions[0].Outcome)
+	pending, err := f.store.indexedJobs(f.ctx, resourcePendingPrefix)
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
+
+// A reporter who lost permission since reporting does not get the event
+// applied at reconciliation: the job is untouched and the event completes
+// without a disposition for it.
+func TestReconcileResourceEventsRechecksReporter(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-10")} })
+	ev := ResourceEvent{Schema: SchemaVersion, EventID: f.mint(PrefixEvent), Target: target("v-10"), Observation: ResourceDeleted,
+		Authoritative: true, ObservedAt: f.now, Reporter: agent, Pending: []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}}
+	require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+ev.EventID, &ev))
+	require.NoError(t, f.store.createJSON(f.ctx, resourcePendingPrefix+ev.EventID, indexEntry{}))
+	f.store.reauthorize = func(context.Context, Actor, *Job) bool { return false }
+
+	require.NoError(t, f.store.ReconcileResourceEvents(f.ctx))
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle)
+	stored, err := f.store.GetResourceEvent(f.ctx, ev.EventID)
+	require.NoError(t, err)
+	assert.Empty(t, stored.Dispositions)
 }

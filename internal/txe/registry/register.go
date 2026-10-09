@@ -227,6 +227,12 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 		return nil, err
 	}
 	key := keyDigest(in.JobKey)
+	// Index before the job exists, so a committed job is always findable by
+	// its targets; an entry for a job that never commits is re-checked and
+	// ignored.
+	if err := s.indexTargets(ctx, in.JobID, in.Version.Targets); err != nil {
+		return nil, err
+	}
 	job, err := s.createJob(ctx, in, key, hash, by)
 	if err != nil {
 		return nil, err
@@ -244,9 +250,6 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 		if winner.JobID != in.JobID {
 			return nil, s.markDuplicate(ctx, in.JobID, winner.JobID, by)
 		}
-	}
-	if err := s.indexTargets(ctx, in.JobID, in.Version.Targets); err != nil {
-		return nil, err
 	}
 	if job.Registration.State == RegistrationIncomplete {
 		if err := s.publishCurrent(ctx, in.JobID); err != nil {
@@ -546,6 +549,11 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 	if err != nil {
 		return nil, err
 	}
+	// Indexing is idempotent and precedes the commit, so a replay after an
+	// interruption also repairs it.
+	if err := s.indexTargets(ctx, jobID, v.Targets); err != nil {
+		return nil, err
+	}
 	if job.Registration.RequestID == requestID && job.Registration.RequestHash == hash {
 		return job, nil
 	}
@@ -591,9 +599,6 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 		return tx.event(Event{Kind: EventVersion, From: fmt.Sprint(from), To: fmt.Sprint(nv.Version), Affected: affected})
 	})
 	if err != nil {
-		return nil, err
-	}
-	if err := s.indexTargets(ctx, jobID, v.Targets); err != nil {
 		return nil, err
 	}
 	if err := s.publishCurrent(ctx, jobID); err != nil {

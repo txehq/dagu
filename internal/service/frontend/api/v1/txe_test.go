@@ -512,4 +512,17 @@ func TestTxeAPIResourceEventAndRunGuard(t *testing.T) {
 
 	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: opsJob})
 	requireStatus(t, err, http.StatusConflict)
+	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: opsJob + ".yaml"})
+	requireStatus(t, err, http.StatusConflict)
+	other := "renamed-run"
+	_, err = a.EnqueueDAGDAGRun(txeAdmin, apigen.EnqueueDAGDAGRunRequestObject{FileName: secretJob, Body: &apigen.EnqueueDAGDAGRunJSONRequestBody{DagName: &other}})
+	requireStatus(t, err, http.StatusConflict)
+
+	// Someone who can see none of the affected jobs and did not report the
+	// event cannot read it.
+	secretOnly := auth.WithUser(context.Background(), &auth.User{Username: "sec", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "secret", Role: auth.RoleDeveloper}},
+	}})
+	_, err = a.GetTxeResourceEvent(secretOnly, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
+	requireStatus(t, err, http.StatusNotFound)
 }

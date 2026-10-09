@@ -71,6 +71,11 @@ func (c *Control) StopRun(ctx context.Context, dagName, runID string) error {
 	return c.Manager.Stop(ctx, dag, runID)
 }
 
+// IsSuspended reports Dagu's suspend flag for the DAG.
+func (c *Control) IsSuspended(ctx context.Context, dagName string) (bool, error) {
+	return c.DAGs.IsSuspended(ctx, dagName)
+}
+
 // SetSuspended sets Dagu's suspend flag for the DAG.
 func (c *Control) SetSuspended(ctx context.Context, dagName string, suspended bool) error {
 	return c.DAGs.SetSuspended(ctx, dagName, suspended)

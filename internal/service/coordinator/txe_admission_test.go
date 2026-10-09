@@ -26,7 +26,7 @@ type fakeRunAdmitter struct {
 	dropped []string
 }
 
-func (f *fakeRunAdmitter) AdmitRun(context.Context, string, string) (registry.Admission, error) {
+func (f *fakeRunAdmitter) AdmitClaim(context.Context, string, string, string) (registry.Admission, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.adm, nil
@@ -96,4 +96,42 @@ func TestAckTaskClaimRefusesRetiredJob(t *testing.T) {
 	resp, err = h.AckTaskClaim(ctx, &coordinatorv1.AckTaskClaimRequest{ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: "attempt-key-2"})
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
+}
+
+// A registered job called as a subworkflow of an ordinary parent is admitted
+// on its own identity; a retired child is refused and its sub-attempt aborted.
+func TestAckTaskClaimRefusesRetiredChildJob(t *testing.T) {
+	t.Parallel()
+	jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	baseDir := filepath.Join(t.TempDir(), "distributed")
+	dispatchStore := newTestDispatchTaskStore(baseDir)
+	runs := newMockDAGRunStore()
+	root := ir.NewDAGRunRef("parent", "root-1")
+	child := runs.addSubAttempt(root, "child-1", &ir.DAGRunStatus{Name: jobID, DAGRunID: "child-1", Status: ir.NotStarted})
+	admitter := &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitPaused, Reason: "job is paused"}}
+	h := NewHandler(HandlerConfig{
+		RunAdmitter:               admitter,
+		DAGRunRepository:          runs.repository,
+		DispatchTaskStore:         dispatchStore,
+		DAGRunLeaseStore:          newTestDAGRunLeaseStore(baseDir),
+		ActiveDistributedRunStore: newTestActiveDistributedRunStore(baseDir),
+		Owner:                     dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+	})
+	ctx := context.Background()
+	require.NoError(t, dispatchStore.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID: "child-1", Target: jobID, AttemptID: "attempt-c", AttemptKey: "attempt-key-c",
+		RootDAGRunName: "parent", RootDAGRunID: "root-1", ParentDAGRunName: "parent", ParentDAGRunID: "root-1",
+	}))
+	claimed, err := dispatchStore.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "poller-1",
+		Owner: dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055}})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	resp, err := h.AckTaskClaim(ctx, &coordinatorv1.AckTaskClaimRequest{ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: "attempt-key-c"})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+	status, err := child.ReadStatus(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Aborted, status.Status)
 }

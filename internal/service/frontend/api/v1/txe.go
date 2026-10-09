@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -887,27 +889,59 @@ func derefSlice[T any](p *[]T) []T {
 	return *p
 }
 
-// txeAdmitRun refuses a direct start, enqueue or retry of a registered job's
-// DAG unless the registry admits a run now. Other DAGs are unaffected; queued
-// runs are re-checked again at dispatch.
-func (a *API) txeAdmitRun(ctx context.Context, dagName string) error {
-	if !registry.IsJobDAG(dagName) {
+// txeAdmitDAG applies the registry run guard to a loaded DAG. It keys on
+// the DAG's definition (its file stem, which is the job ID for registry
+// written DAGs) and on its declared name, so no alias of a job's DAG and no
+// other DAG claiming a job's name can start a run the registry refuses.
+func (a *API) txeAdmitDAG(ctx context.Context, dag *ir.DAG) error {
+	if dag == nil {
+		return nil
+	}
+	stem := dag.SuspendFlagName()
+	if registry.IsJobDAG(dag.Name) && dag.Name != stem {
+		return txeRefuseInlineJobDAG(dag.Name)
+	}
+	if !registry.IsJobDAG(stem) {
 		return nil
 	}
 	s, err := a.txeStore()
 	if err != nil {
 		return err
 	}
-	adm, err := s.AdmitRun(ctx, dagName, "")
+	spec := ""
+	if len(dag.YamlData) > 0 {
+		spec = fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData))
+	}
+	adm, err := s.AdmitRun(ctx, stem, spec)
 	if err != nil {
 		return err
 	}
+	return txeRunRefused(stem, adm)
+}
+
+// txeRunRefused turns a refused admission into the API error.
+func txeRunRefused(dagName string, adm registry.Admission) error {
 	if adm.Admit {
 		return nil
 	}
 	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 		Message: fmt.Sprintf("job %s does not accept runs: %s", dagName, adm.Reason),
 		Details: map[string]any{"code": "run_refused", "admission": string(adm.Code)}}
+}
+
+// txeRefuseRunName refuses running a registered job's DAG under another
+// name, and any DAG under a job's name: the run name is the identity the
+// scheduler and coordinator guard on.
+func txeRefuseRunName(dag *ir.DAG, name string) error {
+	if name == "" || dag == nil {
+		return nil
+	}
+	if registry.IsJobDAG(dag.SuspendFlagName()) && name != dag.SuspendFlagName() {
+		return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: "a registered job's DAG cannot run under another name",
+			Details: map[string]any{"code": "run_refused"}}
+	}
+	return txeRefuseInlineJobDAG(name)
 }
 
 // txeRefuseInlineJobDAG refuses an inline spec that names itself as a
@@ -953,9 +987,9 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 		return nil, txeError(err)
 	}
 	if err != nil {
-		// Recorded, but some dependents could not be updated; the record
-		// lists the ones that were.
-		logger.Warn(ctx, "TXE resource event partially applied", tag.Error(err))
+		// The event is saved and will be retried; its complete flag and
+		// pending dependents say what is still owed.
+		logger.Warn(ctx, "TXE resource event saved but not completely applied", tag.Error(err))
 	}
 	out, err := txeConvert[api.TxeResourceEvent](recorded)
 	return api.RecordTxeResourceEvent200JSONResponse(out), err
@@ -970,13 +1004,36 @@ func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEve
 	if err != nil {
 		return nil, txeError(err)
 	}
+	canSee := func(jobID string) bool {
+		_, err := a.txeVisibleJob(ctx, s, jobID)
+		return err == nil
+	}
 	visible := ev.Dispositions[:0]
 	for _, d := range ev.Dispositions {
-		if _, err := a.txeVisibleJob(ctx, s, d.JobID); err == nil {
+		if canSee(d.JobID) {
 			visible = append(visible, d)
 		}
 	}
 	ev.Dispositions = visible
+	pending := ev.Pending[:0]
+	for _, p := range ev.Pending {
+		if canSee(p.JobID) {
+			pending = append(pending, p)
+		}
+	}
+	ev.Pending = pending
+	failures := ev.Failures[:0]
+	for _, f := range ev.Failures {
+		if canSee(f.JobID) {
+			failures = append(failures, f)
+		}
+	}
+	ev.Failures = failures
+	// The target and evidence are shown only to the reporter or to someone
+	// who can see a job the event affected.
+	if user, ok := auth.UserFromContext(ctx); a.authService != nil && len(visible)+len(pending) == 0 && (!ok || user.Username != ev.Reporter.ID) {
+		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "resource event " + req.EventId + " not found"})
+	}
 	out, err := txeConvert[api.TxeResourceEvent](ev)
 	return api.GetTxeResourceEvent200JSONResponse(out), err
 }

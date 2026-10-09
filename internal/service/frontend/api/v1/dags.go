@@ -1003,9 +1003,6 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
-		return nil, err
-	}
 	dag, err := a.dagRepository.GetDetails(ctx, request.FileName, persis.DAGLoadOptions{AllowBuildErrors: true})
 	if err != nil {
 		return nil, &Error{
@@ -1015,6 +1012,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		}
 	}
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+		return nil, err
+	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -1039,6 +1039,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 
 	if err := validateDAGRunID(dagRunId); err != nil {
 		return nil, err
@@ -1118,9 +1121,6 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
-		return nil, err
-	}
 
 	if request.Body == nil {
 		return nil, &Error{
@@ -1145,11 +1145,17 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
 		return nil, err
 	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return nil, err
+	}
 
 	dagRunId := valueOf(request.Body.DagRunId)
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 	timeout := request.Body.Timeout
 
 	if err := validateDAGRunID(dagRunId); err != nil {
@@ -1690,9 +1696,6 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeAdmitRun(ctx, request.FileName); err != nil {
-		return nil, err
-	}
 
 	dag, err := a.dagRepository.GetDetails(ctx, request.FileName, persis.DAGLoadOptions{AllowBuildErrors: true})
 	if err != nil {
@@ -1703,6 +1706,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 		}
 	}
 	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+		return nil, err
+	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -1723,6 +1729,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}
 
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return nil, err
+	}
 	if nameOverride != "" {
 		if err := ir.ValidateDAGName(nameOverride); err != nil {
 			return nil, &Error{

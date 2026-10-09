@@ -2948,9 +2948,6 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeAdmitRun(ctx, request.Name); err != nil {
-		return nil, err
-	}
 
 	retryDagRunID := request.DagRunId
 	stepName := ""
@@ -3072,6 +3069,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	dag, err := attempt.ReadDAG(ctx)
 	if err != nil {
 		return retryDAGRunResult{}, fmt.Errorf("error reading DAG: %w", err)
+	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return retryDAGRunResult{}, err
 	}
 	prevStatus, err := attempt.ReadStatus(ctx)
 	if err != nil {
@@ -3488,9 +3488,6 @@ func (a *API) RescheduleDAGRun(ctx context.Context, request api.RescheduleDAGRun
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeAdmitRun(ctx, request.Name); err != nil {
-		return nil, err
-	}
 
 	var opts rescheduleDAGRunOptions
 	if body := request.Body; body != nil {
@@ -3579,6 +3576,12 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 				Message:    err.Error(),
 			}
 		}
+	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return rescheduleDAGRunResult{}, err
+	}
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return rescheduleDAGRunResult{}, err
 	}
 	currentFileParams := preservedSnapshotParams
 	if currentFileParams == "" {
