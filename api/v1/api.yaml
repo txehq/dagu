@@ -15764,6 +15764,10 @@ components:
           type: string
           readOnly: true
           description: "Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID"
+        executionRef:
+          type: string
+          readOnly: true
+          description: "Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference"
         name:
           $ref: "#/components/schemas/DAGName"
         workspace:
@@ -20874,10 +20878,10 @@ components:
           description: "The job version the person saw; refused with 409 when the job moved on"
         attempt_id:
           type: string
-          description: "The run attempt the person reviewed; when present the request is refused with 409 unless it is the run's latest attempt"
+          description: "The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409"
         queued_at:
           type: string
-          description: "The queue marker of the execution the person reviewed (the run's queuedAt); with attempt_id it names the execution, and a different latest execution is refused with 409"
+          description: "The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409"
         run_spec_sha256:
           type: string
           description: "The run's DAG snapshot digest; when omitted the server reads it from the run"

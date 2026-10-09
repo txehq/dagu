@@ -6074,6 +6074,8 @@ export interface components {
             dagRunId: components["schemas"]["DAGRunId"];
             /** @description Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID */
             readonly attemptId?: string;
+            /** @description Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference */
+            readonly executionRef?: string;
             name: components["schemas"]["DAGName"];
             /** @description Workspace label value for the DAG-run. Omitted for default DAG-runs and invalid workspace labels. */
             workspace?: string;
@@ -8605,9 +8607,9 @@ export interface components {
             idempotency_key: string;
             /** @description The job version the person saw; refused with 409 when the job moved on */
             expected_job_version: number;
-            /** @description The run attempt the person reviewed; when present the request is refused with 409 unless it is the run's latest attempt */
+            /** @description The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409 */
             attempt_id?: string;
-            /** @description The queue marker of the execution the person reviewed (the run's queuedAt); with attempt_id it names the execution, and a different latest execution is refused with 409 */
+            /** @description The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409 */
             queued_at?: string;
             /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
             run_spec_sha256?: string;
