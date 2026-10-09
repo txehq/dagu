@@ -763,3 +763,22 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 	}
 	assert.Equal(t, []string{"deliverable_missing"}, kinds)
 }
+
+// A caller who cannot write a job learns nothing about its runs from the
+// artifacts endpoint: the write check comes before the run lookup.
+func TestTxeAPIRunArtifactsAuthorizeFirst(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	outsider := auth.WithUser(context.Background(), &auth.User{Username: "out", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleDeveloper}},
+	}})
+	for _, run := range []string{"run-1", "no-such-run"} {
+		_, err := a.RecordTxeRunArtifacts(outsider, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: run,
+			Body: &apigen.TxeArtifactManifestRequest{JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.HTTPStatus, "refused by the write check, the same for every run")
+	}
+}

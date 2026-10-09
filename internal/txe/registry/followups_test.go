@@ -61,7 +61,9 @@ func TestRetryVerdictOnlyWhereItHasAMeaning(t *testing.T) {
 // once under an execution claim; a run of another version is refused.
 func TestProposeRetry(t *testing.T) {
 	f := newFixture(t)
+	rc := withRuns(f)
 	job := f.ready("k")
+	rc.specs = map[string]string{"run-1": job.DAGSpecSHA256}
 	propose := func(params RetryRunParams, key string) (*Proposal, *Decision, error) {
 		var p *Proposal
 		var d *Decision
@@ -316,9 +318,11 @@ func TestProposalClosures(t *testing.T) {
 // versions with different packages share is refused.
 func TestRetryResolvesRunThroughVersions(t *testing.T) {
 	f := newFixture(t)
+	rc := withRuns(f)
+	rc.specs = map[string]string{}
 	retry := func(jobID string, params RetryRunParams) error {
 		_, err := f.tx(jobID, person, func(tx *JobTx) error {
-			_, _, err := tx.ProposeRetry(params, "key-"+params.RunSpecSHA256+params.PackageDigest)
+			_, _, err := tx.ProposeRetry(params, "key-"+params.RunID+params.RunSpecSHA256+params.PackageDigest)
 			return err
 		})
 		return err
@@ -332,6 +336,7 @@ func TestRetryResolvesRunThroughVersions(t *testing.T) {
 	// A new version with another spec and package: the old run is refused.
 	job := f.ready("k1")
 	v1Spec, v1Pkg := job.DAGSpecSHA256, job.PackageDigest
+	rc.specs["old"] = v1Spec
 	v2 := f.version(2)
 	v2.DAG.Spec += "  - name: report\n    run: /pkg/report.sh\n"
 	job = update(job.JobID, 1, v2)
@@ -339,13 +344,22 @@ func TestRetryResolvesRunThroughVersions(t *testing.T) {
 	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: job.PackageDigest})))
 	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: v1Spec, PackageDigest: v1Pkg})))
 	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "x", RunSpecSHA256: "sha256:" + strings.Repeat("0", 64), PackageDigest: job.PackageDigest})))
+	rc.specs["x"] = "sha256:" + strings.Repeat("0", 64)
+	rc.specs["new"] = job.DAGSpecSHA256
 	require.NoError(t, retry(job.JobID, RetryRunParams{RunID: "new", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}))
+
+	// The digest is the run's own: an old run named with the current digest,
+	// or a run the job does not have, is refused.
+	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "old", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest})),
+		"a forged digest for an old run")
+	assert.Equal(t, CodeStaleBinding, code(t, retry(job.JobID, RetryRunParams{RunID: "ghost", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest})))
 
 	// A new version with the same spec and another package: the spec no
 	// longer tells which package a run executed.
 	shared := f.ready("k2")
 	shared = update(shared.JobID, 1, f.version(3))
 	require.Equal(t, v1Spec, shared.DAGSpecSHA256)
+	rc.specs["r"] = shared.DAGSpecSHA256
 	assert.Equal(t, CodeStaleBinding, code(t, retry(shared.JobID, RetryRunParams{RunID: "r", RunSpecSHA256: shared.DAGSpecSHA256, PackageDigest: shared.PackageDigest})))
 }
 
@@ -372,11 +386,23 @@ func TestObservationsCoalesce(t *testing.T) {
 	for range 3 {
 		observe(Observation{State: AvailabilityAuthRequired, Scope: ScopeReviewer})
 	}
+	observe(Observation{State: AvailabilityWorkerOffline})
 	got := observe(Observation{State: AvailabilityWorkerOffline})
-	got = observe(Observation{State: AvailabilityWorkerOffline})
 	assert.Equal(t, 2, open(got), "one per scope, kind and state")
 	got = observe(Observation{State: AvailabilityReady, Scope: ScopeReviewer})
 	assert.Equal(t, 1, open(got), "the reviewer's is resolved, the job's stays")
 	got = observe(Observation{State: AvailabilityAuthRequired, Scope: ScopeReviewer})
 	assert.Equal(t, 2, open(got))
+}
+
+// Without run history the registry cannot read a run's own digest, so it
+// refuses to bind the retry rather than trust the caller's.
+func TestRetryNeedsRunHistory(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	_, err := f.tx(job.JobID, person, func(tx *JobTx) error {
+		_, _, err := tx.ProposeRetry(RetryRunParams{RunID: "run-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest}, "k1")
+		return err
+	})
+	assert.Equal(t, CodeNotReady, code(t, err))
 }

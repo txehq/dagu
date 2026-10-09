@@ -1165,13 +1165,14 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if err != nil {
 		return nil, err
 	}
-	runSpec, err := a.txeRunSpecDigest(ctx, req.JobId, req.RunId)
-	if err != nil {
-		return nil, err
-	}
 	var m *registry.ArtifactManifest
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
-		var err error
+		// The run is looked up only after txeTx checked that the caller may
+		// write this job, so its existence is never disclosed to others.
+		runSpec, err := a.txeRunSpecDigest(ctx, req.JobId, req.RunId)
+		if err != nil {
+			return err
+		}
 		m, err = tx.RecordArtifacts(ctx, s, req.RunId, runSpec, in)
 		return err
 	}); err != nil {
