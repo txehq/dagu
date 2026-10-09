@@ -374,28 +374,55 @@ func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
 	require.NoError(t, err)
 	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
 
-	decisionID := mint(t, registry.PrefixDecision)
 	person := registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
-	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
-		_, err := tx.AppendDecision(registry.Decision{DecisionID: decisionID, ProposalID: p.ProposalId, ProposalRevision: p.Revision,
-			BindingDigest: p.BindingDigest, Verdict: registry.VerdictReject}, registry.ProposalRejected)
-		return err
-	})
-	require.NoError(t, err)
-
-	nativeResume := func() string {
+	decide := func(verdict registry.Verdict, revision int, next registry.ProposalState) string {
+		t.Helper()
+		id := mint(t, registry.PrefixDecision)
+		_, err := store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
+			_, err := tx.AppendDecision(registry.Decision{DecisionID: id, ProposalID: p.ProposalId, ProposalRevision: revision,
+				BindingDigest: p.BindingDigest, Verdict: verdict}, next)
+			return err
+		})
+		require.NoError(t, err)
+		return id
+	}
+	nativeResume := func() []string {
 		t.Helper()
 		resp, err := a.ListTxeJobDecisions(ctx, apigen.ListTxeJobDecisionsRequestObject{JobId: jobID})
 		require.NoError(t, err)
-		decisions := resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions
-		require.Len(t, decisions, 1)
-		require.NotNil(t, decisions[0].NativeResume)
-		return string(*decisions[0].NativeResume)
+		var out []string
+		for _, d := range resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions {
+			if d.NativeResume == nil {
+				out = append(out, "")
+				continue
+			}
+			out = append(out, string(*d.NativeResume))
+		}
+		return out
 	}
-	assert.Equal(t, "pending", nativeResume())
-	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error { return tx.MarkNativeResumed(decisionID) })
+
+	// A snooze leaves the task waiting: nothing to resume, nothing reported.
+	decide(registry.VerdictSnooze, p.Revision, registry.ProposalSnoozed)
+	job, err := store.GetJob(ctx, jobID)
 	require.NoError(t, err)
-	assert.Equal(t, "completed", nativeResume())
+	assert.Empty(t, job.NativeResumes)
+	assert.Equal(t, []string{""}, nativeResume())
+
+	rejected := decide(registry.VerdictReject, p.Revision+1, registry.ProposalRejected)
+	assert.Equal(t, []string{"pending", ""}, nativeResume(), "newest first")
+	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error { return tx.MarkNativeResumed(rejected) })
+	require.NoError(t, err)
+	assert.Equal(t, []string{"completed", ""}, nativeResume())
+
+	// The state is projected at read time: a new store and API over the same
+	// data report it, and the immutable records still hold what was written.
+	a = newTxeTestAPIAt(t, dir, true)
+	assert.Equal(t, []string{"completed", ""}, nativeResume())
+	restarted, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	stored, err := restarted.GetDecision(ctx, jobID, rejected)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", stored.NativeResume)
 }
 
 // Registry reads follow workspace visibility: a job, its versions and its

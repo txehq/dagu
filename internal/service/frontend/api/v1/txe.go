@@ -755,14 +755,8 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 		return nil, txeError(err)
 	}
 	for i, d := range decisions {
-		if d.NativeResume == "" {
-			continue
-		}
 		cp := *d
-		cp.NativeResume = "completed"
-		if _, pending := job.NativeResumes[d.DecisionID]; pending {
-			cp.NativeResume = "pending"
-		}
+		cp.NativeResume = registry.CurrentNativeResume(job, d)
 		decisions[i] = &cp
 	}
 	if since := valueOf(req.Params.Since); since != "" {
