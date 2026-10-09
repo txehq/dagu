@@ -4299,7 +4299,7 @@ export interface paths {
         };
         /**
          * List a run's abandoned retry preparations
-         * @description Every attempt of the run that the coordinator prepared and abandoned without dispatching it, newest first, whatever happened to the run since: hidden preparations of a retry and first attempts marked failed alike. Each entry is either the trusted record (with attributable, true only when it carries a request correlation) or, for a record that cannot be trusted, the attempt and an error; such an entry is never attributable. Visible to callers who can see the job and the workspace of the run.
+         * @description Every attempt of the run that the coordinator prepared and abandoned without dispatching it, newest first, whatever happened to the run since: hidden preparations of a retry and first attempts marked failed alike. Each entry is either the trusted record (with attributable, true only when it carries a request correlation) or, for a record that cannot be trusted, the attempt and an error; such an entry is never attributable. Visible to callers who can see the job and the workspace of the run. runId is a run of the job's own DAG (the root run TXE retries act on); abandoned preparations of its sub-DAG runs are not listed here.
          */
         get: operations["listTxeRunAbandonments"];
         put?: never;
