@@ -60,6 +60,17 @@ export type ArtifactRef = {
   path: string;
 };
 
+// JobException is an open, actionable problem reported for a job, such as a
+// missing local login on its machine. Detail is sanitized by the reporter.
+export type JobException = {
+  exceptionId: string;
+  kind: string;
+  state?: JobAvailability;
+  detail: string;
+  evidence?: string[];
+  createdAt: string;
+};
+
 export type TxeJob = {
   jobId: string;
   ownerId: string;
@@ -74,7 +85,9 @@ export type TxeJob = {
   schedule?: { cron?: string; timezone?: string; reviewCadence?: string };
   lifecycle: JobLifecycle;
   availability: JobAvailability;
+  availabilityDetail?: string;
   availabilityObservedAt?: string;
+  exceptions?: JobException[];
   lastObservationAt?: string;
   latestRuns: RunRef[];
   machineId?: string;
@@ -146,7 +159,8 @@ export type InboxReason =
   | 'proposal'
   | 'needs_human'
   | 'unavailable'
-  | 'run-failed';
+  | 'run-failed'
+  | 'exception';
 
 export type InboxItem = {
   reason: InboxReason;
@@ -154,4 +168,5 @@ export type InboxItem = {
   proposal?: Proposal;
   waitingOn: WaitingOn;
   failedRun?: RunRef;
+  exceptions?: JobException[];
 };

@@ -68,6 +68,47 @@ describe('buildInbox', () => {
   });
 });
 
+describe('buildInbox exceptions', () => {
+  // A missing credential can stop a run before any step reports, so an auth
+  // exception alone must surface as a login action on the job's machine.
+  it('surfaces an auth exception reported without a run status', () => {
+    const job = fixtureJob({
+      exceptions: [
+        {
+          exceptionId: 'exc_1',
+          kind: 'auth',
+          detail: 'credential ref kubeconfig-dev missing on machine',
+          createdAt: '2026-10-09T09:58:00Z',
+        },
+      ],
+    });
+    const items = buildInbox([job], [], now);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      reason: 'unavailable',
+      waitingOn: 'credentials',
+    });
+    expect(items[0]?.exceptions?.[0]?.detail).toContain('kubeconfig-dev');
+  });
+
+  it('lists other open exceptions for agent follow-up', () => {
+    const job = fixtureJob({
+      exceptions: [
+        {
+          exceptionId: 'exc_2',
+          kind: 'reviewer_launch',
+          detail: 'reviewer profile missing',
+          createdAt: '2026-10-09T09:58:00Z',
+        },
+      ],
+    });
+    expect(buildInbox([job], [], now)[0]).toMatchObject({
+      reason: 'exception',
+      waitingOn: 'agent',
+    });
+  });
+});
+
 describe('buildDecisionRequest', () => {
   const proposal = fixtureProposal({
     revision: 4,
