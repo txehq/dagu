@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,12 +34,7 @@ func machineAbsPath(p string) bool {
 	if !strings.HasPrefix(p, "/") && !windowsAbsPath.MatchString(p) {
 		return false
 	}
-	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if seg == ".." {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }), "..")
 }
 
 // Worker label that routes a job to its machine.
