@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -117,8 +118,19 @@ type hubFixture struct {
 	opts     txeHubInstallOptions
 }
 
+// skipOnWindows skips a test that renders the reconcile DAG: it carries the
+// worker's POSIX paths, which the renderer requires, and a TXE worker runs
+// on macOS or Linux only.
+func skipOnWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the reconcile DAG renders POSIX paths for a macOS or Linux worker")
+	}
+}
+
 func newHubFixture(t *testing.T) hubFixture {
 	t.Helper()
+	skipOnWindows(t)
 	home := txepkg.Home{Root: "/Users/someone/.local/share/txe-dagu"}
 	machine := txepkg.Machine{MachineID: txeTestMachine, OwnerID: txeTestOwner}
 	hub := &fakeHub{specs: map[string]string{}, workers: []api.Worker{{
@@ -132,6 +144,7 @@ func newHubFixture(t *testing.T) hubFixture {
 // The DAG is rendered from the TXE home's layout, with only paths and the
 // context name, and the step can find that home.
 func TestTXEHubProbeConfig(t *testing.T) {
+	skipOnWindows(t)
 	home := txepkg.Home{Root: "/Users/someone/.local/share/txe-dagu"}
 	cfg := txeHubProbeConfig(home, txepkg.Machine{MachineID: txeTestMachine}, txeclient.HubContext{})
 	assert.Equal(t, txeTestMachine, cfg.MachineID)
