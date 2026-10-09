@@ -89,6 +89,10 @@ const (
 	ResourceUnreachable ResourceObservation = "unreachable"
 	ResourceAuthDenied  ResourceObservation = "auth_denied"
 	ResourceTimeout     ResourceObservation = "timeout"
+	// ResourceUnknown is an answer that neither confirms nor denies the
+	// resource (a lookup that returns nothing where absence cannot be
+	// proven). It is recorded and changes nothing.
+	ResourceUnknown ResourceObservation = "unknown"
 )
 
 // ResourceOutcome is what an event did to one job.
@@ -187,6 +191,10 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 	}
 	switch ev.Observation {
 	case ResourceDeleted, ResourceAbsent, ResourcePresent, ResourceUnreachable, ResourceAuthDenied, ResourceTimeout:
+	case ResourceUnknown:
+		if ev.Authoritative {
+			return nil, refuse(CodeInvalid, "an unknown observation cannot be authoritative")
+		}
 	default:
 		return nil, refuse(CodeInvalid, "unknown observation %q", ev.Observation)
 	}
@@ -539,6 +547,8 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnreachable, Kind: "target_" + string(ev.Observation), Detail: ev.Detail, Evidence: evidence}, by, c)
 	case ResourceAuthDenied:
 		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence}, by, c)
+	case ResourceUnknown:
+		return s.recordOnly(ctx, job, d, "target could not be confirmed or denied; nothing changes", evidence, by, c)
 	case ResourcePresent:
 		if job.Availability.State == AvailabilityTargetUnreachable || job.Availability.State == AvailabilityAuthRequired {
 			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence}, by, c)
@@ -672,6 +682,42 @@ func ignoreNotFound(err error) error {
 		return nil
 	}
 	return err
+}
+
+// IncompleteResourceEvents lists events not yet applied to every dependent,
+// oldest first, after the event ID after; only those a reporter on machineID
+// sent when machineID is set. It returns at most limit events and the cursor
+// for the next page, empty at the end.
+func (s *Store) IncompleteResourceEvents(ctx context.Context, machineID, after string, limit int) ([]ResourceEvent, string, error) {
+	if limit <= 0 {
+		return nil, "", refuse(CodeInvalid, "limit must be positive")
+	}
+	ids, err := s.indexedJobs(ctx, resourcePendingPrefix)
+	if err != nil {
+		return nil, "", err
+	}
+	sort.Strings(ids)
+	var out []ResourceEvent
+	for _, id := range ids {
+		if id <= after {
+			continue
+		}
+		ev, err := s.GetResourceEvent(ctx, id)
+		if err != nil {
+			if ErrorCode(err) == CodeNotFound {
+				continue
+			}
+			return nil, "", err
+		}
+		if ev.Complete || (machineID != "" && ev.Reporter.MachineID != machineID) {
+			continue
+		}
+		if len(out) == limit {
+			return out, out[len(out)-1].EventID, nil
+		}
+		out = append(out, *ev)
+	}
+	return out, "", nil
 }
 
 // GetResourceEvent returns a recorded resource event.

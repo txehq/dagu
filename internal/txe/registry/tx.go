@@ -358,6 +358,9 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 	if ttl <= 0 {
 		return nil, refuse(CodeInvalid, "claim ttl must be positive")
 	}
+	if err := tx.checkReviewerMachine(r); err != nil {
+		return nil, err
+	}
 	if c := j.Claim; c != nil {
 		if c.State == ClaimLive {
 			if tx.now.Before(c.ExpiresAt) {
@@ -401,12 +404,25 @@ func (tx *JobTx) interrupt(a *Action) {
 	tx.touch()
 }
 
+// checkReviewerMachine refuses a reviewer that is not on the job's machine:
+// a job's effects run only where its package and credentials are, so a
+// claim from another machine is never acquired or used.
+func (tx *JobTx) checkReviewerMachine(r Reviewer) error {
+	if r.MachineID == "" || r.MachineID != tx.Job.MachineID {
+		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("reviewer machine %q is not the job's machine %q", r.MachineID, tx.Job.MachineID)}
+	}
+	return nil
+}
+
 // CheckClaim refuses unless claimID with fence is the job's live claim and,
 // when kinds are given, of one of those kinds.
 func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) error {
 	c := tx.Job.Claim
 	if c == nil || c.ClaimID != claimID || c.Fence != fence || c.State != ClaimLive || !tx.now.Before(c.ExpiresAt) {
 		return &Error{Code: CodeClaimStale, Message: "claim " + claimID + " is not the live claim", Current: c}
+	}
+	if err := tx.checkReviewerMachine(c.Reviewer); err != nil {
+		return err
 	}
 	if len(kinds) == 0 {
 		return nil

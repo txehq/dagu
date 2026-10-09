@@ -272,7 +272,7 @@ func TestTxeAPIKeepsParamsExact(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 
@@ -373,7 +373,7 @@ func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
@@ -549,7 +549,7 @@ func TestTxeAPIReviewsObservationsAndDecisionOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 600}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 
@@ -635,7 +635,7 @@ func TestTxeAPIProposalClosures(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 600}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
@@ -803,4 +803,33 @@ func TestTxeAPIRunArtifactsAuthorizeFirst(t *testing.T) {
 		require.ErrorAs(t, err, &apiErr)
 		assert.Equal(t, http.StatusForbidden, apiErr.HTTPStatus, "refused by the write check, the same for every run")
 	}
+}
+
+// A claim names the job's machine or is refused before anything is written;
+// incomplete resource events are listed only as incomplete.
+func TestTxeAPIClaimMachineAndIncompleteEvents(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+
+	other := "mch_other"
+	for _, reviewer := range []apigen.TxeReviewer{{}, {MachineId: &other}} {
+		_, err = a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+			Kind: apigen.TxeClaimKindExecution, TtlSec: 60, Reviewer: reviewer}})
+		requireStatus(t, err, http.StatusConflict)
+	}
+	_, err = a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindExecution, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err, "the job's machine")
+
+	_, err = a.ListTxeResourceEvents(ctx, apigen.ListTxeResourceEventsRequestObject{Params: apigen.ListTxeResourceEventsParams{Complete: true}})
+	requireStatus(t, err, http.StatusBadRequest)
+	resp, err := a.ListTxeResourceEvents(ctx, apigen.ListTxeResourceEventsRequestObject{Params: apigen.ListTxeResourceEventsParams{Complete: false}})
+	require.NoError(t, err)
+	body, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"events":[]}`, string(body))
 }
