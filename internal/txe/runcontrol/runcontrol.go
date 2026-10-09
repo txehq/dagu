@@ -35,12 +35,13 @@ type Control struct {
 
 var _ registry.RunControl = (*Control)(nil)
 
-// ActiveRuns lists the DAG's queued, running and waiting runs. A waiting
-// run is reported as running: it has started and the run policy applies.
+// ActiveRuns lists the DAG's runs that are not finished: not started,
+// queued, running and waiting. A waiting run is reported as running: it has
+// started and the run policy applies.
 func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.RunRef, error) {
 	statuses, err := c.Runs.ListStatuses(ctx, persis.DAGRunListOptions{
 		ExactName:  dagName,
-		Statuses:   []ir.Status{ir.Queued, ir.Running, ir.Waiting},
+		Statuses:   []ir.Status{ir.NotStarted, ir.Queued, ir.Running, ir.Waiting},
 		AllHistory: true,
 		Unbounded:  true,
 	})
@@ -49,7 +50,7 @@ func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.Ru
 	}
 	out := make([]registry.RunRef, 0, len(statuses))
 	for _, st := range statuses {
-		out = append(out, registry.RunRef{RunID: st.DAGRunID, Running: st.Status != ir.Queued})
+		out = append(out, registry.RunRef{RunID: st.DAGRunID, Running: st.Status == ir.Running || st.Status == ir.Waiting})
 	}
 	return out, nil
 }

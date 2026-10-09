@@ -338,7 +338,7 @@ func (s *Store) applyDependent(ctx context.Context, p ResourceDependent, ev *Res
 		if err != nil {
 			return nil, ignoreNotFound(err)
 		}
-		if d := job.appliedResourceEvent(TargetKey(ev.Target), ev.EventID); d != nil {
+		if d := job.appliedResourceEvent(appliedKey(p.Match, ev.Target), ev.EventID); d != nil {
 			return d, nil
 		}
 		var d *ResourceDisposition
@@ -464,7 +464,7 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		return nil, nil
 	}
 	d := &ResourceDisposition{JobID: jobID, Match: matchIdentity}
-	c := eventCommit{check: atVersion(job.Version, permitted), eventID: ev.EventID, key: TargetKey(ev.Target), d: d}
+	c := eventCommit{s: s, check: atVersion(job.Version, permitted), eventID: ev.EventID, key: appliedKey(d.Match, ev.Target), d: d}
 	evidence := append([]string{"resource_event:" + ev.EventID}, ev.Evidence...)
 	if job.Lifecycle.Terminal() {
 		d.Outcome, d.Detail = OutcomeUnchanged, "job is "+string(job.Lifecycle)
@@ -513,7 +513,7 @@ func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *Resource
 		return nil, nil
 	}
 	d := &ResourceDisposition{JobID: jobID, Match: matchReplacement}
-	c := eventCommit{check: atVersion(job.Version, permitted), eventID: ev.EventID, key: TargetKey(ev.Target), d: d}
+	c := eventCommit{s: s, check: atVersion(job.Version, permitted), eventID: ev.EventID, key: appliedKey(d.Match, ev.Target), d: d}
 	if job.Lifecycle.Terminal() {
 		d.Outcome, d.Detail = OutcomeUnchanged, "job is "+string(job.Lifecycle)
 		return d, nil
@@ -661,9 +661,8 @@ func atVersion(version int, permitted ResourceJobFilter) jobCheck {
 
 // recheck runs check inside the commit, so authorization and the evaluated
 // version hold for the state committed.
-// maxAppliedResourceEvents bounds the applied events a job remembers per
-// target. A replay only matters while its event is incomplete, which is
-// resolved long before that many newer events reach the same target.
+// maxAppliedResourceEvents is how many applied events a job keeps per
+// target and match before dropping those whose event is complete.
 const maxAppliedResourceEvents = 20
 
 // eventCommit is the in-commit part of applying a resource event to a job:
@@ -671,6 +670,7 @@ const maxAppliedResourceEvents = 20
 // applied, written in the same commit as the change so a replay of the
 // event returns that result instead of applying it again.
 type eventCommit struct {
+	s       *Store
 	check   jobCheck
 	eventID string
 	key     string
@@ -690,13 +690,38 @@ func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
 			tx.Job.AppliedResourceEvents = map[string][]AppliedResourceEvent{}
 		}
 		list := append(tx.Job.AppliedResourceEvents[c.key], AppliedResourceEvent{EventID: c.eventID, At: tx.now, Disposition: *c.d})
-		if len(list) > maxAppliedResourceEvents {
-			list = list[len(list)-maxAppliedResourceEvents:]
-		}
-		tx.Job.AppliedResourceEvents[c.key] = list
+		tx.Job.AppliedResourceEvents[c.key] = c.s.compactApplied(ctx, list)
 		tx.touch()
 		return nil
 	}
+}
+
+// compactApplied drops the oldest applied records beyond the limit, but only
+// those whose event is recorded complete: a replay of a complete event
+// returns the saved event and never reaches the job, while an incomplete
+// one still needs its record.
+func (s *Store) compactApplied(ctx context.Context, list []AppliedResourceEvent) []AppliedResourceEvent {
+	excess := len(list) - maxAppliedResourceEvents
+	if excess <= 0 {
+		return list
+	}
+	out := make([]AppliedResourceEvent, 0, len(list))
+	for i, a := range list {
+		if excess > 0 && i < len(list)-1 {
+			if ev, err := s.GetResourceEvent(ctx, a.EventID); err == nil && ev.Complete {
+				excess--
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// appliedKey keys a job's applied-event records by how the event matched
+// the job and by the event's target.
+func appliedKey(match string, t Target) string {
+	return match + "|" + TargetKey(t)
 }
 
 // appliedResourceEvent returns the recorded result of an event already
