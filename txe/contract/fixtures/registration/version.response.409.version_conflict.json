@@ -1,0 +1,56 @@
+{
+  "code": "conflict",
+  "details": {
+    "code": "version_conflict",
+    "current": {
+      "job_id": "job_01K7A5ZQ8M3N4P5R6S7T8V9W01",
+      "owner_id": "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
+      "project_id": "prj_00000000000000000000000001",
+      "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+      "revision": 2,
+      "version": 1,
+      "package_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "dag_spec_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "registration": {
+        "state": "ready",
+        "job_key": "nightly-collector",
+        "request_id": "req_01K7A5ZQ8M3N4P5R6S7T8V9W02",
+        "package": {
+          "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "path": "/Users/connor/.local/share/txe-dagu/packages/job_01K7A5ZQ8M3N4P5R6S7T8V9W01/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+          "manifest_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "files": 2,
+          "bytes": 93
+        },
+        "dag_verified": true
+      },
+      "lifecycle": "active",
+      "availability": {
+        "state": "ready"
+      },
+      "created": {
+        "at": "0001-01-01T00:00:00Z",
+        "by": {
+          "kind": "cli",
+          "id": "cli",
+          "session": "cc1-s000001",
+          "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+          "client": "dagu test"
+        }
+      },
+      "updated": {
+        "at": "0001-01-01T00:00:00Z",
+        "by": {
+          "kind": "cli",
+          "id": "cli",
+          "session": "cc1-s000001",
+          "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+          "client": "dagu test"
+        }
+      }
+    }
+  },
+  "message": "job is at version 1, not 7"
+}
+

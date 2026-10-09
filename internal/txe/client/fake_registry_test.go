@@ -4,6 +4,7 @@
 package txeclient
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,6 +56,29 @@ type fakeJob struct {
 type recordedRequest struct {
 	Method, Path string
 	Body         []byte
+	// Status and Response are what the fake answered.
+	Status   int
+	Response []byte
+}
+
+// capture records what a handler writes while passing it through.
+type capture struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (c *capture) WriteHeader(status int) {
+	c.status = status
+	c.ResponseWriter.WriteHeader(status)
+}
+
+func (c *capture) Write(p []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	c.body.Write(p)
+	return c.ResponseWriter.Write(p)
 }
 
 func newFakeRegistry(t *testing.T) *fakeRegistry {
@@ -126,6 +150,18 @@ func hashOf(data []byte) string {
 
 func (f *fakeRegistry) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
+	recorded := &capture{ResponseWriter: w}
+	w = recorded
+	defer func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i := len(f.requests) - 1; i >= 0; i-- {
+			if f.requests[i].Status == 0 && f.requests[i].Method == r.Method && f.requests[i].Path == r.URL.Path {
+				f.requests[i].Status, f.requests[i].Response = recorded.status, recorded.body.Bytes()
+				break
+			}
+		}
+	}()
 	if r.Header.Get("Authorization") != "Bearer dagu_test_key" {
 		answer(w, http.StatusUnauthorized, map[string]string{"code": "unauthorized", "message": "bad key"})
 		return
@@ -133,7 +169,7 @@ func (f *fakeRegistry) serve(w http.ResponseWriter, r *http.Request) {
 	key := r.Method + " " + r.URL.Path
 
 	f.mu.Lock()
-	f.requests = append(f.requests, recordedRequest{r.Method, r.URL.Path, body})
+	f.requests = append(f.requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Body: body})
 	if f.fail[key] > 0 {
 		f.fail[key]--
 		f.mu.Unlock()

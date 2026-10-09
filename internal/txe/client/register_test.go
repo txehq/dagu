@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -510,4 +511,33 @@ func TestJobSpecUnknownKey(t *testing.T) {
 
 	_, err := LoadJobSpec(path)
 	require.ErrorContains(t, err, "titel")
+}
+
+// registerWithoutLookup sends a registration as a session would after losing
+// the race for a job key: its own lookup saw nothing.
+func (s *session) registerWithoutLookup(ctx context.Context, spec *JobSpec) (*Outcome, error) {
+	f := s.Client
+	hidden := *f
+	hidden.HTTP = &http.Client{Transport: hideJobs{f.HTTP.Transport}}
+	r := *s.Registrar
+	r.Client = &hidden
+	return r.Register(ctx, spec)
+}
+
+// hideJobs answers a job listing with an empty list and passes everything
+// else through.
+type hideJobs struct{ next http.RoundTripper }
+
+func (h hideJobs) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/txe/jobs") {
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"jobs":[]}`)), Request: req,
+		}, nil
+	}
+	next := h.next
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	return next.RoundTrip(req)
 }
