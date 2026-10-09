@@ -632,3 +632,29 @@ func TestListAttemptAbandonmentsStrictWaitsForAnAbandonmentInProgress(t *testing
 	require.NoError(t, r.results[0].Err)
 	assert.Equal(t, placeholder.ID(), r.results[0].AttemptID)
 }
+
+// Something at the record's name that cannot be read, such as a dangling
+// link, is reported, not taken for an absent record; the good records stay.
+func TestListAttemptAbandonmentsStrictReportsADanglingRecord(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	hidden := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	_, err := abandon(th, abandonRecord(dag, hidden.ID(), nil))
+	require.NoError(t, err)
+	dangling := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "gone.json"), filepath.Join(filepath.Dir(dangling.file), AbandonmentRecordFile)))
+
+	results, err := th.Repository.ListAttemptAbandonmentsStrict(th.Context, ref, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.Equal(t, dangling.ID(), results[0].AttemptID)
+	require.ErrorIs(t, results[0].Err, persis.ErrAttemptAbandonmentConflict)
+	assert.Equal(t, hidden.ID(), results[1].AttemptID)
+	require.NoError(t, results[1].Err)
+
+	_, err = th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, dangling.ID())
+	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, "the single read refuses it too")
+}
