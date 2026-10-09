@@ -304,3 +304,186 @@ func (s *syncableWriter) Sync() error {
 	s.synced = true
 	return s.err
 }
+
+// recordingStream is a remote log stream that records what it is given and
+// which of its flush methods are called.
+type recordingStream struct {
+	bytes.Buffer
+	flushed, flushedIfDue, closed int
+	writeErr, closeErr            error
+}
+
+func (s *recordingStream) Write(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	return s.Buffer.Write(p)
+}
+func (s *recordingStream) Flush() error      { s.flushed++; return nil }
+func (s *recordingStream) FlushIfDue() error { s.flushedIfDue++; return nil }
+func (s *recordingStream) Close() error      { s.closed++; return s.closeErr }
+
+func newTestMaskedStream(secrets ...string) (*maskedStreamWriter, *recordingStream) {
+	if len(secrets) == 0 {
+		secrets = []string{"TOKEN=s3cr3t"}
+	}
+	stream := &recordingStream{}
+	masker := masking.NewMasker(masking.SourcedEnvVars{Secrets: secrets})
+	return newMaskedStreamWriter(stream, masker), stream
+}
+
+// However the writes divide a secret, the stream never receives it: not when
+// it is split mid-value, and not when a periodic flush falls inside it.
+func TestMaskedStreamWriter_SplitSecret(t *testing.T) {
+	const text = "start s3cr3t middle s3cr3t end"
+	for cut := 1; cut < len(text); cut++ {
+		w, stream := newTestMaskedStream()
+
+		_, err := w.Write([]byte(text[:cut]))
+		require.NoError(t, err)
+		require.NoError(t, w.FlushIfDue())
+		assert.NotContains(t, stream.String(), "s3cr3t", "cut at %d", cut)
+		_, err = w.Write([]byte(text[cut:]))
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+
+		assert.Equal(t, "start ******* middle ******* end", stream.String(), "cut at %d", cut)
+	}
+}
+
+// Streaming must give the same result as masking the whole text, wherever the
+// writes fall. The hard case is a secret that contains another: masking the
+// short one early must not stop the long one from being recognised.
+func TestMaskedStreamWriter_MatchesWholeText(t *testing.T) {
+	secrets := []string{"URL=postgres://u:hunter2@host/db", "PASSWORD=hunter2", "TOKEN=s3cr3t\n"}
+	texts := []string{
+		"url=postgres://u:hunter2@host/db end",
+		"pw=hunter2 url=postgres://u:hunter2@host/db",
+		"token=s3cr3t\ntoken=s3cr3t end hunter2hunter2",
+		"postgres://u:hunter2@host/dbpostgres://u:hunter2@host/db",
+	}
+	whole := masking.NewMasker(masking.SourcedEnvVars{Secrets: secrets})
+	for _, text := range texts {
+		want := whole.MaskString(text)
+		for first := 1; first < len(text); first++ {
+			for second := first; second <= len(text); second += 7 {
+				w, stream := newTestMaskedStream(secrets...)
+				for _, part := range []string{text[:first], text[first:second], text[second:]} {
+					_, err := w.Write([]byte(part))
+					require.NoError(t, err)
+					require.NoError(t, w.FlushIfDue())
+				}
+				require.NoError(t, w.Close())
+				require.Equal(t, want, stream.String(), "text %q cut at %d and %d", text, first, second)
+			}
+		}
+	}
+}
+
+// Only the bytes that could begin a secret are held back, so output with no
+// line break does not accumulate in memory.
+func TestMaskedStreamWriter_BoundsHeldOutput(t *testing.T) {
+	w, stream := newTestMaskedStream()
+	const held = len("s3cr3t") - 1
+
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	for range 64 {
+		_, err := w.Write(chunk)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, w.mask.Held(), held)
+	}
+	assert.Equal(t, 64*4096-held, stream.Len())
+
+	require.NoError(t, w.Flush())
+	assert.Equal(t, 64*4096, stream.Len())
+	assert.Equal(t, 1, stream.flushed)
+}
+
+// A secret of several lines is masked when its lines arrive in separate writes.
+func TestMaskedStreamWriter_MultilineSecret(t *testing.T) {
+	w, stream := newTestMaskedStream("KEY=line-one\nline-two\n")
+
+	for _, part := range []string{"before\nline-one\n", "line-two\n", "after\n"} {
+		_, err := w.Write([]byte(part))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+
+	assert.Equal(t, "before\n*******after\n", stream.String())
+}
+
+// A secret read from a file ends with a newline; the value a script prints
+// after stripping it is masked as well.
+func TestMaskedStreamWriter_TrimmedSecret(t *testing.T) {
+	w, stream := newTestMaskedStream("TOKEN=s3cr3t\n")
+
+	_, err := w.Write([]byte("token=s3cr3t end"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	assert.Equal(t, "token=******* end", stream.String())
+}
+
+// Flush and Close send the bytes held back, masked, and close the stream once.
+func TestMaskedStreamWriter_FlushAndClose(t *testing.T) {
+	w, stream := newTestMaskedStream()
+
+	_, err := w.Write([]byte("tail s3cr3t"))
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	assert.Equal(t, "tail *******", stream.String())
+
+	_, err = w.Write([]byte(" more s3cr3t"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	assert.Equal(t, "tail ******* more *******", stream.String())
+	assert.Equal(t, 1, stream.closed)
+}
+
+// The stream is closed even when it reports an error, and the error is returned.
+func TestMaskedStreamWriter_CloseError(t *testing.T) {
+	w, stream := newTestMaskedStream()
+	stream.closeErr = errors.New("stream lost")
+
+	_, err := w.Write([]byte("tail s3cr3t"))
+	require.NoError(t, err)
+	require.ErrorContains(t, w.Close(), "stream lost")
+	assert.Equal(t, "tail *******", stream.String())
+	assert.Equal(t, 1, stream.closed)
+}
+
+// A stream that refuses writes reports the error and does not make the held
+// output grow.
+func TestMaskedStreamWriter_WriteError(t *testing.T) {
+	w, stream := newTestMaskedStream()
+	stream.writeErr = errors.New("stream closed")
+
+	for range 8 {
+		_, err := w.Write(bytes.Repeat([]byte("y"), 1024))
+		require.ErrorContains(t, err, "stream closed")
+		assert.LessOrEqual(t, w.mask.Held(), len("s3cr3t")-1)
+	}
+}
+
+// Stdout and stderr share one writer when they are merged, so writes arrive
+// from two goroutines.
+func TestMaskedStreamWriter_ConcurrentWrites(t *testing.T) {
+	w, stream := newTestMaskedStream()
+
+	done := make(chan struct{})
+	for range 2 {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for range 200 {
+				_, _ = w.Write([]byte("line s3cr3t\n"))
+				_ = w.FlushIfDue()
+			}
+		}()
+	}
+	<-done
+	<-done
+	require.NoError(t, w.Close())
+
+	assert.NotContains(t, stream.String(), "s3cr3t")
+	assert.Equal(t, 400, bytes.Count(stream.Bytes(), []byte("line *******\n")))
+}

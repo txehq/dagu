@@ -1,0 +1,18 @@
+{
+  "expected_revision": 1,
+  "package": {
+    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "path": "/Users/connor/.local/share/txe-dagu/packages/job_01K7A5ZQ8M3N4P5R6S7T8V9W01/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+    "manifest_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "files": 2,
+    "bytes": 93
+  },
+  "actor": {
+    "kind": "cli",
+    "id": "cli",
+    "session": "cc1-s000001",
+    "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+    "client": "dagu test"
+  }
+}

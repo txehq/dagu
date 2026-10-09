@@ -65,3 +65,16 @@ func TestCheckSecrets(t *testing.T) {
 	assert.NotContains(t, masker.MaskString("tok-12345 and 731902"), "731902")
 	assert.Contains(t, masker.MaskString("pin 42"), "42", "values shorter than four characters are not masked")
 }
+
+// A padded secret or answer is masked as given. Its stripped form is masked
+// only when it is long enough not to match ordinary words and numbers.
+func TestNewMasker_PaddedValues(t *testing.T) {
+	masker := agentstep.NewMasker(
+		map[string]string{"SHORT": "  a ", "TOKEN": " tok-12345\n"},
+		map[string]string{"page": " 7  "},
+	)
+
+	assert.Equal(t, "navigate to page 7", masker.MaskString("navigate to page 7"))
+	assert.Equal(t, "x*******y", masker.MaskString("x  a y"))
+	assert.Equal(t, "use ******* now", masker.MaskString("use tok-12345 now"))
+}
