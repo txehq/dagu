@@ -169,6 +169,12 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 	target := apigen.TxeTarget{Kind: "fixture.volume", StableId: map[string]string{"cluster_uid": "c-1", "uid": "vol-1"}}
 	digest := fmt.Sprintf("sha256:%064x", 7)
 	readOnly, none := apigen.TxePermittedActionIdempotency("read_only"), apigen.TxePermittedActionIdempotency("none")
+	depthSchema := map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"depth":   map[string]any{"type": "integer", "minimum": 1, "maximum": 5},
+		"ratio":   map[string]any{"type": "number", "maximum": 1},
+		"verbose": map[string]any{"type": "boolean"},
+		"label":   map[string]any{"type": "string", "maxLength": 8},
+	}}
 	sizeSchema := map[string]any{"type": "object", "properties": map[string]any{"size_gb": map[string]any{"type": "string"}}}
 	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)
 	post("/txe/jobs", apigen.TxeRegisterRequest{
@@ -181,7 +187,7 @@ func newRemoteFixture(t *testing.T) *remoteFixture {
 			ReviewPolicy: &apigen.TxeReviewPolicy{
 				Brief: new("Check usage."), Cadence: new("1h"), MaxAttempts: new(2),
 				PermittedActions: &[]apigen.TxePermittedAction{
-					{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30},
+					{Name: "collect_diagnostics", Routine: true, Command: new("true"), Idempotency: &readOnly, TimeoutSec: 30, ParamSchema: depthSchema},
 					{Name: "expand_volume", Routine: false, Command: new("true"), Idempotency: &none, TimeoutSec: 30, ParamSchema: sizeSchema},
 					{Name: "notify", Routine: true, Command: new("true"), Idempotency: &none, TimeoutSec: 30},
 				},
@@ -1817,6 +1823,78 @@ func TestRemoteAnOwnersRetryAllowsOneMoreAttemptOfARunRetry(t *testing.T) {
 	assert.NotContains(t, about2.AllowedVerdicts, review.VerdictRetry, "the registry allows no third attempt, so none is offered")
 	assert.Empty(t, stalled(), "the exception about the attempt ended with it")
 	assert.Len(t, service.retried, 2)
+}
+
+// Against the real registry: the values the agent chose for a routine
+// action are validated by the registry against the schema the job declares,
+// before anything is granted. The reviewer carries values as text and sends
+// each as the JSON type its property declares, so a number is validated as a
+// number, bounds included. A refused value runs nothing, is recorded on the
+// review with the registry's reason, and does not fail the review.
+func TestRemoteRoutineActionParameterValuesAreValidatedByTheRegistry(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	targetID := f.targetID()
+	var ran []map[string]string
+	f.fx.run = func(action review.Action) (review.EffectResult, bool) {
+		ran = append(ran, action.Params)
+		return review.EffectResult{Status: review.EffectApplied, Receipt: "ok"}, true
+	}
+	round := func(holder string, params map[string]string) review.Applied {
+		t.Helper()
+		*f.ahead += 2 * time.Hour
+		r := f.reviewer(holder)
+		r.Now = func() time.Time { return time.Now().Add(*f.ahead) }
+		prepared, err := r.Prepare(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
+		applied, err := r.Apply(ctx, prepared, review.AgentDecision{
+			Outcome: review.OutcomeAct, Reasoning: "look", EvidenceRunIDs: prepared.Packet.RunIDs(),
+			Actions: []review.AgentAction{{Name: "collect_diagnostics", TargetID: targetID, Params: params, Reason: "look"}},
+		})
+		require.NoError(t, err, "a refused value is not a failure of the review")
+		return applied
+	}
+
+	// Values within the schema run, and reach the command as the text the
+	// agent gave. The registry stores them as the types the schema declares.
+	good := map[string]string{"depth": "3", "ratio": "0.25", "verbose": "true", "label": "007"}
+	applied := round("reviewer-a", good)
+	require.Len(t, applied.Executed, 1)
+	assert.Equal(t, review.ActionSucceeded, applied.Executed[0].State)
+	require.Len(t, ran, 1)
+	assert.Equal(t, good, ran[0])
+	// That the registry granted it shows the values were sent typed: it
+	// does not coerce, and the string "3" is not an integer to it.
+	journaled := func() []review.Action {
+		t.Helper()
+		actions, err := f.remote.Actions(ctx, f.jobID)
+		require.NoError(t, err)
+		return actions
+	}
+	require.Len(t, journaled(), 1)
+	assert.Equal(t, good, journaled()[0].Params, "read back as the same text")
+
+	// Values the schema does not allow: out of bounds, not a number at all,
+	// a string too long, and a parameter that is declared but mistyped.
+	for name, params := range map[string]map[string]string{
+		"above the maximum":  {"depth": "9"},
+		"not an integer":     {"depth": "3; rm -rf /"},
+		"a fraction":         {"depth": "2.5"},
+		"ratio out of range": {"ratio": "7"},
+		"not a boolean":      {"verbose": "yes"},
+		"label too long":     {"label": "far-too-long-a-label"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			applied := round("reviewer-"+name, params)
+			assert.Empty(t, applied.Executed)
+			assert.Len(t, ran, 1, "nothing ran")
+			assert.Len(t, journaled(), 1, "nothing was journaled")
+			require.NotEmpty(t, applied.Review.Notes)
+			note := applied.Review.Notes[len(applied.Review.Notes)-1]
+			assert.Contains(t, note, `action "collect_diagnostics" denied by the guard: invalid_params: the registry said "`)
+		})
+	}
 }
 
 // An effect whose outcome is unknown is escalated as the registry's typed

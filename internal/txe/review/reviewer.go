@@ -886,7 +886,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		review.Notes = append(review.Notes, fmt.Sprintf("action %s was already journaled as %s; not repeated", action.ID, action.State))
 		return nil
 	case errors.As(err, &denied):
-		review.Notes = append(review.Notes, fmt.Sprintf("action %q denied by the guard: %s", requested.Name, denied.Reason))
+		review.Notes = append(review.Notes, fmt.Sprintf("action %q denied by the guard: %s", requested.Name, deniedText(denied)))
 		return nil
 	case err != nil:
 		return fmt.Errorf("begin action %q: %w", requested.Name, err)
@@ -1364,6 +1364,17 @@ func agentReason(reason string) string {
 	return "The review agent's reason, in its own words (not checked): " + agentText(reason)
 }
 
+// deniedText is what is recorded of a refusal by the guard. A refusal of
+// the parameter values says which value and why, in the registry's words,
+// which quote the value the agent chose: that part is shown as a bounded
+// quotation like the agent's other text.
+func deniedText(denied *GuardDeniedError) string {
+	if denied.Reason == DenyInvalidParams && denied.Detail != "" {
+		return string(denied.Reason) + ": the registry said " + agentText(denied.Detail)
+	}
+	return string(denied.Reason)
+}
+
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
 	for name := range params {
 		found := slices.Contains(declared.Params, name)
@@ -1544,7 +1555,7 @@ func (r *Reviewer) executeClaimed(ctx context.Context, claim Claim, job Job, dec
 	case errors.Is(err, ErrActionExists):
 		return Executed{Skipped: "already journaled as " + string(action.State), Action: action}, nil
 	case errors.As(err, &denied):
-		return Executed{Skipped: "denied by the guard: " + string(denied.Reason)}, nil
+		return Executed{Skipped: "denied by the guard: " + deniedText(denied)}, nil
 	case err != nil:
 		return Executed{}, fmt.Errorf("begin action: %w", err)
 	}

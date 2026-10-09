@@ -39,6 +39,9 @@ const (
 	DenyDecisionStale  DenyReason = "decision_stale"
 	DenyNotApproved    DenyReason = "not_approved"
 	DenyNotPermitted   DenyReason = "not_permitted"
+	// DenyInvalidParams means the registry refused the action's parameter
+	// values against the schema the job declares for them.
+	DenyInvalidParams DenyReason = "invalid_params"
 	// DenyIntentUnresolved means an earlier attempt of the same intent has
 	// an outcome nobody has settled yet.
 	DenyIntentUnresolved DenyReason = "intent_unresolved"

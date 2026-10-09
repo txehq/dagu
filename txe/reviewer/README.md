@@ -20,7 +20,13 @@ project settings and no saved session, and it is given only the packet. Its
 answer is a request: `apply` runs an action only when the job's saved policy
 declares it `routine`, files any other declared action as a proposal, and
 turns anything undeclared into a question. Parameters reach an action as
-`TXE_PARAM_<NAME>` environment variables, never as shell text.
+`TXE_PARAM_<NAME>` environment variables, never as shell text. The registry
+validates the values against the `param_schema` the job declares for the
+action before it grants an attempt, as JSON and without coercion. The
+reviewer carries every value as text and sends it as the JSON type its
+property declares (`integer`, `number`, `boolean`) when the text is exactly
+a value of that type, and as a string otherwise; a value the schema does not
+allow runs nothing and is recorded on the review with the registry's reason.
 
 ## Reviewer profile
 

@@ -4,6 +4,7 @@
 package review
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -47,6 +48,7 @@ const (
 	codeClaimHeld        = "claim_held"
 	codeClaimStale       = "claim_stale"
 	codeNotPermitted     = "not_permitted"
+	codeInvalid          = "invalid"
 	codeStaleBinding     = "stale_binding"
 	codeProposalState    = "proposal_state"
 	codeActionExists     = "action_exists"
@@ -144,26 +146,73 @@ func deref[T any](p *T) T {
 
 func paramsOf(raw json.RawMessage) map[string]string {
 	out := map[string]string{}
+	// Numbers are kept as they are written, not as floating point: a value
+	// stored as 1000000 reaches the command as 1000000, and its intent key
+	// is the one the reviewer computed from that text.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var m map[string]any
-	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+	if len(raw) == 0 || dec.Decode(&m) != nil {
 		return out
 	}
 	for k, val := range m {
-		if s, ok := val.(string); ok {
-			out[k] = s
-		} else {
+		switch v := val.(type) {
+		case string:
+			out[k] = v
+		case json.Number:
+			out[k] = v.String()
+		default:
 			out[k] = fmt.Sprint(val)
 		}
 	}
 	return out
 }
 
-func paramsValue(params map[string]string) json.RawMessage {
+// paramsValue encodes an action's parameters for the registry. The reviewer
+// carries every value as text: that is what the agent returns and what the
+// command receives in its environment. The registry validates the values
+// against the schema the job declares, as JSON and without coercion, so a
+// value whose property the schema types as integer, number or boolean is
+// sent as that JSON type when its text is exactly one. Any other value is
+// sent as the string it is, and the registry decides: nothing is guessed or
+// repaired here. schema is the action's declared param_schema, or nil.
+func paramsValue(params map[string]string, schema any) json.RawMessage {
 	if len(params) == 0 {
 		return nil
 	}
-	// A string map always marshals, with its keys in order.
-	raw, _ := json.Marshal(params)
+	m, _ := schema.(map[string]any)
+	props, _ := m["properties"].(map[string]any)
+	typed := make(map[string]json.RawMessage, len(params))
+	for name, text := range params {
+		prop, _ := props[name].(map[string]any)
+		declared, _ := prop["type"].(string)
+		typed[name] = paramValue(text, declared)
+	}
+	// A map always marshals, with its keys in order.
+	raw, _ := json.Marshal(typed)
+	return raw
+}
+
+// paramValue is one parameter's JSON value: text as the declared type when
+// it is exactly a value of that type, and as a string otherwise.
+func paramValue(text, declared string) json.RawMessage {
+	switch declared {
+	case "integer":
+		// Only the canonical text of an integer: "007" and "+7" stay text.
+		if n, err := strconv.ParseInt(text, 10, 64); err == nil && strconv.FormatInt(n, 10) == text {
+			return json.RawMessage(text)
+		}
+	case "number":
+		var n json.Number
+		if json.Unmarshal([]byte(text), &n) == nil && n.String() == text {
+			return json.RawMessage(text)
+		}
+	case "boolean":
+		if text == "true" || text == "false" {
+			return json.RawMessage(text)
+		}
+	}
+	raw, _ := json.Marshal(text)
 	return raw
 }
 
@@ -959,10 +1008,7 @@ func (r *Remote) Actions(ctx context.Context, jobID string) ([]Action, error) {
 }
 
 func (r *Remote) specOf(ctx context.Context, jobID, name, targetID string, params map[string]string) (api.TxeActionSpec, error) {
-	spec := api.TxeActionSpec{Name: name, Params: paramsValue(params)}
-	if targetID == "" {
-		return spec, nil
-	}
+	spec := api.TxeActionSpec{Name: name}
 	doc, err := r.jobDoc(ctx, jobID)
 	if err != nil {
 		return spec, err
@@ -970,6 +1016,20 @@ func (r *Remote) specOf(ctx context.Context, jobID, name, targetID string, param
 	var v api.TxeJobVersion
 	if err := r.do(ctx, http.MethodGet, jobPath(jobID, "versions", strconv.Itoa(doc.Version)), nil, &v); err != nil {
 		return spec, err
+	}
+	// The values are typed by the schema of the action as the job's current
+	// version declares it, which is what the registry validates against.
+	var schema any
+	if rp := v.ReviewPolicy; rp != nil {
+		for _, pa := range deref(rp.PermittedActions) {
+			if pa.Name == name {
+				schema = pa.ParamSchema
+			}
+		}
+	}
+	spec.Params = paramsValue(params, schema)
+	if targetID == "" {
+		return spec, nil
 	}
 	for _, t := range deref(v.Targets) {
 		if targetKey(t) == targetID {
@@ -1031,6 +1091,13 @@ func (r *Remote) BeginAction(ctx context.Context, req BeginRequest) (Action, err
 	}
 	var grant api.TxeGrant
 	err = r.do(ctx, http.MethodPost, jobPath(jobID, "effect-grants"), body, &grant)
+	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusBadRequest && te.Code == codeInvalid {
+		// The registry validates an attempt's parameter values against the
+		// action's declared schema before it grants anything. A refusal is
+		// made before any effect: nothing runs, and it is reported as a
+		// refused action, not as a failure of the review.
+		return Action{}, &GuardDeniedError{Reason: DenyInvalidParams, Detail: te.Message}
+	}
 	if errors.Is(err, ErrActionExists) {
 		// The stored record is authoritative; nothing may run on it.
 		actions, listErr := r.Actions(ctx, jobID)
