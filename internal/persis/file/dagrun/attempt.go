@@ -219,6 +219,57 @@ func (att *Attempt) Write(ctx context.Context, status ir.DAGRunStatus) error {
 		return fmt.Errorf("%w: %w", ErrWriteFailed, writeErr)
 	}
 
+	att.afterWriteLocked(ctx, status)
+	return nil
+}
+
+// WriteIfLatest implements dagrun.ConditionalWriter. The latest status is read
+// from the file under the status file's lock, which every append and every
+// compaction of the file holds, so no other write can land between the check
+// and the append.
+func (att *Attempt) WriteIfLatest(
+	ctx context.Context,
+	status ir.DAGRunStatus,
+	check func(latest *ir.DAGRunStatus) error,
+) error {
+	if att.isClosing.Load() {
+		return fmt.Errorf("cannot write while file is closing: %w", ErrStatusFileNotOpen)
+	}
+
+	att.mu.Lock()
+	defer att.mu.Unlock()
+
+	if att.writer == nil {
+		return fmt.Errorf("status file not open: %w", ErrStatusFileNotOpen)
+	}
+
+	ir.NormalizeDAGRunConditions(&status)
+
+	var checkErr error
+	writeErr := att.writer.writeIf(status, func() error {
+		latest, err := att.parseLocked(ctx)
+		if err != nil {
+			return fmt.Errorf("%w: read latest status: %w", ErrWriteFailed, err)
+		}
+		checkErr = check(latest)
+		return checkErr
+	})
+	if checkErr != nil {
+		return checkErr
+	}
+	if writeErr != nil {
+		if errors.Is(writeErr, ErrWriteFailed) {
+			return writeErr
+		}
+		return fmt.Errorf("%w: %w", ErrWriteFailed, writeErr)
+	}
+
+	att.afterWriteLocked(ctx, status)
+	return nil
+}
+
+// afterWriteLocked updates what a successful status append makes stale.
+func (att *Attempt) afterWriteLocked(ctx context.Context, status ir.DAGRunStatus) {
 	// Invalidate cache after successful write
 	if att.cache != nil {
 		att.cache.Invalidate(att.file)
@@ -238,8 +289,6 @@ func (att *Attempt) Write(ctx context.Context, status ir.DAGRunStatus) error {
 	if err := att.updateArtifactIndex(status); err != nil {
 		logger.Warn(ctx, "Failed to update DAG-run artifact index", tag.Error(err))
 	}
-
-	return nil
 }
 
 // updateArtifactIndex records a finished run in the artifact index.

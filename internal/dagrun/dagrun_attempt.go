@@ -5,11 +5,26 @@ package dagrun
 
 import (
 	"context"
+	"errors"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // Attempt represents a single execution of a dag-run to record the status and execution details.
+// ErrConditionalWriteUnsupported is returned by WriteIfLatest when the
+// attempt's store cannot make an append conditional on the latest status.
+var ErrConditionalWriteUnsupported = errors.New("conditional status write is not supported by this store")
+
+// ConditionalWriter makes a status write conditional on the attempt's latest
+// status, atomically with every other append to the attempt and with its
+// compaction, including those made by other handles and processes.
+type ConditionalWriter interface {
+	// WriteIfLatest appends status only if check accepts the latest stored
+	// status, which is read under the same serialization as the append. An
+	// error from check is returned as is, and nothing is written.
+	WriteIfLatest(ctx context.Context, status ir.DAGRunStatus, check func(latest *ir.DAGRunStatus) error) error
+}
+
 type Attempt interface {
 	// ID returns the identifier for the attempt that is unique within the dag-run.
 	ID() string

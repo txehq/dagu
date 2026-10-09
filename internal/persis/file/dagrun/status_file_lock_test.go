@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -138,3 +139,57 @@ func TestStatusFileWriterRecoversFromAFailedReopen(t *testing.T) {
 	require.NoError(t, other.Write(ctx, createTestStatus(ir.Queued)))
 	assert.Equal(t, ir.Queued, latestStatusOf(t, file))
 }
+
+func TestStatusFileWriteIfLatest(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	file, owner := statusFileWithHistory(t)
+	t.Cleanup(func() { _ = owner.Close(ctx) })
+	other, err := NewAttempt(file, nil)
+	require.NoError(t, err)
+	require.NoError(t, other.Open(ctx))
+	t.Cleanup(func() { _ = other.Close(ctx) })
+
+	expectRunning := func(latest *ir.DAGRunStatus) error {
+		if latest.Status != ir.Running {
+			return errStatusChanged
+		}
+		return nil
+	}
+
+	// Accepted: the latest status is still the one expected.
+	require.NoError(t, owner.WriteIfLatest(ctx, createTestStatus(ir.Running), expectRunning))
+
+	// Another handle changes the status; the check sees it and nothing is
+	// written.
+	require.NoError(t, other.Write(ctx, createTestStatus(ir.Queued)))
+	err = owner.WriteIfLatest(ctx, createTestStatus(ir.Running), expectRunning)
+	require.ErrorIs(t, err, errStatusChanged)
+	assert.Equal(t, ir.Queued, latestStatusOf(t, file))
+}
+
+func TestStatusFileWriteIfLatestChecksUnderTheLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	file, owner := statusFileWithHistory(t)
+	t.Cleanup(func() { _ = owner.Close(ctx) })
+
+	lockedDuringCheck := false
+	require.NoError(t, owner.WriteIfLatest(ctx, createTestStatus(ir.Running), func(*ir.DAGRunStatus) error {
+		probe := flock.New(statusLockPath(file))
+		got, err := probe.TryLock()
+		if err != nil {
+			return err
+		}
+		lockedDuringCheck = !got
+		if got {
+			_ = probe.Unlock()
+		}
+		return probe.Close()
+	}))
+	assert.True(t, lockedDuringCheck, "the check must run while the status lock is held")
+}
+
+var errStatusChanged = errors.New("status changed")

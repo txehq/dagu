@@ -103,6 +103,13 @@ func (w *Writer) Write(ctx context.Context, st ir.DAGRunStatus) error {
 
 // write encodes a single status entry and persists it to disk.
 func (w *Writer) write(st ir.DAGRunStatus) error {
+	return w.writeIf(st, nil)
+}
+
+// writeIf is write, made conditional: under the status file's lock, after any
+// reopen, it calls check and appends only if check returns nil. A writer
+// without a file lock cannot make the check atomic and refuses a check.
+func (w *Writer) writeIf(st ir.DAGRunStatus, check func() error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -116,6 +123,13 @@ func (w *Writer) write(st ir.DAGRunStatus) error {
 		}
 		defer func() { _ = w.fileLock.Unlock() }()
 		if err := w.reopenIfReplacedLocked(); err != nil {
+			return err
+		}
+	} else if check != nil {
+		return errors.New("conditional write requires a status file lock")
+	}
+	if check != nil {
+		if err := check(); err != nil {
 			return err
 		}
 	}
