@@ -596,10 +596,10 @@ func TestRunOpenerClosesWithASystemMarker(t *testing.T) {
 	require.Error(t, err)
 }
 
-// A job whose scripts print a lot cannot blow up the packet: step output is
-// dropped from the oldest runs first, every run stays listed, and the packet
-// says that it was trimmed.
-func TestPacketIsBoundedWhateverScriptsPrint(t *testing.T) {
+// A job whose scripts print a lot cannot blow up the packet, and cannot use
+// volume to hide results either: runs that do not fit are left for the next
+// review instead of being covered without their output.
+func TestPacketIsBoundedWithoutHidingEvidence(t *testing.T) {
 	f := newFixture(t)
 	big := strings.Repeat("x", 2048)
 	for i := range 40 {
@@ -609,14 +609,47 @@ func TestPacketIsBoundedWhateverScriptsPrint(t *testing.T) {
 		}
 		require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: fmt.Sprintf("run-%02d", i), Status: "succeeded", Steps: steps}))
 	}
+	prepared := f.prepare("reviewer-a")
+	packet := prepared.Packet
+	raw, err := json.Marshal(packet)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(raw), 256<<10)
+	require.NotEmpty(t, packet.NewRuns)
+	assert.Less(t, len(packet.NewRuns), 40)
+	assert.True(t, packet.MoreRunsPending)
+	assert.Equal(t, "run-00", packet.NewRuns[0].RunID, "the oldest runs are reviewed first")
+	for _, run := range packet.NewRuns {
+		require.Len(t, run.Steps, 12, "at most the last steps of a run are kept")
+		assert.Equal(t, "step-19", run.Steps[11].Name)
+		assert.Len(t, run.Steps[11].Stdout, 2048, "a run in the packet keeps its step output")
+	}
+
+	// The checkpoint advances only over the runs that were shown, and the
+	// rest are due again at once.
+	last := packet.NewRuns[len(packet.NewRuns)-1].RunID
+	f.apply("reviewer-a", prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "ok"})
+	cp := f.state().Checkpoints[jobID]
+	assert.Equal(t, last, cp.RunCursor)
+	assert.Equal(t, f.clock.Now().Add(time.Minute), cp.NextReviewAt)
+	f.clock.Advance(time.Minute)
+	next := f.prepare("reviewer-b").Packet
+	assert.Greater(t, next.NewRuns[0].RunID, last)
+}
+
+// One run that is alone too large has its step output shortened to its
+// ends, and the packet says so.
+func TestOversizedSingleRunIsShortenedAndFlagged(t *testing.T) {
+	f := newFixture(t)
+	huge := strings.Repeat("y", 200<<10)
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-big", Status: "failed", Steps: []review.StepEvidence{
+		{Name: "a", Status: "failed", Stdout: huge + "END-A", Stderr: huge + "END-ERR"},
+	}}))
 	packet := f.prepare("reviewer-a").Packet
 	raw, err := json.Marshal(packet)
 	require.NoError(t, err)
 	assert.LessOrEqual(t, len(raw), 256<<10)
 	assert.True(t, packet.EvidenceTrimmed)
-	require.Len(t, packet.NewRuns, 40, "no run is dropped from the review")
-	assert.Empty(t, packet.NewRuns[0].Steps, "the oldest run lost its step output first")
-	last := packet.NewRuns[39]
-	require.Len(t, last.Steps, 12, "at most the last steps of a run are kept")
-	assert.Equal(t, "step-19", last.Steps[11].Name)
+	require.Len(t, packet.NewRuns, 1)
+	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stdout, "END-A"), "the end of the output is what is kept")
+	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stderr, "END-ERR"))
 }

@@ -42,9 +42,9 @@ type Packet struct {
 	// UnresolvedActions have an external effect whose outcome is not settled.
 	UnresolvedActions []Action `json:"unresolved_actions"`
 	RecentActions     []Action `json:"recent_actions"`
-	// EvidenceTrimmed is true when step output was dropped to keep the
-	// packet within its size limit. The runs and their statuses are all
-	// still listed.
+	// EvidenceTrimmed is true when a run's step output had to be shortened
+	// or its early steps left out. Runs that did not fit are not in the
+	// packet at all and stay for the next review.
 	EvidenceTrimmed bool `json:"evidence_trimmed,omitempty"`
 	// MoreRunsPending is true when results beyond this packet exist.
 	MoreRunsPending bool `json:"more_runs_pending,omitempty"`
@@ -170,24 +170,35 @@ func truncateOutputs(outputs map[string]string) map[string]string {
 	return out
 }
 
-// trim drops step output, oldest run first, and then captured outputs, until
-// the packet fits its size limit. No run is removed: a review still covers
-// every run it lists, with less detail for the older ones.
+// trim keeps the packet within its size limit without hiding evidence from
+// a review that then covers it. Runs that do not fit are left out of the
+// packet, newest first, so the checkpoint advances only over runs the agent
+// was shown in full and the rest are reviewed in the next episode. Only when
+// a single run is itself too large is its step output shortened, and the
+// packet then says so.
 func (p *Packet) trim() {
-	if p.size() <= maxPacketBytes {
-		return
+	for p.size() > maxPacketBytes && len(p.NewRuns) > 1 {
+		p.NewRuns = p.NewRuns[:len(p.NewRuns)-1]
+		p.MoreRunsPending = true
 	}
-	p.EvidenceTrimmed = true
-	for i := range p.NewRuns {
-		p.NewRuns[i].Steps = nil
-		if p.size() <= maxPacketBytes {
-			return
+	for limit := stepTailFloor * 8; p.size() > maxPacketBytes && limit >= stepTailFloor; limit /= 2 {
+		p.EvidenceTrimmed = true
+		for i := range p.NewRuns {
+			for j := range p.NewRuns[i].Steps {
+				step := &p.NewRuns[i].Steps[j]
+				step.Stdout, step.Stderr = keepTail(step.Stdout, limit), keepTail(step.Stderr, limit)
+			}
 		}
 	}
-	for i := range p.NewRuns {
-		p.NewRuns[i].Outputs = nil
-		if p.size() <= maxPacketBytes {
-			return
-		}
+}
+
+// stepTailFloor is the least step output kept per stream when one run alone
+// exceeds the packet limit.
+const stepTailFloor = 256
+
+func keepTail(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
+	return "..." + s[len(s)-n:]
 }
