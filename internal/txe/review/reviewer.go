@@ -29,7 +29,14 @@ var (
 	actionVerdicts = []Verdict{VerdictApprove, VerdictReject, VerdictRedirect, VerdictSnooze}
 	// questionVerdicts are the answers to a proposal with nothing to run.
 	// Approve is absent on purpose: there is nothing it could authorize.
-	questionVerdicts = []Verdict{VerdictRedirect, VerdictRetry, VerdictPause, VerdictSnooze, VerdictRetire, VerdictReject}
+	// Retry is absent too: it is valid on two kinds of proposal only.
+	questionVerdicts = []Verdict{VerdictRedirect, VerdictPause, VerdictSnooze, VerdictRetire, VerdictReject}
+	// retryRunVerdicts are the answers to a proposal to re-run one run.
+	retryRunVerdicts = []Verdict{VerdictRetry, VerdictReject, VerdictRedirect, VerdictSnooze}
+	// uncertainVerdicts are the answers to an effect whose outcome is
+	// unknown. Retry here means the owner confirms it did not take effect
+	// and allows one more attempt of that same action.
+	uncertainVerdicts = []Verdict{VerdictRetry, VerdictReject, VerdictRedirect, VerdictPause, VerdictSnooze, VerdictRetire}
 )
 
 // Reviewer drives one job's review against the registry. It holds no state
@@ -53,6 +60,8 @@ type Reviewer struct {
 	// usage for the decision being applied.
 	AgentInputTokens  int
 	AgentOutputTokens int
+	// Retry performs the reserved retry of one run; nil disables it.
+	Retry RetryFunc
 	// DecideDAG is the DAG whose runs carry proposals as native human tasks.
 	DecideDAG string
 	ClaimTTL  time.Duration
@@ -420,7 +429,9 @@ func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Ac
 		TargetID:        action.TargetID,
 		ObservedAt:      r.now(),
 		WaitingOn:       waitingOnPerson,
-		AllowedVerdicts: questionVerdicts,
+		AllowedVerdicts: uncertainVerdicts,
+		ActionName:      UncertainEffectAction,
+		Params:          map[string]string{UncertainEffectParam: action.ID},
 		Question:        fmt.Sprintf("Action %q on %s may or may not have taken effect (%s). Confirm its real state before it is tried again.", action.Name, action.TargetID, detail),
 		RelatedAction:   action.ID,
 		ReviewID:        action.ReviewID,
@@ -592,6 +603,16 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 		return r.propose(ctx, claim, job, packet, kind, requested, question, review, result)
 	}
 
+	if requested.Name == RetryRunAction {
+		// A retry is proposed only for a run the reviewer was shown, and it
+		// names that run exactly. It runs when the owner says so.
+		runID := requested.Params[RetryRunParam]
+		if len(requested.Params) != 1 || !packet.hasRun(runID) {
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying a run it was not shown (%q): %s", runID, requested.Reason))
+		}
+		requested.TargetID = ""
+		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, requested.Reason))
+	}
 	switch {
 	case !isDeclared:
 		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q on %s, which this job does not declare: %s", requested.Name, requested.TargetID, requested.Reason))
@@ -670,7 +691,11 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 		// The effect is killed when the grant ends, so a later holder that
 		// waits for that moment never probes an attempt still in progress.
 		runCtx, cancel := context.WithDeadline(ctx, action.GrantExpiresAt)
-		res = r.Effector.Run(runCtx, job, declared, action)
+		if action.Name == RetryRunAction {
+			res = r.retryRun(runCtx, job, action)
+		} else {
+			res = r.Effector.Run(runCtx, job, declared, action)
+		}
 		cancel()
 	} else {
 		res = EffectResult{Status: EffectNotApplied, Detail: "the grant ended before the effect could start"}
@@ -707,7 +732,15 @@ func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Pac
 		for _, existing := range open {
 			if existing.Kind == ProposalAction && existing.ActionName == requested.Name && existing.TargetID == requested.TargetID &&
 				maps.Equal(normalizeParams(existing.Params), normalizeParams(requested.Params)) {
+				// Its decision run is opened again all the same. Opening is a
+				// no-op when the run exists, and it repairs a proposal whose
+				// earlier review died between filing it and opening its run,
+				// which would otherwise never become answerable.
+				if err := r.openDecision(ctx, existing); err != nil {
+					return fmt.Errorf("open decision for proposal %s: %w", existing.ID, err)
+				}
 				review.Notes = append(review.Notes, fmt.Sprintf("action %q is already proposed as %s; not proposed again", requested.Name, existing.ID))
+				review.ProposalIDs = append(review.ProposalIDs, existing.ID)
 				return nil
 			}
 		}
@@ -732,6 +765,9 @@ func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Pac
 	if kind == ProposalAction {
 		draft.ActionName, draft.TargetID, draft.Params = requested.Name, requested.TargetID, requested.Params
 		draft.AllowedVerdicts = actionVerdicts
+		if requested.Name == RetryRunAction {
+			draft.AllowedVerdicts = retryRunVerdicts
+		}
 	}
 	proposal, err := r.Registry.CreateProposal(ctx, claim, draft)
 	if err != nil {
@@ -769,6 +805,25 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomeContinue, OutcomeAct:
 	}
 	return nil
+}
+
+// retryRunDeclaration bounds the built-in retry like any other effect. A
+// retry starts a run, so an unknown outcome is uncertain, not harmless.
+var retryRunDeclaration = DeclaredAction{Name: RetryRunAction, Idempotency: IdempotencyNone, TimeoutSec: 60}
+
+// RetryFunc asks the service to retry one run of a job and returns the
+// service's receipt for it.
+type RetryFunc func(ctx context.Context, jobID, runID string) (receipt string, err error)
+
+// retryRun performs the reserved retry action. Whether the service started
+// the retry is unknown after any failure of the call, so it is never
+// reported as not applied.
+func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectResult {
+	receipt, err := r.Retry(ctx, job.ID, action.Params[RetryRunParam])
+	if err != nil {
+		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + action.Params[RetryRunParam] + ": " + err.Error()}
+	}
+	return EffectResult{Status: EffectApplied, Receipt: receipt}
 }
 
 // leaseCovers reports whether the claim outlives one full attempt of the
@@ -916,12 +971,12 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 	if decision.ProposalID != proposalID {
 		return Executed{Skipped: "decision belongs to another proposal"}, nil
 	}
-	if decision.Verdict != VerdictApprove {
+	proposal := current
+	// An approval runs a proposed action. A retry verdict runs exactly one
+	// thing: the re-run of the one run a retry proposal names.
+	runs := decision.Verdict == VerdictApprove || (decision.Verdict == VerdictRetry && proposal.ActionName == RetryRunAction)
+	if !runs {
 		return Executed{Skipped: "verdict is " + string(decision.Verdict)}, nil
-	}
-	proposal, err := r.Registry.Proposal(ctx, jobID, proposalID)
-	if err != nil {
-		return Executed{}, fmt.Errorf("read proposal: %w", err)
 	}
 	if proposal.Kind != ProposalAction {
 		return Executed{Skipped: "proposal carries no executable action"}, nil
@@ -931,8 +986,11 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 		return Executed{}, fmt.Errorf("read job: %w", err)
 	}
 	declared, ok := job.Review.Action(proposal.ActionName)
+	if proposal.ActionName == RetryRunAction {
+		declared, ok = retryRunDeclaration, r.Retry != nil && proposal.Params[RetryRunParam] != ""
+	}
 	if !ok {
-		return Executed{Skipped: "action is no longer declared by the job"}, nil
+		return Executed{Skipped: "action is not available for this job"}, nil
 	}
 
 	if !job.Lifecycle.Reviewable() {

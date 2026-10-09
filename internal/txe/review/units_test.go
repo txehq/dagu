@@ -715,10 +715,14 @@ func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
 	f.apply("reviewer-a", f.prepare("reviewer-a"), ask)
 	require.Len(t, f.state().Proposals[jobID], 1)
 
+	first := f.state().Proposals[jobID][0]
 	f.clock.Advance(2 * time.Hour)
 	applied := f.apply("reviewer-b", f.prepare("reviewer-b"), ask)
 	assert.Len(t, f.state().Proposals[jobID], 1)
 	assert.Contains(t, applied.Review.Notes[0], "already proposed")
+	// Its decision run is opened again, which repairs a proposal whose
+	// first review died before the run was enqueued.
+	assert.Equal(t, 2, f.opener.opened[first.NativeTask.RunID])
 
 	// A different size is a different request.
 	f.clock.Advance(2 * time.Hour)
@@ -726,4 +730,128 @@ func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
 	other.Actions = []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "400"})}
 	f.apply("reviewer-c", f.prepare("reviewer-c"), other)
 	assert.Len(t, f.state().Proposals[jobID], 2)
+}
+
+// The reserved retry: the reviewer proposes re-running one exact run it was
+// shown, nothing runs until the owner answers "retry", and then that run is
+// retried once through the journal with the service's receipt.
+func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "failed")
+	var retried []string
+	withRetry := func(holder string) *review.Reviewer {
+		r := f.reviewer(holder)
+		r.Retry = func(_ context.Context, job, run string) (string, error) {
+			retried = append(retried, job+"/"+run)
+			return "attempt-2", nil
+		}
+		return r
+	}
+	prepared := f.prepare("reviewer-a")
+	_, err := withRetry("reviewer-a").Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"},
+			{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-unknown"}, Reason: "not shown"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, retried, "a retry never runs on the agent's request")
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 2)
+	retry, question := proposals[0], proposals[1]
+	assert.Equal(t, review.ProposalAction, retry.Kind)
+	assert.Equal(t, map[string]string{"run_id": "run-1"}, retry.Params)
+	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
+	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
+	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
+
+	// "retry" is not an answer to an ordinary question.
+	_, err = f.registry.Decide(jobID, question.ID, review.VerdictRetry, "", "connor")
+	require.ErrorIs(t, err, reviewtest.ErrVerdictNotAllowed)
+
+	decided, err := f.registry.Decide(jobID, retry.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	ctx := context.Background()
+	out, err := withRetry("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, "attempt-2", out.Action.Receipt)
+	assert.Equal(t, []string{jobID + "/run-1"}, retried)
+
+	out, err = withRetry("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+	assert.Len(t, retried, 1, "one decision retries the run once")
+
+	// Without a way to retry configured, nothing is attempted.
+	out, err = f.reviewer("executor").Execute(ctx, jobID, retry.ID, decided.ID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, out.Skipped)
+}
+
+// A retry call whose outcome is unknown is journaled uncertain, never
+// "not applied": the service may have started the run.
+func TestRetryRunWithUnknownOutcomeIsUncertain(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "failed")
+	r := f.reviewer("reviewer-a")
+	calls := 0
+	r.Retry = func(context.Context, string, string) (string, error) {
+		calls++
+		return "", errors.New("connection reset")
+	}
+	_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "retry", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "transient"}},
+	})
+	require.NoError(t, err)
+	proposal := f.state().Proposals[jobID][0]
+	decided, err := f.registry.Decide(jobID, proposal.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	exec := f.reviewer("executor")
+	exec.Retry = r.Retry
+	out, err := exec.Execute(context.Background(), jobID, proposal.ID, decided.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.ActionUncertain, out.Action.State)
+	assert.Equal(t, 1, calls)
+}
+
+// An owner's "retry" on an uncertain effect allows exactly one more attempt.
+// The escalation carries the reserved action name and the journaled action.
+func TestUncertainRetryAllowsExactlyOneMoreAttempt(t *testing.T) {
+	f := newFixture(t)
+	f.effects.run = func(review.Action) (review.EffectResult, bool) {
+		return review.EffectResult{Status: review.EffectUnknown, Detail: "timed out"}, true
+	}
+	notify := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), notify)
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-b", f.prepare("reviewer-b"), review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+
+	escalation := f.state().Proposals[jobID][0]
+	first := f.state().Actions[jobID][0]
+	assert.Equal(t, review.UncertainEffectAction, escalation.ActionName)
+	assert.Equal(t, map[string]string{"action_id": first.ID}, escalation.Params)
+	assert.Equal(t, review.UncertainProposalID(first.ID, 1), escalation.ID)
+	_, err := f.registry.Decide(jobID, escalation.ID, review.VerdictRetry, "It did not go out.", "connor")
+	require.NoError(t, err)
+
+	// The one permitted attempt also ends unknown.
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-c", f.prepare("reviewer-c"), notify)
+	assert.Equal(t, 2, f.effects.count("notify"))
+
+	// The old answer is used up: the intent is blocked again, by the new
+	// attempt and independently in the registry.
+	f.clock.Advance(2 * time.Hour)
+	next := f.prepare("reviewer-d")
+	applied := f.apply("reviewer-d", next, notify)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 2, f.effects.count("notify"))
+	assert.True(t, f.state().ConsumedResolutions[escalation.ID])
 }

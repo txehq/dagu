@@ -509,7 +509,7 @@ func (r *Remote) proposalOf(jobID string, p api.TxeProposal) Proposal {
 		ID: p.ProposalId, JobID: jobID, JobVersion: p.JobVersion, PackageDigest: p.PackageDigest,
 		Kind: ProposalQuestion, Question: deref(p.Question), Rationale: deref(p.Rationale),
 		ReviewID: deref(p.ReviewId), BindingDigest: p.BindingDigest, State: ProposalState(p.State),
-		WaitingOn: string(deref(p.WaitingOn)), RelatedAction: deref(p.Reasoning),
+		WaitingOn: string(deref(p.WaitingOn)),
 	}
 	for _, v := range deref(p.AllowedVerdicts) {
 		out.AllowedVerdicts = append(out.AllowedVerdicts, Verdict(v))
@@ -525,7 +525,7 @@ func (r *Remote) proposalOf(jobID string, p api.TxeProposal) Proposal {
 		out.NativeTask = TaskLocator{DAG: nt.Dag, RunID: nt.RunId, StepID: nt.StepId}
 	}
 	switch {
-	case out.RelatedAction != "":
+	case p.Action.Name == UncertainEffectAction:
 		out.Kind = ProposalUncertain
 	case p.Action.Name != "":
 		out.Kind = ProposalAction
@@ -533,6 +533,9 @@ func (r *Remote) proposalOf(jobID string, p api.TxeProposal) Proposal {
 	if out.Kind != ProposalQuestion {
 		out.ActionName = p.Action.Name
 		out.Params = paramsOf(p.Action.Params)
+	}
+	if out.Kind == ProposalUncertain {
+		out.RelatedAction = out.Params[UncertainEffectParam]
 	}
 	if t := p.Action.Target; t != nil {
 		out.TargetID = targetKey(t.StableId)
@@ -845,9 +848,9 @@ func (r *Remote) CreateProposal(ctx context.Context, claim Claim, draft Proposal
 		verdicts = append(verdicts, api.TxeVerdict(v))
 	}
 	in.AllowedVerdicts = &verdicts
-	if draft.RelatedAction != "" {
-		// The escalated action's id; the registry has no typed field for it.
-		in.Reasoning = &draft.RelatedAction
+	if draft.Kind == ProposalUncertain {
+		// A reserved, non-executable action naming the journaled action.
+		in.Action = api.TxeActionSpec{Name: UncertainEffectAction, Params: paramsValue(draft.Params)}
 	}
 	if draft.Kind == ProposalAction {
 		spec, err := r.specOf(ctx, draft.JobID, draft.ActionName, draft.TargetID, draft.Params)
@@ -973,5 +976,22 @@ func RemoteComplete(t Transport) CompleteFunc {
 			}
 		}
 		return err
+	}
+}
+
+// RemoteRetry returns a RetryFunc that retries one run through the service
+// and reports the service's answer as the receipt.
+func RemoteRetry(t Transport) RetryFunc {
+	return func(ctx context.Context, jobID, runID string) (string, error) {
+		var out json.RawMessage
+		path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
+		if err := t.Do(ctx, http.MethodPost, path, map[string]string{"dagRunId": runID}, &out); err != nil {
+			return "", err
+		}
+		receipt := "retry of " + runID + " accepted"
+		if len(out) > 0 && len(out) < maxReceiptLen {
+			receipt += ": " + string(out)
+		}
+		return receipt, nil
 	}
 }

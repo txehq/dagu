@@ -239,6 +239,7 @@ func runRemote(ctx context.Context, command string, o options, base string) erro
 			Registry:    remote,
 			Effector:    &review.CommandEffector{},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(t), Complete: review.RemoteComplete(t)},
+			Retry:       review.RemoteRetry(t),
 			Holder:      fmt.Sprintf("%s/%s", o.machine, o.runID),
 			AgentClient: o.agentClient,
 			DecideDAG:   review.DecideDAGName(o.machine),

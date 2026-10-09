@@ -65,6 +65,21 @@ const (
 	IdempotencyNone Idempotency = "none"
 )
 
+const (
+	// RetryRunAction is the reserved action that re-runs one exact run of
+	// the job through the service. It is never routine and never declared by
+	// a job: only the owner's decision on a proposal carrying it runs it.
+	RetryRunAction = "dagu.retry_run"
+	// RetryRunParam names the run to retry.
+	RetryRunParam = "run_id"
+	// UncertainEffectAction is the reserved action name of a proposal that
+	// asks the owner about an effect whose outcome is unknown. It is not
+	// executable.
+	UncertainEffectAction = "txe.uncertain_effect"
+	// UncertainEffectParam names the journaled action in question.
+	UncertainEffectParam = "action_id"
+)
+
 // DeclaredAction is an executable follow-up saved with the job. The reviewer
 // runs nothing that is not declared here.
 type DeclaredAction struct {
