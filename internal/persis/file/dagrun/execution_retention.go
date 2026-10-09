@@ -323,7 +323,9 @@ func (store *Store) executionLogs(root ir.DAGRunRef, status *ir.DAGRunStatus) *e
 		if n == nil {
 			continue
 		}
-		ran := n.Status != ir.NodeNotStarted
+		// A step that never started (its dependency failed, it was skipped)
+		// produced no streams, whatever paths its status names.
+		ran := n.StartedAt != "" && n.StartedAt != "-" && n.Status != ir.NodeNotStarted && n.Status != ir.NodeSkipped
 		step := fileutil.SafeName(n.Step.Name)
 		if n.Stdout != "" {
 			stream(n.Stdout, step+".stdout.log", ran)
