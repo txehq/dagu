@@ -88,6 +88,28 @@ func logObservation(t *testing.T, label string, f *testFixture, runID, obs strin
 	for _, a := range hubAttempts(t, f, runID) {
 		t.Logf("hub attempt dir=%s id=%s status=%s archive=%s files=%v", a.dir, a.id, a.status, filepath.Base(a.archive), a.files)
 	}
+	_ = filepath.WalkDir(f.coord.Config.Paths.DAGRunsDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Name() == "status.jsonl" && strings.Contains(p, runID) {
+			b, _ := os.ReadFile(p)
+			t.Logf("hub status.jsonl %s: %d line(s), %d bytes", filepath.Base(filepath.Dir(p)), strings.Count(strings.TrimSpace(string(b)), "\n")+1, len(b))
+		}
+		return nil
+	})
+	_ = filepath.WalkDir(f.logDir(), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.Contains(p, runID) {
+			b, _ := os.ReadFile(p)
+			var marks []string
+			for _, line := range strings.Split(string(b), "\n") {
+				if strings.Contains(line, "stdout of ") {
+					marks = append(marks, line[strings.Index(line, "stdout of "):])
+				}
+			}
+			rel, _ := filepath.Rel(f.logDir(), p)
+			parts := strings.Split(rel, string(os.PathSeparator))
+			t.Logf("hub log %s: %d bytes, marks=%v", strings.Join(parts[len(parts)-2:], "/"), len(b), marks)
+		}
+		return nil
+	})
 	entries, _ := os.ReadDir(obs)
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "run.") || strings.HasPrefix(e.Name(), "publish.") {
@@ -104,6 +126,7 @@ func observeRetries(t *testing.T, queued bool) {
 n=$(ls "$OBS" | grep -c "^$1\.[0-9]*$")
 n=$((n+1))
 printf 'env=%s arg=%s started=%s artifacts=%s\n' "$TXE_ATTEMPT_ID" "$2" "$3" "$(ls "$DAG_RUN_ARTIFACTS_DIR" | tr '\n' ',')" > "$OBS/$1.$n"
+echo "stdout of $1 execution $n"
 if [ "$1" = run ]; then
   printf 'bytes-%s\n' "$n" > "$DAG_RUN_ARTIFACTS_DIR/out.txt"
   printf 'only-%s\n' "$n" > "$DAG_RUN_ARTIFACTS_DIR/only-$n.txt"
@@ -113,7 +136,7 @@ test -e "$OBS/allow-$1"
 
 	queueLine := ""
 	var opts []fixtureOption
-	opts = append(opts, withArtifactPersistence())
+	opts = append(opts, withArtifactPersistence(), withLogPersistence())
 	if queued {
 		queueLine = "queue: txe-obs\n"
 		opts = append(opts, withConfigMutator(func(c *config.Config) {
