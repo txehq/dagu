@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -647,8 +648,7 @@ func (r *Reviewer) leaseCovers(claim Claim, declared DeclaredAction) bool {
 // says the intent may run again; an answer given before the job changed was
 // about a different command and unlocks nothing.
 func unresolvedAttempt(history []Action, decisions []Decision, intent string, jobVersion int) (Action, bool) {
-	for i := len(history) - 1; i >= 0; i-- {
-		a := history[i]
+	for _, a := range slices.Backward(history) {
 		if a.IntentKey != intent {
 			continue
 		}
@@ -676,13 +676,7 @@ func retryDecided(decisions []Decision, proposalID string) bool {
 
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
 	for name := range params {
-		found := false
-		for _, allowed := range declared.Params {
-			if allowed == name {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(declared.Params, name)
 		if !found {
 			return false
 		}
@@ -701,8 +695,7 @@ func maxAttempts(job Job) int {
 // failed without a success in between.
 func trailingFailures(history []Action, intent string) int {
 	n := 0
-	for i := len(history) - 1; i >= 0; i-- {
-		a := history[i]
+	for _, a := range slices.Backward(history) {
 		if a.IntentKey != intent {
 			continue
 		}
@@ -784,8 +777,7 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 	}
 
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimExecution, Holder: r.Holder, TTL: r.claimTTL()})
-	var refused *GuardDeniedError
-	if errors.As(err, &refused) {
+	if refused, ok := errors.AsType[*GuardDeniedError](err); ok {
 		// The job left a live lifecycle between the read and the claim.
 		return Executed{Skipped: "denied by the guard: " + string(refused.Reason)}, nil
 	}

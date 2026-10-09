@@ -455,8 +455,7 @@ func grantTimeout(d time.Duration) time.Duration {
 func (s *State) intentUnresolved(job review.Job, intent string) bool {
 	jobID := job.ID
 	actions := s.Actions[jobID]
-	for i := len(actions) - 1; i >= 0; i-- {
-		a := actions[i]
+	for _, a := range slices.Backward(actions) {
 		if a.IntentKey != intent {
 			continue
 		}
