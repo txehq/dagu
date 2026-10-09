@@ -225,6 +225,8 @@ func TestAbandonAttemptUnsupportedStore(t *testing.T) {
 	repository := persis.NewDAGRunRepository(nil, nil, persis.DAGRunRepositoryOptions{})
 	_, err := repository.AbandonAttempt(context.Background(), persis.AbandonAttemptRequest{})
 	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentUnsupported)
+	_, err = repository.ListAttemptAbandonmentsStrict(context.Background(), ir.NewDAGRunRef("d", "r"), ir.DAGRunRef{})
+	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentUnsupported)
 }
 
 // A run's only execution has nothing to fall back to: it stays visible,
@@ -523,4 +525,110 @@ func TestReadAttemptAbandonmentWaitsForAnAbandonmentInProgress(t *testing.T) {
 	require.NoError(t, r.err)
 	require.NotNil(t, r.record, "the hidden attempt's record is found")
 	assert.Equal(t, placeholder.ID(), r.record.AbandonedAttemptID)
+}
+
+// The strict listing reports every record: a trusted one as a record, one it
+// cannot trust as an error beside the others, and attempts without a record
+// not at all. Newest attempt first.
+func TestListAttemptAbandonmentsStrict(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	previous := createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	hidden := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	_, err := abandon(th, abandonRecord(dag, hidden.ID(), nil))
+	require.NoError(t, err)
+	retried := createRunAttempt(t, th, dag, true, ir.Failed, "", "worker-1")
+	corrupt := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(corrupt.file), AbandonmentRecordFile), []byte("{"), 0600))
+
+	results, err := th.Repository.ListAttemptAbandonmentsStrict(th.Context, ref, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, results, 2, "attempts %s and %s have no record", previous.ID(), retried.ID())
+	assert.Equal(t, corrupt.ID(), results[0].AttemptID, "newest first")
+	assert.Nil(t, results[0].Record)
+	require.ErrorIs(t, results[0].Err, persis.ErrAttemptAbandonmentConflict)
+	assert.Equal(t, hidden.ID(), results[1].AttemptID)
+	require.NoError(t, results[1].Err, "a bad record does not spoil the good one")
+	require.NotNil(t, results[1].Record)
+	assert.Equal(t, persis.AbandonmentHidden, results[1].Record.Outcome)
+}
+
+// A record that parses but is incomplete is reported as an error, under the
+// same checks as the strict single read.
+func TestListAttemptAbandonmentsStrictReportsIncompleteRecords(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+	stored, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+	require.NoError(t, err)
+	stored.AbandonedExecution = persis.ExecutionIdentity{}
+	data, err := json.Marshal(stored)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(only.file), AbandonmentRecordFile), data, 0600))
+
+	results, err := th.Repository.ListAttemptAbandonmentsStrict(th.Context, ref, ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0].Err, persis.ErrAttemptAbandonmentConflict)
+	_, readErr := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, only.ID())
+	require.ErrorIs(t, readErr, persis.ErrAttemptAbandonmentConflict, "the single read agrees")
+}
+
+// A run without any record lists nothing; a run that does not exist is the
+// call's own error.
+func TestListAttemptAbandonmentsStrictEmptyAndMissingRuns(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+
+	results, err := th.Repository.ListAttemptAbandonmentsStrict(th.Context, ir.NewDAGRunRef(dag.Name, abandonRunID), ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Empty(t, results)
+
+	_, err = th.Repository.ListAttemptAbandonmentsStrict(th.Context, ir.NewDAGRunRef(dag.Name, "no-such-run"), ir.DAGRunRef{})
+	require.Error(t, err)
+}
+
+// The strict listing waits for an abandonment in progress, and then lists
+// the hidden attempt's record.
+func TestListAttemptAbandonmentsStrictWaitsForAnAbandonmentInProgress(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+
+	root := th.Backend.dataRoot(dag.Name)
+	require.NoError(t, root.Lock(th.Context))
+	type result struct {
+		results []persis.AttemptAbandonmentResult
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		results, err := th.Repository.ListAttemptAbandonmentsStrict(th.Context, ref, ir.DAGRunRef{})
+		done <- result{results, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("the listing did not wait for the lock: %+v", r)
+	case <-time.After(200 * time.Millisecond):
+	}
+	record := abandonRecord(dag, placeholder.ID(), &persis.ExecutionIdentity{AttemptID: "previous"})
+	record.Outcome = persis.AbandonmentHidden
+	require.NoError(t, writeRecordExclusive(filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile), record))
+	require.NoError(t, placeholder.Hide(th.Context))
+	require.NoError(t, root.Unlock())
+
+	r := <-done
+	require.NoError(t, r.err)
+	require.Len(t, r.results, 1)
+	require.NoError(t, r.results[0].Err)
+	assert.Equal(t, placeholder.ID(), r.results[0].AttemptID)
 }
