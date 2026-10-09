@@ -132,7 +132,7 @@ func contentDigest(files []File) string {
 		if f.Executable {
 			mode = "x"
 		}
-		fmt.Fprintf(h, "%s\x00%s\x00%s\n", f.Path, mode, f.SHA256)
+		h.Write([]byte(f.Path + "\x00" + mode + "\x00" + f.SHA256 + "\n"))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
