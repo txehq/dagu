@@ -207,11 +207,49 @@ describe('run retry', () => {
     );
     expect(
       await screen.findByText(
-        'Retry requested; waiting for the reviewer to run it'
+        'Retry requested; waiting for the reviewer to dispatch it'
       )
     ).toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'Retry this run' })
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('dispatched retry', () => {
+  // A receipt proves the retry was dispatched, not that the run succeeded:
+  // the run's own status is shown beside it.
+  it('shows the attempt receipt and the run status separately', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () =>
+          fixtureJob({
+            latestRuns: [
+              {
+                dagName: 'job_volume_monitor',
+                dagRunId: 'run-0003',
+                status: 'running',
+              },
+            ],
+          }),
+        listRetryStates: async () =>
+          new Map([
+            [
+              'run-0003',
+              {
+                runId: 'run-0003',
+                proposalId: 'prp_r',
+                status: 'succeeded' as const,
+                receipt: 'attempt-2',
+              },
+            ],
+          ]),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    const retry = await screen.findByTestId('txe-run-retry');
+    expect(retry).toHaveTextContent('Retry dispatched as attempt attempt-2');
+    expect(retry).toHaveTextContent('run is now running');
+    expect(retry).not.toHaveTextContent('Retried');
   });
 });
