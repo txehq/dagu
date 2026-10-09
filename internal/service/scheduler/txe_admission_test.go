@@ -41,6 +41,9 @@ func (f *fakeAdmitter) RecordDroppedRun(_ context.Context, jobID, runID string, 
 }
 
 func (f *fakeAdmitter) ReconcileExpired(context.Context) ([]string, error) { return nil, nil }
+func (f *fakeAdmitter) ReconcileEffects(context.Context) error             { return nil }
+func (f *fakeAdmitter) ReconcileResourceEvents(context.Context) error      { return nil }
+func (f *fakeAdmitter) RebuildResourceIndex(context.Context) error         { return nil }
 
 func mintJobID(t *testing.T) string {
 	t.Helper()

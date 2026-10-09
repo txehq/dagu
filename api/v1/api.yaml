@@ -10361,7 +10361,7 @@ paths:
   /txe/resource-events:
     post:
       summary: "Report a resource event"
-      description: "Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
+      description: "The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
       operationId: "recordTxeResourceEvent"
       tags:
         - "txe"
@@ -18998,7 +18998,33 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TxeResourceDisposition"
-      required: [schema, event_id, target, observation, authoritative, observed_at, reporter, dispositions]
+        pending:
+          type: array
+          description: "Dependents not yet updated; the server keeps retrying them"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              match:
+                type: string
+                enum: [identity, replacement]
+            required: [job_id, match]
+        failures:
+          type: array
+          description: "Last error for each pending dependent"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              error:
+                type: string
+            required: [job_id, error]
+        complete:
+          type: boolean
+          description: "True when every dependent has been updated"
+      required: [schema, event_id, target, observation, authoritative, observed_at, reporter, dispositions, complete]
 
     TxeActor:
       type: object

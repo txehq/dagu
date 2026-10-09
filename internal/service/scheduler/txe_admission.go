@@ -22,6 +22,9 @@ type RunAdmitter interface {
 	AdmitRun(ctx context.Context, dagName, specSHA256 string) (registry.Admission, error)
 	RecordDroppedRun(ctx context.Context, jobID, runID string, adm registry.Admission) error
 	ReconcileExpired(ctx context.Context) ([]string, error)
+	ReconcileEffects(ctx context.Context) error
+	ReconcileResourceEvents(ctx context.Context) error
+	RebuildResourceIndex(ctx context.Context) error
 }
 
 const txeReconcileInterval = time.Minute
@@ -108,11 +111,17 @@ func (d *queueDispatcher) admitQueuedRun(
 	return false
 }
 
-// startTxeReconciler retires registered jobs whose lifetime has ended, so
-// expiry is recorded even when no run is scheduled.
+// startTxeReconciler keeps the registry and Dagu converged: it indexes the
+// targets of jobs registered before resource events existed, then every
+// interval retires jobs whose lifetime has ended, applies lifecycle effects
+// that are pending or were lost, and completes resource events whose
+// application was cut short.
 func (s *Scheduler) startTxeReconciler(ctx context.Context) {
 	if s.runAdmitter == nil {
 		return
+	}
+	if err := s.runAdmitter.RebuildResourceIndex(ctx); err != nil {
+		logger.Warn(ctx, "TXE resource index rebuild incomplete", tag.Error(err))
 	}
 	ticker := time.NewTicker(txeReconcileInterval)
 	defer ticker.Stop()
@@ -123,6 +132,12 @@ func (s *Scheduler) startTxeReconciler(ctx context.Context) {
 		}
 		if len(retired) > 0 {
 			logger.Info(ctx, "Retired expired TXE jobs", slog.Any("job_ids", retired))
+		}
+		if err := s.runAdmitter.ReconcileEffects(ctx); err != nil {
+			logger.Warn(ctx, "TXE lifecycle effects not all applied", tag.Error(err))
+		}
+		if err := s.runAdmitter.ReconcileResourceEvents(ctx); err != nil {
+			logger.Warn(ctx, "TXE resource events not all applied", tag.Error(err))
 		}
 		select {
 		case <-ctx.Done():

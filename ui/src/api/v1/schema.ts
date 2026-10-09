@@ -3766,7 +3766,7 @@ export interface paths {
         put?: never;
         /**
          * Report a resource event
-         * @description Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved.
+         * @description The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved.
          */
         post: operations["recordTxeResourceEvent"];
         delete?: never;
@@ -7738,6 +7738,19 @@ export interface components {
             observed_at: string;
             reporter: components["schemas"]["TxeActor"];
             dispositions: components["schemas"]["TxeResourceDisposition"][];
+            /** @description Dependents not yet updated; the server keeps retrying them */
+            pending?: {
+                job_id: string;
+                /** @enum {string} */
+                match: TxeResourceEventPendingMatch;
+            }[];
+            /** @description Last error for each pending dependent */
+            failures?: {
+                job_id: string;
+                error: string;
+            }[];
+            /** @description True when every dependent has been updated */
+            complete: boolean;
         };
         /** @description Who made a change. Never the owner: owner is a separate stable ID. */
         TxeActor: {
@@ -23870,6 +23883,10 @@ export enum TxeResourceDispositionOutcome {
     availability = "availability",
     recorded = "recorded",
     unchanged = "unchanged"
+}
+export enum TxeResourceEventPendingMatch {
+    identity = "identity",
+    replacement = "replacement"
 }
 export enum TxeActorKind {
     human = "human",

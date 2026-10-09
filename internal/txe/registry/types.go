@@ -317,6 +317,7 @@ const (
 	DispositionCancelRequested   = "cancel_requested"
 	DispositionStopRequested     = "stop_requested"
 	DispositionStopFailed        = "stop_failed"
+	DispositionAdmittedBeforeEnd = "admitted_before_end"
 )
 
 // Retirement is the recorded end of a job.
@@ -487,6 +488,17 @@ type Proposal struct {
 	Created         Stamp         `json:"created"`
 	Updated         Stamp         `json:"updated"`
 	Prev            string        `json:"prev,omitempty"`
+}
+
+// PendingEffects is Dagu work a lifecycle transition still owes: runs to
+// stop under the cancel policy. Suspension is not stored here; it is always
+// reconciled to the state the current lifecycle requires.
+type PendingEffects struct {
+	Revision  int64     `json:"revision"`
+	StopRuns  []string  `json:"stop_runs,omitempty"`
+	Attempts  int       `json:"attempts"`
+	Since     time.Time `json:"since"`
+	LastError string    `json:"last_error,omitempty"`
 }
 
 // NativeResume is a pending completion of the Dagu human task that collected
@@ -711,9 +723,18 @@ type Job struct {
 	// completed, so a failed completion can be retried after its proposal
 	// left the aggregate. Entries are removed once completed.
 	NativeResumes map[string]*NativeResume `json:"native_resumes,omitempty"`
-	Chains        Chains                   `json:"chains"`
-	Created       Stamp                    `json:"created"`
-	Updated       Stamp                    `json:"updated"`
+	// AdmittedRuns are runs a worker was allowed to start, by run ID, so a
+	// later retirement knows them even before Dagu reports them running.
+	AdmittedRuns map[string]time.Time `json:"admitted_runs,omitempty"`
+	// PendingEffects are lifecycle effects on Dagu committed with the
+	// transition and not yet confirmed applied.
+	PendingEffects *PendingEffects `json:"pending_effects,omitempty"`
+	// SuspendedByRegistry is set while the registry holds the job's DAG
+	// suspended, so lifting it never overrides a person's own suspension.
+	SuspendedByRegistry bool   `json:"suspended_by_registry,omitempty"`
+	Chains              Chains `json:"chains"`
+	Created             Stamp  `json:"created"`
+	Updated             Stamp  `json:"updated"`
 }
 
 // Runnable reports whether Dagu may start a run of this job now.
