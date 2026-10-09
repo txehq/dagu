@@ -41,6 +41,8 @@ type EffectResult struct {
 	// AdmittedRef is the execution the destination named for the admitted
 	// request, when it names one.
 	AdmittedRef string
+	// AdmittedAt is when the destination admitted the request.
+	AdmittedAt time.Time
 	// Pending is true for an unknown outcome that later looks can still
 	// settle: the admitted effect has not shown up yet and still may.
 	Pending bool

@@ -99,6 +99,8 @@ type FinishRequest struct {
 	// named for it, if it named one.
 	Admitted    bool
 	AdmittedRef string
+	// AdmittedAt is when the destination admitted the request.
+	AdmittedAt time.Time
 }
 
 // Registry is the part of the TXE job registry the reviewer consumes. The

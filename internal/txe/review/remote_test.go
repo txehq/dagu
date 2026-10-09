@@ -1601,15 +1601,68 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	assert.Empty(t, again)
 	assert.Len(t, service.retried, 1)
 
+	require.Equal(t, review.ExecutionRef("att-2", ""), out.Action.AdmittedRef)
+	stalled := func() (open, resolved []*registry.Exception) {
+		for _, e := range f.job().Exceptions {
+			if e.Kind != string(review.ExceptionRetryStalled) {
+				continue
+			}
+			if e.ResolvedAt == nil {
+				open = append(open, e)
+			} else {
+				resolved = append(resolved, e)
+			}
+		}
+		return open, resolved
+	}
+	reviewAt := func(holder string, after time.Duration) {
+		t.Helper()
+		r := f.retrying(holder, service)
+		r.Now = func() time.Time { return time.Now().Add(after) }
+		prepared, err := r.Prepare(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
+		_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
+		require.NoError(t, err)
+	}
+	availability := f.job().Availability.State
+
+	// Ten minutes on the attempt is still only reserved: a busy worker.
+	// Nothing is raised, and the action stays open.
+	reviewAt("reviewer-early", 10*time.Minute)
+	open, _ := stalled()
+	assert.Empty(t, open)
+
+	// Past half an hour the owner is told by an exception about this
+	// attempt of this action. Each review is a new process reading the
+	// registry: it raises the same exception again and the registry keeps
+	// one. The action stays uncertain and no question is asked.
+	for i, after := range []time.Duration{2 * time.Hour, 4 * time.Hour} {
+		reviewAt(fmt.Sprintf("reviewer-late-%d", i), after)
+		open, _ = stalled()
+		require.Len(t, open, 1)
+		assert.Equal(t, registry.ScopeAction, open[0].Scope)
+		assert.Equal(t, out.Action.ID, open[0].ActionID)
+		assert.Contains(t, open[0].Detail, review.ExecutionRef("att-2", ""))
+		job := f.job()
+		assert.Equal(t, job.Actions[out.Action.ID].Attempt, open[0].Attempt)
+		assert.Equal(t, registry.ActionUncertain, job.Actions[out.Action.ID].State)
+		assert.Equal(t, availability, job.Availability.State, "the job's availability is untouched")
+		assert.Nil(t, job.ReviewerAvailability, "and so is the reviewer's")
+		for _, p := range job.Proposals {
+			assert.NotEqual(t, review.UncertainEffectAction, p.Action.Name, "no question is put to the owner")
+		}
+	}
+	assert.Len(t, service.retried, 1)
+
 	// A worker takes it: the next review of the job sees the admitted
 	// attempt running and settles the action with it. The admission the
 	// reviewer journaled is what lets it recognise the attempt.
-	require.Equal(t, review.ExecutionRef("att-2", ""), out.Action.AdmittedRef)
 	service.state["run-7"] = review.RunState{AttemptID: "att-2", Status: "running", Active: true}
 	r := f.retrying("reviewer-b", service)
 	prepared, err := r.Prepare(ctx, f.jobID)
 	require.NoError(t, err)
-	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: []string{"run-1"}})
+	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
 	require.NoError(t, err)
 	actions, err := f.remote.Actions(ctx, f.jobID)
 	require.NoError(t, err)
@@ -1617,6 +1670,55 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	assert.Equal(t, review.ActionSucceeded, actions[0].State)
 	assert.Equal(t, review.ExecutionRef("att-2", ""), actions[0].Receipt)
 	assert.Len(t, service.retried, 1, "settled from the run, never by dispatching again")
+	open, resolved := stalled()
+	assert.Empty(t, open, "the registry resolves the exception when the attempt settles")
+	assert.Len(t, resolved, 1)
+}
+
+// Against the real registry: a retry of a run has one attempt. When its
+// outcome is unknown and the owner is asked, an answer of "retry" is
+// refused, so the action never gets a second attempt whose reservation
+// could be timed from the first one's start. (The time a stalled
+// reservation is reported after is taken from the attempt's own admission
+// in any case; TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt.)
+func TestRemoteARetryOfARunIsNeverAttemptedTwice(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	service.fail("run-7", "att-1")
+	var proposal *registry.Proposal
+	var decided *registry.Decision
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+		proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "run-7", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-run-7")
+		return err
+	})
+	require.NoError(t, err)
+
+	// The service admits the retry without naming an execution: unknown.
+	service.unnamed = true
+	service.retry = func(string) error { return nil }
+	first, err := f.retrying("tick-1", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
+	require.NoError(t, err)
+	require.Equal(t, review.ActionUncertain, first.Action.State)
+
+	r := f.retrying("reviewer-a", service)
+	r.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	prepared, err := r.Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
+	require.NoError(t, err)
+	require.Equal(t, registry.ActionEscalated, f.job().Actions[first.Action.ID].State)
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+
+	_, err = f.decide(open[0], 1, "retry")
+	require.ErrorContains(t, err, "used all 1 attempts")
+	assert.Equal(t, 1, f.job().Actions[first.Action.ID].Attempt)
+	assert.Len(t, service.retried, 1)
 }
 
 // An effect whose outcome is unknown is escalated as the registry's typed
@@ -1779,7 +1881,7 @@ func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
 	closures, err := f.store.ListClosures(ctx, f.jobID, 0)
 	require.NoError(t, err)
 	require.Len(t, closures, 1)
-	assert.Equal(t, registry.ClosureClosed, closures[0].Outcome)
+	assert.Equal(t, registry.ClosureRunEnded, closures[0].Outcome)
 	assert.Contains(t, closures[0].Detail, "records no completion")
 	assert.Contains(t, closures[0].Detail, "is not known from the run", "the record does not claim that nobody answered")
 	assert.NotContains(t, closures[0].Detail, "without an answer")

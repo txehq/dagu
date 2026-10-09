@@ -1319,9 +1319,30 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		assert.Contains(t, out.Action.Detail, review.ExecutionRef("att-reserved", ""))
 		assert.Contains(t, out.Action.Detail, "not seen queued or started")
 
-		// A busy worker has not taken the attempt by the next review, nor
-		// by the one after. The owner is not asked: that would end the
-		// action, and it could then never be settled by its own execution.
+		stalled := func() []review.Exception {
+			var out []review.Exception
+			for _, e := range f.state().Exceptions {
+				if e.Kind == review.ExceptionRetryStalled {
+					out = append(out, e)
+				}
+			}
+			return out
+		}
+		// A review ten minutes on finds it still reserved. That is a busy
+		// worker, not yet a problem: nothing is raised.
+		f.clock.Advance(10 * time.Minute)
+		r := f.executor("reviewer-b")
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionUncertain, f.state().Actions[jobID][0].State)
+		assert.Empty(t, stalled(), "ten minutes reserved is not stalled")
+
+		// It is still reserved at the next review, and at the one after.
+		// The owner is not asked: that would end the action, and it could
+		// then never be settled by its own execution. Past half an hour the
+		// owner is told, once, by an exception that names the attempt.
 		for range 2 {
 			action := nextReview(f)
 			assert.Equal(t, review.ActionUncertain, action.State, "still only reserved: it stays open to be settled")
@@ -1331,6 +1352,14 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		for _, p := range f.state().Proposals[jobID] {
 			assert.NotEqual(t, review.UncertainEffectAction, p.ActionName, "no question is put to the owner while the retry may still start")
 		}
+		raised := stalled()
+		require.Len(t, raised, 1, "raised once, however many reviews see it")
+		assert.Equal(t, out.Action.ID, raised[0].ActionID)
+		assert.Equal(t, out.Action.Attempt, raised[0].Attempt)
+		assert.Equal(t, fixtureJob().MachineID, raised[0].MachineID)
+		assert.Contains(t, raised[0].Message, review.ExecutionRef("att-reserved", ""))
+		assert.Contains(t, raised[0].Message, "run-1")
+		assert.Nil(t, raised[0].ResolvedAt)
 
 		// The worker takes it, and the review after that records the retry.
 		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "failed"}
@@ -1338,6 +1367,9 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		assert.Equal(t, review.ActionSucceeded, action.State)
 		assert.Equal(t, review.ExecutionRef("att-reserved", ""), action.Receipt)
 		assert.Len(t, f.runs.requested, 1, "nothing is dispatched again because time passed")
+		raised = stalled()
+		require.Len(t, raised, 1)
+		assert.NotNil(t, raised[0].ResolvedAt, "settling the attempt ends its exception")
 	})
 	t.Run("the reserved attempt is then handed to a worker", func(t *testing.T) {
 		f := newRetryFixture(t)
@@ -1370,6 +1402,95 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 		assert.Equal(t, review.ActionSucceeded, out.Action.State)
 		assert.Equal(t, review.ExecutionRef("att-reserved", ""), out.Action.Receipt)
 	})
+}
+
+// The half hour after which a reservation is reported runs from the
+// admission of the attempt that made it. An action can be attempted again
+// on the owner's word, long after it was created: its new reservation is
+// not stalled from its first minute.
+func TestRetryRunAStalledReservationIsTimedFromItsOwnAttempt(t *testing.T) {
+	f := newRetryFixture(t)
+	review1 := func(holder string, wait time.Duration) {
+		t.Helper()
+		f.clock.Advance(wait)
+		r := f.executor(holder)
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+	}
+	stalled := func() []review.Exception {
+		var out []review.Exception
+		for _, e := range f.state().Exceptions {
+			if e.Kind == review.ExceptionRetryStalled {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+
+	// The action is hours old when this attempt of it is admitted, as a
+	// named attempt that no worker has taken yet. (The reference registry
+	// keeps one attempt per approved action, so the age an earlier attempt
+	// would have given the action is set on the record directly.)
+	f.runs.retry = func(runID string) error {
+		f.runs.state[runID] = review.RunState{AttemptID: "att-second", Status: "not_started", Active: true}
+		return nil
+	}
+	second := f.execute("executor")
+	require.Equal(t, review.ActionUncertain, second.Action.State)
+	require.Equal(t, review.ExecutionRef("att-second", ""), second.Action.AdmittedRef)
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		s.Actions[jobID][0].StartedAt = s.Actions[jobID][0].StartedAt.Add(-5 * time.Hour)
+		return nil
+	}))
+	require.Equal(t, f.clock.Now(), f.state().Actions[jobID][0].AdmittedAt, "the admission time is journaled with the attempt")
+
+	review1("reviewer-b", 10*time.Minute)
+	assert.Empty(t, stalled(), "ten minutes after this attempt's admission, whatever the action's age")
+
+	review1("reviewer-c", 2*time.Hour)
+	raised := stalled()
+	require.Len(t, raised, 1)
+	assert.Equal(t, second.Action.Attempt, raised[0].Attempt)
+	assert.Contains(t, raised[0].Message, review.ExecutionRef("att-second", ""))
+}
+
+// A registry that cannot take the exception does not stop the review of the
+// job: the action stays uncertain, the review is recorded, and the next
+// review tries to raise it again.
+func TestRetryRunAFailedStalledExceptionDoesNotBlockTheReview(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.retry = func(runID string) error {
+		f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+		return nil
+	}
+	out := f.execute("executor")
+	require.Equal(t, review.ActionUncertain, out.Action.State)
+
+	refusing := &refusingExceptions{Registry: f.registry}
+	for range 2 {
+		f.clock.Advance(2 * time.Hour)
+		r := f.executor("reviewer-b")
+		r.Registry = refusing
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err, "the review goes on")
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionUncertain, f.state().Actions[jobID][0].State)
+	}
+	assert.Equal(t, 2, refusing.asked, "it is raised again by each review until it is recorded")
+}
+
+// refusingExceptions is a registry that refuses every exception.
+type refusingExceptions struct {
+	review.Registry
+	asked int
+}
+
+func (r *refusingExceptions) RaiseException(context.Context, review.Exception) error {
+	r.asked++
+	return errors.New("the registry cannot record it")
 }
 
 // A service that names the execution it admitted a retry as makes that

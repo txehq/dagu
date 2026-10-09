@@ -837,12 +837,11 @@ const maxUnreadReported = 10
 func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error) {
 	outcome, detail := api.TxeClosureOutcome(closure.Outcome), closure.Detail
 	if closure.Outcome == ClosureEnded {
-		// The registry has no outcome of its own for a task that was
-		// already over with no completion on record. It is recorded as
-		// closed, with a detail that says exactly what is known: the task
-		// was over, the service shows no completion, the reviewer completed
-		// nothing. It neither claims an answer nor denies one.
-		outcome = api.TxeClosureOutcomeClosed
+		// The registry's outcome for a task that was already over with no
+		// completion on record. The detail says exactly what is known: the
+		// task was over, the service shows no completion, the reviewer
+		// completed nothing. It neither claims an answer nor denies one.
+		outcome = api.TxeClosureOutcomeRunEnded
 		detail = strings.TrimSpace(endedDetail + " " + detail)
 	}
 	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: outcome, Detail: optional(detail)}
@@ -916,7 +915,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 	}
 	var outcome actionOutcome
 	if len(a.Outcome) > 0 && json.Unmarshal(a.Outcome, &outcome) == nil {
-		out.Detail, out.Admitted, out.AdmittedRef = outcome.Detail, outcome.Admitted, outcome.AdmittedRef
+		out.Detail, out.Admitted, out.AdmittedRef, out.AdmittedAt = outcome.Detail, outcome.Admitted, outcome.AdmittedRef, outcome.AdmittedAt
 	}
 	// The registry's first state for an authorized attempt is one the
 	// reviewer treats the same as executing: the effect may have begun.
@@ -1046,6 +1045,8 @@ type actionOutcome struct {
 	Admitted bool `json:"admitted,omitempty"`
 	// AdmittedRef: the execution the destination named for the request.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
+	// AdmittedAt: when it accepted the request, by the registry's clock.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 }
 
 // FinishAction implements Registry.
@@ -1058,7 +1059,7 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 		body.Receipt = &req.Receipt
 	}
 	if req.Detail != "" || req.Admitted {
-		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef})
+		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef, AdmittedAt: req.AdmittedAt})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }
@@ -1209,6 +1210,23 @@ var jobExceptions = map[ExceptionKind]bool{ExceptionUnavailable: true}
 
 // RaiseException implements Registry.
 func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
+	if exc.ActionID != "" {
+		// An exception about one attempt of an action is filed under the
+		// claim that holds the job. It changes no availability. The
+		// registry keeps one open per (action, attempt, kind), so raising
+		// it again is harmless, and resolves it itself when that attempt
+		// is settled or another is granted.
+		kind, scope := string(exc.Kind), api.TxeObservationRequestScopeAction
+		fence := int64(exc.Claim.Fence)
+		body := api.TxeObservationRequest{
+			Actor: r.actor(), Scope: &scope, Kind: &kind, Detail: &exc.Message,
+			// The registry ignores the state of an action observation; the
+			// field is required by the request's schema.
+			State:    api.TxeAvailabilityState(registry.AvailabilityReady),
+			ActionId: &exc.ActionID, Attempt: &exc.Attempt, ClaimId: &exc.Claim.ID, Fence: &fence,
+		}
+		return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
+	}
 	kind := string(exc.Kind)
 	body := api.TxeObservationRequest{Actor: r.actor(), State: exceptionStates[exc.Kind], Kind: &kind, Detail: &exc.Message}
 	if body.State == "" {

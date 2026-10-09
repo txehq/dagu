@@ -309,6 +309,9 @@ type Action struct {
 	// request as, when it names one. Only that execution is then this
 	// action's effect.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
+	// AdmittedAt is when, by the registry's clock, the destination
+	// admitted the request of this attempt of the action.
+	AdmittedAt time.Time `json:"admitted_at,omitzero"`
 	// Attempt is the registry's count of attempts of this action. An
 	// owner's answer about an unknown outcome is about one attempt.
 	Attempt int `json:"attempt,omitempty"`
@@ -491,6 +494,12 @@ const (
 	// ExceptionUnavailable means the reviewer judged the job's target or
 	// credentials unavailable. It is not a retirement.
 	ExceptionUnavailable ExceptionKind = "target_unavailable"
+	// ExceptionRetryStalled means a retry the service admitted has stayed a
+	// reservation: its execution exists and no worker has started it. It
+	// is about one attempt of one action, which stays uncertain and keeps
+	// being probed; the registry resolves the exception when that attempt
+	// is settled.
+	ExceptionRetryStalled ExceptionKind = "retry_reservation_stalled"
 )
 
 // Exception is an actionable condition surfaced on the dashboard.
@@ -500,6 +509,16 @@ type Exception struct {
 	MachineID string        `json:"machine_id"`
 	Message   string        `json:"message"`
 	ReviewID  string        `json:"review_id,omitempty"`
+	// ActionID and Attempt name the action attempt an exception is about.
+	// Such an exception is open once per attempt, however often it is
+	// raised, and does not change the job's or the reviewer's availability.
+	ActionID string `json:"action_id,omitempty"`
+	Attempt  int    `json:"attempt,omitempty"`
+	// Claim is the live claim an action's exception is raised under. It
+	// is not part of the record.
+	Claim Claim `json:"-"`
+	// ResolvedAt is set by the registry when the condition is over.
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
 
 // LocalFile is a reference to a file kept on one machine. The digest lets a

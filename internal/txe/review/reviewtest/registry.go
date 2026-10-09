@@ -670,9 +670,17 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 				return fmt.Errorf("%w: action %s cannot go from %s to %s", review.ErrConflict, req.ActionID, actions[i].State, req.State)
 			}
 			actions[i].State = req.State
+			if req.State != review.ActionUncertain {
+				// An exception about this attempt is over once it is settled.
+				for e := range s.Exceptions {
+					if exc := &s.Exceptions[e]; exc.ResolvedAt == nil && exc.JobID == req.JobID && exc.ActionID == req.ActionID {
+						exc.ResolvedAt = &now
+					}
+				}
+			}
 			actions[i].Receipt = req.Receipt
 			actions[i].Detail = req.Detail
-			actions[i].Admitted, actions[i].AdmittedRef = req.Admitted, req.AdmittedRef
+			actions[i].Admitted, actions[i].AdmittedRef, actions[i].AdmittedAt = req.Admitted, req.AdmittedRef, req.AdmittedAt
 			actions[i].FinishedAt = now
 			return nil
 		}
@@ -761,6 +769,13 @@ func (r *Registry) DeferReview(_ context.Context, claim review.Claim, until time
 // RaiseException implements review.Registry.
 func (r *Registry) RaiseException(_ context.Context, exc review.Exception) error {
 	return r.Update(func(s *State) error {
+		if exc.ActionID != "" {
+			for _, open := range s.Exceptions {
+				if open.ResolvedAt == nil && open.JobID == exc.JobID && open.Kind == exc.Kind && open.ActionID == exc.ActionID && open.Attempt == exc.Attempt {
+					return nil
+				}
+			}
+		}
 		s.Exceptions = append(s.Exceptions, exc)
 		return nil
 	})

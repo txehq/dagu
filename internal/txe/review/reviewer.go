@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strconv"
 	"time"
@@ -430,7 +431,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			State: state, Receipt: res.Receipt, Detail: res.Detail,
 			// The registry replaces the stored outcome, so what is known
 			// about the request's admission is written again with it.
-			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef,
+			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef, AdmittedAt: action.AdmittedAt,
 		})
 	}
 	if action.State == ActionExecuting {
@@ -463,6 +464,24 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// stay unresolved after it visibly ran. It is left uncertain
 			// instead: it stays in every packet as unresolved and is
 			// probed again by every review until the run settles it.
+			//
+			// A reservation that outlasts reservationStalledAfter is put in
+			// front of the owner as an exception, not as a question: an
+			// answer could only allow another retry, and the reserved
+			// execution can still start. The time runs from the admission
+			// of this attempt of the action, which is journaled with it
+			// and written again by every reconciliation: not from the
+			// action's creation, which an earlier attempt may have set.
+			// An attempt with no admission time on record is told at once.
+			if escalate && !r.now().Before(action.AdmittedAt.Add(reservationStalledAfter)) {
+				// Telling the owner must not stop the review: a registry
+				// that cannot take the exception would otherwise keep the
+				// job from ever being reviewed again. Nothing is recorded
+				// on a failure, so the next review raises it again.
+				if err := r.raiseStalled(ctx, claim, job, action); err != nil {
+					fmt.Fprintf(os.Stderr, "txe review: action %s of %s: %v; the action stays uncertain and the review goes on\n", action.ID, job.ID, err)
+				}
+			}
 			return nil
 		}
 	}
@@ -518,6 +537,30 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 // escalate asks the owner how to settle an attempt whose effect is unknown.
 // The question is bound to the job's current version and filing it again is
 // a no-op.
+// reservationStalledAfter is how long an admitted retry may stay a
+// reservation, by the registry's clock, before the owner is told.
+const reservationStalledAfter = 30 * time.Minute
+
+// raiseStalled files the exception for an admitted retry whose execution
+// has not started. It names the attempt, the execution and the machine, and
+// says what to look at. It grants nothing and asks for no decision.
+func (r *Reviewer) raiseStalled(ctx context.Context, claim Claim, job Job, action Action) error {
+	err := r.Registry.RaiseException(ctx, Exception{
+		JobID: job.ID, Kind: ExceptionRetryStalled, MachineID: job.MachineID, Claim: claim,
+		ActionID: action.ID, Attempt: action.Attempt, ReviewID: action.ReviewID,
+		Message: fmt.Sprintf(
+			"The retry of run %s (action %s, attempt %d) was admitted by the service as execution %s on machine %s at %s and no worker has started it. "+
+				"Check that a worker for this job is connected to the service and can take queued work, and look at execution %s of the run. "+
+				"Nothing is sent again: the reviewer keeps looking and records the retry when that execution starts, or when the service records that its preparation was abandoned. "+
+				"Do not retry the run by hand while the execution can still start, or it may run twice.",
+			action.Params[RetryRunParam], action.ID, action.Attempt, action.AdmittedRef, job.MachineID, action.AdmittedAt.UTC().Format(time.RFC3339), action.AdmittedRef),
+	})
+	if err != nil {
+		return fmt.Errorf("raise exception: %w", err)
+	}
+	return nil
+}
+
 func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Action, detail string) error {
 	id := UncertainProposalID(action.ID, action.Attempt, job.Version)
 	proposal, err := r.Registry.CreateProposal(ctx, claim, Proposal{
@@ -831,13 +874,13 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 	}
 	err := r.Registry.FinishAction(ctx, FinishRequest{
 		Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
-		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
+		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef, AdmittedAt: res.AdmittedAt,
 	})
 	if err != nil {
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", action.ID, err)
 	}
 	action.State, action.Receipt, action.Detail = state, res.Receipt, res.Detail
-	action.Admitted, action.AdmittedRef = res.Admitted, res.AdmittedRef
+	action.Admitted, action.AdmittedRef, action.AdmittedAt = res.Admitted, res.AdmittedRef, res.AdmittedAt
 	return action, nil
 }
 
@@ -1058,7 +1101,10 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		// caller after this retry's execution finished or was abandoned.
 		return unnamedAdmission(runID, r.seenOnRun(ctx, job.ID, runID, bound))
 	}
-	return r.observeRetry(ctx, job.ID, runID, bound, admitted.Ref(), watch, "the service accepted a retry of run "+runID)
+	admittedAt := r.now()
+	res := r.observeRetry(ctx, job.ID, runID, bound, admitted.Ref(), watch, "the service accepted a retry of run "+runID)
+	res.AdmittedAt = admittedAt
+	return res
 }
 
 // unnamedAdmission is the unknown outcome of a retry the service admitted
