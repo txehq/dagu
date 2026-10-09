@@ -178,6 +178,11 @@ func PrepareRetry(
 		status.AttemptID,
 		status.Status,
 		func(latest *ir.DAGRunStatus) error {
+			// The caller decided on one execution of the attempt; a later
+			// execution of the same attempt is not retried in its place.
+			if latest.QueuedAt != status.QueuedAt {
+				return ErrRetryStaleLatest
+			}
 			snapshot := *latest
 			originalStatus = &snapshot
 			now := time.Now()
@@ -203,6 +208,9 @@ func PrepareRetry(
 			return nil
 		}, persis.DAGRunCompareAndSwapOptions{},
 	)
+	if errors.Is(err, ErrRetryStaleLatest) {
+		return nil, ErrRetryStaleLatest
+	}
 	if err != nil {
 		return nil, fmt.Errorf("persist queued retry status: %w", err)
 	}

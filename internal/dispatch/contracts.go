@@ -74,6 +74,10 @@ type DispatchTask struct {
 	IncludeDownstream   bool
 	BypassPreconditions bool
 	RetryPath           string
+	// RequireLatestIsPrevious makes a retry conditional: the coordinator
+	// creates its attempt only if the run's latest execution is
+	// PreviousStatus's (AttemptID, QueuedAt) and has finished.
+	RequireLatestIsPrevious bool
 
 	WorkspaceBundleDigest      string
 	WorkspaceBundleSize        int64

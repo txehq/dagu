@@ -362,6 +362,36 @@ func TestClientDispatch(t *testing.T) {
 		require.Equal(t, "queued attempt was superseded", staleErr.Reason)
 	})
 
+	t.Run("ChangedLatestExecutionIsPermanent", func(t *testing.T) {
+		t.Parallel()
+
+		config := coordinator.DefaultConfig()
+		config.MaxRetries = 3
+		config.RetryInterval = time.Millisecond
+		config.RequestTimeout = 100 * time.Millisecond
+
+		var calls atomic.Int32
+		mockCoord := &mockCoordinatorService{
+			dispatchFunc: func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+				calls.Add(1)
+				return nil, status.Error(codes.Aborted, "failed to prepare attempt: "+persis.ErrLatestExecutionChanged.Error()+": latest is attempt a2")
+			},
+		}
+		server, addr := startMockServer(t, mockCoord)
+		defer server.Stop()
+		host, port := parseHostPort(addr)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+		}}
+
+		err := coordinator.New(monitor, config).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag"},
+		})
+		require.ErrorIs(t, err, backoff.ErrPermanent)
+		require.ErrorIs(t, err, persis.ErrLatestExecutionChanged)
+		assert.Equal(t, int32(1), calls.Load(), "a refused conditional retry is not dispatched again")
+	})
+
 	t.Run("InvalidDefinitionReturnsDefinitionError", func(t *testing.T) {
 		t.Parallel()
 
