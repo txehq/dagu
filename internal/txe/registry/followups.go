@@ -4,8 +4,10 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -312,4 +314,168 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	}
 	out := *j.Proposals[id]
 	return &out, d, nil
+}
+
+// ClosureOutcome is the result of closing a superseded proposal's Dagu
+// human task.
+type ClosureOutcome string
+
+const (
+	// ClosureClosed: the task was closed.
+	ClosureClosed ClosureOutcome = "closed"
+	// ClosureAlreadyAnswered: a person had answered the task first.
+	ClosureAlreadyAnswered ClosureOutcome = "already_answered"
+	// ClosureRunMissing: the task's run no longer exists.
+	ClosureRunMissing ClosureOutcome = "run_missing"
+	// ClosureLocatorRefused: the machine refused the task's locator.
+	ClosureLocatorRefused ClosureOutcome = "locator_refused"
+	// ClosureFailed: the attempt failed and will be retried.
+	ClosureFailed ClosureOutcome = "failed"
+)
+
+// Final reports whether the outcome ends the closure obligation.
+func (o ClosureOutcome) Final() bool { return o != ClosureFailed }
+
+func knownClosureOutcome(o ClosureOutcome) bool {
+	switch o {
+	case ClosureClosed, ClosureAlreadyAnswered, ClosureRunMissing, ClosureLocatorRefused, ClosureFailed:
+		return true
+	}
+	return false
+}
+
+// PendingClosure is a superseded proposal whose Dagu human task still waits.
+type PendingClosure struct {
+	JobID         string     `json:"job_id"`
+	ProposalID    string     `json:"proposal_id"`
+	MachineID     string     `json:"machine_id"`
+	NativeTask    NativeTask `json:"native_task"`
+	SupersededAt  time.Time  `json:"superseded_at"`
+	Failures      int        `json:"failures"`
+	LastAttemptAt *time.Time `json:"last_attempt_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+}
+
+// Closure is an immutable record of one attempt to close a superseded
+// proposal's Dagu human task.
+type Closure struct {
+	ClosureID  string         `json:"closure_id"`
+	ProposalID string         `json:"proposal_id"`
+	Outcome    ClosureOutcome `json:"outcome"`
+	Detail     string         `json:"detail,omitempty"`
+	Attempt    int            `json:"attempt"`
+	Created    Stamp          `json:"created"`
+	Prev       string         `json:"prev,omitempty"`
+}
+
+// closeLater records that p's Dagu human task must be closed: superseding
+// the proposal does not end the task a person may still be looking at.
+func (tx *JobTx) closeLater(p *Proposal) {
+	if p.NativeTask == nil {
+		return
+	}
+	j := tx.Job
+	if j.PendingClosures == nil {
+		j.PendingClosures = map[string]*PendingClosure{}
+	}
+	j.PendingClosures[p.ProposalID] = &PendingClosure{JobID: j.JobID, ProposalID: p.ProposalID, MachineID: j.MachineID,
+		NativeTask: *p.NativeTask, SupersededAt: tx.now}
+}
+
+// RecordClosure appends the outcome of an attempt to close a superseded
+// proposal's Dagu human task. A failure is counted and the closure stays
+// pending; a final outcome ends it. Replaying a final outcome after it was
+// recorded returns the stored closure; another final outcome is refused.
+func (tx *JobTx) RecordClosure(ctx context.Context, s *Store, proposalID string, outcome ClosureOutcome, detail string) (*Closure, error) {
+	j := tx.Job
+	if !knownClosureOutcome(outcome) {
+		return nil, refuse(CodeInvalid, "unknown closure outcome %q", outcome)
+	}
+	pc, ok := j.PendingClosures[proposalID]
+	if !ok {
+		final, err := s.finalClosure(ctx, j, proposalID)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case final == nil:
+			return nil, refuse(CodeNotFound, "proposal %s has no task to close", proposalID)
+		case final.Outcome == outcome:
+			return final, nil
+		}
+		return nil, &Error{Code: CodeProposalState, Message: "the closure of proposal " + proposalID + " already ended as " + string(final.Outcome), Current: final}
+	}
+	id, err := NewID(PrefixClosure, tx.now)
+	if err != nil {
+		return nil, err
+	}
+	c := Closure{ClosureID: id, ProposalID: proposalID, Outcome: outcome, Detail: detail, Attempt: pc.Failures + 1, Created: Stamp{At: tx.now, By: tx.actor}}
+	if _, err := tx.attach(kindClosures, &c, func(prev string) { c.Prev = prev }); err != nil {
+		return nil, err
+	}
+	if outcome.Final() {
+		delete(j.PendingClosures, proposalID)
+	} else {
+		now := tx.now
+		pc.Failures++
+		pc.LastAttemptAt = &now
+		pc.LastError = detail
+	}
+	tx.touch()
+	return &c, nil
+}
+
+// finalClosure returns the final closure recorded for proposalID, or nil.
+func (s *Store) finalClosure(ctx context.Context, job *Job, proposalID string) (*Closure, error) {
+	for id := job.Chains.Closures; id != ""; {
+		var c Closure
+		if err := s.getJSON(ctx, id, &c); err != nil {
+			return nil, fmt.Errorf("registry: history %s: %w", id, err)
+		}
+		if c.ProposalID == proposalID && c.Outcome.Final() {
+			return &c, nil
+		}
+		id = c.Prev
+	}
+	return nil, nil
+}
+
+// ListClosures returns a job's closure records, newest first.
+func (s *Store) ListClosures(ctx context.Context, jobID string, limit int) ([]*Closure, error) {
+	return walkChain[Closure](ctx, s, jobID, func(c Chains) string { return c.Closures }, func(c *Closure) string { return c.Prev }, limit)
+}
+
+// PendingClosures lists the closures still owed on a machine's jobs that
+// filter keeps, least recently attempted first (never attempted first),
+// then by proposal ID.
+func (s *Store) PendingClosures(ctx context.Context, machineID string, limit int, keep func(*Job) bool) ([]PendingClosure, error) {
+	jobs, err := s.ListJobs(ctx, JobFilter{MachineID: machineID})
+	if err != nil {
+		return nil, err
+	}
+	var out []PendingClosure
+	for _, j := range jobs {
+		if keep != nil && !keep(j) {
+			continue
+		}
+		for _, pc := range j.PendingClosures {
+			out = append(out, *pc)
+		}
+	}
+	sort.Slice(out, func(i, k int) bool {
+		a, b := out[i].LastAttemptAt, out[k].LastAttemptAt
+		switch {
+		case a == nil && b != nil:
+			return true
+		case a != nil && b == nil:
+			return false
+		case a != nil && b != nil && !a.Equal(*b):
+			return a.Before(*b)
+		}
+		return out[i].ProposalID < out[k].ProposalID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }

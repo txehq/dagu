@@ -11770,6 +11770,112 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /txe/proposal-closures/pending:
+    get:
+      summary: "List Dagu human tasks still to be closed"
+      description: "Superseded proposals whose Dagu human task is still waiting, on the given machine's jobs the caller can see: never-attempted first, then least recently attempted, then by proposal ID."
+      operationId: "listTxePendingClosures"
+      tags:
+        - "txe"
+      parameters:
+        - name: machine
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Pending closures"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxePendingClosureList"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/proposals/{proposalId}/closures:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeProposalId"
+    post:
+      summary: "Record an attempt to close a superseded proposal's Dagu human task"
+      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing and locator_refused end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
+      operationId: "recordTxeProposalClosure"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeClosureRequest"
+      responses:
+        "200":
+          description: "Closure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeClosure"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/proposals/{proposalId}/decisions:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -20445,6 +20551,70 @@ components:
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [expected_proposal_revision, binding_digest, verdict, idempotency_key]
+
+    TxeClosureOutcome:
+      type: string
+      enum: [closed, already_answered, run_missing, locator_refused, failed]
+
+    TxeClosureRequest:
+      type: object
+      properties:
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [outcome]
+
+    TxeClosure:
+      type: object
+      properties:
+        closure_id:
+          type: string
+        proposal_id:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        attempt:
+          type: integer
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [closure_id, proposal_id, outcome, attempt, created]
+
+    TxePendingClosure:
+      type: object
+      properties:
+        job_id:
+          type: string
+        proposal_id:
+          type: string
+        machine_id:
+          type: string
+        native_task:
+          $ref: "#/components/schemas/TxeNativeTask"
+        superseded_at:
+          type: string
+          format: date-time
+        failures:
+          type: integer
+        last_attempt_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+      required: [job_id, proposal_id, machine_id, native_task, superseded_at, failures]
+
+    TxePendingClosureList:
+      type: object
+      properties:
+        closures:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxePendingClosure"
+      required: [closures]
 
     TxeRetryRequest:
       type: object
