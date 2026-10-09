@@ -89,7 +89,7 @@ func checkDeliverablePath(p string) error {
 	if len(p) > 1024 || path.Clean(p) != p {
 		return errors.New("path must be a clean relative path of at most 1024 bytes")
 	}
-	for _, seg := range strings.Split(p, "/") {
+	for seg := range strings.SplitSeq(p, "/") {
 		if !pathSegment.MatchString(seg) || strings.HasSuffix(seg, ".") || windowsDevice.MatchString(seg) {
 			return fmt.Errorf("path segment %q must use letters, digits, '.', '_' and '-', not start or end with a dot, and not be a device name", seg)
 		}
