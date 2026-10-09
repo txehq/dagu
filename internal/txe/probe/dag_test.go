@@ -83,6 +83,15 @@ func TestRenderReconcileDAGRefusesUnsafeInput(t *testing.T) {
 		"env linear key": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"X": "lin_api_abc"} },
 		"flag token":     func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--token=abc"} },
 		"flag api key":   func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--context", "dagu_0123456789abcdef"} },
+		// A JWT has dots, dashes and underscores but is no path.
+		"env jwt": func(c *ReconcileDAGConfig) {
+			c.Env = map[string]string{"X": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"}
+		},
+		"flag jwt": func(c *ReconcileDAGConfig) {
+			c.StoreFlags = []string{"--context", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc-def_ghi"}
+		},
+		"env dots": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"X": "/a/../../etc"} },
+		"relative": func(c *ReconcileDAGConfig) { c.DaguBin = "dagu" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := reconcileConfig()

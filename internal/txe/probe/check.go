@@ -52,7 +52,10 @@ type Check struct {
 	Client string
 	// Out receives one JSON line per observed target.
 	Out io.Writer
-	Now func() time.Time
+	// Evidence is added to every report, such as the run execution a
+	// pre-run check belongs to.
+	Evidence []string
+	Now      func() time.Time
 }
 
 // Line is the JSON line a check prints for one target. It carries no
@@ -86,8 +89,9 @@ func (c *Check) actor() *txeclient.Actor {
 // identity is not also reported absent, so the registry applies the job's
 // replacement rule and not its deletion rule.
 func (c *Check) event(t Target, r Result) Event {
+	evidence := append(append([]string{}, r.Evidence...), c.Evidence...)
 	ev := Event{Target: t, Observation: r.Outcome, Authoritative: r.Outcome == Absent && r.Authoritative,
-		Detail: r.Detail, Evidence: r.Evidence, ObservedAt: c.now().UTC(), Actor: c.actor()}
+		Detail: r.Detail, Evidence: evidence, ObservedAt: c.now().UTC(), Actor: c.actor()}
 	if r.Observed != nil {
 		ev.Target = *r.Observed
 	}
@@ -152,6 +156,12 @@ func (c *Check) print(line Line) {
 
 func terminal(lifecycle string) bool { return lifecycle == "completed" || lifecycle == "retired" }
 
+// mayRun reports whether a job in lifecycle may run its command. It is an
+// allowlist, so a paused job, an ended one, or a state this build does not
+// know stops the run: a job waiting for a person (needs_human) still runs
+// its ordinary checks.
+func mayRun(lifecycle string) bool { return lifecycle == "active" || lifecycle == "needs_human" }
+
 func toTarget(t txeclient.Target) Target {
 	return Target{Kind: t.Kind, Environment: t.Environment, StableID: t.StableID, DisplayName: t.DisplayName}
 }
@@ -170,7 +180,7 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 	if job.MachineID != c.MachineID {
 		return ExitUsage, fmt.Errorf("job %s runs on %s, not on %s", jobID, job.MachineID, c.MachineID)
 	}
-	if terminal(job.Lifecycle) {
+	if !mayRun(job.Lifecycle) {
 		return ExitStop, fmt.Errorf("job %s is %s", jobID, job.Lifecycle)
 	}
 	v, err := c.Registry.JobVersion(ctx, jobID, version)
@@ -207,7 +217,7 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 	if err != nil {
 		return ExitUnobserved, fmt.Errorf("read job %s after the check: %w", jobID, err)
 	}
-	if terminal(after.Lifecycle) {
+	if !mayRun(after.Lifecycle) {
 		return ExitStop, fmt.Errorf("job %s is %s", jobID, after.Lifecycle)
 	}
 	return ExitOK, nil
@@ -353,13 +363,20 @@ func (e EnvCredentials) Lookup(name string) (Credential, bool) {
 // check, which carries no secrets in its DAG.
 type FileCredentials map[string]string
 
-// FileCredentialsOf returns the file references of v.
+// FileCredentialsOf returns the file references of v. The locators come from
+// the registry, so each is checked before the probe reads it: an absolute,
+// clean path to a regular file this user owns that nobody else can write.
+// A locator that fails is a missing credential with the reason, never read.
 func FileCredentialsOf(v *txeclient.JobVersion) Credentials {
 	out := FileCredentials{}
 	missing := map[string]string{}
 	for _, ref := range v.Package.CredentialRefs {
 		switch ref.Kind {
 		case "file":
+			if err := checkCredentialFile(ref.Locator); err != nil {
+				missing[ref.Name] = "credential reference " + ref.Name + ": " + err.Error()
+				continue
+			}
 			out[ref.Name] = ref.Locator
 		default:
 			missing[ref.Name] = "credential reference " + ref.Name + " is an environment variable, which the periodic check does not receive"
