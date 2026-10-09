@@ -7,8 +7,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A queued retry reuses the attempt key, so a cancellation that names an
@@ -48,4 +51,19 @@ func TestProcessCancellationsScopesToExecutionMarker(t *testing.T) {
 			assert.Equal(t, tc.cancelled, ctx.Err() != nil)
 		})
 	}
+}
+
+// A load or init failure is reported before the agent runs, so it must carry
+// the queued-at the agent would have echoed; otherwise two failed executions
+// of one attempt both report an empty queued-at and cannot be told apart.
+func TestTaskQueuedAt(t *testing.T) {
+	t.Parallel()
+
+	previous, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
+		Name: "dag", DAGRunID: "run", AttemptID: "a1", Status: ir.Queued, QueuedAt: "2026-10-10T01:05:00Z",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "2026-10-10T01:05:00Z", taskQueuedAt(&coordinatorv1.Task{PreviousStatus: previous, ExecutionMarker: "other"}))
+	assert.Equal(t, "2026-10-10T01:05:00Z", taskQueuedAt(&coordinatorv1.Task{ExecutionMarker: "2026-10-10T01:05:00Z"}))
+	assert.Equal(t, "", taskQueuedAt(&coordinatorv1.Task{}))
 }

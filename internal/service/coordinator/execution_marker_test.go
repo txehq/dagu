@@ -807,6 +807,40 @@ func TestExecutionMarkerRequeueWindowBeforeClaim(t *testing.T) {
 	assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 4, SHA256: digestOf("2nd\n")}, record)
 }
 
+// A separately dispatched child holds its own claim and an empty marker. While
+// the root waits in the queue its writes are judged by its own lease, not by
+// the root's queued marker.
+func TestExecutionMarkerRequeueCheckSparesIndependentChild(t *testing.T) {
+	t.Parallel()
+
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(markerQ2))
+	child := ir.NewDAGRunRef("child-dag", "child-run")
+	childKey := ir.GenerateAttemptKey(markerDAG, markerRun, child.Name, child.ID, "child-attempt")
+	now := time.Now().UTC().UnixMilli()
+	require.NoError(t, f.leaseStore.Upsert(t.Context(), dispatch.DAGRunLease{
+		AttemptKey: childKey, DAGRun: child, Root: f.ref, AttemptID: "child-attempt", WorkerID: markerWorker,
+		Owner:     dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "coordinator", Port: 50055},
+		ClaimedAt: now, LastHeartbeatAt: now,
+	}))
+	chunk := func(data string, final bool) *coordinatorv1.LogChunk {
+		return &coordinatorv1.LogChunk{
+			WorkerId: markerWorker, DagName: child.Name, DagRunId: child.ID, AttemptId: "child-attempt",
+			RootDagRunName: markerDAG, RootDagRunId: markerRun, AttemptKey: childKey,
+			StepName: "step1", StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
+			Data: []byte(data), IsFinal: final, OwnerCoordinatorId: "coord-a",
+		}
+	}
+	require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+		chunk("child\n", false), chunk("", true),
+	}}))
+
+	// The root's own earlier execution is still refused.
+	err := f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+		markerLogChunk(markerQ1, "late\n", false),
+	}})
+	require.Error(t, err)
+}
+
 // hookedLogStream runs before(idx) ahead of delivering chunk idx.
 type hookedLogStream struct {
 	*mockStreamLogsServer

@@ -370,7 +370,12 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	}
 
 	current := *attempt.status
-	if req.ExpectedAttemptID != "" && current.AttemptID != req.ExpectedAttemptID {
+	// Match mockAttempt.ID, which stands in for a missing attempt ID.
+	currentAttemptID := current.AttemptID
+	if currentAttemptID == "" {
+		currentAttemptID = "test-attempt"
+	}
+	if req.ExpectedAttemptID != "" && currentAttemptID != req.ExpectedAttemptID {
 		return &current, false, nil
 	}
 	if req.ExpectedAttemptKey != "" && current.AttemptKey != req.ExpectedAttemptKey {
@@ -381,6 +386,9 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	}
 	if err := req.Mutate(&current); err != nil {
 		return nil, false, err
+	}
+	if attempt.writeError != nil {
+		return nil, false, attempt.writeError
 	}
 	attempt.status = &current
 	attempt.written = true
@@ -4805,8 +4813,8 @@ func TestHandler_ReportStatus(t *testing.T) {
 		current, readErr := attempt.ReadStatus(ctx)
 		require.NoError(t, readErr)
 		assert.Equal(t, "duplicate terminal payload", current.Error)
-		// A write over a terminal status goes through the store's
-		// compare-and-swap (TXE-3772), which opens no attempt handle.
+		// A terminal write goes through the store's compare-and-swap
+		// (TXE-3772), which opens no attempt handle.
 		assert.True(t, attempt.WasClosed() || !attempt.WasOpened(), "no attempt handle may be left open")
 
 		h.attemptsMu.RLock()
@@ -4853,7 +4861,9 @@ func TestHandler_ReportStatus(t *testing.T) {
 		_, err := h.ReportStatus(ctx, &coordinatorv1.ReportStatusRequest{Status: incoming})
 		require.Error(t, err)
 		assert.Equal(t, codes.Internal, status.Code(err))
-		assert.True(t, attempt.WasClosed())
+		// A terminal write goes through the store's compare-and-swap
+		// (TXE-3772), which opens no attempt handle.
+		assert.True(t, attempt.WasClosed() || !attempt.WasOpened(), "no attempt handle may be left open")
 
 		h.attemptsMu.RLock()
 		_, cached := h.openAttempts[ref.ID]

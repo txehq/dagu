@@ -269,7 +269,15 @@ func (h *Handler) refuseRequeuedExecution(ctx context.Context, identity attemptI
 		}
 		return status.Error(codes.Internal, "failed to read run status for write validation: "+err.Error())
 	}
-	if runStatus != nil && runStatus.Status == ir.Queued && runStatus.QueuedAt != identity.executionMarker {
+	if runStatus == nil || runStatus.Status != ir.Queued {
+		return nil
+	}
+	// Only writes under the root attempt's own claim carry its execution
+	// marker: the root and its inline descendants. A separately dispatched
+	// child holds its own claim and marker, and its lease is checked instead.
+	underRootClaim := identity.claimKey == runStatus.AttemptKey ||
+		(runStatus.AttemptKey == "" && identity.dagRun == identity.root)
+	if underRootClaim && runStatus.QueuedAt != identity.executionMarker {
 		return status.Error(codes.FailedPrecondition, remoteAttemptRejectedSuperseded)
 	}
 	return nil

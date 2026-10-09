@@ -19,9 +19,11 @@ import (
 // A retry queued the moment the hub shows the failure reuses the attempt id
 // and key while the first execution may still be sending its last reports.
 // Those late reports must not overwrite the queued status, so the retry runs.
-// The race is timing-dependent and this test does not reproduce it reliably,
-// so it checks the end-to-end property only; the coordinator's
-// TestExecutionMarker* tests pin the mechanism deterministically.
+// The worker is isolated, so its status reaches the hub only through the
+// coordinator, as in a real deployment; a worker sharing the hub's files
+// writes them directly and bypasses every fence. The race is timing-dependent,
+// so this checks the end-to-end property; the coordinator's TestExecutionMarker*
+// tests pin the mechanism deterministically.
 func TestRetry_QueuedImmediatelyAfterFailureExecutes(t *testing.T) {
 	const executions = 2
 	for i := range 4 {
@@ -35,7 +37,7 @@ worker_selector:
 steps:
   - name: count-and-fail
     run: echo x >> %q && exit 1
-`, counter))
+`, counter), withIsolatedWorker())
 			defer f.cleanup()
 
 			require.NoError(t, f.enqueue())

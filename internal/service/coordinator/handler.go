@@ -2125,12 +2125,19 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 
 	attempt := latestAttempt
 	// A retry can re-queue the attempt only from a terminal status, and it may
-	// do so from another process, between this report's validation and its
-	// write. Over a terminal status the write is therefore conditional, in the
-	// store's own compare-and-swap that the retry also uses: it applies only
-	// if the status and queued-at are still those validated against.
+	// do so from another process. Every root write that produces or replaces a
+	// terminal status therefore goes through the store's compare-and-swap,
+	// which the retry also uses:
+	//   - over a terminal status, it applies only if the status and queued-at
+	//     are still those validated against, so a late replay cannot restore
+	//     an earlier execution over a queued retry;
+	//   - to a terminal status, the write and the file's compaction finish
+	//     under the store's lock. Through the open attempt, closing it after
+	//     the write would compact the file from a read taken before a retry
+	//     queued in between, and drop that retry.
 	conditional := dagRunStatus.Status == ir.Waiting ||
-		(!isSubDAGStatus(dagRunStatus) && isTerminalRunStatus(latestStatus.Status))
+		(!isSubDAGStatus(dagRunStatus) &&
+			(isTerminalRunStatus(latestStatus.Status) || isTerminalRunStatus(dagRunStatus.Status)))
 	if conditional {
 		h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, latestAttempt.ID())
 		persisted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(
