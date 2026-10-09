@@ -783,8 +783,22 @@ func TestRegisterRefusesAMachineWithoutTheCommands(t *testing.T) {
 	assert.Equal(t, filepath.Join(home.Root, "bin", "dagu"), askedOf)
 	assert.Equal(t, [][]string{{"resource", "check"}}, asked, "a job without deliverables needs only the check")
 	assert.Zero(t, f.jobCount())
+	staged, err := os.ReadDir(home.PackagesDir())
+	if !errors.Is(err, fs.ErrNotExist) {
+		require.NoError(t, err)
+	}
+	assert.Empty(t, staged, "a package was staged for a job that was refused")
 	_, err = s.Plan(context.Background(), spec)
 	require.Error(t, err, "a dry run did not report that the job could not run here")
+
+	// An update is refused the same way, and the job stays at its version.
+	ok := newSession(f, home, "cc1-s000001")
+	first, err := ok.Register(context.Background(), spec)
+	require.NoError(t, err)
+	_, err = s.Update(context.Background(), first.Receipt.JobID, 1, spec)
+	require.ErrorContains(t, err, `it has no "dagu txe resource check" command`)
+	assert.Equal(t, 1, f.jobCount())
+	assert.Equal(t, 1, f.versionCount(first.Receipt.JobID), "an update was recorded for a machine that cannot run it")
 }
 
 // The installed dagu is asked through each command's own help. One that lacks
@@ -817,4 +831,27 @@ esac
 	require.ErrorContains(t, HasTXECommands(ctx, lacks, [][]string{{"resource", "check"}}), `it has no "dagu txe resource check" command`)
 	require.ErrorContains(t, HasTXECommands(ctx, fails, [][]string{{"resource", "check"}}), "failed")
 	require.Error(t, HasTXECommands(ctx, filepath.Join(dir, "absent"), [][]string{{"resource", "check"}}))
+
+	// Only the usage line counts. A parent's help that mentions the command
+	// in an example, and a command with a longer name, are not the command.
+	mentions := script("mentions", `printf 'Usage:\n  dagu txe artifacts [command]\n\nExamples:\n  dagu txe artifacts seal\n'
+`)
+	longer := script("longer", `printf 'Usage:\n  dagu txe artifacts sealed [flags]\n'
+`)
+	require.ErrorContains(t, HasTXECommands(ctx, mentions, [][]string{{"artifacts", "seal"}}), `it has no "dagu txe artifacts seal" command`)
+	require.ErrorContains(t, HasTXECommands(ctx, longer, [][]string{{"artifacts", "seal"}}), `it has no "dagu txe artifacts seal" command`)
+
+	for help, want := range map[string]bool{
+		"Usage:\n  dagu txe artifacts seal [flags]\n":                               true,
+		"Usage:\n  dagu txe artifacts seal\n":                                       true,
+		"Usage:\n  dagu txe artifacts [flags]\n  dagu txe artifacts seal [flags]\n": true,
+		"Record.\n\nUsage:\n  dagu txe artifacts seal [flags]\n\nFlags:\n":          true,
+		"Usage:\n  dagu txe artifacts sealed [flags]\n":                             false,
+		"Usage:\n  dagu txe artifacts seal now\n":                                   false,
+		"Usage:\n  dagu txe artifacts [command]\n\nSee: dagu txe artifacts seal\n":  false,
+		"dagu txe artifacts seal [flags]\n":                                         false,
+		"":                                                                          false,
+	} {
+		assert.Equal(t, want, usageNames(help, []string{"txe", "artifacts", "seal"}), "%q", help)
+	}
 }
