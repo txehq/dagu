@@ -34,18 +34,23 @@ type fakeRuns struct {
 	unsuspendErr error
 	// onUnsuspend runs after a write lifting a suspension, outside the lock.
 	onUnsuspend func(dag string)
-	// specs are the saved DAG digests of runs, by run ID.
-	specs map[string]string
+	// attempts are the latest attempts of runs, by run ID.
+	attempts map[string]RunAttempt
 }
 
-func (r *fakeRuns) RunSpecSHA256(_ context.Context, _, runID string) (string, error) {
+func (r *fakeRuns) LatestAttempt(_ context.Context, _, runID string) (RunAttempt, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	spec, ok := r.specs[runID]
+	a, ok := r.attempts[runID]
 	if !ok {
-		return "", ErrRunNotFound
+		return RunAttempt{}, ErrRunNotFound
 	}
-	return spec, nil
+	return a, nil
+}
+
+// failedAttempt is a finished, unsuccessful attempt of a run of spec.
+func failedAttempt(id, spec string) RunAttempt {
+	return RunAttempt{AttemptID: id, SpecSHA256: spec, Status: "failed", Finished: true}
 }
 
 func (r *fakeRuns) RunFinished(_ context.Context, _ string, run RunRef) (bool, error) {
