@@ -14,6 +14,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"time"
 )
 
 // Outcome is what a probe observed of one target. The values match the
@@ -84,11 +85,21 @@ type Prober interface {
 // Probes dispatches each target to the first prober that supports its kind.
 type Probes []Prober
 
-// Probe observes t. A kind no prober supports is reported unreachable:
-// nothing could look, which says nothing about the target.
+// TargetTimeout bounds one target's probe; requestTimeout bounds each
+// request a probe makes.
+const (
+	TargetTimeout  = 20 * time.Second
+	requestTimeout = 15 * time.Second
+)
+
+// Probe observes t within TargetTimeout. A kind no prober supports is
+// reported unreachable: nothing could look, which says nothing about the
+// target.
 func (ps Probes) Probe(ctx context.Context, t Target, creds Credentials) Result {
 	for _, p := range ps {
 		if p.Supports(t.Kind) {
+			ctx, cancel := context.WithTimeout(ctx, TargetTimeout)
+			defer cancel()
 			return p.Probe(ctx, t, creds)
 		}
 	}

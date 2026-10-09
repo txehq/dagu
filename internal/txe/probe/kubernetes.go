@@ -14,18 +14,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // KubernetesKindPrefix starts every Kubernetes target kind, as in
 // "kubernetes.configmap".
 const KubernetesKindPrefix = "kubernetes."
 
-// Stable identity keys of a Kubernetes target.
+// Stable identity keys of a Kubernetes target. The stable id holds only the
+// identity; where the object lives is its display name, "namespace/name" for
+// a namespaced kind and "name" for a cluster-scoped one.
 const (
 	KeyClusterUID = "cluster_uid"
 	KeyUID        = "uid"
-	KeyNamespace  = "namespace"
-	KeyName       = "name"
 )
 
 // KubernetesCredential names the credential reference holding the
@@ -55,9 +56,10 @@ var kubeResources = map[string]kubeResource{
 
 var namespacesGVR = schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 
-// KubeClientFactory builds a client from the kubeconfig at path and an
-// optional context name.
-type KubeClientFactory func(kubeconfigPath, contextName string) (dynamic.Interface, error)
+// KubeClientFactory builds a client from a kubeconfig credential (a file
+// path, or the kubeconfig's content as a resolved secret) and an optional
+// context name.
+type KubeClientFactory func(kubeconfig Credential, contextName string) (dynamic.Interface, error)
 
 // Kubernetes probes Kubernetes objects.
 type Kubernetes struct {
@@ -77,12 +79,15 @@ func (Kubernetes) Supports(kind string) bool {
 func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Result {
 	res := kubeResources[strings.TrimPrefix(t.Kind, KubernetesKindPrefix)]
 	clusterUID, uid := trimmed(t.StableID[KeyClusterUID]), trimmed(t.StableID[KeyUID])
-	namespace, name := kubeObjectName(t, res.namespaced)
-	if clusterUID == "" || uid == "" || name == "" || (res.namespaced && namespace == "") {
-		return Result{Outcome: Unreachable, Detail: "target lacks cluster_uid, uid, namespace or name; nothing to look up"}
+	if clusterUID == "" || uid == "" {
+		return Result{Outcome: Unknown, Detail: "target's stable id lacks cluster_uid or uid; nothing to compare with"}
+	}
+	namespace, name, ok := kubeObjectName(t.DisplayName, res.namespaced)
+	if !ok {
+		return Result{Outcome: Unknown, Detail: fmt.Sprintf("display name %q is not an exact %s locator; not guessed", t.DisplayName, kubeLocatorShape(res.namespaced))}
 	}
 	cred, ok := creds.Lookup(KubernetesCredential)
-	if !ok || cred.Path == "" {
+	if !ok || (cred.Path == "" && cred.Value == "") {
 		return noCredential(KubernetesCredential)
 	}
 	contextName := ""
@@ -93,7 +98,7 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 	if newClient == nil {
 		newClient = kubeconfigClient
 	}
-	client, err := newClient(cred.Path, contextName)
+	client, err := newClient(cred, contextName)
 	if err != nil {
 		return Result{Outcome: Unreachable, Detail: "build Kubernetes client: " + err.Error()}
 	}
@@ -136,18 +141,30 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 		Evidence: evidence}
 }
 
-// kubeObjectName reads namespace and name from the stable identity, falling
-// back to a display name of the form "namespace/name" (or "name").
-func kubeObjectName(t Target, namespaced bool) (string, string) {
-	namespace, name := trimmed(t.StableID[KeyNamespace]), trimmed(t.StableID[KeyName])
-	if name == "" && t.DisplayName != "" {
-		if ns, n, ok := strings.Cut(t.DisplayName, "/"); ok && namespaced {
-			namespace, name = trimmed(ns), trimmed(n)
-		} else if !ok {
-			name = trimmed(t.DisplayName)
+// kubeObjectName parses a display name that must be exactly
+// "namespace/name" (namespaced) or "name" (cluster-scoped). Anything else is
+// refused rather than guessed.
+func kubeObjectName(displayName string, namespaced bool) (namespace, name string, ok bool) {
+	parts := strings.Split(displayName, "/")
+	for _, p := range parts {
+		if p == "" || p != strings.TrimSpace(p) {
+			return "", "", false
 		}
 	}
-	return namespace, name
+	switch {
+	case namespaced && len(parts) == 2:
+		return parts[0], parts[1], true
+	case !namespaced && len(parts) == 1:
+		return "", parts[0], true
+	}
+	return "", "", false
+}
+
+func kubeLocatorShape(namespaced bool) string {
+	if namespaced {
+		return `"namespace/name"`
+	}
+	return `"name"`
 }
 
 func kubeRef(res kubeResource, namespace, name string) string {
@@ -169,12 +186,29 @@ func kubeError(ctx context.Context, err error, what string) Result {
 	return Result{Outcome: classify(ctx, err), Detail: what + ": " + err.Error()}
 }
 
-func kubeconfigClient(path, contextName string) (dynamic.Interface, error) {
-	rules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
+func kubeconfigClient(kubeconfig Credential, contextName string) (dynamic.Interface, error) {
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
-	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+	var loader clientcmd.ClientConfig
+	if kubeconfig.Path != "" {
+		rules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig.Path}
+		loader = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
+	} else {
+		raw, err := clientcmd.Load([]byte(kubeconfig.Value))
+		if err != nil {
+			return nil, fmt.Errorf("parse kubeconfig: %w", err)
+		}
+		loader = clientcmd.NewNonInteractiveClientConfig(*raw, contextName, overrides, nil)
+	}
+	cfg, err := loader.ClientConfig()
 	if err != nil {
 		return nil, err
 	}
+	// A background check must never wait for someone to log in: an exec
+	// credential plugin may not prompt, and every request is bounded.
+	if cfg.ExecProvider != nil {
+		cfg.ExecProvider.InteractiveMode = clientcmdapi.NeverExecInteractiveMode
+		cfg.ExecProvider.StdinUnavailable = true
+	}
+	cfg.Timeout = requestTimeout
 	return dynamic.NewForConfig(cfg)
 }
