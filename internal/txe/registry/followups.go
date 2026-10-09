@@ -5,9 +5,12 @@ package registry
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"sort"
 	"strings"
 	"time"
@@ -45,8 +48,11 @@ func IsReservedAction(name string) bool {
 // native retry keeps the run ID and starts a new attempt, so the attempt is
 // what a person decided on, and each failed attempt is decided separately.
 type RetryRunParams struct {
-	RunID         string `json:"run_id"`
-	AttemptID     string `json:"attempt_id"`
+	RunID     string `json:"run_id"`
+	AttemptID string `json:"attempt_id"`
+	// QueuedAt is the queue marker of the execution being retried, as Dagu
+	// stored it; with AttemptID it names the execution.
+	QueuedAt      string `json:"queued_at"`
 	RunSpecSHA256 string `json:"run_spec_sha256"`
 	PackageDigest string `json:"package_digest"`
 }
@@ -85,11 +91,24 @@ func EscalationProposalID(actionID string, jobVersion int) (string, error) {
 	return DerivedID(PrefixProposal, "uncertain", actionID, jobVersion)
 }
 
-// RetryProposalID is the ID of the proposal to retry attemptID of runID at
-// jobVersion.
-func RetryProposalID(runID, attemptID string, jobVersion int) (string, error) {
-	return DerivedID(PrefixProposal, "retry", runID, attemptID, jobVersion)
+// RetryProposalID is the ID of the proposal to retry the execution
+// executionRef of runID at jobVersion.
+func RetryProposalID(runID, executionRef string, jobVersion int) (string, error) {
+	return DerivedID(PrefixProposal, "retry", runID, executionRef, jobVersion)
 }
+
+// ExecutionRef is the portable reference of one execution of a run: the
+// attempt ID and the first 8 bytes of sha256(attemptID + "\n" + queuedAt) in
+// hex. A queued retry runs an attempt again under a later queue marker, so
+// the attempt ID alone does not name an execution. The reference is the only
+// form used as a path segment, a proposal input and a receipt.
+func ExecutionRef(attemptID, queuedAt string) string {
+	sum := sha256.Sum256([]byte(attemptID + "\n" + queuedAt))
+	return attemptID + "-" + hex.EncodeToString(sum[:8])
+}
+
+// Ref is the execution's portable reference.
+func (a RunAttempt) Ref() string { return ExecutionRef(a.AttemptID, a.QueuedAt) }
 
 // DecideTaskDAG is the name of the DAG that holds a machine's decision tasks.
 func DecideTaskDAG(machineID string) string {
@@ -214,12 +233,15 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
 		return stale("is not a run of this job")
 	case err != nil:
 		return err
-	case latest.AttemptID != rp.AttemptID:
-		return stale("is now at attempt " + latest.AttemptID + ", not " + rp.AttemptID)
+	case latest.AttemptID != rp.AttemptID || latest.QueuedAt != rp.QueuedAt:
+		return stale("is now at execution " + latest.Ref() + ", not " + ExecutionRef(rp.AttemptID, rp.QueuedAt))
 	case !latest.Finished || latest.Succeeded:
 		return stale("attempt " + latest.AttemptID + " is " + latest.Status + ", not finished unsuccessfully")
 	case latest.SpecSHA256 != rp.RunSpecSHA256:
 		return stale("ran another DAG than the one named")
+	}
+	if err := tx.store.retainExecution(tx.ctx, j.JobID, rp.RunID, latest); err != nil {
+		return err
 	}
 	packages := map[string]bool{}
 	current := false
@@ -262,10 +284,42 @@ func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	if err != nil {
 		return err
 	}
-	if receipt == rp.AttemptID || receipt != latest.AttemptID {
-		return refuse(CodeInvalid, "a retry of run %s succeeds only with the new attempt observed on it (latest is %s, retried %s)", rp.RunID, latest.AttemptID, rp.AttemptID)
+	retried := ExecutionRef(rp.AttemptID, rp.QueuedAt)
+	if receipt == retried || receipt != latest.Ref() {
+		return refuse(CodeInvalid, "a retry of run %s succeeds only with the new execution observed on it (latest is %s, retried %s)", rp.RunID, latest.Ref(), retried)
 	}
 	return nil
+}
+
+// executionsPrefix holds immutable copies of executions' stored status.
+const executionsPrefix = "executions/"
+
+// retainExecution keeps the stored status of an execution the registry
+// acts on, once: a queued retry overwrites it in place, and the evidence of
+// what was retried must survive that.
+func (s *Store) retainExecution(ctx context.Context, jobID, runID string, e RunAttempt) error {
+	if len(e.Snapshot) == 0 {
+		return nil
+	}
+	err := s.col.Create(ctx, &persis.Record{ID: executionsPrefix + jobID + "/" + runID + "/" + e.Ref(), Data: e.Snapshot,
+		CreatedAt: s.clock(), UpdatedAt: s.clock()})
+	if errors.Is(err, persis.ErrConflict) {
+		return nil
+	}
+	return err
+}
+
+// GetRetainedExecution returns the stored status the registry kept for an
+// execution of a run.
+func (s *Store) GetRetainedExecution(ctx context.Context, jobID, runID, executionRef string) (json.RawMessage, error) {
+	rec, err := s.col.Get(ctx, executionsPrefix+jobID+"/"+runID+"/"+executionRef)
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) {
+			return nil, refuse(CodeNotFound, "execution %s of run %s is not retained", executionRef, runID)
+		}
+		return nil, err
+	}
+	return rec.Data, nil
 }
 
 // checkNativeTask validates a proposal's Dagu human task locator: decisions
@@ -364,7 +418,7 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	if err != nil {
 		return nil, nil, err
 	}
-	id, err := RetryProposalID(params.RunID, params.AttemptID, j.Version)
+	id, err := RetryProposalID(params.RunID, ExecutionRef(params.AttemptID, params.QueuedAt), j.Version)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -374,7 +428,7 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 		return nil, nil, err
 	}
 	if cur, ok := j.Proposals[id]; ok && cur.State != ProposalOpen && cur.State != ProposalSnoozed {
-		return nil, nil, &Error{Code: CodeProposalState, Message: "the retry of attempt " + params.AttemptID + " of run " + params.RunID + " is already " + string(cur.State), Current: cur}
+		return nil, nil, &Error{Code: CodeProposalState, Message: "the retry of execution " + ExecutionRef(params.AttemptID, params.QueuedAt) + " of run " + params.RunID + " is already " + string(cur.State), Current: cur}
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {

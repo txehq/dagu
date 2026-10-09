@@ -4295,13 +4295,13 @@ export interface paths {
         };
         /**
          * Get a run's deliverables
-         * @description Returns the run's manifest. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub.
+         * @description Returns a manifest of the run, one per publishing attempt. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub.
          */
         get: operations["getTxeRunArtifacts"];
         put?: never;
         /**
          * Record a run's deliverables
-         * @description Sent by the run's last step. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception.
+         * @description Sent by the run's last step, naming the attempt it runs in. A new manifest is accepted only while that attempt is the run's latest and running (a late publish is 409 stale_binding); it is written once per attempt, earlier attempts' manifests are kept. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception.
          */
         post: operations["recordTxeRunArtifacts"];
         delete?: never;
@@ -6074,6 +6074,8 @@ export interface components {
             dagRunId: components["schemas"]["DAGRunId"];
             /** @description Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID */
             readonly attemptId?: string;
+            /** @description Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference */
+            readonly executionRef?: string;
             name: components["schemas"]["DAGName"];
             /** @description Workspace label value for the DAG-run. Omitted for default DAG-runs and invalid workspace labels. */
             workspace?: string;
@@ -8552,6 +8554,11 @@ export interface components {
             recorded_at?: string;
         };
         TxeArtifactManifestRequest: {
+            /** @description The run attempt publishing, from the step's own context (context.attempt.id) */
+            attempt_id: string;
+            /** @description The publishing execution's queue marker exactly as the hub stores it; with attempt_id it names the execution, accepted only while it is the run's latest execution and running */
+            queued_at: string;
+            produced_in?: components["schemas"]["TxeExecutionId"];
             job_version: number;
             artifacts: components["schemas"]["TxeArtifactRecordInput"][];
             actor?: components["schemas"]["TxeActor"];
@@ -8577,17 +8584,33 @@ export interface components {
             schema?: number;
             job_id: string;
             run_id: string;
+            attempt_id: string;
+            queued_at: string;
+            /** @description The execution's portable reference: attempt_id + '-' + 16 hex of sha256(attempt_id + newline + queued_at) */
+            execution: string;
+            produced_in: components["schemas"]["TxeExecutionId"];
             job_version: number;
             artifacts: components["schemas"]["TxeArtifactRecord"][];
             digest: string;
             recorded: components["schemas"]["TxeStamp"];
+            /** @description Executions of the run that published a manifest, oldest first (GET only) */
+            executions?: string[];
+        };
+        /** @description One execution of a run: a direct retry starts a new attempt, a queued retry runs the same attempt under a later queue marker */
+        TxeExecutionId: {
+            attempt_id: string;
+            queued_at: string;
+            /** @description Portable reference (response only) */
+            execution?: string;
         };
         TxeRetryRequest: {
             idempotency_key: string;
             /** @description The job version the person saw; refused with 409 when the job moved on */
             expected_job_version: number;
-            /** @description The run attempt the person reviewed; when present the request is refused with 409 unless it is the run's latest attempt */
+            /** @description The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409 */
             attempt_id?: string;
+            /** @description The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409 */
+            queued_at?: string;
             /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
             run_spec_sha256?: string;
             /** @description The run's package digest; when omitted the server reads it from the run */
@@ -23273,7 +23296,10 @@ export interface operations {
     };
     getTxeRunArtifacts: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description An execution reference of the run; default the run's latest execution if it published, else the most recent */
+                execution?: string;
+            };
             header?: never;
             path: {
                 jobId: components["parameters"]["TxeJobId"];

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,6 +90,9 @@ func checkDeliverablePath(p string) error {
 	if len(p) > 1024 || path.Clean(p) != p {
 		return errors.New("path must be a clean relative path of at most 1024 bytes")
 	}
+	if first, _, _ := strings.Cut(p, "/"); strings.EqualFold(first, HubAttemptsDir) {
+		return fmt.Errorf("path may not start with %s, where hub copies are kept", HubAttemptsDir)
+	}
 	for seg := range strings.SplitSeq(p, "/") {
 		if !pathSegment.MatchString(seg) || strings.HasSuffix(seg, ".") || windowsDevice.MatchString(seg) {
 			return fmt.Errorf("path segment %q must use letters, digits, '.', '_' and '-', not start or end with a dot, and not be a device name", seg)
@@ -118,19 +122,56 @@ type ArtifactRecord struct {
 // ArtifactManifest is a run's deliverables. It is written once per run; an
 // identical report again is a no-op and a different one is refused.
 type ArtifactManifest struct {
-	Schema     int              `json:"schema"`
-	JobID      string           `json:"job_id"`
-	RunID      string           `json:"run_id"`
+	Schema int    `json:"schema"`
+	JobID  string `json:"job_id"`
+	RunID  string `json:"run_id"`
+	// AttemptID and QueuedAt name the execution that published the manifest,
+	// from the step's own context; Execution is its ExecutionRef. A manifest
+	// is written once per execution; every execution's manifest is kept.
+	AttemptID string `json:"attempt_id"`
+	QueuedAt  string `json:"queued_at"`
+	Execution string `json:"execution"`
+	// ProducedIn is the execution whose run of the job's step wrote the
+	// files; it differs from the publishing one after a publish-only retry.
+	ProducedIn ExecutionID      `json:"produced_in"`
 	JobVersion int              `json:"job_version"`
 	Artifacts  []ArtifactRecord `json:"artifacts"`
+	// ArchiveDir is the attempt's native artifact directory on the hub, as
+	// recorded when its hub copies were first checked.
+	ArchiveDir string `json:"archive_dir,omitempty"`
 	// Digest identifies the report as sent, so a replay is recognized.
 	Digest   string `json:"digest"`
 	Recorded Stamp  `json:"recorded"`
 }
 
+// ExecutionID names one execution of a run.
+type ExecutionID struct {
+	AttemptID string `json:"attempt_id"`
+	QueuedAt  string `json:"queued_at"`
+	Execution string `json:"execution,omitempty"`
+}
+
 const artifactsPrefix = "artifacts/"
 
-func artifactKey(jobID, runID string) string { return artifactsPrefix + jobID + "/" + runID }
+func artifactRunPrefix(jobID, runID string) string {
+	return artifactsPrefix + jobID + "/" + runID + "/"
+}
+
+func artifactKey(jobID, runID, executionRef string) string {
+	return artifactRunPrefix(jobID, runID) + executionRef
+}
+
+// HubAttemptsDir is the first path segment of a hub copy in a run's native
+// artifact directory: copies sit under txe-attempts/<attempt id>/<path>, so
+// attempts that share a directory never replace each other's bytes. A
+// deliverable path may not start with it.
+const HubAttemptsDir = "txe-attempts"
+
+// HubCopyPath is where the hub copy of a deliverable published by an
+// execution sits in the run's native artifact directory.
+func HubCopyPath(executionRef, deliverablePath string) string {
+	return HubAttemptsDir + "/" + executionRef + "/" + deliverablePath
+}
 
 // ArtifactLookup reports the digest of the hub's copy at path in a run's
 // native artifact directory, or found false when there is none.
@@ -142,24 +183,34 @@ type ArtifactLookup func(path string) (sha256 string, found bool, err error)
 // returns it (and repairs a missing exception), a different one is 409
 // artifact_conflict.
 //
-// runSpecSHA256 is the digest of the run's saved DAG, read by the caller from
-// the run itself: the manifest is accepted only for the version that run
-// executed, so no one can record deliverables for a run that does not exist
-// or under another version.
-func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSHA256 string, in ArtifactManifest) (*ArtifactManifest, error) {
+// latest is the run's latest attempt as Dagu stored it, read by the caller:
+// a new manifest is accepted only from that attempt while it is running and
+// only for the version its saved DAG is, so no one can record deliverables
+// for a run that does not exist, under another version, or for an earlier
+// attempt whose publish arrives late. An identical report again is accepted
+// whenever it comes.
+func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, latest RunAttempt, in ArtifactManifest) (*ArtifactManifest, error) {
 	j := tx.Job
 	if !runIDPattern.MatchString(runID) {
 		return nil, refuse(CodeInvalid, "run id %q is not valid", runID)
 	}
+	if !runIDPattern.MatchString(in.AttemptID) {
+		return nil, refuse(CodeInvalid, "attempt_id %q is not valid", in.AttemptID)
+	}
+	if in.ProducedIn.AttemptID == "" {
+		in.ProducedIn = ExecutionID{AttemptID: in.AttemptID, QueuedAt: in.QueuedAt}
+	}
+	if !runIDPattern.MatchString(in.ProducedIn.AttemptID) {
+		return nil, refuse(CodeInvalid, "produced_in.attempt_id %q is not valid", in.ProducedIn.AttemptID)
+	}
+	in.Execution = ExecutionRef(in.AttemptID, in.QueuedAt)
+	in.ProducedIn.Execution = ExecutionRef(in.ProducedIn.AttemptID, in.ProducedIn.QueuedAt)
 	v, err := s.GetVersion(ctx, j.JobID, in.JobVersion)
 	if err != nil {
 		if ErrorCode(err) == CodeNotFound {
 			return nil, refuse(CodeInvalid, "job %s has no version %d", j.JobID, in.JobVersion)
 		}
 		return nil, err
-	}
-	if runSpecSHA256 == "" || runSpecSHA256 != v.DAG.SpecSHA256 {
-		return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
 	}
 	declared := map[string]Deliverable{}
 	for _, d := range v.ExpectedOutcome.Deliverables {
@@ -198,12 +249,12 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSH
 		a.Status, a.CheckedAt, a.CheckError = "", nil, ""
 		sent = append(sent, a)
 	}
-	digest, err := manifestDigest(in.JobVersion, sent)
+	digest, err := manifestDigest(in.JobVersion, in.ProducedIn, sent)
 	if err != nil {
 		return nil, err
 	}
-	m := ArtifactManifest{Schema: SchemaVersion, JobID: j.JobID, RunID: runID, JobVersion: in.JobVersion, Digest: digest,
-		Recorded: Stamp{At: tx.now, By: tx.actor}}
+	m := ArtifactManifest{Schema: SchemaVersion, JobID: j.JobID, RunID: runID, AttemptID: in.AttemptID, QueuedAt: in.QueuedAt, Execution: in.Execution,
+		ProducedIn: in.ProducedIn, JobVersion: in.JobVersion, Digest: digest, Recorded: Stamp{At: tx.now, By: tx.actor}}
 	for _, a := range sent {
 		switch {
 		case a.Missing:
@@ -215,18 +266,42 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSH
 		}
 		m.Artifacts = append(m.Artifacts, a)
 	}
-	if err := s.createJSON(ctx, artifactKey(j.JobID, runID), &m); err != nil {
-		if !errors.Is(err, persis.ErrConflict) {
-			return nil, err
-		}
-		var saved ArtifactManifest
-		if err := s.getJSON(ctx, artifactKey(j.JobID, runID), &saved); err != nil {
-			return nil, err
-		}
+	key := artifactKey(j.JobID, runID, in.Execution)
+	var saved ArtifactManifest
+	switch err := s.getJSON(ctx, key, &saved); {
+	case err == nil:
 		if saved.Digest != digest {
-			return nil, &Error{Code: CodeArtifactConflict, Message: "run " + runID + " already reported other deliverables", Current: &saved}
+			return nil, &Error{Code: CodeArtifactConflict, Message: "execution " + in.Execution + " of run " + runID + " already reported other deliverables", Current: &saved}
 		}
 		m = saved
+	case ErrorCode(err) != CodeNotFound:
+		return nil, err
+	default:
+		switch {
+		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
+		case latest.Finished:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s has finished; a late publish is not recorded", in.Execution, runID)}
+		case latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
+		}
+		// The execution's stored status is kept with its manifest: a queued
+		// retry overwrites it in place.
+		if err := s.retainExecution(ctx, j.JobID, runID, latest); err != nil {
+			return nil, err
+		}
+		if err := s.createJSON(ctx, key, &m); err != nil {
+			if !errors.Is(err, persis.ErrConflict) {
+				return nil, err
+			}
+			if err := s.getJSON(ctx, key, &saved); err != nil {
+				return nil, err
+			}
+			if saved.Digest != digest {
+				return nil, &Error{Code: CodeArtifactConflict, Message: "execution " + in.Execution + " of run " + runID + " already reported other deliverables", Current: &saved}
+			}
+			m = saved
+		}
 	}
 	// Every required deliverable the run did not produce, whether reported
 	// missing or not reported at all, needs a person.
@@ -241,8 +316,8 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSH
 			}
 		}
 		if missing {
-			if err := tx.openException("deliverable_missing", "run "+runID+" did not produce required deliverable "+d.Name+" ("+d.Path+")",
-				"artifact:"+runID+"/"+d.Name); err != nil {
+			if err := tx.openException("deliverable_missing", "run "+runID+" execution "+m.Execution+" did not produce required deliverable "+d.Name+" ("+d.Path+")",
+				"artifact:"+runID+"/"+m.Execution+"/"+d.Name); err != nil {
 				return nil, err
 			}
 		}
@@ -253,13 +328,13 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSH
 // manifestDigest identifies what a run reported. recorded_at is the
 // reporter's clock, not part of the report: a retried publish of the same
 // files sends a new one and must still be recognized as a replay.
-func manifestDigest(version int, artifacts []ArtifactRecord) (string, error) {
+func manifestDigest(version int, producedIn ExecutionID, artifacts []ArtifactRecord) (string, error) {
 	report := make([]ArtifactRecord, len(artifacts))
 	for i, a := range artifacts {
 		a.RecordedAt = ""
 		report[i] = a
 	}
-	b, err := json.Marshal(map[string]any{"job_version": version, "artifacts": report})
+	b, err := json.Marshal(map[string]any{"job_version": version, "produced_in": producedIn, "artifacts": report})
 	if err != nil {
 		return "", err
 	}
@@ -291,16 +366,64 @@ func (tx *JobTx) openException(kind, detail, subject string) error {
 	return nil
 }
 
-// GetArtifacts returns a run's manifest.
-func (s *Store) GetArtifacts(ctx context.Context, jobID, runID string) (*ArtifactManifest, error) {
+// GetArtifacts returns the manifest an execution of a run published. With
+// no execution it returns the manifest of preferExecution (the run's latest
+// execution) if it published one, otherwise the most recently recorded.
+func (s *Store) GetArtifacts(ctx context.Context, jobID, runID, executionRef, preferExecution string) (*ArtifactManifest, error) {
 	if !runIDPattern.MatchString(runID) {
 		return nil, refuse(CodeInvalid, "run id %q is not valid", runID)
 	}
-	var m ArtifactManifest
-	if err := s.getJSON(ctx, artifactKey(jobID, runID), &m); err != nil {
+	if executionRef != "" {
+		if !runIDPattern.MatchString(executionRef) {
+			return nil, refuse(CodeInvalid, "execution %q is not valid", executionRef)
+		}
+		var m ArtifactManifest
+		if err := s.getJSON(ctx, artifactKey(jobID, runID, executionRef), &m); err != nil {
+			return nil, err
+		}
+		return &m, nil
+	}
+	all, err := s.ListArtifacts(ctx, jobID, runID)
+	if err != nil {
 		return nil, err
 	}
-	return &m, nil
+	if len(all) == 0 {
+		return nil, refuse(CodeNotFound, "run %s of job %s has no artifacts", runID, jobID)
+	}
+	for _, m := range all {
+		if m.Execution == preferExecution {
+			return m, nil
+		}
+	}
+	return all[len(all)-1], nil
+}
+
+// ListArtifacts returns every manifest of a run, oldest first.
+func (s *Store) ListArtifacts(ctx context.Context, jobID, runID string) ([]*ArtifactManifest, error) {
+	if !runIDPattern.MatchString(runID) {
+		return nil, refuse(CodeInvalid, "run id %q is not valid", runID)
+	}
+	var out []*ArtifactManifest
+	cursor := ""
+	for {
+		page, err := s.col.List(ctx, persis.ListQuery{Prefix: artifactRunPrefix(jobID, runID), Cursor: cursor, Limit: 500})
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range page.Records {
+			var m ArtifactManifest
+			if err := json.Unmarshal(rec.Data, &m); err != nil {
+				return nil, fmt.Errorf("registry: decode %s: %w", rec.ID, err)
+			}
+			out = append(out, &m)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	sort.SliceStable(out, func(i, k int) bool { return out[i].Recorded.At.Before(out[k].Recorded.At) })
+	return out, nil
 }
 
 // CheckHubArtifacts checks each hub copy still pending against the bytes
@@ -308,9 +431,14 @@ func (s *Store) GetArtifacts(ctx context.Context, jobID, runID string) (*Artifac
 // and no bytes once the run has ended is a failed upload. A mismatch or a
 // failed upload opens an exception. A copy is never reported available
 // before its bytes were checked.
-func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, lookup ArtifactLookup, runEnded bool) (*ArtifactManifest, error) {
+//
+// lookup reads the attempt's native artifact directory archiveDir (recorded
+// on the manifest the first time it is known) at HubCopyPath. runEnded says
+// whether the attempt has ended.
+func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID, executionRef, archiveDir string, lookup ArtifactLookup, runEnded bool) (*ArtifactManifest, error) {
+	key := artifactKey(jobID, runID, executionRef)
 	for range maxProgressRounds {
-		rec, err := s.col.Get(ctx, artifactKey(jobID, runID))
+		rec, err := s.col.Get(ctx, key)
 		if err != nil {
 			if errors.Is(err, persis.ErrNotFound) {
 				return nil, refuse(CodeNotFound, "run %s of job %s has no artifacts", runID, jobID)
@@ -322,6 +450,9 @@ func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, look
 			return nil, fmt.Errorf("registry: decode artifacts of %s: %w", runID, err)
 		}
 		changed := false
+		if archiveDir != "" && m.ArchiveDir == "" {
+			m.ArchiveDir, changed = archiveDir, true
+		}
 		var opened []ArtifactRecord
 		now := s.clock()
 		for i := range m.Artifacts {
@@ -329,7 +460,7 @@ func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, look
 			if a.Status != ArtifactPendingUpload {
 				continue
 			}
-			sha, found, err := lookup(a.Path)
+			sha, found, err := lookup(HubCopyPath(m.Execution, a.Path))
 			switch {
 			case err != nil:
 				// The cause stays with the caller's logs; it can name paths
@@ -355,7 +486,7 @@ func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, look
 			if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
 				for _, a := range opened {
 					kind := "artifact_" + string(a.Status)
-					if err := tx.openException(kind, "deliverable "+a.Deliverable+" of run "+runID+": "+a.CheckError, "artifact:"+runID+"/"+a.Deliverable); err != nil {
+					if err := tx.openException(kind, "deliverable "+a.Deliverable+" of run "+runID+" execution "+executionRef+": "+a.CheckError, "artifact:"+runID+"/"+executionRef+"/"+a.Deliverable); err != nil {
 						return err
 					}
 				}
@@ -368,7 +499,7 @@ func (s *Store) CheckHubArtifacts(ctx context.Context, jobID, runID string, look
 		if err != nil {
 			return nil, err
 		}
-		if err := s.col.CompareAndSwap(ctx, artifactKey(jobID, runID), rec.Data, data); err != nil {
+		if err := s.col.CompareAndSwap(ctx, key, rec.Data, data); err != nil {
 			if errors.Is(err, persis.ErrConflict) {
 				continue
 			}
