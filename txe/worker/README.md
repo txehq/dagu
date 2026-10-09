@@ -39,6 +39,16 @@ txe/worker/status.sh
 The owner id is minted once for the installation (`txe/worker/mint-id.sh own`) and recorded with
 the service. Pass it only on the first install.
 
+Once the hub knows the machine, install its periodic resource check on the hub. The hub schedules
+that check, and this worker runs it.
+
+```sh
+~/.local/share/txe-dagu/bin/dagu txe hub install --dry-run   # shows what would change
+~/.local/share/txe-dagu/bin/dagu txe hub install
+```
+
+Run it again after an upgrade. It rewrites the hub's copy only when the rendered DAG differs.
+
 ## Upgrade
 
 Use the same tag as the server image: server and worker must run the same version.
