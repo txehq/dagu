@@ -376,10 +376,14 @@ func TestRetainedLogsAreFinalOnlyWhenEveryStreamArrived(t *testing.T) {
 		// The worker's own paths: the coordinator stores the streams under
 		// the attempt's directory.
 		status.Log = "/worker/logs/scheduler.log"
-		status.Nodes = []*ir.Node{{Step: ir.Step{Name: "build"}, Status: ir.NodeFailed,
-			Stdout: "/worker/logs/build.stdout.log", Stderr: "/worker/logs/build.stderr.log"}}
+		status.Nodes = []*ir.Node{{Step: ir.Step{Name: "build"}, Status: ir.NodeFailed, StartedAt: "2026-10-09T12:00:00Z",
+			Stdout: "/worker/logs/build.stdout.log", Stderr: "/worker/logs/build.stderr.log"},
+			// Never started: its dependency failed. It names log paths but
+			// produced nothing, so it is not waited for.
+			{Step: ir.Step{Name: "publish"}, Status: ir.NodeNotStarted,
+				Stdout: "/worker/logs/publish.stdout.log", Stderr: "/worker/logs/publish.stderr.log"}}
 		// A local failure handler writes inside the log directory itself.
-		status.OnFailure = &ir.Node{Step: ir.Step{Name: "onFailure"}, Status: ir.NodeSucceeded,
+		status.OnFailure = &ir.Node{Step: ir.Step{Name: "onFailure"}, Status: ir.NodeSucceeded, StartedAt: "2026-10-09T12:00:01Z",
 			Stdout: filepath.Join(runner, "onFailure.stdout.log")}
 		require.NoError(t, f.handle.Open(f.ctx))
 		require.NoError(t, f.handle.Write(f.ctx, status))
