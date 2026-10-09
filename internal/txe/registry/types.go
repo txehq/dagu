@@ -138,11 +138,18 @@ type Schedule struct {
 	MissedRun  string `json:"missed_run,omitempty"`
 }
 
-// Deliverable is an expected output of the job.
+// Deliverable is one file a run is expected to produce, named so a run's
+// manifest can report it.
 type Deliverable struct {
-	Path        string `json:"path,omitempty"`
+	Name string `json:"name"`
+	// Path is the exact file, relative to the run's output directory.
+	Path        string `json:"path"`
 	Type        string `json:"type,omitempty"`
 	Description string `json:"description,omitempty"`
+	// Delivery is machine (the default) or hub.
+	Delivery string `json:"delivery,omitempty"`
+	// Required makes a run that does not produce it need a person.
+	Required bool `json:"required,omitempty"`
 }
 
 // ExpectedOutcome states what success means and when the job is finished.

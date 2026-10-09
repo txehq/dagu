@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"slices"
 	"time"
 
@@ -58,7 +60,7 @@ func txeError(err error) error {
 	case registry.CodeVersionConflict, registry.CodeDuplicate, registry.CodeNotReady, registry.CodeLifecycle,
 		registry.CodeTransition, registry.CodeClaimHeld, registry.CodeClaimStale, registry.CodeNotPermitted,
 		registry.CodeStaleBinding, registry.CodeProposalState, registry.CodeActionExists, registry.CodeActionState,
-		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved, registry.CodeReviewConflict:
+		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved, registry.CodeReviewConflict, registry.CodeArtifactConflict:
 		// Refused against current state: 409 with the record to re-read.
 	}
 	if re.Current != nil {
@@ -1142,4 +1144,87 @@ func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxePro
 	}
 	out, err := txeConvert[api.TxeClosure](closure)
 	return api.RecordTxeProposalClosure200JSONResponse(out), err
+}
+
+func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArtifactsRequestObject) (api.RecordTxeRunArtifactsResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	in, err := txeConvert[registry.ArtifactManifest](struct {
+		JobVersion int                          `json:"job_version"`
+		Artifacts  []api.TxeArtifactRecordInput `json:"artifacts"`
+	}{body.JobVersion, body.Artifacts})
+	if err != nil {
+		return nil, ErrInvalidRequestBody
+	}
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var m *registry.ArtifactManifest
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+		var err error
+		m, err = tx.RecordArtifacts(ctx, s, req.RunId, in)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeArtifactManifest](m)
+	return api.RecordTxeRunArtifacts200JSONResponse(out), err
+}
+
+func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifactsRequestObject) (api.GetTxeRunArtifactsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	m, err := s.GetArtifacts(ctx, req.JobId, req.RunId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	pending := slices.ContainsFunc(m.Artifacts, func(r registry.ArtifactRecord) bool { return r.Status == registry.ArtifactPendingUpload })
+	if pending && a.dagRunRepository != nil {
+		// The run's native artifact directory holds the hub copies. A run the
+		// hub does not know yet is left unchecked rather than failed.
+		status, err := a.getDAGRunArtifactStatus(ctx, req.JobId, req.RunId)
+		switch {
+		case err == nil:
+			ended := !status.Status.IsActive() && status.Status != ir.NotStarted
+			m, err = s.CheckHubArtifacts(ctx, req.JobId, req.RunId, func(p string) (string, bool, error) {
+				return txeArtifactDigest(status.ArchiveDir, p)
+			}, ended)
+			if err != nil {
+				return nil, txeError(err)
+			}
+		case !isArtifactStatusNotFound(err):
+			return nil, err
+		}
+	}
+	out, err := txeConvert[api.TxeArtifactManifest](m)
+	return api.GetTxeRunArtifacts200JSONResponse(out), err
+}
+
+// txeArtifactDigest returns the sha256 of the file at relPath in a run's
+// native artifact directory, or found false when there is no such file.
+func txeArtifactDigest(archiveDir, relPath string) (string, bool, error) {
+	f, info, err := openArtifactFile(archiveDir, relPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errArtifactUnavailable) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer func() { _ = f.Close() }()
+	if !info.Mode().IsRegular() {
+		return "", false, nil
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), true, nil
 }
