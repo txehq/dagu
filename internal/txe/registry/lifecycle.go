@@ -43,9 +43,6 @@ func IsJobDAG(name string) bool {
 	return ValidateID(PrefixJob, name) == nil
 }
 
-// maxAdmittedRuns bounds the admitted-run record kept on a job.
-const maxAdmittedRuns = 200
-
 // AdmitRun decides whether a run of dagName may start. specSHA256 is the
 // digest of the run's DAG snapshot; when set it must equal the current
 // version's spec, so a run queued under an older version never executes
@@ -91,7 +88,6 @@ func (s *Store) AdmitClaim(ctx context.Context, dagName, specSHA256 string, run 
 			tx.Job.AdmittedRuns = map[string]AdmittedRun{}
 		}
 		tx.Job.AdmittedRuns[run.RunID] = AdmittedRun{At: tx.now, RootName: run.RootName, RootRunID: run.RootRunID}
-		pruneAdmitted(tx.Job.AdmittedRuns)
 		tx.touch()
 		return nil
 	})
@@ -138,20 +134,6 @@ func admissionFor(job *Job, specSHA256 string, now time.Time) Admission {
 		return refuseRun(job.JobID, AdmitSupersededVersion, fmt.Sprintf("run is for another version; current is %d", job.Version))
 	}
 	return Admission{Admit: true, JobID: job.JobID}
-}
-
-func pruneAdmitted(m map[string]AdmittedRun) {
-	if len(m) <= maxAdmittedRuns {
-		return
-	}
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, k int) bool { return m[ids[i]].At.Before(m[ids[k]].At) })
-	for _, id := range ids[:len(ids)-maxAdmittedRuns] {
-		delete(m, id)
-	}
 }
 
 func refuseRun(jobID string, code AdmitCode, reason string) Admission {
@@ -235,7 +217,18 @@ type RunControl interface {
 	IsSuspended(ctx context.Context, dagName string) (bool, error)
 	// SetSuspended sets Dagu's own suspend flag for the DAG.
 	SetSuspended(ctx context.Context, dagName string, suspended bool) error
+	// RunFinished reports whether a run reached a terminal status, or
+	// ErrRunNotFound when Dagu has no record of it.
+	RunFinished(ctx context.Context, dagName string, run RunRef) (bool, error)
 }
+
+// ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.
+var ErrRunNotFound = errors.New("run not found")
+
+// admissionSettle is how long an admitted run may go unrecorded by Dagu
+// before its admission is dropped: a worker records the attempt it claimed
+// well within it.
+const admissionSettle = 10 * time.Minute
 
 // WithRunControl lets lifecycle changes suspend DAGs and stop runs.
 func WithRunControl(rc RunControl) Option {
@@ -284,7 +277,9 @@ func (s *Store) ChangeLifecycle(ctx context.Context, jobID string, t Transition,
 			if listErr != nil {
 				tt.Detail = strings.TrimSpace(tt.Detail + " (active runs could not be listed: " + listErr.Error() + ")")
 			}
-			discover := listErr != nil && policy == ActiveRunCancel
+			// Without run control (the coordinator's registry) the runs are
+			// listed later by the scheduler's reconciler.
+			discover := (listErr != nil || s.runs == nil) && policy == ActiveRunCancel
 			if len(stops) > 0 || discover {
 				tx.Job.PendingEffects = &PendingEffects{Revision: tx.Job.Revision + 1, StopRuns: stops, DiscoverRuns: discover, Since: tx.now}
 			}
@@ -363,11 +358,18 @@ func (s *Store) ApplyEffects(ctx context.Context, jobID string) error {
 	return errors.Join(s.reconcileSuspension(ctx, jobID), s.applyPendingStops(ctx, jobID))
 }
 
-// reconcileSuspension owns a suspension only when it makes it: ownership is
-// recorded before the write, and refused if the job no longer wants to be
-// suspended; after the write the job is read again and a write made stale by
-// a newer transition is undone. Whatever interleaving remains is corrected
-// by the next reconciliation, which compares the job with Dagu again.
+// suspendWriteLease is how long a suspend write may stay outstanding. A
+// writer that has not finished by then is taken to have stopped, and the
+// suspension it may have left is reconciled.
+const suspendWriteLease = 10 * time.Minute
+
+// reconcileSuspension owns a suspension only when it makes it. Before the
+// write it records ownership and a writer token, refusing if the job no
+// longer wants to be suspended; after the write it removes the token, reads
+// the job again and undoes a write made stale by a newer transition.
+// Ownership is not released while a writer is outstanding, so a writer that
+// stops midway leaves ownership in place and the next reconciliation, once
+// the lease has passed, lifts the suspension it may have made.
 func (s *Store) reconcileSuspension(ctx context.Context, jobID string) error {
 	job, err := s.GetJob(ctx, jobID)
 	if err != nil {
@@ -380,31 +382,7 @@ func (s *Store) reconcileSuspension(ctx context.Context, jobID string) error {
 	want := wantsSuspension(job.Lifecycle)
 	switch {
 	case want && !suspended:
-		owned := false
-		if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
-			owned = wantsSuspension(tx.Job.Lifecycle)
-			if owned && !tx.Job.SuspendedByRegistry {
-				tx.Job.SuspendedByRegistry = true
-				tx.touch()
-			}
-			return nil
-		}); err != nil || !owned {
-			return err
-		}
-		if err := s.runs.SetSuspended(ctx, jobID, true); err != nil {
-			return fmt.Errorf("suspend DAG: %w", err)
-		}
-		current, err := s.GetJob(ctx, jobID)
-		if err != nil {
-			return err
-		}
-		if wantsSuspension(current.Lifecycle) {
-			return nil
-		}
-		if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
-			return fmt.Errorf("undo stale suspension: %w", err)
-		}
-		return s.releaseSuspension(ctx, jobID)
+		return s.suspendOwned(ctx, jobID)
 	case !want && job.SuspendedByRegistry:
 		if suspended {
 			if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
@@ -412,16 +390,74 @@ func (s *Store) reconcileSuspension(ctx context.Context, jobID string) error {
 			}
 		}
 		return s.releaseSuspension(ctx, jobID)
+	case len(job.SuspendWriters) > 0:
+		return s.releaseSuspension(ctx, jobID)
 	}
 	return nil
 }
 
+func (s *Store) suspendOwned(ctx context.Context, jobID string) error {
+	token, err := NewID(PrefixEvent, s.clock())
+	if err != nil {
+		return err
+	}
+	owned := false
+	if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+		owned = wantsSuspension(tx.Job.Lifecycle)
+		if !owned {
+			return nil
+		}
+		tx.Job.SuspendedByRegistry = true
+		if tx.Job.SuspendWriters == nil {
+			tx.Job.SuspendWriters = map[string]time.Time{}
+		}
+		tx.Job.SuspendWriters[token] = tx.now
+		tx.touch()
+		return nil
+	}); err != nil || !owned {
+		return err
+	}
+	writeErr := s.runs.SetSuspended(ctx, jobID, true)
+	var current *Job
+	if _, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
+		current = tx.Job
+		if _, ok := tx.Job.SuspendWriters[token]; ok {
+			delete(tx.Job.SuspendWriters, token)
+			tx.touch()
+		}
+		return nil
+	}); err != nil {
+		return errors.Join(writeErr, err)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("suspend DAG: %w", writeErr)
+	}
+	if wantsSuspension(current.Lifecycle) {
+		return nil
+	}
+	if err := s.runs.SetSuspended(ctx, jobID, false); err != nil {
+		return fmt.Errorf("undo stale suspension: %w", err)
+	}
+	return s.releaseSuspension(ctx, jobID)
+}
+
 // releaseSuspension drops the registry's ownership of the DAG's suspension
-// while the job is active.
+// while the job is active and no suspend write is outstanding. Writers past
+// their lease are dropped first.
 func (s *Store) releaseSuspension(ctx context.Context, jobID string) error {
 	_, err := s.WithJobTx(ctx, jobID, reconcilerActor, func(tx *JobTx) error {
-		if !wantsSuspension(tx.Job.Lifecycle) && tx.Job.SuspendedByRegistry {
+		changed := false
+		for token, at := range tx.Job.SuspendWriters {
+			if tx.now.Sub(at) >= suspendWriteLease {
+				delete(tx.Job.SuspendWriters, token)
+				changed = true
+			}
+		}
+		if !wantsSuspension(tx.Job.Lifecycle) && tx.Job.SuspendedByRegistry && len(tx.Job.SuspendWriters) == 0 {
 			tx.Job.SuspendedByRegistry = false
+			changed = true
+		}
+		if changed {
 			tx.touch()
 		}
 		return nil
@@ -530,7 +566,12 @@ func (s *Store) ReconcileEffects(ctx context.Context) error {
 	}
 	var errs []error
 	for _, job := range jobs {
-		if job.PendingEffects == nil && !wantsSuspension(job.Lifecycle) && !job.SuspendedByRegistry {
+		if len(job.AdmittedRuns) > 0 {
+			if err := s.settleAdmissions(ctx, job); err != nil {
+				errs = append(errs, fmt.Errorf("%s: settle admissions: %w", job.JobID, err))
+			}
+		}
+		if job.PendingEffects == nil && !wantsSuspension(job.Lifecycle) && !job.SuspendedByRegistry && len(job.SuspendWriters) == 0 {
 			continue
 		}
 		if err := s.ApplyEffects(ctx, job.JobID); err != nil {
@@ -538,6 +579,46 @@ func (s *Store) ReconcileEffects(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// settleAdmissions drops the admissions of runs Dagu reports finished, or
+// has no record of once the settling time has passed. An admission is never
+// dropped while its run may still be active, so retirement can stop it.
+func (s *Store) settleAdmissions(ctx context.Context, job *Job) error {
+	now := s.clock()
+	settled := map[string]time.Time{}
+	var errs []error
+	for id, a := range job.AdmittedRuns {
+		if now.Sub(a.At) < admissionSettle {
+			continue
+		}
+		done, err := s.runs.RunFinished(ctx, job.JobID, RunRef{RunID: id, RootName: a.RootName, RootRunID: a.RootRunID})
+		switch {
+		case errors.Is(err, ErrRunNotFound):
+			settled[id] = a.At
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+		case done:
+			settled[id] = a.At
+		}
+	}
+	if len(settled) == 0 {
+		return errors.Join(errs...)
+	}
+	_, err := s.WithJobTx(ctx, job.JobID, reconcilerActor, func(tx *JobTx) error {
+		changed := false
+		for id, at := range settled {
+			if a, ok := tx.Job.AdmittedRuns[id]; ok && a.At.Equal(at) {
+				delete(tx.Job.AdmittedRuns, id)
+				changed = true
+			}
+		}
+		if changed {
+			tx.touch()
+		}
+		return nil
+	})
+	return errors.Join(append(errs, err)...)
 }
 
 // RecordDroppedRun notes on the job that a queued or claimed run was

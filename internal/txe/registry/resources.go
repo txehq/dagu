@@ -324,7 +324,7 @@ func (s *Store) resumeResourceEvent(ctx context.Context, saved *ResourceEvent, s
 
 func sameReport(a, b *ResourceEvent) bool {
 	digest := func(e *ResourceEvent) string {
-		bs, _ := CanonicalJSON([]any{TargetKey(e.Target), e.Observation, e.Authoritative, e.Detail, e.Evidence})
+		bs, _ := CanonicalJSON([]any{e.Target, e.Observation, e.Authoritative, e.Detail, e.Evidence})
 		return sha256Hex(bs)
 	}
 	return digest(a) == digest(b)
@@ -334,8 +334,14 @@ func sameReport(a, b *ResourceEvent) bool {
 // job's current version when the version changes before the commit.
 func (s *Store) applyDependent(ctx context.Context, p ResourceDependent, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) (*ResourceDisposition, error) {
 	for range maxReevaluations {
+		job, err := s.GetJob(ctx, p.JobID)
+		if err != nil {
+			return nil, ignoreNotFound(err)
+		}
+		if d := job.appliedResourceEvent(TargetKey(ev.Target), ev.EventID); d != nil {
+			return d, nil
+		}
 		var d *ResourceDisposition
-		var err error
 		if p.Match == matchReplacement {
 			d, err = s.applyReplacement(ctx, p.JobID, ev, by, permitted)
 		} else {
@@ -457,8 +463,8 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 	if !permitted(ctx, job) {
 		return nil, nil
 	}
-	check := atVersion(job.Version, permitted)
 	d := &ResourceDisposition{JobID: jobID, Match: matchIdentity}
+	c := eventCommit{check: atVersion(job.Version, permitted), eventID: ev.EventID, key: TargetKey(ev.Target), d: d}
 	evidence := append([]string{"resource_event:" + ev.EventID}, ev.Evidence...)
 	if job.Lifecycle.Terminal() {
 		d.Outcome, d.Detail = OutcomeUnchanged, "job is "+string(job.Lifecycle)
@@ -467,7 +473,7 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 	switch ev.Observation {
 	case ResourceDeleted, ResourceAbsent:
 		if !ev.Authoritative {
-			return s.askPerson(ctx, job, d, "target reported "+string(ev.Observation)+" without authoritative evidence", evidence, by, check)
+			return s.askPerson(ctx, job, d, "target reported "+string(ev.Observation)+" without authoritative evidence", evidence, by, c)
 		}
 		v, err := s.versionOf(ctx, job, job.Version)
 		if err != nil {
@@ -475,18 +481,18 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		}
 		switch v.RetirementRules.OnTargetDeleted {
 		case RuleRetire:
-			return s.retireFor(ctx, job, d, RetireTargetDeleted, "target "+describeTarget(ev.Target)+" deleted", evidence, by, check)
+			return s.retireFor(ctx, job, d, RetireTargetDeleted, "target "+describeTarget(ev.Target)+" deleted", evidence, by, c)
 		case RuleReview:
-			return s.askPerson(ctx, job, d, "target "+describeTarget(ev.Target)+" deleted", evidence, by, check)
+			return s.askPerson(ctx, job, d, "target "+describeTarget(ev.Target)+" deleted", evidence, by, c)
 		}
-		return s.recordOnly(ctx, job, d, "target deleted; job rule keeps it", evidence, by, check)
+		return s.recordOnly(ctx, job, d, "target deleted; job rule keeps it", evidence, by, c)
 	case ResourceUnreachable, ResourceTimeout:
-		return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnreachable, Kind: "target_" + string(ev.Observation), Detail: ev.Detail, Evidence: evidence}, by, check)
+		return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnreachable, Kind: "target_" + string(ev.Observation), Detail: ev.Detail, Evidence: evidence}, by, c)
 	case ResourceAuthDenied:
-		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence}, by, check)
+		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence}, by, c)
 	case ResourcePresent:
 		if job.Availability.State == AvailabilityTargetUnreachable || job.Availability.State == AvailabilityAuthRequired {
-			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence}, by, check)
+			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence}, by, c)
 		}
 		d.Outcome = OutcomeUnchanged
 		return d, nil
@@ -506,8 +512,8 @@ func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *Resource
 	if !permitted(ctx, job) {
 		return nil, nil
 	}
-	check := atVersion(job.Version, permitted)
 	d := &ResourceDisposition{JobID: jobID, Match: matchReplacement}
+	c := eventCommit{check: atVersion(job.Version, permitted), eventID: ev.EventID, key: TargetKey(ev.Target), d: d}
 	if job.Lifecycle.Terminal() {
 		d.Outcome, d.Detail = OutcomeUnchanged, "job is "+string(job.Lifecycle)
 		return d, nil
@@ -520,15 +526,16 @@ func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *Resource
 	}
 	switch v.RetirementRules.OnReplacement {
 	case RuleRetire:
-		return s.retireFor(ctx, job, d, RetireReplaced, detail, evidence, by, check)
+		return s.retireFor(ctx, job, d, RetireReplaced, detail, evidence, by, c)
 	case RuleKeep:
-		return s.recordOnly(ctx, job, d, detail, evidence, by, check)
+		return s.recordOnly(ctx, job, d, detail, evidence, by, c)
 	}
-	return s.askPerson(ctx, job, d, detail, evidence, by, check)
+	return s.askPerson(ctx, job, d, detail, evidence, by, c)
 }
 
-func (s *Store) retireFor(ctx context.Context, job *Job, d *ResourceDisposition, reason RetirementReason, detail string, evidence []string, by Actor, check jobCheck) (*ResourceDisposition, error) {
-	_, err := s.ChangeLifecycle(ctx, job.JobID, Transition{Op: OpRetire, Reason: reason, Detail: detail, Evidence: evidence, Authorize: recheck(ctx, check)}, by)
+func (s *Store) retireFor(ctx context.Context, job *Job, d *ResourceDisposition, reason RetirementReason, detail string, evidence []string, by Actor, c eventCommit) (*ResourceDisposition, error) {
+	d.Outcome, d.Detail = OutcomeRetired, detail
+	_, err := s.ChangeLifecycle(ctx, job.JobID, Transition{Op: OpRetire, Reason: reason, Detail: detail, Evidence: evidence, Authorize: c.in(ctx)}, by)
 	if ErrorCode(err) == CodeNotPermitted {
 		return nil, nil
 	}
@@ -543,16 +550,17 @@ func (s *Store) retireFor(ctx context.Context, job *Job, d *ResourceDisposition,
 	return d, nil
 }
 
-func (s *Store) askPerson(ctx context.Context, job *Job, d *ResourceDisposition, detail string, evidence []string, by Actor, check jobCheck) (*ResourceDisposition, error) {
+func (s *Store) askPerson(ctx context.Context, job *Job, d *ResourceDisposition, detail string, evidence []string, by Actor, c eventCommit) (*ResourceDisposition, error) {
 	if job.Lifecycle != LifecycleActive {
-		return s.recordOnly(ctx, job, d, detail, evidence, by, check)
+		return s.recordOnly(ctx, job, d, detail, evidence, by, c)
 	}
-	_, err := s.ChangeLifecycle(ctx, job.JobID, Transition{Op: OpNeedsHuman, Detail: detail, Evidence: evidence, Authorize: recheck(ctx, check)}, by)
+	d.Outcome, d.Detail = OutcomeNeedsHuman, detail
+	_, err := s.ChangeLifecycle(ctx, job.JobID, Transition{Op: OpNeedsHuman, Detail: detail, Evidence: evidence, Authorize: c.in(ctx)}, by)
 	if ErrorCode(err) == CodeNotPermitted {
 		return nil, nil
 	}
 	if ErrorCode(err) == CodeTransition {
-		return s.recordOnly(ctx, job, d, detail, evidence, by, check)
+		return s.recordOnly(ctx, job, d, detail, evidence, by, c)
 	}
 	if err != nil {
 		return nil, err
@@ -561,8 +569,9 @@ func (s *Store) askPerson(ctx context.Context, job *Job, d *ResourceDisposition,
 	return d, nil
 }
 
-func (s *Store) recordOnly(ctx context.Context, job *Job, d *ResourceDisposition, detail string, evidence []string, by Actor, check jobCheck) (*ResourceDisposition, error) {
-	inCommit := recheck(ctx, check)
+func (s *Store) recordOnly(ctx context.Context, job *Job, d *ResourceDisposition, detail string, evidence []string, by Actor, c eventCommit) (*ResourceDisposition, error) {
+	d.Outcome, d.Detail = OutcomeRecorded, detail
+	inCommit := c.in(ctx)
 	if _, err := s.WithJobTx(ctx, job.JobID, by, func(tx *JobTx) error {
 		if err := inCommit(tx); err != nil {
 			return err
@@ -578,8 +587,9 @@ func (s *Store) recordOnly(ctx context.Context, job *Job, d *ResourceDisposition
 	return d, nil
 }
 
-func (s *Store) observe(ctx context.Context, job *Job, d *ResourceDisposition, o Observation, by Actor, check jobCheck) (*ResourceDisposition, error) {
-	inCommit := recheck(ctx, check)
+func (s *Store) observe(ctx context.Context, job *Job, d *ResourceDisposition, o Observation, by Actor, c eventCommit) (*ResourceDisposition, error) {
+	d.Outcome, d.Detail = OutcomeAvailability, string(o.State)
+	inCommit := c.in(ctx)
 	if _, err := s.WithJobTx(ctx, job.JobID, by, func(tx *JobTx) error {
 		if err := inCommit(tx); err != nil {
 			return err
@@ -651,6 +661,52 @@ func atVersion(version int, permitted ResourceJobFilter) jobCheck {
 
 // recheck runs check inside the commit, so authorization and the evaluated
 // version hold for the state committed.
-func recheck(ctx context.Context, check jobCheck) func(tx *JobTx) error {
-	return func(tx *JobTx) error { return check(ctx, tx.Job) }
+// maxAppliedResourceEvents bounds the applied events a job remembers per
+// target. A replay only matters while its event is incomplete, which is
+// resolved long before that many newer events reach the same target.
+const maxAppliedResourceEvents = 20
+
+// eventCommit is the in-commit part of applying a resource event to a job:
+// the authorization and version check, and the record that the event was
+// applied, written in the same commit as the change so a replay of the
+// event returns that result instead of applying it again.
+type eventCommit struct {
+	check   jobCheck
+	eventID string
+	key     string
+	d       *ResourceDisposition
+}
+
+func (c eventCommit) in(ctx context.Context) func(tx *JobTx) error {
+	return func(tx *JobTx) error {
+		if err := c.check(ctx, tx.Job); err != nil {
+			return err
+		}
+		if tx.Job.appliedResourceEvent(c.key, c.eventID) != nil {
+			// Applied by a concurrent replay; re-read its result.
+			return errVersionChanged
+		}
+		if tx.Job.AppliedResourceEvents == nil {
+			tx.Job.AppliedResourceEvents = map[string][]AppliedResourceEvent{}
+		}
+		list := append(tx.Job.AppliedResourceEvents[c.key], AppliedResourceEvent{EventID: c.eventID, At: tx.now, Disposition: *c.d})
+		if len(list) > maxAppliedResourceEvents {
+			list = list[len(list)-maxAppliedResourceEvents:]
+		}
+		tx.Job.AppliedResourceEvents[c.key] = list
+		tx.touch()
+		return nil
+	}
+}
+
+// appliedResourceEvent returns the recorded result of an event already
+// applied to the job, or nil.
+func (j *Job) appliedResourceEvent(key, eventID string) *ResourceDisposition {
+	for _, a := range j.AppliedResourceEvents[key] {
+		if a.EventID == eventID {
+			d := a.Disposition
+			return &d
+		}
+	}
+	return nil
 }

@@ -6,6 +6,7 @@ package scheduler
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -164,4 +165,18 @@ func WithRunAdmitter(a RunAdmitter) QueueProcessorOption {
 	return func(p *QueueProcessor) {
 		p.runAdmitter = a
 	}
+}
+
+// ErrJobRequiresWorker refuses running a registered job in the scheduler's
+// process: jobs run only through their machine's worker, where the claim is
+// admitted and recorded against retirement.
+var ErrJobRequiresWorker = errors.New("txe: registered jobs run only on their machine's worker")
+
+// refuseLocalJobRun is the worker-only rule at the scheduler's execution
+// handoff, so scheduled starts dispatched without a queue are covered too.
+func refuseLocalJobRun(dag *ir.DAG) error {
+	if dag != nil && (registry.IsJobDAG(dag.SuspendFlagName()) || registry.IsJobDAG(dag.Name)) {
+		return fmt.Errorf("%w: %s", ErrJobRequiresWorker, dag.SuspendFlagName())
+	}
+	return nil
 }

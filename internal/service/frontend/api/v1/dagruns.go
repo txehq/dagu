@@ -4122,6 +4122,9 @@ func (a *API) resumeManagedAttempt(ctx context.Context, dag *ir.DAG, status *ir.
 		return nil
 	}
 
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return err
+	}
 	prepared, err := a.prepareRetryDAGForSubprocess(ctx, dag, status)
 	if err != nil {
 		return fmt.Errorf("prepare DAG retry env: %w", err)

@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,18 @@ type fakeRuns struct {
 	listErr   error
 	// onSuspend runs after a suspend write, outside the lock.
 	onSuspend func(dag string)
+	// finished are run IDs RunFinished reports terminal; others are active.
+	finished map[string]bool
+}
+
+func (r *fakeRuns) RunFinished(_ context.Context, _ string, run RunRef) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	done, ok := r.finished[run.RunID]
+	if !ok {
+		return false, ErrRunNotFound
+	}
+	return done, nil
 }
 
 func newFakeRuns() *fakeRuns {
@@ -659,4 +672,128 @@ func TestResourceEventResumesByID(t *testing.T) {
 	assert.True(t, ev.Complete)
 	require.Len(t, ev.Dispositions, 1)
 	assert.Equal(t, OutcomeRetired, ev.Dispositions[0].Outcome)
+}
+
+// Admissions are kept whatever their number, and dropped only once Dagu
+// reports the run finished or has no record of it after the settling time.
+func TestAdmissionsSettleWhenRunsFinish(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	for i := range 250 {
+		_, err := f.store.AdmitClaim(f.ctx, job.JobID, "", RunRef{RunID: fmt.Sprintf("run-%03d", i)})
+		require.NoError(t, err)
+	}
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Len(t, got.AdmittedRuns, 250, "no admission is dropped by count")
+
+	rc.finished = map[string]bool{"run-000": true}
+	for i := 1; i < 249; i++ {
+		rc.finished[fmt.Sprintf("run-%03d", i)] = false
+	}
+	// run-249 has no record in Dagu.
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Len(t, got.AdmittedRuns, 250, "nothing settles before the settling time")
+
+	f.advance(admissionSettle)
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Len(t, got.AdmittedRuns, 248)
+	assert.NotContains(t, got.AdmittedRuns, "run-000")
+	assert.NotContains(t, got.AdmittedRuns, "run-249")
+	assert.Contains(t, got.AdmittedRuns, "run-001")
+}
+
+// A store without run control (the coordinator's) retiring a cancel-policy
+// job leaves the runs to be listed and stopped by the scheduler.
+func TestRetireWithoutRunControlRecordsDiscovery(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.RetirementRules.ActiveRunPolicy = ActiveRunCancel })
+	got, err := f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpRetire, Reason: RetireManual}, person)
+	require.NoError(t, err)
+	require.NotNil(t, got.PendingEffects)
+	assert.True(t, got.PendingEffects.DiscoverRuns)
+
+	rc := withRuns(f)
+	rc.runs[job.JobID] = []RunRef{{RunID: "r-1", Running: true}}
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.Equal(t, []string{job.JobID + "/r-1"}, rc.stopped)
+}
+
+// A suspend writer that stopped after writing keeps the registry's
+// ownership until its lease passes, so the suspension it left on an active
+// job is lifted, however late the write lands.
+func TestStoppedSuspendWriterIsRecovered(t *testing.T) {
+	f := newFixture(t)
+	rc := withRuns(f)
+	job := f.ready("k")
+	_, err := f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		tx.Job.SuspendedByRegistry = true
+		tx.Job.SuspendWriters = map[string]time.Time{"w-1": tx.now}
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	rc.suspended[job.JobID] = true
+
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.False(t, rc.suspended[job.JobID])
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.True(t, got.SuspendedByRegistry, "ownership is kept while the writer may still write")
+
+	rc.suspended[job.JobID] = true // the stopped writer's write lands late
+	f.advance(suspendWriteLease)
+	require.NoError(t, f.store.ReconcileEffects(f.ctx))
+	assert.False(t, rc.suspended[job.JobID])
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.False(t, got.SuspendedByRegistry)
+	assert.Empty(t, got.SuspendWriters)
+}
+
+// An event whose job change committed but whose progress was not saved is
+// not applied again on replay, even after the job was reactivated.
+func TestResourceEventReplayDoesNotReapply(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.Targets = []Target{target("v-12")}
+		v.RetirementRules.OnTargetDeleted = RuleReview
+	})
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-12"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeNeedsHuman, ev.Dispositions[0].Outcome)
+
+	// Lose the progress write: the saved event still lists the job.
+	lost := *ev
+	lost.Dispositions, lost.Complete = nil, false
+	lost.Pending = []ResourceDependent{{JobID: job.JobID, Match: matchIdentity}}
+	require.NoError(t, f.store.putJSON(f.ctx, resourceEventsPrefix+ev.EventID, &lost))
+	_, err = f.store.ChangeLifecycle(f.ctx, job.JobID, Transition{Op: OpResume}, person)
+	require.NoError(t, err)
+
+	replayed, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: ev.EventID, Target: target("v-12"), Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	assert.True(t, replayed.Complete)
+	require.Len(t, replayed.Dispositions, 1)
+	assert.Equal(t, OutcomeNeedsHuman, replayed.Dispositions[0].Outcome, "the recorded result is returned")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleActive, got.Lifecycle, "the reactivated job is not changed again")
+}
+
+// A different target under a reused event ID is a different report.
+func TestResourceEventIDCoversWholeTarget(t *testing.T) {
+	f := newFixture(t)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-13"), Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	other := target("v-13")
+	other.DisplayName = "another name"
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{EventID: ev.EventID, Target: other, Observation: ResourcePresent}, agent)
+	assert.Equal(t, CodeDuplicate, code(t, err))
 }

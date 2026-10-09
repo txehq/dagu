@@ -1621,6 +1621,9 @@ func (a *API) startPreparedDAGRunWithOptions(
 		}
 		return nil, a.dispatchStartToCoordinator(ctx, dag, opts, dispatchParams, timeout)
 	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return nil, err
+	}
 
 	// Only pass trigger type if it's a known value (not TriggerTypeUnknown)
 	triggerTypeStr := ""
