@@ -101,3 +101,48 @@ func TestResolveStringLegacyBuiltInRunContextAliases(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "test|run-1|2026-03-13T10:00:01Z|attempt-1|step", got)
 }
+
+// The queue marker reaches a step exactly as it is stored. It is compared for
+// equality with the stored status, so neither the zone of a first enqueue nor
+// the fraction a queued retry writes may be normalised away.
+func TestResolveStringAttemptQueuedAt(t *testing.T) {
+	t.Parallel()
+
+	for _, queuedAt := range []string{
+		"2026-10-09T23:48:55+08:00",
+		"2026-10-09T15:48:58.155644Z",
+		"2026-10-09T15:48:58.155644001Z",
+	} {
+		ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "dag.log",
+			runtime.WithAttemptID("attempt-1"),
+			runtime.WithAttemptQueuedAt(queuedAt),
+			runtime.WithWorkDir(t.TempDir()),
+		)
+		ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "step"}))
+
+		got, err := runtime.ResolveString(ctx, "${context.attempt.id}|${context.attempt.queued_at}", cmnvalue.WorkflowField("run"))
+		require.NoError(t, err)
+		assert.Equal(t, "attempt-1|"+queuedAt, got)
+	}
+}
+
+// A run that was never queued has an empty marker, which is what its status
+// holds, and a reference resolves to the empty string: a command or a
+// variable built from it is well formed. A context that was told nothing
+// about the marker leaves the reference as it is written, like any other
+// unavailable field.
+func TestResolveStringAttemptQueuedAtEmptyAndUnknown(t *testing.T) {
+	t.Parallel()
+
+	resolve := func(opts ...runtime.ContextOption) string {
+		opts = append(opts, runtime.WithAttemptID("attempt-1"), runtime.WithWorkDir(t.TempDir()))
+		ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "dag.log", opts...)
+		ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "step"}))
+		got, err := runtime.ResolveString(ctx, "${context.attempt.id}|${context.attempt.queued_at}|end", cmnvalue.WorkflowField("run"))
+		require.NoError(t, err)
+		return got
+	}
+
+	assert.Equal(t, "attempt-1||end", resolve(runtime.WithAttemptQueuedAt("")))
+	assert.Equal(t, "attempt-1|${context.attempt.queued_at}|end", resolve())
+}

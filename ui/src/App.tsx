@@ -11,6 +11,7 @@ import {
 } from 'react-router-dom';
 import { SWRConfig, mutate as globalMutate } from 'swr';
 
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { LicenseFeaturePrompt } from '@/components/LicenseFeaturePrompt';
 import { hasActiveLicense, type LicensedFeature } from '@/lib/license';
 
@@ -700,25 +701,37 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                       <Route
                                         path="/incidents"
                                         element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentsPage />
-                                          </ActiveLicenseDeveloperElement>
+                                          INCIDENTS_ENABLED ? (
+                                            <ActiveLicenseDeveloperElement>
+                                              <IncidentsPage />
+                                            </ActiveLicenseDeveloperElement>
+                                          ) : (
+                                            <Navigate to="/" replace />
+                                          )
                                         }
                                       />
                                       <Route
                                         path="/incident-providers"
                                         element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentProvidersPage />
-                                          </ActiveLicenseDeveloperElement>
+                                          INCIDENTS_ENABLED ? (
+                                            <ActiveLicenseDeveloperElement>
+                                              <IncidentProvidersPage />
+                                            </ActiveLicenseDeveloperElement>
+                                          ) : (
+                                            <Navigate to="/" replace />
+                                          )
                                         }
                                       />
                                       <Route
                                         path="/incident-policies"
                                         element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentPoliciesPage />
-                                          </ActiveLicenseDeveloperElement>
+                                          INCIDENTS_ENABLED ? (
+                                            <ActiveLicenseDeveloperElement>
+                                              <IncidentPoliciesPage />
+                                            </ActiveLicenseDeveloperElement>
+                                          ) : (
+                                            <Navigate to="/" replace />
+                                          )
                                         }
                                       />
                                       <Route path="/dags/" element={<DAGs />} />

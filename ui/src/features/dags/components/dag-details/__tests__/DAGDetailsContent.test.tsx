@@ -102,7 +102,6 @@ describe('DAGDetailsContent', () => {
 
     for (const label of [
       'Latest Run',
-      'Incidents',
       'Spec',
       'Webhook',
       'Settings',
@@ -112,6 +111,8 @@ describe('DAGDetailsContent', () => {
     ]) {
       expect(screen.getAllByText(label)).toHaveLength(2);
     }
+    // The fork does not offer the licensed incident feature.
+    expect(screen.queryByText('Incidents')).not.toBeInTheDocument();
   });
 
   it.each(['log', 'dagRun-log'])(

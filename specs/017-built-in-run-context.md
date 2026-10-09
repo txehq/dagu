@@ -103,6 +103,7 @@ ${context.run.root_name}
 ${context.run.root_id}
 ${context.attempt.id}
 ${context.attempt.started_at}
+${context.attempt.queued_at}
 ${context.step.id}
 ${context.step.name}
 ${context.trigger.type}
@@ -198,6 +199,7 @@ Rules:
 | --- | --- | --- |
 | `context.attempt.id` | Attempt-aware run, step, and handler scopes | Identifier for the current DAG-run attempt. |
 | `context.attempt.started_at` | After run-attempt start is recorded | UTC RFC3339 timestamp for the start of this DAG-run attempt. |
+| `context.attempt.queued_at` | Attempt-aware run, step, and handler scopes | Queue marker of this execution: the `queuedAt` its status holds, as stored. Empty when the run was never queued. |
 
 Rules:
 
@@ -205,6 +207,24 @@ Rules:
 - `context.attempt.id` is not the same as `context.run.id`.
 - Step retry attempts are outside this namespace unless a step-retry-owning
   spec adds a separate field.
+- `context.attempt.id` alone does not identify one execution. A retry that is
+  queued executes again under the same attempt ID and gets a new
+  `context.attempt.queued_at`; a retry dispatched directly gets a new attempt
+  ID and keeps the earlier attempt's `context.attempt.queued_at`. The pair of
+  the two values identifies one execution of a DAG run.
+- `context.attempt.queued_at` equals the `queuedAt` of every status the
+  execution reports, byte for byte. It is an opaque string: the first enqueue
+  writes RFC3339 at second resolution in the enqueuing host's zone, and a
+  queued retry writes UTC with a fraction. Compare it for equality; do not
+  parse or reformat it.
+- A run that was started without being queued has an empty `queuedAt`, and
+  `context.attempt.queued_at` resolves to the empty string for it. The empty
+  marker is a value: with the attempt ID it still identifies the execution,
+  because such a run is never executed twice under one attempt ID.
+- The runtime hands a step only a marker that is an RFC3339 timestamp. A
+  stored marker of any other form is withheld and a reference to it is left
+  unchanged: the value comes from stored run state and may be placed in a
+  command.
 
 `context.step` fields:
 

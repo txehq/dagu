@@ -137,4 +137,22 @@ describe('DAGDetails page', () => {
       );
     });
   });
+
+  // The fork does not offer incidents: the tab's URL shows the status tab
+  // of the same run.
+  it('sends the incidents tab to the status tab of the same run', async () => {
+    renderPage(
+      '/dags/release-notes/incidents?dagRunId=run-1&dagRunName=release-notes'
+    );
+
+    expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+      'data-active-tab',
+      'status'
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent(
+        '/dags/release-notes?dagRunId=run-1&dagRunName=release-notes'
+      );
+    });
+  });
 });

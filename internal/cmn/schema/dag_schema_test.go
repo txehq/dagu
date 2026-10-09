@@ -518,6 +518,15 @@ steps:
 `,
 		},
 		{
+			name: "TemplateRenderAttemptContextReference",
+			spec: `
+steps:
+  - action: template.render
+    with:
+      template_ref: ${context.attempt.queued_at}
+`,
+		},
+		{
 			name: "TemplateRenderReference",
 			spec: `
 steps:
