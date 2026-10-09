@@ -165,6 +165,31 @@ func must(t *testing.T, fn func() error) {
 	}
 }
 
+// fileProposalWith files p under a review claim, filling its ID.
+func (f *fixture) fileProposalWith(p registry.Proposal) *registry.Proposal {
+	f.t.Helper()
+	id, err := registry.NewID(registry.PrefixProposal, f.now)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	p.ProposalID = id
+	var filed *registry.Proposal
+	_, err = f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		if err != nil {
+			return err
+		}
+		if filed, err = tx.PutProposal(claim.ClaimID, claim.Fence, p); err != nil {
+			return err
+		}
+		return tx.ReleaseClaim(claim.ClaimID, claim.Fence)
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return filed
+}
+
 // fileProposal files a proposal the way a reviewer does: under a review claim.
 func (f *fixture) fileProposal(action string, native bool) *registry.Proposal {
 	f.t.Helper()
@@ -534,5 +559,30 @@ func TestDecideReplaysExpiredSnooze(t *testing.T) {
 	stale.SnoozeUntil = &until
 	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, stale, f.human); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("new past snooze err = %v, want ErrInvalid", err)
+	}
+}
+
+// Retry is refused on an ordinary proposal even when the proposal allows
+// every verdict or names retry explicitly.
+func TestDecideRefusesRetryOnUntypedProposal(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictRetry, "key-retry-untyped"), f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("retry with empty allowed verdicts: err = %v, want not_permitted", err)
+	}
+	explicit := f.fileProposalWith(registry.Proposal{
+		Action:          registry.ActionSpec{Name: "resize", Target: &f.version.Targets[0], Params: json.RawMessage(`{"sizeGi":30}`)},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{
+		ExpectedProposalRevision: explicit.Revision,
+		BindingDigest:            explicit.BindingDigest,
+		Verdict:                  VerdictRetry,
+		IdempotencyKey:           "key-retry-explicit",
+	}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, explicit.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("retry explicitly allowed: err = %v, want not_permitted", err)
+	}
+	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
+		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
 	}
 }
