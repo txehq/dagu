@@ -8586,6 +8586,8 @@ export interface components {
             idempotency_key: string;
             /** @description The job version the person saw; refused with 409 when the job moved on */
             expected_job_version: number;
+            /** @description The run attempt the person reviewed; when present the request is refused with 409 unless it is the run's latest attempt */
+            attempt_id?: string;
             /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
             run_spec_sha256?: string;
             /** @description The run's package digest; when omitted the server reads it from the run */
