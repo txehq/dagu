@@ -177,6 +177,43 @@ func (h *txeHub) manifest(jobID, runID string, e txeclient.Execution) (int, map[
 	return h.call(http.MethodGet, "/txe/jobs/"+jobID+"/runs/"+runID+"/artifacts?execution="+e.Ref(), nil)
 }
 
+// txeKeep saves raw evidence under TXE_EVIDENCE_DIR when that is set: what
+// the registry answered, what a command printed, what the hub holds.
+func txeKeep(t *testing.T, name string, data []byte) {
+	t.Helper()
+	base := os.Getenv("TXE_EVIDENCE_DIR")
+	if base == "" {
+		return
+	}
+	path := filepath.Join(base, filepath.FromSlash(name))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, data, 0o644)) //nolint:gosec // evidence for people to read
+}
+
+// txeKeepHubCopies saves every file the hub holds under txe-attempts, and a
+// list of their SHA-256 digests as computed here from the hub's bytes.
+func txeKeepHubCopies(t *testing.T, name, artifactDir string) {
+	t.Helper()
+	if os.Getenv("TXE_EVIDENCE_DIR") == "" {
+		return
+	}
+	var inventory strings.Builder
+	require.NoError(t, filepath.WalkDir(artifactDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.Contains(filepath.ToSlash(path), "/"+txeclient.HubAttemptsDir+"/") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(artifactDir, path)
+		fmt.Fprintf(&inventory, "%s  %d bytes  %s\n", txeSum(string(data)), len(data), filepath.ToSlash(rel))
+		txeKeep(t, name+"/files/"+filepath.ToSlash(rel), data)
+		return nil
+	}))
+	txeKeep(t, name+"/sha256-inventory.txt", []byte(inventory.String()))
+}
+
 func txeErrorCode(value map[string]any) string {
 	details, _ := value["details"].(map[string]any)
 	code, _ := details["code"].(string)
@@ -345,11 +382,13 @@ if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
 	verified := func(runID string, e txeclient.Execution, producedIn txeclient.Execution, want string) map[string]any {
 		t.Helper()
 		var manifest map[string]any
+		var rawManifest string
 		require.Eventually(t, func() bool {
-			code, value, _ := hub.manifest(jobID, runID, e)
-			manifest = value
+			code, value, raw := hub.manifest(jobID, runID, e)
+			manifest, rawManifest = value, raw
 			return code == http.StatusOK && txeRecord(t, value, "snapshot")["status"] == "verified"
 		}, 30*time.Second, 300*time.Millisecond, "the hub did not verify the copy of execution %s: %v", e.Ref(), manifest)
+		txeKeep(t, "manifests/"+runID+"/"+e.Ref()+".json", []byte(rawManifest))
 		assert.Equal(t, e.AttemptID, manifest["attempt_id"])
 		assert.Equal(t, e.QueuedAt, manifest["queued_at"])
 		assert.Equal(t, e.Ref(), manifest["execution"])
@@ -401,9 +440,11 @@ if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
 	code, listing, raw := hub.call(http.MethodGet, "/txe/jobs/"+jobID+"/runs/"+runA+"/artifacts", nil)
 	require.Equal(t, http.StatusOK, code, raw)
 	t.Logf("run A executions listed by the registry: %v", listing["executions"])
+	txeKeep(t, "manifests/"+runA+"/default.json", []byte(raw))
 
 	// The same report again, after the run ended, is taken as a replay.
 	out, err := publish(runA, a3.execution())
+	txeKeep(t, "commands/replay-run-a-execution-3.txt", fmt.Appendf(nil, "error: %v\n\nstdout:\n%s", err, out))
 	require.NoError(t, err, "an identical replay was refused: %s", out)
 	t.Logf("identical replay of execution %s after the run ended: accepted", a3.execution().Ref())
 
@@ -419,12 +460,14 @@ if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
 		"actor": map[string]any{"kind": "cli", "id": "publish", "machine_id": txeITMachine},
 	}
 	code, value, raw := hub.call(http.MethodPost, "/txe/jobs/"+jobID+"/runs/"+runA+"/artifacts", changed)
+	txeKeep(t, "responses/changed-report-run-a-execution-3.txt", fmt.Appendf(nil, "HTTP %d\n%s", code, raw))
 	assert.Equal(t, http.StatusConflict, code, raw)
 	assert.Equal(t, "artifact_conflict", txeErrorCode(value), raw)
 	t.Logf("registry: another report for execution %s: HTTP %d %s", a3.execution().Ref(), code, txeErrorCode(value))
 
 	// A first report from an execution the run never had is refused.
 	out, err = publish(runA, txeclient.Execution{AttemptID: a1.attemptID, QueuedAt: "2026-01-01T00:00:00Z"})
+	txeKeep(t, "commands/never-latest-run-a.txt", fmt.Appendf(nil, "error: %v\n\nstdout:\n%s", err, out))
 	require.Error(t, err, "a publication from an execution that is not the latest was recorded: %s", out)
 	assert.Contains(t, err.Error(), "stale_binding")
 	t.Logf("publish as an execution run A never had: %v", err)
@@ -493,6 +536,7 @@ if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
 	// The second execution never published. Its publication arriving now,
 	// late, is refused: it does not become the latest execution's.
 	out, err = publish(runB, b2.execution())
+	txeKeep(t, "commands/late-run-b-execution-2.txt", fmt.Appendf(nil, "error: %v\n\nstdout:\n%s", err, out))
 	require.Error(t, err, "a late publication was recorded: %s", out)
 	assert.Contains(t, err.Error(), "stale_binding")
 	t.Logf("late publish as run B's second execution %s: %v", b2.execution().Ref(), err)
@@ -501,4 +545,10 @@ if [ -e "$TXE_FIXTURE_CONTROL/fail-job" ]; then exit 7; fi
 		listing["executions"], b1.execution().Ref(), b2.execution().Ref(), b3.execution().Ref(), b1.attemptID)
 	code, _, raw = hub.manifest(jobID, runB, b2.execution())
 	assert.Equal(t, http.StatusNotFound, code, raw)
+	txeKeep(t, "responses/manifest-of-run-b-execution-2.txt", fmt.Appendf(nil, "HTTP %d\n%s", code, raw))
+	_, _, raw = hub.call(http.MethodGet, "/txe/jobs/"+jobID+"/runs/"+runB+"/artifacts", nil)
+	txeKeep(t, "manifests/"+runB+"/default.json", []byte(raw))
+	_, _, raw = hub.call(http.MethodGet, "/txe/jobs/"+jobID, nil)
+	txeKeep(t, "responses/job.json", []byte(raw))
+	txeKeepHubCopies(t, "hub-copies", hubHelper.Config.Paths.ArtifactDir)
 }
