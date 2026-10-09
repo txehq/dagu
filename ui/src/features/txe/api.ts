@@ -22,6 +22,12 @@ export interface TxeApi {
     proposalId: string,
     request: DecisionRequest
   ): Promise<DecisionSubmitResult>;
+  // replayDecision repeats a stored decision exactly, which completes a
+  // follow-up the server reported as pending.
+  replayDecision(
+    jobId: string,
+    decision: Decision
+  ): Promise<DecisionSubmitResult>;
 }
 
 export class TxeApiError extends Error {
@@ -72,6 +78,19 @@ export function createTxeApi(client: Client<paths>): TxeApi {
     return toJob(job, versionRes.data, runs);
   };
 
+  const decide: TxeApi['decide'] = async (jobId, proposalId, request) => {
+    const res = await client.POST(
+      '/txe/jobs/{jobId}/proposals/{proposalId}/decisions',
+      {
+        params: { path: { jobId, proposalId } },
+        body: toDecisionBody(request),
+      }
+    );
+    if (res.data) return { ok: true };
+    const err = failure(res.response, res.error);
+    return { ok: false, status: err.status, message: err.message };
+  };
+
   return {
     listJobs: async () => {
       const res = await client.GET('/txe/jobs', {});
@@ -118,17 +137,15 @@ export function createTxeApi(client: Client<paths>): TxeApi {
         toDecision(d, job, versionOf.get(d.proposal_id) ?? job.version)
       );
     },
-    decide: async (jobId, proposalId, request) => {
-      const res = await client.POST(
-        '/txe/jobs/{jobId}/proposals/{proposalId}/decisions',
-        {
-          params: { path: { jobId, proposalId } },
-          body: toDecisionBody(request),
-        }
-      );
-      if (res.data) return { ok: true };
-      const err = failure(res.response, res.error);
-      return { ok: false, status: err.status, message: err.message };
-    },
+    decide,
+    replayDecision: (jobId, d) =>
+      decide(jobId, d.proposalId, {
+        expectedProposalRevision: d.proposalRevision,
+        bindingDigest: d.bindingDigest,
+        verdict: d.verdict,
+        instructions: d.instructions,
+        snoozeUntil: d.snoozeUntil,
+        idempotencyKey: d.idempotencyKey,
+      }),
   };
 }
