@@ -767,6 +767,10 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                         element={<TxeInboxPage />}
                                       />
                                       <Route
+                                        path="/txe/jobs"
+                                        element={<Navigate to="/txe" replace />}
+                                      />
+                                      <Route
                                         path="/txe/jobs/:jobId"
                                         element={<TxeJobPage />}
                                       />
