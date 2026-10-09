@@ -254,6 +254,15 @@ func (tx *JobTx) archiveAction(a *Action) error {
 		return err
 	}
 	delete(tx.Job.Actions, a.ActionID)
+	// An archived action can no longer be settled or stall: its
+	// action-scope exceptions end with it (also when a later episode
+	// replaces an uncertain action).
+	now := tx.now
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeAction && e.ActionID == a.ActionID {
+			e.ResolvedAt = &now
+		}
+	}
 	return nil
 }
 
