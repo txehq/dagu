@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -247,7 +248,7 @@ func (att *Attempt) WriteIfLatest(
 
 	var checkErr error
 	writeErr := att.writer.writeIf(status, func() error {
-		latest, err := att.parseLocked(ctx)
+		latest, err := parseLatestStatusFromTail(ctx, att.file)
 		if err != nil {
 			return fmt.Errorf("%w: read latest status: %w", ErrWriteFailed, err)
 		}
@@ -628,6 +629,80 @@ func parseStatusFileWithContext(ctx context.Context, file string) (*ir.DAGRunSta
 				result = status
 			}
 		}
+	}
+}
+
+// statusTailChunk is how much of a status file parseLatestStatusFromTail reads
+// at a time, backwards from the end.
+const statusTailChunk = 64 << 10
+
+// statusTailBytesRead, when set by a test, receives the number of bytes
+// parseLatestStatusFromTail read.
+var statusTailBytesRead func(n int64)
+
+// parseLatestStatusFromTail returns the last valid status in the file, as
+// parseStatusFileWithContext does, reading backwards from the end so that its
+// cost does not grow with the file's history. A final line without a newline
+// is incomplete and skipped, as are lines that do not decode.
+func parseLatestStatusFromTail(ctx context.Context, file string) (*ir.DAGRunStatus, error) {
+	f, err := openStatusFileWithRetry(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+	}
+
+	var read int64
+	defer func() {
+		if statusTailBytesRead != nil {
+			statusTailBytesRead(read)
+		}
+	}()
+
+	// buf holds the file's bytes from start up to the end of the last
+	// complete line not yet rejected; complete means it ends in a newline.
+	var buf []byte
+	start := info.Size()
+	terminated := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+		}
+		if !terminated {
+			if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+				buf = buf[:i+1]
+				terminated = true
+			}
+		}
+		for terminated && len(buf) > 0 {
+			body := buf[:len(buf)-1]
+			j := bytes.LastIndexByte(body, '\n')
+			if j < 0 && start > 0 {
+				break // the line may begin before the bytes read so far
+			}
+			if line := body[j+1:]; len(line) > 0 {
+				if status, err := ir.StatusFromJSON(string(line)); err == nil {
+					return status, nil
+				}
+			}
+			buf = buf[:j+1]
+		}
+		if start == 0 {
+			return nil, io.EOF
+		}
+		n := min(int64(statusTailChunk), start)
+		start -= n
+		piece := make([]byte, n)
+		if _, err := f.ReadAt(piece, start); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: %w", ErrReadFailed, err)
+		}
+		read += n
+		buf = append(piece, buf...)
 	}
 }
 

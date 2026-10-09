@@ -5,12 +5,14 @@ package dagrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/gofrs/flock"
@@ -74,27 +76,33 @@ func TestStatusFileCompactionHoldsTheLockFromReadToRename(t *testing.T) {
 	assert.True(t, lockedDuringWindow, "no other handle may take the status lock between compaction's read and its rename")
 }
 
-func TestStatusFileAppendWaitsForTheLock(t *testing.T) {
-	t.Parallel()
-
+// Not parallel: the hook is package state.
+func TestStatusFileAppendHoldsTheLock(t *testing.T) {
 	ctx := context.Background()
 	file, owner := statusFileWithHistory(t)
 	t.Cleanup(func() { _ = owner.Close(ctx) })
 
-	held := flock.New(statusLockPath(file))
-	require.NoError(t, held.Lock())
-	written := make(chan error, 1)
-	go func() { written <- owner.Write(ctx, createTestStatus(ir.Queued)) }()
-	select {
-	case err := <-written:
-		_ = held.Unlock()
-		require.FailNow(t, "the append did not wait for the status lock", "err: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	probed := false
+	lockedDuringAppend := false
+	appendLockedHook = func(target string) {
+		if target != file || probed {
+			return
+		}
+		probed = true
+		probe := flock.New(statusLockPath(file))
+		got, err := probe.TryLock()
+		require.NoError(t, err)
+		lockedDuringAppend = !got
+		if got {
+			_ = probe.Unlock()
+		}
+		_ = probe.Close()
 	}
-	require.NoError(t, held.Unlock())
-	_ = held.Close()
-	require.NoError(t, <-written)
-	assert.Equal(t, ir.Queued, latestStatusOf(t, file))
+	t.Cleanup(func() { appendLockedHook = nil })
+
+	require.NoError(t, owner.Write(ctx, createTestStatus(ir.Queued)))
+	require.True(t, probed, "the append must reach its locked section")
+	assert.True(t, lockedDuringAppend, "no other handle may take the status lock during an append")
 }
 
 func TestStatusFileWriterReopensAfterAnotherHandleCompacts(t *testing.T) {
@@ -193,3 +201,67 @@ func TestStatusFileWriteIfLatestChecksUnderTheLock(t *testing.T) {
 }
 
 var errStatusChanged = errors.New("status changed")
+
+// The tail reader returns what the full parser returns: the last complete line
+// that decodes.
+func TestParseLatestStatusFromTailMatchesFullParse(t *testing.T) {
+	t.Parallel()
+
+	line := func(st ir.Status) string {
+		data, err := json.Marshal(createTestStatus(st))
+		require.NoError(t, err)
+		return string(data) + "\n"
+	}
+	long := createTestStatus(ir.Succeeded)
+	long.Error = strings.Repeat("x", 3*statusTailChunk)
+	longData, err := json.Marshal(long)
+	require.NoError(t, err)
+
+	cases := map[string]string{
+		"valid lines":                         line(ir.Running) + line(ir.Failed),
+		"invalid last line":                   line(ir.Running) + "{not json\n",
+		"partial trailing line":               line(ir.Running) + `{"status":`,
+		"complete record without its newline": line(ir.Running) + strings.TrimSuffix(line(ir.Failed), "\n"),
+		"blank lines":                         line(ir.Failed) + "\n\n",
+		"line longer than a chunk":            line(ir.Running) + string(longData) + "\n",
+		"only invalid":                        "nope\n{\n",
+		"empty":                               "",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			file := filepath.Join(t.TempDir(), JSONLStatusFile)
+			require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+			want, wantErr := parseStatusFileWithContext(context.Background(), file)
+			got, gotErr := parseLatestStatusFromTail(context.Background(), file)
+			if wantErr != nil {
+				require.ErrorIs(t, gotErr, io.EOF)
+				require.ErrorIs(t, wantErr, io.EOF)
+				return
+			}
+			require.NoError(t, gotErr)
+			assert.Equal(t, want.Status, got.Status)
+			assert.Equal(t, want.Error, got.Error)
+		})
+	}
+}
+
+// Not parallel: the counter is package state. A conditional write over a long
+// history reads only the end of the file.
+func TestStatusFileWriteIfLatestReadsOnlyTheTail(t *testing.T) {
+	ctx := context.Background()
+	file, owner := statusFileWithHistory(t)
+	t.Cleanup(func() { _ = owner.Close(ctx) })
+	for range 800 {
+		require.NoError(t, owner.Write(ctx, createTestStatus(ir.Running)))
+	}
+	info, err := os.Stat(file)
+	require.NoError(t, err)
+	require.Greater(t, info.Size(), int64(4*statusTailChunk), "the history must span several chunks")
+
+	var read int64
+	statusTailBytesRead = func(n int64) { read = n }
+	t.Cleanup(func() { statusTailBytesRead = nil })
+	require.NoError(t, owner.WriteIfLatest(ctx, createTestStatus(ir.Running), func(*ir.DAGRunStatus) error { return nil }))
+	assert.LessOrEqual(t, read, int64(statusTailChunk), "only the last chunk is read")
+}

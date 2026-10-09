@@ -38,6 +38,10 @@ type Writer struct {
 // WriterOption defines functional options for configuring a Writer.
 type WriterOption func(*Writer)
 
+// appendLockedHook, when set by a test, runs while an append holds the status
+// file's lock.
+var appendLockedHook func(target string)
+
 // withFileLock makes each append hold an exclusive lock on lockPath, the lock
 // that compaction of the same file also holds, and reopen the target first if
 // a compaction replaced it. Without it, an append can land between a
@@ -122,6 +126,9 @@ func (w *Writer) writeIf(st ir.DAGRunStatus, check func() error) error {
 			return fmt.Errorf("failed to lock status file: %w", err)
 		}
 		defer func() { _ = w.fileLock.Unlock() }()
+		if appendLockedHook != nil {
+			appendLockedHook(w.target)
+		}
 		if err := w.reopenIfReplacedLocked(); err != nil {
 			return err
 		}
