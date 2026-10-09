@@ -109,6 +109,43 @@ describe('DecisionPanel', () => {
     expect(onStale).toHaveBeenCalledTimes(1);
   });
 
+  // A verdict chosen against one revision must not carry over to the reloaded
+  // revision; the person has to review and choose again.
+  it('discards the draft when the proposal revision changes', async () => {
+    const onSubmit = vi
+      .fn()
+      .mockResolvedValue({ ok: false, status: 409, message: 'stale_binding' });
+    const { rerender } = render(
+      <DecisionPanel
+        proposal={fixtureProposal({ revision: 1 })}
+        canDecide
+        onSubmit={onSubmit}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Record decision' }));
+    await screen.findByText(/This proposal changed/);
+
+    rerender(
+      <DecisionPanel
+        proposal={fixtureProposal({ revision: 2, bindingDigest: 'd'.repeat(64) })}
+        canDecide
+        onSubmit={onSubmit}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    expect(screen.getByRole('button', { name: 'Approve' })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    );
+    expect(screen.getByRole('button', { name: 'Record decision' })).toBeDisabled();
+    expect(screen.getByText(/This proposal changed/)).toBeInTheDocument();
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
   it('shows no controls without permission', () => {
     render(
       <DecisionPanel

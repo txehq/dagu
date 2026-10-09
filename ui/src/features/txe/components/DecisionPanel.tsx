@@ -58,16 +58,26 @@ export function DecisionPanel({
   // draft replays safely, a changed draft is a new decision attempt.
   const keyRef = React.useRef<string>(newIdempotencyKey());
 
+  // A new revision or proposal discards the draft: a choice made against the
+  // previous revision must never be submitted against the new one. The stale
+  // notice stays until the person chooses again.
   React.useEffect(() => {
-    setStale(false);
+    setVerdict(null);
+    setInstructions('');
+    setSnoozeUntil('');
     setError(null);
     keyRef.current = newIdempotencyKey();
-  }, [proposal.proposalId, proposal.revision]);
+  }, [proposal.proposalId, proposal.revision, proposal.bindingDigest]);
+
+  const resetAttempt = () => {
+    setError(null);
+    keyRef.current = newIdempotencyKey();
+  };
 
   const choose = (next: Verdict) => {
     setVerdict(next);
-    setError(null);
-    keyRef.current = newIdempotencyKey();
+    setStale(false);
+    resetAttempt();
   };
 
   const submit = async () => {
@@ -134,7 +144,10 @@ export function DecisionPanel({
           aria-label="Revised instructions"
           placeholder="Revised instructions for the next review"
           value={instructions}
-          onChange={(event) => setInstructions(event.target.value)}
+          onChange={(event) => {
+            setInstructions(event.target.value);
+            resetAttempt();
+          }}
         />
       )}
       {verdict === 'snooze' && (
@@ -142,7 +155,10 @@ export function DecisionPanel({
           aria-label="Snooze until"
           type="datetime-local"
           value={snoozeUntil}
-          onChange={(event) => setSnoozeUntil(event.target.value)}
+          onChange={(event) => {
+            setSnoozeUntil(event.target.value);
+            resetAttempt();
+          }}
         />
       )}
 
