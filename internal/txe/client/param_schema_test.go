@@ -192,6 +192,68 @@ func TestParamSchemaMustBeAMapping(t *testing.T) {
 	assert.JSONEq(t, `{}`, string(spec.ReviewPolicy.PermittedActions[0].ParamSchema))
 }
 
+// A spec built in memory never passed through the spec file's checks. A
+// schema that is not exactly one JSON object is refused there too, before a
+// package is staged, a journal entry written or the hub asked to change
+// anything, even on a hub that enforces schemas.
+func TestParamSchemaIsCheckedForASpecBuiltInMemory(t *testing.T) {
+	f := newFakeRegistry(t)
+	f.capabilities = []string{CapabilityParamSchema}
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	ctx := context.Background()
+	registered, err := LoadJobSpec(specWithActions(t, unboundedAction))
+	require.NoError(t, err)
+	out, err := cc1.Register(ctx, registered)
+	require.NoError(t, err)
+	posts := f.calls(http.MethodPost, "/txe/jobs")
+
+	for name, schema := range map[string]string{
+		"a list":            `[]`,
+		"null":              `null`,
+		"a string":          `"object"`,
+		"an unclosed brace": `{`,
+		"two values":        `{} []`,
+		"only whitespace":   ` `,
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec, err := LoadJobSpec(specWithActions(t, unboundedAction+boundedAction))
+			require.NoError(t, err)
+			spec.JobKey = "built-in-memory"
+			spec.ReviewPolicy.PermittedActions[1].ParamSchema = ParamSchema(schema)
+			var missing *MissingContextError
+			require.ErrorAs(t, spec.Validate(), &missing)
+
+			_, err = cc1.Register(ctx, spec)
+			require.ErrorContains(t, err, `permitted action "reopen-ticket": param_schema must be a mapping`)
+			_, err = cc1.Plan(ctx, spec)
+			require.ErrorContains(t, err, `permitted action "reopen-ticket": param_schema must be a mapping`)
+			spec.JobKey = registered.JobKey
+			_, err = cc1.Update(ctx, out.Receipt.JobID, 1, spec)
+			require.ErrorContains(t, err, `permitted action "reopen-ticket": param_schema must be a mapping`)
+
+			assert.Equal(t, posts, f.calls(http.MethodPost, "/txe/jobs"))
+			assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+out.Receipt.JobID+"/versions"))
+			assert.Equal(t, 1, f.job(out.Receipt.JobID).Version)
+			assert.Empty(t, pendingSteps(t, cc1.Journal))
+		})
+	}
+}
+
+// A YAML merge key lets a merged entry replace a bound written beside it:
+// maxLength 10 would be sent as 200. A schema that uses one is refused. A
+// property that is really named "<<" is not a merge, and neither is an alias.
+func TestParamSchemaRefusesMergeKeys(t *testing.T) {
+	action := "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n        type: object\n        properties:\n"
+	_, err := LoadJobSpec(specWithActions(t, action+"          reason:\n            maxLength: 10\n            <<: {type: string, maxLength: 200}\n"))
+	require.ErrorContains(t, err, "merge key")
+
+	spec, err := LoadJobSpec(specWithActions(t, action+"          \"<<\": &text {type: string, maxLength: 10}\n          reason: *text\n"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"object","properties":{"<<":{"type":"string","maxLength":10},"reason":{"type":"string","maxLength":10}}}`,
+		string(spec.ReviewPolicy.PermittedActions[0].ParamSchema))
+}
+
 // What YAML can say and JSON cannot is refused when the spec is read, not
 // sent as something else.
 func TestParamSchemaRefusesWhatJSONCannotHold(t *testing.T) {

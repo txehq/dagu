@@ -59,7 +59,7 @@ review_policy:
 - Registration refuses a spec with a `param_schema` on a hub whose registry does not say it enforces them, because that registry would store the schema and check nothing. The fix is to upgrade the hub, not to remove the schema.
 - Parameters reach the command as variables named `TXE_PARAM_<NAME>`, each a string. Declare each one as `type: string`, and set `additionalProperties: false` so that nothing undeclared is passed.
 - Such a registry admits JSON Schema draft 2020-12 and only the keywords it enforces exactly. It refuses `format`, `multipleOf`, unknown keywords and references to other documents. `pattern` is read as RE2.
-- A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read.
+- A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read. So is one that uses a YAML merge key (`<<`), which could replace a bound written beside it: write the schema out in full.
 
 ## Write the script for an unattended worker
 

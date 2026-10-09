@@ -308,9 +308,15 @@ var ErrParamSchemaUnenforced = errors.New("this hub's registry does not say it c
 // would store and not enforce. A param_schema is a bound on what a reviewer
 // may pass to an action; a registry that only stores it leaves the action
 // unbounded while its job says otherwise.
+//
+// The schemas themselves are checked here too, not only when a spec file is
+// read: a spec may be built by a caller that never validated it.
 func (r *Registrar) checkRegistry(ctx context.Context, spec *JobSpec) error {
 	var bounded []string
 	for _, a := range spec.ReviewPolicy.PermittedActions {
+		if !a.ParamSchema.isMapping() {
+			return fmt.Errorf("permitted action %q: param_schema must be a mapping (a JSON Schema)", a.Name)
+		}
 		if len(a.ParamSchema) > 0 {
 			bounded = append(bounded, a.Name)
 		}

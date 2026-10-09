@@ -6,10 +6,13 @@ package txeclient
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
 )
 
 // The types in this file are the bodies of the registry calls the CLI makes.
@@ -190,7 +193,22 @@ func (p *ParamSchema) UnmarshalJSON(data []byte) error {
 // UnmarshalYAML reads the schema from a job spec. Whatever the spec wrote is
 // kept, so that Validate can refuse a value that is not a mapping and name
 // the action it belongs to.
+//
+// A YAML merge key (<<) is refused: the decoder lets a merged entry replace
+// one written beside it, so a schema could carry a looser bound than the one
+// its author wrote out.
 func (p *ParamSchema) UnmarshalYAML(data []byte) error {
+	file, err := parser.ParseBytes(data, 0)
+	if err != nil {
+		return err
+	}
+	var found mergeKeys
+	for _, doc := range file.Docs {
+		ast.Walk(&found, doc.Body)
+	}
+	if found {
+		return errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
+	}
 	var value any
 	if err := yaml.Unmarshal(data, &value); err != nil {
 		return err
@@ -203,10 +221,24 @@ func (p *ParamSchema) UnmarshalYAML(data []byte) error {
 	return nil
 }
 
-// isMapping reports whether the schema is absent or a JSON object.
+// mergeKeys records whether a YAML node holds a merge key.
+type mergeKeys bool
+
+func (m *mergeKeys) Visit(node ast.Node) ast.Visitor {
+	if _, ok := node.(*ast.MergeKeyNode); ok {
+		*m = true
+	}
+	return m
+}
+
+// isMapping reports whether the schema is absent or exactly one JSON object.
+// Only a field of no bytes at all is absent.
 func (p ParamSchema) isMapping() bool {
+	if len(p) == 0 {
+		return true
+	}
 	trimmed := bytes.TrimSpace(p)
-	return len(trimmed) == 0 || trimmed[0] == '{'
+	return len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(p)
 }
 
 // PermittedAction is a follow-up a reviewer may take.
