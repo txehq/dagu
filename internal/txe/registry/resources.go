@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -559,10 +558,17 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		return s.recordOnly(ctx, job, d, "target could not be confirmed or denied; nothing changes", evidence, by, c)
 	case ResourcePresent:
 		// Only this target's open conditions are resolved; others stay.
-		if slices.ContainsFunc(slices.Collect(maps.Values(job.Exceptions)), func(e *Exception) bool {
-			return e.ResolvedAt == nil && e.Scope == "" && s.exceptionTarget(ctx, e) == key
-		}) {
-			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence, Target: key}, by, c)
+		for _, e := range job.Exceptions {
+			if e.ResolvedAt != nil || e.Scope != "" {
+				continue
+			}
+			t, err := s.exceptionTarget(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if t == key {
+				return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence, Target: key}, by, c)
+			}
 		}
 		d.Outcome = OutcomeUnchanged
 		return d, nil
@@ -688,22 +694,27 @@ func (s *Store) observe(ctx context.Context, job *Job, d *ResourceDisposition, o
 
 // exceptionTarget is the key of the target whose resource event opened e, or
 // empty. Exceptions recorded before they carried their target are matched
-// through the resource event named in their evidence; exceptions of other
-// kinds (a worker, a login) never belong to a target.
-func (s *Store) exceptionTarget(ctx context.Context, e *Exception) string {
-	if e.Target != "" || !strings.HasPrefix(e.Kind, "target_") {
-		return e.Target
+// through the event that opened them, which is always the first evidence
+// entry; later entries are the reporter's and are never used. A missing
+// originating event matches nothing; any other read error is returned so the
+// caller can be retried. Exceptions of other kinds (a worker, a login) never
+// belong to a target.
+func (s *Store) exceptionTarget(ctx context.Context, e *Exception) (string, error) {
+	if e.Target != "" || !strings.HasPrefix(e.Kind, "target_") || len(e.Evidence) == 0 {
+		return e.Target, nil
 	}
-	for _, ev := range e.Evidence {
-		id, ok := strings.CutPrefix(ev, "resource_event:")
-		if !ok {
-			continue
-		}
-		if saved, err := s.GetResourceEvent(ctx, id); err == nil {
-			return TargetKey(saved.Target)
-		}
+	id, ok := strings.CutPrefix(e.Evidence[0], "resource_event:")
+	if !ok {
+		return "", nil
 	}
-	return ""
+	saved, err := s.GetResourceEvent(ctx, id)
+	switch {
+	case ErrorCode(err) == CodeNotFound:
+		return "", nil
+	case err != nil:
+		return "", err
+	}
+	return TargetKey(saved.Target), nil
 }
 
 func describeTarget(t Target) string {

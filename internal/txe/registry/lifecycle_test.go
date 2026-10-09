@@ -1322,3 +1322,31 @@ func TestLegacyTargetExceptionAndFallbackDisposition(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, AvailabilityReady, got.Availability.State, "the legacy exception was resolved by its target")
 }
+
+// A legacy exception is matched only through the event that opened it: an
+// originating event that is gone matches nothing, even when the reporter's
+// evidence names another target's event.
+func TestLegacyTargetExceptionUsesOnlyItsOrigin(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	evB, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	f.now = f.now.Add(time.Second)
+	// A legacy exception whose originating event is missing, with the
+	// reporter's evidence naming B's event.
+	_, err = f.store.WithJobTx(f.ctx, job.JobID, person, func(tx *JobTx) error {
+		for _, e := range tx.Job.Exceptions {
+			e.Target = ""
+			e.Evidence = []string{"resource_event:" + f.mint(PrefixEvent), "resource_event:" + evB.EventID}
+		}
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourcePresent}, agent)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityTargetUnreachable, got.Availability.State, "B's present does not resolve an exception of unknown origin")
+}
