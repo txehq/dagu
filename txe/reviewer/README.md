@@ -88,7 +88,10 @@ resolved stops the command before it starts, as it stops a run, and the
 record names the reference and the kind of failure: not a value, and not
 where the credential is kept. A reference cannot use a name that
 identifies the action or marks the review. The references are not part of
-what the review agent is shown.
+what the review agent is shown. They are trusted input to the reviewer: it
+reads whatever a reference names. Whatever supplies a job to the reviewer
+from a record that can change after registration has to check the
+references against what was authorized on the job's machine first.
 
 This removes accidental inheritance. It is not isolation: the command runs
 as the same operating-system user as the reviewer and can read the same

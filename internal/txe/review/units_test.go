@@ -610,8 +610,9 @@ func TestCommandEffectorSuppliesTheJobsDeclaredCredentialsNotTheReviewers(t *tes
 	})
 	for name, refs := range map[string][]review.CredentialRef{
 		"the file is missing":            {{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: filepath.Join(secrets, "absent")}},
+		"the path is a directory":        {{Name: "OPENAI_API_KEY", Kind: review.CredentialFile, Locator: secrets}},
 		"the variable is not set":        {{Name: "LINEAR_API_KEY", Kind: review.CredentialEnv, Locator: "JOB_VARIABLE_THAT_IS_NOT_SET"}},
-		"an unknown kind":                {{Name: "OPENAI_API_KEY", Kind: "vault", Locator: "x"}},
+		"an unknown kind":                {{Name: "OPENAI_API_KEY", Kind: "vault", Locator: "secret/data/the-path"}},
 		"a name reserved for the action": {{Name: "TXE_ACTION_ID", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
 		"the marker of a review":         {{Name: review.ReviewerEnv, Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
 		"not a variable name":            {{Name: "a=b", Kind: review.CredentialEnv, Locator: "JOB_LINEAR_TOKEN_SOURCE"}},
