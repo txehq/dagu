@@ -1041,7 +1041,9 @@ func TestTxeAPIRunAbandonments(t *testing.T) {
 		}})
 		require.NoError(t, err)
 	}
-	abandon := func(runID, attemptID string, expected *persis.ExecutionIdentity) { abandonWith(runID, attemptID, expected, nil) }
+	abandon := func(runID, attemptID string, expected *persis.ExecutionIdentity) {
+		abandonWith(runID, attemptID, expected, nil)
+	}
 	list := func(ctx context.Context, runID string) ([]apigen.TxeAbandonment, error) {
 		resp, err := a.ListTxeRunAbandonments(ctx, apigen.ListTxeRunAbandonmentsRequestObject{JobId: jobID, RunId: runID})
 		if err != nil {
