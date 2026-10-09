@@ -102,7 +102,7 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	assert.Equal(t, ir.NodeSucceeded, got.Nodes[0].Status)
 	assert.Equal(t, ir.NodeFailed, got.Nodes[1].Status)
 	assert.Equal(t, next.ID(), got.AttemptID)
-	assert.Empty(t, got.QueuedAt)
+	assert.Equal(t, "q1", got.QueuedAt, "a direct retry keeps the retried status's queued-at")
 	assert.Empty(t, got.WorkerID, "the claim belongs to no worker yet")
 	assert.Empty(t, got.ClaimKey, "nor to the retried execution's lease")
 	assert.Empty(t, got.StartedAt, "it has not started")

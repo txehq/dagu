@@ -2989,7 +2989,11 @@ paths:
                         - stepName
       responses:
         "200":
-          description: "A successful response"
+          description: "The retry was admitted. A conditional request (expectedAttemptId/expectedQueuedAt) names the exact execution it admitted when the server knows it; other requests return an empty object."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetryDAGRunAdmission"
         default:
           description: "Generic error response"
           content:
@@ -15290,6 +15294,17 @@ components:
           $ref: "#/components/schemas/Step"
         exit:
           $ref: "#/components/schemas/Step"
+
+    RetryDAGRunAdmission:
+      type: object
+      description: "The execution a conditional retry admitted: the queued execution, or the new attempt of a distributed retry, with the queuedAt its statuses carry (a direct retry keeps the retried status's queuedAt; empty when never queued). executionRef is derived from the two exactly as run details derive it."
+      properties:
+        attemptId:
+          type: string
+        queuedAt:
+          type: string
+        executionRef:
+          type: string
 
     DAGRunCondition:
       type: object

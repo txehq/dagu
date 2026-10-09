@@ -535,7 +535,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 			h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
 			return nil, status.Error(dispatchErrorCode(err), err.Error())
 		}
-		return &coordinatorv1.DispatchResponse{}, nil
+		return admittedResponse(req.Task, prepared), nil
 	}
 	if h.dagRunRepository == nil {
 		return nil, status.Error(codes.FailedPrecondition, "distributed dispatch requires DAG run storage")
@@ -576,7 +576,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
 	h.notifyDispatchAvailable()
-	return &coordinatorv1.DispatchResponse{}, nil
+	return admittedResponse(req.Task, prepared), nil
 }
 
 func (h *Handler) ensureWorkspaceBundle(ctx context.Context, task *coordinatorv1.Task) error {
