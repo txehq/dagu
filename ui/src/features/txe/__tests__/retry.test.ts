@@ -114,12 +114,13 @@ describe('canRequestRetry', () => {
         status: 'uncertain',
       })
     ).toBe(false);
+    // The registry refuses a second request for the same run and version.
     expect(
       canRequestRetry('failed', {
         runId: 'r',
         proposalId: 'p',
         status: 'failed',
       })
-    ).toBe(true);
+    ).toBe(false);
   });
 });

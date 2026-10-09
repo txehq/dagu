@@ -360,7 +360,9 @@ func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string) {
 	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
 	require.NoError(t, err)
 	require.NotEmpty(t, dag.YamlData)
-	started := time.Now()
+	// Run times have whole-second precision; start after the second the
+	// job's version was created so the run is unambiguously of it.
+	started := time.Now().Add(2 * time.Second)
 	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 	status := ir.NewStatusBuilder(dag).Create(runID, ir.Failed, 0, started,
@@ -397,6 +399,21 @@ func TestTxeRunRetryRequest(t *testing.T) {
 	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &again)
 	require.True(t, again.Replayed)
 	require.Equal(t, first.Decision.DecisionId, again.Decision.DecisionId)
+
+	// Once the run has a newer successful attempt it is no longer
+	// retryable, but an identical replay still returns its decision.
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	retried, err := server.DAGRunRepository.CreateAttempt(ctx, dag, time.Now().Add(3*time.Second), "run-failed-1", persis.DAGRunCreateAttemptOptions{Retry: true})
+	require.NoError(t, err)
+	require.NoError(t, retried.Open(ctx))
+	require.NoError(t, retried.Write(ctx, ir.NewStatusBuilder(dag).Create("run-failed-1", ir.Succeeded, 0, time.Now(), ir.WithAttemptID(retried.ID()))))
+	require.NoError(t, retried.Close(ctx))
+	var late api.TxeDecisionResponse
+	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &late)
+	require.True(t, late.Replayed)
+	require.Equal(t, first.Decision.DecisionId, late.Decision.DecisionId)
 
 	stale := map[string]any{"idempotency_key": "dashboard-retry-2", "expected_job_version": job.Version,
 		"run_spec_sha256": fmt.Sprintf("sha256:%064x", 9)}
