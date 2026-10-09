@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -548,9 +549,16 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 	case ResourceAuthDenied:
 		return s.observe(ctx, job, d, Observation{State: AvailabilityAuthRequired, Kind: "target_auth_denied", Detail: ev.Detail, Evidence: evidence}, by, c)
 	case ResourceUnknown:
+		// A target checked before each run that cannot be confirmed stops
+		// those runs; availability makes that visible and actionable. It
+		// never touches the lifecycle.
+		if slices.ContainsFunc(hits, func(t Target) bool { return t.ExistenceCheck == CheckPreRun }) {
+			return s.observe(ctx, job, d, Observation{State: AvailabilityTargetUnconfirmed, Kind: "target_unknown", Detail: ev.Detail, Evidence: evidence}, by, c)
+		}
 		return s.recordOnly(ctx, job, d, "target could not be confirmed or denied; nothing changes", evidence, by, c)
 	case ResourcePresent:
-		if job.Availability.State == AvailabilityTargetUnreachable || job.Availability.State == AvailabilityAuthRequired {
+		if job.Availability.State == AvailabilityTargetUnreachable || job.Availability.State == AvailabilityAuthRequired ||
+			job.Availability.State == AvailabilityTargetUnconfirmed {
 			return s.observe(ctx, job, d, Observation{State: AvailabilityReady, Detail: "target present", Evidence: evidence}, by, c)
 		}
 		d.Outcome = OutcomeUnchanged

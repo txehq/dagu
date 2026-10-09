@@ -283,6 +283,9 @@ const (
 	AvailabilityWorkerOffline     AvailabilityState = "worker_offline"
 	AvailabilityAuthRequired      AvailabilityState = "auth_required"
 	AvailabilityTargetUnreachable AvailabilityState = "target_unreachable"
+	// AvailabilityTargetUnconfirmed: a target checked before each run could
+	// be neither confirmed nor denied (an unknown observation).
+	AvailabilityTargetUnconfirmed AvailabilityState = "target_unconfirmed"
 	AvailabilityStale             AvailabilityState = "stale"
 )
 

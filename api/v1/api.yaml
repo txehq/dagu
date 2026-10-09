@@ -19892,7 +19892,7 @@ components:
 
     TxeAvailabilityState:
       type: string
-      enum: [ready, worker_offline, auth_required, target_unreachable, stale]
+      enum: [ready, worker_offline, auth_required, target_unreachable, target_unconfirmed, stale]
 
     TxeAvailability:
       type: object
