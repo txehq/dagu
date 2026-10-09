@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -87,9 +88,51 @@ type Publish struct {
 	HubArtifacts bool
 }
 
-// RunOutputEnv is the variable holding a run's own output directory. Declared
-// deliverables are read from there, by exact name.
+// publishVerb is what follows the dagu binary in a publish command.
+var publishVerb = []string{"txe", "artifacts", "publish"}
+
+// verb is the publish command with another verb of "txe artifacts" in place
+// of "publish". It keeps the publish command's flags: every "dagu txe"
+// command resolves the hub's context before it does anything, so a command
+// without them would look for the context in another store. A job therefore
+// does not execute when its results could not be recorded for lack of one.
+func (p *Publish) verb(name string) []string {
+	argv := []string{p.Command[0], publishVerb[0], publishVerb[1], name}
+	return append(argv, p.Command[1+len(publishVerb):]...)
+}
+
+// RunOutputEnv is the variable holding the output directory of the attempt
+// that is executing. Declared deliverables are read from there, by exact name.
 const RunOutputEnv = "TXE_RUN_OUTPUT_DIR"
+
+// AttemptEnv is the variable holding the Dagu attempt that is executing. A
+// retry keeps the run ID; the attempt is what tells one execution of a run
+// from the next.
+const AttemptEnv = "TXE_ATTEMPT_ID"
+
+// QueuedAtEnv is the variable holding the queue marker the executing attempt
+// was dispatched with: empty for a run that was never queued. A retry through
+// a queue keeps the attempt ID and gets a later marker, so the attempt and
+// the marker together name one execution.
+const QueuedAtEnv = "TXE_QUEUED_AT"
+
+// The values Dagu replaces with the executing attempt's ID and queue marker.
+const (
+	attemptRef  = "${context.attempt.id}"
+	queuedAtRef = "${context.attempt.queued_at}"
+)
+
+// AttemptOutputDir is where the job that is executing in an attempt writes,
+// under the job's output directory.
+func AttemptOutputDir(outputDir, runID, attemptID string) string {
+	return filepath.Join(outputDir, "runs", runID, "attempts", attemptID)
+}
+
+// ExecutionOutputDir is where the results of an execution that succeeded are
+// kept, by the execution's reference.
+func ExecutionOutputDir(outputDir, runID, executionRef string) string {
+	return filepath.Join(outputDir, "runs", runID, "executions", executionRef)
+}
 
 // RenderDAG returns the Dagu workflow for a job. The same input always gives
 // the same bytes, so a replayed registration sends an identical definition.
@@ -136,9 +179,12 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	line("  - TXE_JOB_ID: %s", quote(s.JobID))
 	line("  - TXE_JOB_VERSION: %s", quote(fmt.Sprint(s.Version)))
 	line("  - TXE_OUTPUT_DIR: %s", quote(s.OutputDir))
-	// Dagu substitutes the run ID when the run starts, so each run writes its
-	// deliverables to a directory of its own.
-	line("  - %s: %s", RunOutputEnv, quote(s.OutputDir+"/runs/${DAG_RUN_ID}"))
+	// Dagu substitutes the run ID, the attempt ID and the queue marker when
+	// an execution starts. The marker reaches the commands as a variable,
+	// which is well formed when it is empty.
+	line("  - %s: %s", AttemptEnv, quote(attemptRef))
+	line("  - %s: %s", QueuedAtEnv, quote(queuedAtRef))
+	line("  - %s: %s", RunOutputEnv, quote(AttemptOutputDir(s.OutputDir, "${DAG_RUN_ID}", attemptRef)))
 	if s.Publish != nil {
 		line("  - %s: %s", EnvHome, quote(s.Publish.HomeRoot))
 	}
@@ -162,7 +208,20 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 
 	line("steps:")
 	line("  - name: run")
-	line("    command: %s", quote(shellJoin(s.Entrypoint)))
+	if s.Publish == nil {
+		line("    command: %s", quote(shellJoin(s.Entrypoint)))
+	} else {
+		// The job's command runs between two commands of the same step.
+		// The first gives it an empty output directory, keeping what an
+		// earlier execution left there; the last seals what the job
+		// wrote, which is what the publish step reads. A failed command
+		// stops the step, so nothing is sealed unless the job's command
+		// succeeded.
+		line("    command:")
+		line("      - %s", quote(shellJoin(s.Publish.verb("begin"))))
+		line("      - %s", quote(shellJoin(s.Entrypoint)))
+		line("      - %s", quote(shellJoin(s.Publish.verb("seal"))))
+	}
 	if s.Schedule.Retry > 0 {
 		line("    retry_policy:")
 		line("      limit: %d", s.Schedule.Retry)
@@ -197,7 +256,7 @@ func (s DAGSpec) overlap() string {
 
 // reservedEnv are set by the renderer and cannot be supplied by the job.
 var reservedEnv = map[string]bool{
-	"TXE_JOB_ID": true, "TXE_JOB_VERSION": true, "TXE_OUTPUT_DIR": true, RunOutputEnv: true, EnvHome: true,
+	"TXE_JOB_ID": true, "TXE_JOB_VERSION": true, "TXE_OUTPUT_DIR": true, RunOutputEnv: true, AttemptEnv: true, QueuedAtEnv: true, EnvHome: true,
 }
 
 func (s DAGSpec) validate() error {
@@ -227,6 +286,9 @@ func (s DAGSpec) validate() error {
 	if p := s.Publish; p != nil {
 		if len(p.Command) == 0 || !filepath.IsAbs(p.Command[0]) {
 			return fmt.Errorf("render DAG: the publish command must start with the absolute path of the dagu binary")
+		}
+		if len(p.Command) < 1+len(publishVerb) || !slices.Equal(p.Command[1:1+len(publishVerb)], publishVerb) {
+			return fmt.Errorf("render DAG: the publish command must be %q after the dagu binary", strings.Join(publishVerb, " "))
 		}
 		if !filepath.IsAbs(p.HomeRoot) {
 			return fmt.Errorf("render DAG: the TXE home %q must be absolute", p.HomeRoot)

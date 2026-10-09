@@ -28,10 +28,12 @@ import (
 var ErrDeliverableMissing = errors.New("a required deliverable was not produced")
 
 // Publisher records what a run produced. It reads only the files the job's
-// current version declares, by exact name, from the run's own output
-// directory. A file declared for the hub is also copied into the run's native
-// artifact directory, which the worker uploads; every file stays on the
-// machine as well. Nothing else is read or copied.
+// version declares, by exact name, from the sealed output directory of the
+// execution that produced them, and only while each still has the digest its
+// seal recorded. A file declared for the hub is also copied into the run's
+// native artifact directory, under the publishing execution's own directory,
+// which the worker uploads; every file stays on the machine as well. Nothing
+// else is read or copied.
 type Publisher struct {
 	Client *Client
 	Home   txepkg.Home
@@ -45,6 +47,11 @@ type PublishInput struct {
 	JobID      string
 	JobVersion int
 	RunID      string
+	// Execution is the execution the publish step is running in: the Dagu
+	// attempt and its queue marker. The registry accepts a manifest only
+	// from the run's latest execution, so a publication that arrives late
+	// from an earlier one is refused.
+	Execution Execution
 	// ArtifactDir is the run's native artifact directory. It is required
 	// only when a deliverable is declared for the hub.
 	ArtifactDir string
@@ -56,12 +63,20 @@ var runIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 // manifest it sent. It returns ErrDeliverableMissing, after recording, when a
 // required file is absent.
 //
+// The files are those of a sealed execution: the publishing one when it ran
+// the job itself, and never another's then; otherwise the latest that was
+// sealed. The second case is a retry that ran only the publish step: the job
+// did not execute again, and the manifest says which execution produced the
+// bytes. A deliverable whose bytes are not the ones its seal recorded is not
+// published.
+//
 // The manifest is sent before any file is copied for upload. If the registry
-// refuses it, as it does when a retried run produced different bytes under a
-// name already recorded, nothing in the artifact directory has changed.
+// refuses it, as it does for an execution that is no longer the run's latest
+// or for other bytes under an execution already recorded, nothing in the
+// artifact directory has changed.
 func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactManifest, error) {
-	if !runIDPattern.MatchString(in.JobID) || !runIDPattern.MatchString(in.RunID) {
-		return nil, fmt.Errorf("invalid job id %q or run id %q", in.JobID, in.RunID)
+	if err := checkRun(in.JobID, in.RunID, in.Execution); err != nil {
+		return nil, err
 	}
 	machine, err := p.Home.Machine()
 	if err != nil {
@@ -72,40 +87,64 @@ func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactMani
 		return nil, fmt.Errorf("read version %d of %s: %w", in.JobVersion, in.JobID, err)
 	}
 
-	// A run that wrote nothing has no output directory. That is not an
-	// error: its deliverables are recorded as missing.
-	runDir := filepath.Join(p.Home.OutputDir(in.JobID), "runs", in.RunID)
-	run, err := openRunDir(p.Home, in.JobID, in.RunID)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		run = nil
-	case err != nil:
-		return nil, err
-	default:
-		defer func() { _ = run.Close() }()
+	runRoot, err := openRunDir(p.Home, in.JobID, in.RunID)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("run %s: %w", in.RunID, ErrNotSealed)
 	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = runRoot.Close() }()
+	sealed, err := readSeals(runRoot, in.JobID, in.RunID)
+	if err != nil {
+		return nil, err
+	}
+	// An execution that sealed its own outputs publishes those. Only one
+	// that did not run the job takes the run's latest result.
+	seal := sealed.of(in.Execution)
+	if seal == nil {
+		seal = sealed.latest()
+	}
+	if seal == nil {
+		return nil, fmt.Errorf("run %s: %w", in.RunID, ErrNotSealed)
+	}
+	runDir := txepkg.ExecutionOutputDir(p.Home.OutputDir(in.JobID), in.RunID, seal.Ref)
+	run, err := openPath(runRoot, executionsDir+"/"+seal.Ref)
+	if err != nil {
+		return nil, fmt.Errorf("the sealed outputs of execution %s: %w", seal.Ref, err)
+	}
+	defer func() { _ = run.Close() }()
 
 	now := time.Now
 	if p.Now != nil {
 		now = p.Now
 	}
-	manifest := &ArtifactManifest{JobVersion: in.JobVersion, Actor: p.Actor}
+	manifest := &ArtifactManifest{JobVersion: in.JobVersion, Execution: in.Execution, ProducedIn: seal.Execution, Actor: p.Actor}
 	var missing []string
 	type upload struct{ path, sha256 string }
 	var uploads []upload
 	for _, d := range version.ExpectedOutcome.Deliverables {
 		record := ArtifactRecord{Deliverable: d.Name, Path: d.Path}
-		sum, size, err := hashDeliverable(run, d.Path)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
+		if err := CheckDeliverablePath(d.Path); err != nil {
+			return nil, fmt.Errorf("deliverable %s: %w", d.Name, err)
+		}
+		// What the execution did not seal, it did not produce: a file put
+		// there afterwards is not part of its result.
+		was, ok := seal.file(d.Path)
+		if !ok {
 			record.Missing = true
 			if d.Required {
 				missing = append(missing, d.Path)
 			}
 			manifest.Artifacts = append(manifest.Artifacts, record)
 			continue
-		case err != nil:
+		}
+		sum, size, err := hashDeliverable(run, d.Path)
+		if err != nil {
 			return nil, fmt.Errorf("deliverable %s: %w", d.Name, err)
+		}
+		if "sha256:"+sum != was.SHA256 || size != was.Bytes {
+			return nil, fmt.Errorf("deliverable %s (%s) of execution %s: %w", d.Name, d.Path, seal.Ref, ErrChangedAfterSeal)
 		}
 		record.SHA256, record.Bytes = "sha256:"+sum, size
 		record.Location, record.MachineID = DeliveryMachine, machine.MachineID
@@ -126,7 +165,7 @@ func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactMani
 	}
 
 	if len(uploads) > 0 {
-		artifacts, err := openArtifactDir(in.ArtifactDir)
+		artifacts, err := openHubExecutionDir(in.ArtifactDir, in.Execution)
 		if err != nil {
 			return manifest, err
 		}
@@ -186,6 +225,29 @@ func openArtifactDir(dir string) (*os.Root, error) {
 		return nil, fmt.Errorf("the run's artifact directory: %w", err)
 	}
 	return root, nil
+}
+
+// openHubExecutionDir opens the publishing execution's directory inside the
+// run's native artifact directory, creating it. The hub may keep several
+// executions of a run in one artifact directory and replaces a file that
+// arrives at a path it already holds, so each execution's copies go under
+// its own reference and an earlier execution's bytes are never replaced.
+func openHubExecutionDir(dir string, e Execution) (*os.Root, error) {
+	root, err := openArtifactDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	attempts, err := makeDir(root, HubAttemptsDir)
+	if err != nil {
+		return nil, fmt.Errorf("the run's artifact directory: %w", err)
+	}
+	defer func() { _ = attempts.Close() }()
+	execution, err := makeDir(attempts, e.Ref())
+	if err != nil {
+		return nil, fmt.Errorf("the run's artifact directory: %w", err)
+	}
+	return execution, nil
 }
 
 // openDir opens the directory called name in parent. The name must hold a
