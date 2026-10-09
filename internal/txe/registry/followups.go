@@ -150,8 +150,8 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		if rp.RunID == "" {
 			return refuse(CodeInvalid, "dagu.retry_run needs run_id")
 		}
-		if rp.RunSpecSHA256 != j.DAGSpecSHA256 || rp.PackageDigest != j.PackageDigest {
-			return &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s is not of the current version %d; it is not retried", rp.RunID, j.Version), Current: j}
+		if err := tx.checkRunBinding(rp); err != nil {
+			return err
 		}
 		if p.Action.Target != nil {
 			return refuse(CodeInvalid, "dagu.retry_run takes no target")
@@ -176,6 +176,47 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		if IsReservedAction(p.Action.Name) {
 			return refuse(CodeInvalid, "%q is a reserved action name", p.Action.Name)
 		}
+	}
+	return nil
+}
+
+// checkRunBinding resolves a run to the job's immutable versions through
+// its saved DAG spec digest: every version whose spec has that digest must
+// name the same package, the current version must be among them, and that
+// package must be the one the request names and the job's current one. A
+// spec that matches no version, or versions with different packages, is
+// refused: the run's package is then unknown, and an unknown binding is
+// never retried.
+func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
+	j := tx.Job
+	stale := func(msg string) error {
+		return &Error{Code: CodeStaleBinding, Message: "run " + rp.RunID + " " + msg + "; it is not retried", Current: j}
+	}
+	if rp.RunSpecSHA256 == "" || rp.PackageDigest == "" {
+		return refuse(CodeInvalid, "dagu.retry_run needs run_spec_sha256 and package_digest")
+	}
+	packages := map[string]bool{}
+	current := false
+	for n := 1; n <= j.Version; n++ {
+		v, err := tx.Version(n)
+		if err != nil {
+			return err
+		}
+		if v.DAG.SpecSHA256 != rp.RunSpecSHA256 {
+			continue
+		}
+		packages[v.Package.Digest] = true
+		current = current || n == j.Version
+	}
+	switch {
+	case len(packages) == 0:
+		return stale("ran a DAG that is no version of this job")
+	case len(packages) > 1:
+		return stale("ran a DAG that versions with different packages share, so its package is unknown")
+	case !current:
+		return stale(fmt.Sprintf("is of an older version, not the current version %d", j.Version))
+	case !packages[j.PackageDigest] || rp.PackageDigest != j.PackageDigest:
+		return stale("ran another package than the current one")
 	}
 	return nil
 }

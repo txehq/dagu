@@ -297,7 +297,7 @@ func TestWithJobTxRetriesConflicts(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
-				return tx.Observe(Observation{State: AvailabilityWorkerOffline, Detail: fmt.Sprint(i)})
+				return tx.Observe(Observation{State: AvailabilityWorkerOffline, Kind: fmt.Sprint("offline-", i), Detail: fmt.Sprint(i)})
 			})
 			assert.NoError(t, err)
 		}(i)

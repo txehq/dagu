@@ -33,6 +33,7 @@ const (
 	CodeEventComplete    Code = "event_complete"
 	CodeIntentUnresolved Code = "intent_unresolved"
 	CodeReviewConflict   Code = "review_conflict"
+	CodeArtifactConflict Code = "artifact_conflict"
 )
 
 // Error is a refused registry operation. Current, when set, is the record
