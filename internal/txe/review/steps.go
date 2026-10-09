@@ -93,6 +93,11 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save prepared review: %w", err)
 		}
+		// A job that could not be prepared is not dropped silently just
+		// because another one was: it is named in this run's log.
+		if failed != nil {
+			fmt.Fprintln(os.Stderr, "txe review: jobs that could not be prepared:", failed)
+		}
 		if err := s.saveArtifact(packetArtifact, prepared.Packet); err != nil {
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save packet artifact: %w", err)

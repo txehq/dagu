@@ -653,3 +653,46 @@ func TestOversizedSingleRunIsShortenedAndFlagged(t *testing.T) {
 	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stdout, "END-A"), "the end of the output is what is kept")
 	assert.True(t, strings.HasSuffix(packet.NewRuns[0].Steps[0].Stderr, "END-ERR"))
 }
+
+// Every list in the packet is bounded. Human feedback beyond the bound is
+// not skipped: it stays after the cursor and comes in the next review.
+func TestPacketListsAreBoundedAndFeedbackIsNotSkipped(t *testing.T) {
+	f := newFixture(t)
+	// 60 questions, each answered by the owner.
+	for round := range 3 {
+		prepared := f.prepare(fmt.Sprintf("reviewer-%d", round))
+		var actions []review.AgentAction
+		for i := range 20 {
+			actions = append(actions, act("expand_volume", map[string]string{"size_gb": fmt.Sprint(round*100 + i)}))
+		}
+		f.apply("r", prepared, review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "ask", Actions: actions})
+		f.clock.Advance(2 * time.Hour)
+	}
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 60)
+	for _, p := range proposals {
+		_, err := f.registry.Decide(jobID, p.ID, review.VerdictReject, "", "connor")
+		require.NoError(t, err)
+	}
+
+	first := f.prepare("reviewer-x")
+	require.Len(t, first.Packet.HumanFeedback, 50)
+	assert.True(t, first.Packet.MoreRunsPending, "more feedback is waiting")
+	f.apply("reviewer-x", first, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "read 50"})
+	f.clock.Advance(time.Minute)
+	second := f.prepare("reviewer-y")
+	require.Len(t, second.Packet.HumanFeedback, 10, "the rest arrives next, none skipped")
+	assert.NotEqual(t, first.Packet.HumanFeedback[49].ID, second.Packet.HumanFeedback[0].ID)
+}
+
+// A job whose own registered context is larger than the packet limit is not
+// reviewed from a cut-down version of it: prepare fails and says why.
+func TestOversizedJobContextFailsPrepare(t *testing.T) {
+	f := newFixture(t)
+	job := fixtureJob()
+	job.Purpose = strings.Repeat("p", 300<<10)
+	require.NoError(t, f.registry.PutJob(job))
+	_, err := f.reviewer("reviewer-a").Prepare(context.Background(), jobID)
+	require.ErrorIs(t, err, review.ErrPacketTooLarge)
+	assert.Empty(t, f.state().Claims, "the claim is released")
+}

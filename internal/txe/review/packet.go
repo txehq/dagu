@@ -5,8 +5,14 @@ package review
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 )
+
+// ErrPacketTooLarge means a job's context cannot be reduced to the packet
+// limit. The job is not reviewed until that is resolved.
+var ErrPacketTooLarge = errors.New("txe review: context packet exceeds its size limit")
 
 // PacketSchemaVersion is the version of the context packet format.
 const PacketSchemaVersion = 1
@@ -21,8 +27,11 @@ const (
 	// maxPacketBytes bounds the whole packet. It is the agent's context and
 	// it travels as one captured step output, so it must stay well under
 	// the service's output limit whatever the job's scripts print.
-	maxPacketBytes   = 256 << 10
-	maxRecentActions = 20
+	maxPacketBytes      = 256 << 10
+	maxPacketFeedback   = 50
+	maxPacketProposals  = 50
+	maxPacketUnresolved = 50
+	maxRecentActions    = 20
 )
 
 // Packet is everything a fresh reviewer is given. It must be sufficient
@@ -99,7 +108,7 @@ func (p Packet) hasRun(id string) bool {
 	return false
 }
 
-func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, decisions []Decision, proposals []Proposal, actions []Action) Packet {
+func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, decisions []Decision, proposals []Proposal, actions []Action) (Packet, error) {
 	p := Packet{
 		SchemaVersion: PacketSchemaVersion,
 		ReviewID:      ReviewID(job.ID, cp.Version),
@@ -109,6 +118,17 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 		NewRuns:       []RunEvidence{},
 		HumanFeedback: decisions,
 		OpenProposals: proposals,
+	}
+	// Every list in the packet is bounded, not only the runs. Feedback
+	// beyond the bound stays after the cursor for the next review, the
+	// same as runs; the oldest is kept so nothing is skipped.
+	if len(p.HumanFeedback) > maxPacketFeedback {
+		p.HumanFeedback = p.HumanFeedback[:maxPacketFeedback]
+		p.MoreRunsPending = true
+	}
+	if n := len(p.OpenProposals); n > maxPacketProposals {
+		p.OpenProposals = p.OpenProposals[n-maxPacketProposals:]
+		p.EvidenceTrimmed = true
 	}
 	if len(runs) > maxPacketRuns {
 		runs = runs[:maxPacketRuns]
@@ -136,6 +156,12 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 			p.UnresolvedActions = append(p.UnresolvedActions, a)
 		}
 	}
+	// What the agent is shown of unresolved actions is bounded; what blocks
+	// an action from running again is checked against the full journal.
+	if n := len(p.UnresolvedActions); n > maxPacketUnresolved {
+		p.UnresolvedActions = p.UnresolvedActions[n-maxPacketUnresolved:]
+		p.EvidenceTrimmed = true
+	}
 	if n := len(actions); n > maxRecentActions {
 		actions = actions[n-maxRecentActions:]
 	}
@@ -153,7 +179,13 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 		p.RecentActions = []Action{}
 	}
 	p.trim()
-	return p
+	// A packet that still does not fit is not sent at all. Its size comes
+	// from what the job itself registered or from one enormous record, and
+	// a review of a truncated contract would be a review of something else.
+	if size := p.size(); size > maxPacketBytes {
+		return Packet{}, fmt.Errorf("%w: %d bytes, limit %d", ErrPacketTooLarge, size, maxPacketBytes)
+	}
+	return p, nil
 }
 
 func truncateOutputs(outputs map[string]string) map[string]string {

@@ -246,7 +246,7 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 	if err != nil {
 		return Packet{}, fmt.Errorf("read actions: %w", err)
 	}
-	return buildPacket(r.now(), job, cp, runs, decisions, proposals, actions), nil
+	return buildPacket(r.now(), job, cp, runs, decisions, proposals, actions)
 }
 
 // finishInterrupted completes an episode whose review was recorded but whose
