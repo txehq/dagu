@@ -833,3 +833,29 @@ func TestTxeAPIClaimMachineAndIncompleteEvents(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"events":[]}`, string(body))
 }
+
+// A caller who may not write a job cannot change it by asking for a grant:
+// the request is refused before any transaction, and the job is untouched.
+func TestTxeAPIRefusedGrantChangesNothing(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	before, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+
+	body := &apigen.TxeEffectGrantRequest{ActionId: "act_x", JobVersion: 1, PackageDigest: "sha256:x"}
+	body.Approved = &struct {
+		ClaimId    string `json:"claim_id"`
+		DecisionId string `json:"decision_id"`
+		Fence      int64  `json:"fence"`
+		ProposalId string `json:"proposal_id"`
+	}{ClaimId: "clm_x", DecisionId: "dec_x", ProposalId: "prp_x", Fence: 1}
+	_, err = a.AuthorizeTxeEffect(txeOps, apigen.AuthorizeTxeEffectRequestObject{JobId: jobID, Body: body})
+	require.Error(t, err)
+
+	after, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "nothing was written")
+}

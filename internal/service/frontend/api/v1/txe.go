@@ -861,18 +861,24 @@ func (a *API) AuthorizeTxeEffect(ctx context.Context, req api.AuthorizeTxeEffect
 		effect.Routine = &registry.RoutineEffect{ReviewID: r.ReviewId, ClaimID: r.ClaimId, Fence: r.Fence, Spec: spec}
 	}
 	var g *registry.Grant
+	staleRetry := false
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
 		var err error
 		g, err = tx.Authorize(effect)
+		// Reached only once the caller may write the job: an approved
+		// effect refused because its run no longer binds.
+		staleRetry = effect.Approved != nil && registry.ErrorCode(err) == registry.CodeStaleBinding
 		return err
 	}); err != nil {
-		if effect.Approved != nil {
+		if staleRetry {
 			// A decided retry whose run moved on can never be authorized: end
-			// it, so it leaves the decision queue, and return the refusal.
-			if s, serr := a.txeStore(); serr == nil {
-				if _, eerr := s.EndMovedOnRetries(ctx, req.JobId); eerr != nil {
-					logger.Warn(ctx, "Failed to end retries whose run moved on", tag.Error(eerr))
-				}
+			// such retries (the caller's write permission is checked again),
+			// so they leave the decision queue, and return the refusal.
+			if _, eerr := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+				_, err := tx.EndMovedOnRetries()
+				return err
+			}); eerr != nil {
+				logger.Warn(ctx, "Failed to end retries whose run moved on", tag.Error(eerr))
 			}
 		}
 		return nil, err
@@ -1122,17 +1128,14 @@ func (a *API) ListTxeResourceEvents(ctx context.Context, req api.ListTxeResource
 	if limit < 1 || limit > 200 {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: "limit must be between 1 and 200"}
 	}
-	events, next, err := s.IncompleteResourceEvents(ctx, valueOf(req.Params.ReporterMachineId), valueOf(req.Params.After), limit)
+	// Visibility decides the page, so neither the events nor the cursor
+	// name an event the caller may not see.
+	events, next, err := s.IncompleteResourceEvents(ctx, valueOf(req.Params.ReporterMachineId), valueOf(req.Params.After), limit,
+		func(ev *registry.ResourceEvent) bool { return a.txeShowResourceEvent(ctx, s, ev) })
 	if err != nil {
 		return nil, txeError(err)
 	}
-	shown := make([]registry.ResourceEvent, 0, len(events))
-	for i := range events {
-		if a.txeShowResourceEvent(ctx, s, &events[i]) {
-			shown = append(shown, events[i])
-		}
-	}
-	out, err := txeConvert[[]api.TxeResourceEvent](shown)
+	out, err := txeConvert[[]api.TxeResourceEvent](events)
 	if out == nil {
 		out = []api.TxeResourceEvent{}
 	}

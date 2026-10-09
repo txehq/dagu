@@ -686,9 +686,11 @@ func ignoreNotFound(err error) error {
 
 // IncompleteResourceEvents lists events not yet applied to every dependent,
 // oldest first, after the event ID after; only those a reporter on machineID
-// sent when machineID is set. It returns at most limit events and the cursor
-// for the next page, empty at the end.
-func (s *Store) IncompleteResourceEvents(ctx context.Context, machineID, after string, limit int) ([]ResourceEvent, string, error) {
+// sent when machineID is set, and only those show accepts (it may also trim
+// what the caller sees of an event). It returns at most limit events and the
+// cursor for the next page, empty at the end; the cursor is always the ID of
+// a returned event.
+func (s *Store) IncompleteResourceEvents(ctx context.Context, machineID, after string, limit int, show func(*ResourceEvent) bool) ([]ResourceEvent, string, error) {
 	if limit <= 0 {
 		return nil, "", refuse(CodeInvalid, "limit must be positive")
 	}
@@ -709,7 +711,7 @@ func (s *Store) IncompleteResourceEvents(ctx context.Context, machineID, after s
 			}
 			return nil, "", err
 		}
-		if ev.Complete || (machineID != "" && ev.Reporter.MachineID != machineID) {
+		if ev.Complete || (machineID != "" && ev.Reporter.MachineID != machineID) || (show != nil && !show(ev)) {
 			continue
 		}
 		if len(out) == limit {

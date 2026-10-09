@@ -8154,6 +8154,7 @@ export interface components {
         /** @enum {string} */
         TxeClaimKind: TxeClaimKind;
         TxeReviewer: {
+            /** @description The reviewer's machine. Required to acquire a claim of any kind (review, execution, reconcile) and must equal the job's machine_id; otherwise the claim is refused with 409 not_permitted before anything is written, and a live claim held by another machine cannot be used. */
             machine_id?: string;
             dag_run_id?: string;
             agent_client_version?: string;

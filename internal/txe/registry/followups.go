@@ -462,7 +462,8 @@ func (tx *JobTx) EndMovedOnRetries() ([]Affected, error) {
 		p.State = ProposalSuperseded
 		p.Revision++
 		p.Reasoning = err.Error()
-		p.Updated = Stamp{At: tx.now, By: tx.actor}
+		// The registry ends it, whoever's request found it stale.
+		p.Updated = Stamp{At: tx.now, By: registryActor}
 		tx.closeLater(p)
 		if err := tx.archiveProposal(p); err != nil {
 			return nil, err
@@ -473,10 +474,13 @@ func (tx *JobTx) EndMovedOnRetries() ([]Affected, error) {
 	return affected, nil
 }
 
+// registryActor attributes changes the registry makes on its own.
+var registryActor = Actor{Kind: ActorSystem, ID: "registry"}
+
 // EndMovedOnRetries runs JobTx.EndMovedOnRetries for jobID as the registry.
 func (s *Store) EndMovedOnRetries(ctx context.Context, jobID string) ([]Affected, error) {
 	var out []Affected
-	_, err := s.WithJobTx(ctx, jobID, Actor{Kind: ActorSystem, ID: "registry"}, func(tx *JobTx) error {
+	_, err := s.WithJobTx(ctx, jobID, registryActor, func(tx *JobTx) error {
 		var err error
 		out, err = tx.EndMovedOnRetries()
 		return err

@@ -632,3 +632,21 @@ func TestDecidedRetriesWhoseRunMovedOnAreEnded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, affected, "ending them again changes nothing")
 }
+
+// A person's retry request that finds another decided retry stale ends it as
+// the registry, not as that person.
+func TestRetriesEndedOnARequestAreTheRegistrys(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	r.rc.attempts["run-2"] = failedAttempt("b1", r.job.DAGSpecSHA256)
+	p1, _, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+	_, _, err = r.propose(r.params("run-2", "b1"), "key-2")
+	require.NoError(t, err)
+	archived, err := r.f.store.ListArchivedProposals(r.f.ctx, r.job.JobID, 0)
+	require.NoError(t, err)
+	require.Len(t, archived, 1)
+	assert.Equal(t, p1.ProposalID, archived[0].ProposalID)
+	assert.Equal(t, registryActor, archived[0].Updated.By)
+}
