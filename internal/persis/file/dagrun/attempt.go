@@ -26,6 +26,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/artifact"
+	"github.com/gofrs/flock"
 )
 
 // Error definitions for common issues
@@ -187,7 +188,7 @@ func (att *Attempt) Open(ctx context.Context) error {
 	logger.Debug(ctx, "Initializing status file",
 		tag.File(att.file))
 
-	writer := NewWriter(att.file)
+	writer := NewWriter(att.file, withFileLock(statusLockPath(att.file)))
 
 	if err := writer.Open(); err != nil {
 		return fmt.Errorf("failed to open writer: %w", err)
@@ -346,7 +347,22 @@ func (att *Attempt) compactLocked(ctx context.Context) (retErr error) {
 		}()
 	}
 
+	// Hold the status file's lock from the read to the rename, the lock every
+	// append also holds, so no append from another handle or process can land
+	// in between and be dropped by the rename.
+	fileLock := flock.New(statusLockPath(att.file))
+	if err := fileLock.Lock(); err != nil {
+		return fmt.Errorf("%w: lock %s: %v", ErrCompactFailed, att.file, err)
+	}
+	defer func() {
+		_ = fileLock.Unlock()
+		_ = fileLock.Close()
+	}()
+
 	status, shouldCompact, err := att.statusForCompactionLocked(ctx)
+	if compactionReadHook != nil {
+		compactionReadHook(att.file)
+	}
 	if err == io.EOF {
 		return nil // Empty file, nothing to compact
 	}
@@ -409,6 +425,18 @@ func (att *Attempt) compactLocked(ctx context.Context) (retErr error) {
 	success = true
 	return nil
 }
+
+// statusLockSuffix names the lock file beside a status file. Appends and
+// compaction of the status file hold it exclusively.
+const statusLockSuffix = ".lock"
+
+func statusLockPath(statusFile string) string {
+	return statusFile + statusLockSuffix
+}
+
+// compactionReadHook, when set by a test, runs after compaction has read the
+// status file and before it replaces it.
+var compactionReadHook func(statusFile string)
 
 // statusForCompactionLocked reads the current file and reports whether a
 // replacement would change its compacted contents.
