@@ -3,6 +3,8 @@
 
 import type { components } from '@/api/v1/schema';
 
+import type { Execution } from './types';
+
 type ApiProposal = components['schemas']['TxeProposal'];
 type ApiAction = components['schemas']['TxeAction'];
 
@@ -10,8 +12,8 @@ export const ACTION_RETRY_RUN = 'dagu.retry_run';
 
 // RetryStatus is what a person may conclude about a requested retry. It is
 // "requested" until the reviewer is granted the action, and only
-// "succeeded" with the receipt of the new attempt; saving the decision alone
-// never means the retry ran.
+// "succeeded" with the receipt of the new execution; saving the decision
+// alone never means the retry ran.
 export type RetryStatus =
   | 'requested'
   | 'executing'
@@ -23,22 +25,30 @@ export type RetryStatus =
 
 export type RetryState = {
   runId: string;
-  // attemptId is the failed attempt this retry was bound to.
+  // attemptId and queuedAt name the failed execution this retry was bound
+  // to; a proposal recorded before queue markers were bound has none, which
+  // the hub stored as never queued.
   attemptId?: string;
+  queuedAt: string;
   proposalId: string;
   status: RetryStatus;
   receipt?: string;
   attempt?: number;
 };
 
-function paramsOf(p: ApiProposal): { runId?: string; attemptId?: string } {
+function paramsOf(p: ApiProposal): {
+  runId?: string;
+  attemptId?: string;
+  queuedAt: string;
+} {
   const params = p.action.params as
-    | { run_id?: unknown; attempt_id?: unknown }
+    | { run_id?: unknown; attempt_id?: unknown; queued_at?: unknown }
     | undefined;
   return {
     runId: typeof params?.run_id === 'string' ? params.run_id : undefined,
     attemptId:
       typeof params?.attempt_id === 'string' ? params.attempt_id : undefined,
+    queuedAt: typeof params?.queued_at === 'string' ? params.queued_at : '',
   };
 }
 
@@ -77,7 +87,7 @@ export function retryStates(
   );
   for (const p of newestFirst) {
     if (p.action.name !== ACTION_RETRY_RUN) continue;
-    const { runId, attemptId } = paramsOf(p);
+    const { runId, attemptId, queuedAt } = paramsOf(p);
     if (!runId || out.has(runId)) continue;
     const action = byProposal.get(p.proposal_id);
     let status: RetryStatus = 'requested';
@@ -92,6 +102,7 @@ export function retryStates(
     out.set(runId, {
       runId,
       attemptId,
+      queuedAt,
       proposalId: p.proposal_id,
       status,
       receipt: action?.receipt,
@@ -120,19 +131,24 @@ export function retryLabel(state: RetryState): string {
 }
 
 // canRequestRetry reports whether the dashboard offers a retry of a run: its
-// latest attempt must have finished without success (the server counts a
-// partial success as success) and no retry may be bound to that attempt yet.
-// A native retry adds an attempt, so once a retried attempt has failed too,
-// the run may be retried again; the registry allows one retry per attempt.
+// latest execution must have finished without success (the server counts a
+// partial success as success) and no retry may be bound to that execution
+// yet. A native retry starts a new execution, so once a retried execution has
+// failed too, the run may be retried again; the registry allows one retry per
+// execution.
 export function canRequestRetry(
   runStatus: string,
-  runAttemptId: string | undefined,
+  execution: Execution | undefined,
   state: RetryState | undefined
 ): boolean {
   const finishedUnsuccessfully =
     runStatus === 'failed' ||
     runStatus === 'aborted' ||
     runStatus === 'rejected';
-  if (!finishedUnsuccessfully || !runAttemptId) return false;
-  return !state || state.attemptId !== runAttemptId;
+  if (!finishedUnsuccessfully || !execution) return false;
+  return (
+    !state ||
+    state.attemptId !== execution.attemptId ||
+    state.queuedAt !== execution.queuedAt
+  );
 }

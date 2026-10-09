@@ -32,7 +32,11 @@ function proposal(
     state,
     action: {
       name: 'dagu.retry_run',
-      params: { run_id: runId, attempt_id: runId + '-a1' },
+      params: {
+        run_id: runId,
+        attempt_id: runId + '-a1',
+        queued_at: '2026-10-09T12:00:00Z',
+      },
     },
     created: stamp(at),
     updated: stamp(at),
@@ -87,6 +91,17 @@ describe('retryStates', () => {
     }
   });
 
+  it('carries the execution the retry was bound to', () => {
+    const states = retryStates(
+      [proposal('prp_1', 'run-1', '2026-10-09T10:00:00Z')],
+      []
+    );
+    expect(states.get('run-1')).toMatchObject({
+      attemptId: 'run-1-a1',
+      queuedAt: '2026-10-09T12:00:00Z',
+    });
+  });
+
   it('uses the newest retry of a run', () => {
     const states = retryStates(
       [
@@ -103,35 +118,44 @@ describe('retryStates', () => {
 });
 
 describe('canRequestRetry', () => {
-  const bound = (
-    status: RetryState['status'],
-    attemptId = 'a1'
-  ): RetryState => ({
+  const q1 = '2026-10-09T12:00:00Z';
+  const q2 = '2026-10-09T12:00:05Z';
+  const exec = (attemptId: string, queuedAt = q1) => ({ attemptId, queuedAt });
+  const bound = (status: RetryState['status']): RetryState => ({
     runId: 'r',
     proposalId: 'p',
-    attemptId,
+    attemptId: 'a1',
+    queuedAt: q1,
     status,
   });
 
-  it('offers a retry of a failed latest attempt with none bound to it', () => {
-    expect(canRequestRetry('failed', 'a1', undefined)).toBe(true);
-    expect(canRequestRetry('succeeded', 'a1', undefined)).toBe(false);
-    expect(canRequestRetry('partially_succeeded', 'a1', undefined)).toBe(false);
-    expect(canRequestRetry('running', 'a1', undefined)).toBe(false);
-    // Without Dagu's attempt identity there is nothing to bind a retry to.
+  it('offers a retry of a failed latest execution with none bound to it', () => {
+    expect(canRequestRetry('failed', exec('a1'), undefined)).toBe(true);
+    expect(canRequestRetry('succeeded', exec('a1'), undefined)).toBe(false);
+    expect(canRequestRetry('partially_succeeded', exec('a1'), undefined)).toBe(
+      false
+    );
+    expect(canRequestRetry('running', exec('a1'), undefined)).toBe(false);
+    // Without Dagu's execution identity there is nothing to bind a retry to.
     expect(canRequestRetry('failed', undefined, undefined)).toBe(false);
   });
 
-  it('allows one retry per attempt', () => {
+  it('allows one retry per execution', () => {
     for (const status of [
       'requested',
       'executing',
       'uncertain',
       'failed',
     ] as const) {
-      expect(canRequestRetry('failed', 'a1', bound(status))).toBe(false);
+      expect(canRequestRetry('failed', exec('a1'), bound(status))).toBe(false);
     }
-    // The retried attempt a2 failed too: the run may be retried again.
-    expect(canRequestRetry('failed', 'a2', bound('succeeded'))).toBe(true);
+    // The retried execution failed too: the run may be retried again,
+    // whether the retry added an attempt or re-queued the same one.
+    expect(canRequestRetry('failed', exec('a2'), bound('succeeded'))).toBe(
+      true
+    );
+    expect(canRequestRetry('failed', exec('a1', q2), bound('succeeded'))).toBe(
+      true
+    );
   });
 });

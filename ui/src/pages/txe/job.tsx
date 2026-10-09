@@ -298,15 +298,23 @@ export default function TxeJobPage(): React.ReactElement {
                 dagName={run.dagName}
                 runId={run.dagRunId}
                 runStatus={run.status}
-                runAttemptId={run.attemptId}
+                execution={run.execution}
                 state={retries?.get(run.dagRunId)}
                 canDecide={canDecide}
                 onRequest={async (key) => {
+                  // The button is offered only for a run with a known
+                  // execution; the request names exactly that one.
+                  if (!run.execution) {
+                    return {
+                      ok: false,
+                      status: 0,
+                      message: 'this run has no execution to retry',
+                    };
+                  }
                   const result = await api.requestRetry(
                     job.jobId,
                     run.dagRunId,
-                    // The button is offered only for a run with a known attempt.
-                    run.attemptId ?? '',
+                    run.execution,
                     job.version,
                     key
                   );

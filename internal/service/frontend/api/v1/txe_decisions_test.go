@@ -354,7 +354,7 @@ func registerTxeJobHTTP(t *testing.T, server test.Server) string {
 
 // seedFailedTxeRun writes a failed attempt of the job's saved DAG, as a run
 // that already happened on the worker.
-func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string) {
+func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string, opts ...ir.StatusOption) {
 	t.Helper()
 	ctx := t.Context()
 	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
@@ -365,11 +365,30 @@ func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string) {
 	started := time.Now().Add(2 * time.Second)
 	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, runID, persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
-	status := ir.NewStatusBuilder(dag).Create(runID, ir.Failed, 0, started,
-		ir.WithAttemptID(attempt.ID()), ir.WithFinishedAt(started.Add(time.Second)), ir.WithError("probe failed"))
+	opts = append([]ir.StatusOption{ir.WithAttemptID(attempt.ID()), ir.WithFinishedAt(started.Add(time.Second)), ir.WithError("probe failed")}, opts...)
+	status := ir.NewStatusBuilder(dag).Create(runID, ir.Failed, 0, started, opts...)
 	require.NoError(t, attempt.Open(ctx))
 	require.NoError(t, attempt.Write(ctx, status))
 	require.NoError(t, attempt.Close(ctx))
+}
+
+// txeExecution reads the run's latest execution as the dashboard shows it.
+func txeExecution(t *testing.T, c *test.APIClient, jobID, runID string) (attemptID, queuedAt string) {
+	t.Helper()
+	var details api.GetDAGRunDetails200JSONResponse
+	c.Get(fmt.Sprintf("/api/v1/dag-runs/%s/%s", jobID, runID)).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &details)
+	require.NotNil(t, details.DagRunDetails.AttemptId)
+	require.NotNil(t, details.DagRunDetails.ExecutionRef)
+	if q := details.DagRunDetails.QueuedAt; q != nil {
+		queuedAt = *q
+	}
+	require.Equal(t, registry.ExecutionRef(*details.DagRunDetails.AttemptId, queuedAt), *details.DagRunDetails.ExecutionRef)
+	return *details.DagRunDetails.AttemptId, queuedAt
+}
+
+// retryBody is a retry request naming the execution the person reviewed.
+func retryBody(key string, version int, attemptID, queuedAt string) map[string]any {
+	return map[string]any{"idempotency_key": key, "expected_job_version": version, "attempt_id": attemptID, "queued_at": queuedAt}
 }
 
 // Retrying one exact failed run records a decided dagu.retry_run proposal
@@ -380,11 +399,28 @@ func TestTxeRunRetryRequest(t *testing.T) {
 	c := server.Client()
 	jobID := registerTxeJobHTTP(t, server)
 	seedFailedTxeRun(t, server, jobID, "run-failed-1")
+	seen, queued := txeExecution(t, c, jobID, "run-failed-1")
 
 	var job api.TxeJob
 	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
 	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-failed-1")
-	body := map[string]any{"idempotency_key": "dashboard-retry-1", "expected_job_version": job.Version}
+	body := retryBody("dashboard-retry-1", job.Version, seen, queued)
+
+	// A request that does not name the reviewed execution completely is
+	// refused before anything is looked up or recorded.
+	for name, b := range map[string]map[string]any{
+		"no attempt":    {"idempotency_key": "dashboard-retry-1", "expected_job_version": job.Version, "queued_at": queued},
+		"empty attempt": retryBody("dashboard-retry-1", job.Version, "", queued),
+		"no queued_at":  {"idempotency_key": "dashboard-retry-1", "expected_job_version": job.Version, "attempt_id": seen},
+	} {
+		var apiErr api.Error
+		c.Post(path, b).ExpectStatus(http.StatusBadRequest).Send(t).Unmarshal(t, &apiErr)
+		require.NotNil(t, apiErr.Details, name)
+		require.Equal(t, "missing_execution", (*apiErr.Details)["code"], name)
+	}
+	var none api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &none)
+	require.Empty(t, none.Decisions)
 
 	var first api.TxeDecisionResponse
 	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
@@ -394,6 +430,7 @@ func TestTxeRunRetryRequest(t *testing.T) {
 	require.Equal(t, api.TxeProposalState("decided"), first.Proposal.State)
 	require.Equal(t, decision.ActionRetryRun, first.Proposal.Action.Name)
 	require.Contains(t, string(first.Proposal.Action.Params), `"run_id":"run-failed-1"`)
+	require.Contains(t, string(first.Proposal.Action.Params), `"attempt_id":"`+seen+`"`)
 
 	var again api.TxeDecisionResponse
 	c.Post(path, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &again)
@@ -415,12 +452,20 @@ func TestTxeRunRetryRequest(t *testing.T) {
 	require.True(t, late.Replayed)
 	require.Equal(t, first.Decision.DecisionId, late.Decision.DecisionId)
 
-	stale := map[string]any{"idempotency_key": "dashboard-retry-2", "expected_job_version": job.Version,
-		"run_spec_sha256": fmt.Sprintf("sha256:%064x", 9)}
+	// The key binds the whole request: reusing it for another execution is
+	// refused, not answered with the stored decision.
+	var mismatch api.Error
+	c.Post(path, retryBody("dashboard-retry-1", job.Version, seen, "2026-10-09T12:00:00Z")).
+		ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &mismatch)
+	require.NotNil(t, mismatch.Details)
+	require.Equal(t, string(decision.CodeIdempotencyMismatch), (*mismatch.Details)["code"])
+
+	stale := retryBody("dashboard-retry-2", job.Version, seen, queued)
+	stale["run_spec_sha256"] = fmt.Sprintf("sha256:%064x", 9)
 	c.Post(path, stale).ExpectStatus(http.StatusConflict).Send(t)
 
 	c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "no-such-run"),
-		map[string]any{"idempotency_key": "dashboard-retry-3", "expected_job_version": job.Version}).
+		retryBody("dashboard-retry-3", job.Version, seen, queued)).
 		ExpectStatus(http.StatusNotFound).Send(t)
 }
 
@@ -449,20 +494,17 @@ func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
 	c := server.Client()
 	jobID := registerTxeJobHTTP(t, server)
 	seedFailedTxeRun(t, server, jobID, "run-moved-1")
-
-	var details api.GetDAGRunDetails200JSONResponse
-	c.Get(fmt.Sprintf("/api/v1/dag-runs/%s/%s", jobID, "run-moved-1")).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &details)
-	require.NotNil(t, details.DagRunDetails.AttemptId)
-	seen := *details.DagRunDetails.AttemptId
+	seen, queued := txeExecution(t, c, jobID, "run-moved-1")
 
 	next := seedRetriedTxeAttempt(t, server, jobID, "run-moved-1", ir.Failed)
 	require.NotEqual(t, seen, next)
+	_, nextQueued := txeExecution(t, c, jobID, "run-moved-1")
 
 	var job api.TxeJob
 	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
 	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-moved-1")
 	var apiErr api.Error
-	c.Post(path, map[string]any{"idempotency_key": "dashboard-moved-1", "expected_job_version": job.Version, "attempt_id": seen}).
+	c.Post(path, retryBody("dashboard-moved-1", job.Version, seen, queued)).
 		ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &apiErr)
 	require.NotNil(t, apiErr.Details)
 	require.Equal(t, string(decision.CodeRunStale), (*apiErr.Details)["code"])
@@ -471,8 +513,52 @@ func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
 	require.Empty(t, decisions.Decisions)
 
 	var res api.TxeDecisionResponse
-	c.Post(path, map[string]any{"idempotency_key": "dashboard-moved-2", "expected_job_version": job.Version, "attempt_id": next}).
+	c.Post(path, retryBody("dashboard-moved-2", job.Version, next, nextQueued)).
 		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
 	require.NotNil(t, res.Proposal)
 	require.Contains(t, string(res.Proposal.Action.Params), `"attempt_id":"`+next+`"`)
+}
+
+// Dagu's queued retry keeps the attempt and records a later queue marker in
+// place. A request naming the earlier marker, or none, reviewed another
+// execution and is refused; one naming the re-queued execution binds it.
+func TestTxeRunRetryRefusesRequeuedExecution(t *testing.T) {
+	server := test.SetupServer(t)
+	c := server.Client()
+	jobID := registerTxeJobHTTP(t, server)
+	const q1, q2 = "2026-10-09T12:00:00.000000001Z", "2026-10-09T12:00:05.000000001Z"
+	seedFailedTxeRun(t, server, jobID, "run-queued-1", ir.WithQueuedAt(q1))
+	seen, queued := txeExecution(t, c, jobID, "run-queued-1")
+	require.Equal(t, q1, queued)
+
+	ctx := t.Context()
+	attempt, err := server.DAGRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, "run-queued-1"))
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(ctx)
+	require.NoError(t, err)
+	status.QueuedAt = q2
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, *status))
+	require.NoError(t, attempt.Close(ctx))
+	again, requeued := txeExecution(t, c, jobID, "run-queued-1")
+	require.Equal(t, seen, again)
+	require.Equal(t, q2, requeued)
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-queued-1")
+	for key, q := range map[string]string{"dashboard-queued-1": q1, "dashboard-queued-2": ""} {
+		var apiErr api.Error
+		c.Post(path, retryBody(key, job.Version, seen, q)).ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &apiErr)
+		require.NotNil(t, apiErr.Details, key)
+		require.Equal(t, string(decision.CodeRunStale), (*apiErr.Details)["code"], key)
+	}
+	var decisions api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &decisions)
+	require.Empty(t, decisions.Decisions)
+
+	var res api.TxeDecisionResponse
+	c.Post(path, retryBody("dashboard-queued-3", job.Version, seen, q2)).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
+	require.NotNil(t, res.Proposal)
+	require.Contains(t, string(res.Proposal.Action.Params), `"queued_at":"`+q2+`"`)
 }

@@ -48,13 +48,25 @@ export type TargetIdentity = {
   namespace?: string;
 };
 
+// Execution names one execution of a run: the attempt and its queue marker,
+// byte for byte as the hub stores it ('' when the run was never queued).
+// ref is the hub's portable reference to it, for display; the UI compares the
+// pair and never computes a reference itself.
+export type Execution = {
+  attemptId: string;
+  queuedAt: string;
+  ref?: string;
+};
+
 export type RunRef = {
   dagName: string;
   dagRunId: string;
   status: string;
-  // attemptId is Dagu's identity of the run's latest attempt; a native retry
-  // keeps the run ID and adds an attempt.
-  attemptId?: string;
+  // execution is Dagu's identity of the run's latest execution, absent when
+  // the hub reports no attempt. A native retry keeps the run ID and either
+  // adds an attempt or, through the queue, keeps the attempt and records a
+  // later queue marker.
+  execution?: Execution;
   startedAt?: string;
   finishedAt?: string;
   error?: string;

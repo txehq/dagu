@@ -114,11 +114,30 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
 		return nil, err
 	}
+	// The person decides on the execution they reviewed, so the request must
+	// name it completely: a request without it would bind whatever execution
+	// is latest, one they may never have seen. An empty queued_at is a value
+	// (never queued), distinct from an absent one.
+	if body.AttemptId == nil || *body.AttemptId == "" || body.QueuedAt == nil {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
+			Message: "attempt_id and queued_at of the execution you reviewed are required",
+			Details: map[string]any{"code": "missing_execution"}}
+	}
+	retry := decision.RetryRequest{
+		RunID:              req.RunId,
+		AttemptID:          *body.AttemptId,
+		QueuedAt:           *body.QueuedAt,
+		ExpectedJobVersion: body.ExpectedJobVersion,
+		IdempotencyKey:     body.IdempotencyKey,
+	}
+	if err := retry.ValidateShape(); err != nil {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
+	}
 	svc := a.txeDecisionService(store)
 	// An identical replay returns the stored decision before the run's
 	// current state is checked: after the retry ran, the run is no longer
 	// retryable, but a client recovering a lost response must still get it.
-	if res, found, err := svc.ReplayRetry(ctx, req.JobId, req.RunId, body.IdempotencyKey, actor); found || err != nil {
+	if res, found, err := svc.ReplayRetry(ctx, req.JobId, retry, actor); found || err != nil {
 		if err != nil {
 			return nil, txeError(err)
 		}
@@ -128,12 +147,14 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil {
 		return nil, err
 	}
-	// The person decided on the attempt they saw. If the run has moved on to
-	// another attempt since, retrying the latest would retry one they never
-	// reviewed, so refuse and let them look again.
-	if body.AttemptId != nil && *body.AttemptId != run.attemptID {
+	// If the run has moved on to another execution since the person reviewed
+	// it, retrying the latest would retry one they never reviewed, so refuse
+	// and let them look again. The registry checks the binding again inside
+	// the commit, against the run as it is then.
+	if retry.AttemptID != run.attemptID || retry.QueuedAt != run.queuedAt {
 		return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
-			Message: fmt.Sprintf("run %s is now at attempt %s, not the attempt %s you reviewed; review it again", req.RunId, run.attemptID, *body.AttemptId),
+			Message: fmt.Sprintf("run %s is now at execution %s, not the execution %s you reviewed; review it again",
+				req.RunId, registry.ExecutionRef(run.attemptID, run.queuedAt), registry.ExecutionRef(retry.AttemptID, retry.QueuedAt)),
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
 	// A client that saw a different snapshot of the run is acting on stale
@@ -143,14 +164,8 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 			Message: "the run's DAG snapshot differs from the one in the request",
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
-	res, err := svc.RequestRetry(ctx, req.JobId, decision.RetryRequest{
-		RunID:              req.RunId,
-		AttemptID:          run.attemptID,
-		ExpectedJobVersion: body.ExpectedJobVersion,
-		RunSpecSHA256:      run.specSHA256,
-		RunStartedAt:       run.startedAt,
-		IdempotencyKey:     body.IdempotencyKey,
-	}, actor)
+	retry.RunSpecSHA256, retry.RunStartedAt = run.specSHA256, run.startedAt
+	res, err := svc.RequestRetry(ctx, req.JobId, retry, actor)
 	if err != nil {
 		if errors.Is(err, decision.ErrInvalid) {
 			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
@@ -182,8 +197,10 @@ func txeRetryResponse(res *decision.Result) (api.RequestTxeRunRetryResponseObjec
 }
 
 type txeRun struct {
-	// attemptID is the run's latest attempt, the one a retry would follow.
+	// attemptID and queuedAt name the run's latest execution, the one a
+	// retry would follow.
 	attemptID  string
+	queuedAt   string
 	specSHA256 string
 	startedAt  time.Time
 }
@@ -227,7 +244,7 @@ func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, err
 			Message: fmt.Sprintf("run %s has no attempt identity to bind a retry to", runID),
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
-	return txeRun{attemptID: status.AttemptID, specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
+	return txeRun{attemptID: status.AttemptID, queuedAt: status.QueuedAt, specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
 }
 
 // ListTxeProposalDecisions lists every decision recorded for a proposal,

@@ -656,9 +656,10 @@ func (f *fixture) retryRequest(runID, key string) RetryRequest {
 	if _, ok := f.runs.attempts[runID]; !ok {
 		f.runs.add(runID, j.DAGSpecSHA256)
 	}
+	latest := f.runs.latest(runID)
 	return RetryRequest{
-		RunID: runID, AttemptID: f.runs.latest(runID).AttemptID, ExpectedJobVersion: j.Version, RunSpecSHA256: j.DAGSpecSHA256,
-		RunStartedAt: f.now.Add(time.Minute), IdempotencyKey: key,
+		RunID: runID, AttemptID: latest.AttemptID, QueuedAt: latest.QueuedAt, ExpectedJobVersion: j.Version,
+		RunSpecSHA256: j.DAGSpecSHA256, RunStartedAt: f.now.Add(time.Minute), IdempotencyKey: key,
 	}
 }
 
@@ -667,7 +668,8 @@ func (f *fixture) retryRequest(runID, key string) RetryRequest {
 // receipt.
 func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	f := newFixture(t)
-	res, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0042", "key-retry-run-1"), f.human)
+	req := f.retryRequest("run-0042", "key-retry-run-1")
+	res, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,13 +703,14 @@ func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first grant: %v", err)
 	}
-	// The executor's native retry adds an attempt to the same run; the
-	// receipt names that observed attempt.
+	// The executor's native retry adds an execution to the same run; the
+	// receipt names that observed execution.
 	j := f.job()
-	f.runs.set("run-0042", registry.RunAttempt{AttemptID: "run-0042-a2", SpecSHA256: j.DAGSpecSHA256, Status: "running"})
+	next := registry.RunAttempt{AttemptID: "run-0042-a2", SpecSHA256: j.DAGSpecSHA256, Status: "running"}
+	f.runs.set("run-0042", next)
 	if _, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
 		_, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: claim.ClaimID,
-			Fence: claim.Fence, State: registry.ActionSucceeded, Receipt: "run-0042-a2"})
+			Fence: claim.Fence, State: registry.ActionSucceeded, Receipt: next.Ref()})
 		if err != nil {
 			return err
 		}
@@ -718,8 +721,9 @@ func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	if _, _, err := grant(); registry.ErrorCode(err) == "" {
 		t.Fatalf("second grant err = %v, want a refusal", err)
 	}
-	// After the retry ran, an identical request still returns its decision.
-	again, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0042", "key-retry-run-1"), f.human)
+	// After the retry ran, an identical request still returns its decision,
+	// though the execution it names is no longer the latest.
+	again, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human)
 	if err != nil {
 		t.Fatalf("replay after settlement: %v", err)
 	}
@@ -789,7 +793,7 @@ func TestDecideRetryOnRetryRunProposal(t *testing.T) {
 	f.runs.add("run-0044", j.DAGSpecSHA256)
 	attempt := f.runs.latest("run-0044").AttemptID
 	params, _ := json.Marshal(registry.RetryRunParams{RunID: "run-0044", AttemptID: attempt, RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest})
-	id, err := registry.RetryProposalID("run-0044", attempt, j.Version)
+	id, err := registry.RetryProposalID("run-0044", registry.ExecutionRef(attempt, ""), j.Version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,9 +812,10 @@ func TestDecideRetryOnRetryRunProposal(t *testing.T) {
 }
 
 // grantAndSettle performs a recorded retry as the executor does: one grant
-// under an execution claim, a native retry that adds attempt next to the
-// run, and a settlement whose receipt is that observed attempt.
-func (f *fixture) grantAndSettle(res *Result, runID, next string, nextFailed bool) error {
+// under an execution claim, a native retry that leaves execution next as the
+// run's latest, and a settlement whose receipt is that observed execution.
+// next finishes unsuccessfully, so the run can be retried again.
+func (f *fixture) grantAndSettle(res *Result, runID string, next registry.RunAttempt) error {
 	f.t.Helper()
 	actionID, err := registry.ApprovedActionID(res.Proposal.ProposalID, res.Decision.DecisionID)
 	if err != nil {
@@ -831,11 +836,11 @@ func (f *fixture) grantAndSettle(res *Result, runID, next string, nextFailed boo
 	}); err != nil {
 		return err
 	}
-	j := f.job()
-	f.runs.set(runID, registry.RunAttempt{AttemptID: next, SpecSHA256: j.DAGSpecSHA256, Status: "failed", Finished: true, Succeeded: !nextFailed})
+	next.SpecSHA256, next.Status, next.Finished = f.job().DAGSpecSHA256, "failed", true
+	f.runs.set(runID, next)
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
 		if _, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID,
-			Fence: c.Fence, State: registry.ActionSucceeded, Receipt: next}); err != nil {
+			Fence: c.Fence, State: registry.ActionSucceeded, Receipt: next.Ref()}); err != nil {
 			return err
 		}
 		return tx.ReleaseClaim(c.ClaimID, c.Fence)
@@ -848,11 +853,12 @@ func (f *fixture) grantAndSettle(res *Result, runID, next string, nextFailed boo
 // more, while replaying the first request still returns only its decision.
 func TestRequestRetryLaterAttempt(t *testing.T) {
 	f := newFixture(t)
-	first, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-1"), f.human)
+	firstReq := f.retryRequest("run-0050", "key-later-1")
+	first, err := f.svc.RequestRetry(f.ctx, f.jobID, firstReq, f.human)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.grantAndSettle(first, "run-0050", "run-0050-a2", true); err != nil {
+	if err := f.grantAndSettle(first, "run-0050", registry.RunAttempt{AttemptID: "run-0050-a2"}); err != nil {
 		t.Fatalf("first retry: %v", err)
 	}
 	second, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-2"), f.human)
@@ -862,10 +868,10 @@ func TestRequestRetryLaterAttempt(t *testing.T) {
 	if second.Proposal.ProposalID == first.Proposal.ProposalID {
 		t.Fatal("the later attempt's retry reused the first attempt's proposal")
 	}
-	if err := f.grantAndSettle(second, "run-0050", "run-0050-a3", true); err != nil {
+	if err := f.grantAndSettle(second, "run-0050", registry.RunAttempt{AttemptID: "run-0050-a3"}); err != nil {
 		t.Fatalf("second retry: %v", err)
 	}
-	replay, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-1"), f.human)
+	replay, err := f.svc.RequestRetry(f.ctx, f.jobID, firstReq, f.human)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -894,5 +900,120 @@ func TestRequestRetryRefusesForgedAndStaleAttempts(t *testing.T) {
 	}
 	if n := len(f.decisions()); n != 0 {
 		t.Fatalf("decisions = %d, want 0", n)
+	}
+}
+
+// Dagu's queued retry keeps the attempt ID and records a later queue marker,
+// so the execution, not the attempt, is what a retry is bound to: the re-run
+// may be retried once more, a request still naming the earlier marker is
+// refused, and the first request replays with its own tuple.
+func TestRequestRetryQueuedExecution(t *testing.T) {
+	f := newFixture(t)
+	j := f.job()
+	const q1, q2 = "2026-10-09T12:00:00.000000001Z", "2026-10-09T12:00:05.000000001Z"
+	f.runs.set("run-0070", registry.RunAttempt{AttemptID: "run-0070-a1", QueuedAt: q1, SpecSHA256: j.DAGSpecSHA256, Status: "failed", Finished: true})
+	firstReq := f.retryRequest("run-0070", "key-queued-1")
+	first, err := f.svc.RequestRetry(f.ctx, f.jobID, firstReq, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.grantAndSettle(first, "run-0070", registry.RunAttempt{AttemptID: "run-0070-a1", QueuedAt: q2}); err != nil {
+		t.Fatalf("queued retry: %v", err)
+	}
+	stale := firstReq
+	stale.IdempotencyKey = "key-queued-stale"
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, stale, f.human); registry.ErrorCode(err) != registry.CodeStaleBinding {
+		t.Fatalf("request naming the earlier queue marker err = %v, want stale_binding", err)
+	}
+	second, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0070", "key-queued-2"), f.human)
+	if err != nil {
+		t.Fatalf("retry of the re-queued execution: %v", err)
+	}
+	if second.Proposal.ProposalID == first.Proposal.ProposalID {
+		t.Fatal("the re-queued execution's retry reused the first execution's proposal")
+	}
+	replay, err := f.svc.RequestRetry(f.ctx, f.jobID, firstReq, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.AlreadyRecorded || replay.Decision.DecisionID != first.Decision.DecisionID {
+		t.Fatalf("replay of the first request = %+v", replay.Decision)
+	}
+	if n := len(f.decisions()); n != 2 {
+		t.Fatalf("decisions = %d, want 2", n)
+	}
+}
+
+// An idempotency key binds the whole request: reusing it with another run,
+// attempt, queue marker or job version is refused, never aliased to the
+// stored decision, and records nothing.
+func TestReplayRetryRefusesChangedIntent(t *testing.T) {
+	f := newFixture(t)
+	req := f.retryRequest("run-0080", "key-intent-1")
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*RetryRequest){
+		"run":       func(r *RetryRequest) { r.RunID = "run-0081" },
+		"attempt":   func(r *RetryRequest) { r.AttemptID = "run-0080-a9" },
+		"queued_at": func(r *RetryRequest) { r.QueuedAt = "2026-10-09T12:00:00Z" },
+		"version":   func(r *RetryRequest) { r.ExpectedJobVersion++ },
+	} {
+		changed := req
+		change(&changed)
+		if _, found, err := f.svc.ReplayRetry(f.ctx, f.jobID, changed, f.human); !found || registry.ErrorCode(err) != CodeIdempotencyMismatch {
+			t.Errorf("%s: replay found=%v err=%v, want idempotency_mismatch", name, found, err)
+		}
+		if _, err := f.svc.RequestRetry(f.ctx, f.jobID, changed, f.human); registry.ErrorCode(err) != CodeIdempotencyMismatch {
+			t.Errorf("%s: request err = %v, want idempotency_mismatch", name, err)
+		}
+	}
+	if n := len(f.decisions()); n != 1 {
+		t.Fatalf("decisions = %d, want 1", n)
+	}
+}
+
+// A request that does not name an execution is refused before any lookup.
+func TestRetryRequestShape(t *testing.T) {
+	f := newFixture(t)
+	req := f.retryRequest("run-0090", "key-shape-1")
+	req.AttemptID = ""
+	if _, _, err := f.svc.ReplayRetry(f.ctx, f.jobID, req, f.human); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("replay without attempt err = %v, want ErrInvalid", err)
+	}
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("request without attempt err = %v, want ErrInvalid", err)
+	}
+	short := f.retryRequest("run-0090", "short")
+	if _, _, err := f.svc.ReplayRetry(f.ctx, f.jobID, short, f.human); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("replay with short key err = %v, want ErrInvalid", err)
+	}
+}
+
+// A stored retry that does not record its queue marker, as one recorded
+// before markers were bound, cannot be shown to be the execution a request
+// names: replaying its key with an empty marker is refused, not aliased.
+func TestReplayRetryRefusesUnmarkedExecution(t *testing.T) {
+	f := newFixture(t)
+	j := f.job()
+	f.runs.add("run-0095", j.DAGSpecSHA256)
+	attempt := f.runs.latest("run-0095").AttemptID
+	params := json.RawMessage(fmt.Sprintf(`{"run_id":"run-0095","attempt_id":%q,"run_spec_sha256":%q,"package_digest":%q}`,
+		attempt, j.DAGSpecSHA256, j.PackageDigest))
+	id, err := registry.RetryProposalID("run-0095", registry.ExecutionRef(attempt, ""), j.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := f.fileProposalWithID(id, registry.Proposal{
+		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: params},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-unmarked-1"}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); err != nil {
+		t.Fatal(err)
+	}
+	replay := RetryRequest{RunID: "run-0095", AttemptID: attempt, QueuedAt: "", ExpectedJobVersion: j.Version, IdempotencyKey: "key-unmarked-1"}
+	if _, found, err := f.svc.ReplayRetry(f.ctx, f.jobID, replay, f.human); !found || registry.ErrorCode(err) != CodeIdempotencyMismatch {
+		t.Fatalf("replay found=%v err=%v, want idempotency_mismatch", found, err)
 	}
 }

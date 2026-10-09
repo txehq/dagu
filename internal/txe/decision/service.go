@@ -305,10 +305,13 @@ func (s *Service) resumeNative(ctx context.Context, job *registry.Job, pending *
 // sees it from the dashboard.
 type RetryRequest struct {
 	RunID string
-	// AttemptID is the run's latest attempt as the hub read it: the failed
-	// attempt the person asks to retry. A native retry keeps the run ID and
-	// adds an attempt, so the attempt is what makes a retry request unique.
+	// AttemptID and QueuedAt name the execution the person reviewed and asks
+	// to retry. A native retry keeps the run ID and either adds an attempt or,
+	// through the queue, keeps the attempt and records a later queue marker,
+	// so the pair is what makes a retry request unique. QueuedAt is the stored
+	// marker byte for byte, empty when the run was never queued.
 	AttemptID          string
+	QueuedAt           string
 	ExpectedJobVersion int
 	// RunSpecSHA256 is the digest of the run's DAG snapshot.
 	RunSpecSHA256 string
@@ -327,12 +330,21 @@ const CodeRunStale registry.Code = "run_stale"
 // dagu.retry_run proposal decided with retry, in one commit. The reviewer
 // executes it under an execution claim through the registry's action
 // journal; nothing runs here.
-func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryRequest, actor registry.Actor) (*Result, error) {
-	if req.RunID == "" || req.AttemptID == "" {
-		return nil, fmt.Errorf("%w: run id and attempt id are required", ErrInvalid)
+// ValidateShape checks the request names an execution and carries a usable
+// idempotency key. It reads no state, so it runs before a replay lookup.
+func (r RetryRequest) ValidateShape() error {
+	if r.RunID == "" || r.AttemptID == "" {
+		return fmt.Errorf("%w: run id and attempt id are required", ErrInvalid)
 	}
-	if !idempotencyKeyPattern.MatchString(req.IdempotencyKey) {
-		return nil, fmt.Errorf("%w: idempotencyKey must be 8-128 characters of [A-Za-z0-9._:-]", ErrInvalid)
+	if !idempotencyKeyPattern.MatchString(r.IdempotencyKey) {
+		return fmt.Errorf("%w: idempotencyKey must be 8-128 characters of [A-Za-z0-9._:-]", ErrInvalid)
+	}
+	return nil
+}
+
+func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryRequest, actor registry.Actor) (*Result, error) {
+	if err := req.ValidateShape(); err != nil {
+		return nil, err
 	}
 	if s.AuthorizeDecision == nil {
 		return nil, errNoAuthorizer
@@ -367,7 +379,8 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 				Message: fmt.Sprintf("run %s is of an earlier version of this job; retrying it would run version %d's code, so start a new run instead", req.RunID, j.Version)}
 		}
 		p, d, err := tx.ProposeRetry(registry.RetryRunParams{
-			RunID: req.RunID, AttemptID: req.AttemptID, RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest,
+			RunID: req.RunID, AttemptID: req.AttemptID, QueuedAt: req.QueuedAt,
+			RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest,
 		}, req.IdempotencyKey)
 		if err != nil {
 			return err
@@ -379,7 +392,7 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 		return nil, err
 	}
 	if replayID != "" {
-		res, _, err := s.ReplayRetry(ctx, jobID, req.RunID, req.IdempotencyKey, actor)
+		res, _, err := s.ReplayRetry(ctx, jobID, req, actor)
 		return res, err
 	}
 	result := &Result{Job: job, Proposal: proposal, Decision: stored}
@@ -388,11 +401,16 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 }
 
 // ReplayRetry returns the decision an earlier retry request stored under
-// idempotencyKey, checked against the run it named. found is false when no
-// decision is stored under the key. A replay reads durable history, so it
-// still resolves after the retry ran and its proposal was archived, and it
-// needs no new-request checks on the run.
-func (s *Service) ReplayRetry(ctx context.Context, jobID, runID, idempotencyKey string, actor registry.Actor) (*Result, bool, error) {
+// req.IdempotencyKey. found is false when no decision is stored under the
+// key. The stored request must be the same request: the same run, execution
+// and job version, or the key is refused as reused for a different intent. A
+// replay reads durable history, so it still resolves after the retry ran and
+// its proposal was archived, and it needs no new-request checks on the run:
+// the execution it names need not still be the latest.
+func (s *Service) ReplayRetry(ctx context.Context, jobID string, req RetryRequest, actor registry.Actor) (*Result, bool, error) {
+	if err := req.ValidateShape(); err != nil {
+		return nil, false, err
+	}
 	if s.AuthorizeDecision == nil {
 		return nil, false, errNoAuthorizer
 	}
@@ -402,7 +420,7 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID, runID, idempotencyKey 
 		if err := s.AuthorizeDecision(ctx, tx, VerdictRetry); err != nil {
 			return err
 		}
-		if id, ok := tx.DecisionByKey(idempotencyKey); ok {
+		if id, ok := tx.DecisionByKey(req.IdempotencyKey); ok {
 			replayID = id
 		}
 		return nil
@@ -418,19 +436,27 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID, runID, idempotencyKey 
 	if err != nil {
 		return nil, true, err
 	}
-	// The replay names the same run; its attempt may have moved on since, so
-	// the stored proposal's own parameters are the reference.
-	sameRun := false
+	// The run may have moved on since, so the stored proposal's own
+	// parameters, not the run's latest execution, are the reference. A
+	// stored retry that does not record its queue marker cannot be shown to
+	// be the execution the request names, so it matches no request; an
+	// absent marker is not read as an empty one.
+	same := false
 	if p != nil && d.Verdict == VerdictRetry && p.Action.Name == ActionRetryRun {
-		var params registry.RetryRunParams
+		var params struct {
+			RunID     string  `json:"run_id"`
+			AttemptID string  `json:"attempt_id"`
+			QueuedAt  *string `json:"queued_at"`
+		}
 		if err := json.Unmarshal(p.Action.Params, &params); err != nil {
 			return nil, true, fmt.Errorf("decision: retry proposal %s params: %w", p.ProposalID, err)
 		}
-		sameRun = params.RunID == runID
+		same = params.RunID == req.RunID && params.AttemptID == req.AttemptID &&
+			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion
 	}
-	if !sameRun {
+	if !same {
 		return nil, true, &registry.Error{Code: CodeIdempotencyMismatch,
-			Message: "idempotency key was used for a different decision", Current: d}
+			Message: "idempotency key was used for a different retry request", Current: d}
 	}
 	d.NativeResume = registry.CurrentNativeResume(job, d)
 	return &Result{Job: job, Proposal: p, Decision: d, AlreadyRecorded: true}, true, nil
