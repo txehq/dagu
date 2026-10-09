@@ -577,6 +577,8 @@ func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus)
 	status := *source
 	status.AttemptID, status.AttemptKey, status.Status = attempt.ID(), "", ir.NotStarted
 	status.QueuedAt, status.WorkerID, status.PID, status.PIDStartedAt, status.LeaseAt = "", "", 0, 0, 0
+	// Ownership, timing and the outcome belong to the retried execution.
+	status.ClaimKey, status.StartedAt, status.FinishedAt, status.Error = "", "", "", ""
 	status.TriggerType = ir.TriggerTypeRetry
 	if err := attempt.Open(ctx); err != nil {
 		return fmt.Errorf("claim retry attempt: %w", err)
