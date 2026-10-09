@@ -1458,8 +1458,9 @@ func deniedText(denied *GuardDeniedError) string {
 func CommandsUnboundMessage(job Job) string {
 	return commandsUnboundPrefix + "On machine " + job.MachineID + ": " + job.CommandsRefused +
 		". Reviews and questions go on; routine actions, approved actions and reconcile probes of this job do not run. " +
-		"If the job was changed on purpose, register it again from that machine with `dagu txe register`, which keeps the job and its history and records the new version there. " +
-		"If nobody changed it, the registry's record of the job was altered: look at who wrote to it before registering again."
+		"If an update of the job from that machine was interrupted, finish it there with `dagu txe resume <request id>`; the unfinished request is under the TXE home's receipts/pending. " +
+		"If the job was changed on purpose from elsewhere, update it from that machine with `dagu txe update <job id> -f <spec> --expected-version <n>`, which keeps the job and its history and records the new version there. " +
+		"If nobody changed it, the registry's record of the job was altered: find out who wrote to it before updating."
 }
 
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {

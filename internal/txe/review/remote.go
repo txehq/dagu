@@ -101,10 +101,14 @@ type executed struct {
 	// MaxAttempts is the policy's limit on attempts of an action. Brief and
 	// HumanDecisionConditions are what the review agent is told to do and
 	// when it must ask a person: they steer which commands run unasked.
-	MaxAttempts             int              `json:"max_attempts"`
-	Brief                   string           `json:"brief"`
-	HumanDecisionConditions []string         `json:"human_decision_conditions"`
-	Actions                 []executedAction `json:"actions"`
+	MaxAttempts             int      `json:"max_attempts"`
+	Brief                   string   `json:"brief"`
+	HumanDecisionConditions []string `json:"human_decision_conditions"`
+	// Told is everything else of the version the review agent is told
+	// about the job, and decides from: its title and purpose, the expected
+	// outcome with its deliverables, and the retirement rules.
+	Told    string           `json:"told"`
+	Actions []executedAction `json:"actions"`
 }
 
 type executedAction struct {
@@ -119,13 +123,83 @@ type executedAction struct {
 	ParamSchema string `json:"param_schema"`
 }
 
+// canonicalJSON is one form for a JSON value however it was written: the
+// service re-encodes what it stores, so the same schema can differ from the
+// registered one in spacing, member order and how characters are escaped.
+// Numbers keep their text. Something that is not JSON is compared as it is.
+func canonicalJSON(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return string(raw)
+	}
+	if v == nil {
+		// An absent schema and a null one are the same.
+		return ""
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(out)
+}
+
+// toldToAgent is what a version tells the review agent about the job besides
+// its policy. The agent's decision runs routine actions unasked, so text it
+// decides from is bound like the commands themselves.
+type toldToAgent struct {
+	Title           string                  `json:"title"`
+	Purpose         string                  `json:"purpose"`
+	ExpectedOutcome *api.TxeExpectedOutcome `json:"expected_outcome,omitempty"`
+	RetirementRules *api.TxeRetirementRules `json:"retirement_rules,omitempty"`
+}
+
+// canonical is one comparable form of it. The registry fills in the
+// retirement rules a registration left out, so the same defaults are
+// applied before comparing: what the registry may add is exactly them.
+// These two adjustments are what a real registration needs to round-trip;
+// TestRemoteARegisteredJobMatchesItsLocalRegistration holds them to it.
+func (t toldToAgent) canonical() string {
+	rules := api.TxeRetirementRules{}
+	if t.RetirementRules != nil {
+		rules = *t.RetirementRules
+	}
+	if deref(rules.OnTargetDeleted) == "" {
+		rules.OnTargetDeleted = new(api.TxeRetirementRulesOnTargetDeleted(registry.RuleRetire))
+	}
+	if deref(rules.OnReplacement) == "" {
+		rules.OnReplacement = new(api.TxeRetirementRulesOnReplacement(registry.RuleReview))
+	}
+	if deref(rules.OnCompletion) == "" {
+		rules.OnCompletion = new(api.TxeRetirementRulesOnCompletion(registry.RuleRetire))
+	}
+	if deref(rules.ActiveRunPolicy) == "" {
+		rules.ActiveRunPolicy = new(api.TxeRetirementRulesActiveRunPolicy(registry.ActiveRunFinish))
+	}
+	t.RetirementRules = &rules
+	// The registry answers an expected outcome that was left out as an
+	// empty one. They are the same.
+	if raw, err := json.Marshal(t.ExpectedOutcome); err == nil && string(raw) == "{}" {
+		t.ExpectedOutcome = nil
+	}
+	raw, err := json.Marshal(t)
+	if err != nil {
+		return ""
+	}
+	return canonicalJSON(raw)
+}
+
 // executedOf puts the executed part of a version into one comparable form.
 //
 // A list that is empty and one that is absent are the same thing here: the
 // service leaves an empty list out of what it returns, and a registration
 // may have sent one.
-func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.TxeTarget) executed {
-	out := executed{Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint}
+func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.TxeTarget, told toldToAgent) executed {
+	out := executed{Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint, Told: told.canonical()}
 	if refs := deref(pkg.CredentialRefs); len(refs) > 0 {
 		out.CredentialRefs = slices.Clone(refs)
 	}
@@ -142,16 +216,7 @@ func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.T
 			out.HumanDecisionConditions = slices.Clone(conditions)
 		}
 		for _, pa := range deref(policy.PermittedActions) {
-			schema := ""
-			if len(pa.ParamSchema) > 0 {
-				// The same schema, whatever its spacing.
-				var buf bytes.Buffer
-				if json.Compact(&buf, pa.ParamSchema) == nil {
-					schema = buf.String()
-				} else {
-					schema = string(pa.ParamSchema)
-				}
-			}
+			schema := canonicalJSON(pa.ParamSchema)
 			out.Actions = append(out.Actions, executedAction{
 				Name: pa.Name, Command: deref(pa.Command), Reconcile: deref(pa.Reconcile), Entrypoint: deref(pa.Entrypoint),
 				Routine: pa.Routine, Idempotency: string(deref(pa.Idempotency)), TimeoutSec: pa.TimeoutSec,
@@ -210,11 +275,13 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 		Package      api.TxePackage       `json:"package"`
 		ReviewPolicy *api.TxeReviewPolicy `json:"review_policy"`
 		Targets      []api.TxeTarget      `json:"targets"`
+		toldToAgent
 	}
 	if err != nil || json.Unmarshal(raw, &registered) != nil {
 		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	local, remote := executedOf(registered.Package, registered.ReviewPolicy, registered.Targets), executedOf(v.Package, v.ReviewPolicy, deref(v.Targets))
+	local := executedOf(registered.Package, registered.ReviewPolicy, registered.Targets, registered.toldToAgent)
+	remote := executedOf(v.Package, v.ReviewPolicy, deref(v.Targets), toldToAgent{Title: v.Title, Purpose: v.Purpose, ExpectedOutcome: v.ExpectedOutcome, RetirementRules: v.RetirementRules})
 	switch {
 	case !reflect.DeepEqual(local.CredentialRefs, remote.CredentialRefs):
 		return refuse(fmt.Sprintf("the registry's credential references for version %d of the job are not the ones this machine registered", version))
@@ -222,6 +289,8 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 		return refuse(fmt.Sprintf("the registry's package for version %d of the job is not the one this machine registered", version))
 	case !reflect.DeepEqual(local.Targets, remote.Targets):
 		return refuse(fmt.Sprintf("the registry's targets for version %d of the job are not the ones this machine registered", version))
+	case local.Told != remote.Told:
+		return refuse(fmt.Sprintf("the registry's description of version %d of the job (title, purpose, expected outcome or retirement rules) is not the one this machine registered", version))
 	case local.Brief != remote.Brief || !reflect.DeepEqual(local.HumanDecisionConditions, remote.HumanDecisionConditions):
 		return refuse(fmt.Sprintf("the registry's review policy for version %d of the job is not the one this machine registered", version))
 	case local.MaxAttempts != remote.MaxAttempts || !reflect.DeepEqual(local.Actions, remote.Actions):

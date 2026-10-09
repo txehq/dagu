@@ -5,7 +5,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/dagucloud/dagu/v2/internal/txe/probe"
@@ -113,48 +112,17 @@ func (t txeReviewTransport) Do(ctx context.Context, method, path string, in, out
 	return err
 }
 
-// localVersion reads what this machine registered as a version of a job:
-// the "version" object of the request `dagu txe register` filed beside the
-// version's receipt. It is the reviewer's only source for what a job's
-// commands may be given, and the record the registry's copy is checked
-// against. A version this machine did not register has none.
-func localVersion(home txepkg.Home) func(string, int) (json.RawMessage, error) {
-	return func(jobID string, version int) (json.RawMessage, error) {
-		receipt, err := txepkg.NewJournal(home).Receipt(jobID, version)
-		if err != nil {
-			return nil, err
-		}
-		if receipt.RequestID == "" || strings.ContainsAny(receipt.RequestID, `/\.`) {
-			return nil, fmt.Errorf("receipt names request %q", receipt.RequestID)
-		}
-		path := filepath.Join(home.ReceiptsDir(), jobID, "requests", receipt.RequestID+".json")
-		raw, err := os.ReadFile(filepath.Clean(path))
-		if err != nil {
-			return nil, fmt.Errorf("read registration request: %w", err)
-		}
-		var entry txepkg.Entry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, fmt.Errorf("parse registration record: %w", err)
-		}
-		if entry.JobID != jobID || entry.Version != version || entry.RequestID != receipt.RequestID {
-			return nil, fmt.Errorf("registration record is request %s for %s v%d", entry.RequestID, entry.JobID, entry.Version)
-		}
-		var request struct {
-			Version json.RawMessage `json:"version"`
-		}
-		if err := json.Unmarshal(entry.Request, &request); err != nil || len(request.Version) == 0 {
-			return nil, fmt.Errorf("registration request has no version (%v)", err)
-		}
-		return request.Version, nil
-	}
-}
-
 // localLatest reads the newest version of a job this machine registered and
-// the owner it registered it for, from the receipts `dagu txe register`
-// leaves.
+// the owner it registered it for, from the records `dagu txe register` and
+// `dagu txe update` leave. A version counts from the moment this machine
+// sent it to the service, not only once its receipt is written: a request
+// the service may hold (sent, or sent and committed, with its receipt still
+// to come) is this machine's newest version, and a registry that names an
+// older one has been set back.
 func localLatest(home txepkg.Home) func(string) (int, string, error) {
 	return func(jobID string) (int, string, error) {
-		receipts, err := txepkg.NewJournal(home).Receipts(jobID)
+		journal := txepkg.NewJournal(home)
+		receipts, err := journal.Receipts(jobID)
 		if err != nil {
 			return 0, "", err
 		}
@@ -165,7 +133,17 @@ func localLatest(home txepkg.Home) func(string) (int, string, error) {
 		if newest.JobID != jobID {
 			return 0, "", fmt.Errorf("receipt is for job %s", newest.JobID)
 		}
-		return newest.Version, newest.OwnerID, nil
+		latest := newest.Version
+		pending, err := journal.Pending()
+		if err != nil {
+			return 0, "", fmt.Errorf("read unfinished registrations: %w", err)
+		}
+		for _, e := range pending {
+			if e.JobID == jobID && (e.Step == txepkg.StepRegistered || e.Step == txepkg.StepCommitted) && e.Version > latest {
+				latest = e.Version
+			}
+		}
+		return latest, newest.OwnerID, nil
 	}
 }
 
@@ -211,7 +189,9 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 			MachineID: machine,
 			Registry: &review.Remote{
 				Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient,
-				LocalVersion: localVersion(txeHome),
+				// This machine's record of what it registered, through the
+				// one reader of that record.
+				LocalVersion: probe.LocalCredentials{Home: txeHome}.Version,
 				LocalLatest:  localLatest(txeHome),
 			},
 			// A job's file credentials are read with the checks this

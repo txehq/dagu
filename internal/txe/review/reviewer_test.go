@@ -756,7 +756,9 @@ func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
 	for _, e := range f.state().Exceptions {
 		if e.Kind == review.ExceptionCommandsUnbound {
 			raised++
-			assert.Contains(t, e.Message, "dagu txe register")
+			assert.Contains(t, e.Message, "dagu txe update")
+			assert.Contains(t, e.Message, "dagu txe resume")
+			assert.NotContains(t, e.Message, "dagu txe register", "a job cannot be registered a second time")
 		}
 	}
 	assert.Positive(t, raised)

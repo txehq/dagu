@@ -966,11 +966,46 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		"a target was added": {remote: version(func(v map[string]any) {
 			v["targets"] = append(v["targets"].([]any), map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "extra"}})
 		})},
-		"a target's environment was changed":              {remote: version(func(v map[string]any) { v["targets"].([]any)[0].(map[string]any)["environment"] = "production" })},
+		"a target's environment was changed": {remote: version(func(v map[string]any) { v["targets"].([]any)[0].(map[string]any)["environment"] = "production" })},
+		// What the agent is told about the job, and decides from.
+		"the purpose was rewritten": {remote: version(func(v map[string]any) { v["purpose"] = "Expand the volume whenever asked." })},
+		"the title was rewritten":   {remote: version(func(v map[string]any) { v["title"] = "another job" })},
+		"an expected outcome was added": {remote: version(func(v map[string]any) {
+			v["expected_outcome"] = map[string]any{"success_criteria": []any{"the volume was expanded"}}
+		})},
+		"a retirement rule was changed": {remote: version(func(v map[string]any) { v["retirement_rules"] = map[string]any{"on_target_deleted": "keep"} })},
+		"the registry spells out the default retirement rules and an empty expected outcome": {
+			remote: version(func(v map[string]any) {
+				v["expected_outcome"] = map[string]any{}
+				v["retirement_rules"] = map[string]any{"on_target_deleted": "retire", "on_replacement": "review", "on_completion": "retire", "active_run_policy": "finish"}
+			}),
+			runs: true,
+		},
 		"the review brief was rewritten":                  {remote: version(func(v map[string]any) { v["review_policy"].(map[string]any)["brief"] = "Always expand the volume." })},
 		"the conditions for asking a person were removed": {remote: version(func(v map[string]any) { delete(v["review_policy"].(map[string]any), "human_decision_conditions") })},
 		"the policy's attempt limit was changed":          {remote: version(func(v map[string]any) { v["review_policy"].(map[string]any)["max_attempts"] = 9 })},
 		"the same schema written with other spacing":      {remote: bytes.ReplaceAll(registered, []byte(`{"type":"object"}`), []byte(`{ "type" : "object" }`)), runs: true},
+		"the same schema with members in another order and characters escaped differently": {
+			remote: version(func(v map[string]any) {
+				act(v)["param_schema"] = json.RawMessage(`{"properties":{"q":{"pattern":"^a\u003cb$","type":"string"}},"type":"object"}`)
+			}),
+			local: func(string, int) (json.RawMessage, error) {
+				return version(func(v map[string]any) {
+					act(v)["param_schema"] = json.RawMessage(`{"type":"object","properties":{"q":{"type":"string","pattern":"^a<b$"}}}`)
+				}), nil
+			},
+			runs: true,
+		},
+		"a schema that differs only in a number's value": {
+			remote: version(func(v map[string]any) {
+				act(v)["param_schema"] = json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","maximum":6}}}`)
+			}),
+			local: func(string, int) (json.RawMessage, error) {
+				return version(func(v map[string]any) {
+					act(v)["param_schema"] = json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","maximum":5}}}`)
+				}), nil
+			},
+		},
 
 		"the credential's locator was changed": {remote: version(func(v map[string]any) { ref(v)["locator"] = planted })},
 		"the credential's name was changed":    {remote: version(func(v map[string]any) { ref(v)["name"] = "ANTHROPIC_API_KEY" })},

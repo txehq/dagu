@@ -17,6 +17,7 @@ import (
 
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/probe"
 	"github.com/dagucloud/dagu/v2/internal/txe/review"
 )
 
@@ -90,12 +91,38 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	_, _, err = localLatest(home)("job_01JTXE00000000000000000BBB")
 	require.Error(t, err, "a job this machine never registered has no receipt")
 
+	// An update this machine sent and has not finished is its newest
+	// version already: the service may hold it. One that was only staged,
+	// or that the service refused, is not; nor is another job's.
+	pending := filepath.Join(home.ReceiptsDir(), "pending")
+	require.NoError(t, os.MkdirAll(pending, 0o700))
+	file := func(name, job string, version int, step txepkg.Step) {
+		t.Helper()
+		raw, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: name, JobID: job, Version: version, Step: step, Request: json.RawMessage(`{}`)})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(pending, name+".json"), raw, 0o600))
+	}
+	file("req_staged", jobID, 9, txepkg.StepStaged)
+	file("req_rejected", jobID, 8, txepkg.StepRejected)
+	file("req_other", "job_01JTXE00000000000000000BBB", 7, txepkg.StepRegistered)
+	latest, _, err = localLatest(home)(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, latest, "nothing the service may hold is newer")
+	file("req_sent", jobID, 3, txepkg.StepRegistered)
+	latest, _, err = localLatest(home)(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, 3, latest, "a sent, unfinished update counts")
+	file("req_committed", jobID, 4, txepkg.StepCommitted)
+	latest, _, err = localLatest(home)(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, 4, latest)
+
 	version := `{"package":{"digest":"sha256:aa","path":"/pkg","entrypoint":"run.sh","credential_refs":[{"name":"LINEAR_API_KEY","kind":"file","locator":"/home/me/.config/txe/linear"}]},"review_policy":{"permitted_actions":[{"name":"restart","command":"./restart.sh","routine":true,"timeout_sec":60}]}}`
 	entry, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 2, Request: json.RawMessage(`{"job_id":"` + jobID + `","version":` + version + `}`)})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), entry, 0o600))
 
-	local := localVersion(home)
+	local := probe.LocalCredentials{Home: home}.Version
 	got, err := local(jobID, 2)
 	require.NoError(t, err)
 	assert.JSONEq(t, version, string(got))
@@ -103,13 +130,6 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	_, err = local(jobID, 3)
 	require.Error(t, err, "a version this machine did not register has no record")
 	_, err = local("job_01JTXE00000000000000000BBB", 2)
-	require.Error(t, err)
-
-	// A record filed under another request id is not the receipt's.
-	mismatched, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_9", JobID: jobID, Version: 2, Request: json.RawMessage(`{"version":` + version + `}`)})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), mismatched, 0o600))
-	_, err = local(jobID, 2)
 	require.Error(t, err)
 
 	// A record filed for another job or version is not this one's.

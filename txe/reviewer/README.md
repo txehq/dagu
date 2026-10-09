@@ -107,11 +107,16 @@ reaches execution: the package (digest, path, working directory,
 entrypoint), the registered targets, every permitted action (command and
 reconcile lines, the `routine` flag, idempotency class, timeout, attempt
 limits, parameter schema), the review brief and the conditions for asking
-a person, the credential references, and the job's owner. The registry's
-current version must also not be older than the newest version this
-machine registered: an older one may match what was once registered and
-was replaced. This holds for every job, with or without credentials. The
-references used are the local ones. Title and purpose are not compared.
+a person, what the review agent is told about the job (title, purpose,
+expected outcome and deliverables, retirement rules), the credential
+references, and the job's owner. The registry's current version must also
+not be older than the newest version this machine registered, counting an
+update it has sent and not yet finished: an older one may match what was
+once registered and was replaced. This holds for every job, with or
+without credentials. The references used are the local ones. Values are
+compared as values, not as bytes: an absent, null or empty list or object
+is the same, a parameter schema is compared decoded, and the retirement
+rules a registration left out equal the registry's defaults for them.
 
 If this machine has no usable record of the version, or anything differs,
 none of the job's commands is started: no routine action, no approved
@@ -120,8 +125,12 @@ read, and the job's declaration is not used to settle an interrupted
 action either: it stays unresolved. The job is still reviewed and questions still reach the owner, and
 the exception `job_commands_unbound` says what differs, without a locator
 or a command line. A recorded review does not clear it; it ends when the
-job is bound again. Registering the job again from that machine with
-`dagu txe register` binds it; that keeps the job and its history. A retry
+job is bound again. `dagu txe update <job id> -f <spec>
+--expected-version <n>` from that machine binds it and keeps the job and
+its history (a job cannot be registered a second time); an update that
+was interrupted is finished with `dagu txe resume <request id>`. While an
+update is in flight the registry is ahead of this machine's record and
+the job's commands wait. A retry
 of a run is the service's own operation and is not affected.
 
 This protects a job registered from its machine against a changed
