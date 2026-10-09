@@ -68,6 +68,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/dagucloud/dagu/v2/internal/telemetry"
 	"github.com/dagucloud/dagu/v2/internal/tunnel"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/upgrade"
 	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 )
@@ -535,6 +536,14 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 
 	if stores.View != nil {
 		apiOpts = append(apiOpts, apiv1.WithViewStore(stores.View))
+	}
+
+	if cfg.Paths.DataDir != "" && dr != nil {
+		txeRegistry, err := registry.NewFileStore(cfg.Paths.DataDir, registry.WithDAGStore(registry.NewDAGStore(dr)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TXE registry: %w", err)
+		}
+		apiOpts = append(apiOpts, apiv1.WithTxeRegistry(txeRegistry))
 	}
 
 	var notificationSvc *notificationservice.Service
