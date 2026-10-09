@@ -17,8 +17,8 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
-// A permitted action's param_schema is a JSON Schema (draft 2020-12 or
-// draft-07) that the registry enforces on every attempt of that action
+// A permitted action's param_schema is a JSON Schema (draft 2020-12) that
+// the registry enforces on every attempt of that action
 // before it is granted. It is checked when a version is registered: it must
 // resolve with no remote reference, and it may use only keywords the
 // validator enforces, so a schema never promises a restriction (a format,
@@ -209,6 +209,8 @@ func checkKeywordValue(k string, v any, path string) error {
 		if r, _ := new(big.Rat).SetString(n.String()); r == nil || !r.IsInt() || r.Sign() < 0 {
 			return bad("a non-negative integer")
 		}
+	// Patterns are Go RE2 (syntax and semantics, e.g. ASCII-only \s), the
+	// dialect the validator applies; the API documents it, not ECMA-262.
 	case "pattern":
 		p, ok := v.(string)
 		if !ok {

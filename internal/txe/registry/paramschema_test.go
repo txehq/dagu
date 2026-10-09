@@ -182,3 +182,13 @@ func TestParamSchemaBoundsItsWork(t *testing.T) {
 		assert.Less(t, time.Since(start), time.Second, name)
 	}
 }
+
+// Patterns are Go RE2, as documented: \s is ASCII-only, so a non-breaking
+// space is not whitespace to the registry.
+func TestParamSchemaPatternsAreGoRE2(t *testing.T) {
+	pa := PermittedAction{Name: "tag", ParamSchema: json.RawMessage(`{"type": "object", "properties": {"t": {"type": "string", "pattern": "^[^\\s]+$"}}}`)}
+	_, err := compileParamSchema(pa.ParamSchema)
+	require.NoError(t, err)
+	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"t": "a b"}`))), "an ASCII space is whitespace")
+	require.NoError(t, checkActionParams(pa, json.RawMessage(`{"t": "a\u00a0b"}`)), "U+00A0 is not whitespace in Go RE2")
+}
