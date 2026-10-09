@@ -293,8 +293,10 @@ func TestExecutionMarkerRunningReportRacesRepairAndRequeue(t *testing.T) {
 	t.Parallel()
 
 	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+	fired := false
 	f.store.beforeCompareAndSwap = func() {
 		f.store.beforeCompareAndSwap = nil
+		fired = true
 		next := f.stored(t)
 		next.Status = ir.Queued
 		next.QueuedAt = markerQ2
@@ -303,7 +305,11 @@ func TestExecutionMarkerRunningReportRacesRepairAndRequeue(t *testing.T) {
 		f.attempt.mu.Unlock()
 	}
 
+	// The mock store cannot append conditionally, so the report falls back
+	// to the store's compare-and-swap; the repair and requeue land just
+	// before it.
 	resp := f.report(t, ir.Running, markerQ1, markerQ1)
+	require.True(t, fired, "the report must reach the store write")
 	assert.False(t, resp.Accepted)
 	st := f.stored(t)
 	assert.Equal(t, ir.Queued, st.Status, "E1 must not restore Running over the retry")

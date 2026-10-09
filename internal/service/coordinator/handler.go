@@ -2126,15 +2126,34 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	attempt := latestAttempt
 	// Other writers change a root run's status outside this coordinator's locks:
 	// a retry re-queues it, a stale-run repair fails it, and a Waiting run is
-	// resumed, all through the store's compare-and-swap, from any process. Every
-	// root write therefore goes through that compare-and-swap too, and applies
-	// only if the status is still exactly the one validated against: the same
-	// status, attempt and queued-at. Otherwise a late report could overwrite a
-	// queued retry, which the queue then drops. Writing through the cached open
-	// attempt and closing it afterwards would also compact the file from a stale
-	// read. Sub-DAG statuses keep the open attempt, except while Waiting.
+	// resumed, from any process. Every root write therefore applies only if
+	// the stored status is still exactly the one validated against: the same
+	// status, attempt id, attempt key and queued-at. Otherwise a late report
+	// could overwrite a queued retry, which the queue then drops.
+	//
+	// A terminal or Waiting write goes through the store's compare-and-swap,
+	// which those writers also use. A nonterminal root report is appended
+	// through the cached open attempt, conditionally, under the status file's
+	// lock that every append and compaction holds; a compare-and-swap per
+	// report serializes every run of a DAG on its data-root lock. A store that
+	// cannot append conditionally falls back to the compare-and-swap, never to
+	// a plain write. Sub-DAG statuses keep the plain open-attempt write, except
+	// while Waiting.
 	rootWrite := !isSubDAGStatus(dagRunStatus)
-	conditional := rootWrite || dagRunStatus.Status == ir.Waiting
+	conditional := dagRunStatus.Status == ir.Waiting ||
+		(rootWrite && (isTerminalRunStatus(latestStatus.Status) || isTerminalRunStatus(dagRunStatus.Status)))
+	if rootWrite && !conditional {
+		var appended bool
+		attempt, appended, err = h.appendRootStatusIfLatest(ctx, dagRunStatus, latestAttempt, latestStatus)
+		if errors.Is(err, errExecutionReplaced) {
+			logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
+			return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		conditional = !appended
+	}
 	expectedAttemptID, expectedAttemptKey := latestAttempt.ID(), dagRunStatus.AttemptKey
 	if rootWrite {
 		expectedAttemptID, expectedAttemptKey = latestStatus.AttemptID, latestStatus.AttemptKey
@@ -2179,7 +2198,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			}, nil
 		}
 		dagRunStatus = persisted
-	} else {
+	} else if !rootWrite {
 		attempt, err = h.replaceOpenAttempt(ctx, dagRunStatus.DAGRunID, latestAttempt, latestStatus.AttemptID)
 		if err != nil {
 			return nil, status.Error(codes.Internal, "failed to get/open latest attempt: "+err.Error())
@@ -2200,6 +2219,46 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	h.closeCachedInactiveAttempt(ctx, dagRunStatus, attempt)
 
 	return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
+}
+
+// appendRootStatusIfLatest appends a nonterminal root report through the
+// cached open attempt, only if the stored status is still the one validated
+// against. appended is false, with no error, when the attempt's store cannot
+// append conditionally; the caller then uses the store's compare-and-swap.
+func (h *Handler) appendRootStatusIfLatest(
+	ctx context.Context,
+	dagRunStatus *ir.DAGRunStatus,
+	latestAttempt dagrun.Attempt,
+	latestStatus *ir.DAGRunStatus,
+) (dagrun.Attempt, bool, error) {
+	attempt, err := h.replaceOpenAttempt(ctx, dagRunStatus.DAGRunID, latestAttempt, latestStatus.AttemptID)
+	if err != nil {
+		return nil, false, status.Error(codes.Internal, "failed to get/open latest attempt: "+err.Error())
+	}
+	writer, ok := attempt.(dagrun.ConditionalWriter)
+	if !ok {
+		return latestAttempt, false, nil
+	}
+	err = writer.WriteIfLatest(ctx, *dagRunStatus, func(current *ir.DAGRunStatus) error {
+		if current.Status != latestStatus.Status ||
+			current.AttemptID != latestStatus.AttemptID ||
+			current.AttemptKey != latestStatus.AttemptKey ||
+			current.QueuedAt != latestStatus.QueuedAt {
+			return errExecutionReplaced
+		}
+		return nil
+	})
+	switch {
+	case err == nil:
+		return attempt, true, nil
+	case errors.Is(err, dagrun.ErrConditionalWriteUnsupported):
+		return latestAttempt, false, nil
+	case errors.Is(err, errExecutionReplaced):
+		return attempt, false, err
+	default:
+		h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, attempt.ID())
+		return nil, false, status.Error(codes.Internal, "failed to write status: "+err.Error())
+	}
 }
 
 func preservesCompletedManualActions(current, incoming *ir.DAGRunStatus) bool {
