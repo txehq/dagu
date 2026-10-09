@@ -52,6 +52,37 @@ func (m *memDAGs) WriteSpec(_ context.Context, name string, spec []byte) error {
 	return nil
 }
 
+// memRuns is Dagu's run history as the registry sees it: the saved DAG
+// digest of each run a test recorded. Unknown runs are not found.
+type memRuns struct {
+	mu      sync.Mutex
+	digests map[string]string
+}
+
+func (m *memRuns) add(runID, digest string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.digests[runID] = digest
+}
+
+func (m *memRuns) RunSpecSHA256(_ context.Context, _, runID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.digests[runID]
+	if !ok {
+		return "", registry.ErrRunNotFound
+	}
+	return d, nil
+}
+
+func (m *memRuns) ActiveRuns(context.Context, string) ([]registry.RunRef, error) { return nil, nil }
+func (m *memRuns) StopRun(context.Context, string, registry.RunRef) error        { return nil }
+func (m *memRuns) IsSuspended(context.Context, string) (bool, error)             { return false, nil }
+func (m *memRuns) SetSuspended(context.Context, string, bool) error              { return nil }
+func (m *memRuns) RunFinished(context.Context, string, registry.RunRef) (bool, error) {
+	return true, nil
+}
+
 // recordingTasks completes native tasks in memory and can fail on demand.
 type recordingTasks struct {
 	mu    sync.Mutex
@@ -74,6 +105,7 @@ type fixture struct {
 	ctx       context.Context
 	store     *registry.Store
 	tasks     *recordingTasks
+	runs      *memRuns
 	svc       *Service
 	now       time.Time
 	clock     *time.Time
@@ -95,8 +127,9 @@ func newFixture(t *testing.T) *fixture {
 	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
 	current := now
 	clock := func() time.Time { return current }
+	runs := &memRuns{digests: map[string]string{}}
 	store, err := registry.NewFileStore(t.TempDir(),
-		registry.WithClock(clock), registry.WithDAGStore(&memDAGs{specs: map[string][]byte{}}))
+		registry.WithClock(clock), registry.WithDAGStore(&memDAGs{specs: map[string][]byte{}}), registry.WithRunControl(runs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +178,7 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{
 		t: t, ctx: ctx, store: store, now: now, clock: &current, jobID: jobID, machineID: machineID, version: version,
 		tasks: &recordingTasks{},
+		runs:  runs,
 		human: registry.Actor{Kind: registry.ActorHuman, ID: "connor", Client: "dashboard"},
 	}
 	f.svc = &Service{
@@ -603,8 +637,11 @@ func (f *fixture) job() *registry.Job {
 	return j
 }
 
+// retryRequest is a request to retry runID, which the fixture records in
+// Dagu's run history as a run of the job's current DAG.
 func (f *fixture) retryRequest(runID, key string) RetryRequest {
 	j := f.job()
+	f.runs.add(runID, j.DAGSpecSHA256)
 	return RetryRequest{
 		RunID: runID, ExpectedJobVersion: j.Version, RunSpecSHA256: j.DAGSpecSHA256,
 		RunStartedAt: f.now.Add(time.Minute), IdempotencyKey: key,
@@ -731,6 +768,7 @@ func TestRequestRetryReplay(t *testing.T) {
 func TestDecideRetryOnRetryRunProposal(t *testing.T) {
 	f := newFixture(t)
 	j := f.job()
+	f.runs.add("run-0044", j.DAGSpecSHA256)
 	params, _ := json.Marshal(registry.RetryRunParams{RunID: "run-0044", RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest})
 	id, err := registry.RetryProposalID("run-0044", j.Version)
 	if err != nil {
