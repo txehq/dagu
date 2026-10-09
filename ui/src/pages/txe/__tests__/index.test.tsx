@@ -45,6 +45,8 @@ function fakeApi(initial: Proposal[]) {
     listDecisions: async () => [],
     decide,
     replayDecision: vi.fn(),
+    requestRetry: vi.fn(),
+    listRetryStates: async () => new Map(),
   };
   return { api, decide };
 }
@@ -97,6 +99,8 @@ describe('TxeInboxPage refused decisions', () => {
       listProposals: async () => proposals,
       listDecisions: async () => [],
       replayDecision: vi.fn(),
+      requestRetry: vi.fn(),
+      listRetryStates: async () => new Map(),
       decide: vi.fn(async () => {
         proposals = [{ ...proposals[0]!, state: 'superseded' as const }];
         return {
