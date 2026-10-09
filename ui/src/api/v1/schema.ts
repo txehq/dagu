@@ -8276,6 +8276,11 @@ export interface components {
             state: components["schemas"]["TxeActionState"];
             attempt: number;
             max_attempts: number;
+            /**
+             * Format: date-time
+             * @description When the current attempt was granted.
+             */
+            attempt_started_at?: string;
             grant?: components["schemas"]["TxeGrant"];
             receipt?: string;
             /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
@@ -8297,6 +8302,10 @@ export interface components {
             state?: components["schemas"]["TxeAvailabilityState"];
             /** @description Key of the target whose resource event opened it, if one did; a present observation of that target resolves it. */
             target?: string;
+            /** @description For scope action: the action the exception is about. */
+            action_id?: string;
+            /** @description For scope action: the action attempt; resolved when that attempt ends. */
+            attempt?: number;
             detail: string;
             evidence?: string[];
             created: components["schemas"]["TxeStamp"];
@@ -8401,12 +8410,23 @@ export interface components {
             /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
             kind?: string;
             /**
-             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; default job
+             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action.
              * @enum {string}
              */
             scope?: TxeObservationRequestScope;
             detail?: string;
             evidence?: string[];
+            /** @description scope action: the action. */
+            action_id?: string;
+            /** @description scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state. */
+            attempt?: number;
+            /** @description scope action: the caller's live claim on the job. */
+            claim_id?: string;
+            /**
+             * Format: int64
+             * @description scope action: that claim's fence.
+             */
+            fence?: number;
             actor?: components["schemas"]["TxeActor"];
         };
         TxeClaimRequest: {
@@ -24784,7 +24804,8 @@ export enum TxeLifecycleRequestActive_run_policy {
 }
 export enum TxeObservationRequestScope {
     job = "job",
-    reviewer = "reviewer"
+    reviewer = "reviewer",
+    action = "action"
 }
 export enum TxeReviewOutcome {
     continue = "continue",

@@ -20233,6 +20233,10 @@ components:
           type: integer
         max_attempts:
           type: integer
+        attempt_started_at:
+          type: string
+          format: date-time
+          description: "When the current attempt was granted."
         grant:
           $ref: "#/components/schemas/TxeGrant"
         receipt:
@@ -20279,6 +20283,12 @@ components:
         target:
           type: string
           description: "Key of the target whose resource event opened it, if one did; a present observation of that target resolves it."
+        action_id:
+          type: string
+          description: "For scope action: the action the exception is about."
+        attempt:
+          type: integer
+          description: "For scope action: the action attempt; resolved when that attempt ends."
         detail:
           type: string
         evidence:
@@ -20485,14 +20495,27 @@ components:
           description: "Exception kind, such as auth, worker_offline or reviewer_launch"
         scope:
           type: string
-          enum: [job, reviewer]
-          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; default job"
+          enum: [job, reviewer, action]
+          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action."
         detail:
           type: string
         evidence:
           type: array
           items:
             type: string
+        action_id:
+          type: string
+          description: "scope action: the action."
+        attempt:
+          type: integer
+          description: "scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state."
+        claim_id:
+          type: string
+          description: "scope action: the caller's live claim on the job."
+        fence:
+          type: integer
+          format: int64
+          description: "scope action: that claim's fence."
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [state]

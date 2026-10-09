@@ -144,6 +144,7 @@ func unresolved(s ActionState) bool {
 
 // noteIntent records a's state as the latest of its intent.
 func (tx *JobTx) noteIntent(a *Action) {
+	tx.resolveActionExceptions(a)
 	j := tx.Job
 	if j.Intents == nil {
 		j.Intents = map[string]*IntentRecord{}

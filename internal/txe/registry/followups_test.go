@@ -650,3 +650,53 @@ func TestRetriesEndedOnARequestAreTheRegistrys(t *testing.T) {
 	assert.Equal(t, p1.ProposalID, archived[0].ProposalID)
 	assert.Equal(t, registryActor, archived[0].Updated.By)
 }
+
+// A stalled action attempt is raised under the live claim as one action-scope
+// exception per action, attempt and kind; it changes no availability, and the
+// registry resolves it when the attempt ends.
+func TestActionScopeExceptionsFollowTheAttempt(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	actionID, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+
+	observe := func(o Observation) error {
+		_, err := r.f.tx(r.job.JobID, agent, func(tx *JobTx) error { return tx.Observe(o) })
+		return err
+	}
+	stalled := Observation{Scope: ScopeAction, Kind: "retry_reservation_stalled", ActionID: actionID, Attempt: 1, ClaimID: ec.ClaimID, Fence: ec.Fence, Detail: "not started after 30m"}
+	open := func() []*Exception {
+		got, err := r.f.store.GetJob(r.f.ctx, r.job.JobID)
+		require.NoError(t, err)
+		var out []*Exception
+		for _, e := range got.Exceptions {
+			if e.Scope == ScopeAction && e.ResolvedAt == nil {
+				out = append(out, e)
+			}
+		}
+		assert.Equal(t, AvailabilityReady, got.Availability.State, "no availability change")
+		require.NotNil(t, got.Actions[actionID].AttemptStartedAt, "the attempt's start is recorded")
+		return out
+	}
+
+	wrong := stalled
+	wrong.Attempt = 2
+	assert.Equal(t, CodeActionState, code(t, observe(wrong)), "another attempt")
+	noClaim := stalled
+	noClaim.Fence = ec.Fence + 1
+	assert.Equal(t, CodeClaimStale, code(t, observe(noClaim)), "only under the live claim")
+
+	require.NoError(t, observe(stalled))
+	require.NoError(t, observe(stalled), "a repeat changes nothing")
+	got := open()
+	require.Len(t, got, 1)
+	assert.Equal(t, actionID, got[0].ActionID)
+	assert.Equal(t, 1, got[0].Attempt)
+
+	// The attempt ends: the registry resolves it.
+	require.NoError(t, r.settle(actionID, g, ec, ActionFailed, ""))
+	assert.Empty(t, open())
+}
