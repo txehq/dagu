@@ -7,6 +7,7 @@ package runcontrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -34,11 +35,12 @@ type Control struct {
 
 var _ registry.RunControl = (*Control)(nil)
 
-// ActiveRuns lists the DAG's queued and running runs.
+// ActiveRuns lists the DAG's queued, running and waiting runs. A waiting
+// run is reported as running: it has started and the run policy applies.
 func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.RunRef, error) {
 	statuses, err := c.Runs.ListStatuses(ctx, persis.DAGRunListOptions{
 		ExactName:  dagName,
-		Statuses:   []ir.Status{ir.Queued, ir.Running},
+		Statuses:   []ir.Status{ir.Queued, ir.Running, ir.Waiting},
 		AllHistory: true,
 		Unbounded:  true,
 	})
@@ -47,9 +49,32 @@ func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.Ru
 	}
 	out := make([]registry.RunRef, 0, len(statuses))
 	for _, st := range statuses {
-		out = append(out, registry.RunRef{RunID: st.DAGRunID, Running: st.Status == ir.Running})
+		out = append(out, registry.RunRef{RunID: st.DAGRunID, Running: st.Status != ir.Queued})
 	}
 	return out, nil
+}
+
+// RunFinished reports whether a run has reached a terminal status.
+func (c *Control) RunFinished(ctx context.Context, dagName string, run registry.RunRef) (bool, error) {
+	attempt, err := c.findAttempt(ctx, dagName, run)
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+		return false, registry.ErrRunNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return false, err
+	}
+	return status != nil && !status.Status.IsActive() && status.Status != ir.NotStarted, nil
+}
+
+func (c *Control) findAttempt(ctx context.Context, dagName string, run registry.RunRef) (dagrun.Attempt, error) {
+	if run.RootRunID != "" {
+		return c.Runs.FindSubAttempt(ctx, ir.NewDAGRunRef(run.RootName, run.RootRunID), run.RunID)
+	}
+	return c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, run.RunID))
 }
 
 // StopRun stops a run the way the API's terminate operation does: through
@@ -57,15 +82,11 @@ func (c *Control) ActiveRuns(ctx context.Context, dagName string) ([]registry.Ru
 // found under its root run, and the root is passed with the cancellation.
 func (c *Control) StopRun(ctx context.Context, dagName string, run registry.RunRef) error {
 	var root *ir.DAGRunRef
-	var attempt dagrun.Attempt
-	var err error
 	if run.RootRunID != "" {
 		ref := ir.NewDAGRunRef(run.RootName, run.RootRunID)
 		root = &ref
-		attempt, err = c.Runs.FindSubAttempt(ctx, ref, run.RunID)
-	} else {
-		attempt, err = c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, run.RunID))
 	}
+	attempt, err := c.findAttempt(ctx, dagName, run)
 	if err != nil {
 		return err
 	}

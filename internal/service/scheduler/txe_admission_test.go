@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/launcher"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -154,4 +156,17 @@ func TestQueueProcessor_TxeLocalJobRunIsDropped(t *testing.T) {
 	assert.Equal(t, ir.Aborted, status.Status)
 	assert.Contains(t, status.Error, string(registry.AdmitNotOnWorker))
 	assert.Equal(t, []string{jobID + "/run-1"}, admitter.dropped)
+}
+
+// A scheduled start dispatched without a queue reaches the executor
+// directly; a registered job is still never launched in-process.
+func TestDAGExecutor_RefusesLocalJobRun(t *testing.T) {
+	jobID := mintJobID(t)
+	e := NewDAGExecutor(nil, launcher.NewSubCmdBuilder(&config.Config{Paths: config.PathsConfig{Executable: "/nonexistent/dagu"}}), config.ExecutionModeLocal, "")
+	dag := &ir.DAG{Name: jobID, Location: "/dags/" + jobID + ".yaml"}
+	err := e.HandleJob(context.Background(), DAGEntry{DAG: dag}, dispatch.DispatchOperationStart, "run-1", ir.TriggerTypeScheduler, time.Now())
+	require.ErrorIs(t, err, ErrJobRequiresWorker)
+
+	err = e.ExecuteDAG(context.Background(), dag, dispatch.DispatchOperationRetry, "run-1", &ir.DAGRunStatus{}, ir.TriggerTypeRetry, "")
+	require.ErrorIs(t, err, ErrJobRequiresWorker)
 }
