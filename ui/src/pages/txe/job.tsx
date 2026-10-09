@@ -298,6 +298,7 @@ export default function TxeJobPage(): React.ReactElement {
                 dagName={run.dagName}
                 runId={run.dagRunId}
                 runStatus={run.status}
+                runAttemptId={run.attemptId}
                 state={retries?.get(run.dagRunId)}
                 canDecide={canDecide}
                 onRequest={async (key) => {
