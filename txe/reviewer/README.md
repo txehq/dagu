@@ -121,7 +121,12 @@ else a review step needs must be rendered into the DAG:
   by status how many steps it left out (`omitted_steps`), and step output is cut to its end only when one run
   alone is too large. Such a run is marked `evidence_trimmed`, the agent is
   told not to pass it on what it cannot see, and the review that covers it
-  records it in `trimmed_executions`.
+  records it in `trimmed_executions`. A step that printed more than the end
+  that is shown is marked `truncated`. When the reviewer recommends
+  completing or retiring a job, the question put to the owner names
+  everything the review was not shown: runs with evidence left out, runs
+  whose steps printed more than was shown, runs not shown at all, and other
+  records left out to fit.
 - Bounds: at most 50 runs per review, oldest first; the rest wait for the
   next one. No number of results, unfinished runs or queued runs stops a
   job's reviews.

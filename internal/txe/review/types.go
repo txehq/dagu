@@ -243,6 +243,17 @@ type RunEvidence struct {
 	Steps []StepEvidence `json:"steps,omitempty"`
 }
 
+// outputTruncated reports whether any step of the run printed more than the
+// evidence shows.
+func (r RunEvidence) outputTruncated() bool {
+	for _, s := range r.Steps {
+		if s.Truncated {
+			return true
+		}
+	}
+	return false
+}
+
 // Execution is the execution of the run this evidence is of.
 func (r RunEvidence) Execution() Execution {
 	return Execution{AttemptID: r.AttemptID, QueuedAt: r.QueuedAt}
@@ -254,6 +265,8 @@ type StepEvidence struct {
 	Status string `json:"status"`
 	Stdout string `json:"stdout_tail,omitempty"`
 	Stderr string `json:"stderr_tail,omitempty"`
+	// Truncated is true when the step printed more than is shown here.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ActionState is the journal state of one follow-up action.

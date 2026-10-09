@@ -317,6 +317,9 @@ type CompleteFunc func(ctx context.Context, task TaskLocator, input map[string]s
 var (
 	// ErrTaskAnswered means the task already holds a different answer.
 	ErrTaskAnswered = errors.New("txe review: task already answered")
+	// ErrTaskEnded means the task can no longer be answered because its
+	// step or its run is over, and nothing shows that anyone answered it.
+	ErrTaskEnded = errors.New("txe review: task ended without an answer")
 	// ErrRunMissing means the service has no such run.
 	ErrRunMissing = errors.New("txe review: run not found")
 )
@@ -369,6 +372,8 @@ func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) (Closu
 		return ClosureClosed, nil
 	case errors.Is(err, ErrTaskAnswered):
 		return ClosureAnswered, nil
+	case errors.Is(err, ErrTaskEnded):
+		return ClosureEnded, nil
 	case errors.Is(err, ErrRunMissing):
 		return ClosureMissing, nil
 	default:

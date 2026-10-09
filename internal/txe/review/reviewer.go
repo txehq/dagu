@@ -254,9 +254,12 @@ func (r *Reviewer) RunRequestedRetries(ctx context.Context, machineID string) ([
 	if r.Runs == nil {
 		return nil, nil
 	}
-	pending, err := r.Registry.RequestedRetries(ctx, machineID, closureBatch)
-	if err != nil {
-		return nil, fmt.Errorf("list requested retries: %w", err)
+	// The listing can return requests together with an error: the ones it
+	// could check, and a report of the ones it could not. Those found are
+	// executed either way.
+	pending, listErr := r.Registry.RequestedRetries(ctx, machineID, closureBatch)
+	if listErr != nil {
+		listErr = fmt.Errorf("list requested retries: %w", listErr)
 	}
 	out := make([]RetryOutcome, 0, len(pending))
 	for _, req := range pending {
@@ -268,7 +271,7 @@ func (r *Reviewer) RunRequestedRetries(ctx context.Context, machineID string) ([
 		res.Executed = executed
 		out = append(out, res)
 	}
-	return out, nil
+	return out, listErr
 }
 
 // settleTerminal settles effects left open on a job that completed or

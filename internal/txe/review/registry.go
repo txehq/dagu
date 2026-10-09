@@ -135,7 +135,9 @@ type Registry interface {
 	// RequestedRetries lists the retries a person requested directly for
 	// the machine's reviewable jobs and that nothing has attempted yet:
 	// decided retry proposals with no decision run of their own to execute
-	// them. It returns at most limit.
+	// them. It returns at most limit. It may return requests and an error
+	// together: the error then reports requests it could not check, and
+	// the ones returned are still to be executed.
 	RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error)
 	// Review returns a recorded review, or ErrNotFound.
 	Review(ctx context.Context, jobID, reviewID string) (Review, error)
@@ -183,6 +185,10 @@ const (
 	// ClosureAnswered means the task had already been completed with a
 	// real answer, which the registry refuses for a superseded proposal.
 	ClosureAnswered ClosureOutcome = "already_answered"
+	// ClosureEnded means the task's step or run was already over and
+	// nothing shows that it was answered: a run aborted before anyone
+	// decided, for one. Nothing is waiting, and nothing was answered.
+	ClosureEnded ClosureOutcome = "run_ended"
 	// ClosureMissing means the service knows no such run. That is recorded
 	// as missing; it is not evidence that a wait was ever completed.
 	ClosureMissing ClosureOutcome = "run_missing"

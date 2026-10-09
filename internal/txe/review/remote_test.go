@@ -781,8 +781,11 @@ func (t runsTransport) Do(ctx context.Context, method, path string, _, out any) 
 		return &review.TransportError{Status: http.StatusNotFound, Message: "no fake for " + method + " " + path}
 	}
 	state, err := t.runs.RunState(ctx, parts[0], parts[1])
-	if err != nil {
+	if errors.Is(err, review.ErrNotFound) {
 		return &review.TransportError{Status: http.StatusNotFound, Code: "not_found", Message: "run " + parts[1] + " not found"}
+	}
+	if err != nil {
+		return &review.TransportError{Status: http.StatusBadGateway, Message: err.Error()}
 	}
 	raw, err := json.Marshal(map[string]any{"dagRunDetails": map[string]any{
 		"attemptId": state.AttemptID, "queuedAt": state.QueuedAt, "statusLabel": state.Status,
@@ -911,14 +914,29 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 
 	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict, Message: "conflict"}}
 	for name, tc := range map[string]struct {
-		detail   string
-		answered bool
+		detail string
+		want   error
+		closed review.ClosureOutcome
 	}{
-		"the step was completed with another input": {
-			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"succeeded"}]}}`, answered: true,
+		"completed by someone with another input": {
+			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"succeeded","humanTaskCompletedBy":"connor","humanTaskCompletedById":"u-1"}]}}`,
+			want:   review.ErrTaskAnswered, closed: review.ClosureAnswered,
 		},
-		"the run is over": {
-			detail: `{"dagRunDetails":{"statusLabel":"aborted","nodes":[{"step":{"name":"decide"},"statusLabel":"aborted"}]}}`, answered: true,
+		"completed by someone, run already over": {
+			detail: `{"dagRunDetails":{"statusLabel":"succeeded","nodes":[{"step":{"name":"decide"},"statusLabel":"succeeded","humanTaskCompletedById":"os:501"}]}}`,
+			want:   review.ErrTaskAnswered, closed: review.ClosureAnswered,
+		},
+		"run aborted before anyone answered": {
+			detail: `{"dagRunDetails":{"statusLabel":"aborted","nodes":[{"step":{"name":"decide"},"statusLabel":"aborted"}]}}`,
+			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
+		},
+		"run failed before reaching the task": {
+			detail: `{"dagRunDetails":{"statusLabel":"failed","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
+			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
+		},
+		"step over with no completion on record": {
+			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"decide"},"statusLabel":"skipped"}]}}`,
+			want:   review.ErrTaskEnded, closed: review.ClosureEnded,
 		},
 		"the run has not reached the task yet": {
 			detail: `{"dagRunDetails":{"statusLabel":"queued","nodes":[{"step":{"name":"decide"},"statusLabel":"not_started"}]}}`,
@@ -927,22 +945,25 @@ func TestRemoteCompleteReportsWhatTheServiceSaid(t *testing.T) {
 			detail: `{"dagRunDetails":{"statusLabel":"waiting","nodes":[{"step":{"name":"decide"},"statusLabel":"waiting"}]}}`,
 		},
 		"another step finished, not the task": {
-			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"other"},"statusLabel":"succeeded"},{"step":{"name":"decide"},"statusLabel":"running"}]}}`,
+			detail: `{"dagRunDetails":{"statusLabel":"running","nodes":[{"step":{"name":"other"},"statusLabel":"succeeded","humanTaskCompletedBy":"connor"},{"step":{"name":"decide"},"statusLabel":"running"}]}}`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.replies[run] = tc.detail
 			err := complete(context.Background(), task, nil)
-			if tc.answered {
-				require.ErrorIs(t, err, review.ErrTaskAnswered)
+			opener := &review.RunOpener{Complete: complete}
+			outcome, closeErr := opener.CloseDecision(context.Background(), review.Proposal{NativeTask: task})
+			if tc.want != nil {
+				require.ErrorIs(t, err, tc.want)
+				require.NoError(t, closeErr)
+				assert.Equal(t, tc.closed, outcome)
 				return
 			}
 			require.Error(t, err)
 			require.NotErrorIs(t, err, review.ErrTaskAnswered, "a task that cannot be answered yet was not answered")
+			require.NotErrorIs(t, err, review.ErrTaskEnded, "and it has not ended")
 			// Closing the decision run on it is a failure to retry, not a
 			// final closure.
-			opener := &review.RunOpener{Complete: complete}
-			outcome, closeErr := opener.CloseDecision(context.Background(), review.Proposal{NativeTask: task})
 			require.Error(t, closeErr)
 			assert.Equal(t, review.ClosureFailed, outcome)
 		})
@@ -1354,11 +1375,58 @@ func TestRemoteStaleRetryRequestsDoNotStarveAValidOne(t *testing.T) {
 	pending, err := f.remote.RequestedRetries(ctx, f.remote.MachineID, 20)
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "only a request that can still be carried out takes a place")
+
+	// A run that cannot be read does not stop the others either: its
+	// request is reported and left, and the valid one is still executed.
+	request("unreadable")
+	service.unreadable = map[string]error{"unreadable": errors.New("hub timeout")}
 	done, err := f.retrying("tick-1", service).RunRequestedRetries(ctx, f.remote.MachineID)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "unreadable")
+	require.ErrorContains(t, err, "left for the next tick")
 	require.Len(t, done, 1)
 	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
 	assert.Equal(t, []string{"valid"}, service.retried)
+
+	// Once it can be read again it is carried out, whatever the time of
+	// day or the number of requests before it.
+	service.unreadable = nil
+	done, err = f.retrying("tick-2", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, []string{"valid", "unreadable"}, service.retried)
+}
+
+// However many requests can never be carried out, a valid one behind all of
+// them is reached in the same listing: nothing is scanned in part, and
+// nothing depends on the clock.
+func TestRemoteAValidRetryBehindHundredsOfDeadOnesIsReached(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	for i := range 260 {
+		runID := fmt.Sprintf("dead-%03d", i)
+		service.fail(runID, "att-1")
+		_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+			_, _, err := tx.ProposeRetry(registry.RetryRunParams{
+				RunID: runID, AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+			}, "retry-"+runID)
+			return err
+		})
+		require.NoError(t, err)
+		service.start(runID)
+	}
+	service.fail("valid", "att-1")
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		_, _, err := tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "valid", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-valid")
+		return err
+	})
+	require.NoError(t, err)
+	pending, err := f.remote.RequestedRetries(ctx, f.remote.MachineID, 20)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
 }
 
 // A registered target is named by its kind and its whole stable id. Two
@@ -1598,6 +1666,47 @@ func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
 	stored, err := f.store.GetReview(ctx, f.jobID, prepared.Packet.ReviewID)
 	require.NoError(t, err)
 	assert.Positive(t, stored.PacketBytes)
+}
+
+// A decision run that ended before anyone answered is not recorded as
+// answered. The registry has no outcome of its own for it, so it is
+// recorded as closed with a detail that says the reviewer completed
+// nothing, and it leaves the pending list.
+func TestRemoteAnEndedDecisionRunIsNotRecordedAsAnswered(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	prepared, err := f.reviewer("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = f.reviewer("reviewer-a").Apply(ctx, prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "grow", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: "expand_volume", TargetID: f.targetID(), Params: map[string]string{"size_gb": "200"}, Reason: "grow"}},
+	})
+	require.NoError(t, err)
+	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		return tx.Transition(registry.Transition{Op: registry.OpRetire, Reason: registry.RetireManual})
+	})
+	require.NoError(t, err)
+	pending, err := f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+
+	f.opener.close = func(review.Proposal) (review.ClosureOutcome, error) { return review.ClosureEnded, nil }
+	done, err := f.reviewer("tick-1").CloseSuperseded(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, review.ClosureEnded, done[0].Outcome)
+
+	pending, err = f.remote.PendingClosures(ctx, f.remote.MachineID, 10)
+	require.NoError(t, err)
+	assert.Empty(t, pending, "nothing is waiting, so nothing is pending")
+	raw, err := json.Marshal(f.job())
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"outcome":"already_answered"`)
+	closures, err := f.store.ListClosures(ctx, f.jobID, 0)
+	require.NoError(t, err)
+	require.Len(t, closures, 1)
+	assert.Equal(t, registry.ClosureClosed, closures[0].Outcome)
+	assert.Contains(t, closures[0].Detail, "ended without an answer")
 }
 
 // Superseded proposals leave their decision runs waiting. The registry

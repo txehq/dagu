@@ -128,26 +128,50 @@ func (p Packet) trimmedExecutions() []string {
 }
 
 // trimmedCaveat is what a recommendation to end a job must tell the owner
-// when the review behind it was shown runs with part of their evidence left
-// out. Evidence nobody saw cannot support the conclusion that a job is done
-// or should stop, so the owner is told which runs to look at themselves.
-// It is empty when every run was shown whole.
+// about everything the review behind it was not shown. Evidence nobody saw
+// cannot support the conclusion that a job is done or should stop, so each
+// kind of it is named: runs shown with evidence left out, runs whose steps
+// printed more than was shown, runs that were not shown at all, and other
+// records that were left out to fit. It is empty only when the review was
+// shown everything there was.
 func (p Packet) trimmedCaveat() string {
-	var ids []string
+	var trimmed, partial []string
 	for _, r := range p.NewRuns {
-		if r.EvidenceTrimmed {
-			ids = append(ids, r.RunID)
+		switch {
+		case r.EvidenceTrimmed:
+			trimmed = append(trimmed, r.RunID)
+		case r.outputTruncated():
+			partial = append(partial, r.RunID)
 		}
 	}
-	if len(ids) == 0 {
+	var gaps []string
+	if len(trimmed) > 0 {
+		gaps = append(gaps, fmt.Sprintf("%d run(s) with part of their evidence left out to fit (%s)", len(trimmed), someOf(trimmed)))
+	}
+	if len(partial) > 0 {
+		gaps = append(gaps, fmt.Sprintf("%d run(s) whose steps printed more than the end that was shown (%s)", len(partial), someOf(partial)))
+	}
+	if p.MoreRunsPending {
+		gaps = append(gaps, "later runs or decisions that were not shown at all and wait for the next review")
+	}
+	if p.EvidenceTrimmed && len(trimmed) == 0 {
+		gaps = append(gaps, "open proposals or unresolved actions that were left out to fit")
+	}
+	if len(gaps) == 0 {
 		return ""
 	}
+	return " This review was not shown everything: " + strings.Join(gaps, "; ") +
+		". What it was not shown is not evidence for this recommendation: check it yourself before deciding."
+}
+
+// someOf lists a few ids and counts the rest.
+func someOf(ids []string) string {
 	const shown = 5
 	list := strings.Join(ids[:min(len(ids), shown)], ", ")
 	if len(ids) > shown {
 		list += fmt.Sprintf(" and %d more", len(ids)-shown)
 	}
-	return fmt.Sprintf(" This review was shown %d run(s) with part of their evidence left out to fit (%s). What was left out is not evidence for this recommendation: check those runs yourself before deciding.", len(ids), list)
+	return list
 }
 
 // run returns the finished run with this id that the packet shows.
@@ -187,7 +211,10 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 		p.MoreRunsPending = true
 	}
 	for _, r := range runs {
-		r.Outputs = truncateOutputs(r.Outputs)
+		var cut bool
+		if r.Outputs, cut = truncateOutputs(r.Outputs); cut {
+			r.EvidenceTrimmed, p.EvidenceTrimmed = true, true
+		}
 		if len(r.Steps) > maxRunSteps {
 			r.Steps, r.OmittedSteps = boundSteps(r.Steps)
 			r.EvidenceTrimmed, p.EvidenceTrimmed = true, true
@@ -239,18 +266,19 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 	return p, nil
 }
 
-func truncateOutputs(outputs map[string]string) map[string]string {
+// truncateOutputs bounds each output value and reports whether any was cut.
+func truncateOutputs(outputs map[string]string) (bounded map[string]string, cut bool) {
 	if len(outputs) == 0 {
-		return outputs
+		return outputs, false
 	}
 	out := make(map[string]string, len(outputs))
 	for k, v := range outputs {
 		if len(v) > maxOutputValueLen {
-			v = v[:maxOutputValueLen] + "...[truncated]"
+			v, cut = v[:maxOutputValueLen]+"...[truncated]", true
 		}
 		out[k] = v
 	}
-	return out
+	return out, cut
 }
 
 // trim keeps the packet within its size limit without hiding evidence from
@@ -287,7 +315,7 @@ func (p *Packet) trim() {
 				before := len(step.Stdout) + len(step.Stderr)
 				step.Stdout, step.Stderr = keepTail(step.Stdout, limit), keepTail(step.Stderr, limit)
 				if len(step.Stdout)+len(step.Stderr) != before {
-					p.NewRuns[i].EvidenceTrimmed = true
+					step.Truncated, p.NewRuns[i].EvidenceTrimmed = true, true
 				}
 			}
 		}

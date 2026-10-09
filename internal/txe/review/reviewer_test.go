@@ -134,7 +134,9 @@ type runs struct {
 	retry func(runID string) error
 	// readErr fails reads of a run's state while set.
 	readErr error
-	seq     int
+	// unreadable fails reads of single runs.
+	unreadable map[string]error
+	seq        int
 }
 
 func newRuns() *runs {
@@ -178,6 +180,9 @@ func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, er
 	defer r.mu.Unlock()
 	if r.readErr != nil {
 		return review.RunState{}, r.readErr
+	}
+	if err := r.unreadable[runID]; err != nil {
+		return review.RunState{}, err
 	}
 	state, ok := r.state[runID]
 	if !ok {

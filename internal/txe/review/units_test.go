@@ -719,33 +719,49 @@ func TestTrimmedEvidenceKeepsFailuresAndIsOnTheRecord(t *testing.T) {
 	assert.Equal(t, []string{first}, recorded.TrimmedExecutions, "the record says which result was reviewed on part of its evidence")
 }
 
-// Evidence that was left out cannot support the conclusion that a job is
-// done. When the reviewer recommends completing or retiring a job after
-// being shown runs with trimmed evidence, the question put to the owner
-// says so and names the runs; with every run shown whole it says nothing.
-func TestARecommendationToEndAJobSaysWhenItsEvidenceWasTrimmed(t *testing.T) {
-	steps := make([]review.StepEvidence, 0, 30)
+// Evidence that was not shown cannot support the conclusion that a job is
+// done. When the reviewer recommends completing or retiring a job, the
+// question put to the owner names every kind of thing the review was not
+// shown: runs with evidence left out, runs whose steps printed more than
+// was shown, and runs that were not shown at all. With everything shown it
+// says nothing.
+func TestARecommendationToEndAJobSaysWhatTheReviewWasNotShown(t *testing.T) {
+	long := make([]review.StepEvidence, 0, 30)
 	for j := range 30 {
-		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("step-%02d", j), Status: "succeeded"})
+		long = append(long, review.StepEvidence{Name: fmt.Sprintf("step-%02d", j), Status: "succeeded"})
 	}
 	for _, outcome := range []review.Outcome{review.OutcomeComplete, review.OutcomeRetire} {
-		t.Run(string(outcome)+" on trimmed evidence", func(t *testing.T) {
+		t.Run(string(outcome)+" with gaps", func(t *testing.T) {
 			f := newFixture(t)
-			require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-long", Status: "succeeded", AttemptID: "att-1", Steps: steps}))
-			f.addRun("run-short", "succeeded")
+			require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-long", Status: "succeeded", AttemptID: "att-1", Steps: long}))
+			require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-tail", Status: "succeeded", AttemptID: "att-1",
+				Steps: []review.StepEvidence{{Name: "sync", Status: "succeeded", Stdout: "...end", Truncated: true}}}))
+			require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-big-output", Status: "succeeded", AttemptID: "att-1",
+				Outputs: map[string]string{"report": strings.Repeat("x", 100000)}}))
+			f.addRun("run-whole", "succeeded")
 			f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: outcome, Reasoning: "done", EvidenceRunIDs: []string{"run-long"}})
 			question := f.state().Proposals[jobID][0].Question
-			assert.Contains(t, question, "1 run(s) with part of their evidence left out")
-			assert.Contains(t, question, "run-long")
-			assert.NotContains(t, question, "run-short")
-			assert.Contains(t, question, "check those runs yourself")
+			assert.Contains(t, question, "2 run(s) with part of their evidence left out to fit (run-long, run-big-output)")
+			assert.Contains(t, question, "1 run(s) whose steps printed more than the end that was shown (run-tail)")
+			assert.NotContains(t, question, "run-whole")
+			assert.Contains(t, question, "is not evidence for this recommendation")
 		})
 	}
-	t.Run("complete on whole evidence", func(t *testing.T) {
+	t.Run("complete while later runs were not shown", func(t *testing.T) {
 		f := newFixture(t)
-		f.addRun("run-short", "succeeded")
-		f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: review.OutcomeComplete, Reasoning: "done", EvidenceRunIDs: []string{"run-short"}})
-		assert.NotContains(t, f.state().Proposals[jobID][0].Question, "left out")
+		for i := range 60 {
+			f.addRun(fmt.Sprintf("run-%02d", i), "succeeded")
+		}
+		prepared := f.prepare("reviewer-a")
+		require.True(t, prepared.Packet.MoreRunsPending)
+		f.apply("reviewer-a", prepared, review.AgentDecision{Outcome: review.OutcomeComplete, Reasoning: "done", EvidenceRunIDs: []string{"run-00"}})
+		assert.Contains(t, f.state().Proposals[jobID][0].Question, "later runs or decisions that were not shown at all")
+	})
+	t.Run("complete with everything shown", func(t *testing.T) {
+		f := newFixture(t)
+		f.addRun("run-whole", "succeeded")
+		f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: review.OutcomeComplete, Reasoning: "done", EvidenceRunIDs: []string{"run-whole"}})
+		assert.NotContains(t, f.state().Proposals[jobID][0].Question, "not shown")
 	})
 }
 

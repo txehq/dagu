@@ -548,12 +548,20 @@ func (r *Remote) stepEvidence(ctx context.Context, jobID, runID string) ([]StepE
 			// step-log request that omits it.
 			q := url.Values{"stream": {stream}, "tail": {strconv.Itoa(stepLogTailLines)}}
 			var log struct {
-				Content string `json:"content"`
+				Content    string `json:"content"`
+				HasMore    bool   `json:"hasMore"`
+				LineCount  int    `json:"lineCount"`
+				TotalLines int    `json:"totalLines"`
 			}
 			err := r.do(ctx, http.MethodGet, base+"/steps/"+url.PathEscape(step.Name)+"/log?"+q.Encode(), nil, &log)
 			switch {
 			case err == nil:
 				*into = tailBytes(log.Content, stepLogTailBytes)
+				// The evidence says when it is only the end of what the
+				// step printed.
+				if log.HasMore || log.TotalLines > log.LineCount || len(*into) != len(log.Content) {
+					step.Truncated = true
+				}
 			case errors.Is(err, ErrNotFound):
 				// The step wrote nothing to this stream.
 			default:
@@ -708,9 +716,6 @@ func (r *Remote) PendingClosures(ctx context.Context, machineID string, limit in
 	return out, nil
 }
 
-// retryScan bounds how many requested retries one listing looks at.
-const retryScan = 200
-
 // RequestedRetries implements Registry. A retry a person requested is a
 // decided retry proposal without a native task. Its latest retry decision
 // is the request; once that decision has a journaled action it was
@@ -720,10 +725,18 @@ const retryScan = 200
 // A request whose run has moved on from the execution it names can never be
 // carried out, and nothing in the registry ends it. Such a request must not
 // take a place in the batch, or enough of them would keep every valid one
-// waiting for good. So each request is checked against its run, only the
-// ones that can still be carried out are returned, and when there are more
-// requests than one listing looks at, the place it starts from moves on
-// with time so that every request is reached.
+// waiting for good. So every request is checked against its run, in a fixed
+// order, and the first limit that can still be carried out are returned.
+// Those are executed and leave the list, so the ones behind them are next;
+// no request depends on the clock or on where a scan happened to start.
+//
+// A run that cannot be read does not stop the others: its request is left
+// for the next listing, and the failures are returned as an error alongside
+// the requests that were found.
+//
+// The cost is one read of a run for each request that was never attempted,
+// on every listing. Requests that can never run stay in that number until
+// the job's version changes; ending them is the registry's to do.
 func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit int) ([]RequestedRetry, error) {
 	var list api.TxeJobList
 	if err := r.do(ctx, http.MethodGet, "/txe/jobs?"+url.Values{"machine": {machineID}}.Encode(), nil, &list); err != nil {
@@ -786,34 +799,48 @@ func (r *Remote) RequestedRetries(ctx context.Context, machineID string, limit i
 		}
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].DecisionID < all[j].DecisionID })
-	start := 0
-	if len(all) > retryScan {
-		start = int(time.Now().Unix()/60) % len(all)
-	}
 	runs := remoteRuns{t: r.Transport}
 	var out []RequestedRetry
-	for i := 0; i < min(len(all), retryScan) && (limit <= 0 || len(out) < limit); i++ {
-		req := all[(start+i)%len(all)]
+	var unread []error
+	for _, req := range all {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 		state, err := runs.RunState(ctx, req.JobID, req.runID)
-		if errors.Is(err, ErrNotFound) {
+		switch {
+		case errors.Is(err, ErrNotFound):
 			// The service no longer has the run: nothing can be retried.
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read run %s of job %s: %w", req.runID, req.JobID, err)
-		}
-		if state.retryable(req.bound) {
+		case err != nil:
+			if len(unread) < maxUnreadReported {
+				unread = append(unread, fmt.Errorf("run %s of job %s: %w", req.runID, req.JobID, err))
+			}
+		case state.retryable(req.bound):
 			out = append(out, req.RequestedRetry)
 		}
 	}
+	if len(unread) > 0 {
+		return out, fmt.Errorf("some requested retries could not be checked and are left for the next tick: %w", errors.Join(unread...))
+	}
 	return out, nil
 }
+
+// maxUnreadReported bounds how many unreadable runs one listing names.
+const maxUnreadReported = 10
 
 // RecordClosure implements Registry. The registry keeps every attempt and
 // counts the failed ones; any other outcome is final and takes the proposal
 // off its pending list.
 func (r *Remote) RecordClosure(ctx context.Context, closure Closure) (int, error) {
-	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: api.TxeClosureOutcome(closure.Outcome), Detail: optional(closure.Detail)}
+	outcome, detail := api.TxeClosureOutcome(closure.Outcome), closure.Detail
+	if closure.Outcome == ClosureEnded {
+		// The registry has no outcome of its own for a task that ended
+		// unanswered. It is recorded as closed, which is what it is, with
+		// the detail saying that the reviewer completed nothing; it is not
+		// recorded as answered, which it was not.
+		outcome = api.TxeClosureOutcomeClosed
+		detail = strings.TrimSpace("the decision run had already ended without an answer; the reviewer completed nothing. " + detail)
+	}
+	body := api.TxeClosureRequest{Actor: r.actor(), Outcome: outcome, Detail: optional(detail)}
 	var out api.TxeClosure
 	err := r.do(ctx, http.MethodPost, jobPath(closure.JobID, "proposals", closure.ProposalID, "closures"), body, &out)
 	if denied, ok := errors.AsType[*GuardDeniedError](err); ok && denied.Reason == DenyDecisionStale {
@@ -1209,13 +1236,21 @@ func RemoteEnqueue(t Transport) EnqueueFunc {
 // RemoteComplete returns a CompleteFunc that completes a human task through
 // the service.
 //
-// The service answers 409 both when the task was completed with another
-// input and when it simply cannot be completed yet: the run has not reached
-// the task, is still being finalized, or changed underneath the request.
-// Only the first means the task was answered. So a conflict is checked
-// against the run itself: answered only when the task's step, or the whole
-// run, is over. Anything else is returned as an error, which leaves the
-// task to be tried again and is never recorded as a final outcome.
+// The service answers 409 for three different things: the task was completed
+// with another input; the task can no longer be completed because its step
+// or run is over; and the task cannot be completed yet, because the run has
+// not reached it, is being finalized, or changed underneath the request. So
+// a conflict is checked against the run itself:
+//
+//   - answered, only when the task's step records who completed it;
+//   - ended, when the step or the whole run is over and no completion is
+//     recorded: nothing is waiting, and nothing says anyone answered;
+//   - otherwise an error, which leaves the task to be tried again and is
+//     never recorded as a final outcome.
+//
+// A service that does not record who completed a task, as one running
+// without authentication, reports an answered task as ended. Both are final
+// and neither claims an answer that is not on record.
 func RemoteComplete(t Transport) CompleteFunc {
 	return func(ctx context.Context, task TaskLocator, input map[string]string) error {
 		base := "/dag-runs/" + url.PathEscape(task.DAG) + "/" + url.PathEscape(task.RunID)
@@ -1235,7 +1270,9 @@ func RemoteComplete(t Transport) CompleteFunc {
 						Step struct {
 							Name string `json:"name"`
 						} `json:"step"`
-						StatusLabel string `json:"statusLabel"`
+						StatusLabel   string `json:"statusLabel"`
+						CompletedBy   string `json:"humanTaskCompletedBy"`
+						CompletedByID string `json:"humanTaskCompletedById"`
 					} `json:"nodes"`
 				} `json:"dagRunDetails"`
 			}
@@ -1243,13 +1280,18 @@ func RemoteComplete(t Transport) CompleteFunc {
 				return fmt.Errorf("the task could not be completed (%s) and its run could not be read: %w", te.Message, readErr)
 			}
 			run := detail.DagRunDetails
-			if terminalRunStatuses[run.StatusLabel] {
-				return ErrTaskAnswered
-			}
+			stepOver, stepStatus := false, "not found"
 			for _, node := range run.Nodes {
-				if node.Step.Name == task.StepID && finishedStepStatuses[node.StatusLabel] {
+				if node.Step.Name != task.StepID {
+					continue
+				}
+				if node.CompletedBy != "" || node.CompletedByID != "" {
 					return ErrTaskAnswered
 				}
+				stepOver, stepStatus = finishedStepStatuses[node.StatusLabel], node.StatusLabel
+			}
+			if stepOver || terminalRunStatuses[run.StatusLabel] {
+				return fmt.Errorf("%w: its run is %s and its step is %s", ErrTaskEnded, run.StatusLabel, stepStatus)
 			}
 			return fmt.Errorf("the task cannot be completed yet: %s (run is %s)", te.Message, run.StatusLabel)
 		}
