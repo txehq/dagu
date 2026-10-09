@@ -137,6 +137,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	}
 	res, err := svc.RequestRetry(ctx, req.JobId, decision.RetryRequest{
 		RunID:              req.RunId,
+		AttemptID:          run.attemptID,
 		ExpectedJobVersion: body.ExpectedJobVersion,
 		RunSpecSHA256:      run.specSHA256,
 		RunStartedAt:       run.startedAt,
@@ -173,6 +174,8 @@ func txeRetryResponse(res *decision.Result) (api.RequestTxeRunRetryResponseObjec
 }
 
 type txeRun struct {
+	// attemptID is the run's latest attempt, the one a retry would follow.
+	attemptID  string
 	specSHA256 string
 	startedAt  time.Time
 }
@@ -211,7 +214,12 @@ func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, err
 	if err != nil {
 		return txeRun{}, fmt.Errorf("parse start time of run %s: %w", runID, err)
 	}
-	return txeRun{specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
+	if status.AttemptID == "" {
+		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: fmt.Sprintf("run %s has no attempt identity to bind a retry to", runID),
+			Details: map[string]any{"code": string(decision.CodeRunStale)}}
+	}
+	return txeRun{attemptID: status.AttemptID, specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
 }
 
 // ListTxeProposalDecisions lists every decision recorded for a proposal,

@@ -5,7 +5,12 @@ import { describe, expect, it } from 'vitest';
 
 import type { components } from '@/api/v1/schema';
 
-import { canRequestRetry, retryLabel, retryStates } from '../retry';
+import {
+  canRequestRetry,
+  retryLabel,
+  retryStates,
+  type RetryState,
+} from '../retry';
 
 type ApiProposal = components['schemas']['TxeProposal'];
 type ApiAction = components['schemas']['TxeAction'];
@@ -25,7 +30,10 @@ function proposal(
     binding_digest: 'sha256:' + 'b'.repeat(64),
     revision: 2,
     state,
-    action: { name: 'dagu.retry_run', params: { run_id: runId } },
+    action: {
+      name: 'dagu.retry_run',
+      params: { run_id: runId, attempt_id: runId + '-a1' },
+    },
     created: stamp(at),
     updated: stamp(at),
   } as unknown as ApiProposal;
@@ -95,32 +103,35 @@ describe('retryStates', () => {
 });
 
 describe('canRequestRetry', () => {
-  it('offers a retry only of a finished, unsuccessful run with none pending', () => {
-    expect(canRequestRetry('failed', undefined)).toBe(true);
-    expect(canRequestRetry('succeeded', undefined)).toBe(false);
-    expect(canRequestRetry('partially_succeeded', undefined)).toBe(false);
-    expect(canRequestRetry('running', undefined)).toBe(false);
-    expect(
-      canRequestRetry('failed', {
-        runId: 'r',
-        proposalId: 'p',
-        status: 'requested',
-      })
-    ).toBe(false);
-    expect(
-      canRequestRetry('failed', {
-        runId: 'r',
-        proposalId: 'p',
-        status: 'uncertain',
-      })
-    ).toBe(false);
-    // The registry refuses a second request for the same run and version.
-    expect(
-      canRequestRetry('failed', {
-        runId: 'r',
-        proposalId: 'p',
-        status: 'failed',
-      })
-    ).toBe(false);
+  const bound = (
+    status: RetryState['status'],
+    attemptId = 'a1'
+  ): RetryState => ({
+    runId: 'r',
+    proposalId: 'p',
+    attemptId,
+    status,
+  });
+
+  it('offers a retry of a failed latest attempt with none bound to it', () => {
+    expect(canRequestRetry('failed', 'a1', undefined)).toBe(true);
+    expect(canRequestRetry('succeeded', 'a1', undefined)).toBe(false);
+    expect(canRequestRetry('partially_succeeded', 'a1', undefined)).toBe(false);
+    expect(canRequestRetry('running', 'a1', undefined)).toBe(false);
+    // Without Dagu's attempt identity there is nothing to bind a retry to.
+    expect(canRequestRetry('failed', undefined, undefined)).toBe(false);
+  });
+
+  it('allows one retry per attempt', () => {
+    for (const status of [
+      'requested',
+      'executing',
+      'uncertain',
+      'failed',
+    ] as const) {
+      expect(canRequestRetry('failed', 'a1', bound(status))).toBe(false);
+    }
+    // The retried attempt a2 failed too: the run may be retried again.
+    expect(canRequestRetry('failed', 'a2', bound('succeeded'))).toBe(true);
   });
 });

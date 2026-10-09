@@ -164,7 +164,12 @@ describe('snooze expiry', () => {
 describe('run retry', () => {
   const failedJob = fixtureJob({
     latestRuns: [
-      { dagName: 'job_volume_monitor', dagRunId: 'run-0003', status: 'failed' },
+      {
+        dagName: 'job_volume_monitor',
+        dagRunId: 'run-0003',
+        status: 'failed',
+        attemptId: 'run-0003-a1',
+      },
     ],
   });
 
@@ -198,6 +203,7 @@ describe('run retry', () => {
               {
                 runId: 'run-0003',
                 proposalId: 'prp_r',
+                attemptId: 'run-0003-a1',
                 status: 'requested' as const,
               },
             ],
@@ -217,9 +223,10 @@ describe('run retry', () => {
 });
 
 describe('dispatched retry', () => {
-  // A dispatch says nothing about how the run went: the run's own status is
-  // shown beside it, and the receipt is not presented as an attempt.
-  it('shows the dispatch and the run status, not the receipt', async () => {
+  // The registry accepts a successful dispatch only with the new attempt it
+  // observed, so the receipt names a real attempt; the run's own status is
+  // shown beside it and never read as the job succeeding.
+  it('names the observed attempt and shows the run status separately', async () => {
     renderAt(
       baseApi({
         getJob: async () =>
@@ -229,6 +236,7 @@ describe('dispatched retry', () => {
                 dagName: 'job_volume_monitor',
                 dagRunId: 'run-0003',
                 status: 'running',
+                attemptId: 'run-0003-a2',
               },
             ],
           }),
@@ -239,8 +247,9 @@ describe('dispatched retry', () => {
               {
                 runId: 'run-0003',
                 proposalId: 'prp_r',
+                attemptId: 'run-0003-a1',
                 status: 'succeeded' as const,
-                receipt: 'attempt-2',
+                receipt: 'run-0003-a2',
               },
             ],
           ]),
@@ -248,10 +257,8 @@ describe('dispatched retry', () => {
       '/txe/jobs/job_volume_monitor'
     );
     const retry = await screen.findByTestId('txe-run-retry');
-    expect(retry).toHaveTextContent('Retry dispatched');
+    expect(retry).toHaveTextContent('Retry dispatched as attempt run-0003-a2');
     expect(retry).toHaveTextContent('run is now running');
-    // The journal receipt is not an attempt identity and is never shown as one.
-    expect(retry).not.toHaveTextContent('attempt-2');
     expect(retry).not.toHaveTextContent('Retried');
   });
 });

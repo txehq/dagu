@@ -52,27 +52,39 @@ func (m *memDAGs) WriteSpec(_ context.Context, name string, spec []byte) error {
 	return nil
 }
 
-// memRuns is Dagu's run history as the registry sees it: the saved DAG
-// digest of each run a test recorded. Unknown runs are not found.
+// memRuns is Dagu's run history as the registry sees it: each recorded run's
+// latest attempt. Unknown runs are not found.
 type memRuns struct {
-	mu      sync.Mutex
-	digests map[string]string
+	mu       sync.Mutex
+	attempts map[string]registry.RunAttempt
 }
 
+// add records runID with a failed first attempt of the DAG with digest.
 func (m *memRuns) add(runID, digest string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.digests[runID] = digest
+	m.set(runID, registry.RunAttempt{AttemptID: runID + "-a1", SpecSHA256: digest, Status: "failed", Finished: true})
 }
 
-func (m *memRuns) RunSpecSHA256(_ context.Context, _, runID string) (string, error) {
+// set replaces runID's latest attempt, as a native retry or a later run would.
+func (m *memRuns) set(runID string, a registry.RunAttempt) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	d, ok := m.digests[runID]
+	m.attempts[runID] = a
+}
+
+func (m *memRuns) latest(runID string) registry.RunAttempt {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attempts[runID]
+}
+
+func (m *memRuns) LatestAttempt(_ context.Context, _, runID string) (registry.RunAttempt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.attempts[runID]
 	if !ok {
-		return "", registry.ErrRunNotFound
+		return registry.RunAttempt{}, registry.ErrRunNotFound
 	}
-	return d, nil
+	return a, nil
 }
 
 func (m *memRuns) ActiveRuns(context.Context, string) ([]registry.RunRef, error) { return nil, nil }
@@ -127,7 +139,7 @@ func newFixture(t *testing.T) *fixture {
 	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
 	current := now
 	clock := func() time.Time { return current }
-	runs := &memRuns{digests: map[string]string{}}
+	runs := &memRuns{attempts: map[string]registry.RunAttempt{}}
 	store, err := registry.NewFileStore(t.TempDir(),
 		registry.WithClock(clock), registry.WithDAGStore(&memDAGs{specs: map[string][]byte{}}), registry.WithRunControl(runs))
 	if err != nil {
@@ -641,9 +653,11 @@ func (f *fixture) job() *registry.Job {
 // Dagu's run history as a run of the job's current DAG.
 func (f *fixture) retryRequest(runID, key string) RetryRequest {
 	j := f.job()
-	f.runs.add(runID, j.DAGSpecSHA256)
+	if _, ok := f.runs.attempts[runID]; !ok {
+		f.runs.add(runID, j.DAGSpecSHA256)
+	}
 	return RetryRequest{
-		RunID: runID, ExpectedJobVersion: j.Version, RunSpecSHA256: j.DAGSpecSHA256,
+		RunID: runID, AttemptID: f.runs.latest(runID).AttemptID, ExpectedJobVersion: j.Version, RunSpecSHA256: j.DAGSpecSHA256,
 		RunStartedAt: f.now.Add(time.Minute), IdempotencyKey: key,
 	}
 }
@@ -687,9 +701,13 @@ func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first grant: %v", err)
 	}
+	// The executor's native retry adds an attempt to the same run; the
+	// receipt names that observed attempt.
+	j := f.job()
+	f.runs.set("run-0042", registry.RunAttempt{AttemptID: "run-0042-a2", SpecSHA256: j.DAGSpecSHA256, Status: "running"})
 	if _, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
 		_, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: claim.ClaimID,
-			Fence: claim.Fence, State: registry.ActionSucceeded, Receipt: "attempt-0042-2"})
+			Fence: claim.Fence, State: registry.ActionSucceeded, Receipt: "run-0042-a2"})
 		if err != nil {
 			return err
 		}
@@ -769,8 +787,9 @@ func TestDecideRetryOnRetryRunProposal(t *testing.T) {
 	f := newFixture(t)
 	j := f.job()
 	f.runs.add("run-0044", j.DAGSpecSHA256)
-	params, _ := json.Marshal(registry.RetryRunParams{RunID: "run-0044", RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest})
-	id, err := registry.RetryProposalID("run-0044", j.Version)
+	attempt := f.runs.latest("run-0044").AttemptID
+	params, _ := json.Marshal(registry.RetryRunParams{RunID: "run-0044", AttemptID: attempt, RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest})
+	id, err := registry.RetryProposalID("run-0044", attempt, j.Version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,5 +804,95 @@ func TestDecideRetryOnRetryRunProposal(t *testing.T) {
 	}
 	if res.Proposal == nil || res.Proposal.State != registry.ProposalDecided {
 		t.Fatalf("proposal = %+v, want decided", res.Proposal)
+	}
+}
+
+// grantAndSettle performs a recorded retry as the executor does: one grant
+// under an execution claim, a native retry that adds attempt next to the
+// run, and a settlement whose receipt is that observed attempt.
+func (f *fixture) grantAndSettle(res *Result, runID, next string, nextFailed bool) error {
+	f.t.Helper()
+	actionID, err := registry.ApprovedActionID(res.Proposal.ProposalID, res.Decision.DecisionID)
+	if err != nil {
+		return err
+	}
+	executor := registry.Actor{Kind: registry.ActorReviewer, ID: "executor"}
+	var g *registry.Grant
+	var c *registry.Claim
+	if _, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
+		var err error
+		if c, err = tx.AcquireClaim(registry.ClaimExecution, registry.Reviewer{MachineID: f.machineID}, time.Hour); err != nil {
+			return err
+		}
+		j := tx.Job
+		g, err = tx.Authorize(registry.EffectRequest{ActionID: actionID, JobVersion: j.Version, PackageDigest: j.PackageDigest,
+			Approved: &registry.ApprovedEffect{ProposalID: res.Proposal.ProposalID, DecisionID: res.Decision.DecisionID, ClaimID: c.ClaimID, Fence: c.Fence}})
+		return err
+	}); err != nil {
+		return err
+	}
+	j := f.job()
+	f.runs.set(runID, registry.RunAttempt{AttemptID: next, SpecSHA256: j.DAGSpecSHA256, Status: "failed", Finished: true, Succeeded: !nextFailed})
+	_, err = f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
+		if _, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID,
+			Fence: c.Fence, State: registry.ActionSucceeded, Receipt: next}); err != nil {
+			return err
+		}
+		return tx.ReleaseClaim(c.ClaimID, c.Fence)
+	})
+	return err
+}
+
+// A native retry keeps the run ID, so a retry is bound to the failed attempt.
+// When the retried attempt fails too, a fresh decision may retry the run once
+// more, while replaying the first request still returns only its decision.
+func TestRequestRetryLaterAttempt(t *testing.T) {
+	f := newFixture(t)
+	first, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-1"), f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.grantAndSettle(first, "run-0050", "run-0050-a2", true); err != nil {
+		t.Fatalf("first retry: %v", err)
+	}
+	second, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-2"), f.human)
+	if err != nil {
+		t.Fatalf("retry of the failed retried attempt: %v", err)
+	}
+	if second.Proposal.ProposalID == first.Proposal.ProposalID {
+		t.Fatal("the later attempt's retry reused the first attempt's proposal")
+	}
+	if err := f.grantAndSettle(second, "run-0050", "run-0050-a3", true); err != nil {
+		t.Fatalf("second retry: %v", err)
+	}
+	replay, err := f.svc.RequestRetry(f.ctx, f.jobID, f.retryRequest("run-0050", "key-later-1"), f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.AlreadyRecorded || replay.Decision.DecisionID != first.Decision.DecisionID {
+		t.Fatalf("replay of the first request = %+v", replay.Decision)
+	}
+	if n := len(f.decisions()); n != 2 {
+		t.Fatalf("decisions = %d, want 2", n)
+	}
+}
+
+// A request naming an attempt that is not the run's latest, or a run whose
+// latest attempt succeeded, is refused and records nothing.
+func TestRequestRetryRefusesForgedAndStaleAttempts(t *testing.T) {
+	f := newFixture(t)
+	forged := f.retryRequest("run-0060", "key-forged")
+	forged.AttemptID = "run-0060-a0"
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, forged, f.human); registry.ErrorCode(err) != registry.CodeStaleBinding {
+		t.Fatalf("forged attempt err = %v, want stale_binding", err)
+	}
+	stale := f.retryRequest("run-0061", "key-stale-attempt")
+	j := f.job()
+	f.runs.set("run-0061", registry.RunAttempt{AttemptID: stale.AttemptID, SpecSHA256: j.DAGSpecSHA256, Status: "succeeded", Finished: true, Succeeded: true})
+	if _, err := f.svc.RequestRetry(f.ctx, f.jobID, stale, f.human); registry.ErrorCode(err) != registry.CodeStaleBinding {
+		t.Fatalf("succeeded attempt err = %v, want stale_binding", err)
+	}
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
 	}
 }

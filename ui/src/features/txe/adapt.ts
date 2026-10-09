@@ -48,6 +48,7 @@ export function toRun(r: ApiRun): RunRef {
     dagName: r.name,
     dagRunId: r.dagRunId,
     status: r.statusLabel,
+    attemptId: r.attemptId,
     startedAt: r.startedAt || undefined,
     finishedAt: r.finishedAt || undefined,
   };
