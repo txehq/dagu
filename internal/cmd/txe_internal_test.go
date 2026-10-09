@@ -72,16 +72,92 @@ func TestTXEOutputIsCleaned(t *testing.T) {
 	})
 }
 
+// keepDaguEnvironment puts the process's DAGU_* variables back when the test
+// ends. A txe command clears them, and sets two, for the whole process.
+func keepDaguEnvironment(t *testing.T) {
+	t.Helper()
+	before := map[string]string{}
+	for _, variable := range os.Environ() {
+		if name, value, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
+			before[name] = value
+		}
+	}
+	t.Cleanup(func() {
+		for _, variable := range os.Environ() {
+			if name, _, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
+				_ = os.Unsetenv(name)
+			}
+		}
+		for name, value := range before {
+			_ = os.Setenv(name, value)
+		}
+	})
+}
+
+// A configuration with relative paths puts the context store wherever the
+// command happens to run. The store a session resolved is recorded as two
+// absolute directories, and a command given those two reads the same store
+// from any directory, as a job's publish step must.
+func TestTXEHubContextPinsResolvedStore(t *testing.T) {
+	keepDaguEnvironment(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	// The user's home is HOME on Unix and USERPROFILE on Windows.
+	t.Setenv("HOME", base)
+	t.Setenv("USERPROFILE", base)
+	t.Setenv("TXE_DAGU_HOME", filepath.Join(base, "txe-home"))
+	home, session, step := filepath.Join(base, "hub-home"), filepath.Join(base, "session"), filepath.Join(base, "step")
+	for _, dir := range []string{home, session, step} {
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+	}
+	config := filepath.Join(base, "hub.yaml")
+	require.NoError(t, os.WriteFile(config, []byte("paths:\n  contexts_dir: ./contexts\n  data_dir: ./data\n"), 0o600))
+
+	probe := func(dir string, args ...string) txeclient.HubContext {
+		t.Helper()
+		t.Chdir(dir)
+		var hub txeclient.HubContext
+		root := &cobra.Command{Use: "dagu", SilenceErrors: true, SilenceUsage: true}
+		family := TXE()
+		family.AddCommand(NewCommand(&cobra.Command{
+			Use: "probe", Annotations: map[string]string{txeLocalAnnotation: "true"},
+		}, nil, func(ctx *Context, _ []string) error {
+			hub = txeHubContext(ctx)
+			return nil
+		}))
+		root.AddCommand(family)
+		root.SetArgs(append([]string{"txe", "probe"}, args...))
+		require.NoError(t, root.Execute())
+		return hub
+	}
+
+	registered := probe(session, "--dagu-home", home, "--config", config)
+	assert.Equal(t, filepath.Join(session, "contexts"), registered.ContextsDir)
+	assert.Equal(t, filepath.Join(session, "data"), registered.DataDir)
+	assert.Equal(t, config, registered.ConfigFile)
+
+	// The same two flags, from a step's directory, name a different store.
+	replayed := probe(step, "--dagu-home", home, "--config", config)
+	assert.Equal(t, filepath.Join(step, "contexts"), replayed.ContextsDir)
+
+	// With the two directories named outright, it is the registered store.
+	pinned := probe(step, "--dagu-home", home, "--config", config,
+		"--contexts-dir", registered.ContextsDir, "--data-dir", registered.DataDir)
+	assert.Equal(t, registered.ContextsDir, pinned.ContextsDir)
+	assert.Equal(t, registered.DataDir, pinned.DataDir)
+
+	// A home written with ~ is recorded as the configuration loader reads it.
+	userHome, err := os.UserHomeDir()
+	require.NoError(t, err)
+	tilde := probe(session, "--dagu-home", "~/custom-dagu")
+	assert.Equal(t, filepath.Join(userHome, "custom-dagu"), tilde.DaguHome)
+}
+
 // A txe command takes its context store from its flags. DAGU_* variables,
 // which a job's step inherits from the worker, are dropped before the
 // configuration is read, and the default store is the TXE home's own.
 func TestTXEDefaultsIgnoreInheritedEnvironment(t *testing.T) {
-	// The command clears these for the whole process; other tests get them back.
-	for _, variable := range os.Environ() {
-		if name, value, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
-			t.Cleanup(func() { _ = os.Setenv(name, value) })
-		}
-	}
+	keepDaguEnvironment(t)
 	txeHome := filepath.Join(t.TempDir(), "txe-home")
 	worker := filepath.Join(t.TempDir(), "worker-home")
 	t.Setenv("TXE_DAGU_HOME", txeHome)

@@ -102,9 +102,10 @@ type Registrar struct {
 // HubContext is a CLI context by reference: the flags that select the context
 // store, and the context's name in it. It carries no credential.
 //
-// A txe command ignores DAGU_* environment variables, so these flags are all
-// that decides which store a command reads. A publish step given the same
-// flags reads the store this session read.
+// A txe command ignores DAGU_* environment variables, so its flags are all
+// that decides which store a command reads. A publish step is given the
+// session's flags and the two directories they resolved to, and so reads the
+// store this session read.
 type HubContext struct {
 	// DaguHome is the --dagu-home the session used.
 	DaguHome string
@@ -112,9 +113,10 @@ type HubContext struct {
 	ConfigFile string
 	// Name is the context's name in that store.
 	Name string
-	// ContextsDir and DataDir are where those flags resolved to: the
-	// contexts, and the key they are read with. They are checked, not passed
-	// on; the flags reproduce them.
+	// ContextsDir and DataDir are where those flags resolved to in the
+	// session: the contexts, and the key they are read with. A publish step
+	// is given both outright, because resolving the same configuration again
+	// from a step's working directory can give other directories.
 	ContextsDir string
 	DataDir     string
 }
@@ -268,6 +270,12 @@ func (r *Registrar) publishStep(spec *JobSpec) *txepkg.Publish {
 	command := []string{filepath.Join(r.Home.Root, "bin", "dagu"), "txe", "artifacts", "publish", "--dagu-home", daguHome}
 	if r.Hub.ConfigFile != "" {
 		command = append(command, "--config", r.Hub.ConfigFile)
+	}
+	if r.Hub.ContextsDir != "" {
+		command = append(command, "--contexts-dir", r.Hub.ContextsDir)
+	}
+	if r.Hub.DataDir != "" {
+		command = append(command, "--data-dir", r.Hub.DataDir)
 	}
 	if r.Hub.Name != "" {
 		command = append(command, "--context", r.Hub.Name)

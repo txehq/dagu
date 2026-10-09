@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	txeskill "github.com/dagucloud/dagu/v2/txe/skill"
@@ -73,6 +74,8 @@ DAGU_* environment variables are ignored: a job's steps inherit the worker's.`,
 		return ctx.Command.Help()
 	})
 	root.PersistentPreRunE = txeDefaults
+	root.PersistentFlags().String(txeContextsDirFlag, "", "Directory of the context store, when it is not the one --dagu-home and --config resolve to")
+	root.PersistentFlags().String(txeDataDirFlag, "", "Directory that holds the context store's key, when it is not the one --dagu-home and --config resolve to")
 
 	for _, sub := range []*cobra.Command{
 		txeDoctorCommand(),
@@ -91,6 +94,16 @@ DAGU_* environment variables are ignored: a job's steps inherit the worker's.`,
 	txeCleanErrors(root)
 	return root
 }
+
+// The two directories that make up a context store: the contexts, and the
+// data directory whose key they are read with. A job's publish step is given
+// both as they were resolved at registration, because resolving a
+// configuration again can give other directories: a relative path in it
+// follows the working directory, and a step runs somewhere else.
+const (
+	txeContextsDirFlag = "contexts-dir"
+	txeDataDirFlag     = "data-dir"
+)
 
 // txeCleanErrors makes every command beneath cmd return errors whose text is
 // safe to print. An error here often quotes the hub, and through it what
@@ -142,13 +155,29 @@ func isTXECommand(cmd *cobra.Command) bool {
 // and a session may carry some for a different Dagu altogether. Any of them
 // would move the context store, or the key it is read with, away from the one
 // the job was registered with. So they are dropped before the configuration is
-// read: --dagu-home and --config say where the store is.
+// read: --dagu-home and --config say where the store is, and --contexts-dir
+// and --data-dir name its two directories outright. Those two reach the
+// configuration the way Dagu takes such a setting, as its own variables, set
+// here after the inherited ones are gone.
 func txeDefaults(cmd *cobra.Command, _ []string) error {
 	for _, variable := range os.Environ() {
 		if name, _, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
 			if err := os.Unsetenv(name); err != nil {
 				return err
 			}
+		}
+	}
+	for flag, variable := range map[string]string{txeContextsDirFlag: "DAGU_CONTEXTS_DIR", txeDataDirFlag: "DAGU_DATA_DIR"} {
+		f := cmd.Flags().Lookup(flag)
+		if f == nil || f.Value.String() == "" {
+			continue
+		}
+		dir, err := fileutil.ResolvePath(f.Value.String())
+		if err != nil {
+			return fmt.Errorf("--%s: %w", flag, err)
+		}
+		if err := os.Setenv(variable, dir); err != nil {
+			return err
 		}
 	}
 	home, err := txepkg.DefaultHome()
@@ -332,17 +361,15 @@ func txeCleanValue(v any) any {
 // txeHubContext names the context a command is using by where it is stored
 // and what it is called, so a job's publish step can use the same one.
 func txeHubContext(ctx *Context) txeclient.HubContext {
-	absolute := func(flag string) string {
+	// Resolved as the configuration loader resolves them.
+	resolved := func(flag string) string {
 		value, _ := ctx.Command.Flags().GetString(flag)
 		if value == "" {
 			return ""
 		}
-		if abs, err := filepath.Abs(value); err == nil {
-			return abs
-		}
-		return value
+		return fileutil.ResolvePathOrBlank(value)
 	}
-	hub := txeclient.HubContext{DaguHome: absolute("dagu-home"), ConfigFile: absolute("config"), Name: ctx.ContextName}
+	hub := txeclient.HubContext{DaguHome: resolved("dagu-home"), ConfigFile: resolved("config"), Name: ctx.ContextName}
 	if ctx.Config != nil {
 		hub.ContextsDir, hub.DataDir = ctx.Config.Paths.ContextsDir, ctx.Config.Paths.DataDir
 	}
