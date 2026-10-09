@@ -71,6 +71,8 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	require.NoError(t, err)
 	status := ir.InitialStatus(dag)
 	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", first.ID(), ir.Failed, "q1"
+	status.Nodes = []*ir.Node{{Step: ir.Step{Name: "build"}, Status: ir.NodeSucceeded}, {Step: ir.Step{Name: "publish"}, Status: ir.NodeFailed}}
+	status.WorkerID = "worker-1"
 	require.NoError(t, first.Open(ctx))
 	require.NoError(t, first.Write(ctx, status))
 	require.NoError(t, first.Close(ctx))
@@ -93,4 +95,12 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	got, err := latest.ReadStatus(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, ir.NotStarted, got.Status)
+	// If the retry is never dispatched, the run still holds the retried
+	// execution's checkpoint, so a later retry does not rerun finished steps.
+	require.Len(t, got.Nodes, 2)
+	assert.Equal(t, ir.NodeSucceeded, got.Nodes[0].Status)
+	assert.Equal(t, ir.NodeFailed, got.Nodes[1].Status)
+	assert.Equal(t, next.ID(), got.AttemptID)
+	assert.Empty(t, got.QueuedAt)
+	assert.Empty(t, got.WorkerID, "the claim belongs to no worker yet")
 }
