@@ -1194,6 +1194,81 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
 }
 
+// On Dagu's queued path a retry runs the latest attempt again under the same
+// attempt id with a later queue marker. Against the real registry: the
+// decision is bound to (attempt, queued marker); the retry is recorded with
+// the reference of the execution observed afterwards, which has the same
+// attempt id; and when that execution fails too, a fresh decision about it
+// is a different proposal and runs once, while one that still names the
+// first execution of the attempt is refused.
+func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	service.fail("run-7", "att-1")
+	// Every retry in this test takes the queued path.
+	service.retry = func(runID string) error {
+		service.requeue(runID)
+		return nil
+	}
+	request := func(e review.Execution, key string) (*registry.Proposal, *registry.Decision, error) {
+		var proposal *registry.Proposal
+		var decided *registry.Decision
+		_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+			proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+				RunID: "run-7", AttemptID: e.AttemptID, QueuedAt: e.QueuedAt, RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+			}, key)
+			return err
+		})
+		return proposal, decided, err
+	}
+	first := service.state["run-7"].Execution()
+	require.Equal(t, review.Execution{AttemptID: "att-1"}, first, "never queued: the marker is empty, and that is a value")
+	proposal, _, err := request(first, "retry-run-7-queued-1")
+	require.NoError(t, err)
+
+	done, err := f.retrying("tick-1", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	require.Empty(t, done[0].Executed.Skipped)
+	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	second := service.state["run-7"].Execution()
+	assert.Equal(t, "att-1", second.AttemptID, "the queued path keeps the attempt id")
+	assert.NotEmpty(t, second.QueuedAt)
+	assert.Equal(t, second.Ref(), done[0].Executed.Action.Receipt, "the registry accepted the observed execution's reference as the receipt")
+	assert.NotEqual(t, first.Ref(), second.Ref())
+	assert.Contains(t, done[0].Executed.Action.Detail, "queued", "the record says the execution was queued, not that anything succeeded")
+
+	// That execution fails as well.
+	state := service.state["run-7"]
+	state.Status, state.Active = "failed", false
+	service.state["run-7"] = state
+
+	// A decision that still names the first execution of att-1 is stale,
+	// although the attempt id is the run's current one.
+	_, _, err = request(first, "retry-run-7-queued-stale")
+	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
+	// A fresh decision about the execution that just failed is another
+	// proposal and runs exactly once.
+	later, laterDecision, err := request(second, "retry-run-7-queued-2")
+	require.NoError(t, err)
+	assert.NotEqual(t, proposal.ProposalID, later.ProposalID)
+	done, err = f.retrying("tick-2", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, laterDecision.DecisionID, done[0].DecisionID)
+	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
+	third := service.state["run-7"].Execution()
+	assert.Equal(t, third.Ref(), done[0].Executed.Action.Receipt)
+	assert.Len(t, service.retried, 2)
+
+	again, err := f.retrying("tick-3", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, again)
+	assert.Len(t, service.retried, 2)
+}
+
 // A retry whose dispatch was accepted but whose new attempt was not seen is
 // uncertain in the real registry too, and the registry itself refuses to
 // record it as succeeded on anything but the run's observed new attempt.

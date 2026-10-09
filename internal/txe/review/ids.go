@@ -4,8 +4,6 @@
 package review
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -102,10 +100,9 @@ func (e Execution) Ref() string {
 	return ExecutionRef(e.AttemptID, e.QueuedAt)
 }
 
-// ExecutionRef derives the reference of an execution exactly as the
-// registry does, so a receipt the reviewer records is the one the registry
-// observes.
+// ExecutionRef is the registry's reference of an execution. The reviewer
+// never derives one itself: a receipt it records has to be the one the
+// registry observes.
 func ExecutionRef(attemptID, queuedAt string) string {
-	sum := sha256.Sum256([]byte(attemptID + "\n" + queuedAt))
-	return attemptID + "-" + hex.EncodeToString(sum[:8])
+	return registry.ExecutionRef(attemptID, queuedAt)
 }
