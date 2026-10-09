@@ -1512,6 +1512,11 @@ func (a *API) ListTxeRunAbandonments(ctx context.Context, req api.ListTxeRunAban
 	}
 	out := make([]api.TxeAbandonment, 0, len(results))
 	for _, r := range results {
+		if r.Err != nil {
+			// The reason stays in the hub's log: it can name storage paths
+			// or another run's identifiers.
+			logger.Warn(ctx, "Untrusted abandonment record", tag.RunID(req.RunId), tag.AttemptID(r.AttemptID), tag.Error(r.Err))
+		}
 		entry, err := txeAbandonment(r)
 		if err != nil {
 			return nil, err
@@ -1525,10 +1530,7 @@ func (a *API) ListTxeRunAbandonments(ctx context.Context, req api.ListTxeRunAban
 // record, or the attempt and an error, never attributable.
 func txeAbandonment(r persis.AttemptAbandonmentResult) (api.TxeAbandonment, error) {
 	if r.Err != nil || r.Record == nil {
-		msg := "the abandonment record cannot be trusted"
-		if r.Err != nil {
-			msg += ": " + r.Err.Error()
-		}
+		msg := "the abandonment record cannot be trusted (unreadable, malformed, of another attempt or inconsistent)"
 		return api.TxeAbandonment{AttemptId: r.AttemptID, Attributable: false, Error: &msg}, nil
 	}
 	rec := r.Record
