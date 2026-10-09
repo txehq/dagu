@@ -134,6 +134,16 @@ func (f *fakeRegistry) job(id string) Job {
 	return f.jobs[id].Job
 }
 
+// versionCount is how many versions the registry holds for a job.
+func (f *fakeRegistry) versionCount(jobID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if j, ok := f.jobs[jobID]; ok {
+		return len(j.versions)
+	}
+	return 0
+}
+
 func (f *fakeRegistry) jobCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

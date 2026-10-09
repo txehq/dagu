@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -97,6 +99,11 @@ type Registrar struct {
 	// publish step reaches the same hub. The zero value is the TXE home's own
 	// context store and its default context.
 	Hub HubContext
+	// HasCommands reports whether the dagu binary at the given path has each
+	// of the "dagu txe" commands named. A job's DAG calls that binary on
+	// this machine, so a job is not registered while the binary lacks a
+	// command its DAG calls. Nil means: ask the binary itself.
+	HasCommands func(ctx context.Context, dagu string, commands [][]string) error
 }
 
 // HubContext is a CLI context by reference: the flags that select the context
@@ -212,6 +219,7 @@ func (r *Registrar) version(spec *JobSpec, who *subject, jobID string, number in
 		},
 		Env:            spec.Env,
 		CredentialRefs: spec.CredentialRefs,
+		CLI:            r.cli(),
 		Publish:        r.publishStep(spec),
 	})
 	if err != nil {
@@ -250,10 +258,31 @@ func (r *Registrar) version(spec *JobSpec, who *subject, jobID string, number in
 	}, nil
 }
 
-// publishStep describes the step that records a run's deliverables, or nil
-// when the job declares none. The step runs this machine's dagu binary with
-// the TXE home's own context store, because a step inherits neither the
-// worker's working directory nor its environment.
+// cli is how the job's DAG calls dagu on this machine: the installed binary
+// and the context store this registration used.
+func (r *Registrar) cli() txepkg.CLI {
+	daguHome := r.Hub.DaguHome
+	if daguHome == "" {
+		daguHome = r.Home.ClientDir()
+	}
+	flags := []string{"--dagu-home", daguHome}
+	if r.Hub.ConfigFile != "" {
+		flags = append(flags, "--config", r.Hub.ConfigFile)
+	}
+	if r.Hub.ContextsDir != "" {
+		flags = append(flags, "--contexts-dir", r.Hub.ContextsDir)
+	}
+	if r.Hub.DataDir != "" {
+		flags = append(flags, "--data-dir", r.Hub.DataDir)
+	}
+	if r.Hub.Name != "" {
+		flags = append(flags, "--context", r.Hub.Name)
+	}
+	return txepkg.CLI{Dagu: filepath.Join(r.Home.Root, "bin", "dagu"), StoreFlags: flags, HomeRoot: r.Home.Root}
+}
+
+// publishStep says how the run's deliverables are recorded, or nil when the
+// job declares none.
 func (r *Registrar) publishStep(spec *JobSpec) *txepkg.Publish {
 	deliverables := spec.ExpectedOutcome.Deliverables
 	if len(deliverables) == 0 {
@@ -263,41 +292,96 @@ func (r *Registrar) publishStep(spec *JobSpec) *txepkg.Publish {
 	for _, d := range deliverables {
 		hub = hub || d.Delivery == DeliveryHub
 	}
-	daguHome := r.Hub.DaguHome
-	if daguHome == "" {
-		daguHome = r.Home.ClientDir()
-	}
-	command := []string{filepath.Join(r.Home.Root, "bin", "dagu"), "txe", "artifacts", "publish", "--dagu-home", daguHome}
-	if r.Hub.ConfigFile != "" {
-		command = append(command, "--config", r.Hub.ConfigFile)
-	}
-	if r.Hub.ContextsDir != "" {
-		command = append(command, "--contexts-dir", r.Hub.ContextsDir)
-	}
-	if r.Hub.DataDir != "" {
-		command = append(command, "--data-dir", r.Hub.DataDir)
-	}
-	if r.Hub.Name != "" {
-		command = append(command, "--context", r.Hub.Name)
-	}
-	return &txepkg.Publish{Command: command, HomeRoot: r.Home.Root, HubArtifacts: hub}
+	return &txepkg.Publish{HubArtifacts: hub}
 }
 
-// checkHub refuses a context store a scheduled run could not rely on. The
-// publish step reads it at every run, long after this session is gone.
-func (r *Registrar) checkHub(spec *JobSpec) error {
-	if len(spec.ExpectedOutcome.Deliverables) == 0 {
-		return nil
-	}
+// checkHub refuses a context store a scheduled run could not rely on. Every
+// job's DAG reads it at every run, long after this session is gone: the
+// resource check before the job, and the publish step after it.
+func (r *Registrar) checkHub() error {
 	for _, path := range []string{r.Hub.DaguHome, r.Hub.ConfigFile, r.Hub.ContextsDir, r.Hub.DataDir} {
 		if path == "" {
 			continue
 		}
 		if err := r.Store.Policy.CheckDurable(path); err != nil {
-			return fmt.Errorf("the context store used for this registration cannot be used by the job's publish step: %w", err)
+			return fmt.Errorf("the context store used for this registration cannot be used by the job's own steps: %w", err)
 		}
 	}
 	return nil
+}
+
+// checkMachine refuses a registration whose DAG could not run on this
+// machine as it is installed now: a context store a later run could not rely
+// on, or a dagu that lacks a command the DAG calls.
+func (r *Registrar) checkMachine(ctx context.Context, spec *JobSpec) error {
+	if err := r.checkHub(); err != nil {
+		return err
+	}
+	commands := [][]string{{"resource", "check"}}
+	if len(spec.ExpectedOutcome.Deliverables) > 0 {
+		commands = append(commands, []string{"artifacts", "begin"}, []string{"artifacts", "seal"}, []string{"artifacts", "publish"})
+	}
+	has := r.HasCommands
+	if has == nil {
+		has = HasTXECommands
+	}
+	dagu := r.cli().Dagu
+	if err := has(ctx, dagu, commands); err != nil {
+		return fmt.Errorf("the dagu this machine's jobs run (%s) cannot run this job's DAG: %w; install a dagu that has the command on this machine, then register again", dagu, err)
+	}
+	return nil
+}
+
+// HasTXECommands asks the dagu binary at the given path whether it has each
+// "dagu txe" command, by reading the command's own help. A dagu without the
+// command prints the help of the nearest command it does have and exits
+// zero, so the exit status says nothing. What is read is the usage line: it
+// names the command that answered, word for word. A mention of the command
+// anywhere else in the text, or a longer command name, does not count.
+func HasTXECommands(ctx context.Context, dagu string, commands [][]string) error {
+	for _, words := range commands {
+		name := "txe " + strings.Join(words, " ")
+		probe, cancel := context.WithTimeout(ctx, 20*time.Second)
+		args := append(append([]string{"txe"}, words...), "--help")
+		cmd := exec.CommandContext(probe, dagu, args...) //nolint:gosec // the machine's own installed dagu
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			return fmt.Errorf("asking it for %q failed: %w", "dagu "+name, err)
+		}
+		if !usageNames(string(out), append([]string{"txe"}, words...)) {
+			return fmt.Errorf("it has no %q command", "dagu "+name)
+		}
+	}
+	return nil
+}
+
+// usageNames reports whether a help text's usage block has a line for
+// exactly the command path given: the program's name, the path's words, and
+// then nothing or a bracketed placeholder such as "[flags]".
+func usageNames(help string, path []string) bool {
+	inUsage := false
+	for line := range strings.SplitSeq(help, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "Usage:":
+			inUsage = true
+			continue
+		case !inUsage:
+			continue
+		case trimmed == "":
+			return false // the usage block has ended
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 1+len(path) || !slices.Equal(fields[1:1+len(path)], path) {
+			continue
+		}
+		if rest := fields[1+len(path):]; len(rest) == 0 || strings.HasPrefix(rest[0], "[") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) (*txepkg.Staged, error) {
@@ -319,7 +403,7 @@ func (r *Registrar) Plan(ctx context.Context, spec *JobSpec) (*Plan, error) {
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
 	}
-	if err := r.checkHub(spec); err != nil {
+	if err := r.checkMachine(ctx, spec); err != nil {
 		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
@@ -355,7 +439,7 @@ func (r *Registrar) Register(ctx context.Context, spec *JobSpec) (*Outcome, erro
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
 	}
-	if err := r.checkHub(spec); err != nil {
+	if err := r.checkMachine(ctx, spec); err != nil {
 		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
@@ -415,7 +499,7 @@ func (r *Registrar) Update(ctx context.Context, jobID string, expectedVersion in
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
 	}
-	if err := r.checkHub(spec); err != nil {
+	if err := r.checkMachine(ctx, spec); err != nil {
 		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)

@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,6 +71,9 @@ func newSession(f *fakeRegistry, home txepkg.Home, name string) *session {
 		NewID: func(prefix string) (string, error) {
 			return fmt.Sprintf("%s_%026d", prefix, idCounter.Add(1)), nil
 		},
+		// The test machine has no dagu installed; it is taken to have every
+		// command, except where a test is about one that is missing.
+		HasCommands: func(context.Context, string, [][]string) error { return nil },
 	}}
 }
 
@@ -576,17 +581,30 @@ func TestPublishStepUsesRegistrationContext(t *testing.T) {
 	s.Store.Policy = txepkg.PathPolicy{TempRoots: []string{scratch}}
 	s.Hub.ContextsDir = filepath.Join(scratch, "contexts")
 	_, err = s.Plan(context.Background(), spec)
-	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	require.ErrorContains(t, err, "cannot be used by the job's own steps")
 	s.Hub.ContextsDir = ""
 	_, err = s.Plan(context.Background(), spec)
 	require.NoError(t, err)
 
 	s.Store.Policy = txepkg.PathPolicy{TempRoots: []string{stores}}
 	_, err = s.Plan(context.Background(), spec)
-	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	require.ErrorContains(t, err, "cannot be used by the job's own steps")
 	_, err = s.Register(context.Background(), spec)
-	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	require.ErrorContains(t, err, "cannot be used by the job's own steps")
 	assert.Zero(t, f.jobCount())
+
+	// A job without deliverables calls dagu too, for the resource check
+	// before it runs, so its DAG carries the same flags and its
+	// registration needs the same durable store.
+	plain, _ := worktree(t, credentialFile(t))
+	_, err = s.Plan(context.Background(), plain)
+	require.ErrorContains(t, err, "cannot be used by the job's own steps")
+	s.Store.Policy = txepkg.PathPolicy{}
+	plan, err = s.Plan(context.Background(), plain)
+	require.NoError(t, err)
+	assert.NotContains(t, plan.DAGSpec, "txe artifacts")
+	assert.Contains(t, plan.DAGSpec, "txe resource check --job ")
+	assert.Contains(t, plan.DAGSpec, " --machine "+testMachine+" --dagu-home "+filepath.Join(stores, "other-hub")+" --config "+filepath.Join(stores, "hub.yaml")+" --context staging")
 }
 
 // An update names the version it changes. One made against an outdated
@@ -742,4 +760,98 @@ func (h hideJobs) RoundTrip(req *http.Request) (*http.Response, error) {
 		next = http.DefaultTransport
 	}
 	return next.RoundTrip(req)
+}
+
+// A job's DAG calls the dagu installed on the machine. While that dagu lacks
+// a command the DAG calls, the job is not registered: it would fail at that
+// command on every run. Nothing is sent to the hub and no package is kept.
+func TestRegisterRefusesAMachineWithoutTheCommands(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	spec, _ := worktree(t, credentialFile(t))
+	s := newSession(f, home, "cc1-s000001")
+
+	var asked [][]string
+	var askedOf string
+	s.HasCommands = func(_ context.Context, dagu string, commands [][]string) error {
+		askedOf, asked = dagu, commands
+		return errors.New(`it has no "dagu txe resource check" command`)
+	}
+	_, err := s.Register(context.Background(), spec)
+	require.ErrorContains(t, err, `it has no "dagu txe resource check" command`)
+	require.ErrorContains(t, err, "then register again")
+	assert.Equal(t, filepath.Join(home.Root, "bin", "dagu"), askedOf)
+	assert.Equal(t, [][]string{{"resource", "check"}}, asked, "a job without deliverables needs only the check")
+	assert.Zero(t, f.jobCount())
+	staged, err := os.ReadDir(home.PackagesDir())
+	if !errors.Is(err, fs.ErrNotExist) {
+		require.NoError(t, err)
+	}
+	assert.Empty(t, staged, "a package was staged for a job that was refused")
+	_, err = s.Plan(context.Background(), spec)
+	require.Error(t, err, "a dry run did not report that the job could not run here")
+
+	// An update is refused the same way, and the job stays at its version.
+	ok := newSession(f, home, "cc1-s000001")
+	first, err := ok.Register(context.Background(), spec)
+	require.NoError(t, err)
+	_, err = s.Update(context.Background(), first.Receipt.JobID, 1, spec)
+	require.ErrorContains(t, err, `it has no "dagu txe resource check" command`)
+	assert.Equal(t, 1, f.jobCount())
+	assert.Equal(t, 1, f.versionCount(first.Receipt.JobID), "an update was recorded for a machine that cannot run it")
+}
+
+// The installed dagu is asked through each command's own help. One that lacks
+// the command answers with the help of the nearest command it has, and exits
+// zero, so the answer is read, not the exit status.
+func TestHasTXECommands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in dagu is a shell script")
+	}
+	dir := t.TempDir()
+	script := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700)) //nolint:gosec // a test script
+		return path
+	}
+	// Prints what cobra prints: the usage line names the command that ran.
+	has := script("has", `case "$*" in
+  "txe resource check --help") printf 'Check targets.\n\nUsage:\n  dagu txe resource check [flags]\n' ;;
+  "txe artifacts begin --help") printf 'Usage:\n  dagu txe artifacts begin [flags]\n' ;;
+  *) printf 'Usage:\n  dagu txe [command]\n\nAvailable Commands:\n  artifacts   Record files\n  resource    Check targets\n' ;;
+esac
+`)
+	lacks := script("lacks", `printf 'Usage:\n  dagu txe [command]\n\nAvailable Commands:\n  artifacts   Record files\n'
+`)
+	fails := script("fails", "exit 3\n")
+	ctx := context.Background()
+
+	require.NoError(t, HasTXECommands(ctx, has, [][]string{{"resource", "check"}, {"artifacts", "begin"}}))
+	require.ErrorContains(t, HasTXECommands(ctx, has, [][]string{{"artifacts", "seal"}}), `it has no "dagu txe artifacts seal" command`)
+	require.ErrorContains(t, HasTXECommands(ctx, lacks, [][]string{{"resource", "check"}}), `it has no "dagu txe resource check" command`)
+	require.ErrorContains(t, HasTXECommands(ctx, fails, [][]string{{"resource", "check"}}), "failed")
+	require.Error(t, HasTXECommands(ctx, filepath.Join(dir, "absent"), [][]string{{"resource", "check"}}))
+
+	// Only the usage line counts. A parent's help that mentions the command
+	// in an example, and a command with a longer name, are not the command.
+	mentions := script("mentions", `printf 'Usage:\n  dagu txe artifacts [command]\n\nExamples:\n  dagu txe artifacts seal\n'
+`)
+	longer := script("longer", `printf 'Usage:\n  dagu txe artifacts sealed [flags]\n'
+`)
+	require.ErrorContains(t, HasTXECommands(ctx, mentions, [][]string{{"artifacts", "seal"}}), `it has no "dagu txe artifacts seal" command`)
+	require.ErrorContains(t, HasTXECommands(ctx, longer, [][]string{{"artifacts", "seal"}}), `it has no "dagu txe artifacts seal" command`)
+
+	for help, want := range map[string]bool{
+		"Usage:\n  dagu txe artifacts seal [flags]\n":                               true,
+		"Usage:\n  dagu txe artifacts seal\n":                                       true,
+		"Usage:\n  dagu txe artifacts [flags]\n  dagu txe artifacts seal [flags]\n": true,
+		"Record.\n\nUsage:\n  dagu txe artifacts seal [flags]\n\nFlags:\n":          true,
+		"Usage:\n  dagu txe artifacts sealed [flags]\n":                             false,
+		"Usage:\n  dagu txe artifacts seal now\n":                                   false,
+		"Usage:\n  dagu txe artifacts [command]\n\nSee: dagu txe artifacts seal\n":  false,
+		"dagu txe artifacts seal [flags]\n":                                         false,
+		"":                                                                          false,
+	} {
+		assert.Equal(t, want, usageNames(help, []string{"txe", "artifacts", "seal"}), "%q", help)
+	}
 }

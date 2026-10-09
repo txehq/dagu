@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -380,6 +381,20 @@ type txePublishRun struct {
 	// step inherits it as DAGU_HOME. It is not the store the job was
 	// registered with and holds no "txe" context.
 	workerHome string
+	// checkLog has one line per call of the stand-in resource check; a
+	// number in checkExit makes the stand-in exit with it.
+	checkLog, checkExit string
+}
+
+// checks returns the argument lines of every resource check so far.
+func (r *txePublishRun) checks(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(r.checkLog)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	require.NoError(t, err)
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
 }
 
 // txePublishStore says where the CLI's "txe" context is created, when that is
@@ -452,12 +467,9 @@ func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, 
 		Entrypoint: pkg.Manifest.Entrypoint,
 		Schedule:   txepkg.Schedule{Cron: "0 2 * * *", Timezone: "Australia/Perth", TimeoutSec: 120},
 		Env:        env,
-		Publish: &txepkg.Publish{
-			// Filled in below, once the fixture has built the binary.
-			Command:      []string{"/placeholder", "txe", "artifacts", "publish"},
-			HomeRoot:     home.Root,
-			HubArtifacts: true,
-		},
+		// Filled in below, once the fixture has built the binary.
+		CLI:     txepkg.CLI{Dagu: "/placeholder", HomeRoot: home.Root},
+		Publish: &txepkg.Publish{HubArtifacts: true},
 	}
 	rendered, err := txepkg.RenderDAG(spec)
 	require.NoError(t, err)
@@ -468,11 +480,28 @@ func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, 
 	)
 	t.Cleanup(f.cleanup)
 
-	// The publish step runs the dagu binary built from this tree, whose path
-	// is known only now. Render again with it and run that DAG.
+	// The steps run the dagu binary built from this tree, whose path is
+	// known only now. Render again with it and run that DAG.
+	//
+	// The binary has no "txe resource check" yet: that command is another
+	// change. The dagu the DAG calls is therefore a wrapper that stands in
+	// for that one command, recording how it was called and exiting with the
+	// code the test asks for, and hands every other command to the binary.
 	executable := f.coord.Config.Paths.Executable
 	workerHome := filepath.Dir(f.coord.Config.Paths.DataDir)
-	spec.Publish.Command = append([]string{executable, "txe", "artifacts", "publish"}, bind(home, workerHome)...)
+	require.NoError(t, os.MkdirAll(filepath.Join(home.Root, "bin"), 0o700))
+	checkLog, checkExit := filepath.Join(home.Root, "resource-check.log"), filepath.Join(home.Root, "resource-check.exit")
+	wrapper := fmt.Sprintf(`#!/bin/sh
+if [ "$1 $2 $3" = "txe resource check" ]; then
+  printf '%%s\n' "$*" >> %q
+  if [ -e %q ]; then exit "$(cat %q)"; fi
+  exit 0
+fi
+exec %q "$@"
+`, checkLog, checkExit, checkExit, executable)
+	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "bin", "dagu"), []byte(wrapper), 0o700)) //nolint:gosec // a test script
+	spec.CLI.Dagu = filepath.Join(home.Root, "bin", "dagu")
+	spec.CLI.StoreFlags = bind(home, workerHome)
 	rendered, err = txepkg.RenderDAG(spec)
 	require.NoError(t, err)
 	f.dagWrapper = new(f.coord.DAG(t, string(rendered)))
@@ -488,7 +517,7 @@ func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, 
 	out, err := add.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	run := &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome}
+	run := &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome, checkLog: checkLog, checkExit: checkExit}
 
 	start(f)
 	return run
@@ -937,4 +966,69 @@ func TestTXEPackage_UnqueuedRunPublishes(t *testing.T) {
 	assert.Equal(t, execution, manifest.ProducedIn)
 	assert.Equal(t, txeHubContent, txeReadFile(t, run.outputDir(status), "snapshot.json"))
 	assert.Equal(t, txeHubContent, txeReadFile(t, txeHubCopies(status.ArchiveDir, status), "snapshot.json"))
+}
+
+// The resource check is the first command of the job's step. It is called
+// with the job, the version and the machine the DAG was rendered for and the
+// store flags; when it stops, the job does not run and nothing is sealed or
+// published; and it is called again whenever the job runs again, a retry
+// included, but not when only the publish step is retried.
+//
+// The check itself is a stand-in here: what is shown is what the rendered
+// step does with its exit code.
+func TestTXEPackage_ResourceCheckGatesTheJob(t *testing.T) {
+	control := t.TempDir()
+	// Not started yet: the stand-in is told what to answer first.
+	run := txeStartPublishJobWith(t, txeRetryScript, map[string]string{"TXE_FIXTURE_CONTROL": control},
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} },
+		func(*testFixture) {})
+	f, home := run.f, run.home
+
+	// Exit 3: a target is gone. The job's command does not run.
+	require.NoError(t, os.WriteFile(run.checkExit, []byte("3"), 0o600))
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(60 * time.Second)
+	first := f.waitForStatus(ir.Failed, executionStatusTimeout())
+	runID := first.DAGRunID
+	require.Len(t, first.Nodes, 2)
+	assert.Equal(t, ir.NodeFailed, first.Nodes[0].Status)
+	assert.Contains(t, []ir.NodeStatus{ir.NodeNotStarted, ir.NodeAborted}, first.Nodes[1].Status, "publish ran after the check stopped the job")
+	assert.Equal(t, 0, txeExecutions(t, control), "the job ran although the check said not to")
+	_, err := txeclient.Outputs{Home: home}.Sealed(txeTestJob, runID)
+	require.ErrorIs(t, err, txeclient.ErrNotSealed)
+	assert.Empty(t, run.registry.manifests)
+	checks := run.checks(t)
+	require.Len(t, checks, 1)
+	assert.Equal(t, "txe resource check --job "+txeTestJob+" --job-version 1 --machine "+txeTestMachine+" --dagu-home "+home.ClientDir(), checks[0])
+
+	// Exit 75: a target cannot be observed. A retry checks again and the
+	// job still does not run.
+	require.NoError(t, os.WriteFile(run.checkExit, []byte("75"), 0o600))
+	run.retryDirect(t, runID, "")
+	second := run.waitFor(t, "the second execution did not fail", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != first.AttemptID && s.Status == ir.Failed
+	})
+	assert.Len(t, run.checks(t), 2, "a retry of the job's step did not check again")
+	assert.Equal(t, 0, txeExecutions(t, control))
+
+	// Exit 0: the job runs, seals and publishes.
+	require.NoError(t, os.Remove(run.checkExit))
+	run.retryDirect(t, runID, "")
+	third := run.waitFor(t, "the third execution did not succeed", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != second.AttemptID && s.Status == ir.Succeeded
+	})
+	assert.Len(t, run.checks(t), 3)
+	assert.Equal(t, 1, txeExecutions(t, control))
+	_, ok := run.registry.execution(third)
+	assert.True(t, ok, "the job ran and nothing was published")
+
+	// A retry of the publish step alone does not run the job, and so does
+	// not check.
+	run.retryDirect(t, runID, "publish")
+	run.waitFor(t, "the publish-only execution did not succeed", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != third.AttemptID && s.Status == ir.Succeeded
+	})
+	assert.Len(t, run.checks(t), 3, "a retry of the publish step ran the resource check")
+	assert.Equal(t, 1, txeExecutions(t, control))
 }
