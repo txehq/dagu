@@ -5,6 +5,8 @@ package dagrun_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -164,18 +166,37 @@ func TestRetainedExecutionCopiesOnlyHubLogs(t *testing.T) {
 	}
 }
 
+// sha256Of is the digest form the coordinator writes into .final.
+func sha256Of(b string) string {
+	sum := sha256.Sum256([]byte(b))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 // A log is final only when the coordinator's .final record names this
-// execution and the copied size; the record itself is not copied as a log.
+// execution and the exact bytes copied (size and digest); the record itself
+// is not copied as a log. A record of another execution, of other bytes of
+// the same length, or without a digest proves nothing.
 func TestRetainedLogsAreFinalOnlyWhenRecorded(t *testing.T) {
 	f := newRetentionFixture(t)
 	status := f.execution("q1", ir.Failed, "execution 1")
 	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
-	write := func(name, marker string, size int) {
-		rec := fmt.Sprintf(`{"executionMarker":%q,"attemptId":%q,"size":%d}`, marker, status.AttemptID, size)
+	extra := map[string]string{"same-size.log": "AAAA", "no-digest.log": "CCCC", "stale.log": "DDDD"}
+	for name, content := range extra {
+		require.NoError(t, os.WriteFile(filepath.Join(logs, name), []byte(content), 0o600))
+	}
+	write := func(name, marker string, size int, digest string) {
+		rec := fmt.Sprintf(`{"executionMarker":%q,"attemptId":%q,"size":%d,"sha256":%q}`, marker, status.AttemptID, size, digest)
+		if digest == "" {
+			rec = fmt.Sprintf(`{"executionMarker":%q,"attemptId":%q,"size":%d}`, marker, status.AttemptID, size)
+		}
 		require.NoError(t, os.WriteFile(filepath.Join(logs, name+".final"), []byte(rec), 0o600))
 	}
-	write("scheduler.log", "q1", len("scheduler execution 1\n"))
-	write("run.stdout.log", "q0", len("stdout execution 1\n"))
+	sched := "scheduler execution 1\n"
+	write("scheduler.log", "q1", len(sched), sha256Of(sched))
+	write("run.stdout.log", "q0", len("stdout execution 1\n"), sha256Of("stdout execution 1\n"))
+	write("same-size.log", "q1", 4, sha256Of("BBBB"))
+	write("no-digest.log", "q1", 4, "")
+	write("stale.log", "q0", 4, sha256Of("DDDD"))
 	require.NoError(t, f.requeue(ir.Failed, nil))
 
 	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
@@ -185,7 +206,31 @@ func TestRetainedLogsAreFinalOnlyWhenRecorded(t *testing.T) {
 	for _, file := range all[0].Files {
 		final[file.Name] = file.Final
 	}
-	assert.Equal(t, map[string]bool{"scheduler.log": true, "run.stdout.log": false}, final, "a record of another execution proves nothing")
-	assert.False(t, all[0].LogsFinal)
+	assert.Equal(t, map[string]bool{"scheduler.log": true, "run.stdout.log": false, "same-size.log": false,
+		"no-digest.log": false, "stale.log": false}, final)
+	assert.False(t, all[0].LogsFinal, "one log not proven final keeps the execution's logs not final")
 	assert.NotEmpty(t, all[0].LogsNote)
+}
+
+// The copy is fixed when it is taken: bytes or a .final record the old
+// execution writes afterwards change neither the copy nor its finality.
+func TestRetainedCopyIgnoresLateWrites(t *testing.T) {
+	f := newRetentionFixture(t)
+	status := f.execution("q1", ir.Failed, "execution 1")
+	require.NoError(t, f.requeue(ir.Failed, nil))
+	ref := ir.ExecutionRef(status.AttemptID, "q1")
+	before := f.file(ref, "run.stdout.log")
+
+	logs := filepath.Join(f.logDir, f.dag.Name, f.runID, f.attempt)
+	late := "stdout execution 1\nlate chunk\n"
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log"), []byte(late), 0o600))
+	rec := fmt.Sprintf(`{"executionMarker":"q1","attemptId":%q,"size":%d,"sha256":%q}`, status.AttemptID, len(late), sha256Of(late))
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "run.stdout.log.final"), []byte(rec), 0o600))
+
+	assert.Equal(t, before, f.file(ref, "run.stdout.log"), "the copy does not change")
+	all, err := f.repo.ListRetainedExecutions(f.ctx, ir.NewDAGRunRef(f.dag.Name, f.runID))
+	require.NoError(t, err)
+	for _, file := range all[0].Files {
+		assert.False(t, file.Final, "%s: finality is decided when the copy is taken", file.Name)
+	}
 }
