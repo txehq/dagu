@@ -223,6 +223,9 @@ func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) 
 // Plan validates a spec against this machine and the hub, builds the package
 // and renders the DAG, then discards the package. Nothing is registered.
 func (r *Registrar) Plan(ctx context.Context, spec *JobSpec) (*Plan, error) {
+	if os.Getenv(EnvReviewer) == "1" {
+		return nil, ErrReviewerSession
+	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
 	who, err := r.resolve(ctx, spec, provenance)
 	if err != nil {
@@ -321,9 +324,8 @@ func (r *Registrar) Update(ctx context.Context, jobID string, expectedVersion in
 	if err != nil {
 		return nil, fmt.Errorf("read job %s: %w", jobID, err)
 	}
-	if job.MachineID != who.machine.MachineID {
-		return nil, fmt.Errorf("job %s runs on machine %s; update it from that machine, not from %s",
-			jobID, job.MachineID, who.machine.MachineID)
+	if err := sameMachine(job, who.machine); err != nil {
+		return nil, err
 	}
 	if job.Registration.JobKey != spec.JobKey {
 		return nil, fmt.Errorf("job %s has job key %q, but the spec says %q; a job's key does not change",
@@ -384,12 +386,18 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 		return &ErrIncomplete{RequestID: entry.RequestID, Step: entry.Step, Cause: cause}
 	}
 
+	// Every path into here, a first attempt or a resume, acts for this
+	// machine: it is this machine's disk the package is on.
+	machine, err := r.Home.Machine()
+	if err != nil {
+		return nil, err
+	}
+
 	// 1. The hub saves the job version and its DAG. Before this succeeds the
 	// package stays in the staging area: a refused request leaves no package
 	// where a worker could run it.
 	var job *Job
 	if entry.Step == txepkg.StepStaged {
-		var err error
 		if job, err = r.send(ctx, entry); err != nil {
 			var refusal *Error
 			if errors.As(err, &refusal) && refusal.rejectsRequest() {
@@ -408,6 +416,16 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 		if err := r.Journal.Save(entry); err != nil {
 			return nil, &ErrIncomplete{RequestID: entry.RequestID, Step: entry.Step, Cause: err}
 		}
+	}
+
+	if job == nil {
+		var err error
+		if job, err = r.Client.Job(ctx, entry.JobID); err != nil {
+			return nil, incomplete(fmt.Errorf("read the job: %w", err))
+		}
+	}
+	if err := sameMachine(job, machine); err != nil {
+		return nil, incomplete(err)
 	}
 
 	// 2. The package moves to the path the DAG names. An earlier attempt may
@@ -439,12 +457,6 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	}
 
 	// 3. The hub marks the job ready against the package now in place.
-	if job == nil {
-		var err error
-		if job, err = r.Client.Job(ctx, entry.JobID); err != nil {
-			return nil, incomplete(fmt.Errorf("read the job before marking it ready: %w", err))
-		}
-	}
 	if job.Version != entry.Version || job.PackageDigest != entry.PackageDigest {
 		return nil, incomplete(fmt.Errorf("job %s is now at version %d with package %s; this request registered version %d with %s",
 			entry.JobID, job.Version, job.PackageDigest, entry.Version, entry.PackageDigest))
@@ -456,7 +468,7 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	receipt, err := r.Client.MarkReady(ctx, entry.JobID, ReadyRequest{
 		ExpectedRevision: job.Revision,
 		Package: PackageEvidence{
-			Digest: pkg.Digest, Path: pkg.Dir, MachineID: job.MachineID,
+			Digest: pkg.Digest, Path: pkg.Dir, MachineID: machine.MachineID,
 			ManifestSHA256: strings.TrimPrefix(pkg.Digest, "sha256:"), Files: len(pkg.Manifest.Files), Bytes: size,
 		},
 		Actor: r.Actor,
@@ -488,6 +500,20 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 		dagSpec = sent.Version.DAG.Spec
 	}
 	return &Outcome{Receipt: local, Package: pkg, DAGSpec: dagSpec}, nil
+}
+
+// sameMachine refuses to act on a job that belongs to another machine or
+// another owner. A package can only be vouched for by the machine that holds it.
+func sameMachine(job *Job, machine *txepkg.Machine) error {
+	if job.MachineID != machine.MachineID {
+		return fmt.Errorf("job %s runs on machine %s; this is machine %s, which cannot place or vouch for its package",
+			job.JobID, job.MachineID, machine.MachineID)
+	}
+	if job.OwnerID != machine.OwnerID {
+		return fmt.Errorf("job %s belongs to owner %s, but this machine belongs to %s",
+			job.JobID, job.OwnerID, machine.OwnerID)
+	}
+	return nil
 }
 
 // send posts the saved request exactly as it was first built, so the hub
