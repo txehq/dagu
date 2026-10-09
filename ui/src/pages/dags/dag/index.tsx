@@ -30,6 +30,7 @@ import {
   WorkspaceKind,
   workspaceNameFromLabels,
 } from '../../../lib/workspace';
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { I18nText } from '@/i18n/I18nText';
 
 type Params = {
@@ -76,7 +77,12 @@ function DAGDetails() {
   const dagSSE = useDAGSSE(fileName, !!fileName, remoteNode);
 
   // Determine active tab
-  const tab = params.tab === 'docs' ? 'wiki' : params.tab || 'status';
+  const tab =
+    params.tab === 'docs'
+      ? 'wiki'
+      : !INCIDENTS_ENABLED && params.tab === 'incidents'
+        ? 'status'
+        : params.tab || 'status';
 
   // Format duration utility function
   const formatDuration = useCallback(
@@ -128,6 +134,9 @@ function DAGDetails() {
   useEffect(() => {
     if (params.tab === 'docs' && fileName) {
       navigate(buildUrl(`/dags/${fileName}/wiki`), { replace: true });
+    }
+    if (!INCIDENTS_ENABLED && params.tab === 'incidents' && fileName) {
+      navigate(buildUrl(`/dags/${fileName}`), { replace: true });
     }
   }, [buildUrl, fileName, navigate, params.tab]);
 

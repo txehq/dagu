@@ -1,6 +1,7 @@
 import { useContext, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertTriangle, Check, Info } from 'lucide-react';
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import ConfirmModal from '@/components/ui/confirm-dialog';
@@ -207,60 +208,64 @@ export default function LicensePage() {
         >
           <h2 className="text-sm font-semibold">{ts('Features')}</h2>
           <div className="grid gap-3 sm:grid-cols-2">
-            {licensedFeatures.map((feature) => {
-              const included = hasLicensedFeature(license, feature.id);
-              const setup =
-                feature.id === 'sso' ||
-                (feature.id === 'rbac' && config.authMode !== 'builtin');
-              const href =
-                feature.id === 'rbac' && setup
-                  ? 'https://docs.dagu.sh/server-admin/authentication/builtin'
-                  : feature.href;
-              return (
-                <article
-                  key={feature.id}
-                  className="card-obsidian p-3 flex flex-col items-start gap-2"
-                >
-                  <h3 className="text-sm font-medium">{ts(feature.title)}</h3>
-                  <p className="text-sm text-muted-foreground flex-1">
-                    {ts(feature.description)}
-                  </p>
-                  <div className="flex w-full flex-wrap items-center justify-between gap-2 text-xs">
-                    <span
-                      className={
-                        included
-                          ? 'text-success inline-flex items-center gap-1'
-                          : 'text-muted-foreground'
-                      }
-                    >
-                      {included && (
-                        <Check className="h-3 w-3" aria-hidden="true" />
-                      )}
-                      {ts(
-                        included
-                          ? 'Included'
-                          : 'Requires a license with this feature'
-                      )}
-                    </span>
-                    {included &&
-                      (setup ? (
-                        <a
-                          className="underline"
-                          href={href}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          {ts('Setup guide')}
-                        </a>
-                      ) : (
-                        <Link className="underline" to={href}>
-                          {ts('Open feature')}
-                        </Link>
-                      ))}
-                  </div>
-                </article>
-              );
-            })}
+            {licensedFeatures
+              .filter(
+                (feature) => INCIDENTS_ENABLED || feature.id !== 'incidents'
+              )
+              .map((feature) => {
+                const included = hasLicensedFeature(license, feature.id);
+                const setup =
+                  feature.id === 'sso' ||
+                  (feature.id === 'rbac' && config.authMode !== 'builtin');
+                const href =
+                  feature.id === 'rbac' && setup
+                    ? 'https://docs.dagu.sh/server-admin/authentication/builtin'
+                    : feature.href;
+                return (
+                  <article
+                    key={feature.id}
+                    className="card-obsidian p-3 flex flex-col items-start gap-2"
+                  >
+                    <h3 className="text-sm font-medium">{ts(feature.title)}</h3>
+                    <p className="text-sm text-muted-foreground flex-1">
+                      {ts(feature.description)}
+                    </p>
+                    <div className="flex w-full flex-wrap items-center justify-between gap-2 text-xs">
+                      <span
+                        className={
+                          included
+                            ? 'text-success inline-flex items-center gap-1'
+                            : 'text-muted-foreground'
+                        }
+                      >
+                        {included && (
+                          <Check className="h-3 w-3" aria-hidden="true" />
+                        )}
+                        {ts(
+                          included
+                            ? 'Included'
+                            : 'Requires a license with this feature'
+                        )}
+                      </span>
+                      {included &&
+                        (setup ? (
+                          <a
+                            className="underline"
+                            href={href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {ts('Setup guide')}
+                          </a>
+                        ) : (
+                          <Link className="underline" to={href}>
+                            {ts('Open feature')}
+                          </Link>
+                        ))}
+                    </div>
+                  </article>
+                );
+              })}
           </div>
         </section>
       )}

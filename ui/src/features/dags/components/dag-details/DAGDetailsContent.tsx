@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import LoadingIndicator from '@/components/ui/loading-indicator';
 import { Tabs } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
@@ -250,7 +251,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {INCIDENTS_ENABLED && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Incidents"
                   value="incidents"
@@ -265,7 +266,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   isActive={activeTab === 'incidents'}
                   icon={AlertTriangle}
                 /></I18nProps>
-              )}
+              ))}
 
               {isModal ? (
                 <I18nProps><ModalLinkTab
@@ -338,7 +339,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {INCIDENTS_ENABLED && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Incidents"
                   value="incidents"
@@ -357,7 +358,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   className="flex-1 justify-center"
                   aria-label="Incidents"
                 /></I18nProps>
-              )}
+              ))}
 
               {isModal ? (
                 <I18nProps><ModalLinkTab
@@ -560,7 +561,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
               <div className="h-6 flex-shrink-0" />
             </>
           ) : null}
-          {activeTab === 'incidents' ? (
+          {INCIDENTS_ENABLED && activeTab === 'incidents' ? (
             <>
               <IncidentsTab
                 fileName={fileName || ''}
