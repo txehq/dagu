@@ -16,26 +16,28 @@ vi.mock('@/contexts/AuthContext', () => ({
   useCanExecute: () => true,
 }));
 
-vi.mock('@/contexts/ConfigContext', () => ({
-  useConfig: () => ({ apiURL: '/api/v1' }),
+vi.mock('@/hooks/api', () => ({
+  useClient: () => ({}),
 }));
 
 // fakeApi keeps proposals in memory and applies the server's revision check,
 // so the page is exercised against the same refusal it gets in production.
 function fakeApi(initial: Proposal[]) {
   let proposals = initial;
-  const decide = vi.fn(async (proposalId: string, request: DecisionRequest) => {
-    const current = proposals.find((p) => p.proposalId === proposalId);
-    if (!current || current.revision !== request.expectedProposalRevision) {
-      return { ok: false as const, status: 409, message: 'stale_binding' };
+  const decide = vi.fn(
+    async (_jobId: string, proposalId: string, request: DecisionRequest) => {
+      const current = proposals.find((p) => p.proposalId === proposalId);
+      if (!current || current.revision !== request.expectedProposalRevision) {
+        return { ok: false as const, status: 409, message: 'stale_binding' };
+      }
+      proposals = proposals.map((p) =>
+        p.proposalId === proposalId
+          ? { ...p, state: 'decided' as const, revision: p.revision + 1 }
+          : p
+      );
+      return { ok: true as const };
     }
-    proposals = proposals.map((p) =>
-      p.proposalId === proposalId
-        ? { ...p, state: 'decided' as const, revision: p.revision + 1 }
-        : p
-    );
-    return { ok: true as const };
-  });
+  );
   const api: TxeApi = {
     listJobs: async () => [fixtureJob()],
     getJob: async () => fixtureJob(),
@@ -75,7 +77,7 @@ describe('TxeInboxPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Record decision' }));
 
     await waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
-    expect(decide.mock.calls[0]?.[1]).toMatchObject({
+    expect(decide.mock.calls[0]?.[2]).toMatchObject({
       verdict: 'reject',
       expectedProposalRevision: 1,
     });
