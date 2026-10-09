@@ -108,6 +108,8 @@ func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (reg
 		Snapshot:   snapshot,
 		SpecSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)),
 		Status:     status.Status.String(),
+		Running:    status.Status == ir.Running,
+		ArchiveDir: status.ArchiveDir,
 		Finished:   !status.Status.IsActive() && status.Status != ir.NotStarted,
 		Succeeded:  status.Status.IsSuccess(),
 	}, nil

@@ -28,7 +28,7 @@ func running(attemptID, spec string) RunAttempt {
 
 // runningQueued is an execution queued at queuedAt.
 func runningQueued(attemptID, queuedAt, spec string) RunAttempt {
-	return RunAttempt{AttemptID: attemptID, QueuedAt: queuedAt, SpecSHA256: spec, Status: "running"}
+	return RunAttempt{AttemptID: attemptID, QueuedAt: queuedAt, SpecSHA256: spec, Status: "running", Running: true}
 }
 
 func withDeliverables(v *JobVersion) {
@@ -256,9 +256,15 @@ func TestArtifactsPerExecution(t *testing.T) {
 	_, err = record(runningQueued("a1", q2, spec), report("a1", "2026-10-09T11:00:00Z", ExecutionID{}, shaA))
 	assert.Equal(t, CodeStaleBinding, code(t, err), "same attempt, earlier marker, while a1 runs again")
 	ended := running("a4", spec)
-	ended.Finished, ended.Status = true, "failed"
+	ended.Running, ended.Finished, ended.Status = false, true, "failed"
 	_, err = record(ended, report("a4", "", ExecutionID{}, shaA))
 	assert.Equal(t, CodeStaleBinding, code(t, err), "a publish after the execution ended")
+	for _, status := range []string{"queued", "not_started", "waiting"} {
+		pending := running("a5", spec)
+		pending.Running, pending.Status = false, status
+		_, err = record(pending, report("a5", "", ExecutionID{}, shaA))
+		assert.Equal(t, CodeStaleBinding, code(t, err), "a %s execution cannot take its publication slot", status)
+	}
 
 	again, err := record(ended, report("a1", q1, ExecutionID{}, shaA))
 	require.NoError(t, err, "the same report again is a no-op even after the execution ended")
@@ -320,4 +326,28 @@ func TestHubCopiesArePerExecution(t *testing.T) {
 	assert.Equal(t, []string{"txe-attempts/" + e1.Ref() + "/out.json", "txe-attempts/" + e2.Ref() + "/out.json"}, looked)
 	assert.Equal(t, "/hub/shared", m1.ArchiveDir)
 	assert.Regexp(t, `^a1-[0-9a-f]{16}$`, e1.Ref(), "a portable path segment")
+}
+
+// The execution's native artifact directory is kept from publication, so its
+// hub copies are checked even when a later execution was started before
+// anyone read them.
+func TestManifestKeepsArchiveDirFromPublication(t *testing.T) {
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) {
+		v.ExpectedOutcome.Deliverables = []Deliverable{{Name: "out", Path: "out.json", Delivery: DeliveryHub}}
+	})
+	e := running("a1", job.DAGSpecSHA256)
+	e.ArchiveDir = "/hub/artifacts/run-1-a1"
+	var m *ArtifactManifest
+	_, err := f.tx(job.JobID, cli, func(tx *JobTx) error {
+		var err error
+		m, err = tx.RecordArtifacts(f.ctx, f.store, "run-1", e, ArtifactManifest{AttemptID: "a1", JobVersion: 1,
+			Artifacts: []ArtifactRecord{{Deliverable: "out", Path: "out.json", SHA256: shaA, Location: DeliveryHub, MachineID: f.machine}}})
+		return err
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/hub/artifacts/run-1-a1", m.ArchiveDir)
+	saved, err := f.store.GetArtifacts(f.ctx, job.JobID, "run-1", e.Ref(), "")
+	require.NoError(t, err)
+	assert.Equal(t, "/hub/artifacts/run-1-a1", saved.ArchiveDir)
 }
