@@ -45,6 +45,9 @@ func New(baseURL, apiKey string, httpClient *http.Client) *Client {
 }
 
 // Error is a response outside the 2xx range.
+//
+// Message and Code are the hub's text as it sent them, and may quote what
+// another session stored. Pass them through CleanText before showing them.
 type Error struct {
 	// Status is the HTTP status code.
 	Status int
@@ -148,20 +151,17 @@ func decodeError(status int, statusText string, data []byte) *Error {
 		} `json:"details"`
 	}
 	refusal := &Error{Status: status}
-	// The message and code are shown to a person or an agent, and may quote
-	// text another session stored, so they are cleaned here once.
 	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Message != "" {
-		refusal.Message = CleanText(envelope.Message, false)
-		refusal.Code = CleanText(envelope.Details.Code, false)
+		refusal.Message = envelope.Message
+		refusal.Code = envelope.Details.Code
 		refusal.Current = envelope.Details.Current
 		return refusal
 	}
 	const maxShown = 512
-	text := strings.TrimSpace(string(data))
-	if len(text) > maxShown {
-		text = text[:maxShown] + "..."
+	refusal.Message = strings.TrimSpace(string(data))
+	if len(refusal.Message) > maxShown {
+		refusal.Message = refusal.Message[:maxShown] + "..."
 	}
-	refusal.Message = CleanText(text, false)
 	if refusal.Message == "" {
 		refusal.Message = statusText
 	}

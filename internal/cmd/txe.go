@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf16"
 
 	"github.com/spf13/cobra"
 
@@ -83,8 +86,41 @@ These commands use the "txe" context in the TXE home's own context store
 	for _, build := range txeSubcommands {
 		root.AddCommand(build())
 	}
+	txeCleanErrors(root)
 	return root
 }
+
+// txeCleanErrors makes every command beneath cmd return errors whose text is
+// safe to print. An error here often quotes the hub, and through it what
+// another session stored; cobra prints it as it is.
+func txeCleanErrors(cmd *cobra.Command) {
+	if run := cmd.RunE; run != nil {
+		cmd.RunE = func(c *cobra.Command, args []string) error {
+			if err := run(c, args); err != nil {
+				return &txeShownError{err: err}
+			}
+			return nil
+		}
+	}
+	for _, sub := range cmd.Commands() {
+		txeCleanErrors(sub)
+	}
+}
+
+// txeShownError is an error as it will be printed. The original stays
+// reachable for errors.Is and errors.As.
+type txeShownError struct {
+	err error
+}
+
+func (e *txeShownError) Error() string {
+	// A spec's list of gaps is laid out over several lines by this program;
+	// its values are quoted when they are formatted.
+	var missing *txeclient.MissingContextError
+	return txeclient.CleanText(e.err.Error(), errors.As(e.err, &missing))
+}
+
+func (e *txeShownError) Unwrap() error { return e.err }
 
 // isTXECommand reports whether cmd is the txe command or one beneath it.
 func isTXECommand(cmd *cobra.Command) bool {
@@ -276,10 +312,36 @@ func txeOutput(ctx *Context, value any, human func(p *txePrinter)) error {
 		human(p)
 		return p.err
 	}
-	enc := json.NewEncoder(out)
+	return txeWriteJSON(out, value)
+}
+
+// txeWriteJSON prints value as indented JSON in which every character that
+// is not printable is written as a JSON escape. The encoder already escapes
+// the ASCII control characters; this adds the rest, such as the characters
+// that reorder or hide text, so the output is safe on a terminal and means
+// the same to a parser.
+func txeWriteJSON(w io.Writer, value any) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	return enc.Encode(value)
+	if err := enc.Encode(value); err != nil {
+		return err
+	}
+	var out strings.Builder
+	for _, r := range buf.String() {
+		switch {
+		case r < 0x7f || unicode.IsPrint(r):
+			out.WriteRune(r)
+		case r > 0xffff:
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(&out, `\u%04x`+`\u%04x`, hi, lo)
+		default:
+			fmt.Fprintf(&out, `\u%04x`, r)
+		}
+	}
+	_, err := io.WriteString(w, out.String())
+	return err
 }
 
 // txeFailure describes a refused or unfinished change for --json output, so a
@@ -323,9 +385,6 @@ func txeReportFailure(ctx *Context, err error) error {
 	case errors.Is(err, txeclient.ErrReviewerSession):
 		failure.Kind = "reviewer_session"
 	}
-	enc := json.NewEncoder(ctx.Command.OutOrStdout())
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(failure)
+	_ = txeWriteJSON(ctx.Command.OutOrStdout(), failure)
 	return err
 }

@@ -106,6 +106,9 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	var b strings.Builder
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 
+	// Steps run in the order written. Dagu's default runs steps that name no
+	// dependency in parallel, which would publish before the job had written.
+	line("type: chain")
 	line("description: %s", quote(s.Title))
 	if s.ProjectName != "" {
 		line("group: %s", quote(s.ProjectName))
