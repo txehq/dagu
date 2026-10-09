@@ -75,6 +75,14 @@ func TestRenderReconcileDAGRefusesUnsafeInput(t *testing.T) {
 		"env name":     func(c *ReconcileDAGConfig) { c.Env = map[string]string{"bad-name": "x"} },
 		"schedule":     func(c *ReconcileDAGConfig) { c.Schedule = "@every 5m" },
 		"timeout":      func(c *ReconcileDAGConfig) { c.TimeoutSec = -1 },
+		// The DAG is stored on the hub in plain text: credentials never.
+		"env api key":    func(c *ReconcileDAGConfig) { c.Env = map[string]string{"TXE_DAGU_HOME": "dagu_0123456789abcdef"} },
+		"env token name": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"LINEAR_API_KEY": "/x"} },
+		"env secret var": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"GITHUB_TOKEN": "/x"} },
+		"env long value": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"X": "AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ012345"} },
+		"env linear key": func(c *ReconcileDAGConfig) { c.Env = map[string]string{"X": "lin_api_abc"} },
+		"flag token":     func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--token=abc"} },
+		"flag api key":   func(c *ReconcileDAGConfig) { c.StoreFlags = []string{"--context", "dagu_0123456789abcdef"} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := reconcileConfig()

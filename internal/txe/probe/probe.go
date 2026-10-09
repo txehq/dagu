@@ -119,8 +119,16 @@ func classify(ctx context.Context, err error) Outcome {
 	return Unreachable
 }
 
-func noCredential(name string) Result {
-	return Result{Outcome: AuthDenied, Detail: "no credential reference named " + name + " on this machine"}
+// noCredential reports a credential the probe needs and does not have. It
+// is auth_denied, which asks for the credential, never an absence.
+func noCredential(creds Credentials, name string) Result {
+	detail := "no credential reference named " + name + " on this machine"
+	if e, ok := creds.(interface{ MissingReason(string) string }); ok {
+		if why := e.MissingReason(name); why != "" {
+			detail = why
+		}
+	}
+	return Result{Outcome: AuthDenied, Detail: detail}
 }
 
 // trimmed returns s without surrounding space, so an id copied with a stray
