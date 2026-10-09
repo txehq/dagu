@@ -574,8 +574,10 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	}
 	switch next {
 	case ProposalDecided, ProposalSnoozed, ProposalRejected:
-	default:
+	case ProposalOpen, ProposalExecuted, ProposalSuperseded:
 		return nil, refuse(CodeInvalid, "a decision moves a proposal to decided, snoozed or rejected, not %s", next)
+	default:
+		return nil, refuse(CodeInvalid, "unknown proposal state %q", next)
 	}
 	if p.State != ProposalOpen && p.State != ProposalSnoozed {
 		return nil, &Error{Code: CodeProposalState, Message: "proposal is " + string(p.State), Current: p}

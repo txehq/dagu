@@ -40,9 +40,9 @@ var idPattern = regexp.MustCompile(`^([a-z]{3})_([0-9A-HJKMNP-TV-Z]{26})$`)
 // NewID mints a ULID-shaped ID: 48 bits of milliseconds and 80 random bits.
 func NewID(p Prefix, now time.Time) (string, error) {
 	var b [16]byte
-	ms := uint64(now.UnixMilli()) //nolint:gosec // wall-clock milliseconds are positive
-	binary.BigEndian.PutUint16(b[0:2], uint16(ms>>32))
-	binary.BigEndian.PutUint32(b[2:6], uint32(ms))
+	var ms [8]byte
+	binary.BigEndian.PutUint64(ms[:], uint64(now.UnixMilli())) //nolint:gosec // wall-clock milliseconds are positive
+	copy(b[0:6], ms[2:8])
 	if _, err := rand.Read(b[6:]); err != nil {
 		return "", fmt.Errorf("registry: mint %s id: %w", p, err)
 	}
