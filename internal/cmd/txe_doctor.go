@@ -10,9 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	txeskill "github.com/dagucloud/dagu/v2/txe/skill"
 )
 
 func txeDoctorCommand() *cobra.Command {
@@ -59,7 +59,15 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 		return err == nil
 	}
 
-	add("cli", nil, "dagu "+config.Version, "")
+	add("cli", nil, txeClientVersion(), "")
+	if state := txeskill.Inspect(func() string {
+		home, _ := txepkg.DefaultHome()
+		return home.SkillDir() + "/current"
+	}()); state.Current {
+		add("skill", nil, "revision "+state.Revision+" unpacked", "")
+	} else {
+		add("skill", fmt.Errorf("%s", state.Problem), "", "run dagu txe skill install, then link it into each agent profile")
+	}
 	session := txeSession(ctx)
 	if session == "" {
 		add("session", fmt.Errorf("no session identity could be derived"), "", "pass --session or set TXE_SESSION when registering")

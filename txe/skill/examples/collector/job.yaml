@@ -1,0 +1,48 @@
+# Data collector: one snapshot per run, published to the hub.
+schema: 1
+job_key: example-nightly-collector
+title: Collect the nightly snapshot
+purpose: >-
+  Record a snapshot of the export directory each night so a missing or empty
+  export is noticed the next morning. The snapshot is the deliverable.
+project:
+  key: example.invalid/txe/examples
+  name: txe examples
+targets:
+  - kind: example.directory
+    environment: local
+    stable_id:
+      id: example-exports-0001
+    display_name: exports
+schedule:
+  cron: "0 2 * * *"
+  timezone: Australia/Perth
+  timeout_sec: 300
+  retry: 1
+  retry_interval_sec: 60
+package:
+  # lib/ is a dependency of collect.py; leaving it out breaks the job.
+  include: [collect.py, lib]
+  entrypoint: [./collect.py]
+  runtimes: [python3]
+env:
+  SOURCE_DIR: /var/tmp/txe-example-exports
+expected_outcome:
+  success_criteria:
+    - Each night's run produces a snapshot that lists at least one file.
+  deliverables:
+    - name: snapshot
+      path: snapshot.json
+      type: json
+      description: File count, total size and a digest of the listing.
+      delivery: hub
+      required: true
+lifetime:
+  expires_at: "2027-01-31T00:00:00Z"
+review_policy:
+  cadence: "0 9 * * *"
+  brief: >-
+    Check that last night's snapshot exists and lists files. An empty listing
+    or a failed run needs a look at the export before the next night.
+  human_decision_conditions:
+    - two consecutive nights without a snapshot

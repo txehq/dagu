@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Data collector: write one dated snapshot of a source directory.
+"""Data collector: write one snapshot of a source directory per run.
 
 The job depends on lib/snapshot.py, which sits beside this file. Registering the
 job must package both; a package holding only this file fails at import.
 
-    SOURCE_DIR       directory to summarise
-    TXE_OUTPUT_DIR   durable directory for this job's snapshots
+    SOURCE_DIR           directory to summarise
+    TXE_RUN_OUTPUT_DIR   this run's own output directory
 
-Prints the snapshot path and a one-line JSON summary. Exit 0 on success, 1 when
-the source cannot be read, 2 when misconfigured.
+Writes snapshot.json there, the deliverable the job declares, and prints a
+one-line JSON summary. Exit 0 on success, 1 when the source cannot be read, 2
+when misconfigured.
 """
 
 import json
@@ -21,9 +22,9 @@ from lib.snapshot import summarise
 
 def main() -> int:
     source = os.environ.get("SOURCE_DIR")
-    output = os.environ.get("TXE_OUTPUT_DIR")
+    output = os.environ.get("TXE_RUN_OUTPUT_DIR")
     if not source or not output:
-        print("SOURCE_DIR and TXE_OUTPUT_DIR are required", file=sys.stderr)
+        print("SOURCE_DIR and TXE_RUN_OUTPUT_DIR are required", file=sys.stderr)
         return 2
 
     try:
@@ -32,11 +33,10 @@ def main() -> int:
         print(f"cannot read {source}: {err}", file=sys.stderr)
         return 1
 
-    taken = datetime.now(timezone.utc)
-    summary["collected_at"] = taken.strftime("%Y-%m-%dT%H:%M:%SZ")
+    summary["collected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     os.makedirs(output, exist_ok=True)
-    path = os.path.join(output, f"snapshot-{taken.strftime('%Y%m%dT%H%M%SZ')}.json")
+    path = os.path.join(output, "snapshot.json")
     partial = path + ".partial"
     with open(partial, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, sort_keys=True)
@@ -45,7 +45,6 @@ def main() -> int:
         os.fsync(handle.fileno())
     os.replace(partial, path)
 
-    print(path)
     print(json.dumps({k: summary[k] for k in ("collected_at", "files", "bytes")}))
     return 0
 

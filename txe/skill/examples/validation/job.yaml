@@ -1,0 +1,46 @@
+# Post-integration validation: runs until a success condition is met.
+schema: 1
+job_key: example-integration-validation
+title: Validate the example integration
+purpose: >-
+  Probe the integration every ten minutes after the change. Three consecutive
+  passes mean the change holds; the run that reaches them writes the final
+  report, and the job is then complete.
+project:
+  key: example.invalid/txe/examples
+  name: txe examples
+targets:
+  - kind: example.integration
+    environment: local
+    stable_id:
+      id: example-integration-0001
+    display_name: example integration
+schedule:
+  cron: "*/10 * * * *"
+  timezone: Australia/Perth
+  timeout_sec: 60
+package:
+  include: [validate.sh]
+  entrypoint: [./validate.sh]
+env:
+  PROBE_PATH: /var/tmp/txe-example-probe
+  REQUIRED_PASSES: "3"
+expected_outcome:
+  success_criteria:
+    - Three consecutive probes pass; the result line then reports complete true.
+  deliverables:
+    - name: report
+      path: validation-report.json
+      type: json
+      description: Written by the run that reaches the required passes.
+      delivery: hub
+lifetime:
+  expires_at: "2026-12-31T00:00:00Z"
+retirement_rules:
+  on_completion: retire
+review_policy:
+  cadence: "0 * * * *"
+  brief: >-
+    When a result line reports complete true, record the job as completed with
+    the report as evidence. A failed probe after earlier passes is worth a
+    look; do not restart the count by hand.

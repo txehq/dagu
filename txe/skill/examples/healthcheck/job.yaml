@@ -1,0 +1,45 @@
+# Health check: is one resource present, the same one, and fresh?
+schema: 1
+job_key: example-target-health
+title: Watch the example target
+purpose: >-
+  Report every five minutes whether the example target is present, is still
+  the resource that was registered, and has changed within the last hour.
+  A missing, replaced or stale target needs a person; the job never acts on it.
+project:
+  key: example.invalid/txe/examples
+  name: txe examples
+targets:
+  - kind: example.file
+    environment: local
+    stable_id:
+      id: example-target-0001
+    display_name: example target
+    existence_check: pre_run
+schedule:
+  cron: "*/5 * * * *"
+  timezone: Australia/Perth
+  timeout_sec: 60
+package:
+  include: [check.sh]
+  entrypoint: [./check.sh]
+env:
+  TARGET_PATH: /var/tmp/txe-example-target
+  TARGET_ID: example-target-0001
+  MAX_AGE_SEC: "3600"
+expected_outcome:
+  success_criteria:
+    - Every run reports state healthy for the registered target id.
+lifetime:
+  expires_at: "2027-01-31T00:00:00Z"
+retirement_rules:
+  on_target_deleted: retire
+  on_replacement: review
+review_policy:
+  cadence: "0 9 * * *"
+  brief: >-
+    Read the observations since the last checkpoint. A run of healthy results
+    needs no action. absent, replaced, stale or unreadable needs a human
+    decision. unreadable is a permission problem, not a deletion.
+  human_decision_conditions:
+    - state is absent, replaced or stale
