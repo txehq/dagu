@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -75,6 +76,12 @@ func TestTXEOutputIsCleaned(t *testing.T) {
 // which a job's step inherits from the worker, are dropped before the
 // configuration is read, and the default store is the TXE home's own.
 func TestTXEDefaultsIgnoreInheritedEnvironment(t *testing.T) {
+	// The command clears these for the whole process; other tests get them back.
+	for _, variable := range os.Environ() {
+		if name, value, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
+			t.Cleanup(func() { _ = os.Setenv(name, value) })
+		}
+	}
 	txeHome := filepath.Join(t.TempDir(), "txe-home")
 	worker := filepath.Join(t.TempDir(), "worker-home")
 	t.Setenv("TXE_DAGU_HOME", txeHome)

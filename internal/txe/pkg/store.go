@@ -353,7 +353,7 @@ var errTooLarge = errors.New("package size limit exceeded")
 func (s *Store) copyOne(source *os.Root, rel string, dst string, credentials []fs.FileInfo, budget int64) (File, error) {
 	// A link is packaged as the file it points to, so every name on the way
 	// to that file is judged, not only the one the spec used.
-	names, err := linkNames(source, rel)
+	names, real, err := linkNames(source, rel)
 	if err != nil {
 		return File{}, err
 	}
@@ -373,6 +373,11 @@ func (s *Store) copyOne(source *os.Root, rel string, dst string, credentials []f
 	}
 	if !info.Mode().IsRegular() {
 		return File{}, fmt.Errorf("%s is not a regular file", rel)
+	}
+	// The names were judged before the file was opened. The file that was
+	// opened must be the one those names led to.
+	if judged, err := source.Lstat(real); err != nil || !os.SameFile(judged, info) {
+		return File{}, fmt.Errorf("%s changed while it was being packaged", rel)
 	}
 	for _, credential := range credentials {
 		if os.SameFile(info, credential) {
@@ -428,13 +433,14 @@ const maxLinkHops = 40
 
 // linkNames returns the names a packaged path goes by: its own base name, the
 // base name of every link that stands for it, and the name of the file it
-// finally is. It resolves the path the way the operating system does, one
-// component at a time, asking the root about each. A directory walk reports
-// its starting path by what it points to, so the walk's own entry cannot be
-// trusted to say whether the path is a link.
-func linkNames(source *os.Root, rel string) ([]string, error) {
+// finally is. It also returns that file's own path, which has no link in it.
+// It resolves the path the way the operating system does, one component at a
+// time, asking the root about each. A directory walk reports its starting
+// path by what it points to, so the walk's own entry cannot be trusted to say
+// whether the path is a link.
+func linkNames(source *os.Root, rel string) (names []string, real string, err error) {
 	pending := strings.Split(path.Clean(filepath.ToSlash(rel)), "/")
-	names := []string{pending[len(pending)-1]}
+	names = []string{pending[len(pending)-1]}
 	var resolved []string
 	hops := 0
 	for len(pending) > 0 {
@@ -445,7 +451,7 @@ func linkNames(source *os.Root, rel string) ([]string, error) {
 			continue
 		case "..":
 			if len(resolved) == 0 {
-				return nil, fmt.Errorf("%s is a link that leaves the source root", rel)
+				return nil, "", fmt.Errorf("%s is a link that leaves the source root", rel)
 			}
 			resolved = resolved[:len(resolved)-1]
 			continue
@@ -453,22 +459,22 @@ func linkNames(source *os.Root, rel string) ([]string, error) {
 		candidate := filepath.Join(filepath.Join(resolved...), part)
 		info, err := source.Lstat(candidate)
 		if err != nil {
-			return nil, fmt.Errorf("inspect %s: %w", rel, err)
+			return nil, "", fmt.Errorf("inspect %s: %w", rel, err)
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
 			resolved = append(resolved, part)
 			continue
 		}
 		if hops++; hops > maxLinkHops {
-			return nil, fmt.Errorf("%s is a chain of more than %d links", rel, maxLinkHops)
+			return nil, "", fmt.Errorf("%s is a chain of more than %d links", rel, maxLinkHops)
 		}
 		target, err := source.Readlink(candidate)
 		if err != nil {
-			return nil, fmt.Errorf("read link %s: %w", rel, err)
+			return nil, "", fmt.Errorf("read link %s: %w", rel, err)
 		}
 		target = filepath.ToSlash(target)
 		if path.IsAbs(target) {
-			return nil, fmt.Errorf("%s is a link to an absolute path; a link is packaged only when it is relative and stays inside the source root", rel)
+			return nil, "", fmt.Errorf("%s is a link to an absolute path; a link is packaged only when it is relative and stays inside the source root", rel)
 		}
 		if len(pending) == 0 {
 			// This link stands for the file itself, not a directory on the way.
@@ -476,10 +482,11 @@ func linkNames(source *os.Root, rel string) ([]string, error) {
 		}
 		pending = append(strings.Split(target, "/"), pending...)
 	}
-	if len(resolved) > 0 {
-		names = append(names, resolved[len(resolved)-1])
+	if len(resolved) == 0 {
+		return nil, "", fmt.Errorf("%s names the source root, not a file", rel)
 	}
-	return names, nil
+	names = append(names, resolved[len(resolved)-1])
+	return names, filepath.Join(resolved...), nil
 }
 
 // checkEntrypoint validates the command. A first element naming a packaged
