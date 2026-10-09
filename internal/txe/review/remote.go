@@ -1041,6 +1041,15 @@ func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 	if !jobExceptions[exc.Kind] {
 		scope := api.TxeObservationRequestScopeReviewer
 		body.Scope = &scope
+		// The registry files one exception per observation. A reviewer that
+		// fails the same way on every tick reports it once, not once a tick.
+		doc, err := r.jobDoc(ctx, exc.JobID)
+		if err != nil {
+			return err
+		}
+		if av := doc.ReviewerAvailability; av != nil && av.State == body.State && deref(av.Detail) == exc.Message {
+			return nil
+		}
 	}
 	return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
 }

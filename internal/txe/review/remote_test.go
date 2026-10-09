@@ -791,6 +791,10 @@ func TestRemoteReviewerExceptionLeavesTheJobAvailable(t *testing.T) {
 	require.NoError(t, f.remote.RaiseException(ctx, review.Exception{
 		JobID: f.jobID, Kind: review.ExceptionReviewerAuth, MachineID: f.remote.MachineID, Message: "the agent is not logged in",
 	}))
+	// The same failure on the next tick is not filed again.
+	require.NoError(t, f.remote.RaiseException(ctx, review.Exception{
+		JobID: f.jobID, Kind: review.ExceptionReviewerAuth, MachineID: f.remote.MachineID, Message: "the agent is not logged in",
+	}))
 	job := f.job()
 	assert.Equal(t, before, job.Availability.State, "the job's availability is untouched")
 	require.NotNil(t, job.ReviewerAvailability)
