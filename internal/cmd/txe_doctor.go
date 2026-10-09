@@ -146,8 +146,8 @@ func txeDoctorReport(ctx *Context, checks []txeCheck, unfinished []txeUnfinished
 		}
 		for _, u := range unfinished {
 			p.f("\nUnfinished %s %s (%s, job key %q) at step %q, started by %s\n", u.Operation, u.RequestID, u.JobID, u.JobKey, u.Step, u.Session)
-			if u.Step == txepkg.StepRejected {
-				p.f("      refused by the hub: %s\n      kept as a record; nothing to resume\n", u.Error)
+			if u.Step.Closed() {
+				p.f("      closed (%s): %s\n      kept as a record; nothing to resume\n", u.Step, u.Error)
 			} else {
 				p.f("      -> dagu txe resume %s\n", u.RequestID)
 			}

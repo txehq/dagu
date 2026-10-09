@@ -35,7 +35,13 @@ const (
 	// StepRejected: the service refused the request. The entry and the staged
 	// package are kept as evidence.
 	StepRejected Step = "rejected"
+	// StepSuperseded: the job moved to a later version before this request's
+	// receipt was written. There is nothing left to resume.
+	StepSuperseded Step = "superseded"
 )
+
+// Closed reports whether nothing more can be done for an entry at this step.
+func (s Step) Closed() bool { return s == StepRejected || s == StepSuperseded }
 
 // Operations recorded in the journal.
 const (
@@ -52,6 +58,10 @@ type Entry struct {
 	Operation string `json:"operation"`
 	JobID     string `json:"job_id"`
 	JobKey    string `json:"job_key,omitempty"`
+	// MachineID and OwnerID are the machine the request was built on and its
+	// owner. A request is only ever sent, or resumed, from that machine.
+	MachineID string `json:"machine_id"`
+	OwnerID   string `json:"owner_id"`
 	// Version is the job version this request creates.
 	Version       int             `json:"version"`
 	Step          Step            `json:"step"`

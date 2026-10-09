@@ -78,12 +78,20 @@ func TestTXESession(t *testing.T) {
 
 	t.Setenv("TMUX", "")
 	t.Setenv("TXE_SESSION", "")
+	t.Setenv("CODEX_THREAD_ID", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/Users/x/.claude2")
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "855054c9-633c-4dcc")
 	assert.Equal(t, "cc2-s855054", txeSession(ctx))
 
 	t.Setenv("CLAUDE_CONFIG_DIR", "/Users/x/.claude")
 	assert.Equal(t, "cc-s855054", txeSession(ctx))
+
+	// A Codex thread started from that Claude session carries both ids. The
+	// Claude ones are its parent's, so nothing is derived.
+	t.Setenv("CLAUDE_CONFIG_DIR", "/Users/x/.claude2")
+	t.Setenv("CODEX_THREAD_ID", "0199e3a4-7c1e-7b2a-9d4f-5e6a7b8c9d0e")
+	assert.Empty(t, txeSession(ctx), "a Codex thread is not its parent Claude session")
+	t.Setenv("CODEX_THREAD_ID", "")
 
 	t.Setenv("CLAUDE_CONFIG_DIR", "/Users/x/.config/other")
 	assert.Empty(t, txeSession(ctx), "not a Claude Code session: nothing is guessed")

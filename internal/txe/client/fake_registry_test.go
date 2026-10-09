@@ -44,6 +44,8 @@ type fakeRegistry struct {
 	fail map[string]int
 	// failNextReady fails the next ready call once, whatever its job.
 	failNextReady bool
+	// loseNextReady applies the next ready call and then loses its answer.
+	loseNextReady bool
 }
 
 type fakeJob struct {
@@ -183,6 +185,9 @@ func (f *fakeRegistry) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lose := f.loseResponse[key] > 0
+	if f.loseNextReady && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ready") {
+		f.loseNextReady, lose = false, true
+	}
 	if lose {
 		f.loseResponse[key]--
 	}

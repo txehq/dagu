@@ -372,7 +372,7 @@ func TestResumeFromAnotherMachine(t *testing.T) {
 	}
 
 	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
-	require.ErrorContains(t, err, "cannot place or vouch for its package")
+	require.ErrorContains(t, err, "cannot send or finish it")
 
 	readyAfter := 0
 	for _, r := range f.requests {
@@ -385,6 +385,106 @@ func TestResumeFromAnotherMachine(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
+}
+
+// The same holds for a request that was saved but never delivered: resuming
+// it from another machine sends nothing, so no job is created or changed
+// before the refusal.
+func TestResumeUndeliveredRequestFromAnotherMachine(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	spec, _ := worktree(t, credentialFile(t))
+	f.fail["POST /txe/jobs"] = 1
+
+	_, err := cc1.Register(context.Background(), spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+	require.Equal(t, txepkg.StepStaged, incomplete.Step)
+	require.Zero(t, f.jobCount())
+	posts := f.calls(http.MethodPost, "/txe/jobs")
+
+	other := `{"schema":1,"machine_id":"mch_01K7A5ZQ8M3N4P5R6S7T8V9W0D","owner_id":"` + testOwner + `"}`
+	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "machine.json"), []byte(other), 0o600))
+	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
+	require.ErrorContains(t, err, "cannot send or finish it")
+
+	assert.Equal(t, posts, f.calls(http.MethodPost, "/txe/jobs"), "the other machine sent the saved request")
+	assert.Zero(t, f.jobCount())
+}
+
+// The hub marks version 1 ready but its answer is lost; before the first
+// session resumes, another session updates the job. The first request can no
+// longer be completed, and says so once instead of failing every resume.
+func TestResumeAfterJobMovedOn(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	cc2 := newSession(f, home, "cc2-s000002")
+	spec, dir := worktree(t, credentialFile(t))
+	f.mu.Lock()
+	f.loseNextReady = true
+	f.mu.Unlock()
+
+	_, err := cc1.Register(context.Background(), spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+	jobs, err := cc1.Client.ListJobs(context.Background(), JobFilter{JobKey: "nightly-collector"})
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	require.Equal(t, RegistrationReady, jobs[0].Registration.State, "the hub did mark it ready")
+	jobID := jobs[0].JobID
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "lib", "snapshot.py"), []byte("def summarise(root):\n    return {'v': 2}\n"), 0o644)) //nolint:gosec // test file
+	second, err := cc2.Update(context.Background(), jobID, 1, spec)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Receipt.Version)
+
+	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
+	var superseded *ErrSuperseded
+	require.ErrorAs(t, err, &superseded)
+	assert.Equal(t, 1, superseded.Version)
+	assert.Equal(t, 2, superseded.Current)
+
+	// The entry is closed, with the reason, and there is still no receipt
+	// for the version nobody can vouch for.
+	assert.Equal(t, txepkg.StepSuperseded, pendingSteps(t, cc1.Journal)[incomplete.RequestID])
+	_, err = cc1.Journal.Receipt(jobID, 1)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
+	require.ErrorContains(t, err, "cannot be resumed")
+
+	// Version 2 is untouched.
+	assert.Equal(t, 2, f.job(jobID).Version)
+	assert.Equal(t, RegistrationReady, f.job(jobID).Registration.State)
+}
+
+// A job registered through another context publishes through that context.
+func TestPublishStepUsesRegistrationContext(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	_, dir := worktree(t, credentialFile(t))
+	specPath := filepath.Join(dir, "job.yaml")
+	text, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(specPath, []byte(strings.Replace(string(text), "expected_outcome:\n", "expected_outcome:\n"+deliverablesYAML, 1)), 0o644)) //nolint:gosec // test file
+	spec, err := LoadJobSpec(specPath)
+	require.NoError(t, err)
+
+	stores := t.TempDir()
+	s := newSession(f, home, "cc1-s000001")
+	s.Hub = HubContext{DaguHome: filepath.Join(stores, "other-hub"), Name: "staging"}
+	plan, err := s.Plan(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Contains(t, plan.DAGSpec, "txe artifacts publish --dagu-home "+filepath.Join(stores, "other-hub")+" --context staging")
+
+	// A context store that a later run could not rely on is refused.
+	s.Store.Policy = txepkg.PathPolicy{TempRoots: []string{stores}}
+	_, err = s.Plan(context.Background(), spec)
+	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	_, err = s.Register(context.Background(), spec)
+	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	assert.Zero(t, f.jobCount())
 }
 
 // An update names the version it changes. One made against an outdated

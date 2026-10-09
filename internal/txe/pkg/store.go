@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -90,9 +91,16 @@ func (p *Package) WorkDir() string { return filepath.Join(p.Dir, FilesDir) }
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
+// hasModeBits is false where the file system has no Unix permission bits to
+// check. Job packages run on Unix workers.
+const hasModeBits = runtime.GOOS != "windows"
+
 // Stage builds a package in the staging area under requestID and returns its
 // digest. Nothing outside the staging area changes.
 func (s *Store) Stage(requestID string, opts BuildOptions) (*Staged, error) {
+	if !hasModeBits {
+		return nil, errors.New("job packages are built on the Unix machine that runs them; this is a Windows build")
+	}
 	if !namePattern.MatchString(requestID) {
 		return nil, fmt.Errorf("invalid request id %q", requestID)
 	}
@@ -109,9 +117,8 @@ func (s *Store) Stage(requestID string, opts BuildOptions) (*Staged, error) {
 		return nil, fmt.Errorf("resolve source root: %w", err)
 	}
 	root = resolveExisting(root)
-	sources, err := s.collect(root, opts.Include)
-	if err != nil {
-		return nil, err
+	if len(opts.Include) == 0 {
+		return nil, errors.New("no files to package: name at least one file or directory")
 	}
 
 	dir := filepath.Join(s.Root, stagingDir, requestID)
@@ -125,7 +132,7 @@ func (s *Store) Stage(requestID string, opts BuildOptions) (*Staged, error) {
 		return nil, fmt.Errorf("create staging directory: %w", err)
 	}
 
-	staged, err := s.build(dir, root, sources, opts)
+	staged, err := s.build(dir, root, opts)
 	if err != nil {
 		// A failed build was never referenced by anything.
 		_ = os.RemoveAll(dir)
@@ -134,15 +141,10 @@ func (s *Store) Stage(requestID string, opts BuildOptions) (*Staged, error) {
 	return staged, nil
 }
 
-func (s *Store) build(dir, root string, sources []string, opts BuildOptions) (*Staged, error) {
-	files := make([]File, 0, len(sources))
-	for _, rel := range sources {
-		f, err := copyInto(filepath.Join(root, filepath.FromSlash(rel)), filepath.Join(dir, FilesDir, filepath.FromSlash(rel)))
-		if err != nil {
-			return nil, err
-		}
-		f.Path = rel
-		files = append(files, f)
+func (s *Store) build(dir, root string, opts BuildOptions) (*Staged, error) {
+	files, err := s.copySources(root, filepath.Join(dir, FilesDir), opts)
+	if err != nil {
+		return nil, err
 	}
 
 	entrypoint, runtimes, err := checkEntrypoint(opts.Entrypoint, opts.Runtimes, files, s.Policy)
@@ -181,7 +183,7 @@ func (s *Store) LoadStaged(requestID string) (*Staged, error) {
 		return nil, fmt.Errorf("invalid request id %q", requestID)
 	}
 	dir := filepath.Join(s.Root, stagingDir, requestID)
-	manifest, digest, err := verifyDir(dir)
+	manifest, digest, err := verifyDir(dir, false)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +199,7 @@ func (s *Store) Commit(staged *Staged, jobID string) (*Package, error) {
 		return nil, err
 	}
 	if _, err := os.Lstat(final); err == nil {
-		return s.Verify(jobID, staged.Digest)
+		return s.Adopt(jobID, staged.Digest)
 	}
 	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
 		return nil, fmt.Errorf("create package directory: %w", err)
@@ -205,23 +207,38 @@ func (s *Store) Commit(staged *Staged, jobID string) (*Package, error) {
 	if err := os.Rename(staged.Dir, final); err != nil {
 		return nil, fmt.Errorf("move package into place: %w", err)
 	}
+	return s.Adopt(jobID, staged.Digest)
+}
+
+// Adopt finishes placing a package that is already in its final location: it
+// seals it, in case an earlier attempt stopped between moving and sealing,
+// and then verifies it. A package is never vouched for unsealed.
+func (s *Store) Adopt(jobID, digest string) (*Package, error) {
+	final, err := s.packageDir(jobID, digest)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := verifyDir(final, false); err != nil {
+		return nil, err
+	}
 	if err := sealTree(final); err != nil {
 		return nil, err
 	}
 	if err := fileutil.SyncDir(filepath.Dir(final)); err != nil {
 		return nil, fmt.Errorf("sync package directory: %w", err)
 	}
-	return &Package{JobID: jobID, Digest: staged.Digest, Dir: final, Manifest: staged.Manifest}, nil
+	return s.Verify(jobID, digest)
 }
 
-// Verify re-reads a stored package and checks the manifest against its digest
-// and every payload file against the manifest.
+// Verify re-reads a stored package and checks the manifest against its digest,
+// every payload file against the manifest, each file's executable bit, and
+// that nothing in the package is writable.
 func (s *Store) Verify(jobID, digest string) (*Package, error) {
 	dir, err := s.packageDir(jobID, digest)
 	if err != nil {
 		return nil, err
 	}
-	manifest, found, err := verifyDir(dir)
+	manifest, found, err := verifyDir(dir, true)
 	if err != nil {
 		return nil, err
 	}
@@ -250,114 +267,129 @@ func (s *Store) packageDir(jobID, digest string) (string, error) {
 	return filepath.Join(s.Root, jobID, name), nil
 }
 
-// collect expands the include list into sorted slash-separated file paths
-// relative to root, refusing anything that must not be packaged.
-func (s *Store) collect(root string, include []string) ([]string, error) {
-	if len(include) == 0 {
-		return nil, errors.New("no files to package: name at least one file or directory")
-	}
-	maxFiles, maxBytes := s.MaxFiles, s.MaxBytes
+// copySources copies the included files from the source root into dst and
+// returns them sorted by path.
+//
+// Each file is opened once, through a handle on the source root, and what is
+// checked is what is copied: the handle cannot be led outside the root by a
+// link that appears after the walk has seen the path, and the checks for a
+// regular file, for credentials and for size apply to the opened file itself.
+func (s *Store) copySources(root, dst string, opts BuildOptions) ([]File, error) {
+	maxFiles, remaining := s.MaxFiles, s.MaxBytes
 	if maxFiles == 0 {
 		maxFiles = defaultMaxFiles
 	}
-	if maxBytes == 0 {
-		maxBytes = defaultMaxBytes
+	if remaining == 0 {
+		remaining = defaultMaxBytes
+	}
+	limit := remaining
+
+	source, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("open source root: %w", err)
+	}
+	defer func() { _ = source.Close() }()
+
+	// A credential the job refers to by file must not also travel in the
+	// package, under any name.
+	var credentials []fs.FileInfo
+	for _, ref := range opts.CredentialRefs {
+		if ref.Kind != CredentialFile {
+			continue
+		}
+		if info, err := os.Stat(ref.Locator); err == nil {
+			credentials = append(credentials, info)
+		}
 	}
 
 	seen := map[string]bool{}
-	var total int64
-	add := func(abs string, info fs.FileInfo) error {
-		rel, err := filepath.Rel(root, abs)
-		if err != nil || !within(root, abs) {
-			return fmt.Errorf("%s is outside the source root %s", abs, root)
-		}
-		if looksLikeCredentialName(info.Name()) {
-			return fmt.Errorf("%w: %s; reference it with a credential reference instead of packaging it", ErrCredentialFile, rel)
-		}
-		rel = filepath.ToSlash(rel)
-		if seen[rel] {
-			return nil
-		}
-		seen[rel] = true
-		total += info.Size()
-		if len(seen) > maxFiles {
-			return fmt.Errorf("package has more than %d files; name the needed files instead of a whole tree", maxFiles)
-		}
-		if total > maxBytes {
-			return fmt.Errorf("package is larger than %d bytes", maxBytes)
-		}
-		return nil
-	}
-
-	for _, item := range include {
+	var files []File
+	for _, item := range opts.Include {
 		if filepath.IsAbs(item) {
 			return nil, fmt.Errorf("include path %q must be relative to the source root", item)
 		}
-		start := filepath.Join(root, item)
-		if !within(root, start) {
+		start := filepath.ToSlash(filepath.Clean(item))
+		if start == ".." || strings.HasPrefix(start, "../") {
 			return nil, fmt.Errorf("include path %q leaves the source root", item)
 		}
-		err := filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
+		err := fs.WalkDir(source.FS(), start, func(rel string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if d.Name() == ".git" {
-				return fmt.Errorf("include path %q contains %s; name the files the job needs, not a repository", item, p)
+				return fmt.Errorf("include path %q contains %s; name the files the job needs, not a repository", item, rel)
 			}
-			if d.IsDir() {
+			if d.IsDir() || seen[rel] {
 				return nil
 			}
-			// A symlink is packaged as the file it points to, and only when
-			// that file is inside the source root.
-			target, err := filepath.EvalSymlinks(p)
-			if err != nil {
-				return fmt.Errorf("resolve %s: %w", p, err)
+			seen[rel] = true
+			if len(seen) > maxFiles {
+				return fmt.Errorf("package has more than %d files; name the needed files instead of a whole tree", maxFiles)
 			}
-			if !within(root, target) {
-				return fmt.Errorf("%s links outside the source root, to %s", p, target)
-			}
-			info, err := os.Stat(target)
+			f, err := s.copyOne(source, rel, d, filepath.Join(dst, filepath.FromSlash(rel)), credentials, remaining)
 			if err != nil {
+				if errors.Is(err, errTooLarge) {
+					return fmt.Errorf("package is larger than %d bytes", limit)
+				}
 				return err
 			}
-			if !info.Mode().IsRegular() {
-				return fmt.Errorf("%s is not a regular file", p)
-			}
-			return add(p, info)
+			remaining -= f.Size
+			f.Path = rel
+			files = append(files, f)
+			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	out := make([]string, 0, len(seen))
-	for rel := range seen {
-		out = append(out, rel)
-	}
-	sort.Strings(out)
-	return out, nil
+	sort.Slice(files, func(a, b int) bool { return files[a].Path < files[b].Path })
+	return files, nil
 }
 
-// copyInto copies src to dst, creating parents, and returns its size and hash.
-func copyInto(src, dst string) (File, error) {
-	in, err := os.Open(src) //nolint:gosec // src was resolved inside the caller's source root
+var errTooLarge = errors.New("package size limit exceeded")
+
+// copyOne opens rel beneath the source root, checks the opened file, and
+// copies at most budget bytes of it to dst.
+func (s *Store) copyOne(source *os.Root, rel string, d fs.DirEntry, dst string, credentials []fs.FileInfo, budget int64) (File, error) {
+	names := []string{d.Name()}
+	if d.Type()&fs.ModeSymlink != 0 {
+		// A link is packaged as the file it points to; that file's own name
+		// is judged as well.
+		if target, err := source.Readlink(filepath.FromSlash(rel)); err == nil {
+			names = append(names, filepath.Base(target))
+		}
+	}
+	if slices.ContainsFunc(names, looksLikeCredentialName) {
+		return File{}, fmt.Errorf("%w: %s; reference it with a credential reference instead of packaging it", ErrCredentialFile, rel)
+	}
+
+	// The root handle follows a link only while it stays inside the root.
+	in, err := source.Open(filepath.FromSlash(rel))
 	if err != nil {
-		return File{}, fmt.Errorf("open %s: %w", src, err)
+		return File{}, fmt.Errorf("open %s: %w (a link is packaged only when it is relative and stays inside the source root)", rel, err)
 	}
 	defer func() { _ = in.Close() }()
 	info, err := in.Stat()
 	if err != nil {
 		return File{}, err
 	}
+	if !info.Mode().IsRegular() {
+		return File{}, fmt.Errorf("%s is not a regular file", rel)
+	}
+	for _, credential := range credentials {
+		if os.SameFile(info, credential) {
+			return File{}, fmt.Errorf("%w: %s is the file a credential reference points to; a job refers to its credential, it does not carry it", ErrCredentialFile, rel)
+		}
+	}
 
 	head := make([]byte, sniffBytes)
 	n, err := io.ReadFull(in, head)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return File{}, fmt.Errorf("read %s: %w", src, err)
+		return File{}, fmt.Errorf("read %s: %w", rel, err)
 	}
 	head = head[:n]
 	if looksLikeCredentialContent(head) {
-		return File{}, fmt.Errorf("%w: %s holds a private key or a kubeconfig", ErrCredentialFile, src)
+		return File{}, fmt.Errorf("%w: %s holds a private key or a kubeconfig", ErrCredentialFile, rel)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -373,7 +405,11 @@ func copyInto(src, dst string) (File, error) {
 		return File{}, fmt.Errorf("create %s: %w", dst, err)
 	}
 	hash := sha256.New()
-	size, err := io.Copy(io.MultiWriter(out, hash), io.MultiReader(bytes.NewReader(head), in))
+	// One byte past the budget tells a file that fits from one that does not.
+	size, err := io.Copy(io.MultiWriter(out, hash), io.LimitReader(io.MultiReader(bytes.NewReader(head), in), budget+1))
+	if err == nil && size > budget {
+		err = errTooLarge
+	}
 	if err == nil {
 		err = out.Sync()
 	}
@@ -381,7 +417,10 @@ func copyInto(src, dst string) (File, error) {
 		err = closeErr
 	}
 	if err != nil {
-		return File{}, fmt.Errorf("copy %s: %w", src, err)
+		if errors.Is(err, errTooLarge) {
+			return File{}, err
+		}
+		return File{}, fmt.Errorf("copy %s: %w", rel, err)
 	}
 	return File{Size: size, SHA256: hex.EncodeToString(hash.Sum(nil)), Executable: executable}, nil
 }
@@ -419,8 +458,10 @@ func checkEntrypoint(argv, runtimes []string, files []File, policy PathPolicy) (
 }
 
 // verifyDir checks a package directory against its own manifest and returns
-// the manifest with the digest of its bytes.
-func verifyDir(dir string) (*Manifest, string, error) {
+// the manifest with the digest of its bytes. With sealed set it also requires
+// what a package in its final place must have: each file's executable bit as
+// the manifest records it, and no write permission anywhere.
+func verifyDir(dir string, sealed bool) (*Manifest, string, error) {
 	data, err := os.ReadFile(filepath.Join(dir, ManifestName)) //nolint:gosec // dir is built from validated names
 	if err != nil {
 		return nil, "", fmt.Errorf("read package manifest: %w", err)
@@ -432,6 +473,17 @@ func verifyDir(dir string) (*Manifest, string, error) {
 	if manifest.Schema != ManifestSchema {
 		return nil, "", fmt.Errorf("package manifest schema %d is not supported by this build (wants %d)", manifest.Schema, ManifestSchema)
 	}
+	if sealed && hasModeBits {
+		for _, p := range []string{dir, filepath.Join(dir, ManifestName)} {
+			info, err := os.Stat(p)
+			if err != nil {
+				return nil, "", err
+			}
+			if info.Mode().Perm()&0o222 != 0 {
+				return nil, "", fmt.Errorf("%w: %s is writable; the package was not sealed", ErrPackageCorrupt, p)
+			}
+		}
+	}
 
 	listed := make(map[string]File, len(manifest.Files))
 	for _, f := range manifest.Files {
@@ -441,6 +493,13 @@ func verifyDir(dir string) (*Manifest, string, error) {
 	err = filepath.WalkDir(payload, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if sealed && hasModeBits && info.Mode().Perm()&0o222 != 0 {
+			return fmt.Errorf("%w: %s is writable; the package was not sealed", ErrPackageCorrupt, p)
 		}
 		if d.IsDir() {
 			return nil
@@ -461,6 +520,9 @@ func verifyDir(dir string) (*Manifest, string, error) {
 		}
 		if size != want.Size || sum != want.SHA256 {
 			return fmt.Errorf("%w: %s changed after packaging", ErrPackageCorrupt, p)
+		}
+		if sealed && hasModeBits && (info.Mode().Perm()&0o111 != 0) != want.Executable {
+			return fmt.Errorf("%w: the executable bit of %s is not as packaged", ErrPackageCorrupt, p)
 		}
 		return nil
 	})
