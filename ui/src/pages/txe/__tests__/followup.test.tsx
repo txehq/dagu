@@ -27,6 +27,12 @@ vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
 
+// The hub signs people in individually, so decisions are offered.
+const authMode = vi.hoisted(() => ({ value: 'builtin' }));
+vi.mock('@/contexts/ConfigContext', () => ({
+  useConfig: () => ({ authMode: authMode.value }),
+}));
+
 function renderAt(api: TxeApi, path: string) {
   return render(
     <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>

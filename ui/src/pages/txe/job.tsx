@@ -14,7 +14,12 @@ import { I18nText } from '@/i18n/I18nText';
 
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { dagRunPath } from '@/features/txe/components/InboxItemCard';
-import { useJobDetail, useTxeApi } from '@/features/txe/hooks';
+import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
+import {
+  useJobDetail,
+  usePersonDecisions,
+  useTxeApi,
+} from '@/features/txe/hooks';
 import { isProposalActionable } from '@/features/txe/inbox';
 import type { Decision, Proposal } from '@/features/txe/types';
 
@@ -164,7 +169,9 @@ function ProposalSection({
 export default function TxeJobPage(): React.ReactElement {
   const { jobId } = useParams<{ jobId: string }>();
   const appBarContext = React.useContext(AppBarContext);
-  const canDecide = useCanExecute();
+  const personDecisions = usePersonDecisions();
+  // A person may decide only where the hub can tell who they are.
+  const canDecide = useCanExecute() && personDecisions;
   const { data, error, mutate } = useJobDetail(jobId);
 
   React.useEffect(() => {
@@ -200,6 +207,7 @@ export default function TxeJobPage(): React.ReactElement {
     .pop();
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4" data-testid="txe-job">
+      {!personDecisions && <DecisionAuthNotice />}
       <header className="space-y-1">
         <Link to="/txe" className="text-xs hover:underline">
           ← <I18nText text="Job inbox" />
