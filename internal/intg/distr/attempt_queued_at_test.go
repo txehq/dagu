@@ -6,6 +6,7 @@ package distr_test
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,9 @@ type queuedAtFixture struct {
 
 func newQueuedAtFixture(t *testing.T) *queuedAtFixture {
 	t.Helper()
+	if goruntime.GOOS == "windows" {
+		t.Skip("fixture uses a POSIX shell script")
+	}
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "record.sh"), []byte(`#!/bin/sh
 # $1 attempt id, $2 queue marker, as the step's command received them
