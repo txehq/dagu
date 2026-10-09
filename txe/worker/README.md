@@ -49,6 +49,19 @@ that check, and this worker runs it.
 
 Run it again after an upgrade. It rewrites the hub's copy only when the rendered DAG differs.
 
+The installer manages that DAG: it restores its own rendered spec, so do not edit the hub's copy.
+
+It also has limits. Installs from this machine's TXE home run one at a time, and each install
+reads its write back. Neither step protects against:
+
+- a copy of the home on another machine;
+- another API client writing the DAG;
+- an edit made on the hub while an install runs. The hub's spec API has no conditional write, so
+  such an edit is overwritten without notice.
+
+Keep one owner for installs and updates of this machine's hub DAG. Nothing here prevents
+conflicting writes atomically.
+
 ## Upgrade
 
 Use the same tag as the server image: server and worker must run the same version.
