@@ -27,8 +27,10 @@ function newKey(): string {
 
 // RunRetry offers "Retry this run" for a finished, unsuccessful run and shows
 // the state of its newest retry. A request is a recorded decision: the
-// reviewer dispatches it, and it reads as dispatched only with a receipt;
-// the run's own status, shown beside it, says how the retried run went.
+// reviewer dispatches it, and it reads as dispatched only once the action
+// journal records the dispatch; the run's own status, linked beside it, says
+// how the retried run went. The journal receipt is not an attempt identity
+// and is never shown as one.
 export function RunRetry({
   dagName,
   runId,
@@ -51,22 +53,15 @@ export function RunRetry({
       {state && (
         <span className="text-muted-foreground">
           <I18nText text={retryLabel(state)} />
-          {state.receipt && (
-            <>
-              {' '}
-              <I18nText text="as attempt" />{' '}
-              <Link className="hover:underline" to={dagRunPath(dagName, runId)}>
-                {state.receipt}
-              </Link>
-            </>
-          )}
           {state.status === 'succeeded' && (
             <>
               {' · '}
-              <I18nText
-                text="run is now {status}"
-                values={{ status: runStatus }}
-              />
+              <Link className="hover:underline" to={dagRunPath(dagName, runId)}>
+                <I18nText
+                  text="run is now {status}"
+                  values={{ status: runStatus }}
+                />
+              </Link>
             </>
           )}
         </span>
