@@ -198,6 +198,12 @@ jobs:
           - { suite: intg, shard: 1, shards: 3 }
           - { suite: intg, shard: 2, shards: 3 }
           - { suite: intg, shard: 3, shards: 3 }
+    env:
+      # TXE fork (TXE-3747): the fork has no Docker Hub credentials, so log in only
+      # when both exist and otherwise pull anonymously, as upstream already does for
+      # pull requests from forks. The pre-pull step below still fails the job when a
+      # pull fails, so an auth or rate-limit failure is never hidden.
+      DOCKERHUB_CREDENTIALS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -208,8 +214,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Report Docker Hub access
+        if: ${{ matrix.suite == 'intg' }}
+        run: |
+          if [ "$DOCKERHUB_CREDENTIALS" = "true" ]; then
+            echo "Docker Hub: authenticated pulls"
+          else
+            echo "Docker Hub: no credentials in this repository; pulling anonymously"
+          fi
+
       - name: Login to Docker Hub
-        if: ${{ matrix.suite == 'intg' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
+        if: ${{ matrix.suite == 'intg' && env.DOCKERHUB_CREDENTIALS == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
