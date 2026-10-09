@@ -586,3 +586,20 @@ func TestDecideRefusesRetryOnUntypedProposal(t *testing.T) {
 		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
 	}
 }
+
+// Until the registry can authorize a bound native retry, retry on a
+// dagu.retry_run proposal is refused rather than recorded as unexecutable.
+func TestDecideRefusesRunRetryUntilAuthorizable(t *testing.T) {
+	f := newFixture(t)
+	p := f.fileProposalWith(registry.Proposal{
+		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: json.RawMessage(`{"run_id":"run-0003"}`)},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-run-retry-1"}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("err = %v, want not_permitted", err)
+	}
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
+	}
+}
