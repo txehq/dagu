@@ -235,16 +235,17 @@ steps:
 	assert.Empty(t, txePackageFilesContaining(t, pkg, credential))
 }
 
-// A missing credential fails the run before the script starts, and the hub's
-// log for the run names the reference, so the fault can be acted on from the
-// dashboard without the worker's own logs.
+// A missing credential fails the run before the script starts. The hub's
+// stored status for the run classifies the failure and names the reference,
+// so the fault can be acted on without reading any log; where the credential
+// is kept is not in the status. The hub's log for the run names it too.
 func TestTXEPackage_MissingCredentialIsReported(t *testing.T) {
 	pkg := txeCommitPackage(t, map[string]string{"probe.sh": `#!/bin/sh
 mkdir -p "$TXE_OUTPUT_DIR"
 echo ran > "$TXE_OUTPUT_DIR/ran"
 `}, []string{"probe.sh"}, []string{"./probe.sh"})
 
-	missing := filepath.Join(t.TempDir(), "machine-credentials", "absent-token")
+	missing := filepath.Join(t.TempDir(), "txe-locator-marker", "absent-token")
 	outputs := filepath.Join(t.TempDir(), "outputs", txeTestJob)
 
 	f := newTestFixture(t, fmt.Sprintf(`
@@ -275,8 +276,14 @@ steps:
 
 	status := f.waitForStatus(ir.Failed, executionStatusTimeout())
 
-	// The run status carries no reason, so the hub's log for the run is where
-	// the missing reference is named.
+	// The status the hub stored, as pushed by the worker.
+	require.NotNil(t, status.StartupFailure, "the hub's status does not classify the failure")
+	assert.Equal(t, ir.StartupFailure{Code: ir.StartupFailureSecretUnavailable, Secret: "FIXTURE_TOKEN", Provider: "file"}, *status.StartupFailure)
+	assert.Equal(t, `secret "FIXTURE_TOKEN" could not be resolved from provider "file"`, status.Error)
+	statusJSON, err := json.Marshal(status)
+	require.NoError(t, err)
+	assert.NotContains(t, string(statusJSON), "txe-locator-marker", "the hub's status says where the credential is kept")
+
 	var runLog string
 	require.NoError(t, filepath.WalkDir(filepath.Join(f.logDir(), status.Name, status.DAGRunID), func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.Name() == "scheduler.log" {

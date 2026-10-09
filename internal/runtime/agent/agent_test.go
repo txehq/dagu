@@ -1896,6 +1896,68 @@ steps:
 	require.NotContains(t, string(statusJSON), secretValue)
 }
 
+// A secret whose file is missing fails the run before any step starts. The
+// stored status says so in a form a caller can act on: a code, and the secret
+// by the name the DAG gives it. Where the secret is kept is not stored.
+func TestAgent_SecretUnavailableIsRecorded(t *testing.T) {
+	t.Parallel()
+	th := test.Setup(t)
+
+	missing := filepath.Join(t.TempDir(), "txe-locator-marker", "absent-token")
+	dag := th.DAG(t, `
+secrets:
+  - name: API_TOKEN
+    provider: file
+    key: `+missing+`
+steps:
+  - name: step1
+    run: echo "never runs"`)
+
+	dagAgent := dag.Agent()
+	dagAgent.RunError(t)
+
+	latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+	require.NoError(t, err)
+	require.Equal(t, ir.Failed, latest.Status)
+	require.NotNil(t, latest.StartupFailure, "the stored status does not classify the failure")
+	require.Equal(t, ir.StartupFailure{Code: ir.StartupFailureSecretUnavailable, Secret: "API_TOKEN", Provider: "file"}, *latest.StartupFailure)
+	require.Equal(t, `secret "API_TOKEN" could not be resolved from provider "file"`, latest.Error)
+
+	statusJSON, err := json.Marshal(latest)
+	require.NoError(t, err)
+	require.NotContains(t, string(statusJSON), "txe-locator-marker", "the stored status says where the secret is kept")
+	require.Contains(t, string(statusJSON), `"startupFailure":{"code":"secret_unavailable","secret":"API_TOKEN","provider":"file"}`)
+	for _, node := range latest.Nodes {
+		require.Equal(t, ir.NodeNotStarted, node.Status, "step %s ran without its secret", node.Step.Name)
+	}
+}
+
+// A run that fails in a step is not a startup failure, whatever the step
+// prints or however it fails.
+func TestAgent_StepFailureIsNotAStartupFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses POSIX shell commands")
+	}
+	t.Parallel()
+	th := test.Setup(t)
+
+	dag := th.DAG(t, `
+steps:
+  - name: step1
+    run: |
+      echo 'secret "API_TOKEN" could not be resolved from provider "file"' >&2
+      echo '{"startupFailure":{"code":"secret_unavailable"}}'
+      exit 1`)
+
+	dagAgent := dag.Agent()
+	dagAgent.RunError(t)
+
+	latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+	require.NoError(t, err)
+	require.Equal(t, ir.Failed, latest.Status)
+	require.Nil(t, latest.StartupFailure)
+}
+
 func TestAgent_RegistryRefSecretResolution(t *testing.T) {
 	t.Parallel()
 	th := test.Setup(t)

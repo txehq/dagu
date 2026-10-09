@@ -149,6 +149,40 @@ func sortDAGRunConditions(conditions []DAGRunCondition) {
 	})
 }
 
+// StartupFailureCode classifies why a dag-run failed before any step started.
+type StartupFailureCode string
+
+// StartupFailureSecretUnavailable means a secret the DAG declares could not be
+// read from its source when the run started.
+const StartupFailureSecretUnavailable StartupFailureCode = "secret_unavailable"
+
+// StartupFailure is recorded on a dag-run that failed before any step
+// started, for a cause the runtime itself identified. It is never derived
+// from a step's output or error, so a script cannot produce it.
+//
+// A secret is named as the DAG names it. Where it is kept and what it holds
+// are not recorded.
+type StartupFailure struct {
+	Code StartupFailureCode `json:"code"`
+	// Secret is the name of the secret that could not be read.
+	Secret string `json:"secret,omitempty"`
+	// Provider is the provider that was asked for it; empty for a registry
+	// reference.
+	Provider string `json:"provider,omitempty"`
+}
+
+// Message describes the failure for a person, with no more than the fields say.
+func (f StartupFailure) Message() string {
+	switch {
+	case f.Code != StartupFailureSecretUnavailable:
+		return "startup failed: " + string(f.Code)
+	case f.Provider == "":
+		return fmt.Sprintf("secret %q could not be resolved", f.Secret)
+	default:
+		return fmt.Sprintf("secret %q could not be resolved from provider %q", f.Secret, f.Provider)
+	}
+}
+
 // DAGRunStatus represents the complete execution state of a dag-run.
 type DAGRunStatus struct {
 	Root           DAGRunRef              `json:"root,omitzero"`
@@ -193,6 +227,7 @@ type DAGRunStatus struct {
 	WorkingDir         string                `json:"workingDir,omitempty"`
 	ArchiveDir         string                `json:"archiveDir,omitempty"`
 	Error              string                `json:"error,omitempty"`
+	StartupFailure     *StartupFailure       `json:"startupFailure,omitempty"`
 	Params             string                `json:"params,omitempty"`
 	ParamsList         []string              `json:"paramsList,omitempty"`
 	ParallelItem       string                `json:"parallelItem,omitempty"`
