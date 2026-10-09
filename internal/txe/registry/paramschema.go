@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"math/big"
 	"regexp"
 	"sort"
@@ -53,10 +52,19 @@ var (
 // validator enforces as written (under draft-07 some are ignored).
 const draft202012 = "https://json-schema.org/draft/2020-12/schema"
 
-// maxExactNumber bounds every number in a schema or in parameters: within it
-// a JSON number's float64 value, which the validator compares, keeps its
-// magnitude and whether it is an integer.
+// maxExactNumber bounds every number in a schema or in parameters. Every
+// number admitted is also exactly a float64 (an integer, or a binary
+// fraction such as 0.5), so the validator, which compares float64 values,
+// compares the numbers themselves.
 var maxExactNumber = new(big.Rat).SetInt64(1 << 53)
+
+// Limits on what is decoded, so a schema or parameters cannot make the
+// check itself expensive.
+const (
+	maxNumberLiteral  = 64
+	maxNumberExponent = 400
+	maxJSONDepth      = 64
+)
 
 // compileParamSchema resolves a permitted action's param_schema, refusing a
 // schema that is not strict JSON, is of another dialect than draft 2020-12,
@@ -77,8 +85,15 @@ func compileParamSchema(raw json.RawMessage) (*jsonschema.Resolved, error) {
 	if err := checkSchemaKeywords(generic, "param_schema", true); err != nil {
 		return nil, err
 	}
+	// The library reads integer-valued keywords as Go integers: give it
+	// each one written as an integer (1.0 and 1e0 are 1), from the checked
+	// value rather than the original bytes.
+	normalized, err := json.Marshal(normalizeIntegerKeywords(generic))
+	if err != nil {
+		return nil, fmt.Errorf("param_schema: %w", err)
+	}
 	var schema jsonschema.Schema
-	if err := json.Unmarshal(raw, &schema); err != nil {
+	if err := json.Unmarshal(normalized, &schema); err != nil {
 		return nil, fmt.Errorf("param_schema: %w", err)
 	}
 	if schema.Schema == "" {
@@ -191,11 +206,12 @@ func checkKeywordValue(k string, v any, path string) error {
 			return bad("a number")
 		}
 	case "maxLength", "minLength", "maxItems", "minItems", "maxContains", "minContains", "maxProperties", "minProperties":
+		// By value, not spelling: 1, 1.0 and 1e0 are the same integer.
 		n, ok := v.(json.Number)
 		if !ok {
 			return bad("a non-negative integer")
 		}
-		if i, err := n.Int64(); err != nil || i < 0 {
+		if r, _ := new(big.Rat).SetString(n.String()); r == nil || !r.IsInt() || r.Sign() < 0 {
 			return bad("a non-negative integer")
 		}
 	case "pattern":
@@ -252,6 +268,34 @@ func checkKeywordValue(k string, v any, path string) error {
 	return nil
 }
 
+var integerKeywords = map[string]bool{"maxLength": true, "minLength": true, "maxItems": true, "minItems": true,
+	"maxContains": true, "minContains": true, "maxProperties": true, "minProperties": true}
+
+// normalizeIntegerKeywords rewrites integer-valued keywords, at any depth of
+// subschemas, as integer literals. Their values were checked to be
+// non-negative integers.
+func normalizeIntegerKeywords(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, e := range t {
+			if n, ok := e.(json.Number); ok && integerKeywords[k] {
+				if r, _ := new(big.Rat).SetString(n.String()); r != nil && r.IsInt() {
+					t[k] = json.Number(r.Num().String())
+					continue
+				}
+			}
+			t[k] = normalizeIntegerKeywords(e)
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = normalizeIntegerKeywords(e)
+		}
+		return t
+	}
+	return v
+}
+
 func distinctStrings(v any) bool {
 	list, ok := v.([]any)
 	if !ok {
@@ -274,7 +318,7 @@ func distinctStrings(v any) bool {
 func strictJSON(raw []byte) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	v, err := strictValue(dec)
+	v, err := strictValue(dec, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +328,10 @@ func strictJSON(raw []byte) (any, error) {
 	return v, nil
 }
 
-func strictValue(dec *json.Decoder) (any, error) {
+func strictValue(dec *json.Decoder, depth int) (any, error) {
+	if depth > maxJSONDepth {
+		return nil, fmt.Errorf("nested deeper than %d levels", maxJSONDepth)
+	}
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, err
@@ -303,7 +350,7 @@ func strictValue(dec *json.Decoder) (any, error) {
 				if _, dup := m[k]; dup {
 					return nil, fmt.Errorf("duplicate key %q", k)
 				}
-				v, err := strictValue(dec)
+				v, err := strictValue(dec, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -314,7 +361,7 @@ func strictValue(dec *json.Decoder) (any, error) {
 		case '[':
 			list := []any{}
 			for dec.More() {
-				v, err := strictValue(dec)
+				v, err := strictValue(dec, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -334,10 +381,23 @@ func strictValue(dec *json.Decoder) (any, error) {
 	}
 }
 
-// checkExactNumber refuses a number beyond 2^53 in magnitude, or one whose
-// float64 value is an integer when the number is not (or the reverse).
+// checkExactNumber refuses a number beyond 2^53 in magnitude, or one that is
+// not exactly a float64 (0.1 is not; 0.5 and 3 are): the validator compares
+// float64 values, and only for these is that the number itself.
 func checkExactNumber(n json.Number) error {
-	r, ok := new(big.Rat).SetString(n.String())
+	// Bounded before any exact arithmetic: a long literal or a huge
+	// exponent (1e1000000000) would make it arbitrarily expensive.
+	lit := n.String()
+	if len(lit) > maxNumberLiteral {
+		return fmt.Errorf("number %.20s... is longer than %d characters", lit, maxNumberLiteral)
+	}
+	if i := strings.IndexAny(lit, "eE"); i >= 0 {
+		exp, err := strconv.Atoi(strings.TrimPrefix(lit[i+1:], "+"))
+		if err != nil || exp > maxNumberExponent || exp < -maxNumberExponent {
+			return fmt.Errorf("number %s has an exponent beyond %d", lit, maxNumberExponent)
+		}
+	}
+	r, ok := new(big.Rat).SetString(lit)
 	if !ok {
 		return fmt.Errorf("number %s is not valid", n)
 	}
@@ -348,8 +408,8 @@ func checkExactNumber(n json.Number) error {
 	if err != nil {
 		return fmt.Errorf("number %s is not valid", n)
 	}
-	if r.IsInt() != (f == math.Trunc(f)) {
-		return fmt.Errorf("number %s cannot be checked exactly", n)
+	if exact := new(big.Rat).SetFloat64(f); exact == nil || exact.Cmp(r) != 0 {
+		return fmt.Errorf("number %s cannot be checked exactly; use an integer or a binary fraction such as 0.5", n)
 	}
 	return nil
 }

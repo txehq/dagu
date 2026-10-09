@@ -5,6 +5,7 @@ package registry
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,4 +143,41 @@ func TestParamSchemaDraft202012KeywordsAreEnforced(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"destination": "production"}`))))
 	require.NoError(t, checkActionParams(pa, json.RawMessage(`{"destination": "production", "approval": "cab-1"}`)))
+}
+
+// Only numbers that are exactly a float64 are admitted, so bounds and
+// equality compare the numbers themselves; integer-valued keywords are read
+// by value.
+func TestParamSchemaNumbersAreExact(t *testing.T) {
+	_, err := compileParamSchema(json.RawMessage(`{"type": "number", "maximum": 0.1}`))
+	assert.Error(t, err, "0.1 is not exactly a float64")
+	pa := PermittedAction{Name: "scale", ParamSchema: json.RawMessage(`{"type": "object", "properties": {"f": {"type": "number", "maximum": 0.5, "multipleOf": 0.25}}}`)}
+	_, err = compileParamSchema(pa.ParamSchema)
+	require.NoError(t, err)
+	require.NoError(t, checkActionParams(pa, json.RawMessage(`{"f": 0.5}`)))
+	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"f": 0.75}`))), "above the bound")
+	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"f": 0.10000000000000001}`))), "not exactly a float64")
+	assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(`{"f": 0.3}`))), "not exactly a float64")
+	for _, spelling := range []string{"1", "1.0", "1e0"} {
+		_, err := compileParamSchema(json.RawMessage(`{"type": "array", "maxItems": ` + spelling + `}`))
+		assert.NoError(t, err, spelling)
+	}
+	_, err = compileParamSchema(json.RawMessage(`{"type": "array", "maxItems": 1.5}`))
+	assert.Error(t, err)
+}
+
+// The check bounds its own work: a huge exponent, a very long number or a
+// deeply nested value is refused before any exact arithmetic.
+func TestParamSchemaBoundsItsWork(t *testing.T) {
+	pa := PermittedAction{Name: "scale", ParamSchema: json.RawMessage(`{"type": "object"}`)}
+	for name, params := range map[string]string{
+		"huge exponent": `{"f": 1e1000000000}`,
+		"tiny exponent": `{"f": 1e-1000000000}`,
+		"long literal":  `{"f": 1` + strings.Repeat("0", 100) + `}`,
+		"deep nesting":  `{"f": ` + strings.Repeat("[", 100) + strings.Repeat("]", 100) + `}`,
+	} {
+		start := time.Now()
+		assert.Equal(t, CodeInvalid, ErrorCode(checkActionParams(pa, json.RawMessage(params))), name)
+		assert.Less(t, time.Since(start), time.Second, name)
+	}
 }
