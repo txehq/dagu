@@ -273,7 +273,7 @@ func (store *Store) executionLogs(root ir.DAGRunRef, status *ir.DAGRunStatus) *e
 		}
 		_ = f.Close()
 		name := retainedFileName(filepath.Base(rel))
-		for i := 1; nameTaken(set.files, name); i++ {
+		for i := 1; nameTaken(set.files, name) || reservedName(name); i++ {
 			name = fmt.Sprintf("%d-%s", i, retainedFileName(filepath.Base(rel)))
 		}
 		seen[rel] = true
@@ -467,10 +467,11 @@ func (store *Store) ReadRetainedExecutionFile(ctx context.Context, root, dagRun 
 		rel := ""
 		if name == retainedStatusFile {
 			rel = retainedStatusFile
-		}
-		for _, f := range c.manifest.Files {
-			if f.Name == name {
-				rel = filepath.Join(retainedLogsDir, f.Name)
+		} else {
+			for _, f := range c.manifest.Files {
+				if f.Name == name {
+					rel = filepath.Join(retainedLogsDir, f.Name)
+				}
 			}
 		}
 		if rel == "" {
@@ -514,15 +515,33 @@ func openSubRoot(parent *os.Root, name string, create bool) (*os.Root, error) {
 			return nil, err
 		}
 	}
-	info, err := parent.Lstat(name)
+	checked, err := parent.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
-	if !info.IsDir() {
+	if !checked.IsDir() {
 		return nil, fmt.Errorf("%s: %w", name, errNotPlain)
 	}
-	return parent.OpenRoot(name)
+	if beforeOpenSubRoot != nil {
+		beforeOpenSubRoot(parent, name)
+	}
+	sub, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	// The directory opened must be the one checked: a directory replaced in
+	// between by a link to another inside the same root is refused.
+	opened, err := sub.Stat(".")
+	if err != nil || !os.SameFile(checked, opened) {
+		_ = sub.Close()
+		return nil, fmt.Errorf("%s: %w", name, errNotPlain)
+	}
+	return sub, nil
 }
+
+// beforeOpenSubRoot runs between a directory's check and its open; tests use
+// it to replace the directory in that window.
+var beforeOpenSubRoot func(parent *os.Root, name string)
 
 // openRootPath opens the directory rel below root, element by element,
 // refusing any element that is a symbolic link.
@@ -686,6 +705,12 @@ func retainedFileName(name string) string {
 		name = name[:200]
 	}
 	return name
+}
+
+// reservedName is a name the copy's own files use: a log never takes it, so
+// a read of status.json is always the saved status.
+func reservedName(name string) bool {
+	return name == retainedStatusFile || name == retainedManifestFile
 }
 
 func nameTaken(logs []executionLog, name string) bool {
