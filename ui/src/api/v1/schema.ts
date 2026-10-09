@@ -7827,7 +7827,7 @@ export interface components {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
         /**
-         * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative, is recorded on each dependent, and changes nothing.
+         * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open.
          * @enum {string}
          */
         TxeResourceObservation: TxeResourceObservation;
@@ -8295,6 +8295,8 @@ export interface components {
             /** @description reviewer for a problem with the job's reviewer; absent for the job */
             scope?: string;
             state?: components["schemas"]["TxeAvailabilityState"];
+            /** @description Key of the target whose resource event opened it, if one did; a present observation of that target resolves it. */
+            target?: string;
             detail: string;
             evidence?: string[];
             created: components["schemas"]["TxeStamp"];
