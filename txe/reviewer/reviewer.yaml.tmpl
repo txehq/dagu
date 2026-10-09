@@ -45,6 +45,9 @@ steps:
       strict-mcp-config: true
       setting-sources: [""]
       no-session-persistence: true
+{{- if .AgentModel}}
+      model: {{yaml .AgentModel}}
+{{- end}}
     output: TXE_DECISION
 
   - id: apply

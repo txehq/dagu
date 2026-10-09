@@ -133,6 +133,7 @@ func render(o options) error {
 			"DAGU_HOME":                os.Getenv("TXE_FIXTURE_DAGU_HOME"),
 		},
 		AgentConfigDir: os.Getenv("CLAUDE_CONFIG_DIR"),
+		AgentModel:     os.Getenv("TXE_FIXTURE_AGENT_MODEL"),
 	})
 	if err != nil {
 		return err

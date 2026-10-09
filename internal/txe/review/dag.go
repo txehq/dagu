@@ -34,6 +34,11 @@ type DAGConfig struct {
 	// an allowlist of the worker's environment, so anything the steps need
 	// beyond PATH and HOME has to be named here.
 	Env map[string]string
+	// AgentModel, when set, is the model the agent profile is configured
+	// with. Disabling the profile's settings also drops its model choice,
+	// so the installer reads it from the profile and passes it here. It is
+	// the profile's own value carried over, not a model picked for reviews.
+	AgentModel string
 	// AuthCheck is the agent CLI's login status command; empty disables it.
 	AuthCheck string
 	// TimeoutSec bounds one whole review run.
@@ -59,7 +64,8 @@ var (
 	envNamePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 	// authCheckPattern keeps the command a plain word list, so it cannot
 	// carry shell syntax into the rendered step.
-	authCheckPattern = regexp.MustCompile(`^[A-Za-z0-9_./ -]*$`)
+	authCheckPattern  = regexp.MustCompile(`^[A-Za-z0-9_./ -]*$`)
+	agentModelPattern = regexp.MustCompile(`^[A-Za-z0-9_.:\[\]-]{0,128}$`)
 )
 
 var machineIDPattern = regexp.MustCompile(`^mch_[0-9A-HJKMNP-TV-Z]{26}$`)
@@ -94,6 +100,9 @@ func (c DAGConfig) withDefaults() (DAGConfig, error) {
 		if c.AuthCheck == "" {
 			c.AuthCheck = "claude auth status"
 		}
+	}
+	if !agentModelPattern.MatchString(c.AgentModel) {
+		return c, fmt.Errorf("invalid agent model %q", c.AgentModel)
 	}
 	if !authCheckPattern.MatchString(c.AuthCheck) {
 		return c, fmt.Errorf("invalid auth check command %q", c.AuthCheck)

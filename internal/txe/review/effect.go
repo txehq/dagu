@@ -123,21 +123,23 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
 	cmd.Env = append(e.baseEnv(), actionEnv(job, action)...)
-	// The action runs in its own process group and the whole group is
-	// killed when the deadline passes. Killing only the direct child would
-	// leave a script's own children free to perform the effect after the
-	// attempt was already recorded as over.
-	cmdutil.SetupCommand(cmd)
+	// The action runs as a managed process: in its own process group, which
+	// is killed as a whole when the deadline passes and also when this
+	// process dies. Killing only the direct child, or only while the
+	// reviewer is alive, would leave a script's children free to perform
+	// the effect after the attempt was recorded as over.
 	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
 	cmd.WaitDelay = 5 * time.Second
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Start(); err != nil {
+	proc, err := cmdutil.StartManagedProcess(cmd)
+	if err != nil {
 		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
 	}
-	err := cmd.Wait()
+	err = proc.Wait()
+	_ = proc.Release()
 	if ctx.Err() != nil {
 		return 0, stdout.String(), fmt.Errorf("action %q did not finish within %s", declared.Name, timeout)
 	}

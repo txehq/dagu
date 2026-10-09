@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -94,6 +95,7 @@ func TestRenderDAGs(t *testing.T) {
 		MachineID:      "mch_0000000000000000000F1XT001",
 		StateDir:       "/var/lib/txe/state",
 		AgentConfigDir: "/home/reviewer/.claude-reviewer",
+		AgentModel:     "opus[1m]",
 		Env:            map[string]string{"TXE_DAGU_HOME": "/home/x/txe: #weird"},
 	}
 	dags, err := review.RenderDAGs(cfg)
@@ -116,6 +118,7 @@ func TestRenderDAGs(t *testing.T) {
 		"action: harness.run",
 		`provider: "claude"`,
 		`tools: [""]`,
+		`model: "opus[1m]"`,
 		`setting-sources: [""]`,
 		"strict-mcp-config: true",
 		"no-session-persistence: true",
@@ -151,6 +154,7 @@ func TestRenderDAGsRejectsBadConfig(t *testing.T) {
 		"env name":      func(c *review.DAGConfig) { c.Env = map[string]string{"bad-name": "x"} },
 		"agent timeout": func(c *review.DAGConfig) { c.TimeoutSec, c.AgentTimeoutSec = 60, 60 },
 		"auth check":    func(c *review.DAGConfig) { c.AuthCheck = `x"; rm -rf ~; "` },
+		"agent model":   func(c *review.DAGConfig) { c.AgentModel = "opus --dangerously-skip-permissions" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -432,4 +436,50 @@ func TestCommandEffectorKillsTheActionsChildren(t *testing.T) {
 	time.Sleep(4 * time.Second)
 	_, err := os.Stat(filepath.Join(dir, "effect.txt"))
 	assert.ErrorIs(t, err, os.ErrNotExist, "the background child outlived the action's deadline")
+}
+
+const helperActionDirEnv = "TXE_REVIEW_TEST_HELPER_DIR"
+
+// TestHelperRunAction is not a test: re-executed by the test below, it plays
+// a reviewer process that starts an action and is then killed.
+func TestHelperRunAction(t *testing.T) {
+	dir := os.Getenv(helperActionDirEnv)
+	if dir == "" {
+		t.Skip("helper process only")
+	}
+	job := review.Job{ID: "job_A", WorkingDir: dir}
+	action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
+	declared := review.DeclaredAction{
+		Name: "a", Idempotency: review.IdempotencyNone, TimeoutSec: 60,
+		Command: []string{"/bin/sh", "-c", `echo started > started.txt; (sleep 3; echo late > effect.txt) & wait`},
+	}
+	(&review.CommandEffector{}).Run(context.Background(), job, declared, action)
+}
+
+// Pass 3 finding: an action does not outlive the reviewer process that
+// started it. If the reviewer is killed, the action's process group is
+// killed too, so a later holder that finds no effect is not contradicted by
+// an orphan performing it afterwards.
+func TestActionDoesNotOutliveItsReviewerProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	dir := t.TempDir()
+	// #nosec G204 -- re-executes this test binary.
+	helper := exec.Command(os.Args[0], "-test.run=^TestHelperRunAction$")
+	helper.Env = append(os.Environ(), helperActionDirEnv+"="+dir)
+	require.NoError(t, helper.Start())
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dir, "started.txt"))
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond, "the action never started")
+
+	// The reviewer dies without any chance to clean up.
+	require.NoError(t, helper.Process.Kill())
+	_ = helper.Wait()
+
+	time.Sleep(5 * time.Second)
+	_, err := os.Stat(filepath.Join(dir, "effect.txt"))
+	assert.ErrorIs(t, err, os.ErrNotExist, "the action outlived the reviewer that started it")
 }

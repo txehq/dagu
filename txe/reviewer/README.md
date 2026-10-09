@@ -35,6 +35,11 @@ servers and no saved session. Measured with claude 2.1.295 on a shared
 interactive profile: about 4.7k input tokens per review with these flags,
 against about 38k when they are missing.
 
+Disabling the profile's settings also drops its model choice. To keep
+reviews on the model the profile is configured with, read the `model` value
+from that profile's settings and pass it as `AgentModel`; leave it empty to
+use the CLI's default.
+
 If the profile's login expires, the review records a
 `reviewer_authentication_required` exception for the machine and defers the
 job's next review by one cadence; it does not retry on every tick and leaves
