@@ -47,13 +47,14 @@ func (c *remoteClient) updateDAGSpec(ctx context.Context, fileName, spec string)
 	return nil
 }
 
-// listWorkers returns the coordinator's distributed workers.
-func (c *remoteClient) listWorkers(ctx context.Context) ([]api.Worker, error) {
+// listWorkers returns the coordinator's distributed workers, and the errors
+// the hub reported alongside a partial list.
+func (c *remoteClient) listWorkers(ctx context.Context) ([]api.Worker, []string, error) {
 	var out api.WorkersListResponse
 	if err := c.do(ctx, http.MethodGet, "/workers", nil, &out, nil); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out.Workers, nil
+	return out.Workers, out.Errors, nil
 }
 
 // remoteSpecError is a spec the hub stored but could not load.
