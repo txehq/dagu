@@ -36,10 +36,18 @@ type Stamp struct {
 	By Actor     `json:"by"`
 }
 
+// CapabilityParamSchema is what a registry lists when it admits a permitted
+// action's param_schema only if it can enforce it exactly, and checks the
+// parameters of every action request and proposal against it.
+const CapabilityParamSchema = "param_schema"
+
 // Installation describes the registry and the owners it holds.
 type Installation struct {
 	Schema int     `json:"schema"`
 	Owners []Owner `json:"owners"`
+	// Capabilities names what this registry enforces rather than only
+	// stores. A registry that lists none promises nothing beyond storage.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // Owner is the stable opaque owner of jobs.
