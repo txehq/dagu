@@ -66,14 +66,22 @@ export function buildInbox(
     if (job.lifecycle === 'retired' || job.lifecycle === 'completed') continue;
     if (job.availability === 'auth_required') {
       items.push({ reason: 'unavailable', job, waitingOn: 'credentials' });
-    } else if (job.availability === 'worker_offline' || job.availability === 'stale') {
+    } else if (
+      job.availability === 'worker_offline' ||
+      job.availability === 'stale'
+    ) {
       items.push({ reason: 'unavailable', job, waitingOn: 'machine' });
     } else if (job.lifecycle === 'needs_human') {
       items.push({ reason: 'needs_human', job, waitingOn: 'person' });
     } else {
       const failedRun = latestFailedRun(job);
       if (failedRun) {
-        items.push({ reason: 'run-failed', job, waitingOn: 'agent', failedRun });
+        items.push({
+          reason: 'run-failed',
+          job,
+          waitingOn: 'agent',
+          failedRun,
+        });
       }
     }
   }

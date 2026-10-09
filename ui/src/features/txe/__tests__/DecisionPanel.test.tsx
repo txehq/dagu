@@ -130,7 +130,10 @@ describe('DecisionPanel', () => {
 
     rerender(
       <DecisionPanel
-        proposal={fixtureProposal({ revision: 2, bindingDigest: 'd'.repeat(64) })}
+        proposal={fixtureProposal({
+          revision: 2,
+          bindingDigest: 'd'.repeat(64),
+        })}
         canDecide
         onSubmit={onSubmit}
         onStale={vi.fn()}
@@ -141,7 +144,9 @@ describe('DecisionPanel', () => {
       'aria-pressed',
       'false'
     );
-    expect(screen.getByRole('button', { name: 'Record decision' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Record decision' })
+    ).toBeDisabled();
     expect(screen.getByText(/This proposal changed/)).toBeInTheDocument();
     expect(onSubmit).toHaveBeenCalledTimes(1);
   });
