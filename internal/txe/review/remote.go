@@ -565,6 +565,17 @@ func (r *Remote) runEvidence(ctx context.Context, jobID string, run runSummary) 
 		return ev, false, fmt.Errorf("run %s after reading its evidence: %w", run.DagRunID, err)
 	}
 	now := after.DagRunDetails
+	if run.StatusLabel == api.StatusLabelFailed && run.AttemptID != "" {
+		// A failed run may be one the service created and never handed to
+		// a worker: it stays visible as failed, and nothing of the job ran.
+		// The service's record of that, not the status, says which it is.
+		switch was, known := abandoned(ctx, r.Transport, jobID, run.DagRunID, ExecutionRef(run.AttemptID, run.QueuedAt)); {
+		case was:
+			ev.Preparation = PreparationAbandoned
+		case !known:
+			ev.Preparation = PreparationUnknown
+		}
+	}
 	return ev, now.AttemptID == run.AttemptID && now.QueuedAt == run.QueuedAt && now.StatusLabel == run.StatusLabel, nil
 }
 
@@ -1525,6 +1536,38 @@ func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState
 		return RunState{}, err
 	}
 	return out.DagRunDetails.state(), nil
+}
+
+// abandoned reports whether the service recorded that the execution of the
+// run named by ref was created and never dispatched. known is false when
+// the records cannot be relied on to answer: the service does not keep
+// them, it could not be asked, or one of the run's records is not trusted
+// and so may be about this execution. Only a trusted record that names
+// exactly this execution says it was abandoned; a record about another
+// execution of the run, such as one retried from the same predecessor by
+// someone else, says nothing about this one.
+func abandoned(ctx context.Context, t Transport, jobID, runID, ref string) (abandoned, known bool) {
+	var list api.TxeAbandonmentList
+	path := "/txe/jobs/" + url.PathEscape(jobID) + "/runs/" + url.PathEscape(runID) + "/abandonments"
+	if err := t.Do(ctx, http.MethodGet, path, nil, &list); err != nil {
+		return false, false
+	}
+	known = true
+	for _, a := range list.Abandonments {
+		if a.Error != nil || a.Outcome == nil || !a.Outcome.Valid() || a.AbandonedExecution == nil {
+			known = false
+			continue
+		}
+		if e := a.AbandonedExecution; ExecutionRef(e.AttemptId, e.QueuedAt) == ref {
+			return true, true
+		}
+	}
+	return false, known
+}
+
+// Abandoned implements RunRetrier.
+func (r remoteRuns) Abandoned(ctx context.Context, jobID, runID, ref string) (bool, bool) {
+	return abandoned(ctx, r.t, jobID, runID, ref)
 }
 
 // RetryRun implements RunRetrier. The request names the execution the retry

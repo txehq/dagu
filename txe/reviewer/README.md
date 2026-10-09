@@ -158,6 +158,18 @@ files.
   as a failed request or a reviewer that died first, is not settled from
   the run, because a newer execution may be someone else's retry: it goes
   to the owner. Nothing is ever sent again because time passed.
+  The service can admit a retry, create its execution and then abandon
+  the preparation without dispatching it; it records that. A retry is
+  settled as not dispatched only by that record for exactly the admitted
+  execution, read before any receipt is settled. The retried execution
+  being the latest again, a reservation that is gone, a record about
+  another execution of the run, a record the service does not vouch for,
+  or a service that keeps or returns no such records settle nothing: the
+  retry stays uncertain or goes to the owner. A failed admitted execution
+  is taken for a retry that ran only when the records show no abandonment
+  of it. In review evidence a failed run carries `preparation`:
+  `abandoned_before_dispatch` when the service recorded that it never
+  started, `unknown` when it could not say.
   When the owner answers `retry` to the question about an attempt whose
   outcome is unknown, the question's decision run executes the original
   decision once more: for a run retry, with the same expected execution,

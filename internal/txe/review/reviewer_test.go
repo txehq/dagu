@@ -142,6 +142,10 @@ type runs struct {
 	// beforeAdmission runs as a retry request arrives, before the service
 	// compares the run's latest execution with the one the request names.
 	beforeAdmission func(runID string)
+	// abandonedRefs are the executions the service recorded as created and
+	// never dispatched; abandonUnknown makes its records unable to say.
+	abandonedRefs  map[string]bool
+	abandonUnknown bool
 	// unnamed makes the service answer an admitted retry without the
 	// execution it admitted it as, as a service older than the conditional
 	// retry's answer does.
@@ -202,6 +206,16 @@ func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, er
 		return review.RunState{}, review.ErrNotFound
 	}
 	return state, nil
+}
+
+// Abandoned is the service's record of abandoned preparations.
+func (r *runs) Abandoned(_ context.Context, _, _, ref string) (bool, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.abandonUnknown {
+		return false, false
+	}
+	return r.abandonedRefs[ref], true
 }
 
 // RetryRun is the service's conditional retry: it is admitted only while

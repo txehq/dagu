@@ -1803,6 +1803,117 @@ func TestRetryRunWithoutANamedAdmissionNothingOnTheRunIsItsReceipt(t *testing.T)
 	}
 }
 
+// The service can admit a retry, create its execution, and then abandon the
+// preparation without ever handing it to a worker. It records that. The
+// record, for exactly the admitted execution, is what settles the retry as
+// not dispatched; nothing else does. In particular the retried execution
+// being the latest again is not proof, and a record about another
+// execution of the run (someone else's retry of the same predecessor, also
+// abandoned) is not this retry's.
+func TestRetryRunAnAbandonedPreparationIsSettledOnlyByItsOwnRecord(t *testing.T) {
+	admittedRef := review.ExecutionRef("att-reserved", "")
+	setup := func(t *testing.T) *retryFixture {
+		f := newRetryFixture(t)
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		out := f.execute("executor")
+		require.Equal(t, review.ActionUncertain, out.Action.State)
+		require.Equal(t, admittedRef, out.Action.AdmittedRef)
+		return f
+	}
+	nextReview := func(f *retryFixture) review.Action {
+		f.t.Helper()
+		f.clock.Advance(2 * time.Hour)
+		r := f.executor("reviewer-b")
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(f.t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(f.t, err)
+		return f.state().Actions[jobID][0]
+	}
+	hidden := func(f *retryFixture) {
+		// The service hid the placeholder: the retried execution is the
+		// run's latest again.
+		f.runs.fail("run-1", "att-1")
+	}
+
+	t.Run("its own record: not dispatched", func(t *testing.T) {
+		f := setup(t)
+		hidden(f)
+		f.runs.abandonedRefs = map[string]bool{admittedRef: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionNotApplied, action.State)
+		assert.Contains(t, action.Detail, "not dispatched")
+		assert.Contains(t, action.Detail, admittedRef)
+		assert.Empty(t, action.Receipt)
+		for _, p := range f.state().Proposals[jobID] {
+			assert.NotEqual(t, review.ProposalUncertain, p.Kind, "the owner is not asked about something the service settled")
+		}
+		assert.Len(t, f.runs.requested, 1, "and nothing is sent again")
+	})
+	t.Run("still a reservation, with its own record: not dispatched", func(t *testing.T) {
+		f := setup(t)
+		f.runs.abandonedRefs = map[string]bool{admittedRef: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionNotApplied, action.State)
+	})
+	t.Run("marked failed, with its own record: not taken for a retry that ran", func(t *testing.T) {
+		f := setup(t)
+		f.runs.fail("run-1", "att-reserved")
+		f.runs.abandonedRefs = map[string]bool{admittedRef: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionNotApplied, action.State)
+		assert.Empty(t, action.Receipt, "a failed status is not a receipt of something that never ran")
+	})
+	t.Run("failed, and the service cannot say whether it ran: the owner is asked", func(t *testing.T) {
+		f := setup(t)
+		f.runs.fail("run-1", "att-reserved")
+		f.runs.abandonUnknown = true
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State)
+		assert.Empty(t, action.Receipt)
+		assert.Contains(t, action.Detail, "could not say whether it was ever dispatched")
+	})
+	t.Run("failed, and the records show no abandonment: it ran", func(t *testing.T) {
+		f := setup(t)
+		f.runs.fail("run-1", "att-reserved")
+		action := nextReview(f)
+		assert.Equal(t, review.ActionSucceeded, action.State)
+		assert.Equal(t, admittedRef, action.Receipt)
+	})
+	t.Run("the predecessor is latest again, with no record: not settled", func(t *testing.T) {
+		f := setup(t)
+		hidden(f)
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State, "the run reverting proves nothing: the owner is asked")
+		assert.NotContains(t, action.Detail, "not dispatched")
+	})
+	t.Run("another caller's abandoned retry of the same predecessor: not this retry's", func(t *testing.T) {
+		f := setup(t)
+		hidden(f)
+		f.runs.abandonedRefs = map[string]bool{review.ExecutionRef("att-someone-elses", ""): true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State)
+		assert.NotContains(t, action.Detail, "not dispatched")
+	})
+	t.Run("the records cannot be relied on: not settled", func(t *testing.T) {
+		f := setup(t)
+		hidden(f)
+		f.runs.abandonUnknown = true
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State)
+	})
+	t.Run("another execution is latest, and this one was abandoned: not dispatched", func(t *testing.T) {
+		f := setup(t)
+		f.runs.state["run-1"] = review.RunState{AttemptID: "att-someone-elses", Status: "running", Active: true}
+		f.runs.abandonedRefs = map[string]bool{admittedRef: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionNotApplied, action.State)
+	})
+}
+
 // When the service's answer says nothing about whether it started the
 // retry, the reviewer does not decide for it, and it does not take what the
 // run shows as the answer either. A newer execution on the run may be

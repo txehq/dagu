@@ -529,6 +529,13 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		if ok && declared.Idempotency == IdempotencyReadOnly {
 			return finish(ActionNotApplied, res)
 		}
+		if action.Name == RetryRunAction {
+			// A retry is found not applied only by the service's own
+			// record that it abandoned exactly the admitted execution
+			// before dispatch. That is proof, not absence: nothing of it
+			// can still start.
+			return finish(ActionNotApplied, res)
+		}
 		res = EffectResult{Status: EffectUnknown, Detail: "a probe found no effect yet, which does not prove the interrupted attempt will not still apply"}
 	case EffectUnknown:
 	}
@@ -1091,6 +1098,10 @@ type RunRetrier interface {
 	// execution the service says it admitted it as, or the zero Execution
 	// when the service does not name one.
 	RetryRun(ctx context.Context, jobID, runID string, expected Execution) (admitted Execution, err error)
+	// Abandoned reports whether the service recorded that the execution of
+	// the run named by ref was created and never dispatched. known is false
+	// when its records cannot answer that for this execution.
+	Abandoned(ctx context.Context, jobID, runID, ref string) (abandoned, known bool)
 }
 
 const (
@@ -1213,10 +1224,28 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 			ref := now.Ref()
 			switch {
 			case ref != named:
+				if was, _ := r.Runs.Abandoned(ctx, jobID, runID, named); was {
+					return notDispatched(runID, named)
+				}
 				return EffectResult{
 					Status: EffectUnknown, Admitted: true, AdmittedRef: named,
 					Detail: fmt.Sprintf("the service admitted the retry of run %s as execution %s, and the run now shows execution %s (%s), which is not it; whether %s ran cannot be told from the run's latest execution", runID, named, ref, state.Status, named),
 				}
+			case state.Status == runFailed:
+				// A failed execution is not proof that anything ran: the
+				// service marks one it never dispatched the same way. Its
+				// record of that is read before the execution is taken for
+				// the retry.
+				switch was, known := r.Runs.Abandoned(ctx, jobID, runID, named); {
+				case was:
+					return notDispatched(runID, named)
+				case !known:
+					return EffectResult{
+						Status: EffectUnknown, Admitted: true, AdmittedRef: named,
+						Detail: fmt.Sprintf("execution %s of run %s is failed, and the service could not say whether it was ever dispatched", named, runID),
+					}
+				}
+				fallthrough
 			case state.Status != runNotStarted && state.Status != "":
 				return EffectResult{
 					Status: EffectApplied, Receipt: ref, Admitted: true, AdmittedRef: named,
@@ -1237,6 +1266,14 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 			break
 		}
 	}
+	// The admitted execution was not seen dispatched. The service may have
+	// recorded that it abandoned its preparation: that record, for exactly
+	// this execution, is what settles the retry as not dispatched. The
+	// retried execution being the latest again, or the reservation being
+	// gone, does not.
+	if was, _ := r.Runs.Abandoned(ctx, jobID, runID, named); was {
+		return notDispatched(runID, named)
+	}
 	detail := fmt.Sprintf("no execution of run %s after %s was seen queued or started", runID, bound.Ref())
 	if reserved != "" {
 		detail = fmt.Sprintf("an attempt (%s) was created for the retry of run %s but was not seen queued or started; it may not have been handed to a worker yet, or never will be", reserved, runID)
@@ -1251,8 +1288,21 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 }
 
 // runNotStarted is the service's status of an attempt that exists but has
-// not been queued or started.
-const runNotStarted = "not_started"
+// not been queued or started, and runFailed of one that failed, which
+// includes one the service marked failed without ever dispatching it.
+const (
+	runNotStarted = "not_started"
+	runFailed     = "failed"
+)
+
+// notDispatched is the outcome of a retry whose admitted execution the
+// service recorded as abandoned before dispatch: nothing ran.
+func notDispatched(runID, named string) EffectResult {
+	return EffectResult{
+		Status: EffectNotApplied, Admitted: true, AdmittedRef: named,
+		Detail: fmt.Sprintf("not dispatched: the service recorded that it abandoned the preparation of execution %s of run %s before handing it to a worker", named, runID),
+	}
+}
 
 // probeRetry settles a retry whose result was not seen, from the run, when
 // that is sound. It is sound only when the service had admitted the

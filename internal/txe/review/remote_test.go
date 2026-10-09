@@ -770,6 +770,80 @@ func TestRemoteRunsAfterFailsOnARunTheServiceDoesNotIdentify(t *testing.T) {
 	assert.Empty(t, runs)
 }
 
+// The service's record of an abandoned preparation settles a question only
+// for exactly the execution it names, and only when the run's records can
+// be relied on. Another execution's record, such as someone else's retry of
+// the same predecessor, says nothing about this one. A record the service
+// does not vouch for, a service without such records, or one that cannot be
+// asked, leave it unknown.
+func TestRemoteAbandonedNeedsATrustedRecordOfExactlyThisExecution(t *testing.T) {
+	path := "/txe/jobs/job_1/runs/run-1/abandonments"
+	stub := &stubTransport{t: t, replies: map[string]string{}}
+	runs := review.RemoteRuns(stub)
+	mine := review.ExecutionRef("a2", "2026-10-09T12:00:00Z")
+	record := func(attempt, queuedAt, outcome string) string {
+		return fmt.Sprintf(`{"attempt_id":%q,"attributable":false,"outcome":%q,"abandoned_execution":{"attempt_id":%q,"queued_at":%q},"expected_execution":{"attempt_id":"a1","queued_at":""}}`, attempt, outcome, attempt, queuedAt)
+	}
+	list := func(entries ...string) string { return `{"abandonments":[` + strings.Join(entries, ",") + `]}` }
+	for name, tc := range map[string]struct {
+		reply            string
+		fail             *review.TransportError
+		abandoned, known bool
+	}{
+		"this execution, hidden":                         {reply: list(record("a2", "2026-10-09T12:00:00Z", "hidden")), abandoned: true, known: true},
+		"this execution among others":                    {reply: list(record("a9", "", "hidden"), record("a2", "2026-10-09T12:00:00Z", "marked_failed")), abandoned: true, known: true},
+		"no records":                                     {reply: list(), known: true},
+		"another caller's retry of the same predecessor": {reply: list(record("a3", "2026-10-09T12:00:00Z", "hidden")), known: true},
+		"the same attempt under another queued time":     {reply: list(record("a2", "2026-10-09T13:00:00Z", "hidden")), known: true},
+		"a record the service does not vouch for":        {reply: list(`{"attempt_id":"a2","attributable":false,"error":"record unreadable"}`)},
+		"an outcome this client does not know":           {reply: list(record("a2", "2026-10-09T12:00:00Z", "resurrected"))},
+		"the service keeps no such records":              {fail: &review.TransportError{Status: http.StatusNotImplemented, Code: "abandonment_history_unsupported"}},
+		"the service fails":                              {fail: &review.TransportError{Status: http.StatusBadGateway}},
+		"not visible to this caller":                     {fail: &review.TransportError{Status: http.StatusNotFound, Code: "not_found"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub.replies, stub.fail = map[string]string{path: tc.reply}, nil
+			if tc.fail != nil {
+				stub.replies, stub.fail = map[string]string{}, map[string]*review.TransportError{path: tc.fail}
+			}
+			abandoned, known := runs.Abandoned(context.Background(), "job_1", "run-1", mine)
+			assert.Equal(t, tc.abandoned, abandoned)
+			assert.Equal(t, tc.known, known)
+		})
+	}
+}
+
+// A failed run is shown to the review with what the service recorded about
+// its preparation: a run the service created and never dispatched is
+// labelled as such, so its failure is not read as a result of the job; when
+// the service cannot say, that is stated; and a failed run with no such
+// record carries no label.
+func TestRemoteFailedRunEvidenceSaysWhetherItWasEverDispatched(t *testing.T) {
+	path := func(l *runList, run string) string { return "/txe/jobs/" + l.job + "/runs/" + run + "/abandonments" }
+	for name, tc := range map[string]struct {
+		reply string
+		want  string
+	}{
+		"abandoned before dispatch": {`{"abandonments":[{"attempt_id":"a1","attributable":false,"outcome":"marked_failed","predecessor_absent":true,"abandoned_execution":{"attempt_id":"a1","queued_at":"2026-10-09T09:59:00Z"}}]}`, review.PreparationAbandoned},
+		"dispatched and failed":     {`{"abandonments":[]}`, ""},
+		"the service cannot say":    {"", review.PreparationUnknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := newRunList(t)
+			l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
+			if tc.reply != "" {
+				l.stub.replies[path(l, "r1")] = tc.reply
+			}
+			runs := l.uncovered()
+			require.Len(t, runs, 2)
+			assert.Equal(t, "r1", runs[0].RunID)
+			assert.Equal(t, tc.want, runs[0].Preparation)
+			assert.Empty(t, runs[1].Preparation, "only a failed run is asked about")
+			assert.NotContains(t, l.stub.calls, "GET "+path(l, "r2"))
+		})
+	}
+}
+
 // A run that ended in the queue has no finish time and is still a result,
 // ordered by the latest time the service has for it.
 func TestRemoteRunsAfterKeepsRunsWithoutAFinishTime(t *testing.T) {

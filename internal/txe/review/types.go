@@ -189,6 +189,12 @@ type CredentialRef struct {
 	Locator string `json:"locator"`
 }
 
+// What the service recorded about a failed execution's preparation.
+const (
+	PreparationAbandoned = "abandoned_before_dispatch"
+	PreparationUnknown   = "unknown"
+)
+
 // The kinds of credential reference.
 const (
 	CredentialFile = "file"
@@ -254,6 +260,13 @@ type RunEvidence struct {
 	// this evidence is of.
 	AttemptID string `json:"attempt_id,omitempty"`
 	QueuedAt  string `json:"queued_at,omitempty"`
+	// Preparation says what the service recorded about whether this
+	// execution was ever handed to a worker, for a run that failed:
+	// PreparationAbandoned when the service recorded that it was created and
+	// never dispatched, so nothing of the job ran; PreparationUnknown when
+	// the service could not say. Empty when the run is not a failed one, or
+	// the service's records show no abandonment of this execution.
+	Preparation string `json:"preparation,omitempty"`
 	// EvidenceTrimmed is true when this run's evidence was shortened to fit
 	// the packet: steps left out, or step output cut to its end.
 	EvidenceTrimmed bool `json:"evidence_trimmed,omitempty"`
