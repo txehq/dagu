@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,14 +61,6 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 	}
 
 	add("cli", nil, txeClientVersion(), "")
-	if state := txeskill.Inspect(func() string {
-		home, _ := txepkg.DefaultHome()
-		return home.SkillDir() + "/current"
-	}()); state.Current {
-		add("skill", nil, "revision "+state.Revision+" unpacked", "")
-	} else {
-		add("skill", fmt.Errorf("%s", state.Problem), "", "run dagu txe skill install, then link it into each agent profile")
-	}
 	session := txeSession(ctx)
 	if session == "" {
 		add("session", fmt.Errorf("no session identity could be derived"), "", "pass --session or set TXE_SESSION when registering")
@@ -81,6 +74,11 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 	}
 	add("home is durable", txepkg.DefaultPathPolicy().CheckDurable(home.PackagesDir()), home.PackagesDir(),
 		"move the TXE home out of the worktree or temporary directory; packages there would be lost with it")
+	if skill := txeskill.Inspect(filepath.Join(home.SkillDir(), "current")); skill.Current {
+		add("skill", nil, "revision "+skill.Revision+" unpacked", "")
+	} else {
+		add("skill", errors.New(skill.Problem), "", "run dagu txe skill install, then link it into each agent profile")
+	}
 
 	machine, err := home.Machine()
 	if add("machine identity", err, "", "run the worker installer on this machine") {

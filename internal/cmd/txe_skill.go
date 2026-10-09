@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -66,7 +67,7 @@ func runTXESkill(ctx *Context, install bool) error {
 		return err
 	}
 
-	unpacked := home.SkillDir() + "/current"
+	unpacked := filepath.Join(home.SkillDir(), "current")
 	if install {
 		if unpacked, err = txeskill.Unpack(home.SkillDir()); err != nil {
 			return fmt.Errorf("unpack the skill: %w", err)
@@ -74,7 +75,7 @@ func runTXESkill(ctx *Context, install bool) error {
 	}
 	states := []txeskill.State{txeskill.Inspect(unpacked)}
 	for _, dir := range links {
-		link := dir + "/" + txeskill.Name
+		link := filepath.Join(dir, txeskill.Name)
 		if install {
 			if link, err = txeskill.Link(unpacked, dir); err != nil {
 				return fmt.Errorf("link the skill into %s: %w", dir, err)
