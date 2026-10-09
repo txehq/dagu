@@ -269,7 +269,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	if eo := v.ExpectedOutcome; eo != nil {
 		job.ExpectedOutcomes = deref(eo.SuccessCriteria)
 		for _, d := range deref(eo.Deliverables) {
-			job.Deliverables = append(job.Deliverables, strings.TrimSpace(strings.Join([]string{deref(d.Type), deref(d.Path), deref(d.Description)}, " ")))
+			job.Deliverables = append(job.Deliverables, strings.TrimSpace(strings.Join(strings.Fields(strings.Join([]string{d.Name, deref(d.Type), d.Path, deref(d.Description)}, " ")), " ")))
 		}
 	}
 	if rr := v.RetirementRules; rr != nil {
