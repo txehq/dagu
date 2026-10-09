@@ -119,6 +119,26 @@ func TestRegistry_Resolve(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to resolve secret")
 		assert.Contains(t, err.Error(), "NONEXISTENT")
+
+		// A source that was asked and gave no value is told apart by type,
+		// and the secret is named as the DAG names it.
+		var unresolved *ResolveError
+		require.ErrorAs(t, err, &unresolved)
+		assert.Equal(t, "NONEXISTENT", unresolved.Name)
+		assert.Equal(t, "env", unresolved.Provider)
+		assert.Empty(t, unresolved.Ref)
+		assert.Equal(t, `failed to resolve secret "NONEXISTENT" from provider "env": `+unresolved.Err.Error(), err.Error())
+	})
+
+	t.Run("InvalidReferenceIsNotAResolveError", func(t *testing.T) {
+		var unresolved *ResolveError
+		_, err := registry.Resolve(ctx, secretref.Ref{Name: "SECRET", Provider: "env"})
+		require.Error(t, err)
+		assert.False(t, errors.As(err, &unresolved), "an empty key is a mistake in the reference")
+
+		_, err = registry.Resolve(ctx, secretref.Ref{Name: "SECRET", Provider: "no-such-provider", Key: "k"})
+		require.Error(t, err)
+		assert.False(t, errors.As(err, &unresolved), "an unknown provider is a mistake in the reference")
 	})
 
 	t.Run("RegistryRefRequiresReferenceResolver", func(t *testing.T) {

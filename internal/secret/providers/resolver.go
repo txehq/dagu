@@ -163,7 +163,7 @@ func (r *Registry) Resolve(ctx context.Context, ref secretref.Ref) (string, erro
 		}
 		value, err := r.referenceResolver.ResolveReference(ctx, ref)
 		if err != nil {
-			return "", fmt.Errorf("failed to resolve secret %q from registry ref %q: %w", ref.Name, ref.Ref, err)
+			return "", &ResolveError{Name: ref.Name, Ref: ref.Ref, Err: err}
 		}
 		return value, nil
 	}
@@ -183,11 +183,35 @@ func (r *Registry) Resolve(ctx context.Context, ref secretref.Ref) (string, erro
 
 	value, err := res.Resolve(ctx, ref)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve secret %q from provider %q: %w", ref.Name, ref.Provider, err)
+		return "", &ResolveError{Name: ref.Name, Provider: ref.Provider, Err: err}
 	}
 
 	return value, nil
 }
+
+// ResolveError reports that a secret's source was asked for its value and did
+// not give one: the file is missing, the variable is unset, the backend
+// refused. A reference that is itself invalid is not a ResolveError.
+//
+// Name is the name the DAG gives the secret. The cause, which may name where
+// the secret is kept, stays in Err.
+type ResolveError struct {
+	Name string
+	// Provider is the provider that was asked. It is empty for a registry
+	// reference, which Ref then names.
+	Provider string
+	Ref      string
+	Err      error
+}
+
+func (e *ResolveError) Error() string {
+	if e.Ref != "" {
+		return fmt.Sprintf("failed to resolve secret %q from registry ref %q: %v", e.Name, e.Ref, e.Err)
+	}
+	return fmt.Sprintf("failed to resolve secret %q from provider %q: %v", e.Name, e.Provider, e.Err)
+}
+
+func (e *ResolveError) Unwrap() error { return e.Err }
 
 // ResolveAll fetches all secrets and returns them as environment variable strings.
 // Format: "NAME=value"
