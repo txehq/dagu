@@ -1059,6 +1059,7 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	}, retry.Params, "the retry is bound to the failed execution, the snapshot it ran and that version's package")
 	assert.Contains(t, retry.AllowedVerdicts, review.VerdictRetry)
 	assert.NotContains(t, retry.AllowedVerdicts, review.VerdictApprove)
+	assert.Contains(t, retry.Question, "The review agent's reason, in its own words (not checked): ", "what the owner approves marks the agent's text as the agent's")
 	assert.Equal(t, review.ProposalQuestion, question.Kind, "a run the reviewer was not shown cannot be retried")
 	assert.Equal(t, review.ProposalQuestion, proposals[2].Kind, "a run of an older version is never retried")
 	assert.Contains(t, proposals[2].Question, "run-old")

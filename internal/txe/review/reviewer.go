@@ -828,7 +828,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 			RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
 		}
 		requested.TargetID = ""
-		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, requested.Reason))
+		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, agentReason(requested.Reason)))
 	}
 	switch {
 	case !isDeclared:
@@ -838,7 +838,7 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 	case !paramsDeclared(declared, requested.Params):
 		return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests %q with parameters the job does not declare: %s", requested.Name, requested.Reason))
 	case !declared.Routine:
-		return propose(ProposalAction, fmt.Sprintf("Approve %q on %s? %s", requested.Name, requested.TargetID, requested.Reason))
+		return propose(ProposalAction, fmt.Sprintf("Approve %q on %s? %s", requested.Name, requested.TargetID, agentReason(requested.Reason)))
 	}
 
 	intent := IntentKey(requested.Name, requested.TargetID, requested.Params)
@@ -1332,6 +1332,14 @@ func (r *Reviewer) verifyGranted(ctx context.Context, jobID string, action Actio
 		return nil
 	}
 	return errors.New("the granted action is not in the journal")
+}
+
+// agentReason marks the agent's own words in a question the owner is asked
+// to approve. The agent read the job's output, which can contain anything a
+// script printed; its reason is offered as its opinion, not as a fact the
+// reviewer checked.
+func agentReason(reason string) string {
+	return "The review agent's reason, in its own words (not checked): " + reason
 }
 
 func paramsDeclared(declared DeclaredAction, params map[string]string) bool {
