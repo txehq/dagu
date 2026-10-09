@@ -266,6 +266,10 @@ type Observation struct {
 	// Scope is ScopeReviewer for the job's reviewer; empty or ScopeJob for
 	// the job itself.
 	Scope string
+	// Target is the key of the one target a resource event observed. Its
+	// exception belongs to that target, and a ready observation of it
+	// resolves only that target's exceptions.
+	Target string
 }
 
 // Observation scopes.
@@ -293,13 +297,25 @@ func (tx *JobTx) Observe(o Observation) error {
 	now := tx.now
 	actor := tx.actor
 	j.Availability = Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
-	if o.State == AvailabilityReady {
+	switch {
+	case o.State == AvailabilityReady && o.Target != "":
+		// One target recovered: only its exceptions are resolved, and the
+		// job stays unavailable while any other condition is open.
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" && e.Target == o.Target {
+				e.ResolvedAt = &now
+			}
+		}
+		if open := tx.latestOpenException(); open != nil {
+			j.Availability = Availability{State: open.State, Detail: open.Detail, Evidence: open.Evidence, ObservedAt: &now, Reporter: &actor}
+		}
+	case o.State == AvailabilityReady:
 		for _, e := range j.Exceptions {
 			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" {
 				e.ResolvedAt = &now
 			}
 		}
-	} else {
+	default:
 		id, err := NewID(PrefixException, now)
 		if err != nil {
 			return err
@@ -311,15 +327,16 @@ func (tx *JobTx) Observe(o Observation) error {
 		if kind == "" {
 			kind = string(o.State)
 		}
-		if !tx.hasOpenException("", kind, o.State) {
-			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		if !tx.hasOpenException("", kind, o.State, o.Target) {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Target: o.Target, Created: Stamp{At: now, By: actor}}
 		}
 	}
 	tx.touch()
-	if from == o.State {
+	to := j.Availability.State
+	if from == to {
 		return nil
 	}
-	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(o.State), Detail: o.Detail, Evidence: o.Evidence})
+	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(to), Detail: j.Availability.Detail, Evidence: j.Availability.Evidence})
 }
 
 // ResolveException marks one exception resolved.
@@ -490,13 +507,29 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 // hasOpenException reports whether an unresolved exception of the same
 // scope, kind and state exists: repeated observations of one condition
 // coalesce into it instead of opening another each time.
-func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState) bool {
+func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState, target string) bool {
 	for _, e := range tx.Job.Exceptions {
-		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state {
+		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state && e.Target == target {
 			return true
 		}
 	}
 	return false
+}
+
+// latestOpenException is the most recent unresolved availability exception
+// of the job itself, or nil.
+func (tx *JobTx) latestOpenException() *Exception {
+	var latest *Exception
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.State == "" || e.Scope != "" {
+			continue
+		}
+		if latest == nil || e.Created.At.After(latest.Created.At) ||
+			(e.Created.At.Equal(latest.Created.At) && e.ExceptionID > latest.ExceptionID) {
+			latest = e
+		}
+	}
+	return latest
 }
 
 // reviewDigest identifies what a review concluded from which evidence.
@@ -547,7 +580,7 @@ func (tx *JobTx) observeReviewer(o Observation) error {
 		if kind == "" {
 			kind = "reviewer_" + string(o.State)
 		}
-		if !tx.hasOpenException(ScopeReviewer, kind, o.State) {
+		if !tx.hasOpenException(ScopeReviewer, kind, o.State, "") {
 			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
 		}
 	}

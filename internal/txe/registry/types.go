@@ -685,12 +685,15 @@ type Exception struct {
 	Kind        string `json:"kind"`
 	// Scope is "reviewer" for a problem with the job's reviewer, which never
 	// changes the job's own availability; empty for the job.
-	Scope      string            `json:"scope,omitempty"`
-	State      AvailabilityState `json:"state,omitempty"`
-	Detail     string            `json:"detail"`
-	Evidence   []string          `json:"evidence,omitempty"`
-	Created    Stamp             `json:"created"`
-	ResolvedAt *time.Time        `json:"resolved_at,omitempty"`
+	Scope string            `json:"scope,omitempty"`
+	State AvailabilityState `json:"state,omitempty"`
+	// Target is the key of the target whose observation opened it, if one
+	// did; a present observation of that target resolves it.
+	Target     string     `json:"target,omitempty"`
+	Detail     string     `json:"detail"`
+	Evidence   []string   `json:"evidence,omitempty"`
+	Created    Stamp      `json:"created"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
 
 // EventKind classifies a job history event.

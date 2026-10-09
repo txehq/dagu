@@ -1226,3 +1226,56 @@ func TestUnknownPreRunTargetIsUnconfirmed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, AvailabilityReady, got.Availability.State)
 }
+
+// Target conditions belong to their target: a present observation of one
+// target resolves only that target's exceptions, the job stays unavailable
+// while another target's or the worker's condition is open, and becomes
+// ready only when none is.
+func TestTargetConditionsResolvePerTarget(t *testing.T) {
+	f := newFixture(t)
+	a, b := target("v-1"), target("v-2")
+	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
+	report := func(tg Target, obs ResourceObservation) {
+		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		require.NoError(t, err)
+		f.now = f.now.Add(time.Second)
+	}
+	state := func() AvailabilityState {
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		return got.Availability.State
+	}
+
+	report(a, ResourceUnknown)
+	report(b, ResourceUnreachable)
+	report(b, ResourcePresent)
+	assert.Equal(t, AvailabilityTargetUnconfirmed, state(), "A is still unconfirmed")
+	report(a, ResourcePresent)
+	assert.Equal(t, AvailabilityReady, state())
+
+	// The worker goes offline, then a target is unconfirmed and recovers:
+	// the worker's condition is not resolved by the target's recovery.
+	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.Observe(Observation{State: AvailabilityWorkerOffline, Kind: "worker_offline"})
+	})
+	require.NoError(t, err)
+	f.now = f.now.Add(time.Second)
+	report(a, ResourceUnknown)
+	report(a, ResourcePresent)
+	assert.Equal(t, AvailabilityWorkerOffline, state(), "the worker is still offline")
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	open := 0
+	for _, e := range got.Exceptions {
+		if e.ResolvedAt == nil {
+			open++
+			assert.Equal(t, "worker_offline", e.Kind)
+		}
+	}
+	assert.Equal(t, 1, open)
+
+	// A present of a target with no open condition changes nothing.
+	report(b, ResourcePresent)
+	assert.Equal(t, AvailabilityWorkerOffline, state())
+}
