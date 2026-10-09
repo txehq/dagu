@@ -110,7 +110,8 @@ func upsertMarkerLease(t *testing.T, leaseStore *store.DAGRunLeaseStore, attempt
 	}))
 }
 
-func strPtr(s string) *string { return &s }
+//go:fix inline
+func strPtr(s string) *string { return new(s) }
 
 func (f *markerFixture) report(t *testing.T, st ir.Status, queuedAt, marker string) *coordinatorv1.ReportStatusResponse {
 	t.Helper()
@@ -150,7 +151,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 		t.Parallel()
 		// E1 failed and a retry re-queued the attempt (q2) before E1's last
 		// report arrived; E1's lease has not been cleaned up yet.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, new(markerQ1))
 
 		resp := f.report(t, ir.Failed, markerQ1, markerQ1)
 		assert.False(t, resp.Accepted)
@@ -164,7 +165,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 	t.Run("StaleExecutionRefusedAfterLeaseReplacement", func(t *testing.T) {
 		t.Parallel()
 		// E2 has claimed the attempt and is running.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		resp := f.report(t, ir.Failed, markerQ1, markerQ1)
 		assert.False(t, resp.Accepted)
@@ -174,7 +175,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 
 	t.Run("CurrentExecutionAcceptedAndReplayAccepted", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		for range 2 {
 			resp := f.report(t, ir.Running, markerQ2, markerQ2)
@@ -187,7 +188,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 		t.Parallel()
 		// E2 has been claimed but its first report still finds the stored
 		// status Queued; it carries the queued marker and must be accepted.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, new(markerQ2))
 
 		resp := f.report(t, ir.Running, markerQ2, markerQ2)
 		assert.True(t, resp.Accepted, resp.Error)
@@ -198,7 +199,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 		t.Parallel()
 		// E1 was a direct start (empty marker). Its status echoes an earlier
 		// queued-at, so only the request's marker can identify it.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(""))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, new(""))
 
 		resp := f.report(t, ir.Failed, markerQ1, "")
 		assert.False(t, resp.Accepted)
@@ -207,7 +208,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 
 	t.Run("StaleDirectStartRefusedOnceRequeuedExecutionRuns", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		resp := f.report(t, ir.Failed, "", "")
 		assert.False(t, resp.Accepted)
@@ -218,7 +219,7 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 		t.Parallel()
 		// A direct retry's status echoes the previous attempt's queued-at
 		// while its task marker is empty; that must not refuse it.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(""))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(""))
 
 		resp := f.report(t, ir.Running, markerQ1, "")
 		assert.True(t, resp.Accepted, resp.Error)
@@ -292,7 +293,7 @@ func TestExecutionMarkerTerminalReplayRacesRequeue(t *testing.T) {
 func TestExecutionMarkerRunningReportRacesRepairAndRequeue(t *testing.T) {
 	t.Parallel()
 
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 	fired := false
 	f.store.beforeCompareAndSwap = func() {
 		f.store.beforeCompareAndSwap = nil
@@ -321,7 +322,7 @@ func TestExecutionMarkerReportStatusHoldsTheWriteLock(t *testing.T) {
 
 	// A claim of the next execution takes the run's write lock, so a report
 	// must hold it from validation through the write.
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 	unlock := f.h.attemptWriteLocks.lock(f.ref)
 	done := make(chan *coordinatorv1.ReportStatusResponse, 1)
 	go func() {
@@ -419,7 +420,7 @@ func TestExecutionMarkerSyncFromStatus(t *testing.T) {
 func TestExecutionMarkerReconcileDropsEarlierExecutionLease(t *testing.T) {
 	t.Parallel()
 
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(markerQ1))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, new(markerQ1))
 	lease, err := f.h.dagRunLeaseStore.Get(t.Context(), f.attemptKey)
 	require.NoError(t, err)
 
@@ -443,7 +444,7 @@ func TestExecutionMarkerReconcileDropsEarlierExecutionLease(t *testing.T) {
 func TestExecutionMarkerRunHeartbeatCancelsOnlyTheStaleExecution(t *testing.T) {
 	t.Parallel()
 
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 	running := func(marker string) *coordinatorv1.RunningTask {
 		return &coordinatorv1.RunningTask{
 			DagName:         markerDAG,
@@ -512,7 +513,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("CompleteStreamRecordsFinalization", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ2, "second\n", false),
@@ -528,7 +529,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("IncompleteStreamHasNoFinalization", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ2, "partial\n", false),
@@ -539,7 +540,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("ReopeningClearsAnEarlierFinalization", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ1, "first\n", false),
 			markerLogChunk(markerQ1, "", true),
@@ -561,7 +562,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		t.Parallel()
 		// The worker checkpoints by ending the RPC without a final chunk, then
 		// sends the final chunk alone on a new RPC.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
 			c.ByteOffset = &offset
 			return c
@@ -584,7 +585,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		t.Parallel()
 		// A resumed stream rewrites earlier offsets; the record must hash the
 		// file as finalized, not the bytes received on the last RPC.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
 			c.ByteOffset = &offset
 			return c
@@ -608,7 +609,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		t.Parallel()
 		// A stream that wrote nothing sends only its final chunk at offset 0;
 		// the log is complete and empty for this execution.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		offset := uint64(0)
 		final := markerLogChunk(markerQ2, "", true)
 		final.ByteOffset = &offset
@@ -625,7 +626,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		t.Parallel()
 		// The earlier bytes reached another coordinator; this one cannot
 		// vouch for the log, and must not fail the worker's final RPC.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		offset := uint64(64)
 		final := markerLogChunk(markerQ2, "", true)
 		final.ByteOffset = &offset
@@ -636,7 +637,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("FinalOnlyUnpositionedStreamStaysIncomplete", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		require.NoError(t, os.MkdirAll(filepath.Dir(f.logPath()), 0o750))
 		require.NoError(t, os.WriteFile(f.logPath(), []byte("earlier\n"), 0o600))
 		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
@@ -648,7 +649,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("StaleStreamRefusedBeforeWriting", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		require.NoError(t, os.MkdirAll(filepath.Dir(f.logPath()), 0o750))
 		require.NoError(t, os.WriteFile(f.logPath(), []byte("second\n"), 0o600))
 
@@ -670,7 +671,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		// E1's stream is open and has written. E2 is admitted and writes its
 		// own output. E1's next chunk arrives at once, with no time for any
 		// periodic revalidation: it must be refused, and E2's bytes kept.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 		chunks := []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ1, "first\n", false),
 			markerLogChunk(markerQ1, "late first\n", false),
@@ -699,7 +700,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 
 	t.Run("FinalChunkRefusedAfterLeaseReplacement", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 		chunks := []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ1, "first\n", false),
 			markerLogChunk(markerQ1, "", true),
@@ -722,7 +723,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		// E1's chunk has passed validation and is about to be written when
 		// E2's claim arrives. The claim must wait until the write is done,
 		// and E1's next chunk must then be refused.
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 		lh := newLogHandler(f.logDir)
 		lh.lockAttempt = f.h.attemptWriteLocks.lock
 		defer lh.Close(t.Context())
@@ -780,7 +781,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 func TestExecutionMarkerRequeueWindowBeforeClaim(t *testing.T) {
 	t.Parallel()
 
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 	at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
 		c.ByteOffset = &offset
 		return c
@@ -861,7 +862,7 @@ func TestExecutionMarkerRequeueWindowBeforeClaim(t *testing.T) {
 func TestExecutionMarkerRequeueCheckSparesIndependentChild(t *testing.T) {
 	t.Parallel()
 
-	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, strPtr(markerQ2))
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Queued, QueuedAt: markerQ2}, new(markerQ2))
 	child := ir.NewDAGRunRef("child-dag", "child-run")
 	childKey := ir.GenerateAttemptKey(markerDAG, markerRun, child.Name, child.ID, "child-attempt")
 	now := time.Now().UTC().UnixMilli()
@@ -922,7 +923,7 @@ func TestExecutionMarkerStreamArtifacts(t *testing.T) {
 
 	t.Run("CurrentExecutionCommits", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 
 		require.NoError(t, f.h.StreamArtifacts(&mockStreamArtifactsServer{ctx: t.Context(), chunks: []*coordinatorv1.ArtifactChunk{
 			markerArtifactChunk(f.attemptKey, markerQ2, "second"),
@@ -934,7 +935,7 @@ func TestExecutionMarkerStreamArtifacts(t *testing.T) {
 
 	t.Run("StaleExecutionRefused", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, new(markerQ2))
 		require.NoError(t, os.WriteFile(filepath.Join(f.archiveDir, "artifact.txt"), []byte("second"), 0o600))
 
 		err := f.h.StreamArtifacts(&mockStreamArtifactsServer{ctx: t.Context(), chunks: []*coordinatorv1.ArtifactChunk{
@@ -948,7 +949,7 @@ func TestExecutionMarkerStreamArtifacts(t *testing.T) {
 
 	t.Run("DelayedUploadNotCommittedAfterLeaseReplacement", func(t *testing.T) {
 		t.Parallel()
-		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, new(markerQ1))
 		require.NoError(t, os.WriteFile(filepath.Join(f.archiveDir, "artifact.txt"), []byte("second"), 0o600))
 
 		first := markerArtifactChunk(f.attemptKey, markerQ1, "late ")

@@ -393,7 +393,13 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 	} else {
 		attempt, ok = m.attempts[req.DAGRun.ID]
 	}
-	if !ok || attempt.status == nil {
+	if !ok {
+		return nil, false, nil
+	}
+	// The attempt's own fields are guarded by its mutex, as in its methods.
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.status == nil {
 		return nil, false, nil
 	}
 

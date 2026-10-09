@@ -66,7 +66,8 @@ steps:
 
 			require.Eventually(t, func() bool {
 				data, err := os.ReadFile(counter)
-				if err != nil || bytes.Count(data, []byte("x\n")) < executions {
+				// Each execution appends one "x"; Windows' echo adds a space and CRLF.
+				if err != nil || bytes.Count(data, []byte("x")) < executions {
 					return false
 				}
 				st, err := f.latestStoredStatus()
