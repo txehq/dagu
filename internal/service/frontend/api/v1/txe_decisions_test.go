@@ -52,6 +52,7 @@ const decideSpec = `steps:
 type txeDecisionFixture struct {
 	server   test.Server
 	jobID    string
+	client   txeAuthedClient
 	decide   string
 	runID    string
 	proposal api.TxeProposal
@@ -61,8 +62,8 @@ type txeDecisionFixture struct {
 // the human task waits, and files a proposal pointing at that task.
 func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 	t.Helper()
-	server := test.SetupServer(t)
-	c := server.Client()
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
 	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
 
 	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
@@ -121,7 +122,21 @@ func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 		},
 	}).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &proposal)
 
-	return &txeDecisionFixture{server: server, jobID: jobID, decide: decideDAG, runID: started.DagRunId, proposal: proposal}
+	return &txeDecisionFixture{server: server, client: c, jobID: jobID, decide: decideDAG, runID: started.DagRunId, proposal: proposal}
+}
+
+// txeAuthedClient sends every request as a signed-in person: a decision is
+// accepted only from one.
+type txeAuthedClient struct {
+	c     *test.APIClient
+	token string
+}
+
+func (a txeAuthedClient) Get(path string) *test.Request {
+	return a.c.Get(path).WithBearerToken(a.token)
+}
+func (a txeAuthedClient) Post(path string, body any) *test.Request {
+	return a.c.Post(path, body).WithBearerToken(a.token)
 }
 
 func (f *txeDecisionFixture) decisionPath() string {
@@ -142,7 +157,7 @@ func (f *txeDecisionFixture) body(verdict, key string) map[string]any {
 // refuses a second decision bound to the old revision.
 func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 	f := newTxeDecisionFixture(t)
-	c := f.server.Client()
+	c := f.client
 
 	var resp api.TxeDecisionResponse
 	c.Post(f.decisionPath(), f.body("approve", "dashboard-approve-1")).
@@ -205,7 +220,7 @@ func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 // the same request returns the stored decision without a second one.
 func TestTxeDecisionRejectAndReplay(t *testing.T) {
 	f := newTxeDecisionFixture(t)
-	c := f.server.Client()
+	c := f.client
 	var first, again api.TxeDecisionResponse
 	c.Post(f.decisionPath(), f.body("reject", "dashboard-reject-1")).
 		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
@@ -228,10 +243,10 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 	f := newTxeDecisionFixture(t)
 	body := f.body("approve", "reviewer-self-approve")
 	body["actor"] = map[string]any{"kind": "reviewer", "id": "cc5-test"}
-	f.server.Client().Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t)
+	f.client.Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t)
 
 	var list api.TxeDecisionList
-	f.server.Client().Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
+	f.client.Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
 	require.Empty(t, list.Decisions)
 	require.False(t, strings.Contains(fmt.Sprint(list), "reviewer-self-approve"))
 }
@@ -240,11 +255,17 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 // recording a decision requires.
 func newTxeDecisionAPI(t *testing.T) *apiv1.API {
 	t.Helper()
+	return newTxeDecisionAPIWithAuth(t, config.AuthModeBuiltin)
+}
+
+func newTxeDecisionAPIWithAuth(t *testing.T, mode config.AuthMode) *apiv1.API {
+	t.Helper()
 	dir := t.TempDir()
 	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
 	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
 	require.NoError(t, err)
 	cfg := &config.Config{}
+	cfg.Server.Auth.Mode = mode
 	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
 	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
 		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
@@ -320,4 +341,49 @@ func TestTxeDecisionChecksWorkspace(t *testing.T) {
 	ops := fileTxeProposal(t, f, txeAdmin, opsJob)
 	requireStatus(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictRetire, "operator-retire", nil), http.StatusForbidden)
 	require.NoError(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictApprove, "operator-approve", nil))
+}
+
+// A decision is recorded only for an individually signed-in person. On a hub
+// with no authentication, or with basic auth's one shared credential, a
+// request cannot show it comes from a person rather than a reviewer or a job
+// script holding the hub context, so it is refused and nothing is recorded.
+func TestTxeDecisionNeedsAPersonAuthMode(t *testing.T) {
+	for _, mode := range []config.AuthMode{config.AuthModeNone, config.AuthModeBasic, ""} {
+		t.Run(string(mode), func(t *testing.T) {
+			a := newTxeDecisionAPIWithAuth(t, mode)
+			f := newTxeFixture(t, a, txeAdmin)
+			jobID, err := f.register(txeAdmin, "")
+			require.NoError(t, err)
+			require.NoError(t, f.ready(txeAdmin, jobID))
+			p := fileTxeProposal(t, f, txeAdmin, jobID)
+			err = decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "shared-credential-1", nil)
+			requireStatus(t, err, http.StatusForbidden)
+			var apiErr *apiv1.Error
+			require.ErrorAs(t, err, &apiErr)
+			require.Equal(t, "person_auth_required", apiErr.Details["code"])
+			list, err := a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: jobID, ProposalId: p.ProposalId})
+			require.NoError(t, err)
+			require.Empty(t, list.(api.ListTxeProposalDecisions200JSONResponse).Decisions)
+		})
+	}
+}
+
+// The person is the signed-in user, whatever identity the body claims.
+func TestTxeDecisionActorIsTheSignedInUser(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	p := fileTxeProposal(t, f, txeAdmin, jobID)
+	require.NoError(t, decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "claims-another-1",
+		&api.TxeActor{Kind: api.TxeActorKindHuman, Id: "someone-else"}))
+	list, err := a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: jobID, ProposalId: p.ProposalId})
+	require.NoError(t, err)
+	decisions := list.(api.ListTxeProposalDecisions200JSONResponse).Decisions
+	require.Len(t, decisions, 1)
+	user, _ := auth.UserFromContext(txeAdmin)
+	require.Equal(t, user.Username, decisions[0].Actor.Id)
+	// No signed-in user at all is refused.
+	requireStatus(t, decideTxe(context.Background(), f, jobID, p, api.TxeVerdictApprove, "nobody-1", nil), http.StatusForbidden)
 }
