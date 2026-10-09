@@ -270,12 +270,21 @@ type Observation struct {
 	// exception belongs to that target, and a ready observation of it
 	// resolves only that target's exceptions.
 	Target string
+	// ActionID and Attempt name the action attempt of a ScopeAction
+	// observation; ClaimID and Fence are the reporter's live claim.
+	ActionID string
+	Attempt  int
+	ClaimID  string
+	Fence    int64
 }
 
 // Observation scopes.
 const (
 	ScopeJob      = "job"
 	ScopeReviewer = "reviewer"
+	// ScopeAction is a problem with one attempt of one action (a retry
+	// reservation that never started); it changes no availability.
+	ScopeAction = "action"
 )
 
 // Observe records availability. It never changes the lifecycle: an offline
@@ -283,6 +292,9 @@ const (
 // A non-ready observation opens an exception; a ready one resolves them.
 func (tx *JobTx) Observe(o Observation) error {
 	j := tx.Job
+	if o.Scope == ScopeAction {
+		return tx.observeAction(o)
+	}
 	if o.State == "" {
 		return refuse(CodeInvalid, "observation state is required")
 	}
@@ -291,7 +303,7 @@ func (tx *JobTx) Observe(o Observation) error {
 	case ScopeReviewer:
 		return tx.observeReviewer(o)
 	default:
-		return refuse(CodeInvalid, "observation scope must be job or reviewer")
+		return refuse(CodeInvalid, "observation scope must be job, reviewer or action")
 	}
 	from := j.Availability.State
 	now := tx.now
@@ -521,6 +533,61 @@ func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState, t
 		}
 	}
 	return false
+}
+
+// observeAction records a problem with one attempt of one action, raised by
+// the holder of the job's live claim: the attempt must be the action's
+// current one and still unresolved (executing or uncertain). It changes no
+// availability. One exception stays open per action, attempt and kind; the
+// registry resolves it when that attempt ends (see resolveActionExceptions).
+func (tx *JobTx) observeAction(o Observation) error {
+	j := tx.Job
+	if err := tx.CheckClaim(o.ClaimID, o.Fence); err != nil {
+		return err
+	}
+	if o.Kind == "" || o.ActionID == "" || o.Attempt <= 0 {
+		return refuse(CodeInvalid, "an action observation needs kind, action_id and attempt")
+	}
+	a, ok := j.Actions[o.ActionID]
+	if !ok {
+		return refuse(CodeNotFound, "action %s not found", o.ActionID)
+	}
+	if a.Attempt != o.Attempt || (a.State != ActionExecuting && a.State != ActionUncertain) {
+		return &Error{Code: CodeActionState, Message: fmt.Sprintf("action %s is at attempt %d and %s", a.ActionID, a.Attempt, a.State), Current: a}
+	}
+	for _, e := range j.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeAction && e.ActionID == o.ActionID && e.Attempt == o.Attempt && e.Kind == o.Kind {
+			return nil
+		}
+	}
+	id, err := NewID(PrefixException, tx.now)
+	if err != nil {
+		return err
+	}
+	if j.Exceptions == nil {
+		j.Exceptions = map[string]*Exception{}
+	}
+	j.Exceptions[id] = &Exception{ExceptionID: id, Kind: o.Kind, Scope: ScopeAction, Detail: o.Detail, Evidence: o.Evidence,
+		ActionID: o.ActionID, Attempt: o.Attempt, Created: Stamp{At: tx.now, By: tx.actor}}
+	tx.touch()
+	return nil
+}
+
+// resolveActionExceptions resolves the open action-scope exceptions of a
+// that no longer apply: those of an earlier attempt, and all of them once
+// the action is neither executing nor uncertain.
+func (tx *JobTx) resolveActionExceptions(a *Action) {
+	live := a.State == ActionExecuting || a.State == ActionUncertain
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.Scope != ScopeAction || e.ActionID != a.ActionID {
+			continue
+		}
+		if e.Attempt != a.Attempt || !live {
+			now := tx.now
+			e.ResolvedAt = &now
+			tx.touch()
+		}
+	}
 }
 
 // latestOpenException is the most recent unresolved availability exception
@@ -982,6 +1049,8 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 		j.Actions[a.ActionID] = a
 	}
 	a.Attempt++
+	started := tx.now
+	a.AttemptStartedAt = &started
 	timeout := defaultActionTimeout
 	if pa, ok := v.PermittedAction(a.Spec.Name); ok && pa.TimeoutSec > 0 {
 		timeout = time.Duration(pa.TimeoutSec) * time.Second

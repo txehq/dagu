@@ -631,6 +631,7 @@ func (a *API) ObserveTxeJob(ctx context.Context, req api.ObserveTxeJobRequestObj
 	if body.Scope != nil {
 		o.Scope = string(*body.Scope)
 	}
+	o.ActionID, o.Attempt, o.ClaimID, o.Fence = valueOf(body.ActionId), valueOf(body.Attempt), valueOf(body.ClaimId), valueOf(body.Fence)
 	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Observe(o) })
 	return api.ObserveTxeJob200JSONResponse(job), err
 }
