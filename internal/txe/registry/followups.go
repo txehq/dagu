@@ -258,6 +258,9 @@ func (tx *JobTx) takeResolution(prior string, a *Action) error {
 // The caller has checked that runID is a run of the job's DAG.
 func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Proposal, *Decision, error) {
 	j := tx.Job
+	if tx.actor.Kind != ActorHuman {
+		return nil, nil, refuse(CodeNotPermitted, "a retry is requested by a person, not %s", tx.actor.Kind)
+	}
 	if idempotencyKey == "" {
 		return nil, nil, refuse(CodeInvalid, "idempotency_key is required")
 	}
