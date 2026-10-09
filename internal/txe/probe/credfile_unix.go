@@ -9,8 +9,14 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"syscall"
 )
+
+// openNoFollow opens path for reading and refuses a symbolic link.
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(filepath.Clean(path), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+}
 
 func checkOwner(path string, info fs.FileInfo) error {
 	st, ok := info.Sys().(*syscall.Stat_t)

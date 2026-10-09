@@ -256,7 +256,7 @@ type PeriodicResult struct {
 // deadline. Targets it has waited longest to see go first, so a run cut
 // short by slow targets resumes with the rest next time; what it did not
 // reach is reported as unfinished.
-func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(*txeclient.JobVersion) Credentials) (PeriodicResult, int, error) {
+func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(jobID string, version int) Credentials) (PeriodicResult, int, error) {
 	var res PeriodicResult
 	for _, ev := range c.Journal.Undelivered() {
 		if _, err := c.Registry.RecordEvent(ctx, ev); err != nil {
@@ -281,7 +281,7 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		if err != nil {
 			return res, ExitUnobserved, fmt.Errorf("read version %d of job %s: %w", job.Version, job.JobID, err)
 		}
-		creds := credsFor(v)
+		creds := credsFor(job.JobID, job.Version)
 		for _, t := range v.Targets {
 			pt := toTarget(t)
 			cand := candidate{jobID: job.JobID, target: pt, creds: creds}
@@ -357,44 +357,3 @@ func (e EnvCredentials) Lookup(name string) (Credential, bool) {
 	}
 	return Credential{Value: v}, true
 }
-
-// FileCredentials resolves a version's file credential references from the
-// worker's disk. Environment references are not available to the periodic
-// check, which carries no secrets in its DAG.
-type FileCredentials map[string]string
-
-// FileCredentialsOf returns the file references of v. The locators come from
-// the registry, so each is checked before the probe reads it: an absolute,
-// clean path to a regular file this user owns that nobody else can write.
-// A locator that fails is a missing credential with the reason, never read.
-func FileCredentialsOf(v *txeclient.JobVersion) Credentials {
-	out := FileCredentials{}
-	missing := map[string]string{}
-	for _, ref := range v.Package.CredentialRefs {
-		switch ref.Kind {
-		case "file":
-			if err := checkCredentialFile(ref.Locator); err != nil {
-				missing[ref.Name] = "credential reference " + ref.Name + ": " + err.Error()
-				continue
-			}
-			out[ref.Name] = ref.Locator
-		default:
-			missing[ref.Name] = "credential reference " + ref.Name + " is an environment variable, which the periodic check does not receive"
-		}
-	}
-	return explained{out, missing}
-}
-
-// Lookup returns the file reference's path.
-func (f FileCredentials) Lookup(name string) (Credential, bool) {
-	p, ok := f[name]
-	return Credential{Path: p}, ok && p != ""
-}
-
-// explained adds why a reference is missing to a Credentials.
-type explained struct {
-	Credentials
-	missing map[string]string
-}
-
-func (e explained) MissingReason(name string) string { return e.missing[name] }

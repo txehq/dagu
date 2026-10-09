@@ -58,28 +58,12 @@ var (
 	pathPattern = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
 	// shortWordPattern is a short identifier such as a context name.
 	shortWordPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
-	// flagNamePattern is a long flag name, with no value attached.
-	flagNamePattern = regexp.MustCompile(`^--[a-z][a-z0-9-]*$`)
 )
 
 // looksSecret reports whether a value could be a credential: a
 // credential-like word or a known key prefix.
 func looksSecret(s string) bool {
 	return secretPattern.MatchString(s) || keyPrefixPattern.MatchString(s)
-}
-
-// plainValue reports whether s may enter the hub-stored DAG as a value: an
-// absolute path, or a short identifier. Anything longer that is not a path
-// could be a token (a JWT has dots, dashes and underscores), so it is
-// refused rather than judged by its shape.
-func plainValue(s string) bool {
-	if looksSecret(s) {
-		return false
-	}
-	if pathPattern.MatchString(s) && !strings.Contains(s, "..") {
-		return true
-	}
-	return shortWordPattern.MatchString(s)
 }
 
 const reconcileTemplate = `# Periodic target reconciliation for TXE jobs on machine {{.MachineID}}.
@@ -119,10 +103,8 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 	if !pathPattern.MatchString(cfg.DaguBin) || strings.Contains(cfg.DaguBin, "..") {
 		return "", nil, fmt.Errorf("probe: dagu binary %q must be a plain path", cfg.DaguBin)
 	}
-	for _, f := range cfg.StoreFlags {
-		if !flagNamePattern.MatchString(f) && !plainValue(f) {
-			return "", nil, fmt.Errorf("probe: store flag %q must be a flag name, an absolute path or a short name; only references may enter the DAG", f)
-		}
+	if err := checkStoreFlags(cfg.StoreFlags); err != nil {
+		return "", nil, err
 	}
 	schedule := cfg.Schedule
 	if schedule == "" {
@@ -168,6 +150,36 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 		return "", nil, fmt.Errorf("probe: render reconcile DAG: %w", err)
 	}
 	return ReconcileDAGName(cfg.MachineID), out.Bytes(), nil
+}
+
+// storeFlags are the only flags that may point the step at the machine's
+// CLI context: each is followed by its value, an absolute path, or for
+// --context a short context name. Nothing else may enter the hub-stored DAG.
+var storeFlags = map[string]bool{"--dagu-home": true, "--config": true, "--contexts-dir": true, "--data-dir": true, "--context": false}
+
+func checkStoreFlags(flags []string) error {
+	if len(flags)%2 != 0 {
+		return fmt.Errorf("probe: store flags %v must be flag and value pairs", flags)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < len(flags); i += 2 {
+		name, value := flags[i], flags[i+1]
+		isPath, ok := storeFlags[name]
+		if !ok {
+			return fmt.Errorf("probe: %q is not a store flag; only --dagu-home, --config, --contexts-dir, --data-dir and --context may enter the DAG", name)
+		}
+		if seen[name] {
+			return fmt.Errorf("probe: store flag %s is given twice", name)
+		}
+		seen[name] = true
+		if isPath && (!pathPattern.MatchString(value) || strings.Contains(value, "..") || looksSecret(value)) {
+			return fmt.Errorf("probe: %s needs an absolute, clean path, not %q", name, value)
+		}
+		if !isPath && (!shortWordPattern.MatchString(value) || looksSecret(value)) {
+			return fmt.Errorf("probe: %s needs a short context name, not %q", name, value)
+		}
+	}
+	return nil
 }
 
 // yamlString quotes s as a YAML scalar; a JSON string is valid YAML.

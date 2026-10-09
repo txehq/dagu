@@ -1,0 +1,407 @@
+{
+  "rule": "A target probed before a run (existence_check pre_run) or periodically (reconcile) must be observable. kubernetes.{configmap,secret,service,persistentvolumeclaim,deployment,statefulset,job,cronjob} are namespaced and kubernetes.namespace is cluster-scoped: environment is the cluster and is required; stable_id has exactly {cluster_uid, uid}, non-empty and unpadded; display_name is exactly 'namespace/name' (namespaced) or 'name' (cluster-scoped); a credential reference 'kubernetes' of kind file is required and 'kubernetes_context', if present, is of kind env. linear.issue: stable_id has exactly {id}; a credential reference 'linear' of kind env or file is required. Any other kind must be event_only. event_only targets are not checked.",
+  "accepted": [
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ]
+    },
+    {
+      "target": {
+        "kind": "kubernetes.namespace",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ]
+    },
+    {
+      "target": {
+        "kind": "kubernetes.deployment",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "reconcile"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        },
+        {
+          "name": "kubernetes_context",
+          "kind": "env",
+          "locator": "KUBE_CONTEXT"
+        }
+      ]
+    },
+    {
+      "target": {
+        "kind": "linear.issue",
+        "stable_id": {
+          "id": "9b1d0e7c-0000-4000-8000-000000000001"
+        },
+        "display_name": "TXE-1",
+        "existence_check": "reconcile"
+      },
+      "credential_refs": [
+        {
+          "name": "linear",
+          "kind": "env",
+          "locator": "LINEAR_API_KEY"
+        }
+      ]
+    },
+    {
+      "target": {
+        "kind": "linear.issue",
+        "stable_id": {
+          "id": "9b1d0e7c-0000-4000-8000-000000000001"
+        },
+        "display_name": "TXE-1",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "linear",
+          "kind": "file",
+          "locator": "/Users/me/.config/linear/key"
+        }
+      ]
+    },
+    {
+      "target": {
+        "kind": "aws.bucket",
+        "stable_id": {
+          "arn": "arn:aws:s3:::b"
+        },
+        "existence_check": "event_only"
+      },
+      "credential_refs": []
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "anything at all",
+        "existence_check": "event_only"
+      },
+      "credential_refs": []
+    }
+  ],
+  "refused": [
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "environment (cluster) is required"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "stable_id lacks uid"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1",
+          "namespace": "probe-ns"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "stable_id holds only identity"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": " u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "padded stable id value"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "namespaced kind needs namespace/name"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "a/b/c",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "extra path segment"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": " probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "padded display name"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.namespace",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "x/probe-ns",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "cluster-scoped kind takes a bare name"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.widget",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        }
+      ],
+      "reason": "unknown Kubernetes kind"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [],
+      "reason": "no kubernetes credential reference"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "env",
+          "locator": "KUBECONFIG"
+        }
+      ],
+      "reason": "kubernetes reference must be a file"
+    },
+    {
+      "target": {
+        "kind": "kubernetes.configmap",
+        "environment": "dev",
+        "stable_id": {
+          "cluster_uid": "c1",
+          "uid": "u1"
+        },
+        "display_name": "probe-ns/settings",
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [
+        {
+          "name": "kubernetes",
+          "kind": "file",
+          "locator": "/Users/me/.kube/config"
+        },
+        {
+          "name": "kubernetes_context",
+          "kind": "file",
+          "locator": "/x"
+        }
+      ],
+      "reason": "kubernetes_context must be env"
+    },
+    {
+      "target": {
+        "kind": "linear.issue",
+        "stable_id": {
+          "id": "x",
+          "team": "TXE"
+        },
+        "display_name": "TXE-1",
+        "existence_check": "reconcile"
+      },
+      "credential_refs": [
+        {
+          "name": "linear",
+          "kind": "env",
+          "locator": "LINEAR_API_KEY"
+        }
+      ],
+      "reason": "stable_id has exactly id"
+    },
+    {
+      "target": {
+        "kind": "linear.issue",
+        "stable_id": {
+          "id": "9b1d0e7c-0000-4000-8000-000000000001"
+        },
+        "display_name": "TXE-1",
+        "existence_check": "reconcile"
+      },
+      "credential_refs": [],
+      "reason": "no linear credential reference"
+    },
+    {
+      "target": {
+        "kind": "aws.bucket",
+        "stable_id": {
+          "arn": "arn:aws:s3:::b"
+        },
+        "existence_check": "pre_run"
+      },
+      "credential_refs": [],
+      "reason": "no probe observes this kind"
+    }
+  ]
+}

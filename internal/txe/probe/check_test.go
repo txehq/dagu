@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -290,7 +289,7 @@ func TestPeriodicScope(t *testing.T) {
 	// An incomplete event about the pre_run target is observed again.
 	pre := cm("u-1", "one", CheckPreRun)
 	f.reg.incomplete = []RecordedEvent{{EventID: "evt_x", Target: toTarget(pre), Observation: Unreachable}}
-	res, code, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), FileCredentialsOf)
+	res, code, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), noCreds)
 	if err != nil || code != ExitOK {
 		t.Fatalf("exit = %d, %v", code, err)
 	}
@@ -303,7 +302,7 @@ func TestPeriodicScope(t *testing.T) {
 	}
 	f.reg.jobs[jobA].Lifecycle = "retired"
 	f.probe.probed = nil
-	if _, _, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), FileCredentialsOf); err != nil || len(f.probe.probed) != 0 {
+	if _, _, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), noCreds); err != nil || len(f.probe.probed) != 0 {
 		t.Fatalf("an ended job's targets were probed: %v %v", f.probe.probed, err)
 	}
 }
@@ -315,78 +314,19 @@ func TestPeriodicSlowTargetDoesNotStarveTheRest(t *testing.T) {
 	f.reg.versions[jobA][2].Targets = []txeclient.Target{cm("slow", "slow", CheckReconcile), cm("fast", "fast", CheckReconcile)}
 	f.probe.cost["slow"] = 30 * time.Second
 	f.probe.results["slow"] = Result{Outcome: Timeout}
-	res, code, _ := f.check.Periodic(context.Background(), f.now.Add(45*time.Second), FileCredentialsOf)
+	res, code, _ := f.check.Periodic(context.Background(), f.now.Add(45*time.Second), noCreds)
 	if code != ExitUnobserved || res.Unfinished != 1 || strings.Join(f.probe.probed, ",") != "slow" {
 		t.Fatalf("first run: exit %d, %+v, probed %v", code, res, f.probe.probed)
 	}
 	f.check = f.newCheck(t)
 	f.probe.probed = nil
-	res, code, _ = f.check.Periodic(context.Background(), f.now.Add(45*time.Second), FileCredentialsOf)
+	res, code, _ = f.check.Periodic(context.Background(), f.now.Add(45*time.Second), noCreds)
 	if len(f.probe.probed) == 0 || f.probe.probed[0] != "fast" {
 		t.Fatalf("second run probed %v first, want the target the first run did not reach", f.probe.probed)
 	}
 	// With the slow target last, both fit in the second run's budget.
 	if code != ExitOK || res.Unfinished != 0 || strings.Join(f.probe.probed, ",") != "fast,slow" {
 		t.Fatalf("second run: exit %d, %+v, probed %v", code, res, f.probe.probed)
-	}
-}
-
-// Environment credential references are not available to the periodic
-// check; it says so instead of reporting the target missing.
-func TestPeriodicEnvCredentialIsExplained(t *testing.T) {
-	kubeconfig := filepath.Join(t.TempDir(), "config")
-	if err := os.WriteFile(kubeconfig, []byte("apiVersion: v1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	v := &txeclient.JobVersion{Package: txeclient.Package{CredentialRefs: []txeclient.CredentialRef{
-		{Name: KubernetesCredential, Kind: "file", Locator: kubeconfig},
-		{Name: LinearCredential, Kind: "env", Locator: "LINEAR_KEY"},
-	}}}
-	creds := FileCredentialsOf(v)
-	if c, ok := creds.Lookup(KubernetesCredential); !ok || c.Path != kubeconfig {
-		t.Fatalf("file ref = %+v %v", c, ok)
-	}
-	r := (Linear{}).Probe(context.Background(), linearTarget("uuid-1"), creds)
-	if r.Outcome != AuthDenied || !strings.Contains(r.Detail, "periodic check does not receive") {
-		t.Fatalf("env ref: %+v", r)
-	}
-}
-
-// File locators come from the registry, so the periodic check reads only an
-// absolute, clean path to a regular file this user owns and others cannot
-// write; any other locator is a missing credential with its reason.
-func TestFileCredentialLocatorsAreChecked(t *testing.T) {
-	dir := t.TempDir()
-	good := filepath.Join(dir, "config")
-	shared := filepath.Join(dir, "shared")
-	for path, mode := range map[string]os.FileMode{good: 0o600, shared: 0o666} {
-		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(path, mode); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for locator, ok := range map[string]bool{
-		good:     true,
-		"config": false, // relative
-		dir + "/../" + filepath.Base(dir) + "/config": false, // not clean
-		filepath.Join(dir, "absent"):                  false,
-		dir:                                           false, // a directory
-		shared:                                        false, // writable by others
-	} {
-		creds := FileCredentialsOf(&txeclient.JobVersion{Package: txeclient.Package{CredentialRefs: []txeclient.CredentialRef{
-			{Name: KubernetesCredential, Kind: "file", Locator: locator}}}})
-		_, got := creds.Lookup(KubernetesCredential)
-		if got != ok {
-			t.Errorf("locator %q accepted = %v, want %v", locator, got, ok)
-		}
-		if !ok {
-			r := (Kubernetes{}).Probe(context.Background(), configMapTarget(), creds)
-			if r.Outcome != AuthDenied || !strings.Contains(r.Detail, "credential reference kubernetes") {
-				t.Errorf("locator %q: %+v, want auth_denied with the reason", locator, r)
-			}
-		}
 	}
 }
 
@@ -402,3 +342,5 @@ func TestEnvCredentials(t *testing.T) {
 		t.Fatal("an empty variable counted as a credential")
 	}
 }
+
+func noCreds(string, int) Credentials { return credMap{} }
