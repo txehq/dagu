@@ -125,7 +125,7 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 			return nil, err
 		}
 		if predecessor == nil && !req.AllowWithoutPredecessor {
-			return nil, fmt.Errorf("%w: attempt %s has no earlier execution to restore", persis.ErrAttemptNotAbandonable, latest.ID())
+			return nil, fmt.Errorf("%w: attempt %s", persis.ErrAttemptHasNoPredecessor, latest.ID())
 		}
 		record.ExpectedExecution = predecessor
 		if err := writeRecordExclusive(recordPath, record); err != nil {

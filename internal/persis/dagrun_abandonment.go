@@ -6,6 +6,7 @@ package persis
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 )
@@ -34,6 +35,10 @@ var (
 	// not the named, never-dispatched attempt, so nothing is recorded or
 	// hidden.
 	ErrAttemptNotAbandonable = errors.New("attempt is not an abandonable never-dispatched attempt")
+	// ErrAttemptHasNoPredecessor is returned, wrapping ErrAttemptNotAbandonable,
+	// when the attempt is the run's only execution and the request does not
+	// allow leaving the run without a visible attempt.
+	ErrAttemptHasNoPredecessor = fmt.Errorf("%w: no earlier execution to restore", ErrAttemptNotAbandonable)
 	// ErrAttemptAbandonmentConflict is returned when an existing record for
 	// the attempt is unreadable or describes something else; it never
 	// authorizes a hide.
