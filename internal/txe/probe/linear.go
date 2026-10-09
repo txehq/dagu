@@ -18,8 +18,9 @@ import (
 const (
 	KindLinearIssue  = "linear.issue"
 	KeyLinearIssueID = "id"
-	// LinearCredential names the credential reference holding the API key.
-	LinearCredential = "linear"
+	// LinearCredential names the credential reference holding the API key,
+	// the name job authors already declare for their own scripts.
+	LinearCredential = "LINEAR_API_KEY" //nolint:gosec // A credential reference name, not a credential.
 	// LinearEndpoint is Linear's GraphQL API.
 	LinearEndpoint = "https://api.linear.app/graphql"
 )

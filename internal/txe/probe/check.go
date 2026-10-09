@@ -156,11 +156,25 @@ func (c *Check) print(line Line) {
 
 func terminal(lifecycle string) bool { return lifecycle == "completed" || lifecycle == "retired" }
 
-// mayRun reports whether a job in lifecycle may run its command. It is an
-// allowlist, so a paused job, an ended one, or a state this build does not
-// know stops the run: a job waiting for a person (needs_human) still runs
-// its ordinary checks.
-func mayRun(lifecycle string) bool { return lifecycle == "active" || lifecycle == "needs_human" }
+// admits mirrors the registry's run admission for a run rendered for
+// version: the lifecycle must be active or needs_human (an allowlist, so a
+// paused or ended job, or a state this build does not know, stops); the
+// job must not have expired, its registration must be ready, and the
+// version the run was rendered for must still be the job's. A job waiting
+// for a person, or a target's availability, never stops it here.
+func admits(job *txeclient.Job, version int, now time.Time) error {
+	switch {
+	case job.Lifecycle != "active" && job.Lifecycle != "needs_human":
+		return fmt.Errorf("job %s is %s", job.JobID, job.Lifecycle)
+	case job.ExpiresAt != nil && !now.Before(*job.ExpiresAt):
+		return fmt.Errorf("job %s expired at %s", job.JobID, job.ExpiresAt.UTC().Format(time.RFC3339))
+	case job.Registration.State != "ready":
+		return fmt.Errorf("job %s registration is %q, not ready", job.JobID, job.Registration.State)
+	case job.Version != version:
+		return fmt.Errorf("job %s is at version %d; this run was rendered for version %d", job.JobID, job.Version, version)
+	}
+	return nil
+}
 
 func toTarget(t txeclient.Target) Target {
 	return Target{Kind: t.Kind, Environment: t.Environment, StableID: t.StableID, DisplayName: t.DisplayName}
@@ -168,10 +182,10 @@ func toTarget(t txeclient.Target) Target {
 
 // PreRun checks the pre_run targets of version of jobID before the job's
 // command runs on machineID, and says whether it may run. It binds the
-// version the run was rendered for, never a newer one. A job waiting for a
-// person (needs_human) may still run its ordinary checks; only an ended
-// job, or a target this check found gone, replaced or unobservable, stops
-// the run.
+// version the run was rendered for, never a newer one. It stops (3) where
+// the registry's run admission would refuse, and where a target is gone or
+// replaced; it stops (75) when a target could not be observed or a report
+// could not be saved. A job waiting for a person (needs_human) still runs.
 func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Credentials) (int, error) {
 	job, err := c.Registry.Job(ctx, jobID)
 	if err != nil {
@@ -180,8 +194,8 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 	if job.MachineID != c.MachineID {
 		return ExitUsage, fmt.Errorf("job %s runs on %s, not on %s", jobID, job.MachineID, c.MachineID)
 	}
-	if !mayRun(job.Lifecycle) {
-		return ExitStop, fmt.Errorf("job %s is %s", jobID, job.Lifecycle)
+	if err := admits(job, version, c.now()); err != nil {
+		return ExitStop, err
 	}
 	v, err := c.Registry.JobVersion(ctx, jobID, version)
 	if err != nil {
@@ -217,8 +231,8 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 	if err != nil {
 		return ExitUnobserved, fmt.Errorf("read job %s after the check: %w", jobID, err)
 	}
-	if !mayRun(after.Lifecycle) {
-		return ExitStop, fmt.Errorf("job %s is %s", jobID, after.Lifecycle)
+	if err := admits(after, version, c.now()); err != nil {
+		return ExitStop, err
 	}
 	return ExitOK, nil
 }

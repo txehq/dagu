@@ -30,10 +30,13 @@ const (
 )
 
 // KubernetesCredential names the credential reference holding the
-// kubeconfig file; KubernetesContextCredential optionally names the context.
+// kubeconfig (a file reference; the step receives its content);
+// KubernetesContextCredential optionally names the context. The names are
+// also the variables the job's own script receives, so they avoid
+// KUBECONFIG, which kubectl reads as a path.
 const (
-	KubernetesCredential        = "kubernetes"
-	KubernetesContextCredential = "kubernetes_context" //nolint:gosec // A credential reference name, not a credential.
+	KubernetesCredential        = "TXE_KUBECONFIG"   //nolint:gosec // A credential reference name, not a credential.
+	KubernetesContextCredential = "TXE_KUBE_CONTEXT" //nolint:gosec // A credential reference name, not a credential.
 )
 
 type kubeResource struct {

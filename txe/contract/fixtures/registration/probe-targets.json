@@ -1,5 +1,5 @@
 {
-  "rule": "A target probed before a run (existence_check pre_run) or periodically (reconcile) must be observable. kubernetes.{configmap,secret,service,persistentvolumeclaim,deployment,statefulset,job,cronjob} are namespaced and kubernetes.namespace is cluster-scoped: environment is the cluster and is required; stable_id has exactly {cluster_uid, uid}, non-empty and unpadded; display_name is exactly 'namespace/name' (namespaced) or 'name' (cluster-scoped); a credential reference 'kubernetes' of kind file is required and 'kubernetes_context', if present, is of kind env. linear.issue: stable_id has exactly {id}; a credential reference 'linear' of kind env or file is required. Any other kind must be event_only. event_only targets are not checked.",
+  "rule": "A target probed before a run (existence_check pre_run) or periodically (reconcile) must be observable. kubernetes.{configmap,secret,service,persistentvolumeclaim,deployment,statefulset,job,cronjob} are namespaced and kubernetes.namespace is cluster-scoped: environment is the cluster and is required; stable_id has exactly {cluster_uid, uid}, non-empty and unpadded; display_name is exactly 'namespace/name' (namespaced) or 'name' (cluster-scoped); a credential reference 'TXE_KUBECONFIG' of kind file is required and 'TXE_KUBE_CONTEXT', if present, is of kind env. linear.issue: stable_id has exactly {id}; a credential reference 'LINEAR_API_KEY' of kind env or file is required. Any other kind must be event_only. event_only targets are not checked.",
   "accepted": [
     {
       "target": {
@@ -14,7 +14,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -33,7 +33,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -52,12 +52,12 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         },
         {
-          "name": "kubernetes_context",
+          "name": "TXE_KUBE_CONTEXT",
           "kind": "env",
           "locator": "KUBE_CONTEXT"
         }
@@ -74,7 +74,7 @@
       },
       "credential_refs": [
         {
-          "name": "linear",
+          "name": "LINEAR_API_KEY",
           "kind": "env",
           "locator": "LINEAR_API_KEY"
         }
@@ -91,7 +91,7 @@
       },
       "credential_refs": [
         {
-          "name": "linear",
+          "name": "LINEAR_API_KEY",
           "kind": "file",
           "locator": "/Users/me/.config/linear/key"
         }
@@ -135,7 +135,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -154,7 +154,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -175,7 +175,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -195,7 +195,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -215,7 +215,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -235,7 +235,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -255,7 +255,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -275,7 +275,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -295,7 +295,7 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         }
@@ -314,7 +314,7 @@
         "existence_check": "pre_run"
       },
       "credential_refs": [],
-      "reason": "no kubernetes credential reference"
+      "reason": "no TXE_KUBECONFIG credential reference"
     },
     {
       "target": {
@@ -329,12 +329,12 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "env",
           "locator": "KUBECONFIG"
         }
       ],
-      "reason": "kubernetes reference must be a file"
+      "reason": "TXE_KUBECONFIG must be a file reference"
     },
     {
       "target": {
@@ -349,17 +349,17 @@
       },
       "credential_refs": [
         {
-          "name": "kubernetes",
+          "name": "TXE_KUBECONFIG",
           "kind": "file",
           "locator": "/Users/me/.kube/config"
         },
         {
-          "name": "kubernetes_context",
+          "name": "TXE_KUBE_CONTEXT",
           "kind": "file",
           "locator": "/x"
         }
       ],
-      "reason": "kubernetes_context must be env"
+      "reason": "TXE_KUBE_CONTEXT must be an env reference"
     },
     {
       "target": {
@@ -373,7 +373,7 @@
       },
       "credential_refs": [
         {
-          "name": "linear",
+          "name": "LINEAR_API_KEY",
           "kind": "env",
           "locator": "LINEAR_API_KEY"
         }
@@ -390,7 +390,7 @@
         "existence_check": "reconcile"
       },
       "credential_refs": [],
-      "reason": "no linear credential reference"
+      "reason": "no LINEAR_API_KEY credential reference"
     },
     {
       "target": {
