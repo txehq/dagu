@@ -167,9 +167,9 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 // Otherwise the command inherits this process's environment, which is the
 // reviewer step's, minus what belongs to the reviewer and not to the job:
 //
-//   - the hub client's and the service's own settings (DAGU_* and
-//     TXE_DAGU_*): the context and credentials the reviewer writes to the
-//     registry with. The marker that stops a job from registering work
+//   - the hub client's and the service's own settings (DAGU_*, TXE_DAGU_*, and
+//     the bindings of the reviewer fixture, TXE_FIXTURE_*): the context and credentials the reviewer writes to
+//     the registry with, and which registry that is. The marker that stops a job from registering work
 //     under a review is kept;
 //   - the review's own variables: the packet, the decision, the ids the
 //     decision run passes to its step, and anything named like a parameter
@@ -193,7 +193,7 @@ func (e *CommandEffector) baseEnv() []string {
 
 // reviewerEnvPrefixes are the variable name prefixes that belong to the
 // reviewer, the service it talks to, the agent it runs, or the review.
-var reviewerEnvPrefixes = []string{"DAGU_", "TXE_DAGU_", "TXE_PARAM_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
+var reviewerEnvPrefixes = []string{"DAGU_", "TXE_DAGU_", "TXE_FIXTURE_", "TXE_PARAM_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_"}
 
 // reviewerEnvNames are the review's own variables that have no prefix of
 // their own: what the rendered DAGs hand from one step to the next, and the

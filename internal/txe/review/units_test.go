@@ -430,6 +430,7 @@ func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
 	}
 	reviewers := map[string]string{
 		"DAGU_HOME": "/reviewer/dagu", "DAGU_CONTEXTS_DIR": "/reviewer/contexts", "DAGU_API_KEY": "hub-key",
+		"TXE_FIXTURE_REGISTRY": "/reviewer/registry.json", "TXE_FIXTURE_STATE_DIR": "/reviewer/state",
 		"TXE_DAGU_HOME": "/reviewer/dagu", "TXE_PACKET": `{"job":{}}`, "TXE_DECISION": "{}", "TXE_PARAM_SIZE_GB": "999",
 		"CLAUDE_CONFIG_DIR": "/reviewer/.claude", "ANTHROPIC_API_KEY": "agent-key", "CODEX_HOME": "/reviewer/.codex", "OPENAI_API_KEY": "agent-key-2",
 	}

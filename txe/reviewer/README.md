@@ -58,8 +58,9 @@ else a review step needs must be rendered into the DAG:
 
 A job's declared action and reconcile commands are started from the review
 step, and do not inherit what is the reviewer's own. Removed before the
-command starts: every `DAGU_*` and `TXE_DAGU_*` variable (the hub client's
-context and the service's settings), the review's own variables
+command starts: every `DAGU_*` and `TXE_DAGU_*` variable
+(the hub client's context and the service's settings; also `TXE_FIXTURE_*`,
+the bindings of the test fixture's reviewer), the review's own variables
 (`TXE_PACKET`, `TXE_DECISION`, `TXE_PROPOSAL_ID`, `TXE_DECISION_ID`, and
 every `TXE_PARAM_*`, which could otherwise pass for a parameter of the
 action), and the agent's profile and keys (`CLAUDE_*`, `ANTHROPIC_*`,
