@@ -76,6 +76,7 @@ type fixture struct {
 	tasks     *recordingTasks
 	svc       *Service
 	now       time.Time
+	clock     *time.Time
 	jobID     string
 	machineID string
 	version   registry.JobVersion
@@ -92,7 +93,8 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
-	clock := func() time.Time { return now }
+	current := now
+	clock := func() time.Time { return current }
 	store, err := registry.NewFileStore(t.TempDir(),
 		registry.WithClock(clock), registry.WithDAGStore(&memDAGs{specs: map[string][]byte{}}))
 	if err != nil {
@@ -141,7 +143,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	f := &fixture{
-		t: t, ctx: ctx, store: store, now: now, jobID: jobID, machineID: machineID, version: version,
+		t: t, ctx: ctx, store: store, now: now, clock: &current, jobID: jobID, machineID: machineID, version: version,
 		tasks: &recordingTasks{},
 		human: registry.Actor{Kind: registry.ActorHuman, ID: "connor", Client: "dashboard"},
 	}
@@ -149,7 +151,7 @@ func newFixture(t *testing.T) *fixture {
 		Registry:          store,
 		Tasks:             f.tasks,
 		Now:               clock,
-		AuthorizeDecision: func(context.Context, *registry.Job) error { return nil },
+		AuthorizeDecision: func(context.Context, *registry.JobTx, Verdict) error { return nil },
 		AuthorizeTask:     func(context.Context, string, string) error { return nil },
 	}
 	f.proposal = f.fileProposal("resize", true)
@@ -161,6 +163,31 @@ func must(t *testing.T, fn func() error) {
 	if err := fn(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// fileProposalWith files p under a review claim, filling its ID.
+func (f *fixture) fileProposalWith(p registry.Proposal) *registry.Proposal {
+	f.t.Helper()
+	id, err := registry.NewID(registry.PrefixProposal, f.now)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	p.ProposalID = id
+	var filed *registry.Proposal
+	_, err = f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		if err != nil {
+			return err
+		}
+		if filed, err = tx.PutProposal(claim.ClaimID, claim.Fence, p); err != nil {
+			return err
+		}
+		return tx.ReleaseClaim(claim.ClaimID, claim.Fence)
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return filed
 }
 
 // fileProposal files a proposal the way a reviewer does: under a review claim.
@@ -199,6 +226,9 @@ func (f *fixture) fileProposal(action string, native bool) *registry.Proposal {
 	}
 	return filed
 }
+
+// setClock moves the fixture clock used by both the registry and the service.
+func (f *fixture) setClock(t time.Time) { *f.clock = t }
 
 func (f *fixture) request(v Verdict, key string) Request {
 	return Request{
@@ -448,7 +478,7 @@ func TestDecideFailsClosedWithoutAuthorizers(t *testing.T) {
 	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-noauth-1"), f.human); !errors.Is(err, errNoAuthorizer) {
 		t.Fatalf("without decision authorizer err = %v", err)
 	}
-	f.svc.AuthorizeDecision = func(context.Context, *registry.Job) error { return nil }
+	f.svc.AuthorizeDecision = func(context.Context, *registry.JobTx, Verdict) error { return nil }
 	f.svc.AuthorizeTask = nil
 	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictApprove, "key-noauth-2"), f.human); !errors.Is(err, errNoAuthorizer) {
 		t.Fatalf("without task authorizer err = %v", err)
@@ -461,9 +491,9 @@ func TestDecideFailsClosedWithoutAuthorizers(t *testing.T) {
 func TestDecideRequiresDecisionAuthorization(t *testing.T) {
 	f := newFixture(t)
 	denied := errors.New("not the job owner")
-	f.svc.AuthorizeDecision = func(_ context.Context, job *registry.Job) error {
-		if job.JobID != f.jobID {
-			t.Fatalf("authorized job %s", job.JobID)
+	f.svc.AuthorizeDecision = func(_ context.Context, tx *registry.JobTx, v Verdict) error {
+		if tx.Job.JobID != f.jobID || v != VerdictReject {
+			t.Fatalf("authorized job %s verdict %s", tx.Job.JobID, v)
 		}
 		return denied
 	}
@@ -472,5 +502,104 @@ func TestDecideRequiresDecisionAuthorization(t *testing.T) {
 	}
 	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
 		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
+	}
+}
+
+// A snooze keeps the native task open, so the decision made after it expires
+// completes the task, once, with that decision.
+func TestDecideSnoozeThenApproveCompletesTaskOnce(t *testing.T) {
+	f := newFixture(t)
+	snooze := f.request(VerdictSnooze, "key-snooze-then")
+	until := f.now.Add(time.Hour)
+	snooze.SnoozeUntil = &until
+	res, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, snooze, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Decision.NativeResume != "" || len(f.tasks.calls) != 0 {
+		t.Fatalf("snooze native_resume = %q, completions = %d; want empty, 0", res.Decision.NativeResume, len(f.tasks.calls))
+	}
+
+	f.setClock(until.Add(time.Minute))
+	approve := f.request(VerdictApprove, "key-after-snooze")
+	approve.ExpectedProposalRevision = res.Proposal.Revision
+	res, err = f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, approve, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.NativeErr != nil || res.Decision.NativeResume != "completed" {
+		t.Fatalf("approve after snooze = %+v, native err %v", res.Decision, res.NativeErr)
+	}
+	if len(f.tasks.calls) != 1 || f.tasks.calls[0].Input.Values["verdict"] != "approve" {
+		t.Fatalf("native completions = %+v, want one approve", f.tasks.calls)
+	}
+}
+
+// A committed snooze is recoverable by an identical replay after its expiry.
+func TestDecideReplaysExpiredSnooze(t *testing.T) {
+	f := newFixture(t)
+	req := f.request(VerdictSnooze, "key-expired-snooze")
+	until := f.now.Add(time.Hour)
+	req.SnoozeUntil = &until
+	first, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, req, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.setClock(until.Add(24 * time.Hour))
+	again, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, req, f.human)
+	if err != nil {
+		t.Fatalf("replay after expiry: %v", err)
+	}
+	if !again.AlreadyRecorded || again.Decision.DecisionID != first.Decision.DecisionID {
+		t.Fatalf("replay = %+v", again.Decision)
+	}
+	// A new snooze with that past expiry is still refused.
+	stale := f.request(VerdictSnooze, "key-new-past-snooze")
+	stale.ExpectedProposalRevision = again.Proposal.Revision
+	stale.SnoozeUntil = &until
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, stale, f.human); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("new past snooze err = %v, want ErrInvalid", err)
+	}
+}
+
+// Retry is refused on an ordinary proposal even when the proposal allows
+// every verdict or names retry explicitly.
+func TestDecideRefusesRetryOnUntypedProposal(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.svc.Decide(f.ctx, f.jobID, f.proposal.ProposalID, f.request(VerdictRetry, "key-retry-untyped"), f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("retry with empty allowed verdicts: err = %v, want not_permitted", err)
+	}
+	explicit := f.fileProposalWith(registry.Proposal{
+		Action:          registry.ActionSpec{Name: "resize", Target: &f.version.Targets[0], Params: json.RawMessage(`{"sizeGi":30}`)},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{
+		ExpectedProposalRevision: explicit.Revision,
+		BindingDigest:            explicit.BindingDigest,
+		Verdict:                  VerdictRetry,
+		IdempotencyKey:           "key-retry-explicit",
+	}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, explicit.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("retry explicitly allowed: err = %v, want not_permitted", err)
+	}
+	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
+		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
+	}
+}
+
+// Until the registry can authorize a bound native retry, retry on a
+// dagu.retry_run proposal is refused rather than recorded as unexecutable.
+func TestDecideRefusesRunRetryUntilAuthorizable(t *testing.T) {
+	f := newFixture(t)
+	p := f.fileProposalWith(registry.Proposal{
+		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: json.RawMessage(`{"run_id":"run-0003"}`)},
+		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
+	})
+	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-run-retry-1"}
+	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
+		t.Fatalf("err = %v, want not_permitted", err)
+	}
+	if n := len(f.decisions()); n != 0 {
+		t.Fatalf("decisions = %d, want 0", n)
 	}
 }

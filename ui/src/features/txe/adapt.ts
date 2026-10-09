@@ -118,6 +118,18 @@ export function toProposal(
   };
 }
 
+// currentNativeResume mirrors the server's rule. The stored decision keeps
+// the state it was written with; the job's pending list says whether native
+// completion is outstanding, and a snooze never completes its task.
+function currentNativeResume(
+  d: ApiDecision,
+  job: Pick<ApiJob, 'native_resumes'>
+): Decision['nativeResume'] {
+  if (job.native_resumes?.[d.decision_id] !== undefined) return 'pending';
+  if (d.verdict === 'snooze' || !d.native_resume) return 'none';
+  return 'completed';
+}
+
 export function toDecision(
   d: ApiDecision,
   job: Pick<ApiJob, 'job_id' | 'owner_id' | 'native_resumes'>,
@@ -140,12 +152,7 @@ export function toDecision(
     createdAt: d.decided_at,
     // The stored decision keeps the state it was written with; the job's
     // pending list says whether native completion is still outstanding.
-    nativeResume:
-      job.native_resumes?.[d.decision_id] !== undefined
-        ? 'pending'
-        : d.native_resume === 'pending'
-          ? 'completed'
-          : (d.native_resume ?? 'none'),
+    nativeResume: currentNativeResume(d, job),
   };
 }
 
@@ -198,6 +205,7 @@ export function toJob(
       job.availability.observed_at ?? latestRuns[0]?.finishedAt,
     latestRuns,
     machineId: job.machine_id,
+    pendingFollowUps: Object.keys(job.native_resumes ?? {}),
     retirement: job.retirement
       ? {
           reason: job.retirement.reason,

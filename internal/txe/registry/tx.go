@@ -6,6 +6,7 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -384,10 +385,8 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	if len(kinds) == 0 {
 		return nil
 	}
-	for _, k := range kinds {
-		if c.Kind == k {
-			return nil
-		}
+	if slices.Contains(kinds, c.Kind) {
+		return nil
 	}
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }
@@ -610,7 +609,9 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	if d.Actor.Kind == "" {
 		d.Actor = tx.actor
 	}
-	if p.NativeTask != nil {
+	// A snooze leaves the Dagu human task waiting, so there is nothing to
+	// resume yet.
+	if p.NativeTask != nil && next != ProposalSnoozed {
 		d.NativeResume = "pending"
 		if j.NativeResumes == nil {
 			j.NativeResumes = map[string]*NativeResume{}
@@ -642,6 +643,21 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	}
 	out := stored
 	return &out, nil
+}
+
+// CurrentNativeResume is the native task state of decision d on job now:
+// "pending" while job still has to complete the decision's Dagu human task,
+// "completed" once it has, and "" when there was none to complete (no
+// native task, or a snooze). The decision record keeps the value it was
+// written with; readers report this instead.
+func CurrentNativeResume(job *Job, d *Decision) string {
+	if _, pending := job.NativeResumes[d.DecisionID]; pending {
+		return "pending"
+	}
+	if d.NativeResume == "" || d.Verdict == VerdictSnooze {
+		return ""
+	}
+	return "completed"
 }
 
 // PendingNativeResumes returns decisions whose Dagu human task has not been

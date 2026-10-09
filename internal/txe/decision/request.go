@@ -62,9 +62,10 @@ type Request struct {
 	IdempotencyKey           string
 }
 
-// Validate checks the request shape. State checks (revision, digest,
-// lifecycle, allowed verdicts) happen inside the job transaction.
-func (r *Request) Validate(now time.Time) error {
+// ValidateShape checks the request independently of time and current state.
+// It applies to every request, including an identical replay of a decision
+// stored earlier.
+func (r *Request) ValidateShape() error {
 	if r.ExpectedProposalRevision < 1 {
 		return fmt.Errorf("%w: expectedProposalRevision must be at least 1", ErrInvalid)
 	}
@@ -84,22 +85,40 @@ func (r *Request) Validate(now time.Time) error {
 	if r.Verdict == VerdictRedirect && r.Instructions == "" {
 		return fmt.Errorf("%w: redirect requires instructions", ErrInvalid)
 	}
-	if r.Verdict == VerdictSnooze {
-		if r.SnoozeUntil == nil {
-			return fmt.Errorf("%w: snooze requires snoozeUntil", ErrInvalid)
-		}
+	switch {
+	case r.Verdict == VerdictSnooze && r.SnoozeUntil == nil:
+		return fmt.Errorf("%w: snooze requires snoozeUntil", ErrInvalid)
+	case r.Verdict != VerdictSnooze && r.SnoozeUntil != nil:
+		return fmt.Errorf("%w: snoozeUntil is only valid with snooze", ErrInvalid)
+	case r.SnoozeUntil != nil:
 		until := r.SnoozeUntil.UTC()
 		r.SnoozeUntil = &until
-		if !until.After(now) {
-			return fmt.Errorf("%w: snoozeUntil must be in the future", ErrInvalid)
-		}
-		if until.Sub(now) > MaxSnooze {
-			return fmt.Errorf("%w: snoozeUntil must be within %s", ErrInvalid, MaxSnooze)
-		}
-	} else if r.SnoozeUntil != nil {
-		return fmt.Errorf("%w: snoozeUntil is only valid with snooze", ErrInvalid)
 	}
 	return nil
+}
+
+// ValidateNew checks what only a new decision must satisfy at now: a snooze
+// expiry in the future and within MaxSnooze. A replay of a stored decision
+// skips it, so a committed snooze can be recovered after it expired.
+func (r *Request) ValidateNew(now time.Time) error {
+	if r.SnoozeUntil == nil {
+		return nil
+	}
+	if !r.SnoozeUntil.After(now) {
+		return fmt.Errorf("%w: snoozeUntil must be in the future", ErrInvalid)
+	}
+	if r.SnoozeUntil.Sub(now) > MaxSnooze {
+		return fmt.Errorf("%w: snoozeUntil must be within %s", ErrInvalid, MaxSnooze)
+	}
+	return nil
+}
+
+// Validate checks a new decision: its shape and its timing at now.
+func (r *Request) Validate(now time.Time) error {
+	if err := r.ValidateShape(); err != nil {
+		return err
+	}
+	return r.ValidateNew(now)
 }
 
 // SameAs reports whether two requests carry the same decision content, which
@@ -127,19 +146,28 @@ const (
 	LifecycleRetire LifecycleOp = "retire"
 )
 
-// Effect describes what recording a verdict changes. Only approve leaves the
-// proposal executable, and only through the pre-effect guard. Every other
-// verdict except snooze closes the proposal; redirect saves instructions for
-// the next review and grants nothing.
+// Effect describes what recording a verdict changes. Only approve, and retry
+// on a bound native-retry proposal, leave the proposal executable, and only
+// through the pre-effect guard. Every other verdict except snooze closes the
+// proposal. Nothing here causes an effect: the reviewer executes decided
+// proposals through the registry's action journal.
 type Effect struct {
 	Proposal  registry.ProposalState
 	Lifecycle LifecycleOp
-	// RetryRun asks for a native retry of the job's latest run after commit.
-	RetryRun bool
 }
 
-// EffectOf maps a verdict to its effect.
-func EffectOf(v Verdict) Effect {
+// Typed actions on which a retry verdict has a meaning. The registry refuses
+// retry on any other proposal.
+const (
+	// ActionRetryRun retries one exact, bound native run.
+	ActionRetryRun = "dagu.retry_run"
+	// ActionUncertainEffect is an escalation of an action whose effect is
+	// unknown; retry there resolves it and allows one more attempt.
+	ActionUncertainEffect = "txe.uncertain_effect"
+)
+
+// EffectOf maps a verdict on a proposal for action to its effect.
+func EffectOf(v Verdict, action string) Effect {
 	switch v {
 	case VerdictApprove:
 		return Effect{Proposal: registry.ProposalDecided}
@@ -150,7 +178,12 @@ func EffectOf(v Verdict) Effect {
 	case VerdictRetire:
 		return Effect{Proposal: registry.ProposalRejected, Lifecycle: LifecycleRetire}
 	case VerdictRetry:
-		return Effect{Proposal: registry.ProposalRejected, RetryRun: true}
+		// Executable only as the bound native retry; on an uncertain-effect
+		// escalation it records the resolution and closes the escalation.
+		if action == ActionRetryRun {
+			return Effect{Proposal: registry.ProposalDecided}
+		}
+		return Effect{Proposal: registry.ProposalRejected}
 	case VerdictReject, VerdictRedirect:
 		return Effect{Proposal: registry.ProposalRejected}
 	}

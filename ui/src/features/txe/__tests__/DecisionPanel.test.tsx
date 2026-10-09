@@ -151,6 +151,75 @@ describe('DecisionPanel', () => {
     expect(onSubmit).toHaveBeenCalledTimes(1);
   });
 
+  it('offers retry only on the typed retry proposals', () => {
+    render(
+      <DecisionPanel
+        proposal={fixtureProposal({
+          allowedVerdicts: ['approve', 'retry', 'reject'],
+        })}
+        canDecide
+        onSubmit={vi.fn()}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    expect(
+      screen.queryByRole('button', { name: /Retry/ })
+    ).not.toBeInTheDocument();
+  });
+
+  it('names the two meanings of retry differently', () => {
+    const { rerender } = render(
+      <DecisionPanel
+        proposal={fixtureProposal({
+          action: {
+            name: 'dagu.retry_run',
+            target: { kind: 'dagu.run', stableId: 'run-0003' },
+            params: { run_id: 'run-0003' },
+          },
+          allowedVerdicts: ['retry', 'reject'],
+        })}
+        canDecide
+        onSubmit={vi.fn()}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    // Run retry is not offered until the server can authorize it.
+    expect(
+      screen.queryByRole('button', { name: 'Retry this run' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId('txe-uncertain-effect')
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <DecisionPanel
+        proposal={fixtureProposal({
+          proposalId: 'prp_uncertain',
+          action: {
+            name: 'txe.uncertain_effect',
+            target: { kind: 'k8s.pv', stableId: 'pv-uid-0001' },
+            params: {},
+          },
+          allowedVerdicts: ['retry', 'reject'],
+        })}
+        canDecide
+        onSubmit={vi.fn()}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    expect(
+      screen.getByRole('button', {
+        name: 'Confirm it did not take effect and allow one retry',
+      })
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('txe-uncertain-effect')).toHaveTextContent(
+      'It has not proved the effect is absent.'
+    );
+  });
+
   it('shows no controls without permission', () => {
     render(
       <DecisionPanel

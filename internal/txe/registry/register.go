@@ -16,7 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/gofrs/flock"
+
 	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
@@ -231,25 +232,18 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 		}
 	}
 	if job.Registration.State == RegistrationIncomplete {
-		if err := s.withDAGLock(ctx, in.JobID, func() error {
-			_, _, err := s.publishDAG(ctx, in.JobID)
-			return err
-		}); err != nil {
+		if err := s.publishCurrent(ctx, in.JobID); err != nil {
 			return nil, err
 		}
 	}
 	return job, nil
 }
 
-// dagLockStale is how long a silent cross-process DAG lock is honoured;
-// a holder renews it every third of that.
-const dagLockStale = 30 * time.Second
-
-// withDAGLock runs fn while holding the job's DAG publication lock. Every
-// write of a job's DAG happens under it, so an older request does not
-// replace the DAG a newer one published. If a stalled holder loses the
-// cross-process lock anyway, publishDAG converges back to the current
-// version after its write.
+// withDAGLock runs fn while holding the job's DAG publication lock: a
+// mutex in this process and an OS file lock across processes, which the
+// kernel releases only when its holder closes it or exits, so it cannot be
+// taken from a live writer. Every write of a job's DAG happens under it and
+// publishes the version the job has when the lock is held.
 func (s *Store) withDAGLock(ctx context.Context, jobID string, fn func() error) error {
 	m, _ := s.dagLocks.LoadOrStore(jobID, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
@@ -258,69 +252,58 @@ func (s *Store) withDAGLock(ctx context.Context, jobID string, fn func() error) 
 	if s.lockDir == "" {
 		return fn()
 	}
-	dir := filepath.Join(s.lockDir, jobID)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(s.lockDir, 0o750); err != nil {
 		return fmt.Errorf("registry: DAG lock %s: %w", jobID, err)
 	}
-	lock := dirlock.New(dir, &dirlock.LockOptions{StaleThreshold: dagLockStale, RetryInterval: 20 * time.Millisecond})
-	if err := lock.Lock(ctx); err != nil {
+	lock := flock.New(filepath.Join(s.lockDir, jobID+".lock"))
+	locked, err := lock.TryLockContext(ctx, 20*time.Millisecond)
+	if err != nil {
 		return fmt.Errorf("registry: DAG lock %s: %w", jobID, err)
 	}
-	done := make(chan struct{})
-	renewed := make(chan struct{})
-	go func() {
-		defer close(renewed)
-		t := time.NewTicker(dagLockStale / 3)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				_ = lock.Heartbeat(ctx)
-			}
-		}
-	}()
-	defer func() {
-		close(done)
-		<-renewed
-		_ = lock.Unlock()
-	}()
+	if !locked {
+		return fmt.Errorf("registry: DAG lock %s was not acquired", jobID)
+	}
+	defer func() { _ = lock.Unlock() }()
 	return fn()
 }
 
-// publishDAG makes the saved DAG match the job's committed current version.
-// It never writes the version a caller started from, only the one committed
-// now, and after writing it re-reads both, so a writer that raced a newer
-// publication writes the newer version again. It must run under withDAGLock
-// and returns the job it published for and the saved spec digest.
-func (s *Store) publishDAG(ctx context.Context, jobID string) (*Job, string, error) {
-	for attempt := 0; ; attempt++ {
+// publishDAG makes the saved DAG match the current version of job, a
+// snapshot read under withDAGLock. A version committed after that read is
+// published by its own writer once the lock is free, so the saved DAG never
+// goes back to an older version than one already published. It returns the
+// saved spec digest.
+func (s *Store) publishDAG(ctx context.Context, job *Job) (string, error) {
+	v, err := s.versionOf(ctx, job, job.Version)
+	if err != nil {
+		return "", err
+	}
+	specSHA, err := s.dags.SpecSHA256(ctx, job.JobID)
+	if err != nil && !errors.Is(err, persis.ErrNotFound) {
+		return "", err
+	}
+	if specSHA == v.DAG.SpecSHA256 {
+		return specSHA, nil
+	}
+	if err := s.dags.WriteSpec(ctx, job.JobID, []byte(v.DAG.Spec)); err != nil {
+		return "", fmt.Errorf("registry: write DAG %s: %w", job.JobID, err)
+	}
+	return s.dags.SpecSHA256(ctx, job.JobID)
+}
+
+// publishCurrent publishes the job's current version unless the job is a
+// duplicate.
+func (s *Store) publishCurrent(ctx context.Context, jobID string) error {
+	return s.withDAGLock(ctx, jobID, func() error {
 		job, err := s.GetJob(ctx, jobID)
 		if err != nil {
-			return nil, "", err
+			return err
 		}
 		if job.Registration.State == RegistrationDuplicate {
-			return job, "", nil
+			return nil
 		}
-		v, err := s.versionOf(ctx, job, job.Version)
-		if err != nil {
-			return nil, "", err
-		}
-		specSHA, err := s.dags.SpecSHA256(ctx, jobID)
-		if err != nil && !errors.Is(err, persis.ErrNotFound) {
-			return nil, "", err
-		}
-		if specSHA == v.DAG.SpecSHA256 {
-			return job, specSHA, nil
-		}
-		if attempt == 5 {
-			return nil, "", fmt.Errorf("registry: DAG %s keeps changing during publication", jobID)
-		}
-		if err := s.dags.WriteSpec(ctx, jobID, []byte(v.DAG.Spec)); err != nil {
-			return nil, "", fmt.Errorf("registry: write DAG %s: %w", jobID, err)
-		}
-	}
+		_, err = s.publishDAG(ctx, job)
+		return err
+	})
 }
 
 func (s *Store) markDuplicate(ctx context.Context, jobID, winnerID string, by Actor) error {
@@ -447,11 +430,17 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 	}
 	var receipt *Receipt
 	// The lock spans publication and the ready commit, so the DAG verified is
-	// still the saved one when the job becomes ready.
+	// still the saved one when the job becomes ready. Only the version of
+	// the job read under the lock is published and made ready, and with an
+	// expected revision nothing is written, nor a receipt returned, unless
+	// that is the revision read.
 	err := s.withDAGLock(ctx, jobID, func() error {
 		job, err := s.GetJob(ctx, jobID)
 		if err != nil {
 			return err
+		}
+		if expectedRevision != 0 && job.Revision != expectedRevision {
+			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, expectedRevision), Current: job}
 		}
 		dedupeID := dedupePrefix + job.OwnerID + "/" + job.ProjectID + "/" + job.Registration.DedupeKey
 		var winner dedupeRecord
@@ -464,18 +453,13 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 		if winner.JobID != jobID {
 			return refuse(CodeDuplicate, "job key is registered as %s", winner.JobID)
 		}
-		published, specSHA, err := s.publishDAG(ctx, jobID)
+		specSHA, err := s.publishDAG(ctx, job)
 		if err != nil {
 			return err
 		}
-		if published.Registration.State == RegistrationReady && published.Registration.Package != nil && published.Registration.Package.Digest == pkg.Digest {
-			receipt = receiptOf(published)
+		if job.Registration.State == RegistrationReady && job.Registration.Package != nil && job.Registration.Package.Digest == pkg.Digest {
+			receipt = receiptOf(job)
 			return nil
-		}
-		// The revision names the job state the caller checked; only the
-		// version of that state is made ready.
-		if expectedRevision != 0 && published.Revision != expectedRevision {
-			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", published.Revision, expectedRevision), Current: published}
 		}
 		committed, err := s.WithJobTx(ctx, jobID, by, func(tx *JobTx) error {
 			j := tx.Job
@@ -486,7 +470,7 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 				return refuse(CodeDuplicate, "job is a duplicate of %s", j.Registration.DuplicateOf)
 			case RegistrationIncomplete:
 			}
-			if j.Version != published.Version {
+			if j.Version != job.Version {
 				return &Error{Code: CodeVersionConflict, Message: "job version changed during readiness check", Current: j}
 			}
 			if specSHA != j.DAGSpecSHA256 {
@@ -592,10 +576,7 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 	if err != nil {
 		return nil, err
 	}
-	if err := s.withDAGLock(ctx, jobID, func() error {
-		_, _, err := s.publishDAG(ctx, jobID)
-		return err
-	}); err != nil {
+	if err := s.publishCurrent(ctx, jobID); err != nil {
 		return nil, err
 	}
 	return committed, nil

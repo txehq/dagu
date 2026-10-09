@@ -6,6 +6,7 @@ import { Link, useParams } from 'react-router-dom';
 
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { RelativeTime } from '@/components/ui/relative-time';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { useCanExecute } from '@/contexts/AuthContext';
@@ -17,7 +18,15 @@ import { useJobDetail, useTxeApi } from '@/features/txe/hooks';
 import { isProposalActionable } from '@/features/txe/inbox';
 import type { Decision, Proposal } from '@/features/txe/types';
 
-function DecisionHistory({ decisions }: { decisions: Decision[] }) {
+function DecisionHistory({
+  decisions,
+  onReplay,
+}: {
+  decisions: Decision[];
+  onReplay: (d: Decision) => Promise<string | null>;
+}) {
+  const [replaying, setReplaying] = React.useState<string | null>(null);
+  const [outcome, setOutcome] = React.useState<Record<string, string>>({});
   if (decisions.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
@@ -34,6 +43,43 @@ function DecisionHistory({ decisions }: { decisions: Decision[] }) {
           <RelativeTime timestamp={decision.createdAt} /> · rev{' '}
           {decision.proposalRevision} · v{decision.jobVersion}
           {decision.snoozeUntil && <> · until {decision.snoozeUntil}</>}
+          {decision.nativeResume === 'pending' && (
+            <span className="ml-2" data-testid="txe-follow-up-pending">
+              <span className="text-warning">
+                <I18nText text="follow-up pending" />
+              </span>{' '}
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                disabled={replaying === decision.decisionId}
+                onClick={async () => {
+                  setReplaying(decision.decisionId);
+                  let message: string | null;
+                  try {
+                    message = await onReplay(decision);
+                  } catch (error) {
+                    // A transport failure must leave the control usable.
+                    message =
+                      error instanceof Error ? error.message : String(error);
+                  } finally {
+                    setReplaying(null);
+                  }
+                  setOutcome((o) => ({
+                    ...o,
+                    [decision.decisionId]: message ?? 'Follow-up completed.',
+                  }));
+                }}
+              >
+                <I18nText text="Complete follow-up" />
+              </Button>
+              {outcome[decision.decisionId] && (
+                <span className="ml-2 text-muted-foreground">
+                  {outcome[decision.decisionId]}
+                </span>
+              )}
+            </span>
+          )}
           {decision.instructions && (
             <p className="whitespace-pre-wrap pl-2 text-muted-foreground">
               {decision.instructions}
@@ -103,6 +149,11 @@ function ProposalSection({
         decisions={decisions.filter(
           (d) => d.proposalId === proposal.proposalId
         )}
+        onReplay={async (d) => {
+          const result = await api.replayDecision(proposal.jobId, d);
+          await onChanged();
+          return result.ok ? null : result.message;
+        }}
       />
     </section>
   );

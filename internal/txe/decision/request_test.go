@@ -98,19 +98,27 @@ func TestRequestSameAs(t *testing.T) {
 }
 
 func TestEffectOf(t *testing.T) {
-	if got := EffectOf(VerdictReject); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone {
+	if got := EffectOf(VerdictReject, ""); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone {
 		t.Fatalf("reject = %+v", got)
 	}
-	if got := EffectOf(VerdictRetire); got.Lifecycle != LifecycleRetire {
+	if got := EffectOf(VerdictRetire, ""); got.Lifecycle != LifecycleRetire {
 		t.Fatalf("retire = %+v", got)
 	}
-	if got := EffectOf(VerdictApprove); got.Proposal != registry.ProposalDecided {
+	if got := EffectOf(VerdictApprove, ""); got.Proposal != registry.ProposalDecided {
 		t.Fatalf("approve = %+v", got)
 	}
-	if got := EffectOf(VerdictRedirect); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone || got.RetryRun {
+	if got := EffectOf(VerdictRedirect, ""); got.Proposal != registry.ProposalRejected || got.Lifecycle != LifecycleNone {
 		t.Fatalf("redirect must grant nothing beyond a decided proposal: %+v", got)
 	}
-	if got := EffectOf(VerdictSnooze); got.Proposal != registry.ProposalSnoozed {
+	// Retry is executable only on the bound native-retry proposal; on an
+	// uncertain-effect escalation it closes the escalation.
+	if got := EffectOf(VerdictRetry, ActionRetryRun); got != (Effect{Proposal: registry.ProposalDecided}) {
+		t.Fatalf("retry on %s = %+v", ActionRetryRun, got)
+	}
+	if got := EffectOf(VerdictRetry, ActionUncertainEffect); got != (Effect{Proposal: registry.ProposalRejected}) {
+		t.Fatalf("retry on %s = %+v", ActionUncertainEffect, got)
+	}
+	if got := EffectOf(VerdictSnooze, ""); got.Proposal != registry.ProposalSnoozed {
 		t.Fatalf("snooze = %+v", got)
 	}
 }

@@ -45,8 +45,7 @@ func (e *Error) Error() string {
 
 // ErrorCode returns err's registry code, or "" when err is not a registry error.
 func ErrorCode(err error) Code {
-	var re *Error
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*Error](err); ok {
 		return re.Code
 	}
 	return ""

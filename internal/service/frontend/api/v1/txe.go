@@ -152,17 +152,18 @@ func (a *API) txeRequireJobWrite(ctx context.Context, tx *registry.JobTx) error 
 }
 
 // txeCheckVersion runs check on the workspaces of one committed version of
-// a job and of its saved DAG. A version that does not exist is left to the
-// registry to refuse.
-func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, jobID string, version int, check func(context.Context, string) error) error {
-	v, err := s.GetVersion(ctx, jobID, version)
+// a job and of its saved DAG. A version that does not exist yet is refused
+// as a version conflict: it was not authorized, even if it is committed
+// before the change is.
+func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, job *registry.Job, version int, check func(context.Context, string) error) error {
+	if version < 1 || version > job.Version {
+		return txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at version %d, not %d", job.Version, version), Current: job})
+	}
+	v, err := s.GetVersion(ctx, job.JobID, version)
 	if err != nil {
-		if registry.ErrorCode(err) == registry.CodeNotFound {
-			return nil
-		}
 		return txeError(err)
 	}
-	return a.txeCheckWorkspaces(ctx, jobID, v.DAG.Spec, true, check)
+	return a.txeCheckWorkspaces(ctx, job.JobID, v.DAG.Spec, true, check)
 }
 
 func (a *API) txeRequireWorkspaceWrite(ctx context.Context, workspaceName string) error {
@@ -203,6 +204,62 @@ func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict
 		return err
 	}
 	return check(ctx, dagWorkspaceName(cur))
+}
+
+// txeJobVisible refuses, as not found, a job the caller cannot see: the
+// workspaces of its current version and of its saved DAG must be visible.
+func (a *API) txeJobVisible(ctx context.Context, s *registry.Store, job *registry.Job) error {
+	if a.authService == nil {
+		return nil
+	}
+	v, err := s.GetVersion(ctx, job.JobID, job.Version)
+	if err != nil {
+		return txeError(err)
+	}
+	return a.txeCheckWorkspaces(ctx, job.JobID, v.DAG.Spec, true, a.requireWorkspaceVisible)
+}
+
+// txeVisibleJob returns the committed job if the caller can see it.
+func (a *API) txeVisibleJob(ctx context.Context, s *registry.Store, jobID string) (*registry.Job, error) {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	if err := a.txeJobVisible(ctx, s, job); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// txeReadHistory authorizes a job and runs read, which reads its history,
+// on the snapshot it authorized: if the job changed meanwhile, both are
+// repeated, so no record committed after the authorization is returned.
+func (a *API) txeReadHistory(ctx context.Context, s *registry.Store, jobID string, read func() error) (*registry.Job, error) {
+	for range 5 {
+		job, err := a.txeVisibleJob(ctx, s, jobID)
+		if err != nil {
+			return nil, err
+		}
+		if err := read(); err != nil {
+			return nil, txeError(err)
+		}
+		after, err := s.GetJob(ctx, jobID)
+		if err != nil {
+			return nil, txeError(err)
+		}
+		if after.Revision == job.Revision {
+			return job, nil
+		}
+	}
+	return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict, Message: "job " + jobID + " kept changing while it was read; retry",
+		Details: map[string]any{"code": string(registry.CodeVersionConflict)}}
+}
+
+// txeAlreadyReady reports whether job is ready with pkg, which readiness
+// returns as is.
+func txeAlreadyReady(job *registry.Job, pkg registry.PackageEvidence) bool {
+	r := job.Registration
+	return r.State == registry.RegistrationReady && r.Package != nil && r.Package.Digest == pkg.Digest
 }
 
 func txeBody[T any](body *T) (*T, error) {
@@ -353,9 +410,15 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 	if p.Lifecycle != nil {
 		f.Lifecycle = registry.Lifecycle(*p.Lifecycle)
 	}
-	jobs, err := s.ListJobs(ctx, f)
+	all, err := s.ListJobs(ctx, f)
 	if err != nil {
 		return nil, txeError(err)
+	}
+	jobs := make([]*registry.Job, 0, len(all))
+	for _, job := range all {
+		if a.txeJobVisible(ctx, s, job) == nil {
+			jobs = append(jobs, job)
+		}
 	}
 	out, err := txeConvert[[]api.TxeJob](jobs)
 	if out == nil {
@@ -396,9 +459,9 @@ func (a *API) GetTxeJob(ctx context.Context, req api.GetTxeJobRequestObject) (ap
 	if err != nil {
 		return nil, err
 	}
-	job, err := s.GetJob(ctx, req.JobId)
+	job, err := a.txeVisibleJob(ctx, s, req.JobId)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, err
 	}
 	out, err := txeConvert[api.TxeJob](job)
 	return api.GetTxeJob200JSONResponse(out), err
@@ -429,18 +492,21 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 		if err != nil {
 			return nil, txeError(err)
 		}
-		if err := a.txeCheckVersion(ctx, s, req.JobId, job.Version, a.requireDAGWriteForWorkspace); err != nil {
+		if err := a.txeCheckVersion(ctx, s, job, job.Version, a.requireDAGWriteForWorkspace); err != nil {
 			return nil, err
 		}
-		expected := valueOf(body.ExpectedRevision)
-		if expected == 0 {
-			expected = job.Revision
+		// An explicit revision must be the one authorized, except for a
+		// replay of a readiness that already succeeded.
+		explicit := valueOf(body.ExpectedRevision)
+		pinned := explicit != 0 && !txeAlreadyReady(job, pkg)
+		if pinned && explicit != job.Revision {
+			return nil, txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, explicit), Current: job})
 		}
-		receipt, err = s.MarkReady(ctx, req.JobId, expected, pkg, actor)
+		receipt, err = s.MarkReady(ctx, req.JobId, job.Revision, pkg, actor)
 		if err == nil {
 			break
 		}
-		if valueOf(body.ExpectedRevision) != 0 || registry.ErrorCode(err) != registry.CodeVersionConflict || attempt == 4 {
+		if pinned || registry.ErrorCode(err) != registry.CodeVersionConflict || attempt == 4 {
 			return nil, txeError(err)
 		}
 	}
@@ -466,7 +532,11 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	}
 	// The update is accepted only against expected_version, so that is the
 	// committed version the caller must be able to write.
-	if err := a.txeCheckVersion(ctx, s, req.JobId, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
+	cur, err := s.GetJob(ctx, req.JobId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	if err := a.txeCheckVersion(ctx, s, cur, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
 		return nil, err
 	}
 	job, err := s.UpdateVersion(ctx, req.JobId, body.RequestId, body.ExpectedVersion, v, actor)
@@ -482,9 +552,18 @@ func (a *API) GetTxeJobVersion(ctx context.Context, req api.GetTxeJobVersionRequ
 	if err != nil {
 		return nil, err
 	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
 	v, err := s.GetVersion(ctx, req.JobId, req.Version)
 	if err != nil {
 		return nil, txeError(err)
+	}
+	// An earlier version may name a workspace the job has since left.
+	if a.authService != nil {
+		if err := a.txeCheckWorkspaces(ctx, req.JobId, v.DAG.Spec, true, a.requireWorkspaceVisible); err != nil {
+			return nil, err
+		}
 	}
 	out, err := txeConvert[api.TxeJobVersion](v)
 	return api.GetTxeJobVersion200JSONResponse(out), err
@@ -511,9 +590,12 @@ func (a *API) ListTxeJobEvents(ctx context.Context, req api.ListTxeJobEventsRequ
 	if err != nil {
 		return nil, err
 	}
-	events, err := s.ListEvents(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
+	var events []*registry.Event
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		events, err = s.ListEvents(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	}); err != nil {
+		return nil, err
 	}
 	out, err := txeConvert[[]api.TxeEvent](events)
 	if out == nil {
@@ -599,9 +681,12 @@ func (a *API) ListTxeReviews(ctx context.Context, req api.ListTxeReviewsRequestO
 	if err != nil {
 		return nil, err
 	}
-	reviews, err := s.ListReviews(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
+	var reviews []*registry.Review
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		reviews, err = s.ListReviews(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	}); err != nil {
+		return nil, err
 	}
 	out, err := txeConvert[[]api.TxeReview](reviews)
 	if out == nil {
@@ -630,13 +715,13 @@ func (a *API) ListTxeProposals(ctx context.Context, req api.ListTxeProposalsRequ
 	if err != nil {
 		return nil, err
 	}
-	job, err := s.GetJob(ctx, req.JobId)
+	var finished []*registry.Proposal
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		finished, err = s.ListArchivedProposals(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
 	if err != nil {
-		return nil, txeError(err)
-	}
-	finished, err := s.ListArchivedProposals(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
+		return nil, err
 	}
 	open := make([]*registry.Proposal, 0, len(job.Proposals))
 	for _, p := range job.Proposals {
@@ -679,9 +764,20 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 	if err != nil {
 		return nil, err
 	}
-	decisions, err := s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
+	var decisions []*registry.Decision
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		decisions, err = s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
 	if err != nil {
-		return nil, txeError(err)
+		return nil, err
+	}
+	// A decision record keeps the native_resume it was written with; report
+	// the state of the job the decisions were read from.
+	for i, d := range decisions {
+		cp := *d
+		cp.NativeResume = registry.CurrentNativeResume(job, d)
+		decisions[i] = &cp
 	}
 	if since := valueOf(req.Params.Since); since != "" {
 		for i, d := range decisions {
@@ -731,13 +827,13 @@ func (a *API) ListTxeActions(ctx context.Context, req api.ListTxeActionsRequestO
 	if err != nil {
 		return nil, err
 	}
-	job, err := s.GetJob(ctx, req.JobId)
+	var archived []*registry.Action
+	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		archived, err = s.ListArchivedActions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		return err
+	})
 	if err != nil {
-		return nil, txeError(err)
-	}
-	archived, err := s.ListArchivedActions(ctx, req.JobId, txeLimit(req.Params.Limit))
-	if err != nil {
-		return nil, txeError(err)
+		return nil, err
 	}
 	inFlight := make([]*registry.Action, 0, len(job.Actions))
 	for _, act := range job.Actions {

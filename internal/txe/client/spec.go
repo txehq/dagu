@@ -149,7 +149,7 @@ func CheckDeliverablePath(path string) error {
 	case strings.ContainsAny(path, "*?[]{}$`\\\n\r\x00"):
 		return fmt.Errorf("%q must be an exact file name: no patterns, variables or control characters", path)
 	}
-	for _, part := range strings.Split(path, "/") {
+	for part := range strings.SplitSeq(path, "/") {
 		if part == "" || part == "." || part == ".." {
 			return fmt.Errorf("%q must not contain empty, \".\" or \"..\" components", path)
 		}

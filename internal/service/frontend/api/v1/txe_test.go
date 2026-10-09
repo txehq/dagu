@@ -296,4 +296,176 @@ func TestTxeAPIUpdateChecksCommittedVersion(t *testing.T) {
 			Dag:     apigen.TxeDAGRef{Spec: spec},
 		}}})
 	requireStatus(t, err, http.StatusForbidden)
+
+	// A version that does not exist yet was not authorized: it is a conflict,
+	// whatever is committed after the check.
+	opsJob, err := f.register(txeOps, "ops")
+	require.NoError(t, err)
+	_, err = a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: opsJob, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 2,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+		}}})
+	requireStatus(t, err, http.StatusConflict)
+}
+
+// Only a signed-in person reactivates a retired job. An API key cannot claim
+// to be human, and the descriptive actor fields never make it one.
+func TestTxeAPIReactivateNeedsHumanPrincipal(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	reason := apigen.TxeLifecycleRequestReasonManual
+	_, err = a.TransitionTxeJob(txeAdmin, apigen.TransitionTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeLifecycleRequest{
+		Op: apigen.TxeLifecycleRequestOpRetire, Reason: &reason}})
+	require.NoError(t, err)
+
+	key := &auth.APIKey{ID: "k1", Name: "reviewer", Role: auth.RoleDeveloper}
+	keyCtx := auth.WithAPIKey(auth.WithUser(context.Background(), &auth.User{ID: "apikey:k1", Username: "apikey:reviewer", Role: auth.RoleDeveloper}), key)
+	reactivate := func(ctx context.Context, actor *apigen.TxeActor) error {
+		_, err := a.TransitionTxeJob(ctx, apigen.TransitionTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeLifecycleRequest{
+			Op: apigen.TxeLifecycleRequestOpReactivate, Actor: actor}})
+		return err
+	}
+	requireStatus(t, reactivate(keyCtx, &apigen.TxeActor{Kind: apigen.TxeActorKindHuman, Id: "admin"}), http.StatusForbidden)
+
+	human, machine, client := "human", "human", "human"
+	requireStatus(t, reactivate(keyCtx, &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "admin", Session: &human, MachineId: &machine, Client: &client}), http.StatusConflict)
+	requireStatus(t, reactivate(keyCtx, nil), http.StatusConflict)
+
+	got, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeLifecycleRetired, got.(apigen.GetTxeJob200JSONResponse).Lifecycle, "the job stays retired")
+
+	require.NoError(t, reactivate(txeAdmin, nil))
+	got, err = a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	job := got.(apigen.GetTxeJob200JSONResponse)
+	assert.Equal(t, apigen.TxeLifecycleActive, job.Lifecycle)
+	assert.Equal(t, apigen.TxeActorKindHuman, job.Updated.By.Kind)
+	assert.Equal(t, "admin", job.Updated.By.Id)
+}
+
+// The decision list reports whether each decision's Dagu task is still to be
+// completed now, not the state the immutable record was written with.
+func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
+			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
+			NativeTask: &apigen.TxeNativeTask{Dag: jobID, RunId: "run-1", StepId: "approve"},
+		}}})
+	require.NoError(t, err)
+	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
+
+	person := registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
+	decide := func(verdict registry.Verdict, revision int, next registry.ProposalState) string {
+		t.Helper()
+		id := mint(t, registry.PrefixDecision)
+		_, err := store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
+			_, err := tx.AppendDecision(registry.Decision{DecisionID: id, ProposalID: p.ProposalId, ProposalRevision: revision,
+				BindingDigest: p.BindingDigest, Verdict: verdict}, next)
+			return err
+		})
+		require.NoError(t, err)
+		return id
+	}
+	nativeResume := func() []string {
+		t.Helper()
+		resp, err := a.ListTxeJobDecisions(ctx, apigen.ListTxeJobDecisionsRequestObject{JobId: jobID})
+		require.NoError(t, err)
+		var out []string
+		for _, d := range resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions {
+			if d.NativeResume == nil {
+				out = append(out, "")
+				continue
+			}
+			out = append(out, string(*d.NativeResume))
+		}
+		return out
+	}
+
+	// A snooze leaves the task waiting: nothing to resume, nothing reported.
+	decide(registry.VerdictSnooze, p.Revision, registry.ProposalSnoozed)
+	job, err := store.GetJob(ctx, jobID)
+	require.NoError(t, err)
+	assert.Empty(t, job.NativeResumes)
+	assert.Equal(t, []string{""}, nativeResume())
+
+	rejected := decide(registry.VerdictReject, p.Revision+1, registry.ProposalRejected)
+	assert.Equal(t, []string{"pending", ""}, nativeResume(), "newest first")
+	_, err = store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error { return tx.MarkNativeResumed(rejected) })
+	require.NoError(t, err)
+	assert.Equal(t, []string{"completed", ""}, nativeResume())
+
+	// The state is projected at read time: a new store and API over the same
+	// data report it, and the immutable records still hold what was written.
+	a = newTxeTestAPIAt(t, dir, true)
+	assert.Equal(t, []string{"completed", ""}, nativeResume())
+	restarted, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	stored, err := restarted.GetDecision(ctx, jobID, rejected)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", stored.NativeResume)
+}
+
+// Registry reads follow workspace visibility: a job, its versions and its
+// history are not found by a caller who cannot see its workspace, and a
+// version from a workspace the job has left stays hidden.
+func TestTxeAPIReadsFollowWorkspaceVisibility(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	opsJob, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+	secretJob, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+
+	list, err := a.ListTxeJobs(txeOps, apigen.ListTxeJobsRequestObject{})
+	require.NoError(t, err)
+	var ids []string
+	for _, j := range list.(apigen.ListTxeJobs200JSONResponse).Jobs {
+		ids = append(ids, j.JobId)
+	}
+	assert.Equal(t, []string{opsJob}, ids)
+
+	_, err = a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: secretJob})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 1})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.ListTxeJobEvents(txeOps, apigen.ListTxeJobEventsRequestObject{JobId: secretJob})
+	requireStatus(t, err, http.StatusNotFound)
+	_, err = a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: opsJob})
+	require.NoError(t, err)
+
+	// The admin moves the secret job to ops: its current version is visible,
+	// its secret first version is not.
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	_, err = a.UpdateTxeJobVersion(txeAdmin, apigen.UpdateTxeJobVersionRequestObject{JobId: secretJob, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 1,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+		}}})
+	require.NoError(t, err)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 2})
+	require.NoError(t, err)
+	_, err = a.GetTxeJobVersion(txeOps, apigen.GetTxeJobVersionRequestObject{JobId: secretJob, Version: 1})
+	requireStatus(t, err, http.StatusNotFound)
 }

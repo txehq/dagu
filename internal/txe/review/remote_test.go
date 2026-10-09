@@ -480,7 +480,7 @@ func (f *remoteFixture) decide(p review.Proposal, revision int, verdict string) 
 	svc := &decision.Service{
 		Registry:          f.store,
 		Tasks:             f.tasks,
-		AuthorizeDecision: func(context.Context, *registry.Job) error { return nil },
+		AuthorizeDecision: func(context.Context, *registry.JobTx, decision.Verdict) error { return nil },
 		AuthorizeTask:     func(context.Context, string, string) error { return nil },
 	}
 	return svc.Decide(context.Background(), f.jobID, p.ID, decision.Request{
