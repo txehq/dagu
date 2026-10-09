@@ -342,11 +342,6 @@ var terminalRunStatuses = map[api.StatusLabel]bool{
 	api.StatusLabelPartiallySucceeded: true, api.StatusLabelRejected: true,
 }
 
-// queuedRunStatuses are the run states with no execution under way yet.
-var queuedRunStatuses = map[api.StatusLabel]bool{
-	api.StatusLabelQueued: true, api.StatusLabelNotStarted: true,
-}
-
 const runPageLimit = 100
 
 // walkRuns visits every run the service lists for the job, newest created
@@ -408,20 +403,15 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 	todo := uncovered{limit: maxPacketRuns + 1}
 	byKey := map[string]runSummary{}
 	owed := map[string]bool{}
-	var executing, queued []string
+	var unfinished []string
 	note := func(run runSummary) (runPoint, bool, error) {
-		switch {
-		case queuedRunStatuses[run.StatusLabel]:
-			// The listing is newest created first, so the oldest queued
-			// runs, the next to start, are the last ones seen. Only as
-			// many as can be tracked are kept.
-			if queued = append(queued, run.DagRunID); len(queued) > 2*maxCoverageSet {
-				queued = append(queued[:0], queued[len(queued)-maxCoverageSet:]...)
-			}
-			return runPoint{}, false, nil
-		case !terminalRunStatuses[run.StatusLabel]:
-			if executing = append(executing, run.DagRunID); len(executing) > maxCoverageSet {
-				return runPoint{}, false, fmt.Errorf("%w: more than %d runs of job %s are executing at once", ErrRunsUntrackable, maxCoverageSet, jobID)
+		if !terminalRunStatuses[run.StatusLabel] {
+			// Every unfinished run is remembered, queued ones too: any of
+			// them can end before the next listing. None is left out to
+			// fit; a job with more than can be remembered is refused.
+			if unfinished = append(unfinished, run.DagRunID); len(unfinished) > maxCoverageSet {
+				return runPoint{}, false, fmt.Errorf("%w: more than %d of its runs are queued or executing at once; a review can keep track of at most that many",
+					ErrRunsUntrackable, maxCoverageSet)
 			}
 			return runPoint{}, false, nil
 		}
@@ -461,9 +451,8 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 	}
 	if pages > 1 {
 		last := points[len(points)-1]
-		executing, queued = executing[:0], queued[:0]
+		unfinished = unfinished[:0]
 		stable := map[string]bool{}
-		churned := false
 		_, err := r.walkRuns(ctx, jobID, func(run runSummary) error {
 			point, show, err := note(run)
 			if err != nil || !show || last.before(point) {
@@ -478,18 +467,12 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 			// New or changed since the first pass, and ending no later
 			// than a result about to be returned: owed, not passed over.
 			if owed[run.DagRunID] = true; len(owed) > maxCoverageSet {
-				churned = true
+				return fmt.Errorf("%w: more than %d of its runs changed while they were being listed", ErrRunsUntrackable, maxCoverageSet)
 			}
 			return nil
 		})
 		if err != nil {
 			return nil, err
-		}
-		if churned {
-			// The history changed too much between the two passes to say
-			// what is safe to cover. Nothing is returned and the cursor
-			// stays where it is; the next review lists it again.
-			return nil, nil
 		}
 		kept := points[:0]
 		for _, p := range points {
@@ -518,14 +501,21 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 		shown = append(shown, p)
 		out = append(out, ev)
 	}
-	now := inFlight{executing: executing, queued: queued, owed: make([]string, 0, len(owed))}
+	owedIDs := make([]string, 0, len(owed))
 	for id := range owed {
-		now.owed = append(now.owed, id)
+		owedIDs = append(owedIDs, id)
 	}
 	for i := range out {
-		next, err := covered.after(shown[:i+1], now)
+		next, err := covered.after(shown[:i+1], unfinished, owedIDs)
 		if err != nil {
-			return nil, err
+			if i == 0 {
+				// Not even the next result fits the bound. Nothing is
+				// returned and the coverage stays as it is.
+				return nil, err
+			}
+			// The results before this one fit and are returned with their
+			// cursors. This one is not covered and is met again next time.
+			return out[:i], nil
 		}
 		out[i].Cursor = next.String()
 	}

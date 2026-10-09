@@ -748,11 +748,15 @@ func TestRemoteRunsAfterNeverMixesTheEvidenceOfTwoAttempts(t *testing.T) {
 	assert.Equal(t, []string{"r1@a2"}, owed)
 }
 
-// Nothing in a job's history may stop its reviews for good. Hundreds of
-// results in one instant, as when a whole queue is aborted at once, are
-// shown across reviews, each once, with a cursor that stays small.
-func TestRemoteRunsAfterIsNotBlockedByManyResultsInOneInstant(t *testing.T) {
+// The supported bound on results sharing one end timestamp is exact. Up to
+// it, each result is named and shown once. Beyond it the job is refused
+// with a typed error and its coverage is left as it was: nothing is folded
+// into an order, so a result that turns up at that same timestamp with a
+// key sorting before the covered ones is never taken for covered.
+func TestRemoteRunsAfterRefusesMoreResultsAtOneTimestampThanItCanName(t *testing.T) {
 	l := newRunList(t)
+	remote := &review.Remote{Transport: l.stub}
+	ctx := context.Background()
 	var many []string
 	for i := range 700 {
 		many = append(many, fmt.Sprintf("m%04d a1 aborted 2026-10-09T11:00:00Z", i))
@@ -760,64 +764,80 @@ func TestRemoteRunsAfterIsNotBlockedByManyResultsInOneInstant(t *testing.T) {
 	l.set(many...)
 	seen := map[string]bool{}
 	cursor := ""
-	for range 16 {
-		page, next := l.after(cursor)
-		for _, key := range page {
-			require.False(t, seen[key], "%s shown twice", key)
-			seen[key] = true
+	for {
+		runs, err := remote.RunsAfter(ctx, l.job, cursor)
+		if err != nil {
+			require.ErrorIs(t, err, review.ErrRunsUntrackable)
+			require.ErrorContains(t, err, "512")
+			break
 		}
-		cursor = next
+		require.NotEmpty(t, runs)
+		for _, run := range runs {
+			require.False(t, seen[run.RunID], "%s shown twice", run.RunID)
+			seen[run.RunID] = true
+			cursor = run.Cursor
+		}
 	}
-	assert.Len(t, seen, 700, "every result is shown, none twice")
-	assert.Less(t, len(cursor), 4096, "the cursor does not hold them one by one")
-	none, _ := l.after(cursor)
-	assert.Empty(t, none)
+	assert.Len(t, seen, 512, "exactly as many as the bound are covered, each once")
 
-	// A result of a later instant is still told apart after that.
-	l.set(append(many, "z a1 failed 2026-10-09T11:00:01Z")...)
-	later, _ := l.after(cursor)
-	assert.Equal(t, []string{"z@a1"}, later)
+	// A result at that same timestamp whose key sorts before every covered
+	// one, as a run created later can have, is not silently covered: with
+	// the bound reached it is refused, and the coverage does not move.
+	l.set(append([]string{"a0000 a1 failed 2026-10-09T11:00:00Z"}, many[:512]...)...)
+	_, err := remote.RunsAfter(ctx, l.job, cursor)
+	require.ErrorIs(t, err, review.ErrRunsUntrackable)
+
+	// Below the bound the same late, lower-sorting result is simply shown.
+	l.set(many[:10]...)
+	_, few := l.after("")
+	l.set(append([]string{"a0000 a1 failed 2026-10-09T11:00:00Z"}, many[:10]...)...)
+	late, next := l.after(few)
+	assert.Equal(t, []string{"a0000@a1"}, late)
+	none, _ := l.after(next)
+	assert.Empty(t, none)
 }
 
-// A long queue does not stop reviews either. Results are returned as usual,
-// and the runs remembered as unfinished are the oldest queued ones, which
-// are the next to start.
-func TestRemoteRunsAfterIsNotBlockedByALongQueue(t *testing.T) {
+// Every unfinished run is remembered, queued ones too: none is left out to
+// make room. A queued run can end before the next listing with an end time
+// before what is already covered, and it is still shown. A job with more
+// unfinished runs than can be remembered is refused, with its coverage
+// unchanged, rather than reviewed with some of them forgotten.
+func TestRemoteRunsAfterRemembersEveryQueuedRunOrRefuses(t *testing.T) {
 	l := newRunList(t)
-	runs := []string{"done d1 failed 2026-10-09T10:01:00Z", "busy b1 running"}
+	runs := []string{"done d1 failed 2026-10-09T10:05:00Z", "busy b1 running"}
 	// Newest created first, as the service lists them.
-	for i := 799; i >= 0; i-- {
+	for i := 499; i >= 0; i-- {
 		runs = append(runs, fmt.Sprintf("q%04d a1 queued", i))
 	}
 	l.set(runs...)
 	shown, cursor := l.after("")
 	assert.Equal(t, []string{"done@d1"}, shown)
 	parts := strings.Split(cursor, "|")
-	require.Len(t, parts, 5)
-	pending := strings.Split(parts[4], ",")
-	assert.Len(t, pending, 512, "the remembered runs are bounded")
-	assert.Contains(t, pending, "busy", "a run that is executing is always remembered")
-	assert.Contains(t, pending, "q0000", "the oldest queued runs are kept")
-	assert.NotContains(t, pending, "q0799", "the newest queued runs are the ones left out")
-}
+	require.Len(t, parts, 4)
+	pending := strings.Split(parts[3], ",")
+	assert.Len(t, pending, 501, "the running run and all 500 queued runs")
+	assert.Contains(t, pending, "q0499", "the newest queued run is remembered like the oldest")
 
-// More runs executing at once than can be tracked is the one case that
-// stops a job's reviews. It is a typed refusal, which the reviewer raises
-// as an exception and defers, not a failing step.
-func TestRemoteRunsAfterRefusesOnlyWhatCannotBeTracked(t *testing.T) {
-	l := newRunList(t)
-	runs := []string{"done d1 failed 2026-10-09T10:01:00Z"}
-	for i := range 600 {
-		runs = append(runs, fmt.Sprintf("x%04d a1 running", i))
+	// The newest queued run ends, reporting a time before the cursor's.
+	runs[2] = "q0499 a1 failed 2026-10-09T10:04:00Z"
+	l.set(runs...)
+	late, _ := l.after(cursor)
+	assert.Equal(t, []string{"q0499@a1"}, late)
+
+	// More unfinished runs than can be remembered: refused, nothing
+	// returned, no cursor handed out.
+	for i := 500; i < 520; i++ {
+		runs = append(runs, fmt.Sprintf("q%04d a1 queued", i))
 	}
 	l.set(runs...)
-	_, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
+	got, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, cursor)
 	require.ErrorIs(t, err, review.ErrRunsUntrackable)
+	assert.Empty(t, got)
 }
 
-// A history that changes too much between the two passes of a listing gives
-// no results this time and leaves the cursor alone. It is not an error.
-func TestRemoteRunsAfterWaitsOutAHistoryThatChurnsWhileListed(t *testing.T) {
+// A history that changes more than can be tracked between the two passes of
+// a listing is refused the same way: typed, and with nothing covered.
+func TestRemoteRunsAfterRefusesAHistoryThatChurnsWhileListed(t *testing.T) {
 	l := newRunList(t)
 	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
 	var churn []string
@@ -830,7 +850,7 @@ func TestRemoteRunsAfterWaitsOutAHistoryThatChurnsWhileListed(t *testing.T) {
 		p2:    {l.page("", y), l.page("", y)},
 	}
 	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, review.ErrRunsUntrackable)
 	assert.Empty(t, runs)
 }
 

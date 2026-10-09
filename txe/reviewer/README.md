@@ -108,14 +108,15 @@ else a review step needs must be rendered into the DAG:
   A job's runs are on one machine and their times come from its clock, so
   it fails only if that clock is set back between two runs.
 - Bounds: at most 50 runs per review, and a cursor of bounded size kept
-  apart from what the agent is shown. Nothing a job's history contains
-  stops its reviews for good. More than 512 results in one instant, as when
-  a whole queue is aborted at once, are shown in order across reviews. A
-  queue longer than 512 is fine: the oldest queued runs, the next to start,
-  are the ones remembered. Only more than 512 runs executing at once, or
-  owed a review at once, cannot be tracked: the job then gets a
-  `review_runs_untrackable` exception and is deferred by one cadence until
-  that passes, instead of a step that fails quietly.
+  apart from what the agent is shown. The supported bound is exact: at most
+  512 results of one job sharing one end timestamp, and at most 512 of its
+  runs queued, executing or owed a review at once. Nothing is dropped or
+  approximated to fit. A job beyond either gets a `review_runs_untrackable`
+  exception saying which bound and by how much, its review is deferred by
+  one cadence and its coverage is left exactly as it was, so no result is
+  passed over. Reviews resume when the job is within the bound again; a
+  job that stays beyond it stays unreviewed and visible. Raising the bound
+  is capacity work, not part of this phase.
 
 ## Declared actions
 
