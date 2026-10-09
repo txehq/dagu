@@ -379,6 +379,9 @@ const (
 	ExceptionReviewerAuth ExceptionKind = "reviewer_authentication_required"
 	// ExceptionReviewerFailed means the agent ran but produced no usable decision.
 	ExceptionReviewerFailed ExceptionKind = "reviewer_failed"
+	// ExceptionContextTooLarge means the job's context does not fit a review
+	// packet, so it is not being reviewed.
+	ExceptionContextTooLarge ExceptionKind = "review_context_too_large"
 	// ExceptionCleanupFailed means a superseded proposal's decision run
 	// could not be closed after repeated attempts.
 	ExceptionCleanupFailed ExceptionKind = "decision_run_cleanup_failed"

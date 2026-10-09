@@ -686,13 +686,44 @@ func TestPacketListsAreBoundedAndFeedbackIsNotSkipped(t *testing.T) {
 }
 
 // A job whose own registered context is larger than the packet limit is not
-// reviewed from a cut-down version of it: prepare fails and says why.
-func TestOversizedJobContextFailsPrepare(t *testing.T) {
+// reviewed from a cut-down version of it, and does not go quiet either: it
+// is raised as an exception, deferred, and its claim released.
+func TestOversizedJobContextIsRaisedNotSilentlySkipped(t *testing.T) {
 	f := newFixture(t)
 	job := fixtureJob()
 	job.Purpose = strings.Repeat("p", 300<<10)
 	require.NoError(t, f.registry.PutJob(job))
-	_, err := f.reviewer("reviewer-a").Prepare(context.Background(), jobID)
-	require.ErrorIs(t, err, review.ErrPacketTooLarge)
-	assert.Empty(t, f.state().Claims, "the claim is released")
+	prepared, err := f.reviewer("reviewer-a").Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipUnreviewable, prepared.Skipped)
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Equal(t, review.ExceptionContextTooLarge, s.Exceptions[0].Kind)
+	assert.Empty(t, s.Claims, "the claim is released")
+	assert.Equal(t, f.clock.Now().Add(time.Hour), s.Checkpoints[jobID].NextReviewAt, "it is not retried on every tick")
+	assert.Equal(t, 0, s.Checkpoints[jobID].Version)
+}
+
+// An action already in front of the owner is not proposed again by a later
+// review, even when the agent could not see the earlier proposal.
+func TestAnOpenProposalIsNotDuplicated(t *testing.T) {
+	f := newFixture(t)
+	ask := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), ask)
+	require.Len(t, f.state().Proposals[jobID], 1)
+
+	f.clock.Advance(2 * time.Hour)
+	applied := f.apply("reviewer-b", f.prepare("reviewer-b"), ask)
+	assert.Len(t, f.state().Proposals[jobID], 1)
+	assert.Contains(t, applied.Review.Notes[0], "already proposed")
+
+	// A different size is a different request.
+	f.clock.Advance(2 * time.Hour)
+	other := ask
+	other.Actions = []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "400"})}
+	f.apply("reviewer-c", f.prepare("reviewer-c"), other)
+	assert.Len(t, f.state().Proposals[jobID], 2)
 }

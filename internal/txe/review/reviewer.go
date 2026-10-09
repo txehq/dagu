@@ -79,6 +79,8 @@ type SkipReason string
 const (
 	SkipNotReviewable SkipReason = "lifecycle_not_reviewable"
 	SkipClaimHeld     SkipReason = "claim_held"
+	// SkipUnreviewable means the job was raised as an exception instead.
+	SkipUnreviewable SkipReason = "unreviewable"
 )
 
 // Prepared is the hand-off from Prepare to the agent and to Apply.
@@ -110,6 +112,12 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	}
 
 	packet, err := r.prepareClaimed(ctx, claim, job)
+	if errors.Is(err, ErrPacketTooLarge) {
+		// A job that cannot be reviewed must not simply go quiet. It is
+		// raised as an exception and deferred, and it stays unreviewed and
+		// visible until its context is fixed.
+		return r.unreviewable(ctx, claim, job, err)
+	}
 	if err != nil {
 		// The claim is released so the next tick can retry promptly; a
 		// failed release only delays that retry until the claim expires.
@@ -247,6 +255,30 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 		return Packet{}, fmt.Errorf("read actions: %w", err)
 	}
 	return buildPacket(r.now(), job, cp, runs, decisions, proposals, actions)
+}
+
+// unreviewable records that a job cannot be reviewed as it is registered.
+func (r *Reviewer) unreviewable(ctx context.Context, claim Claim, job Job, cause error) (Prepared, error) {
+	err := r.Registry.RaiseException(ctx, Exception{
+		JobID: job.ID, Kind: ExceptionContextTooLarge, MachineID: job.MachineID,
+		Message: "the job is not being reviewed: " + cause.Error(),
+	})
+	if err != nil {
+		_ = r.Registry.ReleaseClaim(ctx, claim)
+		return Prepared{}, fmt.Errorf("raise exception: %w", err)
+	}
+	interval := defaultCadence
+	if job.Review.CadenceSec > 0 {
+		interval = time.Duration(job.Review.CadenceSec) * time.Second
+	}
+	if err := r.Registry.DeferReview(ctx, claim, r.now().Add(interval)); err != nil {
+		_ = r.Registry.ReleaseClaim(ctx, claim)
+		return Prepared{}, fmt.Errorf("defer review: %w", err)
+	}
+	if err := r.Registry.ReleaseClaim(ctx, claim); err != nil {
+		return Prepared{}, fmt.Errorf("release claim: %w", err)
+	}
+	return Prepared{Skipped: SkipUnreviewable}, nil
 }
 
 // finishInterrupted completes an episode whose review was recorded but whose
@@ -663,6 +695,23 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 }
 
 func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Packet, kind ProposalKind, requested AgentAction, question string, review *Review, result *Applied) error {
+	// The agent sees a bounded list of open proposals, so it may ask again
+	// for something the owner is already being asked. The registry's full
+	// list decides: the same action on the same target with the same
+	// parameters is not put in front of the owner twice.
+	if kind == ProposalAction {
+		open, err := r.Registry.OpenProposals(ctx, job.ID)
+		if err != nil {
+			return fmt.Errorf("read open proposals: %w", err)
+		}
+		for _, existing := range open {
+			if existing.Kind == ProposalAction && existing.ActionName == requested.Name && existing.TargetID == requested.TargetID &&
+				maps.Equal(normalizeParams(existing.Params), normalizeParams(requested.Params)) {
+				review.Notes = append(review.Notes, fmt.Sprintf("action %q is already proposed as %s; not proposed again", requested.Name, existing.ID))
+				return nil
+			}
+		}
+	}
 	id := ProposalID(packet.ReviewID, kind, requested.Name, requested.TargetID, requested.Params, question)
 	draft := Proposal{
 		ID:              id,
