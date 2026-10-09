@@ -1265,6 +1265,35 @@ func TestRetryRunIsRefusedByTheServiceWhenTheRunMovesBeforeAdmission(t *testing.
 	assert.Len(t, f.runs.requested, 1)
 }
 
+// When the service itself cannot say whether it dispatched the retry, the
+// reviewer does not decide for it. With no other execution to be seen the
+// outcome is uncertain; with one, it is recorded as the retry. Either way
+// nothing is sent a second time.
+func TestRetryRunTheServiceCouldNotConfirmIsUncertainUntilTheRunShowsIt(t *testing.T) {
+	uncertain := errors.New("503 dispatch_uncertain: the retry may or may not have been dispatched")
+	t.Run("nothing to be seen on the run", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.retry = func(string) error { return uncertain }
+		out := f.execute("executor")
+		assert.Equal(t, review.ActionUncertain, out.Action.State)
+		assert.Empty(t, out.Action.Receipt)
+		assert.Contains(t, out.Action.Detail, "dispatch_uncertain")
+		assert.Len(t, f.runs.requested, 1)
+	})
+	t.Run("the run shows another execution", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.retry = func(runID string) error {
+			// The dispatch did go out before the service lost track of it.
+			f.runs.start(runID)
+			return uncertain
+		}
+		out := f.execute("executor")
+		assert.Equal(t, review.ActionSucceeded, out.Action.State, "observed on the run, so recorded as done")
+		assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+		assert.Len(t, f.runs.requested, 1)
+	})
+}
+
 // A refusal by the service started nothing and is recorded as such.
 func TestRetryRunRefusedByTheServiceIsNotApplied(t *testing.T) {
 	f := newRetryFixture(t)

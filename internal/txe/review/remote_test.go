@@ -908,24 +908,35 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	assert.True(t, named)
 	assert.Empty(t, marker)
 
+	// Only the refusals the service documents as made before anything is
+	// queued or created mean "nothing started".
 	for name, refusal := range map[string]*review.TransportError{
-		"the run moved on":                   {Status: http.StatusConflict, Code: "execution_changed", Message: "run is at another execution"},
-		"it would run outside the workers":   {Status: http.StatusConflict, Code: "conditional_retry_unsupported", Message: "local process"},
-		"the run is active":                  {Status: http.StatusConflict, Message: "DAG-run is active and cannot be retried"},
-		"the service does not know the run":  {Status: http.StatusNotFound, Message: "not found"},
-		"the request was not accepted as is": {Status: http.StatusBadRequest, Message: "expectedAttemptId and expectedQueuedAt go together"},
+		"the run moved on, or the expected execution has not finished": {Status: http.StatusConflict, Code: "execution_changed", Message: "run is at another execution"},
+		"it would run in a local process":                              {Status: http.StatusConflict, Code: "conditional_retry_unsupported", Message: "local process"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.fail = map[string]*review.TransportError{path: refusal}
 			require.ErrorIs(t, runs.RetryRun(context.Background(), "job_1", "run-1", queued), review.ErrRunNotRetryable)
 		})
 	}
-	t.Run("a server error is not a refusal", func(t *testing.T) {
-		stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadGateway, Message: "upstream"}}
-		err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
-		require.Error(t, err)
-		require.NotErrorIs(t, err, review.ErrRunNotRetryable, "whether a retry started is unknown")
-	})
+	// Everything else leaves the outcome unknown: the service saying so
+	// itself, a refusal this client does not recognise, and any failure of
+	// the request. None of them is read as "nothing started".
+	for name, failure := range map[string]*review.TransportError{
+		"the service says the dispatch is uncertain":       {Status: http.StatusServiceUnavailable, Code: "dispatch_uncertain", Message: "the retry may or may not have been dispatched"},
+		"a conflict with no code":                          {Status: http.StatusConflict, Message: "conflict"},
+		"a conflict with a code this client does not know": {Status: http.StatusConflict, Code: "something_new", Message: "conflict"},
+		"not found":      {Status: http.StatusNotFound, Message: "not found"},
+		"bad request":    {Status: http.StatusBadRequest, Message: "expectedAttemptId and expectedQueuedAt go together"},
+		"a server error": {Status: http.StatusBadGateway, Message: "upstream"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub.fail = map[string]*review.TransportError{path: failure}
+			err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+			require.Error(t, err)
+			require.NotErrorIs(t, err, review.ErrRunNotRetryable, "whether a retry started is unknown")
+		})
+	}
 }
 
 // Completing a human task: success, a run the service does not know, and a

@@ -969,8 +969,9 @@ type RunRetrier interface {
 	// expected is still the run's latest execution. The service checks that
 	// together with admitting the retry, so a run that moved on between
 	// this caller's own read and its request is refused, not retried again.
-	// It returns ErrRunNotRetryable when the service refused; after any
-	// other error whether a retry started is unknown.
+	// It returns ErrRunNotRetryable only for a refusal the service is known
+	// to make before anything is started; after any other error whether a
+	// retry started is unknown.
 	RetryRun(ctx context.Context, jobID, runID string, expected Execution) error
 }
 

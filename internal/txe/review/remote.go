@@ -1385,17 +1385,30 @@ func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState
 
 // RetryRun implements RunRetrier. The request names the execution the retry
 // is for, and the service admits it only while that is the run's latest
-// execution, checking it together with the admission. Its refusals all
-// started nothing: the run moved on (409 execution_changed), the retry
-// would run outside the queue and the workers (409
-// conditional_retry_unsupported), the run is active, or the service does
-// not know the run.
+// execution and has finished, checking it together with the admission.
+//
+// "Nothing was started" is claimed only for the refusals the service itself
+// documents as made before anything is queued or created: 409 with
+// details.code execution_changed (another execution is the latest, or the
+// expected one has not finished) and 409 with conditional_retry_unsupported
+// (the retry would run in a local process). Every other failure is returned
+// as it is and leaves the outcome unknown: 503 dispatch_uncertain, where
+// the service says itself that the retry may have been dispatched, any
+// other status, and a failure of the transport. An unknown outcome is
+// settled by looking at the run, never by assuming.
 func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) error {
 	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
 	body := map[string]string{"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt}
 	err := r.t.Do(ctx, http.MethodPost, path, body, nil)
-	if te, ok := errors.AsType[*TransportError](err); ok && (te.Status == http.StatusConflict || te.Status == http.StatusNotFound || te.Status == http.StatusBadRequest) {
+	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusConflict && retryRefusedBeforeEffect[te.Code] {
 		return fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
 	return err
+}
+
+// retryRefusedBeforeEffect are the service's codes for a conditional retry
+// it refused before queueing or creating anything.
+var retryRefusedBeforeEffect = map[string]bool{
+	"execution_changed":             true,
+	"conditional_retry_unsupported": true,
 }
