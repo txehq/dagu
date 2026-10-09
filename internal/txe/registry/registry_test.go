@@ -906,3 +906,15 @@ func TestReadyReplayStaleRevisionWritesNothing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, job.DAGSpecSHA256, saved)
 }
+
+// A package path is absolute on the job's machine, whatever the hub runs.
+func TestMachineAbsPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/opt/pkg": true, `C:\pkg`: true, "c:/pkg": true, `\\host\share\pkg`: true,
+		"/pkg": true, `\\srv\share\pkg`: true,
+		"pkg": false, "./pkg": false, "~/pkg": false, `C:pkg`: false, "": false,
+		"/a/../b": false, `C:\a\..\b`: false, "/a/..": false,
+	} {
+		assert.Equal(t, want, machineAbsPath(p), p)
+	}
+}
