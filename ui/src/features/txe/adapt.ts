@@ -198,6 +198,7 @@ export function toJob(
       job.availability.observed_at ?? latestRuns[0]?.finishedAt,
     latestRuns,
     machineId: job.machine_id,
+    pendingFollowUps: Object.keys(job.native_resumes ?? {}),
     retirement: job.retirement
       ? {
           reason: job.retirement.reason,

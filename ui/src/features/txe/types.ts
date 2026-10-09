@@ -88,6 +88,8 @@ export type TxeJob = {
   availabilityDetail?: string;
   availabilityObservedAt?: string;
   exceptions?: JobException[];
+  // Decisions stored whose native follow-up has not completed yet.
+  pendingFollowUps?: string[];
   lastObservationAt?: string;
   latestRuns: RunRef[];
   machineId?: string;
@@ -160,7 +162,8 @@ export type InboxReason =
   | 'needs_human'
   | 'unavailable'
   | 'run-failed'
-  | 'exception';
+  | 'exception'
+  | 'follow-up';
 
 export type InboxItem = {
   reason: InboxReason;

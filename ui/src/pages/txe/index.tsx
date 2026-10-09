@@ -14,6 +14,8 @@ import { InboxItemCard } from '@/features/txe/components/InboxItemCard';
 import { useInboxData, useTxeApi } from '@/features/txe/hooks';
 import { buildInbox } from '@/features/txe/inbox';
 
+const CLOCK_TICK_MS = 15_000;
+
 // TxeInboxPage lists registered jobs that need attention, with the context
 // and proposed action needed to decide.
 export default function TxeInboxPage(): React.ReactElement {
@@ -32,9 +34,16 @@ export default function TxeInboxPage(): React.ReactElement {
     appBarContext.setTitle('Job inbox');
   }, [appBarContext]);
 
+  // Actionability depends on time as well as data: a snoozed proposal
+  // returns when its expiry passes even if the polled records are unchanged.
+  const [now, setNow] = React.useState(() => new Date());
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), CLOCK_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, []);
   const items = React.useMemo(
-    () => (data ? buildInbox(data.jobs, data.proposals, new Date()) : []),
-    [data]
+    () => (data ? buildInbox(data.jobs, data.proposals, now) : []),
+    [data, now]
   );
 
   return (

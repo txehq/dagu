@@ -63,6 +63,12 @@ export function buildInbox(
 
   for (const job of jobs) {
     if (covered.has(job.jobId)) continue;
+    // A stored decision whose native follow-up has not completed needs a
+    // replay from the job page, even after the job stopped.
+    if ((job.pendingFollowUps ?? []).length > 0) {
+      items.push({ reason: 'follow-up', job, waitingOn: 'person' });
+      continue;
+    }
     if (job.lifecycle === 'retired' || job.lifecycle === 'completed') continue;
     // An auth failure can be reported only as an exception: a missing
     // credential may stop a run before any step records a status.

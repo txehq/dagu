@@ -4,17 +4,26 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
+	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -214,4 +223,84 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 	f.server.Client().Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
 	require.Empty(t, list.Decisions)
 	require.False(t, strings.Contains(fmt.Sprint(list), "reviewer-self-approve"))
+}
+
+// newTxeDecisionAPI is a registry API whose server allows running DAGs, which
+// recording a decision requires.
+func newTxeDecisionAPI(t *testing.T) *apiv1.API {
+	t.Helper()
+	dir := t.TempDir()
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+}
+
+// fileTxeProposal files a proposal without a native task on jobID as a
+// reviewer would, and returns it.
+func fileTxeProposal(t *testing.T, f *txeFixture, ctx context.Context, jobID string) api.TxeProposal {
+	t.Helper()
+	reviewer := &api.TxeActor{Kind: api.TxeActorKindReviewer, Id: "cc5-test"}
+	claimResp, err := f.a.AcquireTxeClaim(ctx, api.AcquireTxeClaimRequestObject{JobId: jobID, Body: &api.TxeClaimRequest{
+		Kind: api.TxeClaimKindReview, Reviewer: api.TxeReviewer{MachineId: &f.machine}, TtlSec: 600, Actor: reviewer}})
+	require.NoError(t, err)
+	claim := claimResp.(api.AcquireTxeClaim200JSONResponse)
+	question := "Resize?"
+	resp, err := f.a.CreateTxeProposal(ctx, api.CreateTxeProposalRequestObject{JobId: jobID, Body: &api.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Actor: reviewer,
+		Proposal: api.TxeProposalInput{ProposalId: mint(t, registry.PrefixProposal), Question: &question,
+			Action: api.TxeActionSpec{Name: "resize"}},
+	}})
+	require.NoError(t, err)
+	return api.TxeProposal(resp.(api.CreateTxeProposal200JSONResponse))
+}
+
+func decideTxe(ctx context.Context, f *txeFixture, jobID string, p api.TxeProposal, verdict api.TxeVerdict, key string, actor *api.TxeActor) error {
+	_, err := f.a.DecideTxeProposal(ctx, api.DecideTxeProposalRequestObject{JobId: jobID, ProposalId: p.ProposalId, Body: &api.TxeDecisionRequest{
+		ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: verdict, IdempotencyKey: key, Actor: actor}})
+	return err
+}
+
+// An API key is not a person: it cannot record a human decision whatever
+// actor it claims, including none.
+func TestTxeDecisionRefusesAPIKey(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	p := fileTxeProposal(t, f, txeAdmin, jobID)
+
+	key := &auth.APIKey{ID: "k1", Name: "reviewer", Role: auth.RoleDeveloper}
+	keyCtx := auth.WithAPIKey(auth.WithUser(context.Background(), &auth.User{ID: "apikey:k1", Username: "apikey:reviewer", Role: auth.RoleDeveloper}), key)
+	for i, actor := range []*api.TxeActor{nil, {Kind: api.TxeActorKindHuman, Id: "admin"}, {Kind: api.TxeActorKindCli, Id: "cli"}} {
+		requireStatus(t, decideTxe(keyCtx, f, jobID, p, api.TxeVerdictApprove, fmt.Sprintf("apikey-key-%d", i), actor), http.StatusForbidden)
+	}
+	require.NoError(t, decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "admin-approve-1", nil))
+}
+
+// Deciding needs execute access to the job's workspace; pausing or retiring
+// the job through a decision needs write access there.
+func TestTxeDecisionChecksWorkspace(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	secretJob, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, secretJob))
+	opsJob, err := f.register(txeAdmin, "ops")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, opsJob))
+
+	secret := fileTxeProposal(t, f, txeAdmin, secretJob)
+	requireStatus(t, decideTxe(txeOps, f, secretJob, secret, api.TxeVerdictApprove, "ops-on-secret", nil), http.StatusForbidden)
+
+	operator := auth.WithUser(context.Background(), &auth.User{Username: "op", Role: auth.RoleOperator, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleOperator}},
+	}})
+	ops := fileTxeProposal(t, f, txeAdmin, opsJob)
+	requireStatus(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictRetire, "operator-retire", nil), http.StatusForbidden)
+	require.NoError(t, decideTxe(operator, f, opsJob, ops, api.TxeVerdictApprove, "operator-approve", nil))
 }

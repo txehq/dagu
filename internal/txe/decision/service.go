@@ -31,11 +31,18 @@ type TaskCompleter interface {
 	Complete(ctx context.Context, request humantask.CompleteRequest) (humantask.Result, error)
 }
 
-// RunRetrier queues a native retry of a job's latest run and returns the
-// retried DAG-run ID.
+// RunRetrier queues a native retry of a job's latest run for a retry
+// decision made at decidedAt. It dispatches only while that run is finished
+// and started before the decision, so replaying the decision never retries
+// twice. It returns the run ID and whether this call dispatched it.
 type RunRetrier interface {
-	RetryLatest(ctx context.Context, dagName string) (string, error)
+	RetryLatest(ctx context.Context, dagName string, decidedAt time.Time) (runID string, dispatched bool, err error)
 }
+
+// DecisionAuthorizer must allow the caller to record verdict on the job as it
+// is inside the decision transaction. It may run more than once, so it must
+// only read.
+type DecisionAuthorizer func(ctx context.Context, tx *registry.JobTx, verdict Verdict) error
 
 // TaskAuthorizer applies the native authorization for completing the human
 // task of one DAG-run on behalf of the caller.
@@ -80,9 +87,9 @@ type Service struct {
 	Registry Registry
 	Tasks    TaskCompleter
 	Retrier  RunRetrier
-	// AuthorizeDecision must allow the caller to decide on the job. It is
-	// required: without it every decision is refused.
-	AuthorizeDecision func(ctx context.Context, job *registry.Job) error
+	// AuthorizeDecision is required: without it every decision is refused.
+	// It runs for replays too.
+	AuthorizeDecision DecisionAuthorizer
 	// AuthorizeTask must allow completing the native task before any
 	// decision is recorded. It is required for proposals with a native task.
 	AuthorizeTask TaskAuthorizer
@@ -101,9 +108,17 @@ type Result struct {
 	// NativeErr is set when the decision is stored but its native human task
 	// could not be completed yet; replaying the request retries it.
 	NativeErr error
-	// RetryRunID is the DAG-run retried by a retry verdict.
+	// RetryRunID is the DAG-run a retry verdict retried, or found already
+	// retried. RetryErr is set when the decision is stored but the retry could
+	// not be dispatched; replaying the request retries it.
 	RetryRunID string
 	RetryErr   error
+}
+
+// FollowUpPending reports a stored decision whose native completion or
+// retry still has to happen.
+func (r *Result) FollowUpPending() bool {
+	return r.NativeErr != nil || r.RetryErr != nil
 }
 
 func (s *Service) now() time.Time {
@@ -116,8 +131,11 @@ func (s *Service) now() time.Time {
 // Decide records req for proposalID of jobID on behalf of actor.
 func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Request, actor registry.Actor) (*Result, error) {
 	now := s.now()
-	if err := req.Validate(now); err != nil {
+	if err := req.ValidateShape(); err != nil {
 		return nil, err
+	}
+	if s.AuthorizeDecision == nil {
+		return nil, errNoAuthorizer
 	}
 	decisionID, err := registry.NewID(registry.PrefixDecision, now)
 	if err != nil {
@@ -132,9 +150,15 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 	var replayID string
 	job, err := s.Registry.WithJobTx(ctx, jobID, actor, func(tx *registry.JobTx) error {
 		stored, replayID = nil, ""
+		if err := s.AuthorizeDecision(ctx, tx, req.Verdict); err != nil {
+			return err
+		}
 		if id, ok := tx.DecisionByKey(req.IdempotencyKey); ok {
 			replayID = id
 			return nil
+		}
+		if err := req.ValidateNew(tx.Now()); err != nil {
+			return err
 		}
 		if p := tx.Proposal(proposalID); p != nil {
 			if err := checkNativeTask(tx.Job, p.NativeTask); err != nil {
@@ -153,6 +177,14 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		}, effect.Proposal)
 		if err != nil {
 			return err
+		}
+		// A snooze keeps the native task open for the decision that follows
+		// it, so it has nothing to complete.
+		if effect.Proposal == registry.ProposalSnoozed {
+			if err := tx.MarkNativeResumed(decisionID); err != nil {
+				return err
+			}
+			d.NativeResume = "none"
 		}
 		if err := applyLifecycle(tx, effect.Lifecycle, decisionID); err != nil {
 			return err
@@ -180,8 +212,12 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		result.Decision, result.AlreadyRecorded = d, true
 	} else {
 		result.Decision = stored
-		if effect.RetryRun && s.Retrier != nil {
-			result.RetryRunID, result.RetryErr = s.Retrier.RetryLatest(ctx, jobID)
+	}
+	if effect.RetryRun {
+		if s.Retrier == nil {
+			result.RetryErr = errors.New("decision: run retry is not configured")
+		} else {
+			result.RetryRunID, _, result.RetryErr = s.Retrier.RetryLatest(ctx, jobID, result.Decision.DecidedAt)
 		}
 	}
 
@@ -193,26 +229,36 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 		if result.NativeErr == nil {
 			result.Decision.NativeResume = "completed"
 		}
-	} else if result.Decision.NativeResume == "pending" {
-		result.Decision.NativeResume = "completed"
+	} else {
+		result.Decision.NativeResume = CurrentNativeResume(job, result.Decision)
 	}
 	return result, nil
+}
+
+// CurrentNativeResume is a decision's native-completion state now. The stored
+// decision is immutable and keeps the state it was written with; the job's
+// pending list is the authority on whether completion is outstanding, and a
+// snooze never completes its task.
+func CurrentNativeResume(job *registry.Job, d *registry.Decision) string {
+	switch {
+	case job.NativeResumes[d.DecisionID] != nil:
+		return "pending"
+	case d.Verdict == VerdictSnooze:
+		return "none"
+	case d.NativeResume == "pending":
+		return "completed"
+	}
+	return d.NativeResume
 }
 
 // errNoAuthorizer refuses work when the caller wired no authorization.
 var errNoAuthorizer = errors.New("decision: authorization is not configured")
 
-// preflight checks the caller's right to decide on the job, the proposal's
-// native task and the right to complete it, before anything is recorded.
+// preflight checks the proposal's native task and the caller's right to
+// complete it before anything is recorded.
 func (s *Service) preflight(ctx context.Context, jobID, proposalID string) error {
 	job, err := s.Registry.GetJob(ctx, jobID)
 	if err != nil {
-		return err
-	}
-	if s.AuthorizeDecision == nil {
-		return errNoAuthorizer
-	}
-	if err := s.AuthorizeDecision(ctx, job); err != nil {
 		return err
 	}
 	p := job.Proposals[proposalID]
@@ -266,6 +312,8 @@ func (s *Service) resumeNative(ctx context.Context, job *registry.Job, pending *
 		return errNoTaskCompleter
 	}
 	task := pending.NativeTask
+	// Authorized again on every attempt: a replay may come from another
+	// person, and access may have changed since the decision.
 	if err := s.authorizeNative(ctx, job, &task); err != nil {
 		return err
 	}
