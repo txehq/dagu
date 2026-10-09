@@ -68,7 +68,28 @@ type DAGSpec struct {
 	// Env are literal, non-secret settings for the job's script.
 	Env            map[string]string
 	CredentialRefs []CredentialRef
+
+	// Publish, when set, adds a final step that records the run's declared
+	// deliverables. Without it the run publishes nothing.
+	Publish *Publish
 }
+
+// Publish describes the step that records a run's deliverables.
+type Publish struct {
+	// Command is the absolute path of the dagu binary on the assigned
+	// machine followed by its arguments.
+	Command []string
+	// HomeRoot is the TXE home on the assigned machine. The step needs it
+	// spelled out: a step does not inherit the worker's environment.
+	HomeRoot string
+	// HubArtifacts enables the run's native artifact directory, which the
+	// worker uploads to the hub when the run ends.
+	HubArtifacts bool
+}
+
+// RunOutputEnv is the variable holding a run's own output directory. Declared
+// deliverables are read from there, by exact name.
+const RunOutputEnv = "TXE_RUN_OUTPUT_DIR"
 
 // RenderDAG returns the Dagu workflow for a job. The same input always gives
 // the same bytes, so a replayed registration sends an identical definition.
@@ -103,11 +124,21 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	line("max_active_runs: 1")
 	line("timeout_sec: %d", s.Schedule.TimeoutSec)
 	line("working_dir: %s", quote(s.WorkDir))
+	if s.Publish != nil && s.Publish.HubArtifacts {
+		line("artifacts:")
+		line("  enabled: true")
+	}
 
 	line("env:")
 	line("  - TXE_JOB_ID: %s", quote(s.JobID))
 	line("  - TXE_JOB_VERSION: %s", quote(fmt.Sprint(s.Version)))
 	line("  - TXE_OUTPUT_DIR: %s", quote(s.OutputDir))
+	// Dagu substitutes the run ID when the run starts, so each run writes its
+	// deliverables to a directory of its own.
+	line("  - %s: %s", RunOutputEnv, quote(s.OutputDir+"/runs/${DAG_RUN_ID}"))
+	if s.Publish != nil {
+		line("  - %s: %s", EnvHome, quote(s.Publish.HomeRoot))
+	}
 	names := make([]string, 0, len(s.Env))
 	for name := range s.Env {
 		names = append(names, name)
@@ -134,6 +165,10 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 		line("      limit: %d", s.Schedule.Retry)
 		line("      interval_sec: %d", s.Schedule.RetryIntervalSec)
 	}
+	if s.Publish != nil {
+		line("  - name: publish")
+		line("    command: %s", quote(shellJoin(s.Publish.Command)))
+	}
 	return []byte(b.String()), nil
 }
 
@@ -158,7 +193,9 @@ func (s DAGSpec) overlap() string {
 }
 
 // reservedEnv are set by the renderer and cannot be supplied by the job.
-var reservedEnv = map[string]bool{"TXE_JOB_ID": true, "TXE_JOB_VERSION": true, "TXE_OUTPUT_DIR": true}
+var reservedEnv = map[string]bool{
+	"TXE_JOB_ID": true, "TXE_JOB_VERSION": true, "TXE_OUTPUT_DIR": true, RunOutputEnv: true, EnvHome: true,
+}
 
 func (s DAGSpec) validate() error {
 	for _, id := range []string{s.JobID, s.OwnerID, s.ProjectID, s.MachineID} {
@@ -182,6 +219,26 @@ func (s DAGSpec) validate() error {
 	}
 	if len(s.Entrypoint) == 0 {
 		return fmt.Errorf("render DAG: entrypoint is required")
+	}
+
+	if p := s.Publish; p != nil {
+		if len(p.Command) == 0 || !filepath.IsAbs(p.Command[0]) {
+			return fmt.Errorf("render DAG: the publish command must start with the absolute path of the dagu binary")
+		}
+		if !filepath.IsAbs(p.HomeRoot) {
+			return fmt.Errorf("render DAG: the TXE home %q must be absolute", p.HomeRoot)
+		}
+		for i, arg := range p.Command {
+			if err := literal(fmt.Sprintf("publish command argument %d", i), arg); err != nil {
+				return err
+			}
+		}
+		if err := literal("TXE home", p.HomeRoot); err != nil {
+			return err
+		}
+	}
+	if err := literal("output directory", s.OutputDir); err != nil {
+		return err
 	}
 
 	sch := s.Schedule

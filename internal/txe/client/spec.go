@@ -132,7 +132,30 @@ func (e *MissingContextError) Error() string {
 	return "the job spec is incomplete:\n  - " + strings.Join(e.Problems, "\n  - ")
 }
 
-var jobKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,62}$`)
+var (
+	jobKeyPattern          = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,62}$`)
+	deliverableNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+)
+
+// CheckDeliverablePath accepts only the exact name of a file inside the run's
+// output directory: a relative path with no parent components, no pattern
+// characters, and nothing a shell or Dagu would expand.
+func CheckDeliverablePath(path string) error {
+	switch {
+	case path == "":
+		return errors.New("a file name relative to the run's output directory is required")
+	case filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, "~"):
+		return fmt.Errorf("%q must be relative to the run's output directory", path)
+	case strings.ContainsAny(path, "*?[]{}$`\\\n\r\x00"):
+		return fmt.Errorf("%q must be an exact file name: no patterns, variables or control characters", path)
+	}
+	for _, part := range strings.Split(path, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("%q must not contain empty, \".\" or \"..\" components", path)
+		}
+	}
+	return nil
+}
 
 // Validate checks that the spec carries the context a job needs to outlive
 // its creating session. It reports every problem at once.
@@ -171,6 +194,19 @@ func (s *JobSpec) Validate() error {
 
 	need(len(s.ExpectedOutcome.SuccessCriteria) > 0,
 		"expected_outcome.success_criteria needs at least one entry: what a good result looks like")
+
+	names := map[string]bool{}
+	for i, d := range s.ExpectedOutcome.Deliverables {
+		need(deliverableNamePattern.MatchString(d.Name),
+			"expected_outcome.deliverables[%d].name is required: lowercase letters, digits, dot, dash or underscore", i)
+		need(!names[d.Name], "expected_outcome.deliverables[%d].name %q is used twice", i, d.Name)
+		names[d.Name] = true
+		if err := CheckDeliverablePath(d.Path); err != nil {
+			need(false, "expected_outcome.deliverables[%d].path: %v", i, err)
+		}
+		need(d.Delivery == "" || d.Delivery == DeliveryMachine || d.Delivery == DeliveryHub,
+			"expected_outcome.deliverables[%d].delivery must be %q or %q, got %q", i, DeliveryMachine, DeliveryHub, d.Delivery)
+	}
 
 	switch {
 	case s.Lifetime.ExpiresAt != "" && s.Lifetime.OpenEnded:

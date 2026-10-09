@@ -31,6 +31,8 @@ type fakeRegistry struct {
 	jobs     map[string]*fakeJob
 	byKey    map[string]string // project + "/" + job key -> job id
 	requests []recordedRequest
+	// manifests holds the artifact manifests recorded per job and run.
+	manifests map[string]ArtifactManifest
 
 	// beforeList, when set, runs before a job listing is answered.
 	beforeList func()
@@ -63,6 +65,7 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 		projects:     map[string]Project{},
 		jobs:         map[string]*fakeJob{},
 		byKey:        map[string]string{},
+		manifests:    map[string]ArtifactManifest{},
 		loseResponse: map[string]int{},
 		fail:         map[string]int{},
 	}
@@ -188,6 +191,24 @@ func (f *fakeRegistry) route(w http.ResponseWriter, r *http.Request, body []byte
 		f.ready(w, strings.TrimSuffix(strings.TrimPrefix(path, "/txe/jobs/"), "/ready"), body)
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/versions"):
 		f.update(w, strings.TrimSuffix(strings.TrimPrefix(path, "/txe/jobs/"), "/versions"), body)
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/artifacts"):
+		f.recordArtifacts(w, strings.TrimSuffix(strings.TrimPrefix(path, "/txe/jobs/"), "/artifacts"), body)
+	case r.Method == http.MethodGet && strings.Contains(path, "/versions/"):
+		jobID, number, _ := strings.Cut(strings.TrimPrefix(path, "/txe/jobs/"), "/versions/")
+		f.mu.Lock()
+		var version json.RawMessage
+		if j, ok := f.jobs[jobID]; ok {
+			var n int
+			_, _ = fmt.Sscanf(number, "%d", &n)
+			version = j.versions[n]
+		}
+		f.mu.Unlock()
+		if version == nil {
+			refuse(w, 404, "not_found", "no such version", nil)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(version)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/txe/jobs/"):
 		f.mu.Lock()
 		j, ok := f.jobs[strings.TrimPrefix(path, "/txe/jobs/")]
@@ -337,4 +358,35 @@ func (f *fakeRegistry) ready(w http.ResponseWriter, jobID string, body []byte) {
 		"version": j.Version, "package_digest": j.PackageDigest, "dag_name": j.JobID,
 		"dag_spec_sha256": j.DAGSpecSHA256, "registration": RegistrationReady, "revision": j.Revision,
 	})
+}
+
+// recordArtifacts stores a run's manifest. The same manifest again is a
+// no-op; a different digest for a path already recorded is refused.
+func (f *fakeRegistry) recordArtifacts(w http.ResponseWriter, jobAndRun string, body []byte) {
+	jobID, runID, _ := strings.Cut(jobAndRun, "/runs/")
+	var in ArtifactManifest
+	if err := json.Unmarshal(body, &in); err != nil {
+		refuse(w, 400, "invalid", "bad body", nil)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[jobID]
+	if !ok || j.versions[in.JobVersion] == nil {
+		refuse(w, 404, "not_found", "no such job version", nil)
+		return
+	}
+	key := jobID + "/" + runID
+	if previous, ok := f.manifests[key]; ok {
+		for _, old := range previous.Artifacts {
+			for _, now := range in.Artifacts {
+				if old.Path == now.Path && old.SHA256 != now.SHA256 {
+					refuse(w, 409, "artifact_conflict", "a different digest is recorded for "+now.Path, nil)
+					return
+				}
+			}
+		}
+	}
+	f.manifests[key] = in
+	answer(w, 200, in)
 }

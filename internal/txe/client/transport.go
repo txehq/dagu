@@ -148,13 +148,20 @@ func decodeError(status int, statusText string, data []byte) *Error {
 		} `json:"details"`
 	}
 	refusal := &Error{Status: status}
+	// The message and code are shown to a person or an agent, and may quote
+	// text another session stored, so they are cleaned here once.
 	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Message != "" {
-		refusal.Message = envelope.Message
-		refusal.Code = envelope.Details.Code
+		refusal.Message = CleanText(envelope.Message, false)
+		refusal.Code = CleanText(envelope.Details.Code, false)
 		refusal.Current = envelope.Details.Current
 		return refusal
 	}
-	refusal.Message = strings.TrimSpace(string(data))
+	const maxShown = 512
+	text := strings.TrimSpace(string(data))
+	if len(text) > maxShown {
+		text = text[:maxShown] + "..."
+	}
+	refusal.Message = CleanText(text, false)
 	if refusal.Message == "" {
 		refusal.Message = statusText
 	}

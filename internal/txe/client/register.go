@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
@@ -170,6 +171,7 @@ func (r *Registrar) version(spec *JobSpec, who *subject, jobID string, number in
 		},
 		Env:            spec.Env,
 		CredentialRefs: spec.CredentialRefs,
+		Publish:        r.publishStep(spec),
 	})
 	if err != nil {
 		return nil, err
@@ -205,6 +207,29 @@ func (r *Registrar) version(spec *JobSpec, who *subject, jobID string, number in
 		RetirementRules: spec.RetirementRules,
 		ReviewPolicy:    spec.ReviewPolicy,
 	}, nil
+}
+
+// publishStep describes the step that records a run's deliverables, or nil
+// when the job declares none. The step runs this machine's dagu binary with
+// the TXE home's own context store, because a step inherits neither the
+// worker's working directory nor its environment.
+func (r *Registrar) publishStep(spec *JobSpec) *txepkg.Publish {
+	deliverables := spec.ExpectedOutcome.Deliverables
+	if len(deliverables) == 0 {
+		return nil
+	}
+	hub := false
+	for _, d := range deliverables {
+		hub = hub || d.Delivery == DeliveryHub
+	}
+	return &txepkg.Publish{
+		Command: []string{
+			filepath.Join(r.Home.Root, "bin", "dagu"), "txe", "artifacts", "publish",
+			"--dagu-home", r.Home.ClientDir(),
+		},
+		HomeRoot:     r.Home.Root,
+		HubArtifacts: hub,
+	}
 }
 
 func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) (*txepkg.Staged, error) {

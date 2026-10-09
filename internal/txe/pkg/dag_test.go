@@ -60,6 +60,7 @@ env:
   - TXE_JOB_ID: "job_01K7A5ZQ8M3N4P5R6S7T8V9W0X"
   - TXE_JOB_VERSION: "2"
   - TXE_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X"
+  - TXE_RUN_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X/runs/${DAG_RUN_ID}"
   - MAX_AGE_SEC: "600"
   - TARGET_ID: "vol-uid-1"
 secrets:
@@ -146,6 +147,42 @@ func TestRenderDAGHasNoOutputRedirect(t *testing.T) {
 	// The worker selector is what makes the run execute on a worker, where
 	// step output is streamed, and never in the hub's own process.
 	assert.NotEmpty(t, dag.WorkerSelector)
+}
+
+// A job with deliverables gets a second step that records them, and the
+// native artifact directory only when a deliverable goes to the hub.
+func TestRenderDAGPublishStep(t *testing.T) {
+	s := testDAGSpec()
+	s.Publish = &Publish{
+		Command:      []string{"/Users/x/.local/share/txe-dagu/bin/dagu", "txe", "artifacts", "publish", "--dagu-home", "/Users/x/.local/share/txe-dagu/client"},
+		HomeRoot:     "/Users/x/.local/share/txe-dagu",
+		HubArtifacts: true,
+	}
+	data, err := RenderDAG(s)
+	require.NoError(t, err)
+	text := string(data)
+	assert.Contains(t, text, "artifacts:\n  enabled: true\n")
+	assert.Contains(t, text, `  - TXE_DAGU_HOME: "/Users/x/.local/share/txe-dagu"`)
+	assert.Contains(t, text, "  - name: publish\n    command: \"/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts publish --dagu-home /Users/x/.local/share/txe-dagu/client\"\n")
+
+	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
+	require.NoError(t, err)
+	require.Len(t, dag.Steps, 2)
+	assert.Equal(t, "publish", dag.Steps[1].Name)
+	assert.True(t, dag.ArtifactsEnabled())
+	// Still no redirect of step output.
+	for _, step := range dag.Steps {
+		assert.Empty(t, step.Stdout+step.Stderr+step.StdoutArtifact+step.StderrArtifact+step.Output)
+	}
+
+	s.Publish.HubArtifacts = false
+	data, err = RenderDAG(s)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "artifacts:")
+
+	s.Publish.Command = []string{"dagu", "txe", "artifacts", "publish"}
+	_, err = RenderDAG(s)
+	require.ErrorContains(t, err, "absolute path of the dagu binary")
 }
 
 func TestRenderDAGRefusals(t *testing.T) {
