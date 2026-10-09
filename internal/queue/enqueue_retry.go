@@ -212,7 +212,7 @@ func PrepareRetry(
 				latest.Root = status.Root
 			}
 			return nil
-		}, persis.DAGRunCompareAndSwapOptions{},
+		}, persis.DAGRunCompareAndSwapOptions{RetainBeforeSwap: true},
 	)
 	if errors.Is(err, ErrRetryStaleLatest) {
 		return nil, ErrRetryStaleLatest

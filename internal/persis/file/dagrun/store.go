@@ -28,6 +28,7 @@ type Store struct {
 	baseDir         string
 	artifactDir     string
 	preparationDir  string
+	logDir          string
 	cache           *fileutil.Cache[*ir.DAGRunStatus]
 	retryCandidates retryCandidateCache
 }
@@ -39,6 +40,7 @@ type options struct {
 	fileCache                *fileutil.Cache[*ir.DAGRunStatus]
 	artifactDir              string
 	preparationDir           string
+	logDir                   string
 	retryCandidateCacheLimit int
 }
 
@@ -91,6 +93,7 @@ func NewStore(baseDir string, opts ...StoreOption) *Store {
 		baseDir:         baseDir,
 		artifactDir:     cfg.artifactDir,
 		preparationDir:  cfg.preparationDir,
+		logDir:          cfg.logDir,
 		cache:           cfg.fileCache,
 		retryCandidates: retryCandidateCache{limit: cfg.retryCandidateCacheLimit},
 	}
@@ -247,6 +250,14 @@ func (store *Store) CompareAndSwapLatestAttemptStatus(
 	}
 	if status.Status != req.ExpectedStatus {
 		return status, false, nil
+	}
+
+	// The finished execution is copied before anything replaces it; a copy
+	// that cannot be made refuses the swap.
+	if req.RetainBeforeSwap && !status.Status.IsActive() && status.Status != ir.NotStarted {
+		if err := store.retainExecution(rootRef, attempt, status); err != nil {
+			return nil, false, err
+		}
 	}
 
 	if err := attempt.Open(ctx); err != nil {
