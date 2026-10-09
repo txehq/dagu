@@ -22,6 +22,7 @@ const REASON_LABELS: Record<InboxItem['reason'], string> = {
   needs_human: 'Needs a decision',
   unavailable: 'Cannot run',
   'run-failed': 'Latest run failed',
+  exception: 'Problem reported',
 };
 
 export function dagRunPath(dagName: string, dagRunId: string): string {
@@ -38,6 +39,7 @@ type Props = {
 // proposed action.
 export function InboxItemCard({ item, children }: Props): React.ReactElement {
   const { job, proposal, failedRun } = item;
+  const exceptions = item.exceptions ?? [];
   const observedAt =
     proposal?.evidence.observedAt ??
     job.lastObservationAt ??
@@ -106,6 +108,43 @@ export function InboxItemCard({ item, children }: Props): React.ReactElement {
           </>
         )}
       </dl>
+
+      {(exceptions.length > 0 ||
+        (job.availability !== 'ready' && job.availabilityDetail)) && (
+        <section
+          className="space-y-1 rounded-md border border-warning/30 bg-warning/5 p-3 text-xs"
+          data-testid="txe-exceptions"
+        >
+          {job.availability !== 'ready' && job.availabilityDetail && (
+            <p>
+              <span className="font-medium">{job.availability}</span>:{' '}
+              {job.availabilityDetail}
+              {job.machineId && (
+                <span className="text-muted-foreground">
+                  {' '}
+                  · {job.machineId}
+                </span>
+              )}
+            </p>
+          )}
+          {exceptions.map((exception) => (
+            <div key={exception.exceptionId}>
+              <p>
+                <span className="font-medium">{exception.kind}</span>:{' '}
+                {exception.detail}{' '}
+                <span className="text-muted-foreground">
+                  <RelativeTime timestamp={exception.createdAt} />
+                </span>
+              </p>
+              {exception.evidence && exception.evidence.length > 0 && (
+                <p className="text-muted-foreground">
+                  {exception.evidence.join(' · ')}
+                </p>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
 
       {proposal && (
         <section className="space-y-2 rounded-md bg-muted/40 p-3">
