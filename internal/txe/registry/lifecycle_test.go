@@ -866,7 +866,6 @@ func TestFailedUndoKeepsWriterToken(t *testing.T) {
 	assert.Empty(t, got.SuspendWriters)
 }
 
-
 // A job matching an event both by identity and as a replacement has both
 // applied: the identity result does not stand in for the replacement rule.
 func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
@@ -891,7 +890,6 @@ func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleRetired, got.Lifecycle)
 }
-
 
 // An older writer's undo does not release ownership of a suspension a newer
 // writer made after it: the newer suspension is still lifted on resume.
