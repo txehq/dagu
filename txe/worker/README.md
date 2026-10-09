@@ -19,7 +19,8 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 | `machine.json` | `machine_id`, `owner_id`, display name | written once; a reinstall never changes it |
 | `bin/dagu-<version>`, `bin/dagu` | every installed binary with its build record; `dagu` points at the current one | kept across upgrades |
 | `packages/` | job packages (written by the CLI, TXE-3408) | kept |
-| `outputs/` | job outputs and deliverables | kept |
+| `outputs/` | job outputs and deliverables, `outputs/<job id>/` | kept |
+| `receipts/`, `client/`, `skill/` | registration receipts, the CLI's context store with its API key, the shared skill (all owned by the CLI, TXE-3408) | kept |
 | `tunnel/kubeconfig` | the tunnel's ServiceAccount token, mode 0600 | renewed by `tunnel-credential.sh` |
 | `worker-home/` | the worker's `DAGU_HOME` | kept |
 | `logs/` | agent logs | kept |
@@ -31,7 +32,7 @@ txehq/txe `kubernetes/dagu` and must exist first.
 
 ```sh
 txe/worker/tunnel-credential.sh                     # uses your own context once
-txe/worker/install.sh --tag txe-v2.18.2-1 --owner-id own_...
+txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_...
 txe/worker/status.sh
 ```
 

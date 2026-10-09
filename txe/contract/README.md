@@ -55,11 +55,14 @@ changes its owner.
   - `txe.version` (the job version)
   - `txe.package=sha256-<first 32 hex>`
 
-  **The registry's full digest is authoritative; the label is only for display.**
+  **The registry's full digest is authoritative; the label is only for display.** Dagu lowercases
+  DAG labels when it loads them, so an id read from a label is not the id; read ids from the
+  registry.
 - `worker_selector: {txe.machine: mch_…}` routes every run to the assigned machine's worker.
-- `working_dir` is the absolute package directory on that machine,
-  `~/.local/share/txe-dagu/packages/<job id>/<digest>/`. Validation refuses any execution path
-  inside a git worktree or a temporary directory.
+- `working_dir` is the package's `files/` directory on that machine,
+  `~/.local/share/txe-dagu/packages/<job id>/<digest>/files`. The job's outputs go to
+  `~/.local/share/txe-dagu/outputs/<job id>/`, passed as `TXE_OUTPUT_DIR`. Validation refuses any
+  execution path inside a git worktree or a temporary directory.
 - Schedules use `CRON_TZ=<zone> <cron>`. Overlap defaults to skip. `timeout_sec` is required and
   retries are bounded. `catchup_window` is set only when the job's missed-run policy asks for it.
 - The review cadence is its own reviewer DAG, not the job's schedule.
@@ -87,8 +90,12 @@ Constraints the coordinator set for the freeze:
 4. **Credentials are named precisely.** Resource credentials (kubeconfigs, Linear tokens, cloud
    logins used by job scripts) stay on the machine and are referenced by name, never copied. They
    are distinct from service-issued state: the Dagu API keys, the admin login and the tunnel's
-   ServiceAccount token. Those are also kept only on the machine (Keychain, or files under
-   `~/.local/share/txe-dagu` with mode 0600), and the server holds only what it issues.
+   ServiceAccount token. The machine keeps the admin password in the Keychain, the CLI's API key
+   in Dagu's own encrypted context store under `~/.local/share/txe-dagu/client`, and the tunnel
+   token under `~/.local/share/txe-dagu/tunnel`. The server keeps its own builtin auth state and,
+   in the cluster, the image pull Secret. Phase one has two API keys, `cli` (shared by Connor's
+   Claude sessions) and `reviewer`. A job's credential refs are file locators resolved on the
+   worker; the worker passes no extra environment variables to jobs.
 
 Lifecycle values are `active`, `paused`, `needs-human`, `completed` and `retired`. They are separate
 from run status, and from machine availability (`ready`, `offline`, `auth-required`).
