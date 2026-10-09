@@ -34,6 +34,8 @@ type ArtifactUploader struct {
 	rootRef   ir.DAGRunRef
 	owner     serviceregistry.HostInfo
 	mu        sync.RWMutex
+	// executionMarker is the claimed task's execution marker.
+	executionMarker string
 }
 
 // NewArtifactUploader creates a new ArtifactUploader.
@@ -73,6 +75,20 @@ func (u *ArtifactUploader) SetClaimKey(claimKey string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.claimKey = claimKey
+}
+
+// SetExecutionMarker binds uploaded artifacts to one execution of the attempt,
+// so the coordinator can refuse uploads of an earlier execution.
+func (u *ArtifactUploader) SetExecutionMarker(marker string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.executionMarker = marker
+}
+
+func (u *ArtifactUploader) getExecutionMarker() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.executionMarker
 }
 
 // Finalize uploads artifacts for the finalized attempt before the terminal status is written.
@@ -190,6 +206,7 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 						AttemptId:          attemptID,
 						OwnerCoordinatorId: u.owner.ID,
 						AttemptKey:         u.attemptKey(attemptID),
+						ExecutionMarker:    u.getExecutionMarker(),
 					}
 					if err := sendChunk(chunk); err != nil {
 						return fmt.Errorf("send artifact chunk: %w", err)
@@ -217,6 +234,7 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 				AttemptId:          attemptID,
 				OwnerCoordinatorId: u.owner.ID,
 				AttemptKey:         u.attemptKey(attemptID),
+				ExecutionMarker:    u.getExecutionMarker(),
 			}); err != nil {
 				return fmt.Errorf("send artifact final marker: %w", err)
 			}

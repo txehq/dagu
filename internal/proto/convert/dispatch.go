@@ -34,6 +34,7 @@ func DispatchTaskToProto(task *dispatch.DispatchTask) (*coordinatorv1.Task, erro
 		WorkerId:                   task.WorkerID,
 		AttemptId:                  task.AttemptID,
 		AttemptKey:                 task.AttemptKey,
+		ExecutionMarker:            task.ExecutionMarker,
 		Step:                       task.Step,
 		Params:                     task.Params,
 		ParallelItem:               task.ParallelItem,
@@ -94,6 +95,7 @@ func ProtoToDispatchTask(task *coordinatorv1.Task) (*dispatch.DispatchTask, erro
 		WorkerID:                   task.WorkerId,
 		AttemptID:                  task.AttemptId,
 		AttemptKey:                 task.AttemptKey,
+		ExecutionMarker:            task.ExecutionMarker,
 		Step:                       task.Step,
 		Params:                     task.Params,
 		ParallelItem:               task.ParallelItem,
@@ -181,6 +183,7 @@ func RunningTaskToProto(task *dispatch.RunningTask) *coordinatorv1.RunningTask {
 		ParentDagRunName: task.ParentDAGRunName,
 		ParentDagRunId:   task.ParentDAGRunID,
 		AttemptKey:       task.AttemptKey,
+		ExecutionMarker:  task.ExecutionMarker,
 	}
 }
 
@@ -198,5 +201,6 @@ func ProtoToRunningTask(task *coordinatorv1.RunningTask) *dispatch.RunningTask {
 		ParentDAGRunName: task.ParentDagRunName,
 		ParentDAGRunID:   task.ParentDagRunId,
 		AttemptKey:       task.AttemptKey,
+		ExecutionMarker:  task.ExecutionMarker,
 	}
 }

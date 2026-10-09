@@ -172,6 +172,10 @@ message Task {
   // Resolved "KEY=value" pairs the parent opted to share with the child run via
   // the step's pass_env field.
   repeated string passed_envs = 41;
+  // Execution marker of the dispatched attempt: its persisted queued-at marker
+  // when dispatched, empty for a direct start. A queued retry reuses the attempt
+  // and its key, so the marker is what tells one execution from the next.
+  string execution_marker = 42;
 }
 
 enum Operation {
@@ -277,6 +281,10 @@ message RunHeartbeatResponse {
 // Information about a cancelled DAG run.
 message CancelledRun {
   string attempt_key = 1; // Globally unique attempt identifier to cancel
+  // When present, only the execution with this Task.execution_marker is
+  // cancelled; an empty value names a direct-start execution. When absent, every
+  // execution of the attempt key is cancelled.
+  optional string execution_marker = 2;
 }
 
 // Worker statistics reported via heartbeat.
@@ -296,6 +304,7 @@ message RunningTask {
   string parent_dag_run_name = 6;
   string parent_dag_run_id = 7;
   string attempt_key = 8;       // Globally unique attempt identifier
+  string execution_marker = 9;  // Task.execution_marker of this execution
 }
 
 // Request message for reporting DAG run status.
@@ -305,6 +314,8 @@ message ReportStatusRequest {
   string owner_coordinator_id = 3;
   string source_file = 4;
   string labels = 5;
+  // Task.execution_marker of the execution that produced the status.
+  string execution_marker = 6;
 }
 
 // Response message for reporting DAG run status.
@@ -341,6 +352,8 @@ message LogChunk {
   string attempt_key = 13;
   // When present, data is written at this absolute byte position; otherwise it is appended.
   optional uint64 byte_offset = 14;
+  // Task.execution_marker of the execution that produced the log.
+  string execution_marker = 15;
 }
 
 // Type of log stream.
@@ -378,6 +391,8 @@ message ArtifactChunk {
   string owner_coordinator_id = 11;
   // Durable attempt identity used to fence artifact writes.
   string attempt_key = 12;
+  // Task.execution_marker of the execution that produced the artifact.
+  string execution_marker = 13;
 }
 
 // Response message for artifact streaming.

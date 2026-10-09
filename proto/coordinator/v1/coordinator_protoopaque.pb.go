@@ -490,6 +490,7 @@ type Task struct {
 	xxx_hidden_BaseConfigWorkspace        *string                `protobuf:"bytes,39,opt,name=base_config_workspace,json=baseConfigWorkspace,proto3,oneof"`
 	xxx_hidden_BypassPreconditions        bool                   `protobuf:"varint,40,opt,name=bypass_preconditions,json=bypassPreconditions,proto3"`
 	xxx_hidden_PassedEnvs                 []string               `protobuf:"bytes,41,rep,name=passed_envs,json=passedEnvs,proto3"`
+	xxx_hidden_ExecutionMarker            string                 `protobuf:"bytes,42,opt,name=execution_marker,json=executionMarker,proto3"`
 	XXX_raceDetectHookData                protoimpl.RaceDetectHookData
 	XXX_presence                          [2]uint32
 	unknownFields                         protoimpl.UnknownFields
@@ -804,6 +805,13 @@ func (x *Task) GetPassedEnvs() []string {
 	return nil
 }
 
+func (x *Task) GetExecutionMarker() string {
+	if x != nil {
+		return x.xxx_hidden_ExecutionMarker
+	}
+	return ""
+}
+
 func (x *Task) SetOperation(v Operation) {
 	x.xxx_hidden_Operation = v
 }
@@ -954,7 +962,7 @@ func (x *Task) SetIncludeDownstream(v bool) {
 
 func (x *Task) SetBaseConfigWorkspace(v string) {
 	x.xxx_hidden_BaseConfigWorkspace = &v
-	protoimpl.X.SetPresent(&(x.XXX_presence[1]), 37, 40)
+	protoimpl.X.SetPresent(&(x.XXX_presence[1]), 37, 41)
 }
 
 func (x *Task) SetBypassPreconditions(v bool) {
@@ -963,6 +971,10 @@ func (x *Task) SetBypassPreconditions(v bool) {
 
 func (x *Task) SetPassedEnvs(v []string) {
 	x.xxx_hidden_PassedEnvs = v
+}
+
+func (x *Task) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = v
 }
 
 func (x *Task) HasPreviousStatus() bool {
@@ -1055,6 +1067,10 @@ type Task_builder struct {
 	// Resolved "KEY=value" pairs the parent opted to share with the child run via
 	// the step's pass_env field.
 	PassedEnvs []string
+	// Execution marker of the dispatched attempt: its persisted queued-at marker
+	// when dispatched, empty for a direct start. A queued retry reuses the attempt
+	// and its key, so the marker is what tells one execution from the next.
+	ExecutionMarker string
 }
 
 func (b0 Task_builder) Build() *Task {
@@ -1099,11 +1115,12 @@ func (b0 Task_builder) Build() *Task {
 	x.xxx_hidden_TargetWorkerId = b.TargetWorkerId
 	x.xxx_hidden_IncludeDownstream = b.IncludeDownstream
 	if b.BaseConfigWorkspace != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[1]), 37, 40)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[1]), 37, 41)
 		x.xxx_hidden_BaseConfigWorkspace = b.BaseConfigWorkspace
 	}
 	x.xxx_hidden_BypassPreconditions = b.BypassPreconditions
 	x.xxx_hidden_PassedEnvs = b.PassedEnvs
+	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	return m0
 }
 
@@ -2215,10 +2232,13 @@ func (b0 RunHeartbeatResponse_builder) Build() *RunHeartbeatResponse {
 
 // Information about a cancelled DAG run.
 type CancelledRun struct {
-	state                 protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_AttemptKey string                 `protobuf:"bytes,1,opt,name=attempt_key,json=attemptKey,proto3"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	state                      protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_AttemptKey      string                 `protobuf:"bytes,1,opt,name=attempt_key,json=attemptKey,proto3"`
+	xxx_hidden_ExecutionMarker *string                `protobuf:"bytes,2,opt,name=execution_marker,json=executionMarker,proto3,oneof"`
+	XXX_raceDetectHookData     protoimpl.RaceDetectHookData
+	XXX_presence               [1]uint32
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *CancelledRun) Reset() {
@@ -2253,14 +2273,45 @@ func (x *CancelledRun) GetAttemptKey() string {
 	return ""
 }
 
+func (x *CancelledRun) GetExecutionMarker() string {
+	if x != nil {
+		if x.xxx_hidden_ExecutionMarker != nil {
+			return *x.xxx_hidden_ExecutionMarker
+		}
+		return ""
+	}
+	return ""
+}
+
 func (x *CancelledRun) SetAttemptKey(v string) {
 	x.xxx_hidden_AttemptKey = v
+}
+
+func (x *CancelledRun) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = &v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 1, 2)
+}
+
+func (x *CancelledRun) HasExecutionMarker() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 1)
+}
+
+func (x *CancelledRun) ClearExecutionMarker() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 1)
+	x.xxx_hidden_ExecutionMarker = nil
 }
 
 type CancelledRun_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	AttemptKey string
+	// When present, only the execution with this Task.execution_marker is
+	// cancelled; an empty value names a direct-start execution. When absent, every
+	// execution of the attempt key is cancelled.
+	ExecutionMarker *string
 }
 
 func (b0 CancelledRun_builder) Build() *CancelledRun {
@@ -2268,6 +2319,10 @@ func (b0 CancelledRun_builder) Build() *CancelledRun {
 	b, x := &b0, m0
 	_, _ = b, x
 	x.xxx_hidden_AttemptKey = b.AttemptKey
+	if b.ExecutionMarker != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 1, 2)
+		x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
+	}
 	return m0
 }
 
@@ -2370,6 +2425,7 @@ type RunningTask struct {
 	xxx_hidden_ParentDagRunName string                 `protobuf:"bytes,6,opt,name=parent_dag_run_name,json=parentDagRunName,proto3"`
 	xxx_hidden_ParentDagRunId   string                 `protobuf:"bytes,7,opt,name=parent_dag_run_id,json=parentDagRunId,proto3"`
 	xxx_hidden_AttemptKey       string                 `protobuf:"bytes,8,opt,name=attempt_key,json=attemptKey,proto3"`
+	xxx_hidden_ExecutionMarker  string                 `protobuf:"bytes,9,opt,name=execution_marker,json=executionMarker,proto3"`
 	unknownFields               protoimpl.UnknownFields
 	sizeCache                   protoimpl.SizeCache
 }
@@ -2455,6 +2511,13 @@ func (x *RunningTask) GetAttemptKey() string {
 	return ""
 }
 
+func (x *RunningTask) GetExecutionMarker() string {
+	if x != nil {
+		return x.xxx_hidden_ExecutionMarker
+	}
+	return ""
+}
+
 func (x *RunningTask) SetDagRunId(v string) {
 	x.xxx_hidden_DagRunId = v
 }
@@ -2487,6 +2550,10 @@ func (x *RunningTask) SetAttemptKey(v string) {
 	x.xxx_hidden_AttemptKey = v
 }
 
+func (x *RunningTask) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = v
+}
+
 type RunningTask_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
@@ -2498,6 +2565,7 @@ type RunningTask_builder struct {
 	ParentDagRunName string
 	ParentDagRunId   string
 	AttemptKey       string
+	ExecutionMarker  string
 }
 
 func (b0 RunningTask_builder) Build() *RunningTask {
@@ -2512,6 +2580,7 @@ func (b0 RunningTask_builder) Build() *RunningTask {
 	x.xxx_hidden_ParentDagRunName = b.ParentDagRunName
 	x.xxx_hidden_ParentDagRunId = b.ParentDagRunId
 	x.xxx_hidden_AttemptKey = b.AttemptKey
+	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	return m0
 }
 
@@ -2523,6 +2592,7 @@ type ReportStatusRequest struct {
 	xxx_hidden_OwnerCoordinatorId string                 `protobuf:"bytes,3,opt,name=owner_coordinator_id,json=ownerCoordinatorId,proto3"`
 	xxx_hidden_SourceFile         string                 `protobuf:"bytes,4,opt,name=source_file,json=sourceFile,proto3"`
 	xxx_hidden_Labels             string                 `protobuf:"bytes,5,opt,name=labels,proto3"`
+	xxx_hidden_ExecutionMarker    string                 `protobuf:"bytes,6,opt,name=execution_marker,json=executionMarker,proto3"`
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -2587,6 +2657,13 @@ func (x *ReportStatusRequest) GetLabels() string {
 	return ""
 }
 
+func (x *ReportStatusRequest) GetExecutionMarker() string {
+	if x != nil {
+		return x.xxx_hidden_ExecutionMarker
+	}
+	return ""
+}
+
 func (x *ReportStatusRequest) SetWorkerId(v string) {
 	x.xxx_hidden_WorkerId = v
 }
@@ -2605,6 +2682,10 @@ func (x *ReportStatusRequest) SetSourceFile(v string) {
 
 func (x *ReportStatusRequest) SetLabels(v string) {
 	x.xxx_hidden_Labels = v
+}
+
+func (x *ReportStatusRequest) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = v
 }
 
 func (x *ReportStatusRequest) HasStatus() bool {
@@ -2626,6 +2707,8 @@ type ReportStatusRequest_builder struct {
 	OwnerCoordinatorId string
 	SourceFile         string
 	Labels             string
+	// Task.execution_marker of the execution that produced the status.
+	ExecutionMarker string
 }
 
 func (b0 ReportStatusRequest_builder) Build() *ReportStatusRequest {
@@ -2637,6 +2720,7 @@ func (b0 ReportStatusRequest_builder) Build() *ReportStatusRequest {
 	x.xxx_hidden_OwnerCoordinatorId = b.OwnerCoordinatorId
 	x.xxx_hidden_SourceFile = b.SourceFile
 	x.xxx_hidden_Labels = b.Labels
+	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	return m0
 }
 
@@ -2787,6 +2871,7 @@ type LogChunk struct {
 	xxx_hidden_OwnerCoordinatorId string                 `protobuf:"bytes,12,opt,name=owner_coordinator_id,json=ownerCoordinatorId,proto3"`
 	xxx_hidden_AttemptKey         string                 `protobuf:"bytes,13,opt,name=attempt_key,json=attemptKey,proto3"`
 	xxx_hidden_ByteOffset         uint64                 `protobuf:"varint,14,opt,name=byte_offset,json=byteOffset,proto3,oneof"`
+	xxx_hidden_ExecutionMarker    string                 `protobuf:"bytes,15,opt,name=execution_marker,json=executionMarker,proto3"`
 	XXX_raceDetectHookData        protoimpl.RaceDetectHookData
 	XXX_presence                  [1]uint32
 	unknownFields                 protoimpl.UnknownFields
@@ -2916,6 +3001,13 @@ func (x *LogChunk) GetByteOffset() uint64 {
 	return 0
 }
 
+func (x *LogChunk) GetExecutionMarker() string {
+	if x != nil {
+		return x.xxx_hidden_ExecutionMarker
+	}
+	return ""
+}
+
 func (x *LogChunk) SetWorkerId(v string) {
 	x.xxx_hidden_WorkerId = v
 }
@@ -2973,7 +3065,11 @@ func (x *LogChunk) SetAttemptKey(v string) {
 
 func (x *LogChunk) SetByteOffset(v uint64) {
 	x.xxx_hidden_ByteOffset = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 13, 14)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 13, 15)
+}
+
+func (x *LogChunk) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = v
 }
 
 func (x *LogChunk) HasByteOffset() bool {
@@ -3010,6 +3106,8 @@ type LogChunk_builder struct {
 	AttemptKey string
 	// When present, data is written at this absolute byte position; otherwise it is appended.
 	ByteOffset *uint64
+	// Task.execution_marker of the execution that produced the log.
+	ExecutionMarker string
 }
 
 func (b0 LogChunk_builder) Build() *LogChunk {
@@ -3030,9 +3128,10 @@ func (b0 LogChunk_builder) Build() *LogChunk {
 	x.xxx_hidden_OwnerCoordinatorId = b.OwnerCoordinatorId
 	x.xxx_hidden_AttemptKey = b.AttemptKey
 	if b.ByteOffset != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 13, 14)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 13, 15)
 		x.xxx_hidden_ByteOffset = *b.ByteOffset
 	}
+	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	return m0
 }
 
@@ -3137,6 +3236,7 @@ type ArtifactChunk struct {
 	xxx_hidden_AttemptId          string                 `protobuf:"bytes,10,opt,name=attempt_id,json=attemptId,proto3"`
 	xxx_hidden_OwnerCoordinatorId string                 `protobuf:"bytes,11,opt,name=owner_coordinator_id,json=ownerCoordinatorId,proto3"`
 	xxx_hidden_AttemptKey         string                 `protobuf:"bytes,12,opt,name=attempt_key,json=attemptKey,proto3"`
+	xxx_hidden_ExecutionMarker    string                 `protobuf:"bytes,13,opt,name=execution_marker,json=executionMarker,proto3"`
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -3250,6 +3350,13 @@ func (x *ArtifactChunk) GetAttemptKey() string {
 	return ""
 }
 
+func (x *ArtifactChunk) GetExecutionMarker() string {
+	if x != nil {
+		return x.xxx_hidden_ExecutionMarker
+	}
+	return ""
+}
+
 func (x *ArtifactChunk) SetWorkerId(v string) {
 	x.xxx_hidden_WorkerId = v
 }
@@ -3301,6 +3408,10 @@ func (x *ArtifactChunk) SetAttemptKey(v string) {
 	x.xxx_hidden_AttemptKey = v
 }
 
+func (x *ArtifactChunk) SetExecutionMarker(v string) {
+	x.xxx_hidden_ExecutionMarker = v
+}
+
 type ArtifactChunk_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
@@ -3320,6 +3431,8 @@ type ArtifactChunk_builder struct {
 	OwnerCoordinatorId string
 	// Durable attempt identity used to fence artifact writes.
 	AttemptKey string
+	// Task.execution_marker of the execution that produced the artifact.
+	ExecutionMarker string
 }
 
 func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
@@ -3338,6 +3451,7 @@ func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
 	x.xxx_hidden_AttemptId = b.AttemptId
 	x.xxx_hidden_OwnerCoordinatorId = b.OwnerCoordinatorId
 	x.xxx_hidden_AttemptKey = b.AttemptKey
+	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	return m0
 }
 
@@ -6016,7 +6130,7 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x0fDispatchRequest\x12(\n" +
 	"\x04task\x18\x01 \x01(\v2\x14.coordinator.v1.TaskR\x04task\x12>\n" +
 	"\x1badmission_reservation_token\x18\x02 \x01(\tR\x19admissionReservationToken\"\x12\n" +
-	"\x10DispatchResponse\"\x97\x0e\n" +
+	"\x10DispatchResponse\"\xc2\x0e\n" +
 	"\x04Task\x127\n" +
 	"\toperation\x18\x06 \x01(\x0e2\x19.coordinator.v1.OperationR\toperation\x12)\n" +
 	"\x11root_dag_run_name\x18\x01 \x01(\tR\x0erootDagRunName\x12%\n" +
@@ -6069,7 +6183,8 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x15base_config_workspace\x18' \x01(\tH\x00R\x13baseConfigWorkspace\x88\x01\x01\x121\n" +
 	"\x14bypass_preconditions\x18( \x01(\bR\x13bypassPreconditions\x12\x1f\n" +
 	"\vpassed_envs\x18) \x03(\tR\n" +
-	"passedEnvs\x1aA\n" +
+	"passedEnvs\x12)\n" +
+	"\x10execution_marker\x18* \x01(\tR\x0fexecutionMarker\x1aA\n" +
 	"\x13WorkerSelectorEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x18\n" +
@@ -6135,14 +6250,16 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x14owner_coordinator_id\x18\x02 \x01(\tR\x12ownerCoordinatorId\x12@\n" +
 	"\rrunning_tasks\x18\x03 \x03(\v2\x1b.coordinator.v1.RunningTaskR\frunningTasks\"[\n" +
 	"\x14RunHeartbeatResponse\x12C\n" +
-	"\x0ecancelled_runs\x18\x01 \x03(\v2\x1c.coordinator.v1.CancelledRunR\rcancelledRuns\"/\n" +
+	"\x0ecancelled_runs\x18\x01 \x03(\v2\x1c.coordinator.v1.CancelledRunR\rcancelledRuns\"t\n" +
 	"\fCancelledRun\x12\x1f\n" +
 	"\vattempt_key\x18\x01 \x01(\tR\n" +
-	"attemptKey\"\x97\x01\n" +
+	"attemptKey\x12.\n" +
+	"\x10execution_marker\x18\x02 \x01(\tH\x00R\x0fexecutionMarker\x88\x01\x01B\x13\n" +
+	"\x11_execution_marker\"\x97\x01\n" +
 	"\vWorkerStats\x12#\n" +
 	"\rtotal_pollers\x18\x01 \x01(\x05R\ftotalPollers\x12!\n" +
 	"\fbusy_pollers\x18\x02 \x01(\x05R\vbusyPollers\x12@\n" +
-	"\rrunning_tasks\x18\x03 \x03(\v2\x1b.coordinator.v1.RunningTaskR\frunningTasks\"\xb2\x02\n" +
+	"\rrunning_tasks\x18\x03 \x03(\v2\x1b.coordinator.v1.RunningTaskR\frunningTasks\"\xdd\x02\n" +
 	"\vRunningTask\x12\x1c\n" +
 	"\n" +
 	"dag_run_id\x18\x01 \x01(\tR\bdagRunId\x12\x19\n" +
@@ -6154,19 +6271,21 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x13parent_dag_run_name\x18\x06 \x01(\tR\x10parentDagRunName\x12)\n" +
 	"\x11parent_dag_run_id\x18\a \x01(\tR\x0eparentDagRunId\x12\x1f\n" +
 	"\vattempt_key\x18\b \x01(\tR\n" +
-	"attemptKey\"\xd8\x01\n" +
+	"attemptKey\x12)\n" +
+	"\x10execution_marker\x18\t \x01(\tR\x0fexecutionMarker\"\x83\x02\n" +
 	"\x13ReportStatusRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x129\n" +
 	"\x06status\x18\x02 \x01(\v2!.coordinator.v1.DAGRunStatusProtoR\x06status\x120\n" +
 	"\x14owner_coordinator_id\x18\x03 \x01(\tR\x12ownerCoordinatorId\x12\x1f\n" +
 	"\vsource_file\x18\x04 \x01(\tR\n" +
 	"sourceFile\x12\x16\n" +
-	"\x06labels\x18\x05 \x01(\tR\x06labels\"H\n" +
+	"\x06labels\x18\x05 \x01(\tR\x06labels\x12)\n" +
+	"\x10execution_marker\x18\x06 \x01(\tR\x0fexecutionMarker\"H\n" +
 	"\x14ReportStatusResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"0\n" +
 	"\x11DAGRunStatusProto\x12\x1b\n" +
-	"\tjson_data\x18\x01 \x01(\tR\bjsonData\"\x82\x04\n" +
+	"\tjson_data\x18\x01 \x01(\tR\bjsonData\"\xad\x04\n" +
 	"\bLogChunk\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1c\n" +
 	"\n" +
@@ -6187,12 +6306,13 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\vattempt_key\x18\r \x01(\tR\n" +
 	"attemptKey\x12$\n" +
 	"\vbyte_offset\x18\x0e \x01(\x04H\x00R\n" +
-	"byteOffset\x88\x01\x01B\x0e\n" +
+	"byteOffset\x88\x01\x01\x12)\n" +
+	"\x10execution_marker\x18\x0f \x01(\tR\x0fexecutionMarkerB\x0e\n" +
 	"\f_byte_offset\"x\n" +
 	"\x12StreamLogsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\x99\x03\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"\xc4\x03\n" +
 	"\rArtifactChunk\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1c\n" +
 	"\n" +
@@ -6209,7 +6329,8 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	" \x01(\tR\tattemptId\x120\n" +
 	"\x14owner_coordinator_id\x18\v \x01(\tR\x12ownerCoordinatorId\x12\x1f\n" +
 	"\vattempt_key\x18\f \x01(\tR\n" +
-	"attemptKey\"}\n" +
+	"attemptKey\x12)\n" +
+	"\x10execution_marker\x18\r \x01(\tR\x0fexecutionMarker\"}\n" +
 	"\x17StreamArtifactsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
@@ -6543,6 +6664,7 @@ func file_proto_coordinator_v1_coordinator_proto_init() {
 		return
 	}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[4].OneofWrappers = []any{}
+	file_proto_coordinator_v1_coordinator_proto_msgTypes[18].OneofWrappers = []any{}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[24].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

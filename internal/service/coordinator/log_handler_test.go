@@ -312,7 +312,8 @@ func TestLogHandler_CloseWriter(t *testing.T) {
 		require.True(t, exists)
 
 		// Close the writer
-		require.NoError(t, h.closeWriter(chunk))
+		_, _, closeErr := h.closeWriter(chunk)
+		require.NoError(t, closeErr)
 
 		// Verify it's removed
 		h.writersMu.Lock()
@@ -336,7 +337,8 @@ func TestLogHandler_CloseWriter(t *testing.T) {
 		}
 
 		// Should not panic
-		require.NoError(t, h.closeWriter(chunk))
+		_, _, closeErr := h.closeWriter(chunk)
+		require.NoError(t, closeErr)
 	})
 }
 
@@ -422,7 +424,8 @@ func TestStreamLogWriter_Write(t *testing.T) {
 		require.Equal(t, len(testData), n)
 
 		// Close writer (which flushes)
-		require.NoError(t, h.closeWriter(chunk))
+		_, _, closeErr := h.closeWriter(chunk)
+		require.NoError(t, closeErr)
 
 		// Verify file contents
 		filePath := h.logFilePath(chunk)

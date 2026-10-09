@@ -43,6 +43,9 @@ type StatusPusher struct {
 	claimKey   string
 	sourceFile string
 	labels     string
+	// executionMarker is the dispatched task's execution marker, sent with
+	// every report so the coordinator can refuse reports of other executions.
+	executionMarker string
 }
 
 // NewTaskStatusPusher creates a StatusPusher bound to a dispatched task.
@@ -53,6 +56,7 @@ func NewTaskStatusPusher(client coordinator.Client, workerID string, task *coord
 	pusher := NewStatusPusher(client, workerID, task.AttemptKey, owner...)
 	pusher.sourceFile = task.SourceFile
 	pusher.labels = task.Labels
+	pusher.executionMarker = task.ExecutionMarker
 	return pusher
 }
 
@@ -106,6 +110,7 @@ func (p *StatusPusher) Push(ctx context.Context, status ir.DAGRunStatus) error {
 		OwnerCoordinatorId: p.owner.ID,
 		SourceFile:         p.sourceFile,
 		Labels:             p.labels,
+		ExecutionMarker:    p.executionMarker,
 	}
 
 	var resp *coordinatorv1.ReportStatusResponse

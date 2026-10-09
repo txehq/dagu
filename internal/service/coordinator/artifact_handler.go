@@ -26,6 +26,9 @@ import (
 type artifactHandler struct {
 	dagRunRepository *persis.DAGRunRepository
 	attemptValidator func(context.Context, attemptIdentity) error
+	// lockAttempt holds an attempt's write lock across the final
+	// revalidation and the commit; see attemptWriteLocks.
+	lockAttempt func(root ir.DAGRunRef) (unlock func())
 }
 
 type artifactWriter struct {
@@ -127,15 +130,42 @@ func (h *artifactHandler) handleStream(stream coordinatorv1.CoordinatorService_S
 		}
 
 		if chunk.IsFinal {
-			if _, err := h.archiveDir(ctx, chunk); err != nil {
-				_ = h.closeWriter(activeWriters, key, false)
-				return fmt.Errorf("failed to validate artifact finalization: %w", err)
-			}
-			if err := h.closeWriter(activeWriters, key, true); err != nil {
-				return fmt.Errorf("failed to finalize artifact: %w", err)
+			if err := h.commit(ctx, chunk, key, validatedIdentity, activeWriters); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+// commit makes a finished upload visible. Data chunks go to a temporary file,
+// so only the commit can touch a file that the attempt's archive exposes, and
+// a queued retry reuses that archive. The commit therefore revalidates under
+// the attempt's write lock, so an earlier execution's upload is committed
+// before the next execution's claim or is refused after it.
+func (h *artifactHandler) commit(
+	ctx context.Context,
+	chunk *coordinatorv1.ArtifactChunk,
+	key string,
+	validatedIdentity *attemptIdentity,
+	activeWriters map[string]*artifactWriter,
+) error {
+	if validatedIdentity != nil {
+		if h.lockAttempt != nil {
+			defer h.lockAttempt(validatedIdentity.root)()
+		}
+		if err := h.attemptValidator(ctx, *validatedIdentity); err != nil {
+			_ = h.closeWriter(activeWriters, key, false)
+			return err
+		}
+	}
+	if _, err := h.archiveDir(ctx, chunk); err != nil {
+		_ = h.closeWriter(activeWriters, key, false)
+		return fmt.Errorf("failed to validate artifact finalization: %w", err)
+	}
+	if err := h.closeWriter(activeWriters, key, true); err != nil {
+		return fmt.Errorf("failed to finalize artifact: %w", err)
+	}
+	return nil
 }
 
 func (h *artifactHandler) streamKey(chunk *coordinatorv1.ArtifactChunk) string {

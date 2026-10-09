@@ -195,6 +195,44 @@ func TestDAGRunLeaseStore_RejectsWorkerTransfer(t *testing.T) {
 	assert.Equal(t, initial.ClaimedAt, lease.ClaimedAt)
 }
 
+// A queued retry reuses the attempt key, so a lease must not change execution
+// in place: a claim with another marker, including the empty marker of a
+// direct start, conflicts until the earlier execution's lease is removed.
+func TestDAGRunLeaseStore_RejectsExecutionChange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := store.NewDAGRunLeaseStore(testutil.NewMemoryBackend().Collection("dag_run_leases"))
+
+	initial := dispatch.DAGRunLease{
+		AttemptKey:      "attempt-key-marker",
+		DAGRun:          ir.NewDAGRunRef("dag-a", "run-1"),
+		Root:            ir.NewDAGRunRef("dag-a", "run-1"),
+		AttemptID:       "attempt-1",
+		WorkerID:        "worker-1",
+		ExecutionMarker: "2026-10-10T01:00:00Z",
+	}
+	require.NoError(t, s.Upsert(ctx, initial))
+	require.NoError(t, s.Upsert(ctx, initial), "the same execution may record its lease again")
+
+	for _, marker := range []string{"2026-10-10T01:05:00Z", ""} {
+		next := initial
+		next.ExecutionMarker = marker
+		require.ErrorIs(t, s.Upsert(ctx, next), dispatch.ErrDAGRunLeaseConflict, "marker %q", marker)
+	}
+	lease, err := s.Get(ctx, initial.AttemptKey)
+	require.NoError(t, err)
+	assert.Equal(t, initial.ExecutionMarker, lease.ExecutionMarker)
+
+	require.NoError(t, s.Delete(ctx, initial.AttemptKey))
+	next := initial
+	next.ExecutionMarker = "2026-10-10T01:05:00Z"
+	require.NoError(t, s.Upsert(ctx, next))
+	lease, err = s.Get(ctx, initial.AttemptKey)
+	require.NoError(t, err)
+	assert.Equal(t, next.ExecutionMarker, lease.ExecutionMarker)
+}
+
 func TestDAGRunLeaseStore_SharedFileInstancesPreserveLeaseIdentity(t *testing.T) {
 	t.Parallel()
 
