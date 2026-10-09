@@ -1,0 +1,13 @@
+{
+  "dag_name": "job_01K7A5ZQ8M3N4P5R6S7T8V9W01",
+  "dag_spec_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+  "job_id": "job_01K7A5ZQ8M3N4P5R6S7T8V9W01",
+  "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+  "owner_id": "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
+  "package_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "project_id": "prj_00000000000000000000000001",
+  "registration": "ready",
+  "revision": 2,
+  "version": 1
+}
+

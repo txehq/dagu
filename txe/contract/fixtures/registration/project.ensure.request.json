@@ -1,0 +1,12 @@
+{
+  "owner_id": "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
+  "key": "github.com/txehq/txe",
+  "name": "txehq/txe",
+  "actor": {
+    "kind": "cli",
+    "id": "cli",
+    "session": "cc1-s000001",
+    "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+    "client": "dagu test"
+  }
+}

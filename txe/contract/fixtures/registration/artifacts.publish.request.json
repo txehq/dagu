@@ -1,0 +1,34 @@
+{
+  "job_version": 1,
+  "artifacts": [
+    {
+      "deliverable": "snapshot",
+      "path": "snapshot.json",
+      "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "bytes": 11,
+      "location": "hub",
+      "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+      "recorded_at": "2026-10-09T12:00:00Z"
+    },
+    {
+      "deliverable": "raw",
+      "path": "raw/export.csv",
+      "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "bytes": 8,
+      "location": "machine",
+      "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+      "recorded_at": "2026-10-09T12:00:00Z"
+    },
+    {
+      "deliverable": "notes",
+      "path": "notes.txt",
+      "missing": true
+    }
+  ],
+  "actor": {
+    "kind": "cli",
+    "id": "publish",
+    "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C",
+    "client": "dagu test"
+  }
+}
