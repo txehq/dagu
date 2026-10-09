@@ -20,7 +20,7 @@ import (
 
 // RunAdmitter is the TXE job registry's run guard.
 type RunAdmitter interface {
-	AdmitClaim(ctx context.Context, dagName, specSHA256, runID string) (registry.Admission, error)
+	AdmitClaim(ctx context.Context, dagName, specSHA256 string, run registry.RunRef) (registry.Admission, error)
 	RecordDroppedRun(ctx context.Context, jobID, runID string, adm registry.Admission) error
 }
 
@@ -48,7 +48,11 @@ func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, 
 	if task.Definition != "" {
 		spec = fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(task.Definition)))
 	}
-	adm, err := h.runAdmitter.AdmitClaim(ctx, name, spec, task.DAGRunID)
+	run := registry.RunRef{RunID: task.DAGRunID}
+	if task.RootDAGRunID != "" && task.RootDAGRunID != task.DAGRunID {
+		run.RootName, run.RootRunID = task.RootDAGRunName, task.RootDAGRunID
+	}
+	adm, err := h.runAdmitter.AdmitClaim(ctx, name, spec, run)
 	if err != nil {
 		return false, "", fmt.Errorf("check TXE job admission: %w", err)
 	}

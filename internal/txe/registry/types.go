@@ -490,15 +490,34 @@ type Proposal struct {
 	Prev            string        `json:"prev,omitempty"`
 }
 
+// RunRef identifies a run of a job's DAG. RootName and RootRunID are set
+// when the run is a child of another DAG's run.
+type RunRef struct {
+	RunID     string `json:"run_id"`
+	Running   bool   `json:"running,omitempty"`
+	RootName  string `json:"root_name,omitempty"`
+	RootRunID string `json:"root_run_id,omitempty"`
+}
+
+// AdmittedRun records when a worker was allowed to start a run.
+type AdmittedRun struct {
+	At        time.Time `json:"at"`
+	RootName  string    `json:"root_name,omitempty"`
+	RootRunID string    `json:"root_run_id,omitempty"`
+}
+
 // PendingEffects is Dagu work a lifecycle transition still owes: runs to
 // stop under the cancel policy. Suspension is not stored here; it is always
 // reconciled to the state the current lifecycle requires.
 type PendingEffects struct {
-	Revision  int64     `json:"revision"`
-	StopRuns  []string  `json:"stop_runs,omitempty"`
-	Attempts  int       `json:"attempts"`
-	Since     time.Time `json:"since"`
-	LastError string    `json:"last_error,omitempty"`
+	Revision int64    `json:"revision"`
+	StopRuns []RunRef `json:"stop_runs,omitempty"`
+	// DiscoverRuns means the job's runs could not be listed when it ended
+	// under the cancel policy; they are listed again and stopped.
+	DiscoverRuns bool      `json:"discover_runs,omitempty"`
+	Attempts     int       `json:"attempts"`
+	Since        time.Time `json:"since"`
+	LastError    string    `json:"last_error,omitempty"`
 }
 
 // NativeResume is a pending completion of the Dagu human task that collected
@@ -725,7 +744,7 @@ type Job struct {
 	NativeResumes map[string]*NativeResume `json:"native_resumes,omitempty"`
 	// AdmittedRuns are runs a worker was allowed to start, by run ID, so a
 	// later retirement knows them even before Dagu reports them running.
-	AdmittedRuns map[string]time.Time `json:"admitted_runs,omitempty"`
+	AdmittedRuns map[string]AdmittedRun `json:"admitted_runs,omitempty"`
 	// PendingEffects are lifecycle effects on Dagu committed with the
 	// transition and not yet confirmed applied.
 	PendingEffects *PendingEffects `json:"pending_effects,omitempty"`

@@ -26,7 +26,7 @@ type fakeRunAdmitter struct {
 	dropped []string
 }
 
-func (f *fakeRunAdmitter) AdmitClaim(context.Context, string, string, string) (registry.Admission, error) {
+func (f *fakeRunAdmitter) AdmitClaim(context.Context, string, string, registry.RunRef) (registry.Admission, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.adm, nil

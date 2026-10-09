@@ -3073,6 +3073,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
 		return retryDAGRunResult{}, err
 	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return retryDAGRunResult{}, err
+	}
 	prevStatus, err := attempt.ReadStatus(ctx)
 	if err != nil {
 		return retryDAGRunResult{}, fmt.Errorf("error reading status: %w", err)
@@ -3577,7 +3580,10 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 			}
 		}
 	}
-	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+	// The job identity comes from the run being rescheduled; admission is
+	// applied below to the definition actually selected for execution.
+	txeJobID, err := txeJobIdentity(dag)
+	if err != nil {
 		return rescheduleDAGRunResult{}, err
 	}
 	if err := txeRefuseRunName(dag, nameOverride); err != nil {
@@ -3637,6 +3643,11 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 		}
 		dag.SourceFile = snapshotDAG.SourceFile
 		dag.WorkingDir = snapshotDAG.WorkingDir
+	}
+	if txeJobID != "" {
+		if err := a.txeAdmitJob(ctx, txeJobID, dag); err != nil {
+			return rescheduleDAGRunResult{}, err
+		}
 	}
 
 	if err := a.ensureDAGRunIDUnique(ctx, dag, newDagRunID); err != nil {
