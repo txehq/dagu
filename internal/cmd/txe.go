@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	txeskill "github.com/dagucloud/dagu/v2/txe/skill"
 )
 
 // txeContextName is the CLI context the worker installer creates for the hub.
@@ -238,10 +239,16 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 		Journal: txepkg.NewJournal(home),
 		Actor: txeclient.Actor{
 			Kind: txeclient.ActorKindCLI, ID: "cli", Session: session,
-			MachineID: machine.MachineID, Client: "dagu " + config.Version,
+			MachineID: machine.MachineID, Client: txeClientVersion(),
 		},
 		NewID: txeclient.NewID,
 	}, nil
+}
+
+// txeClientVersion names the CLI build and the skill revision it carries, for
+// the record of who made a change.
+func txeClientVersion() string {
+	return "dagu " + config.Version + " skill " + txeskill.Name + "@" + txeskill.Revision()
 }
 
 // txePrinter writes human-readable output and keeps the first write error.

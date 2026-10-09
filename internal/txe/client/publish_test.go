@@ -220,3 +220,23 @@ func TestJobSpecDeliverableRules(t *testing.T) {
 	assert.Contains(t, joined, "deliverables[2].name")
 	assert.Contains(t, joined, `delivery must be "machine" or "hub"`)
 }
+
+// The examples shipped with the skill are complete job specs whose packages
+// build, so a session that copies one starts from something that registers.
+func TestSkillExamplesAreValid(t *testing.T) {
+	examples := filepath.Join("..", "..", "..", "txe", "skill", "examples")
+	for _, name := range []string{"healthcheck", "collector", "validation"} {
+		t.Run(name, func(t *testing.T) {
+			spec, err := LoadJobSpec(filepath.Join(examples, name, "job.yaml"))
+			require.NoError(t, err)
+
+			f := newFakeRegistry(t)
+			home := machineHome(t, f)
+			plan, err := newSession(f, home, "cc1-s000001").Plan(context.Background(), spec)
+			require.NoError(t, err)
+			assert.NotEmpty(t, plan.Manifest.Files)
+			assert.Contains(t, plan.DAGSpec, "type: chain\n")
+			assert.Zero(t, f.jobCount(), "a plan registers nothing")
+		})
+	}
+}

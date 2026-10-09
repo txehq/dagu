@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -107,7 +106,7 @@ func runTXEArtifactsPublish(ctx *Context, _ []string) error {
 		return err
 	}
 	publisher := &txeclient.Publisher{Client: client, Home: home, Actor: txeclient.Actor{
-		Kind: txeclient.ActorKindCLI, ID: "publish", MachineID: machine.MachineID, Client: "dagu " + config.Version,
+		Kind: txeclient.ActorKindCLI, ID: "publish", MachineID: machine.MachineID, Client: txeClientVersion(),
 	}}
 	manifest, publishErr := publisher.Publish(ctx, in)
 	if manifest == nil {
