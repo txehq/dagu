@@ -913,7 +913,7 @@ func TestFlush_DataCopied(t *testing.T) {
 	assert.Equal(t, byte('o'), chunks[0].Data[0], "sent data should not be affected by buffer modification")
 }
 
-func TestClose_NoData(t *testing.T) {
+func TestClose_NoDataSendsEmptyFinal(t *testing.T) {
 	t.Parallel()
 	mockStream := &mockStreamLogsClient{}
 	client := &logStreamerMockClient{
@@ -927,8 +927,39 @@ func TestClose_NoData(t *testing.T) {
 	err := writer.Close()
 
 	require.NoError(t, err)
-	// No stream was created (no data written), so no chunks sent
-	assert.Empty(t, mockStream.getSentChunks())
+	// A stream that wrote nothing still sends one positioned final chunk, so
+	// the coordinator records the empty log as complete (TXE-3772).
+	chunks := mockStream.getSentChunks()
+	require.Len(t, chunks, 1)
+	assert.True(t, chunks[0].IsFinal)
+	assert.Empty(t, chunks[0].Data)
+	require.True(t, chunks[0].HasByteOffset())
+	assert.Equal(t, uint64(0), chunks[0].GetByteOffset())
+}
+
+func TestSchedulerLogWriterCloseWithoutDataSendsFinal(t *testing.T) {
+	t.Parallel()
+	mockStream := &mockStreamLogsClient{}
+	client := &logStreamerMockClient{
+		streamLogsFunc: func(_ context.Context) (coordinatorv1.CoordinatorService_StreamLogsClient, error) {
+			return mockStream, nil
+		},
+	}
+	streamer := coordreport.NewLogStreamer(client, "w", "r", "d", "a", ir.DAGRunRef{})
+	localFile, err := os.CreateTemp(t.TempDir(), "scheduler-*.log")
+	require.NoError(t, err)
+	defer func() { _ = localFile.Close() }()
+
+	scheduler := streamer.NewSchedulerLogWriter(context.Background(), localFile)
+	require.NoError(t, scheduler.Close())
+
+	// An empty scheduler log is finalized too (TXE-3772).
+	chunks := mockStream.getSentChunks()
+	require.Len(t, chunks, 1)
+	assert.True(t, chunks[0].IsFinal)
+	assert.Equal(t, coordinatorv1.LogStreamType_LOG_STREAM_TYPE_SCHEDULER, chunks[0].StreamType)
+	require.True(t, chunks[0].HasByteOffset())
+	assert.Equal(t, uint64(0), chunks[0].GetByteOffset())
 }
 
 func TestClose_WithUnflushedData(t *testing.T) {

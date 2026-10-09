@@ -2124,26 +2124,27 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	}
 
 	attempt := latestAttempt
-	// A retry can re-queue the attempt only from a terminal status, and it may
-	// do so from another process. Every root write that produces or replaces a
-	// terminal status therefore goes through the store's compare-and-swap,
-	// which the retry also uses:
-	//   - over a terminal status, it applies only if the status and queued-at
-	//     are still those validated against, so a late replay cannot restore
-	//     an earlier execution over a queued retry;
-	//   - to a terminal status, the write and the file's compaction finish
-	//     under the store's lock. Through the open attempt, closing it after
-	//     the write would compact the file from a read taken before a retry
-	//     queued in between, and drop that retry.
-	conditional := dagRunStatus.Status == ir.Waiting ||
-		(!isSubDAGStatus(dagRunStatus) &&
-			(isTerminalRunStatus(latestStatus.Status) || isTerminalRunStatus(dagRunStatus.Status)))
+	// Other writers change a root run's status outside this coordinator's locks:
+	// a retry re-queues it, a stale-run repair fails it, and a Waiting run is
+	// resumed, all through the store's compare-and-swap, from any process. Every
+	// root write therefore goes through that compare-and-swap too, and applies
+	// only if the status is still exactly the one validated against: the same
+	// status, attempt and queued-at. Otherwise a late report could overwrite a
+	// queued retry, which the queue then drops. Writing through the cached open
+	// attempt and closing it afterwards would also compact the file from a stale
+	// read. Sub-DAG statuses keep the open attempt, except while Waiting.
+	rootWrite := !isSubDAGStatus(dagRunStatus)
+	conditional := rootWrite || dagRunStatus.Status == ir.Waiting
+	expectedAttemptID, expectedAttemptKey := latestAttempt.ID(), dagRunStatus.AttemptKey
+	if rootWrite {
+		expectedAttemptID, expectedAttemptKey = latestStatus.AttemptID, latestStatus.AttemptKey
+	}
 	if conditional {
 		h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, latestAttempt.ID())
 		persisted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(
 			ctx,
 			dagRunStatus.DAGRun(),
-			latestAttempt.ID(),
+			expectedAttemptID,
 			latestStatus.Status,
 			func(current *ir.DAGRunStatus) error {
 				if current.QueuedAt != latestStatus.QueuedAt {
@@ -2154,7 +2155,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 				}
 				*current = *dagRunStatus
 				return nil
-			}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: dagRunStatus.Root, ExpectedAttemptKey: dagRunStatus.AttemptKey},
+			}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: dagRunStatus.Root, ExpectedAttemptKey: expectedAttemptKey},
 		)
 		if errors.Is(err, errExecutionReplaced) {
 			logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)

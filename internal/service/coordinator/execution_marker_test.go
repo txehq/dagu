@@ -285,6 +285,31 @@ func TestExecutionMarkerTerminalReplayRacesRequeue(t *testing.T) {
 	})
 }
 
+// A delayed E1 Running report reads Running(Q1); before it is written, another
+// process fails the run as stale and a retry queues Q2, both through the
+// store's compare-and-swap and outside this coordinator's locks. The report
+// must not restore Running over the queued retry.
+func TestExecutionMarkerRunningReportRacesRepairAndRequeue(t *testing.T) {
+	t.Parallel()
+
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+	f.store.beforeCompareAndSwap = func() {
+		f.store.beforeCompareAndSwap = nil
+		next := f.stored(t)
+		next.Status = ir.Queued
+		next.QueuedAt = markerQ2
+		f.attempt.mu.Lock()
+		f.attempt.status = next
+		f.attempt.mu.Unlock()
+	}
+
+	resp := f.report(t, ir.Running, markerQ1, markerQ1)
+	assert.False(t, resp.Accepted)
+	st := f.stored(t)
+	assert.Equal(t, ir.Queued, st.Status, "E1 must not restore Running over the retry")
+	assert.Equal(t, markerQ2, st.QueuedAt)
+}
+
 func TestExecutionMarkerReportStatusHoldsTheWriteLock(t *testing.T) {
 	t.Parallel()
 
@@ -571,6 +596,23 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		record, ok := readFinalRecord(t, f.logPath())
 		require.True(t, ok)
 		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 5, SHA256: digestOf("bbaaa")}, record)
+	})
+
+	t.Run("EmptyStreamRecordsEmptyFinalization", func(t *testing.T) {
+		t.Parallel()
+		// A stream that wrote nothing sends only its final chunk at offset 0;
+		// the log is complete and empty for this execution.
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		offset := uint64(0)
+		final := markerLogChunk(markerQ2, "", true)
+		final.ByteOffset = &offset
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{final}}))
+		content, err := os.ReadFile(f.logPath())
+		require.NoError(t, err)
+		assert.Empty(t, content)
+		record, ok := readFinalRecord(t, f.logPath())
+		require.True(t, ok)
+		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 0, SHA256: digestOf("")}, record)
 	})
 
 	t.Run("FinalOnlyBeyondReceivedBytesStaysIncomplete", func(t *testing.T) {

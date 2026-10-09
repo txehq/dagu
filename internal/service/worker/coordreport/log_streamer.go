@@ -552,9 +552,9 @@ func (w *stepLogWriter) finishLocked() error {
 	if w.streamingDisabled {
 		return nil
 	}
-	if w.stream == nil && w.sequence == 0 && len(w.remoteBuffer) == 0 {
-		return nil
-	}
+	// A stream that wrote nothing still sends its positioned final chunk, so
+	// the coordinator records the empty log as complete for this execution;
+	// without one, the log reads as never finalized.
 	if w.stream == nil {
 		var stream coordinatorv1.CoordinatorService_StreamLogsClient
 		err := w.withOperationTimeout(func() error {
@@ -958,7 +958,9 @@ func (w *schedulerLogWriter) close(ctx context.Context) error {
 				return err
 			}
 		}
-		if w.stream == nil && !w.streamInitFailed && localBytes > 0 {
+		// Opened even when the log is empty, so its final chunk records it
+		// as complete.
+		if w.stream == nil && !w.streamInitFailed {
 			if err := w.ensureStreamLocked(); err != nil {
 				return err
 			}
