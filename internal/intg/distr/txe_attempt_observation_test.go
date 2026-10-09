@@ -171,6 +171,12 @@ test -e "$OBS/allow-$1"
 	queueLine := ""
 	var opts []fixtureOption
 	opts = append(opts, withArtifactPersistence(), withLogPersistence())
+	// TXE_ISOLATED_WORKER=1 gives the worker its own data, log and artifact
+	// directories and no handle on the hub's stores, as a worker on another
+	// machine has. Without it the fixture's worker shares the hub's paths.
+	if os.Getenv("TXE_ISOLATED_WORKER") == "1" {
+		opts = append(opts, withIsolatedWorker())
+	}
 	if queued {
 		queueLine = "queue: txe-obs\n"
 		opts = append(opts, withConfigMutator(func(c *config.Config) {
