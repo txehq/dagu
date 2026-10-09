@@ -1463,3 +1463,95 @@ func (a *API) GetTxeRunExecutionFile(ctx context.Context, req api.GetTxeRunExecu
 	}
 	return api.GetTxeRunExecutionFile200ApplicationoctetStreamResponse{Body: bytes.NewReader(data), ContentLength: int64(len(data))}, nil
 }
+
+func (a *API) ListTxeRunAbandonments(ctx context.Context, req api.ListTxeRunAbandonmentsRequestObject) (api.ListTxeRunAbandonmentsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	if a.dagRunRepository == nil {
+		return nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	run := ir.NewDAGRunRef(req.JobId, req.RunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + req.JobId + " has no run " + req.RunId}
+	// The run's own saved status decides its workspace, as for the run's
+	// other history.
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, run)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	results, err := a.dagRunRepository.ListAttemptAbandonmentsStrict(ctx, run, run)
+	switch {
+	case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return nil, notFound
+	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		// Not an empty history: without the capability nothing is known
+		// about abandoned preparations, so consumers must not infer one.
+		return nil, &Error{HTTPStatus: http.StatusNotImplemented, Code: api.ErrorCodeInternalError,
+			Message: "this hub's run store keeps no abandonment history; abandoned preparations are unknown",
+			Details: map[string]any{"code": "abandonment_history_unsupported"}}
+	case err != nil:
+		return nil, err
+	}
+	out := make([]api.TxeAbandonment, 0, len(results))
+	for _, r := range results {
+		if r.Err != nil {
+			// The reason stays in the hub's log: it can name storage paths
+			// or another run's identifiers.
+			logger.Warn(ctx, "Untrusted abandonment record", tag.RunID(req.RunId), tag.AttemptID(r.AttemptID), tag.Error(r.Err))
+		}
+		entry, err := txeAbandonment(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entry)
+	}
+	return api.ListTxeRunAbandonments200JSONResponse{Abandonments: out}, nil
+}
+
+// txeAbandonment is one strict-listing result in the API's shape: the trusted
+// record, or the attempt and an error, never attributable.
+func txeAbandonment(r persis.AttemptAbandonmentResult) (api.TxeAbandonment, error) {
+	if r.Err != nil || r.Record == nil {
+		msg := "the abandonment record cannot be trusted (unreadable, malformed, of another attempt or inconsistent)"
+		return api.TxeAbandonment{AttemptId: r.AttemptID, Attributable: false, Error: &msg}, nil
+	}
+	rec := r.Record
+	identity := func(e *persis.ExecutionIdentity) map[string]any {
+		if e == nil {
+			return nil
+		}
+		return map[string]any{"attempt_id": e.AttemptID, "queued_at": e.QueuedAt}
+	}
+	m := map[string]any{
+		"attempt_id": r.AttemptID, "attributable": rec.Attributable(), "outcome": rec.Outcome,
+		"abandoned_execution": identity(&rec.AbandonedExecution), "predecessor_absent": rec.PredecessorAbsent,
+		"reason": rec.Reason, "detail": rec.Detail, "decided_at": rec.DecidedAt, "coordinator_id": rec.CoordinatorID,
+		"evidence": map[string]any{"dispatch_task": rec.Evidence.DispatchTask, "lease": rec.Evidence.Lease,
+			"active_run": rec.Evidence.ActiveRun, "worker": rec.Evidence.Worker, "observed_at": rec.Evidence.ObservedAt},
+	}
+	if rec.ExpectedExecution != nil {
+		m["expected_execution"] = identity(rec.ExpectedExecution)
+	}
+	if c := rec.RequestCorrelation; c != nil {
+		m["request_correlation"] = map[string]any{"id": c.ID, "action_id": c.ActionID, "action_attempt": c.ActionAttempt, "binding_digest": c.BindingDigest}
+	}
+	return txeConvert[api.TxeAbandonment](m)
+}
