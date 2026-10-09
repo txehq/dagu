@@ -4,8 +4,12 @@
 package txeclient
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
+
+	"github.com/goccy/go-yaml"
 )
 
 // The types in this file are the bodies of the registry calls the CLI makes.
@@ -152,17 +156,62 @@ type RetirementRules struct {
 	ActiveRunPolicy string `json:"active_run_policy,omitempty" yaml:"active_run_policy"`
 }
 
+// ParamSchema is the JSON Schema the registry checks a reviewer's parameters
+// against before it grants an attempt of a permitted action. A job spec
+// writes it as a YAML mapping; it is sent, and read back, as JSON.
+type ParamSchema json.RawMessage
+
+// MarshalJSON returns the schema as it is held.
+func (p ParamSchema) MarshalJSON() ([]byte, error) {
+	if len(p) == 0 {
+		return []byte("null"), nil
+	}
+	return p, nil
+}
+
+// UnmarshalJSON keeps the schema as the registry answered it.
+func (p *ParamSchema) UnmarshalJSON(data []byte) error {
+	if string(bytes.TrimSpace(data)) == "null" {
+		*p = nil
+		return nil
+	}
+	*p = append((*p)[:0], data...)
+	return nil
+}
+
+// UnmarshalYAML reads the schema from a job spec. Whatever the spec wrote is
+// kept, so that Validate can refuse a value that is not a mapping and name
+// the action it belongs to.
+func (p *ParamSchema) UnmarshalYAML(data []byte) error {
+	var value any
+	if err := yaml.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	out, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("param_schema cannot be written as JSON: %w", err)
+	}
+	*p = out
+	return nil
+}
+
+// isMapping reports whether the schema is absent or a JSON object.
+func (p ParamSchema) isMapping() bool {
+	trimmed := bytes.TrimSpace(p)
+	return len(trimmed) == 0 || trimmed[0] == '{'
+}
+
 // PermittedAction is a follow-up a reviewer may take.
 type PermittedAction struct {
-	Name        string          `json:"name" yaml:"name"`
-	Command     string          `json:"command,omitempty" yaml:"command"`
-	Entrypoint  string          `json:"entrypoint,omitempty" yaml:"entrypoint"`
-	ParamSchema json.RawMessage `json:"param_schema,omitempty" yaml:"-"`
-	Idempotency string          `json:"idempotency,omitempty" yaml:"idempotency"`
-	Reconcile   string          `json:"reconcile,omitempty" yaml:"reconcile"`
-	TimeoutSec  int             `json:"timeout_sec" yaml:"timeout_sec"`
-	Routine     bool            `json:"routine" yaml:"routine"`
-	MaxAttempts int             `json:"max_attempts,omitempty" yaml:"max_attempts"`
+	Name        string      `json:"name" yaml:"name"`
+	Command     string      `json:"command,omitempty" yaml:"command"`
+	Entrypoint  string      `json:"entrypoint,omitempty" yaml:"entrypoint"`
+	ParamSchema ParamSchema `json:"param_schema,omitempty" yaml:"param_schema"`
+	Idempotency string      `json:"idempotency,omitempty" yaml:"idempotency"`
+	Reconcile   string      `json:"reconcile,omitempty" yaml:"reconcile"`
+	TimeoutSec  int         `json:"timeout_sec" yaml:"timeout_sec"`
+	Routine     bool        `json:"routine" yaml:"routine"`
+	MaxAttempts int         `json:"max_attempts,omitempty" yaml:"max_attempts"`
 }
 
 // ReviewPolicy is the brief and bounds for periodic review.

@@ -99,6 +99,9 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 	if err := yaml.UnmarshalWithOptions(data, &spec, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
 	}
+	if err := markEmptyParamSchemas(data, &spec); err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -108,6 +111,27 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 		return nil, err
 	}
 	return &spec, nil
+}
+
+// markEmptyParamSchemas marks every permitted action whose spec writes the
+// param_schema key with no value. The YAML decoder leaves such a field as if
+// the key were absent, which would register the action with no bounds on its
+// parameters; marked, Validate refuses it by name.
+func markEmptyParamSchemas(data []byte, spec *JobSpec) error {
+	var raw struct {
+		ReviewPolicy struct {
+			PermittedActions []map[string]any `yaml:"permitted_actions"`
+		} `yaml:"review_policy"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for i, action := range raw.ReviewPolicy.PermittedActions {
+		if value, declared := action["param_schema"]; declared && value == nil && i < len(spec.ReviewPolicy.PermittedActions) {
+			spec.ReviewPolicy.PermittedActions[i].ParamSchema = ParamSchema("null")
+		}
+	}
+	return nil
 }
 
 // SourceRoot returns the absolute directory the package is built from.
@@ -247,6 +271,7 @@ func (s *JobSpec) Validate() error {
 	for i, a := range s.ReviewPolicy.PermittedActions {
 		need(a.Name != "", "review_policy.permitted_actions[%d].name is required", i)
 		need(a.TimeoutSec > 0, "review_policy.permitted_actions[%d].timeout_sec is required", i)
+		need(a.ParamSchema.isMapping(), "review_policy.permitted_actions[%d].param_schema must be a mapping (a JSON Schema)", i)
 	}
 
 	if len(problems) > 0 {
