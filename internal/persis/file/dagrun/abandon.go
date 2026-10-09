@@ -219,13 +219,27 @@ func readWrittenStatus(ctx context.Context, att *Attempt) (*ir.DAGRunStatus, err
 	return status, err
 }
 
-// ReadAttemptAbandonment implements persis.DAGRunAttemptAbandoner. It reads
-// without the run's lock: a record is written whole and never changes.
+// ReadAttemptAbandonment implements persis.DAGRunAttemptAbandoner. It holds
+// the run's data-root lock, which AbandonAttempt holds from writing a record
+// to hiding the attempt, so it never lists an attempt directory that a hide
+// then renames away before its record is read. A directory that vanishes
+// anyway is an error, never an absent record.
 func (store *Store) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*persis.AttemptAbandonment, error) {
 	if rootDAGRun.Zero() {
 		rootDAGRun = dagRun
 	}
-	run, err := store.findRunLocked(ctx, store.dataRoot(rootDAGRun.Name), rootDAGRun, dagRun)
+	root := store.dataRoot(rootDAGRun.Name)
+	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := root.Lock(lockCtx); err != nil {
+		return nil, fmt.Errorf("failed to acquire lock for dag-run %s: %w", dagRun.ID, err)
+	}
+	defer func() {
+		if err := root.Unlock(); err != nil {
+			logger.Error(ctx, "Failed to unlock dag-run", tag.RunID(dagRun.ID), tag.Error(err))
+		}
+	}()
+	run, err := store.findRunLocked(ctx, root, rootDAGRun, dagRun)
 	if err != nil {
 		return nil, err
 	}
@@ -246,12 +260,15 @@ func (store *Store) ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGR
 		record, err := readAbandonmentRecord(att.file)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
+			if _, statErr := os.Stat(filepath.Dir(att.file)); statErr != nil {
+				return nil, fmt.Errorf("%w: attempt %s directory: %v", persis.ErrAttemptAbandonmentConflict, attemptID, statErr)
+			}
 			return nil, nil
 		case err != nil:
 			return nil, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, attemptID, err)
-		case record.AbandonedAttemptID != attemptID || record.Run != dagRun:
-			return nil, fmt.Errorf("%w: attempt %s holds a record for %s attempt %s",
-				persis.ErrAttemptAbandonmentConflict, attemptID, record.Run.String(), record.AbandonedAttemptID)
+		}
+		if err := validateStoredAbandonment(*record, dagRun, rootDAGRun, attemptID); err != nil {
+			return nil, err
 		}
 		return record, nil
 	}
@@ -406,17 +423,37 @@ func validateAbandonmentRecord(record persis.AttemptAbandonment, dagRun ir.DAGRu
 // same run, attempt and a complete absence proof. Its time and evidence may
 // predate this call, as after a crash between the record and the hide.
 func sameAbandonment(existing, want persis.AttemptAbandonment) error {
-	if err := validateAbandonmentRecord(existing, want.Run, want.AbandonedAttemptID); err != nil {
-		return fmt.Errorf("%w: %v", persis.ErrAttemptAbandonmentConflict, err)
+	if err := validateStoredAbandonment(existing, want.Run, want.RootRun, want.AbandonedAttemptID); err != nil {
+		return err
 	}
-	if existing.RootRun != want.RootRun || existing.Reason != want.Reason {
+	if existing.Reason != want.Reason {
 		return fmt.Errorf("%w: existing record describes another abandonment", persis.ErrAttemptAbandonmentConflict)
 	}
+	return nil
+}
+
+// validateStoredAbandonment checks a record read from disk in full before it
+// completes an abandonment or decides a claim: the run, root and attempt it
+// names, a complete absence proof, the abandoned execution and a consistent
+// outcome. Anything else is a conflict and authorizes nothing.
+func validateStoredAbandonment(record persis.AttemptAbandonment, dagRun, root ir.DAGRunRef, attemptID string) error {
+	if root.Zero() {
+		root = dagRun
+	}
+	if err := validateAbandonmentRecord(record, dagRun, attemptID); err != nil {
+		return fmt.Errorf("%w: %v", persis.ErrAttemptAbandonmentConflict, err)
+	}
+	if record.RootRun != root {
+		return fmt.Errorf("%w: record names root %s", persis.ErrAttemptAbandonmentConflict, record.RootRun.String())
+	}
+	if record.AbandonedExecution.AttemptID != attemptID {
+		return fmt.Errorf("%w: record does not name the abandoned execution", persis.ErrAttemptAbandonmentConflict)
+	}
 	switch {
-	case existing.Outcome == persis.AbandonmentHidden && existing.ExpectedExecution != nil && !existing.PredecessorAbsent:
-	case existing.Outcome == persis.AbandonmentMarkedFailed && existing.ExpectedExecution == nil && existing.PredecessorAbsent:
+	case record.Outcome == persis.AbandonmentHidden && record.ExpectedExecution != nil && !record.PredecessorAbsent:
+	case record.Outcome == persis.AbandonmentMarkedFailed && record.ExpectedExecution == nil && record.PredecessorAbsent:
 	default:
-		return fmt.Errorf("%w: existing record has an inconsistent outcome %q", persis.ErrAttemptAbandonmentConflict, existing.Outcome)
+		return fmt.Errorf("%w: record has an inconsistent outcome %q", persis.ErrAttemptAbandonmentConflict, record.Outcome)
 	}
 	return nil
 }

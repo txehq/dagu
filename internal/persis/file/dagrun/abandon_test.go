@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,6 +48,7 @@ func abandonRecord(dag *ir.DAG, attemptID string, expected *persis.ExecutionIden
 		Run:                ref,
 		RootRun:            ref,
 		AbandonedAttemptID: attemptID,
+		AbandonedExecution: persis.ExecutionIdentity{AttemptID: attemptID},
 		ExpectedExecution:  expected,
 		Reason:             persis.AbandonedRetryPreparation,
 		DecidedAt:          time.Now().UTC().Format(time.RFC3339Nano),
@@ -443,4 +445,82 @@ func TestReadAttemptAbandonment(t *testing.T) {
 		_, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, placeholder.ID())
 		require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, "unreadable")
 	}
+}
+
+// A record that parses but is incomplete or inconsistent authorizes nothing:
+// the strict read reports a conflict.
+func TestReadAttemptAbandonmentRefusesIncompleteRecords(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*persis.AttemptAbandonment){
+		"no abandoned execution": func(r *persis.AttemptAbandonment) { r.AbandonedExecution = persis.ExecutionIdentity{} },
+		"another execution":      func(r *persis.AttemptAbandonment) { r.AbandonedExecution.AttemptID = "other" },
+		"another root":           func(r *persis.AttemptAbandonment) { r.RootRun = ir.NewDAGRunRef("other", "other") },
+		"evidence not absent":    func(r *persis.AttemptAbandonment) { r.Evidence.Lease = "present" },
+		"no outcome":             func(r *persis.AttemptAbandonment) { r.Outcome = "" },
+		"hidden without expected execution": func(r *persis.AttemptAbandonment) {
+			r.Outcome = persis.AbandonmentHidden
+			r.ExpectedExecution = nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			th := setupTestRepository(t)
+			dag := th.DAG("abandon_dag").DAG
+			ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+			only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+			stored, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+			require.NoError(t, err)
+			_, err = th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, only.ID())
+			require.NoError(t, err, "the intact record reads")
+
+			mutate(stored)
+			data, err := json.Marshal(stored)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(only.file), AbandonmentRecordFile), data, 0600))
+			_, err = th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, only.ID())
+			require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict)
+		})
+	}
+}
+
+// The strict read waits for the run's data-root lock, which abandonment holds
+// from writing the record to hiding the attempt. A read that starts while an
+// abandonment is in progress therefore sees the hidden attempt's record, not
+// a directory that vanished.
+func TestReadAttemptAbandonmentWaitsForAnAbandonmentInProgress(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("abandon_dag").DAG
+	ref := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	placeholder := createRunAttempt(t, th, dag, true, ir.NotStarted, "", "")
+
+	root := th.Backend.dataRoot(dag.Name)
+	require.NoError(t, root.Lock(th.Context))
+	type result struct {
+		record *persis.AttemptAbandonment
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		record, err := th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, placeholder.ID())
+		done <- result{record, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("the read did not wait for the lock: %+v", r)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// What AbandonAttempt does under the lock: the record, then the hide.
+	record := abandonRecord(dag, placeholder.ID(), &persis.ExecutionIdentity{AttemptID: "previous"})
+	record.Outcome = persis.AbandonmentHidden
+	require.NoError(t, writeRecordExclusive(filepath.Join(filepath.Dir(placeholder.file), AbandonmentRecordFile), record))
+	require.NoError(t, placeholder.Hide(th.Context))
+	require.NoError(t, root.Unlock())
+
+	r := <-done
+	require.NoError(t, r.err)
+	require.NotNil(t, r.record, "the hidden attempt's record is found")
+	assert.Equal(t, placeholder.ID(), r.record.AbandonedAttemptID)
 }
