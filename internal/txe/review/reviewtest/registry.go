@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -196,6 +197,13 @@ func (r *Registry) DueJobs(_ context.Context, machineID string, now time.Time) (
 			}
 			due = append(due, id)
 		}
+		sort.Slice(due, func(i, j int) bool {
+			a, b := s.Checkpoints[due[i]].NextReviewAt, s.Checkpoints[due[j]].NextReviewAt
+			if !a.Equal(b) {
+				return a.Before(b)
+			}
+			return due[i] < due[j]
+		})
 		return nil
 	})
 	return due, err

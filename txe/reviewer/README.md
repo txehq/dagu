@@ -90,4 +90,7 @@ ending:
 a repeat of that same attempt; a later review's attempt has a new key.
 
 A `reconcile` probe exits `0` if the effect is present at the destination,
-`3` if it is absent, and anything else if it cannot tell.
+`3` if it is absent, and anything else if it cannot tell. Only presence
+settles an interrupted attempt. Absence does not prove a request already
+sent will not still take effect, so the attempt goes to the owner instead of
+being closed as not applied.

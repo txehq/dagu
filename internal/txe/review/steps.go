@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 )
@@ -61,7 +60,6 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 	if err != nil {
 		return fmt.Errorf("list due jobs: %w", err)
 	}
-	sort.Strings(due)
 	// One job that cannot be prepared must not starve the others, so its
 	// error is reported only when the tick found nothing else to review.
 	var failed error

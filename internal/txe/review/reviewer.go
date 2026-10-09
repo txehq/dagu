@@ -280,7 +280,15 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		res.Detail = "reconciled: the effect was applied"
 		return finish(ActionSucceeded, res)
 	case EffectNotApplied:
-		return finish(ActionNotApplied, res)
+		// Only an action with no external effect can be closed as not
+		// applied. For any other, a probe that finds nothing proves only
+		// that the effect is absent now: a request the interrupted attempt
+		// already sent can still commit afterwards. Presence settles an
+		// attempt; absence leaves it to the owner.
+		if ok && declared.Idempotency == IdempotencyReadOnly {
+			return finish(ActionNotApplied, res)
+		}
+		res = EffectResult{Status: EffectUnknown, Detail: "a probe found no effect yet, which does not prove the interrupted attempt will not still apply"}
 	case EffectUnknown:
 	}
 	if !escalate {

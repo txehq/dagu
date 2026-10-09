@@ -136,6 +136,12 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 
 	proc, err := cmdutil.StartManagedProcess(cmd)
 	if err != nil {
+		// A failure to contain the process comes after it was started and
+		// stopped again, so it may already have acted. Only a process that
+		// never existed is known to have applied nothing.
+		if cmd.Process != nil {
+			return 0, stdout.String(), fmt.Errorf("action %q started but could not be supervised: %v", declared.Name, err)
+		}
 		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
 	}
 	err = proc.Wait()

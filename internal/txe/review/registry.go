@@ -97,7 +97,9 @@ type FinishRequest struct {
 // Every method that takes a Claim must refuse with ErrStaleFence when that
 // claim is not the job's current live claim.
 type Registry interface {
-	// DueJobs lists jobs on the machine whose next review time has passed.
+	// DueJobs lists jobs on the machine whose next review time has passed,
+	// longest overdue first, so a job with a short cadence cannot keep a
+	// longer-waiting one from ever being reviewed.
 	DueJobs(ctx context.Context, machineID string, now time.Time) ([]string, error)
 	Job(ctx context.Context, jobID string) (Job, error)
 	Checkpoint(ctx context.Context, jobID string) (Checkpoint, error)

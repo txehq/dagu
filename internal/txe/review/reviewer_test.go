@@ -524,9 +524,10 @@ func TestCrashAfterEffectReconcilesByProbe(t *testing.T) {
 	assert.Len(t, f.state().Actions[jobID], 1)
 }
 
-// IT-12, probe proves the effect did not happen: the action is closed as
-// not applied and stays closed for that episode.
-func TestCrashBeforeEffectReconcilesAsNotApplied(t *testing.T) {
+// IT-12, the probe finds nothing after an interrupted attempt: that is not
+// proof the attempt will not still apply, so the action is not closed as
+// not applied. It goes to the owner and the intent stays blocked.
+func TestAbsentProbeDoesNotCloseAnInterruptedAttempt(t *testing.T) {
 	f := newFixture(t)
 	job := fixtureJob()
 	job.Review.Actions[1].Reconcile = []string{"probe"}
@@ -551,8 +552,47 @@ func TestCrashBeforeEffectReconcilesAsNotApplied(t *testing.T) {
 	}
 	f.clock.Advance(11 * time.Minute)
 	recovered := f.prepare("reviewer-b")
+	s := f.state()
+	assert.Equal(t, review.ActionEscalated, s.Actions[jobID][0].State)
+	require.Len(t, s.Proposals[jobID], 1)
+	assert.Equal(t, review.ProposalUncertain, s.Proposals[jobID][0].Kind)
+	require.Len(t, recovered.Packet.UnresolvedActions, 1)
+
+	// The agent asks again; nothing runs while the owner has not answered.
+	f.effects.run = nil
+	f.apply("reviewer-b", recovered, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
+	})
+	assert.Equal(t, 0, f.effects.count("notify"))
+	assert.Len(t, f.effects.keys, 1, "only the interrupted attempt was ever made")
+}
+
+// An interrupted read-only action has no external effect to wait for, so it
+// is closed as not applied and may be requested again.
+func TestInterruptedReadOnlyActionIsClosed(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	dying := f.reviewer("reviewer-a")
+	dying.Registry = crashAfterEffect{f.registry}
+	collect := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Collect.",
+		Actions: []review.AgentAction{act("collect_diagnostics", nil)},
+	}
+	_, err := dying.Apply(context.Background(), prepared, collect)
+	require.ErrorIs(t, err, errCrash)
+
+	f.clock.Advance(11 * time.Minute)
+	recovered := f.prepare("reviewer-b")
 	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
 	assert.Empty(t, recovered.Packet.UnresolvedActions)
+	assert.Empty(t, f.state().Proposals[jobID])
+
+	// A later episode may run the diagnostic again.
+	f.apply("reviewer-b", recovered, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "ok"})
+	f.clock.Advance(2 * time.Hour)
+	f.apply("reviewer-c", f.prepare("reviewer-c"), collect)
+	assert.Equal(t, 2, f.effects.count("collect_diagnostics"))
 }
 
 // IT-12, timeout with an uncertain effect and no way to probe: the action
@@ -952,11 +992,12 @@ func TestEffectsAreBoundedByLeaseAndGrant(t *testing.T) {
 	assert.Empty(t, applied.Executed)
 	assert.Equal(t, 0, f.effects.count("notify"))
 
-	// Once the grant and its margin have passed, the probe may settle it.
+	// Once the grant and its margin have passed, the attempt is probed. The
+	// probe finds nothing, which still does not close it.
 	f.clock.Advance(2 * time.Hour)
 	f.prepare("reviewer-c")
 	assert.Equal(t, 1, probes)
-	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
+	assert.Equal(t, review.ActionEscalated, f.state().Actions[jobID][0].State)
 }
 
 // A holder whose grant has already ended does not start the effect at all.

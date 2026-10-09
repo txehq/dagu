@@ -483,3 +483,35 @@ func TestActionDoesNotOutliveItsReviewerProcess(t *testing.T) {
 	_, err := os.Stat(filepath.Join(dir, "effect.txt"))
 	assert.ErrorIs(t, err, os.ErrNotExist, "the action outlived the reviewer that started it")
 }
+
+// Pass 4 finding: a tick reviews the job that has been due longest, so a job
+// with a short cadence cannot keep another from ever being reviewed.
+func TestPrepareTakesTheLongestOverdueJob(t *testing.T) {
+	f := newFixture(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	// jobID sorts first and wants a review every minute.
+	fast := fixtureJob()
+	fast.Review.CadenceSec = 60
+	require.NoError(t, f.registry.PutJob(fast))
+	slow := fixtureJob()
+	slow.ID = "job_01HZX0000000000000000000ZZ"
+	require.NoError(t, f.registry.PutJob(slow))
+
+	reviewed := map[string]int{}
+	for i := range 6 {
+		runID := "tick-" + string(rune('a'+i))
+		var packet bytes.Buffer
+		require.NoError(t, f.steps(runID, dir).Prepare(ctx, runID, &packet))
+		for _, id := range []string{jobID, slow.ID} {
+			if strings.Contains(packet.String(), `"job_id":"`+id+`"`) {
+				reviewed[id]++
+			}
+		}
+		var out bytes.Buffer
+		require.NoError(t, f.steps(runID, dir).Apply(ctx, runID, strings.NewReader(`{"outcome":"continue","reasoning":"ok","evidence_run_ids":[]}`), "", &out))
+		f.clock.Advance(10 * time.Minute)
+	}
+	assert.Positive(t, reviewed[slow.ID], "the slower job was never reviewed")
+	assert.Positive(t, reviewed[jobID])
+}
