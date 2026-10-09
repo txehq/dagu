@@ -102,7 +102,9 @@ func TestTXEHubContextPinsResolvedStore(t *testing.T) {
 	keepDaguEnvironment(t)
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
+	// The user's home is HOME on Unix and USERPROFILE on Windows.
 	t.Setenv("HOME", base)
+	t.Setenv("USERPROFILE", base)
 	t.Setenv("TXE_DAGU_HOME", filepath.Join(base, "txe-home"))
 	home, session, step := filepath.Join(base, "hub-home"), filepath.Join(base, "session"), filepath.Join(base, "step")
 	for _, dir := range []string{home, session, step} {
@@ -145,8 +147,10 @@ func TestTXEHubContextPinsResolvedStore(t *testing.T) {
 	assert.Equal(t, registered.DataDir, pinned.DataDir)
 
 	// A home written with ~ is recorded as the configuration loader reads it.
+	userHome, err := os.UserHomeDir()
+	require.NoError(t, err)
 	tilde := probe(session, "--dagu-home", "~/custom-dagu")
-	assert.Equal(t, filepath.Join(base, "custom-dagu"), tilde.DaguHome)
+	assert.Equal(t, filepath.Join(userHome, "custom-dagu"), tilde.DaguHome)
 }
 
 // A txe command takes its context store from its flags. DAGU_* variables,
