@@ -108,6 +108,8 @@ Registration prints a receipt only when the hub has marked the job ready. Until 
 
 Add `--json` to any command for structured output.
 
+Every change records the session that made it. A Claude Code session is recognised by itself. Any other session, including a Codex thread started from a Claude session, must pass `--session <its own identity>` or set `TXE_SESSION`; the command refuses otherwise.
+
 ## Before removing the worktree
 
 ```sh

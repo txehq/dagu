@@ -178,7 +178,7 @@ func TestStageRefusals(t *testing.T) {
 			files:   map[string]string{"run.sh+x": "#!/bin/sh\n"},
 			link:    [2]string{"leak", filepath.Join(outside, "secret.txt")},
 			include: []string{"."}, entry: []string{"./run.sh"},
-			wantMsg: "links outside the source root",
+			wantMsg: "stays inside the source root",
 		},
 		{
 			name:    "Repository",
@@ -253,7 +253,7 @@ func TestStageRefusals(t *testing.T) {
 func TestStageFollowsInternalSymlink(t *testing.T) {
 	store := newStore(t)
 	root := writeSource(t, map[string]string{"run.sh+x": "#!/bin/sh\n", "real/data.txt": "payload\n"})
-	require.NoError(t, os.Symlink(filepath.Join(root, "real", "data.txt"), filepath.Join(root, "data.txt")))
+	require.NoError(t, os.Symlink(filepath.Join("real", "data.txt"), filepath.Join(root, "data.txt")))
 
 	staged, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "data.txt"}, Entrypoint: []string{"./run.sh"}})
 	require.NoError(t, err)
@@ -261,6 +261,184 @@ func TestStageFollowsInternalSymlink(t *testing.T) {
 	info, err := os.Lstat(filepath.Join(staged.Dir, FilesDir, "data.txt"))
 	require.NoError(t, err)
 	assert.True(t, info.Mode().IsRegular())
+}
+
+// A link is followed only while it stays inside the source root, whichever
+// component of the path it is. This is what holds when a file or a directory
+// is swapped for a link after it was listed: the copy opens it through the
+// root and is refused.
+func TestStageRefusesEscapingLinks(t *testing.T) {
+	outside := writeSource(t, map[string]string{"token": "plain-text-token-value\n", "dir/data.txt": "x"})
+	tests := []struct {
+		name    string
+		link    [2]string // name under the source root -> target
+		include []string
+	}{
+		{"FileLinkRelative", [2]string{"data.txt", "../" + filepath.Base(outside) + "/token"}, []string{"run.sh", "data.txt"}},
+		{"FileLinkAbsolute", [2]string{"data.txt", filepath.Join(outside, "token")}, []string{"run.sh", "data.txt"}},
+		{"DirectoryLink", [2]string{"lib", filepath.Join(outside, "dir")}, []string{"run.sh", "lib"}},
+		{"DirectoryLinkInTree", [2]string{"lib", filepath.Join(outside, "dir")}, []string{"."}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newStore(t)
+			// The source root sits beside the outside directory, so a
+			// relative link can reach it.
+			root := filepath.Join(filepath.Dir(outside), "src-"+tt.name)
+			require.NoError(t, os.MkdirAll(root, 0o755))
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			require.NoError(t, os.WriteFile(filepath.Join(root, "run.sh"), []byte("#!/bin/sh\n"), 0o755)) //nolint:gosec // test script
+			require.NoError(t, os.Symlink(tt.link[1], filepath.Join(root, tt.link[0])))
+
+			_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: tt.include, Entrypoint: []string{"./run.sh"}})
+			require.Error(t, err)
+			assert.NoDirExists(t, filepath.Join(store.Root, stagingDir, "req-1"))
+		})
+	}
+}
+
+// The file a credential reference points to cannot also be packaged, whatever
+// it is called and however it is reached.
+func TestStageRefusesReferencedCredential(t *testing.T) {
+	root := writeSource(t, map[string]string{"run.sh+x": "#!/bin/sh\n", "linear-token": "lin_api_0123456789\n"})
+	token := filepath.Join(root, "linear-token")
+	refs := []CredentialRef{{Name: "LINEAR_API_KEY", Kind: CredentialFile, Locator: token}}
+
+	t.Run("ByName", func(t *testing.T) {
+		store := newStore(t)
+		_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "linear-token"}, Entrypoint: []string{"./run.sh"}, CredentialRefs: refs})
+		require.ErrorIs(t, err, ErrCredentialFile)
+		require.ErrorContains(t, err, "credential reference points to")
+	})
+	t.Run("ByHardLink", func(t *testing.T) {
+		store := newStore(t)
+		require.NoError(t, os.Link(token, filepath.Join(root, "settings.dat")))
+		_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "settings.dat"}, Entrypoint: []string{"./run.sh"}, CredentialRefs: refs})
+		require.ErrorIs(t, err, ErrCredentialFile)
+	})
+	t.Run("ByLink", func(t *testing.T) {
+		store := newStore(t)
+		require.NoError(t, os.Symlink("linear-token", filepath.Join(root, "alias.txt")))
+		_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "alias.txt"}, Entrypoint: []string{"./run.sh"}, CredentialRefs: refs})
+		require.ErrorIs(t, err, ErrCredentialFile)
+	})
+	t.Run("NotIncluded", func(t *testing.T) {
+		store := newStore(t)
+		_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh"}, Entrypoint: []string{"./run.sh"}, CredentialRefs: refs})
+		require.NoError(t, err)
+	})
+}
+
+// A file that looks like a credential is refused under any name a link gives
+// it: a link named in the spec, a link found by walking a directory, a chain
+// of links, and a link reached through a linked directory.
+func TestStageRefusesLinkedCredentialName(t *testing.T) {
+	stage := func(t *testing.T, root string, include ...string) error {
+		t.Helper()
+		_, err := newStore(t).Stage("req-1", BuildOptions{
+			SourceRoot: root, Include: append([]string{"run.sh"}, include...), Entrypoint: []string{"./run.sh"},
+		})
+		return err
+	}
+	source := func(t *testing.T) string {
+		t.Helper()
+		return writeSource(t, map[string]string{"run.sh+x": "#!/bin/sh\n", ".env": "TOKEN=abc\n", "conf/keep.txt": "x\n"})
+	}
+
+	t.Run("NamedLink", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "alias.txt"), ErrCredentialFile)
+	})
+	t.Run("WalkedLink", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("../.env", filepath.Join(root, "conf", "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "conf"), ErrCredentialFile)
+	})
+	t.Run("Chain", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "middle.txt")))
+		require.NoError(t, os.Symlink("middle.txt", filepath.Join(root, "alias.txt")))
+		require.ErrorIs(t, stage(t, root, "alias.txt"), ErrCredentialFile)
+	})
+	t.Run("ThroughLinkedDirectory", func(t *testing.T) {
+		// conf/deep is reached as "d"; "d/x" points one level up from the
+		// real directory, which is conf, not the source root.
+		root := writeSource(t, map[string]string{
+			"run.sh+x": "#!/bin/sh\n", "y": "harmless\n", "conf/deep/keep.txt": "x\n", "conf/.env": "TOKEN=abc\n",
+		})
+		require.NoError(t, os.Symlink(".env", filepath.Join(root, "conf", "y")))
+		require.NoError(t, os.Symlink("../y", filepath.Join(root, "conf", "deep", "x")))
+		require.NoError(t, os.Symlink("conf/deep", filepath.Join(root, "d")))
+		require.ErrorIs(t, stage(t, root, "d/x"), ErrCredentialFile)
+	})
+	t.Run("HarmlessLinkStillPackaged", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("conf/keep.txt", filepath.Join(root, "alias.txt")))
+		require.NoError(t, stage(t, root, "alias.txt"))
+	})
+	t.Run("LinkLoop", func(t *testing.T) {
+		root := source(t)
+		require.NoError(t, os.Symlink("b.txt", filepath.Join(root, "a.txt")))
+		require.NoError(t, os.Symlink("a.txt", filepath.Join(root, "b.txt")))
+		require.Error(t, stage(t, root, "a.txt"))
+	})
+}
+
+// The size limit counts the bytes copied, not what a file looked like earlier.
+func TestStageSizeLimit(t *testing.T) {
+	store := newStore(t)
+	store.MaxBytes = 64
+	root := writeSource(t, map[string]string{"run.sh+x": "#!/bin/sh\n", "data.bin": strings.Repeat("x", 60)})
+
+	_, err := store.Stage("req-1", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "data.bin"}, Entrypoint: []string{"./run.sh"}})
+	require.ErrorContains(t, err, "larger than 64 bytes")
+
+	store.MaxBytes = 80
+	_, err = store.Stage("req-2", BuildOptions{SourceRoot: root, Include: []string{"run.sh", "data.bin"}, Entrypoint: []string{"./run.sh"}})
+	require.NoError(t, err)
+}
+
+// A package found in its final place but never sealed, as after a crash
+// between the move and the seal, is sealed before it is accepted; until then
+// it does not verify.
+func TestAdoptSealsAnUnsealedPackage(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	staged, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+
+	// Move it into place by hand, without sealing.
+	final, err := store.PackageDir(testJob, staged.Digest)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(final), 0o700))
+	require.NoError(t, os.Rename(staged.Dir, final))
+
+	_, err = store.Verify(testJob, staged.Digest)
+	require.ErrorIs(t, err, ErrPackageCorrupt)
+	require.ErrorContains(t, err, "not sealed")
+
+	pkg, err := store.Adopt(testJob, staged.Digest)
+	require.NoError(t, err)
+	assert.Error(t, os.WriteFile(filepath.Join(pkg.WorkDir(), "new"), nil, 0o600))
+	_, err = store.Verify(testJob, staged.Digest)
+	require.NoError(t, err)
+}
+
+// An entrypoint that lost its executable bit has the same bytes and would
+// fail at its scheduled time; verification reports it.
+func TestVerifyChecksExecutableBit(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	staged, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	pkg, err := store.Commit(staged, testJob)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Chmod(filepath.Join(pkg.WorkDir(), "collect.py"), 0o444))
+	_, err = store.Verify(testJob, pkg.Digest)
+	require.ErrorIs(t, err, ErrPackageCorrupt)
+	require.ErrorContains(t, err, "executable bit")
 }
 
 // A bare command is a runtime the worker must provide, and is recorded.

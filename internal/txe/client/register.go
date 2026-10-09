@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
@@ -66,6 +67,20 @@ func (e *ErrIncomplete) Error() string {
 
 func (e *ErrIncomplete) Unwrap() error { return e.Cause }
 
+// ErrSuperseded reports a request whose job version was replaced by a later
+// one before its receipt was written. The job itself is unaffected.
+type ErrSuperseded struct {
+	RequestID string
+	JobID     string
+	Version   int
+	Current   int
+}
+
+func (e *ErrSuperseded) Error() string {
+	return fmt.Sprintf("request %s registered version %d of %s, but the job is now at version %d; nothing is left to resume and no receipt exists for version %d",
+		e.RequestID, e.Version, e.JobID, e.Current, e.Version)
+}
+
 // Registrar registers and updates jobs from this machine. Each step is saved
 // in the journal before the next begins, and a receipt is written only after
 // the hub has marked the job ready.
@@ -78,6 +93,30 @@ type Registrar struct {
 	Actor Actor
 	// NewID mints an opaque ID with the given prefix.
 	NewID func(prefix string) (string, error)
+	// Hub names the connection these registrations use, so that a job's
+	// publish step reaches the same hub. The zero value is the TXE home's own
+	// context store and its default context.
+	Hub HubContext
+}
+
+// HubContext is a CLI context by reference: the flags that select the context
+// store, and the context's name in it. It carries no credential.
+//
+// A txe command ignores DAGU_* environment variables, so these flags are all
+// that decides which store a command reads. A publish step given the same
+// flags reads the store this session read.
+type HubContext struct {
+	// DaguHome is the --dagu-home the session used.
+	DaguHome string
+	// ConfigFile is the --config the session used, if any.
+	ConfigFile string
+	// Name is the context's name in that store.
+	Name string
+	// ContextsDir and DataDir are where those flags resolved to: the
+	// contexts, and the key they are read with. They are checked, not passed
+	// on; the flags reproduce them.
+	ContextsDir string
+	DataDir     string
 }
 
 // Outcome is a completed registration or update.
@@ -222,14 +261,35 @@ func (r *Registrar) publishStep(spec *JobSpec) *txepkg.Publish {
 	for _, d := range deliverables {
 		hub = hub || d.Delivery == DeliveryHub
 	}
-	return &txepkg.Publish{
-		Command: []string{
-			filepath.Join(r.Home.Root, "bin", "dagu"), "txe", "artifacts", "publish",
-			"--dagu-home", r.Home.ClientDir(),
-		},
-		HomeRoot:     r.Home.Root,
-		HubArtifacts: hub,
+	daguHome := r.Hub.DaguHome
+	if daguHome == "" {
+		daguHome = r.Home.ClientDir()
 	}
+	command := []string{filepath.Join(r.Home.Root, "bin", "dagu"), "txe", "artifacts", "publish", "--dagu-home", daguHome}
+	if r.Hub.ConfigFile != "" {
+		command = append(command, "--config", r.Hub.ConfigFile)
+	}
+	if r.Hub.Name != "" {
+		command = append(command, "--context", r.Hub.Name)
+	}
+	return &txepkg.Publish{Command: command, HomeRoot: r.Home.Root, HubArtifacts: hub}
+}
+
+// checkHub refuses a context store a scheduled run could not rely on. The
+// publish step reads it at every run, long after this session is gone.
+func (r *Registrar) checkHub(spec *JobSpec) error {
+	if len(spec.ExpectedOutcome.Deliverables) == 0 {
+		return nil
+	}
+	for _, path := range []string{r.Hub.DaguHome, r.Hub.ConfigFile, r.Hub.ContextsDir, r.Hub.DataDir} {
+		if path == "" {
+			continue
+		}
+		if err := r.Store.Policy.CheckDurable(path); err != nil {
+			return fmt.Errorf("the context store used for this registration cannot be used by the job's publish step: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) (*txepkg.Staged, error) {
@@ -250,6 +310,9 @@ func (r *Registrar) stage(ctx context.Context, spec *JobSpec, requestID string) 
 func (r *Registrar) Plan(ctx context.Context, spec *JobSpec) (*Plan, error) {
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
+	}
+	if err := r.checkHub(spec); err != nil {
+		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
 	who, err := r.resolve(ctx, spec, provenance)
@@ -283,6 +346,9 @@ func (r *Registrar) Plan(ctx context.Context, spec *JobSpec) (*Plan, error) {
 func (r *Registrar) Register(ctx context.Context, spec *JobSpec) (*Outcome, error) {
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
+	}
+	if err := r.checkHub(spec); err != nil {
+		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
 	who, err := r.resolve(ctx, spec, provenance)
@@ -326,6 +392,7 @@ func (r *Registrar) Register(ctx context.Context, spec *JobSpec) (*Outcome, erro
 	}
 	entry, err := r.Journal.Begin(txepkg.Entry{
 		RequestID: requestID, Operation: txepkg.OpRegister, JobID: jobID, JobKey: spec.JobKey, Version: 1,
+		MachineID: who.machine.MachineID, OwnerID: who.machine.OwnerID,
 		Step: txepkg.StepStaged, PackageDigest: staged.Digest, Session: r.Actor.Session, Request: body,
 	})
 	if err != nil {
@@ -339,6 +406,9 @@ func (r *Registrar) Register(ctx context.Context, spec *JobSpec) (*Outcome, erro
 func (r *Registrar) Update(ctx context.Context, jobID string, expectedVersion int, spec *JobSpec) (*Outcome, error) {
 	if os.Getenv(EnvReviewer) == "1" {
 		return nil, ErrReviewerSession
+	}
+	if err := r.checkHub(spec); err != nil {
+		return nil, err
 	}
 	provenance := txepkg.DetectProvenance(ctx, spec.SourceRoot(), spec.Package.Include)
 	who, err := r.resolve(ctx, spec, provenance)
@@ -376,6 +446,7 @@ func (r *Registrar) Update(ctx context.Context, jobID string, expectedVersion in
 	}
 	entry, err := r.Journal.Begin(txepkg.Entry{
 		RequestID: requestID, Operation: txepkg.OpUpdate, JobID: jobID, JobKey: spec.JobKey, Version: expectedVersion + 1,
+		MachineID: who.machine.MachineID, OwnerID: who.machine.OwnerID,
 		Step: txepkg.StepStaged, PackageDigest: staged.Digest, Session: r.Actor.Session, Request: body,
 	})
 	if err != nil {
@@ -395,8 +466,12 @@ func (r *Registrar) Resume(ctx context.Context, requestID string) (*Outcome, err
 	if err != nil {
 		return nil, err
 	}
-	if entry.Step == txepkg.StepRejected {
+	switch entry.Step {
+	case txepkg.StepRejected:
 		return nil, fmt.Errorf("request %s was refused by the hub and cannot be resumed: %s", requestID, entry.Error)
+	case txepkg.StepSuperseded:
+		return nil, fmt.Errorf("request %s cannot be resumed: %s", requestID, entry.Error)
+	case txepkg.StepStaged, txepkg.StepRegistered, txepkg.StepCommitted:
 	}
 	return r.advance(ctx, entry)
 }
@@ -416,6 +491,12 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	machine, err := r.Home.Machine()
 	if err != nil {
 		return nil, err
+	}
+	// The check comes before anything is sent: a request built on one machine
+	// must not create or change a job from another.
+	if entry.MachineID != machine.MachineID || entry.OwnerID != machine.OwnerID {
+		return nil, fmt.Errorf("request %s was built on machine %s for owner %s; this is machine %s of owner %s, which cannot send or finish it",
+			entry.RequestID, entry.MachineID, entry.OwnerID, machine.MachineID, machine.OwnerID)
 	}
 
 	// 1. The hub saves the job version and its DAG. Before this succeeds the
@@ -460,7 +541,9 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	switch {
 	case stagedErr != nil:
 		var err error
-		if pkg, err = r.Store.Verify(entry.JobID, entry.PackageDigest); err != nil {
+		// Adopt seals the package before verifying it: an earlier attempt may
+		// have stopped between moving it and sealing it.
+		if pkg, err = r.Store.Adopt(entry.JobID, entry.PackageDigest); err != nil {
 			return nil, incomplete(fmt.Errorf("the package is neither staged (%w) nor in place (%w)", stagedErr, err))
 		}
 	case staged.Digest != entry.PackageDigest:
@@ -482,8 +565,11 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	}
 
 	// 3. The hub marks the job ready against the package now in place.
+	if job.Version > entry.Version {
+		return r.overtaken(ctx, entry, job, pkg, incomplete)
+	}
 	if job.Version != entry.Version || job.PackageDigest != entry.PackageDigest {
-		return nil, incomplete(fmt.Errorf("job %s is now at version %d with package %s; this request registered version %d with %s",
+		return nil, incomplete(fmt.Errorf("job %s is at version %d with package %s; this request registered version %d with %s",
 			entry.JobID, job.Version, job.PackageDigest, entry.Version, entry.PackageDigest))
 	}
 	var size int64
@@ -514,7 +600,10 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	if err != nil {
 		return nil, incomplete(err)
 	}
+	return outcome(entry, local, pkg), nil
+}
 
+func outcome(entry *txepkg.Entry, receipt *txepkg.Receipt, pkg *txepkg.Package) *Outcome {
 	dagSpec := ""
 	var sent struct {
 		Version struct {
@@ -524,7 +613,60 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	if json.Unmarshal(entry.Request, &sent) == nil {
 		dagSpec = sent.Version.DAG.Spec
 	}
-	return &Outcome{Receipt: local, Package: pkg, DAGSpec: dagSpec}, nil
+	return &Outcome{Receipt: receipt, Package: pkg, DAGSpec: dagSpec}
+}
+
+// overtaken finishes a request whose version is no longer the job's current
+// one: another session recorded a later version before this request had its
+// receipt filed. The job can no longer be marked ready for this version, but
+// the version may have been, with the answer lost on the way back.
+//
+// A receipt this request already wrote is filed. Otherwise the registry's
+// history is asked: it keeps an entry for every version that became ready,
+// naming the package and the DAG. If this version has one, the receipt is
+// written from it. If it has none, the version never became ready, and the
+// request is closed as superseded with no receipt.
+func (r *Registrar) overtaken(ctx context.Context, entry *txepkg.Entry, job *Job, pkg *txepkg.Package, incomplete func(error) error) (*Outcome, error) {
+	if existing, err := r.Journal.Receipt(entry.JobID, entry.Version); err == nil && existing.RequestID == entry.RequestID {
+		local, err := r.Journal.Complete(entry, *existing)
+		if err != nil {
+			return nil, incomplete(err)
+		}
+		return outcome(entry, local, pkg), nil
+	}
+
+	version, err := r.Client.JobVersion(ctx, entry.JobID, entry.Version)
+	if err != nil {
+		return nil, incomplete(fmt.Errorf("read version %d of %s: %w", entry.Version, entry.JobID, err))
+	}
+	events, err := r.Client.JobEvents(ctx, entry.JobID)
+	if err != nil {
+		return nil, incomplete(fmt.Errorf("read the history of %s: %w", entry.JobID, err))
+	}
+	for _, event := range events {
+		// The DAG's hash is different for every version; the package's need not be.
+		if event.Kind != EventReady || version.DAG.SpecSHA256 == "" ||
+			!slices.Contains(event.Evidence, entry.PackageDigest) || !slices.Contains(event.Evidence, version.DAG.SpecSHA256) {
+			continue
+		}
+		local, err := r.Journal.Complete(entry, txepkg.Receipt{
+			JobID: entry.JobID, Version: entry.Version, OwnerID: job.OwnerID, ProjectID: job.ProjectID,
+			MachineID: job.MachineID, PackageDigest: entry.PackageDigest, PackageDir: pkg.Dir,
+			Session: r.Actor.Session, Service: event.Raw, Recovered: "registry event " + event.EventID,
+		})
+		if err != nil {
+			return nil, incomplete(err)
+		}
+		return outcome(entry, local, pkg), nil
+	}
+
+	entry.Step = txepkg.StepSuperseded
+	entry.Error = fmt.Sprintf("job %s moved on to version %d, and its history has no record that version %d was ever marked ready; the package stays in place and no receipt is written for that version",
+		entry.JobID, job.Version, entry.Version)
+	if err := r.Journal.Save(entry); err != nil {
+		return nil, err
+	}
+	return nil, &ErrSuperseded{RequestID: entry.RequestID, JobID: entry.JobID, Version: entry.Version, Current: job.Version}
 }
 
 // sameMachine refuses to act on a job that belongs to another machine or

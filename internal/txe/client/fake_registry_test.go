@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -44,6 +45,8 @@ type fakeRegistry struct {
 	fail map[string]int
 	// failNextReady fails the next ready call once, whatever its job.
 	failNextReady bool
+	// loseNextReady applies the next ready call and then loses its answer.
+	loseNextReady bool
 }
 
 type fakeJob struct {
@@ -51,6 +54,8 @@ type fakeJob struct {
 	requestID   string
 	requestHash string
 	versions    map[int]json.RawMessage
+	// events is the job's history, oldest first.
+	events []map[string]any
 }
 
 type recordedRequest struct {
@@ -183,6 +188,9 @@ func (f *fakeRegistry) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lose := f.loseResponse[key] > 0
+	if f.loseNextReady && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/ready") {
+		f.loseNextReady, lose = false, true
+	}
 	if lose {
 		f.loseResponse[key]--
 	}
@@ -245,6 +253,20 @@ func (f *fakeRegistry) route(w http.ResponseWriter, r *http.Request, body []byte
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(version)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/events"):
+		f.mu.Lock()
+		j, ok := f.jobs[strings.TrimSuffix(strings.TrimPrefix(path, "/txe/jobs/"), "/events")]
+		var events []map[string]any
+		if ok {
+			events = slices.Clone(j.events)
+			slices.Reverse(events) // newest first
+		}
+		f.mu.Unlock()
+		if !ok {
+			refuse(w, 404, "not_found", "no such job", nil)
+			return
+		}
+		answer(w, 200, map[string]any{"events": events})
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/txe/jobs/"):
 		f.mu.Lock()
 		j, ok := f.jobs[strings.TrimPrefix(path, "/txe/jobs/")]
@@ -313,6 +335,7 @@ func (f *fakeRegistry) register(w http.ResponseWriter, body []byte) {
 		refuse(w, 409, "duplicate", "job key "+in.JobKey+" is already registered in this project", f.jobs[id].Job)
 		return
 	}
+	in.Version.DAG.SpecSHA256 = hashOf([]byte(in.Version.DAG.Spec))
 	versionJSON, _ := json.Marshal(in.Version)
 	j := &fakeJob{
 		Job: Job{
@@ -351,6 +374,7 @@ func (f *fakeRegistry) update(w http.ResponseWriter, jobID string, body []byte) 
 		refuse(w, 409, "version_conflict", fmt.Sprintf("job is at version %d, not %d", j.Version, in.ExpectedVersion), j.Job)
 		return
 	}
+	in.Version.DAG.SpecSHA256 = hashOf([]byte(in.Version.DAG.Spec))
 	versionJSON, _ := json.Marshal(in.Version)
 	j.Version++
 	j.Revision++
@@ -388,6 +412,12 @@ func (f *fakeRegistry) ready(w http.ResponseWriter, jobID string, body []byte) {
 		evidence := in.Package
 		j.Registration.State, j.Registration.Package, j.Registration.DAGVerified = RegistrationReady, &evidence, true
 		j.Revision++
+		// The history keeps what became ready, whatever happens to the job later.
+		j.events = append(j.events, map[string]any{
+			"event_id": fmt.Sprintf("evt_%s_%d", j.JobID, len(j.events)+1), "job_id": j.JobID, "revision": j.Revision,
+			"kind": EventReady, "from": RegistrationIncomplete, "to": RegistrationReady,
+			"evidence": []string{in.Package.Digest, j.DAGSpecSHA256}, "actor": in.Actor, "at": "2026-10-09T00:00:00Z",
+		})
 	}
 	answer(w, 200, map[string]any{
 		"job_id": j.JobID, "owner_id": j.OwnerID, "project_id": j.ProjectID, "machine_id": j.MachineID,

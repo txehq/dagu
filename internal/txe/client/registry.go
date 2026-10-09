@@ -101,6 +101,17 @@ func (c *Client) JobVersion(ctx context.Context, jobID string, version int) (*Jo
 	return &out, nil
 }
 
+// JobEvents returns a job's whole history, newest first.
+func (c *Client) JobEvents(ctx context.Context, jobID string) ([]Event, error) {
+	var out struct {
+		Events []Event `json:"events"`
+	}
+	if err := c.Do(ctx, http.MethodGet, "/txe/jobs/"+url.PathEscape(jobID)+"/events", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Events, nil
+}
+
 // RegisterJob saves a new job, its first version and its DAG. The job is
 // incomplete until MarkReady. Sending the same request again returns the job
 // that was stored the first time.

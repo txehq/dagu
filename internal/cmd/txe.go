@@ -67,7 +67,8 @@ later reviewer needs: purpose, targets, expected outcome, lifetime and review
 policy. The hub schedules it; this machine's worker runs it.
 
 These commands use the "txe" context in the TXE home's own context store
-(~/.local/share/txe-dagu/client) unless --context or --dagu-home says otherwise.`,
+(~/.local/share/txe-dagu/client) unless --context or --dagu-home says otherwise.
+DAGU_* environment variables are ignored: a job's steps inherit the worker's.`,
 	}, nil, func(ctx *Context, _ []string) error {
 		return ctx.Command.Help()
 	})
@@ -134,13 +135,27 @@ func isTXECommand(cmd *cobra.Command) bool {
 }
 
 // txeDefaults points a txe command at the TXE home's context store and the
-// hub's context, unless the caller chose otherwise.
+// hub's context, unless the caller's flags chose otherwise.
+//
+// The store is chosen by flags and by nothing else. A job's publish step
+// inherits the worker's DAGU_* variables, the worker's own home among them,
+// and a session may carry some for a different Dagu altogether. Any of them
+// would move the context store, or the key it is read with, away from the one
+// the job was registered with. So they are dropped before the configuration is
+// read: --dagu-home and --config say where the store is.
 func txeDefaults(cmd *cobra.Command, _ []string) error {
+	for _, variable := range os.Environ() {
+		if name, _, _ := strings.Cut(variable, "="); strings.HasPrefix(name, "DAGU_") {
+			if err := os.Unsetenv(name); err != nil {
+				return err
+			}
+		}
+	}
 	home, err := txepkg.DefaultHome()
 	if err != nil {
 		return err
 	}
-	if flag := cmd.Flags().Lookup("dagu-home"); flag != nil && !flag.Changed && os.Getenv("DAGU_HOME") == "" {
+	if flag := cmd.Flags().Lookup("dagu-home"); flag != nil && !flag.Changed {
 		if err := cmd.Flags().Set("dagu-home", home.ClientDir()); err != nil {
 			return err
 		}
@@ -187,12 +202,19 @@ var claudeConfigDir = regexp.MustCompile(`^\.claude([0-9]*)$`)
 // txeSession returns the coding session to record as the author of a change:
 // the --session flag, TXE_SESSION, or cc<n>-<workspace> derived for a Claude
 // Code session. It is never guessed: when none applies the result is empty.
+//
+// A Codex thread started from a Claude session inherits that session's
+// variables. They are the parent's identity, not its own, so when a Codex
+// thread id is present nothing is derived and the caller has to say.
 func txeSession(ctx *Context) string {
 	if value, err := ctx.StringParam("session"); err == nil && value != "" {
 		return value
 	}
 	if value := os.Getenv("TXE_SESSION"); value != "" {
 		return value
+	}
+	if os.Getenv("CODEX_THREAD_ID") != "" {
+		return ""
 	}
 	match := claudeConfigDir.FindStringSubmatch(filepath.Base(filepath.Clean(os.Getenv("CLAUDE_CONFIG_DIR"))))
 	if match == nil {
@@ -226,7 +248,7 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 	}
 	session := txeSession(ctx)
 	if session == "" {
-		return nil, errors.New("cannot tell which session is making this change; pass --session or set TXE_SESSION")
+		return nil, errors.New("cannot tell which session is making this change: it is not a Claude Code session with its own identity (a Codex thread started from one inherits the parent's); pass --session or set TXE_SESSION")
 	}
 	machine, err := home.Machine()
 	if err != nil {
@@ -242,6 +264,7 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 			MachineID: machine.MachineID, Client: txeClientVersion(),
 		},
 		NewID: txeclient.NewID,
+		Hub:   txeHubContext(ctx),
 	}, nil
 }
 
@@ -304,6 +327,26 @@ func txeCleanValue(v any) any {
 	default:
 		return v
 	}
+}
+
+// txeHubContext names the context a command is using by where it is stored
+// and what it is called, so a job's publish step can use the same one.
+func txeHubContext(ctx *Context) txeclient.HubContext {
+	absolute := func(flag string) string {
+		value, _ := ctx.Command.Flags().GetString(flag)
+		if value == "" {
+			return ""
+		}
+		if abs, err := filepath.Abs(value); err == nil {
+			return abs
+		}
+		return value
+	}
+	hub := txeclient.HubContext{DaguHome: absolute("dagu-home"), ConfigFile: absolute("config"), Name: ctx.ContextName}
+	if ctx.Config != nil {
+		hub.ContextsDir, hub.DataDir = ctx.Config.Paths.ContextsDir, ctx.Config.Paths.DataDir
+	}
+	return hub
 }
 
 // txeOutput prints a result: as indented JSON with --json, otherwise through
@@ -376,6 +419,7 @@ func txeReportFailure(ctx *Context, err error) error {
 		exists     *txeclient.ErrJobExists
 		rejected   *txeclient.ErrRejected
 		incomplete *txeclient.ErrIncomplete
+		superseded *txeclient.ErrSuperseded
 	)
 	switch {
 	case errors.As(err, &missing):
@@ -389,6 +433,8 @@ func txeReportFailure(ctx *Context, err error) error {
 		}
 	case errors.As(err, &incomplete):
 		failure.Kind, failure.RequestID = "incomplete", incomplete.RequestID
+	case errors.As(err, &superseded):
+		failure.Kind, failure.RequestID, failure.JobID = "superseded", superseded.RequestID, superseded.JobID
 	case errors.Is(err, txeclient.ErrReviewerSession):
 		failure.Kind = "reviewer_session"
 	}

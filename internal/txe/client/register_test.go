@@ -372,7 +372,7 @@ func TestResumeFromAnotherMachine(t *testing.T) {
 	}
 
 	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
-	require.ErrorContains(t, err, "cannot place or vouch for its package")
+	require.ErrorContains(t, err, "cannot send or finish it")
 
 	readyAfter := 0
 	for _, r := range f.requests {
@@ -385,6 +385,199 @@ func TestResumeFromAnotherMachine(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
+}
+
+// The same holds for a request that was saved but never delivered: resuming
+// it from another machine sends nothing, so no job is created or changed
+// before the refusal.
+func TestResumeUndeliveredRequestFromAnotherMachine(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	spec, _ := worktree(t, credentialFile(t))
+	f.fail["POST /txe/jobs"] = 1
+
+	_, err := cc1.Register(context.Background(), spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+	require.Equal(t, txepkg.StepStaged, incomplete.Step)
+	require.Zero(t, f.jobCount())
+	posts := f.calls(http.MethodPost, "/txe/jobs")
+
+	other := `{"schema":1,"machine_id":"mch_01K7A5ZQ8M3N4P5R6S7T8V9W0D","owner_id":"` + testOwner + `"}`
+	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "machine.json"), []byte(other), 0o600))
+	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
+	require.ErrorContains(t, err, "cannot send or finish it")
+
+	assert.Equal(t, posts, f.calls(http.MethodPost, "/txe/jobs"), "the other machine sent the saved request")
+	assert.Zero(t, f.jobCount())
+}
+
+// overtakenFixture leaves cc1 with an unfinished registration of version 1 of
+// a job that cc2 has since moved to version 2. arrange runs first and decides
+// how cc1's registration stops.
+type overtaken struct {
+	f                *fakeRegistry
+	cc1              *session
+	requestID, jobID string
+}
+
+func overtakenFixture(t *testing.T, arrange func(f *fakeRegistry)) overtaken {
+	t.Helper()
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	cc2 := newSession(f, home, "cc2-s000002")
+	spec, dir := worktree(t, credentialFile(t))
+	f.mu.Lock()
+	arrange(f)
+	f.mu.Unlock()
+
+	_, err := cc1.Register(context.Background(), spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+	jobs, err := cc1.Client.ListJobs(context.Background(), JobFilter{JobKey: "nightly-collector"})
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	jobID := jobs[0].JobID
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "lib", "snapshot.py"), []byte("def summarise(root):\n    return {'v': 2}\n"), 0o644)) //nolint:gosec // test file
+	second, err := cc2.Update(context.Background(), jobID, 1, spec)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Receipt.Version)
+	return overtaken{f: f, cc1: cc1, requestID: incomplete.RequestID, jobID: jobID}
+}
+
+// The hub marks version 1 ready but its answer is lost; before the first
+// session resumes, another session updates the job. The job can no longer be
+// marked ready for version 1, but the hub's history shows that it was, and
+// the receipt is written from that.
+func TestResumeRecoversReceiptAfterJobMovedOn(t *testing.T) {
+	o := overtakenFixture(t, func(f *fakeRegistry) { f.loseNextReady = true })
+	f, cc1, requestID, jobID := o.f, o.cc1, o.requestID, o.jobID
+	readyCalls := f.calls(http.MethodPost, "/txe/jobs/"+jobID+"/ready")
+
+	out, err := cc1.Resume(context.Background(), requestID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, out.Receipt.Version)
+	assert.Equal(t, requestID, out.Receipt.RequestID)
+	assert.Contains(t, out.Receipt.Recovered, "registry event evt_")
+	var event Event
+	require.NoError(t, json.Unmarshal(out.Receipt.Service, &event))
+	assert.Equal(t, EventReady, event.Kind)
+	assert.Contains(t, event.Evidence, out.Receipt.PackageDigest)
+
+	// The receipt is on disk, the request is closed, and nothing was asked
+	// of the job's current version.
+	onDisk, err := cc1.Journal.Receipt(jobID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, out.Receipt.Recovered, onDisk.Recovered)
+	assert.NotContains(t, pendingSteps(t, cc1.Journal), requestID)
+	assert.Equal(t, readyCalls, f.calls(http.MethodPost, "/txe/jobs/"+jobID+"/ready"))
+	assert.Equal(t, 2, f.job(jobID).Version)
+	assert.Equal(t, RegistrationReady, f.job(jobID).Registration.State)
+}
+
+// Version 1 never became ready: the ready call failed, and another session
+// moved the job on. The history has nothing for version 1, so no receipt is
+// written, and the request says so once instead of failing every resume.
+func TestResumeAfterJobMovedOnBeforeReady(t *testing.T) {
+	o := overtakenFixture(t, func(f *fakeRegistry) { f.failNextReady = true })
+	f, cc1, requestID, jobID := o.f, o.cc1, o.requestID, o.jobID
+
+	_, err := cc1.Resume(context.Background(), requestID)
+	var superseded *ErrSuperseded
+	require.ErrorAs(t, err, &superseded)
+	assert.Equal(t, 1, superseded.Version)
+	assert.Equal(t, 2, superseded.Current)
+
+	assert.Equal(t, txepkg.StepSuperseded, pendingSteps(t, cc1.Journal)[requestID])
+	_, err = cc1.Journal.Receipt(jobID, 1)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	_, err = cc1.Resume(context.Background(), requestID)
+	require.ErrorContains(t, err, "cannot be resumed")
+	require.ErrorContains(t, err, "no record that version 1 was ever marked ready")
+
+	// Version 2 is untouched.
+	assert.Equal(t, 2, f.job(jobID).Version)
+	assert.Equal(t, RegistrationReady, f.job(jobID).Registration.State)
+}
+
+// A registration wrote its receipt and stopped before filing its journal
+// entry; then the job moved on. Resuming files the entry against the receipt
+// that exists, without asking the hub's history.
+func TestResumeFilesExistingReceiptAfterJobMovedOn(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	cc2 := newSession(f, home, "cc2-s000002")
+	spec, dir := worktree(t, credentialFile(t))
+
+	first, err := cc1.Register(context.Background(), spec)
+	require.NoError(t, err)
+	jobID, requestID := first.Receipt.JobID, first.Receipt.RequestID
+
+	// Put the entry back where an interrupted registration would have left it.
+	filed := filepath.Join(cc1.Journal.Dir, jobID, "requests", requestID+".json")
+	pending := filepath.Join(cc1.Journal.Dir, "pending", requestID+".json")
+	require.NoError(t, os.Rename(filed, pending))
+	require.Contains(t, pendingSteps(t, cc1.Journal), requestID)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "lib", "snapshot.py"), []byte("def summarise(root):\n    return {'v': 2}\n"), 0o644)) //nolint:gosec // test file
+	_, err = cc2.Update(context.Background(), jobID, 1, spec)
+	require.NoError(t, err)
+
+	out, err := cc1.Resume(context.Background(), requestID)
+	require.NoError(t, err)
+	assert.Equal(t, first.Receipt.WrittenAt, out.Receipt.WrittenAt, "the receipt was rewritten")
+	assert.Empty(t, out.Receipt.Recovered)
+	assert.NotContains(t, pendingSteps(t, cc1.Journal), requestID)
+	assert.FileExists(t, filed)
+	assert.Zero(t, f.calls(http.MethodGet, "/txe/jobs/"+jobID+"/events"))
+}
+
+// A job registered through another context publishes through that context.
+func TestPublishStepUsesRegistrationContext(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	_, dir := worktree(t, credentialFile(t))
+	specPath := filepath.Join(dir, "job.yaml")
+	text, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(specPath, []byte(strings.Replace(string(text), "expected_outcome:\n", "expected_outcome:\n"+deliverablesYAML, 1)), 0o644)) //nolint:gosec // test file
+	spec, err := LoadJobSpec(specPath)
+	require.NoError(t, err)
+
+	stores := t.TempDir()
+	s := newSession(f, home, "cc1-s000001")
+	s.Hub = HubContext{DaguHome: filepath.Join(stores, "other-hub"), Name: "staging"}
+	plan, err := s.Plan(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Contains(t, plan.DAGSpec, "txe artifacts publish --dagu-home "+filepath.Join(stores, "other-hub")+" --context staging")
+
+	// A configuration file that moves the store travels with the home.
+	s.Hub.ConfigFile = filepath.Join(stores, "hub.yaml")
+	plan, err = s.Plan(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Contains(t, plan.DAGSpec, "--dagu-home "+filepath.Join(stores, "other-hub")+" --config "+filepath.Join(stores, "hub.yaml")+" --context staging")
+
+	// A store that a later run could not rely on is refused, wherever the
+	// flags resolved it to.
+	scratch := t.TempDir()
+	s.Store.Policy = txepkg.PathPolicy{TempRoots: []string{scratch}}
+	s.Hub.ContextsDir = filepath.Join(scratch, "contexts")
+	_, err = s.Plan(context.Background(), spec)
+	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	s.Hub.ContextsDir = ""
+	_, err = s.Plan(context.Background(), spec)
+	require.NoError(t, err)
+
+	s.Store.Policy = txepkg.PathPolicy{TempRoots: []string{stores}}
+	_, err = s.Plan(context.Background(), spec)
+	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	_, err = s.Register(context.Background(), spec)
+	require.ErrorContains(t, err, "cannot be used by the job's publish step")
+	assert.Zero(t, f.jobCount())
 }
 
 // An update names the version it changes. One made against an outdated
