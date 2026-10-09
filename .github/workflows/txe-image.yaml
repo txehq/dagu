@@ -1,0 +1,111 @@
+# TXE fork image: the server image the TXE staging cluster runs (TXE-3727).
+#
+# Tags are `txe-v<upstream version>-<n>`, for example `txe-v2.18.2-1`. No upstream
+# workflow matches them: ci.yaml, docker.yaml and release.yaml all trigger on `v*`
+# tags only. The image is built for linux/amd64 alone, the architecture of every
+# capso-txe-development node, and pushed with this workflow's own GITHUB_TOKEN,
+# because upstream's docker.yaml needs a DAGU_GITHUB_TOKEN secret the fork lacks.
+#
+# The laptop worker is built from the same tag (txe/worker/install.sh). Server and
+# worker must run the same version, so a tag is the unit of release for both.
+name: TXE image
+
+on:
+  push:
+    tags:
+      - "txe-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing txe-v<upstream>-<n> tag to (re)build"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: txe-image-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve tag and version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^txe-v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+            echo "::error::tag '$TAG' is not txe-v<major>.<minor>.<patch>-<n>"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+
+      - name: Check out the tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Record the tag's commit
+        run: echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          platforms: linux/amd64
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+          build-args: |
+            LDFLAGS=-X 'main.version=${{ env.VERSION }}'
+
+      - name: Verify the pushed image reports its version
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST" || { echo "::error::build produced no digest"; exit 1; }
+          ref="${IMAGE_NAME}@${DIGEST}"
+          docker pull --quiet "$ref" >/dev/null
+          got="$(docker run --rm --entrypoint dagu "$ref" version 2>&1 | tr -d '\r')"
+          echo "dagu version -> $got"
+          case "$got" in
+            *"$VERSION"*) ;;
+            *) echo "::error::image reports '$got', expected $VERSION"; exit 1 ;;
+          esac
+          {
+            echo "### TXE image"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`$TAG\` |"
+            echo "| commit | \`$COMMIT\` |"
+            echo "| version | \`$VERSION\` |"
+            echo "| image | \`$ref\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
