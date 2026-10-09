@@ -5,6 +5,7 @@ package distr_test
 
 import (
 	"fmt"
+	goruntime "runtime"
 	"testing"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 // status and their own log lines, and an earlier copy does not change when a
 // later execution is copied.
 func TestQueuedRetryRetainsEachExecution(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("the job's steps are POSIX shell; Windows runs them under PowerShell")
+	}
 	state := t.TempDir()
 	f := newTestFixture(t, fmt.Sprintf(`
 type: chain
