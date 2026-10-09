@@ -236,8 +236,43 @@ func runningTaskIdentity(workerID string, task *coordinatorv1.RunningTask) (atte
 }
 
 func (h *Handler) validateAttempt(ctx context.Context, identity attemptIdentity) error {
-	_, err := h.attemptLease(ctx, identity)
-	return err
+	if _, err := h.attemptLease(ctx, identity); err != nil {
+		return err
+	}
+	return h.refuseRequeuedExecution(ctx, identity)
+}
+
+// refuseRequeuedExecution refuses a write once the run's root attempt waits in
+// the queue for a later execution. Between the retry persisting the queued
+// status and the next execution's claim, the earlier execution's lease still
+// matches, so the lease alone would admit its late output.
+//
+// A write validated just before the queued status is persisted can still land
+// after it; the retry's snapshot is taken under the store's lock and does not
+// see it. In the live files, the next execution's positioned stream rewrites
+// and truncates the log, and its first open removes the earlier .final record.
+func (h *Handler) refuseRequeuedExecution(ctx context.Context, identity attemptIdentity) error {
+	if h.dagRunRepository == nil {
+		return nil
+	}
+	attempt, err := h.dagRunRepository.FindAttempt(ctx, identity.root)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil
+		}
+		return status.Error(codes.Internal, "failed to resolve run for write validation: "+err.Error())
+	}
+	runStatus, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		if errors.Is(err, dagrun.ErrNoStatusData) {
+			return nil
+		}
+		return status.Error(codes.Internal, "failed to read run status for write validation: "+err.Error())
+	}
+	if runStatus != nil && runStatus.Status == ir.Queued && runStatus.QueuedAt != identity.executionMarker {
+		return status.Error(codes.FailedPrecondition, remoteAttemptRejectedSuperseded)
+	}
+	return nil
 }
 
 func (h *Handler) attemptLease(ctx context.Context, identity attemptIdentity) (*dispatch.DAGRunLease, error) {

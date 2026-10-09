@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,7 @@ var (
 	errNoMatchingWorkers            = errors.New("no workers match the required selector")
 	errRunHeartbeatRepairSkipped    = errors.New("run heartbeat repair skipped")
 	errManualActionCheckpointChange = errors.New("completed manual action checkpoint changed")
+	errExecutionReplaced            = errors.New("attempt was re-queued for another execution")
 )
 
 type preparedDispatchAttempt struct {
@@ -148,9 +150,12 @@ type Handler struct {
 	coordinatorv1.UnimplementedCoordinatorServiceServer
 
 	mu             sync.Mutex
-	waitingPollers map[string]*workerInfo    // pollerID -> worker info
-	heartbeats     map[string]*heartbeatInfo // workerID -> heartbeat info
-	owner          dispatch.CoordinatorEndpoint
+	waitingPollers map[string]*workerInfo // pollerID -> worker info
+	// attemptWriteLocks orders worker output writes against claims; see
+	// attemptWriteLocks.
+	attemptWriteLocks attemptWriteLocks
+	heartbeats        map[string]*heartbeatInfo // workerID -> heartbeat info
+	owner             dispatch.CoordinatorEndpoint
 
 	dispatchWakeMu          sync.Mutex
 	dispatchWakeCh          chan struct{}
@@ -464,6 +469,9 @@ func (h *Handler) Poll(ctx context.Context, req *coordinatorv1.PollRequest) (*co
 		if claimed != nil && claimed.Task != nil {
 			claimed.Task.WorkerID = req.WorkerId
 			task, err := convert.DispatchTaskToProto(claimed.Task)
+			if err == nil {
+				err = fillLegacyExecutionMarker(task)
+			}
 			if err != nil {
 				releaseCtx := context.WithoutCancel(ctx)
 				if releaseErr := h.dispatchTaskStore.ReleaseClaim(releaseCtx, claimed.ClaimToken); releaseErr != nil && !errors.Is(releaseErr, dispatch.ErrDispatchTaskNotFound) {
@@ -783,6 +791,24 @@ func queueDispatchStatusForTask(task *coordinatorv1.Task) (*ir.DAGRunStatus, err
 		return nil, nil
 	}
 	return status, nil
+}
+
+// fillLegacyExecutionMarker gives a queued dispatch persisted before execution
+// markers existed the marker it would have been dispatched with: the queued
+// status's queued-at, which the task carries. Poll and the claim acknowledgment
+// both apply it, so the worker and the lease agree. A queued dispatch's marker
+// is never empty, so an empty marker on one is always a legacy task's. Other
+// tasks keep their marker, including the empty one of a direct start.
+func fillLegacyExecutionMarker(task *coordinatorv1.Task) error {
+	if task == nil || task.ExecutionMarker != "" {
+		return nil
+	}
+	queued, err := queueDispatchStatusForTask(task)
+	if err != nil || queued == nil {
+		return err
+	}
+	task.ExecutionMarker = queued.QueuedAt
+	return nil
 }
 
 func staleQueueDispatchError(reason string) error {
@@ -1399,13 +1425,16 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 		claimed.Task.Owner = claimOwner
 	}
 	task, err := convert.DispatchTaskToProto(claimed.Task)
+	if err == nil {
+		err = fillLegacyExecutionMarker(task)
+	}
 	if err != nil {
 		return nil, status.Error(codes.Internal, "failed to encode claimed task: "+err.Error())
 	}
 	if req.AttemptKey != "" && req.AttemptKey != task.AttemptKey {
 		return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "claim belongs to a different attempt"}, nil
 	}
-	if err := h.attemptOwnership().recordTaskClaim(ctx, task, workerID); err != nil {
+	if err := h.recordTaskClaim(ctx, task, workerID); err != nil {
 		if errors.Is(err, dispatch.ErrDAGRunLeaseConflict) {
 			return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "attempt claim conflicts with the active lease"}, nil
 		}
@@ -1416,6 +1445,18 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 	}
 
 	return &coordinatorv1.AckTaskClaimResponse{Accepted: true}, nil
+}
+
+// recordTaskClaim records an acknowledged claim's lease under the attempt's
+// write lock, so no output write validated for an earlier execution of the
+// attempt can land after the new execution owns it.
+func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task, workerID string) error {
+	root := ir.DAGRunRef{Name: task.GetRootDagRunName(), ID: task.GetRootDagRunId()}
+	if root.Zero() {
+		root = ir.DAGRunRef{Name: task.GetTarget(), ID: task.GetDagRunId()}
+	}
+	defer h.attemptWriteLocks.lock(root)()
+	return h.attemptOwnership().recordTaskClaim(ctx, task, workerID)
 }
 
 // ClaimAgentSessionCleanup reserves deferred provider cleanup for its owning worker.
@@ -1844,7 +1885,12 @@ func appendCancelledRuns(dst []*coordinatorv1.CancelledRun, src []*coordinatorv1
 		if cancelled == nil || cancelled.AttemptKey == "" {
 			continue
 		}
-		dst = appendCancelledRunIfMissing(dst, cancelled.AttemptKey)
+		if !slices.ContainsFunc(dst, func(existing *coordinatorv1.CancelledRun) bool {
+			return existing != nil && existing.AttemptKey == cancelled.AttemptKey
+		}) {
+			// Keep the directive whole: its execution marker scopes it.
+			dst = append(dst, cancelled)
+		}
 	}
 	return dst
 }
@@ -1886,7 +1932,9 @@ func (h *Handler) getCancelledRunsForWorker(ctx context.Context, stats *coordina
 	var cancelledRuns []*coordinatorv1.CancelledRun
 	for _, task := range stats.RunningTasks {
 		if h.isTaskCancelled(ctx, task) {
-			cancelledRuns = appendCancelledRunIfMissing(cancelledRuns, task.AttemptKey)
+			// Scoped to the observed execution: a delayed response must not
+			// cancel a newer execution of the same attempt.
+			cancelledRuns = appendCancelledExecutionIfMissing(cancelledRuns, task)
 		}
 	}
 	return cancelledRuns
@@ -1952,6 +2000,13 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	var activeLease *dispatch.DAGRunLease
 	leaseMissing := false
 	if h.dagRunLeaseStore != nil {
+		// Hold the run's write lock from validation through the write, so a
+		// claim of the attempt's next execution cannot fall between them.
+		lockRoot := dagRunStatus.Root
+		if lockRoot.Zero() {
+			lockRoot = dagRunStatus.DAGRun()
+		}
+		defer h.attemptWriteLocks.lock(lockRoot)()
 		var validationErr error
 		activeLease, leaseMissing, validationErr = h.validateStatusLease(ctx, req.WorkerId, dagRunStatus, req.ExecutionMarker)
 		if validationErr != nil {
@@ -2024,6 +2079,17 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedLeaseInactive)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedLeaseInactive}, nil
 	}
+	// A terminal attempt's lease is gone, so there is no marker to check. The
+	// stored status was written by the execution that finished, and every
+	// execution's status echoes its own queued-at, which a queued retry always
+	// advances. A terminal report with a different queued-at is therefore an
+	// earlier execution's and must not overwrite the result. A replay from the
+	// finished execution matches and is still accepted.
+	if leaseMissing && isTerminalRunStatus(latestStatus.Status) && !isSubDAGStatus(dagRunStatus) &&
+		dagRunStatus.AttemptID == latestStatus.AttemptID && dagRunStatus.QueuedAt != latestStatus.QueuedAt {
+		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
+		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
+	}
 	profileErr := h.reconcileStatusProfile(ctx, activeLease, latestStatus, dagRunStatus)
 	if errors.Is(profileErr, errProfileMismatch) {
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
@@ -2058,7 +2124,14 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	}
 
 	attempt := latestAttempt
-	if dagRunStatus.Status == ir.Waiting {
+	// A retry can re-queue the attempt only from a terminal status, and it may
+	// do so from another process, between this report's validation and its
+	// write. Over a terminal status the write is therefore conditional, in the
+	// store's own compare-and-swap that the retry also uses: it applies only
+	// if the status and queued-at are still those validated against.
+	conditional := dagRunStatus.Status == ir.Waiting ||
+		(!isSubDAGStatus(dagRunStatus) && isTerminalRunStatus(latestStatus.Status))
+	if conditional {
 		h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, latestAttempt.ID())
 		persisted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(
 			ctx,
@@ -2066,13 +2139,20 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			latestAttempt.ID(),
 			latestStatus.Status,
 			func(current *ir.DAGRunStatus) error {
-				if !preservesCompletedManualActions(current, dagRunStatus) {
+				if current.QueuedAt != latestStatus.QueuedAt {
+					return errExecutionReplaced
+				}
+				if dagRunStatus.Status == ir.Waiting && !preservesCompletedManualActions(current, dagRunStatus) {
 					return errManualActionCheckpointChange
 				}
 				*current = *dagRunStatus
 				return nil
 			}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: dagRunStatus.Root, ExpectedAttemptKey: dagRunStatus.AttemptKey},
 		)
+		if errors.Is(err, errExecutionReplaced) {
+			logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
+			return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
+		}
 		if errors.Is(err, errManualActionCheckpointChange) {
 			logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedManualAction)
 			return &coordinatorv1.ReportStatusResponse{
@@ -2081,7 +2161,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			}, nil
 		}
 		if err != nil {
-			return nil, status.Error(codes.Internal, "failed to write waiting status: "+err.Error())
+			return nil, status.Error(codes.Internal, "failed to write status: "+err.Error())
 		}
 		if !swapped {
 			logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, persisted, remoteAttemptRejectedSuperseded)
@@ -2611,6 +2691,7 @@ func (h *Handler) StreamLogs(stream coordinatorv1.CoordinatorService_StreamLogsS
 	logHandler := newLogHandler(h.logDir)
 	if h.dagRunLeaseStore != nil {
 		logHandler.attemptValidator = h.validateAttempt
+		logHandler.lockAttempt = h.attemptWriteLocks.lock
 	}
 	defer logHandler.Close(stream.Context()) // Ensure file handles are closed on stream end or error
 	return logHandler.handleStream(stream)
@@ -2628,6 +2709,7 @@ func (h *Handler) StreamArtifacts(stream coordinatorv1.CoordinatorService_Stream
 	artifactHandler := newArtifactHandler(h.dagRunRepository)
 	if h.dagRunLeaseStore != nil {
 		artifactHandler.attemptValidator = h.validateAttempt
+		artifactHandler.lockAttempt = h.attemptWriteLocks.lock
 	}
 	return artifactHandler.handleStream(stream)
 }

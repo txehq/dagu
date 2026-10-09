@@ -5,6 +5,8 @@ package coordinator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,19 +16,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-// logStreamRevalidateInterval bounds how long a stream keeps writing on one
-// validation. A queued retry reuses the attempt's log files, so a stream of an
-// earlier execution must stop once the attempt is claimed again.
-const logStreamRevalidateInterval = time.Second
 
 // logFinalRecordSuffix names the record written beside a log file when its
 // final chunk is accepted. A log without a record matching an execution's
@@ -34,17 +31,22 @@ const logStreamRevalidateInterval = time.Second
 const logFinalRecordSuffix = ".final"
 
 // logFinalRecord is the content of a log file's finalization record.
+// SHA256 is "sha256:<hex>" of the file's bytes at finalization, the bytes Size
+// describes, so a reader can prove that a copy it took is the finalized log.
 type logFinalRecord struct {
 	ExecutionMarker string `json:"executionMarker"`
 	AttemptID       string `json:"attemptId"`
 	Size            int64  `json:"size"`
+	SHA256          string `json:"sha256"`
 }
 
 // logHandler handles log streaming from workers
 type logHandler struct {
 	logDir           string
 	attemptValidator func(context.Context, attemptIdentity) error
-	now              func() time.Time
+	// lockAttempt holds an attempt's write lock across a chunk's validation
+	// and write; see attemptWriteLocks.
+	lockAttempt func(root ir.DAGRunRef) (unlock func())
 
 	// Active writers: streamKey -> writer
 	writers   map[string]*streamLogWriter
@@ -114,7 +116,6 @@ func (w *streamLogWriter) close(finalSize *uint64) error {
 func newLogHandler(logDir string) *logHandler {
 	return &logHandler{
 		logDir:  logDir,
-		now:     time.Now,
 		writers: make(map[string]*streamLogWriter),
 	}
 }
@@ -125,7 +126,6 @@ func (h *logHandler) handleStream(stream coordinatorv1.CoordinatorService_Stream
 	var chunksReceived uint64
 	var bytesWritten uint64
 	var validatedIdentity *attemptIdentity
-	var lastValidated time.Time
 
 	for {
 		chunk, err := stream.Recv()
@@ -142,6 +142,7 @@ func (h *logHandler) handleStream(stream coordinatorv1.CoordinatorService_Stream
 
 		chunksReceived++
 
+		unlock := func() {}
 		if h.attemptValidator != nil {
 			identity, identityErr := logChunkIdentity(chunk)
 			if identityErr != nil {
@@ -150,57 +151,98 @@ func (h *logHandler) handleStream(stream coordinatorv1.CoordinatorService_Stream
 			if validatedIdentity != nil && identity != *validatedIdentity {
 				return status.Error(codes.FailedPrecondition, "log stream attempt identity changed")
 			}
-			// Validate before a file is opened or truncated, and at least every
-			// interval while data flows, so a stream of an earlier execution
-			// cannot keep writing once the attempt has been claimed again.
-			if validatedIdentity == nil || chunk.IsFinal || !h.hasWriter(chunk) ||
-				h.now().Sub(lastValidated) >= logStreamRevalidateInterval {
-				if err := h.attemptValidator(ctx, identity); err != nil {
-					return err
-				}
-				validatedIdentity = &identity
-				lastValidated = h.now()
+			// Every chunk is validated, and under the attempt's write lock, so
+			// a claim of the attempt's next execution cannot fall between this
+			// validation and the write: an earlier execution's chunk is either
+			// written before that claim or refused after it.
+			if h.lockAttempt != nil {
+				unlock = h.lockAttempt(identity.root)
 			}
+			if err := h.attemptValidator(ctx, identity); err != nil {
+				unlock()
+				return err
+			}
+			validatedIdentity = &identity
 		}
 
-		// Handle final marker
-		if chunk.IsFinal {
-			size, finalized, err := h.closeWriter(chunk)
-			if err != nil {
-				return fmt.Errorf("failed to finalize log file: %w", err)
-			}
-			if finalized {
-				if err := writeLogFinalRecord(h.logFilePath(chunk), logFinalRecord{
-					ExecutionMarker: chunk.ExecutionMarker,
-					AttemptID:       chunk.AttemptId,
-					Size:            size,
-				}); err != nil {
-					return fmt.Errorf("failed to record log finalization: %w", err)
-				}
-			}
-			continue
-		}
-
-		// Skip empty data
-		if len(chunk.Data) == 0 {
-			continue
-		}
-
-		// Get or create writer for this stream
-		writer, err := h.getOrCreateWriter(chunk)
+		n, err := h.applyChunk(chunk)
+		unlock()
 		if err != nil {
-			return fmt.Errorf("failed to create writer: %w", err)
+			return err
 		}
-
-		// Write the data using thread-safe method
-		n, err := writer.write(chunk)
-		if err != nil {
-			return fmt.Errorf("failed to write data: %w", err)
-		}
-		if n > 0 {
-			bytesWritten += uint64(n) // #nosec G115 -- n is non-negative from successful Write
-		}
+		bytesWritten += n
 	}
+}
+
+// applyChunk writes one chunk, or finalizes its stream, and returns the
+// number of bytes written.
+func (h *logHandler) applyChunk(chunk *coordinatorv1.LogChunk) (uint64, error) {
+	if chunk.IsFinal {
+		// A checkpointed stream resumes on a new RPC, which may carry only the
+		// final chunk. A positioned final chunk names the final size, so the
+		// file can be reopened, truncated to it and finalized. An unpositioned
+		// one cannot say which bytes are this execution's, so without an open
+		// writer it records nothing and the log stays incomplete.
+		if chunk.HasByteOffset() && !h.hasWriter(chunk) {
+			w, err := h.getOrCreateWriter(chunk)
+			if err != nil {
+				return 0, fmt.Errorf("failed to reopen log file for finalization: %w", err)
+			}
+			// This coordinator did not receive all of the execution's bytes,
+			// so it cannot vouch for the log: leave it incomplete.
+			if chunk.GetByteOffset() > uint64(w.size) { // #nosec G115 -- size is non-negative
+				h.discardWriter(chunk)
+				return 0, nil
+			}
+		}
+		size, finalized, err := h.closeWriter(chunk)
+		if err != nil {
+			return 0, fmt.Errorf("failed to finalize log file: %w", err)
+		}
+		if finalized {
+			logPath := h.logFilePath(chunk)
+			// Hash the file as finalized rather than the bytes received: a
+			// resumed stream rewrites earlier offsets, and the record must
+			// describe the file a reader will copy.
+			digest, hashedSize, err := fileSHA256(logPath)
+			if err != nil {
+				return 0, fmt.Errorf("failed to hash finalized log file: %w", err)
+			}
+			if hashedSize != size {
+				return 0, fmt.Errorf("finalized log file changed size: %d bytes, want %d", hashedSize, size)
+			}
+			if err := writeLogFinalRecord(logPath, logFinalRecord{
+				ExecutionMarker: chunk.ExecutionMarker,
+				AttemptID:       chunk.AttemptId,
+				Size:            size,
+				SHA256:          digest,
+			}); err != nil {
+				return 0, fmt.Errorf("failed to record log finalization: %w", err)
+			}
+		}
+		return 0, nil
+	}
+
+	// Skip empty data
+	if len(chunk.Data) == 0 {
+		return 0, nil
+	}
+
+	// Get or create writer for this stream
+	writer, err := h.getOrCreateWriter(chunk)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create writer: %w", err)
+	}
+
+	// Write the data using thread-safe method
+	n, err := writer.write(chunk)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write data: %w", err)
+	}
+	if n > 0 {
+		return uint64(n), nil // #nosec G115 -- n is non-negative from successful Write
+	}
+	return 0, nil
 }
 
 // streamKey creates a unique key for identifying a log stream.
@@ -215,12 +257,39 @@ func (h *logHandler) streamKey(chunk *coordinatorv1.LogChunk) string {
 	)
 }
 
-// hasWriter reports whether a writer is already open for the chunk's stream.
+// hasWriter reports whether a writer is open for the chunk's stream.
 func (h *logHandler) hasWriter(chunk *coordinatorv1.LogChunk) bool {
 	h.writersMu.Lock()
 	defer h.writersMu.Unlock()
 	_, ok := h.writers[h.streamKey(chunk)]
 	return ok
+}
+
+// discardWriter closes the chunk's writer without truncating or recording it.
+func (h *logHandler) discardWriter(chunk *coordinatorv1.LogChunk) {
+	key := h.streamKey(chunk)
+	h.writersMu.Lock()
+	w, ok := h.writers[key]
+	delete(h.writers, key)
+	h.writersMu.Unlock()
+	if ok {
+		_ = w.close(nil)
+	}
+}
+
+// fileSHA256 returns "sha256:<hex>" of the file's content and its length.
+func fileSHA256(path string) (string, int64, error) {
+	f, err := os.Open(path) // #nosec G304 -- path is the coordinator's own log file
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
 // writeLogFinalRecord atomically records that a log file was finalized.

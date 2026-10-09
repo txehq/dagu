@@ -4,6 +4,9 @@
 package coordinator
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -223,6 +226,140 @@ func TestExecutionMarkerReportStatus(t *testing.T) {
 
 }
 
+func TestExecutionMarkerReportStatusAfterLeaseRetired(t *testing.T) {
+	t.Parallel()
+
+	// E2, a queued retry, has finished: its lease is gone. A delayed terminal
+	// report from E1 must not replace E2's result; E2's own replay must.
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Succeeded, QueuedAt: markerQ2}, nil)
+
+	resp := f.report(t, ir.Failed, markerQ1, markerQ1)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, remoteAttemptRejectedSuperseded, resp.Error)
+	resp = f.report(t, ir.Failed, "", "")
+	assert.False(t, resp.Accepted, "a direct-start E1 is refused too")
+	assert.Equal(t, ir.Succeeded, f.stored(t).Status)
+
+	resp = f.report(t, ir.Succeeded, markerQ2, markerQ2)
+	assert.True(t, resp.Accepted, resp.Error)
+}
+
+// E1's terminal replay is validated against E1's terminal status, then a
+// retry persists Q2 before the replay is written. The retry may run in another
+// process, so only the store's compare-and-swap orders the two: the replay
+// must not restore E1's status over Q2.
+func TestExecutionMarkerTerminalReplayRacesRequeue(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		after func(*ir.DAGRunStatus)
+	}{
+		{"retry queued", func(st *ir.DAGRunStatus) { st.Status = ir.Queued; st.QueuedAt = markerQ2 }},
+		{"retry already failed again", func(st *ir.DAGRunStatus) { st.Status = ir.Failed; st.QueuedAt = markerQ2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Failed, QueuedAt: markerQ1}, nil)
+			f.store.beforeCompareAndSwap = func() {
+				f.store.beforeCompareAndSwap = nil
+				next := f.stored(t)
+				tc.after(next)
+				f.attempt.mu.Lock()
+				f.attempt.status = next
+				f.attempt.mu.Unlock()
+			}
+
+			resp := f.report(t, ir.Failed, markerQ1, markerQ1)
+			assert.False(t, resp.Accepted)
+			assert.Equal(t, remoteAttemptRejectedSuperseded, resp.Error)
+			assert.Equal(t, markerQ2, f.stored(t).QueuedAt, "E1 must not restore its status over the retry")
+		})
+	}
+
+	t.Run("replay without a requeue is accepted", func(t *testing.T) {
+		t.Parallel()
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Failed, QueuedAt: markerQ1}, nil)
+		resp := f.report(t, ir.Failed, markerQ1, markerQ1)
+		assert.True(t, resp.Accepted, resp.Error)
+	})
+}
+
+func TestExecutionMarkerReportStatusHoldsTheWriteLock(t *testing.T) {
+	t.Parallel()
+
+	// A claim of the next execution takes the run's write lock, so a report
+	// must hold it from validation through the write.
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+	unlock := f.h.attemptWriteLocks.lock(f.ref)
+	done := make(chan *coordinatorv1.ReportStatusResponse, 1)
+	go func() {
+		protoStatus, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
+			Name: markerDAG, DAGRunID: markerRun, AttemptID: markerAttempt, AttemptKey: f.attemptKey,
+			ProcGroup: markerDAG, Status: ir.Running, QueuedAt: markerQ2, WorkerID: markerWorker,
+		})
+		if err != nil {
+			done <- nil
+			return
+		}
+		resp, _ := f.h.ReportStatus(context.Background(), &coordinatorv1.ReportStatusRequest{
+			Status: protoStatus, WorkerId: markerWorker, OwnerCoordinatorId: "coord-a", ExecutionMarker: markerQ2,
+		})
+		done <- resp
+	}()
+	select {
+	case <-done:
+		unlock()
+		require.FailNow(t, "the report completed while the run's write lock was held")
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlock()
+	resp := <-done
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted, resp.Error)
+}
+
+func TestExecutionMarkerHeartbeatCancellationIsScoped(t *testing.T) {
+	t.Parallel()
+
+	// The run was aborted while E1 ran; the directive names E1 so a delayed
+	// response cannot cancel a newer execution under the same key.
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Aborted, QueuedAt: markerQ1}, nil)
+	cancelled := f.h.getCancelledRunsForWorker(t.Context(), &coordinatorv1.WorkerStats{
+		RunningTasks: []*coordinatorv1.RunningTask{{
+			DagName: markerDAG, DagRunId: markerRun, AttemptKey: f.attemptKey, ExecutionMarker: markerQ1,
+		}},
+	})
+	require.Len(t, cancelled, 1)
+	require.NotNil(t, cancelled[0].ExecutionMarker)
+	assert.Equal(t, markerQ1, cancelled[0].GetExecutionMarker())
+
+	merged := appendCancelledRuns(nil, cancelled)
+	require.Len(t, merged, 1)
+	require.NotNil(t, merged[0].ExecutionMarker, "merging directives keeps their marker")
+	assert.Equal(t, markerQ1, merged[0].GetExecutionMarker())
+}
+
+func TestFillLegacyExecutionMarker(t *testing.T) {
+	t.Parallel()
+
+	queued, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
+		Name: markerDAG, DAGRunID: markerRun, AttemptID: markerAttempt, Status: ir.Queued, QueuedAt: markerQ2,
+	})
+	require.NoError(t, err)
+	legacy := &coordinatorv1.Task{Operation: coordinatorv1.Operation_OPERATION_RETRY, PreviousStatus: queued}
+	require.NoError(t, fillLegacyExecutionMarker(legacy))
+	assert.Equal(t, markerQ2, legacy.ExecutionMarker, "a pre-marker queued dispatch gets its queued-at")
+
+	current := &coordinatorv1.Task{Operation: coordinatorv1.Operation_OPERATION_RETRY, PreviousStatus: queued, ExecutionMarker: markerQ1}
+	require.NoError(t, fillLegacyExecutionMarker(current))
+	assert.Equal(t, markerQ1, current.ExecutionMarker, "a stamped marker is kept")
+
+	direct := &coordinatorv1.Task{Operation: coordinatorv1.Operation_OPERATION_START}
+	require.NoError(t, fillLegacyExecutionMarker(direct))
+	assert.Equal(t, "", direct.ExecutionMarker, "a direct start keeps its empty marker")
+}
+
 // A lease rebuilt from an accepted report takes the reporting execution's
 // marker, never the status's queued-at: a direct retry's status echoes the
 // previous attempt's queued-at while its task marker is empty. An existing
@@ -322,6 +459,11 @@ func (f *markerFixture) logPath() string {
 	return filepath.Join(f.logDir, markerDAG, markerRun, markerAttempt, "step1.stdout.log")
 }
 
+func digestOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func readFinalRecord(t *testing.T, logPath string) (logFinalRecord, bool) {
 	t.Helper()
 	data, err := os.ReadFile(logPath + logFinalRecordSuffix)
@@ -350,7 +492,7 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		assert.Equal(t, "second\n", string(content))
 		record, ok := readFinalRecord(t, f.logPath())
 		require.True(t, ok)
-		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 7}, record)
+		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 7, SHA256: digestOf("second\n")}, record)
 	})
 
 	t.Run("IncompleteStreamHasNoFinalization", func(t *testing.T) {
@@ -384,6 +526,78 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		assert.False(t, ok)
 	})
 
+	t.Run("FinalOnlyResumedStreamRecordsFinalization", func(t *testing.T) {
+		t.Parallel()
+		// The worker checkpoints by ending the RPC without a final chunk, then
+		// sends the final chunk alone on a new RPC.
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
+			c.ByteOffset = &offset
+			return c
+		}
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			at(markerLogChunk(markerQ2, "second\n", false), 0),
+		}}))
+		_, ok := readFinalRecord(t, f.logPath())
+		require.False(t, ok)
+
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			at(markerLogChunk(markerQ2, "", true), 7),
+		}}))
+		record, ok := readFinalRecord(t, f.logPath())
+		require.True(t, ok)
+		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 7, SHA256: digestOf("second\n")}, record)
+	})
+
+	t.Run("DigestDescribesRewrittenBytes", func(t *testing.T) {
+		t.Parallel()
+		// A resumed stream rewrites earlier offsets; the record must hash the
+		// file as finalized, not the bytes received on the last RPC.
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
+			c.ByteOffset = &offset
+			return c
+		}
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			at(markerLogChunk(markerQ2, "aaaaaa\n", false), 0),
+		}}))
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			at(markerLogChunk(markerQ2, "bb", false), 0),
+			at(markerLogChunk(markerQ2, "", true), 5),
+		}}))
+		content, err := os.ReadFile(f.logPath())
+		require.NoError(t, err)
+		require.Equal(t, "bbaaa", string(content))
+		record, ok := readFinalRecord(t, f.logPath())
+		require.True(t, ok)
+		assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 5, SHA256: digestOf("bbaaa")}, record)
+	})
+
+	t.Run("FinalOnlyBeyondReceivedBytesStaysIncomplete", func(t *testing.T) {
+		t.Parallel()
+		// The earlier bytes reached another coordinator; this one cannot
+		// vouch for the log, and must not fail the worker's final RPC.
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		offset := uint64(64)
+		final := markerLogChunk(markerQ2, "", true)
+		final.ByteOffset = &offset
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{final}}))
+		_, ok := readFinalRecord(t, f.logPath())
+		assert.False(t, ok)
+	})
+
+	t.Run("FinalOnlyUnpositionedStreamStaysIncomplete", func(t *testing.T) {
+		t.Parallel()
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
+		require.NoError(t, os.MkdirAll(filepath.Dir(f.logPath()), 0o750))
+		require.NoError(t, os.WriteFile(f.logPath(), []byte("earlier\n"), 0o600))
+		require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			markerLogChunk(markerQ2, "", true),
+		}}))
+		_, ok := readFinalRecord(t, f.logPath())
+		assert.False(t, ok, "nothing says which bytes are this execution's")
+	})
+
 	t.Run("StaleStreamRefusedBeforeWriting", func(t *testing.T) {
 		t.Parallel()
 		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ2}, strPtr(markerQ2))
@@ -403,41 +617,39 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		assert.False(t, ok)
 	})
 
-	t.Run("DelayedStreamStopsAfterLeaseReplacement", func(t *testing.T) {
+	t.Run("StaleChunkAfterNewExecutionAdmittedIsRefused", func(t *testing.T) {
 		t.Parallel()
+		// E1's stream is open and has written. E2 is admitted and writes its
+		// own output. E1's next chunk arrives at once, with no time for any
+		// periodic revalidation: it must be refused, and E2's bytes kept.
 		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
-		clock := time.Date(2026, 10, 10, 1, 0, 0, 0, time.UTC)
-		lh := newLogHandler(f.logDir)
-		lh.attemptValidator = f.h.validateAttempt
-		lh.now = func() time.Time { return clock }
-		defer lh.Close(t.Context())
-
 		chunks := []*coordinatorv1.LogChunk{
 			markerLogChunk(markerQ1, "first\n", false),
-			markerLogChunk(markerQ1, "still first\n", false),
+			markerLogChunk(markerQ1, "late first\n", false),
 			markerLogChunk(markerQ1, "", true),
 		}
 		stream := &hookedLogStream{mockStreamLogsServer: &mockStreamLogsServer{ctx: t.Context(), chunks: chunks}}
 		stream.before = func(idx int) {
-			if idx == 1 {
-				// E2 claims the attempt between E1's chunks, and the stream
-				// outlives the revalidation interval.
-				upsertMarkerLease(t, f.leaseStore, f.attemptKey, markerQ2)
-				clock = clock.Add(logStreamRevalidateInterval)
+			if idx != 1 {
+				return
 			}
+			upsertMarkerLease(t, f.leaseStore, f.attemptKey, markerQ2)
+			require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+				markerLogChunk(markerQ2, "second\n", false),
+			}}))
 		}
 
-		err := lh.handleStream(stream)
+		err := f.h.StreamLogs(stream)
 		require.Error(t, err)
 		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 		content, readErr := os.ReadFile(f.logPath())
 		require.NoError(t, readErr)
-		assert.Equal(t, "first\n", string(content))
+		assert.Equal(t, "first\nsecond\n", string(content), "E2's bytes must be unchanged")
 		_, ok := readFinalRecord(t, f.logPath())
 		assert.False(t, ok, "an execution that lost the attempt cannot finalize its log")
 	})
 
-	t.Run("FinalChunkRevalidatesWithinInterval", func(t *testing.T) {
+	t.Run("FinalChunkRefusedAfterLeaseReplacement", func(t *testing.T) {
 		t.Parallel()
 		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
 		chunks := []*coordinatorv1.LogChunk{
@@ -456,6 +668,143 @@ func TestExecutionMarkerStreamLogs(t *testing.T) {
 		_, ok := readFinalRecord(t, f.logPath())
 		assert.False(t, ok)
 	})
+
+	t.Run("ClaimWaitsForAValidatedWriteInFlight", func(t *testing.T) {
+		t.Parallel()
+		// E1's chunk has passed validation and is about to be written when
+		// E2's claim arrives. The claim must wait until the write is done,
+		// and E1's next chunk must then be refused.
+		f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+		lh := newLogHandler(f.logDir)
+		lh.lockAttempt = f.h.attemptWriteLocks.lock
+		defer lh.Close(t.Context())
+
+		claimed := make(chan error, 1)
+		var claimDoneDuringWrite bool
+		validations := 0
+		lh.attemptValidator = func(ctx context.Context, identity attemptIdentity) error {
+			err := f.h.validateAttempt(ctx, identity)
+			validations++
+			if validations == 1 && err == nil {
+				go func() {
+					if err := f.leaseStore.Delete(t.Context(), f.attemptKey); err != nil {
+						claimed <- err
+						return
+					}
+					claimed <- f.h.recordTaskClaim(t.Context(), &coordinatorv1.Task{
+						Target:          markerDAG,
+						DagRunId:        markerRun,
+						AttemptId:       markerAttempt,
+						AttemptKey:      f.attemptKey,
+						ExecutionMarker: markerQ2,
+					}, markerWorker)
+				}()
+				select {
+				case <-claimed:
+					claimDoneDuringWrite = true
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			return err
+		}
+
+		stream := &mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+			markerLogChunk(markerQ1, "first\n", false),
+			markerLogChunk(markerQ1, "late first\n", false),
+		}}
+		err := lh.handleStream(stream)
+		require.False(t, claimDoneDuringWrite, "the claim must not complete while a validated write is in flight")
+		require.NoError(t, <-claimed)
+		require.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		content, readErr := os.ReadFile(f.logPath())
+		require.NoError(t, readErr)
+		assert.Equal(t, "first\n", string(content))
+		lease, leaseErr := f.h.dagRunLeaseStore.Get(t.Context(), f.attemptKey)
+		require.NoError(t, leaseErr)
+		assert.Equal(t, markerQ2, lease.ExecutionMarker)
+	})
+}
+
+// The retry persists the queued status (Q2) before the next execution claims,
+// so for a while E1's lease still matches. Every E1 write in that window must
+// be refused, not just its status. E2 then claims and its output stands alone.
+func TestExecutionMarkerRequeueWindowBeforeClaim(t *testing.T) {
+	t.Parallel()
+
+	f := newMarkerFixture(t, &ir.DAGRunStatus{Status: ir.Running, QueuedAt: markerQ1}, strPtr(markerQ1))
+	at := func(c *coordinatorv1.LogChunk, offset uint64) *coordinatorv1.LogChunk {
+		c.ByteOffset = &offset
+		return c
+	}
+	requeue := func() {
+		queued := f.stored(t)
+		queued.Status = ir.Queued
+		queued.QueuedAt = markerQ2
+		require.NoError(t, f.attempt.Write(t.Context(), *queued))
+	}
+
+	// E1's stream is open and has written when the retry is queued.
+	stream := &hookedLogStream{mockStreamLogsServer: &mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+		at(markerLogChunk(markerQ1, "first\n", false), 0),
+		at(markerLogChunk(markerQ1, "late\n", false), 6),
+	}}}
+	stream.before = func(idx int) {
+		if idx == 1 {
+			requeue()
+		}
+	}
+	err := f.h.StreamLogs(stream)
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	// E1's final chunk and status arrive before E2 claims.
+	err = f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+		at(markerLogChunk(markerQ1, "", true), 6),
+	}})
+	require.Error(t, err)
+	resp := f.report(t, ir.Failed, markerQ1, markerQ1)
+	assert.False(t, resp.Accepted)
+	err = f.h.StreamArtifacts(&mockStreamArtifactsServer{ctx: t.Context(), chunks: []*coordinatorv1.ArtifactChunk{
+		markerArtifactChunk(f.attemptKey, markerQ1, "late first"),
+	}})
+	require.Error(t, err)
+	hb, err := f.h.RunHeartbeat(t.Context(), &coordinatorv1.RunHeartbeatRequest{
+		WorkerId: markerWorker,
+		RunningTasks: []*coordinatorv1.RunningTask{{
+			DagName: markerDAG, DagRunId: markerRun, AttemptKey: f.attemptKey, ExecutionMarker: markerQ1,
+		}},
+	})
+	require.NoError(t, err)
+	require.Len(t, hb.CancelledRuns, 1)
+	assert.Equal(t, markerQ1, hb.CancelledRuns[0].GetExecutionMarker())
+
+	content, err := os.ReadFile(f.logPath())
+	require.NoError(t, err)
+	assert.Equal(t, "first\n", string(content))
+	_, ok := readFinalRecord(t, f.logPath())
+	assert.False(t, ok, "E1 must not finalize its log after the retry was queued")
+	_, err = os.Stat(filepath.Join(f.archiveDir, "artifact.txt"))
+	assert.True(t, os.IsNotExist(err))
+	st := f.stored(t)
+	assert.Equal(t, ir.Queued, st.Status)
+	assert.Equal(t, markerQ2, st.QueuedAt)
+
+	// E2 claims and writes its own output from offset zero.
+	require.NoError(t, f.leaseStore.Delete(t.Context(), f.attemptKey))
+	require.NoError(t, f.h.recordTaskClaim(t.Context(), &coordinatorv1.Task{
+		Target: markerDAG, DagRunId: markerRun, AttemptId: markerAttempt, AttemptKey: f.attemptKey, ExecutionMarker: markerQ2,
+	}, markerWorker))
+	require.NoError(t, f.h.StreamLogs(&mockStreamLogsServer{ctx: t.Context(), chunks: []*coordinatorv1.LogChunk{
+		at(markerLogChunk(markerQ2, "2nd\n", false), 0),
+		at(markerLogChunk(markerQ2, "", true), 4),
+	}}))
+	content, err = os.ReadFile(f.logPath())
+	require.NoError(t, err)
+	assert.Equal(t, "2nd\n", string(content))
+	record, ok := readFinalRecord(t, f.logPath())
+	require.True(t, ok)
+	assert.Equal(t, logFinalRecord{ExecutionMarker: markerQ2, AttemptID: markerAttempt, Size: 4, SHA256: digestOf("2nd\n")}, record)
 }
 
 // hookedLogStream runs before(idx) ahead of delivering chunk idx.

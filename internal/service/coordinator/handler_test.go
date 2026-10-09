@@ -138,7 +138,10 @@ type mockDAGRunStore struct {
 	attemptWriteErr     error
 	listStatusesCalls   int
 	compareAndSwapCalls int
-	mu                  sync.Mutex
+	// beforeCompareAndSwap, when set, runs before a compare-and-swap takes
+	// the store lock, so a test can change the stored status in between.
+	beforeCompareAndSwap func()
+	mu                   sync.Mutex
 }
 
 func newMockDAGRunStore() *mockDAGRunStore {
@@ -340,6 +343,9 @@ func (m *mockDAGRunStore) CompareAndSwapLatestAttemptStatus(
 ) (*ir.DAGRunStatus, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
+	}
+	if m.beforeCompareAndSwap != nil {
+		m.beforeCompareAndSwap()
 	}
 
 	m.mu.Lock()
@@ -4799,7 +4805,9 @@ func TestHandler_ReportStatus(t *testing.T) {
 		current, readErr := attempt.ReadStatus(ctx)
 		require.NoError(t, readErr)
 		assert.Equal(t, "duplicate terminal payload", current.Error)
-		assert.True(t, attempt.WasClosed())
+		// A write over a terminal status goes through the store's
+		// compare-and-swap (TXE-3772), which opens no attempt handle.
+		assert.True(t, attempt.WasClosed() || !attempt.WasOpened(), "no attempt handle may be left open")
 
 		h.attemptsMu.RLock()
 		_, cached := h.openAttempts[ref.ID]
