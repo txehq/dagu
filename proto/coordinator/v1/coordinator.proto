@@ -103,7 +103,11 @@ message DispatchRequest {
 
 // Response message for dispatching a task.
 message DispatchResponse {
-  // No field
+  // The execution the dispatch admitted, when it prepared an attempt: the
+  // attempt and the queued_at its statuses carry (the retried status's for
+  // a retry, else the task's marker).
+  string attempt_id = 1;
+  string queued_at = 2;
 }
 
 // Task to process.
@@ -172,6 +176,11 @@ message Task {
   // Resolved "KEY=value" pairs the parent opted to share with the child run via
   // the step's pass_env field.
   repeated string passed_envs = 41;
+  // When true on a retry, the coordinator creates the retry's attempt only if
+  // the run's latest execution is previous_status's (attempt_id, queued_at)
+  // and has finished; otherwise the dispatch fails with ABORTED and nothing
+  // is created.
+  bool require_latest_is_previous = 43;
 }
 
 enum Operation {

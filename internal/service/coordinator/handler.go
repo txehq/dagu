@@ -535,7 +535,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 			h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
 			return nil, status.Error(dispatchErrorCode(err), err.Error())
 		}
-		return &coordinatorv1.DispatchResponse{}, nil
+		return admittedResponse(req.Task, prepared), nil
 	}
 	if h.dagRunRepository == nil {
 		return nil, status.Error(codes.FailedPrecondition, "distributed dispatch requires DAG run storage")
@@ -576,7 +576,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
 	h.notifyDispatchAvailable()
-	return &coordinatorv1.DispatchResponse{}, nil
+	return admittedResponse(req.Task, prepared), nil
 }
 
 func (h *Handler) ensureWorkspaceBundle(ctx context.Context, task *coordinatorv1.Task) error {
@@ -871,6 +871,9 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		}
 	}
 	if existingStatus != nil && existingStatus.Status == ir.Queued {
+		if task.RequireLatestIsPrevious {
+			return nil, fmt.Errorf("%w: latest is a queued execution", persis.ErrLatestExecutionChanged)
+		}
 		task.AttemptId = existingAttempt.ID()
 		task.AttemptKey = generateRootAttemptKey(task)
 
@@ -893,7 +896,11 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 
 	// Create new attempt (either first attempt or retry)
 	isRetry := task.Operation == coordinatorv1.Operation_OPERATION_RETRY || findErr == nil
-	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry}
+	expect, err := expectedLatest(task)
+	if err != nil {
+		return nil, err
+	}
+	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, ExpectLatest: expect}
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, opts)
 	if err != nil {
@@ -1028,6 +1035,7 @@ func (h *Handler) writeInitialStatus(ctx context.Context, attempt dagrun.Attempt
 		AttemptID:    attempt.ID(),
 		AttemptKey:   task.AttemptKey,
 		Status:       ir.NotStarted,
+		QueuedAt:     admittedQueuedAt(task),
 		StartedAt:    time.Now().UTC().Format(time.RFC3339),
 		Root:         root,
 		Labels:       labels,
@@ -1165,6 +1173,9 @@ func dispatchErrorCode(err error) codes.Code {
 func prepareAttemptErrorCode(err error) codes.Code {
 	if _, ok := errors.AsType[*queue.StaleQueueDispatchError](err); ok {
 		return codes.FailedPrecondition
+	}
+	if errors.Is(err, persis.ErrLatestExecutionChanged) {
+		return codes.Aborted
 	}
 	return codes.Internal
 }

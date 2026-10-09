@@ -635,7 +635,7 @@ func (svc *Service) retryDAGRun(ctx context.Context, input executeInput) error {
 		return err
 	}
 	switch resp.(type) {
-	case daguapi.RetryDAGRun200Response, *daguapi.RetryDAGRun200Response:
+	case daguapi.RetryDAGRun200JSONResponse, *daguapi.RetryDAGRun200JSONResponse:
 		return nil
 	default:
 		return fmt.Errorf("unexpected retry DAG-run response %T", resp)

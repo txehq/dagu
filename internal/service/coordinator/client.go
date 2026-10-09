@@ -28,6 +28,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
@@ -235,6 +236,11 @@ func New(registry serviceregistry.ServiceRegistry, config *Config) Client {
 }
 
 // Dispatch sends a task to the coordinator.
+// ErrDispatchUncertain is a conditional retry whose single dispatch call
+// failed without an authoritative refusal: the retry may or may not have
+// been created and dispatched.
+var ErrDispatchUncertain = errors.New("the conditional retry was sent once and its outcome is unknown")
+
 func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchRequest) error {
 	task := req.Task
 	if task == nil {
@@ -286,7 +292,8 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 			defer cancel()
 
 			// Try to dispatch
-			if _, err := client.client.Dispatch(dispatchCtx, protoReq); err != nil {
+			resp, err := client.client.Dispatch(dispatchCtx, protoReq)
+			if err != nil {
 				logger.Warn(ctx, "Failed to dispatch task to coordinator",
 					tag.RunID(task.DAGRunID),
 					tag.Target(task.Target),
@@ -305,10 +312,31 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 					return backoff.PermanentError(wrapped)
 				}
 
+				// Aborted naming ErrLatestExecutionChanged is a conditional retry
+				// the coordinator refused before creating anything: its expected
+				// execution is no longer the latest, and retrying cannot change
+				// that. Any other Aborted stays a transient failure.
+				if st, ok := status.FromError(err); ok && st.Code() == codes.Aborted &&
+					strings.Contains(st.Message(), persis.ErrLatestExecutionChanged.Error()) {
+					return backoff.PermanentError(fmt.Errorf("failed to dispatch task to coordinator %s: %w: %s",
+						member.ID, persis.ErrLatestExecutionChanged, st.Message()))
+				}
+
+				// A conditional retry is sent once: the coordinator may have
+				// created or dispatched it before this error, and a repeated call
+				// would be refused as if nothing had happened. Its outcome is
+				// unknown, and it is not retried here or on another coordinator.
+				if task.RequireLatestIsPrevious {
+					return backoff.PermanentError(fmt.Errorf("%w: %w", ErrDispatchUncertain, wrapped))
+				}
+
 				// Unavailable and other transient errors will be retried.
 				return wrapped
 			}
 
+			if req.Admitted != nil {
+				req.Admitted.AttemptID, req.Admitted.QueuedAt = resp.GetAttemptId(), resp.GetQueuedAt()
+			}
 			logger.Info(ctx, "Task dispatched successfully",
 				tag.RunID(task.DAGRunID),
 				tag.Target(task.Target),

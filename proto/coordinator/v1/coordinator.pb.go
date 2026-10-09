@@ -405,7 +405,12 @@ func (b0 DispatchRequest_builder) Build() *DispatchRequest {
 
 // Response message for dispatching a task.
 type DispatchResponse struct {
-	state         protoimpl.MessageState `protogen:"hybrid.v1"`
+	state protoimpl.MessageState `protogen:"hybrid.v1"`
+	// The execution the dispatch admitted, when it prepared an attempt: the
+	// attempt and the queued_at its statuses carry (the retried status's for
+	// a retry, else the task's marker).
+	AttemptId     string `protobuf:"bytes,1,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	QueuedAt      string `protobuf:"bytes,2,opt,name=queued_at,json=queuedAt,proto3" json:"queued_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -435,15 +440,44 @@ func (x *DispatchResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *DispatchResponse) GetAttemptId() string {
+	if x != nil {
+		return x.AttemptId
+	}
+	return ""
+}
+
+func (x *DispatchResponse) GetQueuedAt() string {
+	if x != nil {
+		return x.QueuedAt
+	}
+	return ""
+}
+
+func (x *DispatchResponse) SetAttemptId(v string) {
+	x.AttemptId = v
+}
+
+func (x *DispatchResponse) SetQueuedAt(v string) {
+	x.QueuedAt = v
+}
+
 type DispatchResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	// The execution the dispatch admitted, when it prepared an attempt: the
+	// attempt and the queued_at its statuses carry (the retried status's for
+	// a retry, else the task's marker).
+	AttemptId string
+	QueuedAt  string
 }
 
 func (b0 DispatchResponse_builder) Build() *DispatchResponse {
 	m0 := &DispatchResponse{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.AttemptId = b.AttemptId
+	x.QueuedAt = b.QueuedAt
 	return m0
 }
 
@@ -513,9 +547,14 @@ type Task struct {
 	BypassPreconditions bool `protobuf:"varint,40,opt,name=bypass_preconditions,json=bypassPreconditions,proto3" json:"bypass_preconditions,omitempty"`
 	// Resolved "KEY=value" pairs the parent opted to share with the child run via
 	// the step's pass_env field.
-	PassedEnvs    []string `protobuf:"bytes,41,rep,name=passed_envs,json=passedEnvs,proto3" json:"passed_envs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PassedEnvs []string `protobuf:"bytes,41,rep,name=passed_envs,json=passedEnvs,proto3" json:"passed_envs,omitempty"`
+	// When true on a retry, the coordinator creates the retry's attempt only if
+	// the run's latest execution is previous_status's (attempt_id, queued_at)
+	// and has finished; otherwise the dispatch fails with ABORTED and nothing
+	// is created.
+	RequireLatestIsPrevious bool `protobuf:"varint,43,opt,name=require_latest_is_previous,json=requireLatestIsPrevious,proto3" json:"require_latest_is_previous,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Task) Reset() {
@@ -823,6 +862,13 @@ func (x *Task) GetPassedEnvs() []string {
 	return nil
 }
 
+func (x *Task) GetRequireLatestIsPrevious() bool {
+	if x != nil {
+		return x.RequireLatestIsPrevious
+	}
+	return false
+}
+
 func (x *Task) SetOperation(v Operation) {
 	x.Operation = v
 }
@@ -983,6 +1029,10 @@ func (x *Task) SetPassedEnvs(v []string) {
 	x.PassedEnvs = v
 }
 
+func (x *Task) SetRequireLatestIsPrevious(v bool) {
+	x.RequireLatestIsPrevious = v
+}
+
 func (x *Task) HasPreviousStatus() bool {
 	if x == nil {
 		return false
@@ -1072,6 +1122,11 @@ type Task_builder struct {
 	// Resolved "KEY=value" pairs the parent opted to share with the child run via
 	// the step's pass_env field.
 	PassedEnvs []string
+	// When true on a retry, the coordinator creates the retry's attempt only if
+	// the run's latest execution is previous_status's (attempt_id, queued_at)
+	// and has finished; otherwise the dispatch fails with ABORTED and nothing
+	// is created.
+	RequireLatestIsPrevious bool
 }
 
 func (b0 Task_builder) Build() *Task {
@@ -1118,6 +1173,7 @@ func (b0 Task_builder) Build() *Task {
 	x.BaseConfigWorkspace = b.BaseConfigWorkspace
 	x.BypassPreconditions = b.BypassPreconditions
 	x.PassedEnvs = b.PassedEnvs
+	x.RequireLatestIsPrevious = b.RequireLatestIsPrevious
 	return m0
 }
 
@@ -6021,8 +6077,11 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x04task\x18\x01 \x01(\v2\x14.coordinator.v1.TaskR\x04task\"{\n" +
 	"\x0fDispatchRequest\x12(\n" +
 	"\x04task\x18\x01 \x01(\v2\x14.coordinator.v1.TaskR\x04task\x12>\n" +
-	"\x1badmission_reservation_token\x18\x02 \x01(\tR\x19admissionReservationToken\"\x12\n" +
-	"\x10DispatchResponse\"\x97\x0e\n" +
+	"\x1badmission_reservation_token\x18\x02 \x01(\tR\x19admissionReservationToken\"N\n" +
+	"\x10DispatchResponse\x12\x1d\n" +
+	"\n" +
+	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12\x1b\n" +
+	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\xd4\x0e\n" +
 	"\x04Task\x127\n" +
 	"\toperation\x18\x06 \x01(\x0e2\x19.coordinator.v1.OperationR\toperation\x12)\n" +
 	"\x11root_dag_run_name\x18\x01 \x01(\tR\x0erootDagRunName\x12%\n" +
@@ -6075,7 +6134,8 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x15base_config_workspace\x18' \x01(\tH\x00R\x13baseConfigWorkspace\x88\x01\x01\x121\n" +
 	"\x14bypass_preconditions\x18( \x01(\bR\x13bypassPreconditions\x12\x1f\n" +
 	"\vpassed_envs\x18) \x03(\tR\n" +
-	"passedEnvs\x1aA\n" +
+	"passedEnvs\x12;\n" +
+	"\x1arequire_latest_is_previous\x18+ \x01(\bR\x17requireLatestIsPrevious\x1aA\n" +
 	"\x13WorkerSelectorEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x18\n" +

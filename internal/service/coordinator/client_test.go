@@ -362,6 +362,92 @@ func TestClientDispatch(t *testing.T) {
 		require.Equal(t, "queued attempt was superseded", staleErr.Reason)
 	})
 
+	t.Run("ChangedLatestExecutionIsPermanent", func(t *testing.T) {
+		t.Parallel()
+
+		config := coordinator.DefaultConfig()
+		config.MaxRetries = 3
+		config.RetryInterval = time.Millisecond
+		config.RequestTimeout = 100 * time.Millisecond
+
+		var calls atomic.Int32
+		mockCoord := &mockCoordinatorService{
+			dispatchFunc: func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+				calls.Add(1)
+				return nil, status.Error(codes.Aborted, "failed to prepare attempt: "+persis.ErrLatestExecutionChanged.Error()+": latest is attempt a2")
+			},
+		}
+		server, addr := startMockServer(t, mockCoord)
+		defer server.Stop()
+		host, port := parseHostPort(addr)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+		}}
+
+		err := coordinator.New(monitor, config).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag"},
+		})
+		require.ErrorIs(t, err, backoff.ErrPermanent)
+		require.ErrorIs(t, err, persis.ErrLatestExecutionChanged)
+		assert.Equal(t, int32(1), calls.Load(), "a refused conditional retry is not dispatched again")
+	})
+
+	t.Run("AdmittedExecutionIsReturned", func(t *testing.T) {
+		t.Parallel()
+
+		mockCoord := &mockCoordinatorService{
+			dispatchFunc: func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+				return &coordinatorv1.DispatchResponse{AttemptId: "attempt-2", QueuedAt: "q1"}, nil
+			},
+		}
+		server, addr := startMockServer(t, mockCoord)
+		defer server.Stop()
+		host, port := parseHostPort(addr)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+		}}
+		admitted := &dispatch.AdmittedExecution{}
+		err := coordinator.New(monitor, coordinator.DefaultConfig()).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag", RequireLatestIsPrevious: true}, Admitted: admitted,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, dispatch.AdmittedExecution{AttemptID: "attempt-2", QueuedAt: "q1"}, *admitted)
+	})
+
+	t.Run("ConditionalRetryIsSentOnce", func(t *testing.T) {
+		t.Parallel()
+
+		config := coordinator.DefaultConfig()
+		config.MaxRetries = 3
+		config.RetryInterval = time.Millisecond
+		config.RequestTimeout = 100 * time.Millisecond
+
+		var calls atomic.Int32
+		failing := func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+			calls.Add(1)
+			// The coordinator may have created and dispatched the retry
+			// before this error reached the client.
+			return nil, status.Error(codes.Unavailable, "connection reset")
+		}
+		s1, a1 := startMockServer(t, &mockCoordinatorService{dispatchFunc: failing})
+		defer s1.Stop()
+		s2, a2 := startMockServer(t, &mockCoordinatorService{dispatchFunc: failing})
+		defer s2.Stop()
+		h1, p1 := parseHostPort(a1)
+		h2, p2 := parseHostPort(a2)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: h1, Port: p1, Status: serviceregistry.ServiceStatusActive},
+			{ID: "coord-2", Host: h2, Port: p2, Status: serviceregistry.ServiceStatusActive},
+		}}
+
+		err := coordinator.New(monitor, config).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag", RequireLatestIsPrevious: true},
+		})
+		require.ErrorIs(t, err, coordinator.ErrDispatchUncertain)
+		require.NotErrorIs(t, err, persis.ErrLatestExecutionChanged, "an unknown outcome is not reported as a refusal")
+		assert.Equal(t, int32(1), calls.Load(), "sent once, to one coordinator, never again")
+	})
+
 	t.Run("InvalidDefinitionReturnsDefinitionError", func(t *testing.T) {
 		t.Parallel()
 
