@@ -72,7 +72,8 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	status := ir.InitialStatus(dag)
 	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", first.ID(), ir.Failed, "q1"
 	status.Nodes = []*ir.Node{{Step: ir.Step{Name: "build"}, Status: ir.NodeSucceeded}, {Step: ir.Step{Name: "publish"}, Status: ir.NodeFailed}}
-	status.WorkerID = "worker-1"
+	status.WorkerID, status.ClaimKey, status.Error = "worker-1", "claim-1", "publish failed"
+	status.StartedAt, status.FinishedAt = "2026-10-09T12:00:00Z", "2026-10-09T12:01:00Z"
 	require.NoError(t, first.Open(ctx))
 	require.NoError(t, first.Write(ctx, status))
 	require.NoError(t, first.Close(ctx))
@@ -103,4 +104,8 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	assert.Equal(t, next.ID(), got.AttemptID)
 	assert.Empty(t, got.QueuedAt)
 	assert.Empty(t, got.WorkerID, "the claim belongs to no worker yet")
+	assert.Empty(t, got.ClaimKey, "nor to the retried execution's lease")
+	assert.Empty(t, got.StartedAt, "it has not started")
+	assert.Empty(t, got.FinishedAt)
+	assert.Empty(t, got.Error, "the retried execution's error is not the claim's")
 }
