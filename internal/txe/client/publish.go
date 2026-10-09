@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -99,10 +98,15 @@ func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactMani
 	if err != nil {
 		return nil, err
 	}
-	// An execution that sealed its own outputs publishes those. Only one
-	// that did not run the job takes the run's latest result.
+	// An execution that sealed its own outputs publishes those. One that
+	// ran the job and did not seal has no result, whatever others sealed.
+	// Only one that did not run the job takes the run's latest result.
 	seal := sealed.of(in.Execution)
-	if seal == nil {
+	switch {
+	case seal != nil:
+	case sealed.began(in.Execution):
+		return nil, fmt.Errorf("run %s: execution %s ran the job and did not seal its outputs: %w", in.RunID, in.Execution.Ref(), ErrNotSealed)
+	default:
 		seal = sealed.latest()
 	}
 	if seal == nil {
@@ -183,17 +187,17 @@ func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactMani
 }
 
 // openRunDir opens a run's own output directory, one real directory at a time
-// from the TXE home's outputs directory: the job, "runs", the run. A symbolic
-// link at any of them is refused, so a run cannot stand another directory in
+// from the TXE home: "outputs", the job, "runs", the run. A symbolic link at
+// any of them is refused, so a run cannot stand another directory in
 // for its own. The handle returned pins the directory that was checked for
 // the whole publication. A directory that does not exist is reported as
 // fs.ErrNotExist.
 func openRunDir(home txepkg.Home, jobID, runID string) (*os.Root, error) {
-	current, err := os.OpenRoot(filepath.Join(home.Root, "outputs"))
+	current, err := os.OpenRoot(home.Root)
 	if err != nil {
-		return nil, fmt.Errorf("open the outputs directory: %w", err)
+		return nil, fmt.Errorf("open the TXE home: %w", err)
 	}
-	for _, part := range []string{jobID, "runs", runID} {
+	for _, part := range []string{"outputs", jobID, "runs", runID} {
 		next, err := openDir(current, part)
 		_ = current.Close()
 		if err != nil {

@@ -95,8 +95,15 @@ func (e Execution) check() error {
 		return fmt.Errorf("invalid attempt id %q", e.AttemptID)
 	case strings.HasPrefix(e.QueuedAt, "${"):
 		return fmt.Errorf("the run's queue marker was not resolved (%s): the worker's dagu does not provide it, or the stored marker is not a timestamp", e.QueuedAt)
-	case e.QueuedAt != "" && !queueMarkerPattern.MatchString(e.QueuedAt):
+	case e.QueuedAt == "":
+		return nil
+	case !queueMarkerPattern.MatchString(e.QueuedAt):
 		return fmt.Errorf("invalid queue marker %q", e.QueuedAt)
+	}
+	// The same two checks the runtime makes before it hands a marker to a
+	// step: the characters of a timestamp, and the form of one.
+	if _, err := time.Parse(time.RFC3339Nano, e.QueuedAt); err != nil {
+		return fmt.Errorf("invalid queue marker %q: not a timestamp", e.QueuedAt)
 	}
 	return nil
 }
@@ -135,7 +142,16 @@ type seals struct {
 	Schema int    `json:"schema"`
 	JobID  string `json:"job_id"`
 	RunID  string `json:"run_id"`
-	Seals  []Seal `json:"seals"`
+	// Begun are the executions that started the job, in order, whether or
+	// not they went on to seal. An execution listed here ran the job; one
+	// that is not, and has no seal, only ran the publish step.
+	Begun []Execution `json:"begun"`
+	Seals []Seal      `json:"seals"`
+}
+
+// began reports whether the execution started the job.
+func (s *seals) began(e Execution) bool {
+	return slices.Contains(s.Begun, e)
 }
 
 func (s *seals) of(e Execution) *Seal {
@@ -204,6 +220,14 @@ func (o Outputs) Begin(jobID, runID string, e Execution) (string, error) {
 		return "", err
 	}
 	_ = attempt.Close()
+	// Recorded before the job runs: from here on this execution has a
+	// result of its own or none, and never another execution's.
+	if !sealed.began(e) {
+		sealed.Begun = append(sealed.Begun, e)
+		if err := writeSeals(run, sealed); err != nil {
+			return "", err
+		}
+	}
 	return txepkg.AttemptOutputDir(o.Home.OutputDir(jobID), runID, e.AttemptID), nil
 }
 
@@ -348,6 +372,11 @@ func readSeals(run *os.Root, jobID, runID string) (*seals, error) {
 			return nil, fmt.Errorf("%s of run %s holds a seal that does not name its execution", sealsFile, runID)
 		}
 	}
+	for _, e := range sealed.Begun {
+		if err := e.check(); err != nil {
+			return nil, fmt.Errorf("%s of run %s names an execution that is not one: %w", sealsFile, runID, err)
+		}
+	}
 	return &sealed, nil
 }
 
@@ -434,17 +463,13 @@ func openPath(root *os.Root, rel string) (*os.Root, error) {
 }
 
 // makeRunDir opens a run's directory, creating what is missing beneath the
-// TXE home's outputs directory. Like openRunDir it follows no link.
+// TXE home. Like openRunDir it follows no link, "outputs" included.
 func makeRunDir(home txepkg.Home, jobID, runID string) (*os.Root, error) {
-	outputs := home.Root + string(os.PathSeparator) + "outputs"
-	if err := os.MkdirAll(outputs, 0o750); err != nil {
-		return nil, fmt.Errorf("create the outputs directory: %w", err)
-	}
-	current, err := os.OpenRoot(outputs)
+	current, err := os.OpenRoot(home.Root)
 	if err != nil {
-		return nil, fmt.Errorf("open the outputs directory: %w", err)
+		return nil, fmt.Errorf("open the TXE home: %w", err)
 	}
-	for _, part := range []string{jobID, "runs", runID} {
+	for _, part := range []string{"outputs", jobID, "runs", runID} {
 		next, err := makeDir(current, part)
 		_ = current.Close()
 		if err != nil {

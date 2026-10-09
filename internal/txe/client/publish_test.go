@@ -203,11 +203,11 @@ func TestExecutionRef(t *testing.T) {
 	}
 }
 
-// The run's output directory must be a real directory at every level. A run
-// that points "runs", or the place sealed outputs are kept, at another
-// directory publishes nothing.
+// The run's output directory must be a real directory at every level, from
+// the TXE home down. A run whose "outputs", "runs", or the place sealed
+// outputs are kept points at another directory publishes nothing.
 func TestPublishRefusesLinkedRunDirectory(t *testing.T) {
-	for _, name := range []string{"runs", "executions"} {
+	for _, name := range []string{"outputs", "runs", "executions"} {
 		t.Run(name, func(t *testing.T) {
 			run := publishFixture(t)
 			f, p, in := run.registry, run.publisher, run.in
@@ -215,10 +215,9 @@ func TestPublishRefusesLinkedRunDirectory(t *testing.T) {
 			sealedDir := run.seal(t)
 
 			target := filepath.Dir(sealedDir) // executions
-			if name == "runs" {
-				target = filepath.Dir(filepath.Dir(target))
+			for filepath.Base(target) != name {
+				target = filepath.Dir(target)
 			}
-			require.Equal(t, name, filepath.Base(target))
 			moved := filepath.Join(t.TempDir(), "moved")
 			require.NoError(t, os.Rename(target, moved))
 			require.NoError(t, os.Symlink(moved, target))
@@ -663,6 +662,41 @@ func TestExecutionSeal(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotSealed)
 }
 
+// An execution that ran the job and did not seal has no result of its own,
+// and does not take another's: publishing as that execution is refused even
+// though an earlier execution of the run is sealed. Only an execution that
+// never began the job publishes the latest sealed result.
+func TestPublishBegunWithoutSeal(t *testing.T) {
+	run := publishFixture(t)
+	f, p, first := run.registry, run.publisher, run.in
+	run.write(t, "snapshot.json", `{"files":2}`)
+	run.seal(t)
+
+	// A second execution begins, writes other bytes, and its seal never
+	// happens: the job failed, or the seal was interrupted.
+	second := first
+	second.Execution = Execution{AttemptID: "45642f", QueuedAt: first.Execution.QueuedAt}
+	dir, err := Outputs{Home: p.Home}.Begin(second.JobID, second.RunID, second.Execution)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "snapshot.json"), []byte(`{"files":3}`), 0o600))
+	f.setLatest(second.JobID, second.RunID, second.Execution)
+
+	manifest, err := p.Publish(context.Background(), second)
+	require.ErrorIs(t, err, ErrNotSealed)
+	require.ErrorContains(t, err, "ran the job and did not seal")
+	assert.Nil(t, manifest)
+	assert.Empty(t, f.manifests, "the first execution's files were published as the second's")
+	assert.NoDirExists(t, second.ArtifactDir)
+
+	// A third execution that only publishes still gets the sealed result.
+	third := first
+	third.Execution = Execution{AttemptID: "dd13aa", QueuedAt: first.Execution.QueuedAt}
+	f.setLatest(third.JobID, third.RunID, third.Execution)
+	manifest, err = p.Publish(context.Background(), third)
+	require.NoError(t, err)
+	assert.Equal(t, first.Execution, manifest.ProducedIn)
+}
+
 // An execution is named by an attempt ID and a queue marker as Dagu hands
 // them over. Anything else is refused before a directory is made from it.
 func TestExecutionNames(t *testing.T) {
@@ -675,6 +709,12 @@ func TestExecutionNames(t *testing.T) {
 		{AttemptID: "ok", QueuedAt: "2026-10-09 15:48:58"},
 		{AttemptID: "ok", QueuedAt: "$(id)"},
 		{AttemptID: "ok", QueuedAt: "../../x"},
+		// Made of a timestamp's characters, and not one.
+		{AttemptID: "ok", QueuedAt: "1"},
+		{AttemptID: "ok", QueuedAt: "T"},
+		{AttemptID: "ok", QueuedAt: "---"},
+		{AttemptID: "ok", QueuedAt: "2026"},
+		{AttemptID: "ok", QueuedAt: "2026-10-09T15:48:58"},
 	} {
 		_, err := outputs.Begin(run.in.JobID, run.in.RunID, bad)
 		require.Error(t, err, "%+v", bad)
@@ -684,8 +724,15 @@ func TestExecutionNames(t *testing.T) {
 	_, err := outputs.Begin(run.in.JobID, run.in.RunID, Execution{AttemptID: "ok", QueuedAt: "${context.attempt.queued_at}"})
 	require.ErrorContains(t, err, "was not resolved")
 	// A run that was never queued has an empty marker, and that is a name.
-	_, err = outputs.Begin(run.in.JobID, run.in.RunID, Execution{AttemptID: "never-queued"})
-	require.NoError(t, err)
+	// So are the two forms Dagu writes a marker in.
+	for _, good := range []Execution{
+		{AttemptID: "never-queued"},
+		{AttemptID: "queued", QueuedAt: "2026-10-09T23:48:55+08:00"},
+		{AttemptID: "requeued", QueuedAt: "2026-10-09T15:48:58.155644001Z"},
+	} {
+		_, err = outputs.Begin(run.in.JobID, run.in.RunID, good)
+		require.NoError(t, err, "%+v", good)
+	}
 }
 
 // One file holds every seal of a run. A seal that was interrupted after the
@@ -745,6 +792,17 @@ func TestSealsAreOneRecord(t *testing.T) {
 // them is not followed.
 func TestExecutionRefusesLinks(t *testing.T) {
 	elsewhere := t.TempDir()
+	t.Run("outputs", func(t *testing.T) {
+		run := publishFixture(t)
+		home := run.publisher.Home
+		moved := filepath.Join(t.TempDir(), "moved")
+		require.NoError(t, os.Rename(filepath.Join(home.Root, "outputs"), moved))
+		require.NoError(t, os.Symlink(elsewhere, filepath.Join(home.Root, "outputs")))
+
+		_, err := Outputs{Home: home}.Begin(run.in.JobID, "run-0002", Execution{AttemptID: "45642f"})
+		require.ErrorContains(t, err, "symbolic link")
+		assert.Empty(t, filesUnder(t, elsewhere))
+	})
 	for _, name := range []string{"attempts", "executions", "unsealed"} {
 		t.Run(name, func(t *testing.T) {
 			run := publishFixture(t)
