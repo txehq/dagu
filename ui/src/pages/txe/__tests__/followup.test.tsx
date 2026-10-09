@@ -236,6 +236,51 @@ describe('run retry', () => {
     ).toBeInTheDocument();
   });
 
+  // Retry states are refreshed in place after a request; the page must show
+  // the new state, not keep the first one it loaded (SWR's default
+  // comparison sees every two Maps as equal).
+  it('shows the recorded request after asking, without a reload', async () => {
+    let recorded = false;
+    renderAt(
+      baseApi({
+        getJob: async () => failedJob,
+        requestRetry: vi.fn(async () => {
+          recorded = true;
+          return { ok: true as const };
+        }),
+        listRetryStates: async () =>
+          recorded
+            ? new Map([
+                [
+                  'run-0003',
+                  {
+                    runId: 'run-0003',
+                    proposalId: 'prp_r',
+                    attemptId: 'run-0003-a1',
+                    queuedAt: '2026-10-09T12:00:00.000000001Z',
+                    status: 'requested' as const,
+                  },
+                ],
+              ])
+            : new Map(),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Retry this run' })
+    );
+    expect(
+      await screen.findByText(
+        'Retry requested; waiting for the reviewer to dispatch it'
+      )
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'Retry this run' })
+      ).not.toBeInTheDocument()
+    );
+  });
+
   // A recorded request is not a retry: it waits for the reviewer, and the
   // run is not offered again meanwhile.
   it('shows a requested retry as waiting, not done', async () => {

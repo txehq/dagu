@@ -28,6 +28,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
@@ -303,6 +304,16 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 						return backoff.PermanentError(fmt.Errorf("failed to dispatch task to coordinator %s: %w", member.ID, staleErr))
 					}
 					return backoff.PermanentError(wrapped)
+				}
+
+				// Aborted naming ErrLatestExecutionChanged is a conditional retry
+				// the coordinator refused before creating anything: its expected
+				// execution is no longer the latest, and retrying cannot change
+				// that. Any other Aborted stays a transient failure.
+				if st, ok := status.FromError(err); ok && st.Code() == codes.Aborted &&
+					strings.Contains(st.Message(), persis.ErrLatestExecutionChanged.Error()) {
+					return backoff.PermanentError(fmt.Errorf("failed to dispatch task to coordinator %s: %w: %s",
+						member.ID, persis.ErrLatestExecutionChanged, st.Message()))
 				}
 
 				// Unavailable and other transient errors will be retried.

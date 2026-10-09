@@ -744,6 +744,12 @@ func TestTxeAPIRunArtifacts(t *testing.T) {
 	}
 	assert.Equal(t, map[string]apigen.TxeArtifactStatus{"snapshot": apigen.TxeArtifactStatusPendingUpload,
 		"raw": apigen.TxeArtifactStatusStoredOnMachine, "notes": apigen.TxeArtifactStatusMissing}, status)
+	// The publishing execution's observed status is kept as publication
+	// evidence through the HTTP path too.
+	evidence, err := store.GetRetainedExecution(ctx, jobID, "run-1",
+		registry.ExecutionRef(attempt.ID(), "2026-10-09T12:00:00.000000001Z"), registry.EvidencePublication)
+	require.NoError(t, err)
+	assert.Contains(t, string(evidence), `"dagRunId":"run-1"`)
 
 	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
 	require.NoError(t, err, "the same report again is a no-op")

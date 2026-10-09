@@ -1272,8 +1272,13 @@ func (a *API) txeLatestRunAttempt(ctx context.Context, jobID, runID string) (reg
 	if err != nil {
 		return registry.RunAttempt{}, nil, err
 	}
+	snapshot, err := json.Marshal(status)
+	if err != nil {
+		return registry.RunAttempt{}, nil, err
+	}
 	out := registry.RunAttempt{AttemptID: status.AttemptID, QueuedAt: status.QueuedAt, Status: status.Status.String(),
-		Finished: !status.Status.IsActive() && status.Status != ir.NotStarted, Succeeded: status.Status.IsSuccess()}
+		Running: status.Status == ir.Running, Finished: !status.Status.IsActive() && status.Status != ir.NotStarted,
+		Succeeded: status.Status.IsSuccess(), ArchiveDir: status.ArchiveDir, Snapshot: snapshot}
 	if out.AttemptID == "" {
 		out.AttemptID = attempt.ID()
 	}

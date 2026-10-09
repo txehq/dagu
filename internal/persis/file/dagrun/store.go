@@ -286,6 +286,11 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 		if err != nil {
 			return nil, fmt.Errorf("failed to find execution: %w", err)
 		}
+		if req.ExpectLatest != nil {
+			if err := store.checkLatestExecution(ctx, r, *req.ExpectLatest); err != nil {
+				return nil, err
+			}
+		}
 		run = r
 	} else {
 		// Check if the dag-run already exists
@@ -530,4 +535,25 @@ func (store *Store) listRoot(_ context.Context, include string) ([]DataRoot, err
 	}
 
 	return roots, nil
+}
+
+// checkLatestExecution refuses unless the run's latest execution is want and
+// has finished. It runs under the run's lock, with the attempt creation it
+// guards.
+func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want persis.ExpectedExecution) error {
+	attempt, err := run.LatestAttempt(ctx, store.cache)
+	if err != nil {
+		return fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %w", persis.ErrLatestExecutionChanged, err)
+	}
+	if status.AttemptID != want.AttemptID || status.QueuedAt != want.QueuedAt {
+		return fmt.Errorf("%w: latest is attempt %s queued at %q", persis.ErrLatestExecutionChanged, status.AttemptID, status.QueuedAt)
+	}
+	if status.Status.IsActive() || status.Status == ir.NotStarted {
+		return fmt.Errorf("%w: latest is %s", persis.ErrLatestExecutionChanged, status.Status)
+	}
+	return nil
 }

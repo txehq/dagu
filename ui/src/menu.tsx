@@ -1,3 +1,4 @@
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { LicenseBadge } from '@/components/LicenseBadge';
 import {
   Select,
@@ -662,7 +663,7 @@ export const mainListItems = React.forwardRef<
     config.authMode !== 'builtin'
       ? config.permissions.writeDags
       : roleAtLeast(user?.role ?? null, UserRole.developer);
-  const canManageIncidents = canManageNotifications;
+  const canManageIncidents = INCIDENTS_ENABLED && canManageNotifications;
   const canAccessSystemStatus = useCanAccessSystemStatus();
   const canAccessGitSync = useCanAccessGitSync();
   const canManageWebhooks = useCanManageWebhooks();

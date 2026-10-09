@@ -253,7 +253,11 @@ describe('LicensePage', () => {
     expect(
       within(sso).queryByRole('link', { name: 'Setup guide' })
     ).not.toBeInTheDocument();
-    expect(screen.getAllByText('Included')).toHaveLength(3);
+    // The fork does not offer incident routing, so it is not listed.
+    expect(
+      screen.queryByRole('heading', { name: 'Incident routing' })
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText('Included')).toHaveLength(2);
   });
 
   it('preserves the current plan when activation fails', async () => {
@@ -299,7 +303,7 @@ describe('LicensePage', () => {
     expect(screen.getByText('Community', { exact: true })).toBeVisible();
     expect(
       screen.getAllByText('Requires a license with this feature')
-    ).toHaveLength(5);
+    ).toHaveLength(4);
   });
   it('labels a pending deactivation without claiming activation', async () => {
     let resolve!: (value: object) => void;

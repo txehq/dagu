@@ -130,6 +130,9 @@ func builtinContextFromDAGContext(rCtx Context, scope *cmnvalue.EnvScope, step i
 		addBuiltinContextValue(values, "context.run.root_id", rCtx.RootDAGRun.ID)
 	}
 	addBuiltinContextValue(values, "context.attempt.id", rCtx.AttemptID)
+	if rCtx.AttemptQueuedAtKnown {
+		values["context.attempt.queued_at"] = rCtx.AttemptQueuedAt
+	}
 	addBuiltinContextValue(values, "context.step.id", step.ID)
 	addBuiltinContextValue(values, "context.step.name", step.Name)
 	addBuiltinContextValue(values, "context.trigger.type", rCtx.TriggerType.String())

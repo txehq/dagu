@@ -756,6 +756,9 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 	if scheduleTime := a.contextScheduleTime(); scheduleTime != "" {
 		contextOpts = append(contextOpts, runtime.WithScheduleTime(scheduleTime))
 	}
+	if queuedAt, ok := a.contextQueuedAt(); ok {
+		contextOpts = append(contextOpts, runtime.WithAttemptQueuedAt(queuedAt))
+	}
 	if len(a.extraEnvs) > 0 {
 		contextOpts = append(contextOpts, runtime.WithEnvVars(a.extraEnvs...))
 	}
@@ -1654,6 +1657,36 @@ func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 	return a.retryTarget
 }
 
+// contextQueuedAt is the queue marker of this execution: the queuedAt every
+// status this agent reports carries, so a step and the stored status name the
+// same execution. It is passed as stored, never reformatted. A run that was
+// not dispatched from a queued or earlier status has an empty marker, which
+// is what its status holds.
+//
+// The marker comes from a stored status, and on a worker that status arrives
+// from the coordinator, which stores what workers report. A step may put the
+// value into a shell command, so only a marker that is an RFC3339 timestamp
+// written with digits, "T", "Z", ".", ":", "+" and "-" is handed to steps:
+// nothing a shell acts on. Parsing alone does not ensure that, because the
+// parser also takes a comma before the fraction. Any other marker is
+// withheld, and a reference to it is left as written.
+func (a *Agent) contextQueuedAt() (string, bool) {
+	source := a.statusSourceTarget()
+	if source == nil || source.QueuedAt == "" {
+		return "", true
+	}
+	if !queueMarkerPattern.MatchString(source.QueuedAt) {
+		return "", false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, source.QueuedAt); err != nil {
+		return "", false
+	}
+	return source.QueuedAt, true
+}
+
+// queueMarkerPattern holds the characters of an RFC3339 timestamp.
+var queueMarkerPattern = regexp.MustCompile(`^[0-9TZ.:+-]+$`)
+
 func (a *Agent) contextScheduleTime() string {
 	var raw string
 	if source := a.statusSourceTarget(); source != nil && source.ScheduleTime != "" {
@@ -2354,6 +2387,9 @@ func (a *Agent) dryRun(ctx context.Context) error {
 	}
 	if scheduleTime := a.contextScheduleTime(); scheduleTime != "" {
 		contextOpts = append(contextOpts, runtime.WithScheduleTime(scheduleTime))
+	}
+	if queuedAt, ok := a.contextQueuedAt(); ok {
+		contextOpts = append(contextOpts, runtime.WithAttemptQueuedAt(queuedAt))
 	}
 	if a.artifactDir != "" {
 		contextOpts = append(contextOpts, runtime.WithArtifactDir(a.artifactDir))

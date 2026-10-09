@@ -2120,6 +2120,7 @@ Run and step metadata:
 | `${context.run.root_id}` | Root run ID when this run is part of a nested run |
 | `${context.attempt.id}` | Current attempt ID |
 | `${context.attempt.started_at}` | Current attempt start time |
+| `${context.attempt.queued_at}` | Queue marker of this execution, as stored in the run status. With `${context.attempt.id}` it identifies one execution: a queued retry keeps the attempt ID and gets a new marker. Empty when the run was never queued |
 | `${context.step.id}` | Current step ID |
 | `${context.step.name}` | Current step name |
 | `${context.trigger.type}` | Run trigger type when trigger metadata is available |

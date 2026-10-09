@@ -5,6 +5,7 @@ package registry
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -90,8 +91,8 @@ func TestUncertainEffectResolution(t *testing.T) {
 	_, _, err = routine(t, f, job, c, "restart")
 	assert.Equal(t, CodeIntentUnresolved, code(t, err), "the same intent is not started again")
 
-	params := json.RawMessage(`{"action_id":"` + actionID + `"}`)
-	escalation, err := EscalationProposalID(actionID, job.Version)
+	params := json.RawMessage(`{"action_id":"` + actionID + `","attempt":1}`)
+	escalation, err := EscalationProposalID(actionID, 1, job.Version)
 	require.NoError(t, err)
 	put := func(id string) (*Proposal, error) {
 		var p *Proposal
@@ -149,13 +150,13 @@ func TestUncertainResolutionRespectsMaxAttempts(t *testing.T) {
 		return err
 	})
 	require.NoError(t, err)
-	escalation, err := EscalationProposalID(actionID, job.Version)
+	escalation, err := EscalationProposalID(actionID, 2, job.Version)
 	require.NoError(t, err)
 	var p *Proposal
 	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
 		var err error
 		p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: escalation,
-			Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(`{"action_id":"` + actionID + `"}`)}})
+			Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(`{"action_id":"` + actionID + `","attempt":2}`)}})
 		return err
 	})
 	require.NoError(t, err)
@@ -505,4 +506,83 @@ func TestRetryEvidenceIsTheTerminalStatus(t *testing.T) {
 	published, err := r.f.store.GetRetainedExecution(r.f.ctx, r.job.JobID, "run-1", failed.Ref(), EvidencePublication)
 	require.NoError(t, err)
 	assert.JSONEq(t, string(publishing.Snapshot), string(published), "the publication observation is kept apart")
+}
+
+// Each escalation is about one attempt: after a retry decision and a second
+// unresolved outcome, the first escalation's decision context does not
+// carry over, and a decision filed against the earlier attempt is refused.
+func TestEscalationsAreBoundToTheAttempt(t *testing.T) {
+	f := newFixture(t)
+	v := f.version(1)
+	v.ReviewPolicy.MaxAttempts = 3
+	job, err := f.store.Register(f.ctx, RegisterInput{JobID: f.mint(PrefixJob), RequestID: "r", OwnerID: f.owner, ProjectID: f.project,
+		MachineID: f.machine, JobKey: "three", Version: v}, cli)
+	require.NoError(t, err)
+	pv, err := f.store.GetVersion(f.ctx, job.JobID, 1)
+	require.NoError(t, err)
+	_, err = f.store.MarkReady(f.ctx, job.JobID, 0, PackageEvidence{Digest: job.PackageDigest, Path: pv.Package.Path, MachineID: f.machine}, cli)
+	require.NoError(t, err)
+	job, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	c := acquire(t, f, job.JobID, ClaimReview, 24*time.Hour)
+
+	escalate := func(actionID string, g *Grant, attempt int) *Proposal {
+		t.Helper()
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID, Fence: c.Fence, State: ActionUncertain})
+			return err
+		})
+		require.NoError(t, err)
+		id, err := EscalationProposalID(actionID, attempt, job.Version)
+		require.NoError(t, err)
+		var p *Proposal
+		_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: id,
+				Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(fmt.Sprintf(`{"action_id":%q,"attempt":%d}`, actionID, attempt))}})
+			return err
+		})
+		require.NoError(t, err)
+		return p
+	}
+	actionID, g, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	first := escalate(actionID, g, 1)
+	_, err = decide(f, job.JobID, first, VerdictRetry, ProposalDecided, "r1")
+	require.NoError(t, err)
+	_, g, err = routine(t, f, job, c, "restart") // attempt 2, under the resolution
+	require.NoError(t, err)
+	second := escalate(actionID, g, 2)
+	assert.NotEqual(t, first.ProposalID, second.ProposalID, "the second escalation is another proposal")
+
+	// A decision against the first escalation finds no open proposal.
+	_, err = decide(f, job.JobID, first, VerdictRetry, ProposalDecided, "r-stale")
+	assert.Equal(t, CodeProposalState, code(t, err))
+	// Filing the first escalation again is refused: the action moved on.
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		_, err := tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: first.ProposalID,
+			Action: ActionSpec{Name: ActionUncertainEffect, Params: json.RawMessage(fmt.Sprintf(`{"action_id":%q,"attempt":1}`, actionID))}})
+		return err
+	})
+	assert.Equal(t, CodeStaleBinding, code(t, err))
+	_, err = decide(f, job.JobID, second, VerdictRetry, ProposalDecided, "r2")
+	require.NoError(t, err)
+}
+
+// The intent index keeps only unresolved intents.
+func TestSettledIntentsAreDropped(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	actionID, g, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	require.Len(t, got.Intents, 1)
+	got, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID, Fence: c.Fence, State: ActionSucceeded, Receipt: "done"})
+		return err
+	})
+	require.NoError(t, err)
+	assert.Empty(t, got.Intents)
 }

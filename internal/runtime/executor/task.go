@@ -129,6 +129,14 @@ func WithBypassPreconditions(enabled bool) TaskOption {
 	}
 }
 
+// WithRequireLatestIsPrevious makes a retry conditional on the run's latest
+// execution being the previous status's (attempt, queue marker).
+func WithRequireLatestIsPrevious(enabled bool) TaskOption {
+	return func(task *dispatch.DispatchTask) {
+		task.RequireLatestIsPrevious = enabled
+	}
+}
+
 // WithLabels sets additional labels (comma-separated) for the task.
 func WithLabels(labels string) TaskOption {
 	return func(task *dispatch.DispatchTask) {

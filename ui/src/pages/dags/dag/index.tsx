@@ -30,6 +30,7 @@ import {
   WorkspaceKind,
   workspaceNameFromLabels,
 } from '../../../lib/workspace';
+import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { I18nText } from '@/i18n/I18nText';
 
 type Params = {
@@ -76,7 +77,12 @@ function DAGDetails() {
   const dagSSE = useDAGSSE(fileName, !!fileName, remoteNode);
 
   // Determine active tab
-  const tab = params.tab === 'docs' ? 'wiki' : params.tab || 'status';
+  const tab =
+    params.tab === 'docs'
+      ? 'wiki'
+      : !INCIDENTS_ENABLED && params.tab === 'incidents'
+        ? 'status'
+        : params.tab || 'status';
 
   // Format duration utility function
   const formatDuration = useCallback(
@@ -129,7 +135,15 @@ function DAGDetails() {
     if (params.tab === 'docs' && fileName) {
       navigate(buildUrl(`/dags/${fileName}/wiki`), { replace: true });
     }
-  }, [buildUrl, fileName, navigate, params.tab]);
+    // The fork does not offer incidents; the DAG's status tab takes their
+    // place, keeping whatever run the URL selected.
+    if (!INCIDENTS_ENABLED && params.tab === 'incidents' && fileName) {
+      const query = searchParams.toString();
+      navigate(buildUrl(`/dags/${fileName}${query ? `?${query}` : ''}`), {
+        replace: true,
+      });
+    }
+  }, [buildUrl, fileName, navigate, params.tab, searchParams]);
 
   // Fetch DAG details — SWR is the single source of truth, refreshed by live invalidations
   const { data: dagData, mutate: mutateDag } = useQuery(

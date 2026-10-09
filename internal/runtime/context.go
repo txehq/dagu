@@ -54,6 +54,8 @@ var (
 	WithTriggerActor = runctx.WithTriggerActor
 	// WithRunStartedAt sets the recorded DAG-run start timestamp.
 	WithRunStartedAt = runctx.WithRunStartedAt
+	// WithAttemptQueuedAt sets the queue marker of this execution.
+	WithAttemptQueuedAt = runctx.WithAttemptQueuedAt
 	// WithScheduleTime sets the logical schedule time.
 	WithScheduleTime = runctx.WithScheduleTime
 	// WithParams sets runtime parameters.
