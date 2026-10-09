@@ -54,7 +54,7 @@ describe('retryStates', () => {
     );
     expect(states.get('run-1')?.status).toBe('requested');
     expect(retryLabel(states.get('run-1')!)).toContain(
-      'waiting for the reviewer'
+      'waiting for the reviewer to dispatch'
     );
   });
 
@@ -114,12 +114,13 @@ describe('canRequestRetry', () => {
         status: 'uncertain',
       })
     ).toBe(false);
+    // The registry refuses a second request for the same run and version.
     expect(
       canRequestRetry('failed', {
         runId: 'r',
         proposalId: 'p',
         status: 'failed',
       })
-    ).toBe(true);
+    ).toBe(false);
   });
 });

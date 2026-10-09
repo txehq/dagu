@@ -24,6 +24,7 @@ type Registry interface {
 	WithJobTx(ctx context.Context, jobID string, actor registry.Actor, fn func(tx *registry.JobTx) error) (*registry.Job, error)
 	GetJob(ctx context.Context, jobID string) (*registry.Job, error)
 	GetDecision(ctx context.Context, jobID, decisionID string) (*registry.Decision, error)
+	ListArchivedProposals(ctx context.Context, jobID string, limit int) ([]*registry.Proposal, error)
 }
 
 // TaskCompleter completes a native Dagu human task.
@@ -353,9 +354,11 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 		if err != nil {
 			return err
 		}
-		// Run start times have whole-second precision, so the version's
-		// creation is compared at the same precision.
-		if req.RunSpecSHA256 != j.DAGSpecSHA256 || req.RunStartedAt.Before(v.Created.At.Truncate(time.Second)) {
+		// Run start times have whole-second precision. A run started in the
+		// second the current version was created may be of the previous
+		// version, whose package can differ under identical DAG text, so it
+		// is refused rather than retried on code it did not run.
+		if req.RunSpecSHA256 != j.DAGSpecSHA256 || !req.RunStartedAt.After(v.Created.At.Truncate(time.Second)) {
 			return &registry.Error{Code: CodeRunStale,
 				Message: fmt.Sprintf("run %s is of an earlier version of this job; retrying it would run version %d's code, so start a new run instead", req.RunID, j.Version)}
 		}
@@ -371,30 +374,76 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 	if err != nil {
 		return nil, err
 	}
-	result := &Result{Job: job, Proposal: proposal, Decision: stored}
 	if replayID != "" {
-		d, err := s.Registry.GetDecision(ctx, jobID, replayID)
-		if err != nil {
-			return nil, err
-		}
-		// A replay names the same run; the proposal ID derives from the run
-		// and the job version the retry was requested at.
-		p := job.Proposals[d.ProposalID]
-		sameRun := false
-		if p != nil {
-			want, err := registry.RetryProposalID(req.RunID, p.JobVersion)
-			if err != nil {
-				return nil, err
-			}
-			sameRun = d.ProposalID == want
-		}
-		if !sameRun || d.Verdict != VerdictRetry {
-			return nil, &registry.Error{Code: CodeIdempotencyMismatch,
-				Message: "idempotency key was used for a different decision", Current: d}
-		}
-		result.Decision, result.AlreadyRecorded = d, true
-		result.Proposal = job.Proposals[d.ProposalID]
+		res, _, err := s.ReplayRetry(ctx, jobID, req.RunID, req.IdempotencyKey, actor)
+		return res, err
 	}
+	result := &Result{Job: job, Proposal: proposal, Decision: stored}
 	result.Decision.NativeResume = registry.CurrentNativeResume(job, result.Decision)
 	return result, nil
+}
+
+// ReplayRetry returns the decision an earlier retry request stored under
+// idempotencyKey, checked against the run it named. found is false when no
+// decision is stored under the key. A replay reads durable history, so it
+// still resolves after the retry ran and its proposal was archived, and it
+// needs no new-request checks on the run.
+func (s *Service) ReplayRetry(ctx context.Context, jobID, runID, idempotencyKey string, actor registry.Actor) (*Result, bool, error) {
+	if s.AuthorizeDecision == nil {
+		return nil, false, errNoAuthorizer
+	}
+	var replayID string
+	job, err := s.Registry.WithJobTx(ctx, jobID, actor, func(tx *registry.JobTx) error {
+		replayID = ""
+		if err := s.AuthorizeDecision(ctx, tx, VerdictRetry); err != nil {
+			return err
+		}
+		if id, ok := tx.DecisionByKey(idempotencyKey); ok {
+			replayID = id
+		}
+		return nil
+	})
+	if err != nil || replayID == "" {
+		return nil, false, err
+	}
+	d, err := s.Registry.GetDecision(ctx, jobID, replayID)
+	if err != nil {
+		return nil, true, err
+	}
+	p, err := s.proposalOf(ctx, job, d.ProposalID)
+	if err != nil {
+		return nil, true, err
+	}
+	sameRun := false
+	if p != nil && d.Verdict == VerdictRetry {
+		want, err := registry.RetryProposalID(runID, p.JobVersion)
+		if err != nil {
+			return nil, true, err
+		}
+		sameRun = d.ProposalID == want
+	}
+	if !sameRun {
+		return nil, true, &registry.Error{Code: CodeIdempotencyMismatch,
+			Message: "idempotency key was used for a different decision", Current: d}
+	}
+	d.NativeResume = registry.CurrentNativeResume(job, d)
+	return &Result{Job: job, Proposal: p, Decision: d, AlreadyRecorded: true}, true, nil
+}
+
+// proposalOf returns a proposal from the job aggregate or, once finished,
+// from its archived history.
+func (s *Service) proposalOf(ctx context.Context, job *registry.Job, proposalID string) (*registry.Proposal, error) {
+	if p := job.Proposals[proposalID]; p != nil {
+		return p, nil
+	}
+	archived, err := s.Registry.ListArchivedProposals(ctx, job.JobID, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range archived {
+		if p.ProposalID == proposalID {
+			return p, nil
+		}
+	}
+	return nil, nil
 }

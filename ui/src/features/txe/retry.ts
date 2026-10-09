@@ -92,13 +92,17 @@ export function retryStates(
   return out;
 }
 
+// The action a retry decision authorizes is the dispatch of a native retry,
+// so these labels describe the dispatch. A dispatched retry says nothing
+// about whether the retried run then succeeded; that is the run's own status.
 const LABELS: Record<RetryStatus, string> = {
-  requested: 'Retry requested; waiting for the reviewer to run it',
-  executing: 'Retry running',
-  succeeded: 'Retried',
-  failed: 'Retry failed',
-  uncertain: 'Retry outcome unknown; it will be reconciled before any repeat',
-  'not-applied': 'Retry did not take effect',
+  requested: 'Retry requested; waiting for the reviewer to dispatch it',
+  executing: 'Retry being dispatched',
+  succeeded: 'Retry dispatched',
+  failed: 'Retry dispatch failed',
+  uncertain:
+    'Retry dispatch outcome unknown; it will be reconciled before any repeat',
+  'not-applied': 'Retry was not dispatched',
   rejected: 'Retry not performed',
 };
 
@@ -108,7 +112,8 @@ export function retryLabel(state: RetryState): string {
 
 // canRequestRetry reports whether the dashboard offers a retry of a run: it
 // must have finished without success (the server counts a partial success
-// as success), and no retry of it may be pending or running.
+// as success) and have no retry yet. A run gets one retry request per job
+// version: the registry refuses a second one, whatever became of the first.
 export function canRequestRetry(
   runStatus: string,
   state: RetryState | undefined
@@ -117,11 +122,5 @@ export function canRequestRetry(
     runStatus === 'failed' ||
     runStatus === 'aborted' ||
     runStatus === 'rejected';
-  if (!finishedUnsuccessfully) return false;
-  if (!state) return true;
-  return (
-    state.status === 'failed' ||
-    state.status === 'not-applied' ||
-    state.status === 'rejected'
-  );
+  return finishedUnsuccessfully && !state;
 }
