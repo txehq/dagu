@@ -84,3 +84,32 @@ describe('TxeInboxPage', () => {
     expect(await screen.findByTestId('txe-inbox-empty')).toBeInTheDocument();
   });
 });
+
+describe('TxeInboxPage refused decisions', () => {
+  // The refused proposal leaves the inbox on reload, so the refusal must stay
+  // visible at page level rather than vanish with its card.
+  it('keeps a notice after a stale proposal disappears', async () => {
+    let proposals: Proposal[] = [fixtureProposal()];
+    const api: TxeApi = {
+      listJobs: async () => [fixtureJob()],
+      getJob: async () => fixtureJob(),
+      listProposals: async () => proposals,
+      listDecisions: async () => [],
+      decide: vi.fn(async () => {
+        proposals = [{ ...proposals[0]!, state: 'superseded' as const }];
+        return {
+          ok: false as const,
+          status: 409,
+          message: 'proposal is not open',
+        };
+      }),
+    };
+    renderPage(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Record decision' }));
+    expect(await screen.findByTestId('txe-inbox-empty')).toBeInTheDocument();
+    expect(screen.getByTestId('txe-decision-refused')).toHaveTextContent(
+      'Usage is at 92%. Resize the volume to 20Gi?'
+    );
+  });
+});
