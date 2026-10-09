@@ -1911,18 +1911,6 @@ func appendCancelledExecutionIfMissing(cancelledRuns []*coordinatorv1.CancelledR
 	return append(cancelledRuns, &coordinatorv1.CancelledRun{AttemptKey: task.AttemptKey, ExecutionMarker: &marker})
 }
 
-func appendCancelledRunIfMissing(cancelledRuns []*coordinatorv1.CancelledRun, attemptKey string) []*coordinatorv1.CancelledRun {
-	if attemptKey == "" {
-		return cancelledRuns
-	}
-	for _, cancelled := range cancelledRuns {
-		if cancelled != nil && cancelled.AttemptKey == attemptKey {
-			return cancelledRuns
-		}
-	}
-	return append(cancelledRuns, &coordinatorv1.CancelledRun{AttemptKey: attemptKey})
-}
-
 // getCancelledRunsForWorker checks which of the worker's running tasks have been cancelled.
 func (h *Handler) getCancelledRunsForWorker(ctx context.Context, stats *coordinatorv1.WorkerStats) []*coordinatorv1.CancelledRun {
 	if h.dagRunRepository == nil || stats == nil || len(stats.RunningTasks) == 0 {

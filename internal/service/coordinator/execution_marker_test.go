@@ -110,9 +110,6 @@ func upsertMarkerLease(t *testing.T, leaseStore *store.DAGRunLeaseStore, attempt
 	}))
 }
 
-//go:fix inline
-func strPtr(s string) *string { return new(s) }
-
 func (f *markerFixture) report(t *testing.T, st ir.Status, queuedAt, marker string) *coordinatorv1.ReportStatusResponse {
 	t.Helper()
 	protoStatus, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{
