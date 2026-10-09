@@ -219,6 +219,9 @@ type RunControl interface {
 	// RunFinished reports whether a run reached a terminal status, or
 	// ErrRunNotFound when Dagu has no record of it.
 	RunFinished(ctx context.Context, dagName string, run RunRef) (bool, error)
+	// RunSpecSHA256 returns the digest of a root run's saved DAG, in the form
+	// recorded for a version's spec, or ErrRunNotFound.
+	RunSpecSHA256(ctx context.Context, dagName, runID string) (string, error)
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.

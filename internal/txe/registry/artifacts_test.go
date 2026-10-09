@@ -107,8 +107,8 @@ func TestRecordArtifacts(t *testing.T) {
 	}
 	assert.Equal(t, 1, missing, "the missing required deliverable needs a person")
 
-	again, err := record(manifest)
-	require.NoError(t, err, "an identical report is a no-op")
+	again, err := record(bad(func(a *ArtifactRecord) { a.RecordedAt = "2026-10-09T13:00:00Z" }))
+	require.NoError(t, err, "the same report again is a no-op, whatever the reporter's clock says")
 	assert.Equal(t, got.Digest, again.Digest)
 	j, err = f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)

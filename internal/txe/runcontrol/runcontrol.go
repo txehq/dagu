@@ -7,6 +7,7 @@ package runcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -69,6 +70,25 @@ func (c *Control) RunFinished(ctx context.Context, dagName string, run registry.
 		return false, err
 	}
 	return status != nil && !status.Status.IsActive() && status.Status != ir.NotStarted, nil
+}
+
+// RunSpecSHA256 returns the digest of a run's saved DAG snapshot.
+func (c *Control) RunSpecSHA256(ctx context.Context, dagName, runID string) (string, error) {
+	attempt, err := c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, runID))
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+		return "", registry.ErrRunNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(dag.YamlData) == 0 {
+		return "", fmt.Errorf("run %s has no saved DAG", runID)
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), nil
 }
 
 func (c *Control) findAttempt(ctx context.Context, dagName string, run registry.RunRef) (dagrun.Attempt, error) {

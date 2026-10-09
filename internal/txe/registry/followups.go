@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -194,6 +195,20 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams) error {
 	}
 	if rp.RunSpecSHA256 == "" || rp.PackageDigest == "" {
 		return refuse(CodeInvalid, "dagu.retry_run needs run_spec_sha256 and package_digest")
+	}
+	// The digest is the run's own: read from the run's saved DAG, never taken
+	// from the caller, so a current digest cannot be paired with an old run.
+	if tx.store.runs == nil {
+		return refuse(CodeNotReady, "run history is not available to bind run %s", rp.RunID)
+	}
+	saved, err := tx.store.runs.RunSpecSHA256(tx.ctx, j.JobID, rp.RunID)
+	switch {
+	case errors.Is(err, ErrRunNotFound):
+		return stale("is not a run of this job")
+	case err != nil:
+		return err
+	case saved != rp.RunSpecSHA256:
+		return stale("ran another DAG than the one named")
 	}
 	packages := map[string]bool{}
 	current := false

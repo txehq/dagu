@@ -250,8 +250,16 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID, runSpecSH
 	return &m, nil
 }
 
+// manifestDigest identifies what a run reported. recorded_at is the
+// reporter's clock, not part of the report: a retried publish of the same
+// files sends a new one and must still be recognized as a replay.
 func manifestDigest(version int, artifacts []ArtifactRecord) (string, error) {
-	b, err := json.Marshal(map[string]any{"job_version": version, "artifacts": artifacts})
+	report := make([]ArtifactRecord, len(artifacts))
+	for i, a := range artifacts {
+		a.RecordedAt = ""
+		report[i] = a
+	}
+	b, err := json.Marshal(map[string]any{"job_version": version, "artifacts": report})
 	if err != nil {
 		return "", err
 	}
