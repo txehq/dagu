@@ -129,8 +129,10 @@ func (w *Writer) write(st ir.DAGRunStatus) error {
 
 // reopenIfReplacedLocked reopens the target when the open descriptor no longer
 // refers to the file at the target path, as after another handle compacted it.
-// A target that no longer exists is left alone: recreating it would resurrect
-// a removed run.
+// The replacement is opened without creating it, so a target removed in the
+// meantime is never recreated, and the current descriptor is kept until the
+// replacement is open, so a failed reopen leaves the writer usable and the
+// next write tries again.
 func (w *Writer) reopenIfReplacedLocked() error {
 	current, err := os.Stat(w.target)
 	if err != nil {
@@ -146,15 +148,18 @@ func (w *Writer) reopenIfReplacedLocked() error {
 	if os.SameFile(current, open) {
 		return nil
 	}
+	file, err := os.OpenFile(w.target, os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0) // #nosec G304 -- the writer's own target
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to reopen status file: %w", err)
+	}
 	if err := w.buffer.Flush(); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("failed to flush replaced status file: %w", err)
 	}
 	_ = w.file.Close()
-	file, err := fileutil.OpenOrCreateFile(w.target)
-	if err != nil {
-		w.file, w.buffer, w.encoder = nil, nil, nil
-		return fmt.Errorf("failed to reopen status file: %w", err)
-	}
 	w.file = file
 	w.buffer = bufio.NewWriterSize(file, w.bufferSize)
 	w.encoder = json.NewEncoder(w.buffer)
