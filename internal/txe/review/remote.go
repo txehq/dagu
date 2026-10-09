@@ -1407,13 +1407,36 @@ func (r remoteRuns) RunState(ctx context.Context, jobID, runID string) (RunState
 func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) (Execution, error) {
 	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
 	body := map[string]string{"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt}
-	err := r.t.Do(ctx, http.MethodPost, path, body, nil)
+	var answer json.RawMessage
+	err := r.t.Do(ctx, http.MethodPost, path, body, &answer)
 	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusConflict && retryRefusedBeforeEffect[te.Code] {
 		return Execution{}, fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
-	// The service's answer to an admitted retry has no body: it does not
-	// name the execution it admitted, so none is returned.
-	return Execution{}, err
+	if err != nil {
+		return Execution{}, err
+	}
+	return admittedExecution(answer), nil
+}
+
+// admittedExecution reads the execution the service says it admitted a
+// conditional retry as: {attemptId, queuedAt, executionRef} in the answer.
+// A service that answers without it, or with something that does not hold
+// together, has named no execution: the zero Execution is returned, and the
+// caller records nothing from the run.
+func admittedExecution(answer json.RawMessage) Execution {
+	var named struct {
+		AttemptID    string `json:"attemptId"`
+		QueuedAt     string `json:"queuedAt"`
+		ExecutionRef string `json:"executionRef"`
+	}
+	if len(answer) == 0 || json.Unmarshal(answer, &named) != nil || named.AttemptID == "" {
+		return Execution{}
+	}
+	admitted := Execution{AttemptID: named.AttemptID, QueuedAt: named.QueuedAt}
+	if named.ExecutionRef != admitted.Ref() {
+		return Execution{}
+	}
+	return admitted
 }
 
 // retryRefusedBeforeEffect are the service's codes for a conditional retry

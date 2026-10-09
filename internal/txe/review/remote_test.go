@@ -900,6 +900,24 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
 	require.NoError(t, err)
 	assert.Equal(t, review.Execution{}, admitted, "the service's answer names no execution")
+
+	// The execution the service names is returned only when its parts hold
+	// together; anything else names none.
+	next := review.Execution{AttemptID: "a2", QueuedAt: "2026-10-09T16:40:00Z"}
+	for answer, want := range map[string]review.Execution{
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `"}`:  next,
+		`{"attemptId":"a3","executionRef":"` + review.ExecutionRef("a3", "") + `"}`:                 {AttemptID: "a3"},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"a2-0000000000000000"}`: {},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z"}`:                                      {},
+		`{"executionRef":"` + next.Ref() + `"}`:                                                     {},
+		`[]`:                                                                                        {},
+	} {
+		stub.replies[path] = answer
+		admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+		require.NoError(t, err, answer)
+		assert.Equal(t, want, admitted, answer)
+	}
+	stub.replies[path] = `{}`
 	assert.Equal(t, map[string]string{"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z"}, sent)
 
 	// An execution that was never queued is named with an empty marker,
@@ -1563,8 +1581,12 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	// The service accepts the request and shows no new attempt.
-	service.retry = func(string) error { return nil }
+	// The service admits the request as a new attempt, which no worker
+	// has taken yet.
+	service.retry = func(runID string) error {
+		service.state[runID] = review.RunState{AttemptID: "att-2", Status: "not_started", Active: true}
+		return nil
+	}
 	out, err := f.retrying("tick-1", service).Execute(ctx, f.jobID, proposal.ProposalID, decided.DecisionID)
 	require.NoError(t, err)
 	assert.Equal(t, review.ActionUncertain, out.Action.State)
@@ -1579,9 +1601,11 @@ func TestRemoteRetryIsRecordedSucceededOnlyWithTheObservedAttempt(t *testing.T) 
 	assert.Empty(t, again)
 	assert.Len(t, service.retried, 1)
 
-	// The dispatch landed after all: the next review of the job sees the
-	// new attempt on the run and settles the action with it.
-	service.start("run-7")
+	// A worker takes it: the next review of the job sees the admitted
+	// attempt running and settles the action with it. The admission the
+	// reviewer journaled is what lets it recognise the attempt.
+	require.Equal(t, review.ExecutionRef("att-2", ""), out.Action.AdmittedRef)
+	service.state["run-7"] = review.RunState{AttemptID: "att-2", Status: "running", Active: true}
 	r := f.retrying("reviewer-b", service)
 	prepared, err := r.Prepare(ctx, f.jobID)
 	require.NoError(t, err)

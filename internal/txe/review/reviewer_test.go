@@ -142,9 +142,10 @@ type runs struct {
 	// beforeAdmission runs as a retry request arrives, before the service
 	// compares the run's latest execution with the one the request names.
 	beforeAdmission func(runID string)
-	// names makes the service answer an admitted retry with the execution
-	// it admitted it as. The service of today names none.
-	names bool
+	// unnamed makes the service answer an admitted retry without the
+	// execution it admitted it as, as a service older than the conditional
+	// retry's answer does.
+	unnamed bool
 	// afterAdmission runs once a retry is admitted, before its answer
 	// reaches the caller, with the fake's lock held.
 	afterAdmission func(runID string)
@@ -227,8 +228,8 @@ func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Exec
 		r.start(runID)
 	}
 	var admitted review.Execution
-	if r.names {
-		admitted = r.state[runID].Execution()
+	if now := r.state[runID].Execution(); !r.unnamed && now != expected {
+		admitted = now
 	}
 	if r.afterAdmission != nil {
 		r.afterAdmission(runID)

@@ -82,22 +82,22 @@ else a review step needs must be rendered into the DAG:
   before. A retry the reviewer proposes runs from its decision run once the
   owner answers `retry`; one the owner requests directly is already decided
   and is run by the next tick. Either way it is sent at most once.
-  What is recorded: done, only when the service admitted the request and
-  another execution of the run is seen queued, running or over, with that
-  execution's reference as receipt and its status, never "the job
-  succeeded"; not dispatched, only for the two refusals the service makes
-  before starting anything (`execution_changed`,
-  `conditional_retry_unsupported`); uncertain for everything else. An
-  attempt that was created but is not started is a reservation, not a
-  retry. An uncertain retry the service had admitted is settled from the
-  run when its execution shows up; while the run shows only the
-  reservation it stays uncertain and is looked at again by every review,
-  however long a worker takes, and the owner is not asked, because an
-  action put to the owner is not probed again. The service does not name
-  the execution it admits, so the receipt is the first execution seen
-  after the retried one and the record says so: if that execution has
-  already finished and been retried by someone else, the receipt names
-  the later one (open, needs the service to name the admitted execution).
+  What is recorded: done, only when the service admitted the request,
+  named the execution it admitted it as, and that execution is seen on
+  the run queued, running or over, with its reference as receipt and its
+  status, never "the job succeeded"; not dispatched, only for the two
+  refusals the service makes before starting anything
+  (`execution_changed`, `conditional_retry_unsupported`); uncertain for
+  everything else. The named execution while it is created but not
+  started is a reservation, not a retry: the action stays uncertain and
+  is looked at again by every review, however long a worker takes, and
+  the owner is not asked meanwhile, because an action put to the owner is
+  not probed again. Any other execution on the run is not this retry's,
+  even a newer one: the admitted execution may have finished and been
+  retried by someone else. That, and an admission that names no
+  execution (a service without the answer body
+  `{attemptId, queuedAt, executionRef}`), go to the owner; nothing on the
+  run is recorded as the retry.
   One whose answer was never known, such
   as a failed request or a reviewer that died first, is not settled from
   the run, because a newer execution may be someone else's retry: it goes

@@ -1381,7 +1381,6 @@ func TestRetryRunAReservedAttemptIsNotADispatchedRetry(t *testing.T) {
 // one.
 func TestRetryRunALaterExecutionIsNotTheAdmittedOne(t *testing.T) {
 	f := newRetryFixture(t)
-	f.runs.names = true
 	var admitted, later string
 	f.runs.afterAdmission = func(runID string) {
 		// E2 is admitted. Before the answer reaches the reviewer, E2
@@ -1416,38 +1415,53 @@ func TestRetryRunALaterExecutionIsNotTheAdmittedOne(t *testing.T) {
 // receipt, once it is seen queued, running or over.
 func TestRetryRunTheAdmittedExecutionIsTheReceipt(t *testing.T) {
 	f := newRetryFixture(t)
-	f.runs.names = true
 	out := f.execute("executor")
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
 	assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
 	assert.Equal(t, out.Action.Receipt, out.Action.AdmittedRef)
-	assert.NotContains(t, out.Action.Detail, "did not name")
 }
 
-// OPEN GAP, kept visible on purpose. The service of today answers an
-// admitted retry without naming its execution, so the reviewer has only the
-// run to go by and records the first execution it sees after the retried
-// one. In the sequence below that is another caller's retry of this
-// retry's execution: the action is rightly recorded as done, because this
-// retry was admitted and its execution ran, but the receipt names the wrong
-// execution. It cannot be told apart from the run alone. The record says
-// that the service did not name the execution, so the receipt is not read
-// as exact. Once the service names it, this sequence is the one in
-// TestRetryRunALaterExecutionIsNotTheAdmittedOne.
-func TestRetryRunWithoutANamedAdmissionTheReceiptIsTheFirstExecutionSeen(t *testing.T) {
-	f := newRetryFixture(t)
-	var admitted, later string
-	f.runs.afterAdmission = func(runID string) {
-		admitted = f.runs.ref(runID)
-		f.runs.start(runID)
-		later = f.runs.ref(runID)
+// A service that admits a retry without naming its execution leaves only
+// the run to go by, and the run cannot say which execution is this retry's:
+// the one it shows may be another caller's retry of this retry's execution,
+// or of the retried execution itself after this retry's attempt was
+// abandoned. So nothing on the run is recorded as this retry's, in either
+// sequence below, at the time or at a later review. The outcome is unknown
+// and goes to the owner.
+func TestRetryRunWithoutANamedAdmissionNothingOnTheRunIsItsReceipt(t *testing.T) {
+	for name, after := range map[string]func(f *retryFixture, runID string){
+		"the run shows this retry's execution": func(*retryFixture, string) {},
+		"the run shows a later execution": func(f *retryFixture, runID string) {
+			// This retry's execution finished and someone else retried it.
+			f.runs.start(runID)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.unnamed = true
+			f.runs.afterAdmission = func(runID string) { after(f, runID) }
+			out := f.execute("executor")
+			shown := f.runs.ref("run-1")
+			require.NotEqual(t, review.ExecutionRef("att-1", ""), shown)
+			assert.Equal(t, review.ActionUncertain, out.Action.State)
+			assert.Empty(t, out.Action.Receipt, "an execution the service did not name is no receipt")
+			assert.True(t, out.Action.Admitted)
+			assert.Empty(t, out.Action.AdmittedRef)
+			assert.Contains(t, out.Action.Detail, "did not name the execution it admitted")
+			assert.Contains(t, out.Action.Detail, shown, "the record says what the run showed")
+
+			f.clock.Advance(2 * time.Hour)
+			r := f.executor("reviewer-b")
+			prepared, err := r.Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+			require.NoError(t, err)
+			action := f.state().Actions[jobID][0]
+			assert.Equal(t, review.ActionEscalated, action.State, "the owner is asked")
+			assert.Empty(t, action.Receipt)
+			assert.Len(t, f.runs.requested, 1, "nothing is sent again")
+		})
 	}
-	out := f.execute("executor")
-	require.NotEqual(t, admitted, later)
-	assert.Equal(t, review.ActionSucceeded, out.Action.State)
-	assert.Equal(t, later, out.Action.Receipt, "the known gap: the receipt is the later execution, not the admitted one")
-	assert.Empty(t, out.Action.AdmittedRef)
-	assert.Contains(t, out.Action.Detail, "did not name the execution it admitted")
 }
 
 // When the service's answer says nothing about whether it started the
@@ -1584,12 +1598,17 @@ func TestRetryRunAcceptedButUnobservedIsUncertainAndNeverRedispatched(t *testing
 	}
 }
 
-// An unobserved retry is settled as soon as the run shows a later attempt.
-func TestRetryRunUnobservedIsSettledWhenTheNewAttemptAppears(t *testing.T) {
+// An unobserved retry is settled as soon as the run shows the execution the
+// service admitted it as queued, running or over.
+func TestRetryRunUnobservedIsSettledWhenItsExecutionAppears(t *testing.T) {
 	f := newRetryFixture(t)
-	f.runs.retry = func(string) error { return nil }
+	f.runs.retry = func(runID string) error {
+		f.runs.state[runID] = review.RunState{AttemptID: "att-2", Status: "not_started", Active: true}
+		return nil
+	}
 	out := f.execute("executor")
 	require.Equal(t, review.ActionUncertain, out.Action.State)
+	require.Equal(t, review.ExecutionRef("att-2", ""), out.Action.AdmittedRef)
 
 	// The dispatch landed after all.
 	f.runs.fail("run-1", "att-2")
