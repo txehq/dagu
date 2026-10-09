@@ -405,6 +405,9 @@ func commandFamilyName(cmd *cobra.Command) string {
 	if isContextCommand(cmd) {
 		return "context"
 	}
+	if isTXECommand(cmd) {
+		return "txe"
+	}
 	return cmd.Name()
 }
 

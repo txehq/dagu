@@ -13,7 +13,7 @@ const (
 
 func scopeForCommand(name string) commandScope {
 	switch name {
-	case "start", "enqueue", "status", "history", "stop", "retry", "restart", "dequeue":
+	case "start", "enqueue", "status", "history", "stop", "retry", "restart", "dequeue", "txe":
 		return commandScopeContextAware
 	case "version", "schema", "xlsx":
 		return commandScopeStatic

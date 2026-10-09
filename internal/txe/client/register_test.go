@@ -344,6 +344,48 @@ func TestRegisterFailsBeforeReady(t *testing.T) {
 	assert.Equal(t, RegistrationReady, f.job(out.Receipt.JobID).Registration.State)
 }
 
+// A registration interrupted on one machine cannot be finished from another:
+// only the machine that holds the package may place it and vouch for it. The
+// same check guards a resume that guards a first attempt.
+func TestResumeFromAnotherMachine(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	spec, _ := worktree(t, credentialFile(t))
+	f.mu.Lock()
+	f.failNextReady = true
+	f.mu.Unlock()
+
+	_, err := cc1.Register(context.Background(), spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+
+	// The home is now read as a different machine of the same owner.
+	other := `{"schema":1,"machine_id":"mch_01K7A5ZQ8M3N4P5R6S7T8V9W0D","owner_id":"` + testOwner + `"}`
+	require.NoError(t, os.WriteFile(filepath.Join(home.Root, "machine.json"), []byte(other), 0o600))
+	readyBefore := 0
+	for _, r := range f.requests {
+		if strings.HasSuffix(r.Path, "/ready") {
+			readyBefore++
+		}
+	}
+
+	_, err = cc1.Resume(context.Background(), incomplete.RequestID)
+	require.ErrorContains(t, err, "cannot place or vouch for its package")
+
+	readyAfter := 0
+	for _, r := range f.requests {
+		if strings.HasSuffix(r.Path, "/ready") {
+			readyAfter++
+		}
+	}
+	assert.Equal(t, readyBefore, readyAfter, "the other machine asserted nothing")
+	jobs, err := cc1.Client.ListJobs(context.Background(), JobFilter{JobKey: "nightly-collector"})
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
+}
+
 // An update names the version it changes. One made against an outdated
 // version is refused and leaves the job, its package and its receipts alone.
 func TestUpdate(t *testing.T) {
@@ -408,6 +450,10 @@ func TestRegisterRefusals(t *testing.T) {
 		_, err := s.Register(context.Background(), spec)
 		require.ErrorIs(t, err, ErrReviewerSession)
 		_, err = s.Update(context.Background(), "job_x", 1, spec)
+		require.ErrorIs(t, err, ErrReviewerSession)
+		_, err = s.Plan(context.Background(), spec)
+		require.ErrorIs(t, err, ErrReviewerSession)
+		_, err = s.Resume(context.Background(), "req_x")
 		require.ErrorIs(t, err, ErrReviewerSession)
 		assert.Zero(t, len(f.requests), "a reviewer session sent nothing to the hub")
 	})

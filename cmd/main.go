@@ -68,6 +68,7 @@ func init() {
 	rootCmd.AddCommand(cmd.Browser())
 	rootCmd.AddCommand(cmd.Computer())
 	rootCmd.AddCommand(cmd.Xlsx())
+	rootCmd.AddCommand(cmd.TXE())
 
 	config.Version = version
 }
