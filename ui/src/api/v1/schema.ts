@@ -4283,6 +4283,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/runs/{runId}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a run's deliverables
+         * @description Returns the run's manifest. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub.
+         */
+        get: operations["getTxeRunArtifacts"];
+        put?: never;
+        /**
+         * Record a run's deliverables
+         * @description Sent by the run's last step. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception.
+         */
+        post: operations["recordTxeRunArtifacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/runs/{runId}/retry-requests": {
         parameters: {
             query?: never;
@@ -7940,9 +7967,18 @@ export interface components {
             missed_run?: string;
         };
         TxeDeliverable: {
-            path?: string;
+            name: string;
+            /** @description The exact file, relative to the run's output directory; no absolute path, parent step or pattern */
+            path: string;
             type?: string;
             description?: string;
+            /**
+             * @description machine (default) keeps the file on the machine; hub also uploads it as a run artifact
+             * @enum {string}
+             */
+            delivery?: TxeDeliverableDelivery;
+            /** @description A run that does not produce it opens a deliverable_missing exception */
+            required?: boolean;
         };
         TxeExpectedOutcome: {
             success_criteria?: string[];
@@ -8500,6 +8536,49 @@ export interface components {
         };
         TxePendingClosureList: {
             closures: components["schemas"]["TxePendingClosure"][];
+        };
+        TxeArtifactRecordInput: {
+            deliverable: string;
+            path: string;
+            missing?: boolean;
+            sha256?: string;
+            /** Format: int64 */
+            bytes?: number;
+            /** @enum {string} */
+            location?: TxeArtifactRecordInputLocation;
+            machine_id?: string;
+            recorded_at?: string;
+        };
+        TxeArtifactManifestRequest: {
+            job_version: number;
+            artifacts: components["schemas"]["TxeArtifactRecordInput"][];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @enum {string} */
+        TxeArtifactStatus: TxeArtifactStatus;
+        TxeArtifactRecord: {
+            deliverable: string;
+            path: string;
+            missing?: boolean;
+            sha256?: string;
+            /** Format: int64 */
+            bytes?: number;
+            location?: string;
+            machine_id?: string;
+            recorded_at?: string;
+            status: components["schemas"]["TxeArtifactStatus"];
+            /** Format: date-time */
+            checked_at?: string;
+            check_error?: string;
+        };
+        TxeArtifactManifest: {
+            schema?: number;
+            job_id: string;
+            run_id: string;
+            job_version: number;
+            artifacts: components["schemas"]["TxeArtifactRecord"][];
+            digest: string;
+            recorded: components["schemas"]["TxeStamp"];
         };
         TxeRetryRequest: {
             idempotency_key: string;
@@ -23188,6 +23267,146 @@ export interface operations {
             };
         };
     };
+    getTxeRunArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Manifest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeArtifactManifest"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    recordTxeRunArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeArtifactManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Manifest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeArtifactManifest"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     requestTxeRunRetry: {
         parameters: {
             query?: never;
@@ -24343,6 +24562,10 @@ export enum TxeCredentialRefKind {
     file = "file",
     env = "env"
 }
+export enum TxeDeliverableDelivery {
+    machine = "machine",
+    hub = "hub"
+}
 export enum TxeRetirementRulesOn_target_deleted {
     retire = "retire",
     review = "review",
@@ -24495,6 +24718,18 @@ export enum TxeClosureOutcome {
     run_missing = "run_missing",
     locator_refused = "locator_refused",
     failed = "failed"
+}
+export enum TxeArtifactRecordInputLocation {
+    machine = "machine",
+    hub = "hub"
+}
+export enum TxeArtifactStatus {
+    pending_upload = "pending_upload",
+    verified = "verified",
+    mismatch = "mismatch",
+    upload_failed = "upload_failed",
+    stored_on_machine = "stored_on_machine",
+    missing = "missing"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

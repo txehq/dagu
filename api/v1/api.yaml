@@ -11705,6 +11705,103 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/runs/{runId}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "Get a run's deliverables"
+      description: "Returns the run's manifest. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub."
+      operationId: "getTxeRunArtifacts"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Record a run's deliverables"
+      description: "Sent by the run's last step. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception."
+      operationId: "recordTxeRunArtifacts"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeArtifactManifestRequest"
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/runs/{runId}/retry-requests:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -19466,12 +19563,24 @@ components:
     TxeDeliverable:
       type: object
       properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]*$"
         path:
           type: string
+          description: "The exact file, relative to the run's output directory; no absolute path, parent step or pattern"
         type:
           type: string
         description:
           type: string
+        delivery:
+          type: string
+          enum: [machine, hub]
+          description: "machine (default) keeps the file on the machine; hub also uploads it as a run artifact"
+        required:
+          type: boolean
+          description: "A run that does not produce it opens a deliverable_missing exception"
+      required: [name, path]
 
     TxeExpectedOutcome:
       type: object
@@ -20615,6 +20724,98 @@ components:
           items:
             $ref: "#/components/schemas/TxePendingClosure"
       required: [closures]
+
+    TxeArtifactRecordInput:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        location:
+          type: string
+          enum: [machine, hub]
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+      required: [deliverable, path]
+
+    TxeArtifactManifestRequest:
+      type: object
+      properties:
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecordInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [job_version, artifacts]
+
+    TxeArtifactStatus:
+      type: string
+      enum: [pending_upload, verified, mismatch, upload_failed, stored_on_machine, missing]
+
+    TxeArtifactRecord:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        location:
+          type: string
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+        status:
+          $ref: "#/components/schemas/TxeArtifactStatus"
+        checked_at:
+          type: string
+          format: date-time
+        check_error:
+          type: string
+      required: [deliverable, path, status]
+
+    TxeArtifactManifest:
+      type: object
+      properties:
+        schema:
+          type: integer
+        job_id:
+          type: string
+        run_id:
+          type: string
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecord"
+        digest:
+          type: string
+        recorded:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [job_id, run_id, job_version, artifacts, digest, recorded]
 
     TxeRetryRequest:
       type: object

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -664,4 +665,80 @@ func TestTxeAPIProposalClosures(t *testing.T) {
 	_, err = a.RecordTxeProposalClosure(ctx, apigen.RecordTxeProposalClosureRequestObject{JobId: jobID, ProposalId: p.ProposalId,
 		Body: &apigen.TxeClosureRequest{Outcome: apigen.TxeClosureOutcomeClosed}})
 	requireStatus(t, err, http.StatusConflict)
+}
+
+// The run's last step reports its deliverables in the body the CLI sends
+// (CC2's txe/contract/fixtures/registration/artifacts.publish.request.json,
+// with this test's machine): the hub copy waits for its bytes to be checked,
+// the machine copy stays on the machine, the missing required file needs a
+// person, and a different report for the same run is refused.
+func TestTxeAPIRunArtifacts(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPI(t)
+	f := newTxeFixture(t, a, ctx)
+	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	jobID := mint(t, registry.PrefixJob)
+	hub, required := apigen.TxeDeliverableDeliveryHub, true
+	_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+		JobId: jobID, RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: "key:" + jobID,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+			ExpectedOutcome: &apigen.TxeExpectedOutcome{Deliverables: &[]apigen.TxeDeliverable{
+				{Name: "snapshot", Path: "snapshot.json", Delivery: &hub},
+				{Name: "raw", Path: "raw/export.csv"},
+				{Name: "notes", Path: "notes.txt", Required: &required},
+			}},
+		},
+		Actor: &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "cc3-test"},
+	}})
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+
+	fixture := strings.ReplaceAll(`{
+  "job_version": 1,
+  "artifacts": [
+    {"deliverable": "snapshot", "path": "snapshot.json",
+     "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+     "bytes": 11, "location": "hub", "machine_id": "MACHINE", "recorded_at": "2026-10-09T12:00:00Z"},
+    {"deliverable": "raw", "path": "raw/export.csv",
+     "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+     "bytes": 8, "location": "machine", "machine_id": "MACHINE", "recorded_at": "2026-10-09T12:00:00Z"},
+    {"deliverable": "notes", "path": "notes.txt", "missing": true}
+  ],
+  "actor": {"kind": "cli", "id": "publish", "machine_id": "MACHINE", "client": "dagu test"}
+}`, "MACHINE", f.machine)
+	var body apigen.TxeArtifactManifestRequest
+	require.NoError(t, json.Unmarshal([]byte(fixture), &body))
+	resp, err := a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
+	require.NoError(t, err)
+	status := map[string]apigen.TxeArtifactStatus{}
+	for _, r := range resp.(apigen.RecordTxeRunArtifacts200JSONResponse).Artifacts {
+		status[r.Deliverable] = r.Status
+	}
+	assert.Equal(t, map[string]apigen.TxeArtifactStatus{"snapshot": apigen.TxeArtifactStatusPendingUpload,
+		"raw": apigen.TxeArtifactStatusStoredOnMachine, "notes": apigen.TxeArtifactStatusMissing}, status)
+
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
+	require.NoError(t, err, "the same report again is a no-op")
+	changed := body
+	changed.Artifacts = append([]apigen.TxeArtifactRecordInput(nil), body.Artifacts...)
+	changed.Artifacts[0].Bytes = new(int64(12))
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &changed})
+	requireStatus(t, err, http.StatusConflict)
+
+	got, err := a.GetTxeRunArtifacts(ctx, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeArtifactStatusPendingUpload, got.(apigen.GetTxeRunArtifacts200JSONResponse).Artifacts[0].Status,
+		"a run the hub does not know is left unchecked, not failed")
+	job, err := a.GetTxeJob(ctx, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	exceptions := job.(apigen.GetTxeJob200JSONResponse).Exceptions
+	require.NotNil(t, exceptions)
+	var kinds []string
+	for _, e := range *exceptions {
+		kinds = append(kinds, e.Kind)
+	}
+	assert.Equal(t, []string{"deliverable_missing"}, kinds)
 }

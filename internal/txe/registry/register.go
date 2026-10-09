@@ -124,6 +124,9 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 			}
 		}
 	}
+	if err := checkDeliverables(v.ExpectedOutcome.Deliverables); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i, a := range v.ReviewPolicy.PermittedActions {
 		if a.Name == "" || seen[a.Name] {
