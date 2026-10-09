@@ -392,6 +392,40 @@ func TestClientDispatch(t *testing.T) {
 		assert.Equal(t, int32(1), calls.Load(), "a refused conditional retry is not dispatched again")
 	})
 
+	t.Run("ConditionalRetryIsSentOnce", func(t *testing.T) {
+		t.Parallel()
+
+		config := coordinator.DefaultConfig()
+		config.MaxRetries = 3
+		config.RetryInterval = time.Millisecond
+		config.RequestTimeout = 100 * time.Millisecond
+
+		var calls atomic.Int32
+		failing := func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+			calls.Add(1)
+			// The coordinator may have created and dispatched the retry
+			// before this error reached the client.
+			return nil, status.Error(codes.Unavailable, "connection reset")
+		}
+		s1, a1 := startMockServer(t, &mockCoordinatorService{dispatchFunc: failing})
+		defer s1.Stop()
+		s2, a2 := startMockServer(t, &mockCoordinatorService{dispatchFunc: failing})
+		defer s2.Stop()
+		h1, p1 := parseHostPort(a1)
+		h2, p2 := parseHostPort(a2)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: h1, Port: p1, Status: serviceregistry.ServiceStatusActive},
+			{ID: "coord-2", Host: h2, Port: p2, Status: serviceregistry.ServiceStatusActive},
+		}}
+
+		err := coordinator.New(monitor, config).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag", RequireLatestIsPrevious: true},
+		})
+		require.ErrorIs(t, err, coordinator.ErrDispatchUncertain)
+		require.NotErrorIs(t, err, persis.ErrLatestExecutionChanged, "an unknown outcome is not reported as a refusal")
+		assert.Equal(t, int32(1), calls.Load(), "sent once, to one coordinator, never again")
+	})
+
 	t.Run("InvalidDefinitionReturnsDefinitionError", func(t *testing.T) {
 		t.Parallel()
 
