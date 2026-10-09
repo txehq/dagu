@@ -392,6 +392,28 @@ func TestClientDispatch(t *testing.T) {
 		assert.Equal(t, int32(1), calls.Load(), "a refused conditional retry is not dispatched again")
 	})
 
+	t.Run("AdmittedExecutionIsReturned", func(t *testing.T) {
+		t.Parallel()
+
+		mockCoord := &mockCoordinatorService{
+			dispatchFunc: func(_ context.Context, _ *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+				return &coordinatorv1.DispatchResponse{AttemptId: "attempt-2", QueuedAt: "q1"}, nil
+			},
+		}
+		server, addr := startMockServer(t, mockCoord)
+		defer server.Stop()
+		host, port := parseHostPort(addr)
+		monitor := &mockServiceMonitor{members: []serviceregistry.HostInfo{
+			{ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+		}}
+		admitted := &dispatch.AdmittedExecution{}
+		err := coordinator.New(monitor, coordinator.DefaultConfig()).Dispatch(context.Background(), dispatch.DispatchRequest{
+			Task: &dispatch.DispatchTask{DAGRunID: "run-123", Target: "test-dag", RequireLatestIsPrevious: true}, Admitted: admitted,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, dispatch.AdmittedExecution{AttemptID: "attempt-2", QueuedAt: "q1"}, *admitted)
+	})
+
 	t.Run("ConditionalRetryIsSentOnce", func(t *testing.T) {
 		t.Parallel()
 

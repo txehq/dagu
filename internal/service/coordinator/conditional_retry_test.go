@@ -153,3 +153,24 @@ func TestDispatchConditionalRetryRefusesARaceBeforeCreation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, count, "nothing was dispatched")
 }
+
+// A dispatch names the attempt it prepared and the queued-at that attempt's
+// statuses will carry: a direct retry keeps the retried status's queued-at
+// (the run was queued before), and a run never queued has none.
+func TestAdmittedResponseNamesTheSavedExecution(t *testing.T) {
+	attempt := &testutil.MockAttempt{}
+	attempt.On("ID").Return("attempt-2")
+	prepared := &preparedDispatchAttempt{attempt: attempt}
+	task := func(queuedAt string) *coordinatorv1.Task {
+		prev, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{Name: "d", DAGRunID: "r", AttemptID: "attempt-1", Status: ir.Failed, QueuedAt: queuedAt})
+		require.NoError(t, err)
+		return &coordinatorv1.Task{Operation: coordinatorv1.Operation_OPERATION_RETRY, PreviousStatus: prev}
+	}
+	got := admittedResponse(task("2026-10-09T12:00:00Z"), prepared)
+	assert.Equal(t, "attempt-2", got.GetAttemptId())
+	assert.Equal(t, "2026-10-09T12:00:00Z", got.GetQueuedAt(), "a direct retry of a queued run keeps its queued-at")
+	got = admittedResponse(task(""), prepared)
+	assert.Equal(t, "attempt-2", got.GetAttemptId())
+	assert.Empty(t, got.GetQueuedAt(), "never queued")
+	assert.Empty(t, admittedResponse(task(""), nil).GetAttemptId(), "nothing prepared, nothing named")
+}

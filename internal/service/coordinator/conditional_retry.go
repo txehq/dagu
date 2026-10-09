@@ -30,3 +30,20 @@ func expectedLatest(task *coordinatorv1.Task) (*persis.ExpectedExecution, error)
 	}
 	return &persis.ExpectedExecution{AttemptID: prev.AttemptID, QueuedAt: prev.QueuedAt}, nil
 }
+
+// admittedResponse names the execution a dispatch admitted: the prepared
+// attempt and the queued-at its statuses will carry, which is what the
+// registry and the publisher read back. A worker's statuses carry the
+// retried status's queued-at (a direct retry of a queued run inherits it),
+// else the task's own marker, empty here. Without a prepared attempt the
+// response names nothing.
+func admittedResponse(task *coordinatorv1.Task, prepared *preparedDispatchAttempt) *coordinatorv1.DispatchResponse {
+	if prepared == nil || prepared.attempt == nil {
+		return &coordinatorv1.DispatchResponse{}
+	}
+	queuedAt := ""
+	if prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus); err == nil && prev != nil {
+		queuedAt = prev.QueuedAt
+	}
+	return &coordinatorv1.DispatchResponse{AttemptId: prepared.attempt.ID(), QueuedAt: queuedAt}
+}

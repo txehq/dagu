@@ -292,7 +292,8 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 			defer cancel()
 
 			// Try to dispatch
-			if _, err := client.client.Dispatch(dispatchCtx, protoReq); err != nil {
+			resp, err := client.client.Dispatch(dispatchCtx, protoReq)
+			if err != nil {
 				logger.Warn(ctx, "Failed to dispatch task to coordinator",
 					tag.RunID(task.DAGRunID),
 					tag.Target(task.Target),
@@ -333,6 +334,9 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 				return wrapped
 			}
 
+			if req.Admitted != nil {
+				req.Admitted.AttemptID, req.Admitted.QueuedAt = resp.GetAttemptId(), resp.GetQueuedAt()
+			}
 			logger.Info(ctx, "Task dispatched successfully",
 				tag.RunID(task.DAGRunID),
 				tag.Target(task.Target),

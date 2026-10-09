@@ -2995,15 +2995,22 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.retryDAGRun(ctx, request.Name, request.DagRunId, retryDagRunID, stepName, subDAGRunID, includeDownstream, bypassPreconditions, expect); err != nil {
+	result, err := a.retryDAGRun(ctx, request.Name, request.DagRunId, retryDagRunID, stepName, subDAGRunID, includeDownstream, bypassPreconditions, expect)
+	if err != nil {
 		return nil, err
 	}
-
-	return api.RetryDAGRun200Response{}, nil
+	out := api.RetryDAGRun200JSONResponse{}
+	if ad := result.admitted; ad != nil && ad.AttemptID != "" {
+		ref := ir.ExecutionRef(ad.AttemptID, ad.QueuedAt)
+		out.AttemptId, out.QueuedAt, out.ExecutionRef = &ad.AttemptID, &ad.QueuedAt, &ref
+	}
+	return out, nil
 }
 
 type retryDAGRunResult struct {
 	queued bool
+	// admitted is the execution a conditional retry admitted, when known.
+	admitted *persis.ExpectedExecution
 }
 
 func (a *API) resolveAttemptForDAGRun(
@@ -3138,11 +3145,15 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	// For DAGs using a global queue, enqueue the retry so it respects queue capacity.
 	// Step retry is not supported via queue (queue processor does not pass step name).
 	if stepName == "" && a.config.FindQueueConfig(dag.ProcGroup()) != nil {
-		if err := a.enqueueRetry(ctx, prevStatus, dag, expect); err != nil {
+		var admitted *persis.ExpectedExecution
+		if expect != nil {
+			admitted = &persis.ExpectedExecution{}
+		}
+		if err := a.enqueueRetry(ctx, prevStatus, dag, expect, admitted); err != nil {
 			return retryDAGRunResult{}, err
 		}
 		a.logRetryAudit(ctx, dagName, sourceDagRunID, auditStepName, includeDownstream, false, false)
-		return retryDAGRunResult{queued: true}, nil
+		return retryDAGRunResult{queued: true, admitted: admitted}, nil
 	}
 
 	// Check if this DAG should be dispatched to the coordinator for distributed execution
@@ -3198,7 +3209,11 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 			opts...,
 		)
 
-		if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
+		var admitted *dispatch.AdmittedExecution
+		if expect != nil {
+			admitted = &dispatch.AdmittedExecution{}
+		}
+		if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task, Admitted: admitted}); err != nil {
 			if expect != nil && errors.Is(err, persis.ErrLatestExecutionChanged) {
 				return retryDAGRunResult{}, executionChangedError(expect, nil)
 			}
@@ -3212,6 +3227,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		}
 
 		a.logRetryAudit(ctx, dagName, sourceDagRunID, auditStepName, includeDownstream, bypassPreconditions, true)
+		if admitted != nil {
+			return retryDAGRunResult{admitted: &persis.ExpectedExecution{AttemptID: admitted.AttemptID, QueuedAt: admitted.QueuedAt}}, nil
+		}
 		return retryDAGRunResult{}, nil
 	}
 
@@ -3266,9 +3284,9 @@ func retryPathRequestError(err error) error {
 // enqueueRetry queues the validated attempt only if its status still matches.
 // Retries respect global queue capacity because the queue processor picks them up
 // when capacity is available.
-func (a *API) enqueueRetry(ctx context.Context, status *ir.DAGRunStatus, dag *ir.DAG, expect *persis.ExpectedExecution) error {
+func (a *API) enqueueRetry(ctx context.Context, status *ir.DAGRunStatus, dag *ir.DAG, expect, admitted *persis.ExpectedExecution) error {
 	eventCtx := a.withEventContext(ctx)
-	opts := queue.EnqueueRetryOptions{Processes: a.procRepository}
+	opts := queue.EnqueueRetryOptions{Processes: a.procRepository, Admitted: admitted}
 	if actor := triggerActorFromContext(ctx); actor != "" {
 		opts.TriggerActor = &actor
 	}

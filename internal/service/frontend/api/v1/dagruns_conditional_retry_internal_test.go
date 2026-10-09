@@ -198,3 +198,61 @@ func TestConditionalRetryUnknownDispatchOutcome(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, apiErr.HTTPStatus)
 	assert.Equal(t, "dispatch_uncertain", apiErr.Details["code"])
 }
+
+// admittingRecorder is a coordinator that admits a new attempt and names it.
+type admittingRecorder struct {
+	retryCoordinatorRecorder
+	admit dispatch.AdmittedExecution
+}
+
+func (c *admittingRecorder) Dispatch(ctx context.Context, req dispatch.DispatchRequest) error {
+	if req.Admitted != nil {
+		*req.Admitted = c.admit
+	}
+	return c.retryCoordinatorRecorder.Dispatch(ctx, req)
+}
+
+// The 200 of a conditional retry names exactly the execution it admitted:
+// the queued execution on the queued path, the coordinator's new attempt on
+// the distributed path; its executionRef is derived from both as run details
+// derive it.
+func TestConditionalRetryNamesTheAdmittedExecution(t *testing.T) {
+	t.Run("queued", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, true, false)
+		resp, err := f.api.RetryDAGRun(context.Background(), openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1", ExpectedAttemptId: &f.attempt, ExpectedQueuedAt: ptrOf("q1")}})
+		require.NoError(t, err)
+		body := resp.(openapiv1.RetryDAGRun200JSONResponse)
+		a, err := f.runs.FindAttempt(context.Background(), ir.NewDAGRunRef(f.dag.Name, "run-1"))
+		require.NoError(t, err)
+		st, err := a.ReadStatus(context.Background())
+		require.NoError(t, err)
+		require.NotNil(t, body.AttemptId)
+		assert.Equal(t, st.AttemptID, *body.AttemptId)
+		assert.Equal(t, st.QueuedAt, *body.QueuedAt, "the queued execution's own marker")
+		assert.NotEqual(t, "q1", *body.QueuedAt)
+		assert.Equal(t, ir.ExecutionRef(st.AttemptID, st.QueuedAt), *body.ExecutionRef)
+	})
+	t.Run("distributed", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, false, false)
+		rec := &admittingRecorder{admit: dispatch.AdmittedExecution{AttemptID: "attempt-2", QueuedAt: "q1"}}
+		f.api.coordinatorCli = rec
+		resp, err := f.api.RetryDAGRun(context.Background(), openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1", ExpectedAttemptId: &f.attempt, ExpectedQueuedAt: ptrOf("q1")}})
+		require.NoError(t, err)
+		body := resp.(openapiv1.RetryDAGRun200JSONResponse)
+		require.NotNil(t, body.AttemptId)
+		assert.Equal(t, "attempt-2", *body.AttemptId)
+		assert.Equal(t, "q1", *body.QueuedAt, "a direct retry keeps the retried status's queued-at")
+		assert.Equal(t, ir.ExecutionRef("attempt-2", "q1"), *body.ExecutionRef)
+	})
+	t.Run("unconditional requests name nothing", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, false, false)
+		resp, err := f.api.RetryDAGRun(context.Background(), openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1"}})
+		require.NoError(t, err)
+		body := resp.(openapiv1.RetryDAGRun200JSONResponse)
+		assert.Nil(t, body.AttemptId)
+	})
+}
+
