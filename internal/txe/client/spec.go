@@ -15,6 +15,7 @@ import (
 	"github.com/goccy/go-yaml"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
 // SpecSchema is the version of the job spec file format.
@@ -180,6 +181,28 @@ func CheckDeliverablePath(path string) error {
 	return nil
 }
 
+// checkTarget says whether a target can be observed the way it asks to be.
+// A target checked before every run, or by the machine's periodic check, is
+// observed by a probe on this machine: its kind, identity and name must be
+// ones a probe understands, and the job must declare the credential
+// reference the probe reads. A job with a target nothing could observe would
+// be stopped before every run. The rules are the probes' own
+// (internal/txe/target); an event_only target is observed by no probe.
+func checkTarget(t Target, refs []txepkg.CredentialRef) error {
+	switch t.ExistenceCheck {
+	case "", target.CheckPreRun, target.CheckReconcile, target.CheckEventOnly:
+	default:
+		return fmt.Errorf("existence_check %q must be %s, %s or %s", t.ExistenceCheck, target.CheckPreRun, target.CheckReconcile, target.CheckEventOnly)
+	}
+	declared := make([]target.CredentialRef, len(refs))
+	for i, ref := range refs {
+		declared[i] = target.CredentialRef{Name: ref.Name, Kind: ref.Kind, Locator: ref.Locator}
+	}
+	return target.Validate(target.Target{
+		Kind: t.Kind, Environment: t.Environment, StableID: t.StableID, DisplayName: t.DisplayName,
+	}, t.ExistenceCheck, declared)
+}
+
 // Validate checks that the spec carries the context a job needs to outlive
 // its creating session. It reports every problem at once.
 func (s *JobSpec) Validate() error {
@@ -205,6 +228,9 @@ func (s *JobSpec) Validate() error {
 			"targets[%d].stable_id is required: an identity that does not change when a resource is renamed or recreated, such as a UID", i)
 		for key, value := range t.StableID {
 			need(key != "" && value != "", "targets[%d].stable_id has an empty key or value", i)
+		}
+		if err := checkTarget(t, s.CredentialRefs); err != nil {
+			need(false, "targets[%d]: %v", i, err)
 		}
 	}
 

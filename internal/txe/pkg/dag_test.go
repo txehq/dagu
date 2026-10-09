@@ -35,6 +35,11 @@ func testDAGSpec() DAGSpec {
 		CredentialRefs: []CredentialRef{
 			{Name: "LINEAR_API_KEY", Kind: CredentialFile, Locator: "/Users/x/.config/txe/linear-token"},
 		},
+		CLI: CLI{
+			Dagu:       "/Users/x/.local/share/txe-dagu/bin/dagu",
+			StoreFlags: []string{"--dagu-home", "/Users/x/.local/share/txe-dagu/client"},
+			HomeRoot:   "/Users/x/.local/share/txe-dagu",
+		},
 	}
 }
 
@@ -64,6 +69,7 @@ env:
   - TXE_ATTEMPT_ID: "${context.attempt.id}"
   - TXE_QUEUED_AT: "${context.attempt.queued_at}"
   - TXE_RUN_OUTPUT_DIR: "/Users/x/.local/share/txe-dagu/outputs/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X/runs/${DAG_RUN_ID}/attempts/${context.attempt.id}"
+  - TXE_DAGU_HOME: "/Users/x/.local/share/txe-dagu"
   - MAX_AGE_SEC: "600"
   - TARGET_ID: "vol-uid-1"
 secrets:
@@ -72,7 +78,9 @@ secrets:
     key: "/Users/x/.config/txe/linear-token"
 steps:
   - name: run
-    command: "./check.sh --label 'it'\\''s a test'"
+    command:
+      - "/Users/x/.local/share/txe-dagu/bin/dagu txe resource check --job job_01K7A5ZQ8M3N4P5R6S7T8V9W0X --job-version 2 --machine mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C --dagu-home /Users/x/.local/share/txe-dagu/client"
+      - "./check.sh --label 'it'\\''s a test'"
     retry_policy:
       limit: 2
       interval_sec: 30
@@ -156,11 +164,7 @@ func TestRenderDAGHasNoOutputRedirect(t *testing.T) {
 // native artifact directory only when a deliverable goes to the hub.
 func TestRenderDAGPublishStep(t *testing.T) {
 	s := testDAGSpec()
-	s.Publish = &Publish{
-		Command:      []string{"/Users/x/.local/share/txe-dagu/bin/dagu", "txe", "artifacts", "publish", "--dagu-home", "/Users/x/.local/share/txe-dagu/client"},
-		HomeRoot:     "/Users/x/.local/share/txe-dagu",
-		HubArtifacts: true,
-	}
+	s.Publish = &Publish{HubArtifacts: true}
 	data, err := RenderDAG(s)
 	require.NoError(t, err)
 	text := string(data)
@@ -168,11 +172,13 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	assert.Contains(t, text, `  - TXE_DAGU_HOME: "/Users/x/.local/share/txe-dagu"`)
 	assert.Contains(t, text, "  - name: publish\n    command: \"/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts publish --dagu-home /Users/x/.local/share/txe-dagu/client\"\n")
 
-	// The job's command runs between begin and seal, in one step: a failed
-	// command stops the step, so the attempt is sealed only if the job's
-	// command succeeded, and a retry of the step runs all three again.
+	// The job's command runs after the resource check and between begin and
+	// seal, in one step: a failed command stops the step, so the job does
+	// not run unchecked, its outputs are sealed only if it succeeded, and a
+	// retry of the step runs all four again.
 	assert.Contains(t, text, `  - name: run
     command:
+      - "/Users/x/.local/share/txe-dagu/bin/dagu txe resource check --job job_01K7A5ZQ8M3N4P5R6S7T8V9W0X --job-version 2 --machine mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C --dagu-home /Users/x/.local/share/txe-dagu/client"
       - "/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts begin --dagu-home /Users/x/.local/share/txe-dagu/client"
       - "./check.sh --label 'it'\\''s a test'"
       - "/Users/x/.local/share/txe-dagu/bin/dagu txe artifacts seal --dagu-home /Users/x/.local/share/txe-dagu/client"
@@ -182,11 +188,13 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
 	require.NoError(t, err)
 	require.Len(t, dag.Steps, 2)
-	require.Len(t, dag.Steps[0].Commands, 3)
+	require.Len(t, dag.Steps[0].Commands, 4)
 	home := []string{"--dagu-home", "/Users/x/.local/share/txe-dagu/client"}
-	assert.Equal(t, append([]string{"txe", "artifacts", "begin"}, home...), dag.Steps[0].Commands[0].Args)
-	assert.Equal(t, "./check.sh", dag.Steps[0].Commands[1].Command)
-	assert.Equal(t, append([]string{"txe", "artifacts", "seal"}, home...), dag.Steps[0].Commands[2].Args)
+	assert.Equal(t, append([]string{"txe", "resource", "check", "--job", s.JobID, "--job-version", "2", "--machine", s.MachineID}, home...),
+		dag.Steps[0].Commands[0].Args)
+	assert.Equal(t, append([]string{"txe", "artifacts", "begin"}, home...), dag.Steps[0].Commands[1].Args)
+	assert.Equal(t, "./check.sh", dag.Steps[0].Commands[2].Command)
+	assert.Equal(t, append([]string{"txe", "artifacts", "seal"}, home...), dag.Steps[0].Commands[3].Args)
 	assert.Equal(t, "publish", dag.Steps[1].Name)
 	require.Len(t, dag.Steps[1].Commands, 1)
 	// The publish step waits for the job's step: the DAG is a chain, and the
@@ -204,13 +212,33 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "artifacts:")
 
-	s.Publish.Command = []string{"dagu", "txe", "artifacts", "publish"}
-	_, err = RenderDAG(s)
-	require.ErrorContains(t, err, "absolute path of the dagu binary")
+}
 
-	s.Publish.Command = []string{"/usr/local/bin/dagu", "txe", "artifacts"}
+// Every job's DAG calls dagu before the job runs, so every job needs the
+// binary, the store flags and the TXE home spelled out.
+func TestRenderDAGNeedsTheCLI(t *testing.T) {
+	s := testDAGSpec()
+	s.CLI.Dagu = "dagu"
+	_, err := RenderDAG(s)
+	require.ErrorContains(t, err, "must be an absolute path")
+
+	s = testDAGSpec()
+	s.CLI.HomeRoot = ""
 	_, err = RenderDAG(s)
-	require.ErrorContains(t, err, `must be "txe artifacts publish"`)
+	require.ErrorContains(t, err, "TXE home")
+
+	// A job without deliverables has the check and its own command, and
+	// nothing that seals or publishes.
+	s = testDAGSpec()
+	data, err := RenderDAG(s)
+	require.NoError(t, err)
+	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
+	require.NoError(t, err)
+	require.Len(t, dag.Steps, 1)
+	require.Len(t, dag.Steps[0].Commands, 2)
+	assert.Equal(t, []string{"txe", "resource", "check"}, dag.Steps[0].Commands[0].Args[:3])
+	assert.Equal(t, "./check.sh", dag.Steps[0].Commands[1].Command)
+	assert.NotContains(t, string(data), "artifacts")
 }
 
 func TestRenderDAGRefusals(t *testing.T) {
