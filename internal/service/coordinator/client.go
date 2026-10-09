@@ -236,6 +236,11 @@ func New(registry serviceregistry.ServiceRegistry, config *Config) Client {
 }
 
 // Dispatch sends a task to the coordinator.
+// ErrDispatchUncertain is a conditional retry whose single dispatch call
+// failed without an authoritative refusal: the retry may or may not have
+// been created and dispatched.
+var ErrDispatchUncertain = errors.New("the conditional retry was sent once and its outcome is unknown")
+
 func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchRequest) error {
 	task := req.Task
 	if task == nil {
@@ -314,6 +319,14 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 					strings.Contains(st.Message(), persis.ErrLatestExecutionChanged.Error()) {
 					return backoff.PermanentError(fmt.Errorf("failed to dispatch task to coordinator %s: %w: %s",
 						member.ID, persis.ErrLatestExecutionChanged, st.Message()))
+				}
+
+				// A conditional retry is sent once: the coordinator may have
+				// created or dispatched it before this error, and a repeated call
+				// would be refused as if nothing had happened. Its outcome is
+				// unknown, and it is not retried here or on another coordinator.
+				if task.RequireLatestIsPrevious {
+					return backoff.PermanentError(fmt.Errorf("%w: %w", ErrDispatchUncertain, wrapped))
 				}
 
 				// Unavailable and other transient errors will be retried.

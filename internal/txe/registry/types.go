@@ -283,6 +283,9 @@ const (
 	AvailabilityWorkerOffline     AvailabilityState = "worker_offline"
 	AvailabilityAuthRequired      AvailabilityState = "auth_required"
 	AvailabilityTargetUnreachable AvailabilityState = "target_unreachable"
+	// AvailabilityTargetUnconfirmed: a target checked before each run could
+	// be neither confirmed nor denied (an unknown observation).
+	AvailabilityTargetUnconfirmed AvailabilityState = "target_unconfirmed"
 	AvailabilityStale             AvailabilityState = "stale"
 )
 
@@ -614,21 +617,23 @@ type Grant struct {
 // Action is a follow-up effect and its outcome. An action ID names one
 // intent; retries are attempts on the same record.
 type Action struct {
-	ActionID      string          `json:"action_id"`
-	Kind          ActionKind      `json:"kind"`
-	JobVersion    int             `json:"job_version"`
-	ReviewID      string          `json:"review_id,omitempty"`
-	ClaimID       string          `json:"claim_id,omitempty"`
-	ProposalID    string          `json:"proposal_id,omitempty"`
-	DecisionID    string          `json:"decision_id,omitempty"`
-	Spec          ActionSpec      `json:"spec"`
-	BindingDigest string          `json:"binding_digest"`
-	State         ActionState     `json:"state"`
-	Attempt       int             `json:"attempt"`
-	MaxAttempts   int             `json:"max_attempts"`
-	Grant         *Grant          `json:"grant,omitempty"`
-	Receipt       string          `json:"receipt,omitempty"`
-	Outcome       json.RawMessage `json:"outcome,omitempty"`
+	ActionID      string      `json:"action_id"`
+	Kind          ActionKind  `json:"kind"`
+	JobVersion    int         `json:"job_version"`
+	ReviewID      string      `json:"review_id,omitempty"`
+	ClaimID       string      `json:"claim_id,omitempty"`
+	ProposalID    string      `json:"proposal_id,omitempty"`
+	DecisionID    string      `json:"decision_id,omitempty"`
+	Spec          ActionSpec  `json:"spec"`
+	BindingDigest string      `json:"binding_digest"`
+	State         ActionState `json:"state"`
+	Attempt       int         `json:"attempt"`
+	MaxAttempts   int         `json:"max_attempts"`
+	// AttemptStartedAt is when the current attempt was granted.
+	AttemptStartedAt *time.Time      `json:"attempt_started_at,omitempty"`
+	Grant            *Grant          `json:"grant,omitempty"`
+	Receipt          string          `json:"receipt,omitempty"`
+	Outcome          json.RawMessage `json:"outcome,omitempty"`
 	// SettledUnderClaim is the claim whose holder recorded the outcome; it
 	// differs from ClaimID when a later claim reconciled the action.
 	SettledUnderClaim string `json:"settled_under_claim,omitempty"`
@@ -682,12 +687,19 @@ type Exception struct {
 	Kind        string `json:"kind"`
 	// Scope is "reviewer" for a problem with the job's reviewer, which never
 	// changes the job's own availability; empty for the job.
-	Scope      string            `json:"scope,omitempty"`
-	State      AvailabilityState `json:"state,omitempty"`
-	Detail     string            `json:"detail"`
-	Evidence   []string          `json:"evidence,omitempty"`
-	Created    Stamp             `json:"created"`
-	ResolvedAt *time.Time        `json:"resolved_at,omitempty"`
+	Scope string            `json:"scope,omitempty"`
+	State AvailabilityState `json:"state,omitempty"`
+	// Target is the key of the target whose observation opened it, if one
+	// did; a present observation of that target resolves it.
+	Target string `json:"target,omitempty"`
+	// ActionID and Attempt name the action attempt an action-scope
+	// exception is about; it is resolved when that attempt ends.
+	ActionID   string     `json:"action_id,omitempty"`
+	Attempt    int        `json:"attempt,omitempty"`
+	Detail     string     `json:"detail"`
+	Evidence   []string   `json:"evidence,omitempty"`
+	Created    Stamp      `json:"created"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
 
 // EventKind classifies a job history event.

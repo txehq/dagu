@@ -631,6 +631,7 @@ func (a *API) ObserveTxeJob(ctx context.Context, req api.ObserveTxeJobRequestObj
 	if body.Scope != nil {
 		o.Scope = string(*body.Scope)
 	}
+	o.ActionID, o.Attempt, o.ClaimID, o.Fence = valueOf(body.ActionId), valueOf(body.Attempt), valueOf(body.ClaimId), valueOf(body.Fence)
 	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Observe(o) })
 	return api.ObserveTxeJob200JSONResponse(job), err
 }
@@ -861,11 +862,26 @@ func (a *API) AuthorizeTxeEffect(ctx context.Context, req api.AuthorizeTxeEffect
 		effect.Routine = &registry.RoutineEffect{ReviewID: r.ReviewId, ClaimID: r.ClaimId, Fence: r.Fence, Spec: spec}
 	}
 	var g *registry.Grant
+	staleRetry := false
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
 		var err error
 		g, err = tx.Authorize(effect)
+		// Reached only once the caller may write the job: an approved
+		// effect refused because its run no longer binds.
+		staleRetry = effect.Approved != nil && registry.ErrorCode(err) == registry.CodeStaleBinding
 		return err
 	}); err != nil {
+		if staleRetry {
+			// A decided retry whose run moved on can never be authorized: end
+			// such retries (the caller's write permission is checked again),
+			// so they leave the decision queue, and return the refusal.
+			if _, eerr := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+				_, err := tx.EndMovedOnRetries()
+				return err
+			}); eerr != nil {
+				logger.Warn(ctx, "Failed to end retries whose run moved on", tag.Error(eerr))
+			}
+		}
 		return nil, err
 	}
 	out, err := txeConvert[api.TxeGrant](g)
@@ -1064,15 +1080,11 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	return api.RecordTxeResourceEvent200JSONResponse(out), err
 }
 
-func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEventRequestObject) (api.GetTxeResourceEventResponseObject, error) {
-	s, err := a.txeStore()
-	if err != nil {
-		return nil, err
-	}
-	ev, err := s.GetResourceEvent(ctx, req.EventId)
-	if err != nil {
-		return nil, txeError(err)
-	}
+// txeShowResourceEvent keeps only the parts of ev about jobs the caller can
+// see, and reports whether the caller may see the event at all: the target
+// and evidence are shown only to the reporter or to someone who can see a
+// job the event affected.
+func (a *API) txeShowResourceEvent(ctx context.Context, s *registry.Store, ev *registry.ResourceEvent) bool {
 	canSee := func(jobID string) bool {
 		_, err := a.txeVisibleJob(ctx, s, jobID)
 		return err == nil
@@ -1098,9 +1110,53 @@ func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEve
 		}
 	}
 	ev.Failures = failures
-	// The target and evidence are shown only to the reporter or to someone
-	// who can see a job the event affected.
-	if user, ok := auth.UserFromContext(ctx); a.authService != nil && len(visible)+len(pending) == 0 && (!ok || user.Username != ev.Reporter.ID) {
+	user, ok := auth.UserFromContext(ctx)
+	return a.authService == nil || len(visible)+len(pending) > 0 || (ok && user.Username == ev.Reporter.ID)
+}
+
+func (a *API) ListTxeResourceEvents(ctx context.Context, req api.ListTxeResourceEventsRequestObject) (api.ListTxeResourceEventsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if req.Params.Complete {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: "only incomplete events can be listed (complete=false)"}
+	}
+	limit := 50
+	if req.Params.Limit != nil {
+		limit = *req.Params.Limit
+	}
+	if limit < 1 || limit > 200 {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: "limit must be between 1 and 200"}
+	}
+	// Visibility decides the page, so neither the events nor the cursor
+	// name an event the caller may not see.
+	events, next, err := s.IncompleteResourceEvents(ctx, valueOf(req.Params.ReporterMachineId), valueOf(req.Params.After), limit,
+		func(ev *registry.ResourceEvent) bool { return a.txeShowResourceEvent(ctx, s, ev) })
+	if err != nil {
+		return nil, txeError(err)
+	}
+	out, err := txeConvert[[]api.TxeResourceEvent](events)
+	if out == nil {
+		out = []api.TxeResourceEvent{}
+	}
+	resp := api.ListTxeResourceEvents200JSONResponse{Events: out}
+	if next != "" {
+		resp.NextCursor = &next
+	}
+	return resp, err
+}
+
+func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEventRequestObject) (api.GetTxeResourceEventResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	ev, err := s.GetResourceEvent(ctx, req.EventId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	if !a.txeShowResourceEvent(ctx, s, ev) {
 		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "resource event " + req.EventId + " not found"})
 	}
 	out, err := txeConvert[api.TxeResourceEvent](ev)

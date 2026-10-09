@@ -55,6 +55,10 @@ type conditionalRetryFixture struct {
 }
 
 func newConditionalRetryFixture(t *testing.T, queued, racing bool) *conditionalRetryFixture {
+	return newConditionalRetryFixtureIn(t, queued, racing, ir.Failed)
+}
+
+func newConditionalRetryFixtureIn(t *testing.T, queued, racing bool, st ir.Status) *conditionalRetryFixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -68,7 +72,7 @@ func newConditionalRetryFixture(t *testing.T, queued, racing bool) *conditionalR
 	attempt, err := runs.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
 	require.NoError(t, err)
 	status := ir.InitialStatus(dag)
-	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", attempt.ID(), ir.Failed, "q1"
+	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", attempt.ID(), st, "q1"
 	require.NoError(t, attempt.Open(ctx))
 	require.NoError(t, attempt.Write(ctx, status))
 	require.NoError(t, attempt.Close(ctx))
@@ -163,4 +167,34 @@ func TestConditionalRetryRefusals(t *testing.T) {
 	var apiErr *Error
 	require.True(t, errors.As(err, &apiErr))
 	assert.Equal(t, http.StatusBadRequest, apiErr.HTTPStatus, "both fields or neither")
+}
+
+// A conditional retry needs the expected execution to have finished: a
+// matching execution that has not is refused the same way, on both paths,
+// and nothing is queued or dispatched.
+func TestConditionalRetryNeedsAFinishedExecution(t *testing.T) {
+	for _, st := range []ir.Status{ir.NotStarted, ir.Queued, ir.Running, ir.Waiting} {
+		for _, queued := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s queued=%v", st, queued), func(t *testing.T) {
+				f := newConditionalRetryFixtureIn(t, queued, false, st)
+				requireConflictCode(t, f.retry(f.attempt, "q1"), "execution_changed")
+				items, err := f.queue.List(context.Background(), f.dag.Name)
+				require.NoError(t, err)
+				assert.Empty(t, items)
+				assert.Empty(t, f.recorder.dispatched)
+			})
+		}
+	}
+}
+
+// A dispatch failure that is not the coordinator's refusal leaves the
+// outcome unknown, and says so.
+func TestConditionalRetryUnknownDispatchOutcome(t *testing.T) {
+	f := newConditionalRetryFixture(t, false, false)
+	f.recorder.dispatchErr = errors.New("connection reset after the request was sent")
+	err := f.retry(f.attempt, "q1")
+	var apiErr *Error
+	require.True(t, errors.As(err, &apiErr), "%v", err)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.HTTPStatus)
+	assert.Equal(t, "dispatch_uncertain", apiErr.Details["code"])
 }
