@@ -245,6 +245,9 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 			return nil, s.markDuplicate(ctx, in.JobID, winner.JobID, by)
 		}
 	}
+	if err := s.indexTargets(ctx, in.JobID, in.Version.Targets); err != nil {
+		return nil, err
+	}
 	if job.Registration.State == RegistrationIncomplete {
 		if err := s.publishCurrent(ctx, in.JobID); err != nil {
 			return nil, err
@@ -588,6 +591,9 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 		return tx.event(Event{Kind: EventVersion, From: fmt.Sprint(from), To: fmt.Sprint(nv.Version), Affected: affected})
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.indexTargets(ctx, jobID, v.Targets); err != nil {
 		return nil, err
 	}
 	if err := s.publishCurrent(ctx, jobID); err != nil {

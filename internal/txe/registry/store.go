@@ -71,6 +71,7 @@ type DAGStore interface {
 type Store struct {
 	col  persis.Collection
 	dags DAGStore
+	runs RunControl
 	now  func() time.Time
 	// dagLocks serializes DAG publication per job in this process; lockDir,
 	// when set, extends that across processes sharing the data directory.
