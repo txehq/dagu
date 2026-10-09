@@ -51,7 +51,25 @@ var (
 	// carry shell syntax into the rendered command.
 	wordPattern     = regexp.MustCompile(`^[A-Za-z0-9_./=:@+-]+$`)
 	schedulePattern = regexp.MustCompile(`^[0-9*/,\- ]+$`)
+	// secretPattern matches names and values that look like credentials.
+	// The rendered DAG is stored on the hub in plain text, so only
+	// references and paths may enter it; a caller's mistake fails closed.
+	secretPattern = regexp.MustCompile(`(?i)token|secret|passw|credential|api[_-]?key|bearer`)
+	// keyPrefixPattern matches values that start like a known API key.
+	keyPrefixPattern = regexp.MustCompile(`(?i)^(dagu_|lin_api_|(sk|ghp|gho|xox[abp])[-_])`)
+	// pathPattern is a plain absolute or home-relative path.
+	pathPattern = regexp.MustCompile(`^[A-Za-z0-9_./~-]+$`)
 )
+
+// looksSecret reports whether a value could be a credential rather than a
+// path or a plain word: a credential-like word, a known key prefix, or a
+// long run without separators.
+func looksSecret(s string) bool {
+	if secretPattern.MatchString(s) || keyPrefixPattern.MatchString(s) {
+		return true
+	}
+	return len(s) >= 32 && !strings.ContainsAny(s, "/.")
+}
 
 const reconcileTemplate = `# Periodic target reconciliation for TXE jobs on machine {{.MachineID}}.
 # Rendered by probe.RenderReconcileDAG; do not edit the installed copy.
@@ -94,6 +112,9 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 		if !wordPattern.MatchString(f) {
 			return "", nil, fmt.Errorf("probe: store flag %q must be a plain word", f)
 		}
+		if looksSecret(f) {
+			return "", nil, fmt.Errorf("probe: store flag %q looks like a credential; only references may enter the DAG", f)
+		}
 	}
 	schedule := cfg.Schedule
 	if schedule == "" {
@@ -113,6 +134,9 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 	for name, value := range cfg.Env {
 		if !envNamePattern.MatchString(name) {
 			return "", nil, fmt.Errorf("probe: env name %q is not an environment variable name", name)
+		}
+		if secretPattern.MatchString(name) || looksSecret(value) || !pathPattern.MatchString(value) {
+			return "", nil, fmt.Errorf("probe: env %s must be a plain path, never a credential; the DAG is stored on the hub", name)
 		}
 		vars = append(vars, reconcileVar{name, value})
 	}

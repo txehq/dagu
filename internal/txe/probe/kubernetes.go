@@ -88,7 +88,7 @@ func (k Kubernetes) Probe(ctx context.Context, t Target, creds Credentials) Resu
 	}
 	cred, ok := creds.Lookup(KubernetesCredential)
 	if !ok || (cred.Path == "" && cred.Value == "") {
-		return noCredential(KubernetesCredential)
+		return noCredential(creds, KubernetesCredential)
 	}
 	contextName := ""
 	if c, ok := creds.Lookup(KubernetesContextCredential); ok {

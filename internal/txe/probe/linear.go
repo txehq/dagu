@@ -62,11 +62,11 @@ func (l Linear) Probe(ctx context.Context, t Target, creds Credentials) Result {
 	}
 	cred, ok := creds.Lookup(LinearCredential)
 	if !ok {
-		return noCredential(LinearCredential)
+		return noCredential(creds, LinearCredential)
 	}
 	key, err := credentialValue(cred)
 	if err != nil || key == "" {
-		return noCredential(LinearCredential)
+		return noCredential(creds, LinearCredential)
 	}
 	body, _ := json.Marshal(map[string]any{"query": linearIssueQuery, "variables": map[string]string{"id": id}})
 	endpoint := l.Endpoint
