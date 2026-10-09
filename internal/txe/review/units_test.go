@@ -596,6 +596,82 @@ func TestRunOpenerClosesWithASystemMarker(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A job is its machine's to review and to act on: its declared commands, its
+// package and its credentials are there. A reviewer on another machine that
+// is handed the job, by a decision run enqueued for the wrong machine or by
+// a mistaken call, claims nothing and runs nothing, even with a valid
+// decision by the owner.
+func TestAJobIsNeverReviewedOrActedOnFromAnotherMachine(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "failed")
+	prepared := f.prepare("reviewer-a")
+	f.apply("reviewer-a", prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "grow", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	proposal := f.state().Proposals[jobID][0]
+	decided, err := f.registry.Decide(jobID, proposal.ID, review.VerdictApprove, "", "connor")
+	require.NoError(t, err)
+	claims := len(f.state().Transitions)
+
+	elsewhere := f.reviewer("executor-on-another-machine")
+	elsewhere.MachineID = "mch_01HZX0000000000000000000ZZ"
+	out, err := elsewhere.Execute(context.Background(), jobID, proposal.ID, decided.ID)
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "not this one")
+	assert.Equal(t, 0, f.effects.count("expand_volume"), "the owner's approval is not carried out on another machine")
+	assert.Empty(t, f.state().Actions[jobID])
+
+	f.clock.Advance(2 * time.Hour)
+	other, err := elsewhere.Prepare(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipOtherMachine, other.Skipped)
+	assert.Len(t, f.state().Transitions, claims, "no claim was taken")
+
+	// On the job's own machine the same decision runs once.
+	out, err = f.reviewer("executor").Execute(context.Background(), jobID, proposal.ID, decided.ID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, 1, f.effects.count("expand_volume"))
+}
+
+// When a run has more steps than a packet carries, the steps that did not
+// succeed are the ones kept: a failure is never left out to make room for
+// steps that went well. The run is marked as shown on trimmed evidence, and
+// the review that covers it records that.
+func TestTrimmedEvidenceKeepsFailuresAndIsOnTheRecord(t *testing.T) {
+	f := newFixture(t)
+	steps := make([]review.StepEvidence, 0, 30)
+	for j := range 30 {
+		status := "succeeded"
+		if j == 1 || j == 4 {
+			status = "failed"
+		}
+		steps = append(steps, review.StepEvidence{Name: fmt.Sprintf("step-%02d", j), Status: status, Stderr: "out"})
+	}
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-1", Status: "failed", AttemptID: "att-1", Steps: steps}))
+	require.NoError(t, f.registry.AddRun(jobID, review.RunEvidence{RunID: "run-2", Status: "succeeded", AttemptID: "att-1", Steps: steps[:3]}))
+
+	prepared := f.prepare("reviewer-a")
+	run := prepared.Packet.NewRuns[0]
+	require.Len(t, run.Steps, 12)
+	var kept []string
+	for _, s := range run.Steps {
+		kept = append(kept, s.Name)
+	}
+	assert.Equal(t, []string{"step-01", "step-04"}, kept[:2], "the early failures are kept, in order")
+	assert.Equal(t, "step-29", kept[11], "the rest are the end of the run")
+	assert.True(t, run.EvidenceTrimmed)
+	assert.False(t, prepared.Packet.NewRuns[1].EvidenceTrimmed, "a run shown whole is not marked")
+	assert.True(t, prepared.Packet.EvidenceTrimmed)
+
+	f.apply("reviewer-a", prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "seen", EvidenceRunIDs: []string{"run-1"}})
+	recorded := f.state().Reviews[jobID][0]
+	first := "run-1@" + review.ExecutionRef("att-1", "")
+	assert.Contains(t, recorded.CoveredExecutions, first)
+	assert.Equal(t, []string{first}, recorded.TrimmedExecutions, "the record says which result was reviewed on part of its evidence")
+}
+
 // A job whose scripts print a lot cannot blow up the packet, and cannot use
 // volume to hide results either: runs that do not fit are left for the next
 // review instead of being covered without their output.
@@ -621,6 +697,7 @@ func TestPacketIsBoundedWithoutHidingEvidence(t *testing.T) {
 	for _, run := range packet.NewRuns {
 		require.Len(t, run.Steps, 12, "at most the last steps of a run are kept")
 		assert.Equal(t, "step-19", run.Steps[11].Name)
+		assert.True(t, run.EvidenceTrimmed, "and the run says its evidence was shortened")
 		assert.Len(t, run.Steps[11].Stdout, 2048, "a run in the packet keeps its step output")
 	}
 

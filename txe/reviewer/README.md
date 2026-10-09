@@ -58,6 +58,11 @@ else a review step needs must be rendered into the DAG:
 
 ## Bounds
 
+- Machine: a reviewer reviews and acts only on jobs registered on its own
+  machine (`--machine`). Handed a job of another machine, by a decision run
+  enqueued for the wrong machine or by a mistaken call, it claims nothing
+  and runs nothing, whatever decision exists: the job's commands, package
+  and credentials are that machine's.
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,
   plus one fenced claim per job in the registry.
 - Duration: a run timeout, a shorter agent step timeout, and a per-action
@@ -109,6 +114,12 @@ else a review step needs must be rendered into the DAG:
   returned that time, so the status of one execution is never paired with
   the output of another. No review names it, so the next review meets the
   run's latest execution.
+- Evidence that does not fit is shortened, never dropped silently: a run
+  with more than 12 steps keeps the steps that did not succeed first and
+  then its last ones, and step output is cut to its end only when one run
+  alone is too large. Such a run is marked `evidence_trimmed`, the agent is
+  told not to pass it on what it cannot see, and the review that covers it
+  records it in `trimmed_executions`.
 - Bounds: at most 50 runs per review, oldest first; the rest wait for the
   next one. No number of results, unfinished runs or queued runs stops a
   job's reviews.

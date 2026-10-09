@@ -215,6 +215,9 @@ type RunEvidence struct {
 	// this evidence is of.
 	AttemptID string `json:"attempt_id,omitempty"`
 	QueuedAt  string `json:"queued_at,omitempty"`
+	// EvidenceTrimmed is true when this run's evidence was shortened to fit
+	// the packet: steps left out, or step output cut to its end.
+	EvidenceTrimmed bool `json:"evidence_trimmed,omitempty"`
 	// Cursor is the checkpoint's run cursor once this run, and every run
 	// listed before it, has been covered, for a registry that keeps its
 	// place in the run history that way. A run without one is its own
@@ -407,6 +410,11 @@ type Review struct {
 	// the job's recorded reviews, are the record of what has been covered:
 	// a result is shown to a review until a recorded review names it.
 	CoveredExecutions []string `json:"covered_executions,omitempty"`
+	// TrimmedExecutions are the covered executions whose evidence had been
+	// shortened to fit when the review was shown them. They are covered,
+	// and the record says on what: a job cannot have a result reviewed on
+	// part of its evidence without that being on the record.
+	TrimmedExecutions []string `json:"trimmed_executions,omitempty"`
 	// RunCursor is the checkpoint's run cursor after this review.
 	RunCursor   string   `json:"run_cursor,omitempty"`
 	ActionIDs   []string `json:"action_ids,omitempty"`

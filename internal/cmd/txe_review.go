@@ -146,6 +146,7 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 		StateDir:    stateDir,
 		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
+			MachineID:   machine,
 			Registry:    &review.Remote{Transport: transport, MachineID: machine, RunID: runID, AgentClient: agentClient},
 			Effector:    &review.CommandEffector{},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(transport), Complete: review.RemoteComplete(transport)},

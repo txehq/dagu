@@ -75,6 +75,7 @@ func run(ctx context.Context, args []string) error {
 		AuthCheck:   strings.Fields(o.authCheck),
 		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
+			MachineID:   o.machine,
 			Registry:    reg,
 			Effector:    &review.CommandEffector{},
 			Opener:      &review.RunOpener{Enqueue: enqueue(o.dagu), Complete: complete(o.dagu)},
@@ -236,6 +237,7 @@ func runRemote(ctx context.Context, command string, o options, base string) erro
 		AuthCheck:   strings.Fields(o.authCheck),
 		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
+			MachineID:   o.machine,
 			Registry:    remote,
 			Effector:    &review.CommandEffector{},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(t), Complete: review.RemoteComplete(t)},

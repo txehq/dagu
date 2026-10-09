@@ -247,6 +247,7 @@ func newFixture(t *testing.T) *fixture {
 // reviewer returns a new Reviewer, as a fresh process would build one.
 func (f *fixture) reviewer(holder string) *review.Reviewer {
 	return &review.Reviewer{
+		MachineID:   fixtureJob().MachineID,
 		Registry:    f.registry,
 		Effector:    f.effects,
 		Opener:      f.opener,

@@ -113,6 +113,18 @@ func (p Packet) coveredExecutions() []string {
 	return out
 }
 
+// trimmedExecutions names the packet's runs whose evidence was shortened to
+// fit: steps left out, or step output cut to its end.
+func (p Packet) trimmedExecutions() []string {
+	var out []string
+	for _, r := range p.NewRuns {
+		if e := r.Execution(); r.EvidenceTrimmed && e.known() {
+			out = append(out, coveredKey(r.RunID, e.Ref()))
+		}
+	}
+	return out
+}
+
 // run returns the finished run with this id that the packet shows.
 func (p Packet) run(id string) (RunEvidence, bool) {
 	for _, r := range p.NewRuns {
@@ -152,9 +164,8 @@ func buildPacket(now time.Time, job Job, cp Checkpoint, runs []RunEvidence, deci
 	for _, r := range runs {
 		r.Outputs = truncateOutputs(r.Outputs)
 		if len(r.Steps) > maxRunSteps {
-			// The last steps of a run are where it ended.
-			r.Steps = r.Steps[len(r.Steps)-maxRunSteps:]
-			p.EvidenceTrimmed = true
+			r.Steps = boundSteps(r.Steps)
+			r.EvidenceTrimmed, p.EvidenceTrimmed = true, true
 		}
 		p.NewRuns = append(p.NewRuns, r)
 	}
@@ -248,11 +259,43 @@ func (p *Packet) trim() {
 		for i := range p.NewRuns {
 			for j := range p.NewRuns[i].Steps {
 				step := &p.NewRuns[i].Steps[j]
+				before := len(step.Stdout) + len(step.Stderr)
 				step.Stdout, step.Stderr = keepTail(step.Stdout, limit), keepTail(step.Stderr, limit)
+				if len(step.Stdout)+len(step.Stderr) != before {
+					p.NewRuns[i].EvidenceTrimmed = true
+				}
 			}
 		}
 	}
 }
+
+// boundSteps keeps at most maxRunSteps of a run's steps, in their order.
+// Steps that did not succeed are kept first, the latest of them if there
+// are too many: a failure is never the evidence that is left out to make
+// room for steps that went well. The rest are the last steps of the run,
+// which are where it ended.
+func boundSteps(steps []StepEvidence) []StepEvidence {
+	keep := make([]bool, len(steps))
+	left := maxRunSteps
+	for _, wantFailed := range []bool{true, false} {
+		for i := len(steps) - 1; i >= 0 && left > 0; i-- {
+			if !keep[i] && (steps[i].Status != stepSucceeded) == wantFailed {
+				keep[i] = true
+				left--
+			}
+		}
+	}
+	out := make([]StepEvidence, 0, maxRunSteps)
+	for i, step := range steps {
+		if keep[i] {
+			out = append(out, step)
+		}
+	}
+	return out
+}
+
+// stepSucceeded is the service's status of a step that went well.
+const stepSucceeded = "succeeded"
 
 // stepTailFloor is the least step output kept per stream when one run alone
 // exceeds the packet limit.

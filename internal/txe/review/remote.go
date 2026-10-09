@@ -809,6 +809,7 @@ type reviewDetail struct {
 	Handoff           LocalFile `json:"handoff,omitzero"`
 	RunCursor         string    `json:"run_cursor,omitempty"`
 	CoveredExecutions []string  `json:"covered_executions,omitempty"`
+	TrimmedExecutions []string  `json:"trimmed_executions,omitempty"`
 }
 
 // Review implements Registry.
@@ -829,7 +830,7 @@ func (r *Remote) Review(ctx context.Context, jobID, reviewID string) (Review, er
 		Reviewer: detail.Reviewer, AgentClient: deref(rev.AgentClientVersion), PacketBytes: int(deref(rev.PacketBytes)),
 		AgentInputTokens: int(deref(rev.AgentInputTokens)), AgentOutputTokens: int(deref(rev.AgentOutputTokens)),
 		PacketArtifact: deref(rev.PacketArtifact), DecisionArtifact: deref(rev.DecisionArtifact),
-		Handoff: detail.Handoff, RunCursor: detail.RunCursor, CoveredExecutions: detail.CoveredExecutions,
+		Handoff: detail.Handoff, RunCursor: detail.RunCursor, CoveredExecutions: detail.CoveredExecutions, TrimmedExecutions: detail.TrimmedExecutions,
 	}, nil
 }
 
@@ -1037,7 +1038,7 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 	detail := reviewDetail{
 		Episode: rev.Episode, CoveredRuns: rev.CoveredRuns, CoveredDecisions: rev.CoveredDecisions,
 		ActionIDs: rev.ActionIDs, ProposalIDs: rev.ProposalIDs, Notes: rev.Notes, Reviewer: rev.Reviewer,
-		Handoff: rev.Handoff, RunCursor: rev.RunCursor, CoveredExecutions: rev.CoveredExecutions,
+		Handoff: rev.Handoff, RunCursor: rev.RunCursor, CoveredExecutions: rev.CoveredExecutions, TrimmedExecutions: rev.TrimmedExecutions,
 	}
 	body := api.TxeReviewRequest{
 		Actor: r.actor(), ClaimId: claim.ID, Fence: int64(claim.Fence),

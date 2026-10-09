@@ -62,6 +62,12 @@ type Reviewer struct {
 	// usage for the decision being applied.
 	AgentInputTokens  int
 	AgentOutputTokens int
+	// MachineID is the machine this reviewer runs on. A job registered on
+	// another machine is never claimed, reviewed or acted on here: its
+	// declared commands, its package and its credentials are that
+	// machine's. Empty disables the check, which only a test harness with
+	// no machines should rely on.
+	MachineID string
 	// Runs reads and retries the job's runs for the reserved retry action;
 	// nil disables it.
 	Runs RunRetrier
@@ -93,10 +99,18 @@ type SkipReason string
 
 const (
 	SkipNotReviewable SkipReason = "lifecycle_not_reviewable"
-	SkipClaimHeld     SkipReason = "claim_held"
+	// SkipOtherMachine means the job is registered on another machine.
+	SkipOtherMachine SkipReason = "other_machine"
+	SkipClaimHeld    SkipReason = "claim_held"
 	// SkipUnreviewable means the job was raised as an exception instead.
 	SkipUnreviewable SkipReason = "unreviewable"
 )
+
+// onThisMachine reports whether the job is registered on the machine this
+// reviewer runs on.
+func (r *Reviewer) onThisMachine(job Job) bool {
+	return r.MachineID == "" || job.MachineID == r.MachineID
+}
 
 // Prepared is the hand-off from Prepare to the agent and to Apply.
 type Prepared struct {
@@ -115,6 +129,9 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	job, err := r.Registry.Job(ctx, jobID)
 	if err != nil {
 		return Prepared{}, fmt.Errorf("read job: %w", err)
+	}
+	if !r.onThisMachine(job) {
+		return Prepared{Skipped: SkipOtherMachine}, nil
 	}
 	if !job.Lifecycle.Reviewable() {
 		if err := r.settleTerminal(ctx, job); err != nil {
@@ -580,6 +597,7 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		EvidenceRuns:      decision.EvidenceRunIDs,
 		CoveredRuns:       packet.RunIDs(),
 		CoveredExecutions: packet.coveredExecutions(),
+		TrimmedExecutions: packet.trimmedExecutions(),
 		RunCursor:         prepared.RunCursor,
 		CoveredDecisions:  packet.DecisionIDs(),
 		Handoff:           r.Handoff,
@@ -1209,6 +1227,12 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 	job, err := r.Registry.Job(ctx, jobID)
 	if err != nil {
 		return Executed{}, fmt.Errorf("read job: %w", err)
+	}
+	if !r.onThisMachine(job) {
+		// A decision is valid wherever it is read, but its effect is the
+		// job's machine's to perform. Run here, the job's command would use
+		// this machine's files and credentials.
+		return Executed{Skipped: fmt.Sprintf("job %s is registered on machine %s, not this one (%s): nothing runs here", jobID, job.MachineID, r.MachineID)}, nil
 	}
 	declared, ok := job.Review.Action(proposal.ActionName)
 	if proposal.ActionName == RetryRunAction {
