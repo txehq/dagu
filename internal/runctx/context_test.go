@@ -357,6 +357,15 @@ func TestNewContext_DAGEnvCanReferenceBuiltInRunContext(t *testing.T) {
 	assert.Equal(t, "attempt-1", envs["ATTEMPT_REF"])
 	// As stored: not converted to UTC and not cut to seconds.
 	assert.Equal(t, "2026-03-13T17:59:58.123456+08:00", envs["QUEUED_REF"])
+
+	// A run that was never queued has an empty marker, and the variable is
+	// empty; a context told nothing about the marker leaves the reference.
+	neverQueued := runctx.NewContext(context.Background(), dag, "run-1", logFile, runctx.WithAttemptQueuedAt(""))
+	value, set := runctx.GetContext(neverQueued).UserEnvsMap()["QUEUED_REF"]
+	assert.True(t, set)
+	assert.Empty(t, value)
+	unknown := runctx.NewContext(context.Background(), dag, "run-1", logFile)
+	assert.Equal(t, "${context.attempt.queued_at}", runctx.GetContext(unknown).UserEnvsMap()["QUEUED_REF"])
 	assert.Equal(t, "scheduler", envs["TRIGGER_REF"])
 	assert.Equal(t, "alice", envs["TRIGGER_ACTOR_REF"])
 	assert.Equal(t, startedAt, envs["STARTED_REF"])

@@ -36,6 +36,7 @@ type Context struct {
 	TriggerActor         string
 	RunStartedAt         string
 	AttemptQueuedAt      string
+	AttemptQueuedAtKnown bool
 	ScheduleTime         string
 	DAG                  *ir.DAG
 	DAGLoader            DAGLoader
@@ -234,11 +235,16 @@ func WithRunStartedAt(startedAt string) ContextOption {
 // resolution: the queuedAt of the status it was dispatched with. A queued
 // retry keeps the attempt ID and gets a new marker, so the two together name
 // one execution. The value is passed through as it is stored, because it is
-// compared for equality with the stored status; it is empty when the run was
-// never queued.
+// compared for equality with the stored status.
+//
+// An empty marker is a value too: it is what the status of a run that was
+// never queued holds, and a reference to it resolves to the empty string.
+// Without this option the marker is unknown and a reference is left as it is
+// written.
 func WithAttemptQueuedAt(queuedAt string) ContextOption {
 	return func(o *contextOptions) {
 		o.AttemptQueuedAt = queuedAt
+		o.AttemptQueuedAtKnown = true
 	}
 }
 
@@ -587,7 +593,9 @@ func buildDAGRunBuiltinContext(
 		addDAGRunBuiltinValue(values, "context.run.root_id", options.RootDAGRun.ID)
 	}
 	addDAGRunBuiltinValue(values, "context.attempt.id", options.AttemptID)
-	addDAGRunBuiltinValue(values, "context.attempt.queued_at", options.AttemptQueuedAt)
+	if options.AttemptQueuedAtKnown {
+		values["context.attempt.queued_at"] = options.AttemptQueuedAt
+	}
 	addDAGRunBuiltinValue(values, "context.trigger.type", options.TriggerType.String())
 	addDAGRunBuiltinValue(values, "context.trigger.actor", options.TriggerActor)
 	addDAGRunBuiltinValue(values, "context.paths.log_file", managedEnvs[runenv.EnvKeyDAGRunLogFile])

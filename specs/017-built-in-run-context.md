@@ -199,7 +199,7 @@ Rules:
 | --- | --- | --- |
 | `context.attempt.id` | Attempt-aware run, step, and handler scopes | Identifier for the current DAG-run attempt. |
 | `context.attempt.started_at` | After run-attempt start is recorded | UTC RFC3339 timestamp for the start of this DAG-run attempt. |
-| `context.attempt.queued_at` | When this execution was dispatched from a queued or an earlier status | Queue marker of this execution: the `queuedAt` of the status it was dispatched with, as stored. |
+| `context.attempt.queued_at` | Attempt-aware run, step, and handler scopes | Queue marker of this execution: the `queuedAt` its status holds, as stored. Empty when the run was never queued. |
 
 Rules:
 
@@ -217,10 +217,14 @@ Rules:
   writes RFC3339 at second resolution in the enqueuing host's zone, and a
   queued retry writes UTC with a fraction. Compare it for equality; do not
   parse or reformat it.
-- `context.attempt.queued_at` is unavailable for a run that was started
-  without being queued. Like any unavailable field, a reference to it is left
-  unchanged. A shell command that may run without one should read the value
-  from an environment variable, where the unchanged reference is plain text.
+- A run that was started without being queued has an empty `queuedAt`, and
+  `context.attempt.queued_at` resolves to the empty string for it. The empty
+  marker is a value: with the attempt ID it still identifies the execution,
+  because such a run is never executed twice under one attempt ID.
+- The runtime hands a step only a marker that is an RFC3339 timestamp. A
+  stored marker of any other form is withheld and a reference to it is left
+  unchanged: the value comes from stored run state and may be placed in a
+  command.
 
 `context.step` fields:
 

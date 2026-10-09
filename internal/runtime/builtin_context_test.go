@@ -126,18 +126,23 @@ func TestResolveStringAttemptQueuedAt(t *testing.T) {
 	}
 }
 
-// A run that was never queued has no marker, and the reference is left as it
-// is written, like any other unavailable field.
-func TestResolveStringAttemptQueuedAtUnavailable(t *testing.T) {
+// A run that was never queued has an empty marker, which is what its status
+// holds, and a reference resolves to the empty string: a command or a
+// variable built from it is well formed. A context that was told nothing
+// about the marker leaves the reference as it is written, like any other
+// unavailable field.
+func TestResolveStringAttemptQueuedAtEmptyAndUnknown(t *testing.T) {
 	t.Parallel()
 
-	ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "dag.log",
-		runtime.WithAttemptID("attempt-1"),
-		runtime.WithWorkDir(t.TempDir()),
-	)
-	ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "step"}))
+	resolve := func(opts ...runtime.ContextOption) string {
+		opts = append(opts, runtime.WithAttemptID("attempt-1"), runtime.WithWorkDir(t.TempDir()))
+		ctx := runtime.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "dag.log", opts...)
+		ctx = runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "step"}))
+		got, err := runtime.ResolveString(ctx, "${context.attempt.id}|${context.attempt.queued_at}|end", cmnvalue.WorkflowField("run"))
+		require.NoError(t, err)
+		return got
+	}
 
-	got, err := runtime.ResolveString(ctx, "${context.attempt.id}|${context.attempt.queued_at}", cmnvalue.WorkflowField("run"))
-	require.NoError(t, err)
-	assert.Equal(t, "attempt-1|${context.attempt.queued_at}", got)
+	assert.Equal(t, "attempt-1||end", resolve(runtime.WithAttemptQueuedAt("")))
+	assert.Equal(t, "attempt-1|${context.attempt.queued_at}|end", resolve())
 }

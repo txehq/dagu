@@ -742,7 +742,6 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		runtime.WithTriggerType(a.triggerType),
 		runtime.WithTriggerActor(a.triggerActor),
 		runtime.WithRunStartedAt(contextTimeString(a.plan.StartAt())),
-		runtime.WithAttemptQueuedAt(a.contextQueuedAt()),
 		runtime.WithParams(a.dag.Params),
 		runtime.WithRuntimeProfileValues(
 			profileValues.defaultEnvs,
@@ -756,6 +755,9 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 	}
 	if scheduleTime := a.contextScheduleTime(); scheduleTime != "" {
 		contextOpts = append(contextOpts, runtime.WithScheduleTime(scheduleTime))
+	}
+	if queuedAt, ok := a.contextQueuedAt(); ok {
+		contextOpts = append(contextOpts, runtime.WithAttemptQueuedAt(queuedAt))
 	}
 	if len(a.extraEnvs) > 0 {
 		contextOpts = append(contextOpts, runtime.WithEnvVars(a.extraEnvs...))
@@ -1658,12 +1660,24 @@ func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 // contextQueuedAt is the queue marker of this execution: the queuedAt every
 // status this agent reports carries, so a step and the stored status name the
 // same execution. It is passed as stored, never reformatted. A run that was
-// not dispatched from a queued or earlier status has none.
-func (a *Agent) contextQueuedAt() string {
-	if source := a.statusSourceTarget(); source != nil {
-		return source.QueuedAt
+// not dispatched from a queued or earlier status has an empty marker, which
+// is what its status holds.
+//
+// The marker comes from a stored status, and on a worker that status arrives
+// from the coordinator, which stores what workers report. A step may put the
+// value into a shell command, so only a marker that is an RFC3339 timestamp
+// is handed to steps; such a string holds digits, "T", "Z", and ".", ":", "+"
+// and "-" and nothing a shell acts on. Any other marker is withheld, and a
+// reference to it is left as written.
+func (a *Agent) contextQueuedAt() (string, bool) {
+	source := a.statusSourceTarget()
+	if source == nil || source.QueuedAt == "" {
+		return "", true
 	}
-	return ""
+	if _, err := time.Parse(time.RFC3339Nano, source.QueuedAt); err != nil {
+		return "", false
+	}
+	return source.QueuedAt, true
 }
 
 func (a *Agent) contextScheduleTime() string {
@@ -2362,11 +2376,13 @@ func (a *Agent) dryRun(ctx context.Context) error {
 		runtime.WithTriggerType(a.triggerType),
 		runtime.WithTriggerActor(a.triggerActor),
 		runtime.WithRunStartedAt(contextTimeString(a.plan.StartAt())),
-		runtime.WithAttemptQueuedAt(a.contextQueuedAt()),
 		runtime.WithParams(a.dag.Params),
 	}
 	if scheduleTime := a.contextScheduleTime(); scheduleTime != "" {
 		contextOpts = append(contextOpts, runtime.WithScheduleTime(scheduleTime))
+	}
+	if queuedAt, ok := a.contextQueuedAt(); ok {
+		contextOpts = append(contextOpts, runtime.WithAttemptQueuedAt(queuedAt))
 	}
 	if a.artifactDir != "" {
 		contextOpts = append(contextOpts, runtime.WithArtifactDir(a.artifactDir))

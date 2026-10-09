@@ -2618,20 +2618,61 @@ steps:
 	})
 
 	t.Run("NeverQueued", func(t *testing.T) {
+		// The status of a run that was never queued holds an empty marker,
+		// and that is what the step reads: an empty string, in the variable
+		// and in the command alike, not the reference left unresolved.
 		th := test.Setup(t)
 		out := filepath.Join(t.TempDir(), "seen")
-		// The reference is left as written when there is no marker. In a
-		// variable that is harmless text; in a shell command it would be a
-		// bad substitution, so a command that must survive it reads the
-		// variable.
-		dag := th.DAG(t, yaml(out, "from-env"))
+		dag := th.DAG(t, yaml(out, reference))
 		dag.Agent().RunSuccess(t)
 
 		seen, err := os.ReadFile(out)
 		require.NoError(t, err)
-		require.Equal(t, reference+"|from-env", string(seen), "a run that was never queued has no marker")
+		require.Equal(t, "|", string(seen))
 		latest, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
 		require.NoError(t, err)
 		require.Empty(t, latest.QueuedAt)
+	})
+
+	// The marker comes from a stored status, which on a worker arrives from
+	// the coordinator. One that is not a timestamp is not handed to steps: it
+	// would reach a shell. The command here runs only because the reference
+	// stays inside single quotes, where it is text.
+	t.Run("NotATimestamp", func(t *testing.T) {
+		for _, marker := range []string{
+			"$(touch " + filepath.Join(os.TempDir(), "txe-marker-injected") + ")",
+			"2026-10-09T15:48:58Z; echo injected",
+			"`id`",
+			"2026-10-09 15:48:58",
+			"not-a-time",
+		} {
+			th := test.Setup(t)
+			out := filepath.Join(t.TempDir(), "seen")
+			dag := th.DAG(t, `
+env:
+  - QUEUED_AT: "`+reference+`"
+steps:
+  - name: record
+    run: printf '%s' "$QUEUED_AT" > `+out)
+
+			runID := "bad-marker-run"
+			prepared, err := th.DAGRunRepository.CreateAttempt(th.Context, dag.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+			require.NoError(t, err)
+			require.NoError(t, prepared.Open(th.Context))
+			queued := ir.NewStatusBuilder(dag.DAG).Create(runID, ir.Queued, 0, time.Time{},
+				ir.WithAttemptID(prepared.ID()), ir.WithQueuedAt(marker))
+			require.NoError(t, prepared.Write(th.Context, queued))
+			require.NoError(t, prepared.Close(th.Context))
+
+			dag.Agent(test.WithDAGRunID(runID), test.WithAgentOptions(agent.Options{
+				RunStateStore: persis.NewRunStateStore(th.DAGRunRepository, prepared),
+				RetryTarget:   &queued,
+			})).RunSuccess(t)
+
+			seen, err := os.ReadFile(out)
+			require.NoError(t, err)
+			require.Equal(t, reference, string(seen), "marker %q reached the step", marker)
+		}
+		require.NoFileExists(t, filepath.Join(os.TempDir(), "txe-marker-injected"))
 	})
 }
