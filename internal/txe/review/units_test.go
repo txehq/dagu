@@ -623,6 +623,12 @@ func TestCommandEffectorSuppliesTheJobsDeclaredCredentialsNotTheReviewers(t *tes
 			assert.Contains(t, res.Detail, "credential")
 			assert.NotContains(t, res.Detail, "the-jobs", "no value is reported")
 			assert.NotContains(t, res.Detail, "the-review-agents")
+			// The record is shown to the review agent later: it does not
+			// say where the credential is kept.
+			for _, ref := range refs {
+				assert.NotContains(t, res.Detail, ref.Locator, "the locator is not reported")
+			}
+			assert.NotContains(t, res.Detail, secrets)
 		})
 	}
 }

@@ -234,6 +234,11 @@ func jobEnv(env []string) []string {
 // (a job may declare its own OPENAI_API_KEY; it gets the declared one, never
 // the review agent's).
 //
+// What is reported of a failure is recorded on the action and shown to the
+// review agent at later reviews, so it names the reference and the kind of
+// failure only: never a value, and never the locator, which says where the
+// credential is kept.
+//
 // A file is read as it is, as the service reads it for the job's own runs.
 // A variable is copied from this process's environment. A credential that
 // cannot be resolved stops the command before it starts, as it stops a run:
@@ -259,13 +264,13 @@ func credentialEnv(job Job) ([]string, error) {
 			// #nosec G304 -- the path is the job's registered credential locator on its own machine.
 			raw, err := os.ReadFile(ref.Locator)
 			if err != nil {
-				return nil, fmt.Errorf("credential %s: its file could not be read: %v", ref.Name, err)
+				return nil, fmt.Errorf("credential %s: its file %s", ref.Name, unreadable(err))
 			}
 			value = string(raw)
 		case CredentialEnv:
 			found, ok := os.LookupEnv(ref.Locator)
 			if !ok {
-				return nil, fmt.Errorf("credential %s: variable %s is not set where the reviewer runs", ref.Name, ref.Locator)
+				return nil, fmt.Errorf("credential %s: the variable it is copied from is not set where the reviewer runs", ref.Name)
 			}
 			value = found
 		default:
@@ -277,6 +282,19 @@ func credentialEnv(job Job) ([]string, error) {
 		env = append(env, ref.Name+"="+value)
 	}
 	return env, nil
+}
+
+// unreadable says why a credential's file could not be read, without the
+// path the system's error carries.
+func unreadable(err error) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "does not exist"
+	case errors.Is(err, os.ErrPermission):
+		return "cannot be read: permission denied"
+	default:
+		return "cannot be read"
+	}
 }
 
 func actionEnv(job Job, action Action) []string {

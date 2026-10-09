@@ -85,7 +85,8 @@ the declared one, not the review agent's (unless its declaration names the
 agent's own key or file as the source, which is the owner's choice at
 registration). A reference that cannot be
 resolved stops the command before it starts, as it stops a run, and the
-record names the reference, not a value. A reference cannot use a name that
+record names the reference and the kind of failure: not a value, and not
+where the credential is kept. A reference cannot use a name that
 identifies the action or marks the review. The references are not part of
 what the review agent is shown.
 
