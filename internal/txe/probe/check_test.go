@@ -123,7 +123,7 @@ func newFixture(t *testing.T) *fixture {
 	f.path = filepath.Join(t.TempDir(), "journal.json")
 	f.reg = &fakeRegistry{
 		jobs: map[string]*txeclient.Job{
-			jobA: {JobID: jobA, MachineID: mch, Version: 2, Lifecycle: "active"},
+			jobA: {JobID: jobA, MachineID: mch, Version: 2, Lifecycle: "active", Registration: txeclient.Registration{State: "ready"}},
 		},
 		versions: map[string]map[int]*txeclient.JobVersion{jobA: {
 			1: {Version: 1, Targets: []txeclient.Target{cm("old-1", "old", CheckPreRun)}},
@@ -178,12 +178,41 @@ func TestPreRunPresentRuns(t *testing.T) {
 	}
 }
 
-// An old run binds the version it was rendered for, not the job's current one.
+// A run binds the version it was rendered for. One rendered for a version
+// that is no longer the job's is refused, as the registry's admission
+// refuses it, and nothing is probed on its behalf; a run of the current
+// version checks that version's targets.
 func TestPreRunBindsTheRenderedVersion(t *testing.T) {
 	f := newFixture(t)
-	f.preRun(t, 1)
-	if strings.Join(f.probe.probed, ",") != "old-1" {
-		t.Fatalf("probed %v, want version 1's target", f.probe.probed)
+	if code := f.preRun(t, 1); code != ExitStop || len(f.probe.probed) != 0 {
+		t.Fatalf("old version: exit %d, probed %v", code, f.probe.probed)
+	}
+	f.reg.jobs[jobA].Version = 1
+	if code := f.preRun(t, 1); code != ExitOK || strings.Join(f.probe.probed, ",") != "old-1" {
+		t.Fatalf("version 1 current: exit %d, probed %v", code, f.probe.probed)
+	}
+}
+
+// The pre-run mirrors the registry's run admission: an expired job or one
+// whose registration is not ready does not run.
+func TestPreRunMirrorsAdmission(t *testing.T) {
+	f := newFixture(t)
+	past := f.now.Add(-time.Minute)
+	f.reg.jobs[jobA].ExpiresAt = &past
+	if code := f.preRun(t, 2); code != ExitStop {
+		t.Fatalf("expired: exit %d, want 3", code)
+	}
+	future := f.now.Add(time.Hour)
+	f.reg.jobs[jobA].ExpiresAt = &future
+	for _, state := range []string{"", "pending", "duplicate"} {
+		f.reg.jobs[jobA].Registration.State = state
+		if code := f.preRun(t, 2); code != ExitStop {
+			t.Fatalf("registration %q: exit %d, want 3", state, code)
+		}
+	}
+	f.reg.jobs[jobA].Registration.State = "ready"
+	if code := f.preRun(t, 2); code != ExitOK {
+		t.Fatalf("admitted job: exit %d, want 0", code)
 	}
 }
 
