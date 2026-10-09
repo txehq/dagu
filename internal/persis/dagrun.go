@@ -17,6 +17,17 @@ import (
 
 var ErrInvalidDAGRunQueryCursor = errors.New("dagrun: invalid query cursor")
 
+// ErrLatestExecutionChanged is a conditional retry whose expected execution
+// is no longer the run's latest: nothing was created.
+var ErrLatestExecutionChanged = errors.New("dagrun: the run's latest execution is not the expected one")
+
+// ExpectedExecution names one execution of a run: an attempt and the queue
+// marker it ran under.
+type ExpectedExecution struct {
+	AttemptID string
+	QueuedAt  string
+}
+
 // DAGRunStore persists DAG runs and their attempts as one consistency boundary.
 type DAGRunStore interface {
 	// OpenLog reads a regular log file up to its size when opened. The caller must close it.
@@ -69,6 +80,10 @@ type DAGRunCreateAttemptRequest struct {
 	// before creating it, for a caller that will hand it to a worker. See
 	// DAGRunPreparationJournal.
 	TrackPreparation bool
+	// ExpectLatest, on a retry, creates the attempt only if the run's latest
+	// execution is this one and has finished; otherwise the store returns
+	// ErrLatestExecutionChanged and creates nothing.
+	ExpectLatest *ExpectedExecution
 }
 
 // DAGRunLatestAttemptQuery selects the newest visible attempt for a DAG.
@@ -151,6 +166,9 @@ type DAGRunCreateAttemptOptions struct {
 	// creating it. The caller ends the preparation once the attempt is handed
 	// to a worker or abandoned.
 	TrackPreparation bool
+	// ExpectLatest makes a retry conditional on the run's latest execution
+	// (see DAGRunCreateAttemptRequest).
+	ExpectLatest *ExpectedExecution
 }
 
 // DAGRunLatestAttemptOptions configures a latest-attempt lookup.

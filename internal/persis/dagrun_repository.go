@@ -71,6 +71,7 @@ func (r *DAGRunRepository) CreateAttempt(
 		AttemptID:        options.AttemptID,
 		Retry:            options.Retry,
 		TrackPreparation: options.TrackPreparation,
+		ExpectLatest:     options.ExpectLatest,
 	})
 	if err != nil {
 		return nil, err
