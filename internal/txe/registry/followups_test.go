@@ -974,3 +974,54 @@ func TestApplyVersionDefaultsDoesNotValidate(t *testing.T) {
 	assert.Equal(t, specDigest([]byte(old.DAG.Spec)), got.DAG.SpecSHA256)
 	assert.JSONEq(t, string(old.ReviewPolicy.PermittedActions[1].ParamSchema), string(got.ReviewPolicy.PermittedActions[1].ParamSchema), "stored as it was")
 }
+
+// A version the registry stored under earlier, looser admission rules (here a
+// draft-07 param_schema, refused at registration since schemas are compiled)
+// stays comparable: the machine's unchanged local input and the stored
+// version agree through ApplyVersionDefaults, though today's admission
+// (NormalizeVersion) refuses the input. Only the action whose schema cannot
+// be enforced is refused; the job's other actions are still granted.
+func TestStoredVersionUnderTightenedRulesStaysComparable(t *testing.T) {
+	f := newFixture(t)
+	draft07 := json.RawMessage(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}`)
+	local := func() JobVersion {
+		v := f.version(1)
+		v.ExpectedOutcome.Deliverables = []Deliverable{{Name: "report", Path: "out/report.md"}}
+		v.ReviewPolicy.PermittedActions[1].ParamSchema = draft07
+		return v
+	}
+	admitted := func() JobVersion { v := local(); v.ReviewPolicy.PermittedActions[1].ParamSchema = nil; return v }
+	job := f.readyWith("k", func(jv *JobVersion) { *jv = admitted() })
+
+	// What an earlier registry stored: the same version with the old schema,
+	// defaults applied as registration applies them.
+	stored, err := f.store.GetVersion(f.ctx, job.JobID, 1)
+	require.NoError(t, err)
+	stored.ReviewPolicy.PermittedActions[1].ParamSchema = draft07
+	require.NoError(t, f.store.putJSON(f.ctx, job.VersionRefs[0], stored))
+	stored, err = f.store.GetVersion(f.ctx, job.JobID, 1)
+	require.NoError(t, err)
+
+	_, err = NormalizeVersion(job.JobID, local())
+	assert.Equal(t, CodeInvalid, code(t, err), "today's admission refuses the unchanged input")
+	mine, err := ApplyVersionDefaults(job.JobID, local())
+	require.NoError(t, err)
+	theirs, err := ApplyVersionDefaults(job.JobID, *stored)
+	require.NoError(t, err)
+	for _, v := range []*JobVersion{&mine, &theirs} {
+		v.OwnerID, v.Version, v.Created = "", 0, Stamp{}
+	}
+	a, err := CanonicalJSON(mine)
+	require.NoError(t, err)
+	b, err := CanonicalJSON(theirs)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(b), string(a), "the unchanged local version matches what was stored")
+
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	_, _, err = routine(t, f, job, c, "diagnose")
+	assert.NoError(t, err, "the job's other actions still run")
+	_, _, err = routine(t, f, job, c, "restart")
+	assert.Equal(t, CodeInvalid, code(t, err), "the action whose schema cannot be enforced is refused")
+	assert.ErrorContains(t, err, `action "restart"`)
+	assert.ErrorContains(t, err, "draft")
+}
