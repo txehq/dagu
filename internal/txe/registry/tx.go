@@ -379,11 +379,16 @@ func (tx *JobTx) Observe(o Observation) error {
 	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(to), Detail: j.Availability.Detail, Evidence: j.Availability.Evidence})
 }
 
-// ResolveException marks one exception resolved.
+// ResolveException marks one exception resolved. Action- and binding-scope
+// exceptions are resolved only by their own rules (the action attempt
+// ending; a ready binding observation or a version change), never here.
 func (tx *JobTx) ResolveException(id string) error {
 	e, ok := tx.Job.Exceptions[id]
 	if !ok {
 		return refuse(CodeNotFound, "exception %s not found", id)
+	}
+	if e.Scope == ScopeAction || e.Scope == ScopeBinding {
+		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("a %s-scope exception is resolved by its own rule, not directly", e.Scope), Current: e}
 	}
 	if e.ResolvedAt == nil {
 		now := tx.now
