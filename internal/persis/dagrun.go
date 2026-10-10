@@ -65,6 +65,10 @@ type DAGRunCreateAttemptRequest struct {
 	DAGRunID   string
 	AttemptID  string
 	Retry      bool
+	// TrackPreparation records the attempt in the store's preparation journal
+	// before creating it, for a caller that will hand it to a worker. See
+	// DAGRunPreparationJournal.
+	TrackPreparation bool
 }
 
 // DAGRunLatestAttemptQuery selects the newest visible attempt for a DAG.
@@ -143,6 +147,10 @@ type DAGRunCreateAttemptOptions struct {
 	Retry bool
 	// AttemptID uses a caller-assigned attempt identifier when non-empty.
 	AttemptID string
+	// TrackPreparation records the attempt in the preparation journal before
+	// creating it. The caller ends the preparation once the attempt is handed
+	// to a worker or abandoned.
+	TrackPreparation bool
 }
 
 // DAGRunLatestAttemptOptions configures a latest-attempt lookup.

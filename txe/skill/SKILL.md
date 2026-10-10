@@ -37,6 +37,30 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 
 Review cadence is separate from the schedule. A check can run every five minutes and be reviewed once a day.
 
+### Bound what a reviewer may pass to an action
+
+A permitted action that takes parameters should say which ones. Give the action a `param_schema`: a JSON Schema, written as a YAML mapping.
+
+```yaml
+review_policy:
+  permitted_actions:
+    - name: reopen-ticket
+      command: ./reopen.sh
+      timeout_sec: 60
+      param_schema:
+        type: object
+        properties:
+          reason: {type: string, maxLength: 200}
+        required: [reason]
+        additionalProperties: false
+```
+
+- A registry that enforces schemas checks a reviewer's parameters against the schema before it grants an attempt of the action, and refuses parameters that do not match. An action with no `param_schema` has its parameters checked by nothing.
+- Registration refuses a spec with a `param_schema` on a hub whose registry does not say it enforces them, because that registry would store the schema and check nothing. The fix is to upgrade the hub, not to remove the schema.
+- Parameters reach the command as variables named `TXE_PARAM_<NAME>`, each a string. Declare each one as `type: string`, and set `additionalProperties: false` so that nothing undeclared is passed.
+- Such a registry admits JSON Schema draft 2020-12 and only the keywords it enforces exactly. It refuses `format`, `multipleOf`, unknown keywords and references to other documents. A number in the schema must be one it can compare exactly: an integer up to 2^53, or a fraction such as 0.5 that is exact in binary. `pattern` is read as RE2.
+- A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read. So is one that uses a YAML merge key (`<<`), which could replace a bound written beside it: write the schema out in full.
+
 ## Targets
 
 A target is the resource the job watches or acts on. Give it an identity that survives a rename or a recreation, and say how its existence is observed:
