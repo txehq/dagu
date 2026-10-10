@@ -886,3 +886,11 @@ func TestTxeAPIParamSchemaKeepsItsBytes(t *testing.T) {
 	requireStatus(t, register(`{"type":"number","maximum":0.49999999999999999}`), http.StatusBadRequest)
 	require.NoError(t, register(`{"type":"object","properties":{"n":{"type":"integer","maximum":5}}}`))
 }
+
+// The installation lists what this registry enforces.
+func TestTxeAPIInstallationCapabilities(t *testing.T) {
+	a := newTxeTestAPI(t)
+	resp, err := a.GetTxeInstallation(context.Background(), apigen.GetTxeInstallationRequestObject{})
+	require.NoError(t, err)
+	assert.Contains(t, resp.(apigen.GetTxeInstallation200JSONResponse).Capabilities, "param_schema")
+}
