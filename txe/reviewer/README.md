@@ -108,7 +108,11 @@ stored form and through the registry's own rule for storing a version
 (its validation, its defaults, the fields it derives), so the version this
 machine filed becomes exactly what an honest registry stored, and nothing
 of that rule is repeated in the reviewer. A version the rule refuses is
-not a registered version, on either side. What the registry assigns at
+not a registered version, on either side. That rule validates by today's
+rules: a job whose version was stored when the rules were laxer, and no
+longer passes them, runs no command although nothing about it was altered.
+Its exception says so and says to update the job from its machine, which
+stores it under the current rules. What the registry assigns at
 commit (owner, version number, stamps) is left out, each parameter schema
 is compared decoded, and what means nothing (absent, null, empty, zero,
 false) is the same however it is spelled, except inside a parameter schema
