@@ -4,8 +4,10 @@
 package review_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -17,8 +19,10 @@ import (
 )
 
 const (
-	jobID    = "job_01HZX0000000000000000000AA"
-	targetID = "volume-uid-1111"
+	// specDigest is the digest of the job's current DAG in these tests.
+	specDigest = "sha256:5pec"
+	jobID      = "job_01HZX0000000000000000000AA"
+	targetID   = "volume-uid-1111"
 )
 
 // clock is a controllable time source shared by the registry and reviewer.
@@ -90,6 +94,9 @@ func (e *effects) count(name string) int {
 type opener struct {
 	mu     sync.Mutex
 	opened map[string]int
+	closed map[string]int
+	// close decides what closing a proposal's run finds; closed when nil.
+	close func(p review.Proposal) (review.ClosureOutcome, error)
 }
 
 func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
@@ -100,6 +107,148 @@ func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
 	}
 	o.opened[p.NativeTask.RunID]++
 	return nil
+}
+
+func (o *opener) CloseDecision(_ context.Context, p review.Proposal) (review.ClosureOutcome, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed == nil {
+		o.closed = map[string]int{}
+	}
+	o.closed[p.NativeTask.RunID]++
+	if o.close != nil {
+		return o.close(p)
+	}
+	return review.ClosureClosed, nil
+}
+
+// runs is a fake of the service's run API. Each run has a latest attempt;
+// a retry keeps the run id and, by default, starts the next attempt.
+type runs struct {
+	mu    sync.Mutex
+	state map[string]review.RunState
+	// retried records every retry request that reached the service.
+	retried []string
+	// retry decides what a retry request does; it starts a new attempt
+	// when nil.
+	retry func(runID string) error
+	// readErr fails reads of a run's state while set.
+	readErr error
+	// unreadable fails reads of single runs.
+	unreadable map[string]error
+	// requested records the execution every retry request named, admitted
+	// or not; retried records only the admitted ones.
+	requested []review.Execution
+	// beforeAdmission runs as a retry request arrives, before the service
+	// compares the run's latest execution with the one the request names.
+	beforeAdmission func(runID string)
+	// abandonedRefs are the executions the service recorded as created and
+	// never dispatched; abandonUnknown makes its records unable to say.
+	abandonedRefs  map[string]bool
+	abandonUnknown bool
+	// unnamed makes the service answer an admitted retry without the
+	// execution it admitted it as, as a service older than the conditional
+	// retry's answer does.
+	unnamed bool
+	// afterAdmission runs once a retry is admitted, before its answer
+	// reaches the caller, with the fake's lock held.
+	afterAdmission func(runID string)
+	seq            int
+}
+
+func newRuns() *runs {
+	return &runs{state: map[string]review.RunState{}, seq: 1}
+}
+
+// fail records a finished, unsuccessful latest attempt of the run.
+func (r *runs) fail(runID, attemptID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state[runID] = review.RunState{AttemptID: attemptID, Status: "failed"}
+}
+
+// start begins the run's next attempt, as a native retry on Dagu's direct
+// path does.
+func (r *runs) start(runID string) string {
+	r.seq++
+	id := fmt.Sprintf("att-%d", r.seq)
+	r.state[runID] = review.RunState{AttemptID: id, Status: "running", Active: true}
+	return id
+}
+
+// requeue queues the run's latest attempt again under the same attempt id,
+// as a native retry on Dagu's queued path does: only the queued time moves.
+func (r *runs) requeue(runID string) review.Execution {
+	r.seq++
+	state := r.state[runID]
+	state.QueuedAt = fmt.Sprintf("2026-10-09T10:00:%02dZ", r.seq)
+	state.Status, state.Active, state.Succeeded = "queued", true, false
+	r.state[runID] = state
+	return state.Execution()
+}
+
+// ref is the reference of the run's latest execution.
+func (r *runs) ref(runID string) string {
+	return r.state[runID].Execution().Ref()
+}
+
+func (r *runs) RunState(_ context.Context, _, runID string) (review.RunState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readErr != nil {
+		return review.RunState{}, r.readErr
+	}
+	if err := r.unreadable[runID]; err != nil {
+		return review.RunState{}, err
+	}
+	state, ok := r.state[runID]
+	if !ok {
+		return review.RunState{}, review.ErrNotFound
+	}
+	return state, nil
+}
+
+// Abandoned is the service's record of abandoned preparations.
+func (r *runs) Abandoned(_ context.Context, _, _, ref string) (bool, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.abandonUnknown {
+		return false, false
+	}
+	return r.abandonedRefs[ref], true
+}
+
+// RetryRun is the service's conditional retry: it is admitted only while
+// expected is the run's latest execution, and that is checked here, at the
+// service, at the moment of admission.
+func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Execution) (review.Execution, error) {
+	// The hook runs before the lock is taken: it changes the run through
+	// the fake's own methods, which lock.
+	if r.beforeAdmission != nil {
+		r.beforeAdmission(runID)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requested = append(r.requested, expected)
+	if now := r.state[runID].Execution(); now != expected {
+		return review.Execution{}, fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
+	}
+	r.retried = append(r.retried, runID)
+	if r.retry != nil {
+		if err := r.retry(runID); err != nil {
+			return review.Execution{}, err
+		}
+	} else {
+		r.start(runID)
+	}
+	var admitted review.Execution
+	if now := r.state[runID].Execution(); !r.unnamed && now != expected {
+		admitted = now
+	}
+	if r.afterAdmission != nil {
+		r.afterAdmission(runID)
+	}
+	return admitted, nil
 }
 
 type fixture struct {
@@ -118,6 +267,7 @@ func fixtureJob() review.Job {
 		MachineID:        "mch_01HZX0000000000000000000AA",
 		Version:          1,
 		PackageDigest:    "sha256:aaaa",
+		DAGSpecSHA256:    specDigest,
 		Title:            "Volume monitor",
 		Purpose:          "Watch free space on the data volume until the migration is done.",
 		Targets:          []review.Target{{Kind: "k8s.pv", StableID: targetID, Environment: "development"}},
@@ -151,6 +301,7 @@ func newFixture(t *testing.T) *fixture {
 // reviewer returns a new Reviewer, as a fresh process would build one.
 func (f *fixture) reviewer(holder string) *review.Reviewer {
 	return &review.Reviewer{
+		MachineID:   fixtureJob().MachineID,
 		Registry:    f.registry,
 		Effector:    f.effects,
 		Opener:      f.opener,
@@ -165,7 +316,7 @@ func (f *fixture) reviewer(holder string) *review.Reviewer {
 func (f *fixture) addRun(id, status string) {
 	f.t.Helper()
 	require.NoError(f.t, f.registry.AddRun(jobID, review.RunEvidence{
-		RunID: id, JobVersion: 1, Status: status,
+		RunID: id, JobVersion: 1, Status: status, SpecSHA256: specDigest, AttemptID: "att-1",
 		Outputs:   map[string]string{"free_pct": "31"},
 		Artifacts: []string{"reports/" + id + ".json"},
 	}))
@@ -389,7 +540,7 @@ func TestStaleApprovalAuthorizesNothing(t *testing.T) {
 
 	out, err := f.reviewer("executor").Execute(context.Background(), jobID, proposal.ID, approved.ID)
 	require.NoError(t, err)
-	assert.Equal(t, "denied by the guard: decision_stale", out.Skipped)
+	assert.Contains(t, out.Skipped, "proposal is superseded")
 	assert.Equal(t, 0, f.effects.count("expand_volume"))
 	assert.Empty(t, f.state().Actions[jobID])
 	assert.Equal(t, review.ProposalSuperseded, f.state().Proposals[jobID][0].State)
@@ -566,6 +717,58 @@ func TestAbsentProbeDoesNotCloseAnInterruptedAttempt(t *testing.T) {
 	})
 	assert.Equal(t, 0, f.effects.count("notify"))
 	assert.Len(t, f.effects.keys, 1, "only the interrupted attempt was ever made")
+}
+
+// When what the registry says a job's actions are could not be established
+// as what was registered, that declaration is not used to settle anything
+// either. An interrupted attempt of an action the registry now calls
+// read-only is not closed as "had no effect" on the registry's word: it
+// stays unresolved, no question is put to the owner about it, and the
+// action is not run again, until the job is bound again.
+func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	dying := f.reviewer("reviewer-a")
+	dying.Registry = crashAfterEffect{f.registry}
+	collect := review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Collect.",
+		Actions: []review.AgentAction{act("collect_diagnostics", nil)},
+	}
+	_, err := dying.Apply(context.Background(), prepared, collect)
+	require.ErrorIs(t, err, errCrash)
+
+	// The job's record now fails the check against the local registration.
+	job := f.state().Jobs[jobID]
+	job.CommandsRefused = "the registry's permitted actions for version 1 of the job are not the ones this machine registered: none of the job's commands is started"
+	require.NoError(t, f.registry.PutJob(job))
+
+	f.clock.Advance(11 * time.Minute)
+	recovered := f.prepare("reviewer-b")
+	action := f.state().Actions[jobID][0]
+	assert.NotEqual(t, review.ActionNotApplied, action.State, "not closed on the strength of an unverified declaration")
+	assert.True(t, action.State.Open())
+	require.Len(t, recovered.Packet.UnresolvedActions, 1)
+	assert.Empty(t, f.state().Proposals[jobID], "the owner has the exception about the job; no question about the action")
+	applied := f.apply("reviewer-b", recovered, collect)
+	assert.Empty(t, applied.Executed)
+	assert.Equal(t, 1, f.effects.count("collect_diagnostics"), "only the interrupted attempt was ever made")
+	var raised int
+	for _, e := range f.state().Exceptions {
+		if e.Kind == review.ExceptionCommandsUnbound {
+			raised++
+			assert.Contains(t, e.Message, "dagu txe update")
+			assert.Contains(t, e.Message, "dagu txe resume")
+			assert.NotContains(t, e.Message, "dagu txe register", "a job cannot be registered a second time")
+		}
+	}
+	assert.Positive(t, raised)
+
+	// Bound again, the interrupted read-only attempt is closed as before.
+	job.CommandsRefused = ""
+	require.NoError(t, f.registry.PutJob(job))
+	f.clock.Advance(2 * time.Hour)
+	f.prepare("reviewer-c")
+	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
 }
 
 // An interrupted read-only action has no external effect to wait for, so it
@@ -1124,4 +1327,186 @@ func TestStaleRetryAnswerDoesNotUnlockAChangedJob(t *testing.T) {
 	f.clock.Advance(2 * time.Hour)
 	f.apply("reviewer-d", f.prepare("reviewer-d"), notify)
 	assert.Equal(t, 2, f.effects.count("notify"))
+}
+
+// supersede files n approval proposals and then changes the job, which
+// supersedes all of them.
+func (f *fixture) supersede(n int) []review.Proposal {
+	f.t.Helper()
+	var actions []review.AgentAction
+	for i := range n {
+		actions = append(actions, act("expand_volume", map[string]string{"size_gb": fmt.Sprint(100 + i)}))
+	}
+	f.apply("reviewer-a", f.prepare("reviewer-a"), review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: actions})
+	changed := fixtureJob()
+	changed.Version = 2
+	changed.PackageDigest = "sha256:bbbb"
+	require.NoError(f.t, f.registry.PutJob(changed))
+	proposals := f.state().Proposals[jobID]
+	require.Len(f.t, proposals, n)
+	for _, p := range proposals {
+		require.Equal(f.t, review.ProposalSuperseded, p.State)
+	}
+	return proposals
+}
+
+// CC4 finding: a superseded proposal can never be answered, so its decision
+// run is closed by the system instead of waiting forever. The closure is a
+// recorded system event with its reason, no human decision is created, and
+// more proposals than one batch are all reached over successive ticks.
+func TestSupersededProposalsAreClosedInBoundedBatches(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(45)
+	machine := fixtureJob().MachineID
+	ctx := context.Background()
+
+	for tick, want := range []int{20, 20, 5, 0} {
+		done, err := f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+		require.NoError(t, err)
+		assert.Len(t, done, want, "tick %d", tick)
+	}
+	s := f.state()
+	for _, p := range proposals {
+		assert.Equal(t, 1, f.opener.closed[p.NativeTask.RunID], "each run is closed exactly once")
+		require.Len(t, s.Closures[p.ID], 1)
+		c := s.Closures[p.ID][0]
+		assert.Equal(t, review.ClosureClosed, c.Outcome)
+		assert.Equal(t, "sweeper", c.By)
+		assert.Contains(t, c.Reason, "superseded")
+	}
+	assert.Empty(t, s.Decisions[jobID], "a system closure is not a decision by anyone")
+
+	// The closed run resumes into the execute step, which runs nothing
+	// because the registry says the proposal is superseded.
+	out, err := f.reviewer("executor").Execute(ctx, jobID, proposals[0].ID, review.NoDecisionID)
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "superseded")
+	assert.Equal(t, 0, f.effects.count("expand_volume"))
+}
+
+// It also covers a retired job, which is never due for review.
+func TestSupersededProposalsOfARetiredJobAreClosed(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(1)
+	retired := fixtureJob()
+	retired.Version = 3
+	retired.Lifecycle = review.LifecycleRetired
+	require.NoError(t, f.registry.PutJob(retired))
+
+	// A tick with nothing due still closes it.
+	var packet bytes.Buffer
+	require.NoError(t, f.steps("tick-1", t.TempDir()).Prepare(context.Background(), "tick-1", &packet))
+	assert.Empty(t, packet.String())
+	assert.Equal(t, 1, f.opener.closed[proposals[0].NativeTask.RunID])
+}
+
+// A failing closure is retried without blocking the others, and after
+// repeated failures it becomes an exception instead of a silent warning.
+func TestFailingClosureIsRetriedThenRaised(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(3)
+	stuck := proposals[1]
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		if p.ID == stuck.ID {
+			return review.ClosureFailed, errors.New("hub unreachable")
+		}
+		return review.ClosureClosed, nil
+	}
+	machine := fixtureJob().MachineID
+	ctx := context.Background()
+
+	done, err := f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	require.Len(t, done, 3)
+	assert.Empty(t, f.state().Exceptions)
+
+	for range 2 {
+		f.clock.Advance(10 * time.Minute)
+		done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+		require.NoError(t, err)
+		require.Len(t, done, 1, "only the failing one is still pending")
+		assert.Equal(t, stuck.ID, done[0].ProposalID)
+	}
+	s := f.state()
+	require.Len(t, s.Exceptions, 1)
+	assert.Equal(t, review.ExceptionCleanupFailed, s.Exceptions[0].Kind)
+	assert.Contains(t, s.Exceptions[0].Message, stuck.ID)
+	assert.Len(t, s.Closures[stuck.ID], 3)
+
+	// Once it can be closed, it is, and it leaves the pending list.
+	f.opener.close = nil
+	f.clock.Advance(10 * time.Minute)
+	done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, review.ClosureClosed, done[0].Outcome)
+	done, err = f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+	require.NoError(t, err)
+	assert.Empty(t, done)
+}
+
+// A real answer that raced the supersession, a run the service does not
+// know, and a locator that is not the proposal's own run are each recorded
+// as what they are. None is treated as a completed wait or as a decision,
+// and a foreign task is never touched.
+func TestClosureRecordsWhatItActuallyFound(t *testing.T) {
+	f := newFixture(t)
+	proposals := f.supersede(3)
+	answered, missing, foreign := proposals[0], proposals[1], proposals[2]
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		s.Proposals[jobID][2].NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+		return nil
+	}))
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		switch p.ID {
+		case answered.ID:
+			return review.ClosureAnswered, nil
+		case missing.ID:
+			return review.ClosureMissing, nil
+		}
+		return review.ClosureClosed, nil
+	}
+	_, err := f.reviewer("sweeper").CloseSuperseded(context.Background(), fixtureJob().MachineID)
+	require.NoError(t, err)
+
+	s := f.state()
+	assert.Equal(t, review.ClosureAnswered, s.Closures[answered.ID][0].Outcome)
+	assert.Equal(t, review.ClosureMissing, s.Closures[missing.ID][0].Outcome)
+	assert.Equal(t, review.ClosureRefused, s.Closures[foreign.ID][0].Outcome)
+	assert.Zero(t, f.opener.closed["release-42"], "a foreign task was completed with the reviewer's credential")
+
+	// The raced answer authorizes nothing: the proposal is superseded.
+	out, err := f.reviewer("executor").Execute(context.Background(), jobID, answered.ID, "dec_raced")
+	require.NoError(t, err)
+	assert.Contains(t, out.Skipped, "superseded")
+	assert.Equal(t, 0, f.effects.count("expand_volume"))
+}
+
+// Security finding: the registry returns the stored proposal when its id
+// already exists. If that stored record names another run, the reviewer does
+// not enqueue it with its own credential.
+func TestOpenRefusesAStoredLocatorThatIsNotTheProposalsOwnRun(t *testing.T) {
+	f := newFixture(t)
+	prepared := f.prepare("reviewer-a")
+	tampering := f.reviewer("reviewer-a")
+	tampering.Registry = foreignLocator{f.registry}
+	_, err := tampering.Apply(context.Background(), prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "Grow it.",
+		Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "200"})},
+	})
+	require.ErrorContains(t, err, "not its decision run")
+	assert.Empty(t, f.opener.opened, "a run named by a stored record was enqueued")
+	assert.Equal(t, 0, f.state().Checkpoints[jobID].Version)
+}
+
+// foreignLocator returns proposals as if the stored record pointed at
+// another workflow's run.
+type foreignLocator struct {
+	*reviewtest.Registry
+}
+
+func (r foreignLocator) CreateProposal(ctx context.Context, claim review.Claim, draft review.Proposal) (review.Proposal, error) {
+	stored, err := r.Registry.CreateProposal(ctx, claim, draft)
+	stored.NativeTask = review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+	return stored, err
 }

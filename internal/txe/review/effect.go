@@ -4,7 +4,6 @@
 package review
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,6 +35,17 @@ type EffectResult struct {
 	Status  EffectStatus
 	Receipt string
 	Detail  string
+	// Admitted is true when the destination accepted the request for the
+	// effect and only its result was not seen. It is what later allows the
+	// effect to be recognised when it shows up: without it, something that
+	// looks like the effect may be someone else's doing.
+	Admitted bool
+	// AdmittedRef is the execution the destination named for the admitted
+	// request, when it names one.
+	AdmittedRef string
+	// Pending is true for an unknown outcome that later looks can still
+	// settle: the admitted effect has not shown up yet and still may.
+	Pending bool
 }
 
 // Effector performs declared actions on the local machine.
@@ -62,6 +72,10 @@ type CommandEffector struct {
 	// given. When nil it is this process's environment without what is the
 	// reviewer's own; see baseEnv.
 	Env []string
+	// ReadCredentialFile reads the file of a job's file credential. When
+	// nil the file is read as it is. Production supplies the checked read
+	// the job's own machine uses for its credentials.
+	ReadCredentialFile func(locator string) (string, error)
 }
 
 var _ Effector = (*CommandEffector)(nil)
@@ -126,7 +140,10 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// #nosec G204 -- argv comes from the job's registered policy, not from the agent.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = job.WorkingDir
-	credentials, err := credentialEnv(job)
+	if job.CommandsRefused != "" {
+		return 0, "", fmt.Errorf("%w: %s", errNotStarted, job.CommandsRefused)
+	}
+	credentials, err := credentialEnv(job, e.ReadCredentialFile)
 	if err != nil {
 		return 0, "", fmt.Errorf("%w: %v", errNotStarted, err)
 	}
@@ -141,7 +158,10 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// the effect after the attempt was recorded as over.
 	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
 	cmd.WaitDelay = 5 * time.Second
-	var stdout bytes.Buffer
+	// Only the end of what the action prints is kept: the receipt is its
+	// last line, and a job's command must not be able to fill the
+	// reviewer's memory with what comes before it.
+	stdout := tailBuffer{limit: maxActionOutput}
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
 
@@ -248,7 +268,7 @@ func jobEnv(env []string) []string {
 // name of a credential reference.
 var credentialNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-func credentialEnv(job Job) ([]string, error) {
+func credentialEnv(job Job, readFile func(string) (string, error)) ([]string, error) {
 	env := make([]string, 0, len(job.CredentialRefs))
 	for _, ref := range job.CredentialRefs {
 		upper := strings.ToUpper(ref.Name)
@@ -261,12 +281,20 @@ func credentialEnv(job Job) ([]string, error) {
 		var value string
 		switch ref.Kind {
 		case CredentialFile:
-			// #nosec G304 -- the path is the job's registered credential locator on its own machine.
-			raw, err := os.ReadFile(ref.Locator)
+			var err error
+			if readFile != nil {
+				// The checked reader's errors name the path; only the
+				// kind of failure is reported.
+				value, err = readFile(ref.Locator)
+			} else {
+				var raw []byte
+				// #nosec G304 -- the path is the job's registered credential locator on its own machine.
+				raw, err = os.ReadFile(ref.Locator)
+				value = string(raw)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("credential %s: its file %s", ref.Name, unreadable(err))
 			}
-			value = string(raw)
 		case CredentialEnv:
 			found, ok := os.LookupEnv(ref.Locator)
 			if !ok {
@@ -334,4 +362,32 @@ func (a DeclaredAction) Timeout() time.Duration {
 		return time.Duration(a.TimeoutSec) * time.Second
 	}
 	return defaultActionTimeout
+}
+
+// maxActionOutput bounds what is kept of an action's standard output.
+const maxActionOutput = 64 << 10
+
+// tailBuffer keeps the last limit bytes written to it and discards what
+// came before, always reporting the whole write as done so the writer is
+// never blocked or failed by it.
+type tailBuffer struct {
+	buf   []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	// Trimmed only once it has doubled, so a stream of small writes does
+	// not copy the kept tail on every one of them.
+	if len(b.buf) > 2*b.limit {
+		b.buf = append(b.buf[:0], b.buf[len(b.buf)-b.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	if len(b.buf) > b.limit {
+		return string(b.buf[len(b.buf)-b.limit:])
+	}
+	return string(b.buf)
 }

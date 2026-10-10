@@ -8,11 +8,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,18 +62,23 @@ func run(ctx context.Context, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if remote := os.Getenv("TXE_FIXTURE_REMOTE"); remote != "" {
+		return runRemote(ctx, args[0], o, remote)
+	}
 	if o.registry == "" {
 		return errors.New("--registry or TXE_FIXTURE_REGISTRY is required")
 	}
 	reg := reviewtest.Open(o.registry)
 	steps := &review.Steps{
-		MachineID: o.machine,
-		StateDir:  o.stateDir,
-		AuthCheck: strings.Fields(o.authCheck),
+		MachineID:   o.machine,
+		StateDir:    o.stateDir,
+		AuthCheck:   strings.Fields(o.authCheck),
+		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
 		Reviewer: &review.Reviewer{
+			MachineID:   o.machine,
 			Registry:    reg,
 			Effector:    &review.CommandEffector{},
-			Opener:      &review.RunOpener{Enqueue: enqueue(o.dagu)},
+			Opener:      &review.RunOpener{Enqueue: enqueue(o.dagu), Complete: complete(o.dagu)},
 			Holder:      fmt.Sprintf("%s/%s", o.machine, o.runID),
 			AgentClient: o.agentClient,
 			DecideDAG:   review.DecideDAGName(o.machine),
@@ -131,6 +139,7 @@ func render(o options) error {
 			"TXE_FIXTURE_DAGU":         o.dagu,
 			"TXE_FIXTURE_AGENT_CLIENT": o.agentClient,
 			"DAGU_HOME":                os.Getenv("TXE_FIXTURE_DAGU_HOME"),
+			"TXE_FIXTURE_REMOTE":       os.Getenv("TXE_FIXTURE_REMOTE"),
 		},
 		AgentConfigDir: os.Getenv("CLAUDE_CONFIG_DIR"),
 		AgentModel:     os.Getenv("TXE_FIXTURE_AGENT_MODEL"),
@@ -154,6 +163,39 @@ func readJSON(path string, v any) error {
 		return err
 	}
 	return json.Unmarshal(data, v)
+}
+
+// complete completes a waiting human task through the dagu CLI of the
+// fixture home.
+func complete(dagu string) review.CompleteFunc {
+	return func(ctx context.Context, task review.TaskLocator, input map[string]string) error {
+		if dagu == "" {
+			return nil
+		}
+		args := []string{"human-task", "complete", "--run-id", task.RunID, "--step", task.StepID}
+		names := make([]string, 0, len(input))
+		for name := range input {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			args = append(args, "--input", name+"="+input[name])
+		}
+		args = append(args, task.DAG)
+		// #nosec G204 -- fixture tooling; the binary path is the operator's.
+		out, err := exec.CommandContext(ctx, dagu, args...).CombinedOutput()
+		if err != nil {
+			text := string(out)
+			if strings.Contains(text, "different input") {
+				return review.ErrTaskAnswered
+			}
+			if strings.Contains(text, "not found") {
+				return review.ErrRunMissing
+			}
+			return fmt.Errorf("dagu human-task complete: %w: %s", err, out)
+		}
+		return nil
+	}
 }
 
 // enqueue opens a decision run through the dagu CLI of the fixture home.
@@ -181,4 +223,85 @@ func enqueue(dagu string) review.EnqueueFunc {
 		}
 		return nil
 	}
+}
+
+// runRemote runs a review step against a real service: the TXE registry and
+// the run history behind its HTTP API. Only the step commands exist in this
+// mode; the job is registered and decided through the service itself.
+func runRemote(ctx context.Context, command string, o options, base string) error {
+	t := httpTransport{base: strings.TrimRight(base, "/")}
+	remote := &review.Remote{Transport: t, MachineID: o.machine, RunID: o.runID, AgentClient: o.agentClient}
+	steps := &review.Steps{
+		MachineID:   o.machine,
+		StateDir:    o.stateDir,
+		AuthCheck:   strings.Fields(o.authCheck),
+		ArtifactDir: os.Getenv("DAG_RUN_ARTIFACTS_DIR"),
+		Reviewer: &review.Reviewer{
+			MachineID:   o.machine,
+			Registry:    remote,
+			Effector:    &review.CommandEffector{},
+			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(t), Complete: review.RemoteComplete(t)},
+			Runs:        review.RemoteRuns(t),
+			Holder:      fmt.Sprintf("%s/%s", o.machine, o.runID),
+			AgentClient: o.agentClient,
+			DecideDAG:   review.DecideDAGName(o.machine),
+		},
+	}
+	switch command {
+	case "prepare":
+		return steps.Prepare(ctx, o.runID, os.Stdout)
+	case "apply":
+		return steps.Apply(ctx, o.runID, os.Stdin, o.agentLog, os.Stdout)
+	case "execute":
+		return steps.Execute(ctx, o.job, o.proposal, o.decision, os.Stdout)
+	case "render":
+		return render(o)
+	default:
+		return fmt.Errorf("command %q is not available against a real service", command)
+	}
+}
+
+// httpTransport is a plain JSON client for a service without authentication,
+// as a disposable local hub runs.
+type httpTransport struct {
+	base string
+}
+
+func (h httpTransport) Do(ctx context.Context, method, path string, in, out any) error {
+	var body io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, h.base+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		var e struct {
+			Message string `json:"message"`
+			Details struct {
+				Code string `json:"code"`
+			} `json:"details"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		return &review.TransportError{Status: resp.StatusCode, Code: e.Details.Code, Message: e.Message}
+	}
+	if out == nil || len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, out)
 }
