@@ -875,3 +875,72 @@ func TestBindingExceptionsPersistUntilRestored(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, open())
 }
+
+// Action- and binding-scope exceptions are not resolved directly; a job
+// exception still is.
+func TestScopedExceptionsAreNotResolvedDirectly(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	actionID, _, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		if err := tx.Observe(Observation{Scope: ScopeBinding, Kind: "job_commands_unbound", State: AvailabilityStale, ClaimID: c.ClaimID, Fence: c.Fence}); err != nil {
+			return err
+		}
+		if err := tx.Observe(Observation{Scope: ScopeAction, Kind: "stalled", ActionID: actionID, Attempt: 1, ClaimID: c.ClaimID, Fence: c.Fence}); err != nil {
+			return err
+		}
+		return tx.Observe(Observation{State: AvailabilityWorkerOffline, Kind: "worker_offline"})
+	})
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	for id, e := range got.Exceptions {
+		_, err := f.tx(job.JobID, person, func(tx *JobTx) error { return tx.ResolveException(id) })
+		if e.Scope == ScopeBinding || e.Scope == ScopeAction {
+			assert.Equal(t, CodeNotPermitted, code(t, err), e.Scope)
+		} else {
+			assert.NoError(t, err)
+		}
+	}
+}
+
+// NormalizeVersion is what registration stores, without touching its input.
+func TestNormalizeVersionIsWhatRegistrationStores(t *testing.T) {
+	f := newFixture(t)
+	input := func() JobVersion {
+		v := f.version(1)
+		v.ExpectedOutcome.Deliverables = []Deliverable{{Name: "report", Path: "out/report.md"}}
+		return v
+	}
+	job := f.readyWith("k", func(jv *JobVersion) { *jv = input() })
+	v := input()
+	stored, err := f.store.GetVersion(f.ctx, job.JobID, 1)
+	require.NoError(t, err)
+
+	got, err := NormalizeVersion(job.JobID, v)
+	require.NoError(t, err)
+	assert.Empty(t, v.ExpectedOutcome.Deliverables[0].Delivery, "the input is not modified")
+	assert.Empty(t, v.RetirementRules.OnTargetDeleted)
+	got.OwnerID, got.Version, got.Created = stored.OwnerID, stored.Version, stored.Created
+	want, err := CanonicalJSON(stored)
+	require.NoError(t, err)
+	have, err := CanonicalJSON(got)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(want), string(have))
+
+	bad := v
+	bad.Title = ""
+	_, err = NormalizeVersion(job.JobID, bad)
+	assert.Equal(t, CodeInvalid, code(t, err), "a structural refusal")
+
+	// Not a preflight: a spec routed to another machine normalizes, though
+	// registration refuses it when it loads the DAG.
+	elsewhere := input()
+	elsewhere.DAG.Spec = "worker_selector:\n  txe.machine: mch_other\nsteps:\n  - name: run\n    run: /pkg/run.sh\n"
+	_, err = NormalizeVersion(job.JobID, elsewhere)
+	require.NoError(t, err)
+	_, err = f.store.UpdateVersion(f.ctx, job.JobID, "upd-x", 1, elsewhere, cli)
+	assert.Equal(t, CodeInvalid, code(t, err), "registration loads and routes the DAG")
+}

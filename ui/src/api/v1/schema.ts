@@ -7983,6 +7983,8 @@ export interface components {
         TxeInstallation: {
             schema: number;
             owners: components["schemas"]["TxeOwner"][];
+            /** @description What this registry enforces. param_schema: a permitted action's param_schema is admitted at registration (refused when it cannot be enforced exactly) and the params of every action attempt are validated against it before a grant. A client must not rely on a capability that is not listed. */
+            capabilities: string[];
         };
         TxeProject: {
             schema: number;

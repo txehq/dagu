@@ -19629,7 +19629,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TxeOwner"
-      required: [schema, owners]
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: "What this registry enforces. param_schema: a permitted action's param_schema is admitted at registration (refused when it cannot be enforced exactly) and the params of every action attempt are validated against it before a grant. A client must not rely on a capability that is not listed."
+      required: [schema, owners, capabilities]
 
     TxeProject:
       type: object
