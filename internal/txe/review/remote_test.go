@@ -881,6 +881,83 @@ func TestRemoteARegisteredJobMatchesItsLocalRegistration(t *testing.T) {
 	assert.NotContains(t, string(raw), "JOB_TOKEN")
 }
 
+// Against the real registry: a version comes back from it as the version
+// that was sent, in the form the two are compared in, for the shapes a
+// registration can take. Each request below is written as a client would
+// send it, with things left out, given empty, or given in an order and
+// spelling of their own; the registry stores it, fills in its defaults,
+// re-encodes it, and the job is still bound. If the registry starts
+// changing something else on the way in, this is where it shows: such a
+// job would otherwise run no command.
+func TestRemoteRegisteredVersionsRoundTripThroughTheRealRegistry(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	base := f.job()
+	pkgDir := t.TempDir()
+	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", base.MachineID)
+	shape := func(pkg, rest string) string {
+		return fmt.Sprintf(`{"title":"t","purpose":"p","dag":{"spec":%q},"package":{"digest":"sha256:%064x","path":%q,"entrypoint":"run.sh"%s}%s}`, spec, 7, pkgDir, pkg, rest)
+	}
+	for name, version := range map[string]string{
+		"the least a registration can say": shape("", ""),
+		"everything given empty": shape(`,"working_dir":"","runtime":[],"credential_refs":[]`,
+			`,"targets":[],"expected_outcome":{"success_criteria":[],"deliverables":[]},"retirement_rules":{},"lifetime":{},"schedule":{},"origin":{},
+			  "review_policy":{"permitted_actions":[],"human_decision_conditions":[],"brief":"","max_attempts":0}`),
+		"deliverables with and without the optional parts": shape("",
+			`,"expected_outcome":{"success_criteria":["a report every day"],"deliverables":[
+			   {"name":"report","path":"out/report.md"},
+			   {"name":"data","path":"out/data.csv","type":"csv","description":"raw numbers","delivery":"hub","required":true},
+			   {"name":"log","path":"out/run.log","required":false,"delivery":"machine"}]}`),
+		"some retirement rules given, a schedule, an origin, an expiry": shape("",
+			`,"retirement_rules":{"on_completion":"keep","active_run_policy":"cancel"},
+			  "schedule":{"cron":"0 * * * *","timezone":"UTC","overlap":"skip","timeout_sec":600,"retry":2,"missed_run":"skip"},
+			  "origin":{"repo":"txehq/example","commit":"abc123","session":"cc5","worktree_path":"/w/tree","chat_ref":"thread-1"},
+			  "lifetime":{"expires_at":"2027-01-02T03:04:05Z"}`),
+		"targets, credentials and a full review policy": shape(`,"working_dir":"/pkg/work","runtime":["bash","jq"],"credential_refs":[
+			   {"name":"TXE_KUBECONFIG","kind":"file","locator":"/home/me/.kube/config"},
+			   {"name":"LINEAR_API_KEY","kind":"env","locator":"JOB_LINEAR"}]`,
+			`,"targets":[{"kind":"k8s.pv","stable_id":{"uid":"vol-9","cluster_uid":"c-1"},"environment":"development","display_name":"data volume"},
+			            {"kind":"linear.issue","stable_id":{"id":"TXE-1"}}],
+			  "review_policy":{"cadence":"30m","max_attempts":3,"max_duration_sec":120,"brief":"Check it & <report>.",
+			    "human_decision_conditions":["before any resize","when cost > 10"],
+			    "permitted_actions":[
+			      {"name":"zeta","routine":false,"timeout_sec":30,"command":"./zeta.sh","reconcile":"./zeta-check.sh","idempotency":"keyed","max_attempts":2,
+			       "param_schema":{ "type":"object", "additionalProperties":false, "required":["size_gb"],
+			                        "properties":{"size_gb":{"type":"integer","minimum":0,"maximum":500},"mode":{"enum":["fast","safe"]},"note":{"type":"string","pattern":"^[a-z<>&]*$","maxLength":0}}}},
+			      {"name":"alpha","routine":true,"timeout_sec":5,"command":"true"},
+			      {"name":"mid","routine":true,"timeout_sec":5,"entrypoint":"bin/mid","idempotency":"read_only","param_schema":{"type":"object","properties":{"ratio":{"type":"number","maximum":0.5}}}}]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+			require.NoError(t, err)
+			body := fmt.Sprintf(`{"job_id":%q,"request_id":"r1","owner_id":%q,"project_id":%q,"machine_id":%q,"job_key":"round-trip:%s","version":%s,"actor":{"kind":"cli","id":"round-trip"}}`,
+				jobID, base.OwnerID, base.ProjectID, base.MachineID, jobID, version)
+			var request apigen.TxeRegisterRequest
+			require.NoError(t, json.Unmarshal([]byte(body), &request))
+			require.NoError(t, f.remote.Transport.Do(ctx, http.MethodPost, "/txe/jobs", request, nil))
+
+			remote := &review.Remote{
+				Transport: f.remote.Transport, MachineID: base.MachineID,
+				// What this machine filed: the version exactly as written above.
+				LocalVersion: func(string, int) (json.RawMessage, error) { return json.RawMessage(version), nil },
+				LocalLatest:  func(string) (int, string, error) { return 1, base.OwnerID, nil },
+			}
+			job, err := remote.Job(ctx, jobID)
+			require.NoError(t, err)
+			assert.Empty(t, job.CommandsRefused, "the registry's copy of an honest registration is the registration")
+
+			// And the comparison is not vacuous for this shape: one changed
+			// word in what this machine filed is seen.
+			remote.LocalVersion = func(string, int) (json.RawMessage, error) {
+				return json.RawMessage(strings.Replace(version, `"purpose":"p"`, `"purpose":"q"`, 1)), nil
+			}
+			job, err = remote.Job(ctx, jobID)
+			require.NoError(t, err)
+			assert.Contains(t, job.CommandsRefused, "differs in: purpose")
+		})
+	}
+}
+
 // A job that declares credentials runs its commands only when the registry's
 // current version says exactly what this machine registered, in everything
 // that reaches execution: the credential references, each permitted action's
@@ -1164,7 +1241,8 @@ func TestRemoteAnUnboundJobIsReviewedAndRunsNoCommand(t *testing.T) {
 	}
 	job, err := f.remote.Job(ctx, f.jobID)
 	require.NoError(t, err)
-	require.Contains(t, job.CommandsRefused, "permitted actions")
+	require.Contains(t, job.CommandsRefused, "differs in: review_policy")
+	require.NotContains(t, job.CommandsRefused, "registered.sh", "the reason names the part, not a value from it")
 
 	unbound := func() (open, resolved int) {
 		for _, e := range f.job().Exceptions {

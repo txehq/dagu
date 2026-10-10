@@ -91,9 +91,9 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	_, _, err = localLatest(home)("job_01JTXE00000000000000000BBB")
 	require.Error(t, err, "a job this machine never registered has no receipt")
 
-	// An update this machine sent and has not finished is its newest
-	// version already: the service may hold it. One that was only staged,
-	// or that the service refused, is not; nor is another job's.
+	// An update this machine has not finished is its newest version already:
+	// it is sent while still marked staged, so the service may hold it. One
+	// the service refused, one that was overtaken, and another job's are not.
 	pending := filepath.Join(home.ReceiptsDir(), "pending")
 	require.NoError(t, os.MkdirAll(pending, 0o700))
 	file := func(name, job string, version int, step txepkg.Step) {
@@ -102,20 +102,22 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(pending, name+".json"), raw, 0o600))
 	}
-	file("req_staged", jobID, 9, txepkg.StepStaged)
+	newest := func() int {
+		t.Helper()
+		latest, _, err := localLatest(home)(jobID)
+		require.NoError(t, err)
+		return latest
+	}
 	file("req_rejected", jobID, 8, txepkg.StepRejected)
+	file("req_superseded", jobID, 9, txepkg.StepSuperseded)
 	file("req_other", "job_01JTXE00000000000000000BBB", 7, txepkg.StepRegistered)
-	latest, _, err = localLatest(home)(jobID)
-	require.NoError(t, err)
-	assert.Equal(t, 2, latest, "nothing the service may hold is newer")
-	file("req_sent", jobID, 3, txepkg.StepRegistered)
-	latest, _, err = localLatest(home)(jobID)
-	require.NoError(t, err)
-	assert.Equal(t, 3, latest, "a sent, unfinished update counts")
-	file("req_committed", jobID, 4, txepkg.StepCommitted)
-	latest, _, err = localLatest(home)(jobID)
-	require.NoError(t, err)
-	assert.Equal(t, 4, latest)
+	assert.Equal(t, 2, newest(), "nothing the service may hold is newer")
+	file("req_staged", jobID, 3, txepkg.StepStaged)
+	assert.Equal(t, 3, newest(), "a staged request may already have been sent")
+	file("req_sent", jobID, 4, txepkg.StepRegistered)
+	assert.Equal(t, 4, newest())
+	file("req_committed", jobID, 5, txepkg.StepCommitted)
+	assert.Equal(t, 5, newest())
 
 	version := `{"package":{"digest":"sha256:aa","path":"/pkg","entrypoint":"run.sh","credential_refs":[{"name":"LINEAR_API_KEY","kind":"file","locator":"/home/me/.config/txe/linear"}]},"review_policy":{"permitted_actions":[{"name":"restart","command":"./restart.sh","routine":true,"timeout_sec":60}]}}`
 	entry, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 2, Request: json.RawMessage(`{"job_id":"` + jobID + `","version":` + version + `}`)})

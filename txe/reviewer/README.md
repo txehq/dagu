@@ -102,29 +102,33 @@ registry's word. The registry's record of a version can be changed after
 registration by whoever can write to it. `dagu txe review` reads this
 machine's own record of the registration (the request `dagu txe register`
 filed beside the version's receipt) and starts a job's commands only when
-the registry's current version says exactly the same in everything that
-reaches execution: the package (digest, path, working directory,
-entrypoint), the registered targets, every permitted action (command and
-reconcile lines, the `routine` flag, idempotency class, timeout, attempt
-limits, parameter schema), the review brief and the conditions for asking
-a person, what the review agent is told about the job (title, purpose,
-expected outcome and deliverables, retirement rules), the credential
-references, and the job's owner. The registry's current version must also
-not be older than the newest version this machine registered, counting an
-update it has sent and not yet finished: an older one may match what was
-once registered and was replaced. This holds for every job, with or
-without credentials. The references used are the local ones. Values are
-compared as values, not as bytes: an absent, null or empty list or object
-is the same, a parameter schema is compared decoded, and the retirement
-rules a registration left out equal the registry's defaults for them.
+the registry's current version is the version this machine registered:
+the whole of it, not a list of fields. Both are put into the registry's own
+stored form and compared there, after doing to the local one exactly what
+the registry does to a version when it stores it: clearing what only the
+registry sets (schema, ids, version number, stamps, the DAG's name and
+digest), filling in its defaults (the four retirement rules, a
+deliverable's delivery), and canonicalising each parameter schema. What
+means nothing (absent, null, empty, zero, false) is the same however it is
+spelled, except inside a parameter schema. So the package, the DAG text,
+the schedule, the targets, the expected outcome, the review policy with
+every permitted action, and the title and purpose the review agent reads
+are all bound, and a field the registry later starts keeping is bound
+without anyone remembering to add it. The job's owner must be the one this
+machine registered it for, and the registry's current version must not be
+older than the newest version this machine has sent, finished or not: an
+older one may match what was once registered and was replaced. This holds
+for every job, with or without credentials. The credential references
+used are the local ones. What a job is doing now is not part of it: its
+availability, lifecycle, runs, and people's decisions.
 
 If this machine has no usable record of the version, or anything differs,
 none of the job's commands is started: no routine action, no approved
 action (its decision is kept for later), no reconcile probe. Nothing is
 read, and the job's declaration is not used to settle an interrupted
 action either: it stays unresolved. The job is still reviewed and questions still reach the owner, and
-the exception `job_commands_unbound` says what differs, without a locator
-or a command line. A recorded review does not clear it; it ends when the
+the exception `job_commands_unbound` says which part of the version
+differs, without any value from it. A recorded review does not clear it; it ends when the
 job is bound again. `dagu txe update <job id> -f <spec>
 --expected-version <n>` from that machine binds it and keeps the job and
 its history (a job cannot be registered a second time); an update that

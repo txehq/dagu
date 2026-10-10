@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -84,47 +85,8 @@ func (r *Remote) actor() *api.TxeActor {
 	return &api.TxeActor{Kind: api.TxeActorKindReviewer, Id: r.MachineID + "/" + r.RunID, MachineId: &r.MachineID}
 }
 
-// executed is everything in a job version that decides what one of the
-// job's commands is and what it is given: where it runs, each permitted
-// action's command lines and the properties that govern running them, and
-// the credential references.
-type executed struct {
-	Digest         string                 `json:"digest"`
-	Path           string                 `json:"path"`
-	WorkingDir     string                 `json:"working_dir"`
-	Entrypoint     string                 `json:"entrypoint"`
-	CredentialRefs []api.TxeCredentialRef `json:"credential_refs"`
-	// Targets are the registered targets, each as its canonical identity
-	// and environment. An action is granted against one of them and its
-	// command is told which, so they are part of what is executed.
-	Targets []string `json:"targets"`
-	// MaxAttempts is the policy's limit on attempts of an action. Brief and
-	// HumanDecisionConditions are what the review agent is told to do and
-	// when it must ask a person: they steer which commands run unasked.
-	MaxAttempts             int      `json:"max_attempts"`
-	Brief                   string   `json:"brief"`
-	HumanDecisionConditions []string `json:"human_decision_conditions"`
-	// Told is everything else of the version the review agent is told
-	// about the job, and decides from: its title and purpose, the expected
-	// outcome with its deliverables, and the retirement rules.
-	Told    string           `json:"told"`
-	Actions []executedAction `json:"actions"`
-}
-
-type executedAction struct {
-	Name        string `json:"name"`
-	Command     string `json:"command"`
-	Reconcile   string `json:"reconcile"`
-	Entrypoint  string `json:"entrypoint"`
-	Routine     bool   `json:"routine"`
-	Idempotency string `json:"idempotency"`
-	TimeoutSec  int    `json:"timeout_sec"`
-	MaxAttempts int    `json:"max_attempts"`
-	ParamSchema string `json:"param_schema"`
-}
-
 // canonicalJSON is one form for a JSON value however it was written: the
-// service re-encodes what it stores, so the same schema can differ from the
+// service re-encodes what it stores, so the same value can differ from the
 // registered one in spacing, member order and how characters are escaped.
 // Numbers keep their text. Something that is not JSON is compared as it is.
 func canonicalJSON(raw json.RawMessage) string {
@@ -138,7 +100,7 @@ func canonicalJSON(raw json.RawMessage) string {
 		return string(raw)
 	}
 	if v == nil {
-		// An absent schema and a null one are the same.
+		// An absent value and a null one are the same.
 		return ""
 	}
 	out, err := json.Marshal(v)
@@ -148,84 +110,126 @@ func canonicalJSON(raw json.RawMessage) string {
 	return string(out)
 }
 
-// toldToAgent is what a version tells the review agent about the job besides
-// its policy. The agent's decision runs routine actions unasked, so text it
-// decides from is bound like the commands themselves.
-type toldToAgent struct {
-	Title           string                  `json:"title"`
-	Purpose         string                  `json:"purpose"`
-	ExpectedOutcome *api.TxeExpectedOutcome `json:"expected_outcome,omitempty"`
-	RetirementRules *api.TxeRetirementRules `json:"retirement_rules,omitempty"`
-}
-
-// canonical is one comparable form of it. The registry fills in the
-// retirement rules a registration left out, so the same defaults are
-// applied before comparing: what the registry may add is exactly them.
-// These two adjustments are what a real registration needs to round-trip;
-// TestRemoteARegisteredJobMatchesItsLocalRegistration holds them to it.
-func (t toldToAgent) canonical() string {
-	rules := api.TxeRetirementRules{}
-	if t.RetirementRules != nil {
-		rules = *t.RetirementRules
-	}
-	if deref(rules.OnTargetDeleted) == "" {
-		rules.OnTargetDeleted = new(api.TxeRetirementRulesOnTargetDeleted(registry.RuleRetire))
-	}
-	if deref(rules.OnReplacement) == "" {
-		rules.OnReplacement = new(api.TxeRetirementRulesOnReplacement(registry.RuleReview))
-	}
-	if deref(rules.OnCompletion) == "" {
-		rules.OnCompletion = new(api.TxeRetirementRulesOnCompletion(registry.RuleRetire))
-	}
-	if deref(rules.ActiveRunPolicy) == "" {
-		rules.ActiveRunPolicy = new(api.TxeRetirementRulesActiveRunPolicy(registry.ActiveRunFinish))
-	}
-	t.RetirementRules = &rules
-	// The registry answers an expected outcome that was left out as an
-	// empty one. They are the same.
-	if raw, err := json.Marshal(t.ExpectedOutcome); err == nil && string(raw) == "{}" {
-		t.ExpectedOutcome = nil
-	}
-	raw, err := json.Marshal(t)
-	if err != nil {
-		return ""
-	}
-	return canonicalJSON(raw)
-}
-
-// executedOf puts the executed part of a version into one comparable form.
+// registeredView is the one form in which a version as this machine sent it
+// and the version as the registry returns it are compared: the whole
+// version, not a list of fields chosen to matter. It is the registry's own
+// stored type, so a field the registry keeps is a field that is compared,
+// and what a registration can leave out is decoded the way the registry
+// decodes it.
 //
-// A list that is empty and one that is absent are the same thing here: the
-// service leaves an empty list out of what it returns, and a registration
-// may have sent one.
-func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.TxeTarget, told toldToAgent) executed {
-	out := executed{Digest: pkg.Digest, Path: pkg.Path, WorkingDir: deref(pkg.WorkingDir), Entrypoint: pkg.Entrypoint, Told: told.canonical()}
-	if refs := deref(pkg.CredentialRefs); len(refs) > 0 {
-		out.CredentialRefs = slices.Clone(refs)
+// Three things are done to it, and they mirror, one for one, what the
+// registry does to a version when it stores it (normalizeVersion and
+// checkDeliverables in internal/txe/registry):
+//
+//   - what only the registry sets is cleared: schema, job id, owner,
+//     version number, creation stamp, previous-version link, and the DAG's
+//     name and digest (the DAG's text itself is compared);
+//   - the defaults it fills in are filled in: the four retirement rules, and
+//     a deliverable's delivery;
+//   - each action's parameter schema is put in canonical form, because the
+//     service re-encodes it.
+//
+// The result is a decoded tree per top-level field, with everything that
+// means "nothing" removed (absent, null, an empty string, list or object,
+// zero, false), since the two sides spell nothing differently. A parameter
+// schema is kept whole, as text: in a schema, zero and false mean something.
+func registeredView(raw json.RawMessage) (map[string]any, error) {
+	var v registry.JobVersion
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
 	}
-	for _, t := range targets {
-		out.Targets = append(out.Targets, targetKey(t)+"\x00"+deref(t.Environment))
+	v.Schema, v.JobID, v.OwnerID, v.Version, v.Created, v.Prev = 0, "", "", 0, registry.Stamp{}, ""
+	v.DAG.Name, v.DAG.SpecSHA256 = "", ""
+	for i := range v.ExpectedOutcome.Deliverables {
+		if d := &v.ExpectedOutcome.Deliverables[i]; d.Delivery == "" {
+			d.Delivery = registry.DeliveryMachine
+		}
 	}
-	slices.Sort(out.Targets)
-	slices.SortFunc(out.CredentialRefs, func(a, b api.TxeCredentialRef) int {
+	rules := &v.RetirementRules
+	if rules.OnTargetDeleted == "" {
+		rules.OnTargetDeleted = registry.RuleRetire
+	}
+	if rules.OnReplacement == "" {
+		rules.OnReplacement = registry.RuleReview
+	}
+	if rules.OnCompletion == "" {
+		rules.OnCompletion = registry.RuleRetire
+	}
+	if rules.ActiveRunPolicy == "" {
+		rules.ActiveRunPolicy = registry.ActiveRunFinish
+	}
+	for i := range v.ReviewPolicy.PermittedActions {
+		a := &v.ReviewPolicy.PermittedActions[i]
+		if schema := canonicalJSON(a.ParamSchema); schema != "" {
+			// As a string, so that nothing inside it is pruned below.
+			a.ParamSchema, _ = json.Marshal(schema)
+		} else {
+			a.ParamSchema = nil
+		}
+	}
+	// Order does not carry meaning in these lists, and is not promised.
+	slices.SortFunc(v.ReviewPolicy.PermittedActions, func(a, b registry.PermittedAction) int { return cmp.Compare(a.Name, b.Name) })
+	slices.SortFunc(v.Package.CredentialRefs, func(a, b registry.CredentialRef) int {
 		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Locator, b.Locator))
 	})
-	if policy != nil {
-		out.MaxAttempts, out.Brief = deref(policy.MaxAttempts), deref(policy.Brief)
-		if conditions := deref(policy.HumanDecisionConditions); len(conditions) > 0 {
-			out.HumanDecisionConditions = slices.Clone(conditions)
-		}
-		for _, pa := range deref(policy.PermittedActions) {
-			schema := canonicalJSON(pa.ParamSchema)
-			out.Actions = append(out.Actions, executedAction{
-				Name: pa.Name, Command: deref(pa.Command), Reconcile: deref(pa.Reconcile), Entrypoint: deref(pa.Entrypoint),
-				Routine: pa.Routine, Idempotency: string(deref(pa.Idempotency)), TimeoutSec: pa.TimeoutSec,
-				MaxAttempts: deref(pa.MaxAttempts), ParamSchema: schema,
-			})
-		}
+	slices.SortFunc(v.Targets, func(a, b registry.Target) int { return cmp.Compare(registry.TargetKey(a), registry.TargetKey(b)) })
+
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
 	}
-	slices.SortFunc(out.Actions, func(a, b executedAction) int { return cmp.Compare(a.Name, b.Name) })
-	return out
+	dec := json.NewDecoder(bytes.NewReader(encoded))
+	dec.UseNumber()
+	var tree map[string]any
+	if err := dec.Decode(&tree); err != nil {
+		return nil, err
+	}
+	pruned, _ := prune(tree).(map[string]any)
+	return pruned, nil
+}
+
+// prune removes from a decoded JSON value everything that means "nothing":
+// null, an empty string, list or object, zero and false. It returns nil for
+// a value that is itself nothing.
+func prune(v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case string:
+		if x == "" {
+			return nil
+		}
+	case bool:
+		if !x {
+			return nil
+		}
+	case json.Number:
+		if f, err := x.Float64(); err == nil && f == 0 {
+			return nil
+		}
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, item := range x {
+			// An element keeps its place even when it is nothing.
+			out = append(out, prune(item))
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, item := range x {
+			if kept := prune(item); kept != nil {
+				out[k] = kept
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return v
 }
 
 // localBinding establishes whether the job's commands may be started, and
@@ -235,19 +239,21 @@ func executedOf(pkg api.TxePackage, policy *api.TxeReviewPolicy, targets []api.T
 // registered, by whoever can write to the registry. What was authorized is
 // what this machine recorded when it registered the version. The reviewer
 // starts a job's commands on this machine, as its own user, and hands them
-// the job's credentials, so the commands have to be the registered ones: it
-// is not enough that the credential references are unchanged if the command
-// line they are given to, the flag that lets it run unasked, or the
-// directory it runs in was rewritten. And a job with no credentials at all
-// still gets a command started on this machine.
+// the job's credentials; and a review agent that reads the version decides
+// which of them run unasked. So for every job, with or without credentials,
+// the registry's current version must be the version this machine
+// registered: the whole of it, compared as registeredView puts it. It must
+// also be the newest version this machine registered, for the owner it
+// registered the job for. The credential references used are the local
+// ones.
 //
-// So for every job the registry's current version must say exactly what
-// this machine registered in everything that reaches execution (see
-// executed), and the credential references used are the local ones. If
-// this machine has no usable record of the version, or anything differs,
-// the reason is returned: no command of the job is started and nothing is
-// read. The reason names the part that differs, and never a locator or a
-// command line.
+// If this machine has no usable record of the version, or anything
+// differs, the reason is returned: no command of the job is started and
+// nothing is read. The reason names the part of the version that differs,
+// and never a value from it.
+//
+// What a job is doing now is not part of this: its availability, its
+// lifecycle, its runs, and the decisions people make about it.
 //
 // This protects the path of a job registered from this machine. It is not
 // isolation from the service that dispatches work to this machine, nor from
@@ -271,36 +277,53 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 		return refuse("the registry's owner of the job is not the one this machine registered it for")
 	}
 	raw, err := r.LocalVersion(jobID, version)
-	var registered struct {
-		Package      api.TxePackage       `json:"package"`
-		ReviewPolicy *api.TxeReviewPolicy `json:"review_policy"`
-		Targets      []api.TxeTarget      `json:"targets"`
-		toldToAgent
-	}
-	if err != nil || json.Unmarshal(raw, &registered) != nil {
+	if err != nil {
 		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	local := executedOf(registered.Package, registered.ReviewPolicy, registered.Targets, registered.toldToAgent)
-	remote := executedOf(v.Package, v.ReviewPolicy, deref(v.Targets), toldToAgent{Title: v.Title, Purpose: v.Purpose, ExpectedOutcome: v.ExpectedOutcome, RetirementRules: v.RetirementRules})
-	switch {
-	case !reflect.DeepEqual(local.CredentialRefs, remote.CredentialRefs):
-		return refuse(fmt.Sprintf("the registry's credential references for version %d of the job are not the ones this machine registered", version))
-	case local.Digest != remote.Digest || local.Path != remote.Path || local.WorkingDir != remote.WorkingDir || local.Entrypoint != remote.Entrypoint:
-		return refuse(fmt.Sprintf("the registry's package for version %d of the job is not the one this machine registered", version))
-	case !reflect.DeepEqual(local.Targets, remote.Targets):
-		return refuse(fmt.Sprintf("the registry's targets for version %d of the job are not the ones this machine registered", version))
-	case local.Told != remote.Told:
-		return refuse(fmt.Sprintf("the registry's description of version %d of the job (title, purpose, expected outcome or retirement rules) is not the one this machine registered", version))
-	case local.Brief != remote.Brief || !reflect.DeepEqual(local.HumanDecisionConditions, remote.HumanDecisionConditions):
-		return refuse(fmt.Sprintf("the registry's review policy for version %d of the job is not the one this machine registered", version))
-	case local.MaxAttempts != remote.MaxAttempts || !reflect.DeepEqual(local.Actions, remote.Actions):
-		return refuse(fmt.Sprintf("the registry's permitted actions for version %d of the job are not the ones this machine registered", version))
+	local, err := registeredView(raw)
+	if err != nil {
+		return refuse(fmt.Sprintf("this machine's registration record of version %d of the job cannot be read", version))
 	}
-	refs := make([]CredentialRef, len(local.CredentialRefs))
-	for i, ref := range local.CredentialRefs {
-		refs[i] = CredentialRef{Name: ref.Name, Kind: string(ref.Kind), Locator: ref.Locator}
+	stored, err := json.Marshal(v)
+	if err != nil {
+		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
+	}
+	remote, err := registeredView(stored)
+	if err != nil {
+		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
+	}
+	var differs []string
+	for _, part := range slices.Sorted(maps.Keys(mergeKeys(local, remote))) {
+		if !reflect.DeepEqual(local[part], remote[part]) {
+			differs = append(differs, part)
+		}
+	}
+	if len(differs) > 0 {
+		return refuse(fmt.Sprintf("the registry's version %d of the job is not the one this machine registered; it differs in: %s", version, strings.Join(differs, ", ")))
+	}
+	// The references come from the local record, decoded as the registry
+	// decodes them.
+	var registered registry.JobVersion
+	if err := json.Unmarshal(raw, &registered); err != nil {
+		return refuse(fmt.Sprintf("this machine's registration record of version %d of the job cannot be read", version))
+	}
+	refs := make([]CredentialRef, len(registered.Package.CredentialRefs))
+	for i, ref := range registered.Package.CredentialRefs {
+		refs[i] = CredentialRef{Name: ref.Name, Kind: ref.Kind, Locator: ref.Locator}
 	}
 	return refs, ""
+}
+
+// mergeKeys is the set of keys of two maps.
+func mergeKeys(a, b map[string]any) map[string]bool {
+	out := make(map[string]bool, len(a)+len(b))
+	for k := range a {
+		out[k] = true
+	}
+	for k := range b {
+		out[k] = true
+	}
+	return out
 }
 
 func jobPath(jobID string, rest ...string) string {

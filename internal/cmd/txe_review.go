@@ -115,10 +115,13 @@ func (t txeReviewTransport) Do(ctx context.Context, method, path string, in, out
 // localLatest reads the newest version of a job this machine registered and
 // the owner it registered it for, from the records `dagu txe register` and
 // `dagu txe update` leave. A version counts from the moment this machine
-// sent it to the service, not only once its receipt is written: a request
-// the service may hold (sent, or sent and committed, with its receipt still
-// to come) is this machine's newest version, and a registry that names an
-// older one has been set back.
+// prepared to send it, not only once its receipt is written. A request is
+// sent while its entry still says "staged", and a lost answer or a crash
+// leaves it so with the service already holding the version; so every
+// unfinished request counts, except one the service refused or one that
+// was overtaken. A registry that names an older version has been set back.
+// This fails closed: a request that was prepared and never sent keeps the
+// job's commands from starting until `dagu txe resume` finishes it.
 func localLatest(home txepkg.Home) func(string) (int, string, error) {
 	return func(jobID string) (int, string, error) {
 		journal := txepkg.NewJournal(home)
@@ -139,7 +142,7 @@ func localLatest(home txepkg.Home) func(string) (int, string, error) {
 			return 0, "", fmt.Errorf("read unfinished registrations: %w", err)
 		}
 		for _, e := range pending {
-			if e.JobID == jobID && (e.Step == txepkg.StepRegistered || e.Step == txepkg.StepCommitted) && e.Version > latest {
+			if e.JobID == jobID && e.Step != txepkg.StepRejected && e.Step != txepkg.StepSuperseded && e.Version > latest {
 				latest = e.Version
 			}
 		}
