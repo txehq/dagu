@@ -1077,8 +1077,6 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		local  func(string, int) (json.RawMessage, error)
 		latest func(string) (int, string, error)
 		runs   bool
-		// outdated: refused as registered under earlier rules.
-		outdated bool
 	}{
 		"the registry still says what was registered": {remote: registered, runs: true},
 		"an empty credential list was registered, and the registry leaves it out": {
@@ -1180,8 +1178,8 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		"the package entrypoint was changed": {remote: version(func(v map[string]any) { pkg(v)["entrypoint"] = "other.sh" })},
 
 		// A version stored when the registry's rules were laxer: the same on
-		// both sides, and no longer a version the rules accept. It is refused
-		// for what it is, with the remedy, and not as an altered record.
+		// both sides, and no longer a version today's rules would accept. It
+		// is still the version that was registered, and its commands run.
 		"an unaltered version the current rules no longer accept": {
 			remote: version(func(v map[string]any) {
 				act(v)["param_schema"] = map[string]any{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
@@ -1191,7 +1189,17 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 					act(v)["param_schema"] = map[string]any{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
 				}), nil
 			},
-			outdated: true,
+			runs: true,
+		},
+		"such a version, altered": {
+			remote: version(func(v map[string]any) {
+				act(v)["param_schema"] = map[string]any{"$schema": "http://json-schema.org/draft-07/schema#", "type": "string"}
+			}),
+			local: func(string, int) (json.RawMessage, error) {
+				return version(func(v map[string]any) {
+					act(v)["param_schema"] = map[string]any{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
+				}), nil
+			},
 		},
 		"this machine has no record of the registration": {remote: registered, local: func(string, int) (json.RawMessage, error) { return nil, errors.New("no receipt") }},
 		"this machine's record cannot be read":           {remote: registered, local: func(string, int) (json.RawMessage, error) { return json.RawMessage(`{"package":`), nil }},
@@ -1241,11 +1249,6 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 			}
 			assert.Empty(t, job.CredentialRefs)
 			assert.NotEmpty(t, job.CommandsRefused)
-			assert.Equal(t, tc.outdated, strings.Contains(job.CommandsRefused, "registered under earlier rules"), job.CommandsRefused)
-			if tc.outdated {
-				assert.Contains(t, job.CommandsRefused, "update the job from this machine")
-				assert.NotContains(t, job.CommandsRefused, "draft-07", "what the rules object to is not quoted")
-			}
 			assert.Equal(t, review.EffectNotApplied, res.Status, "the command is not started")
 			assert.ErrorIs(t, readErr, os.ErrNotExist, "nothing ran")
 			assert.Empty(t, read, "no file is read: not the registered one and not one the registry points at")

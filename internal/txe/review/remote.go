@@ -110,21 +110,19 @@ func canonicalJSON(raw json.RawMessage) string {
 	return string(out)
 }
 
-// errNotCurrentRules means a version is readable and is not one the
-// registry's current rules for a version accept.
-var errNotCurrentRules = errors.New("not accepted by the registry's current rules for a version")
-
 // registeredView is the one form in which a version as this machine sent it
 // and the version as the registry returns it are compared: the whole
 // version, not a list of fields chosen to matter. It is the registry's own
 // stored type, so a field the registry keeps is a field that is compared.
 //
-// The version is put through the registry's own rule for storing one
-// (registry.NormalizeVersion): its validation, the defaults it fills in, and
-// the fields it derives. The same rule that made the stored version is
-// applied to what this machine filed, so nothing about it is repeated
-// here. A version the rule refuses is not a registered version at all, on
-// either side, and is refused.
+// The version is given the registry's own defaults and derived fields
+// (registry.ApplyVersionDefaults, the function registration itself uses),
+// so what this machine filed becomes exactly what an honest registry
+// stored, and nothing of that is repeated here. It is deliberately not the
+// registry's admission check: whether today's rules would accept the
+// version is not the question. The question is whether the registry's copy
+// is the version that was registered, and a version stored when the rules
+// were laxer is still that version.
 //
 // Then what the registry assigns when it commits a version is cleared
 // (owner, version number, creation stamp, link to the previous version),
@@ -141,12 +139,9 @@ func registeredView(jobID string, raw json.RawMessage) (map[string]any, error) {
 	if err := json.Unmarshal(raw, &filed); err != nil {
 		return nil, err
 	}
-	v, err := registry.NormalizeVersion(jobID, filed)
+	v, err := registry.ApplyVersionDefaults(jobID, filed)
 	if err != nil {
-		// The registry's rule for storing a version also validates it, by
-		// today's rules. A version stored when the rules were laxer fails
-		// here although nothing about it was altered.
-		return nil, fmt.Errorf("%w: %v", errNotCurrentRules, err)
+		return nil, err
 	}
 	v.OwnerID, v.Version, v.Created, v.Prev = "", 0, registry.Stamp{}, ""
 	for i := range v.ReviewPolicy.PermittedActions {
@@ -285,13 +280,8 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 	if err != nil {
 		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	// What the rules object to is not repeated: it can quote the version.
-	outdated := fmt.Sprintf("version %d of the job was registered under earlier rules and the registry's current rules for a version do not accept it, so it cannot be checked against this machine's registration; update the job from this machine so that it is stored under the current rules", version)
 	local, err := registeredView(jobID, raw)
-	switch {
-	case errors.Is(err, errNotCurrentRules):
-		return refuse(outdated)
-	case err != nil:
+	if err != nil {
 		return refuse(fmt.Sprintf("this machine's registration record of version %d of the job cannot be read", version))
 	}
 	stored, err := json.Marshal(v)
@@ -299,12 +289,7 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
 	}
 	remote, err := registeredView(jobID, stored)
-	switch {
-	case errors.Is(err, errNotCurrentRules):
-		// This machine's registration passed the current rules and the
-		// registry's copy does not: they are not the same version.
-		return refuse(fmt.Sprintf("the registry's version %d of the job is not one its current rules accept, and the version this machine registered is", version))
-	case err != nil:
+	if err != nil {
 		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
 	}
 	var differs []string

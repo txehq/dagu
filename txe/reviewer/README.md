@@ -104,15 +104,12 @@ machine's own record of the registration (the request `dagu txe register`
 filed beside the version's receipt) and starts a job's commands only when
 the registry's current version is the version this machine registered:
 the whole of it, not a list of fields. Both are put into the registry's own
-stored form and through the registry's own rule for storing a version
-(its validation, its defaults, the fields it derives), so the version this
-machine filed becomes exactly what an honest registry stored, and nothing
-of that rule is repeated in the reviewer. A version the rule refuses is
-not a registered version, on either side. That rule validates by today's
-rules: a job whose version was stored when the rules were laxer, and no
-longer passes them, runs no command although nothing about it was altered.
-Its exception says so and says to update the job from its machine, which
-stores it under the current rules. What the registry assigns at
+stored form and given the registry's own defaults and derived fields, by
+the function registration itself uses, so the version this machine filed
+becomes exactly what an honest registry stored and nothing of that is
+repeated in the reviewer. It is not the registry's admission check: a
+version stored when the rules were laxer is still the version that was
+registered, and its commands run. What the registry assigns at
 commit (owner, version number, stamps) is left out, each parameter schema
 is compared decoded, and what means nothing (absent, null, empty, zero,
 false) is the same however it is spelled, except inside a parameter schema
