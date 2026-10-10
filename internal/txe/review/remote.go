@@ -113,51 +113,35 @@ func canonicalJSON(raw json.RawMessage) string {
 // registeredView is the one form in which a version as this machine sent it
 // and the version as the registry returns it are compared: the whole
 // version, not a list of fields chosen to matter. It is the registry's own
-// stored type, so a field the registry keeps is a field that is compared,
-// and what a registration can leave out is decoded the way the registry
-// decodes it.
+// stored type, so a field the registry keeps is a field that is compared.
 //
-// Three things are done to it, and they mirror, one for one, what the
-// registry does to a version when it stores it (normalizeVersion and
-// checkDeliverables in internal/txe/registry):
+// The version is put through the registry's own rule for storing one
+// (registry.NormalizeVersion): its validation, the defaults it fills in, and
+// the fields it derives. The same rule that made the stored version is
+// applied to what this machine filed, so nothing about it is repeated
+// here. A version the rule refuses is not a registered version at all, on
+// either side, and is refused.
 //
-//   - what only the registry sets is cleared: schema, job id, owner,
-//     version number, creation stamp, previous-version link, and the DAG's
-//     name and digest (the DAG's text itself is compared);
-//   - the defaults it fills in are filled in: the four retirement rules, and
-//     a deliverable's delivery;
-//   - each action's parameter schema is put in canonical form, because the
-//     service re-encodes it.
+// Then what the registry assigns when it commits a version is cleared
+// (owner, version number, creation stamp, link to the previous version),
+// each action's parameter schema is put in canonical form because the
+// service re-encodes it, and the lists whose order means nothing are sorted.
 //
 // The result is a decoded tree per top-level field, with everything that
 // means "nothing" removed (absent, null, an empty string, list or object,
 // zero, false), since the two sides spell nothing differently. A parameter
-// schema is kept whole, as text: in a schema, zero and false mean something.
-func registeredView(raw json.RawMessage) (map[string]any, error) {
-	var v registry.JobVersion
-	if err := json.Unmarshal(raw, &v); err != nil {
+// schema is kept whole, as text, and a target's stable id member for
+// member: in those, an empty value means something.
+func registeredView(jobID string, raw json.RawMessage) (map[string]any, error) {
+	var filed registry.JobVersion
+	if err := json.Unmarshal(raw, &filed); err != nil {
 		return nil, err
 	}
-	v.Schema, v.JobID, v.OwnerID, v.Version, v.Created, v.Prev = 0, "", "", 0, registry.Stamp{}, ""
-	v.DAG.Name, v.DAG.SpecSHA256 = "", ""
-	for i := range v.ExpectedOutcome.Deliverables {
-		if d := &v.ExpectedOutcome.Deliverables[i]; d.Delivery == "" {
-			d.Delivery = registry.DeliveryMachine
-		}
+	v, err := registry.NormalizeVersion(jobID, filed)
+	if err != nil {
+		return nil, err
 	}
-	rules := &v.RetirementRules
-	if rules.OnTargetDeleted == "" {
-		rules.OnTargetDeleted = registry.RuleRetire
-	}
-	if rules.OnReplacement == "" {
-		rules.OnReplacement = registry.RuleReview
-	}
-	if rules.OnCompletion == "" {
-		rules.OnCompletion = registry.RuleRetire
-	}
-	if rules.ActiveRunPolicy == "" {
-		rules.ActiveRunPolicy = registry.ActiveRunFinish
-	}
+	v.OwnerID, v.Version, v.Created, v.Prev = "", 0, registry.Stamp{}, ""
 	for i := range v.ReviewPolicy.PermittedActions {
 		a := &v.ReviewPolicy.PermittedActions[i]
 		if schema := canonicalJSON(a.ParamSchema); schema != "" {
@@ -294,7 +278,7 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 	if err != nil {
 		return refuse(fmt.Sprintf("version %d of the job has no usable registration record on this machine to check it against", version))
 	}
-	local, err := registeredView(raw)
+	local, err := registeredView(jobID, raw)
 	if err != nil {
 		return refuse(fmt.Sprintf("this machine's registration record of version %d of the job cannot be read", version))
 	}
@@ -302,7 +286,7 @@ func (r *Remote) localBinding(jobID, ownerID string, version int, v api.TxeJobVe
 	if err != nil {
 		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
 	}
-	remote, err := registeredView(stored)
+	remote, err := registeredView(jobID, stored)
 	if err != nil {
 		return refuse(fmt.Sprintf("the registry's version %d of the job cannot be read", version))
 	}
@@ -1533,10 +1517,11 @@ func count(n int) *int64 {
 }
 
 // hasOpenBindingException reports whether the job has an unresolved
-// exception of the binding scope. Scope and kind decide, never its text.
-func hasOpenBindingException(doc api.TxeJob) bool {
+// exception of the binding scope about the given version. Scope, kind and
+// version decide, never its text.
+func hasOpenBindingException(doc api.TxeJob, version int) bool {
 	for _, e := range deref(doc.Exceptions) {
-		if e.ResolvedAt == nil && deref(e.Scope) == string(api.TxeObservationRequestScopeBinding) && e.Kind == string(ExceptionCommandsUnbound) {
+		if e.ResolvedAt == nil && deref(e.Scope) == string(api.TxeObservationRequestScopeBinding) && e.Kind == string(ExceptionCommandsUnbound) && deref(e.JobVersion) == version {
 			return true
 		}
 	}
@@ -1636,14 +1621,18 @@ func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 			if err != nil {
 				return err
 			}
-			if !hasOpenBindingException(doc) {
+			if !hasOpenBindingException(doc, exc.JobVersion) {
 				return nil
 			}
 			state = api.TxeAvailabilityState(registry.AvailabilityReady)
 		}
+		// The report is about the version that was checked, and says so:
+		// if the job got another version in the meantime, the registry
+		// refuses it, and neither raises nor clears anything about a
+		// version this reviewer did not look at.
 		body := api.TxeObservationRequest{
 			Actor: r.actor(), Scope: &scope, Kind: &kind, Detail: &exc.Message, State: state,
-			ClaimId: &exc.Claim.ID, Fence: &fence,
+			ClaimId: &exc.Claim.ID, Fence: &fence, JobVersion: &exc.JobVersion,
 		}
 		return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
 	}

@@ -575,6 +575,9 @@ type Exception struct {
 	// Claim is the live claim an action's exception is raised under. It
 	// is not part of the record.
 	Claim Claim `json:"-"`
+	// JobVersion is the version of the job an exception about the job's
+	// binding was established for.
+	JobVersion int `json:"job_version,omitempty"`
 	// Cleared reports that the condition is over, for a kind of exception
 	// the reviewer has to end itself.
 	Cleared bool `json:"-"`

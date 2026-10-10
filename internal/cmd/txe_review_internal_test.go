@@ -134,6 +134,13 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	_, err = local("job_01JTXE00000000000000000BBB", 2)
 	require.Error(t, err)
 
+	// A record filed under another request id is not the receipt's.
+	mismatched, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_9", JobID: jobID, Version: 2, Request: json.RawMessage(`{"version":` + version + `}`)})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), mismatched, 0o600))
+	_, err = local(jobID, 2)
+	require.Error(t, err)
+
 	// A record filed for another job or version is not this one's.
 	other, err := json.Marshal(txepkg.Entry{Schema: 1, RequestID: "req_1", JobID: jobID, Version: 7, Request: json.RawMessage(`{"version":` + version + `}`)})
 	require.NoError(t, err)

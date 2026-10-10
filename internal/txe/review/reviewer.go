@@ -155,7 +155,7 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	// job's commands will be started, and told that this is over once the
 	// job is bound again. The job is reviewed either way: telling must not
 	// stop the review, and what could not be said is said by the next one.
-	binding := Exception{JobID: job.ID, Kind: ExceptionCommandsUnbound, MachineID: job.MachineID, Claim: claim}
+	binding := Exception{JobID: job.ID, Kind: ExceptionCommandsUnbound, MachineID: job.MachineID, Claim: claim, JobVersion: job.Version}
 	if job.CommandsRefused != "" {
 		binding.Message = CommandsUnboundMessage(job)
 	} else {

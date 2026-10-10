@@ -958,6 +958,68 @@ func TestRemoteRegisteredVersionsRoundTripThroughTheRealRegistry(t *testing.T) {
 	}
 }
 
+// bodyTransport records the body of every request and answers from a stub.
+type bodyTransport struct {
+	*stubTransport
+	bodies map[string]map[string]any
+}
+
+func (b *bodyTransport) Do(ctx context.Context, method, path string, in, out any) error {
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return err
+		}
+		b.bodies[method+" "+path] = body
+	}
+	return b.stubTransport.Do(ctx, method, path, in, out)
+}
+
+// What the reviewer reports about the binding of a job's commands is about
+// the version it checked, and it says which: the registry then refuses a
+// report that arrives after the job got another version, so a check of an
+// old version neither raises nor ends anything about a new one. Ending is
+// only said when that version has an open exception of that scope.
+func TestRemoteBindingReportsNameTheVersionThatWasChecked(t *testing.T) {
+	doc := func(exceptions string) string {
+		return `{"job_id":"job_1","owner_id":"own_1","version":4,"machine_id":"mch_1","package_digest":"sha256:aa","lifecycle":"active","availability":{"state":"ready"},"exceptions":{` + exceptions + `}}`
+	}
+	open := func(version int, scope string) string {
+		return fmt.Sprintf(`"exc_%[1]d":{"exception_id":"exc_%[1]d","kind":"job_commands_unbound","scope":%[2]q,"job_version":%[1]d,"detail":"d","created":{"at":"2026-10-09T10:00:00Z","by":{"kind":"reviewer","id":"r"}}}`, version, scope)
+	}
+	const path = "/txe/jobs/job_1/observations"
+	claim := review.Claim{ID: "clm_1", Fence: 7}
+	report := func(exceptions string, exc review.Exception) map[string]any {
+		t.Helper()
+		transport := &bodyTransport{stubTransport: &stubTransport{t: t, replies: map[string]string{"/txe/jobs/job_1": doc(exceptions), path: `{}`}}, bodies: map[string]map[string]any{}}
+		exc.JobID, exc.Kind, exc.Claim = "job_1", review.ExceptionCommandsUnbound, claim
+		require.NoError(t, (&review.Remote{Transport: transport, MachineID: "mch_1"}).RaiseException(context.Background(), exc))
+		return transport.bodies["POST "+path]
+	}
+
+	raised := report("", review.Exception{JobVersion: 3, Message: "not bound"})
+	require.NotNil(t, raised)
+	assert.Equal(t, "binding", raised["scope"])
+	assert.Equal(t, "job_commands_unbound", raised["kind"])
+	assert.InDelta(t, 3, raised["job_version"], 0, "the version that was checked, not whatever is current")
+	assert.Equal(t, "stale", raised["state"])
+	assert.Equal(t, "clm_1", raised["claim_id"])
+	assert.InDelta(t, 7, raised["fence"], 0)
+
+	cleared := report(open(3, "binding"), review.Exception{JobVersion: 3, Cleared: true, Message: "bound again"})
+	require.NotNil(t, cleared)
+	assert.Equal(t, "ready", cleared["state"])
+	assert.InDelta(t, 3, cleared["job_version"], 0)
+
+	assert.Nil(t, report("", review.Exception{JobVersion: 3, Cleared: true}), "nothing is open: nothing is said")
+	assert.Nil(t, report(open(4, "binding"), review.Exception{JobVersion: 3, Cleared: true}), "an exception about another version is not this check's to end")
+	assert.Nil(t, report(open(3, "reviewer"), review.Exception{JobVersion: 3, Cleared: true}), "nor one of another scope")
+}
+
 // A job that declares credentials runs its commands only when the registry's
 // current version says exactly what this machine registered, in everything
 // that reaches execution: the credential references, each permitted action's
@@ -985,9 +1047,9 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 	// version builds a version record; edit changes it after "registration".
 	version := func(edit func(v map[string]any)) json.RawMessage {
 		v := map[string]any{
-			"title": "t", "purpose": "p", "dag": map[string]any{},
+			"title": "t", "purpose": "p", "dag": map[string]any{"spec": "steps:\n  - name: run\n    run: /pkg/run.sh\n"},
 			"package": map[string]any{
-				"digest": "sha256:aa", "path": dir, "entrypoint": "run.sh",
+				"digest": "sha256:" + strings.Repeat("a", 64), "path": dir, "entrypoint": "run.sh",
 				"credential_refs": []any{map[string]any{"name": "OPENAI_API_KEY", "kind": "file", "locator": keyFile}},
 			},
 			"targets": []any{map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "vol-1"}, "environment": "development"}},
@@ -1112,7 +1174,7 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		})},
 		"the package path was changed":       {remote: version(func(v map[string]any) { pkg(v)["path"] = secrets })},
 		"a working directory was set":        {remote: version(func(v map[string]any) { pkg(v)["working_dir"] = secrets })},
-		"the package digest was changed":     {remote: version(func(v map[string]any) { pkg(v)["digest"] = "sha256:bb" })},
+		"the package digest was changed":     {remote: version(func(v map[string]any) { pkg(v)["digest"] = "sha256:" + strings.Repeat("b", 64) })},
 		"the package entrypoint was changed": {remote: version(func(v map[string]any) { pkg(v)["entrypoint"] = "other.sh" })},
 
 		"this machine has no record of the registration": {remote: registered, local: func(string, int) (json.RawMessage, error) { return nil, errors.New("no receipt") }},

@@ -104,14 +104,17 @@ machine's own record of the registration (the request `dagu txe register`
 filed beside the version's receipt) and starts a job's commands only when
 the registry's current version is the version this machine registered:
 the whole of it, not a list of fields. Both are put into the registry's own
-stored form and compared there, after doing to the local one exactly what
-the registry does to a version when it stores it: clearing what only the
-registry sets (schema, ids, version number, stamps, the DAG's name and
-digest), filling in its defaults (the four retirement rules, a
-deliverable's delivery), and canonicalising each parameter schema. What
-means nothing (absent, null, empty, zero, false) is the same however it is
-spelled, except inside a parameter schema and inside a target's stable
-id, which is the target's identity and is compared member for member. So the package, the DAG text,
+stored form and through the registry's own rule for storing a version
+(its validation, its defaults, the fields it derives), so the version this
+machine filed becomes exactly what an honest registry stored, and nothing
+of that rule is repeated in the reviewer. A version the rule refuses is
+not a registered version, on either side. What the registry assigns at
+commit (owner, version number, stamps) is left out, each parameter schema
+is compared decoded, and what means nothing (absent, null, empty, zero,
+false) is the same however it is spelled, except inside a parameter schema
+and inside a target's stable id, which is the target's identity and is
+compared member for member.
+So the package, the DAG text,
 the schedule, the targets, the expected outcome, the review policy with
 every permitted action, and the title and purpose the review agent reads
 are all bound, and a field the registry later starts keeping is bound
