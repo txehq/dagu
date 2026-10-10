@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -106,4 +107,37 @@ func TestTxeJobIdentity(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestTxeArtifactDigest(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "raw"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "raw", "a.csv"), []byte("hello"), 0o600))
+	sha, found, err := txeArtifactDigest(dir, "raw/a.csv")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", sha)
+	_, found, err = txeArtifactDigest(dir, "none.csv")
+	require.NoError(t, err)
+	assert.False(t, found)
+	_, found, err = txeArtifactDigest(dir, "../escape")
+	require.NoError(t, err)
+	assert.False(t, found, "a path outside the run's directory is never read")
+}
+
+// Run summaries and details carry Dagu's attempt identity, so a client can
+// see that a retry started a new attempt of the same run.
+func TestRunAttemptIDIsExposed(t *testing.T) {
+	s := ir.DAGRunStatus{Name: "job", DAGRunID: "run-1", AttemptID: "a2", Status: ir.Queued}
+	require.NotNil(t, toDAGRunSummary(s).AttemptId)
+	assert.Equal(t, "a2", *toDAGRunSummary(s).AttemptId)
+	require.NotNil(t, ToDAGRunDetails(s).AttemptId)
+	assert.Equal(t, "a2", *ToDAGRunDetails(s).AttemptId)
+	s.QueuedAt = "2026-10-09T12:00:00Z"
+	require.NotNil(t, toDAGRunSummary(s).ExecutionRef)
+	assert.Equal(t, registry.ExecutionRef("a2", "2026-10-09T12:00:00Z"), *toDAGRunSummary(s).ExecutionRef)
+	assert.Equal(t, *toDAGRunSummary(s).ExecutionRef, *ToDAGRunDetails(s).ExecutionRef)
+	s.AttemptID = ""
+	assert.Nil(t, toDAGRunSummary(s).AttemptId)
+	assert.Nil(t, toDAGRunSummary(s).ExecutionRef)
 }

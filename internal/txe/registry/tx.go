@@ -221,6 +221,7 @@ func (tx *JobTx) supersedeProposals(reason string) ([]Affected, error) {
 		p.Revision++
 		p.Reasoning = reason
 		p.Updated = Stamp{At: tx.now, By: tx.actor}
+		tx.closeLater(p)
 		if err := tx.archiveProposal(p); err != nil {
 			return nil, err
 		}
@@ -253,6 +254,15 @@ func (tx *JobTx) archiveAction(a *Action) error {
 		return err
 	}
 	delete(tx.Job.Actions, a.ActionID)
+	// An archived action can no longer be settled or stall: its
+	// action-scope exceptions end with it (also when a later episode
+	// replaces an uncertain action).
+	now := tx.now
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeAction && e.ActionID == a.ActionID {
+			e.ResolvedAt = &now
+		}
+	}
 	return nil
 }
 
@@ -262,27 +272,90 @@ type Observation struct {
 	Kind     string // exception kind, e.g. "auth", "worker_offline", "reviewer_launch"
 	Detail   string
 	Evidence []string
+	// Scope is ScopeReviewer for the job's reviewer; empty or ScopeJob for
+	// the job itself.
+	Scope string
+	// Target is the key of the one target a resource event observed. Its
+	// exception belongs to that target, and a ready observation of it
+	// resolves only that target's exceptions.
+	Target string
+	// ActionID and Attempt name the action attempt of a ScopeAction
+	// observation; ClaimID and Fence are the reporter's live claim.
+	ActionID string
+	Attempt  int
+	ClaimID  string
+	Fence    int64
+	// JobVersion is the version a ScopeBinding observation is about; zero
+	// means the job's current version.
+	JobVersion int
 }
+
+// Observation scopes.
+const (
+	ScopeJob      = "job"
+	ScopeReviewer = "reviewer"
+	// ScopeAction is a problem with one attempt of one action (a retry
+	// reservation that never started); it changes no availability.
+	ScopeAction = "action"
+	// ScopeBinding is a problem binding one version of the job to the
+	// reviewer's machine (e.g. job_commands_unbound): it changes no
+	// availability and is not resolved by a review or a ready observation,
+	// only by a ready observation of the same kind and version, or by the
+	// job moving to another version.
+	ScopeBinding = "binding"
+)
 
 // Observe records availability. It never changes the lifecycle: an offline
 // machine, an expired login or an unreachable target is not a retirement.
 // A non-ready observation opens an exception; a ready one resolves them.
 func (tx *JobTx) Observe(o Observation) error {
 	j := tx.Job
+	switch o.Scope {
+	case ScopeAction:
+		return tx.observeAction(o)
+	case ScopeBinding:
+		return tx.observeBinding(o)
+	}
 	if o.State == "" {
 		return refuse(CodeInvalid, "observation state is required")
+	}
+	switch o.Scope {
+	case "", ScopeJob:
+	case ScopeReviewer:
+		return tx.observeReviewer(o)
+	default:
+		return refuse(CodeInvalid, "observation scope must be job, reviewer, action or binding")
 	}
 	from := j.Availability.State
 	now := tx.now
 	actor := tx.actor
 	j.Availability = Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
-	if o.State == AvailabilityReady {
+	switch {
+	case o.State == AvailabilityReady && o.Target != "":
+		// One target recovered: only its exceptions are resolved, and the
+		// job stays unavailable while any other condition is open.
 		for _, e := range j.Exceptions {
-			if e.ResolvedAt == nil && e.State != "" {
+			if e.ResolvedAt != nil || e.State == "" || e.Scope != "" {
+				continue
+			}
+			t, err := tx.store.exceptionTarget(tx.ctx, e)
+			if err != nil {
+				return err
+			}
+			if t == o.Target {
 				e.ResolvedAt = &now
 			}
 		}
-	} else {
+		if open := tx.latestOpenException(); open != nil {
+			j.Availability = Availability{State: open.State, Detail: open.Detail, Evidence: open.Evidence, ObservedAt: &now, Reporter: &actor}
+		}
+	case o.State == AvailabilityReady:
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.State != "" && e.Scope == "" {
+				e.ResolvedAt = &now
+			}
+		}
+	default:
 		id, err := NewID(PrefixException, now)
 		if err != nil {
 			return err
@@ -294,20 +367,28 @@ func (tx *JobTx) Observe(o Observation) error {
 		if kind == "" {
 			kind = string(o.State)
 		}
-		j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		if !tx.hasOpenException("", kind, o.State, o.Target) {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Target: o.Target, Created: Stamp{At: now, By: actor}}
+		}
 	}
 	tx.touch()
-	if from == o.State {
+	to := j.Availability.State
+	if from == to {
 		return nil
 	}
-	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(o.State), Detail: o.Detail, Evidence: o.Evidence})
+	return tx.event(Event{Kind: EventAvailability, From: string(from), To: string(to), Detail: j.Availability.Detail, Evidence: j.Availability.Evidence})
 }
 
-// ResolveException marks one exception resolved.
+// ResolveException marks one exception resolved. Action- and binding-scope
+// exceptions are resolved only by their own rules (the action attempt
+// ending; a ready binding observation or a version change), never here.
 func (tx *JobTx) ResolveException(id string) error {
 	e, ok := tx.Job.Exceptions[id]
 	if !ok {
 		return refuse(CodeNotFound, "exception %s not found", id)
+	}
+	if e.Scope == ScopeAction || e.Scope == ScopeBinding {
+		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("a %s-scope exception is resolved by its own rule, not directly", e.Scope), Current: e}
 	}
 	if e.ResolvedAt == nil {
 		now := tx.now
@@ -338,6 +419,9 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 	}
 	if ttl <= 0 {
 		return nil, refuse(CodeInvalid, "claim ttl must be positive")
+	}
+	if err := tx.checkReviewerMachine(r); err != nil {
+		return nil, err
 	}
 	if c := j.Claim; c != nil {
 		if c.State == ClaimLive {
@@ -378,7 +462,18 @@ func (tx *JobTx) interrupt(a *Action) {
 		a.State = ActionFailed
 	}
 	a.Updated = Stamp{At: tx.now, By: Actor{Kind: ActorSystem, ID: "registry"}}
+	tx.noteIntent(a)
 	tx.touch()
+}
+
+// checkReviewerMachine refuses a reviewer that is not on the job's machine:
+// a job's effects run only where its package and credentials are, so a
+// claim from another machine is never acquired or used.
+func (tx *JobTx) checkReviewerMachine(r Reviewer) error {
+	if r.MachineID == "" || r.MachineID != tx.Job.MachineID {
+		return &Error{Code: CodeNotPermitted, Message: fmt.Sprintf("reviewer machine %q is not the job's machine %q", r.MachineID, tx.Job.MachineID)}
+	}
+	return nil
 }
 
 // CheckClaim refuses unless claimID with fence is the job's live claim and,
@@ -387,6 +482,9 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	c := tx.Job.Claim
 	if c == nil || c.ClaimID != claimID || c.Fence != fence || c.State != ClaimLive || !tx.now.Before(c.ExpiresAt) {
 		return &Error{Code: CodeClaimStale, Message: "claim " + claimID + " is not the live claim", Current: c}
+	}
+	if err := tx.checkReviewerMachine(c.Reviewer); err != nil {
+		return err
 	}
 	if len(kinds) == 0 {
 		return nil
@@ -418,7 +516,14 @@ func (tx *JobTx) ReleaseClaim(claimID string, fence int64) error {
 // most recently recorded review is a no-op.
 func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	j := tx.Job
+	digest, err := reviewDigest(&r)
+	if err != nil {
+		return err
+	}
 	if r.ReviewID != "" && r.ReviewID == j.LastRecordedReview {
+		if j.LastRecordedReviewDigest != "" && j.LastRecordedReviewDigest != digest {
+			return &Error{Code: CodeReviewConflict, Message: "review " + r.ReviewID + " was recorded with other evidence or outcome", Current: r.ReviewID}
+		}
 		return nil
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
@@ -440,7 +545,207 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 		return err
 	}
 	j.LastRecordedReview = r.ReviewID
+	j.LastRecordedReviewDigest = digest
 	return nil
+}
+
+// hasOpenException reports whether an unresolved exception of the same
+// scope, kind and state exists: repeated observations of one condition
+// coalesce into it instead of opening another each time.
+func (tx *JobTx) hasOpenException(scope, kind string, state AvailabilityState, target string) bool {
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == scope && e.Kind == kind && e.State == state && e.Target == target {
+			return true
+		}
+	}
+	return false
+}
+
+// observeAction records a problem with one attempt of one action, raised by
+// the holder of the job's live claim: the attempt must be the action's
+// current one and still unresolved (executing or uncertain). It changes no
+// availability. One exception stays open per action, attempt and kind; the
+// registry resolves it when that attempt ends (see resolveActionExceptions).
+func (tx *JobTx) observeAction(o Observation) error {
+	j := tx.Job
+	if err := tx.CheckClaim(o.ClaimID, o.Fence); err != nil {
+		return err
+	}
+	if o.Kind == "" || o.ActionID == "" || o.Attempt <= 0 {
+		return refuse(CodeInvalid, "an action observation needs kind, action_id and attempt")
+	}
+	a, ok := j.Actions[o.ActionID]
+	if !ok {
+		return refuse(CodeNotFound, "action %s not found", o.ActionID)
+	}
+	if a.Attempt != o.Attempt || (a.State != ActionExecuting && a.State != ActionUncertain) {
+		return &Error{Code: CodeActionState, Message: fmt.Sprintf("action %s is at attempt %d and %s", a.ActionID, a.Attempt, a.State), Current: a}
+	}
+	for _, e := range j.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeAction && e.ActionID == o.ActionID && e.Attempt == o.Attempt && e.Kind == o.Kind {
+			return nil
+		}
+	}
+	id, err := NewID(PrefixException, tx.now)
+	if err != nil {
+		return err
+	}
+	if j.Exceptions == nil {
+		j.Exceptions = map[string]*Exception{}
+	}
+	j.Exceptions[id] = &Exception{ExceptionID: id, Kind: o.Kind, Scope: ScopeAction, Detail: o.Detail, Evidence: o.Evidence,
+		ActionID: o.ActionID, Attempt: o.Attempt, Created: Stamp{At: tx.now, By: tx.actor}}
+	tx.touch()
+	return nil
+}
+
+// observeBinding records, or with a ready state resolves, a problem binding
+// the job's current version to the reviewer's machine, under the reviewer's
+// live claim. One exception stays open per kind and version.
+func (tx *JobTx) observeBinding(o Observation) error {
+	j := tx.Job
+	if err := tx.CheckClaim(o.ClaimID, o.Fence); err != nil {
+		return err
+	}
+	if o.Kind == "" || o.State == "" {
+		return refuse(CodeInvalid, "a binding observation needs kind and state")
+	}
+	version := o.JobVersion
+	if version == 0 {
+		version = j.Version
+	}
+	if version != j.Version {
+		return &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("the job is at version %d, not %d", j.Version, version), Current: j}
+	}
+	now := tx.now
+	if o.State == AvailabilityReady {
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.Kind == o.Kind && e.JobVersion == version {
+				e.ResolvedAt = &now
+				tx.touch()
+			}
+		}
+		return nil
+	}
+	for _, e := range j.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.Kind == o.Kind && e.JobVersion == version {
+			return nil
+		}
+	}
+	id, err := NewID(PrefixException, now)
+	if err != nil {
+		return err
+	}
+	if j.Exceptions == nil {
+		j.Exceptions = map[string]*Exception{}
+	}
+	j.Exceptions[id] = &Exception{ExceptionID: id, Kind: o.Kind, Scope: ScopeBinding, State: o.State, Detail: o.Detail,
+		Evidence: o.Evidence, JobVersion: version, Created: Stamp{At: now, By: tx.actor}}
+	tx.touch()
+	return nil
+}
+
+// resolveStaleBindings resolves binding exceptions of versions the job is no
+// longer at: they describe a binding nothing runs any more.
+func (tx *JobTx) resolveStaleBindings() {
+	now := tx.now
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.JobVersion != tx.Job.Version {
+			e.ResolvedAt = &now
+		}
+	}
+}
+
+// resolveActionExceptions resolves the open action-scope exceptions of a
+// that no longer apply: those of an earlier attempt, and all of them once
+// the action is neither executing nor uncertain.
+func (tx *JobTx) resolveActionExceptions(a *Action) {
+	live := a.State == ActionExecuting || a.State == ActionUncertain
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.Scope != ScopeAction || e.ActionID != a.ActionID {
+			continue
+		}
+		if e.Attempt != a.Attempt || !live {
+			now := tx.now
+			e.ResolvedAt = &now
+			tx.touch()
+		}
+	}
+}
+
+// latestOpenException is the most recent unresolved availability exception
+// of the job itself, or nil.
+func (tx *JobTx) latestOpenException() *Exception {
+	var latest *Exception
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt != nil || e.State == "" || e.Scope != "" {
+			continue
+		}
+		if latest == nil || e.Created.At.After(latest.Created.At) ||
+			(e.Created.At.Equal(latest.Created.At) && e.ExceptionID > latest.ExceptionID) {
+			latest = e
+		}
+	}
+	return latest
+}
+
+// reviewDigest identifies what a review concluded from which evidence.
+func reviewDigest(r *Review) (string, error) {
+	b, err := CanonicalJSON(map[string]any{
+		"evidence_run_ids": nonNil(r.EvidenceRunIDs), "evidence_decision_ids": nonNil(r.EvidenceDecisions), "outcome": r.Outcome,
+	})
+	if err != nil {
+		return "", fmt.Errorf("registry: review digest: %w", err)
+	}
+	return sha256Hex(b), nil
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// observeReviewer records the reviewer's availability. It opens a reviewer
+// exception when the reviewer cannot run and resolves them when it can; the
+// job's own availability is left alone.
+func (tx *JobTx) observeReviewer(o Observation) error {
+	j := tx.Job
+	now := tx.now
+	actor := tx.actor
+	from := AvailabilityState("")
+	if j.ReviewerAvailability != nil {
+		from = j.ReviewerAvailability.State
+	}
+	j.ReviewerAvailability = &Availability{State: o.State, Detail: o.Detail, Evidence: o.Evidence, ObservedAt: &now, Reporter: &actor}
+	if o.State == AvailabilityReady {
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.Scope == ScopeReviewer {
+				e.ResolvedAt = &now
+			}
+		}
+	} else {
+		id, err := NewID(PrefixException, now)
+		if err != nil {
+			return err
+		}
+		if j.Exceptions == nil {
+			j.Exceptions = map[string]*Exception{}
+		}
+		kind := o.Kind
+		if kind == "" {
+			kind = "reviewer_" + string(o.State)
+		}
+		if !tx.hasOpenException(ScopeReviewer, kind, o.State, "") {
+			j.Exceptions[id] = &Exception{ExceptionID: id, Kind: kind, Scope: ScopeReviewer, State: o.State, Detail: o.Detail, Evidence: o.Evidence, Created: Stamp{At: now, By: actor}}
+		}
+	}
+	tx.touch()
+	if from == o.State {
+		return nil
+	}
+	return tx.event(Event{Kind: EventAvailability, Reason: ScopeReviewer, From: string(from), To: string(o.State), Detail: o.Detail, Evidence: o.Evidence})
 }
 
 // AdvanceCheckpoint ends the current review episode. expectedVersion must be
@@ -455,7 +760,7 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("checkpoint is at %d, not %d", j.Checkpoint.Version, expectedVersion), Current: j.Checkpoint}
 	}
 	for _, a := range sortedActions(j.Actions) {
-		if a.Kind == ActionRoutine && a.State != ActionExecuting && a.State != ActionUncertain {
+		if a.Kind == ActionRoutine && !unresolved(a.State) {
 			if err := tx.archiveAction(a); err != nil {
 				return nil, err
 			}
@@ -492,6 +797,12 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	}
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
+	}
+	if err := tx.checkReservedProposal(&p); err != nil {
+		return nil, err
+	}
+	if err := tx.checkNativeTask(&p); err != nil {
+		return nil, err
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {
@@ -564,6 +875,16 @@ func (tx *JobTx) DecisionByKey(idempotencyKey string) (string, bool) {
 // decision ID, so the caller can return the stored decision.
 func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, error) {
 	j := tx.Job
+	// Only a person decides: an approval or retry verdict makes an effect
+	// executable, so no agent or tool may record one, and the decision is
+	// attributed to the actor of this transaction, never to one it names.
+	if tx.actor.Kind != ActorHuman {
+		return nil, refuse(CodeNotPermitted, "decisions are made by a person, not %s", tx.actor.Kind)
+	}
+	if d.Actor.Kind != "" && d.Actor != tx.actor {
+		return nil, refuse(CodeInvalid, "decision actor must be the person deciding")
+	}
+	d.Actor = tx.actor
 	if d.IdempotencyKey != "" {
 		if id, ok := j.DecisionKeys[d.IdempotencyKey]; ok {
 			return nil, &Error{Code: CodeDuplicate, Message: "idempotency key already decided", Current: id}
@@ -588,9 +909,12 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 			return nil, &Error{Code: CodeNotPermitted, Message: "verdict " + string(d.Verdict) + " is not allowed for this proposal", Current: p}
 		}
 	}
+	if err := checkRetryVerdict(p, d.Verdict); err != nil {
+		return nil, err
+	}
 	switch next {
 	case ProposalDecided, ProposalSnoozed, ProposalRejected:
-	case ProposalOpen, ProposalExecuted, ProposalSuperseded:
+	case ProposalOpen, ProposalExecuted, ProposalSuperseded, ProposalClosed:
 		return nil, refuse(CodeInvalid, "a decision moves a proposal to decided, snoozed or rejected, not %s", next)
 	default:
 		return nil, refuse(CodeInvalid, "unknown proposal state %q", next)
@@ -611,10 +935,13 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 	if j.Lifecycle.Terminal() {
 		return nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
 	}
-	d.DecidedAt = tx.now
-	if d.Actor.Kind == "" {
-		d.Actor = tx.actor
+	closes := d.Verdict == VerdictRetry && p.Action.Name == ActionUncertainEffect
+	if closes {
+		if err := tx.resolveUncertain(p, &d); err != nil {
+			return nil, err
+		}
 	}
+	d.DecidedAt = tx.now
 	// A snooze leaves the Dagu human task waiting, so there is nothing to
 	// resume yet.
 	if p.NativeTask != nil && next != ProposalSnoozed {
@@ -642,7 +969,10 @@ func (tx *JobTx) AppendDecision(d Decision, next ProposalState) (*Decision, erro
 		}
 		j.DecisionKeys[d.IdempotencyKey] = d.DecisionID
 	}
-	if next == ProposalRejected {
+	if closes {
+		p.State = ProposalClosed
+	}
+	if next == ProposalRejected || closes {
 		if err := tx.archiveProposal(p); err != nil {
 			return nil, err
 		}
@@ -761,8 +1091,33 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 		return nil, err
 	}
 
+	if req.Routine != nil {
+		// An intent whose last effect is unresolved is not started again
+		// by a later episode unless a person decided to retry it.
+		if rec := j.Intents[intentKey(a.Spec)]; rec != nil && rec.ActionID != a.ActionID && unresolved(rec.State) {
+			if rec.State == ActionExecuting {
+				return nil, &Error{Code: CodeIntentUnresolved, Message: "action " + rec.ActionID + " with the same intent is still executing", Current: rec}
+			}
+			if err := tx.takeResolution(rec.ActionID, a); err != nil {
+				return nil, err
+			}
+			if prior, ok := j.Actions[rec.ActionID]; ok {
+				if err := tx.archiveAction(prior); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 	if cur, ok := j.Actions[a.ActionID]; ok {
-		if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts {
+		retryUnresolved := cur.State == ActionUncertain || cur.State == ActionEscalated
+		if retryUnresolved && cur.Attempt < cur.MaxAttempts {
+			if err := tx.takeResolution(cur.ActionID, a); err != nil {
+				return nil, err
+			}
+		} else if (cur.State != ActionFailed && cur.State != ActionNotApplied) || cur.Attempt >= cur.MaxAttempts ||
+			cur.Spec.Name == ActionRetryRun {
+			// A run retry is attempted again only on a person's retry of its
+			// uncertain outcome, never because an attempt failed.
 			return nil, &Error{Code: CodeActionExists, Message: "action " + a.ActionID + " is " + string(cur.State), Current: cur}
 		}
 		// A retry keeps the version, binding and policy of the first attempt;
@@ -780,6 +1135,8 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 		j.Actions[a.ActionID] = a
 	}
 	a.Attempt++
+	started := tx.now
+	a.AttemptStartedAt = &started
 	timeout := defaultActionTimeout
 	if pa, ok := v.PermittedAction(a.Spec.Name); ok && pa.TimeoutSec > 0 {
 		timeout = time.Duration(pa.TimeoutSec) * time.Second
@@ -793,6 +1150,7 @@ func (tx *JobTx) Authorize(req EffectRequest) (*Grant, error) {
 	a.Receipt = ""
 	a.Outcome = nil
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
+	tx.noteIntent(a)
 	tx.touch()
 	g := *a.Grant
 	return &g, nil
@@ -824,6 +1182,9 @@ func (tx *JobTx) routineAction(v *JobVersion, req EffectRequest) (*Action, error
 	pa, ok := v.PermittedAction(r.Spec.Name)
 	if !ok || !pa.Routine {
 		return nil, refuse(CodeNotPermitted, "action %q is not a routine action of version %d", r.Spec.Name, v.Version)
+	}
+	if err := checkActionParams(pa, r.Spec.Params); err != nil {
+		return nil, err
 	}
 	want, err := RoutineActionID(r.ReviewID, r.Spec)
 	if err != nil {
@@ -860,7 +1221,8 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		return nil, refuse(CodeProposalState, "proposal %s is not open", ap.ProposalID)
 	}
 	d := p.Decision
-	if p.State != ProposalDecided || d == nil || d.Verdict != VerdictApprove || d.DecisionID != ap.DecisionID {
+	executable := d != nil && (d.Verdict == VerdictApprove || (d.Verdict == VerdictRetry && p.Action.Name == ActionRetryRun))
+	if p.State != ProposalDecided || !executable || d.DecisionID != ap.DecisionID {
 		return nil, &Error{Code: CodeStaleBinding, Message: "decision " + ap.DecisionID + " is not the approval of this proposal", Current: p}
 	}
 	current, err := BindingDigest(j, p.Action)
@@ -877,7 +1239,31 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 	if req.ActionID != want {
 		return nil, refuse(CodeInvalid, "approved action id must be %s", want)
 	}
-	pa, _ := v.PermittedAction(p.Action.Name)
+	pa, permitted := v.PermittedAction(p.Action.Name)
+	if permitted {
+		// Checked on every attempt, against the version the attempt runs
+		// under.
+		if err := checkActionParams(pa, p.Action.Params); err != nil {
+			return nil, err
+		}
+	}
+	attempts := maxAttempts(v, pa)
+	if p.Action.Name == ActionRetryRun {
+		// A native retry is not idempotent. It is attempted once, plus at
+		// most one more attempt that only a person's explicit retry of its
+		// uncertain outcome allows (see Authorize). Every attempt binds the
+		// execution the person decided on: the run must still be at that
+		// execution, so an attempt that did take effect makes the next one
+		// stale instead of retrying a later execution.
+		var rp RetryRunParams
+		if err := decodeParams(p.Action.Params, &rp); err != nil {
+			return nil, err
+		}
+		if err := tx.checkRunBinding(rp, false); err != nil {
+			return nil, err
+		}
+		attempts = 2
+	}
 	return &Action{
 		ActionID:      want,
 		Kind:          ActionApproved,
@@ -889,7 +1275,7 @@ func (tx *JobTx) approvedAction(v *JobVersion, req EffectRequest) (*Action, erro
 		DecisionID:    d.DecisionID,
 		Spec:          p.Action,
 		BindingDigest: current,
-		MaxAttempts:   maxAttempts(v, pa),
+		MaxAttempts:   attempts,
 	}, nil
 }
 
@@ -944,11 +1330,17 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	if s.State == ActionSucceeded && s.Receipt == "" {
 		return nil, refuse(CodeInvalid, "succeeded needs a receipt")
 	}
+	if s.State == ActionSucceeded && a.Spec.Name == ActionRetryRun {
+		if err := tx.checkRetryReceipt(a, s.Receipt); err != nil {
+			return nil, err
+		}
+	}
 	a.State = s.State
 	a.Receipt = s.Receipt
 	a.Outcome = s.Outcome
 	a.SettledUnderClaim = s.ClaimID
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
+	tx.noteIntent(a)
 	out := *a
 	if a.Kind == ActionApproved && a.State == ActionSucceeded {
 		if p := j.Proposals[a.ProposalID]; p != nil {

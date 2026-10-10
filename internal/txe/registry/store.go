@@ -43,6 +43,7 @@ const (
 	kindReviews   = "reviews"
 	kindActions   = "actions"
 	kindProposals = "proposals"
+	kindClosures  = "closures"
 )
 
 // Dir returns the registry directory under the Dagu data directory.
@@ -380,6 +381,25 @@ func (s *Store) GetDecision(ctx context.Context, jobID, decisionID string) (*Dec
 }
 
 // ListReviews returns reviews, newest first.
+// GetReview returns a recorded review of the job.
+func (s *Store) GetReview(ctx context.Context, jobID, reviewID string) (*Review, error) {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	for id := job.Chains.Reviews; id != ""; {
+		var r Review
+		if err := s.getJSON(ctx, id, &r); err != nil {
+			return nil, fmt.Errorf("registry: history %s: %w", id, err)
+		}
+		if r.ReviewID == reviewID {
+			return &r, nil
+		}
+		id = r.Prev
+	}
+	return nil, refuse(CodeNotFound, "review %s not found", reviewID)
+}
+
 func (s *Store) ListReviews(ctx context.Context, jobID string, limit int) ([]*Review, error) {
 	return walkChain[Review](ctx, s, jobID, func(c Chains) string { return c.Reviews }, func(r *Review) string { return r.Prev }, limit)
 }
@@ -472,6 +492,9 @@ func (tx *JobTx) attach(kind string, v any, setPrev func(prev string)) (string, 
 	case kindProposals:
 		setPrev(tx.Job.Chains.Proposals)
 		tx.Job.Chains.Proposals = id
+	case kindClosures:
+		setPrev(tx.Job.Chains.Closures)
+		tx.Job.Chains.Closures = id
 	case kindVersions:
 		setPrev("")
 		tx.Job.VersionRefs = append(tx.Job.VersionRefs, id)

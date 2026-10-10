@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -219,6 +220,34 @@ type RunControl interface {
 	// RunFinished reports whether a run reached a terminal status, or
 	// ErrRunNotFound when Dagu has no record of it.
 	RunFinished(ctx context.Context, dagName string, run RunRef) (bool, error)
+	// LatestAttempt returns a root run's latest attempt as Dagu stored it,
+	// or ErrRunNotFound.
+	LatestAttempt(ctx context.Context, dagName, runID string) (RunAttempt, error)
+}
+
+// RunAttempt is the latest execution of a run as Dagu stored it. A direct
+// retry starts a new attempt; a queued retry runs the same attempt again with
+// a later QueuedAt, so an execution is the pair (AttemptID, QueuedAt).
+type RunAttempt struct {
+	AttemptID string
+	// QueuedAt is the stored queue marker, byte for byte; empty when the run
+	// was never queued.
+	QueuedAt string
+	// Snapshot is the stored status, kept as evidence when Dagu is about to
+	// overwrite it.
+	Snapshot json.RawMessage
+	// SpecSHA256 is the digest of the attempt's saved DAG, in the form
+	// recorded for a version's spec.
+	SpecSHA256 string
+	Status     string
+	// Running is true while the execution runs (not queued, not started,
+	// waiting or finished).
+	Running   bool
+	Finished  bool
+	Succeeded bool
+	// ArchiveDir is the execution's native artifact directory on the hub,
+	// when Dagu has assigned one.
+	ArchiveDir string
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.

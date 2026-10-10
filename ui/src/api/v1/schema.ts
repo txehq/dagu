@@ -3762,7 +3762,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List incomplete resource events
+         * @description Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter.
+         */
+        get: operations["listTxeResourceEvents"];
         put?: never;
         /**
          * Report a resource event
@@ -4211,6 +4215,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a recorded review */
+        get: operations["getTxeReview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/reviews": {
         parameters: {
             query?: never;
@@ -4263,6 +4287,99 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/jobs/{jobId}/runs/{runId}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a run's deliverables
+         * @description Returns a manifest of the run, one per publishing attempt. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub.
+         */
+        get: operations["getTxeRunArtifacts"];
+        put?: never;
+        /**
+         * Record a run's deliverables
+         * @description Sent by the run's last step, naming the attempt it runs in. A new manifest is accepted only while that attempt is the run's latest and running (a late publish is 409 stale_binding); it is written once per attempt, earlier attempts' manifests are kept. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception.
+         */
+        post: operations["recordTxeRunArtifacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/runs/{runId}/retry-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request a retry of a job's run
+         * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision.
+         */
+        post: operations["requestTxeRunRetry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/proposal-closures/pending": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Dagu human tasks still to be closed
+         * @description Superseded proposals whose Dagu human task is still waiting, on the given machine's jobs the caller can see: never-attempted first, then least recently attempted, then by proposal ID.
+         */
+        get: operations["listTxePendingClosures"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/proposals/{proposalId}/closures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record an attempt to close a superseded proposal's Dagu human task
+         * @description Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409.
+         */
+        post: operations["recordTxeProposalClosure"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/jobs/{jobId}/proposals/{proposalId}/decisions": {
         parameters: {
             query?: never;
@@ -4301,7 +4418,7 @@ export interface paths {
         };
         /**
          * List job decisions
-         * @description Returns decisions for proposals in any state, newest first; since stops at that decision ID.
+         * @description Returns decisions for proposals in any state. order=desc (default) lists newest first and since stops before that decision; order=asc lists oldest first and since starts after that decision, with limit applied forward from it.
          */
         get: operations["listTxeJobDecisions"];
         put?: never;
@@ -5959,6 +6076,10 @@ export interface components {
         /** @description Current status of a DAG-run */
         DAGRunSummary: {
             dagRunId: components["schemas"]["DAGRunId"];
+            /** @description Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID */
+            readonly attemptId?: string;
+            /** @description Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference */
+            readonly executionRef?: string;
             name: components["schemas"]["DAGName"];
             /** @description Workspace label value for the DAG-run. Omitted for default DAG-runs and invalid workspace labels. */
             workspace?: string;
@@ -7705,7 +7826,10 @@ export interface components {
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
-        /** @enum {string} */
+        /**
+         * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open.
+         * @enum {string}
+         */
         TxeResourceObservation: TxeResourceObservation;
         TxeResourceEventRequest: {
             /** @description Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409 */
@@ -7784,6 +7908,8 @@ export interface components {
         TxeInstallation: {
             schema: number;
             owners: components["schemas"]["TxeOwner"][];
+            /** @description What this registry enforces. param_schema: a permitted action's param_schema is admitted at registration (refused when it cannot be enforced exactly) and the params of every action attempt are validated against it before a grant. A client must not rely on a capability that is not listed. */
+            capabilities: string[];
         };
         TxeProject: {
             schema: number;
@@ -7854,9 +7980,18 @@ export interface components {
             missed_run?: string;
         };
         TxeDeliverable: {
-            path?: string;
+            name: string;
+            /** @description The exact file, relative to the run's output directory; no absolute path, parent step or pattern */
+            path: string;
             type?: string;
             description?: string;
+            /**
+             * @description machine (default) keeps the file on the machine; hub also uploads it as a run artifact
+             * @enum {string}
+             */
+            delivery?: TxeDeliverableDelivery;
+            /** @description A run that does not produce it opens a deliverable_missing exception */
+            required?: boolean;
         };
         TxeExpectedOutcome: {
             success_criteria?: string[];
@@ -7880,6 +8015,7 @@ export interface components {
             name: string;
             command?: string;
             entrypoint?: string;
+            /** @description Optional JSON Schema (draft 2020-12 only) the registry enforces on the params of every attempt of this action before granting it; a refusal is 400 invalid. Admitted: strict JSON (no duplicate keys, nesting up to 64), only keywords enforced exactly (multipleOf, format and unknown keywords are refused), no remote $ref, and numbers that are exactly float64 values (integers within 2^53, binary fractions such as 0.5). pattern and patternProperties use Go RE2 syntax and semantics, not ECMA-262: \s, \d and \w are ASCII-only. */
             param_schema?: unknown;
             /** @enum {string} */
             idempotency?: TxePermittedActionIdempotency;
@@ -8021,6 +8157,7 @@ export interface components {
         /** @enum {string} */
         TxeClaimKind: TxeClaimKind;
         TxeReviewer: {
+            /** @description The reviewer's machine. Required to acquire a claim of any kind (review, execution, reconcile) and must equal the job's machine_id; otherwise the claim is refused with 409 not_permitted before anything is written, and a live claim held by another machine cannot be used. */
             machine_id?: string;
             dag_run_id?: string;
             agent_client_version?: string;
@@ -8142,6 +8279,11 @@ export interface components {
             state: components["schemas"]["TxeActionState"];
             attempt: number;
             max_attempts: number;
+            /**
+             * Format: date-time
+             * @description When the current attempt was granted.
+             */
+            attempt_started_at?: string;
             grant?: components["schemas"]["TxeGrant"];
             receipt?: string;
             /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
@@ -8158,7 +8300,17 @@ export interface components {
         TxeException: {
             exception_id: string;
             kind: string;
+            /** @description reviewer for a problem with the job's reviewer; absent for the job */
+            scope?: string;
             state?: components["schemas"]["TxeAvailabilityState"];
+            /** @description Key of the target whose resource event opened it, if one did; a present observation of that target resolves it. */
+            target?: string;
+            /** @description For scope action: the action the exception is about. */
+            action_id?: string;
+            /** @description For scope action: the action attempt; resolved when that attempt ends. */
+            attempt?: number;
+            /** @description For scope binding: the job version it is about; resolved by a ready binding observation of the same kind and version, or when the job moves to another version. */
+            job_version?: number;
             detail: string;
             evidence?: string[];
             created: components["schemas"]["TxeStamp"];
@@ -8196,6 +8348,7 @@ export interface components {
             lifecycle: components["schemas"]["TxeLifecycle"];
             lifecycle_reason?: string;
             availability: components["schemas"]["TxeAvailability"];
+            reviewer_availability?: components["schemas"]["TxeAvailability"];
             retirement?: components["schemas"]["TxeRetirement"];
             /** Format: date-time */
             expires_at?: string;
@@ -8261,8 +8414,26 @@ export interface components {
             state: components["schemas"]["TxeAvailabilityState"];
             /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
             kind?: string;
+            /**
+             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action. binding records a problem binding one job version to the reviewer's machine (for example job_commands_unbound) under the caller's live claim: it changes no availability, keeps one open exception per kind and job_version (a repeat returns the job unchanged), is NOT resolved by reviews or other ready observations, and is resolved only by a binding observation with state ready for the same kind and job_version, or when the job moves to another version.
+             * @enum {string}
+             */
+            scope?: TxeObservationRequestScope;
             detail?: string;
             evidence?: string[];
+            /** @description scope action: the action. */
+            action_id?: string;
+            /** @description scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state. */
+            attempt?: number;
+            /** @description scope binding: the job version the binding problem is about; default the current version, and only the current version is accepted (409 stale_binding otherwise). */
+            job_version?: number;
+            /** @description scope action or binding: the caller's live claim on the job. */
+            claim_id?: string;
+            /**
+             * Format: int64
+             * @description scope action or binding: that claim's fence.
+             */
+            fence?: number;
             actor?: components["schemas"]["TxeActor"];
         };
         TxeClaimRequest: {
@@ -8307,6 +8478,12 @@ export interface components {
             packet_artifact?: string;
             decision_artifact?: string;
             agent_client_version?: string;
+            /** Format: int64 */
+            packet_bytes?: number;
+            /** Format: int64 */
+            agent_input_tokens?: number;
+            /** Format: int64 */
+            agent_output_tokens?: number;
             detail?: unknown;
             created?: components["schemas"]["TxeStamp"];
         };
@@ -8369,6 +8546,117 @@ export interface components {
             /** Format: date-time */
             snooze_until?: string;
             idempotency_key: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @enum {string} */
+        TxeClosureOutcome: TxeClosureOutcome;
+        TxeClosureRequest: {
+            outcome: components["schemas"]["TxeClosureOutcome"];
+            detail?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeClosure: {
+            closure_id: string;
+            proposal_id: string;
+            outcome: components["schemas"]["TxeClosureOutcome"];
+            detail?: string;
+            attempt: number;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxePendingClosure: {
+            job_id: string;
+            proposal_id: string;
+            machine_id: string;
+            native_task: components["schemas"]["TxeNativeTask"];
+            /** Format: date-time */
+            superseded_at: string;
+            failures: number;
+            /** Format: date-time */
+            last_attempt_at?: string;
+            last_error?: string;
+        };
+        TxeResourceEventList: {
+            events: components["schemas"]["TxeResourceEvent"][];
+            /** @description Present when more events follow; pass it as after. */
+            next_cursor?: string;
+        };
+        TxePendingClosureList: {
+            closures: components["schemas"]["TxePendingClosure"][];
+        };
+        TxeArtifactRecordInput: {
+            deliverable: string;
+            path: string;
+            missing?: boolean;
+            sha256?: string;
+            /** Format: int64 */
+            bytes?: number;
+            /** @enum {string} */
+            location?: TxeArtifactRecordInputLocation;
+            machine_id?: string;
+            recorded_at?: string;
+        };
+        TxeArtifactManifestRequest: {
+            /** @description The run attempt publishing, from the step's own context (context.attempt.id) */
+            attempt_id: string;
+            /** @description The publishing execution's queue marker exactly as the hub stores it; with attempt_id it names the execution, accepted only while it is the run's latest execution and running */
+            queued_at: string;
+            produced_in?: components["schemas"]["TxeExecutionId"];
+            job_version: number;
+            artifacts: components["schemas"]["TxeArtifactRecordInput"][];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @enum {string} */
+        TxeArtifactStatus: TxeArtifactStatus;
+        TxeArtifactRecord: {
+            deliverable: string;
+            path: string;
+            missing?: boolean;
+            sha256?: string;
+            /** Format: int64 */
+            bytes?: number;
+            location?: string;
+            machine_id?: string;
+            recorded_at?: string;
+            status: components["schemas"]["TxeArtifactStatus"];
+            /** Format: date-time */
+            checked_at?: string;
+            check_error?: string;
+        };
+        TxeArtifactManifest: {
+            schema?: number;
+            job_id: string;
+            run_id: string;
+            attempt_id: string;
+            queued_at: string;
+            /** @description The execution's portable reference: attempt_id + '-' + 16 hex of sha256(attempt_id + newline + queued_at) */
+            execution: string;
+            produced_in: components["schemas"]["TxeExecutionId"];
+            job_version: number;
+            artifacts: components["schemas"]["TxeArtifactRecord"][];
+            digest: string;
+            recorded: components["schemas"]["TxeStamp"];
+            /** @description Executions of the run that published a manifest, oldest first (GET only) */
+            executions?: string[];
+        };
+        /** @description One execution of a run: a direct retry starts a new attempt, a queued retry runs the same attempt under a later queue marker */
+        TxeExecutionId: {
+            attempt_id: string;
+            queued_at: string;
+            /** @description Portable reference (response only) */
+            execution?: string;
+        };
+        TxeRetryRequest: {
+            idempotency_key: string;
+            /** @description The job version the person saw; refused with 409 when the job moved on */
+            expected_job_version: number;
+            /** @description The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409 */
+            attempt_id?: string;
+            /** @description The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409 */
+            queued_at?: string;
+            /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
+            run_spec_sha256?: string;
+            /** @description The run's package digest; when omitted the server reads it from the run */
+            package_digest?: string;
             actor?: components["schemas"]["TxeActor"];
         };
         TxeDecisionResponse: {
@@ -8480,6 +8768,7 @@ export interface components {
         TxeMachineId: string;
         TxeEventId: string;
         TxeJobId: string;
+        TxeRunId: string;
         TxeJobVersionNumber: number;
         TxeClaimId: string;
         TxeProposalId: string;
@@ -21182,6 +21471,41 @@ export interface operations {
             };
         };
     };
+    listTxeResourceEvents: {
+        parameters: {
+            query: {
+                complete: false;
+                reporter_machine_id?: string;
+                /** @description The next_cursor of the previous page. */
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incomplete events */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeResourceEventList"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     recordTxeResourceEvent: {
         parameters: {
             query?: never;
@@ -22706,6 +23030,65 @@ export interface operations {
             };
         };
     };
+    getTxeReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Review */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeReview"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeReviews: {
         parameters: {
             query?: {
@@ -22988,6 +23371,380 @@ export interface operations {
             };
         };
     };
+    getTxeRunArtifacts: {
+        parameters: {
+            query?: {
+                /** @description An execution reference of the run; default the run's latest execution if it published, else the most recent */
+                execution?: string;
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Manifest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeArtifactManifest"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    recordTxeRunArtifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeArtifactManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Manifest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeArtifactManifest"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    requestTxeRunRetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not implemented yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxePendingClosures: {
+        parameters: {
+            query: {
+                machine: string;
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pending closures */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxePendingClosureList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    recordTxeProposalClosure: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeClosureRequest"];
+            };
+        };
+        responses: {
+            /** @description Closure */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeClosure"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listTxeProposalDecisions: {
         parameters: {
             query?: never;
@@ -23135,6 +23892,7 @@ export interface operations {
                 since?: components["parameters"]["TxeSince"];
                 /** @description Maximum number of history records; 0 or absent returns all */
                 limit?: components["parameters"]["TxeLimit"];
+                order?: PathsTxeJobsJobIdDecisionsGetParametersQueryOrder;
             };
             header?: never;
             path: {
@@ -23428,6 +24186,10 @@ export enum PathsWikiGetParametersQuerySort {
     mtime = "mtime"
 }
 export enum PathsWikiGetParametersQueryOrder {
+    asc = "asc",
+    desc = "desc"
+}
+export enum PathsTxeJobsJobIdDecisionsGetParametersQueryOrder {
     asc = "asc",
     desc = "desc"
 }
@@ -23873,7 +24635,8 @@ export enum TxeResourceObservation {
     present = "present",
     unreachable = "unreachable",
     auth_denied = "auth_denied",
-    timeout = "timeout"
+    timeout = "timeout",
+    unknown = "unknown"
 }
 export enum TxeResourceDispositionMatch {
     identity = "identity",
@@ -23906,6 +24669,10 @@ export enum TxeTargetExistence_check {
 export enum TxeCredentialRefKind {
     file = "file",
     env = "env"
+}
+export enum TxeDeliverableDelivery {
+    machine = "machine",
+    hub = "hub"
 }
 export enum TxeRetirementRulesOn_target_deleted {
     retire = "retire",
@@ -23948,6 +24715,7 @@ export enum TxeAvailabilityState {
     worker_offline = "worker_offline",
     auth_required = "auth_required",
     target_unreachable = "target_unreachable",
+    target_unconfirmed = "target_unconfirmed",
     stale = "stale"
 }
 export enum TxeRetirementReason {
@@ -23990,7 +24758,8 @@ export enum TxeProposalState {
     decided = "decided",
     executed = "executed",
     rejected = "rejected",
-    superseded = "superseded"
+    superseded = "superseded",
+    closed = "closed"
 }
 export enum TxeProposalInputWaiting_on {
     person = "person",
@@ -24040,6 +24809,12 @@ export enum TxeLifecycleRequestActive_run_policy {
     finish = "finish",
     cancel = "cancel"
 }
+export enum TxeObservationRequestScope {
+    job = "job",
+    reviewer = "reviewer",
+    action = "action",
+    binding = "binding"
+}
 export enum TxeReviewOutcome {
     continue = "continue",
     act = "act",
@@ -24047,6 +24822,26 @@ export enum TxeReviewOutcome {
     pause_unavailable = "pause_unavailable",
     complete = "complete",
     retire = "retire"
+}
+export enum TxeClosureOutcome {
+    closed = "closed",
+    already_answered = "already_answered",
+    run_missing = "run_missing",
+    locator_refused = "locator_refused",
+    run_ended = "run_ended",
+    failed = "failed"
+}
+export enum TxeArtifactRecordInputLocation {
+    machine = "machine",
+    hub = "hub"
+}
+export enum TxeArtifactStatus {
+    pending_upload = "pending_upload",
+    verified = "verified",
+    mismatch = "mismatch",
+    upload_failed = "upload_failed",
+    stored_on_machine = "stored_on_machine",
+    missing = "missing"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

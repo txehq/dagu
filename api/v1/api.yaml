@@ -10359,6 +10359,51 @@ paths:
 
   # TXE job registry (fork extension; see internal/txe/registry).
   /txe/resource-events:
+    get:
+      summary: "List incomplete resource events"
+      description: "Events not yet applied to every dependent, oldest first, so a reporter can observe their targets again and resend them. Only incomplete events can be listed (complete=false is required). With reporter_machine_id, only events reported from that machine. Dependents, pending entries and failures are shown only for jobs the caller can see; an event with none of those is shown only to its reporter."
+      operationId: "listTxeResourceEvents"
+      tags:
+        - "txe"
+      parameters:
+        - name: complete
+          in: query
+          required: true
+          schema:
+            type: boolean
+            enum: [false]
+        - name: reporter_machine_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          description: "The next_cursor of the previous page."
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: "Incomplete events"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEventList"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       summary: "Report a resource event"
       description: "Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
@@ -11465,6 +11510,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/reviews/{reviewId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - name: reviewId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: "Get a recorded review"
+      operationId: "getTxeReview"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Review"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeReview"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /txe/jobs/{jobId}/reviews:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -11661,6 +11750,280 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/jobs/{jobId}/runs/{runId}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    get:
+      summary: "Get a run's deliverables"
+      description: "Returns a manifest of the run, one per publishing attempt. Each hub copy still pending is checked against the bytes in the run's native artifact directory: matching bytes are verified, other bytes are a mismatch, and no bytes after the run ended is upload_failed; the last two open an exception. A machine copy is stored_on_machine and is not retrievable through the hub."
+      operationId: "getTxeRunArtifacts"
+      tags:
+        - "txe"
+      parameters:
+        - name: execution
+          in: query
+          description: "An execution reference of the run; default the run's latest execution if it published, else the most recent"
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Record a run's deliverables"
+      description: "Sent by the run's last step, naming the attempt it runs in. A new manifest is accepted only while that attempt is the run's latest and running (a late publish is 409 stale_binding); it is written once per attempt, earlier attempts' manifests are kept. Each entry names a deliverable of job_version, at its declared path and delivery, produced on the job's machine, or {deliverable, path, missing: true}. The manifest is written once: the same report again returns it, a different one is 409 artifact_conflict. A required deliverable the run did not produce opens a deliverable_missing exception."
+      operationId: "recordTxeRunArtifacts"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeArtifactManifestRequest"
+      responses:
+        "200":
+          description: "Manifest"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeArtifactManifest"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/runs/{runId}/retry-requests:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeRunId"
+    post:
+      summary: "Request a retry of a job's run"
+      description: "Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision."
+      operationId: "requestTxeRunRetry"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRetryRequest"
+      responses:
+        "200":
+          description: "Decision"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeDecisionResponse"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Not implemented yet"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /txe/proposal-closures/pending:
+    get:
+      summary: "List Dagu human tasks still to be closed"
+      description: "Superseded proposals whose Dagu human task is still waiting, on the given machine's jobs the caller can see: never-attempted first, then least recently attempted, then by proposal ID."
+      operationId: "listTxePendingClosures"
+      tags:
+        - "txe"
+      parameters:
+        - name: machine
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/TxeLimit"
+      responses:
+        "200":
+          description: "Pending closures"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxePendingClosureList"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/jobs/{jobId}/proposals/{proposalId}/closures:
+    parameters:
+      - $ref: "#/components/parameters/TxeJobId"
+      - $ref: "#/components/parameters/TxeProposalId"
+    post:
+      summary: "Record an attempt to close a superseded proposal's Dagu human task"
+      description: "Appends an immutable closure record. failed counts the attempt and keeps the closure pending; closed, already_answered, run_missing, locator_refused and run_ended (the run ended before anyone answered; nothing was completed) end it. Replaying the recorded final outcome returns the stored closure; another final outcome is 409."
+      operationId: "recordTxeProposalClosure"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeClosureRequest"
+      responses:
+        "200":
+          description: "Closure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeClosure"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Conflict; details.code is the registry refusal code and details.current the record to re-read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/jobs/{jobId}/proposals/{proposalId}/decisions:
     parameters:
       - $ref: "#/components/parameters/TxeJobId"
@@ -11763,13 +12126,19 @@ paths:
       - $ref: "#/components/parameters/TxeJobId"
     get:
       summary: "List job decisions"
-      description: "Returns decisions for proposals in any state, newest first; since stops at that decision ID."
+      description: "Returns decisions for proposals in any state. order=desc (default) lists newest first and since stops before that decision; order=asc lists oldest first and since starts after that decision, with limit applied forward from it."
       operationId: "listTxeJobDecisions"
       tags:
         - "txe"
       parameters:
         - $ref: "#/components/parameters/TxeSince"
         - $ref: "#/components/parameters/TxeLimit"
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
       responses:
         "200":
           description: "Decisions"
@@ -12446,6 +12815,12 @@ components:
         type: string
     TxeJobId:
       name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeRunId:
+      name: runId
       in: path
       required: true
       schema:
@@ -15430,6 +15805,14 @@ components:
       properties:
         dagRunId:
           $ref: "#/components/schemas/DAGRunId"
+        attemptId:
+          type: string
+          readOnly: true
+          description: "Dagu's identity of this attempt of the run; a retry keeps the DAG-run ID and starts an attempt with a new ID"
+        executionRef:
+          type: string
+          readOnly: true
+          description: "Portable reference of this execution of the run: attemptId + '-' + 16 hex of sha256(attemptId + newline + queuedAt). A queued retry keeps the attempt and changes the reference"
         name:
           $ref: "#/components/schemas/DAGName"
         workspace:
@@ -18930,7 +19313,8 @@ components:
     # TXE job registry (fork extension).
     TxeResourceObservation:
       type: string
-      enum: [deleted, absent, present, unreachable, auth_denied, timeout]
+      enum: [deleted, absent, present, unreachable, auth_denied, timeout, unknown]
+      description: "unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open."
 
     TxeResourceEventRequest:
       type: object
@@ -19093,7 +19477,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TxeOwner"
-      required: [schema, owners]
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: "What this registry enforces. param_schema: a permitted action's param_schema is admitted at registration (refused when it cannot be enforced exactly) and the params of every action attempt are validated against it before a grant. A client must not rely on a capability that is not listed."
+      required: [schema, owners, capabilities]
 
     TxeProject:
       type: object
@@ -19239,12 +19628,24 @@ components:
     TxeDeliverable:
       type: object
       properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]*$"
         path:
           type: string
+          description: "The exact file, relative to the run's output directory; no absolute path, parent step or pattern"
         type:
           type: string
         description:
           type: string
+        delivery:
+          type: string
+          enum: [machine, hub]
+          description: "machine (default) keeps the file on the machine; hub also uploads it as a run artifact"
+        required:
+          type: boolean
+          description: "A run that does not produce it opens a deliverable_missing exception"
+      required: [name, path]
 
     TxeExpectedOutcome:
       type: object
@@ -19290,7 +19691,10 @@ components:
           type: string
         entrypoint:
           type: string
-        param_schema: {}
+        param_schema:
+          description: "Optional JSON Schema (draft 2020-12 only) the registry enforces on the params of every attempt of this action before granting it; a refusal is 400 invalid. Admitted: strict JSON (no duplicate keys, nesting up to 64), only keywords enforced exactly (multipleOf, format and unknown keywords are refused), no remote $ref, and numbers that are exactly float64 values (integers within 2^53, binary fractions such as 0.5). pattern and patternProperties use Go RE2 syntax and semantics, not ECMA-262: \\s, \\d and \\w are ASCII-only."
+          x-go-type: json.RawMessage
+          x-go-type-skip-optional-pointer: true
         idempotency:
           type: string
           enum: [keyed, none, read_only]
@@ -19496,7 +19900,7 @@ components:
 
     TxeAvailabilityState:
       type: string
-      enum: [ready, worker_offline, auth_required, target_unreachable, stale]
+      enum: [ready, worker_offline, auth_required, target_unreachable, target_unconfirmed, stale]
 
     TxeAvailability:
       type: object
@@ -19588,6 +19992,7 @@ components:
       properties:
         machine_id:
           type: string
+          description: "The reviewer's machine. Required to acquire a claim of any kind (review, execution, reconcile) and must equal the job's machine_id; otherwise the claim is refused with 409 not_permitted before anything is written, and a live claim held by another machine cannot be used."
         dag_run_id:
           type: string
         agent_client_version:
@@ -19721,7 +20126,7 @@ components:
 
     TxeProposalState:
       type: string
-      enum: [open, snoozed, decided, executed, rejected, superseded]
+      enum: [open, snoozed, decided, executed, rejected, superseded, closed]
 
     TxeProposalInput:
       type: object
@@ -19836,6 +20241,10 @@ components:
           type: integer
         max_attempts:
           type: integer
+        attempt_started_at:
+          type: string
+          format: date-time
+          description: "When the current attempt was granted."
         grant:
           $ref: "#/components/schemas/TxeGrant"
         receipt:
@@ -19874,8 +20283,23 @@ components:
           type: string
         kind:
           type: string
+        scope:
+          type: string
+          description: "reviewer for a problem with the job's reviewer; absent for the job"
         state:
           $ref: "#/components/schemas/TxeAvailabilityState"
+        target:
+          type: string
+          description: "Key of the target whose resource event opened it, if one did; a present observation of that target resolves it."
+        action_id:
+          type: string
+          description: "For scope action: the action the exception is about."
+        attempt:
+          type: integer
+          description: "For scope action: the action attempt; resolved when that attempt ends."
+        job_version:
+          type: integer
+          description: "For scope binding: the job version it is about; resolved by a ready binding observation of the same kind and version, or when the job moves to another version."
         detail:
           type: string
         evidence:
@@ -19951,6 +20375,8 @@ components:
         lifecycle_reason:
           type: string
         availability:
+          $ref: "#/components/schemas/TxeAvailability"
+        reviewer_availability:
           $ref: "#/components/schemas/TxeAvailability"
         retirement:
           $ref: "#/components/schemas/TxeRetirement"
@@ -20078,12 +20504,32 @@ components:
         kind:
           type: string
           description: "Exception kind, such as auth, worker_offline or reviewer_launch"
+        scope:
+          type: string
+          enum: [job, reviewer, action, binding]
+          description: "reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action. binding records a problem binding one job version to the reviewer's machine (for example job_commands_unbound) under the caller's live claim: it changes no availability, keeps one open exception per kind and job_version (a repeat returns the job unchanged), is NOT resolved by reviews or other ready observations, and is resolved only by a binding observation with state ready for the same kind and job_version, or when the job moves to another version."
         detail:
           type: string
         evidence:
           type: array
           items:
             type: string
+        action_id:
+          type: string
+          description: "scope action: the action."
+        attempt:
+          type: integer
+          description: "scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state."
+        job_version:
+          type: integer
+          description: "scope binding: the job version the binding problem is about; default the current version, and only the current version is accepted (409 stale_binding otherwise)."
+        claim_id:
+          type: string
+          description: "scope action or binding: the caller's live claim on the job."
+        fence:
+          type: integer
+          format: int64
+          description: "scope action or binding: that claim's fence."
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [state]
@@ -20176,6 +20622,15 @@ components:
           type: string
         agent_client_version:
           type: string
+        packet_bytes:
+          type: integer
+          format: int64
+        agent_input_tokens:
+          type: integer
+          format: int64
+        agent_output_tokens:
+          type: integer
+          format: int64
         detail: {}
         created:
           $ref: "#/components/schemas/TxeStamp"
@@ -20306,6 +20761,235 @@ components:
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [expected_proposal_revision, binding_digest, verdict, idempotency_key]
+
+    TxeClosureOutcome:
+      type: string
+      enum: [closed, already_answered, run_missing, locator_refused, run_ended, failed]
+
+    TxeClosureRequest:
+      type: object
+      properties:
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [outcome]
+
+    TxeClosure:
+      type: object
+      properties:
+        closure_id:
+          type: string
+        proposal_id:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/TxeClosureOutcome"
+        detail:
+          type: string
+        attempt:
+          type: integer
+        created:
+          $ref: "#/components/schemas/TxeStamp"
+      required: [closure_id, proposal_id, outcome, attempt, created]
+
+    TxePendingClosure:
+      type: object
+      properties:
+        job_id:
+          type: string
+        proposal_id:
+          type: string
+        machine_id:
+          type: string
+        native_task:
+          $ref: "#/components/schemas/TxeNativeTask"
+        superseded_at:
+          type: string
+          format: date-time
+        failures:
+          type: integer
+        last_attempt_at:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+      required: [job_id, proposal_id, machine_id, native_task, superseded_at, failures]
+
+    TxeResourceEventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeResourceEvent"
+        next_cursor:
+          type: string
+          description: "Present when more events follow; pass it as after."
+      required: [events]
+
+    TxePendingClosureList:
+      type: object
+      properties:
+        closures:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxePendingClosure"
+      required: [closures]
+
+    TxeArtifactRecordInput:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        location:
+          type: string
+          enum: [machine, hub]
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+      required: [deliverable, path]
+
+    TxeArtifactManifestRequest:
+      type: object
+      properties:
+        attempt_id:
+          type: string
+          description: "The run attempt publishing, from the step's own context (context.attempt.id)"
+        queued_at:
+          type: string
+          description: "The publishing execution's queue marker exactly as the hub stores it; with attempt_id it names the execution, accepted only while it is the run's latest execution and running"
+        produced_in:
+          $ref: "#/components/schemas/TxeExecutionId"
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecordInput"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [attempt_id, queued_at, job_version, artifacts]
+
+    TxeArtifactStatus:
+      type: string
+      enum: [pending_upload, verified, mismatch, upload_failed, stored_on_machine, missing]
+
+    TxeArtifactRecord:
+      type: object
+      properties:
+        deliverable:
+          type: string
+        path:
+          type: string
+        missing:
+          type: boolean
+        sha256:
+          type: string
+        bytes:
+          type: integer
+          format: int64
+        location:
+          type: string
+        machine_id:
+          type: string
+        recorded_at:
+          type: string
+        status:
+          $ref: "#/components/schemas/TxeArtifactStatus"
+        checked_at:
+          type: string
+          format: date-time
+        check_error:
+          type: string
+      required: [deliverable, path, status]
+
+    TxeArtifactManifest:
+      type: object
+      properties:
+        schema:
+          type: integer
+        job_id:
+          type: string
+        run_id:
+          type: string
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        execution:
+          type: string
+          description: "The execution's portable reference: attempt_id + '-' + 16 hex of sha256(attempt_id + newline + queued_at)"
+        produced_in:
+          $ref: "#/components/schemas/TxeExecutionId"
+        job_version:
+          type: integer
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeArtifactRecord"
+        digest:
+          type: string
+        recorded:
+          $ref: "#/components/schemas/TxeStamp"
+        executions:
+          type: array
+          description: "Executions of the run that published a manifest, oldest first (GET only)"
+          items:
+            type: string
+      required: [job_id, run_id, attempt_id, queued_at, execution, produced_in, job_version, artifacts, digest, recorded]
+
+    TxeExecutionId:
+      type: object
+      description: "One execution of a run: a direct retry starts a new attempt, a queued retry runs the same attempt under a later queue marker"
+      properties:
+        attempt_id:
+          type: string
+        queued_at:
+          type: string
+        execution:
+          type: string
+          description: "Portable reference (response only)"
+      required: [attempt_id, queued_at]
+
+    TxeRetryRequest:
+      type: object
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 128
+        expected_job_version:
+          type: integer
+          description: "The job version the person saw; refused with 409 when the job moved on"
+        attempt_id:
+          type: string
+          description: "The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409"
+        queued_at:
+          type: string
+          description: "The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409"
+        run_spec_sha256:
+          type: string
+          description: "The run's DAG snapshot digest; when omitted the server reads it from the run"
+        package_digest:
+          type: string
+          description: "The run's package digest; when omitted the server reads it from the run"
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [idempotency_key, expected_job_version]
 
     TxeDecisionResponse:
       type: object

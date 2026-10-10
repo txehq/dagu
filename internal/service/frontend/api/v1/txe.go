@@ -9,7 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"io"
 	"net/http"
+	"os"
+	"slices"
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
@@ -57,7 +63,7 @@ func txeError(err error) error {
 	case registry.CodeVersionConflict, registry.CodeDuplicate, registry.CodeNotReady, registry.CodeLifecycle,
 		registry.CodeTransition, registry.CodeClaimHeld, registry.CodeClaimStale, registry.CodeNotPermitted,
 		registry.CodeStaleBinding, registry.CodeProposalState, registry.CodeActionExists, registry.CodeActionState,
-		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete:
+		registry.CodeGrantInvalid, registry.CodeDAGMismatch, registry.CodeIncomplete, registry.CodeEventComplete, registry.CodeIntentUnresolved, registry.CodeReviewConflict, registry.CodeArtifactConflict:
 		// Refused against current state: 409 with the record to re-read.
 	}
 	if re.Current != nil {
@@ -622,6 +628,11 @@ func (a *API) ObserveTxeJob(ctx context.Context, req api.ObserveTxeJobRequestObj
 		return nil, err
 	}
 	o := registry.Observation{State: registry.AvailabilityState(body.State), Kind: valueOf(body.Kind), Detail: valueOf(body.Detail), Evidence: derefSlice(body.Evidence)}
+	if body.Scope != nil {
+		o.Scope = string(*body.Scope)
+	}
+	o.ActionID, o.Attempt, o.ClaimID, o.Fence = valueOf(body.ActionId), valueOf(body.Attempt), valueOf(body.ClaimId), valueOf(body.Fence)
+	o.JobVersion = valueOf(body.JobVersion)
 	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Observe(o) })
 	return api.ObserveTxeJob200JSONResponse(job), err
 }
@@ -707,6 +718,22 @@ func (a *API) ListTxeReviews(ctx context.Context, req api.ListTxeReviewsRequestO
 	return api.ListTxeReviews200JSONResponse{Reviews: out}, err
 }
 
+func (a *API) GetTxeReview(ctx context.Context, req api.GetTxeReviewRequestObject) (api.GetTxeReviewResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var review *registry.Review
+	if _, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
+		review, err = s.GetReview(ctx, req.JobId, req.ReviewId)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeReview](review)
+	return api.GetTxeReview200JSONResponse(out), err
+}
+
 func (a *API) RecordTxeReview(ctx context.Context, req api.RecordTxeReviewRequestObject) (api.RecordTxeReviewResponseObject, error) {
 	body, err := txeBody(req.Body)
 	if err != nil {
@@ -776,9 +803,16 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 	if err != nil {
 		return nil, err
 	}
+	asc := req.Params.Order != nil && *req.Params.Order == api.ListTxeJobDecisionsParamsOrderAsc
+	readLimit := txeLimit(req.Params.Limit)
+	if asc {
+		// Ascending pages start after the cursor, so the newest-first chain
+		// is read in full and the limit applied forward from it.
+		readLimit = 0
+	}
 	var decisions []*registry.Decision
 	job, err := a.txeReadHistory(ctx, s, req.JobId, func() (err error) {
-		decisions, err = s.ListDecisions(ctx, req.JobId, txeLimit(req.Params.Limit))
+		decisions, err = s.ListDecisions(ctx, req.JobId, readLimit)
 		return err
 	})
 	if err != nil {
@@ -797,6 +831,12 @@ func (a *API) ListTxeJobDecisions(ctx context.Context, req api.ListTxeJobDecisio
 				decisions = decisions[:i]
 				break
 			}
+		}
+	}
+	if asc {
+		slices.Reverse(decisions)
+		if limit := txeLimit(req.Params.Limit); limit > 0 && len(decisions) > limit {
+			decisions = decisions[:limit]
 		}
 	}
 	out, err := txeConvert[[]api.TxeDecision](decisions)
@@ -823,11 +863,26 @@ func (a *API) AuthorizeTxeEffect(ctx context.Context, req api.AuthorizeTxeEffect
 		effect.Routine = &registry.RoutineEffect{ReviewID: r.ReviewId, ClaimID: r.ClaimId, Fence: r.Fence, Spec: spec}
 	}
 	var g *registry.Grant
+	staleRetry := false
 	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
 		var err error
 		g, err = tx.Authorize(effect)
+		// Reached only once the caller may write the job: an approved
+		// effect refused because its run no longer binds.
+		staleRetry = effect.Approved != nil && registry.ErrorCode(err) == registry.CodeStaleBinding
 		return err
 	}); err != nil {
+		if staleRetry {
+			// A decided retry whose run moved on can never be authorized: end
+			// such retries (the caller's write permission is checked again),
+			// so they leave the decision queue, and return the refusal.
+			if _, eerr := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+				_, err := tx.EndMovedOnRetries()
+				return err
+			}); eerr != nil {
+				logger.Warn(ctx, "Failed to end retries whose run moved on", tag.Error(eerr))
+			}
+		}
 		return nil, err
 	}
 	out, err := txeConvert[api.TxeGrant](g)
@@ -1026,15 +1081,11 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	return api.RecordTxeResourceEvent200JSONResponse(out), err
 }
 
-func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEventRequestObject) (api.GetTxeResourceEventResponseObject, error) {
-	s, err := a.txeStore()
-	if err != nil {
-		return nil, err
-	}
-	ev, err := s.GetResourceEvent(ctx, req.EventId)
-	if err != nil {
-		return nil, txeError(err)
-	}
+// txeShowResourceEvent keeps only the parts of ev about jobs the caller can
+// see, and reports whether the caller may see the event at all: the target
+// and evidence are shown only to the reporter or to someone who can see a
+// job the event affected.
+func (a *API) txeShowResourceEvent(ctx context.Context, s *registry.Store, ev *registry.ResourceEvent) bool {
 	canSee := func(jobID string) bool {
 		_, err := a.txeVisibleJob(ctx, s, jobID)
 		return err == nil
@@ -1060,11 +1111,257 @@ func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEve
 		}
 	}
 	ev.Failures = failures
-	// The target and evidence are shown only to the reporter or to someone
-	// who can see a job the event affected.
-	if user, ok := auth.UserFromContext(ctx); a.authService != nil && len(visible)+len(pending) == 0 && (!ok || user.Username != ev.Reporter.ID) {
+	user, ok := auth.UserFromContext(ctx)
+	return a.authService == nil || len(visible)+len(pending) > 0 || (ok && user.Username == ev.Reporter.ID)
+}
+
+func (a *API) ListTxeResourceEvents(ctx context.Context, req api.ListTxeResourceEventsRequestObject) (api.ListTxeResourceEventsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if req.Params.Complete {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: "only incomplete events can be listed (complete=false)"}
+	}
+	limit := 50
+	if req.Params.Limit != nil {
+		limit = *req.Params.Limit
+	}
+	if limit < 1 || limit > 200 {
+		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: "limit must be between 1 and 200"}
+	}
+	// Visibility decides the page, so neither the events nor the cursor
+	// name an event the caller may not see.
+	events, next, err := s.IncompleteResourceEvents(ctx, valueOf(req.Params.ReporterMachineId), valueOf(req.Params.After), limit,
+		func(ev *registry.ResourceEvent) bool { return a.txeShowResourceEvent(ctx, s, ev) })
+	if err != nil {
+		return nil, txeError(err)
+	}
+	out, err := txeConvert[[]api.TxeResourceEvent](events)
+	if out == nil {
+		out = []api.TxeResourceEvent{}
+	}
+	resp := api.ListTxeResourceEvents200JSONResponse{Events: out}
+	if next != "" {
+		resp.NextCursor = &next
+	}
+	return resp, err
+}
+
+func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEventRequestObject) (api.GetTxeResourceEventResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	ev, err := s.GetResourceEvent(ctx, req.EventId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	if !a.txeShowResourceEvent(ctx, s, ev) {
 		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "resource event " + req.EventId + " not found"})
 	}
 	out, err := txeConvert[api.TxeResourceEvent](ev)
 	return api.GetTxeResourceEvent200JSONResponse(out), err
+}
+
+func (a *API) ListTxePendingClosures(ctx context.Context, req api.ListTxePendingClosuresRequestObject) (api.ListTxePendingClosuresResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if err := registry.ValidateID(registry.PrefixMachine, req.Params.Machine); err != nil {
+		return nil, txeError(err)
+	}
+	pending, err := s.PendingClosures(ctx, req.Params.Machine, txeLimit(req.Params.Limit), func(job *registry.Job) bool {
+		return a.txeJobVisible(ctx, s, job) == nil
+	})
+	if err != nil {
+		return nil, txeError(err)
+	}
+	out, err := txeConvert[[]api.TxePendingClosure](pending)
+	if out == nil {
+		out = []api.TxePendingClosure{}
+	}
+	return api.ListTxePendingClosures200JSONResponse{Closures: out}, err
+}
+
+func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxeProposalClosureRequestObject) (api.RecordTxeProposalClosureResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var closure *registry.Closure
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+		var err error
+		closure, err = tx.RecordClosure(ctx, s, req.ProposalId, registry.ClosureOutcome(body.Outcome), valueOf(body.Detail))
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeClosure](closure)
+	return api.RecordTxeProposalClosure200JSONResponse(out), err
+}
+
+func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArtifactsRequestObject) (api.RecordTxeRunArtifactsResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	in, err := txeConvert[registry.ArtifactManifest](struct {
+		AttemptID  string                       `json:"attempt_id"`
+		QueuedAt   string                       `json:"queued_at"`
+		ProducedIn *api.TxeExecutionId          `json:"produced_in,omitempty"`
+		JobVersion int                          `json:"job_version"`
+		Artifacts  []api.TxeArtifactRecordInput `json:"artifacts"`
+	}{body.AttemptId, body.QueuedAt, body.ProducedIn, body.JobVersion, body.Artifacts})
+	if err != nil {
+		return nil, ErrInvalidRequestBody
+	}
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	var m *registry.ArtifactManifest
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+		// The run is looked up only after txeTx checked that the caller may
+		// write this job, so its existence is never disclosed to others.
+		latest, _, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
+		if err != nil {
+			return err
+		}
+		m, err = tx.RecordArtifacts(ctx, s, req.RunId, latest, in)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out, err := txeConvert[api.TxeArtifactManifest](m)
+	return api.RecordTxeRunArtifacts200JSONResponse(out), err
+}
+
+func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifactsRequestObject) (api.GetTxeRunArtifactsResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.txeVisibleJob(ctx, s, req.JobId); err != nil {
+		return nil, err
+	}
+	// The run's latest attempt chooses the default manifest and tells which
+	// attempt's native artifact directory is current. A run the hub does not
+	// know is read without checking hub copies.
+	var latest registry.RunAttempt
+	var status *ir.DAGRunStatus
+	if a.dagRunRepository != nil {
+		latest, status, err = a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
+		var apiErr *Error
+		if err != nil && (!errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusNotFound) {
+			return nil, err
+		}
+	}
+	preferred := ""
+	if latest.AttemptID != "" {
+		preferred = latest.Ref()
+	}
+	m, err := s.GetArtifacts(ctx, req.JobId, req.RunId, valueOf(req.Params.Execution), preferred)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	pending := slices.ContainsFunc(m.Artifacts, func(r registry.ArtifactRecord) bool { return r.Status == registry.ArtifactPendingUpload })
+	if pending && status != nil {
+		dir, ended, known := m.ArchiveDir, true, m.ArchiveDir != ""
+		if m.Execution == preferred {
+			// The current attempt: its directory is the run's, and its copies
+			// count as failed only once it has ended.
+			dir, ended, known = status.ArchiveDir, latest.Finished, true
+		}
+		if known {
+			m, err = s.CheckHubArtifacts(ctx, req.JobId, req.RunId, m.Execution, dir, func(p string) (string, bool, error) {
+				if dir == "" {
+					return "", false, nil
+				}
+				sha, found, err := txeArtifactDigest(dir, p)
+				if err != nil {
+					logger.Warn(ctx, "TXE hub artifact could not be read", tag.RunID(req.RunId), tag.Error(err))
+				}
+				return sha, found, err
+			}, ended)
+			if err != nil {
+				return nil, txeError(err)
+			}
+		}
+	}
+	all, err := s.ListArtifacts(ctx, req.JobId, req.RunId)
+	if err != nil {
+		return nil, txeError(err)
+	}
+	out, err := txeConvert[api.TxeArtifactManifest](m)
+	executions := make([]string, 0, len(all))
+	for _, x := range all {
+		executions = append(executions, x.Execution)
+	}
+	out.Executions = &executions
+	return api.GetTxeRunArtifacts200JSONResponse(out), err
+}
+
+// txeLatestRunAttempt returns the latest attempt of a run of the job as
+// Dagu stored it, with its status. A run the hub has no record of is 404:
+// deliverables are recorded only for real runs.
+func (a *API) txeLatestRunAttempt(ctx context.Context, jobID, runID string) (registry.RunAttempt, *ir.DAGRunStatus, error) {
+	if a.dagRunRepository == nil {
+		return registry.RunAttempt{}, nil, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError, Message: "run history is not available"}
+	}
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
+	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return registry.RunAttempt{}, nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + jobID + " has no run " + runID}
+		}
+		return registry.RunAttempt{}, nil, err
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil {
+		return registry.RunAttempt{}, nil, err
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return registry.RunAttempt{}, nil, err
+	}
+	snapshot, err := json.Marshal(status)
+	if err != nil {
+		return registry.RunAttempt{}, nil, err
+	}
+	out := registry.RunAttempt{AttemptID: status.AttemptID, QueuedAt: status.QueuedAt, Status: status.Status.String(),
+		Running: status.Status == ir.Running, Finished: !status.Status.IsActive() && status.Status != ir.NotStarted,
+		Succeeded: status.Status.IsSuccess(), ArchiveDir: status.ArchiveDir, Snapshot: snapshot}
+	if out.AttemptID == "" {
+		out.AttemptID = attempt.ID()
+	}
+	if len(dag.YamlData) > 0 {
+		out.SpecSHA256 = fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData))
+	}
+	return out, status, nil
+}
+
+// txeArtifactDigest returns the sha256 of the file at relPath in a run's
+// native artifact directory, or found false when there is no such file.
+func txeArtifactDigest(archiveDir, relPath string) (string, bool, error) {
+	f, info, err := openArtifactFile(archiveDir, relPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errArtifactUnavailable) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer func() { _ = f.Close() }()
+	if !info.Mode().IsRegular() {
+		return "", false, nil
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), true, nil
 }
