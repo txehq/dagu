@@ -1153,3 +1153,63 @@ func TestTxeAPIRunAbandonmentsUnsupported(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, apiErr.HTTPStatus)
 	assert.Equal(t, "abandonment_history_unsupported", apiErr.Details["code"])
 }
+
+// The installation lists what this registry enforces.
+func TestTxeAPIInstallationCapabilities(t *testing.T) {
+	a := newTxeTestAPI(t)
+	resp, err := a.GetTxeInstallation(context.Background(), apigen.GetTxeInstallationRequestObject{})
+	require.NoError(t, err)
+	assert.Contains(t, resp.(apigen.GetTxeInstallation200JSONResponse).Capabilities, "param_schema")
+}
+
+// Through the registry API end to end (request bodies decoded as the server
+// decodes them): an action request whose params a registered param_schema
+// refuses gets 400 and no grant, and nothing is recorded; valid params are
+// granted.
+func TestTxeAPIInvalidParamsAreNeverGranted(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	jobID := mint(t, registry.PrefixJob)
+	digest := fmt.Sprintf("sha256:%064x", 7)
+	register := fmt.Sprintf(`{"job_id":%q,"request_id":"r1","owner_id":%q,"project_id":%q,"machine_id":%q,"job_key":"key:%s",
+		"version":{"title":"t","purpose":"p","package":{"digest":%q,"path":"/pkg","entrypoint":"run.sh"},
+		"dag":{"spec":%q},
+		"review_policy":{"permitted_actions":[{"name":"restart","timeout_sec":60,"routine":true,
+			"param_schema":{"type":"object","properties":{"mode":{"type":"string","enum":["soft","hard"]}},"required":["mode"],"additionalProperties":false}}]}},
+		"actor":{"kind":"cli","id":"cc3-test"}}`,
+		jobID, f.owner, f.project, f.machine, jobID, digest,
+		fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine))
+	var reg apigen.TxeRegisterRequest
+	require.NoError(t, json.Unmarshal([]byte(register), &reg))
+	_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &reg})
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	review, err := registry.ReviewID(jobID, 0)
+	require.NoError(t, err)
+
+	authorize := func(params string) error {
+		actionID, err := registry.RoutineActionID(review, registry.ActionSpec{Name: "restart", Params: json.RawMessage(params)})
+		require.NoError(t, err)
+		body := fmt.Sprintf(`{"action_id":%q,"job_version":1,"package_digest":%q,
+			"routine":{"review_id":%q,"claim_id":%q,"fence":%d,"spec":{"name":"restart","params":%s}}}`,
+			actionID, digest, review, claim.ClaimId, claim.Fence, params)
+		var req apigen.TxeEffectGrantRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &req))
+		_, err = a.AuthorizeTxeEffect(ctx, apigen.AuthorizeTxeEffectRequestObject{JobId: jobID, Body: &req})
+		return err
+	}
+	for _, params := range []string{`{"mode":"medium"}`, `{"mode":"soft","force":true}`, `{}`, `{"mode":"soft","mode":"hard"}`} {
+		requireStatus(t, authorize(params), http.StatusBadRequest)
+	}
+	job, err := a.GetTxeJob(ctx, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	body, err := json.Marshal(job)
+	require.NoError(t, err)
+	assert.NotContains(t, string(body), `"grant"`, "no action was granted or recorded")
+	require.NoError(t, authorize(`{"mode":"hard"}`))
+}
