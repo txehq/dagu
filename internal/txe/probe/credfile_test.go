@@ -144,3 +144,27 @@ func TestLocalVersionIsTheRegisteredRequest(t *testing.T) {
 		t.Fatal("a version this machine did not register was returned")
 	}
 }
+
+// The filed entry must be the request the receipt names: an entry with
+// another request id under that file name is an inconsistent record and
+// nothing of it is used.
+func TestLocalVersionRefusesAMismatchedRequest(t *testing.T) {
+	home := localHome(t, nil)
+	path := filepath.Join(home.ReceiptsDir(), credJob, "requests", "req_1.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry txepkg.Entry
+	if err := json.Unmarshal(b, &entry); err != nil {
+		t.Fatal(err)
+	}
+	entry.RequestID = "req_other"
+	b, _ = json.Marshal(entry)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (LocalCredentials{Home: home}).Version(credJob, 2); err == nil {
+		t.Fatal("an entry for another request was accepted")
+	}
+}

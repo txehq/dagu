@@ -77,8 +77,9 @@ func (l LocalCredentials) Version(jobID string, version int) (json.RawMessage, e
 	if err := json.Unmarshal(b, &entry); err != nil {
 		return nil, fmt.Errorf("parse registration record: %w", err)
 	}
-	if entry.JobID != jobID || entry.Version != version {
-		return nil, fmt.Errorf("registration record is for %s v%d", entry.JobID, entry.Version)
+	if entry.JobID != jobID || entry.Version != version || entry.RequestID != receipt.RequestID {
+		return nil, fmt.Errorf("registration record %s is for %s v%d, not request %s of %s v%d",
+			entry.RequestID, entry.JobID, entry.Version, receipt.RequestID, jobID, version)
 	}
 	var req struct {
 		Version json.RawMessage `json:"version"`
