@@ -110,7 +110,8 @@ registry sets (schema, ids, version number, stamps, the DAG's name and
 digest), filling in its defaults (the four retirement rules, a
 deliverable's delivery), and canonicalising each parameter schema. What
 means nothing (absent, null, empty, zero, false) is the same however it is
-spelled, except inside a parameter schema. So the package, the DAG text,
+spelled, except inside a parameter schema and inside a target's stable
+id, which is the target's identity and is compared member for member. So the package, the DAG text,
 the schedule, the targets, the expected outcome, the review policy with
 every permitted action, and the title and purpose the review agent reads
 are all bound, and a field the registry later starts keeping is bound
@@ -128,8 +129,10 @@ action (its decision is kept for later), no reconcile probe. Nothing is
 read, and the job's declaration is not used to settle an interrupted
 action either: it stays unresolved. The job is still reviewed and questions still reach the owner, and
 the exception `job_commands_unbound` says which part of the version
-differs, without any value from it. A recorded review does not clear it; it ends when the
-job is bound again. `dagu txe update <job id> -f <spec>
+differs, without any value from it. It is filed under a scope of its own (`binding`), about that
+version of the job: it changes neither the job's nor the reviewer's
+availability, a recorded review does not clear it, and it ends when the
+reviewer reports the job bound again or the job gets a new version. `dagu txe update <job id> -f <spec>
 --expected-version <n>` from that machine binds it and keeps the job and
 its history (a job cannot be registered a second time); an update that
 was interrupted is finished with `dagu txe resume <request id>`. While an

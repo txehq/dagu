@@ -1706,8 +1706,12 @@ type refusingExceptions struct {
 	asked int
 }
 
-func (r *refusingExceptions) RaiseException(context.Context, review.Exception) error {
-	r.asked++
+func (r *refusingExceptions) RaiseException(_ context.Context, exc review.Exception) error {
+	// Every review also reports on the binding of the job's commands; that
+	// is refused too, and is not what this counts.
+	if exc.Kind == review.ExceptionRetryStalled {
+		r.asked++
+	}
 	return errors.New("the registry cannot record it")
 }
 

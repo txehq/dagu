@@ -191,6 +191,12 @@ func registeredView(raw json.RawMessage) (map[string]any, error) {
 // prune removes from a decoded JSON value everything that means "nothing":
 // null, an empty string, list or object, zero and false. It returns nil for
 // a value that is itself nothing.
+//
+// That is right for the fields of a record, where the registry and a
+// registration spell nothing differently. It is wrong for a map whose keys
+// are themselves data: a target's stable id is its identity, and an added
+// member with an empty value makes it another identity. Such a map is kept
+// exactly as it is.
 func prune(v any) any {
 	switch x := v.(type) {
 	case nil:
@@ -220,6 +226,10 @@ func prune(v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, item := range x {
+			if exactFields[k] {
+				out[k] = item
+				continue
+			}
 			if kept := prune(item); kept != nil {
 				out[k] = kept
 			}
@@ -231,6 +241,10 @@ func prune(v any) any {
 	}
 	return v
 }
+
+// exactFields are the fields of a version whose value is data keyed by
+// data, compared member for member with nothing removed.
+var exactFields = map[string]bool{"stable_id": true}
 
 // localBinding establishes whether the job's commands may be started, and
 // with which credential references.
@@ -1518,10 +1532,16 @@ func count(n int) *int64 {
 	return &v
 }
 
-// commandsUnboundPrefix starts the message of the exception about a job
-// whose commands are not started. It is how that exception is told from the
-// reviewer's own failures, which a recorded review resolves.
-const commandsUnboundPrefix = "The job's commands are not started. "
+// hasOpenBindingException reports whether the job has an unresolved
+// exception of the binding scope. Scope and kind decide, never its text.
+func hasOpenBindingException(doc api.TxeJob) bool {
+	for _, e := range deref(doc.Exceptions) {
+		if e.ResolvedAt == nil && deref(e.Scope) == string(api.TxeObservationRequestScopeBinding) && e.Kind == string(ExceptionCommandsUnbound) {
+			return true
+		}
+	}
+	return false
+}
 
 // reviewerRecovered tells the registry the reviewer works again, once a
 // review was recorded for a job whose reviewer it had as unavailable. That
@@ -1532,16 +1552,8 @@ func (r *Remote) reviewerRecovered(ctx context.Context, jobID string) error {
 	if err != nil {
 		return err
 	}
-	av := doc.ReviewerAvailability
-	if av == nil || av.State == api.TxeAvailabilityState(registry.AvailabilityReady) {
+	if av := doc.ReviewerAvailability; av == nil || av.State == api.TxeAvailabilityState(registry.AvailabilityReady) {
 		return nil
-	}
-	if strings.HasPrefix(deref(av.Detail), commandsUnboundPrefix) {
-		// A recorded review does not mean the job's commands may run
-		// again. That exception ends only when the job is bound again.
-		if job, err := r.Job(ctx, jobID); err != nil || job.CommandsRefused != "" {
-			return err
-		}
 	}
 	scope := api.TxeObservationRequestScopeReviewer
 	detail := "a review was recorded"
@@ -1579,10 +1591,9 @@ func (r *Remote) DeferReview(ctx context.Context, claim Claim, until time.Time) 
 // exceptionStates maps a reviewer exception onto the availability state the
 // registry files it under. None of them is a lifecycle change.
 var exceptionStates = map[ExceptionKind]api.TxeAvailabilityState{
-	ExceptionReviewerAuth:    "auth_required",
-	ExceptionReviewerFailed:  "stale",
-	ExceptionCommandsUnbound: "stale",
-	ExceptionUnavailable:     "target_unreachable",
+	ExceptionReviewerAuth:   "auth_required",
+	ExceptionReviewerFailed: "stale",
+	ExceptionUnavailable:    "target_unreachable",
 }
 
 // jobExceptions are the exceptions about the job itself. Every other one is
@@ -1606,6 +1617,33 @@ func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 			// field is required by the request's schema.
 			State:    api.TxeAvailabilityState(registry.AvailabilityReady),
 			ActionId: &exc.ActionID, Attempt: &exc.Attempt, ClaimId: &exc.Claim.ID, Fence: &fence,
+		}
+		return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
+	}
+	if exc.Kind == ExceptionCommandsUnbound {
+		// A job whose commands are not bound to this machine's registration
+		// has an exception of its own scope, about one version of the job.
+		// It changes no availability, a recorded review does not resolve
+		// it, and the registry keeps one open per version. It ends when
+		// this reviewer reports the binding verified again, or the job
+		// gets a new version.
+		kind, scope := string(exc.Kind), api.TxeObservationRequestScopeBinding
+		fence := int64(exc.Claim.Fence)
+		state := api.TxeAvailabilityState("stale")
+		if exc.Cleared {
+			// Only said when there is something to end.
+			doc, err := r.jobDoc(ctx, exc.JobID)
+			if err != nil {
+				return err
+			}
+			if !hasOpenBindingException(doc) {
+				return nil
+			}
+			state = api.TxeAvailabilityState(registry.AvailabilityReady)
+		}
+		body := api.TxeObservationRequest{
+			Actor: r.actor(), Scope: &scope, Kind: &kind, Detail: &exc.Message, State: state,
+			ClaimId: &exc.Claim.ID, Fence: &fence,
 		}
 		return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
 	}

@@ -151,18 +151,18 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		return Prepared{}, fmt.Errorf("acquire claim: %w", err)
 	}
 
+	// The owner is told, in the place exceptions are read, when none of the
+	// job's commands will be started, and told that this is over once the
+	// job is bound again. The job is reviewed either way: telling must not
+	// stop the review, and what could not be said is said by the next one.
+	binding := Exception{JobID: job.ID, Kind: ExceptionCommandsUnbound, MachineID: job.MachineID, Claim: claim}
 	if job.CommandsRefused != "" {
-		// The owner is told, in the place exceptions are read: the job is
-		// still reviewed, and none of its commands will be started until it
-		// is registered from this machine again. Telling must not stop the
-		// review; an exception that could not be raised is raised again by
-		// the next one.
-		if err := r.Registry.RaiseException(ctx, Exception{
-			JobID: job.ID, Kind: ExceptionCommandsUnbound, MachineID: job.MachineID,
-			Message: CommandsUnboundMessage(job),
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "txe review: job %s: raise exception: %v; the review goes on\n", job.ID, err)
-		}
+		binding.Message = CommandsUnboundMessage(job)
+	} else {
+		binding.Cleared, binding.Message = true, "the job's commands are bound to this machine's registration again"
+	}
+	if err := r.Registry.RaiseException(ctx, binding); err != nil {
+		fmt.Fprintf(os.Stderr, "txe review: job %s: report on the binding of its commands: %v; the review goes on\n", job.ID, err)
 	}
 	packet, err := r.prepareClaimed(ctx, claim, job)
 	if errors.Is(err, ErrPacketTooLarge) {
@@ -1456,7 +1456,7 @@ func deniedText(denied *GuardDeniedError) string {
 // CommandsUnboundMessage is the exception raised for a job none of whose
 // commands is started: what is wrong, on which machine, and what to do.
 func CommandsUnboundMessage(job Job) string {
-	return commandsUnboundPrefix + "On machine " + job.MachineID + ": " + job.CommandsRefused +
+	return "The job's commands are not started. On machine " + job.MachineID + ": " + job.CommandsRefused +
 		". Reviews and questions go on; routine actions, approved actions and reconcile probes of this job do not run. " +
 		"If an update of the job from that machine was interrupted, finish it there with `dagu txe resume <request id>`; the unfinished request is under the TXE home's receipts/pending. " +
 		"If the job was changed on purpose from elsewhere, update it from that machine with `dagu txe update <job id> -f <spec> --expected-version <n>`, which keeps the job and its history and records the new version there. " +

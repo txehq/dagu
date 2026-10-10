@@ -575,6 +575,9 @@ type Exception struct {
 	// Claim is the live claim an action's exception is raised under. It
 	// is not part of the record.
 	Claim Claim `json:"-"`
+	// Cleared reports that the condition is over, for a kind of exception
+	// the reviewer has to end itself.
+	Cleared bool `json:"-"`
 	// ResolvedAt is set by the registry when the condition is over.
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }

@@ -1037,6 +1037,12 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		"this machine has no receipt for the job":                         {remote: registered, latest: func(string) (int, string, error) { return 0, "", errors.New("no receipt") }},
 
 		// What an action is granted against, and what the agent is told.
+		"a target's identity gained a member with an empty value": {remote: version(func(v map[string]any) {
+			v["targets"].([]any)[0].(map[string]any)["stable_id"].(map[string]any)["cluster_uid"] = ""
+		})},
+		"a target's identity gained an empty member": {remote: version(func(v map[string]any) {
+			v["targets"].([]any)[0].(map[string]any)["stable_id"].(map[string]any)[""] = ""
+		})},
 		"a target was replaced": {remote: version(func(v map[string]any) {
 			v["targets"] = []any{map[string]any{"kind": "k8s.pv", "stable_id": map[string]any{"uid": "someone-elses"}}}
 		})},
@@ -1286,6 +1292,14 @@ func TestRemoteAnUnboundJobIsReviewedAndRunsNoCommand(t *testing.T) {
 	require.Len(t, first.Proposals, 1, "a question to the owner can still be asked")
 	open, _ := unbound()
 	assert.Equal(t, 1, open, "the owner is told")
+	for _, e := range f.job().Exceptions {
+		if e.Kind == string(review.ExceptionCommandsUnbound) {
+			assert.Equal(t, registry.ScopeBinding, e.Scope, "under a scope of its own")
+			assert.Equal(t, 1, e.JobVersion)
+		}
+	}
+	assert.Nil(t, f.job().ReviewerAvailability, "the reviewer is not marked unavailable")
+	assert.Equal(t, registry.AvailabilityReady, f.job().Availability.State, "nor the job")
 
 	// The owner approves the other action. It is not executed, and the
 	// decision is not used up.

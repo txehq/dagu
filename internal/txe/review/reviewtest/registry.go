@@ -769,6 +769,21 @@ func (r *Registry) DeferReview(_ context.Context, claim review.Claim, until time
 // RaiseException implements review.Registry.
 func (r *Registry) RaiseException(_ context.Context, exc review.Exception) error {
 	return r.Update(func(s *State) error {
+		if exc.Kind == review.ExceptionCommandsUnbound {
+			// One open per job; ended by the reviewer, not by a review.
+			for i := range s.Exceptions {
+				if e := &s.Exceptions[i]; e.ResolvedAt == nil && e.JobID == exc.JobID && e.Kind == exc.Kind {
+					if exc.Cleared {
+						now := r.now()
+						e.ResolvedAt = &now
+					}
+					return nil
+				}
+			}
+			if exc.Cleared {
+				return nil
+			}
+		}
 		if exc.ActionID != "" {
 			for _, open := range s.Exceptions {
 				if open.ResolvedAt == nil && open.JobID == exc.JobID && open.Kind == exc.Kind && open.ActionID == exc.ActionID && open.Attempt == exc.Attempt {
