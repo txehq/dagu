@@ -150,6 +150,23 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 			}
 		}
 	}
+	applyVersionDefaults(jobID, v)
+	r := &v.RetirementRules
+	if r.ActiveRunPolicy != ActiveRunFinish && r.ActiveRunPolicy != ActiveRunCancel {
+		return refuse(CodeInvalid, "retirement_rules.active_run_policy must be finish or cancel")
+	}
+	for _, rule := range []string{r.OnTargetDeleted, r.OnReplacement, r.OnCompletion} {
+		if rule != RuleRetire && rule != RuleReview && rule != RuleKeep {
+			return refuse(CodeInvalid, "retirement rule %q must be retire, review or keep", rule)
+		}
+	}
+	return nil
+}
+
+// applyVersionDefaults sets the defaults and derived fields registration
+// stores: retirement-rule defaults, deliverable delivery, schema, job_id,
+// dag.name and dag.spec_sha256. It refuses nothing.
+func applyVersionDefaults(jobID string, v *JobVersion) {
 	r := &v.RetirementRules
 	if r.OnTargetDeleted == "" {
 		r.OnTargetDeleted = RuleRetire
@@ -163,19 +180,15 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 	if r.ActiveRunPolicy == "" {
 		r.ActiveRunPolicy = ActiveRunFinish
 	}
-	if r.ActiveRunPolicy != ActiveRunFinish && r.ActiveRunPolicy != ActiveRunCancel {
-		return refuse(CodeInvalid, "retirement_rules.active_run_policy must be finish or cancel")
-	}
-	for _, rule := range []string{r.OnTargetDeleted, r.OnReplacement, r.OnCompletion} {
-		if rule != RuleRetire && rule != RuleReview && rule != RuleKeep {
-			return refuse(CodeInvalid, "retirement rule %q must be retire, review or keep", rule)
+	for i := range v.ExpectedOutcome.Deliverables {
+		if v.ExpectedOutcome.Deliverables[i].Delivery == "" {
+			v.ExpectedOutcome.Deliverables[i].Delivery = DeliveryMachine
 		}
 	}
 	v.Schema = SchemaVersion
 	v.JobID = jobID
 	v.DAG.Name = jobID
 	v.DAG.SpecSHA256 = specDigest([]byte(v.DAG.Spec))
-	return nil
 }
 
 func specDigest(spec []byte) string {
@@ -705,6 +718,32 @@ const (
 // Capabilities is what this registry enforces.
 func Capabilities() []string { return []string{CapabilityParamSchema} }
 
+// ApplyVersionDefaults returns v with exactly the defaults and derived
+// fields registration stores (see NormalizeVersion), and no validation: a
+// version stored under earlier, looser rules compares equal to the same
+// input. It is for comparing what a registry stored with what a client
+// would send. v is not modified.
+func ApplyVersionDefaults(jobID string, v JobVersion) (JobVersion, error) {
+	out, err := copyVersion(v)
+	if err != nil {
+		return JobVersion{}, err
+	}
+	applyVersionDefaults(jobID, &out)
+	return out, nil
+}
+
+func copyVersion(v JobVersion) (JobVersion, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return JobVersion{}, err
+	}
+	var out JobVersion
+	if err := json.Unmarshal(b, &out); err != nil {
+		return JobVersion{}, err
+	}
+	return out, nil
+}
+
 // NormalizeVersion returns v as registration stores it for job jobID: the
 // same defaults and derived fields (retirement-rule defaults, deliverable
 // delivery, dag.name, dag.spec_sha256, schema, job_id) after the same
@@ -716,12 +755,8 @@ func Capabilities() []string { return []string{CapabilityParamSchema} }
 // registered version with what they would register through this one
 // function. v is not modified.
 func NormalizeVersion(jobID string, v JobVersion) (JobVersion, error) {
-	b, err := json.Marshal(v)
+	out, err := copyVersion(v)
 	if err != nil {
-		return JobVersion{}, err
-	}
-	var out JobVersion
-	if err := json.Unmarshal(b, &out); err != nil {
 		return JobVersion{}, err
 	}
 	if err := normalizeVersion(jobID, &out); err != nil {

@@ -944,3 +944,33 @@ func TestNormalizeVersionIsWhatRegistrationStores(t *testing.T) {
 	_, err = f.store.UpdateVersion(f.ctx, job.JobID, "upd-x", 1, elsewhere, cli)
 	assert.Equal(t, CodeInvalid, code(t, err), "registration loads and routes the DAG")
 }
+
+// ApplyVersionDefaults is NormalizeVersion's defaults without its checks: for
+// a valid version both agree, and a version only earlier rules admitted (a
+// draft-07 param_schema) still gets the same defaults instead of an error.
+func TestApplyVersionDefaultsDoesNotValidate(t *testing.T) {
+	f := newFixture(t)
+	v := f.version(1)
+	v.ExpectedOutcome.Deliverables = []Deliverable{{Name: "report", Path: "out/report.md"}}
+	normalized, err := NormalizeVersion("job_x", v)
+	require.NoError(t, err)
+	defaulted, err := ApplyVersionDefaults("job_x", v)
+	require.NoError(t, err)
+	want, err := CanonicalJSON(normalized)
+	require.NoError(t, err)
+	have, err := CanonicalJSON(defaulted)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(want), string(have))
+	assert.Empty(t, v.ExpectedOutcome.Deliverables[0].Delivery, "the input is not modified")
+
+	old := f.version(1)
+	old.ReviewPolicy.PermittedActions[1].ParamSchema = json.RawMessage(`{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}`)
+	_, err = NormalizeVersion("job_x", old)
+	assert.Equal(t, CodeInvalid, code(t, err), "today's rules refuse it")
+	got, err := ApplyVersionDefaults("job_x", old)
+	require.NoError(t, err)
+	assert.Equal(t, RuleRetire, got.RetirementRules.OnTargetDeleted)
+	assert.Equal(t, "job_x", got.DAG.Name)
+	assert.Equal(t, specDigest([]byte(old.DAG.Spec)), got.DAG.SpecSHA256)
+	assert.JSONEq(t, string(old.ReviewPolicy.PermittedActions[1].ParamSchema), string(got.ReviewPolicy.PermittedActions[1].ParamSchema), "stored as it was")
+}
