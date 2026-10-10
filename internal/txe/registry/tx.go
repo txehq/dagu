@@ -285,6 +285,9 @@ type Observation struct {
 	Attempt  int
 	ClaimID  string
 	Fence    int64
+	// JobVersion is the version a ScopeBinding observation is about; zero
+	// means the job's current version.
+	JobVersion int
 }
 
 // Observation scopes.
@@ -294,6 +297,12 @@ const (
 	// ScopeAction is a problem with one attempt of one action (a retry
 	// reservation that never started); it changes no availability.
 	ScopeAction = "action"
+	// ScopeBinding is a problem binding one version of the job to the
+	// reviewer's machine (e.g. job_commands_unbound): it changes no
+	// availability and is not resolved by a review or a ready observation,
+	// only by a ready observation of the same kind and version, or by the
+	// job moving to another version.
+	ScopeBinding = "binding"
 )
 
 // Observe records availability. It never changes the lifecycle: an offline
@@ -301,8 +310,11 @@ const (
 // A non-ready observation opens an exception; a ready one resolves them.
 func (tx *JobTx) Observe(o Observation) error {
 	j := tx.Job
-	if o.Scope == ScopeAction {
+	switch o.Scope {
+	case ScopeAction:
 		return tx.observeAction(o)
+	case ScopeBinding:
+		return tx.observeBinding(o)
 	}
 	if o.State == "" {
 		return refuse(CodeInvalid, "observation state is required")
@@ -312,7 +324,7 @@ func (tx *JobTx) Observe(o Observation) error {
 	case ScopeReviewer:
 		return tx.observeReviewer(o)
 	default:
-		return refuse(CodeInvalid, "observation scope must be job, reviewer or action")
+		return refuse(CodeInvalid, "observation scope must be job, reviewer, action or binding")
 	}
 	from := j.Availability.State
 	now := tx.now
@@ -580,6 +592,63 @@ func (tx *JobTx) observeAction(o Observation) error {
 		ActionID: o.ActionID, Attempt: o.Attempt, Created: Stamp{At: tx.now, By: tx.actor}}
 	tx.touch()
 	return nil
+}
+
+// observeBinding records, or with a ready state resolves, a problem binding
+// the job's current version to the reviewer's machine, under the reviewer's
+// live claim. One exception stays open per kind and version.
+func (tx *JobTx) observeBinding(o Observation) error {
+	j := tx.Job
+	if err := tx.CheckClaim(o.ClaimID, o.Fence); err != nil {
+		return err
+	}
+	if o.Kind == "" || o.State == "" {
+		return refuse(CodeInvalid, "a binding observation needs kind and state")
+	}
+	version := o.JobVersion
+	if version == 0 {
+		version = j.Version
+	}
+	if version != j.Version {
+		return &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("the job is at version %d, not %d", j.Version, version), Current: j}
+	}
+	now := tx.now
+	if o.State == AvailabilityReady {
+		for _, e := range j.Exceptions {
+			if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.Kind == o.Kind && e.JobVersion == version {
+				e.ResolvedAt = &now
+				tx.touch()
+			}
+		}
+		return nil
+	}
+	for _, e := range j.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.Kind == o.Kind && e.JobVersion == version {
+			return nil
+		}
+	}
+	id, err := NewID(PrefixException, now)
+	if err != nil {
+		return err
+	}
+	if j.Exceptions == nil {
+		j.Exceptions = map[string]*Exception{}
+	}
+	j.Exceptions[id] = &Exception{ExceptionID: id, Kind: o.Kind, Scope: ScopeBinding, State: o.State, Detail: o.Detail,
+		Evidence: o.Evidence, JobVersion: version, Created: Stamp{At: now, By: tx.actor}}
+	tx.touch()
+	return nil
+}
+
+// resolveStaleBindings resolves binding exceptions of versions the job is no
+// longer at: they describe a binding nothing runs any more.
+func (tx *JobTx) resolveStaleBindings() {
+	now := tx.now
+	for _, e := range tx.Job.Exceptions {
+		if e.ResolvedAt == nil && e.Scope == ScopeBinding && e.JobVersion != tx.Job.Version {
+			e.ResolvedAt = &now
+		}
+	}
 }
 
 // resolveActionExceptions resolves the open action-scope exceptions of a

@@ -8382,6 +8382,8 @@ export interface components {
             action_id?: string;
             /** @description For scope action: the action attempt; resolved when that attempt ends. */
             attempt?: number;
+            /** @description For scope binding: the job version it is about; resolved by a ready binding observation of the same kind and version, or when the job moves to another version. */
+            job_version?: number;
             detail: string;
             evidence?: string[];
             created: components["schemas"]["TxeStamp"];
@@ -8486,7 +8488,7 @@ export interface components {
             /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
             kind?: string;
             /**
-             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action.
+             * @description reviewer records the reviewer's availability and exceptions without changing the job's availability; action records a problem with one attempt of one action (for example retry_reservation_stalled) under the caller's live claim, changes no availability, keeps one open exception per action_id, attempt and kind (a repeat returns the job unchanged), and is resolved by the registry when that attempt settles, leaves executing/uncertain or a later attempt starts; default job. state is ignored for action. binding records a problem binding one job version to the reviewer's machine (for example job_commands_unbound) under the caller's live claim: it changes no availability, keeps one open exception per kind and job_version (a repeat returns the job unchanged), is NOT resolved by reviews or other ready observations, and is resolved only by a binding observation with state ready for the same kind and job_version, or when the job moves to another version.
              * @enum {string}
              */
             scope?: TxeObservationRequestScope;
@@ -8496,11 +8498,13 @@ export interface components {
             action_id?: string;
             /** @description scope action: the action's current attempt; another attempt, or an action that is not executing or uncertain, is 409 action_state. */
             attempt?: number;
-            /** @description scope action: the caller's live claim on the job. */
+            /** @description scope binding: the job version the binding problem is about; default the current version, and only the current version is accepted (409 stale_binding otherwise). */
+            job_version?: number;
+            /** @description scope action or binding: the caller's live claim on the job. */
             claim_id?: string;
             /**
              * Format: int64
-             * @description scope action: that claim's fence.
+             * @description scope action or binding: that claim's fence.
              */
             fence?: number;
             actor?: components["schemas"]["TxeActor"];
@@ -25126,7 +25130,8 @@ export enum TxeLifecycleRequestActive_run_policy {
 export enum TxeObservationRequestScope {
     job = "job",
     reviewer = "reviewer",
-    action = "action"
+    action = "action",
+    binding = "binding"
 }
 export enum TxeReviewOutcome {
     continue = "continue",

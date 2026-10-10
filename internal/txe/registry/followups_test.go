@@ -816,3 +816,62 @@ func TestUncertainRunRetryGetsOneApprovedExtraAttempt(t *testing.T) {
 		assert.Equal(t, CodeActionExists, code(t, err))
 	})
 }
+
+// A binding problem (the job's commands are not bound on the reviewer's
+// machine) is one exception per kind and version, raised under the live
+// claim; it changes no availability, survives reviews and ready
+// observations, and is resolved only by a ready binding observation of the
+// same kind and version, or by the job moving to another version.
+func TestBindingExceptionsPersistUntilRestored(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	observe := func(o Observation) error {
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.Observe(o) })
+		return err
+	}
+	unbound := Observation{Scope: ScopeBinding, Kind: "job_commands_unbound", State: AvailabilityStale, ClaimID: c.ClaimID, Fence: c.Fence, Detail: "run.sh not found"}
+	open := func() []*Exception {
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, AvailabilityReady, got.Availability.State, "no availability change")
+		var out []*Exception
+		for _, e := range got.Exceptions {
+			if e.Scope == ScopeBinding && e.ResolvedAt == nil {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+
+	noClaim := unbound
+	noClaim.Fence = c.Fence + 1
+	assert.Equal(t, CodeClaimStale, code(t, observe(noClaim)))
+	old := unbound
+	old.JobVersion = job.Version + 1
+	assert.Equal(t, CodeStaleBinding, code(t, observe(old)), "only the current version")
+
+	require.NoError(t, observe(unbound))
+	require.NoError(t, observe(unbound), "a repeat changes nothing")
+	got := open()
+	require.Len(t, got, 1)
+	assert.Equal(t, job.Version, got[0].JobVersion)
+
+	// Neither the reviewer's nor the job's ready observation resolves it.
+	require.NoError(t, observe(Observation{Scope: ScopeReviewer, State: AvailabilityReady}))
+	require.NoError(t, observe(Observation{State: AvailabilityReady}))
+	assert.Len(t, open(), 1)
+
+	restored := unbound
+	restored.State = AvailabilityReady
+	require.NoError(t, observe(restored))
+	assert.Empty(t, open(), "the binding was verified again")
+
+	// Raised again, then the job moves to another version: the old version's
+	// binding problem ends with it.
+	require.NoError(t, observe(unbound))
+	require.Len(t, open(), 1)
+	_, err := f.store.UpdateVersion(f.ctx, job.JobID, "upd-1", job.Version, f.version(2), cli)
+	require.NoError(t, err)
+	assert.Empty(t, open())
+}
