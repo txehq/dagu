@@ -122,7 +122,9 @@ func canonicalJSON(raw json.RawMessage) string {
 // registry's admission check: whether today's rules would accept the
 // version is not the question. The question is whether the registry's copy
 // is the version that was registered, and a version stored when the rules
-// were laxer is still that version.
+// were laxer is still that version. A derived field (the job id, the
+// DAG's name, the digest of its text) is filled in only where a side left
+// it out: one that is stated is compared as stated.
 //
 // Then what the registry assigns when it commits a version is cleared
 // (owner, version number, creation stamp, link to the previous version),
@@ -142,6 +144,20 @@ func registeredView(jobID string, raw json.RawMessage) (map[string]any, error) {
 	v, err := registry.ApplyVersionDefaults(jobID, filed)
 	if err != nil {
 		return nil, err
+	}
+	// The defaults derive these three from the job id and the DAG's text,
+	// and write them over whatever was there. That is right for a side that
+	// left them out and wrong for a side that states them: a registry copy
+	// whose DAG name was changed would come out equal. What a side states
+	// is what is compared.
+	if filed.JobID != "" {
+		v.JobID = filed.JobID
+	}
+	if filed.DAG.Name != "" {
+		v.DAG.Name = filed.DAG.Name
+	}
+	if filed.DAG.SpecSHA256 != "" {
+		v.DAG.SpecSHA256 = filed.DAG.SpecSHA256
 	}
 	v.OwnerID, v.Version, v.Created, v.Prev = "", 0, registry.Stamp{}, ""
 	for i := range v.ReviewPolicy.PermittedActions {

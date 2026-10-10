@@ -1177,7 +1177,13 @@ func TestRemoteJobWithCredentialsRunsOnlyWhatThisMachineRegistered(t *testing.T)
 		"the package digest was changed":     {remote: version(func(v map[string]any) { pkg(v)["digest"] = "sha256:" + strings.Repeat("b", 64) })},
 		"the package entrypoint was changed": {remote: version(func(v map[string]any) { pkg(v)["entrypoint"] = "other.sh" })},
 
-		// A version stored when the registry's rules were laxer: the same on
+		// Fields the registry derives. Its copy states them, and a stated
+		// one that is not what was registered is a difference.
+		"the DAG's name was changed":    {remote: version(func(v map[string]any) { v["dag"].(map[string]any)["name"] = "job_other" })},
+		"the DAG's digest was changed":  {remote: version(func(v map[string]any) { v["dag"].(map[string]any)["spec_sha256"] = "sha256:" + strings.Repeat("c", 64) })},
+		"the DAG's text was changed":    {remote: version(func(v map[string]any) { v["dag"].(map[string]any)["spec"] = "steps:\n  - command: other\n" })},
+		"the version names another job": {remote: version(func(v map[string]any) { v["job_id"] = "job_other" })},
+
 		// both sides, and no longer a version today's rules would accept. It
 		// is still the version that was registered, and its commands run.
 		"an unaltered version the current rules no longer accept": {

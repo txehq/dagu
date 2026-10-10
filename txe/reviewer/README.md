@@ -109,7 +109,9 @@ the function registration itself uses, so the version this machine filed
 becomes exactly what an honest registry stored and nothing of that is
 repeated in the reviewer. It is not the registry's admission check: a
 version stored when the rules were laxer is still the version that was
-registered, and its commands run. What the registry assigns at
+registered, and its commands run. A derived field (the job id, the DAG's
+name, the digest of its text) is filled in only where a side leaves it out;
+one the registry's copy states is compared as stated. What the registry assigns at
 commit (owner, version number, stamps) is left out, each parameter schema
 is compared decoded, and what means nothing (absent, null, empty, zero,
 false) is the same however it is spelled, except inside a parameter schema
