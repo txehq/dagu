@@ -226,3 +226,40 @@ func TestRefusedClaimOfAbandonedExecutionLeavesTheVisibleOneAlone(t *testing.T) 
 	_, err = f.dispatches.GetClaim(t.Context(), claimed.ClaimToken)
 	assert.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the stale claim is removed")
 }
+
+// On the file-backed store a refused claim that matches the run's execution
+// finalizes it: the persisted status is aborted with the reason and the
+// claim is removed.
+func TestRefusedClaimAbortsItsExecutionOnTheFileStore(t *testing.T) {
+	t.Parallel()
+	jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	f := newStrandedFixture(t, nil)
+	f.h.runAdmitter = &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitRetired, Reason: "job retired"}}
+	current := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.Equal(t, current, f.latest(t))
+
+	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
+		Target: strandedDAG, DefinitionID: jobID, DAGRunID: strandedRun, AttemptID: current, AttemptKey: f.attemptKey(current),
+		Owner: dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+	}))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(current),
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+	assert.Contains(t, resp.Error, "retired")
+
+	attempt, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	require.Equal(t, current, attempt.ID())
+	st, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Aborted, st.Status)
+	assert.Contains(t, st.Error, "retired")
+	_, err = f.dispatches.GetClaim(t.Context(), claimed.ClaimToken)
+	assert.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the refused claim is removed")
+}

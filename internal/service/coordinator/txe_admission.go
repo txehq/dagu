@@ -16,6 +16,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -123,12 +124,24 @@ func (h *Handler) abortQueuedAttempt(ctx context.Context, task *dispatch.Dispatc
 	if status.Status == ir.Queued && status.QueuedAt != executionMarker {
 		return nil
 	}
-	status.Status = ir.Aborted
-	status.FinishedAt = stringutil.FormatTime(time.Now().UTC())
-	status.Error = reason
-	if err := attempt.Write(ctx, *status); err != nil {
+	// The store re-checks the attempt, its status and the marker in the same
+	// write, so an execution that changed after the read is never aborted.
+	aborted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(ctx, run, task.AttemptID, status.Status,
+		func(current *ir.DAGRunStatus) error {
+			if current.Status == ir.Queued && current.QueuedAt != executionMarker {
+				return errExecutionReplaced
+			}
+			current.Status = ir.Aborted
+			current.FinishedAt = stringutil.FormatTime(time.Now().UTC())
+			current.Error = reason
+			return nil
+		}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: root})
+	if errors.Is(err, errExecutionReplaced) || (err == nil && !swapped) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("abort refused run: %w", err)
 	}
-	h.finalizeAdmissionForStatus(ctx, status, attempt.ID())
+	h.finalizeAdmissionForStatus(ctx, aborted, task.AttemptID)
 	return nil
 }
