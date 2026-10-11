@@ -10358,6 +10358,86 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   # TXE job registry (fork extension; see internal/txe/registry).
+  /txe/resource-events:
+    post:
+      summary: "Report a resource event"
+      description: "Refused with 409 not_ready until the resource index covers every job. The event is saved before it is applied; complete is false while some dependents are still pending, and the server retries them. Evaluates an observation of one external resource, identified by kind and stable ID, against the jobs that depend on it and that the caller may write. An authoritative deletion applies each job's on_target_deleted rule; an ambiguous absence asks a person; unreachable, denied or timed-out targets change availability and never retire; a present resource reusing a target's display name with a different stable ID is a replacement and applies on_replacement. Other jobs are untouched. The event and its dispositions are saved."
+      operationId: "recordTxeResourceEvent"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeResourceEventRequest"
+      responses:
+        "200":
+          description: "Event recorded with its dispositions"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEvent"
+        "400":
+          description: "Invalid request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not authorized"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/resource-events/{eventId}:
+    parameters:
+      - $ref: "#/components/parameters/TxeEventId"
+    get:
+      summary: "Get a resource event"
+      description: "Returns a recorded resource event with the dispositions visible to the caller."
+      operationId: "getTxeResourceEvent"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Resource event"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeResourceEvent"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/installation:
     get:
       summary: "Get the TXE registry installation"
@@ -12354,6 +12434,12 @@ components:
         type: string
     TxeMachineId:
       name: machineId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeEventId:
+      name: eventId
       in: path
       required: true
       schema:
@@ -18842,6 +18928,107 @@ components:
             $ref: "#/components/schemas/WorkspaceResponse"
 
     # TXE job registry (fork extension).
+    TxeResourceObservation:
+      type: string
+      enum: [deleted, absent, present, unreachable, auth_denied, timeout]
+
+    TxeResourceEventRequest:
+      type: object
+      properties:
+        event_id:
+          type: string
+          description: "Client-minted evt_ ID. Sending the same report again with it resumes the saved event; a different report under it is 409"
+        target:
+          $ref: "#/components/schemas/TxeTarget"
+        observation:
+          $ref: "#/components/schemas/TxeResourceObservation"
+        authoritative:
+          type: boolean
+          description: "True only when the evidence proves the stable identity no longer exists"
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        observed_at:
+          type: string
+          format: date-time
+        actor:
+          $ref: "#/components/schemas/TxeActor"
+      required: [target, observation]
+
+    TxeResourceDisposition:
+      type: object
+      properties:
+        job_id:
+          type: string
+        match:
+          type: string
+          enum: [identity, replacement]
+        outcome:
+          type: string
+          enum: [retired, needs_human, availability, recorded, unchanged]
+        detail:
+          type: string
+      required: [job_id, match, outcome]
+
+    TxeResourceEvent:
+      type: object
+      properties:
+        schema:
+          type: integer
+        event_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/TxeTarget"
+        observation:
+          $ref: "#/components/schemas/TxeResourceObservation"
+        authoritative:
+          type: boolean
+        detail:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        observed_at:
+          type: string
+          format: date-time
+        reporter:
+          $ref: "#/components/schemas/TxeActor"
+        dispositions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeResourceDisposition"
+        pending:
+          type: array
+          description: "Dependents not yet updated; the server keeps retrying them"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              match:
+                type: string
+                enum: [identity, replacement]
+            required: [job_id, match]
+        failures:
+          type: array
+          description: "Last error for each pending dependent"
+          items:
+            type: object
+            properties:
+              job_id:
+                type: string
+              error:
+                type: string
+            required: [job_id, error]
+        complete:
+          type: boolean
+          description: "True when every dependent has been updated"
+      required: [schema, event_id, target, observation, authoritative, observed_at, reporter, dispositions, complete]
+
     TxeActor:
       type: object
       description: "Who made a change. Never the owner: owner is a separate stable ID."
@@ -19828,7 +20015,7 @@ components:
           format: int64
         kind:
           type: string
-          enum: [registered, ready, duplicate, version, lifecycle, availability, claim]
+          enum: [registered, ready, duplicate, version, lifecycle, availability, claim, effect, run_dropped, resource]
         from:
           type: string
         to:

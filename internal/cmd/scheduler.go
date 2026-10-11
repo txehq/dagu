@@ -77,6 +77,13 @@ func newScheduler(ctx *Context, deps scheduler.Dependencies) (*scheduler.Schedul
 	deps.DispatchTaskStore = ctx.Persistence.DispatchTaskStore
 	deps.WorkerHeartbeatStore = ctx.Persistence.WorkerHeartbeatStore
 	deps.LicenseManager = ctx.LicenseManager
+	if deps.RunAdmitter == nil && ctx.Config.Paths.DataDir != "" {
+		guard, err := newJobRegistryGuard(ctx, deps.DAGRunManager, coordinatorClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open TXE job registry: %w", err)
+		}
+		deps.RunAdmitter = guard
+	}
 	return scheduler.New(ctx.Config, deps)
 }
 

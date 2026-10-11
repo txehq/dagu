@@ -93,6 +93,7 @@ type Scheduler struct {
 	eventCollector      func(context.Context)
 	notificationMonitor *chatbridge.NotificationMonitor
 	incidentMonitor     *chatbridge.NotificationMonitor
+	runAdmitter         RunAdmitter
 }
 
 type schedulerHooks struct {
@@ -126,6 +127,8 @@ type Dependencies struct {
 	IncidentState        chatbridge.StateStore
 	NewIncidentLease     func() chatbridge.Lease
 	LicenseManager       *license.Manager
+	// RunAdmitter, when set, guards runs of TXE registered jobs.
+	RunAdmitter RunAdmitter
 }
 
 type startupState struct {
@@ -173,6 +176,9 @@ func New(cfg *config.Config, deps Dependencies) (*Scheduler, error) {
 	scheduler.queueProcessor.workerHeartbeatStore = deps.WorkerHeartbeatStore
 	if deps.WorkerStaleAfter != 0 {
 		scheduler.queueProcessor.workerStaleAfter = deps.WorkerStaleAfter
+	}
+	if deps.RunAdmitter != nil {
+		scheduler.enableRunAdmission(deps.RunAdmitter)
 	}
 	return scheduler, nil
 }
@@ -673,6 +679,10 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	wg.Go(func() {
 		s.startIncidentMonitor(ctx)
+	})
+
+	wg.Go(func() {
+		s.startTxeReconciler(ctx)
 	})
 
 	wg.Go(func() {

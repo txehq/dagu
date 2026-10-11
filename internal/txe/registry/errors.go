@@ -29,6 +29,8 @@ const (
 	CodeActionState     Code = "action_state"
 	CodeGrantInvalid    Code = "grant_invalid"
 	CodeDAGMismatch     Code = "dag_mismatch"
+	CodeIncomplete      Code = "incomplete"
+	CodeEventComplete   Code = "event_complete"
 )
 
 // Error is a refused registry operation. Current, when set, is the record

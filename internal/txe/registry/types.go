@@ -315,6 +315,9 @@ const (
 	DispositionQueuedDropped     = "queued_dropped"
 	DispositionAllowedToFinish   = "allowed_to_finish"
 	DispositionCancelRequested   = "cancel_requested"
+	DispositionStopRequested     = "stop_requested"
+	DispositionStopFailed        = "stop_failed"
+	DispositionAdmittedBeforeEnd = "admitted_before_end"
 )
 
 // Retirement is the recorded end of a job.
@@ -487,6 +490,44 @@ type Proposal struct {
 	Prev            string        `json:"prev,omitempty"`
 }
 
+// RunRef identifies a run of a job's DAG. RootName and RootRunID are set
+// when the run is a child of another DAG's run.
+type RunRef struct {
+	RunID     string `json:"run_id"`
+	Running   bool   `json:"running,omitempty"`
+	RootName  string `json:"root_name,omitempty"`
+	RootRunID string `json:"root_run_id,omitempty"`
+}
+
+// AppliedResourceEvent is a resource event's result on one job.
+type AppliedResourceEvent struct {
+	Key         string              `json:"key"`
+	EventID     string              `json:"event_id"`
+	At          time.Time           `json:"at"`
+	Disposition ResourceDisposition `json:"disposition"`
+}
+
+// AdmittedRun records when a worker was allowed to start a run.
+type AdmittedRun struct {
+	At        time.Time `json:"at"`
+	RootName  string    `json:"root_name,omitempty"`
+	RootRunID string    `json:"root_run_id,omitempty"`
+}
+
+// PendingEffects is Dagu work a lifecycle transition still owes: runs to
+// stop under the cancel policy. Suspension is not stored here; it is always
+// reconciled to the state the current lifecycle requires.
+type PendingEffects struct {
+	Revision int64    `json:"revision"`
+	StopRuns []RunRef `json:"stop_runs,omitempty"`
+	// DiscoverRuns means the job's runs could not be listed when it ended
+	// under the cancel policy; they are listed again and stopped.
+	DiscoverRuns bool      `json:"discover_runs,omitempty"`
+	Attempts     int       `json:"attempts"`
+	Since        time.Time `json:"since"`
+	LastError    string    `json:"last_error,omitempty"`
+}
+
 // NativeResume is a pending completion of the Dagu human task that collected
 // a decision.
 type NativeResume struct {
@@ -643,6 +684,9 @@ const (
 	EventLifecycle    EventKind = "lifecycle"
 	EventAvailability EventKind = "availability"
 	EventClaim        EventKind = "claim"
+	EventEffect       EventKind = "effect"
+	EventRunDropped   EventKind = "run_dropped"
+	EventResource     EventKind = "resource"
 )
 
 // Event is one immutable entry in a job's history.
@@ -706,9 +750,28 @@ type Job struct {
 	// completed, so a failed completion can be retried after its proposal
 	// left the aggregate. Entries are removed once completed.
 	NativeResumes map[string]*NativeResume `json:"native_resumes,omitempty"`
-	Chains        Chains                   `json:"chains"`
-	Created       Stamp                    `json:"created"`
-	Updated       Stamp                    `json:"updated"`
+	// AdmittedRuns are runs a worker was allowed to start, by run ID, so a
+	// later retirement knows them even before Dagu reports them running.
+	AdmittedRuns map[string]AdmittedRun `json:"admitted_runs,omitempty"`
+	// SuspendWriters are suspend writes in progress, by token, with when each
+	// started. Ownership of the suspension is not released while one is live.
+	SuspendWriters map[string]time.Time `json:"suspend_writers,omitempty"`
+	// SuspendGen counts the registry's suspend writes. Releasing ownership is
+	// fenced by it, so reconciling an older write never releases a newer one.
+	SuspendGen int64 `json:"suspend_gen,omitempty"`
+	// AppliedResourceEvents are the resource events applied to the job, oldest
+	// first, keyed by match and target, with their results, so a replayed
+	// event is not applied twice.
+	AppliedResourceEvents []AppliedResourceEvent `json:"applied_resource_events,omitempty"`
+	// PendingEffects are lifecycle effects on Dagu committed with the
+	// transition and not yet confirmed applied.
+	PendingEffects *PendingEffects `json:"pending_effects,omitempty"`
+	// SuspendedByRegistry is set while the registry holds the job's DAG
+	// suspended, so lifting it never overrides a person's own suspension.
+	SuspendedByRegistry bool   `json:"suspended_by_registry,omitempty"`
+	Chains              Chains `json:"chains"`
+	Created             Stamp  `json:"created"`
+	Updated             Stamp  `json:"updated"`
 }
 
 // Runnable reports whether Dagu may start a run of this job now.

@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/goccy/go-yaml"
 )
 
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -183,7 +185,31 @@ func (s *Store) checkDAG(ctx context.Context, jobID, machineID string, v *JobVer
 	if facts.WorkerSelector[machineLabel] != machineID {
 		return refuse(CodeInvalid, "dag.spec worker_selector %s must be %s", machineLabel, machineID)
 	}
+	name, err := declaredName([]byte(v.DAG.Spec))
+	if err != nil {
+		return refuse(CodeInvalid, "dag.spec does not parse: %v", err)
+	}
+	if name != "" && name != jobID {
+		// Runs take the DAG's declared name; a job's runs must carry its ID,
+		// which is what admission, dispatch and run control key on.
+		return refuse(CodeInvalid, "dag.spec must not declare a name other than the job id %s", jobID)
+	}
 	return nil
+}
+
+// declaredName returns the name the entrypoint document of spec declares,
+// or "" when it declares none. Later documents are local sub-DAGs and are
+// named by design.
+func declaredName(spec []byte) (string, error) {
+	var doc map[string]any
+	if err := yaml.NewDecoder(bytes.NewReader(spec)).Decode(&doc); err != nil {
+		return "", err
+	}
+	name, ok := doc["name"]
+	if !ok || name == nil {
+		return "", nil
+	}
+	return fmt.Sprint(name), nil
 }
 
 // TargetKey is the identity of a target: its kind and stable ID, never its name.
@@ -227,6 +253,12 @@ func (s *Store) Register(ctx context.Context, in RegisterInput, by Actor) (*Job,
 		return nil, err
 	}
 	key := keyDigest(in.JobKey)
+	// Index before the job exists, so a committed job is always findable by
+	// its targets; an entry for a job that never commits is re-checked and
+	// ignored.
+	if err := s.indexTargets(ctx, in.JobID, in.Version.Targets); err != nil {
+		return nil, err
+	}
 	job, err := s.createJob(ctx, in, key, hash, by)
 	if err != nil {
 		return nil, err
@@ -541,6 +573,11 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 	}
 	job, err := s.GetJob(ctx, jobID)
 	if err != nil {
+		return nil, err
+	}
+	// Indexing is idempotent and precedes the commit, so a replay after an
+	// interruption also repairs it.
+	if err := s.indexTargets(ctx, jobID, v.Targets); err != nil {
 		return nil, err
 	}
 	if job.Registration.RequestID == requestID && job.Registration.RequestHash == hash {

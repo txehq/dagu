@@ -232,6 +232,10 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 	if err != nil {
 		return nil, err
 	}
+	if err := txeRefuseInlineJobDAG(dag.Name); err != nil {
+		cleanup()
+		return nil, err
+	}
 	cleanupOnReturn := true
 	defer func() {
 		if cleanupOnReturn {
@@ -351,6 +355,10 @@ func (a *API) EnqueueDAGRunFromSpec(ctx context.Context, request api.EnqueueDAGR
 	}
 	dag, cleanup, err := a.loadInlineDAG(ctx, request.Body.Spec, request.Body.Name, dagRunId)
 	if err != nil {
+		return nil, err
+	}
+	if err := txeRefuseInlineJobDAG(dag.Name); err != nil {
+		cleanup()
 		return nil, err
 	}
 	defer cleanup()
@@ -3062,6 +3070,12 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err != nil {
 		return retryDAGRunResult{}, fmt.Errorf("error reading DAG: %w", err)
 	}
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return retryDAGRunResult{}, err
+	}
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return retryDAGRunResult{}, err
+	}
 	prevStatus, err := attempt.ReadStatus(ctx)
 	if err != nil {
 		return retryDAGRunResult{}, fmt.Errorf("error reading status: %w", err)
@@ -3566,6 +3580,15 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 			}
 		}
 	}
+	// The job identity comes from the run being rescheduled; admission is
+	// applied below to the definition actually selected for execution.
+	txeJobID, err := txeJobIdentity(dag)
+	if err != nil {
+		return rescheduleDAGRunResult{}, err
+	}
+	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+		return rescheduleDAGRunResult{}, err
+	}
 	currentFileParams := preservedSnapshotParams
 	if currentFileParams == "" {
 		currentFileParams = status.Params
@@ -3620,6 +3643,11 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 		}
 		dag.SourceFile = snapshotDAG.SourceFile
 		dag.WorkingDir = snapshotDAG.WorkingDir
+	}
+	if txeJobID != "" {
+		if err := a.txeAdmitJob(ctx, txeJobID, dag); err != nil {
+			return rescheduleDAGRunResult{}, err
+		}
 	}
 
 	if err := a.ensureDAGRunIDUnique(ctx, dag, newDagRunID); err != nil {
@@ -4094,6 +4122,9 @@ func (a *API) resumeManagedAttempt(ctx context.Context, dag *ir.DAG, status *ir.
 		return nil
 	}
 
+	if err := a.txeRefuseLocalJobRun(dag); err != nil {
+		return err
+	}
 	prepared, err := a.prepareRetryDAGForSubprocess(ctx, dag, status)
 	if err != nil {
 		return fmt.Errorf("prepare DAG retry env: %w", err)
