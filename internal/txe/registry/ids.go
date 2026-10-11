@@ -31,6 +31,7 @@ const (
 	PrefixEvent     Prefix = "evt"
 	PrefixException Prefix = "exc"
 	PrefixGrant     Prefix = "grt"
+	PrefixClosure   Prefix = "cls"
 )
 
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"

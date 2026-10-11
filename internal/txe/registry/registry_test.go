@@ -297,7 +297,7 @@ func TestWithJobTxRetriesConflicts(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
-				return tx.Observe(Observation{State: AvailabilityWorkerOffline, Detail: fmt.Sprint(i)})
+				return tx.Observe(Observation{State: AvailabilityWorkerOffline, Kind: fmt.Sprint("offline-", i), Detail: fmt.Sprint(i)})
 			})
 			assert.NoError(t, err)
 		}(i)
@@ -381,7 +381,7 @@ func TestClaimFencing(t *testing.T) {
 	job := f.ready("k")
 	c1 := acquire(t, f, job.JobID, ClaimReview, time.Minute)
 	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
-		_, err := tx.AcquireClaim(ClaimReview, Reviewer{}, time.Minute)
+		_, err := tx.AcquireClaim(ClaimReview, Reviewer{MachineID: f.machine}, time.Minute)
 		return err
 	})
 	assert.Equal(t, CodeClaimHeld, code(t, err))
@@ -662,7 +662,7 @@ func TestRetirementStopsFollowUps(t *testing.T) {
 	_, err = decide(f, job.JobID, p, VerdictApprove, ProposalDecided, "")
 	assert.Equal(t, CodeProposalState, code(t, err))
 	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
-		_, err := tx.AcquireClaim(ClaimReview, Reviewer{}, time.Minute)
+		_, err := tx.AcquireClaim(ClaimReview, Reviewer{MachineID: f.machine}, time.Minute)
 		return err
 	})
 	assert.Equal(t, CodeLifecycle, code(t, err))
@@ -748,7 +748,7 @@ func TestNativeResumeSurvivesClosedProposal(t *testing.T) {
 	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
 		var err error
 		p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: f.mint(PrefixProposal), Action: ActionSpec{Name: "resize"},
-			NativeTask: &NativeTask{DAG: "txe-decide-x", RunID: "r1", StepID: "decide"}})
+			NativeTask: &NativeTask{DAG: DecideTaskDAG(f.machine), RunID: "r1", StepID: "decide"}})
 		return err
 	})
 	require.NoError(t, err)
@@ -918,4 +918,40 @@ func TestMachineAbsPath(t *testing.T) {
 	} {
 		assert.Equal(t, want, machineAbsPath(p), p)
 	}
+}
+
+// A claim is bound to the job's machine: a reviewer on another machine, or
+// one that names none, can neither acquire a claim nor use one, and nothing
+// changes when it tries; the job's own machine still can.
+func TestClaimsAreBoundToTheJobsMachine(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	for _, r := range []Reviewer{{}, {MachineID: "mch_other"}} {
+		before, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+			_, err := tx.AcquireClaim(ClaimExecution, r, time.Minute)
+			return err
+		})
+		assert.Equal(t, CodeNotPermitted, code(t, err), "reviewer machine %q", r.MachineID)
+		after, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, before.Fence, after.Fence, "nothing was written")
+		assert.Nil(t, after.Claim)
+	}
+
+	c := acquire(t, f, job.JobID, ClaimExecution, time.Minute)
+	_, err := f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.CheckClaim(c.ClaimID, c.Fence) })
+	require.NoError(t, err, "the job's machine can use its claim")
+
+	// A live claim held by another machine (as one taken before the binding
+	// existed could be) cannot be used.
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		tx.Job.Claim.Reviewer.MachineID = "mch_other"
+		tx.touch()
+		return nil
+	})
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.CheckClaim(c.ClaimID, c.Fence) })
+	assert.Equal(t, CodeNotPermitted, code(t, err))
 }

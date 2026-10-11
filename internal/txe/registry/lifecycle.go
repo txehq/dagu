@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -219,6 +220,65 @@ type RunControl interface {
 	// RunFinished reports whether a run reached a terminal status, or
 	// ErrRunNotFound when Dagu has no record of it.
 	RunFinished(ctx context.Context, dagName string, run RunRef) (bool, error)
+	// LatestAttempt returns a root run's latest attempt as Dagu stored it,
+	// or ErrRunNotFound.
+	LatestAttempt(ctx context.Context, dagName, runID string) (RunAttempt, error)
+}
+
+// RunAttempt is the latest execution of a run as Dagu stored it. A direct
+// retry starts a new attempt; a queued retry runs the same attempt again with
+// a later QueuedAt, so an execution is the pair (AttemptID, QueuedAt).
+type RunAttempt struct {
+	AttemptID string
+	// QueuedAt is the stored queue marker, byte for byte; empty when the run
+	// was never queued.
+	QueuedAt string
+	// Snapshot is the stored status, kept as evidence when Dagu is about to
+	// overwrite it.
+	Snapshot json.RawMessage
+	// SpecSHA256 is the digest of the attempt's saved DAG, in the form
+	// recorded for a version's spec.
+	SpecSHA256 string
+	Status     string
+	// Running is true while the execution runs (not queued, not started,
+	// waiting or finished).
+	Running   bool
+	Finished  bool
+	Succeeded bool
+	// ArchiveDir is the execution's native artifact directory on the hub,
+	// when Dagu has assigned one.
+	ArchiveDir string
+	// Preparing is true while the coordinator's preparation of the attempt
+	// is not known to be settled (its journal entry is present): the attempt
+	// may not have been handed to a worker and may still be abandoned,
+	// making the previous execution the latest again, or it may already have
+	// been dispatched. Either way its outcome is uncertain until the entry
+	// ends, so nothing is decided on it.
+	Preparing bool
+}
+
+// ExecutionPreparing is the Current of a refusal made because a run's latest
+// execution is not yet known to be dispatched or abandoned (see
+// RunAttempt.Preparing): the caller asks again once that is settled.
+type ExecutionPreparing struct {
+	RunID     string `json:"run_id"`
+	Execution string `json:"execution"`
+}
+
+func preparingRefusal(runID string, latest RunAttempt, what string) error {
+	return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: runID, Execution: latest.Ref()},
+		Message: fmt.Sprintf("run %s's latest execution %s is not yet known to be dispatched or abandoned; %s once that is settled", runID, latest.Ref(), what)}
+}
+
+// isPreparing reports whether err is a refusal made because a run's latest
+// execution is not yet known to be dispatched or abandoned.
+func isPreparing(err error) bool {
+	re, ok := errors.AsType[*Error](err)
+	if !ok {
+		return false
+	}
+	_, ok = re.Current.(ExecutionPreparing)
+	return ok
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.

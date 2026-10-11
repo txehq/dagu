@@ -138,11 +138,18 @@ type Schedule struct {
 	MissedRun  string `json:"missed_run,omitempty"`
 }
 
-// Deliverable is an expected output of the job.
+// Deliverable is one file a run is expected to produce, named so a run's
+// manifest can report it.
 type Deliverable struct {
-	Path        string `json:"path,omitempty"`
+	Name string `json:"name"`
+	// Path is the exact file, relative to the run's output directory.
+	Path        string `json:"path"`
 	Type        string `json:"type,omitempty"`
 	Description string `json:"description,omitempty"`
+	// Delivery is machine (the default) or hub.
+	Delivery string `json:"delivery,omitempty"`
+	// Required makes a run that does not produce it need a person.
+	Required bool `json:"required,omitempty"`
 }
 
 // ExpectedOutcome states what success means and when the job is finished.
@@ -276,6 +283,9 @@ const (
 	AvailabilityWorkerOffline     AvailabilityState = "worker_offline"
 	AvailabilityAuthRequired      AvailabilityState = "auth_required"
 	AvailabilityTargetUnreachable AvailabilityState = "target_unreachable"
+	// AvailabilityTargetUnconfirmed: a target checked before each run could
+	// be neither confirmed nor denied (an unknown observation).
+	AvailabilityTargetUnconfirmed AvailabilityState = "target_unconfirmed"
 	AvailabilityStale             AvailabilityState = "stale"
 )
 
@@ -436,11 +446,14 @@ const (
 	ProposalExecuted   ProposalState = "executed"
 	ProposalRejected   ProposalState = "rejected"
 	ProposalSuperseded ProposalState = "superseded"
+	// ProposalClosed is an escalation answered with retry: finished, never
+	// executed itself.
+	ProposalClosed ProposalState = "closed"
 )
 
 // Terminal reports whether the proposal is finished.
 func (s ProposalState) Terminal() bool {
-	return s == ProposalExecuted || s == ProposalRejected || s == ProposalSuperseded
+	return s == ProposalExecuted || s == ProposalRejected || s == ProposalSuperseded || s == ProposalClosed
 }
 
 // NativeTask points at the Dagu human task that collects the decision.
@@ -604,21 +617,23 @@ type Grant struct {
 // Action is a follow-up effect and its outcome. An action ID names one
 // intent; retries are attempts on the same record.
 type Action struct {
-	ActionID      string          `json:"action_id"`
-	Kind          ActionKind      `json:"kind"`
-	JobVersion    int             `json:"job_version"`
-	ReviewID      string          `json:"review_id,omitempty"`
-	ClaimID       string          `json:"claim_id,omitempty"`
-	ProposalID    string          `json:"proposal_id,omitempty"`
-	DecisionID    string          `json:"decision_id,omitempty"`
-	Spec          ActionSpec      `json:"spec"`
-	BindingDigest string          `json:"binding_digest"`
-	State         ActionState     `json:"state"`
-	Attempt       int             `json:"attempt"`
-	MaxAttempts   int             `json:"max_attempts"`
-	Grant         *Grant          `json:"grant,omitempty"`
-	Receipt       string          `json:"receipt,omitempty"`
-	Outcome       json.RawMessage `json:"outcome,omitempty"`
+	ActionID      string      `json:"action_id"`
+	Kind          ActionKind  `json:"kind"`
+	JobVersion    int         `json:"job_version"`
+	ReviewID      string      `json:"review_id,omitempty"`
+	ClaimID       string      `json:"claim_id,omitempty"`
+	ProposalID    string      `json:"proposal_id,omitempty"`
+	DecisionID    string      `json:"decision_id,omitempty"`
+	Spec          ActionSpec  `json:"spec"`
+	BindingDigest string      `json:"binding_digest"`
+	State         ActionState `json:"state"`
+	Attempt       int         `json:"attempt"`
+	MaxAttempts   int         `json:"max_attempts"`
+	// AttemptStartedAt is when the current attempt was granted.
+	AttemptStartedAt *time.Time      `json:"attempt_started_at,omitempty"`
+	Grant            *Grant          `json:"grant,omitempty"`
+	Receipt          string          `json:"receipt,omitempty"`
+	Outcome          json.RawMessage `json:"outcome,omitempty"`
 	// SettledUnderClaim is the claim whose holder recorded the outcome; it
 	// differs from ClaimID when a later claim reconciled the action.
 	SettledUnderClaim string `json:"settled_under_claim,omitempty"`
@@ -644,33 +659,49 @@ const (
 
 // Review is an immutable record of one review run.
 type Review struct {
-	ReviewID           string          `json:"review_id"`
-	JobVersion         int             `json:"job_version"`
-	CheckpointVersion  int             `json:"checkpoint_version"`
-	ClaimID            string          `json:"claim_id"`
-	Fence              int64           `json:"fence"`
-	EvidenceRunIDs     []string        `json:"evidence_run_ids,omitempty"`
-	EvidenceDecisions  []string        `json:"evidence_decision_ids,omitempty"`
-	Outcome            ReviewOutcome   `json:"outcome"`
-	Reasoning          string          `json:"reasoning,omitempty"`
-	PacketArtifact     string          `json:"packet_artifact,omitempty"`
-	DecisionArtifact   string          `json:"decision_artifact,omitempty"`
-	AgentClientVersion string          `json:"agent_client_version,omitempty"`
-	Detail             json.RawMessage `json:"detail,omitempty"`
-	Created            Stamp           `json:"created"`
-	Prev               string          `json:"prev,omitempty"`
+	ReviewID           string        `json:"review_id"`
+	JobVersion         int           `json:"job_version"`
+	CheckpointVersion  int           `json:"checkpoint_version"`
+	ClaimID            string        `json:"claim_id"`
+	Fence              int64         `json:"fence"`
+	EvidenceRunIDs     []string      `json:"evidence_run_ids,omitempty"`
+	EvidenceDecisions  []string      `json:"evidence_decision_ids,omitempty"`
+	Outcome            ReviewOutcome `json:"outcome"`
+	Reasoning          string        `json:"reasoning,omitempty"`
+	PacketArtifact     string        `json:"packet_artifact,omitempty"`
+	DecisionArtifact   string        `json:"decision_artifact,omitempty"`
+	AgentClientVersion string        `json:"agent_client_version,omitempty"`
+	// PacketBytes and the token counts are what the review cost.
+	PacketBytes       int64           `json:"packet_bytes,omitempty"`
+	AgentInputTokens  int64           `json:"agent_input_tokens,omitempty"`
+	AgentOutputTokens int64           `json:"agent_output_tokens,omitempty"`
+	Detail            json.RawMessage `json:"detail,omitempty"`
+	Created           Stamp           `json:"created"`
+	Prev              string          `json:"prev,omitempty"`
 }
 
 // Exception is an actionable item for a person: a failure that needs local
 // action, never a retirement.
 type Exception struct {
-	ExceptionID string            `json:"exception_id"`
-	Kind        string            `json:"kind"`
-	State       AvailabilityState `json:"state,omitempty"`
-	Detail      string            `json:"detail"`
-	Evidence    []string          `json:"evidence,omitempty"`
-	Created     Stamp             `json:"created"`
-	ResolvedAt  *time.Time        `json:"resolved_at,omitempty"`
+	ExceptionID string `json:"exception_id"`
+	Kind        string `json:"kind"`
+	// Scope is "reviewer" for a problem with the job's reviewer, which never
+	// changes the job's own availability; empty for the job.
+	Scope string            `json:"scope,omitempty"`
+	State AvailabilityState `json:"state,omitempty"`
+	// Target is the key of the target whose observation opened it, if one
+	// did; a present observation of that target resolves it.
+	Target string `json:"target,omitempty"`
+	// ActionID and Attempt name the action attempt an action-scope
+	// exception is about; it is resolved when that attempt ends.
+	ActionID string `json:"action_id,omitempty"`
+	Attempt  int    `json:"attempt,omitempty"`
+	// JobVersion is the version a binding-scope exception is about.
+	JobVersion int        `json:"job_version,omitempty"`
+	Detail     string     `json:"detail"`
+	Evidence   []string   `json:"evidence,omitempty"`
+	Created    Stamp      `json:"created"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
 
 // EventKind classifies a job history event.
@@ -714,6 +745,7 @@ type Chains struct {
 	Reviews   string `json:"reviews,omitempty"`
 	Actions   string `json:"actions,omitempty"`
 	Proposals string `json:"proposals,omitempty"`
+	Closures  string `json:"closures,omitempty"`
 }
 
 // Job is the job aggregate: every mutable fact about one job lives in this
@@ -740,9 +772,15 @@ type Job struct {
 	Fence           int64                `json:"fence"`
 	Checkpoint      Checkpoint           `json:"checkpoint"`
 	// LastRecordedReview makes replaying the latest review a no-op.
-	LastRecordedReview string                `json:"last_recorded_review,omitempty"`
-	Actions            map[string]*Action    `json:"actions,omitempty"`
-	Exceptions         map[string]*Exception `json:"exceptions,omitempty"`
+	LastRecordedReview string `json:"last_recorded_review,omitempty"`
+	// LastRecordedReviewDigest is the latest review's evidence and outcome,
+	// so a replay that differs is refused instead of ignored.
+	LastRecordedReviewDigest string `json:"last_recorded_review_digest,omitempty"`
+	// ReviewerAvailability is the reviewer's availability, kept apart from
+	// the job's: a reviewer that cannot run does not make the job unavailable.
+	ReviewerAvailability *Availability         `json:"reviewer_availability,omitempty"`
+	Actions              map[string]*Action    `json:"actions,omitempty"`
+	Exceptions           map[string]*Exception `json:"exceptions,omitempty"`
 	// DecisionKeys maps decision idempotency keys to decision IDs so that a
 	// replayed decision is recognized after its proposal left the aggregate.
 	DecisionKeys map[string]string `json:"decision_keys,omitempty"`
@@ -753,6 +791,14 @@ type Job struct {
 	// AdmittedRuns are runs a worker was allowed to start, by run ID, so a
 	// later retirement knows them even before Dagu reports them running.
 	AdmittedRuns map[string]AdmittedRun `json:"admitted_runs,omitempty"`
+	// UncertainResolutions are retry verdicts on escalations, by action ID,
+	// each allowing one more attempt of that action.
+	UncertainResolutions map[string]*UncertainResolution `json:"uncertain_resolutions,omitempty"`
+	// PendingClosures are superseded proposals whose Dagu human task is still
+	// waiting, by proposal ID, until a closure with a final outcome.
+	PendingClosures map[string]*PendingClosure `json:"pending_closures,omitempty"`
+	// Intents are the latest action of each intent, by intent key.
+	Intents map[string]*IntentRecord `json:"intents,omitempty"`
 	// SuspendWriters are suspend writes in progress, by token, with when each
 	// started. Ownership of the suspension is not released while one is live.
 	SuspendWriters map[string]time.Time `json:"suspend_writers,omitempty"`

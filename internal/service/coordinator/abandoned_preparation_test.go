@@ -796,3 +796,26 @@ func TestDispatchSubDAGPreparationLeftBehindIsReconciled(t *testing.T) {
 	require.Len(t, records, 1)
 	assert.Equal(t, entries[0].AttemptID, records[0].AbandonedAttemptID)
 }
+
+// Two stranded preparations B and C follow the failed execution A. B cannot
+// be abandoned while C is the latest, but C is itself a preparation: B's
+// entry stays, so once C is abandoned and B is the latest again, B is
+// abandoned too and A is the latest. Ending B's entry instead would leave the
+// never-dispatched B as the latest with nothing to settle it.
+func TestReconcileKeepsAPreparationAnotherPreparationSupersedes(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	b := f.writeAttempt(t, true, ir.NotStarted, "")
+	c := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.Equal(t, c, f.latest(t))
+	require.ElementsMatch(t, []string{b, c}, f.preparations(t))
+
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Equal(t, b, f.latest(t), "C was abandoned; B is the latest again")
+	assert.Equal(t, []string{b}, f.preparations(t), "B is still to be judged")
+
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Equal(t, f.previous, f.latest(t))
+	assert.Empty(t, f.preparations(t))
+	assert.Len(t, f.records(t), 2)
+}

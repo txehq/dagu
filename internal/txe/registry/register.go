@@ -124,10 +124,16 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 			}
 		}
 	}
+	if err := checkDeliverables(v.ExpectedOutcome.Deliverables); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i, a := range v.ReviewPolicy.PermittedActions {
 		if a.Name == "" || seen[a.Name] {
 			return refuse(CodeInvalid, "review_policy.permitted_actions[%d] needs a unique name", i)
+		}
+		if IsReservedAction(a.Name) {
+			return refuse(CodeInvalid, "permitted action %q uses a reserved prefix (txe., dagu.)", a.Name)
 		}
 		seen[a.Name] = true
 		if a.TimeoutSec <= 0 {
@@ -138,7 +144,29 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 		default:
 			return refuse(CodeInvalid, "permitted action %q idempotency must be keyed, none or read_only", a.Name)
 		}
+		if len(bytes.TrimSpace(a.ParamSchema)) > 0 {
+			if _, err := compileParamSchema(a.ParamSchema); err != nil {
+				return refuse(CodeInvalid, "permitted action %q: %v", a.Name, err)
+			}
+		}
 	}
+	applyVersionDefaults(jobID, v)
+	r := &v.RetirementRules
+	if r.ActiveRunPolicy != ActiveRunFinish && r.ActiveRunPolicy != ActiveRunCancel {
+		return refuse(CodeInvalid, "retirement_rules.active_run_policy must be finish or cancel")
+	}
+	for _, rule := range []string{r.OnTargetDeleted, r.OnReplacement, r.OnCompletion} {
+		if rule != RuleRetire && rule != RuleReview && rule != RuleKeep {
+			return refuse(CodeInvalid, "retirement rule %q must be retire, review or keep", rule)
+		}
+	}
+	return nil
+}
+
+// applyVersionDefaults sets the defaults and derived fields registration
+// stores: retirement-rule defaults, deliverable delivery, schema, job_id,
+// dag.name and dag.spec_sha256. It refuses nothing.
+func applyVersionDefaults(jobID string, v *JobVersion) {
 	r := &v.RetirementRules
 	if r.OnTargetDeleted == "" {
 		r.OnTargetDeleted = RuleRetire
@@ -152,19 +180,15 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 	if r.ActiveRunPolicy == "" {
 		r.ActiveRunPolicy = ActiveRunFinish
 	}
-	if r.ActiveRunPolicy != ActiveRunFinish && r.ActiveRunPolicy != ActiveRunCancel {
-		return refuse(CodeInvalid, "retirement_rules.active_run_policy must be finish or cancel")
-	}
-	for _, rule := range []string{r.OnTargetDeleted, r.OnReplacement, r.OnCompletion} {
-		if rule != RuleRetire && rule != RuleReview && rule != RuleKeep {
-			return refuse(CodeInvalid, "retirement rule %q must be retire, review or keep", rule)
+	for i := range v.ExpectedOutcome.Deliverables {
+		if v.ExpectedOutcome.Deliverables[i].Delivery == "" {
+			v.ExpectedOutcome.Deliverables[i].Delivery = DeliveryMachine
 		}
 	}
 	v.Schema = SchemaVersion
 	v.JobID = jobID
 	v.DAG.Name = jobID
 	v.DAG.SpecSHA256 = specDigest([]byte(v.DAG.Spec))
-	return nil
 }
 
 func specDigest(spec []byte) string {
@@ -618,6 +642,7 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 		j.Registration.Package = nil
 		j.Registration.DAGVerified = false
 		j.Registration.ReadyAt = nil
+		tx.resolveStaleBindings()
 		affected, err := tx.supersedeProposals("job version changed")
 		if err != nil {
 			return err
@@ -677,11 +702,72 @@ func (s *Store) EnsureProject(ctx context.Context, ownerID, key, name string, by
 type Installation struct {
 	Schema int      `json:"schema"`
 	Owners []*Owner `json:"owners"`
+	// Capabilities names what this registry enforces, so a client can refuse
+	// to rely on a registry that only stores it (see Capabilities).
+	Capabilities []string `json:"capabilities"`
+}
+
+// Capabilities this registry enforces.
+const (
+	// CapabilityParamSchema: a permitted action's param_schema is admitted
+	// at registration (refused when it cannot be enforced exactly) and the
+	// params of every action attempt are validated against it before a grant.
+	CapabilityParamSchema = "param_schema"
+)
+
+// Capabilities is what this registry enforces.
+func Capabilities() []string { return []string{CapabilityParamSchema} }
+
+// ApplyVersionDefaults returns v with exactly the defaults and derived
+// fields registration stores (see NormalizeVersion), and no validation: a
+// version stored under earlier, looser rules compares equal to the same
+// input. It is for comparing what a registry stored with what a client
+// would send. v is not modified.
+func ApplyVersionDefaults(jobID string, v JobVersion) (JobVersion, error) {
+	out, err := copyVersion(v)
+	if err != nil {
+		return JobVersion{}, err
+	}
+	applyVersionDefaults(jobID, &out)
+	return out, nil
+}
+
+func copyVersion(v JobVersion) (JobVersion, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return JobVersion{}, err
+	}
+	var out JobVersion
+	if err := json.Unmarshal(b, &out); err != nil {
+		return JobVersion{}, err
+	}
+	return out, nil
+}
+
+// NormalizeVersion returns v as registration stores it for job jobID: the
+// same defaults and derived fields (retirement-rule defaults, deliverable
+// delivery, dag.name, dag.spec_sha256, schema, job_id) after the same
+// structural checks of the version itself. It is not a registration
+// preflight: it does not load the DAG, check that it routes to the job's
+// machine, or check owners, projects and the job's current state, which
+// Register and UpdateVersion also do. Fields only the registry assigns at
+// commit (owner_id, version, created) are left as given. Clients compare a
+// registered version with what they would register through this one
+// function. v is not modified.
+func NormalizeVersion(jobID string, v JobVersion) (JobVersion, error) {
+	out, err := copyVersion(v)
+	if err != nil {
+		return JobVersion{}, err
+	}
+	if err := normalizeVersion(jobID, &out); err != nil {
+		return JobVersion{}, err
+	}
+	return out, nil
 }
 
 // GetInstallation returns the registry schema and its owners.
 func (s *Store) GetInstallation(ctx context.Context) (*Installation, error) {
-	out := &Installation{Schema: SchemaVersion}
+	out := &Installation{Schema: SchemaVersion, Capabilities: Capabilities()}
 	cursor := ""
 	for {
 		page, err := s.col.List(ctx, persis.ListQuery{Prefix: ownersPrefix, Cursor: cursor, Limit: 100})

@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,7 +272,7 @@ func TestTxeAPIKeepsParamsExact(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 
@@ -370,13 +373,13 @@ func TestTxeAPIDecisionsReportNativeResume(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.ready(ctx, jobID))
 	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
-		Kind: apigen.TxeClaimKindReview, TtlSec: 60}})
+		Kind: apigen.TxeClaimKindReview, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
 	require.NoError(t, err)
 	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
 	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
 		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
 			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
-			NativeTask: &apigen.TxeNativeTask{Dag: jobID, RunId: "run-1", StepId: "approve"},
+			NativeTask: &apigen.TxeNativeTask{Dag: registry.DecideTaskDAG(f.machine), RunId: "run-1", StepId: registry.DecideTaskStep},
 		}}})
 	require.NoError(t, err)
 	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
@@ -530,4 +533,416 @@ func TestTxeAPIResourceEventAndRunGuard(t *testing.T) {
 	}})
 	_, err = a.GetTxeResourceEvent(secretOnly, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
 	requireStatus(t, err, http.StatusNotFound)
+}
+
+// Reviews are read back by ID, a replay that differs is refused, reviewer
+// trouble is kept apart from the job's availability, and decisions page
+// forward in ascending order.
+func TestTxeAPIReviewsObservationsAndDecisionOrder(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+
+	reviewID, err := registry.ReviewID(jobID, 0)
+	require.NoError(t, err)
+	record := func(outcome apigen.TxeReviewOutcome) error {
+		_, err := a.RecordTxeReview(ctx, apigen.RecordTxeReviewRequestObject{JobId: jobID, Body: &apigen.TxeReviewRequest{
+			ClaimId: claim.ClaimId, Fence: claim.Fence, Review: apigen.TxeReview{ReviewId: reviewID, Outcome: outcome,
+				EvidenceRunIds: &[]string{"run-1"}, PacketBytes: new(int64(2048)), AgentInputTokens: new(int64(900))}}})
+		return err
+	}
+	require.NoError(t, record(apigen.TxeReviewOutcomeContinue))
+	require.NoError(t, record(apigen.TxeReviewOutcomeContinue), "an identical replay is a no-op")
+	requireStatus(t, record(apigen.TxeReviewOutcomeAct), http.StatusConflict)
+	got, err := a.GetTxeReview(ctx, apigen.GetTxeReviewRequestObject{JobId: jobID, ReviewId: reviewID})
+	require.NoError(t, err)
+	review := got.(apigen.GetTxeReview200JSONResponse)
+	assert.Equal(t, int64(2048), *review.PacketBytes)
+	assert.Equal(t, int64(900), *review.AgentInputTokens)
+	_, err = a.GetTxeReview(ctx, apigen.GetTxeReviewRequestObject{JobId: jobID, ReviewId: mint(t, registry.PrefixReview)})
+	requireStatus(t, err, http.StatusNotFound)
+
+	reviewer := apigen.TxeObservationRequestScopeReviewer
+	observed, err := a.ObserveTxeJob(ctx, apigen.ObserveTxeJobRequestObject{JobId: jobID, Body: &apigen.TxeObservationRequest{
+		State: apigen.TxeAvailabilityStateAuthRequired, Scope: &reviewer, Detail: new("reviewer login expired")}})
+	require.NoError(t, err)
+	job := observed.(apigen.ObserveTxeJob200JSONResponse)
+	assert.Equal(t, apigen.TxeAvailabilityStateReady, job.Availability.State, "the job itself is still available")
+	require.NotNil(t, job.ReviewerAvailability)
+	assert.Equal(t, apigen.TxeAvailabilityStateAuthRequired, job.ReviewerAvailability.State)
+
+	person := registry.Actor{Kind: registry.ActorHuman, ID: "connor"}
+	var ids []string
+	for range 3 {
+		var p *registry.Proposal
+		_, err := store.WithJobTx(ctx, jobID, person, func(tx *registry.JobTx) error {
+			var err error
+			p, err = tx.PutProposal(claim.ClaimId, claim.Fence, registry.Proposal{ProposalID: mint(t, registry.PrefixProposal), Action: registry.ActionSpec{Name: "resize"}})
+			if err != nil {
+				return err
+			}
+			id := mint(t, registry.PrefixDecision)
+			ids = append(ids, id)
+			_, err = tx.AppendDecision(registry.Decision{DecisionID: id, ProposalID: p.ProposalID, ProposalRevision: p.Revision,
+				BindingDigest: p.BindingDigest, Verdict: registry.VerdictReject}, registry.ProposalRejected)
+			return err
+		})
+		require.NoError(t, err)
+	}
+	list := func(order apigen.ListTxeJobDecisionsParamsOrder, since string, limit int) []string {
+		t.Helper()
+		params := apigen.ListTxeJobDecisionsParams{Order: &order}
+		if since != "" {
+			params.Since = &since
+		}
+		if limit > 0 {
+			params.Limit = &limit
+		}
+		resp, err := a.ListTxeJobDecisions(ctx, apigen.ListTxeJobDecisionsRequestObject{JobId: jobID, Params: params})
+		require.NoError(t, err)
+		var out []string
+		for _, d := range resp.(apigen.ListTxeJobDecisions200JSONResponse).Decisions {
+			out = append(out, d.DecisionId)
+		}
+		return out
+	}
+	asc, desc := apigen.ListTxeJobDecisionsParamsOrderAsc, apigen.ListTxeJobDecisionsParamsOrderDesc
+	assert.Equal(t, []string{ids[2], ids[1], ids[0]}, list(desc, "", 0))
+	assert.Equal(t, ids, list(asc, "", 0))
+	assert.Equal(t, []string{ids[1]}, list(asc, ids[0], 1), "the limit applies forward from the cursor")
+}
+
+// A retired job's superseded proposal with a Dagu human task is listed for
+// its machine until a closure with a final outcome is recorded.
+func TestTxeAPIProposalClosures(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true)
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"))
+	require.NoError(t, err)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	propResp, err := a.CreateTxeProposal(ctx, apigen.CreateTxeProposalRequestObject{JobId: jobID, Body: &apigen.TxeProposalRequest{
+		ClaimId: claim.ClaimId, Fence: claim.Fence, Proposal: apigen.TxeProposalInput{
+			ProposalId: mint(t, registry.PrefixProposal), Action: apigen.TxeActionSpec{Name: "resize"},
+			NativeTask: &apigen.TxeNativeTask{Dag: registry.DecideTaskDAG(f.machine), RunId: "run-1", StepId: registry.DecideTaskStep},
+		}}})
+	require.NoError(t, err)
+	p := propResp.(apigen.CreateTxeProposal200JSONResponse)
+	_, err = store.WithJobTx(ctx, jobID, registry.Actor{Kind: registry.ActorHuman, ID: "connor"}, func(tx *registry.JobTx) error {
+		return tx.Transition(registry.Transition{Op: registry.OpRetire, Reason: registry.RetireManual})
+	})
+	require.NoError(t, err)
+
+	pending := func() []apigen.TxePendingClosure {
+		t.Helper()
+		resp, err := a.ListTxePendingClosures(ctx, apigen.ListTxePendingClosuresRequestObject{Params: apigen.ListTxePendingClosuresParams{Machine: f.machine}})
+		require.NoError(t, err)
+		return resp.(apigen.ListTxePendingClosures200JSONResponse).Closures
+	}
+	require.Len(t, pending(), 1)
+	assert.Equal(t, p.ProposalId, pending()[0].ProposalId)
+
+	closure, err := a.RecordTxeProposalClosure(ctx, apigen.RecordTxeProposalClosureRequestObject{JobId: jobID, ProposalId: p.ProposalId,
+		Body: &apigen.TxeClosureRequest{Outcome: apigen.TxeClosureOutcomeAlreadyAnswered}})
+	require.NoError(t, err)
+	assert.Equal(t, apigen.TxeClosureOutcomeAlreadyAnswered, closure.(apigen.RecordTxeProposalClosure200JSONResponse).Outcome)
+	assert.Empty(t, pending())
+	_, err = a.RecordTxeProposalClosure(ctx, apigen.RecordTxeProposalClosureRequestObject{JobId: jobID, ProposalId: p.ProposalId,
+		Body: &apigen.TxeClosureRequest{Outcome: apigen.TxeClosureOutcomeClosed}})
+	requireStatus(t, err, http.StatusConflict)
+}
+
+// The run's last step reports its deliverables in the body the CLI sends
+// (CC2's txe/contract/fixtures/registration/artifacts.publish.request.json,
+// with this test's machine): the hub copy waits for its bytes to be checked,
+// the machine copy stays on the machine, the missing required file needs a
+// person, and a different report for the same run is refused.
+func TestTxeAPIRunArtifacts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(ctx))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, apiv1.WithTxeRegistry(store))
+	f := newTxeFixture(t, a, ctx)
+	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	jobID := mint(t, registry.PrefixJob)
+	hub, required := apigen.TxeDeliverableDeliveryHub, true
+	_, err = a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+		JobId: jobID, RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: "key:" + jobID,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec},
+			ExpectedOutcome: &apigen.TxeExpectedOutcome{Deliverables: &[]apigen.TxeDeliverable{
+				{Name: "snapshot", Path: "snapshot.json", Delivery: &hub},
+				{Name: "raw", Path: "raw/export.csv"},
+				{Name: "notes", Path: "notes.txt", Required: &required},
+			}},
+		},
+		Actor: &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "cc3-test"},
+	}})
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	// The run whose last step reports, with the DAG the registry saved.
+	runDAG := &ir.DAG{Name: jobID, YamlData: []byte(spec)}
+	attempt, err := runs.CreateAttempt(ctx, runDAG, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	runStatus := ir.InitialStatus(runDAG)
+	runStatus.DAGRunID, runStatus.AttemptID, runStatus.Status = "run-1", attempt.ID(), ir.Running
+	runStatus.QueuedAt = "2026-10-09T12:00:00.000000001Z"
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, runStatus))
+	require.NoError(t, attempt.Close(ctx))
+
+	fixture := strings.ReplaceAll(`{
+  "attempt_id": "ATTEMPT",
+  "queued_at": "2026-10-09T12:00:00.000000001Z",
+  "job_version": 1,
+  "artifacts": [
+    {"deliverable": "snapshot", "path": "snapshot.json",
+     "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+     "bytes": 11, "location": "hub", "machine_id": "MACHINE", "recorded_at": "2026-10-09T12:00:00Z"},
+    {"deliverable": "raw", "path": "raw/export.csv",
+     "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+     "bytes": 8, "location": "machine", "machine_id": "MACHINE", "recorded_at": "2026-10-09T12:00:00Z"},
+    {"deliverable": "notes", "path": "notes.txt", "missing": true}
+  ],
+  "actor": {"kind": "cli", "id": "publish", "machine_id": "MACHINE", "client": "dagu test"}
+}`, "MACHINE", f.machine)
+	fixture = strings.ReplaceAll(fixture, "ATTEMPT", attempt.ID())
+	var body apigen.TxeArtifactManifestRequest
+	require.NoError(t, json.Unmarshal([]byte(fixture), &body))
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-2", Body: &body})
+	requireStatus(t, err, http.StatusNotFound)
+	resp, err := a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
+	require.NoError(t, err)
+	status := map[string]apigen.TxeArtifactStatus{}
+	for _, r := range resp.(apigen.RecordTxeRunArtifacts200JSONResponse).Artifacts {
+		status[r.Deliverable] = r.Status
+	}
+	assert.Equal(t, map[string]apigen.TxeArtifactStatus{"snapshot": apigen.TxeArtifactStatusPendingUpload,
+		"raw": apigen.TxeArtifactStatusStoredOnMachine, "notes": apigen.TxeArtifactStatusMissing}, status)
+	// The publishing execution's observed status is kept as publication
+	// evidence through the HTTP path too.
+	evidence, err := store.GetRetainedExecution(ctx, jobID, "run-1",
+		registry.ExecutionRef(attempt.ID(), "2026-10-09T12:00:00.000000001Z"), registry.EvidencePublication)
+	require.NoError(t, err)
+	assert.Contains(t, string(evidence), `"dagRunId":"run-1"`)
+
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &body})
+	require.NoError(t, err, "the same report again is a no-op")
+	changed := body
+	changed.Artifacts = append([]apigen.TxeArtifactRecordInput(nil), body.Artifacts...)
+	changed.Artifacts[0].Bytes = new(int64(12))
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &changed})
+	requireStatus(t, err, http.StatusConflict)
+
+	got, err := a.GetTxeRunArtifacts(ctx, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
+	require.NoError(t, err)
+	read := got.(apigen.GetTxeRunArtifacts200JSONResponse)
+	assert.Equal(t, apigen.TxeArtifactStatusPendingUpload, read.Artifacts[0].Status,
+		"a running attempt's hub copy that has not arrived stays pending")
+	assert.Equal(t, attempt.ID(), read.AttemptId)
+	execution := registry.ExecutionRef(attempt.ID(), "2026-10-09T12:00:00.000000001Z")
+	assert.Equal(t, execution, read.Execution)
+	require.NotNil(t, read.Executions)
+	assert.Equal(t, []string{execution}, *read.Executions)
+
+	// A publish naming an earlier execution of the run is late and refused.
+	late := body
+	late.QueuedAt = "2026-10-09T11:00:00Z"
+	_, err = a.RecordTxeRunArtifacts(ctx, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1", Body: &late})
+	requireStatus(t, err, http.StatusConflict)
+	job, err := a.GetTxeJob(ctx, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	exceptions := job.(apigen.GetTxeJob200JSONResponse).Exceptions
+	require.NotNil(t, exceptions)
+	var kinds []string
+	for _, e := range *exceptions {
+		kinds = append(kinds, e.Kind)
+	}
+	assert.Equal(t, []string{"deliverable_missing"}, kinds)
+}
+
+// A caller who cannot write a job learns nothing about its runs from the
+// artifacts endpoint: the write check comes before the run lookup.
+func TestTxeAPIRunArtifactsAuthorizeFirst(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	outsider := auth.WithUser(context.Background(), &auth.User{Username: "out", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleDeveloper}},
+	}})
+	for _, run := range []string{"run-1", "no-such-run"} {
+		_, err := a.RecordTxeRunArtifacts(outsider, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: run,
+			Body: &apigen.TxeArtifactManifestRequest{JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.HTTPStatus, "refused by the write check, the same for every run")
+	}
+}
+
+// A claim names the job's machine or is refused before anything is written;
+// incomplete resource events are listed only as incomplete.
+func TestTxeAPIClaimMachineAndIncompleteEvents(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	jobID, err := f.register(ctx, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+
+	other := "mch_other"
+	for _, reviewer := range []apigen.TxeReviewer{{}, {MachineId: &other}} {
+		_, err = a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+			Kind: apigen.TxeClaimKindExecution, TtlSec: 60, Reviewer: reviewer}})
+		requireStatus(t, err, http.StatusConflict)
+	}
+	_, err = a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindExecution, TtlSec: 60, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err, "the job's machine")
+
+	_, err = a.ListTxeResourceEvents(ctx, apigen.ListTxeResourceEventsRequestObject{Params: apigen.ListTxeResourceEventsParams{Complete: true}})
+	requireStatus(t, err, http.StatusBadRequest)
+	resp, err := a.ListTxeResourceEvents(ctx, apigen.ListTxeResourceEventsRequestObject{Params: apigen.ListTxeResourceEventsParams{Complete: false}})
+	require.NoError(t, err)
+	body, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"events":[]}`, string(body))
+}
+
+// A caller who may not write a job cannot change it by asking for a grant:
+// the request is refused before any transaction, and the job is untouched.
+func TestTxeAPIRefusedGrantChangesNothing(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	before, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+
+	body := &apigen.TxeEffectGrantRequest{ActionId: "act_x", JobVersion: 1, PackageDigest: "sha256:x"}
+	body.Approved = &struct {
+		ClaimId    string `json:"claim_id"`
+		DecisionId string `json:"decision_id"`
+		Fence      int64  `json:"fence"`
+		ProposalId string `json:"proposal_id"`
+	}{ClaimId: "clm_x", DecisionId: "dec_x", ProposalId: "prp_x", Fence: 1}
+	_, err = a.AuthorizeTxeEffect(txeOps, apigen.AuthorizeTxeEffectRequestObject{JobId: jobID, Body: body})
+	require.Error(t, err)
+
+	after, err := a.GetTxeJob(txeAdmin, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "nothing was written")
+}
+
+// A param_schema reaches the registry byte for byte from the request body:
+// duplicate keys and numbers that are not exactly float64 are refused, not
+// silently resolved or rounded by decoding.
+func TestTxeAPIParamSchemaKeepsItsBytes(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	register := func(schema string) error {
+		jobID := mint(t, registry.PrefixJob)
+		body := fmt.Sprintf(`{"job_id":%q,"request_id":"r1","owner_id":%q,"project_id":%q,"machine_id":%q,"job_key":"key:%s",
+			"version":{"title":"t","purpose":"p","package":{"digest":"sha256:%064x","path":"/pkg","entrypoint":"run.sh"},
+			"dag":{"spec":%q},
+			"review_policy":{"permitted_actions":[{"name":"restart","timeout_sec":60,"routine":true,"param_schema":%s}]}},
+			"actor":{"kind":"cli","id":"cc3-test"}}`,
+			jobID, f.owner, f.project, f.machine, jobID, 7,
+			fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine), schema)
+		// Decoded exactly as the server decodes a request body.
+		var req apigen.TxeRegisterRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &req))
+		_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &req})
+		return err
+	}
+	requireStatus(t, register(`{"type":"object","type":"string"}`), http.StatusBadRequest)
+	requireStatus(t, register(`{"type":"number","maximum":0.49999999999999999}`), http.StatusBadRequest)
+	require.NoError(t, register(`{"type":"object","properties":{"n":{"type":"integer","maximum":5}}}`))
+}
+
+// The installation lists what this registry enforces.
+func TestTxeAPIInstallationCapabilities(t *testing.T) {
+	a := newTxeTestAPI(t)
+	resp, err := a.GetTxeInstallation(context.Background(), apigen.GetTxeInstallationRequestObject{})
+	require.NoError(t, err)
+	assert.Contains(t, resp.(apigen.GetTxeInstallation200JSONResponse).Capabilities, "param_schema")
+}
+
+// Through the registry API end to end (request bodies decoded as the server
+// decodes them): an action request whose params a registered param_schema
+// refuses gets 400 and no grant, and nothing is recorded; valid params are
+// granted.
+func TestTxeAPIInvalidParamsAreNeverGranted(t *testing.T) {
+	ctx := context.Background()
+	a := newTxeTestAPIAt(t, t.TempDir(), true)
+	f := newTxeFixture(t, a, ctx)
+	jobID := mint(t, registry.PrefixJob)
+	digest := fmt.Sprintf("sha256:%064x", 7)
+	register := fmt.Sprintf(`{"job_id":%q,"request_id":"r1","owner_id":%q,"project_id":%q,"machine_id":%q,"job_key":"key:%s",
+		"version":{"title":"t","purpose":"p","package":{"digest":%q,"path":"/pkg","entrypoint":"run.sh"},
+		"dag":{"spec":%q},
+		"review_policy":{"permitted_actions":[{"name":"restart","timeout_sec":60,"routine":true,
+			"param_schema":{"type":"object","properties":{"mode":{"type":"string","enum":["soft","hard"]}},"required":["mode"],"additionalProperties":false}}]}},
+		"actor":{"kind":"cli","id":"cc3-test"}}`,
+		jobID, f.owner, f.project, f.machine, jobID, digest,
+		fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine))
+	var reg apigen.TxeRegisterRequest
+	require.NoError(t, json.Unmarshal([]byte(register), &reg))
+	_, err := a.RegisterTxeJob(ctx, apigen.RegisterTxeJobRequestObject{Body: &reg})
+	require.NoError(t, err)
+	require.NoError(t, f.ready(ctx, jobID))
+	claimResp, err := a.AcquireTxeClaim(ctx, apigen.AcquireTxeClaimRequestObject{JobId: jobID, Body: &apigen.TxeClaimRequest{
+		Kind: apigen.TxeClaimKindReview, TtlSec: 600, Reviewer: apigen.TxeReviewer{MachineId: &f.machine}}})
+	require.NoError(t, err)
+	claim := claimResp.(apigen.AcquireTxeClaim200JSONResponse)
+	review, err := registry.ReviewID(jobID, 0)
+	require.NoError(t, err)
+
+	authorize := func(params string) error {
+		actionID, err := registry.RoutineActionID(review, registry.ActionSpec{Name: "restart", Params: json.RawMessage(params)})
+		require.NoError(t, err)
+		body := fmt.Sprintf(`{"action_id":%q,"job_version":1,"package_digest":%q,
+			"routine":{"review_id":%q,"claim_id":%q,"fence":%d,"spec":{"name":"restart","params":%s}}}`,
+			actionID, digest, review, claim.ClaimId, claim.Fence, params)
+		var req apigen.TxeEffectGrantRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &req))
+		_, err = a.AuthorizeTxeEffect(ctx, apigen.AuthorizeTxeEffectRequestObject{JobId: jobID, Body: &req})
+		return err
+	}
+	for _, params := range []string{`{"mode":"medium"}`, `{"mode":"soft","force":true}`, `{}`, `{"mode":"soft","mode":"hard"}`} {
+		requireStatus(t, authorize(params), http.StatusBadRequest)
+	}
+	job, err := a.GetTxeJob(ctx, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err)
+	body, err := json.Marshal(job)
+	require.NoError(t, err)
+	assert.NotContains(t, string(body), `"grant"`, "no action was granted or recorded")
+	require.NoError(t, authorize(`{"mode":"hard"}`))
 }
