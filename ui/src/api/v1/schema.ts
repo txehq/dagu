@@ -3755,6 +3755,588 @@ export interface paths {
         patch: operations["updateWorkspace"];
         trace?: never;
     };
+    "/txe/installation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the TXE registry installation
+         * @description Returns the registry schema version and its owners.
+         */
+        get: operations["getTxeInstallation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/owners": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create an owner
+         * @description Creates a stable owner. The owner ID is minted by the installer; replaying an identical request returns the stored owner.
+         */
+        post: operations["createTxeOwner"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/owners/{ownerId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get an owner
+         * @description Returns one owner.
+         */
+        get: operations["getTxeOwner"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Get or create a project by key
+         * @description Returns the owner's project for the natural key, creating it once. Concurrent first calls return the same project.
+         */
+        post: operations["ensureTxeProject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/projects/{projectId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: components["parameters"]["TxeProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a project
+         * @description Returns one project.
+         */
+        get: operations["getTxeProject"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/machines": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a machine
+         * @description Creates an execution machine record. The machine ID is minted by the worker installer.
+         */
+        post: operations["createTxeMachine"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/machines/{machineId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a machine
+         * @description Returns one machine.
+         */
+        get: operations["getTxeMachine"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List jobs
+         * @description Lists job aggregates matching the filters, oldest first.
+         */
+        get: operations["listTxeJobs"];
+        put?: never;
+        /**
+         * Register a job
+         * @description Saves a new job, its first immutable version and its DAG. The job stays incomplete and cannot run until it is marked ready. A replay with the same job_id, request_id and input returns the stored job; another job with the same job_key is refused as a duplicate.
+         */
+        post: operations["registerTxeJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a job
+         * @description Returns the committed job aggregate.
+         */
+        get: operations["getTxeJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark a job ready
+         * @description Records the client's package evidence, verifies the saved DAG against the registered spec (rewriting it from the version when it differs) and returns the durable receipt. This is the only path to a runnable job.
+         */
+        post: operations["markTxeJobReady"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Update a job
+         * @description Records a new immutable version when expected_version is current and writes the new DAG. The job must be marked ready again; open proposals are superseded.
+         */
+        post: operations["updateTxeJobVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                version: components["parameters"]["TxeJobVersionNumber"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a job version
+         * @description Returns one immutable job version.
+         */
+        get: operations["getTxeJobVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/lifecycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change a job's lifecycle
+         * @description Pauses, resumes, completes, retires or reactivates a job. Completion and retirement supersede open proposals and list in-flight work in the same commit; only a person can reactivate.
+         */
+        post: operations["transitionTxeJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List job events
+         * @description Returns the job's history, newest first.
+         */
+        get: operations["listTxeJobEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/observations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record availability
+         * @description Records worker, credential or target availability. Never changes the lifecycle; a non-ready state opens an exception.
+         */
+        post: operations["observeTxeJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acquire the job claim
+         * @description Grants the per-job claim slot of the requested kind. A live claim is refused; an expired one is taken over with a higher fence.
+         */
+        post: operations["acquireTxeClaim"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/claims/{claimId}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                claimId: components["parameters"]["TxeClaimId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release the job claim
+         * @description Releases a live claim. Repeating the release is a no-op.
+         */
+        post: operations["releaseTxeClaim"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/checkpoint": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Advance the review checkpoint
+         * @description Ends the current review episode under the live review claim when expected_version is current.
+         */
+        put: operations["advanceTxeCheckpoint"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/checkpoint/defer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Defer the next review
+         * @description Moves only the next review time, keeping the episode and evidence cursors.
+         */
+        post: operations["deferTxeReview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/reviews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List reviews
+         * @description Returns recorded reviews, newest first.
+         */
+        get: operations["listTxeReviews"];
+        put?: never;
+        /**
+         * Record a review
+         * @description Saves an immutable review of the current episode under the live review claim. Replaying the latest review is a no-op.
+         */
+        post: operations["recordTxeReview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List proposals
+         * @description Returns open proposals and finished proposals, newest first.
+         */
+        get: operations["listTxeProposals"];
+        put?: never;
+        /**
+         * File a proposal
+         * @description Files a proposal under the live review claim. The registry computes its binding digest against the current version.
+         */
+        post: operations["createTxeProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/proposals/{proposalId}/decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List decisions on a proposal
+         * @description Returns decisions recorded for the proposal, newest first.
+         */
+        get: operations["listTxeProposalDecisions"];
+        put?: never;
+        /**
+         * Record a human decision
+         * @description Appends an immutable decision bound to the proposal revision and binding digest the person reviewed. Refused with 409 when stale, closed, not allowed or when the lifecycle does not accept decisions.
+         */
+        post: operations["decideTxeProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List job decisions
+         * @description Returns decisions for proposals in any state, newest first; since stops at that decision ID.
+         */
+        get: operations["listTxeJobDecisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/effect-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Authorize a follow-up effect
+         * @description The pre-effect guard. In one commit it checks lifecycle, version, package, binding and claim, and records the action as executing under a bounded grant.
+         */
+        post: operations["authorizeTxeEffect"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List actions
+         * @description Returns in-flight actions and archived actions, newest first.
+         */
+        get: operations["listTxeActions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/actions/{actionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                actionId: components["parameters"]["TxeActionId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Settle an action
+         * @description Records an attempt's outcome. Requires the caller's live claim and the action's current grant.
+         */
+        put: operations["settleTxeAction"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -7081,6 +7663,632 @@ export interface components {
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
         };
+        /** @description Who made a change. Never the owner: owner is a separate stable ID. */
+        TxeActor: {
+            /** @enum {string} */
+            kind: TxeActorKind;
+            id: string;
+            session?: string;
+            machine_id?: string;
+            client?: string;
+        };
+        TxeStamp: {
+            /** Format: date-time */
+            at: string;
+            by: components["schemas"]["TxeActor"];
+        };
+        TxeOwner: {
+            schema: number;
+            owner_id: string;
+            display_name: string;
+            provenance?: string;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxeOwnerCreateRequest: {
+            owner_id: string;
+            display_name: string;
+            provenance?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeInstallation: {
+            schema: number;
+            owners: components["schemas"]["TxeOwner"][];
+        };
+        TxeProject: {
+            schema: number;
+            project_id: string;
+            owner_id: string;
+            key?: string;
+            name: string;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxeProjectEnsureRequest: {
+            owner_id: string;
+            /** @description Stable natural key, such as a normalized git remote */
+            key: string;
+            name?: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeMachine: {
+            schema: number;
+            machine_id: string;
+            owner_id: string;
+            display_name: string;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxeMachineCreateRequest: {
+            machine_id: string;
+            owner_id: string;
+            display_name: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @description External resource identified by kind and stable ID; the display name never identifies it */
+        TxeTarget: {
+            kind: string;
+            environment?: string;
+            stable_id: {
+                [key: string]: string;
+            };
+            display_name?: string;
+            /** @enum {string} */
+            existence_check?: TxeTargetExistence_check;
+        };
+        /** @description A credential resolved on the assigned machine; the locator is a path or variable name, never a value */
+        TxeCredentialRef: {
+            name: string;
+            /** @enum {string} */
+            kind: TxeCredentialRefKind;
+            locator: string;
+        };
+        TxePackage: {
+            digest: string;
+            path: string;
+            entrypoint: string;
+            working_dir?: string;
+            runtime?: string[];
+            credential_refs?: components["schemas"]["TxeCredentialRef"][];
+        };
+        TxeDAGRef: {
+            name?: string;
+            /** @description DAG YAML; the registry validates and writes it */
+            spec: string;
+            spec_sha256?: string;
+        };
+        TxeSchedule: {
+            cron?: string;
+            timezone?: string;
+            overlap?: string;
+            timeout_sec?: number;
+            retry?: number;
+            missed_run?: string;
+        };
+        TxeDeliverable: {
+            path?: string;
+            type?: string;
+            description?: string;
+        };
+        TxeExpectedOutcome: {
+            success_criteria?: string[];
+            deliverables?: components["schemas"]["TxeDeliverable"][];
+        };
+        TxeLifetime: {
+            /** Format: date-time */
+            expires_at?: string;
+        };
+        TxeRetirementRules: {
+            /** @enum {string} */
+            on_target_deleted?: TxeRetirementRulesOn_target_deleted;
+            /** @enum {string} */
+            on_replacement?: TxeRetirementRulesOn_replacement;
+            /** @enum {string} */
+            on_completion?: TxeRetirementRulesOn_completion;
+            /** @enum {string} */
+            active_run_policy?: TxeRetirementRulesActive_run_policy;
+        };
+        TxePermittedAction: {
+            name: string;
+            command?: string;
+            entrypoint?: string;
+            param_schema?: unknown;
+            /** @enum {string} */
+            idempotency?: TxePermittedActionIdempotency;
+            reconcile?: string;
+            timeout_sec: number;
+            routine: boolean;
+            max_attempts?: number;
+        };
+        TxeReviewPolicy: {
+            cadence?: string;
+            max_duration_sec?: number;
+            max_attempts?: number;
+            brief?: string;
+            permitted_actions?: components["schemas"]["TxePermittedAction"][];
+            human_decision_conditions?: string[];
+        };
+        TxeOrigin: {
+            repo?: string;
+            commit?: string;
+            session?: string;
+            worktree_path?: string;
+            chat_ref?: string;
+        };
+        /** @description Context for a new job version. Immutable once saved. */
+        TxeJobVersionInput: {
+            title: string;
+            purpose: string;
+            origin?: components["schemas"]["TxeOrigin"];
+            package: components["schemas"]["TxePackage"];
+            dag: components["schemas"]["TxeDAGRef"];
+            schedule?: components["schemas"]["TxeSchedule"];
+            targets?: components["schemas"]["TxeTarget"][];
+            expected_outcome?: components["schemas"]["TxeExpectedOutcome"];
+            lifetime?: components["schemas"]["TxeLifetime"];
+            retirement_rules?: components["schemas"]["TxeRetirementRules"];
+            review_policy?: components["schemas"]["TxeReviewPolicy"];
+        };
+        TxeJobVersion: components["schemas"]["TxeJobVersionInput"] & {
+            schema: number;
+            job_id: string;
+            owner_id: string;
+            version: number;
+            created: components["schemas"]["TxeStamp"];
+        };
+        TxeRegisterRequest: {
+            job_id: string;
+            request_id: string;
+            owner_id: string;
+            project_id: string;
+            machine_id: string;
+            /** @description Creator's name for the logical job, unique per owner and project */
+            job_key: string;
+            version: components["schemas"]["TxeJobVersionInput"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxePackageEvidence: {
+            digest: string;
+            path: string;
+            machine_id: string;
+            manifest_sha256?: string;
+            files?: number;
+            /** Format: int64 */
+            bytes?: number;
+            /** Format: date-time */
+            asserted_at?: string;
+            asserted_by?: components["schemas"]["TxeActor"];
+        };
+        TxeReadyRequest: {
+            /** Format: int64 */
+            expected_revision?: number;
+            package: components["schemas"]["TxePackageEvidence"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeReceipt: {
+            job_id: string;
+            owner_id: string;
+            project_id: string;
+            machine_id: string;
+            version: number;
+            package_digest: string;
+            dag_name: string;
+            dag_spec_sha256: string;
+            registration: components["schemas"]["TxeRegistrationState"];
+            /** Format: int64 */
+            revision: number;
+            created: components["schemas"]["TxeStamp"];
+            ready_at?: string;
+        };
+        TxeVersionRequest: {
+            request_id: string;
+            expected_version: number;
+            version: components["schemas"]["TxeJobVersionInput"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @enum {string} */
+        TxeLifecycle: TxeLifecycle;
+        /** @enum {string} */
+        TxeRegistrationState: TxeRegistrationState;
+        /** @enum {string} */
+        TxeAvailabilityState: TxeAvailabilityState;
+        TxeAvailability: {
+            state: components["schemas"]["TxeAvailabilityState"];
+            detail?: string;
+            evidence?: string[];
+            /** Format: date-time */
+            observed_at?: string;
+            reporter?: components["schemas"]["TxeActor"];
+        };
+        TxeAffected: {
+            run_id?: string;
+            action_id?: string;
+            proposal_id?: string;
+            disposition: string;
+        };
+        TxeRetirement: {
+            /** @enum {string} */
+            reason: TxeRetirementReason;
+            detail?: string;
+            evidence?: string[];
+            actor: components["schemas"]["TxeActor"];
+            /** Format: date-time */
+            at: string;
+            /** @enum {string} */
+            active_run_policy: TxeRetirementActive_run_policy;
+            affected?: components["schemas"]["TxeAffected"][];
+        };
+        TxeRegistration: {
+            state: components["schemas"]["TxeRegistrationState"];
+            job_key: string;
+            dedupe_key: string;
+            request_id?: string;
+            request_hash?: string;
+            duplicate_of?: string;
+            package?: components["schemas"]["TxePackageEvidence"];
+            dag_verified: boolean;
+            /** Format: date-time */
+            ready_at?: string;
+        };
+        /** @enum {string} */
+        TxeClaimKind: TxeClaimKind;
+        TxeReviewer: {
+            machine_id?: string;
+            dag_run_id?: string;
+            agent_client_version?: string;
+        };
+        TxeClaim: {
+            claim_id: string;
+            kind: components["schemas"]["TxeClaimKind"];
+            reviewer: components["schemas"]["TxeReviewer"];
+            /** Format: int64 */
+            fence: number;
+            /** Format: date-time */
+            acquired_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** @enum {string} */
+            state: TxeClaimState;
+        };
+        TxeCheckpoint: {
+            version: number;
+            job_version?: number;
+            run_cursor?: string;
+            decision_cursor?: string;
+            last_review_id?: string;
+            /** Format: date-time */
+            next_review_at?: string;
+        };
+        TxeActionSpec: {
+            name: string;
+            target?: components["schemas"]["TxeTarget"];
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
+            params?: unknown;
+        };
+        TxeArtifactRef: {
+            dag: string;
+            run_id: string;
+            path: string;
+        };
+        TxeProposalEvidence: {
+            run_ids?: string[];
+            artifact_refs?: components["schemas"]["TxeArtifactRef"][];
+            /** Format: date-time */
+            observed_at?: string;
+        };
+        TxeNativeTask: {
+            dag: string;
+            run_id: string;
+            step_id: string;
+        };
+        /** @enum {string} */
+        TxeVerdict: TxeVerdict;
+        /** @description Append-only human decision bound to one proposal revision and binding digest */
+        TxeDecision: {
+            decision_id: string;
+            proposal_id: string;
+            proposal_revision: number;
+            binding_digest: string;
+            verdict: components["schemas"]["TxeVerdict"];
+            instructions?: string;
+            /** Format: date-time */
+            snooze_until?: string;
+            actor: components["schemas"]["TxeActor"];
+            /** Format: date-time */
+            decided_at: string;
+            idempotency_key?: string;
+            /** @enum {string} */
+            native_resume?: TxeDecisionNative_resume;
+        };
+        /** @enum {string} */
+        TxeProposalState: TxeProposalState;
+        TxeProposalInput: {
+            proposal_id: string;
+            review_id?: string;
+            question?: string;
+            rationale?: string;
+            evidence?: components["schemas"]["TxeProposalEvidence"];
+            /** @enum {string} */
+            waiting_on?: TxeProposalInputWaiting_on;
+            allowed_verdicts?: components["schemas"]["TxeVerdict"][];
+            action: components["schemas"]["TxeActionSpec"];
+            native_task?: components["schemas"]["TxeNativeTask"];
+            reasoning?: string;
+        };
+        TxeProposal: components["schemas"]["TxeProposalInput"] & {
+            job_version: number;
+            package_digest: string;
+            binding_digest: string;
+            revision: number;
+            state: components["schemas"]["TxeProposalState"];
+            /** Format: date-time */
+            snooze_until?: string;
+            decision?: components["schemas"]["TxeDecision"];
+            created: components["schemas"]["TxeStamp"];
+            updated: components["schemas"]["TxeStamp"];
+        };
+        TxeProposalList: {
+            open: components["schemas"]["TxeProposal"][];
+            finished: components["schemas"]["TxeProposal"][];
+        };
+        TxeGrant: {
+            grant_id: string;
+            action_id: string;
+            attempt: number;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        /** @enum {string} */
+        TxeActionState: TxeActionState;
+        TxeAction: {
+            action_id: string;
+            /** @enum {string} */
+            kind: TxeActionKind;
+            job_version: number;
+            review_id?: string;
+            claim_id?: string;
+            proposal_id?: string;
+            decision_id?: string;
+            spec: components["schemas"]["TxeActionSpec"];
+            binding_digest: string;
+            state: components["schemas"]["TxeActionState"];
+            attempt: number;
+            max_attempts: number;
+            grant?: components["schemas"]["TxeGrant"];
+            receipt?: string;
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
+            outcome?: unknown;
+            settled_under_claim?: string;
+            read_only?: boolean;
+            created: components["schemas"]["TxeStamp"];
+            updated: components["schemas"]["TxeStamp"];
+        };
+        TxeActionList: {
+            in_flight: components["schemas"]["TxeAction"][];
+            archived: components["schemas"]["TxeAction"][];
+        };
+        TxeException: {
+            exception_id: string;
+            kind: string;
+            state?: components["schemas"]["TxeAvailabilityState"];
+            detail: string;
+            evidence?: string[];
+            created: components["schemas"]["TxeStamp"];
+            /** Format: date-time */
+            resolved_at?: string;
+        };
+        TxeNativeResume: {
+            decision_id: string;
+            proposal_id: string;
+            native_task: components["schemas"]["TxeNativeTask"];
+            /** Format: date-time */
+            since: string;
+        };
+        TxeChains: {
+            events?: string;
+            decisions?: string;
+            reviews?: string;
+            actions?: string;
+            proposals?: string;
+        };
+        /** @description The job aggregate: every mutable fact about one job, changed only by atomic compare-and-swap */
+        TxeJob: {
+            schema: number;
+            job_id: string;
+            owner_id: string;
+            project_id: string;
+            machine_id: string;
+            /** Format: int64 */
+            revision: number;
+            version: number;
+            version_refs?: string[];
+            package_digest: string;
+            dag_spec_sha256: string;
+            registration: components["schemas"]["TxeRegistration"];
+            lifecycle: components["schemas"]["TxeLifecycle"];
+            lifecycle_reason?: string;
+            availability: components["schemas"]["TxeAvailability"];
+            retirement?: components["schemas"]["TxeRetirement"];
+            /** Format: date-time */
+            expires_at?: string;
+            proposals?: {
+                [key: string]: components["schemas"]["TxeProposal"];
+            };
+            claim?: components["schemas"]["TxeClaim"];
+            /** Format: int64 */
+            fence: number;
+            checkpoint: components["schemas"]["TxeCheckpoint"];
+            last_recorded_review?: string;
+            actions?: {
+                [key: string]: components["schemas"]["TxeAction"];
+            };
+            exceptions?: {
+                [key: string]: components["schemas"]["TxeException"];
+            };
+            decision_keys?: {
+                [key: string]: string;
+            };
+            native_resumes?: {
+                [key: string]: components["schemas"]["TxeNativeResume"];
+            };
+            chains: components["schemas"]["TxeChains"];
+            created: components["schemas"]["TxeStamp"];
+            updated: components["schemas"]["TxeStamp"];
+        };
+        TxeJobList: {
+            jobs: components["schemas"]["TxeJob"][];
+        };
+        TxeEvent: {
+            event_id: string;
+            job_id: string;
+            /** Format: int64 */
+            revision: number;
+            /** @enum {string} */
+            kind: TxeEventKind;
+            from?: string;
+            to?: string;
+            reason?: string;
+            detail?: string;
+            evidence?: string[];
+            affected?: components["schemas"]["TxeAffected"][];
+            actor: components["schemas"]["TxeActor"];
+            /** Format: date-time */
+            at: string;
+        };
+        TxeEventList: {
+            events: components["schemas"]["TxeEvent"][];
+        };
+        TxeLifecycleRequest: {
+            /** @enum {string} */
+            op: TxeLifecycleRequestOp;
+            /** @enum {string} */
+            reason?: TxeLifecycleRequestReason;
+            detail?: string;
+            evidence?: string[];
+            /** @enum {string} */
+            active_run_policy?: TxeLifecycleRequestActive_run_policy;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeObservationRequest: {
+            state: components["schemas"]["TxeAvailabilityState"];
+            /** @description Exception kind, such as auth, worker_offline or reviewer_launch */
+            kind?: string;
+            detail?: string;
+            evidence?: string[];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeClaimRequest: {
+            kind: components["schemas"]["TxeClaimKind"];
+            reviewer: components["schemas"]["TxeReviewer"];
+            ttl_sec: number;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeFencedRequest: {
+            /** Format: int64 */
+            fence: number;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeCheckpointRequest: {
+            claim_id: string;
+            /** Format: int64 */
+            fence: number;
+            expected_version: number;
+            checkpoint: components["schemas"]["TxeCheckpoint"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeDeferRequest: {
+            claim_id: string;
+            /** Format: int64 */
+            fence: number;
+            /** Format: date-time */
+            next_review_at: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeReview: {
+            review_id: string;
+            job_version?: number;
+            checkpoint_version?: number;
+            claim_id?: string;
+            /** Format: int64 */
+            fence?: number;
+            evidence_run_ids?: string[];
+            evidence_decision_ids?: string[];
+            /** @enum {string} */
+            outcome: TxeReviewOutcome;
+            reasoning?: string;
+            packet_artifact?: string;
+            decision_artifact?: string;
+            agent_client_version?: string;
+            detail?: unknown;
+            created?: components["schemas"]["TxeStamp"];
+        };
+        TxeReviewList: {
+            reviews: components["schemas"]["TxeReview"][];
+        };
+        TxeReviewRequest: {
+            claim_id: string;
+            /** Format: int64 */
+            fence: number;
+            review: components["schemas"]["TxeReview"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeProposalRequest: {
+            claim_id: string;
+            /** Format: int64 */
+            fence: number;
+            proposal: components["schemas"]["TxeProposalInput"];
+            actor?: components["schemas"]["TxeActor"];
+        };
+        /** @description Exactly one of approved or routine */
+        TxeEffectGrantRequest: {
+            action_id: string;
+            job_version: number;
+            package_digest: string;
+            approved?: {
+                proposal_id: string;
+                decision_id: string;
+                claim_id: string;
+                /** Format: int64 */
+                fence: number;
+            };
+            routine?: {
+                review_id: string;
+                claim_id: string;
+                /** Format: int64 */
+                fence: number;
+                spec: components["schemas"]["TxeActionSpec"];
+            };
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeSettleRequest: {
+            grant_id: string;
+            claim_id: string;
+            /** Format: int64 */
+            fence: number;
+            state: components["schemas"]["TxeActionState"];
+            receipt?: string;
+            /** @description Any JSON value, kept byte for byte (numbers are not rounded). */
+            outcome?: unknown;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeDecisionRequest: {
+            /** @description Proposal revision the person reviewed */
+            expected_proposal_revision: number;
+            binding_digest: string;
+            verdict: components["schemas"]["TxeVerdict"];
+            /** @description Required for redirect. Saved context for the next review; never expands permitted actions */
+            instructions?: string;
+            /** Format: date-time */
+            snooze_until?: string;
+            idempotency_key: string;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeDecisionResponse: {
+            decision: components["schemas"]["TxeDecision"];
+            proposal?: components["schemas"]["TxeProposal"];
+            job?: components["schemas"]["TxeJob"];
+            replayed: boolean;
+        };
+        TxeDecisionList: {
+            decisions: components["schemas"]["TxeDecision"][];
+        };
     };
     responses: never;
     parameters: {
@@ -7176,6 +8384,24 @@ export interface components {
         Stream: components["schemas"]["Stream"];
         /** @description The unique identifier of the remote node */
         RemoteNodeId: string;
+        TxeOwnerId: string;
+        TxeProjectId: string;
+        TxeMachineId: string;
+        TxeJobId: string;
+        TxeJobVersionNumber: number;
+        TxeClaimId: string;
+        TxeProposalId: string;
+        TxeActionId: string;
+        TxeOwnerFilter: string;
+        TxeProjectFilter: string;
+        TxeMachineFilter: string;
+        TxeJobKeyFilter: string;
+        TxeLifecycleFilter: components["schemas"]["TxeLifecycle"];
+        TxeReviewDueBeforeFilter: string;
+        /** @description Maximum number of history records; 0 or absent returns all */
+        TxeLimit: number;
+        /** @description Stop before this decision ID (exclusive) */
+        TxeSince: string;
     };
     requestBodies: never;
     headers: never;
@@ -19864,6 +21090,2128 @@ export interface operations {
             };
         };
     };
+    getTxeInstallation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeInstallation"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createTxeOwner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeOwnerCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Owner */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeOwner"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeOwner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeOwner"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    ensureTxeProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeProjectEnsureRequest"];
+            };
+        };
+        responses: {
+            /** @description Project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeProject"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: components["parameters"]["TxeProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeProject"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createTxeMachine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeMachineCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Machine */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeMachine"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeMachine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Machine */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeMachine"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeJobs: {
+        parameters: {
+            query?: {
+                owner?: components["parameters"]["TxeOwnerFilter"];
+                project?: components["parameters"]["TxeProjectFilter"];
+                machine?: components["parameters"]["TxeMachineFilter"];
+                job_key?: components["parameters"]["TxeJobKeyFilter"];
+                lifecycle?: components["parameters"]["TxeLifecycleFilter"];
+                review_due_before?: components["parameters"]["TxeReviewDueBeforeFilter"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Jobs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJobList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    registerTxeJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    markTxeJobReady: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeReadyRequest"];
+            };
+        };
+        responses: {
+            /** @description Receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeReceipt"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateTxeJobVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeJobVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                version: components["parameters"]["TxeJobVersionNumber"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJobVersion"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    transitionTxeJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeLifecycleRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeJobEvents: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Events */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEventList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    observeTxeJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeObservationRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    acquireTxeClaim: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeClaimRequest"];
+            };
+        };
+        responses: {
+            /** @description Claim */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeClaim"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    releaseTxeClaim: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                claimId: components["parameters"]["TxeClaimId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeFencedRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    advanceTxeCheckpoint: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeCheckpointRequest"];
+            };
+        };
+        responses: {
+            /** @description Checkpoint */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeCheckpoint"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deferTxeReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeDeferRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeReviews: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reviews */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeReviewList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    recordTxeReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeJob"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeProposals: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Proposals */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeProposalList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createTxeProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeProposalRequest"];
+            };
+        };
+        responses: {
+            /** @description Proposal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeProposal"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeProposalDecisions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Decisions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    decideTxeProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                proposalId: components["parameters"]["TxeProposalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeJobDecisions: {
+        parameters: {
+            query?: {
+                /** @description Stop before this decision ID (exclusive) */
+                since?: components["parameters"]["TxeSince"];
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Decisions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    authorizeTxeEffect: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeEffectGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeGrant"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeActions: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of history records; 0 or absent returns all */
+                limit?: components["parameters"]["TxeLimit"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Actions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeActionList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    settleTxeAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                actionId: components["parameters"]["TxeActionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeSettleRequest"];
+            };
+        };
+        responses: {
+            /** @description Action */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeAction"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
 }
 export enum PathsDagsGetParametersQuerySort {
     name = "name",
@@ -20317,6 +23665,161 @@ export enum ViewSpecType {
     workflow = "workflow",
     run = "run",
     artifact = "artifact"
+}
+export enum TxeActorKind {
+    human = "human",
+    agent = "agent",
+    reviewer = "reviewer",
+    reconciler = "reconciler",
+    system = "system",
+    cli = "cli"
+}
+export enum TxeTargetExistence_check {
+    pre_run = "pre_run",
+    reconcile = "reconcile",
+    event_only = "event_only"
+}
+export enum TxeCredentialRefKind {
+    file = "file",
+    env = "env"
+}
+export enum TxeRetirementRulesOn_target_deleted {
+    retire = "retire",
+    review = "review",
+    keep = "keep"
+}
+export enum TxeRetirementRulesOn_replacement {
+    retire = "retire",
+    review = "review",
+    keep = "keep"
+}
+export enum TxeRetirementRulesOn_completion {
+    retire = "retire",
+    review = "review",
+    keep = "keep"
+}
+export enum TxeRetirementRulesActive_run_policy {
+    finish = "finish",
+    cancel = "cancel"
+}
+export enum TxePermittedActionIdempotency {
+    keyed = "keyed",
+    none = "none",
+    read_only = "read_only"
+}
+export enum TxeLifecycle {
+    active = "active",
+    paused = "paused",
+    needs_human = "needs_human",
+    completed = "completed",
+    retired = "retired"
+}
+export enum TxeRegistrationState {
+    incomplete = "incomplete",
+    ready = "ready",
+    duplicate = "duplicate"
+}
+export enum TxeAvailabilityState {
+    ready = "ready",
+    worker_offline = "worker_offline",
+    auth_required = "auth_required",
+    target_unreachable = "target_unreachable",
+    stale = "stale"
+}
+export enum TxeRetirementReason {
+    completed = "completed",
+    expired = "expired",
+    manual = "manual",
+    target_deleted = "target_deleted",
+    replaced = "replaced"
+}
+export enum TxeRetirementActive_run_policy {
+    finish = "finish",
+    cancel = "cancel"
+}
+export enum TxeClaimKind {
+    review = "review",
+    execution = "execution",
+    reconcile = "reconcile"
+}
+export enum TxeClaimState {
+    live = "live",
+    released = "released",
+    expired = "expired"
+}
+export enum TxeVerdict {
+    approve = "approve",
+    reject = "reject",
+    redirect = "redirect",
+    retry = "retry",
+    pause = "pause",
+    snooze = "snooze",
+    retire = "retire"
+}
+export enum TxeDecisionNative_resume {
+    pending = "pending",
+    completed = "completed"
+}
+export enum TxeProposalState {
+    open = "open",
+    snoozed = "snoozed",
+    decided = "decided",
+    executed = "executed",
+    rejected = "rejected",
+    superseded = "superseded"
+}
+export enum TxeProposalInputWaiting_on {
+    person = "person",
+    agent = "agent",
+    credentials = "credentials",
+    machine = "machine"
+}
+export enum TxeActionState {
+    executing = "executing",
+    succeeded = "succeeded",
+    failed = "failed",
+    uncertain = "uncertain",
+    not_applied = "not_applied",
+    escalated = "escalated"
+}
+export enum TxeActionKind {
+    routine = "routine",
+    approved = "approved"
+}
+export enum TxeEventKind {
+    registered = "registered",
+    ready = "ready",
+    duplicate = "duplicate",
+    version = "version",
+    lifecycle = "lifecycle",
+    availability = "availability",
+    claim = "claim"
+}
+export enum TxeLifecycleRequestOp {
+    pause = "pause",
+    resume = "resume",
+    needs_human = "needs_human",
+    complete = "complete",
+    retire = "retire",
+    reactivate = "reactivate"
+}
+export enum TxeLifecycleRequestReason {
+    expired = "expired",
+    manual = "manual",
+    target_deleted = "target_deleted",
+    replaced = "replaced"
+}
+export enum TxeLifecycleRequestActive_run_policy {
+    finish = "finish",
+    cancel = "cancel"
+}
+export enum TxeReviewOutcome {
+    continue = "continue",
+    act = "act",
+    wait_human = "wait_human",
+    pause_unavailable = "pause_unavailable",
+    complete = "complete",
+    retire = "retire"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

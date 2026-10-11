@@ -49,6 +49,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/service/resource"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/dagucloud/dagu/v2/internal/tunnel"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/view"
 	"github.com/dagucloud/dagu/v2/internal/wiki"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
@@ -98,6 +99,7 @@ type API struct {
 	secretStore          secretpkg.Store
 	profileStore         profilepkg.Store
 	viewStore            view.Store
+	txeRegistry          *registry.Store
 	licenseManager       *license.Manager
 	apiKeyCreateMu       sync.Mutex
 	workspaceStore       workspace.Store
@@ -788,12 +790,16 @@ func (a *API) handleError(w http.ResponseWriter, r *http.Request, err error) {
 		logger.Errorf(r.Context(), "Internal server error: %v", err)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatusCode)
-	_ = json.NewEncoder(w).Encode(api.Error{
+	body := api.Error{
 		Code:    code,
 		Message: message,
-	})
+	}
+	if apiErr, ok := errors.AsType[*Error](err); ok && apiErr.Details != nil {
+		body.Details = &apiErr.Details
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatusCode)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (a *API) resolveError(err error) (api.ErrorCode, string, int) {
