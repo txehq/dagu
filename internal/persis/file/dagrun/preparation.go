@@ -19,6 +19,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 )
@@ -28,6 +29,7 @@ const preparationExt = ".json"
 var (
 	_ persis.DAGRunPreparationJournal = (*Store)(nil)
 	_ persis.DAGRunPreparationLookup  = (*Store)(nil)
+	_ persis.DAGRunPreparationSettler = (*Store)(nil)
 )
 
 // defaultPreparationDir keeps the journal beside the run tree rather than in
@@ -117,6 +119,79 @@ func (store *Store) AttemptPrepared(_ context.Context, run, root ir.DAGRunRef, a
 		return false, errors.New("the attempt preparation entry names another attempt")
 	}
 	return true, nil
+}
+
+// EndSettledAttemptPreparation implements persis.DAGRunPreparationSettler. It
+// holds the run's data-root lock, which AbandonAttempt and CreateAttempt
+// hold, so no abandonment restores the attempt between the decision and the
+// removal.
+func (store *Store) EndSettledAttemptPreparation(ctx context.Context, p persis.AttemptPreparation) (bool, error) {
+	if p.RootRun.Zero() {
+		p.RootRun = p.Run
+	}
+	root := store.dataRoot(p.RootRun.Name)
+	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := root.Lock(lockCtx); err != nil {
+		return false, fmt.Errorf("failed to acquire lock for dag-run %s: %w", p.Run.ID, err)
+	}
+	defer func() {
+		if err := root.Unlock(); err != nil {
+			logger.Error(ctx, "Failed to unlock dag-run", tag.RunID(p.Run.ID), tag.Error(err))
+		}
+	}()
+	settled, err := store.preparationSettledLocked(ctx, root, p)
+	if err != nil || !settled {
+		return false, err
+	}
+	return true, store.EndAttemptPreparation(ctx, p)
+}
+
+func (store *Store) preparationSettledLocked(ctx context.Context, root DataRoot, p persis.AttemptPreparation) (bool, error) {
+	run, err := store.findRunLocked(ctx, root, p.RootRun, p.Run)
+	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	dirs, err := run.listAttemptDirs()
+	if err != nil {
+		return false, fmt.Errorf("failed to list attempts: %w", err)
+	}
+	var latest, prepared *Attempt
+	for _, dir := range dirs {
+		att, err := run.AttemptByDir(dir, store.cache)
+		if err != nil {
+			continue
+		}
+		visible := !att.Hidden() && att.Exists()
+		if visible && latest == nil {
+			latest = att
+		}
+		if att.ID() == p.AttemptID {
+			if !visible {
+				return true, nil
+			}
+			prepared = att
+			break
+		}
+	}
+	switch {
+	case prepared == nil:
+		return true, nil
+	case latest == prepared:
+		status, err := readWrittenStatus(ctx, prepared)
+		if err != nil {
+			return false, fmt.Errorf("read attempt %s status: %w", prepared.ID(), err)
+		}
+		return status != nil && (status.Status != ir.NotStarted || status.WorkerID != ""), nil
+	}
+	journaled, err := store.AttemptPrepared(ctx, p.Run, p.RootRun, latest.ID())
+	if err != nil {
+		return false, err
+	}
+	return !journaled, nil
 }
 
 // EndAttemptPreparation implements persis.DAGRunPreparationJournal.

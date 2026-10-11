@@ -271,6 +271,29 @@ func (r *DAGRunRepository) AttemptPrepared(ctx context.Context, run, root ir.DAG
 	return lookup.AttemptPrepared(ctx, run, root, attemptID)
 }
 
+// DAGRunPreparationSettler is implemented by journals that end an entry only
+// once nothing of its preparation is left to judge, decided under the lock
+// that abandoning and creating attempts take.
+type DAGRunPreparationSettler interface {
+	// EndSettledAttemptPreparation ends the entry, and reports true, when the
+	// run or the attempt is gone or hidden, when the attempt is the latest
+	// and has started, or when another attempt is the latest and is not
+	// itself a preparation. It keeps the entry, and reports false, while the
+	// attempt is the latest and not started, or the latest is another
+	// preparation that may yet be abandoned, restoring this one.
+	EndSettledAttemptPreparation(ctx context.Context, preparation AttemptPreparation) (bool, error)
+}
+
+// EndSettledAttemptPreparation ends a preparation entry once it is settled
+// (see DAGRunPreparationSettler).
+func (r *DAGRunRepository) EndSettledAttemptPreparation(ctx context.Context, preparation AttemptPreparation) (bool, error) {
+	settler, ok := r.store.(DAGRunPreparationSettler)
+	if !ok {
+		return false, ErrAttemptAbandonmentUnsupported
+	}
+	return settler.EndSettledAttemptPreparation(ctx, preparation)
+}
+
 // ListAttemptPreparations lists the preparation journal.
 func (r *DAGRunRepository) ListAttemptPreparations(ctx context.Context) ([]AttemptPreparation, error) {
 	journal, ok := r.store.(DAGRunPreparationJournal)
