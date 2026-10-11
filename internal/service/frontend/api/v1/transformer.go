@@ -6,7 +6,6 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"io"
 	"log/slog"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/runtime/agentloop"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
