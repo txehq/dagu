@@ -1070,6 +1070,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/retry-requests/{retryRequestId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Find the execution a conditional retry request admitted
+         * @description Returns the run's execution whose status records this retry request (retryRequestId from a conditional retry's response or derivable as described under RetryRequestSpec), so a caller whose response was lost can recover it. It searches every attempt of the run: current executions, retained copies of executions a later queued retry replaced, and preparations the coordinator abandoned. 404 when no execution records it. Visible to whoever can see the run and the matched execution's workspace.
+         */
+        get: operations["getDAGRunRetryRequest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/complete": {
         parameters: {
             query?: never;
@@ -6127,6 +6147,28 @@ export interface components {
             actionAttempt: string;
             bindingDigest: string;
         };
+        /** @description Where the execution a retry request admitted is now. */
+        RetryRequestLookup: {
+            /**
+             * @description admitted: the execution exists (current, or retained when a later queued retry replaced it). abandoned: it was a preparation the coordinator abandoned; nothing ran.
+             * @enum {string}
+             */
+            state: RetryRequestLookupState;
+            attemptId: string;
+            queuedAt: string;
+            executionRef: string;
+            /** @description True when the execution is a retained copy, replaced by a later queued retry. */
+            retained: boolean;
+            status: components["schemas"]["StatusLabel"];
+            retryRequest: components["schemas"]["RetryRequest"];
+            /** @description With state abandoned: the abandonment record. */
+            abandonment?: {
+                outcome?: string;
+                reason?: string;
+                detail?: string;
+                decidedAt?: string;
+            };
+        };
         /** @description The conditional retry that admitted an execution (see RetryRequestSpec). */
         RetryRequest: {
             id: string;
@@ -6235,6 +6277,7 @@ export interface components {
             preconditions?: components["schemas"]["Condition"][];
             /** @description Top-level error recorded for the DAG-run, such as a definition build failure that prevented the run from starting */
             error?: string;
+            retryRequest?: components["schemas"]["RetryRequest"];
             /** @description Goal progress of an agent DAG-run. Absent for other DAG types. */
             agentTasks?: components["schemas"]["AgentTask"][];
             /** @description Ordered decision timeline of an agent DAG-run: what the agent ran, in what order, and when each task was satisfied. Absent for other DAG types. */
@@ -12332,6 +12375,53 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RetryDAGRunAdmission"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunRetryRequest: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run; must not be the special 'latest' alias */
+                dagRunId: components["parameters"]["DAGRunConcreteId"];
+                retryRequestId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The execution the request admitted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryRequestLookup"];
+                };
+            };
+            /** @description No execution of the run records the request */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Generic error response */
@@ -24736,6 +24826,10 @@ export enum ParamDefType {
     integer = "integer",
     number = "number",
     boolean = "boolean"
+}
+export enum RetryRequestLookupState {
+    admitted = "admitted",
+    abandoned = "abandoned"
 }
 export enum DAGRunConditionStatus {
     True = "True",

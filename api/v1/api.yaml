@@ -3003,6 +3003,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dag-runs/{name}/{dagRunId}/retry-requests/{retryRequestId}:
+    get:
+      summary: "Find the execution a conditional retry request admitted"
+      description: "Returns the run's execution whose status records this retry request (retryRequestId from a conditional retry's response or derivable as described under RetryRequestSpec), so a caller whose response was lost can recover it. It searches every attempt of the run: current executions, retained copies of executions a later queued retry replaced, and preparations the coordinator abandoned. 404 when no execution records it. Visible to whoever can see the run and the matched execution's workspace."
+      operationId: "getDAGRunRetryRequest"
+      tags:
+        - "dag-runs"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGName"
+        - $ref: "#/components/parameters/DAGRunConcreteId"
+        - name: retryRequestId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "The execution the request admitted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetryRequestLookup"
+        "404":
+          description: "No execution of the run records the request"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dag-runs/{name}/{dagRunId}/human-tasks/{stepId}/complete:
     post:
       summary: "Complete a waiting human task"
@@ -15915,6 +15951,41 @@ components:
           type: string
       required: [actionId, actionAttempt, bindingDigest]
 
+    RetryRequestLookup:
+      type: object
+      description: "Where the execution a retry request admitted is now."
+      properties:
+        state:
+          type: string
+          enum: [admitted, abandoned]
+          description: "admitted: the execution exists (current, or retained when a later queued retry replaced it). abandoned: it was a preparation the coordinator abandoned; nothing ran."
+        attemptId:
+          type: string
+        queuedAt:
+          type: string
+        executionRef:
+          type: string
+        retained:
+          type: boolean
+          description: "True when the execution is a retained copy, replaced by a later queued retry."
+        status:
+          $ref: "#/components/schemas/StatusLabel"
+        retryRequest:
+          $ref: "#/components/schemas/RetryRequest"
+        abandonment:
+          type: object
+          description: "With state abandoned: the abandonment record."
+          properties:
+            outcome:
+              type: string
+            reason:
+              type: string
+            detail:
+              type: string
+            decidedAt:
+              type: string
+      required: [state, attemptId, queuedAt, executionRef, retained, status, retryRequest]
+
     RetryRequest:
       type: object
       description: "The conditional retry that admitted an execution (see RetryRequestSpec)."
@@ -16126,6 +16197,8 @@ components:
             error:
               type: string
               description: "Top-level error recorded for the DAG-run, such as a definition build failure that prevented the run from starting"
+            retryRequest:
+              $ref: "#/components/schemas/RetryRequest"
             agentTasks:
               type: array
               description: "Goal progress of an agent DAG-run. Absent for other DAG types."

@@ -5369,3 +5369,51 @@ func executionChangedError(expect *persis.ExpectedExecution, latest *ir.DAGRunSt
 	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 		Message: "the run's latest execution is not the expected one; nothing was retried", Details: details}
 }
+
+// GetDAGRunRetryRequest implements api.StrictServerInterface: the execution
+// of the run that recorded the retry request, wherever it now is.
+func (a *API) GetDAGRunRetryRequest(ctx context.Context, request api.GetDAGRunRetryRequestRequestObject) (api.GetDAGRunRetryRequestResponseObject, error) {
+	run := ir.NewDAGRunRef(request.Name, request.DagRunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+		Message: fmt.Sprintf("no execution of dag-run %s records retry request %s", request.DagRunId, request.RetryRequestId)}
+	if err := a.requireDAGRunVisible(ctx, run); err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	match, err := a.dagRunRepository.FindRetryRequest(ctx, run, request.RetryRequestId)
+	switch {
+	case errors.Is(err, persis.ErrNotFound):
+		return nil, notFound
+	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		return nil, &Error{HTTPStatus: http.StatusNotImplemented, Code: api.ErrorCodeInternalError,
+			Message: "this run store cannot look up retry requests"}
+	case err != nil:
+		logger.Warn(ctx, "Failed to look up a retry request", tag.RunID(request.DagRunId), tag.Error(err))
+		return nil, &Error{HTTPStatus: http.StatusInternalServerError, Code: api.ErrorCodeInternalError,
+			Message: "the run's executions could not be read to look up the retry request"}
+	}
+	// The execution's own saved workspace, as for retained executions.
+	if err := a.requireDAGRunStatusVisible(ctx, &match.Status); err != nil {
+		return nil, notFound
+	}
+	out := api.GetDAGRunRetryRequest200JSONResponse{
+		State:        api.RetryRequestLookupState(match.State),
+		AttemptId:    match.Execution.AttemptID,
+		QueuedAt:     match.Execution.QueuedAt,
+		ExecutionRef: ir.ExecutionRef(match.Execution.AttemptID, match.Execution.QueuedAt),
+		Retained:     match.Retained,
+		Status:       api.StatusLabel(match.Status.Status.String()),
+		RetryRequest: *toRetryRequest(match.Status.RetryRequest),
+	}
+	if ab := match.Abandonment; ab != nil {
+		out.Abandonment = &struct {
+			DecidedAt *string `json:"decidedAt,omitempty"`
+			Detail    *string `json:"detail,omitempty"`
+			Outcome   *string `json:"outcome,omitempty"`
+			Reason    *string `json:"reason,omitempty"`
+		}{DecidedAt: &ab.DecidedAt, Detail: &ab.Detail, Outcome: &ab.Outcome, Reason: &ab.Reason}
+	}
+	return out, nil
+}
