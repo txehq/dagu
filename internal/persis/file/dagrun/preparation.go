@@ -101,16 +101,31 @@ func (store *Store) ListAttemptPreparations(ctx context.Context) ([]persis.Attem
 }
 
 // AttemptPrepared implements persis.DAGRunPreparationLookup: it reads the
-// one entry the attempt would have, and an entry that exists but cannot be
-// read, or names another attempt, is an error rather than absent.
+// one entry the attempt would have. Absent means nothing is at the entry's
+// name (Lstat, so a dangling link is not absent); anything there that is not
+// a readable entry for this attempt is an error.
 func (store *Store) AttemptPrepared(_ context.Context, run, root ir.DAGRunRef, attemptID string) (bool, error) {
 	if root.Zero() {
 		root = run
 	}
 	want := persis.AttemptPreparation{Run: run, RootRun: root, AttemptID: attemptID}
-	entry, err := readPreparation(store.preparationPath(want))
+	path := store.preparationPath(want)
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read the attempt preparation: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("the attempt preparation entry is not a regular file (%s)", info.Mode().Type())
+	}
+	entry, err := readPreparation(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// Ended between the two reads: absent only if nothing is there now.
+		if _, again := os.Lstat(path); errors.Is(again, os.ErrNotExist) {
+			return false, nil
+		}
 	}
 	if err != nil {
 		return false, fmt.Errorf("failed to read the attempt preparation: %w", err)

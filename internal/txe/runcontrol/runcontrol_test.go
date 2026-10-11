@@ -137,3 +137,36 @@ func TestLatestAttemptFailsOnAnUnreadablePreparation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "preparation journal")
 }
+
+// Failure and recovery: the attempt was handed to a worker and started, but
+// the coordinator failed to end its journal entry. It is reported as
+// preparing (uncertain), never as never-dispatched or dispatched, until the
+// entry is settled; reconciliation's settle ends it because the attempt
+// started, and then it is reported as dispatched.
+func TestLatestAttemptStaysUncertainUntilALeftoverEntryIsSettled(t *testing.T) {
+	ctx := t.Context()
+	p := newPreparedRun(t)
+	run := ir.NewDAGRunRef("job", "run-1")
+	attempt, err := p.runs.FindAttempt(ctx, run)
+	require.NoError(t, err)
+	require.Equal(t, p.prepared, attempt.ID())
+	status, err := attempt.ReadStatus(ctx)
+	require.NoError(t, err)
+	status.Status, status.WorkerID = ir.Running, "worker-1"
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, *status))
+	require.NoError(t, attempt.Close(ctx))
+
+	latest, err := p.c.LatestAttempt(ctx, "job", "run-1")
+	require.NoError(t, err)
+	assert.Equal(t, p.prepared, latest.AttemptID)
+	assert.True(t, latest.Preparing, "the entry was left behind: uncertain")
+
+	ended, err := p.runs.EndSettledAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: p.prepared})
+	require.NoError(t, err)
+	assert.True(t, ended, "it started, so the preparation is settled")
+	latest, err = p.c.LatestAttempt(ctx, "job", "run-1")
+	require.NoError(t, err)
+	assert.False(t, latest.Preparing)
+	assert.True(t, latest.Running)
+}

@@ -165,3 +165,19 @@ func TestEndSettledAttemptPreparationKeepsAPreparationWithoutStatus(t *testing.T
 	require.NoError(t, err)
 	assert.True(t, ok)
 }
+
+// A dangling link at the entry's name is not absent: something is there.
+func TestAttemptPreparedRefusesADanglingLink(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore(t.TempDir())
+	run := ir.NewDAGRunRef("dag", "run-1")
+	entry, err := store.beginPreparation(run, ir.DAGRunRef{}, "a1")
+	require.NoError(t, err)
+	path := store.preparationPath(entry)
+	require.NoError(t, os.Remove(path))
+	if err := os.Symlink(path+".missing", path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err = store.AttemptPrepared(ctx, run, ir.DAGRunRef{}, "a1")
+	assert.Error(t, err, "a dangling link at the entry's name")
+}

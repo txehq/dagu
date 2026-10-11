@@ -155,9 +155,12 @@ func (c *Control) readLatest(ctx context.Context, dagName, runID string) (regist
 }
 
 // preparing reports whether the root run's attempt is still in the store's
-// preparation journal: created for a worker but not yet handed to one, so
-// the coordinator may still abandon it. An entry that cannot be read is an
-// error, never evidence of dispatch. A store without a journal never
+// preparation journal. Present means its preparation is not known to be
+// settled: it may not have been handed to a worker and may still be
+// abandoned, or it may already be dispatched with its entry not yet ended
+// (reconciliation ends it once the attempt is settled), so the registry
+// treats it as uncertain, never as either. An entry that cannot be read is
+// an error, never evidence of dispatch. A store without a journal never
 // abandons attempts.
 func (c *Control) preparing(ctx context.Context, run ir.DAGRunRef, attemptID string) (bool, error) {
 	prepared, err := c.Runs.AttemptPrepared(ctx, run, run, attemptID)
