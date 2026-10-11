@@ -134,3 +134,34 @@ func TestEndSettledAttemptPreparation(t *testing.T) {
 	assert.True(t, ended, "the latest is no preparation")
 	assert.False(t, journaled(d))
 }
+
+// A preparation whose first status was never written is still present: its
+// entry stays while a later preparation is the latest, and after that one is
+// abandoned, until it is itself abandoned or starts.
+func TestEndSettledAttemptPreparationKeepsAPreparationWithoutStatus(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("settle_nostatus_dag").DAG
+	run := ir.NewDAGRunRef(dag.Name, abandonRunID)
+	createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+	bare, err := th.Backend.CreateAttempt(th.Context, persis.DAGRunCreateAttemptRequest{
+		DAG: dag, Timestamp: time.Now(), DAGRunID: abandonRunID, Retry: true, TrackPreparation: true,
+	})
+	require.NoError(t, err)
+	c := createPreparedAttempt(t, th, dag)
+	entry := persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: bare.ID()}
+
+	ended, err := th.Backend.EndSettledAttemptPreparation(th.Context, entry)
+	require.NoError(t, err)
+	assert.False(t, ended, "C, the latest, is a preparation")
+
+	_, err = abandon(th, abandonRecord(dag, c.ID(), nil))
+	require.NoError(t, err)
+	require.NoError(t, th.Backend.EndAttemptPreparation(th.Context, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: c.ID()}))
+	ended, err = th.Backend.EndSettledAttemptPreparation(th.Context, entry)
+	require.NoError(t, err)
+	assert.False(t, ended, "never started: still to be abandoned")
+	ok, err := th.Backend.AttemptPrepared(th.Context, run, run, bare.ID())
+	require.NoError(t, err)
+	assert.True(t, ok)
+}

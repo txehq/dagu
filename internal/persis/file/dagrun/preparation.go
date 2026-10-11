@@ -159,28 +159,30 @@ func (store *Store) preparationSettledLocked(ctx context.Context, root DataRoot,
 	if err != nil {
 		return false, fmt.Errorf("failed to list attempts: %w", err)
 	}
+	// Attempts are listed newest first. The latest is the newest visible one
+	// with a status; the preparation counts as present unless hidden or
+	// gone, even before its first status is written.
 	var latest, prepared *Attempt
 	for _, dir := range dirs {
 		att, err := run.AttemptByDir(dir, store.cache)
 		if err != nil {
 			continue
 		}
-		visible := !att.Hidden() && att.Exists()
-		if visible && latest == nil {
-			latest = att
-		}
 		if att.ID() == p.AttemptID {
-			if !visible {
+			if att.Hidden() {
 				return true, nil
 			}
 			prepared = att
 			break
 		}
+		if latest == nil && !att.Hidden() && att.Exists() {
+			latest = att
+		}
 	}
 	switch {
 	case prepared == nil:
 		return true, nil
-	case latest == prepared:
+	case latest == nil:
 		status, err := readWrittenStatus(ctx, prepared)
 		if err != nil {
 			return false, fmt.Errorf("read attempt %s status: %w", prepared.ID(), err)
