@@ -46,11 +46,12 @@ func admittedResponse(task *coordinatorv1.Task, prepared *preparedDispatchAttemp
 
 // admittedQueuedAt is the queued-at every status of the task's execution
 // carries, the coordinator's initial one included: the retried status's
-// (a direct retry of a queued run inherits it), else none on this base (on
-// main: the task's execution marker, as the worker's taskQueuedAt).
+// when it has one (a direct retry of a queued run inherits it), else the
+// task's execution marker. It is the worker's rule (taskQueuedAt in
+// internal/service/worker), so the receipt names what the worker saves.
 func admittedQueuedAt(task *coordinatorv1.Task) string {
-	if prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus); err == nil && prev != nil {
+	if prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus); err == nil && prev != nil && prev.QueuedAt != "" {
 		return prev.QueuedAt
 	}
-	return ""
+	return task.GetExecutionMarker()
 }

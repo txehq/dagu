@@ -185,8 +185,18 @@ func TestAdmittedResponseNamesTheSavedExecution(t *testing.T) {
 // execution the saved statuses carry: the new attempt with the retried
 // status's queued-at for a run queued before, none for a run never queued.
 func TestDispatchReceiptMatchesTheSavedExecution(t *testing.T) {
-	for _, queuedAt := range []string{"2026-10-09T12:00:00Z", ""} {
-		t.Run("queuedAt="+queuedAt, func(t *testing.T) {
+	// The worker's rule (taskQueuedAt): the retried status's queued-at when it
+	// has one, else the task's execution marker. A conditional retry always
+	// creates a new attempt, whose marker the coordinator clears, so a marker
+	// the caller sent never reaches the receipt or the saved status.
+	for _, tc := range []struct{ queuedAt, marker, want string }{
+		{"2026-10-09T12:00:00Z", "", "2026-10-09T12:00:00Z"},
+		{"2026-10-09T12:00:00Z", "2026-10-09T13:00:00Z", "2026-10-09T12:00:00Z"},
+		{"", "", ""},
+		{"", "2026-10-09T13:00:00Z", ""},
+	} {
+		queuedAt := tc.queuedAt
+		t.Run("queuedAt="+queuedAt+",marker="+tc.marker, func(t *testing.T) {
 			registerCommandExecutorCapsForCoordinatorTest()
 			ctx := context.Background()
 			dir := t.TempDir()
@@ -212,11 +222,11 @@ func TestDispatchReceiptMatchesTheSavedExecution(t *testing.T) {
 			resp, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
 				Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
 				Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
-				PreviousStatus: previous, RequireLatestIsPrevious: true,
+				PreviousStatus: previous, RequireLatestIsPrevious: true, ExecutionMarker: tc.marker,
 			}})
 			require.NoError(t, err)
 			require.NotEqual(t, first.ID(), resp.GetAttemptId(), "a new attempt")
-			assert.Equal(t, queuedAt, resp.GetQueuedAt())
+			assert.Equal(t, tc.want, resp.GetQueuedAt())
 
 			latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-123"))
 			require.NoError(t, err)
