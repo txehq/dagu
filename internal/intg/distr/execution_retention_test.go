@@ -104,7 +104,10 @@ steps:
 	for _, r := range retained {
 		assert.Equal(t, "failed", r.Status)
 		assert.True(t, r.StatusComplete)
-		assert.False(t, r.LogsFinal, "logs are not claimed final until streams are fenced")
+		// The worker released the run before each retry, and its log
+		// transport (TXE-3772) left a .final record whose digests match the
+		// copies.
+		assert.True(t, r.LogsFinal, "the retained logs are the fenced final streams")
 	}
 
 	assert.Contains(t, e1Stdout, "run execution 1")
