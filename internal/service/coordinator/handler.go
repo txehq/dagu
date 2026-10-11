@@ -1463,7 +1463,11 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 	if claimed.Task == nil {
 		return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "claim has no task payload"}, nil
 	}
-	refused, reason, err := h.refuseUnadmittedClaim(ctx, req.ClaimToken, claimed.Task)
+	marker := claimed.Task.ExecutionMarker
+	if legacy, convErr := convert.DispatchTaskToProto(claimed.Task); convErr == nil && fillLegacyExecutionMarker(legacy) == nil {
+		marker = legacy.GetExecutionMarker()
+	}
+	refused, reason, err := h.refuseUnadmittedClaim(ctx, req.ClaimToken, claimed.Task, marker)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}

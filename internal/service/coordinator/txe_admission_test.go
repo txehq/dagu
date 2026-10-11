@@ -51,7 +51,7 @@ func TestAckTaskClaimRefusesRetiredJob(t *testing.T) {
 	baseDir := filepath.Join(t.TempDir(), "distributed")
 	dispatchStore := newTestDispatchTaskStore(baseDir)
 	runs := newMockDAGRunStore()
-	attempt := runs.addAttempt(ir.NewDAGRunRef(jobID, "run-1"), &ir.DAGRunStatus{Name: jobID, DAGRunID: "run-1", Status: ir.Queued})
+	attempt := runs.addAttempt(ir.NewDAGRunRef(jobID, "run-1"), &ir.DAGRunStatus{Name: jobID, DAGRunID: "run-1", AttemptID: "attempt-1", Status: ir.Queued})
 	admitter := &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitRetired, Reason: "job retired: target_deleted"}}
 	h := NewHandler(HandlerConfig{
 		RunAdmitter:               admitter,
@@ -108,7 +108,7 @@ func TestAckTaskClaimRefusesRetiredChildJob(t *testing.T) {
 	dispatchStore := newTestDispatchTaskStore(baseDir)
 	runs := newMockDAGRunStore()
 	root := ir.NewDAGRunRef("parent", "root-1")
-	child := runs.addSubAttempt(root, "child-1", &ir.DAGRunStatus{Name: jobID, DAGRunID: "child-1", Status: ir.NotStarted})
+	child := runs.addSubAttempt(root, "child-1", &ir.DAGRunStatus{Name: jobID, DAGRunID: "child-1", AttemptID: "attempt-c", Status: ir.NotStarted})
 	admitter := &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitPaused, Reason: "job is paused"}}
 	h := NewHandler(HandlerConfig{
 		RunAdmitter:               admitter,
@@ -134,4 +134,95 @@ func TestAckTaskClaimRefusesRetiredChildJob(t *testing.T) {
 	status, err := child.ReadStatus(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, ir.Aborted, status.Status)
+}
+
+// A refused claim finalizes only its own execution. When the run's visible
+// attempt is another attempt, or the same attempt queued again under a new
+// queued-at marker, the stale claim is removed and nothing is aborted.
+func TestRefusedClaimAbortsOnlyItsOwnExecution(t *testing.T) {
+	t.Parallel()
+	jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name       string
+		status     ir.DAGRunStatus
+		marker     string
+		wantStatus ir.Status
+	}{
+		{"its own queued execution", ir.DAGRunStatus{AttemptID: "attempt-1", Status: ir.Queued, QueuedAt: "q1"}, "q1", ir.Aborted},
+		{"queued again under a new marker", ir.DAGRunStatus{AttemptID: "attempt-1", Status: ir.Queued, QueuedAt: "q2"}, "q1", ir.Queued},
+		{"another attempt", ir.DAGRunStatus{AttemptID: "attempt-2", Status: ir.NotStarted}, "", ir.NotStarted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseDir := filepath.Join(t.TempDir(), "distributed")
+			dispatchStore := newTestDispatchTaskStore(baseDir)
+			runs := newMockDAGRunStore()
+			st := tc.status
+			st.Name, st.DAGRunID = jobID, "run-1"
+			attempt := runs.addAttempt(ir.NewDAGRunRef(jobID, "run-1"), &st)
+			h := NewHandler(HandlerConfig{
+				RunAdmitter:               &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitRetired, Reason: "job retired"}},
+				DAGRunRepository:          runs.repository,
+				DispatchTaskStore:         dispatchStore,
+				DAGRunLeaseStore:          newTestDAGRunLeaseStore(baseDir),
+				ActiveDistributedRunStore: newTestActiveDistributedRunStore(baseDir),
+				Owner:                     dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+			})
+			ctx := context.Background()
+			require.NoError(t, dispatchStore.Enqueue(ctx, &dispatch.DispatchTask{
+				DAGRunID: "run-1", Target: jobID, AttemptID: "attempt-1", AttemptKey: "attempt-key-1",
+				ExecutionMarker: tc.marker, RootDAGRunName: jobID, RootDAGRunID: "run-1",
+			}))
+			claimed, err := dispatchStore.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "poller-1",
+				Owner: dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055}})
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+
+			resp, err := h.AckTaskClaim(ctx, &coordinatorv1.AckTaskClaimRequest{ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: "attempt-key-1"})
+			require.NoError(t, err)
+			assert.False(t, resp.Accepted)
+			got, err := attempt.ReadStatus(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStatus, got.Status)
+			_, err = dispatchStore.GetClaim(ctx, claimed.ClaimToken)
+			assert.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the stale claim is removed")
+		})
+	}
+}
+
+// A delayed claim for an abandoned execution that admission also refuses
+// leaves the run's visible execution alone: only the stale claim goes.
+func TestRefusedClaimOfAbandonedExecutionLeavesTheVisibleOneAlone(t *testing.T) {
+	t.Parallel()
+	jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	f := newStrandedFixture(t, nil)
+	f.h.runAdmitter = &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitRetired, Reason: "job retired"}}
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
+	_, err = f.h.abandonNeverDispatched(t.Context(), f.ref, f.ref, placeholder, "test")
+	require.NoError(t, err)
+	visible := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.Equal(t, visible, f.latest(t))
+
+	require.NoError(t, f.dispatches.Enqueue(t.Context(), &dispatch.DispatchTask{
+		Target: strandedDAG, DefinitionID: jobID, DAGRunID: strandedRun, AttemptID: placeholder, AttemptKey: f.attemptKey(placeholder),
+		Owner: dispatch.CoordinatorEndpoint{ID: "coord-b", Host: "127.0.0.1", Port: 50056},
+	}))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(placeholder),
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+
+	attempt, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	require.Equal(t, visible, attempt.ID())
+	st, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.NotStarted, st.Status, "the visible execution is not aborted")
+	_, err = f.dispatches.GetClaim(t.Context(), claimed.ClaimToken)
+	assert.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the stale claim is removed")
 }
