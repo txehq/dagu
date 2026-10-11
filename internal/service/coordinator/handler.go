@@ -1093,6 +1093,7 @@ func (h *Handler) writeInitialStatus(ctx context.Context, attempt dagrun.Attempt
 		AttemptKey:   task.AttemptKey,
 		Status:       ir.NotStarted,
 		QueuedAt:     admittedQueuedAt(task),
+		RetryRequest: initialRetryRequest(task),
 		StartedAt:    time.Now().UTC().Format(time.RFC3339),
 		Root:         root,
 		Labels:       labels,
@@ -2092,6 +2093,9 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	if h.dagRunLeaseStore == nil {
 		dagRunStatus.LeaseAt = time.Now().UnixMilli()
 	}
+	// A report never sets the retry request; the stored execution's is kept
+	// below.
+	dagRunStatus.RetryRequest = nil
 
 	// Acquire per-run mutex to serialize with markRunFailed
 	held := h.runLocks.lock(dagRunStatus.DAGRunID)
@@ -2143,6 +2147,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 		}
 		return nil, status.Error(codes.Internal, "failed to resolve latest attempt: "+err.Error())
 	}
+	dagRunStatus.RetryRequest = keptRetryRequest(latestStatus, dagRunStatus)
 
 	ownership := h.attemptOwnership()
 	if leaseMissing && latestStatus.Status != ir.NotStarted && !isTerminalRunStatus(latestStatus.Status) {

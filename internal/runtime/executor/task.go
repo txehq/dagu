@@ -137,6 +137,14 @@ func WithRequireLatestIsPrevious(enabled bool) TaskOption {
 	}
 }
 
+// WithRetryRequest names the action attempt a conditional retry is made for
+// (see dispatch.DispatchTask.RetryRequest).
+func WithRetryRequest(actionID, actionAttempt, bindingDigest string) TaskOption {
+	return func(task *dispatch.DispatchTask) {
+		task.RetryRequest = &dispatch.RetryRequestSpec{ActionID: actionID, ActionAttempt: actionAttempt, BindingDigest: bindingDigest}
+	}
+}
+
 // WithLabels sets additional labels (comma-separated) for the task.
 func WithLabels(labels string) TaskOption {
 	return func(task *dispatch.DispatchTask) {

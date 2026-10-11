@@ -58,6 +58,10 @@ type EnqueueRetryOptions struct {
 	// the run. User retries wait briefly; automatic retries defer immediately.
 	// Nil skips the check.
 	Processes RunProcesses
+	// RetryRequest is the request the queued execution records (see
+	// ir.RetryRequest). Nil records none: a queued retry never keeps the
+	// request of the execution it replaces.
+	RetryRequest *ir.RetryRequest
 }
 
 // awaitSourceRelease reports whether the execution that recorded status has
@@ -202,6 +206,7 @@ func PrepareRetry(
 			latest.PIDStartedAt = 0
 			latest.LeaseAt = 0
 			latest.TriggerType = ir.TriggerTypeRetry
+			latest.RetryRequest = opts.RetryRequest.Clone()
 			if opts.TriggerActor != nil {
 				latest.TriggerActor = *opts.TriggerActor
 			}

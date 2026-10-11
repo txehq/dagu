@@ -6118,6 +6118,23 @@ export interface components {
             attemptId?: string;
             queuedAt?: string;
             executionRef?: string;
+            /** @description With retryRequest: the ID of the correlation the admitted execution records. Look it up with GET /dag-runs/{name}/{dagRunId}/retry-requests/{retryRequestId} if this response is lost. */
+            retryRequestId?: string;
+        };
+        /** @description Optional, only with expectedAttemptId/expectedQueuedAt: the action attempt this conditional retry is made for. The server records on the admitted execution a retryRequest {id, actionId, actionAttempt, bindingDigest, retryOf}: id is the sha256 hex of the canonical JSON of these three fields, the run {name, id} and the expected execution {attemptId, queuedAt}, and retryOf is the expected execution's reference. It is kept on every later status of that execution; a worker cannot set or change it. */
+        RetryRequestSpec: {
+            actionId: string;
+            actionAttempt: string;
+            bindingDigest: string;
+        };
+        /** @description The conditional retry that admitted an execution (see RetryRequestSpec). */
+        RetryRequest: {
+            id: string;
+            actionId: string;
+            actionAttempt: string;
+            bindingDigest: string;
+            /** @description The execution reference of the execution the request retried. */
+            retryOf: string;
         };
         /** @description Type-keyed current-state runtime condition for a DAG-run. Each condition is the latest observation for its type, not a historical event. */
         DAGRunCondition: {
@@ -12303,6 +12320,7 @@ export interface operations {
                     expectedAttemptId?: string;
                     /** @description Optional, with expectedAttemptId. The queue marker (queuedAt) of the expected execution; empty for an execution that was never queued. */
                     expectedQueuedAt?: string;
+                    retryRequest?: components["schemas"]["RetryRequestSpec"];
                 };
             };
         };

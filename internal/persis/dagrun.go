@@ -26,6 +26,9 @@ var ErrLatestExecutionChanged = errors.New("dagrun: the run's latest execution i
 type ExpectedExecution struct {
 	AttemptID string
 	QueuedAt  string
+	// Request, on a conditional retry, is the request the admitted
+	// execution records (see ir.RetryRequest); nil records none.
+	Request *ir.RetryRequest
 }
 
 // DAGRunStore persists DAG runs and their attempts as one consistency boundary.

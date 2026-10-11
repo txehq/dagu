@@ -700,3 +700,40 @@ func TestEnqueueRetryRequestsRetention(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, backend.retainRequested)
 }
+
+// A queued retry records the request it was given, and never keeps the
+// request of the execution it replaces.
+func TestPrepareRetryRecordsItsOwnRetryRequest(t *testing.T) {
+	repository := testutil.NewFileDAGRunRepository(t.TempDir(), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "manual"}
+	attempt, err := repository.CreateAttempt(t.Context(), dag, time.Now(), "run", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	earlier := &ir.RetryRequest{ID: "earlier", ActionID: "act-0", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
+	latest := ir.DAGRunStatus{Name: dag.Name, DAGRunID: "run", AttemptID: attempt.ID(), Status: ir.Failed,
+		QueuedAt: "2026-10-09T12:00:01.000000001Z", RetryRequest: earlier}
+	require.NoError(t, attempt.Open(t.Context()))
+	require.NoError(t, attempt.Write(t.Context(), latest))
+	require.NoError(t, attempt.Close(t.Context()))
+
+	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(dag.Name, "run"), attempt.ID(), latest.QueuedAt, "act-1", "1", "sha256:d")
+	require.NoError(t, err)
+	admission, err := queue.PrepareRetry(t.Context(), repository, dag, &latest, queue.EnqueueRetryOptions{RetryRequest: request})
+	require.NoError(t, err)
+	require.NotNil(t, admission)
+	stored, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, request, stored.RetryRequest)
+	assert.NotEqual(t, latest.QueuedAt, stored.QueuedAt, "a new execution")
+
+	// The queued execution fails; a plain queued retry records no request.
+	failed := *stored
+	failed.Status = ir.Failed
+	require.NoError(t, attempt.Open(t.Context()))
+	require.NoError(t, attempt.Write(t.Context(), failed))
+	require.NoError(t, attempt.Close(t.Context()))
+	_, err = queue.PrepareRetry(t.Context(), repository, dag, &failed, queue.EnqueueRetryOptions{})
+	require.NoError(t, err)
+	stored, err = attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Nil(t, stored.RetryRequest, "not inherited from the replaced execution")
+}

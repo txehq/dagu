@@ -649,3 +649,40 @@ func readFileContent(t *testing.T, path string) string {
 	require.NoError(t, err)
 	return string(data)
 }
+
+// A queued retry run locally records the retry request it was queued with
+// on every status its execution writes, through the terminal one.
+func TestLocalQueuedRetryKeepsItsRetryRequest(t *testing.T) {
+	dir := t.TempDir()
+	gate := test.ShellPath(filepath.Join(dir, "gate"))
+	work := test.ForOS(
+		fmt.Sprintf("[ -f %s ] && exit 0; exit 7", test.PosixQuote(gate)),
+		fmt.Sprintf("if (Test-Path %s) { exit 0 }; exit 7", test.PowerShellQuote(gate)),
+	)
+	f := newFixture(t, fmt.Sprintf(`
+type: graph
+name: retry-request-dag
+queue: retry-request-queue
+steps:
+  - id: work
+    run: %q
+`, work), WithQueue("retry-request-queue"), WithGlobalQueue("retry-request-queue", 1))
+
+	f.Enqueue(1).StartScheduler(60 * time.Second)
+	defer f.Stop()
+	runID := f.runIDs[0]
+	f.WaitForStatus(runID, ir.Failed, 25*time.Second)
+	failed := f.MustStatus(runID)
+	require.Nil(t, failed.RetryRequest)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gate"), []byte("open"), 0600))
+	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(failed.Name, runID), failed.AttemptID, failed.QueuedAt, "act-1", "1", "sha256:binding")
+	require.NoError(t, err)
+	_, err = queue.EnqueueRetry(f.th.Context, f.th.DAGRunRepository, f.th.QueueStore, f.dag, failed,
+		queue.EnqueueRetryOptions{Processes: f.th.ProcRepository, RetryRequest: request})
+	require.NoError(t, err)
+
+	f.WaitForStatus(runID, ir.Succeeded, 25*time.Second)
+	done := f.MustStatus(runID)
+	assert.Equal(t, request, done.RetryRequest, "the local agent's statuses keep it")
+}

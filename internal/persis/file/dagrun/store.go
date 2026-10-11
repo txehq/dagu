@@ -354,7 +354,7 @@ func (store *Store) CreateAttempt(ctx context.Context, req persis.DAGRunCreateAt
 		// The new attempt becomes the latest before the lock is released, so
 		// every later admission (another conditional retry, a queued retry's
 		// compare-and-swap) sees that the expected execution was consumed.
-		if err := claimLatest(ctx, attempt, claimFrom); err != nil {
+		if err := claimLatest(ctx, attempt, claimFrom, req.ExpectLatest.Request); err != nil {
 			return nil, err
 		}
 	}
@@ -634,9 +634,11 @@ func (store *Store) checkLatestExecution(ctx context.Context, run *DAGRun, want 
 // retried execution's checkpoint and queued-at, not started, under the new
 // attempt. If the retry is never dispatched, a later retry of the run still
 // starts from that checkpoint rather than from fresh steps.
-func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus) error {
+func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus, request *ir.RetryRequest) error {
 	status := *source
 	status.AttemptID, status.AttemptKey, status.Status = attempt.ID(), "", ir.NotStarted
+	// The new execution records its own request, never the retried one's.
+	status.RetryRequest = request.Clone()
 	// QueuedAt is kept: a direct retry's statuses carry the retried
 	// status's queued-at, so the claim names the execution the retry's
 	// receipt names.
