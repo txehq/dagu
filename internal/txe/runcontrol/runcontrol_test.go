@@ -4,6 +4,7 @@
 package runcontrol
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -54,4 +55,85 @@ func TestLatestAttemptReportsAPreparation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, prepared, latest.AttemptID)
 	assert.False(t, latest.Preparing, "handed to a worker")
+}
+
+// preparedRun is a run whose failed execution is followed by a retry
+// preparation the coordinator has journaled and not yet handed to a worker.
+type preparedRun struct {
+	c               *Control
+	runs            *persis.DAGRunRepository
+	dir             string
+	first, prepared string
+}
+
+func newPreparedRun(t *testing.T) preparedRun {
+	t.Helper()
+	ctx := t.Context()
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "job", YamlData: []byte("steps:\n  - name: s\n    run: true\n")}
+	write := func(opts persis.DAGRunCreateAttemptOptions, st ir.Status) string {
+		attempt, err := runs.CreateAttempt(ctx, dag, time.Now(), "run-1", opts)
+		require.NoError(t, err)
+		status := ir.InitialStatus(dag)
+		status.DAGRunID, status.AttemptID, status.Status = "run-1", attempt.ID(), st
+		require.NoError(t, attempt.Open(ctx))
+		require.NoError(t, attempt.Write(ctx, status))
+		require.NoError(t, attempt.Close(ctx))
+		return attempt.ID()
+	}
+	first := write(persis.DAGRunCreateAttemptOptions{}, ir.Failed)
+	prepared := write(persis.DAGRunCreateAttemptOptions{Retry: true, TrackPreparation: true}, ir.NotStarted)
+	return preparedRun{c: &Control{Runs: runs}, runs: runs, dir: dir, first: first, prepared: prepared}
+}
+
+// The coordinator abandons the preparation between the read of the latest
+// execution and the journal read: it hides the attempt, then ends the entry.
+// The preparation is not reported as dispatched; the restored execution is
+// read again and reported.
+func TestLatestAttemptNeverReportsAnAbandonedPreparationAsDispatched(t *testing.T) {
+	ctx := t.Context()
+	p := newPreparedRun(t)
+	c, runs, first, prepared := p.c, p.runs, p.first, p.prepared
+	run := ir.NewDAGRunRef("job", "run-1")
+	abandoned := false
+	c.afterLatestRead = func() {
+		if abandoned {
+			return
+		}
+		abandoned = true
+		expected := persis.ExecutionIdentity{AttemptID: first}
+		_, err := runs.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: persis.AttemptAbandonment{
+			Schema: persis.AttemptAbandonmentSchema, Run: run, RootRun: run, AbandonedAttemptID: prepared,
+			AbandonedExecution: persis.ExecutionIdentity{AttemptID: prepared}, ExpectedExecution: &expected,
+			Reason: persis.AbandonedRetryPreparation, DecidedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Evidence: persis.AbandonmentEvidence{
+				DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+				ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent,
+				ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		}})
+		require.NoError(t, err)
+		require.NoError(t, runs.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: prepared}))
+	}
+
+	latest, err := c.LatestAttempt(ctx, "job", "run-1")
+	require.NoError(t, err)
+	assert.True(t, abandoned)
+	assert.Equal(t, first, latest.AttemptID, "the restored execution, read again")
+	assert.False(t, latest.Preparing)
+}
+
+// A journal entry that cannot be read is an error, never evidence that the
+// attempt was dispatched.
+func TestLatestAttemptFailsOnAnUnreadablePreparation(t *testing.T) {
+	p := newPreparedRun(t)
+	entries, err := filepath.Glob(filepath.Join(p.dir, "runs.preparations", "*.json"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.NoError(t, os.WriteFile(entries[0], []byte("{"), 0o600))
+
+	_, err = p.c.LatestAttempt(t.Context(), "job", "run-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "preparation journal")
 }

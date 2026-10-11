@@ -25,7 +25,10 @@ import (
 
 const preparationExt = ".json"
 
-var _ persis.DAGRunPreparationJournal = (*Store)(nil)
+var (
+	_ persis.DAGRunPreparationJournal = (*Store)(nil)
+	_ persis.DAGRunPreparationLookup  = (*Store)(nil)
+)
 
 // defaultPreparationDir keeps the journal beside the run tree rather than in
 // it: every directory under the base directory is read as a DAG's runs.
@@ -93,6 +96,27 @@ func (store *Store) ListAttemptPreparations(ctx context.Context) ([]persis.Attem
 		return preparations[i].PreparedAt < preparations[j].PreparedAt
 	})
 	return preparations, nil
+}
+
+// AttemptPrepared implements persis.DAGRunPreparationLookup: it reads the
+// one entry the attempt would have, and an entry that exists but cannot be
+// read, or names another attempt, is an error rather than absent.
+func (store *Store) AttemptPrepared(_ context.Context, run, root ir.DAGRunRef, attemptID string) (bool, error) {
+	if root.Zero() {
+		root = run
+	}
+	want := persis.AttemptPreparation{Run: run, RootRun: root, AttemptID: attemptID}
+	entry, err := readPreparation(store.preparationPath(want))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read the attempt preparation: %w", err)
+	}
+	if entry.Run != run || entry.RootRun != root || entry.AttemptID != attemptID {
+		return false, errors.New("the attempt preparation entry names another attempt")
+	}
+	return true, nil
 }
 
 // EndAttemptPreparation implements persis.DAGRunPreparationJournal.

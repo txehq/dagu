@@ -250,6 +250,27 @@ type DAGRunPreparationJournal interface {
 	EndAttemptPreparation(ctx context.Context, preparation AttemptPreparation) error
 }
 
+// DAGRunPreparationLookup is implemented by journals that can answer for one
+// attempt strictly, unlike ListAttemptPreparations, which skips entries it
+// cannot read.
+type DAGRunPreparationLookup interface {
+	// AttemptPrepared reports whether the journal holds the attempt's entry:
+	// false when it holds none, an error when the entry exists but cannot be
+	// read or names another attempt.
+	AttemptPrepared(ctx context.Context, run, root ir.DAGRunRef, attemptID string) (bool, error)
+}
+
+// AttemptPrepared reports whether the preparation journal holds the attempt
+// (see DAGRunPreparationLookup). A store without one never abandons
+// attempts and returns ErrAttemptAbandonmentUnsupported.
+func (r *DAGRunRepository) AttemptPrepared(ctx context.Context, run, root ir.DAGRunRef, attemptID string) (bool, error) {
+	lookup, ok := r.store.(DAGRunPreparationLookup)
+	if !ok {
+		return false, ErrAttemptAbandonmentUnsupported
+	}
+	return lookup.AttemptPrepared(ctx, run, root, attemptID)
+}
+
 // ListAttemptPreparations lists the preparation journal.
 func (r *DAGRunRepository) ListAttemptPreparations(ctx context.Context) ([]AttemptPreparation, error) {
 	journal, ok := r.store.(DAGRunPreparationJournal)
