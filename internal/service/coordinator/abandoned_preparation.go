@@ -190,6 +190,12 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
 				tag.RunID(p.Run.ID), tag.AttemptID(record.AbandonedAttemptID))
 		case errors.Is(err, persis.ErrAttemptNotAbandonable), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+			if h.supersededByAPreparation(ctx, p) {
+				// The latest attempt is another preparation. If it is
+				// abandoned, this attempt is the latest again and is still to
+				// be judged, so its entry stays.
+				continue
+			}
 			// Settled: nothing of this preparation is left to abandon.
 			h.endPreparation(ctx, p.Run, p.RootRun, p.AttemptID)
 		default:
@@ -197,6 +203,26 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 				tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
 		}
 	}
+}
+
+// supersededByAPreparation reports whether the run's latest attempt is
+// another attempt that is itself still in the preparation journal. Anything
+// it cannot read keeps the entry: it is re-examined on the next pass.
+func (h *Handler) supersededByAPreparation(ctx context.Context, p persis.AttemptPreparation) bool {
+	latest, err := h.findRunAttempt(ctx, p.Run, p.RootRun)
+	switch {
+	case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return false
+	case err != nil:
+		return true
+	case latest.ID() == p.AttemptID:
+		return false
+	}
+	prepared, err := h.dagRunRepository.AttemptPrepared(ctx, p.Run, p.RootRun, latest.ID())
+	if errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+		return false
+	}
+	return err != nil || prepared
 }
 
 // refuseAbandonedClaim refuses a claim of an attempt's execution that was
