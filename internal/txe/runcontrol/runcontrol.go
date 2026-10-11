@@ -102,6 +102,10 @@ func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (reg
 	if err != nil {
 		return registry.RunAttempt{}, err
 	}
+	preparing, err := c.preparing(ctx, ir.NewDAGRunRef(dagName, runID), id)
+	if err != nil {
+		return registry.RunAttempt{}, err
+	}
 	return registry.RunAttempt{
 		AttemptID:  id,
 		QueuedAt:   status.QueuedAt,
@@ -112,7 +116,28 @@ func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (reg
 		ArchiveDir: status.ArchiveDir,
 		Finished:   !status.Status.IsActive() && status.Status != ir.NotStarted,
 		Succeeded:  status.Status.IsSuccess(),
+		Preparing:  preparing,
 	}, nil
+}
+
+// preparing reports whether the root run's attempt is still in the store's
+// preparation journal: created for a worker but not yet handed to one, so
+// the coordinator may still abandon it. A store without a journal never
+// abandons attempts.
+func (c *Control) preparing(ctx context.Context, run ir.DAGRunRef, attemptID string) (bool, error) {
+	entries, err := c.Runs.ListAttemptPreparations(ctx)
+	if errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read preparation journal: %w", err)
+	}
+	for _, e := range entries {
+		if e.Run == run && e.AttemptID == attemptID && (e.RootRun.Zero() || e.RootRun == run) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (c *Control) findAttempt(ctx context.Context, dagName string, run registry.RunRef) (dagrun.Attempt, error) {

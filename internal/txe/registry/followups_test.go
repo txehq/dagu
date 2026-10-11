@@ -1025,3 +1025,43 @@ func TestStoredVersionUnderTightenedRulesStaysComparable(t *testing.T) {
 	assert.ErrorContains(t, err, `action "restart"`)
 	assert.ErrorContains(t, err, "draft")
 }
+
+// A run whose latest execution is a preparation Dagu may still abandon is
+// neither moved on nor retried: authorization is refused for now, the
+// decided retry stays in the queue, and when the preparation is abandoned
+// (the retried execution is the latest again) the decision still binds. A
+// receipt naming a preparation is no receipt; once dispatched it is.
+func TestAPreparationNeitherSupersedesNorSatisfiesARetry(t *testing.T) {
+	r := newRetryFixture(t)
+	failed := failedAttempt("a1", r.job.DAGSpecSHA256)
+	r.rc.attempts["run-1"] = failed
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+
+	// Another retry's preparation makes b2 the visible latest attempt.
+	preparing := RunAttempt{AttemptID: "b2", SpecSHA256: r.job.DAGSpecSHA256, Status: "not_started", Preparing: true}
+	r.rc.attempts["run-1"] = preparing
+	_, _, err = r.authorize(p, d, ec)
+	assert.Equal(t, CodeNotReady, code(t, err), "refused for now, not stale")
+	var re *Error
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, ExecutionPreparing{RunID: "run-1", Execution: preparing.Ref()}, re.Current)
+	affected, err := r.f.store.EndMovedOnRetries(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.Empty(t, affected, "a preparation does not end the decision")
+	got, err := r.f.store.GetJob(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, ProposalDecided, got.Proposals[p.ProposalID].State)
+
+	// Dagu abandons b2: a1 is the latest again and the decision binds.
+	r.rc.attempts["run-1"] = failed
+	act, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+
+	// The retry's own attempt a3 is still being prepared: no receipt yet.
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a3", SpecSHA256: r.job.DAGSpecSHA256, Status: "not_started", Preparing: true}
+	assert.Equal(t, CodeNotReady, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", ""))), "a preparation is no receipt")
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a3", SpecSHA256: r.job.DAGSpecSHA256, Status: "not_started"}
+	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", "")), "dispatched to a worker, it is")
+}

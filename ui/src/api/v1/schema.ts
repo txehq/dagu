@@ -4328,7 +4328,7 @@ export interface paths {
         put?: never;
         /**
          * Request a retry of a job's run
-         * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. The executor performs it under an execution claim; the receipt is the new attempt. A replayed idempotency_key returns the stored decision.
+         * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. While the run's latest execution is a preparation the coordinator has not yet handed to a worker (and may still abandon), proposing, authorizing or settling the retry is refused with 409 not_ready, details.current {run_id, execution}: ask again once it is dispatched or abandoned; such a run is not treated as moved on. The executor performs it under an execution claim; the receipt is the new execution, once dispatched. A replayed idempotency_key returns the stored decision.
          */
         post: operations["requestTxeRunRetry"];
         delete?: never;

@@ -251,6 +251,10 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 		return stale("is not a run of this job")
 	case err != nil:
 		return err
+	case latest.Preparing:
+		// Not stale yet: if Dagu abandons the preparation, the named
+		// execution is the latest again and the decision still binds.
+		return preparingRefusal(rp.RunID, latest, "ask again")
 	case latest.AttemptID != rp.AttemptID || latest.QueuedAt != rp.QueuedAt:
 		return stale("is now at execution " + latest.Ref() + ", not " + ExecutionRef(rp.AttemptID, rp.QueuedAt))
 	case !latest.Finished || latest.Succeeded:
@@ -289,9 +293,11 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 	return nil
 }
 
-// checkRetryReceipt allows a retry to succeed only with the new attempt Dagu
-// was observed to start: the run's latest attempt, and not the retried one.
-// The receipt names that attempt; an accepted request alone is no receipt.
+// checkRetryReceipt allows a retry to succeed only with the new execution
+// Dagu dispatched: the run's latest execution, not the retried one, and not
+// a preparation Dagu may still abandon (once handed to a worker, it runs or
+// fails, but is never withdrawn). The receipt names that execution; an
+// accepted request alone is no receipt.
 func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	var rp RetryRunParams
 	if err := decodeParams(a.Spec.Params, &rp); err != nil {
@@ -303,6 +309,9 @@ func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	latest, err := tx.store.runs.LatestAttempt(tx.ctx, tx.Job.JobID, rp.RunID)
 	if err != nil {
 		return err
+	}
+	if latest.Preparing && receipt == latest.Ref() {
+		return preparingRefusal(rp.RunID, latest, "settle the retry")
 	}
 	retried := ExecutionRef(rp.AttemptID, rp.QueuedAt)
 	if receipt == retried || receipt != latest.Ref() {
@@ -442,7 +451,8 @@ func (tx *JobTx) takeResolution(prior string, a *Action) error {
 // that can never be executed because their run moved on (or no longer
 // binds: another execution, version or package), so they leave the
 // decision queue instead of waiting forever. A retry being executed is
-// left alone.
+// left alone, and so is one whose run has an execution still being
+// prepared: Dagu may abandon it and the decision bind again.
 func (tx *JobTx) EndMovedOnRetries() ([]Affected, error) {
 	var affected []Affected
 	for _, p := range sortedProposals(tx.Job.Proposals) {
@@ -454,7 +464,7 @@ func (tx *JobTx) EndMovedOnRetries() ([]Affected, error) {
 			return nil, err
 		}
 		err := tx.checkRunBinding(rp, false)
-		if err == nil {
+		if err == nil || isPreparing(err) {
 			continue
 		}
 		if ErrorCode(err) != CodeStaleBinding {
