@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	_ "time/tzdata" // Resolve named time zones on hosts without zoneinfo, such as Windows
 
@@ -27,6 +28,11 @@ operations, or remote commands.
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
+		// A command may choose its exit code, as `dagu txe resource check`
+		// does so a DAG step can tell "do not run" from "could not check".
+		if coded, ok := errors.AsType[*cmd.ExitCodeError](err); ok {
+			os.Exit(coded.Code)
+		}
 		os.Exit(1)
 	}
 }
