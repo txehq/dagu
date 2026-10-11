@@ -181,7 +181,8 @@ func (store *Store) preparationSettledLocked(ctx context.Context, root DataRoot,
 	for _, dir := range dirs {
 		att, err := run.AttemptByDir(dir, store.cache)
 		if err != nil {
-			continue
+			// Unknown, not settled: the entry stays for the next pass.
+			return false, fmt.Errorf("failed to open attempt %s: %w", dir, err)
 		}
 		if att.ID() == p.AttemptID {
 			if att.Hidden() {
