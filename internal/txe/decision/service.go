@@ -454,9 +454,11 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID string, req RetryReques
 		same = params.RunID == req.RunID && params.AttemptID == req.AttemptID &&
 			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion
 	}
+	// The stored decision is not returned with the refusal: it may retry a
+	// run the caller cannot see.
 	if !same {
 		return nil, true, &registry.Error{Code: CodeIdempotencyMismatch,
-			Message: "idempotency key was used for a different retry request", Current: d}
+			Message: "idempotency key was used for a different retry request"}
 	}
 	d.NativeResume = registry.CurrentNativeResume(job, d)
 	return &Result{Job: job, Proposal: p, Decision: d, AlreadyRecorded: true}, true, nil

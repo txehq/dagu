@@ -378,6 +378,23 @@ func TestTxeDecisionChecksWorkspace(t *testing.T) {
 // registerTxeJobHTTP registers a ready job over HTTP and returns its ID.
 func registerTxeJobHTTP(t *testing.T, c txeHTTPClient) string {
 	t.Helper()
+	return registerTxeJobHTTPIn(t, c, "")
+}
+
+// txeJobSpec is a registered job's DAG on machine, labelled with workspace
+// (none when empty).
+func txeJobSpec(machine, workspace string) string {
+	labels := ""
+	if workspace != "" {
+		labels = fmt.Sprintf("labels:\n  - workspace=%s\n", workspace)
+	}
+	return labels + fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)
+}
+
+// registerTxeJobHTTPIn is registerTxeJobHTTP for a job whose DAG is in
+// workspace.
+func registerTxeJobHTTPIn(t *testing.T, c txeHTTPClient, workspace string) string {
+	t.Helper()
 	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
 	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
 	c.Post("/api/v1/txe/owners", map[string]any{"owner_id": owner, "display_name": "Connor", "actor": cli}).
@@ -395,13 +412,73 @@ func registerTxeJobHTTP(t *testing.T, c txeHTTPClient) string {
 		"version": map[string]any{
 			"title": "Volume monitor", "purpose": "Watch the fixture volume",
 			"package": map[string]any{"digest": digest, "path": "/pkg", "entrypoint": "run.sh"},
-			"dag":     map[string]any{"spec": fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", machine)},
+			"dag":     map[string]any{"spec": txeJobSpec(machine, workspace)},
 		},
 	}).ExpectStatus(http.StatusCreated).Send(t)
 	c.Post("/api/v1/txe/jobs/"+jobID+"/ready", map[string]any{
 		"package": map[string]any{"digest": digest, "path": "/pkg", "machine_id": machine}, "actor": cli,
 	}).ExpectStatus(http.StatusOK).Send(t)
 	return jobID
+}
+
+// A replay is answered only to a caller who can see the run, by the run's
+// own saved workspace. After a job moves from secret to ops, an ops-only
+// person who holds a retry's key for a run saved in secret gets 404 and
+// nothing stored; reusing the key on a run they can see is refused without
+// disclosing the stored decision.
+func TestTxeRunRetryReplayFollowsTheRunsWorkspace(t *testing.T) {
+	// Workspace-scoped people need the RBAC license.
+	server := setupBuiltinAuthServer(t)
+	token := getAdminToken(t, server)
+	admin := txeAuthedClient{c: server.Client(), token: token}
+	for _, ws := range []string{"secret", "ops"} {
+		server.Client().Post("/api/v1/workspaces", api.CreateWorkspaceRequest{Name: ws}).
+			WithBearerToken(token).ExpectStatus(http.StatusCreated).Send(t)
+	}
+	jobID := registerTxeJobHTTPIn(t, admin, "secret")
+	seedFailedTxeRun(t, server, jobID, "run-secret-1")
+	seen, queued := txeExecution(t, admin, jobID, "run-secret-1")
+	var job api.TxeJob
+	admin.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	secretPath := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-secret-1")
+	body := retryBody("moved-retry-1", job.Version, seen, queued)
+	var first api.TxeDecisionResponse
+	admin.Post(secretPath, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
+
+	// The job moves to ops; the run keeps its saved DAG in secret.
+	var version api.TxeJobVersion
+	admin.Get(fmt.Sprintf("/api/v1/txe/jobs/%s/versions/%d", jobID, job.Version)).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &version)
+	admin.Post("/api/v1/txe/jobs/"+jobID+"/versions", map[string]any{
+		"request_id": "move-1", "expected_version": job.Version, "actor": map[string]any{"kind": "cli", "id": "cc4-test"},
+		"version": map[string]any{
+			"title": version.Title, "purpose": version.Purpose,
+			"package": map[string]any{"digest": version.Package.Digest, "path": version.Package.Path, "entrypoint": version.Package.Entrypoint},
+			"dag":     map[string]any{"spec": txeJobSpec(job.MachineId, "ops")},
+		},
+	}).ExpectStatus(http.StatusOK).Send(t)
+
+	server.Client().Post("/api/v1/users", api.CreateUserRequest{Username: "opsdev", Password: "opsdevpass1", Role: api.UserRoleViewer,
+		WorkspaceAccess: &api.WorkspaceAccess{All: false, Grants: []api.WorkspaceGrant{{Workspace: "ops", Role: api.UserRoleOperator}}}}).
+		WithBearerToken(token).ExpectStatus(http.StatusCreated).Send(t)
+	ops := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "opsdev", "opsdevpass1")}
+
+	resp := ops.Post(secretPath, body).ExpectStatus(http.StatusNotFound).Send(t)
+	require.NotContains(t, resp.Body, first.Decision.DecisionId)
+
+	// A run saved in ops is one the person can see; the key names another
+	// request, and the refusal does not carry the stored decision.
+	seedFailedTxeRun(t, server, jobID, "run-ops-1")
+	opsSeen, opsQueued := txeExecution(t, admin, jobID, "run-ops-1")
+	var now api.TxeJob
+	admin.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &now)
+	var mismatch api.Error
+	resp = ops.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-ops-1"),
+		retryBody("moved-retry-1", now.Version, opsSeen, opsQueued)).ExpectStatus(http.StatusConflict).Send(t)
+	resp.Unmarshal(t, &mismatch)
+	require.NotNil(t, mismatch.Details)
+	require.Equal(t, string(decision.CodeIdempotencyMismatch), (*mismatch.Details)["code"])
+	require.NotContains(t, *mismatch.Details, "current")
+	require.NotContains(t, resp.Body, first.Decision.DecisionId)
 }
 
 // seedFailedTxeRun writes a failed attempt of the job's saved DAG, as a run
