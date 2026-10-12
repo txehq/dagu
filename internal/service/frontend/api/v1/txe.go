@@ -68,7 +68,30 @@ func txeError(err error) error {
 		// Refused against current state: 409 with the record to re-read.
 	}
 	if re.Current != nil {
-		out.Details["current"] = re.Current
+		out.Details["current"] = txePublicCurrent(re.Current)
+	}
+	return out
+}
+
+// txePublicCurrent is the record a refusal returns, in its API shape: a
+// registry record can carry fields the API never publishes (a manifest's
+// absolute archive directory, a registration's request hash), so known
+// records are converted and a record that cannot be is left out.
+func txePublicCurrent(current any) any {
+	var (
+		out any
+		err error
+	)
+	switch c := current.(type) {
+	case *registry.Job:
+		out, err = txeConvert[api.TxeJob](c)
+	case *registry.ArtifactManifest:
+		out, err = txeConvert[api.TxeArtifactManifest](c)
+	default:
+		return current
+	}
+	if err != nil {
+		return nil
 	}
 	return out
 }
@@ -458,10 +481,28 @@ func (a *API) RegisterTxeJob(ctx context.Context, req api.RegisterTxeJobRequestO
 		MachineID: body.MachineId, JobKey: body.JobKey, Version: v,
 	}, actor)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, txeError(a.txeHideDuplicateWinner(ctx, s, err))
 	}
 	out, err := txeConvert[api.TxeJob](job)
 	return api.RegisterTxeJob201JSONResponse(out), err
+}
+
+// txeHideDuplicateWinner keeps a duplicate refusal from disclosing a winner
+// the caller cannot see: the refusal then names neither its ID nor its
+// record. A visible winner is returned as before, so its owner can adopt it.
+func (a *API) txeHideDuplicateWinner(ctx context.Context, s *registry.Store, err error) error {
+	re, ok := errors.AsType[*registry.Error](err)
+	if !ok || re.Code != registry.CodeDuplicate {
+		return err
+	}
+	winner, ok := re.Current.(*registry.Job)
+	if !ok {
+		return err
+	}
+	if visErr := a.txeJobVisible(ctx, s, winner); visErr == nil {
+		return err
+	}
+	return &registry.Error{Code: registry.CodeDuplicate, Message: "job key already registered"}
 }
 
 func (a *API) GetTxeJob(ctx context.Context, req api.GetTxeJobRequestObject) (api.GetTxeJobResponseObject, error) {

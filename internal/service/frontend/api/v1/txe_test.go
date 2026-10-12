@@ -350,6 +350,44 @@ func TestTxeAPIUpdateConflictDisclosesNothing(t *testing.T) {
 	}
 }
 
+// A registration that loses deduplication to a job the caller cannot see is
+// refused without that job's ID or record; a visible winner is named.
+func TestTxeAPIDuplicateDisclosesNoHiddenWinner(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	secretJob, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	opsJob, err := f.register(txeOps, "ops")
+	require.NoError(t, err)
+
+	register := func(jobKey string) error {
+		spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+		_, err := a.RegisterTxeJob(txeOps, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+			JobId: mint(t, registry.PrefixJob), RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: jobKey,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			},
+		}})
+		return err
+	}
+
+	err = register("key:" + secretJob)
+	requireStatus(t, err, http.StatusConflict)
+	var apiErr *apiv1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "duplicate", apiErr.Details["code"])
+	assert.NotContains(t, apiErr.Details, "current", "the hidden winner's record")
+	assert.NotContains(t, apiErr.Message, secretJob, "the hidden winner's ID")
+
+	err = register("key:" + opsJob)
+	requireStatus(t, err, http.StatusConflict)
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Details, "current", "a visible winner is returned")
+	assert.Contains(t, apiErr.Message, opsJob)
+}
+
 // Only a signed-in person reactivates a retired job. An API key cannot claim
 // to be human, and the descriptive actor fields never make it one.
 func TestTxeAPIReactivateNeedsHumanPrincipal(t *testing.T) {
