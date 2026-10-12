@@ -1417,8 +1417,7 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 				err = &registry.Error{Code: re.Code, Message: re.Message}
 			}
 		}
-		var apiErr *Error
-		if errors.As(err, &apiErr) {
+		if _, ok := errors.AsType[*Error](err); ok {
 			return nil, err
 		}
 		return nil, txeError(err)
