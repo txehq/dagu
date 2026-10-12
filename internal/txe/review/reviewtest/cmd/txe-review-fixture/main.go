@@ -29,7 +29,8 @@ import (
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "txe-review-fixture:", err)
-		os.Exit(1)
+		// As dagu itself exits: the decision DAG waits on this code alone.
+		os.Exit(review.StepExitCode(err))
 	}
 }
 

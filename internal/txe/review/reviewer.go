@@ -114,6 +114,21 @@ const MaxClaimTTL = 20 * time.Minute
 // failure.
 const ExitClaimHeld = 75
 
+// StepExitCode is the exit code of a step process that ended with err: the
+// claim-held code when the job is claimed by another holder, and the
+// ordinary failure code for anything else. Every command that runs the
+// execute step uses it, so the code the decision DAG waits on means one
+// thing wherever the step comes from.
+func StepExitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, ErrClaimHeld):
+		return ExitClaimHeld
+	}
+	return 1
+}
+
 func (r *Reviewer) claimTTL() time.Duration {
 	if r.ClaimTTL > 0 {
 		return r.ClaimTTL

@@ -264,8 +264,8 @@ func runTXEReviewExecute(ctx *Context, _ []string) error {
 // alone exits with review.ExitClaimHeld; every other failure keeps the
 // ordinary failure code and is not retried.
 func txeReviewExecuteExit(err error) error {
-	if err != nil && errors.Is(err, review.ErrClaimHeld) {
-		return &ExitCodeError{Code: review.ExitClaimHeld, Err: err}
+	if code := review.StepExitCode(err); code == review.ExitClaimHeld {
+		return &ExitCodeError{Code: code, Err: err}
 	}
 	return err
 }

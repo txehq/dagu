@@ -228,8 +228,13 @@ files.
   when the job is claimed by another holder, and is retried on that code
   alone, once a minute, 22 times, which is longer than a claim lives. Each
   try reads the decision, the proposal and the job again, so an approval
-  that stopped holding while it waited runs nothing, and the registry
-  grants the action once whatever is tried. Any other failure of the step
+  that stopped holding while it waited runs nothing. Tries do not add
+  up to more than the registry allows: an action that succeeded is never
+  granted again, one whose outcome is unknown is settled by a probe or a
+  person before anything else, and a further attempt after a failure
+  follows the job's attempt limit. The decision DAG carries its own run
+  timeout (the waits, one whole try, and five minutes), so a shorter
+  timeout in a base configuration cannot end the wait early. Any other failure of the step
   is not retried and fails the run. If the worker is interrupted again
   during that wait, or the wait runs out, the decision run ends failed and
   a person retries it from the dashboard; the approval is not lost and

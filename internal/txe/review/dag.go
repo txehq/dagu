@@ -59,6 +59,20 @@ type DAGConfig struct {
 // when the claim ends.
 const claimWaitMargin = 2 * time.Minute
 
+// DecideTimeoutSec bounds the decision run's process once a person has
+// answered: all the waits for a claimed job, one whole try of the execute
+// step, and room to end. It is rendered into the decision DAG so that the
+// run has a timeout of its own and never inherits a shorter one from a
+// base configuration, which would end the wait before the claim does.
+// Waiting for the person holds no process and is not bounded by it.
+func (c DAGConfig) DecideTimeoutSec() int {
+	return c.ClaimWaitRetries()*c.ClaimWaitIntervalSec + c.TimeoutSec + int(decideEndMargin/time.Second)
+}
+
+// decideEndMargin is the room the decision run has beyond its waits and one
+// try of the execute step.
+const decideEndMargin = 5 * time.Minute
+
 // ClaimWaitRetries is how many times the execute step is retried while the
 // job is claimed by another holder: enough that the waits alone, without
 // counting the tries, last longer than MaxClaimTTL plus a margin.
