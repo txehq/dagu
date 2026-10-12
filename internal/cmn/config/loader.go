@@ -11,10 +11,12 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -299,6 +301,7 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	l.loadEventStoreConfig(&cfg, def)
 
 	// Load service-specific sections
+	var licenseErr error
 	sectionLoaders := []struct {
 		section ConfigSection
 		load    func()
@@ -313,13 +316,16 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 		{SectionMonitoring, func() { l.loadMonitoringConfig(&cfg, def) }},
 		{SectionGitSync, func() { l.loadGitSyncConfig(&cfg, def) }},
 		{SectionTunnel, func() { l.loadTunnelConfig(&cfg, def) }},
-		{SectionLicense, func() { l.loadLicenseConfig(&cfg, def) }},
+		{SectionLicense, func() { licenseErr = l.loadLicenseConfig(&cfg, def) }},
 	}
 
 	for _, sl := range sectionLoaders {
 		if l.requires(sl.section) {
 			sl.load()
 		}
+	}
+	if licenseErr != nil {
+		return nil, licenseErr
 	}
 
 	l.loadCacheConfig(&cfg, def)
@@ -1702,12 +1708,144 @@ func setDefaultIfNotPositive(target *int, defaultValue int) {
 	}
 }
 
-func (l *ConfigLoader) loadLicenseConfig(cfg *Config, def Definition) {
-	if def.License == nil {
-		return
+func (l *ConfigLoader) loadLicenseConfig(cfg *Config, def Definition) error {
+	if def.License != nil {
+		cfg.License.Key = def.License.Key
+		cfg.License.CloudURL = def.License.CloudURL
 	}
-	cfg.License.Key = def.License.Key
-	cfg.License.CloudURL = def.License.CloudURL
+	return l.loadLicenseForkPolicy(cfg)
+}
+
+const (
+	licenseForkPolicyKey     = "license.fork_policy"
+	licenseForkFeaturesKey   = licenseForkPolicyKey + ".features"
+	licenseForkMaxAPIKeysKey = licenseForkPolicyKey + ".max_api_keys"
+
+	licenseForkFeaturesEnv   = "LICENSE_FORK_FEATURES"
+	licenseForkMaxAPIKeysEnv = "LICENSE_FORK_MAX_API_KEYS"
+)
+
+// loadLicenseForkPolicy reads the fork policy from the raw values rather than
+// the decoded definition. The decoder converts loosely (true becomes 1, 2.5
+// becomes 2), and a policy that opens gates must not be read from a value the
+// operator did not write. A value that cannot be read exactly is an error.
+func (l *ConfigLoader) loadLicenseForkPolicy(cfg *Config) error {
+	// An environment variable that is set to nothing is invisible to the
+	// loader, which reads it as unset everywhere else. Here that would leave a
+	// policy from the config file in force when the operator set the variable
+	// to empty to switch it off, so it is refused instead.
+	for _, env := range []string{licenseForkFeaturesEnv, licenseForkMaxAPIKeysEnv} {
+		name := strings.ToUpper(AppSlug) + "_" + env
+		if value, set := os.LookupEnv(name); set && value == "" {
+			return fmt.Errorf("%s is set but empty: unset it, or give it a value", name)
+		}
+	}
+
+	for key := range l.v.GetStringMap(licenseForkPolicyKey) {
+		if key != "features" && key != "max_api_keys" {
+			return fmt.Errorf("%s: unknown key %q (allowed: features, max_api_keys)", licenseForkPolicyKey, key)
+		}
+	}
+
+	features, err := parseLicenseForkFeatures(l.v.Get(licenseForkFeaturesKey))
+	if err != nil {
+		return err
+	}
+	cfg.License.ForkPolicy.Features = features
+
+	maxAPIKeys, err := parseLicenseForkMaxAPIKeys(l.v.Get(licenseForkMaxAPIKeysKey))
+	if err != nil {
+		return err
+	}
+	cfg.License.ForkPolicy.MaxAPIKeys = maxAPIKeys
+	return nil
+}
+
+// parseLicenseForkFeatures accepts a list of names, or one comma-separated
+// string as an environment variable gives it. Names are kept as written, apart
+// from surrounding spaces, and are checked when the configuration is validated.
+func parseLicenseForkFeatures(input any) ([]string, error) {
+	var names []string
+	switch v := input.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		names = strings.Split(v, ",")
+	case []string:
+		names = v
+	case []any:
+		for _, item := range v {
+			name, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s: every entry must be a feature name, got %v", licenseForkFeaturesKey, item)
+			}
+			names = append(names, name)
+		}
+	default:
+		return nil, fmt.Errorf("%s must be a list of feature names, got %v", licenseForkFeaturesKey, input)
+	}
+
+	_, asString := input.(string)
+	var features []string
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			// A blank between commas in the string form is not a name.
+			if asString {
+				continue
+			}
+			return nil, fmt.Errorf("%s: a feature name is empty", licenseForkFeaturesKey)
+		}
+		if !slices.Contains(features, name) {
+			features = append(features, name)
+		}
+	}
+	if asString && len(features) == 0 {
+		// A blank string would otherwise replace a configured list with none,
+		// for instance when it comes from the environment over a config file.
+		return nil, fmt.Errorf("%s is blank: name at least one feature, or use [] in the config file to list none", licenseForkFeaturesKey)
+	}
+	return features, nil
+}
+
+// parseLicenseForkMaxAPIKeys accepts a whole number, or its decimal text as an
+// environment variable gives it.
+func parseLicenseForkMaxAPIKeys(input any) (*int, error) {
+	invalid := func() (*int, error) {
+		return nil, fmt.Errorf("%s must be a whole number (0 means no limit), got %v", licenseForkMaxAPIKeysKey, input)
+	}
+	var limit int
+	switch v := input.(type) {
+	case nil:
+		return nil, nil
+	case int:
+		limit = v
+	case int64:
+		if v != int64(int(v)) {
+			return invalid()
+		}
+		limit = int(v)
+	case uint64:
+		if v > math.MaxInt32 {
+			return invalid()
+		}
+		limit = int(v)
+	case float32, float64:
+		// A whole number in YAML arrives as an integer. A float is refused
+		// even when it looks whole: 2.0000000000000001 is read as exactly 2.
+		return invalid()
+	case string:
+		// A blank string is refused like any other non-number: reading it as
+		// "unset" would let it replace a configured limit with the community one.
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("%s must be a whole number (0 means no limit), got %q", licenseForkMaxAPIKeysKey, v)
+		}
+		limit = n
+	default:
+		return invalid()
+	}
+	return &limit, nil
 }
 
 func (l *ConfigLoader) loadExecutionModeConfig(cfg *Config, _ Definition) {
@@ -2308,6 +2446,8 @@ var envBindings = []envBinding{
 	// License
 	{key: "license.key", env: "LICENSE_KEY"},
 	{key: "license.cloud_url", env: "LICENSE_CLOUD_URL"},
+	{key: licenseForkFeaturesKey, env: licenseForkFeaturesEnv},
+	{key: licenseForkMaxAPIKeysKey, env: licenseForkMaxAPIKeysEnv},
 
 	// GitSync
 	{key: "git_sync.enabled", env: "GITSYNC_ENABLED"},

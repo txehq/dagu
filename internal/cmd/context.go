@@ -338,8 +338,18 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 	var licMgr *license.Manager
 	switch cmd.Name() {
 	case "server", "start-all":
+		forkPolicy := licenseForkPolicy(cfg)
+		if err := forkPolicy.Validate(); err != nil {
+			return nil, err
+		}
 		pubKey, pubKeyErr := license.PublicKey()
 		if pubKeyErr != nil {
+			if !forkPolicy.IsZero() {
+				// Without a manager the gates do not agree with each other: SSO
+				// would open and RBAC and audit would stay shut. A configured
+				// policy must not start in that state.
+				return nil, fmt.Errorf("license.fork_policy is configured but the license manager could not be built: %w", pubKeyErr)
+			}
 			logger.Warn(ctx, "Failed to load license public key", tag.Error(pubKeyErr))
 			break
 		}
@@ -349,7 +359,13 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 			LicenseDir: licenseDir,
 			ConfigKey:  cfg.License.Key,
 			CloudURL:   cfg.License.CloudURL,
+			ForkPolicy: forkPolicy,
 		}, pubKey, licStore, slog.Default())
+		if applied := licMgr.ForkPolicy(); !applied.IsZero() {
+			logger.Info(ctx, "License fork policy is active; this is not a Dagu license",
+				slog.String("features", strings.Join(applied.Features, ",")),
+				slog.String("max_api_keys", forkPolicyAPIKeyLimitText(applied)))
+		}
 		if err := licMgr.Start(ctx); err != nil {
 			logger.Warn(ctx, "License manager initialization failed", tag.Error(err))
 		}

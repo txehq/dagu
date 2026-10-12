@@ -27,24 +27,14 @@ func toLicenseStatusResponse(status license.Status) api.LicenseStatusResponse {
 		Valid:       status.Valid,
 		Plan:        status.Plan,
 		Expiry:      stringutil.FormatTime(status.Expiry),
-		Features:    status.Features,
+		Features:    status.PublicFeatures(),
 		GracePeriod: status.GracePeriod,
 		GraceEndsAt: stringutil.FormatTime(status.GraceEndsAt),
 		Community:   status.Community,
-		Source:      publicLicenseSource(status.Source),
+		Source:      status.PublicSource(),
 		WarningCode: status.WarningCode,
 		Error:       status.Failure,
 	}
-}
-
-func publicLicenseSource(source license.DiscoverySource) string {
-	if source.IsEnv() {
-		return "env"
-	}
-	if source == license.SourceNone {
-		return ""
-	}
-	return "file"
 }
 
 // ActivateLicense handles license activation from the frontend.
