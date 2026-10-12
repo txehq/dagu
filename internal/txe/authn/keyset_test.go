@@ -431,6 +431,53 @@ func TestRemoteKeysRefreshBoundsAnIdleProcess(t *testing.T) {
 	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
 }
 
+// The bound holds at the smallest maximum key age, and when the set was
+// fetched by a request at a moment that is not on the host's timer. The
+// refresh that is due at half age must not still be inside the fetch limit,
+// or the failure would be noticed only after the set went stale and the bound
+// would slip by up to a minute.
+func TestRemoteKeysRefreshBoundAtTheSmallestKeyAge(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	issuer := newTestIssuerServer(t)
+	key := testRSAKeys()[0]
+	issuer.Publish(t, rsaJWK("k1", &key.PublicKey))
+	keys, err := NewRemoteKeySet(RemoteKeySetConfig{URL: issuer.URL(), MaxKeyAge: minMaxKeyAge, Now: clock.Now})
+	require.NoError(t, err)
+	verifier, err := NewVerifier(Config{
+		Issuer: testIssuer, Audience: testAudience, Clients: map[string]Class{testCLI: ClassCLI}, Keys: keys, Now: clock.Now,
+	})
+	require.NoError(t, err)
+	reason := func() Reason {
+		_, err := verifier.Verify(context.Background(), signRS256(t, key, "k1", accessClaims(clock.Now())))
+		return ReasonOf(err)
+	}
+	ctx := context.Background()
+
+	// A request fetches the set one second after a timer tick. The timer then
+	// runs on whole minutes, and the issuer is unreachable from the start.
+	clock.Advance(time.Second)
+	require.Empty(t, reason())
+	fetchedAt := clock.Now()
+	issuer.Down()
+	clock.Advance(59 * time.Second)
+	for range 15 {
+		_ = keys.Refresh(ctx)
+		clock.Advance(time.Minute)
+	}
+
+	status := keys.Status()
+	assert.True(t, status.FailingSince.Before(fetchedAt.Add(minMaxKeyAge)), "the failure was noticed before the set went stale")
+	bound := fetchedAt.Add(minMaxKeyAge + StaleKeyGrace)
+	assert.True(t, status.UsableUntil.Equal(bound), "%s after the fetch", status.UsableUntil.Sub(fetchedAt))
+
+	clock.Advance(time.Second - time.Nanosecond)
+	require.True(t, clock.Now().Equal(bound.Add(-time.Nanosecond)))
+	require.Empty(t, reason(), "the instant before the bound")
+	clock.Advance(time.Nanosecond)
+	assert.Equal(t, ReasonKeysUnavailable, reason())
+}
+
 // A set whose grace ran out is used again as soon as a fetch replaces it.
 func TestRemoteKeysRunOutSetRecovers(t *testing.T) {
 	t.Parallel()
@@ -706,12 +753,12 @@ func TestNewRemoteKeySetRefusesConfig(t *testing.T) {
 		require.Error(t, err, bad)
 	}
 	const good = "https://issuer.example/certs"
-	for _, age := range []time.Duration{0, time.Minute, time.Hour, 24 * time.Hour} {
+	for _, age := range []time.Duration{0, 10 * time.Minute, time.Hour, 24 * time.Hour} {
 		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, MaxKeyAge: age})
 		require.NoError(t, err, age.String())
 	}
 	// The largest duration would overflow when the grace is added to it.
-	for _, age := range []time.Duration{-time.Second, time.Nanosecond, time.Minute - time.Nanosecond, 24*time.Hour + time.Nanosecond, 1<<63 - 1} {
+	for _, age := range []time.Duration{-time.Second, time.Nanosecond, time.Minute, 10*time.Minute - time.Nanosecond, 24*time.Hour + time.Nanosecond, 1<<63 - 1} {
 		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, MaxKeyAge: age})
 		require.ErrorContains(t, err, "maximum key age", age.String())
 	}

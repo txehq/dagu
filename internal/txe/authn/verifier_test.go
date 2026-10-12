@@ -367,6 +367,43 @@ func TestVerifyReadsThePayloadExactly(t *testing.T) {
 	}
 }
 
+// The decoder replaces text that is not valid Unicode, so two different
+// signed subjects or sessions could come out equal. Such a value is refused.
+func TestVerifyRefusesIdentifiersThatAreNotExactText(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	const header = `{"alg":"RS256","kid":"k1","typ":"JWT"}`
+	now := f.clock.Now().Unix()
+	payload := func(sub, sid string) string {
+		return `{"iss":"` + testIssuer + `","aud":"` + testAudience + `","azp":"` + testCLI + `","typ":"Bearer","iat":` +
+			strconv.FormatInt(now, 10) + `,"exp":` + strconv.FormatInt(now+300, 10) + `,"sub":` + sub + `,"sid":` + sid + `}`
+	}
+
+	principal, err := f.verifier.Verify(context.Background(), signRawRS256(t, f.key, header, payload(`"s\u00e9"`, `"sess-\u00e9"`)))
+	require.NoError(t, err, "an ordinary escape is exact")
+	assert.Equal(t, "s\u00e9", principal.Subject)
+	assert.Equal(t, "sess-\u00e9", principal.SessionID)
+
+	for name, tt := range map[string]struct {
+		raw  string
+		want Reason
+	}{
+		"SessionUnpairedHighSurrogate":  {payload(`"s"`, `"\ud800"`), ReasonMalformed},
+		"SessionOtherUnpairedSurrogate": {payload(`"s"`, `"\ud801"`), ReasonMalformed},
+		"SessionLoneLowSurrogate":       {payload(`"s"`, `"a\udc00b"`), ReasonMalformed},
+		"SessionReplacementCharacter":   {payload(`"s"`, `"\ufffd"`), ReasonMalformed},
+		"SessionInvalidUTF8":            {payload(`"s"`, "\"\xff\""), ReasonMalformed},
+		"SubjectUnpairedSurrogate":      {payload(`"\ud800"`, `"sess"`), ReasonSubject},
+		"SubjectReplacementCharacter":   {payload(`"a\ufffd"`, `"sess"`), ReasonSubject},
+		"SubjectInvalidUTF8":            {payload("\"\xc3\x28\"", `"sess"`), ReasonMalformed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRefused(t, f, signRawRS256(t, f.key, header, tt.raw), tt.want)
+		})
+	}
+}
+
 func TestDecodeObject(t *testing.T) {
 	t.Parallel()
 
@@ -377,7 +414,7 @@ func TestDecodeObject(t *testing.T) {
 	for _, raw := range []string{
 		``, ` `, `null`, `[]`, `"x"`, `1`,
 		`{"a":1}{"a":2}`, `{"a":1} {"a":2}`, `{"a":1}x`, `{"a":1},`, `{"a":1}]`, `{"a":1} null`,
-		`{"a":1`, `{a:1}`,
+		`{"a":1`, `{a:1}`, "{\"a\":\"\xff\"}",
 	} {
 		_, err := decodeObject([]byte(raw))
 		require.Error(t, err, "%q", raw)

@@ -58,8 +58,10 @@ const (
 	minRefetchInterval = time.Minute
 
 	defaultMaxKeyAge = time.Hour
-	minMaxKeyAge     = minRefetchInterval
-	maxMaxKeyAge     = 24 * time.Hour
+	// minMaxKeyAge keeps half the maximum age well above the fetch limit, so
+	// that a Refresh that is due at half age is never still inside it.
+	minMaxKeyAge = 10 * time.Minute
+	maxMaxKeyAge = 24 * time.Hour
 
 	defaultFetchTimeout = 5 * time.Second
 	maxFetchTimeout     = 30 * time.Second
@@ -90,7 +92,7 @@ type RemoteKeySetConfig struct {
 	HTTPClient *http.Client
 	// MaxKeyAge is how old the cached set may get before a use tries to
 	// replace it, so that a key the issuer withdrew stops being trusted. Zero
-	// means one hour. It must be between one minute and 24 hours.
+	// means one hour. It must be between ten minutes and 24 hours.
 	MaxKeyAge time.Duration
 	// FetchTimeout bounds one fetch. Zero means five seconds, and 30 seconds
 	// is the most.
@@ -128,9 +130,11 @@ type RemoteKeySetConfig struct {
 // nobody has asked for a key learns that a fetch fails only when the next
 // request arrives, so the grace can start long after the set went stale and
 // after the issuer withdrew a key. A host that calls Refresh on a timer finds
-// out when the issuer stops answering: the fetch fails while the set is still
-// young, and the set is then used for no longer than its maximum age plus
-// StaleKeyGrace after it was last fetched, however idle the process is.
+// out when the issuer stops answering. Provided it calls at least every half
+// maximum key age, which once a minute always is, a fetch is tried, and
+// fails, before the set reaches its maximum age. The set is then used for no
+// longer than its maximum age plus StaleKeyGrace after it was last fetched,
+// however idle the process is.
 //
 // A process that has never fetched a set can verify nothing.
 type RemoteKeySet struct {
@@ -258,9 +262,10 @@ func (s *RemoteKeySet) Status() KeySetStatus {
 // last fetch, or nil if it succeeded. It is due when there is no set, when
 // the set has reached half its maximum age, or when the last fetch failed.
 // Like every fetch it happens at most once a minute, so a host may call
-// Refresh as often as it likes; once a minute is enough.
+// Refresh as often as it likes.
 //
-// Calling it is optional. See RemoteKeySet for what it buys.
+// Calling it is optional. See RemoteKeySet for what it buys and how often it
+// must be called to buy it.
 func (s *RemoteKeySet) Refresh(ctx context.Context) error {
 	s.fetchMu.Lock()
 	defer s.fetchMu.Unlock()

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -323,8 +324,12 @@ func readClaims(payload string) (map[string]any, error) {
 }
 
 // decodeObject decodes exactly one JSON object, with numbers kept as written
-// and nothing but space after it.
+// and nothing but space after it. The bytes must be valid UTF-8: the decoder
+// would otherwise replace what is invalid and hand back text nobody signed.
 func decodeObject(raw []byte) (map[string]any, error) {
+	if !utf8.Valid(raw) {
+		return nil, errors.New("not valid UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var object map[string]any
@@ -356,7 +361,7 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal,
 		return Principal{}, refuse(ReasonClient, "")
 	}
 	subject, _ := claims["sub"].(string)
-	if subject == "" {
+	if subject == "" || !exactText(subject) {
 		return Principal{}, refuse(ReasonSubject, "")
 	}
 
@@ -397,8 +402,8 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal,
 	session := ""
 	if raw, present := claims["sid"]; present {
 		text, ok := raw.(string)
-		if !ok || text == "" {
-			return Principal{}, refuse(ReasonMalformed, "the token's session is not text")
+		if !ok || text == "" || !exactText(text) {
+			return Principal{}, refuse(ReasonMalformed, "the token's session is not usable text")
 		}
 		session = text
 	}
@@ -411,6 +416,14 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal,
 		IssuedAt:  issuedAt,
 		Expires:   expires,
 	}, nil
+}
+
+// exactText reports whether a decoded string is what the token said. The JSON
+// decoder turns an unpaired surrogate escape into U+FFFD, so two different
+// signed values would come out equal. Subjects and sessions identify someone,
+// and a value holding that character is refused, not compared.
+func exactText(text string) bool {
+	return !strings.ContainsRune(text, utf8.RuneError)
 }
 
 // audienceContains reports whether an "aud" claim, a string or a list of
