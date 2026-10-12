@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -330,45 +332,62 @@ func TestExecutionPreparationNameDiffersFromTheAttempts(t *testing.T) {
 }
 
 // A status writer cannot land between an execution abandonment's check and
-// its record and Failed status: it waits for the status file's lock, so its
-// write follows the abandonment's.
+// its record and Failed status: the abandonment holds the status file's lock,
+// the lock every append takes, throughout.
 func TestAbandonExecutionHoldsTheStatusLock(t *testing.T) {
 	th := setupTestRepository(t)
 	dag := th.DAG("exec_lock_dag").DAG
 	att := createRunAttempt(t, th, dag, false, ir.Queued, execQ1, "")
-	writer, err := th.Repository.FindAttempt(th.Context, runRef(dag))
-	require.NoError(t, err)
 
-	done := make(chan error, 1)
-	executionAbandonCheckedHook = func(string) {
-		go func() {
-			status := ir.InitialStatus(dag)
-			status.DAGRunID, status.AttemptID, status.Status = abandonRunID, att.ID(), ir.Running
-			status.QueuedAt, status.WorkerID = execQ1, "worker-1"
-			if err := writer.Open(th.Context); err != nil {
-				done <- err
-				return
-			}
-			err := writer.Write(th.Context, status)
-			_ = writer.Close(th.Context)
-			done <- err
-		}()
-		select {
-		case err := <-done:
-			t.Errorf("a status write landed inside the abandonment: %v", err)
-			done <- err
-		case <-time.After(300 * time.Millisecond):
+	hooked := false
+	executionAbandonCheckedHook = func(statusFile string) {
+		hooked = true
+		other := flock.New(statusLockPath(statusFile))
+		locked, err := other.TryLock()
+		assert.NoError(t, err)
+		assert.False(t, locked, "another descriptor must not get the status lock inside the abandonment")
+		if locked {
+			_ = other.Unlock()
 		}
+		_ = other.Close()
 	}
 	t.Cleanup(func() { executionAbandonCheckedHook = nil })
 
+	_, err := abandon(th, executionRecord(dag, att.ID(), execQ1))
+	require.NoError(t, err)
+	require.True(t, hooked)
+	executionAbandonCheckedHook = nil
+	other := flock.New(statusLockPath(att.file))
+	locked, err := other.TryLock()
+	require.NoError(t, err)
+	assert.True(t, locked, "released after the abandonment")
+	_ = other.Unlock()
+	_ = other.Close()
+}
+
+// A crash mid-append of the Failed status leaves a partial last line: the
+// next call terminates it and appends a readable Failed status, keeping the
+// history before it.
+func TestAbandonExecutionRecoversFromAPartialStatusLine(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("exec_partial_dag").DAG
+	att := createRunAttempt(t, th, dag, false, ir.Queued, execQ1, "")
+	record := executionRecord(dag, att.ID(), execQ1)
+	record.Outcome, record.PredecessorAbsent = persis.AbandonmentMarkedFailed, true
+	require.NoError(t, writeRecordExclusive(executionRecordPath(att.file, execQ1), record))
+	f, err := os.OpenFile(att.file, os.O_APPEND|os.O_WRONLY, 0) //nolint:gosec // test file
+	require.NoError(t, err)
+	_, err = f.WriteString(`{"name":"` + dag.Name + `","status":`)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
 	_, err = abandon(th, executionRecord(dag, att.ID(), execQ1))
 	require.NoError(t, err)
-	executionAbandonCheckedHook = nil
-	require.NoError(t, <-done)
-	records, err := th.Repository.ListAttemptAbandonments(th.Context, runRef(dag), ir.DAGRunRef{})
+	status, err := att.ReadStatusUncached(th.Context)
 	require.NoError(t, err)
-	require.Len(t, records, 1, "the abandonment was recorded before the late write")
+	assert.Equal(t, ir.Failed, status.Status)
+	assert.Equal(t, execQ1, status.QueuedAt)
 }
 
 // Records and entries are found by listing the literal directory: a path
@@ -376,7 +395,11 @@ func TestAbandonExecutionHoldsTheStatusLock(t *testing.T) {
 // listed is an error rather than no records.
 func TestExecutionRecordsAndEntriesUseLiteralPaths(t *testing.T) {
 	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "[prod]*?")
+	name := "[prod]"
+	if runtime.GOOS != "windows" {
+		name += "*?"
+	}
+	dir := filepath.Join(t.TempDir(), name)
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 	status := filepath.Join(dir, "status.jsonl")
 	record := executionRecordPath(status, execQ1)
@@ -386,7 +409,7 @@ func TestExecutionRecordsAndEntriesUseLiteralPaths(t *testing.T) {
 	assert.Equal(t, []string{record}, paths)
 
 	th := setupTestRepository(t)
-	th.Backend.preparationDir = filepath.Join(t.TempDir(), "[journal]*")
+	th.Backend.preparationDir = filepath.Join(t.TempDir(), "[journal]")
 	run := ir.NewDAGRunRef("d", "r")
 	entry, err := th.Backend.writePreparation(run, run, "a1", execQ1)
 	require.NoError(t, err)
@@ -395,7 +418,7 @@ func TestExecutionRecordsAndEntriesUseLiteralPaths(t *testing.T) {
 	assert.True(t, prepared)
 	assert.Equal(t, execQ1, entry.QueuedAt)
 
-	if os.Getuid() != 0 {
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
 		require.NoError(t, os.Chmod(dir, 0o000))
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
 		_, err = executionRecordPaths(status)

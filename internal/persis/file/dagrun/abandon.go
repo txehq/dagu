@@ -277,6 +277,9 @@ func markExecutionNotDispatchedLocked(ctx context.Context, att *Attempt, status 
 		next.Error = "not dispatched"
 	}
 	ir.NormalizeDAGRunConditions(&next)
+	if err := terminatePartialLine(att.file); err != nil {
+		return fmt.Errorf("mark abandoned execution failed: %w", err)
+	}
 	writer := NewWriter(att.file)
 	if err := writer.Open(); err != nil {
 		return fmt.Errorf("open abandoned attempt: %w", err)
@@ -291,6 +294,33 @@ func markExecutionNotDispatchedLocked(ctx context.Context, att *Attempt, status 
 	}
 	att.afterWriteLocked(ctx, next)
 	return nil
+}
+
+// terminatePartialLine ends a status file whose last line is incomplete, as
+// a crash mid-append leaves it, with a newline: readers skip that line, which
+// does not decode, and the next append starts a line of its own. Nothing is
+// removed. The caller holds the status file's lock.
+func terminatePartialLine(statusFile string) error {
+	f, err := os.OpenFile(statusFile, os.O_RDWR, 0) //nolint:gosec // path is the attempt's status file
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return err
+	}
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, info.Size()-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	if _, err := f.WriteAt([]byte{'\n'}, info.Size()); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // executionRecordPath names the record of the attempt's execution marked
