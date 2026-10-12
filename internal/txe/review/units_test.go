@@ -2583,7 +2583,7 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 				assert.Equal(t, review.ActionUncertain, lasting.State)
 				assert.False(t, asked(f))
 				require.Len(t, f.state().Exceptions, 1)
-				assert.Equal(t, review.ExceptionRetryRecordUnreadable, f.state().Exceptions[0].Kind)
+				assert.Equal(t, review.ExceptionRetryRunUnreadable, f.state().Exceptions[0].Kind)
 				assert.Contains(t, f.state().Exceptions[0].Message, "admitted by the service as execution "+reserved)
 				assert.Contains(t, f.state().Exceptions[0].Message, "the run cannot be read")
 
@@ -2595,6 +2595,61 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 				assert.Len(t, f.runs.requested, 1, "one retry request in all")
 			})
 		}
+	})
+	t.Run("a known reservation whose run the service no longer has goes to the owner", func(t *testing.T) {
+		for name, gone := range map[string]error{
+			"no such run":           fmt.Errorf("%w: dag-run run-1 not found", review.ErrNotFound),
+			"not allowed to see it": &review.TransportError{Status: 403, Message: "forbidden"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.retry = func(runID string) error {
+					f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+					return nil
+				}
+				require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+
+				// That is the service's answer, not a read that failed: the
+				// run will not come back, so waiting would never end. The
+				// owner is asked, with the execution named; nothing is
+				// recorded as not applied and nothing is sent again.
+				f.runs.unreadable = map[string]error{"run-1": gone}
+				asking := soon(f, "reviewer-b")
+				assert.Equal(t, review.ActionEscalated, asking.State)
+				assert.Equal(t, reserved, asking.AdmittedRef)
+				assert.Empty(t, asking.Receipt)
+				assert.True(t, asked(f))
+				assert.Len(t, f.runs.requested, 1)
+			})
+		}
+	})
+	t.Run("the unreadable record was reported, then the record names an execution whose run is unreadable: reported again, as that", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer, f.runs.noRecords = lost, true
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+		require.Equal(t, review.ActionUncertain, nextReview(f).State)
+		require.Len(t, f.state().Exceptions, 1)
+		require.Equal(t, review.ExceptionRetryRecordUnreadable, f.state().Exceptions[0].Kind)
+
+		// The record is readable now and names the execution; the run is not.
+		// The first exception says admission is not known and points at the
+		// lookup, which is no longer true: the owner is told what is.
+		f.runs.noRecords = false
+		f.runs.unreadable = map[string]error{"run-1": errors.New("500 could not read the run")}
+		waiting := soon(f, "reviewer-c")
+		assert.Equal(t, review.ActionUncertain, waiting.State)
+		assert.Equal(t, reserved, waiting.AdmittedRef)
+		assert.False(t, asked(f))
+		kinds := []review.ExceptionKind{}
+		for _, e := range f.state().Exceptions {
+			kinds = append(kinds, e.Kind)
+		}
+		assert.Equal(t, []review.ExceptionKind{review.ExceptionRetryRecordUnreadable, review.ExceptionRetryRunUnreadable}, kinds)
+		assert.Contains(t, f.state().Exceptions[1].Message, "admitted by the service as execution "+reserved)
 	})
 	t.Run("a registry that will not store the recovered execution stops nothing", func(t *testing.T) {
 		f := newRetryFixture(t)

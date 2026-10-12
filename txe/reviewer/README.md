@@ -229,12 +229,19 @@ files.
   record or cannot read it, the retry is still the reservation it was
   seen to be. It is not sent again, not put to the owner as unknown, and
   not taken for a retry that had no effect.
-  A run that cannot be read at all is treated like a record that cannot
-  be read: it says nothing about a known execution, so the action stays
-  uncertain, the owner is not asked a question, and every review reads the
-  run again. After 30 minutes from the registry's grant of the attempt the
-  same exception, `retry_record_unreadable`, is reported; it then names the
-  execution and says the run cannot be read.
+  A run that cannot be read (the service unreachable, a server error) is
+  treated like a record that cannot be read: it says nothing about a known
+  execution, so the action stays uncertain, the owner is not asked a
+  question, and every review reads the run again. After 30 minutes from
+  the registry's grant of the attempt the exception `retry_run_unreadable`
+  is reported about that attempt: it names the execution and says to check
+  that the service's API can read the run. It is a kind of its own, so it
+  is reported even when `retry_record_unreadable` was reported for the same
+  attempt before. It asks for no decision.
+  A run the service answers it does not have, or will not show (404, 401,
+  403), is an answer and not a failed read: the run will not come back, so
+  the retry goes to the owner with the execution named. It is not recorded
+  as not dispatched.
   If the registry refuses to store it (an execution abandoned in the
   meantime, or a registry older than this), the review goes on, the
   refusal is printed in the step's log, and the next review reads the
