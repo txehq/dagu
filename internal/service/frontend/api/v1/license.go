@@ -27,7 +27,7 @@ func toLicenseStatusResponse(status license.Status) api.LicenseStatusResponse {
 		Valid:       status.Valid,
 		Plan:        status.Plan,
 		Expiry:      stringutil.FormatTime(status.Expiry),
-		Features:    status.Features,
+		Features:    status.PublicFeatures(),
 		GracePeriod: status.GracePeriod,
 		GraceEndsAt: stringutil.FormatTime(status.GraceEndsAt),
 		Community:   status.Community,

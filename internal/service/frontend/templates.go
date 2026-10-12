@@ -268,7 +268,7 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 			return status.Expiry.Format("2006-01-02T15:04:05Z")
 		},
 		"licenseFeatures": func() string {
-			features := licenseStatus().Features
+			features := licenseStatus().PublicFeatures()
 			if len(features) == 0 {
 				return "[]"
 			}

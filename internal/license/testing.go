@@ -25,7 +25,17 @@ func NewExpiredTestManager(features ...string) *Manager {
 	return newTestManager(time.Now().Add(-time.Hour), &zeroGraceDays, features...)
 }
 
+// NewForkPolicyTestManager is NewTestManager with a fork policy configured as
+// well, for tests of a server that has both a license and a policy.
+func NewForkPolicyTestManager(policy ForkPolicy, features ...string) *Manager {
+	return newTestManagerWithConfig(ManagerConfig{ForkPolicy: policy}, time.Now().Add(24*time.Hour), nil, features...)
+}
+
 func newTestManager(expiresAt time.Time, graceDays *int, features ...string) *Manager {
+	return newTestManagerWithConfig(ManagerConfig{}, expiresAt, graceDays, features...)
+}
+
+func newTestManagerWithConfig(cfg ManagerConfig, expiresAt time.Time, graceDays *int, features ...string) *Manager {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		panic("ed25519.GenerateKey: " + err.Error())
@@ -51,7 +61,7 @@ func newTestManager(expiresAt time.Time, graceDays *int, features ...string) *Ma
 		panic("jwt sign: " + err.Error())
 	}
 
-	m := NewManager(ManagerConfig{}, pub, nil, slog.Default())
+	m := NewManager(cfg, pub, nil, slog.Default())
 	m.state.Update(claims, signed)
 	return m
 }

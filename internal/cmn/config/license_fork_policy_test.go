@@ -179,6 +179,36 @@ func TestLoad_LicenseForkPolicyRefused(t *testing.T) {
 			want: "license.fork_policy.max_api_keys must be a whole number",
 		},
 		{
+			name: "BlankLimit",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: \"\"\n",
+			want: `license.fork_policy.max_api_keys must be a whole number (0 means no limit), got ""`,
+		},
+		{
+			// A blank value must not replace the configured limit with the
+			// community limit.
+			name: "BlankLimitFromEnvOverFile",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: 1\n",
+			env:  map[string]string{"DAGU_LICENSE_FORK_MAX_API_KEYS": " "},
+			want: `license.fork_policy.max_api_keys must be a whole number (0 means no limit), got " "`,
+		},
+		{
+			name: "BlankFeatures",
+			yaml: "license:\n  fork_policy:\n    features: \"\"\n",
+			want: "license.fork_policy.features is blank",
+		},
+		{
+			name: "OnlyCommasInFeatures",
+			yaml: "license:\n  fork_policy:\n    features: \" , \"\n",
+			want: "license.fork_policy.features is blank",
+		},
+		{
+			// A blank value must not replace the configured list with none.
+			name: "BlankFeaturesFromEnvOverFile",
+			yaml: "license:\n  fork_policy:\n    features: [sso]\n",
+			env:  map[string]string{"DAGU_LICENSE_FORK_FEATURES": " "},
+			want: "license.fork_policy.features is blank",
+		},
+		{
 			name: "UnknownKey",
 			yaml: "license:\n  fork_policy:\n    feature: [sso]\n",
 			want: `license.fork_policy: unknown key "feature" (allowed: features, max_api_keys)`,

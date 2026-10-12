@@ -1771,12 +1771,13 @@ func parseLicenseForkFeatures(input any) ([]string, error) {
 		return nil, fmt.Errorf("%s must be a list of feature names, got %v", licenseForkFeaturesKey, input)
 	}
 
+	_, asString := input.(string)
 	var features []string
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" {
-			// A blank between commas in the environment form is not a name.
-			if _, fromEnv := input.(string); fromEnv {
+			// A blank between commas in the string form is not a name.
+			if asString {
 				continue
 			}
 			return nil, fmt.Errorf("%s: a feature name is empty", licenseForkFeaturesKey)
@@ -1784,6 +1785,11 @@ func parseLicenseForkFeatures(input any) ([]string, error) {
 		if !slices.Contains(features, name) {
 			features = append(features, name)
 		}
+	}
+	if asString && len(features) == 0 {
+		// A blank string would otherwise replace a configured list with none,
+		// for instance when it comes from the environment over a config file.
+		return nil, fmt.Errorf("%s is blank: name at least one feature, or use [] in the config file to list none", licenseForkFeaturesKey)
 	}
 	return features, nil
 }
@@ -1816,13 +1822,11 @@ func parseLicenseForkMaxAPIKeys(input any) (*int, error) {
 		}
 		limit = int(v)
 	case string:
-		text := strings.TrimSpace(v)
-		if text == "" {
-			return nil, nil
-		}
-		n, err := strconv.Atoi(text)
+		// A blank string is refused like any other non-number: reading it as
+		// "unset" would let it replace a configured limit with the community one.
+		n, err := strconv.Atoi(strings.TrimSpace(v))
 		if err != nil {
-			return invalid()
+			return nil, fmt.Errorf("%s must be a whole number (0 means no limit), got %q", licenseForkMaxAPIKeysKey, v)
 		}
 		limit = n
 	default:

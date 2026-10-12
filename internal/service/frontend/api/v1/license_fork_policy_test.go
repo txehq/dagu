@@ -239,3 +239,27 @@ func TestForkPolicy_StatusClaimsNoLicense(t *testing.T) {
 	assert.Equal(t, []string{license.FeatureRBAC, license.FeatureSSO}, status.Features)
 	assert.Equal(t, license.ForkPolicySource, status.Source)
 }
+
+// A server with a license and a policy reports the license alone. The
+// response has one feature list and no field for a policy, so a feature the
+// policy opened must not appear as if the license granted it.
+func TestForkPolicy_StatusWithLicenseReportsLicenseOnly(t *testing.T) {
+	t.Parallel()
+	manager := license.NewForkPolicyTestManager(
+		license.ForkPolicy{Features: []string{license.FeatureSSO, license.FeatureRBAC}},
+		license.FeatureAudit,
+	)
+	require.True(t, manager.Checker().IsFeatureEnabled(license.FeatureRBAC))
+
+	server := test.SetupServer(t, test.WithServerOptions(frontend.WithLicenseManager(manager)))
+
+	var status api.LicenseStatusResponse
+	server.Client().Get("/api/v1/license/status").
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &status)
+
+	assert.False(t, status.Community)
+	assert.True(t, status.Valid)
+	assert.Equal(t, "pro", status.Plan)
+	assert.Equal(t, []string{license.FeatureAudit}, status.Features)
+	assert.NotEqual(t, license.ForkPolicySource, status.Source)
+}

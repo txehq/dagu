@@ -23,11 +23,26 @@ type Status struct {
 	// ForkPolicy is true when a fork policy is configured. Community stays
 	// true and Plan stays empty unless a license is loaded as well.
 	ForkPolicy bool
+	// ForkFeatures lists the gates the fork policy opens. They are kept apart
+	// from Features, which holds the claims of a loaded license and nothing else.
+	ForkFeatures []string
+}
+
+// PublicFeatures returns the feature list shown to clients. The public status
+// has one list and no field that says where an entry came from, so it never
+// mixes the two: a loaded license reports its own claims, exactly as before,
+// and only a server with no license reports what the fork policy opened,
+// together with a source that names the policy.
+func (s Status) PublicFeatures() []string {
+	if s.Community && s.ForkPolicy {
+		return append([]string{}, s.ForkFeatures...)
+	}
+	return s.Features
 }
 
 // PublicSource returns the source category shown to clients. It names the
 // fork policy only when no license is loaded, so a loaded license keeps
-// reporting where it came from.
+// reporting where it came from. See PublicFeatures.
 func (s Status) PublicSource() string {
 	switch {
 	case s.Community && s.ForkPolicy:
@@ -72,18 +87,14 @@ func StatusFor(checker Checker) Status {
 	return status
 }
 
-// Status returns the current license status. Features opened by the fork
-// policy are listed with the license's own, because both are enabled.
+// Status returns the current license status. The fork policy is reported
+// beside the license state and never as part of it.
 func (m *Manager) Status() Status {
 	status := StatusFor(m.Checker())
 	status.Source = m.Source()
 	status.Failure = m.Failure()
 	policy := m.cfg.ForkPolicy
 	status.ForkPolicy = !policy.IsZero()
-	for _, feature := range policy.Features {
-		if !slices.Contains(status.Features, feature) {
-			status.Features = append(status.Features, feature)
-		}
-	}
+	status.ForkFeatures = slices.Clone(policy.Features)
 	return status
 }

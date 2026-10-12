@@ -35,7 +35,8 @@ The code behind those gates is part of the GPL-licensed source in this repositor
 
 The policy is not a Dagu license, and a build that uses it is not an upstream-supported or commercially entitled build:
 
-- It claims no plan and loads no license claims. License status keeps reporting the server as running without a license and names the policy as the source of the enabled features.
+- It claims no plan and loads no license claims. When no license is loaded, license status keeps reporting the server as running without a license, lists the features the policy opened, and names the policy as their source.
+- When a Dagu license is loaded on the same server, license status reports that license alone: its plan, validity, source and feature claims. The policy still opens the gates it lists, and they are shown in the server log and by `dagu license check`, not in that status.
 - It does not open anything else that an active Dagu license unlocks. Incident management stays unavailable without one.
 - It does not change license discovery, activation, verification or heartbeat, and it makes no call to the Dagu license service.
 - It grants no rights beyond the GPL, including none of the commercial embedding rights described above, and no support from the Dagu maintainers.

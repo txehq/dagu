@@ -43,6 +43,8 @@ func TestForkPolicyDefault(t *testing.T) {
 	assert.True(t, status.Community)
 	assert.False(t, status.ForkPolicy)
 	assert.Empty(t, status.Features)
+	assert.Empty(t, status.ForkFeatures)
+	assert.Empty(t, status.PublicFeatures())
 	assert.Empty(t, status.PublicSource())
 }
 
@@ -78,7 +80,9 @@ func TestForkPolicyStatus(t *testing.T) {
 		assert.Empty(t, status.Plan)
 		assert.True(t, status.Expiry.IsZero())
 		assert.True(t, status.ForkPolicy)
-		assert.Equal(t, []string{FeatureRBAC, FeatureSSO}, status.Features)
+		assert.Empty(t, status.Features, "Features holds license claims only")
+		assert.Equal(t, []string{FeatureRBAC, FeatureSSO}, status.ForkFeatures)
+		assert.Equal(t, []string{FeatureRBAC, FeatureSSO}, status.PublicFeatures())
 		assert.Equal(t, ForkPolicySource, status.PublicSource())
 	})
 
@@ -92,9 +96,13 @@ func TestForkPolicyStatus(t *testing.T) {
 		status := m.Status()
 		assert.True(t, status.ForkPolicy)
 		assert.Empty(t, status.Features)
+		assert.NotNil(t, status.PublicFeatures())
+		assert.Empty(t, status.PublicFeatures())
 		assert.Equal(t, ForkPolicySource, status.PublicSource())
 	})
 
+	// With a license loaded, what clients see is that license and nothing
+	// else: a feature the policy opened must not read as a license claim.
 	t.Run("with a license", func(t *testing.T) {
 		t.Parallel()
 
@@ -106,8 +114,13 @@ func TestForkPolicyStatus(t *testing.T) {
 		assert.False(t, status.Community)
 		assert.True(t, status.Valid)
 		assert.Equal(t, "pro", status.Plan)
-		assert.ElementsMatch(t, []string{FeatureAudit, FeatureSSO}, status.Features)
+		assert.Equal(t, []string{FeatureAudit}, status.Features)
+		assert.Equal(t, []string{FeatureAudit}, status.PublicFeatures())
 		assert.Equal(t, "file", status.PublicSource(), "a loaded license keeps reporting its own source")
+		assert.True(t, status.ForkPolicy)
+		assert.Equal(t, []string{FeatureAudit, FeatureSSO}, status.ForkFeatures)
+
+		assert.True(t, m.Checker().IsFeatureEnabled(FeatureSSO), "the policy still opens its gate")
 		assert.True(t, HasActiveLicense(m.Checker()))
 	})
 
