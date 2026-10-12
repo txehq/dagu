@@ -4575,7 +4575,7 @@ export interface paths {
         get?: never;
         /**
          * Settle an action
-         * @description Records an attempt's outcome. Requires the caller's live claim and the action's current grant.
+         * @description Records an attempt's outcome. Requires the caller's live claim and the action's current grant. An uncertain dagu.retry_run may be settled as uncertain again only to record the execution its request admitted, as outcome.admitted_execution, with no receipt: it must be the execution run history holds for this attempt's retry request, admitted and not abandoned (it may not be dispatched yet). Once recorded it is never replaced, recording it again changes nothing, and it binds later settlements: succeeded must name it, not_applied needs run history to show it was abandoned, and every later outcome keeps it.
          */
         put: operations["settleTxeAction"];
         post?: never;

@@ -1116,3 +1116,149 @@ func TestRetryReceiptIsTheExecutionItsRequestAdmitted(t *testing.T) {
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", ""))), "the latest, but not this request's")
 	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a2", "")), "its own execution, though no longer latest")
 }
+
+func (r *retryFixture) settleOutcome(actionID string, g *Grant, ec *Claim, state ActionState, receipt, outcome string) error {
+	_, err := r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+		var o json.RawMessage
+		if outcome != "" {
+			o = json.RawMessage(outcome)
+		}
+		_, err := tx.SettleAction(Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: ec.ClaimID, Fence: ec.Fence, State: state, Receipt: receipt, Outcome: o})
+		return err
+	})
+	return err
+}
+
+// uncertainRetry returns a retry of run-1 whose attempt is uncertain: the
+// answer to its request was lost.
+func (r *retryFixture) uncertainRetry(t *testing.T) (string, *Grant, *Claim) {
+	t.Helper()
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	act, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+	require.NoError(t, r.settle(act, g, ec, ActionUncertain, ""))
+	return act, g, ec
+}
+
+func admittedOutcome(ref string) string {
+	return `{"detail":"recovered","admitted_execution":"` + ref + `"}`
+}
+
+func (r *retryFixture) action(t *testing.T, actionID string) *Action {
+	t.Helper()
+	job, err := r.f.store.GetJob(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	a, ok := job.Actions[actionID]
+	require.True(t, ok, "action %s", actionID)
+	return a
+}
+
+// An uncertain retry records the execution its request admitted, recovered
+// after the answer was lost, without settling: the state, receipt and
+// attempt stay. Only this attempt's own execution can be recorded, once, and
+// it then binds the settlement, even after run history loses it.
+func TestUncertainRetryRecordsItsAdmittedExecution(t *testing.T) {
+	r := newRetryFixture(t)
+	act, g, ec := r.uncertainRetry(t)
+	a2 := ExecutionRef("a2", "")
+
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2))), "no execution records the request yet")
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, true)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, a2, admittedOutcome(a2))), "an uncertain action has no receipt")
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", `{"detail":"x"}`)), "nothing to record")
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(ExecutionRef("x9", "")))), "not this request's execution")
+	assert.Equal(t, CodeGrantInvalid, code(t, r.settleOutcome(act, &Grant{GrantID: "grt_other"}, ec, ActionUncertain, "", admittedOutcome(a2))), "another grant")
+	stale := *ec
+	stale.Fence++
+	assert.NotEmpty(t, code(t, r.settleOutcome(act, g, &stale, ActionUncertain, "", admittedOutcome(a2))), "not the live claim")
+
+	// A reservation not yet dispatched is recorded as admitted.
+	require.NoError(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2)))
+	a := r.action(t, act)
+	assert.Equal(t, ActionUncertain, a.State)
+	assert.Empty(t, a.Receipt)
+	assert.Equal(t, 1, a.Attempt)
+	known, err := admittedExecutionOf(a.Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known)
+
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(ExecutionRef("a3", "")))), "never replaced")
+	r.admit(t, act, r.params("run-1", "a1"), ExecutionRef("a3", ""), false, true)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(ExecutionRef("a3", "")))), "never replaced, even when run history names another")
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, true)
+
+	// Run history loses the execution: the recorded one stands, recording it
+	// again changes nothing, and nothing else can succeed.
+	r.rc.mu.Lock()
+	r.rc.retries = nil
+	r.rc.mu.Unlock()
+	require.NoError(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2)), "recording it again needs no lookup")
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, a2)), "unverifiable without history")
+	known, err = admittedExecutionOf(r.action(t, act).Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known, "the lookup failure keeps the known reservation")
+
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, false)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionNotApplied, "", "")), "it was admitted and not abandoned")
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionSucceeded, a2, admittedOutcome(ExecutionRef("a3", "")))), "the outcome keeps the recorded execution")
+	_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+		a, err = tx.SettleAction(Settlement{ActionID: act, GrantID: g.GrantID, ClaimID: ec.ClaimID, Fence: ec.Fence, State: ActionSucceeded, Receipt: a2})
+		return err
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ActionSucceeded, a.State)
+	known, err = admittedExecutionOf(a.Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known, "a settlement without an outcome keeps the recorded execution")
+}
+
+// An abandoned preparation is not recorded as admitted; one recorded and then
+// abandoned settles as not applied, and escalation keeps the record.
+func TestRecordedAdmittedExecutionAndAbandonment(t *testing.T) {
+	r := newRetryFixture(t)
+	act, g, ec := r.uncertainRetry(t)
+	a2 := ExecutionRef("a2", "")
+	r.admit(t, act, r.params("run-1", "a1"), a2, true, false)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2))), "abandoned: nothing ran")
+
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, true)
+	require.NoError(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2)))
+	r.admit(t, act, r.params("run-1", "a1"), a2, true, false)
+	require.NoError(t, r.settleOutcome(act, g, ec, ActionNotApplied, "", `{"detail":"abandoned"}`))
+	a := r.action(t, act)
+	assert.Equal(t, ActionNotApplied, a.State)
+	known, err := admittedExecutionOf(a.Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known)
+
+	r2 := newRetryFixture(t)
+	act2, g2, ec2 := r2.uncertainRetry(t)
+	r2.admit(t, act2, r2.params("run-1", "a1"), a2, false, true)
+	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionUncertain, "", admittedOutcome(a2)))
+	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionEscalated, "", `{"detail":"owner"}`))
+	known, err = admittedExecutionOf(r2.action(t, act2).Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known, "escalation keeps the recorded execution")
+}
+
+// Only an uncertain retry of a run is settled as uncertain again, to record
+// its admitted execution; any other uncertain action stays as it is.
+func TestOnlyARetryRecordsAnAdmittedExecution(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	id, g, err := routine(t, f, job, c, "restart")
+	require.NoError(t, err)
+	settle := func(state ActionState, outcome string) error {
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			_, err := tx.SettleAction(Settlement{ActionID: id, GrantID: g.GrantID, ClaimID: c.ClaimID, Fence: c.Fence, State: state, Outcome: json.RawMessage(outcome)})
+			return err
+		})
+		return err
+	}
+	require.NoError(t, settle(ActionUncertain, `{"detail":"lost"}`))
+	assert.Equal(t, CodeActionState, code(t, settle(ActionUncertain, admittedOutcome(ExecutionRef("a2", "")))))
+}

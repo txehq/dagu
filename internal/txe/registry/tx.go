@@ -1304,6 +1304,10 @@ type Settlement struct {
 // job's live claim and present the action's current grant; possessing the
 // action ID is not enough. A reconcile claim can settle after retirement so
 // that in-flight outcomes are never lost.
+//
+// An uncertain retry of a run may be settled as uncertain again only to
+// record the execution its request admitted (recordAdmittedExecution); once
+// recorded, that execution binds every later settlement of the attempt.
 func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	j := tx.Job
 	if err := tx.CheckClaim(s.ClaimID, s.Fence); err != nil {
@@ -1321,11 +1325,15 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	case ActionExecuting:
 		allowed = s.State == ActionSucceeded || s.State == ActionFailed || s.State == ActionUncertain || s.State == ActionNotApplied
 	case ActionUncertain:
-		allowed = s.State == ActionSucceeded || s.State == ActionNotApplied || s.State == ActionEscalated
+		allowed = s.State == ActionSucceeded || s.State == ActionNotApplied || s.State == ActionEscalated ||
+			(s.State == ActionUncertain && a.Spec.Name == ActionRetryRun)
 	case ActionSucceeded, ActionFailed, ActionNotApplied, ActionEscalated:
 	}
 	if !allowed {
 		return nil, &Error{Code: CodeActionState, Message: fmt.Sprintf("cannot settle %s action as %s", a.State, s.State), Current: a}
+	}
+	if a.State == ActionUncertain && s.State == ActionUncertain {
+		return tx.recordAdmittedExecution(a, s)
 	}
 	if s.State == ActionSucceeded && s.Receipt == "" {
 		return nil, refuse(CodeInvalid, "succeeded needs a receipt")
@@ -1335,9 +1343,13 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 			return nil, err
 		}
 	}
+	outcome, err := tx.keepAdmittedExecution(a, s)
+	if err != nil {
+		return nil, err
+	}
 	a.State = s.State
 	a.Receipt = s.Receipt
-	a.Outcome = s.Outcome
+	a.Outcome = outcome
 	a.SettledUnderClaim = s.ClaimID
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
 	tx.noteIntent(a)
