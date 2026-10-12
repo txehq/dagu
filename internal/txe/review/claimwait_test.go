@@ -374,20 +374,41 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		at   time.Time
 		code int
 	}
-	tries := func(t *testing.T, w world) (out []try) {
+	// complete is every whole line the wrapper has written so far. It never
+	// fails: the file may not be there yet, be empty, or end in a line that
+	// is still being written, and none of that is an error while a run is
+	// in progress.
+	complete := func(w world) (out []try) {
+		data, err := os.ReadFile(w.tries)
+		if err != nil {
+			return nil
+		}
+		text := string(data)
+		if end := strings.LastIndexByte(text, '\n'); end >= 0 {
+			text = text[:end]
+		} else {
+			return nil
+		}
+		for line := range strings.SplitSeq(text, "\n") {
+			var sec int64
+			var code int
+			if _, err := fmt.Sscanf(line, "%d %d", &sec, &code); err == nil {
+				out = append(out, try{time.Unix(sec, 0), code})
+			}
+		}
+		return out
+	}
+	// tries is the same once a run has ended, read strictly: every line of
+	// the log must be a whole record.
+	tries := func(t *testing.T, w world) []try {
 		t.Helper()
 		data, err := os.ReadFile(w.tries)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		require.NoError(t, err)
-		for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
-			var sec int64
-			var code int
-			_, err := fmt.Sscanf(line, "%d %d", &sec, &code)
-			require.NoError(t, err, line)
-			out = append(out, try{time.Unix(sec, 0), code})
-		}
+		out := complete(w)
+		require.Len(t, out, strings.Count(string(data), "\n"), "every line of the log is a whole record: %q", string(data))
 		return out
 	}
 	actions := func(w world) (out []review.Action) {
@@ -451,7 +472,10 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		short, cancel := context.WithCancel(agent.Context)
 		ended := make(chan error, 1)
 		go func() { ended <- agent.Run(short) }()
-		require.Eventually(t, func() bool { return len(tries(t, w)) > 0 }, 15*time.Second, 100*time.Millisecond, "a try met the claim")
+		require.Eventually(t, func() bool {
+			seen := complete(w)
+			return len(seen) > 0 && seen[0].code == review.ExitClaimHeld
+		}, 15*time.Second, 100*time.Millisecond, "a try met the claim")
 		cancel()
 		select {
 		case err := <-ended:
