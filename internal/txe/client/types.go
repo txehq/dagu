@@ -8,11 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
-	"github.com/goccy/go-yaml/parser"
+	"github.com/goccy/go-yaml/token"
 )
 
 // The types in this file are the bodies of the registry calls the CLI makes.
@@ -194,23 +198,40 @@ func (p *ParamSchema) UnmarshalJSON(data []byte) error {
 // kept, so that Validate can refuse a value that is not a mapping and name
 // the action it belongs to.
 //
-// A YAML merge key (<<) is refused: the decoder lets a merged entry replace
-// one written beside it, so a schema could carry a looser bound than the one
-// its author wrote out.
-func (p *ParamSchema) UnmarshalYAML(data []byte) error {
-	file, err := parser.ParseBytes(data, 0)
-	if err != nil {
-		return err
-	}
-	var found mergeKeys
-	for _, doc := range file.Docs {
-		ast.Walk(&found, doc.Body)
-	}
-	if found {
-		return errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
+// A schema is a set of bounds, and the registry must be sent the bounds its
+// author wrote. YAML can say several things that would arrive as something
+// else, so each is refused here, before anything is sent:
+//
+//   - a merge key (<<): the decoder lets a merged entry replace one written
+//     beside it;
+//   - a tag (!!float, !!int): it turns text into a number after the numbers
+//     have been checked, or a number into text;
+//   - a number that would be sent as a different number, or one not spelled
+//     as JSON spells it: 0.49999999999999999 would be sent as 0.5, and 012
+//     as 10;
+//   - unquoted text that looks like a number, such as 1e3, which would be
+//     sent as text;
+//   - a key that is not text, such as 1.0, which would be sent as "1";
+//   - an anchor or a reference (&name, *name): the decoder can read a
+//     reference as nothing at all, or as something other than what is
+//     written above it.
+//
+// The schema is read from the parsed document itself, not from text rendered
+// back out of it: that rendering is another place a schema could change. A
+// reference that stands for the whole schema is resolved before this is
+// called and cannot be seen here; LoadJobSpec refuses it.
+//
+// This is only about sending what was written. Which numbers a registry can
+// check is the registry's rule: 0.1 is sent as 0.1, and a registry that
+// compares binary fractions refuses it in its own words.
+func (p *ParamSchema) UnmarshalYAML(node ast.Node) error {
+	var check schemaYAML
+	ast.Walk(&check, node)
+	if check.err != nil {
+		return check.err
 	}
 	var value any
-	if err := yaml.Unmarshal(data, &value); err != nil {
+	if err := yaml.NodeToValue(node, &value); err != nil {
 		return err
 	}
 	out, err := json.Marshal(value)
@@ -221,14 +242,135 @@ func (p *ParamSchema) UnmarshalYAML(data []byte) error {
 	return nil
 }
 
-// mergeKeys records whether a YAML node holds a merge key.
-type mergeKeys bool
+// schemaYAML walks a param_schema as it was written and keeps the first
+// thing in it that would not reach the registry as written.
+type schemaYAML struct{ err error }
 
-func (m *mergeKeys) Visit(node ast.Node) ast.Visitor {
-	if _, ok := node.(*ast.MergeKeyNode); ok {
-		*m = true
+func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
+	if s.err != nil {
+		return nil
 	}
-	return m
+	next := s.check(node)
+	if s.err != nil {
+		if tok := node.GetToken(); tok != nil && tok.Position != nil {
+			s.err = fmt.Errorf("line %d: %w", tok.Position.Line, s.err)
+		}
+		return nil
+	}
+	return next
+}
+
+// check looks at one node, and returns nil for one whose parts are not to be
+// looked at.
+func (s *schemaYAML) check(node ast.Node) ast.Visitor {
+	switch n := node.(type) {
+	case *ast.LiteralNode:
+		return nil // a block scalar is text, whatever it looks like
+	case *ast.AnchorNode, *ast.AliasNode:
+		s.err = errors.New("param_schema uses an anchor or a reference (&name, *name), which can be read as something other than what is written; write the schema out in full")
+		return nil
+	case *ast.MergeKeyNode:
+		s.err = errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
+	case *ast.TagNode:
+		s.err = fmt.Errorf("param_schema uses a YAML tag (%s), which can change what the value beside it is; write the value plainly", tokenText(n))
+	case *ast.MappingValueNode:
+		// A key is sent as text whatever it was written as: 1.0 as "1",
+		// beside a "1" it would then replace or be replaced by.
+		switch n.Key.(type) {
+		case *ast.StringNode, *ast.MergeKeyNode:
+		case *ast.MappingKeyNode:
+			s.err = errors.New("param_schema writes a key with \"?\", which this program does not read; write the key as plain or quoted text before its colon")
+		default:
+			s.err = fmt.Errorf("param_schema: the key %s is not text, and the text sent in its place may not be what is written; put the key in quotes", clip(tokenText(n.Key)))
+		}
+	case *ast.IntegerNode:
+		s.err = sentAsWritten(tokenText(n), n.Value)
+	case *ast.FloatNode:
+		s.err = sentAsWritten(tokenText(n), n.Value)
+	case *ast.InfinityNode, *ast.NanNode:
+		s.err = fmt.Errorf("param_schema: %s is not a number JSON can hold", tokenText(n))
+	case *ast.StringNode:
+		if tok := n.GetToken(); tok != nil && tok.Type == token.StringType && numberLike(tok.Value) {
+			s.err = fmt.Errorf("param_schema: %s looks like a number but would be sent as text. For a number, write it in plain decimal (1000, not 1e3); for text, put it in quotes", clip(tok.Value))
+		}
+	}
+	return s
+}
+
+// tokenText is a YAML node as its author spelled it.
+func tokenText(node ast.Node) string {
+	if tok := node.GetToken(); tok != nil {
+		return tok.Value
+	}
+	return node.String()
+}
+
+const (
+	// maxNumberLiteral and maxNumberExponent bound a number before any
+	// exact arithmetic is done on it.
+	maxNumberLiteral  = 64
+	maxNumberExponent = 400
+)
+
+var (
+	// jsonNumber is a number as JSON spells it.
+	jsonNumber = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$`)
+	// numberSpelling is a number in any of the spellings YAML has for one,
+	// once its digit separators are taken out.
+	numberSpelling = regexp.MustCompile(`^[-+]?(` +
+		`(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?` +
+		`|0[xX]([0-9a-fA-F]+(\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)([pP][-+]?[0-9]+)?|0[oO][0-7]+|0[bB][01]+` +
+		`|\.(inf|Inf|INF|nan|NaN|NAN))$`)
+)
+
+// numberLike reports whether text is something a reader would take for a
+// number, whatever the YAML parser made of it. The parser drops "_" from a
+// number before it reads it, and leaves as text a number it cannot hold.
+func numberLike(text string) bool {
+	return !strings.HasPrefix(text, "_") && numberSpelling.MatchString(strings.ReplaceAll(text, "_", ""))
+}
+
+// sentAsWritten refuses a number that would not reach the registry as its
+// author wrote it. The decoder holds a number as an integer or a float64 and
+// that is written back as JSON, so the spelling must be JSON's, and the JSON
+// number sent must be the number written. It does not judge the number: 0.1
+// is sent as 0.1.
+func sentAsWritten(lit string, held any) error {
+	if len(lit) > maxNumberLiteral {
+		return fmt.Errorf("param_schema: the number %s is longer than %d characters", clip(lit), maxNumberLiteral)
+	}
+	if !jsonNumber.MatchString(lit) {
+		return fmt.Errorf("param_schema: the number %s must be written in plain decimal, as JSON writes it. A spelling such as 012, 0x10, 1_000, +5 or .5 can be read as a different number", clip(lit))
+	}
+	if i := strings.IndexAny(lit, "eE"); i >= 0 {
+		exp, err := strconv.Atoi(strings.TrimPrefix(lit[i+1:], "+"))
+		if err != nil || exp > maxNumberExponent || exp < -maxNumberExponent {
+			return fmt.Errorf("param_schema: the number %s has an exponent beyond %d", lit, maxNumberExponent)
+		}
+	}
+	switch held.(type) {
+	case int64, uint64, float64:
+	default:
+		return fmt.Errorf("param_schema: the number %s cannot be sent as a number", lit)
+	}
+	out, err := json.Marshal(held)
+	if err != nil {
+		return fmt.Errorf("param_schema: the number %s cannot be sent as a number: %w", lit, err)
+	}
+	written, ok := new(big.Rat).SetString(lit)
+	sent, sentOK := new(big.Rat).SetString(string(out))
+	if !ok || !sentOK || written.Cmp(sent) != 0 {
+		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number, so the spec is refused. Rounding it would change the bound: choose the bound you intend, and write one that is sent as the same number", lit, out)
+	}
+	return nil
+}
+
+// clip shortens text quoted in an error.
+func clip(s string) string {
+	if len(s) > maxNumberLiteral {
+		return s[:20] + "..."
+	}
+	return s
 }
 
 // isMapping reports whether the schema is absent or exactly one JSON object.
