@@ -1421,10 +1421,13 @@ func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
 		require.NoError(t, attempt.Close(ctx))
 		return attempt.ID()
 	}
-	publish := func(caller context.Context, runID, attemptID string) error {
+	publishAt := func(caller context.Context, runID, attemptID string, version int) error {
 		_, err := a.RecordTxeRunArtifacts(caller, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: runID,
-			Body: &apigen.TxeArtifactManifestRequest{AttemptId: attemptID, JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+			Body: &apigen.TxeArtifactManifestRequest{AttemptId: attemptID, JobVersion: version, Artifacts: []apigen.TxeArtifactRecordInput{}}})
 		return err
+	}
+	publish := func(caller context.Context, runID, attemptID string) error {
+		return publishAt(caller, runID, attemptID, 1)
 	}
 	run1 := runIn("run-1")
 	run2 := runIn("run-2")
@@ -1474,10 +1477,20 @@ func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
 	require.ErrorAs(t, err, &apiErr)
 	assert.NotEqual(t, http.StatusConflict, apiErr.HTTPStatus, "no conflict carrying the secret manifest")
 	assert.NotContains(t, apiErr.Details, "current")
+	// The ops execution publishes; ops lists it and not the secret one.
+	require.NoError(t, publishAt(txeOps, "run-1", again.ID(), 2))
 	listed, err := a.GetTxeRunArtifacts(txeOps, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
-	if err == nil {
-		assert.NotContains(t, *listed.(apigen.GetTxeRunArtifacts200JSONResponse).Executions, ref, "the secret execution is not listed")
-	}
+	require.NoError(t, err)
+	executions := *listed.(apigen.GetTxeRunArtifacts200JSONResponse).Executions
+	assert.Contains(t, executions, registry.ExecutionRef(again.ID(), ""))
+	assert.NotContains(t, executions, ref, "the secret execution is not listed")
+
+	// A publisher who can write only secret still publishes for its run
+	// there after the job moved to ops.
+	secretOnly := auth.WithUser(context.Background(), &auth.User{Username: "sec", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "secret", Role: auth.RoleDeveloper}},
+	}})
+	require.NoError(t, publish(secretOnly, "run-2", run2), "the run's own workspace authorizes publishing")
 }
 
 // A resource event's reply shows only the jobs the caller can see, as GET

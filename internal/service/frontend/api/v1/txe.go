@@ -1205,15 +1205,7 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	recorded, err := s.RecordResourceEvent(ctx, ev, actor, writable)
 	if err != nil {
 		// A save failure after the event exists is a 409 "incomplete" that
-		// carries the event, so the reporter can resume it by its event_id;
-		// it shows only what the caller can see, as GET does.
-		if re, ok := errors.AsType[*registry.Error](err); ok {
-			if current, ok := re.Current.(*registry.ResourceEvent); ok {
-				shown := cloneResourceEvent(current)
-				a.txeShowResourceEvent(ctx, s, shown)
-				return nil, txeError(&registry.Error{Code: re.Code, Message: re.Message, Current: shown})
-			}
-		}
+		// carries only the event's ID, so the reporter can resume it.
 		return nil, txeError(err)
 	}
 	// A reply, a replay of a completed event included, shows only the jobs
@@ -1377,21 +1369,29 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if err != nil {
 		return nil, ErrInvalidRequestBody
 	}
-	s, err := a.txeStore()
+	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
 	var m *registry.ArtifactManifest
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
-		// The run is looked up only after txeTx checked that the caller may
-		// write this job, so its existence is never disclosed to others.
+	// A run publishes in the workspace it was saved in, which may not be the
+	// job's current one (the job may have moved while it ran): publishing
+	// needs write access to the run's saved workspace. A caller who cannot
+	// write the job is refused with the job's own denial whenever the run
+	// does not authorize it, so nothing tells them which runs exist.
+	if _, err := s.WithJobTx(ctx, req.JobId, actor, func(tx *registry.JobTx) error {
+		jobErr := a.txeRequireJobWrite(ctx, tx)
 		latest, status, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
 		if err != nil {
+			if jobErr != nil {
+				return jobErr
+			}
 			return err
 		}
-		// The run publishes in the workspace it was saved in, which may not
-		// be the job's current one.
 		if err := a.txeRequireWorkspaceWrite(ctx, statusWorkspaceName(status)); err != nil {
+			if jobErr != nil {
+				return jobErr
+			}
 			return err
 		}
 		// A report naming an earlier execution can only be a replay or a
@@ -1410,7 +1410,18 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 		m, err = tx.RecordArtifacts(ctx, s, req.RunId, latest, in)
 		return err
 	}); err != nil {
-		return nil, err
+		// The publisher was authorized by the run, not the job: a refusal
+		// never returns the job's record.
+		if re, ok := errors.AsType[*registry.Error](err); ok {
+			if _, isJob := re.Current.(*registry.Job); isJob {
+				err = &registry.Error{Code: re.Code, Message: re.Message}
+			}
+		}
+		var apiErr *Error
+		if errors.As(err, &apiErr) {
+			return nil, err
+		}
+		return nil, txeError(err)
 	}
 	out, err := txeConvert[api.TxeArtifactManifest](m)
 	return api.RecordTxeRunArtifacts200JSONResponse(out), err
