@@ -1341,3 +1341,24 @@ func TestNotAppliedNamesOnlyAnAbandonedExecution(t *testing.T) {
 		})
 	}
 }
+
+// A retry that failed may name its own execution, abandoned or not: the
+// reviewer settles an abandonment seen during the first execution as failed,
+// and a retried run that failed is a failed retry. Neither claims an effect.
+func TestFailedRetryNamesItsOwnExecution(t *testing.T) {
+	for name, abandoned := range map[string]bool{"abandoned": true, "dispatched": false} {
+		t.Run(name, func(t *testing.T) {
+			r := newRetryFixture(t)
+			r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+			p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+			require.NoError(t, err)
+			ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+			act, g, err := r.authorize(p, d, ec)
+			require.NoError(t, err)
+			a2 := ExecutionRef("a2", "")
+			assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionFailed, "", admittedOutcome(ExecutionRef("x9", "")))), "still only its own execution")
+			r.admit(t, act, r.params("run-1", "a1"), a2, abandoned, false)
+			require.NoError(t, r.settleOutcome(act, g, ec, ActionFailed, "", admittedOutcome(a2)))
+		})
+	}
+}

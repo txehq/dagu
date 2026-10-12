@@ -447,8 +447,10 @@ func (tx *JobTx) recordAdmittedExecution(a *Action, s Settlement) (*Action, erro
 
 // checkNamedExecution refuses a settlement of a retry that names, as the
 // execution its request admitted, one run history does not hold for this
-// attempt's request; an abandoned one only, and always, as not applied. Whatever a retry's
-// outcome names as admitted is so verified, on every settlement.
+// attempt's request. Nothing ran of an abandoned one, so it is neither
+// uncertain nor succeeded; one not abandoned may have run, so it is not
+// "not applied". Failed and escalated claim neither and take either. Whatever
+// a retry's outcome names as admitted is so verified, on every settlement.
 func (tx *JobTx) checkNamedExecution(a *Action, s Settlement) (string, error) {
 	next, err := admittedExecutionOf(s.Outcome)
 	if err != nil || next == "" {
@@ -459,7 +461,7 @@ func (tx *JobTx) checkNamedExecution(a *Action, s Settlement) (string, error) {
 		return "", err
 	}
 	switch {
-	case execution.Abandoned && s.State != ActionNotApplied:
+	case execution.Abandoned && (s.State == ActionUncertain || s.State == ActionSucceeded):
 		return "", refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, execution.Request.ID)
 	case !execution.Abandoned && s.State == ActionNotApplied:
 		return "", refuse(CodeInvalid, "the execution %s request %s admitted was not abandoned; it cannot be settled as not applied", execution.Ref, execution.Request.ID)
