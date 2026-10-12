@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"slices"
@@ -22,9 +23,10 @@ const (
 	defaultCadence     = time.Hour
 	defaultMaxAttempts = 3
 	minReviewInterval  = time.Minute
-	// maxSoonerSec bounds the agent's "look again in" so that it stays a
-	// number of seconds that can be added to a time.
-	maxSoonerSec = 10 * 366 * 24 * 3600
+	// maxSoonerSec is the largest number of seconds that is still a
+	// duration: the agent's "look again in" is checked against it before
+	// it is made one, so a larger number never wraps into a small one.
+	maxSoonerSec = int64(math.MaxInt64 / time.Second)
 	decideStepID = "decide"
 	// leaseMargin separates the end of an attempt from anyone else drawing
 	// conclusions about it, to absorb clock and scheduling slack.
@@ -1018,8 +1020,8 @@ func (r *Reviewer) nextReviewAt(job Job, decision AgentDecision, packet Packet) 
 	now := r.now()
 	next := job.Review.nextReview(now)
 	// The agent may ask to look again sooner, never later than the cadence.
-	// A number of seconds too large to be an instant is not sooner.
-	if sec := decision.NextReviewAfterSec; sec > 0 && sec <= maxSoonerSec {
+	// A number of seconds too large to be a duration is not sooner.
+	if sec := int64(decision.NextReviewAfterSec); sec > 0 && sec <= maxSoonerSec {
 		if sooner := now.Add(time.Duration(sec) * time.Second); sooner.Before(next) {
 			next = sooner
 		}

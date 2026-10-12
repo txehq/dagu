@@ -8,6 +8,13 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
+const (
+	// maxCadenceBytes bounds the declared cadence and the zone it is read
+	// in; cadenceShownBytes is how much of a longer one is quoted back.
+	maxCadenceBytes   = 256
+	cadenceShownBytes = 64
+)
+
 // ReadCadence reads a job's declared review cadence. A job declares it as a
 // cron expression, and it is read in the timezone of the job's own schedule
 // (UTC when that is not given): the cadence does not name a zone of its own.
@@ -18,6 +25,15 @@ import (
 // seconds for a duration, the cron expression with its zone, or the reason
 // the declared text is neither.
 func ReadCadence(declared, timezone string) (seconds int, cron, reason string) {
+	// Both texts come from the registry's record. Nothing a person would
+	// write as a cadence or a zone is this long, and a longer one is not
+	// read at all: reading it costs time and memory in proportion.
+	if len(declared) > maxCadenceBytes {
+		return 0, "", fmt.Sprintf("review_policy.cadence is %d bytes long, more than the %d a cadence may be; it starts %q", len(declared), maxCadenceBytes, declared[:cadenceShownBytes])
+	}
+	if len(timezone) > maxCadenceBytes {
+		return 0, "", fmt.Sprintf("review_policy.cadence %q cannot be read: the schedule's timezone is %d bytes long, more than the %d a zone name may be", declared, len(timezone), maxCadenceBytes)
+	}
 	text := strings.Join(strings.Fields(declared), " ")
 	if text == "" {
 		return 0, "", ""
@@ -67,8 +83,8 @@ func wholeFields(expr string) error {
 	if strings.HasPrefix(expr, "@") {
 		return nil
 	}
-	for _, field := range strings.Fields(expr) {
-		for _, item := range strings.Split(field, ",") {
+	for field := range strings.FieldsSeq(expr) {
+		for item := range strings.SplitSeq(field, ",") {
 			if item == "" {
 				return fmt.Errorf("the field %q lists an empty value", field)
 			}

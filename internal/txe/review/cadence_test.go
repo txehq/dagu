@@ -67,6 +67,29 @@ func TestReadCadence(t *testing.T) {
 	}
 }
 
+// The cadence and the zone come from the registry's record. One too long to
+// be either is refused before any of it is split or parsed, and the reason
+// quotes only its start.
+func TestReadCadenceRefusesOversizedText(t *testing.T) {
+	long := "0 " + strings.Repeat("0,", 1<<20) + "0 * * *"
+	seconds, cron, reason := review.ReadCadence(long, "UTC")
+	assert.Zero(t, seconds)
+	assert.Empty(t, cron)
+	assert.Contains(t, reason, "more than the 256 a cadence may be")
+	assert.Less(t, len(reason), 400, "the reason does not carry the text back")
+
+	_, cron, reason = review.ReadCadence("0 9 * * *", strings.Repeat("A", 1<<20))
+	assert.Empty(t, cron)
+	assert.Contains(t, reason, "more than the 256 a zone name may be")
+	assert.Less(t, len(reason), 400)
+
+	// At the limit it is read as usual.
+	padded := "0 9 * * *" + strings.Repeat(" ", 256-len("0 9 * * *"))
+	_, cron, reason = review.ReadCadence(padded, "UTC")
+	assert.Equal(t, "CRON_TZ=UTC 0 9 * * *", cron)
+	assert.Empty(t, reason)
+}
+
 // cadenceFixture is a job reviewed at a known instant with a given policy.
 func cadenceFixture(t *testing.T, at time.Time, policy func(*review.ReviewPolicy)) *fixture {
 	t.Helper()
@@ -137,11 +160,21 @@ func TestNextReviewFollowsTheDeclaredCron(t *testing.T) {
 		f.apply("reviewer-a", prepared, carryOn)
 		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.Equal(reviewed.Add(time.Minute)))
 	})
-	t.Run("a number of seconds too large to be an instant is not sooner", func(t *testing.T) {
-		f := cadenceFixture(t, reviewed, cronPolicy("0 9 * * *", "Australia/Perth"))
-		huge := carryOn
-		huge.NextReviewAfterSec = 1 << 62
-		assert.True(t, next(t, f, huge).Equal(time.Date(2026, 10, 13, 1, 0, 0, 0, time.UTC)))
+	t.Run("a number of seconds too large to be a duration is not sooner", func(t *testing.T) {
+		// 18446744074 seconds wraps into about half a second when it is
+		// multiplied into a duration; 1<<62 wraps to zero.
+		for _, sec := range []int{18446744074, 1 << 62} {
+			f := cadenceFixture(t, reviewed, cronPolicy("0 9 * * *", "Australia/Perth"))
+			huge := carryOn
+			huge.NextReviewAfterSec = sec
+			assert.True(t, next(t, f, huge).Equal(time.Date(2026, 10, 13, 1, 0, 0, 0, time.UTC)), "%d", sec)
+		}
+	})
+	t.Run("a sooner request of many years is still sooner than a longer cadence", func(t *testing.T) {
+		f := cadenceFixture(t, reviewed, cronPolicy("175200h", "UTC"))
+		sooner := carryOn
+		sooner.NextReviewAfterSec = 11 * 365 * 24 * 3600
+		assert.True(t, next(t, f, sooner).Equal(reviewed.Add(11*365*24*time.Hour)))
 	})
 	t.Run("a duration is counted from the review", func(t *testing.T) {
 		f := cadenceFixture(t, reviewed, cronPolicy("6h", "Australia/Perth"))
