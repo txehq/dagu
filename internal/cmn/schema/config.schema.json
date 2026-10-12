@@ -387,6 +387,11 @@
           "type": "string",
           "description": "Label for the OIDC login button."
         },
+        "pkce": {
+          "type": "boolean",
+          "description": "Use PKCE (S256) on the browser sign-in. Needed for a provider client that requires it. Default: false.",
+          "default": false
+        },
         "role_mapping": {
           "$ref": "#/definitions/OIDCRoleMappingDef"
         }

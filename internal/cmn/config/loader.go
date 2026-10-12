@@ -711,6 +711,7 @@ func (l *ConfigLoader) loadOIDCAuth(cfg *Config, auth *AuthDef) {
 	cfg.Server.Auth.OIDC.Whitelist = parseStringList(l.v.Get("auth.oidc.whitelist"))
 	cfg.Server.Auth.OIDC.AllowedDomains = parseStringList(l.v.Get("auth.oidc.allowed_domains"))
 	cfg.Server.Auth.OIDC.ButtonLabel = oidc.ButtonLabel
+	cfg.Server.Auth.OIDC.PKCE = oidc.PKCE
 
 	if oidc.AutoSignup != nil {
 		cfg.Server.Auth.OIDC.AutoSignup = *oidc.AutoSignup
@@ -2334,6 +2335,7 @@ var envBindings = []envBinding{
 	{key: "auth.oidc.auto_signup", env: "AUTH_OIDC_AUTO_SIGNUP"},
 	{key: "auth.oidc.allowed_domains", env: "AUTH_OIDC_ALLOWED_DOMAINS"},
 	{key: "auth.oidc.button_label", env: "AUTH_OIDC_BUTTON_LABEL"},
+	{key: "auth.oidc.pkce", env: "AUTH_OIDC_PKCE"},
 	// Auth OIDC Role Mapping
 	{key: "auth.oidc.role_mapping.default_role", env: "AUTH_OIDC_DEFAULT_ROLE"},
 	{key: "auth.oidc.role_mapping.groups_claim", env: "AUTH_OIDC_GROUPS_CLAIM"},

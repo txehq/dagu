@@ -2721,3 +2721,48 @@ signalHandling:
 		assert.False(t, cfg.SignalHandling.EnablePropagation)
 	})
 }
+
+func TestLoad_OIDCPKCE(t *testing.T) {
+	t.Run("DefaultOff", func(t *testing.T) {
+		cfg := loadFromYAML(t, `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu
+`)
+		assert.False(t, cfg.Server.Auth.OIDC.PKCE)
+	})
+
+	t.Run("FromYAML", func(t *testing.T) {
+		cfg := loadFromYAML(t, `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu
+    pkce: true
+`)
+		assert.True(t, cfg.Server.Auth.OIDC.PKCE)
+	})
+
+	t.Run("FromEnv", func(t *testing.T) {
+		cfg := loadWithEnv(t, `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu
+`, map[string]string{"DAGU_AUTH_OIDC_PKCE": "true"})
+		assert.True(t, cfg.Server.Auth.OIDC.PKCE)
+	})
+
+	t.Run("NotABoolean", func(t *testing.T) {
+		err := loadWithErrorFromYAML(t, `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu
+    pkce: sometimes
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pkce")
+	})
+}

@@ -190,6 +190,8 @@ type AuthOIDCDef struct {
 	AllowedDomains []string            `mapstructure:"allowed_domains"`
 	ButtonLabel    string              `mapstructure:"button_label"`
 	RoleMapping    *OIDCRoleMappingDef `mapstructure:"role_mapping"`
+	// PKCE enables PKCE (S256) on the browser sign-in. Default: false.
+	PKCE bool `mapstructure:"pkce"`
 }
 
 // OIDCRoleMappingDef maps OIDC claims to Dagu roles.

@@ -345,6 +345,8 @@ type AuthOIDC struct {
 	AllowedDomains []string // Email domain whitelist
 	ButtonLabel    string   // Default: "Login with SSO"
 	RoleMapping    OIDCRoleMapping
+	// PKCE makes the browser sign-in use PKCE with S256. Default: false.
+	PKCE bool
 }
 
 // OIDCPolicy contains the OIDC settings evaluated for each login.
