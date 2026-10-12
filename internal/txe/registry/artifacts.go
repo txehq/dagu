@@ -222,6 +222,16 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 	case ErrorCode(err) != CodeNotFound:
 		return nil, err
 	}
+	// What does not depend on the version is checked before the version is
+	// read, so no answer differs by whether a version exists.
+	if !hasSaved {
+		switch {
+		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
+		case !latest.Running:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s is %s, not running; only the running execution publishes", in.Execution, runID, latest.Status)}
+		}
+	}
 	notExecuted := &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
 	v, err := s.GetVersion(ctx, j.JobID, in.JobVersion)
 	switch {
@@ -230,15 +240,8 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 	case err != nil:
 		return nil, err
 	}
-	if !hasSaved {
-		switch {
-		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
-		case !latest.Running:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s is %s, not running; only the running execution publishes", in.Execution, runID, latest.Status)}
-		case latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256:
-			return nil, notExecuted
-		}
+	if !hasSaved && (latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256) {
+		return nil, notExecuted
 	}
 	declared := map[string]Deliverable{}
 	for _, d := range v.ExpectedOutcome.Deliverables {

@@ -1504,6 +1504,27 @@ func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
 		Body: &apigen.TxeArtifactManifestRequest{AttemptId: run2, JobVersion: 9, Artifacts: []apigen.TxeArtifactRecordInput{}}})
 	require.ErrorAs(t, err, &apiErr)
 	assert.Contains(t, apiErr.Message, "did not execute version 9", "a missing version answers the same")
+	require.NoError(t, publish(secretOnly, "run-2", run2), "the run's own workspace authorizes publishing")
+
+	// After its run ended unpublished, an existing hidden version and a
+	// missing one still answer alike.
+	run3 := runIn("run-3")
+	ended, err := runs.FindAttempt(ctx, ir.NewDAGRunRef(jobID, "run-3"))
+	require.NoError(t, err)
+	endedStatus, err := ended.ReadStatus(ctx)
+	require.NoError(t, err)
+	endedStatus.Status = ir.Failed
+	require.NoError(t, ended.Open(ctx))
+	require.NoError(t, ended.Write(ctx, *endedStatus))
+	require.NoError(t, ended.Close(ctx))
+	answers := map[int]string{}
+	for _, version := range []int{2, 9} {
+		_, err := a.RecordTxeRunArtifacts(secretOnly, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-3",
+			Body: &apigen.TxeArtifactManifestRequest{AttemptId: run3, JobVersion: version, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+		require.ErrorAs(t, err, &apiErr)
+		answers[version] = apiErr.Message
+	}
+	assert.Equal(t, answers[9], answers[2], "an existing hidden version and a missing one answer alike")
 }
 
 // A resource event's reply shows only the jobs the caller can see, as GET
