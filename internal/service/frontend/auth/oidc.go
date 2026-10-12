@@ -188,7 +188,47 @@ func clearOIDCStateCookies(w http.ResponseWriter, r *http.Request) {
 	clearCookie(w, r, cookieState)
 	clearCookie(w, r, cookieNonce)
 	clearCookie(w, r, cookieOriginalURL)
-	clearCookie(w, r, cookiePKCEVerifier)
+}
+
+// validPKCEVerifier reports whether a verifier is one RFC 7636 allows: 43 to
+// 128 of the unreserved characters.
+func validPKCEVerifier(verifier string) bool {
+	if len(verifier) < minPKCEVerifierLength || len(verifier) > maxPKCEVerifierLength {
+		return false
+	}
+	for _, c := range []byte(verifier) {
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' || c == '.' || c == '_' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// tokenExchangeFailure describes a failed code exchange for the log without
+// any text the provider chose. The exchange carries the PKCE verifier, and a
+// provider's error description or body can repeat what it was sent.
+func tokenExchangeFailure(err error) []slog.Attr {
+	var retrieveErr *oauth2.RetrieveError
+	if !errors.As(err, &retrieveErr) {
+		return []slog.Attr{slog.String("failure", "no usable response from the token endpoint")}
+	}
+	attrs := []slog.Attr{slog.String("failure", "the token endpoint refused the exchange")}
+	if retrieveErr.Response != nil {
+		attrs = append(attrs, slog.Int("status", retrieveErr.Response.StatusCode))
+	}
+	// Only the error codes RFC 6749 defines are repeated; anything else the
+	// provider put there is not.
+	switch retrieveErr.ErrorCode {
+	case "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope":
+		attrs = append(attrs, slog.String("oauth_error", retrieveErr.ErrorCode))
+	case "":
+	default:
+		attrs = append(attrs, slog.String("oauth_error", "other"))
+	}
+	return attrs
 }
 
 // BuiltinOIDCConfig holds configuration for OIDC under builtin auth mode.
@@ -284,6 +324,17 @@ func BuiltinOIDCCallbackHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
+		// With PKCE on, take this browser's verifier and clear its cookie
+		// now, before anything is written, so that every way out of the
+		// callback clears it. With PKCE off the response is as it always was.
+		var pkceVerifier string
+		if cfg.PKCE {
+			if verifierCookie, err := r.Cookie(cookiePKCEVerifier); err == nil {
+				pkceVerifier = verifierCookie.Value
+			}
+			clearCookie(w, r, cookiePKCEVerifier)
+		}
+
 		if !allowOIDCAfterInitialSetup(w, r, cfg) {
 			return
 		}
@@ -319,18 +370,21 @@ func BuiltinOIDCCallbackHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 		// the code is sent anywhere.
 		var exchangeOptions []oauth2.AuthCodeOption
 		if cfg.PKCE {
-			verifierCookie, err := r.Cookie(cookiePKCEVerifier)
-			if err != nil || len(verifierCookie.Value) < minPKCEVerifierLength || len(verifierCookie.Value) > maxPKCEVerifierLength {
+			if !validPKCEVerifier(pkceVerifier) {
 				redirectWithError(w, r, cfg.LoginBasePath, "Authentication failed: PKCE verifier not found")
 				return
 			}
-			exchangeOptions = append(exchangeOptions, oauth2.VerifierOption(verifierCookie.Value))
+			exchangeOptions = append(exchangeOptions, oauth2.VerifierOption(pkceVerifier))
 		}
 
 		// Exchange code for token
 		oauth2Token, err := cfg.OAuth2Config.Exchange(ctx, r.URL.Query().Get("code"), exchangeOptions...)
 		if err != nil {
-			logger.Error(ctx, "OIDC token exchange failed", tag.Error(err))
+			if cfg.PKCE {
+				logger.Error(ctx, "OIDC token exchange failed", tokenExchangeFailure(err)...)
+			} else {
+				logger.Error(ctx, "OIDC token exchange failed", tag.Error(err))
+			}
 			redirectWithError(w, r, cfg.LoginBasePath, "Authentication failed: could not exchange token")
 			return
 		}

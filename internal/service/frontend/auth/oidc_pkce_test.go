@@ -175,6 +175,9 @@ func TestOIDCCallbackWithoutAPKCEVerifierIsRefused(t *testing.T) {
 		"Empty":    {{Name: cookiePKCEVerifier, Value: ""}},
 		"TooShort": {{Name: cookiePKCEVerifier, Value: strings.Repeat("v", minPKCEVerifierLength-1)}},
 		"TooLong":  {{Name: cookiePKCEVerifier, Value: strings.Repeat("v", maxPKCEVerifierLength+1)}},
+		// Long enough, and not characters a verifier may have.
+		"NotVerifierCharacters": {{Name: cookiePKCEVerifier, Value: strings.Repeat("!", minPKCEVerifierLength)}},
+		"WithASpace":            {{Name: cookiePKCEVerifier, Value: strings.Repeat("v", minPKCEVerifierLength) + " x"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -186,22 +189,128 @@ func TestOIDCCallbackWithoutAPKCEVerifierIsRefused(t *testing.T) {
 			assert.Contains(t, recorder.Header().Get("Location"), "/login?error=")
 			assert.Contains(t, recorder.Header().Get("Location"), "PKCE+verifier+not+found")
 			assert.Empty(t, endpoint.requests(), "the code was not sent to the provider")
+			cleared := cookieNamed(t, recorder, cookiePKCEVerifier)
+			require.NotNil(t, cleared, "the verifier cookie is cleared on this way out too")
+			assert.Negative(t, cleared.MaxAge)
 		})
 	}
 }
 
+func TestValidPKCEVerifier(t *testing.T) {
+	t.Parallel()
+	all := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	assert.True(t, validPKCEVerifier(all))
+	assert.True(t, validPKCEVerifier(oauth2.GenerateVerifier()))
+	assert.True(t, validPKCEVerifier(strings.Repeat("a", minPKCEVerifierLength)))
+	assert.True(t, validPKCEVerifier(strings.Repeat("a", maxPKCEVerifierLength)))
+	for _, bad := range []string{
+		"", strings.Repeat("a", minPKCEVerifierLength-1), strings.Repeat("a", maxPKCEVerifierLength+1),
+		strings.Repeat("a", minPKCEVerifierLength) + "+", strings.Repeat("a", minPKCEVerifierLength) + "/",
+		strings.Repeat("a", minPKCEVerifierLength) + "=", strings.Repeat("a", minPKCEVerifierLength) + "\u00e9",
+		strings.Repeat("a", minPKCEVerifierLength) + "\x00",
+	} {
+		assert.False(t, validPKCEVerifier(bad), "%q", bad)
+	}
+}
+
+// A failed exchange is described for the log without anything the provider
+// chose to say, because a provider can repeat the verifier it was sent.
+func TestTokenExchangeFailureCarriesNoProviderText(t *testing.T) {
+	t.Parallel()
+	verifier := strings.Repeat("s3cr3t-verifier-", 4)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"invalid code_verifier: ` + verifier + `","error_uri":"https://idp.example.com/` + verifier + `"}`))
+	}))
+	t.Cleanup(endpoint.Close)
+	cfg := &oauth2.Config{ClientID: "dagu-web", Endpoint: oauth2.Endpoint{TokenURL: endpoint.URL}}
+
+	_, err := cfg.Exchange(context.Background(), "the-code", oauth2.VerifierOption(verifier))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), verifier, "the library's own error text does repeat it")
+
+	describe := func(err error) string {
+		var out strings.Builder
+		for _, attr := range tokenExchangeFailure(err) {
+			out.WriteString(attr.String() + " ")
+		}
+		return out.String()
+	}
+	described := describe(err)
+	assert.NotContains(t, described, verifier)
+	assert.Contains(t, described, "status=400")
+	assert.Contains(t, described, "oauth_error=invalid_grant")
+
+	// An error code that is not one RFC 6749 defines is not repeated either.
+	odd := &oauth2.RetrieveError{Response: &http.Response{StatusCode: http.StatusBadRequest}, ErrorCode: verifier}
+	assert.NotContains(t, describe(odd), verifier)
+	assert.Contains(t, describe(odd), "oauth_error=other")
+
+	// No response at all.
+	unreachable := &oauth2.Config{ClientID: "dagu-web", Endpoint: oauth2.Endpoint{TokenURL: "http://127.0.0.1:1/token"}}
+	_, err = unreachable.Exchange(context.Background(), "the-code", oauth2.VerifierOption(verifier))
+	require.Error(t, err)
+	assert.NotContains(t, describe(err), verifier)
+	assert.Contains(t, describe(err), "no usable response")
+}
+
 // With PKCE off the exchange carries no verifier, even if a cookie of that
-// name is present.
-func TestOIDCCallbackSendsNoVerifierByDefault(t *testing.T) {
+// name is present, and the response sets exactly the cookies it always did.
+func TestOIDCCallbackIsUnchangedByDefault(t *testing.T) {
 	t.Parallel()
 	endpoint := newTokenEndpoint(t)
 
-	callback(pkceTestConfig(endpoint, false), &http.Cookie{Name: cookiePKCEVerifier, Value: strings.Repeat("v", minPKCEVerifierLength)})
+	recorder := callback(pkceTestConfig(endpoint, false), &http.Cookie{Name: cookiePKCEVerifier, Value: strings.Repeat("v", minPKCEVerifierLength)})
 
 	requests := endpoint.requests()
 	require.Len(t, requests, 1)
 	_, sent := requests[0]["code_verifier"]
 	assert.False(t, sent)
+	assert.Equal(t, []string{cookieState, cookieNonce, cookieOriginalURL}, cookieNames(recorder))
+}
+
+// With PKCE off, every way out of the handlers sets exactly the cookies it
+// set before this setting existed.
+func TestOIDCDefaultResponsesSetNoNewCookie(t *testing.T) {
+	t.Parallel()
+	incomplete := func(cfg *BuiltinOIDCConfig) *BuiltinOIDCConfig {
+		cfg.InitialSetupComplete = func(context.Context) (bool, error) { return false, nil }
+		return cfg
+	}
+
+	_, signedIn := signIn(t, pkceTestConfig(nil, false))
+	assert.Equal(t, []string{cookieState, cookieNonce, cookieOriginalURL}, cookieNames(signedIn))
+
+	for name, recorder := range map[string]*httptest.ResponseRecorder{
+		"CallbackStateMismatch": func() *httptest.ResponseRecorder {
+			request := httptest.NewRequest(http.MethodGet, "/oidc-callback?state=forged&code=c", nil)
+			request.AddCookie(&http.Cookie{Name: cookieState, Value: "the-state"})
+			recorder := httptest.NewRecorder()
+			BuiltinOIDCCallbackHandler(pkceTestConfig(nil, false)).ServeHTTP(recorder, request)
+			return recorder
+		}(),
+		"CallbackSetupIncomplete": func() *httptest.ResponseRecorder {
+			recorder := httptest.NewRecorder()
+			BuiltinOIDCCallbackHandler(incomplete(pkceTestConfig(nil, false))).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oidc-callback", nil))
+			return recorder
+		}(),
+		"SignInSetupIncomplete": func() *httptest.ResponseRecorder {
+			recorder := httptest.NewRecorder()
+			BuiltinOIDCLoginHandler(incomplete(pkceTestConfig(nil, false))).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oidc-login", nil))
+			return recorder
+		}(),
+	} {
+		assert.Equal(t, []string{cookieState, cookieNonce, cookieOriginalURL}, cookieNames(recorder), name)
+	}
+}
+
+func cookieNames(recorder *httptest.ResponseRecorder) []string {
+	var names []string
+	for _, cookie := range recorder.Result().Cookies() {
+		names = append(names, cookie.Name)
+	}
+	return names
 }
 
 // The state is still checked first: a forged callback does not reach the
