@@ -113,6 +113,13 @@ describe('AuthProvider logout', () => {
     expect(logoutCalls(fetchMock)).toHaveLength(0);
     expect(getAuthToken()).toBeNull();
     expect(auth!.isAuthenticated).toBe(false);
+
+    // Signed in again without a reload, the next sign-out clears again.
+    act(() => setAuthSession('second-token', FAR_FUTURE, 'login'));
+    await waitFor(() => expect(auth?.isAuthenticated).toBe(true));
+    expect(await signOut()).toBe('local');
+    expect(getAuthToken()).toBeNull();
+    expect(auth!.isAuthenticated).toBe(false);
   });
 
   it('reports the session ended when the hub answers 204', async () => {
@@ -131,8 +138,8 @@ describe('AuthProvider logout', () => {
     expect(url).toBe('/oidc-logout');
     expect(init?.method).toBe('POST');
     expect(init?.headers).toEqual({ Authorization: `Bearer ${TOKEN}` });
-    // The token is still stored while the hub is asked, and gone after.
-    expect(tokenDuringRequest).toBe(TOKEN);
+    // The browser is signed out before the hub is asked.
+    expect(tokenDuringRequest).toBeNull();
     expect(getAuthToken()).toBeNull();
     expect(auth!.isAuthenticated).toBe(false);
   });
@@ -188,7 +195,10 @@ describe('AuthProvider logout', () => {
     });
     expect(timeoutSpy).toHaveBeenCalledWith(OIDC_LOGOUT_TIMEOUT_MS);
     expect(requestSignal).toBe(timeout.signal);
-    expect(getAuthToken()).toBe(TOKEN);
+    // Already signed out here, while the hub has not answered: closing the
+    // tab now leaves no token behind.
+    expect(getAuthToken()).toBeNull();
+    expect(auth!.isAuthenticated).toBe(false);
 
     await act(async () => {
       timeout.abort(new DOMException('timed out', 'TimeoutError'));

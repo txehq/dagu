@@ -87,40 +87,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // A sign-out already under way: repeated or concurrent calls share it, so
-  // the hub is asked once and the token is cleared once.
+  // the hub is asked once.
   const logoutInFlight = useRef<Promise<LogoutResult> | null>(null);
 
   const logout = useCallback((): Promise<LogoutResult> => {
     if (logoutInFlight.current) {
       return logoutInFlight.current;
     }
-    const run = async (): Promise<LogoutResult> => {
-      const storedToken = getAuthToken();
+    const storedToken = getAuthToken();
+    // This browser is signed out first, whatever the hub answers: a tab
+    // closed while the hub is asked must not leave the token behind.
+    clearAuthSession('logout');
+    clearLocalSession();
+    // With OIDC sessions off the route does not exist: no request.
+    if (!config.oidcSessionEnabled || !storedToken) {
+      return Promise.resolve('local');
+    }
+    const request = (async (): Promise<LogoutResult> => {
       try {
-        // With OIDC sessions off the route does not exist: no request.
-        if (!config.oidcSessionEnabled || !storedToken) {
-          return 'local';
-        }
-        try {
-          const response = await fetch(oidcLogoutURL(config.basePath), {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${storedToken}` },
-            keepalive: true,
-            signal: AbortSignal.timeout(OIDC_LOGOUT_TIMEOUT_MS),
-          });
-          return response.status === 204 ? 'ended' : 'unconfirmed';
-        } catch {
-          return 'unconfirmed';
-        }
-      } finally {
-        // This browser is signed out whatever the hub answered.
-        clearAuthSession('logout');
-        clearLocalSession();
+        const response = await fetch(oidcLogoutURL(config.basePath), {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${storedToken}` },
+          keepalive: true,
+          signal: AbortSignal.timeout(OIDC_LOGOUT_TIMEOUT_MS),
+        });
+        return response.status === 204 ? 'ended' : 'unconfirmed';
+      } catch {
+        return 'unconfirmed';
+      }
+    })();
+    logoutInFlight.current = request;
+    void request.finally(() => {
+      if (logoutInFlight.current === request) {
         logoutInFlight.current = null;
       }
-    };
-    logoutInFlight.current = run();
-    return logoutInFlight.current;
+    });
+    return request;
   }, [clearLocalSession, config.oidcSessionEnabled, config.basePath]);
 
   const refreshUser = useCallback(async () => {
