@@ -495,6 +495,61 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }
 
+// lastRecordedReviewVersion is the job version the last recorded review
+// read: the job's cached copy, or for a review recorded before the copy
+// existed, the version the immutable review itself was stamped with. The
+// review chain's head is that review; anything else fails closed.
+func (tx *JobTx) lastRecordedReviewVersion() (int, error) {
+	j := tx.Job
+	if j.LastRecordedReview == "" {
+		return 0, nil
+	}
+	if j.LastRecordedReviewJobVersion != 0 {
+		return j.LastRecordedReviewJobVersion, nil
+	}
+	if j.Chains.Reviews == "" {
+		return 0, fmt.Errorf("registry: review %s is recorded but the review history is empty", j.LastRecordedReview)
+	}
+	var r Review
+	if err := tx.store.getJSON(tx.ctx, j.Chains.Reviews, &r); err != nil {
+		return 0, fmt.Errorf("registry: history %s: %w", j.Chains.Reviews, err)
+	}
+	if r.ReviewID != j.LastRecordedReview {
+		return 0, fmt.Errorf("registry: the latest review in history is %s, not %s", r.ReviewID, j.LastRecordedReview)
+	}
+	return r.JobVersion, nil
+}
+
+// requireReviewable refuses a review's write unless the job is ready and,
+// when the write names the job version the review read, still at that
+// version. A review binds its records, proposals and checkpoint to the
+// version it read, never to one it did not.
+func (tx *JobTx) requireReviewable(read int) error {
+	j := tx.Job
+	if j.Registration.State != RegistrationReady {
+		return refuse(CodeNotReady, "job registration is %s", j.Registration.State)
+	}
+	if read != 0 && read != j.Version {
+		return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("the review read version %d; the job is at version %d", read, j.Version), Current: j}
+	}
+	return nil
+}
+
+// endReviewClaim ends a live review claim when the job's version changes:
+// the review read the version before, so none of its later writes may bind
+// to the new one. Actions it left executing are interrupted, as on release.
+// It reports the claim it ended, or "".
+func (tx *JobTx) endReviewClaim() string {
+	c := tx.Job.Claim
+	if c == nil || c.State != ClaimLive || c.Kind != ClaimReview {
+		return ""
+	}
+	c.State = ClaimReleased
+	tx.interruptClaim(c.ClaimID)
+	tx.touch()
+	return c.ClaimID
+}
+
 // ReleaseClaim ends a live claim and interrupts the actions it left
 // executing. Releasing an already released claim with the same fence is a
 // no-op.
@@ -524,6 +579,15 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 		if j.LastRecordedReviewDigest != "" && j.LastRecordedReviewDigest != digest {
 			return &Error{Code: CodeReviewConflict, Message: "review " + r.ReviewID + " was recorded with other evidence or outcome", Current: r.ReviewID}
 		}
+		// A replay is the same review only for the version it was recorded
+		// for; after an update it is a review of a version it never read.
+		recorded, err := tx.lastRecordedReviewVersion()
+		if err != nil {
+			return err
+		}
+		if recorded != 0 && (recorded != j.Version || (r.JobVersion != 0 && r.JobVersion != recorded)) {
+			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("review %s was recorded for version %d; the job is at version %d", r.ReviewID, recorded, j.Version), Current: j}
+		}
 		return nil
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
@@ -536,6 +600,9 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	if r.ReviewID != want {
 		return refuse(CodeClaimStale, "review %s is not the current episode %s", r.ReviewID, want)
 	}
+	if err := tx.requireReviewable(r.JobVersion); err != nil {
+		return err
+	}
 	r.JobVersion = j.Version
 	r.CheckpointVersion = j.Checkpoint.Version
 	r.ClaimID = claimID
@@ -546,6 +613,7 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	}
 	j.LastRecordedReview = r.ReviewID
 	j.LastRecordedReviewDigest = digest
+	j.LastRecordedReviewJobVersion = r.JobVersion
 	return nil
 }
 
@@ -756,6 +824,25 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
 		return nil, err
 	}
+	// The episode is labelled with the version its review read: a review
+	// recorded before an update finishes its episode for the old version,
+	// and the new version is then due at once, never marked reviewed by it.
+	reviewed := j.Version
+	if episode, err := ReviewID(j.JobID, j.Checkpoint.Version); err == nil && j.LastRecordedReview == episode {
+		recorded, err := tx.lastRecordedReviewVersion()
+		if err != nil {
+			return nil, err
+		}
+		if recorded != 0 {
+			reviewed = recorded
+		}
+	}
+	if err := tx.requireReviewable(0); err != nil {
+		return nil, err
+	}
+	if cp.JobVersion != 0 && cp.JobVersion != reviewed {
+		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("the review read version %d; this episode reviewed version %d", cp.JobVersion, reviewed), Current: j}
+	}
 	if j.Checkpoint.Version != expectedVersion {
 		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("checkpoint is at %d, not %d", j.Checkpoint.Version, expectedVersion), Current: j.Checkpoint}
 	}
@@ -767,8 +854,10 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 		}
 	}
 	cp.Version = expectedVersion + 1
-	if cp.JobVersion == 0 {
-		cp.JobVersion = j.Version
+	cp.JobVersion = reviewed
+	if reviewed != j.Version {
+		now := tx.now
+		cp.NextReviewAt = &now
 	}
 	j.Checkpoint = cp
 	tx.touch()
@@ -806,6 +895,11 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {
+		return nil, err
+	}
+	// Checked before a replay too: a retry naming another read version is
+	// not the proposal already stored.
+	if err := tx.requireReviewable(p.JobVersion); err != nil {
 		return nil, err
 	}
 	if cur, ok := j.Proposals[p.ProposalID]; ok {

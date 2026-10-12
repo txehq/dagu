@@ -647,7 +647,11 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 		if err != nil {
 			return err
 		}
-		return tx.event(Event{Kind: EventVersion, From: fmt.Sprint(from), To: fmt.Sprint(nv.Version), Affected: affected})
+		ev := Event{Kind: EventVersion, From: fmt.Sprint(from), To: fmt.Sprint(nv.Version), Affected: affected}
+		if ended := tx.endReviewClaim(); ended != "" {
+			ev.Detail = "ended review claim " + ended + ": it read version " + fmt.Sprint(from)
+		}
+		return tx.event(ev)
 	})
 	if err != nil {
 		return nil, err

@@ -20407,6 +20407,9 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TxeVerdict"
+        job_version:
+          type: integer
+          description: "The job version the review read. When given and the job is no longer at it, the proposal is refused with 409 version_conflict; the registry never binds a proposal to a version its review did not read."
         action:
           $ref: "#/components/schemas/TxeActionSpec"
         native_task:

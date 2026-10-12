@@ -8371,6 +8371,8 @@ export interface components {
             /** @enum {string} */
             waiting_on?: TxeProposalInputWaiting_on;
             allowed_verdicts?: components["schemas"]["TxeVerdict"][];
+            /** @description The job version the review read. When given and the job is no longer at it, the proposal is refused with 409 version_conflict; the registry never binds a proposal to a version its review did not read. */
+            job_version?: number;
             action: components["schemas"]["TxeActionSpec"];
             native_task?: components["schemas"]["TxeNativeTask"];
             reasoning?: string;
