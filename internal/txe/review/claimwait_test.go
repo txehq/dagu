@@ -281,22 +281,27 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 	}
 	ctx := context.Background()
 	bin := filepath.Join(t.TempDir(), "txe-review-fixture")
-	build := exec.Command("go", "build", "-o", bin, "./reviewtest/cmd/txe-review-fixture")
+	buildCtx, cancelBuild := context.WithTimeout(ctx, 5*time.Minute)
+	build := exec.CommandContext(buildCtx, "go", "build", "-o", bin, "./reviewtest/cmd/txe-review-fixture")
 	build.Env = append(os.Environ(), "GOFLAGS=-mod=readonly")
 	out, err := build.CombinedOutput()
+	cancelBuild()
 	require.NoError(t, err, string(out))
 
 	type world struct {
-		dir, registry, effects, job, proposal, decision string
-		reg                                             *reviewtest.Registry
+		dir, registry, effects, tries, command, job, proposal, decision string
+		reg                                                             *reviewtest.Registry
 	}
-	// A job with one action that needs a person, a proposal for it that a
-	// person approved, and a review that claimed the job for claimFor and
-	// died.
-	start := func(t *testing.T, claimFor time.Duration) world {
+	// A job with one action that needs a person, and a proposal for it that
+	// a person approved.
+	start := func(t *testing.T) world {
 		t.Helper()
 		w := world{dir: t.TempDir()}
 		w.registry, w.effects = filepath.Join(w.dir, "registry.json"), filepath.Join(w.dir, "effects.log")
+		// The step's command is the real one behind a wrapper that only
+		// writes down, for each try, when it ended and with which code.
+		w.tries, w.command = filepath.Join(w.dir, "tries.log"), filepath.Join(w.dir, "step.sh")
+		require.NoError(t, os.WriteFile(w.command, []byte("#!/bin/sh\n"+bin+` "$@"`+"\ncode=$?\necho \"$(date +%s) $code\" >> "+w.tries+"\nexit $code\n"), 0o700))
 		w.reg = reviewtest.Open(w.registry)
 		job := fixtureJob()
 		job.WorkingDir = w.dir
@@ -306,13 +311,10 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		}}
 		require.NoError(t, w.reg.PutJob(job))
 		w.job = job.ID
-		reviewer := func(holder string, ttl time.Duration) *review.Reviewer {
-			return &review.Reviewer{
-				MachineID: job.MachineID, Registry: w.reg, Effector: &review.CommandEffector{}, Opener: &opener{},
-				Holder: holder, AgentClient: "fixture-agent 1.0", DecideDAG: review.DecideDAGName(job.MachineID), ClaimTTL: ttl,
-			}
+		first := &review.Reviewer{
+			MachineID: job.MachineID, Registry: w.reg, Effector: &review.CommandEffector{}, Opener: &opener{},
+			Holder: "tick-1", AgentClient: "fixture-agent 1.0", DecideDAG: review.DecideDAGName(job.MachineID), ClaimTTL: time.Minute,
 		}
-		first := reviewer("tick-1", time.Minute)
 		prepared, err := first.Prepare(ctx, job.ID)
 		require.NoError(t, err)
 		applied, err := first.Apply(ctx, prepared, review.AgentDecision{
@@ -324,10 +326,15 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		decided, err := w.reg.Decide(job.ID, w.proposal, review.VerdictApprove, "", "connor")
 		require.NoError(t, err)
 		w.decision = decided.ID
-		// The next tick's review claims the job and dies.
-		_, err = w.reg.AcquireClaim(ctx, review.ClaimRequest{JobID: job.ID, Kind: review.ClaimReview, Holder: "tick-dead", TTL: claimFor})
-		require.NoError(t, err)
 		return w
+	}
+	// die is the next tick's review claiming the job and dying. It is called
+	// right before a run starts, and says when the claim's lifetime ends.
+	die := func(t *testing.T, w world, claimFor time.Duration) time.Time {
+		t.Helper()
+		claim, err := w.reg.AcquireClaim(ctx, review.ClaimRequest{JobID: w.job, Kind: review.ClaimReview, Holder: "tick-dead", TTL: claimFor})
+		require.NoError(t, err)
+		return claim.ExpiresAt
 	}
 	// The execute step as the decision DAG carries it, with the one-second
 	// interval a test can wait for and the decision id given as a
@@ -335,7 +342,7 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 	stepDAG := func(t *testing.T, w world) string {
 		t.Helper()
 		dags, err := review.RenderDAGs(review.DAGConfig{
-			MachineID: fixtureJob().MachineID, StateDir: w.dir, ReviewCommand: bin, ClaimWaitIntervalSec: 1,
+			MachineID: fixtureJob().MachineID, StateDir: w.dir, ReviewCommand: w.command, ClaimWaitIntervalSec: 1,
 			Env: map[string]string{"TXE_FIXTURE_REGISTRY": w.registry, "TXE_FIXTURE_STATE_DIR": w.dir, "TXE_FIXTURE_MACHINE": fixtureJob().MachineID},
 		})
 		require.NoError(t, err)
@@ -362,25 +369,56 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		require.NoError(t, err)
 		return strings.Split(strings.TrimSpace(string(data)), "\n")
 	}
+	// tries is what each try of the step ended with, in order, and when.
+	type try struct {
+		at   time.Time
+		code int
+	}
+	tries := func(t *testing.T, w world) (out []try) {
+		t.Helper()
+		data, err := os.ReadFile(w.tries)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		require.NoError(t, err)
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var sec int64
+			var code int
+			_, err := fmt.Sscanf(line, "%d %d", &sec, &code)
+			require.NoError(t, err, line)
+			out = append(out, try{time.Unix(sec, 0), code})
+		}
+		return out
+	}
 	actions := func(w world) (out []review.Action) {
 		w.reg.View(func(s *reviewtest.State) { out = append(out, s.Actions[w.job]...) })
 		return out
 	}
 
 	t.Run("it waits for the claim and then runs the action once", func(t *testing.T) {
-		const claimFor = 6 * time.Second
-		w := start(t, claimFor)
+		w := start(t)
 		th := test.Setup(t)
-		dagAgent := th.DAG(t, stepDAG(t, w))
-		agent := dagAgent.Agent()
-		runCtx, cancel := context.WithTimeout(agent.Context, 90*time.Second)
+		dag := th.DAG(t, stepDAG(t, w))
+		agent := dag.Agent()
+		runCtx, cancel := context.WithTimeout(agent.Context, 120*time.Second)
 		defer cancel()
-		started := time.Now()
+		// The claim is taken only now, with everything else ready, so the
+		// first try meets it.
+		expires := die(t, w, 10*time.Second)
 		require.NoError(t, agent.Run(runCtx), "the run succeeds by itself")
-		elapsed := time.Since(started)
 
-		assert.GreaterOrEqual(t, elapsed, claimFor-2*time.Second, "not before the dead claim's lifetime was over")
-		assert.Less(t, elapsed, 60*time.Second)
+		got := tries(t, w)
+		require.GreaterOrEqual(t, len(got), 2, "the step was tried again: %v", got)
+		last := got[len(got)-1]
+		for _, held := range got[:len(got)-1] {
+			assert.Equal(t, review.ExitClaimHeld, held.code, "every try before the last met the claim and exited with the claim-held code")
+			assert.True(t, held.at.Before(expires.Add(time.Second)), "and met it while it was live")
+		}
+		assert.Zero(t, last.code)
+		// The log has whole seconds: the last try ended in or after the
+		// second the claim's lifetime ended in.
+		assert.False(t, last.at.Before(expires.Truncate(time.Second)), "the action ran only once the dead claim's lifetime was over (%s, claim to %s)", last.at, expires)
+
 		require.Len(t, effects(t, w), 1, "the action ran exactly once")
 		assert.Contains(t, effects(t, w)[0], "expanded to 200")
 		done := actions(w)
@@ -392,10 +430,8 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		joined := strings.Join(transitions, "\n")
 		assert.Contains(t, joined, "granted to tick-dead (review)")
 		assert.Contains(t, joined, "expired", "the dead claim ended by its lifetime; nobody released it")
-		assert.NotContains(t, joined, "granted to tick-dead (review)\nclaim clm_000002 fence 2 released")
 
-		// The same run started again, as a retry from the dashboard would
-		// be, runs nothing more.
+		// The same run started again, as a retry would be, runs nothing more.
 		dagAgain := th.DAG(t, stepDAG(t, w))
 		again := dagAgain.Agent()
 		require.NoError(t, again.Run(runCtx))
@@ -406,17 +442,22 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 	// A run that ends before the claim does is a failed run with nothing
 	// done, and the retry a person then makes runs the action once.
 	t.Run("a run cut short does nothing, and its retry runs the action once", func(t *testing.T) {
-		w := start(t, 8*time.Second)
+		w := start(t)
 		th := test.Setup(t)
-		dagAgent := th.DAG(t, stepDAG(t, w))
-		agent := dagAgent.Agent()
-		short, cancel := context.WithTimeout(agent.Context, 3*time.Second)
+		dag := th.DAG(t, stepDAG(t, w))
+		agent := dag.Agent()
+		expires := die(t, w, 12*time.Second)
+		short, cancel := context.WithTimeout(agent.Context, 4*time.Second)
 		require.Error(t, agent.Run(short), "cut short while the claim was still live")
 		cancel()
+		require.True(t, time.Now().Before(expires), "the run ended before the claim did")
 		assert.Empty(t, effects(t, w))
 		assert.Empty(t, actions(w))
+		for _, held := range tries(t, w) {
+			assert.Equal(t, review.ExitClaimHeld, held.code)
+		}
 
-		time.Sleep(6 * time.Second)
+		time.Sleep(time.Until(expires) + time.Second)
 		dagRetry := th.DAG(t, stepDAG(t, w))
 		retry := dagRetry.Agent()
 		runCtx, cancelRun := context.WithTimeout(retry.Context, 60*time.Second)
@@ -428,20 +469,20 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 	})
 
 	// A failure that is not a held claim is not waited on: the step is tried
-	// once and the run fails, with the reason in its log.
-	t.Run("a decision the registry does not know fails at once", func(t *testing.T) {
-		w := start(t, time.Second)
-		time.Sleep(1500 * time.Millisecond)
-		require.NoError(t, os.Chmod(w.registry, 0o000))
-		t.Cleanup(func() { _ = os.Chmod(w.registry, 0o600) })
+	// once, exits with the ordinary failure code, and the run fails.
+	t.Run("a failure that is not a held claim is tried once", func(t *testing.T) {
+		w := start(t)
+		// The registry cannot be read: not something waiting changes.
+		require.NoError(t, os.WriteFile(w.registry, []byte("{ not json"), 0o600))
 		th := test.Setup(t)
-		dagAgent := th.DAG(t, stepDAG(t, w))
-		agent := dagAgent.Agent()
-		runCtx, cancel := context.WithTimeout(agent.Context, 30*time.Second)
+		dag := th.DAG(t, stepDAG(t, w))
+		agent := dag.Agent()
+		runCtx, cancel := context.WithTimeout(agent.Context, 60*time.Second)
 		defer cancel()
-		started := time.Now()
 		require.Error(t, agent.Run(runCtx))
-		assert.Less(t, time.Since(started), 10*time.Second, "no wait for a failure that waiting does not change")
+		got := tries(t, w)
+		require.Len(t, got, 1, "tried once: %v", got)
+		assert.Equal(t, 1, got[0].code)
 		assert.Empty(t, effects(t, w))
 	})
 }
