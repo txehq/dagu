@@ -51,18 +51,18 @@ func (s *Store) RequestBinding(ctx context.Context, p authn.Principal, shown Sho
 			}
 			continue
 		}
-		if current.State == RequestPending {
-			return &current, nil
-		}
-		// The last request was approved. A new one is wanted only if the
-		// binding it led to has since been revoked.
+		// Whether this request has been used is the binding's to say.
 		binding, _, err := s.binding(ctx, p.Identity)
 		if err != nil {
 			return nil, err
 		}
-		if binding != nil && binding.State == StateActive {
+		used := binding != nil && binding.RequestGeneration >= current.Generation
+		if !used || binding.State == StateActive {
+			// Still waiting, or already bound: asking again changes nothing.
 			return &current, nil
 		}
+		// The binding this request led to has been revoked. Binding again
+		// takes a new request.
 		next := current
 		next.Shown, next.State, next.RequestedAt = shown, RequestPending, s.clock()
 		next.Generation = current.Generation + 1
@@ -77,13 +77,21 @@ func (s *Store) RequestBinding(ctx context.Context, p authn.Principal, shown Sho
 	return nil, errContended
 }
 
-// PendingRequest returns the identity's binding request if one is waiting,
-// or nil.
+// PendingRequest returns the identity's binding request if it has not been
+// used, or nil. A request has been used once a binding records its
+// generation, whether that binding still stands or not.
 func (s *Store) PendingRequest(ctx context.Context, id authn.Identity) (*BindingRequest, error) {
 	var request BindingRequest
 	_, found, err := s.read(ctx, requestsPrefix+identityDigest(id), &request)
-	if err != nil || !found || request.State != RequestPending {
+	if err != nil || !found {
 		return nil, err
+	}
+	binding, _, err := s.binding(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if binding != nil && binding.RequestGeneration >= request.Generation {
+		return nil, nil
 	}
 	return &request, nil
 }
@@ -130,23 +138,29 @@ func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity,
 			}
 			// A repeat. Finish marking the request in case an earlier
 			// approval stopped between the two records.
-			if err := s.markApproved(ctx, id); err != nil {
+			if err := s.markApproved(ctx, id, current.RequestGeneration); err != nil {
 				return nil, err
 			}
 			return &current, nil
 		}
 
-		request, err := s.PendingRequest(ctx, id)
+		// The request must be one no binding has consumed. That is read from
+		// the binding record just read, the same record the write below
+		// replaces, so a request cannot be used twice even if an earlier
+		// approval stopped before it marked the request.
+		var request BindingRequest
+		_, requested, err := s.read(ctx, requestsPrefix+identityDigest(id), &request)
 		if err != nil {
 			return nil, err
 		}
-		if request == nil {
-			return nil, refuse(CodeNotFound, "the identity has no pending binding request; it must sign in and ask first")
+		if !requested || (found && current.RequestGeneration >= request.Generation) {
+			return nil, refuse(CodeNotFound, "the identity has no unused binding request; it must sign in and ask first")
 		}
 
 		next := Binding{
 			Schema: SchemaVersion, Issuer: id.Issuer, Subject: id.Subject, OwnerID: ownerID,
-			Generation: 1, State: StateActive, Bound: Stamp{At: s.clock(), By: by.actor()}, Shown: request.Shown,
+			Generation: 1, RequestGeneration: request.Generation, State: StateActive,
+			Bound: Stamp{At: s.clock(), By: by.actor()}, Shown: request.Shown,
 		}
 		var applied bool
 		if found {
@@ -164,7 +178,7 @@ func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity,
 		if !applied {
 			continue
 		}
-		if err := s.markApproved(ctx, id); err != nil {
+		if err := s.markApproved(ctx, id, next.RequestGeneration); err != nil {
 			return nil, err
 		}
 		return &next, nil
@@ -172,9 +186,10 @@ func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity,
 	return nil, errContended
 }
 
-// markApproved moves a pending request to approved. A request that is not
-// pending is left alone.
-func (s *Store) markApproved(ctx context.Context, id authn.Identity) error {
+// markApproved shows the request of the given generation as approved. It is
+// for a human reading the request: nothing decides by it. A request of
+// another generation, or one already marked, is left alone.
+func (s *Store) markApproved(ctx context.Context, id authn.Identity, generation int) error {
 	requestID := requestsPrefix + identityDigest(id)
 	for range attempts {
 		var request BindingRequest
@@ -182,7 +197,7 @@ func (s *Store) markApproved(ctx context.Context, id authn.Identity) error {
 		if err != nil {
 			return err
 		}
-		if !found || request.State != RequestPending {
+		if !found || request.State != RequestPending || request.Generation != generation {
 			return nil
 		}
 		request.State = RequestApproved

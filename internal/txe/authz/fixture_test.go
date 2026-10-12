@@ -214,11 +214,10 @@ func (f *fixture) enforce(scope Scope, permission Permission, resource Resource)
 	return decision
 }
 
-// enrol enrols a machine with a worker credential by client key, as the
-// person scope given.
-func (f *fixture) enrol(by Scope, machineID string, credential authn.Principal, kind KeyKind) *Enrolment {
+// enrol enrols a machine with a credential, as the person scope given.
+func (f *fixture) enrol(by Scope, machineID string, credential authn.Principal) *Enrolment {
 	f.t.Helper()
-	enrolment, err := f.store.Enrol(context.Background(), by, EnrolmentRequest{MachineID: machineID, Credential: credential, KeyKind: kind})
+	enrolment, err := f.store.Enrol(context.Background(), by, EnrolmentRequest{MachineID: machineID, Credential: credential})
 	require.NoError(f.t, err)
 	return enrolment
 }

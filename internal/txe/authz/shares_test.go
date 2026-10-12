@@ -189,7 +189,7 @@ func TestShareAndClasses(t *testing.T) {
 	assert.Equal(t, ReasonClass, approve.Reason)
 
 	worker := f.token(authn.ClassWorker, "bob", "worker-b1", "")
-	f.enrol(bob, machineB1, worker, KeyClient)
+	f.enrol(bob, machineB1, worker)
 	machine := f.resolve(worker)
 	require.Equal(t, ScopeMachine, machine.Kind())
 	shared := f.enforce(machine, PermissionView, f.job(jobA1))

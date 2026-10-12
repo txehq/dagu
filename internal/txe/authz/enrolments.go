@@ -16,12 +16,10 @@ type EnrolmentRequest struct {
 	// MachineID is the machine, as the registry knows it.
 	MachineID string
 	// Credential is the verified principal of a token the machine obtained
-	// by its own sign-in. Its class is the class enrolled, and the key is
-	// read from it.
+	// by its own sign-in, through the provider client that exists for this
+	// machine and class. Its class is the class enrolled, and the key is its
+	// issuer and client.
 	Credential authn.Principal
-	// KeyKind chooses which provider-set value ties the credential to the
-	// machine.
-	KeyKind KeyKind
 }
 
 // Enrol lets a machine act for its owner.
@@ -30,16 +28,21 @@ type EnrolmentRequest struct {
 // records it. The credential must be a worker's or a reviewer's, unexpired,
 // and its identity must be bound to that same owner.
 //
-// The enrolment is found from then on by the key the credential carries. A
-// key belongs to the first machine and class it was enrolled for, for good:
-// presenting it for another machine is refused with CodeConflict, the first
-// enrolment is untouched, and nothing is ever reassigned. That is what makes
-// two machines that received the same key from the provider fail closed
-// instead of becoming each other.
+// The enrolment is found from then on by the credential's issuer and client.
+// That key belongs to the first machine and class it was enrolled for, for
+// good: presenting it for another machine or class is refused with
+// CodeConflict, the first enrolment is untouched, and nothing is ever
+// reassigned. A machine that is both a worker and a reviewer has two clients.
 //
-// Enrolling again with the same key and identity returns the enrolment that
-// stands. A different key or identity for a machine and class whose
-// enrolment stands is refused with CodeConflict: revoke it first.
+// Enrolling again with the same credential returns the enrolment that stands.
+// Another credential for a machine and class whose enrolment stands, or is
+// being made, is refused with CodeConflict: revoke it first.
+//
+// The enrolment is written in three steps, each one record: it is reserved
+// as pending, which grants nothing and settles which request the machine and
+// class go to; then the key is claimed; then it is made active. A request
+// that stops in between leaves a pending enrolment, which repeating the
+// request finishes and revoking clears.
 func (s *Store) Enrol(ctx context.Context, by Scope, request EnrolmentRequest) (*Enrolment, error) {
 	if err := s.requirePerson(ctx, by); err != nil {
 		return nil, err
@@ -58,7 +61,7 @@ func (s *Store) Enrol(ctx context.Context, by Scope, request EnrolmentRequest) (
 	if request.MachineID == "" {
 		return nil, refuse(CodeInvalid, "a machine id is required")
 	}
-	key, err := KeyOf(request.KeyKind, credential)
+	key, err := KeyOf(credential)
 	if err != nil {
 		return nil, err
 	}
@@ -80,37 +83,65 @@ func (s *Store) Enrol(ctx context.Context, by Scope, request EnrolmentRequest) (
 		return nil, refuse(CodeForbidden, "the credential's identity is not bound to the machine's owner")
 	}
 
-	// Judge the machine's standing enrolment before claiming anything, so
-	// that a refused request leaves no claim behind.
-	digest := enrolmentDigest(request.MachineID, class)
-	var standing Enrolment
-	if _, found, err := s.read(ctx, enrolmentsPrefix+digest, &standing); err != nil {
+	// A key that is another machine's is refused before anything is written.
+	claim, err := s.keyClaim(ctx, key)
+	if err != nil {
 		return nil, err
-	} else if found && standing.State == StateActive && !sameEnrolment(&standing, key, credential, owner) {
-		return nil, enrolledOtherwise(&standing)
+	}
+	if claim != nil && (claim.MachineID != request.MachineID || claim.Class != class) {
+		return nil, keyBelongsElsewhere()
+	}
+
+	want := Enrolment{
+		Schema: SchemaVersion, MachineID: request.MachineID, Class: class, OwnerID: owner,
+		Issuer: credential.Issuer, Subject: credential.Subject, Key: key, SessionID: credential.SessionID,
+	}
+	reserved, err := s.reserve(ctx, by, want)
+	if err != nil {
+		return nil, err
+	}
+	if reserved.State == StateActive {
+		return reserved, nil
 	}
 
 	if err := s.claimKey(ctx, key, request.MachineID, class); err != nil {
+		// The key went to another machine between the check above and here.
+		// The reservation granted nothing; clear it so the machine is free.
+		if CodeOf(err) == CodeConflict {
+			if clearErr := s.clearReservation(ctx, by, reserved); clearErr != nil {
+				return nil, clearErr
+			}
+		}
 		return nil, err
 	}
+	return s.activate(ctx, reserved)
+}
 
+// reserve makes the machine and class this request's, as a pending enrolment,
+// or returns the enrolment of the same credential that is already there. It
+// is where two requests for one machine and class are told apart: one record,
+// written by create or compare-and-swap, so exactly one of them holds it.
+func (s *Store) reserve(ctx context.Context, by Scope, want Enrolment) (*Enrolment, error) {
+	digest := enrolmentDigest(want.MachineID, want.Class)
 	for range attempts {
 		var current Enrolment
 		raw, found, err := s.read(ctx, enrolmentsPrefix+digest, &current)
 		if err != nil {
 			return nil, err
 		}
-		if found && current.State == StateActive {
-			if !sameEnrolment(&current, key, credential, owner) {
-				return nil, enrolledOtherwise(&current)
+		if found && current.State != StateRevoked {
+			if !sameCredential(&current, &want) {
+				return nil, &Error{
+					Code:    CodeConflict,
+					Message: "the machine is already enrolled for this class, or being enrolled, with another credential; revoke that enrolment first",
+					Current: &current,
+				}
 			}
 			return &current, nil
 		}
-		next := Enrolment{
-			Schema: SchemaVersion, MachineID: request.MachineID, Class: class, OwnerID: owner,
-			Issuer: credential.Issuer, Subject: credential.Subject, Key: key,
-			Generation: 1, State: StateActive, Enrolled: Stamp{At: s.clock(), By: by.actor()},
-		}
+		next := want
+		next.Generation, next.State = 1, StatePending
+		next.Enrolled = Stamp{At: s.clock(), By: by.actor()}
 		var applied bool
 		if found {
 			next.Generation = current.Generation + 1
@@ -131,89 +162,113 @@ func (s *Store) Enrol(ctx context.Context, by Scope, request EnrolmentRequest) (
 	return nil, errContended
 }
 
-func sameEnrolment(e *Enrolment, key EnrolmentKey, credential authn.Principal, owner string) bool {
-	return e.Key == key && e.Issuer == credential.Issuer && e.Subject == credential.Subject && e.OwnerID == owner
+// activate makes a pending enrolment active once its key is claimed.
+func (s *Store) activate(ctx context.Context, reserved *Enrolment) (*Enrolment, error) {
+	id := enrolmentsPrefix + enrolmentDigest(reserved.MachineID, reserved.Class)
+	for range attempts {
+		var current Enrolment
+		raw, found, err := s.read(ctx, id, &current)
+		if err != nil {
+			return nil, err
+		}
+		if !found || current.Generation != reserved.Generation || !sameCredential(&current, reserved) || current.State == StateRevoked {
+			// Revoked, or replaced, while it was being made.
+			return nil, refuse(CodeConflict, "the enrolment was revoked while it was being made")
+		}
+		if current.State == StateActive {
+			return &current, nil
+		}
+		current.State = StateActive
+		swapped, err := s.swap(ctx, id, raw, current)
+		if err != nil {
+			return nil, err
+		}
+		if swapped {
+			return &current, nil
+		}
+	}
+	return nil, errContended
 }
 
-func enrolledOtherwise(current *Enrolment) *Error {
-	return &Error{
-		Code:    CodeConflict,
-		Message: "the machine is already enrolled for this class with another credential; revoke that enrolment first",
-		Current: current,
+// clearReservation revokes a pending enrolment that cannot be finished.
+func (s *Store) clearReservation(ctx context.Context, by Scope, reserved *Enrolment) error {
+	id := enrolmentsPrefix + enrolmentDigest(reserved.MachineID, reserved.Class)
+	for range attempts {
+		var current Enrolment
+		raw, found, err := s.read(ctx, id, &current)
+		if err != nil {
+			return err
+		}
+		if !found || current.Generation != reserved.Generation || current.State != StatePending {
+			return nil
+		}
+		current.State = StateRevoked
+		current.Revoked = &Revocation{At: s.clock(), By: by.actor(), Reason: "the credential's key belongs to another machine"}
+		swapped, err := s.swap(ctx, id, raw, current)
+		if err != nil {
+			return err
+		}
+		if swapped {
+			return nil
+		}
 	}
+	return errContended
+}
+
+func sameCredential(a, b *Enrolment) bool {
+	return a.Key == b.Key && a.Issuer == b.Issuer && a.Subject == b.Subject && a.OwnerID == b.OwnerID
+}
+
+func keyBelongsElsewhere() *Error {
+	return refuse(CodeConflict,
+		"this credential's client already belongs to another machine or class; it is not reassigned. "+
+			"Each machine and class needs a provider client of its own")
+}
+
+// keyClaim returns the record of which machine and class a key belongs to,
+// or nil when it belongs to none.
+func (s *Store) keyClaim(ctx context.Context, key EnrolmentKey) (*keyClaim, error) {
+	var claim keyClaim
+	_, found, err := s.read(ctx, keysPrefix+keyDigest(key), &claim)
+	if err != nil || !found {
+		return nil, err
+	}
+	if claim.Key != key {
+		// The record is found by a digest. A record for another key under
+		// this one's digest is not this key's.
+		return nil, errors.New("authz: an enrolment key record does not match its id")
+	}
+	return &claim, nil
 }
 
 // claimKey makes a key belong to a machine and class, or confirms that it
 // already does. The claim is one create-only record, so of two machines that
-// present the same key at the same moment exactly one gets it.
-//
-// It first fixes which kind of key the client's machines are enrolled by. A
-// client is used with one kind only.
+// present the same key at the same moment exactly one gets it. Only the
+// holder of the machine's reservation calls it.
 func (s *Store) claimKey(ctx context.Context, key EnrolmentKey, machineID string, class authn.Class) error {
-	mode, err := s.claimMode(ctx, key)
-	if err != nil {
-		return err
-	}
-	if mode != key.Kind {
-		return refuse(CodeConflict,
-			"machines of this provider client are enrolled by %s key; a client is used with one kind of key only", mode)
-	}
-
-	id := keysPrefix + keyDigest(key)
 	claim := keyClaim{Schema: SchemaVersion, Key: key, MachineID: machineID, Class: class, ClaimedAt: s.clock()}
-	created, err := s.create(ctx, id, claim)
+	created, err := s.create(ctx, keysPrefix+keyDigest(key), claim)
 	if err != nil || created {
 		return err
 	}
-	var current keyClaim
-	_, found, err := s.read(ctx, id, &current)
+	current, err := s.keyClaim(ctx, key)
 	if err != nil {
 		return err
 	}
-	if !found {
+	if current == nil {
 		return errContended
 	}
-	if current.Key != key || current.MachineID != machineID || current.Class != class {
-		return refuse(CodeConflict,
-			"this credential's key already belongs to another machine or class; it is not reassigned. "+
-				"The provider gave two sign-ins the same key: sign the machine in so that it gets its own")
+	if current.MachineID != machineID || current.Class != class {
+		return keyBelongsElsewhere()
 	}
 	return nil
 }
 
-// claimMode records the kind of key a client's machines are enrolled by, the
-// first time one is enrolled, and returns the kind that stands.
-func (s *Store) claimMode(ctx context.Context, key EnrolmentKey) (KeyKind, error) {
-	id := modesPrefix + clientDigest(key.Issuer, key.ClientID)
-	created, err := s.create(ctx, id, clientMode{Schema: SchemaVersion, Issuer: key.Issuer, ClientID: key.ClientID, Kind: key.Kind})
-	if err != nil {
-		return "", err
-	}
-	if created {
-		return key.Kind, nil
-	}
-	return s.modeOf(ctx, key.Issuer, key.ClientID)
-}
-
-// modeOf returns the kind of key a client's machines are enrolled by, or ""
-// when none has been enrolled.
-func (s *Store) modeOf(ctx context.Context, issuer, clientID string) (KeyKind, error) {
-	var mode clientMode
-	_, found, err := s.read(ctx, modesPrefix+clientDigest(issuer, clientID), &mode)
-	if err != nil || !found {
-		return "", err
-	}
-	if mode.Issuer != issuer || mode.ClientID != clientID {
-		return "", nil
-	}
-	return mode.Kind, nil
-}
-
-// RevokeEnrolment ends a machine's enrolment for one class. From the next
-// decision on, its credential acts for nobody. The key stays the machine's:
-// it can be enrolled again for the same machine and class, and never for
-// another. Revoking an enrolment that is already revoked returns it
-// unchanged.
+// RevokeEnrolment ends a machine's enrolment for one class, or clears one
+// that was left pending. From the next decision on, its credential acts for
+// nobody. The key stays the machine's: it can be enrolled again for the same
+// machine and class, and never for another. Revoking an enrolment that is
+// already revoked returns it unchanged.
 //
 // The caller is a person acting for the machine's owner, or the platform
 // administrator.
@@ -252,8 +307,8 @@ func (s *Store) RevokeEnrolment(ctx context.Context, by Scope, machineID string,
 	return nil, errContended
 }
 
-// Enrolments returns an owner's enrolments, revoked ones included, oldest
-// first.
+// Enrolments returns an owner's enrolments, pending and revoked ones
+// included, oldest first.
 func (s *Store) Enrolments(ctx context.Context, ownerID string) ([]*Enrolment, error) {
 	var out []*Enrolment
 	err := s.each(ctx, enrolmentsPrefix, func(data []byte) error {
@@ -269,14 +324,6 @@ func (s *Store) Enrolments(ctx context.Context, ownerID string) ([]*Enrolment, e
 	return out, err
 }
 
-// activeEnrolment finds the enrolment a machine credential belongs to, with
-// the binding of its identity, or the reason there is none.
-//
-// The enrolment is found by a key read from the credential, of the kind its
-// client's machines are enrolled by. Nothing the caller says takes part.
-// Everything else the credential carries must then agree with the enrolment
-// found: class, issuer and subject. The identity's binding to the machine's
-// owner, and the registry's record of who owns the machine, must still stand.
 type enrolled struct {
 	enrolment *Enrolment
 	binding   *Binding
@@ -286,25 +333,25 @@ type enrolled struct {
 
 func notEnrolled(reason Reason) (enrolled, error) { return enrolled{reason: reason}, nil }
 
+// activeEnrolment finds the enrolment a machine credential belongs to, with
+// the binding of its identity, or the reason there is none.
+//
+// The enrolment is found by one key, the credential's issuer and client.
+// There is no second way to find one, and nothing the caller says takes
+// part. Everything else the credential carries must then agree with the
+// enrolment found: class, issuer and subject. The identity's binding to the
+// machine's owner, and the registry's record of who owns the machine, must
+// still stand.
 func (s *Store) activeEnrolment(ctx context.Context, p authn.Principal) (enrolled, error) {
-	kind, err := s.modeOf(ctx, p.Issuer, p.ClientID)
+	key, err := KeyOf(p)
+	if err != nil {
+		return notEnrolled(ReasonNotEnrolled)
+	}
+	claim, err := s.keyClaim(ctx, key)
 	if err != nil {
 		return enrolled{reason: ReasonEvaluationFailed}, err
 	}
-	if kind == "" {
-		return notEnrolled(ReasonNotEnrolled)
-	}
-	key, err := KeyOf(kind, p)
-	if err != nil {
-		// A session key is wanted and the credential names no session.
-		return notEnrolled(ReasonNotEnrolled)
-	}
-	var claim keyClaim
-	_, claimed, err := s.read(ctx, keysPrefix+keyDigest(key), &claim)
-	if err != nil {
-		return enrolled{reason: ReasonEvaluationFailed}, err
-	}
-	if !claimed || claim.Key != key {
+	if claim == nil {
 		return notEnrolled(ReasonNotEnrolled)
 	}
 
@@ -316,11 +363,14 @@ func (s *Store) activeEnrolment(ctx context.Context, p authn.Principal) (enrolle
 	switch {
 	case !found:
 		return notEnrolled(ReasonNotEnrolled)
-	// The machine may have been enrolled again with another key since.
+	// The machine may have been enrolled again with another client since.
 	case enrolment.Key != claim.Key || enrolment.MachineID != claim.MachineID || enrolment.Class != claim.Class:
 		return notEnrolled(ReasonNotEnrolled)
-	case enrolment.State != StateActive:
+	case enrolment.State == StateRevoked:
 		return notEnrolled(ReasonEnrolmentRevoked)
+	// A pending enrolment grants nothing.
+	case enrolment.State != StateActive:
+		return notEnrolled(ReasonNotEnrolled)
 	case enrolment.Class != p.Class:
 		return notEnrolled(ReasonClass)
 	case enrolment.Issuer != p.Issuer || enrolment.Subject != p.Subject:

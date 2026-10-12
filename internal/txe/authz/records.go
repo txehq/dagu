@@ -17,6 +17,9 @@ import (
 type State string
 
 const (
+	// StatePending is an enrolment that has been reserved and grants nothing
+	// yet. Only enrolments are ever pending.
+	StatePending State = "pending"
 	StateActive  State = "active"
 	StateRevoked State = "revoked"
 )
@@ -61,7 +64,9 @@ type Shown struct {
 	Name     string `json:"name,omitempty"`
 }
 
-// RequestState is where a binding request stands.
+// RequestState is where a binding request stands, for a human to read.
+// Whether a request can still be used is not read from it: that is decided by
+// the binding, which records the request it consumed.
 type RequestState string
 
 const (
@@ -92,11 +97,16 @@ type Binding struct {
 	OwnerID string `json:"owner_id"`
 	// Generation counts the bindings this identity has had. A scope carries
 	// the generation it was resolved from, and a later one does not satisfy it.
-	Generation int         `json:"generation"`
-	State      State       `json:"state"`
-	Bound      Stamp       `json:"bound"`
-	Shown      Shown       `json:"shown"`
-	Revoked    *Revocation `json:"revoked,omitempty"`
+	Generation int `json:"generation"`
+	// RequestGeneration is the binding request this binding consumed. It is
+	// written with the binding, in one record, so a request is used exactly
+	// once whatever happens to any other write: a request whose generation is
+	// not above this one has been used and cannot make another binding.
+	RequestGeneration int         `json:"request_generation"`
+	State             State       `json:"state"`
+	Bound             Stamp       `json:"bound"`
+	Shown             Shown       `json:"shown"`
+	Revoked           *Revocation `json:"revoked,omitempty"`
 }
 
 // Identity returns the identity the binding is for.
@@ -136,45 +146,25 @@ type Share struct {
 	Revoked        *Revocation  `json:"revoked,omitempty"`
 }
 
-// KeyKind says which provider-set value ties a credential to one machine.
-type KeyKind string
-
-const (
-	// KeyClient ties a machine to a provider client that exists for that
-	// machine alone. Every token issued to that client is the machine's.
-	KeyClient KeyKind = "client"
-	// KeySession ties a machine to one provider session of a client. It is
-	// safe only when each machine signs in from a browser with no session
-	// yet: sign-ins made in one signed-in browser share a session, and the
-	// second machine to present it is refused.
-	KeySession KeyKind = "session"
-)
-
-// EnrolmentKey is what an enrolment is found by. The provider sets every
-// part of it; a caller can choose none.
+// EnrolmentKey is what an enrolment is found by: the identity provider's
+// issuer and a provider client that exists for one machine and one class.
+// The provider sets both, in every token it issues to that client; a caller
+// can choose neither.
+//
+// Nothing else is a key. A provider session in particular is not: sign-ins
+// made from one signed-in browser share a session, so it does not tell
+// machines apart.
 type EnrolmentKey struct {
-	Kind      KeyKind `json:"kind"`
-	Issuer    string  `json:"issuer"`
-	ClientID  string  `json:"client_id"`
-	SessionID string  `json:"session_id,omitempty"`
+	Issuer   string `json:"issuer"`
+	ClientID string `json:"client_id"`
 }
 
-// KeyOf returns the key of the given kind that a verified principal carries.
-func KeyOf(kind KeyKind, p authn.Principal) (EnrolmentKey, error) {
+// KeyOf returns the key a verified principal carries.
+func KeyOf(p authn.Principal) (EnrolmentKey, error) {
 	if p.Issuer == "" || p.ClientID == "" {
 		return EnrolmentKey{}, refuse(CodeInvalid, "the credential names no issuer or no client")
 	}
-	switch kind {
-	case KeyClient:
-		return EnrolmentKey{Kind: KeyClient, Issuer: p.Issuer, ClientID: p.ClientID}, nil
-	case KeySession:
-		if p.SessionID == "" {
-			return EnrolmentKey{}, refuse(CodeInvalid, "the credential names no session")
-		}
-		return EnrolmentKey{Kind: KeySession, Issuer: p.Issuer, ClientID: p.ClientID, SessionID: p.SessionID}, nil
-	default:
-		return EnrolmentKey{}, refuse(CodeInvalid, "unknown enrolment key kind %q", kind)
-	}
+	return EnrolmentKey{Issuer: p.Issuer, ClientID: p.ClientID}, nil
 }
 
 // Enrolment lets one machine act for its owner as one class. There is one
@@ -186,13 +176,17 @@ type Enrolment struct {
 	OwnerID   string      `json:"owner_id"`
 	// Issuer and Subject are the identity the machine signs in as. It must
 	// be bound to OwnerID for as long as the enrolment is used.
-	Issuer     string       `json:"issuer"`
-	Subject    string       `json:"subject"`
-	Key        EnrolmentKey `json:"key"`
-	Generation int          `json:"generation"`
-	State      State        `json:"state"`
-	Enrolled   Stamp        `json:"enrolled"`
-	Revoked    *Revocation  `json:"revoked,omitempty"`
+	Issuer  string       `json:"issuer"`
+	Subject string       `json:"subject"`
+	Key     EnrolmentKey `json:"key"`
+	// SessionID is the provider session of the credential the machine was
+	// enrolled with. It is recorded so that the session can be ended at the
+	// provider. It is never matched and never finds an enrolment.
+	SessionID  string      `json:"session_id,omitempty"`
+	Generation int         `json:"generation"`
+	State      State       `json:"state"`
+	Enrolled   Stamp       `json:"enrolled"`
+	Revoked    *Revocation `json:"revoked,omitempty"`
 }
 
 // keyClaim is the index record that makes a key belong to one machine and
@@ -207,18 +201,6 @@ type keyClaim struct {
 	ClaimedAt time.Time    `json:"claimed_at"`
 }
 
-// clientMode records which kind of key a provider client's machines are
-// enrolled by. It is created once and never changed. Without it, a client
-// whose machines are told apart by session could later be claimed whole by
-// one machine as a client key, and that machine would then be every machine
-// of that client.
-type clientMode struct {
-	Schema   int     `json:"schema"`
-	Issuer   string  `json:"issuer"`
-	ClientID string  `json:"client_id"`
-	Kind     KeyKind `json:"kind"`
-}
-
 // Record ids. Every free-text part is hashed, so nothing a provider or a
 // caller chose becomes a path.
 const (
@@ -230,7 +212,6 @@ const (
 	enrolmentsPrefix = "enrolments/"
 	enrolmentHistory = "enrolment_history/"
 	keysPrefix       = "enrolment_keys/"
-	modesPrefix      = "client_modes/"
 )
 
 // digest hashes parts so that no two different lists of parts collide: each
@@ -258,12 +239,8 @@ func enrolmentDigest(machineID string, class authn.Class) string {
 	return digest("enrolment", machineID, string(class))
 }
 
-func clientDigest(issuer, clientID string) string {
-	return digest("client", issuer, clientID)
-}
-
 func keyDigest(key EnrolmentKey) string {
-	return digest("key", string(key.Kind), key.Issuer, key.ClientID, key.SessionID)
+	return digest("key", key.Issuer, key.ClientID)
 }
 
 // normalizePermissions returns the permissions sorted in their defined order

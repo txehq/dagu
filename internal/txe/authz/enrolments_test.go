@@ -32,11 +32,13 @@ func TestEnrolByClient(t *testing.T) {
 	assert.Equal(t, ReasonNotEnrolled, reason, "before enrolment the credential is nobody's")
 	assert.Equal(t, ScopeUnbound, f.resolve(credential).Kind())
 
-	enrolment := f.enrol(alice, machineA1, credential, KeyClient)
+	enrolment := f.enrol(alice, machineA1, credential)
 	assert.Equal(t, machineA1, enrolment.MachineID)
 	assert.Equal(t, authn.ClassWorker, enrolment.Class)
 	assert.Equal(t, ownerA, enrolment.OwnerID)
-	assert.Equal(t, EnrolmentKey{Kind: KeyClient, Issuer: issuer, ClientID: "worker-a1"}, enrolment.Key)
+	assert.Equal(t, EnrolmentKey{Issuer: issuer, ClientID: "worker-a1"}, enrolment.Key)
+	assert.Equal(t, "browser-session", enrolment.SessionID, "recorded, for ending the session at the provider")
+	assert.Equal(t, StateActive, enrolment.State)
 	assert.Equal(t, "alice", enrolment.Subject)
 	assert.Equal(t, 1, enrolment.Generation)
 
@@ -48,7 +50,8 @@ func TestEnrolByClient(t *testing.T) {
 	assert.Equal(t, machineA1, scope.MachineID())
 	assert.Equal(t, ownerA, scope.OwnerID())
 
-	// A token refreshed later carries the same key and is the same machine.
+	// A token obtained later carries the same key and is the same machine.
+	// Its session differs: the session is recorded and never matched.
 	f.clock.Advance(4 * time.Minute)
 	refreshed := f.token(authn.ClassWorker, "alice", "worker-a1", "another-session")
 	machine, reason = f.machine(refreshed)
@@ -56,7 +59,7 @@ func TestEnrolByClient(t *testing.T) {
 	assert.Equal(t, machineA1, machine.MachineID)
 
 	// A repeat is the same enrolment.
-	again := f.enrol(alice, machineA1, refreshed, KeyClient)
+	again := f.enrol(alice, machineA1, refreshed)
 	assert.Equal(t, enrolment, again)
 
 	enrolments, err := f.store.Enrolments(context.Background(), ownerA)
@@ -73,8 +76,8 @@ func TestOneMachinesCredentialIsNeverAnother(t *testing.T) {
 	alice := f.bind("alice", ownerA)
 	a1 := f.token(authn.ClassWorker, "alice", "worker-a1", "shared-session")
 	a2 := f.token(authn.ClassWorker, "alice", "worker-a2", "shared-session")
-	f.enrol(alice, machineA1, a1, KeyClient)
-	f.enrol(alice, machineA2, a2, KeyClient)
+	f.enrol(alice, machineA1, a1)
+	f.enrol(alice, machineA2, a2)
 
 	first, _ := f.machine(a1)
 	second, _ := f.machine(a2)
@@ -106,48 +109,39 @@ func TestOneMachinesCredentialIsNeverAnother(t *testing.T) {
 }
 
 // A key that already belongs to a machine is refused for another and never
-// reassigned. This is what a provider that hands two sign-ins the same
-// session comes to: the second machine is not enrolled, and the first is as
-// it was.
+// reassigned: the second machine is not enrolled, and the first is as it was.
 func TestAKeyBelongsToOneMachineForGood(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	ctx := context.Background()
 	alice := f.bind("alice", ownerA)
+	credential := f.token(authn.ClassWorker, "alice", "worker-a1", "s")
+	first := f.enrol(alice, machineA1, credential)
 
-	// Two machines signed in through one signed-in browser: same session.
-	a1 := f.token(authn.ClassWorker, "alice", "worker", "browser-session")
-	a2 := f.token(authn.ClassWorker, "alice", "worker", "browser-session")
-	first := f.enrol(alice, machineA1, a1, KeySession)
-
-	_, err := f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA2, Credential: a2, KeyKind: KeySession})
+	_, err := f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA2, Credential: credential})
 	require.Equal(t, CodeConflict, CodeOf(err))
-	machine, reason := f.machine(a2)
+	machine, reason := f.machine(credential)
 	assert.Empty(t, reason)
 	assert.Equal(t, machineA1, machine.MachineID, "the credential is still the first machine's and nothing else")
 	enrolments, err := f.store.Enrolments(ctx, ownerA)
 	require.NoError(t, err)
-	require.Len(t, enrolments, 1)
+	require.Len(t, enrolments, 1, "the refused request left nothing behind, not even a reservation")
 	assert.Equal(t, first, enrolments[0])
 
-	// A machine that signed in on its own gets its own session, and enrols.
-	separate := f.token(authn.ClassWorker, "alice", "worker", "its-own-session")
-	f.enrol(alice, machineA2, separate, KeySession)
-	machine, _ = f.machine(separate)
-	assert.Equal(t, machineA2, machine.MachineID)
-
-	// Revoking the first enrolment does not free its key for another machine.
+	// Revoking the first enrolment does not free its key for another machine,
+	// of the same owner or of another.
 	_, err = f.store.RevokeEnrolment(ctx, alice, machineA1, authn.ClassWorker, "retired")
 	require.NoError(t, err)
+	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA2, Credential: credential})
+	assert.Equal(t, CodeConflict, CodeOf(err))
 	bob := f.bind("bob", ownerB)
-	_, err = f.store.Enrol(ctx, bob, EnrolmentRequest{
-		MachineID: machineB1, Credential: f.token(authn.ClassWorker, "bob", "worker", "browser-session"), KeyKind: KeySession,
-	})
+	_, err = f.store.Enrol(ctx, bob, EnrolmentRequest{MachineID: machineB1, Credential: f.token(authn.ClassWorker, "bob", "worker-a1", "s")})
 	assert.Equal(t, CodeConflict, CodeOf(err))
 
 	// It can be enrolled again for the same machine, as a new generation.
-	again := f.enrol(alice, machineA1, a1, KeySession)
+	again := f.enrol(alice, machineA1, credential)
 	assert.Equal(t, 2, again.Generation)
+	assert.Equal(t, StateActive, again.State)
 	var archived Enrolment
 	_, found, err := f.store.read(ctx, enrolmentHistory+enrolmentDigest(machineA1, authn.ClassWorker)+"/000001", &archived)
 	require.NoError(t, err)
@@ -155,60 +149,138 @@ func TestAKeyBelongsToOneMachineForGood(t *testing.T) {
 	assert.Equal(t, StateRevoked, archived.State)
 }
 
-// A session key needs a session, and a credential without the enrolled
-// session is not the machine.
-func TestSessionKeyNeedsItsSession(t *testing.T) {
+// A provider client belongs to one machine and one class. A worker's client
+// cannot be enrolled as a reviewer, on its own machine or any other, so a
+// worker's tokens never carry a reviewer's authority.
+func TestAWorkerClientIsNeverAReviewer(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	ctx := context.Background()
 	alice := f.bind("alice", ownerA)
+	f.enrol(alice, machineA1, f.token(authn.ClassWorker, "alice", "client-a1", ""))
 
-	_, err := f.store.Enrol(ctx, alice, EnrolmentRequest{
-		MachineID: machineA1, Credential: f.token(authn.ClassWorker, "alice", "worker", ""), KeyKind: KeySession,
-	})
-	assert.Equal(t, CodeInvalid, CodeOf(err))
-
-	f.enrol(alice, machineA1, f.token(authn.ClassWorker, "alice", "worker", "session-1"), KeySession)
-	for name, credential := range map[string]authn.Principal{
-		"AnotherSession": f.token(authn.ClassWorker, "alice", "worker", "session-2"),
-		"NoSession":      f.token(authn.ClassWorker, "alice", "worker", ""),
-		"AnotherClient":  f.token(authn.ClassWorker, "alice", "worker-2", "session-1"),
-	} {
-		_, reason := f.machine(credential)
-		assert.Equal(t, ReasonNotEnrolled, reason, name)
+	asReviewer := f.token(authn.ClassReviewer, "alice", "client-a1", "")
+	for _, machineID := range []string{machineA1, machineA2} {
+		_, err := f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineID, Credential: asReviewer})
+		assert.Equal(t, CodeConflict, CodeOf(err), machineID)
 	}
+	_, reason := f.machine(asReviewer)
+	assert.Equal(t, ReasonClass, reason)
+
+	// The machine's reviewer has a client of its own.
+	reviewer := f.token(authn.ClassReviewer, "alice", "reviewer-a1", "")
+	f.enrol(alice, machineA1, reviewer)
+	machine, reason := f.machine(reviewer)
+	assert.Empty(t, reason)
+	assert.Equal(t, Machine{MachineID: machineA1, OwnerID: ownerA, Class: authn.ClassReviewer}, machine)
 }
 
-// A client is used with one kind of key. Otherwise a client whose machines
-// are told apart by session could be claimed whole by one machine, which
-// would then be every machine of that client.
-func TestAClientHasOneKindOfKey(t *testing.T) {
+// Nothing but the issuer and the client finds an enrolment. A session never
+// does, in either direction.
+func TestTheSessionFindsNothing(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	alice := f.bind("alice", ownerA)
+	f.enrol(alice, machineA1, f.token(authn.ClassWorker, "alice", "worker-a1", "session-1"))
+
+	// The enrolled session on another client is not the machine.
+	_, reason := f.machine(f.token(authn.ClassWorker, "alice", "worker-other", "session-1"))
+	assert.Equal(t, ReasonNotEnrolled, reason)
+	// The enrolled client with another session, or none, is the machine.
+	for _, session := range []string{"session-2", ""} {
+		machine, reason := f.machine(f.token(authn.ClassWorker, "alice", "worker-a1", session))
+		assert.Empty(t, reason, session)
+		assert.Equal(t, machineA1, machine.MachineID, session)
+	}
+	// A credential with no client carries no key.
+	_, reason = f.machine(f.token(authn.ClassWorker, "alice", "", "session-1"))
+	assert.Equal(t, ReasonNotEnrolled, reason)
+}
+
+// A reservation is not an enrolment. It grants nothing, it holds the machine
+// against another credential, repeating the request finishes it, and revoking
+// clears it.
+func TestAPendingEnrolmentGrantsNothing(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	ctx := context.Background()
 	alice := f.bind("alice", ownerA)
-	a1 := f.token(authn.ClassWorker, "alice", "worker", "session-1")
-	a2 := f.token(authn.ClassWorker, "alice", "worker", "session-2")
-	f.enrol(alice, machineA1, a1, KeySession)
+	credential := f.token(authn.ClassWorker, "alice", "worker-a1", "")
+	other := f.token(authn.ClassWorker, "alice", "worker-new", "")
 
-	_, err := f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA2, Credential: a2, KeyKind: KeyClient})
+	// A request that stopped after its first write.
+	key, err := KeyOf(credential)
+	require.NoError(t, err)
+	want := Enrolment{
+		Schema: SchemaVersion, MachineID: machineA1, Class: authn.ClassWorker, OwnerID: ownerA,
+		Issuer: issuer, Subject: "alice", Key: key,
+	}
+	reserved, err := f.store.reserve(ctx, alice, want)
+	require.NoError(t, err)
+	require.Equal(t, StatePending, reserved.State)
+
+	_, reason := f.machine(credential)
+	assert.Equal(t, ReasonNotEnrolled, reason, "reserved, with no key claimed yet")
+	require.NoError(t, f.store.claimKey(ctx, key, machineA1, authn.ClassWorker))
+	_, reason = f.machine(credential)
+	assert.Equal(t, ReasonNotEnrolled, reason, "reserved, with its key claimed, is still not enrolled")
+	assert.Equal(t, ScopeUnbound, f.resolve(credential).Kind())
+
+	// Another credential for the machine is refused, and its key stays free.
+	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA1, Credential: other})
 	require.Equal(t, CodeConflict, CodeOf(err))
-	machine, reason := f.machine(a1)
+	otherKey, err := KeyOf(other)
+	require.NoError(t, err)
+	claim, err := f.store.keyClaim(ctx, otherKey)
+	require.NoError(t, err)
+	assert.Nil(t, claim, "the refused credential claimed nothing")
+
+	// Repeating the request finishes it.
+	enrolment := f.enrol(alice, machineA1, credential)
+	assert.Equal(t, StateActive, enrolment.State)
+	assert.Equal(t, 1, enrolment.Generation)
+	machine, reason := f.machine(credential)
 	assert.Empty(t, reason)
-	assert.Equal(t, machineA1, machine.MachineID, "machine A1's credential is still machine A1")
-	_, reason = f.machine(a2)
-	assert.Equal(t, ReasonNotEnrolled, reason)
+	assert.Equal(t, machineA1, machine.MachineID)
 
-	// And the other way round.
-	f.enrol(alice, machineA2, f.token(authn.ClassWorker, "alice", "worker-a2", "s"), KeyClient)
-	bob := f.bind("bob", ownerB)
-	_, err = f.store.Enrol(ctx, bob, EnrolmentRequest{
-		MachineID: machineB1, Credential: f.token(authn.ClassWorker, "bob", "worker-a2", "its-own"), KeyKind: KeySession,
+	// A reservation that will never be finished is cleared by revoking it.
+	reserved, err = f.store.reserve(ctx, alice, Enrolment{
+		Schema: SchemaVersion, MachineID: machineA2, Class: authn.ClassWorker, OwnerID: ownerA,
+		Issuer: issuer, Subject: "alice", Key: EnrolmentKey{Issuer: issuer, ClientID: "worker-lost"},
 	})
-	assert.Equal(t, CodeConflict, CodeOf(err))
+	require.NoError(t, err)
+	require.Equal(t, StatePending, reserved.State)
+	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA2, Credential: other})
+	require.Equal(t, CodeConflict, CodeOf(err))
+	_, err = f.store.RevokeEnrolment(ctx, alice, machineA2, authn.ClassWorker, "never finished")
+	require.NoError(t, err)
+	f.enrol(alice, machineA2, other)
+	machine, _ = f.machine(other)
+	assert.Equal(t, machineA2, machine.MachineID)
+}
 
-	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA1, Credential: a1, KeyKind: "proof"})
-	assert.Equal(t, CodeInvalid, CodeOf(err))
+// An enrolment revoked while it was being made does not become active.
+func TestAnEnrolmentRevokedWhileBeingMadeStaysRevoked(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	alice := f.bind("alice", ownerA)
+	credential := f.token(authn.ClassWorker, "alice", "worker-a1", "")
+	key, err := KeyOf(credential)
+	require.NoError(t, err)
+	reserved, err := f.store.reserve(ctx, alice, Enrolment{
+		Schema: SchemaVersion, MachineID: machineA1, Class: authn.ClassWorker, OwnerID: ownerA,
+		Issuer: issuer, Subject: "alice", Key: key,
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.store.claimKey(ctx, key, machineA1, authn.ClassWorker))
+
+	_, err = f.store.RevokeEnrolment(ctx, f.admin, machineA1, authn.ClassWorker, "stop")
+	require.NoError(t, err)
+	_, err = f.store.activate(ctx, reserved)
+	assert.Equal(t, CodeConflict, CodeOf(err))
+	_, reason := f.machine(credential)
+	assert.Equal(t, ReasonEnrolmentRevoked, reason)
 }
 
 // A forged machine, owner or class is refused at enrolment.
@@ -228,19 +300,19 @@ func TestEnrolRefusals(t *testing.T) {
 		request EnrolmentRequest
 		want    Code
 	}{
-		{"AnotherOwnersMachine", alice, EnrolmentRequest{MachineID: machineB1, Credential: worker, KeyKind: KeyClient}, CodeNotFound},
-		{"UnknownMachine", alice, EnrolmentRequest{MachineID: "mch_none", Credential: worker, KeyKind: KeyClient}, CodeNotFound},
-		{"NoMachine", alice, EnrolmentRequest{Credential: worker, KeyKind: KeyClient}, CodeInvalid},
-		{"CredentialOfAnotherOwner", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "bob", "worker-a1", ""), KeyKind: KeyClient}, CodeForbidden},
-		{"CredentialOfAnUnboundIdentity", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "carol", "worker-a1", ""), KeyKind: KeyClient}, CodeForbidden},
-		{"CLICredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassCLI, "alice", "cli", ""), KeyKind: KeyClient}, CodeInvalid},
-		{"PersonCredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: person("alice"), KeyKind: KeyClient}, CodeInvalid},
-		{"ExpiredCredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: expiring, KeyKind: KeyClient}, CodeForbidden},
-		{"CredentialWithNoClient", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "alice", "", ""), KeyKind: KeyClient}, CodeInvalid},
-		{"ByAnotherOwnersPerson", bob, EnrolmentRequest{MachineID: machineA1, Credential: worker, KeyKind: KeyClient}, CodeNotFound},
-		{"ByTheOwnersCLI", f.resolve(f.token(authn.ClassCLI, "alice", "cli", "")), EnrolmentRequest{MachineID: machineA1, Credential: worker, KeyKind: KeyClient}, CodeForbidden},
-		{"ByThePlatformAdmin", f.admin, EnrolmentRequest{MachineID: machineA1, Credential: worker, KeyKind: KeyClient}, CodeForbidden},
-		{"ByNobody", Scope{}, EnrolmentRequest{MachineID: machineA1, Credential: worker, KeyKind: KeyClient}, CodeForbidden},
+		{"AnotherOwnersMachine", alice, EnrolmentRequest{MachineID: machineB1, Credential: worker}, CodeNotFound},
+		{"UnknownMachine", alice, EnrolmentRequest{MachineID: "mch_none", Credential: worker}, CodeNotFound},
+		{"NoMachine", alice, EnrolmentRequest{Credential: worker}, CodeInvalid},
+		{"CredentialOfAnotherOwner", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "bob", "worker-a1", "")}, CodeForbidden},
+		{"CredentialOfAnUnboundIdentity", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "carol", "worker-a1", "")}, CodeForbidden},
+		{"CLICredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassCLI, "alice", "cli", "")}, CodeInvalid},
+		{"PersonCredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: person("alice")}, CodeInvalid},
+		{"ExpiredCredential", alice, EnrolmentRequest{MachineID: machineA1, Credential: expiring}, CodeForbidden},
+		{"CredentialWithNoClient", alice, EnrolmentRequest{MachineID: machineA1, Credential: f.token(authn.ClassWorker, "alice", "", "")}, CodeInvalid},
+		{"ByAnotherOwnersPerson", bob, EnrolmentRequest{MachineID: machineA1, Credential: worker}, CodeNotFound},
+		{"ByTheOwnersCLI", f.resolve(f.token(authn.ClassCLI, "alice", "cli", "")), EnrolmentRequest{MachineID: machineA1, Credential: worker}, CodeForbidden},
+		{"ByThePlatformAdmin", f.admin, EnrolmentRequest{MachineID: machineA1, Credential: worker}, CodeForbidden},
+		{"ByNobody", Scope{}, EnrolmentRequest{MachineID: machineA1, Credential: worker}, CodeForbidden},
 	}
 	for _, tt := range tests {
 		_, err := f.store.Enrol(ctx, tt.by, tt.request)
@@ -254,15 +326,15 @@ func TestEnrolRefusals(t *testing.T) {
 
 	// A machine already enrolled for a class is not re-pointed at another
 	// credential.
-	f.enrol(alice, machineA1, worker, KeyClient)
+	f.enrol(alice, machineA1, worker)
 	other := f.token(authn.ClassWorker, "alice", "worker-new", "")
-	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA1, Credential: other, KeyKind: KeyClient})
+	_, err = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA1, Credential: other})
 	assert.Equal(t, CodeConflict, CodeOf(err))
 	machine, _ := f.machine(worker)
 	assert.Equal(t, machineA1, machine.MachineID)
 	// The refused credential's key was not claimed: it can still enrol the
 	// machine it belongs to.
-	f.enrol(alice, machineA2, other, KeyClient)
+	f.enrol(alice, machineA2, other)
 	machine, _ = f.machine(other)
 	assert.Equal(t, machineA2, machine.MachineID)
 }
@@ -275,7 +347,7 @@ func TestMachineCredentialMustAgreeWithItsEnrolment(t *testing.T) {
 	alice := f.bind("alice", ownerA)
 	f.bind("bob", ownerB)
 	worker := f.token(authn.ClassWorker, "alice", "worker-a1", "")
-	f.enrol(alice, machineA1, worker, KeyClient)
+	f.enrol(alice, machineA1, worker)
 
 	// Someone else signs in to the machine's client.
 	_, reason := f.machine(f.token(authn.ClassWorker, "bob", "worker-a1", ""))
@@ -333,8 +405,8 @@ func TestRevokeEnrolment(t *testing.T) {
 	bob := f.bind("bob", ownerB)
 	worker := f.token(authn.ClassWorker, "alice", "worker-a1", "")
 	reviewer := f.token(authn.ClassReviewer, "alice", "reviewer-a1", "")
-	f.enrol(alice, machineA1, worker, KeyClient)
-	f.enrol(alice, machineA1, reviewer, KeyClient)
+	f.enrol(alice, machineA1, worker)
+	f.enrol(alice, machineA1, reviewer)
 
 	_, err := f.store.RevokeEnrolment(ctx, bob, machineA1, authn.ClassWorker, "mine now")
 	assert.Equal(t, CodeNotFound, CodeOf(err), "another owner learns nothing")
@@ -368,7 +440,7 @@ func TestConcurrentEnrolmentsOfOneKey(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	alice := f.bind("alice", ownerA)
-	credential := f.token(authn.ClassWorker, "alice", "worker", "browser-session")
+	credential := f.token(authn.ClassWorker, "alice", "worker", "s")
 
 	machines := []string{machineA1, machineA2}
 	const each = 10
@@ -378,7 +450,7 @@ func TestConcurrentEnrolmentsOfOneKey(t *testing.T) {
 	for i := range 2 * each {
 		wg.Go(func() {
 			<-start
-			_, errs[i] = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machines[i%2], Credential: credential, KeyKind: KeySession})
+			_, errs[i] = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machines[i%2], Credential: credential})
 		})
 	}
 	close(start)
@@ -396,6 +468,63 @@ func TestConcurrentEnrolmentsOfOneKey(t *testing.T) {
 	}
 	enrolments, err := f.store.Enrolments(ctx, ownerA)
 	require.NoError(t, err)
+	active := 0
+	for _, enrolment := range enrolments {
+		// The loser's reservation, if it got as far as making one, was cleared.
+		require.NotEqual(t, StatePending, enrolment.State)
+		if enrolment.State == StateActive {
+			active++
+			assert.Equal(t, winner.MachineID, enrolment.MachineID)
+		}
+	}
+	assert.Equal(t, 1, active)
+}
+
+// Two credentials that race for one machine and class: exactly one is
+// enrolled, and the other's key is left free for the machine it belongs to.
+func TestConcurrentEnrolmentsOfOneMachine(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	alice := f.bind("alice", ownerA)
+	credentials := []authn.Principal{
+		f.token(authn.ClassWorker, "alice", "worker-x", ""),
+		f.token(authn.ClassWorker, "alice", "worker-y", ""),
+	}
+
+	const each = 10
+	errs := make([]error, 2*each)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range 2 * each {
+		wg.Go(func() {
+			<-start
+			_, errs[i] = f.store.Enrol(ctx, alice, EnrolmentRequest{MachineID: machineA1, Credential: credentials[i%2]})
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	enrolments, err := f.store.Enrolments(ctx, ownerA)
+	require.NoError(t, err)
 	require.Len(t, enrolments, 1)
-	assert.Equal(t, winner.MachineID, enrolments[0].MachineID)
+	require.Equal(t, StateActive, enrolments[0].State)
+	winner := 0
+	if enrolments[0].Key.ClientID == "worker-y" {
+		winner = 1
+	}
+	for i, err := range errs {
+		if i%2 == winner {
+			require.NoError(t, err)
+		} else {
+			assert.Equal(t, CodeConflict, CodeOf(err))
+		}
+	}
+
+	// The losing credential's key was never claimed: it enrols another machine.
+	loser := credentials[1-winner]
+	f.enrol(alice, machineA2, loser)
+	machine, reason := f.machine(loser)
+	assert.Empty(t, reason)
+	assert.Equal(t, machineA2, machine.MachineID)
 }

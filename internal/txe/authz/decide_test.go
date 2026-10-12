@@ -87,8 +87,8 @@ func TestClassPermissions(t *testing.T) {
 	cli := f.resolve(f.token(authn.ClassCLI, "alice", "cli", ""))
 	workerCredential := f.token(authn.ClassWorker, "alice", "worker-a1", "")
 	reviewerCredential := f.token(authn.ClassReviewer, "alice", "reviewer-a1", "")
-	f.enrol(alice, machineA1, workerCredential, KeyClient)
-	f.enrol(alice, machineA1, reviewerCredential, KeyClient)
+	f.enrol(alice, machineA1, workerCredential)
+	f.enrol(alice, machineA1, reviewerCredential)
 	worker, reviewer := f.resolve(workerCredential), f.resolve(reviewerCredential)
 
 	allowed := map[string][]Permission{
@@ -260,7 +260,7 @@ func TestDecideWhenTheRegistryFails(t *testing.T) {
 	ctx := context.Background()
 	alice := f.bind("alice", ownerA)
 	credential := f.token(authn.ClassWorker, "alice", "worker-a1", "")
-	f.enrol(alice, machineA1, credential, KeyClient)
+	f.enrol(alice, machineA1, credential)
 	machine := f.resolve(credential)
 	job := f.job(jobA1)
 

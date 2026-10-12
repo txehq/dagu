@@ -261,6 +261,115 @@ func TestRevokeBinding(t *testing.T) {
 	assert.Equal(t, 1, archived.Generation)
 }
 
+// A request makes one binding. An approval that stopped after writing the
+// binding and before marking the request must not leave the request usable:
+// after a revocation it would let the approval be replayed, for any owner,
+// without the subject signing in again.
+func TestARequestIsUsedOnceEvenIfTheApprovalWasInterrupted(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	alice := person("alice")
+	f.bind("alice", ownerA)
+
+	// Put the request back as it was before it was marked, which is what an
+	// approval that stopped between its two writes leaves behind.
+	requestID := requestsPrefix + identityDigest(alice.Identity)
+	var request BindingRequest
+	raw, found, err := f.store.read(ctx, requestID, &request)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, RequestApproved, request.State)
+	request.State = RequestPending
+	swapped, err := f.store.swap(ctx, requestID, raw, request)
+	require.NoError(t, err)
+	require.True(t, swapped)
+
+	pending, err := f.store.PendingRequest(ctx, alice.Identity)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the binding says the request was used, whatever the request says")
+
+	// A repeat of the approval is still the same binding, and it finishes
+	// the marking.
+	again, err := f.store.ApproveBinding(ctx, f.admin, alice.Identity, ownerA)
+	require.NoError(t, err)
+	assert.Equal(t, 1, again.Generation)
+	assert.Equal(t, 1, again.RequestGeneration)
+	_, _, err = f.store.read(ctx, requestID, &request)
+	require.NoError(t, err)
+	assert.Equal(t, RequestApproved, request.State)
+
+	// Interrupt it again, then revoke.
+	raw, _, err = f.store.read(ctx, requestID, &request)
+	require.NoError(t, err)
+	request.State = RequestPending
+	swapped, err = f.store.swap(ctx, requestID, raw, request)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	_, err = f.store.RevokeBinding(ctx, f.admin, alice.Identity, "left")
+	require.NoError(t, err)
+
+	// The old approval cannot be replayed, for the same owner or another.
+	for _, owner := range []string{ownerA, ownerB} {
+		_, err := f.store.ApproveBinding(ctx, f.admin, alice.Identity, owner)
+		assert.Equal(t, CodeNotFound, CodeOf(err), owner)
+	}
+	assert.Equal(t, ScopeUnbound, f.resolve(alice).Kind())
+
+	// The subject signs in and asks again: a new request, a new binding.
+	fresh, err := f.store.RequestBinding(ctx, alice, Shown{Username: "alice"})
+	require.NoError(t, err)
+	assert.Equal(t, 2, fresh.Generation)
+	assert.Equal(t, RequestPending, fresh.State)
+	rebound, err := f.store.ApproveBinding(ctx, f.admin, alice.Identity, ownerB)
+	require.NoError(t, err)
+	assert.Equal(t, 2, rebound.Generation)
+	assert.Equal(t, 2, rebound.RequestGeneration)
+	assert.Equal(t, ownerB, f.resolve(alice).OwnerID())
+}
+
+// Approvals and revocations that race never produce a binding without a
+// request of its own: each binding consumed a different request.
+func TestConcurrentApprovalAndRevocation(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	alice := person("alice")
+	_, err := f.store.RequestBinding(ctx, alice, Shown{})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range 24 {
+		wg.Go(func() {
+			<-start
+			switch i % 3 {
+			case 0:
+				_, _ = f.store.ApproveBinding(ctx, f.admin, alice.Identity, ownerA)
+			case 1:
+				_, _ = f.store.ApproveBinding(ctx, f.admin, alice.Identity, ownerB)
+			default:
+				_, _ = f.store.RevokeBinding(ctx, f.admin, alice.Identity, "race")
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	// One request was made, so at most one binding was ever made from it.
+	binding, _, err := f.store.binding(ctx, alice.Identity)
+	require.NoError(t, err)
+	require.NotNil(t, binding, "at least one approval ran before any revocation could")
+	assert.Equal(t, 1, binding.Generation)
+	assert.Equal(t, 1, binding.RequestGeneration)
+	if binding.State == StateRevoked {
+		for _, owner := range []string{ownerA, ownerB} {
+			_, err := f.store.ApproveBinding(ctx, f.admin, alice.Identity, owner)
+			assert.Equal(t, CodeNotFound, CodeOf(err), owner)
+		}
+	}
+}
+
 // A revoked identity may be bound to another owner afterwards, by the same
 // two steps.
 func TestRebindToAnotherOwnerAfterRevocation(t *testing.T) {
