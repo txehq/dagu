@@ -54,12 +54,20 @@ export function verdictLabel(verdict: Verdict, action: string): string {
   return RESPONSE_LABELS[verdict];
 }
 
-// offeredVerdicts drops retry from proposals on which it has no meaning, so
-// the panel never offers a verdict the server refuses.
+// offeredVerdicts offers only verdicts the server accepts on this proposal:
+// retry only on a bound run retry or an uncertain-effect escalation, and
+// never approve or redirect on an escalation, which is never executed.
 export function offeredVerdicts(proposal: Proposal): Verdict[] {
-  // Run retry stays hidden until the server can authorize it.
-  const typed = proposal.action.name === ACTION_UNCERTAIN_EFFECT;
-  return proposal.allowedVerdicts.filter((v) => v !== 'retry' || typed);
+  const action = proposal.action.name;
+  return proposal.allowedVerdicts.filter((v) => {
+    if (v === 'retry') {
+      return action === ACTION_RETRY_RUN || action === ACTION_UNCERTAIN_EFFECT;
+    }
+    if (action === ACTION_UNCERTAIN_EFFECT) {
+      return v !== 'approve' && v !== 'redirect';
+    }
+    return true;
+  });
 }
 
 function newIdempotencyKey(): string {
