@@ -9,6 +9,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +275,123 @@ func TestVerifyRefusesByShapeAndSignature(t *testing.T) {
 		_, err := f.verifier.Verify(context.Background(), token)
 		require.NoError(t, err)
 	})
+}
+
+// The header is read by exact field names, the way the JWT library reads it.
+// A second field that differs only in case must not stand in for the real one.
+func TestVerifyReadsTheHeaderExactly(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	payload := claimsJSON(t, accessClaims(f.clock.Now()))
+
+	_, err := f.verifier.Verify(context.Background(), signRawRS256(t, f.key, `{"alg":"RS256","kid":"k1","typ":"JWT"}`, payload))
+	require.NoError(t, err, "the plain header is accepted")
+
+	for name, tt := range map[string]struct {
+		header string
+		want   Reason
+	}{
+		"KeyIDInAnotherCase":     {`{"alg":"RS256","kid":"k9","KID":"k1","typ":"JWT"}`, ReasonUnknownKey},
+		"OnlyKeyIDInAnotherCase": {`{"alg":"RS256","KID":"k1","typ":"JWT"}`, ReasonMalformed},
+		"TypeInAnotherCase":      {`{"alg":"RS256","kid":"k1","typ":"dpop+jwt","TYP":"JWT"}`, ReasonTokenType},
+		"AlgorithmInAnotherCase": {`{"ALG":"RS256","alg":"HS256","kid":"k1"}`, ReasonAlgorithm},
+		"AlgorithmAsList":        {`{"alg":["RS256"],"kid":"k1"}`, ReasonMalformed},
+		"KeyIDAsNumber":          {`{"alg":"RS256","kid":1}`, ReasonMalformed},
+		"TypeAsNumber":           {`{"alg":"RS256","kid":"k1","typ":1}`, ReasonMalformed},
+		"CriticalAsNull":         {`{"alg":"RS256","kid":"k1","crit":null}`, ReasonMalformed},
+		"SecondObjectAfterIt":    {`{"alg":"RS256","kid":"k1"}{"kid":"k2"}`, ReasonMalformed},
+		"NotAnObject":            {`["RS256","k1"]`, ReasonMalformed},
+		"Null":                   {`null`, ReasonMalformed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRefused(t, f, signRawRS256(t, f.key, tt.header, payload), tt.want)
+		})
+	}
+}
+
+// The claims are one JSON object and nothing else. A correctly signed payload
+// with anything after the object is refused, whatever a lenient parser would
+// make of it.
+func TestVerifyReadsThePayloadExactly(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	const header = `{"alg":"RS256","kid":"k1","typ":"JWT"}`
+	claims := accessClaims(f.clock.Now())
+	payload := claimsJSON(t, claims)
+
+	_, err := f.verifier.Verify(context.Background(), signRawRS256(t, f.key, header, payload+" \n"))
+	require.NoError(t, err, "space after the object is still one object")
+
+	for name, raw := range map[string]string{
+		"SecondObject":  payload + claimsJSON(t, with(claims, map[string]any{"sub": "someone-else"})),
+		"TrailingText":  payload + "garbage",
+		"TrailingComma": payload + ",",
+		"List":          "[" + payload + "]",
+		"Null":          "null",
+		"Text":          `"` + testIssuer + `"`,
+		"Empty":         " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRefused(t, f, signRawRS256(t, f.key, header, raw), ReasonMalformed)
+		})
+	}
+}
+
+func TestDecodeObject(t *testing.T) {
+	t.Parallel()
+
+	object, err := decodeObject([]byte(` {"a":1,"b":"x"} ` + "\n"))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"a": json.Number("1"), "b": "x"}, object)
+
+	for _, raw := range []string{
+		``, ` `, `null`, `[]`, `"x"`, `1`,
+		`{"a":1}{"a":2}`, `{"a":1} {"a":2}`, `{"a":1}x`, `{"a":1},`, `{"a":1}]`, `{"a":1} null`,
+		`{"a":1`, `{a:1}`,
+	} {
+		_, err := decodeObject([]byte(raw))
+		require.Error(t, err, "%q", raw)
+	}
+}
+
+// Times are whole seconds. A fraction is refused, not rounded: rounding would
+// let a token through just after its expiry, or just over the lifetime cap.
+func TestVerifyRefusesTimesThatAreNotWholeSeconds(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	const header = `{"alg":"RS256","kid":"k1","typ":"JWT"}`
+	now := f.clock.Now().Unix()
+	issued, expires := strconv.FormatInt(now, 10), strconv.FormatInt(now+300, 10)
+	payload := func(iat, exp, nbf string) string {
+		raw := `{"iss":"` + testIssuer + `","sub":"s","aud":"` + testAudience + `","azp":"` + testCLI + `","typ":"Bearer","iat":` + iat + `,"exp":` + exp
+		if nbf != "" {
+			raw += `,"nbf":` + nbf
+		}
+		return raw + "}"
+	}
+
+	_, err := f.verifier.Verify(context.Background(), signRawRS256(t, f.key, header, payload(issued, expires, issued)))
+	require.NoError(t, err, "whole seconds are accepted")
+
+	for name, raw := range map[string]string{
+		// These would round to an accepted 300 s lifetime, or to an expiry a
+		// fraction of a second later than the whole second.
+		"ExpiryJustOverTheCap":   payload(issued, expires+".0000001", ""),
+		"ExpiryWithTinyFraction": payload(issued, strconv.FormatInt(now+299, 10)+".0000002", ""),
+		"ExpiryWithZeroFraction": payload(issued, expires+".0", ""),
+		"ExpiryAsExponent":       payload(issued, "1.7918067e9", ""),
+		"IssuedAtWithFraction":   payload(issued+".5", expires, ""),
+		"NotBeforeWithFraction":  payload(issued, expires, issued+".5"),
+		"ExpiryAsText":           payload(issued, `"`+expires+`"`, ""),
+		"ExpiryTooManyDigits":    payload(issued, "1791806700000000000000", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRefused(t, f, signRawRS256(t, f.key, header, raw), ReasonTimes)
+		})
+	}
 }
 
 // A key is used only with the algorithm, and the curve, it was published for.

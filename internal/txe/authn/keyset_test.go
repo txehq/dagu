@@ -10,7 +10,9 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -169,17 +171,58 @@ func TestRemoteKeysOutageNeitherBlocksNorExtends(t *testing.T) {
 	f.clock.Advance(time.Nanosecond)
 	assert.Equal(t, ReasonExpired, f.reason(token), "the outage gives no grace")
 
-	// The cached set is past its maximum age and cannot be replaced. It stays
-	// in use, so a token minted just before the outage would still verify;
-	// nothing minted earlier does.
-	f.clock.Advance(2 * time.Hour)
-	assert.Equal(t, ReasonExpired, f.reason(token))
-	fresh := f.token(t, key, "k1")
-	require.Empty(t, f.reason(fresh), "the last keys fetched stay in use while the issuer is unreachable")
 	status := f.keys.Status()
 	assert.Equal(t, 1, status.Keys)
 	assert.NotEmpty(t, status.LastError)
 	assert.True(t, status.AttemptedAt.After(status.FetchedAt))
+}
+
+// A set that cannot be replaced is used for a bounded time and then not at
+// all. Otherwise a key the issuer withdrew would stay trusted for as long as
+// the fetch kept failing, and whoever held it could go on signing tokens with
+// fresh times.
+func TestRemoteKeysUnreplaceableSetRunsOut(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	fetchedAt := f.clock.Now()
+	assert.True(t, f.keys.Status().UsableUntil.Equal(fetchedAt.Add(time.Hour+MaxTokenLifetime)))
+
+	f.issuer.Down()
+
+	// Up to the bound, a token signed with the cached key verifies. The
+	// latest token the issuer could have signed before it became unreachable
+	// expires inside this window.
+	f.clock.Advance(time.Hour + MaxTokenLifetime - time.Nanosecond)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+
+	// At the bound, a token signed with that key and carrying fresh times is
+	// refused, and the refusal blames the provider.
+	f.clock.Advance(time.Nanosecond)
+	for range 3 {
+		assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
+	}
+	f.clock.Advance(24 * time.Hour)
+	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
+}
+
+// A set that ran out is used again as soon as a fetch replaces it.
+func TestRemoteKeysRunOutSetRecovers(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+
+	f.issuer.PublishRaw(http.StatusBadGateway, nil)
+	f.clock.Advance(2 * time.Hour)
+	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
+
+	f.issuer.Publish(t, rsaJWK("k1", &key.PublicKey))
+	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")), "inside the refetch interval")
+	f.clock.Advance(time.Minute)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	assert.Empty(t, f.keys.Status().LastError)
 }
 
 // A process that starts while the issuer is unreachable can verify nothing.
@@ -250,6 +293,21 @@ func TestRemoteKeysBadDocumentKeepsCachedKeys(t *testing.T) {
 			off := ecJWK("k2", "P-256", "ES256", &ec.PublicKey)
 			off["y"] = off["x"]
 			iss.Publish(t, good, off)
+		},
+		// Keys Go's RSA code refuses must not replace a key that works.
+		"EvenModulus": func(t *testing.T, iss *testIssuerServer) {
+			even := rsaJWK("k1", &rsa.PublicKey{N: new(big.Int).Lsh(big.NewInt(1), 2047), E: 65537})
+			iss.Publish(t, even)
+		},
+		"ExponentTooLarge": func(t *testing.T, iss *testIssuerServer) {
+			large := rsaJWK("k1", &key.PublicKey)
+			large["e"] = b64([]byte{0x80, 0x00, 0x00, 0x01})
+			iss.Publish(t, large)
+		},
+		"ModulusTooLarge": func(t *testing.T, iss *testIssuerServer) {
+			huge := new(big.Int).Lsh(big.NewInt(1), maxRSAKeyBits)
+			huge.Add(huge, big.NewInt(1))
+			iss.Publish(t, rsaJWK("k1", &rsa.PublicKey{N: huge, E: 65537}))
 		},
 		"OnlyEncryptionKeys": func(t *testing.T, iss *testIssuerServer) {
 			enc := rsaJWK("k1", &key.PublicKey)
@@ -359,6 +417,10 @@ func TestRemoteKeysStaleRefreshDelaysNobodyElse(t *testing.T) {
 	require.Empty(t, f.reason(f.token(t, key, "k1")))
 
 	release := make(chan struct{})
+	// Registered after the issuer's own cleanup, so it runs first and the
+	// held request is let go on every path, a failed assertion included.
+	letGo := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(letGo)
 	f.issuer.mu.Lock()
 	f.issuer.delay = release
 	f.issuer.mu.Unlock()
@@ -378,9 +440,54 @@ func TestRemoteKeysStaleRefreshDelaysNobodyElse(t *testing.T) {
 		t.Fatal("a caller waited for another caller's refresh")
 	}
 
-	close(release)
+	letGo()
 	assert.Empty(t, <-refreshing)
 	assert.Equal(t, 2, f.issuer.Fetches())
+}
+
+// A redirect is never followed, whatever HTTP client the caller supplies. The
+// URL is checked once; a redirect could lead anywhere, plain http included.
+func TestRemoteKeysNeverFollowRedirects(t *testing.T) {
+	t.Parallel()
+	attackerKey := testRSAKeys()[2]
+	elsewhere := newTestIssuerServer(t)
+	elsewhere.Publish(t, rsaJWK("k1", &attackerKey.PublicKey))
+
+	redirecting := httptest.NewServer(http.RedirectHandler(elsewhere.URL(), http.StatusFound))
+	t.Cleanup(redirecting.Close)
+
+	for name, client := range map[string]*http.Client{
+		"DefaultClient":  nil,
+		"CallersClient":  {},
+		"CallersPolicy":  {CheckRedirect: func(*http.Request, []*http.Request) error { return nil }},
+		"CallersTimeout": {Timeout: 3 * time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := newTestClock()
+			keys, err := NewRemoteKeySet(RemoteKeySetConfig{URL: redirecting.URL, HTTPClient: client, Now: clock.Now})
+			require.NoError(t, err)
+			verifier, err := NewVerifier(Config{
+				Issuer: testIssuer, Audience: testAudience, Clients: map[string]Class{testCLI: ClassCLI},
+				Keys: keys, Now: clock.Now,
+			})
+			require.NoError(t, err)
+
+			_, err = verifier.Verify(context.Background(), signRS256(t, attackerKey, "k1", accessClaims(clock.Now())))
+			require.Error(t, err)
+			assert.True(t, ProviderUnavailable(err), err.Error())
+			assert.Zero(t, keys.Status().Keys)
+		})
+	}
+	assert.Zero(t, elsewhere.Fetches(), "the redirect target was never asked")
+}
+
+// The caller's client is copied, so its own redirect policy is left alone.
+func TestRemoteKeysLeaveTheCallersClientAlone(t *testing.T) {
+	t.Parallel()
+	client := &http.Client{}
+	_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", HTTPClient: client})
+	require.NoError(t, err)
+	assert.Nil(t, client.CheckRedirect)
 }
 
 func TestNewRemoteKeySetRefusesConfig(t *testing.T) {
@@ -410,6 +517,16 @@ func TestNewRemoteKeySetRefusesConfig(t *testing.T) {
 	}
 	_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: -time.Second})
 	require.Error(t, err)
+
+	// The fetch limit cannot be configured below one a minute.
+	for _, interval := range []time.Duration{time.Nanosecond, time.Second, time.Minute - time.Nanosecond} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: interval})
+		require.ErrorContains(t, err, "minimum refetch interval", interval.String())
+	}
+	for _, interval := range []time.Duration{0, time.Minute, 10 * time.Minute} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: interval})
+		require.NoError(t, err, interval.String())
+	}
 }
 
 func TestParseKeySetLimits(t *testing.T) {

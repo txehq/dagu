@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"maps"
@@ -199,6 +200,24 @@ func sign(t *testing.T, method jwt.SigningMethod, key crypto.PrivateKey, kid str
 	signed, err := token.SignedString(key)
 	require.NoError(t, err)
 	return signed
+}
+
+// signRawRS256 signs a header and a payload exactly as given, for tokens no
+// JWT library would produce.
+func signRawRS256(t *testing.T, key *rsa.PrivateKey, header, payload string) string {
+	t.Helper()
+	signingInput := b64([]byte(header)) + "." + b64([]byte(payload))
+	digest := sha256.Sum256([]byte(signingInput))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	require.NoError(t, err)
+	return signingInput + "." + b64(signature)
+}
+
+func claimsJSON(t *testing.T, claims jwt.MapClaims) string {
+	t.Helper()
+	raw, err := json.Marshal(claims)
+	require.NoError(t, err)
+	return string(raw)
 }
 
 func signRS256(t *testing.T, key *rsa.PrivateKey, kid string, claims jwt.MapClaims) string {

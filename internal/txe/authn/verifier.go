@@ -4,6 +4,7 @@
 package authn
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -12,9 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
-	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -234,29 +236,35 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Principal, error) 
 		return Principal{}, refuse(ReasonAlgorithm, "the key cannot be used with the token's algorithm")
 	}
 
-	claims := jwt.MapClaims{}
-	parser := jwt.NewParser(
-		jwt.WithValidMethods([]string{header.Algorithm}),
-		jwt.WithoutClaimsValidation(),
-		jwt.WithJSONNumber(),
-	)
-	if _, err := parser.ParseWithClaims(token, claims, func(*jwt.Token) (any, error) { return key.Public, nil }); err != nil {
+	// The library checks the signature. Its own reading of the claims is not
+	// used: what it accepts after the first JSON value depends on how it is
+	// configured, and the claims this package trusts must not.
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{header.Algorithm}), jwt.WithoutClaimsValidation())
+	if _, err := parser.ParseWithClaims(token, jwt.MapClaims{}, func(*jwt.Token) (any, error) { return key.Public, nil }); err != nil {
 		if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 			return Principal{}, refuse(ReasonSignature, "")
 		}
 		return Principal{}, refuse(ReasonMalformed, "the token could not be parsed")
+	}
+	claims, err := readClaims(header.payload)
+	if err != nil {
+		return Principal{}, err
 	}
 
 	return v.checkClaims(claims, v.now())
 }
 
 type tokenHeader struct {
-	Algorithm string          `json:"alg"`
-	KeyID     string          `json:"kid"`
-	Type      string          `json:"typ"`
-	Critical  json.RawMessage `json:"crit"`
+	Algorithm string
+	KeyID     string
+	Type      string
+	// payload is the token's second part, still encoded.
+	payload string
 }
 
+// readHeader reads the header fields by their exact names, as the JWT library
+// does. Matching names loosely would let "TYP" or "KID" stand in for the real
+// field here while the library read another.
 func (v *Verifier) readHeader(token string) (tokenHeader, error) {
 	var header tokenHeader
 	if len(token) == 0 || len(token) > maxTokenBytes {
@@ -270,8 +278,20 @@ func (v *Verifier) readHeader(token string) (tokenHeader, error) {
 	if err != nil {
 		return header, refuse(ReasonMalformed, "the token header is not base64url")
 	}
-	if err := json.Unmarshal(raw, &header); err != nil {
-		return header, refuse(ReasonMalformed, "the token header is not JSON")
+	fields, err := decodeObject(raw)
+	if err != nil {
+		return header, refuse(ReasonMalformed, "the token header is not one JSON object")
+	}
+	for name, target := range map[string]*string{"alg": &header.Algorithm, "kid": &header.KeyID, "typ": &header.Type} {
+		value, present := fields[name]
+		if !present {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok {
+			return header, refuse(ReasonMalformed, "a token header field is not text")
+		}
+		*target = text
 	}
 	if !slices.Contains(v.algorithms, header.Algorithm) {
 		return header, refuse(ReasonAlgorithm, "the token's signature algorithm is not accepted")
@@ -279,16 +299,48 @@ func (v *Verifier) readHeader(token string) (tokenHeader, error) {
 	if header.KeyID == "" {
 		return header, refuse(ReasonMalformed, "the token names no key")
 	}
-	if len(header.Critical) != 0 {
+	if _, present := fields["crit"]; present {
 		return header, refuse(ReasonMalformed, "the token has critical header fields, and none is understood")
 	}
 	if header.Type != "" && !strings.EqualFold(header.Type, "JWT") && !strings.EqualFold(header.Type, "at+jwt") {
 		return header, refuse(ReasonTokenType, "the token header does not describe an access token")
 	}
+	header.payload = parts[1]
 	return header, nil
 }
 
-func (v *Verifier) checkClaims(claims jwt.MapClaims, now time.Time) (Principal, error) {
+// readClaims decodes the payload of a token whose signature has been checked.
+func readClaims(payload string) (map[string]any, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return nil, refuse(ReasonMalformed, "the token payload is not base64url")
+	}
+	claims, err := decodeObject(raw)
+	if err != nil {
+		return nil, refuse(ReasonMalformed, "the token payload is not one JSON object")
+	}
+	return claims, nil
+}
+
+// decodeObject decodes exactly one JSON object, with numbers kept as written
+// and nothing but space after it.
+func decodeObject(raw []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var object map[string]any
+	if err := decoder.Decode(&object); err != nil {
+		return nil, err
+	}
+	if object == nil {
+		return nil, errors.New("not an object")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("data after the object")
+	}
+	return object, nil
+}
+
+func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal, error) {
 	if typ, _ := claims["typ"].(string); typ != accessTokenType {
 		return Principal{}, refuse(ReasonTokenType, "the token is not an access token")
 	}
@@ -371,26 +423,25 @@ func audienceContains(claim any, want string) bool {
 	}
 }
 
-// Bounds on a NumericDate. Seconds outside them are not a date anyone meant,
-// and would overflow the conversion.
-const (
-	minNumericDate = 1
-	maxNumericDate = 1 << 36
-)
+// maxNumericDate bounds a NumericDate: more seconds than this is not a date
+// anyone meant.
+const maxNumericDate = 1 << 36
 
-// numericDate reads a JSON number of seconds since the epoch.
+// numericDate reads a time claim. It must be a positive whole number of
+// seconds written in plain digits, which is what the provider issues. A
+// fraction or an exponent is refused and never rounded: rounding would move
+// the expiry and the lifetime cap by whatever the conversion lost.
 func numericDate(claim any) (time.Time, bool) {
 	number, ok := claim.(json.Number)
 	if !ok {
 		return time.Time{}, false
 	}
-	seconds, err := number.Float64()
-	if err != nil || math.IsNaN(seconds) || seconds < minNumericDate || seconds > maxNumericDate {
+	// ParseInt takes digits only: "1.0" and "1e9" are errors, not numbers.
+	seconds, err := strconv.ParseInt(number.String(), 10, 64)
+	if err != nil || seconds < 1 || seconds > maxNumericDate {
 		return time.Time{}, false
 	}
-	whole := int64(seconds)
-	nanos := int64((seconds - float64(whole)) * float64(time.Second))
-	return time.Unix(whole, nanos), true
+	return time.Unix(seconds, 0), true
 }
 
 // keyFitsAlgorithm reports whether key is the kind, and for an elliptic curve
