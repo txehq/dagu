@@ -213,16 +213,17 @@ files.
   The retry then stays unknown and goes to the owner, as before.
   A read that fails (the service unreachable, a server error, a reply
   that cannot be decoded) is different: the service was not asked. The
-  owner is not asked yet, because a question ends the probing; the next
-  review reads again, until 30 minutes after the registry granted the
-  attempt, and then the owner is asked.
-  An execution the record names is written on the action with the next
-  outcome the registry accepts. For an attempt found interrupted, the
-  record is read before the attempt is written as uncertain, so the
-  execution is on the action from then on. The registry does not take a
-  second uncertain outcome for the same attempt, so an execution first
-  recovered for an attempt already written as uncertain is held only
-  for that review and read again by the next.
+  owner is not asked a question, because a question ends the probing; the
+  action stays uncertain and every review reads again. If that lasts 30
+  minutes from the registry's grant of the attempt, the exception
+  `retry_record_unreadable` is reported about that attempt: check that the
+  service's API can read the run's executions. It asks for no decision.
+  An execution the record names is written on the action with the outcome
+  that settles it. The registry does not take a second uncertain outcome
+  for the same attempt, so while a recovered execution is still a
+  reservation it is not stored: every review reads the record again. If
+  the service then says it has no record of the request at all, the
+  retry goes to the owner.
   What is recorded: done, only when the service admitted the request,
   named the execution it admitted it as, and that execution is seen on
   the run queued, running or over, with its reference as receipt and its
