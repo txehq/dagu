@@ -186,18 +186,24 @@ func TestRemoteKeysUnreplaceableSetRunsOut(t *testing.T) {
 	f := newRemoteFixture(t)
 	key := testRSAKeys()[0]
 	require.Empty(t, f.reason(f.token(t, key, "k1")))
-	fetchedAt := f.clock.Now()
-	assert.True(t, f.keys.Status().UsableUntil.Equal(fetchedAt.Add(time.Hour+MaxTokenLifetime)))
+	assert.True(t, f.keys.Status().UsableUntil.IsZero(), "no bound while fetches succeed")
 
 	f.issuer.Down()
 
-	// Up to the bound, a token signed with the cached key verifies. The
-	// latest token the issuer could have signed before it became unreachable
-	// expires inside this window.
-	f.clock.Advance(time.Hour + MaxTokenLifetime - time.Nanosecond)
+	// The set reaches its maximum age. The first use tries to replace it,
+	// fails, and the grace starts there.
+	f.clock.Advance(time.Hour)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	failedAt := f.clock.Now()
+	status := f.keys.Status()
+	assert.True(t, status.FailingSince.Equal(failedAt))
+	assert.True(t, status.UsableUntil.Equal(failedAt.Add(StaleKeyGrace)))
+
+	// Until the grace ends, a token signed with the cached key verifies.
+	f.clock.Advance(StaleKeyGrace - time.Nanosecond)
 	require.Empty(t, f.reason(f.token(t, key, "k1")))
 
-	// At the bound, a token signed with that key and carrying fresh times is
+	// From then on, a token signed with that key and carrying fresh times is
 	// refused, and the refusal blames the provider.
 	f.clock.Advance(time.Nanosecond)
 	for range 3 {
@@ -207,7 +213,110 @@ func TestRemoteKeysUnreplaceableSetRunsOut(t *testing.T) {
 	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
 }
 
-// A set that ran out is used again as soon as a fetch replaces it.
+// The grace is counted from the first failed fetch, not from when the set was
+// fetched. A process that was idle past the set's maximum age must still
+// accept the token the issuer signed a minute before it became unreachable.
+func TestRemoteKeysGraceStartsAtTheFailedFetchAfterAnIdleHour(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+
+	// Nothing asks for a key for 64 minutes. The issuer signs a token, then
+	// becomes unreachable.
+	f.clock.Advance(64 * time.Minute)
+	token := f.token(t, key, "k1")
+	f.issuer.Down()
+
+	f.clock.Advance(time.Minute)
+	require.Empty(t, f.reason(token), "65 minutes after the fetch, one minute into the token's life")
+	assert.True(t, f.keys.Status().FailingSince.Equal(f.clock.Now()), "the replacement was tried here and failed")
+
+	f.clock.Advance(4*time.Minute - time.Nanosecond)
+	require.Empty(t, f.reason(token), "the instant before the token expires")
+	f.clock.Advance(time.Nanosecond)
+	assert.Equal(t, ReasonExpired, f.reason(token), "the token ends at its own expiry")
+}
+
+// A fetch that failed while the set was still young does not start the grace
+// early: the set is good until its maximum age, and the grace follows that.
+func TestRemoteKeysGraceAfterAnEarlyFailure(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	fetchedAt := f.clock.Now()
+
+	f.issuer.Down()
+	f.clock.Advance(10 * time.Minute)
+	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, testRSAKeys()[1], "k2")))
+	assert.True(t, f.keys.Status().FailingSince.Equal(fetchedAt.Add(10*time.Minute)))
+	assert.True(t, f.keys.Status().UsableUntil.Equal(fetchedAt.Add(time.Hour+StaleKeyGrace)))
+
+	f.clock.Advance(50*time.Minute + StaleKeyGrace - time.Nanosecond)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	f.clock.Advance(time.Nanosecond)
+	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
+}
+
+// The grace is long enough for a token the issuer signed with its clock a
+// minute ahead, which is the most skew a verifier may be configured to allow.
+func TestRemoteKeysGraceCoversIssuerClockSkew(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	verifier, err := NewVerifier(Config{
+		Issuer: testIssuer, Audience: testAudience, Clients: map[string]Class{testCLI: ClassCLI},
+		IssuedAtSkew: MaxIssuedAtSkew, Keys: f.keys, Now: f.clock.Now,
+	})
+	require.NoError(t, err)
+	reason := func(token string) Reason {
+		_, err := verifier.Verify(context.Background(), token)
+		return ReasonOf(err)
+	}
+	require.Empty(t, reason(f.token(t, key, "k1")))
+
+	f.clock.Advance(time.Hour)
+	issuerNow := f.clock.Now().Add(MaxIssuedAtSkew)
+	token := signRS256(t, key, "k1", accessClaims(issuerNow))
+	f.issuer.Down()
+
+	require.Empty(t, reason(token), "the replacement fails here and the grace starts")
+	f.clock.Advance(MaxTokenLifetime + MaxIssuedAtSkew - time.Nanosecond)
+	require.Empty(t, reason(token), "the instant before a token signed a minute ahead expires")
+	f.clock.Advance(time.Nanosecond)
+	assert.NotEmpty(t, reason(token))
+}
+
+// A fetch that fails once and then works does not cost the set: the next
+// attempt, a minute later, replaces it and ends the grace.
+func TestRemoteKeysTransientFailureEndsWithTheNextFetch(t *testing.T) {
+	t.Parallel()
+	f := newRemoteFixture(t)
+	key := testRSAKeys()[0]
+	good := rsaJWK("k1", &key.PublicKey)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+
+	f.issuer.PublishRaw(http.StatusBadGateway, nil)
+	f.clock.Advance(time.Hour)
+	require.Empty(t, f.reason(f.token(t, key, "k1")), "the set is in its grace")
+	assert.False(t, f.keys.Status().UsableUntil.IsZero())
+
+	f.issuer.Publish(t, good)
+	f.clock.Advance(time.Minute)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	status := f.keys.Status()
+	assert.True(t, status.FailingSince.IsZero())
+	assert.True(t, status.UsableUntil.IsZero())
+	assert.Empty(t, status.LastError)
+
+	// Well past where the grace would have ended.
+	f.clock.Advance(30 * time.Minute)
+	require.Empty(t, f.reason(f.token(t, key, "k1")))
+	assert.Equal(t, 3, f.issuer.Fetches())
+}
+
+// A set whose grace ran out is used again as soon as a fetch replaces it.
 func TestRemoteKeysRunOutSetRecovers(t *testing.T) {
 	t.Parallel()
 	f := newRemoteFixture(t)
@@ -216,48 +325,14 @@ func TestRemoteKeysRunOutSetRecovers(t *testing.T) {
 
 	f.issuer.PublishRaw(http.StatusBadGateway, nil)
 	f.clock.Advance(2 * time.Hour)
+	require.Empty(t, f.reason(f.token(t, key, "k1")), "the grace starts at this failed fetch")
+	f.clock.Advance(StaleKeyGrace)
 	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
 
 	f.issuer.Publish(t, rsaJWK("k1", &key.PublicKey))
 	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")), "inside the refetch interval")
 	f.clock.Advance(time.Minute)
 	require.Empty(t, f.reason(f.token(t, key, "k1")))
-	assert.Empty(t, f.keys.Status().LastError)
-}
-
-// A process that starts while the issuer is unreachable can verify nothing.
-func TestRemoteKeysColdStartDuringOutage(t *testing.T) {
-	t.Parallel()
-	f := newRemoteFixture(t)
-	f.issuer.Down()
-
-	token := f.token(t, testRSAKeys()[0], "k1")
-	for range 5 {
-		_, err := f.verifier.Verify(context.Background(), token)
-		require.Error(t, err)
-		assert.True(t, ProviderUnavailable(err), err.Error())
-	}
-	assert.Zero(t, f.keys.Status().Keys)
-}
-
-// A failing issuer is asked again only after the refetch interval, and
-// recovery is picked up then.
-func TestRemoteKeysRecoverAfterFailure(t *testing.T) {
-	t.Parallel()
-	f := newRemoteFixture(t)
-	key := testRSAKeys()[0]
-	good := rsaJWK("k1", &key.PublicKey)
-
-	f.issuer.PublishRaw(http.StatusServiceUnavailable, []byte("starting"))
-	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
-	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")))
-	assert.Equal(t, 1, f.issuer.Fetches())
-
-	f.issuer.Publish(t, good)
-	assert.Equal(t, ReasonKeysUnavailable, f.reason(f.token(t, key, "k1")), "still inside the interval")
-	f.clock.Advance(time.Minute)
-	require.Empty(t, f.reason(f.token(t, key, "k1")))
-	assert.Equal(t, 2, f.issuer.Fetches())
 	assert.Empty(t, f.keys.Status().LastError)
 }
 
@@ -515,17 +590,23 @@ func TestNewRemoteKeySetRefusesConfig(t *testing.T) {
 		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: bad})
 		require.Error(t, err, bad)
 	}
-	_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: -time.Second})
-	require.Error(t, err)
-
-	// The fetch limit cannot be configured below one a minute.
-	for _, interval := range []time.Duration{time.Nanosecond, time.Second, time.Minute - time.Nanosecond} {
-		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: interval})
-		require.ErrorContains(t, err, "minimum refetch interval", interval.String())
+	const good = "https://issuer.example/certs"
+	for _, age := range []time.Duration{0, time.Minute, time.Hour, 24 * time.Hour} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, MaxKeyAge: age})
+		require.NoError(t, err, age.String())
 	}
-	for _, interval := range []time.Duration{0, time.Minute, 10 * time.Minute} {
-		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: "https://issuer.example/certs", MinRefetchInterval: interval})
-		require.NoError(t, err, interval.String())
+	// The largest duration would overflow when the grace is added to it.
+	for _, age := range []time.Duration{-time.Second, time.Nanosecond, time.Minute - time.Nanosecond, 24*time.Hour + time.Nanosecond, 1<<63 - 1} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, MaxKeyAge: age})
+		require.ErrorContains(t, err, "maximum key age", age.String())
+	}
+	for _, timeout := range []time.Duration{0, time.Second, 30 * time.Second} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, FetchTimeout: timeout})
+		require.NoError(t, err, timeout.String())
+	}
+	for _, timeout := range []time.Duration{-time.Second, 31 * time.Second, 1<<63 - 1} {
+		_, err := NewRemoteKeySet(RemoteKeySetConfig{URL: good, FetchTimeout: timeout})
+		require.ErrorContains(t, err, "fetch timeout", timeout.String())
 	}
 }
 

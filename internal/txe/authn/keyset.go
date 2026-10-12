@@ -50,9 +50,19 @@ func (s StaticKeys) Key(_ context.Context, keyID string) (Key, error) {
 }
 
 const (
-	defaultMinRefetchInterval = time.Minute
-	defaultMaxKeyAge          = time.Hour
-	defaultFetchTimeout       = 5 * time.Second
+	// minRefetchInterval is the least time between two fetches, whatever asks
+	// for them. It is not configurable: it is what stops tokens naming unknown
+	// keys from making this process fetch at will, and it has to stay well
+	// inside StaleKeyGrace so that a set in its grace is retried before the
+	// grace ends.
+	minRefetchInterval = time.Minute
+
+	defaultMaxKeyAge = time.Hour
+	minMaxKeyAge     = minRefetchInterval
+	maxMaxKeyAge     = 24 * time.Hour
+
+	defaultFetchTimeout = 5 * time.Second
+	maxFetchTimeout     = 30 * time.Second
 
 	maxKeySetBytes = 1 << 20
 	maxKeySetKeys  = 64
@@ -61,6 +71,12 @@ const (
 	// maxRSAExponent is the largest public exponent crypto/rsa accepts.
 	maxRSAExponent = 1<<31 - 1
 )
+
+// StaleKeyGrace is how long a key set that needs replacing, and could not be
+// replaced, stays in use. It is as long as a token can still be alive after
+// the issuer signed it: the longest lifetime, plus the most the issuer's
+// clock may be ahead.
+const StaleKeyGrace = MaxTokenLifetime + MaxIssuedAtSkew
 
 // RemoteKeySetConfig configures a RemoteKeySet.
 type RemoteKeySetConfig struct {
@@ -72,17 +88,12 @@ type RemoteKeySetConfig struct {
 	// refuses them, because the URL is checked once and a redirect could
 	// leave https.
 	HTTPClient *http.Client
-	// MinRefetchInterval is the least time between two fetches, whatever asks
-	// for them. A token naming an unknown key can therefore cause at most one
-	// fetch in that time. Zero means one minute, and less than one minute is
-	// refused.
-	MinRefetchInterval time.Duration
 	// MaxKeyAge is how old the cached set may get before a use tries to
-	// replace it, so that a key the issuer withdrew stops being trusted. If
-	// it cannot be replaced, it is used for MaxTokenLifetime longer and then
-	// not at all. Zero means one hour.
+	// replace it, so that a key the issuer withdrew stops being trusted. Zero
+	// means one hour. It must be between one minute and 24 hours.
 	MaxKeyAge time.Duration
-	// FetchTimeout bounds one fetch. Zero means five seconds.
+	// FetchTimeout bounds one fetch. Zero means five seconds, and 30 seconds
+	// is the most.
 	FetchTimeout time.Duration
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
@@ -90,28 +101,36 @@ type RemoteKeySetConfig struct {
 
 // RemoteKeySet caches the keys an issuer publishes.
 //
-// A cached key is returned without any network call. While the issuer cannot
-// be reached, the last set fetched stays in use for a bounded time: an outage
-// does not stop tokens that are still within their own lifetime from being
-// verified, and it does not make any token live longer, because expiry is the
-// verifier's check and not this cache's.
+// A cached key is returned without any network call. A token naming a key
+// that is not cached can cause one fetch a minute and no more.
 //
-// The bound is the set's maximum age plus MaxTokenLifetime, counted from when
-// it was fetched. A set is replaced once it reaches its maximum age, so if it
-// could not be, the issuer has been unreachable since then at the latest, and
-// every token it issued before that has expired by the end of the bound.
-// Past it the set is not used at all. Keeping it would cost nothing the
-// issuer could still vouch for and would go on trusting a key the issuer may
-// have withdrawn, for as long as the fetch keeps failing.
+// A set is replaced when it reaches its maximum age and something needs a key
+// from it. Nothing runs in the background, so a set nobody uses is not
+// replaced, however old it gets.
+//
+// While the issuer cannot be reached, the last set fetched stays in use for a
+// bounded time, so that an outage does not stop tokens that are still within
+// their own lifetime. It never makes a token live longer: expiry is the
+// verifier's check and not this cache's. The bound is StaleKeyGrace, counted
+// from the later of two moments: when the set reached its maximum age, and
+// when a fetch first failed. Every token the issuer signed before that moment
+// has expired by the end of it.
+//
+// Past the bound the set is not used and every token is refused with
+// ReasonKeysUnavailable until a fetch succeeds. That has a cost, and it is
+// deliberate. If this process cannot reach the issuer while callers still
+// can, tokens they obtain after the bound started are refused although the
+// issuer would vouch for them. Without a bound, a key the issuer withdrew
+// would stay trusted for as long as fetches could be made to fail, and
+// whoever held it could keep signing tokens with fresh times.
 //
 // A process that has never fetched a set can verify nothing.
 type RemoteKeySet struct {
-	url        string
-	client     *http.Client
-	minRefetch time.Duration
-	maxAge     time.Duration
-	timeout    time.Duration
-	now        func() time.Time
+	url     string
+	client  *http.Client
+	maxAge  time.Duration
+	timeout time.Duration
+	now     func() time.Time
 
 	// fetchMu admits one fetch at a time.
 	fetchMu sync.Mutex
@@ -120,7 +139,10 @@ type RemoteKeySet struct {
 	keys        map[string]Key
 	fetchedAt   time.Time
 	attemptedAt time.Time
-	lastErr     error
+	// failingSince is when a fetch first failed since the last one that
+	// succeeded, or zero if the last attempt succeeded.
+	failingSince time.Time
+	lastErr      error
 }
 
 // NewRemoteKeySet validates cfg and returns an empty key set. It makes no
@@ -142,11 +164,20 @@ func NewRemoteKeySet(cfg RemoteKeySetConfig) (*RemoteKeySet, error) {
 	default:
 		return nil, errors.New("authn: the key set URL must use https")
 	}
-	if cfg.MinRefetchInterval < 0 || cfg.MaxKeyAge < 0 || cfg.FetchTimeout < 0 {
-		return nil, errors.New("authn: key set intervals must not be negative")
+
+	maxAge := cfg.MaxKeyAge
+	if maxAge == 0 {
+		maxAge = defaultMaxKeyAge
 	}
-	if cfg.MinRefetchInterval != 0 && cfg.MinRefetchInterval < defaultMinRefetchInterval {
-		return nil, fmt.Errorf("authn: the minimum refetch interval must be at least %s", defaultMinRefetchInterval)
+	if maxAge < minMaxKeyAge || maxAge > maxMaxKeyAge {
+		return nil, fmt.Errorf("authn: the maximum key age must be between %s and %s", minMaxKeyAge, maxMaxKeyAge)
+	}
+	timeout := cfg.FetchTimeout
+	if timeout == 0 {
+		timeout = defaultFetchTimeout
+	}
+	if timeout < 0 || timeout > maxFetchTimeout {
+		return nil, fmt.Errorf("authn: the fetch timeout must be at most %s", maxFetchTimeout)
 	}
 
 	client := http.Client{}
@@ -155,27 +186,17 @@ func NewRemoteKeySet(cfg RemoteKeySetConfig) (*RemoteKeySet, error) {
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-	set := &RemoteKeySet{
-		url:        parsed.String(),
-		client:     &client,
-		minRefetch: cfg.MinRefetchInterval,
-		maxAge:     cfg.MaxKeyAge,
-		timeout:    cfg.FetchTimeout,
-		now:        cfg.Now,
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
 	}
-	if set.minRefetch == 0 {
-		set.minRefetch = defaultMinRefetchInterval
-	}
-	if set.maxAge == 0 {
-		set.maxAge = defaultMaxKeyAge
-	}
-	if set.timeout == 0 {
-		set.timeout = defaultFetchTimeout
-	}
-	if set.now == nil {
-		set.now = time.Now
-	}
-	return set, nil
+	return &RemoteKeySet{
+		url:     parsed.String(),
+		client:  &client,
+		maxAge:  maxAge,
+		timeout: timeout,
+		now:     now,
+	}, nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -192,11 +213,15 @@ type KeySetStatus struct {
 	Keys int
 	// FetchedAt is when the cached set was fetched, or zero if none was.
 	FetchedAt time.Time
-	// UsableUntil is when the cached set stops being used unless a fetch
-	// replaces it first, or zero if there is none.
-	UsableUntil time.Time
 	// AttemptedAt is when a fetch was last tried.
 	AttemptedAt time.Time
+	// FailingSince is when a fetch first failed since the last one that
+	// succeeded, or zero if the last attempt succeeded.
+	FailingSince time.Time
+	// UsableUntil is when the cached set stops being used unless a fetch
+	// succeeds first. It is zero while the last attempt succeeded, because
+	// the set is then replaced, not dropped, when it gets old.
+	UsableUntil time.Time
 	// LastError describes the last attempt when it failed, and is empty when
 	// it succeeded.
 	LastError string
@@ -206,9 +231,14 @@ type KeySetStatus struct {
 func (s *RemoteKeySet) Status() KeySetStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	status := KeySetStatus{Keys: len(s.keys), FetchedAt: s.fetchedAt, AttemptedAt: s.attemptedAt}
-	if !s.fetchedAt.IsZero() {
-		status.UsableUntil = s.fetchedAt.Add(s.maxAge + MaxTokenLifetime)
+	status := KeySetStatus{
+		Keys:         len(s.keys),
+		FetchedAt:    s.fetchedAt,
+		AttemptedAt:  s.attemptedAt,
+		FailingSince: s.failingSince,
+	}
+	if !s.fetchedAt.IsZero() && !s.failingSince.IsZero() {
+		status.UsableUntil = s.graceStart().Add(StaleKeyGrace)
 	}
 	if s.lastErr != nil {
 		status.LastError = s.lastErr.Error()
@@ -233,8 +263,7 @@ func (s *RemoteKeySet) Key(ctx context.Context, keyID string) (Key, error) {
 		if key, found, _ = s.cached(keyID); found {
 			return key, nil
 		}
-		// The issuer withdrew the key, or the set could not be replaced and
-		// ran out while this caller held the lock.
+		// The issuer withdrew the key.
 		return Key{}, s.unknown()
 	}
 
@@ -248,7 +277,6 @@ func (s *RemoteKeySet) Key(ctx context.Context, keyID string) (Key, error) {
 	if key, found, _ = s.cached(keyID); found {
 		return key, nil
 	}
-
 	return Key{}, s.unknown()
 }
 
@@ -265,17 +293,29 @@ func (s *RemoteKeySet) unknown() *Error {
 	return refuse(ReasonUnknownKey, "")
 }
 
-// cached returns the cached key, and whether the set it came from is older
-// than the maximum age. A set that is past its bound holds no key.
+// cached returns the cached key, and whether the set it came from is old
+// enough to need replacing. A set whose grace has run out holds no key.
 func (s *RemoteKeySet) cached(keyID string) (key Key, found, stale bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	age := s.now().Sub(s.fetchedAt)
-	if age >= s.maxAge+MaxTokenLifetime {
+	now := s.now()
+	stale = now.Sub(s.fetchedAt) >= s.maxAge
+	if stale && !s.failingSince.IsZero() && !now.Before(s.graceStart().Add(StaleKeyGrace)) {
 		return Key{}, false, false
 	}
 	key, found = s.keys[keyID]
-	return key, found, found && age >= s.maxAge
+	return key, found, found && stale
+}
+
+// graceStart is the later of when the set reached its maximum age and when a
+// fetch first failed. The caller holds mu and has checked that a fetch is
+// failing.
+func (s *RemoteKeySet) graceStart() time.Time {
+	start := s.fetchedAt.Add(s.maxAge)
+	if s.failingSince.After(start) {
+		return s.failingSince
+	}
+	return start
 }
 
 // refreshIfDue fetches the set unless a fetch was tried within the minimum
@@ -286,7 +326,7 @@ func (s *RemoteKeySet) refreshIfDue(ctx context.Context) {
 	s.mu.RLock()
 	attemptedAt := s.attemptedAt
 	s.mu.RUnlock()
-	if !attemptedAt.IsZero() && now.Sub(attemptedAt) < s.minRefetch {
+	if !attemptedAt.IsZero() && now.Sub(attemptedAt) < minRefetchInterval {
 		return
 	}
 
@@ -296,10 +336,15 @@ func (s *RemoteKeySet) refreshIfDue(ctx context.Context) {
 	defer s.mu.Unlock()
 	s.attemptedAt = now
 	s.lastErr = err
-	if err == nil {
-		s.keys = keys
-		s.fetchedAt = now
+	if err != nil {
+		if s.failingSince.IsZero() {
+			s.failingSince = now
+		}
+		return
 	}
+	s.keys = keys
+	s.fetchedAt = now
+	s.failingSince = time.Time{}
 }
 
 func (s *RemoteKeySet) fetch(ctx context.Context) (map[string]Key, error) {
