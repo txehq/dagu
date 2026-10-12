@@ -99,9 +99,6 @@ var (
 type preparedDispatchAttempt struct {
 	attempt      dagrun.Attempt
 	newlyCreated bool
-	// executionJournaled is set when a reused attempt's execution was
-	// journaled for this dispatch (BeginAttemptPreparation).
-	executionJournaled bool
 }
 
 type runClaim struct {
@@ -941,14 +938,10 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		// marker is what distinguishes this execution from the earlier ones.
 		task.ExecutionMarker = existingStatus.QueuedAt
 
-		journaled, err := h.beginQueuedExecutionPreparation(ctx, ref, task)
-		if err != nil {
+		if err := h.beginQueuedExecutionPreparation(ctx, ref, task); err != nil {
 			return nil, err
 		}
 		if err := existingAttempt.Open(ctx); err != nil {
-			if journaled {
-				h.endPreparation(context.WithoutCancel(ctx), ref, ref, task.AttemptId, task.ExecutionMarker)
-			}
 			return nil, fmt.Errorf("failed to open existing attempt: %w", err)
 		}
 
@@ -962,7 +955,7 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 			tag.AttemptID(task.AttemptId),
 			tag.AttemptKey(task.AttemptKey),
 		)
-		return &preparedDispatchAttempt{attempt: existingAttempt, executionJournaled: journaled}, nil
+		return &preparedDispatchAttempt{attempt: existingAttempt}, nil
 	}
 
 	// Create new attempt (either first attempt or retry)
@@ -1012,24 +1005,23 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 // about to publish, keyed by its queued-at marker, so that if no worker claims
 // its task before it expires, reconciliation fails that execution with a
 // record instead of leaving the run queued with nothing left to run it. The
-// caller holds the run's write lock. It reports false when this coordinator
-// does not journal. An execution that is no longer the queued one is a stale
-// dispatch; any other failure fails the dispatch, which the queue retries, so
-// a queued execution is never published unjournaled.
-func (h *Handler) beginQueuedExecutionPreparation(ctx context.Context, run ir.DAGRunRef, task *coordinatorv1.Task) (bool, error) {
+// entry is idempotent: every dispatch of the same execution shares it, and
+// only an acknowledged claim or that execution's abandonment ends it. The
+// caller holds the run's write lock. An execution that is no longer the queued
+// one is a stale dispatch; any other failure fails the dispatch, which the
+// queue retries, so a queued execution is never published unjournaled.
+func (h *Handler) beginQueuedExecutionPreparation(ctx context.Context, run ir.DAGRunRef, task *coordinatorv1.Task) error {
 	if !h.canAbandonPreparations() {
-		return false, nil
+		return nil
 	}
 	_, err := h.dagRunRepository.BeginAttemptPreparation(ctx, run, run, task.AttemptId, task.ExecutionMarker)
 	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
-		return false, nil
+	case err == nil, errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		return nil
 	case errors.Is(err, persis.ErrAttemptNotAbandonable):
-		return false, staleQueueDispatchError("queued execution changed before dispatch")
+		return staleQueueDispatchError("queued execution changed before dispatch")
 	default:
-		return false, fmt.Errorf("failed to journal the queued execution: %w", err)
+		return fmt.Errorf("failed to journal the queued execution: %w", err)
 	}
 }
 
@@ -1303,13 +1295,11 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	defer h.releasePreparedDispatchAttempt(context.WithoutCancel(ctx), dagRunID, prepared.attempt)
 
 	if !prepared.newlyCreated {
-		// A reused attempt's execution stays queued and its queue item is
-		// kept, so the queue dispatches it again; this dispatch's entry
-		// would otherwise let reconciliation fail it meanwhile.
-		if prepared.executionJournaled {
-			h.endPreparation(context.WithoutCancel(ctx), ir.NewDAGRunRef(task.Target, task.DagRunId),
-				taskRootRef(task), prepared.attempt.ID(), task.GetExecutionMarker())
-		}
+		// A reused attempt's execution stays queued and the queue dispatches
+		// it again, under the same journal entry. The entry is kept: it may
+		// be an earlier dispatch's, and a failed publication can still have
+		// left a task behind. If no dispatch of it is ever claimed,
+		// reconciliation fails the execution with a record.
 		return
 	}
 
@@ -1609,9 +1599,15 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 	// undispatched: end its preparation entry under the same lock that
 	// abandonment takes. If ending fails, or the coordinator stops first, the
 	// lease keeps reconciliation from abandoning it and the entry is ended once
-	// the attempt has progressed.
+	// the attempt has progressed. The acknowledgement may carry a marker filled
+	// in for a legacy queued task even when this dispatch created the attempt,
+	// so both the attempt's entry and the execution's are ended; a missing one
+	// is no error.
 	if h.canAbandonPreparations() {
-		h.endPreparation(ctx, run, root, task.GetAttemptId(), task.GetExecutionMarker())
+		h.endPreparation(ctx, run, root, task.GetAttemptId(), "")
+		if marker := task.GetExecutionMarker(); marker != "" {
+			h.endPreparation(ctx, run, root, task.GetAttemptId(), marker)
+		}
 	}
 	return nil
 }

@@ -21,8 +21,9 @@ import (
 )
 
 // shortReservation is the dispatch reservation time these tests run with, so
-// an unclaimed task expires within the test.
-const shortReservation = 50 * time.Millisecond
+// an unclaimed task expires within the test. It leaves a test enough time to
+// claim a task it has just published, even on a loaded machine.
+const shortReservation = 300 * time.Millisecond
 
 func newShortReservationFixture(t *testing.T) *strandedFixture {
 	t.Helper()
@@ -148,4 +149,21 @@ func (f *strandedFixture) reportStatus(t *testing.T, attemptID string, st ir.Sta
 func TestAbandonedPreparationMinAgeOutlastsAnUnacknowledgedReservation(t *testing.T) {
 	t.Parallel()
 	assert.Greater(t, abandonedPreparationMinAge, 2*dagrun.DefaultStaleLeaseThreshold)
+}
+
+// An acknowledgement may carry a marker filled in for a legacy queued task even
+// when the dispatch created the attempt, which is journaled without a marker.
+// Recording the claim still ends that attempt's entry.
+func TestARecordedClaimEndsTheAttemptEntryWhateverItsMarker(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	placeholder := f.writeAttempt(t, true, ir.NotStarted, "")
+	require.Equal(t, []string{placeholder}, f.preparations(t))
+
+	err := f.h.recordTaskClaim(t.Context(), &coordinatorv1.Task{
+		Target: strandedDAG, DagRunId: strandedRun, AttemptId: placeholder, AttemptKey: f.attemptKey(placeholder),
+		ExecutionMarker: "2026-10-12T16:20:00+08:00",
+	}, "worker-1")
+	require.NoError(t, err)
+	assert.Empty(t, f.preparations(t))
 }

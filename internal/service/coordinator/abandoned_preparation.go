@@ -100,6 +100,12 @@ func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey, queue
 	return evidence, nil
 }
 
+// Topology: the ordering between abandonment and a claim's acknowledgement
+// rests on attemptWriteLocks, which is local to this process. It is complete
+// for a single coordinator per store, the supported topology. Two coordinators
+// sharing a store could interleave an acknowledgement on one with an
+// abandonment on the other; that needs a cross-process fence.
+//
 // abandonNeverDispatched records an attempt of a root run or of one of its
 // sub-DAG runs once absence of any dispatch is proven. It holds the root
 // run's write lock, which Dispatch holds from preparing an attempt to

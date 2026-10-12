@@ -4,7 +4,9 @@
 package coordinator
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +17,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
@@ -144,20 +148,77 @@ func TestReconcileFailsOnlyTheUnclaimedQueuedRetry(t *testing.T) {
 	assert.Nil(t, other, "a later execution of the attempt is not covered")
 }
 
-// A queued execution whose dispatch fails stays queued, with its queue item, so
-// the queue dispatches it again: its entry is ended, and reconciliation never
-// fails it for the failed hand-out.
-func TestAFailedQueuedDispatchEndsItsExecutionEntry(t *testing.T) {
-	t.Parallel()
+// scriptedEnqueueStore fails the enqueues listed in fail (by call, from 0) and
+// passes the rest to the dispatch store it wraps.
+type scriptedEnqueueStore struct {
+	dispatch.DispatchTaskStore
+	fail  map[int]bool
+	calls int
+}
+
+func (s *scriptedEnqueueStore) Enqueue(ctx context.Context, task *dispatch.DispatchTask) error {
+	call := s.calls
+	s.calls++
+	if s.fail[call] {
+		return errors.New("disk full")
+	}
+	return s.DispatchTaskStore.Enqueue(ctx, task)
+}
+
+// A queued execution whose dispatch fails stays queued and the queue dispatches
+// it again. Both dispatches share the execution's one journal entry, which the
+// failure leaves in place and the acknowledged claim ends.
+func TestAFailedQueuedDispatchKeepsItsExecutionEntryForTheNextDispatch(t *testing.T) {
 	registerCommandExecutorCapsForCoordinatorTest()
-	f := newStrandedFixture(t, &failingDispatchTaskStore{enqueueErr: errors.New("disk full")})
-	f.writeQueued(t, "", "2026-10-12T15:30:00+08:00")
+	dispatches := &scriptedEnqueueStore{DispatchTaskStore: newTestDispatchTaskStore(filepath.Join(t.TempDir(), "d")), fail: map[int]bool{0: true}}
+	f := newStrandedFixture(t, dispatches)
+	queued := f.writeQueued(t, "", "2026-10-12T15:30:00+08:00")
 
 	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
 	require.Error(t, err)
+	before := f.preparationEntries(t)
+	require.Len(t, before, 1, "a failed dispatch keeps the entry")
+
+	_, err = f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+	assert.Equal(t, before, f.preparationEntries(t), "the queue's next dispatch shares the entry")
+
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(queued),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, resp.Error)
 	assert.Empty(t, f.preparationEntries(t))
+}
+
+// A queued execution's task is published, then a duplicate dispatch of the
+// same execution fails. The failure must not remove the entry protecting the
+// published task: when that task expires unclaimed, the execution is still
+// failed with a record instead of being left queued.
+func TestAFailedDuplicateDispatchKeepsThePublishedExecutionsEntry(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	dispatches := &scriptedEnqueueStore{
+		DispatchTaskStore: store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "d")), store.WithDispatchReservationTTL(shortReservation)),
+		fail:              map[int]bool{1: true},
+	}
+	f := newStrandedFixture(t, dispatches)
+	const marker = "2026-10-12T15:35:00+08:00"
+	queued := f.writeQueued(t, "", marker)
+
+	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+	_, err = f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.Error(t, err)
+	require.Len(t, f.preparationEntries(t), 1, "the published execution stays journaled")
+
+	time.Sleep(3 * shortReservation)
 	f.h.reconcileAbandonedPreparations(t.Context(), later())
-	assert.Empty(t, f.records(t))
+	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
+	require.NoError(t, err)
+	require.NotNil(t, record, "the expired execution is failed, not left queued")
 }
 
 // A queued execution that a worker claims and acknowledges ends its entry and
