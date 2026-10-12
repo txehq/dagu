@@ -5,6 +5,8 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -487,7 +489,17 @@ func (r *Reviewer) reconcile(ctx context.Context, claim Claim, job Job, escalate
 	return nil
 }
 
+// probeReceipt is the receipt of an attempt settled on a reconcile probe.
+// It names the attempt it is about and the review run that ran the probe,
+// so it cannot be read as the receipt the action itself would have printed,
+// and it carries nothing the probe printed.
+func probeReceipt(action Action, run string) string {
+	return fmt.Sprintf("probe:%s:%d:%s", action.ID, action.Attempt, run)
+}
+
 func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, action Action, escalate bool) error {
+	// probed is set when the attempt is settled on what a probe found.
+	var probed *ProbeEvidence
 	finish := func(state ActionState, res EffectResult) error {
 		return r.Registry.FinishAction(ctx, FinishRequest{
 			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
@@ -495,6 +507,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// The registry replaces the stored outcome, so what is known
 			// about the request's admission is written again with it.
 			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef,
+			Probe: probed,
 		})
 	}
 	// stored is the execution the registry holds as admitted for this
@@ -660,6 +673,23 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			res.Detail = "the effect was applied"
 		}
 		res.Detail = "reconciled: " + res.Detail
+		if action.Name != RetryRunAction {
+			// The attempt is done on a probe's word, not on the action's
+			// own receipt, and its record says so. A probe states that the
+			// effect is there by its exit code and need print nothing; what
+			// it does print is not stored, because an outcome is kept with
+			// the action and shown to people, and a probe may print what it
+			// was given to look with. The receipt names this attempt and
+			// the review run that ran the probe, and the record keeps only
+			// a digest of what the probe printed.
+			probed = &ProbeEvidence{Run: r.Holder}
+			if res.Receipt != "" {
+				sum := sha256.Sum256([]byte(res.Receipt))
+				probed.OutputSHA256 = hex.EncodeToString(sum[:])
+			}
+			res.Receipt = probeReceipt(action, r.Holder)
+			res.Detail = "reconciled: a probe found the effect present"
+		}
 		err := finish(ActionSucceeded, res)
 		if action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
 			// The registry does not take the execution as dispatched yet.
@@ -1188,12 +1218,107 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 			State: state, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
 		})
 	}
+	if err != nil && r.outcomeHeld(ctx, job, declared, action, state, res.Receipt, err) {
+		// The registry holds this outcome of this attempt; see outcomeHeld.
+		err = nil
+	}
 	if err != nil {
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", action.ID, err)
 	}
 	action.State, action.Receipt, action.Detail = state, res.Receipt, res.Detail
 	action.Admitted, action.AdmittedRef = res.Admitted, res.AdmittedRef
 	return action, nil
+}
+
+// outcomeHeld reports whether an outcome whose record failed is the outcome
+// the registry holds for exactly this attempt. Only then is the failure not
+// an error. The failure alone proves nothing, so the action is read back,
+// and it must be the same attempt in every respect the reviewer knows: the
+// action, the attempt and its grant, the job version, and what it is bound
+// to (its name, target and parameters, and the binding digest when the
+// reviewer was given one). Anything that differs, an action that is not
+// there, and a registry that cannot be read all leave the failure an error.
+//
+// It is asked in two cases only.
+//
+// The registry refused the record because the action is not in a state the
+// outcome can be recorded from. That is what happens to an attempt that ran
+// to the end of its grant: the command is stopped when the grant ends, and
+// the registry interrupts an attempt whose grant has ended before it looks
+// at any write, making it uncertain, or failed when the attempt was granted
+// as read-only. A record of that same outcome is then refused, and the
+// refused write stores nothing, so the read still shows the attempt
+// executing with its grant ended; the interruption is stored with the next
+// write the registry takes, which is the review's own. The outcome counts
+// as held when the read shows it, or shows this attempt executing past its
+// grant and the outcome being recorded is the one the interruption gives.
+//
+// Or the registry did not answer at all: the record may have been written
+// and its answer lost. Then only an action read back in the recorded state,
+// with the same receipt for a success, counts.
+//
+// Any other answer of the registry (a claim that is no longer this
+// review's, a grant that is not the action's, a refused value) is about
+// something else and stays what it is.
+func (r *Reviewer) outcomeHeld(ctx context.Context, job Job, declared DeclaredAction, action Action, state ActionState, receipt string, failed error) bool {
+	refused := settlementRefused(failed)
+	if !refused && registryAnswered(failed) {
+		return false
+	}
+	actions, err := r.Registry.Actions(ctx, job.ID)
+	if err != nil {
+		return false
+	}
+	for _, held := range actions {
+		if held.ID != action.ID {
+			continue
+		}
+		same := held.GrantID == action.GrantID && held.GrantID != "" && held.Attempt == action.Attempt &&
+			held.JobVersion == action.JobVersion && held.Name == action.Name && held.TargetID == action.TargetID &&
+			maps.Equal(held.Params, action.Params) &&
+			(action.BindingDigest == "" || held.BindingDigest == action.BindingDigest)
+		if !same {
+			return false
+		}
+		if held.State == state {
+			return state != ActionSucceeded || receipt != "" && held.Receipt == receipt
+		}
+		interrupted := ActionUncertain
+		if declared.Idempotency == IdempotencyReadOnly {
+			interrupted = ActionFailed
+		}
+		return refused && state == interrupted && held.State == ActionExecuting &&
+			!held.GrantExpiresAt.IsZero() && !r.now().Before(held.GrantExpiresAt)
+	}
+	return false
+}
+
+// settlementRefused reports whether err is the registry saying that the
+// action is not in a state the outcome can be recorded from: it has moved
+// on, or is no longer in flight.
+func settlementRefused(err error) bool {
+	if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+		return true
+	}
+	te, ok := errors.AsType[*TransportError](err)
+	return ok && te.Status == http.StatusConflict && te.Code == "action_state"
+}
+
+// registryAnswered reports whether err is something the registry said, as
+// opposed to a request whose answer never arrived.
+func registryAnswered(err error) bool {
+	if _, ok := errors.AsType[*TransportError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*GuardDeniedError](err); ok {
+		return true
+	}
+	for _, said := range []error{ErrClaimHeld, ErrStaleFence, ErrConflict, ErrActionExists, ErrNotReady, ErrNotFound} {
+		if errors.Is(err, said) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Packet, kind ProposalKind, requested AgentAction, question string, review *Review, result *Applied) error {

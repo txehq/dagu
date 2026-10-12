@@ -442,3 +442,20 @@ A `reconcile` probe exits `0` if the effect is present at the destination,
 settles an interrupted attempt. Absence does not prove a request already
 sent will not still take effect, so the attempt goes to the owner instead of
 being closed as not applied.
+
+An attempt settled on its probe is recorded as done, and its record says
+that a probe found it: the receipt is `probe:<action id>:<attempt>:<review
+run>`, naming the attempt and the review run that ran the probe, and the
+outcome carries `confirmed_by: probe`, that run, and a SHA-256 digest of
+the last line the probe printed, if any. Nothing the probe prints is
+stored: an outcome is kept with the action and shown to people, and is not
+masked the way step output is. The attempt is never given the receipt the
+action itself would have printed.
+
+A command that does not return before its timeout is stopped when the
+attempt's grant ends, and the attempt is then uncertain (failed, for a
+`read_only` action). The registry marks an attempt whose grant has ended
+the same way by itself, so the reviewer's record of that outcome can arrive
+second and be refused. The reviewer then reads the attempt back, and the
+review goes on only when the registry shows this same attempt in that
+outcome, or still executing past its grant; any difference fails the step.

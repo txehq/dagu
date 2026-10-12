@@ -1419,6 +1419,7 @@ func (r *Remote) BeginAction(ctx context.Context, req BeginRequest) (Action, err
 		ID: req.ActionID, JobID: jobID, JobVersion: req.JobVersion, Name: req.Name, TargetID: req.TargetID,
 		Params: req.Params, IntentKey: req.IntentKey, ReviewID: req.ReviewID, ProposalID: req.ProposalID,
 		DecisionID: req.DecisionID, State: ActionExecuting, GrantID: grant.GrantId, GrantExpiresAt: grant.ExpiresAt,
+		Attempt: grant.Attempt,
 		ClaimID: req.Claim.ID,
 	}, nil
 }
@@ -1431,6 +1432,12 @@ type actionOutcome struct {
 	Admitted bool `json:"admitted,omitempty"`
 	// AdmittedRef: the execution the destination named for the request.
 	AdmittedRef string `json:"admitted_execution,omitempty"`
+	// ConfirmedBy is "probe" when a reconcile probe, not the action, found
+	// the effect present; ProbeRun is the review run that ran it and
+	// ProbeOutputSHA256 the digest of what it printed, never the text.
+	ConfirmedBy       string `json:"confirmed_by,omitempty"`
+	ProbeRun          string `json:"probe_run,omitempty"`
+	ProbeOutputSHA256 string `json:"probe_output_sha256,omitempty"`
 }
 
 // FinishAction implements Registry.
@@ -1445,8 +1452,12 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 	// An execution the destination named is written whenever it is known,
 	// and always as admitted: the registry stores it that way, and refuses
 	// one that says otherwise.
-	if admitted := req.Admitted || req.AdmittedRef != ""; req.Detail != "" || admitted {
-		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: admitted, AdmittedRef: req.AdmittedRef})
+	if admitted := req.Admitted || req.AdmittedRef != ""; req.Detail != "" || admitted || req.Probe != nil {
+		outcome := actionOutcome{Detail: req.Detail, Admitted: admitted, AdmittedRef: req.AdmittedRef}
+		if req.Probe != nil {
+			outcome.ConfirmedBy, outcome.ProbeRun, outcome.ProbeOutputSHA256 = "probe", req.Probe.Run, req.Probe.OutputSHA256
+		}
+		body.Outcome, _ = json.Marshal(outcome)
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }

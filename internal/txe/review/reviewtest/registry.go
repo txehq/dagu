@@ -32,15 +32,17 @@ type State struct {
 	// Registrations keeps each job's registration state, which a job does
 	// not carry in its own JSON because the agent is never shown it.
 	Registrations map[string]review.Registration `json:"registrations,omitempty"`
-	Checkpoints   map[string]review.Checkpoint   `json:"checkpoints"`
-	Claims        map[string]review.Claim        `json:"claims"`
-	Fences        map[string]int                 `json:"fences"`
-	Runs          map[string][]review.RunEvidence
-	Decisions     map[string][]review.Decision
-	Proposals     map[string][]review.Proposal
-	Actions       map[string][]review.Action
-	Reviews       map[string][]review.Review
-	Exceptions    []review.Exception
+	// ReadOnlyAttempts names the actions granted as read-only.
+	ReadOnlyAttempts map[string]bool              `json:"read_only_attempts,omitempty"`
+	Checkpoints      map[string]review.Checkpoint `json:"checkpoints"`
+	Claims           map[string]review.Claim      `json:"claims"`
+	Fences           map[string]int               `json:"fences"`
+	Runs             map[string][]review.RunEvidence
+	Decisions        map[string][]review.Decision
+	Proposals        map[string][]review.Proposal
+	Actions          map[string][]review.Action
+	Reviews          map[string][]review.Review
+	Exceptions       []review.Exception
 	// ConsumedResolutions are escalation answers already used by a grant.
 	ConsumedResolutions map[string]bool
 	// Closures are the recorded attempts to close superseded proposals'
@@ -266,6 +268,7 @@ func (r *Registry) AcquireClaim(_ context.Context, req review.ClaimRequest) (rev
 		if old, ok := s.Claims[req.JobID]; ok {
 			s.Transitions = append(s.Transitions, fmt.Sprintf("claim %s fence %d expired", old.ID, old.Fence))
 		}
+		s.sweep(req.JobID, now)
 		s.Fences[req.JobID]++
 		claim = review.Claim{
 			ID:        s.nextID("clm"),
@@ -284,7 +287,7 @@ func (r *Registry) AcquireClaim(_ context.Context, req review.ClaimRequest) (rev
 
 // ReleaseClaim implements review.Registry.
 func (r *Registry) ReleaseClaim(_ context.Context, claim review.Claim) error {
-	return r.Update(func(s *State) error {
+	return r.write(claim.JobID, func(s *State) error {
 		if err := s.checkFence(claim, r.now()); err != nil {
 			return err
 		}
@@ -558,6 +561,14 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			GrantExpiresAt: now.Add(grantTimeout(req.Timeout)),
 		}
 		s.Actions[jobID] = append(s.Actions[jobID], out)
+		// As the registry: whether the attempt is read-only is fixed when
+		// it is granted, from the job's declaration at that moment.
+		if s.readOnly(jobID, req.Name) {
+			if s.ReadOnlyAttempts == nil {
+				s.ReadOnlyAttempts = map[string]bool{}
+			}
+			s.ReadOnlyAttempts[out.ID] = true
+		}
 		return nil
 	})
 	return out, err
@@ -656,6 +667,59 @@ var allowedTransitions = map[review.ActionState][]review.ActionState{
 	review.ActionUncertain: {review.ActionSucceeded, review.ActionNotApplied, review.ActionEscalated},
 }
 
+// sweep is the registry's time-based transition, applied before each write
+// as the registry applies it before each transaction: an attempt still
+// executing when its grant has ended is interrupted. Its effect may have
+// happened, so it is uncertain, unless the action is read-only. It returns
+// the attempts it interrupted: like everything in a transaction, the
+// interruption is stored only if the write is, so a refused write undoes it
+// (unsweep) and a later read still shows the attempt executing.
+func (s *State) sweep(jobID string, now time.Time) []int {
+	var swept []int
+	actions := s.Actions[jobID]
+	for i := range actions {
+		a := &actions[i]
+		if a.State != review.ActionExecuting || a.GrantExpiresAt.IsZero() || now.Before(a.GrantExpiresAt) {
+			continue
+		}
+		a.State = review.ActionUncertain
+		if s.ReadOnlyAttempts[a.ID] {
+			a.State = review.ActionFailed
+		}
+		swept = append(swept, i)
+	}
+	return swept
+}
+
+func (s *State) unsweep(jobID string, swept []int) {
+	for _, i := range swept {
+		s.Actions[jobID][i].State = review.ActionExecuting
+	}
+}
+
+// write runs fn as a write to one job: the time-based transition first, as
+// in the registry, and undone if the write is refused.
+func (r *Registry) write(jobID string, fn func(s *State) error) error {
+	return r.Update(func(s *State) error {
+		swept := s.sweep(jobID, r.now())
+		err := fn(s)
+		if err != nil {
+			s.unsweep(jobID, swept)
+		}
+		return err
+	})
+}
+
+// readOnly reports whether the job declares the action read-only.
+func (s *State) readOnly(jobID, name string) bool {
+	for _, d := range s.Jobs[jobID].Review.Actions {
+		if d.Name == name {
+			return d.Idempotency == review.IdempotencyReadOnly
+		}
+	}
+	return false
+}
+
 // FinishAction implements review.Registry.
 func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) error {
 	return r.Update(func(s *State) error {
@@ -663,10 +727,25 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 		if err := s.checkFence(req.Claim, now); err != nil {
 			return err
 		}
+		swept := s.sweep(req.JobID, now)
+		err := s.finish(req, now)
+		if err != nil {
+			s.unsweep(req.JobID, swept)
+		}
+		return err
+	})
+}
+
+func (s *State) finish(req review.FinishRequest, now time.Time) error {
+	{
 		actions := s.Actions[req.JobID]
 		for i := range actions {
 			if actions[i].ID != req.ActionID {
 				continue
+			}
+			// As the registry: no success is recorded without a receipt.
+			if req.State == review.ActionSucceeded && req.Receipt == "" {
+				return &review.TransportError{Status: 400, Code: "invalid", Message: "succeeded needs a receipt"}
 			}
 			allowed := false
 			for _, to := range allowedTransitions[actions[i].State] {
@@ -717,13 +796,13 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 			return nil
 		}
 		return review.ErrNotFound
-	})
+	}
 }
 
 // CreateProposal implements review.Registry.
 func (r *Registry) CreateProposal(_ context.Context, claim review.Claim, draft review.Proposal) (review.Proposal, error) {
 	var out review.Proposal
-	err := r.Update(func(s *State) error {
+	err := r.write(claim.JobID, func(s *State) error {
 		if err := s.checkFence(claim, r.now()); err != nil {
 			return err
 		}
@@ -748,7 +827,7 @@ func (r *Registry) CreateProposal(_ context.Context, claim review.Claim, draft r
 
 // RecordReview implements review.Registry.
 func (r *Registry) RecordReview(_ context.Context, claim review.Claim, rev review.Review) error {
-	return r.Update(func(s *State) error {
+	return r.write(claim.JobID, func(s *State) error {
 		if err := s.checkFence(claim, r.now()); err != nil {
 			return err
 		}
@@ -770,7 +849,7 @@ func (r *Registry) RecordReview(_ context.Context, claim review.Claim, rev revie
 
 // AdvanceCheckpoint implements review.Registry.
 func (r *Registry) AdvanceCheckpoint(_ context.Context, claim review.Claim, next review.Checkpoint, expectedVersion int) error {
-	return r.Update(func(s *State) error {
+	return r.write(claim.JobID, func(s *State) error {
 		if err := s.checkFence(claim, r.now()); err != nil {
 			return err
 		}
@@ -786,7 +865,7 @@ func (r *Registry) AdvanceCheckpoint(_ context.Context, claim review.Claim, next
 
 // DeferReview implements review.Registry.
 func (r *Registry) DeferReview(_ context.Context, claim review.Claim, until time.Time) error {
-	return r.Update(func(s *State) error {
+	return r.write(claim.JobID, func(s *State) error {
 		if err := s.checkFence(claim, r.now()); err != nil {
 			return err
 		}

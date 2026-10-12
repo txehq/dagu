@@ -106,6 +106,20 @@ type FinishRequest struct {
 	// named for it, if it named one.
 	Admitted    bool
 	AdmittedRef string
+	// Probe is set when the outcome is a success found by a reconcile
+	// probe and not reported by the action itself.
+	Probe *ProbeEvidence
+}
+
+// ProbeEvidence says what found an interrupted attempt's effect present.
+// It carries nothing the probe printed: an outcome is stored with the
+// action, shown to people and kept, and is not masked as step output is.
+type ProbeEvidence struct {
+	// Run is the review run that ran the probe.
+	Run string
+	// OutputSHA256 is the digest of the probe's last line of output, when
+	// it printed one.
+	OutputSHA256 string
 }
 
 // Registry is the part of the TXE job registry the reviewer consumes. The

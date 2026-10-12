@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -728,7 +729,7 @@ func TestCrashAfterEffectReconcilesByProbe(t *testing.T) {
 
 	action := f.state().Actions[jobID][0]
 	assert.Equal(t, review.ActionSucceeded, action.State)
-	assert.Equal(t, "found-at-destination", action.Receipt)
+	assert.Equal(t, "probe:"+f.state().Actions[jobID][0].ID+":1:reviewer-b", action.Receipt)
 	assert.Empty(t, recovered.Packet.UnresolvedActions)
 
 	// The agent asks for the same thing again in the same episode.
@@ -793,14 +794,17 @@ func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
 	dying := f.reviewer("reviewer-a")
 	dying.Registry = crashAfterEffect{f.registry}
 	collect := review.AgentDecision{
-		Outcome: review.OutcomeAct, Reasoning: "Collect.",
-		Actions: []review.AgentAction{act("collect_diagnostics", nil)},
+		Outcome: review.OutcomeAct, Reasoning: "Notify.",
+		Actions: []review.AgentAction{act("notify", nil)},
 	}
 	_, err := dying.Apply(context.Background(), prepared, collect)
 	require.ErrorIs(t, err, errCrash)
 
-	// The job's record now fails the check against the local registration.
+	// The job's record now fails the check against the local registration,
+	// and calls the action read-only. The attempt was not granted as one.
 	job := f.state().Jobs[jobID]
+	job.Review.Actions = slices.Clone(job.Review.Actions)
+	job.Review.Actions[1].Idempotency = review.IdempotencyReadOnly
 	job.CommandsRefused = "the registry's permitted actions for version 1 of the job are not the ones this machine registered: none of the job's commands is started"
 	require.NoError(t, f.registry.PutJob(job))
 
@@ -813,7 +817,7 @@ func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
 	assert.Empty(t, f.state().Proposals[jobID], "the owner has the exception about the job; no question about the action")
 	applied := f.apply("reviewer-b", recovered, collect)
 	assert.Empty(t, applied.Executed)
-	assert.Equal(t, 1, f.effects.count("collect_diagnostics"), "only the interrupted attempt was ever made")
+	assert.Equal(t, 1, f.effects.count("notify"), "only the interrupted attempt was ever made")
 	var raised int
 	for _, e := range f.state().Exceptions {
 		if e.Kind == review.ExceptionCommandsUnbound {
@@ -834,7 +838,9 @@ func TestAnUnboundJobsDeclarationSettlesNothing(t *testing.T) {
 }
 
 // An interrupted read-only action has no external effect to wait for, so it
-// is closed as not applied and may be requested again.
+// is closed and may be requested again. The registry closes it itself, as
+// failed, when the attempt's grant has ended: it knows the attempt was
+// granted as read-only.
 func TestInterruptedReadOnlyActionIsClosed(t *testing.T) {
 	f := newFixture(t)
 	prepared := f.prepare("reviewer-a")
@@ -849,7 +855,7 @@ func TestInterruptedReadOnlyActionIsClosed(t *testing.T) {
 
 	f.clock.Advance(11 * time.Minute)
 	recovered := f.prepare("reviewer-b")
-	assert.Equal(t, review.ActionNotApplied, f.state().Actions[jobID][0].State)
+	assert.Equal(t, review.ActionFailed, f.state().Actions[jobID][0].State)
 	assert.Empty(t, recovered.Packet.UnresolvedActions)
 	assert.Empty(t, f.state().Proposals[jobID])
 
@@ -1065,7 +1071,7 @@ func TestRetiredJobStillSettlesInFlightAction(t *testing.T) {
 	assert.Equal(t, review.SkipNotReviewable, f.prepare("reviewer-b").Skipped)
 	s := f.state()
 	assert.Equal(t, review.ActionSucceeded, s.Actions[jobID][0].State)
-	assert.Equal(t, "found-at-destination", s.Actions[jobID][0].Receipt)
+	assert.Equal(t, "probe:"+f.state().Actions[jobID][0].ID+":1:reviewer-b", s.Actions[jobID][0].Receipt)
 	assert.Equal(t, 1, f.effects.count("notify"))
 	assert.Empty(t, s.Proposals[jobID])
 	assert.Empty(t, s.Reviews[jobID])
