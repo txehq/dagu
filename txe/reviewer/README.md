@@ -182,6 +182,17 @@ files.
   unavailable, a rejected login, a registration state this reviewer does
   not know, a refusal the job's record does not explain) still fails the
   tick when nothing else was reviewed.
+- Updates: a job updated while it is being reviewed ends that review. The
+  registry ends the review's claim with the update and refuses a write
+  made against another version than the job's, and every proposal is sent
+  with the version its review read. A review that meets this at any of
+  its writes is abandoned: it records no review, leaves the checkpoint
+  where it was, raises no exception, and its run succeeds, saying why
+  (`aborted`) and what it had already done. The next tick reviews the job
+  as it now is. An action already begun is in the journal: the registry
+  interrupts it with the claim, a later review settles it, and it is never
+  run again. A claim that is stale for another reason (it expired and was
+  taken) on a job that did not change still fails the step.
 - Cadence: a job's `review_policy.cadence` is a cron expression, and a
   job's next review is that expression's next occurrence in the timezone of
   the job's own schedule (`schedule.timezone`; UTC when a version carries

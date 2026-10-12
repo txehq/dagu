@@ -95,6 +95,9 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 			failed = errors.Join(failed, fmt.Errorf("prepare %s: %w", jobID, err))
 			continue
 		}
+		if prepared.Skipped == SkipJobChanged {
+			fmt.Fprintf(os.Stderr, "txe review: %s is not reviewed on this tick: %s\n", jobID, prepared.SkipDetail)
+		}
 		if prepared.Skipped == SkipNotRegistered {
 			// Said in the run's log on every tick, so a job that is never
 			// reviewed for this reason is not silent.

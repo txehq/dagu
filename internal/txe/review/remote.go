@@ -1494,6 +1494,12 @@ func (r *Remote) CreateProposal(ctx context.Context, claim Claim, draft Proposal
 	if draft.ReviewID != "" {
 		in.ReviewId = &draft.ReviewID
 	}
+	// The version the review read. The registry refuses the proposal when
+	// the job is no longer at it, so a proposal is never bound to a version
+	// its review did not see.
+	if draft.JobVersion > 0 {
+		in.JobVersion = &draft.JobVersion
+	}
 	if !draft.ObservedAt.IsZero() {
 		in.Evidence.ObservedAt = &draft.ObservedAt
 	}
