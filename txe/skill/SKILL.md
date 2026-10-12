@@ -25,7 +25,7 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 |---|---|
 | `job_key` | A stable lowercase name for this job within its project, such as `hub-volume-health`. Registering the same key twice is refused. |
 | `title`, `purpose` | What the job is for, written for someone who never saw this conversation. |
-| `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). |
+| `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). See "Targets" below. |
 | `schedule` | `cron` (five fields), `timezone`, `timeout_sec`. Optional: `overlap`, `retry` with `retry_interval_sec`, `catchup_window`. |
 | `package` | `include`: the files and directories the job needs, relative to the spec. `entrypoint`: the command. Uncommitted files are packaged as they are. |
 | `env` | Optional. Literal, non-secret settings for the script. |
@@ -66,6 +66,41 @@ review_policy:
 - Write every key in a `param_schema` as text. A key such as `1`, `1.0` or `true` is refused, because it would be sent as text that may not match what is written: put it in quotes (`"1"`). A key written with `?` is refused too.
 - A spec that gives any action a `param_schema` must be written out in full: no anchors (`&name`), references (`*name`) or merge keys (`<<`) anywhere in the file. A reference can be read as something other than what is written above it, so the spec is refused and the line that uses one is named. A job spec is one YAML document: a file with a second one after `---` is refused, because only the first would be read. A spec with no `param_schema` may use them as before.
 
+## Targets
+
+A target is the resource the job watches or acts on. Give it an identity that survives a rename or a recreation, and say how its existence is observed:
+
+| `existence_check` | Who checks | When |
+|---|---|---|
+| `pre_run` | this machine, before the job's command | every run, retries included; the job does not run when the target is gone or cannot be observed |
+| `reconcile` | this machine's periodic check | between runs |
+| `event_only` (or left out) | nobody; someone records a change in the registry | never automatically |
+
+`pre_run` and `reconcile` work only for kinds a probe knows, and the job must declare the credential the probe reads. Anything else is refused at registration, because a target nobody can observe would stop every run.
+
+```yaml
+targets:
+  - kind: kubernetes.deployment      # also configmap, secret, service, persistentvolumeclaim, statefulset, job, cronjob, namespace
+    environment: dev                 # the cluster's name
+    display_name: my-namespace/my-app   # "namespace/name"; just "name" for kubernetes.namespace
+    stable_id:
+      cluster_uid: <uid of the cluster's kube-system namespace>
+      uid: <the object's metadata.uid>
+    existence_check: pre_run
+  - kind: linear.issue
+    stable_id:
+      id: <the issue's UUID, not TXE-123>
+    existence_check: reconcile
+credential_refs:
+  - {name: TXE_KUBECONFIG, kind: file, locator: /Users/you/.kube/config}   # required for a Kubernetes target
+  - {name: TXE_KUBE_CONTEXT, kind: env, locator: TXE_KUBE_CONTEXT}         # optional: the context to use
+  - {name: LINEAR_API_KEY, kind: file, locator: /Users/you/.config/txe/linear-token}   # required for a Linear target
+```
+
+The three names are fixed: they are what the probe looks up. A reference's name is also the variable your script receives, holding the file's content for a `file` reference. So `TXE_KUBECONFIG` holds the kubeconfig's text, not a path: if your script runs `kubectl`, point it at the file with a setting of your own under `env`, such as `KUBECONFIG: /Users/you/.kube/config`.
+
+A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
+
 ## Write the script for an unattended worker
 
 The script runs on this machine, started by the worker, not by a shell you have open. Three things differ from running it yourself.
@@ -95,7 +130,7 @@ Rules for the script:
 
 - Do not write a credential into a deliverable or into a file under the output directories. Files are published as they are; only step output is masked.
 - Do not print a multi-line credential one line at a time. A value is masked when it appears whole.
-- For Kubernetes, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig.
+- For your script's own Kubernetes calls, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig. That does not cover a target check: a Kubernetes target with `pre_run` or `reconcile` still needs the `TXE_KUBECONFIG` file reference described under Targets, and registration refuses the job without it.
 
 If the file is missing or unreadable when a run starts, the run fails before the script starts, and the run's log on the hub names the reference. That is a login to repair on this machine, not a reason to retire the job.
 

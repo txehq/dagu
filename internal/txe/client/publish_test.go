@@ -855,6 +855,51 @@ func TestCheckDeliverablePath(t *testing.T) {
 	}
 }
 
+// The targets a job may ask a probe to observe, and the credential references
+// that go with them, are the probes' own rules: the client and the probe
+// package run the same accepted and refused cases.
+func TestProbeTargetsFixture(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(fixturesDir, "probe-targets.json"))
+	require.NoError(t, err)
+	type fixtureCase struct {
+		Target         Target                 `json:"target"`
+		CredentialRefs []txepkg.CredentialRef `json:"credential_refs"`
+		Reason         string                 `json:"reason"`
+	}
+	var cases struct {
+		Accepted []fixtureCase `json:"accepted"`
+		Refused  []fixtureCase `json:"refused"`
+	}
+	require.NoError(t, json.Unmarshal(data, &cases))
+	require.NotEmpty(t, cases.Accepted)
+	require.NotEmpty(t, cases.Refused)
+	for _, c := range cases.Accepted {
+		require.NoError(t, checkTarget(c.Target, c.CredentialRefs), "%+v", c.Target)
+	}
+	for _, c := range cases.Refused {
+		require.Error(t, checkTarget(c.Target, c.CredentialRefs), "%+v (%s)", c.Target, c.Reason)
+	}
+
+	// The rule is applied to a whole spec, and reported with its other gaps.
+	spec, _ := worktree(t, credentialFile(t))
+	require.NoError(t, spec.Validate())
+	spec.Targets[0].ExistenceCheck = "pre_run"
+	spec.Title = ""
+	err = spec.Validate()
+	var missing *MissingContextError
+	require.ErrorAs(t, err, &missing)
+	require.ErrorContains(t, err, "targets[0]: no probe observes kind "+spec.Targets[0].Kind)
+	require.ErrorContains(t, err, "title is required")
+
+	// An existence check that is not one of the three is refused outright.
+	require.ErrorContains(t, checkTarget(Target{Kind: "example.file", StableID: map[string]string{"id": "x"}, ExistenceCheck: "before_run"}, nil),
+		"existence_check")
+	require.NoError(t, checkTarget(Target{Kind: "example.file", StableID: map[string]string{"id": "x"}}, nil), "a target with no existence check is observed by no probe")
+	require.NoError(t, checkTarget(Target{Kind: "example.file", StableID: map[string]string{"id": "x"}, ExistenceCheck: "event_only"}, nil))
+	require.ErrorContains(t, checkTarget(Target{Kind: "example.file", StableID: map[string]string{"id": "x"}, ExistenceCheck: "pre_run"}, nil),
+		"no probe observes kind example.file")
+}
+
 // A spec cannot declare a deliverable outside the run's directory or twice.
 func TestJobSpecDeliverableRules(t *testing.T) {
 	_, dir := worktree(t, credentialFile(t))
