@@ -660,6 +660,66 @@ func TestUpdate(t *testing.T) {
 	assert.Len(t, receipts, 2)
 }
 
+// An update that changes only a setting, made by the session that built the
+// package, builds the package that is already in place. It ends ready against
+// that package and leaves no staged copy, on a first attempt and on one
+// resumed after the package step.
+func TestUpdateWithAnUnchangedPackage(t *testing.T) {
+	f := newFakeRegistry(t)
+	home := machineHome(t, f)
+	cc1 := newSession(f, home, "cc1-s000001")
+	spec, _ := worktree(t, credentialFile(t))
+	staged := func() []string {
+		names, err := filepath.Glob(filepath.Join(home.PackagesDir(), ".staging", "*"))
+		require.NoError(t, err)
+		return names
+	}
+
+	first, err := cc1.Register(context.Background(), spec)
+	require.NoError(t, err)
+	jobID := first.Receipt.JobID
+	require.Empty(t, staged())
+
+	spec.Env = map[string]string{"MAX_AGE_SEC": "900"}
+	second, err := cc1.Update(context.Background(), jobID, 1, spec)
+	require.NoError(t, err)
+	assert.Equal(t, 2, second.Receipt.Version)
+	assert.Equal(t, first.Receipt.PackageDigest, second.Receipt.PackageDigest)
+	assert.Equal(t, first.Receipt.PackageDir, second.Receipt.PackageDir)
+	assert.Empty(t, staged(), "the update's staged copy of the package in place is removed")
+	assert.Empty(t, pendingSteps(t, cc1.Journal))
+
+	// The hub fails while marking version 3 ready: the package step is done
+	// and the staged copy removed.
+	spec.Env = map[string]string{"MAX_AGE_SEC": "1800"}
+	f.mu.Lock()
+	f.failNextReady = true
+	f.mu.Unlock()
+	_, err = cc1.Update(context.Background(), jobID, 2, spec)
+	var incomplete *ErrIncomplete
+	require.ErrorAs(t, err, &incomplete)
+	assert.Equal(t, txepkg.StepCommitted, incomplete.Step)
+	assert.Empty(t, staged())
+	// As if the removal of that copy had stopped part-way: what is left is
+	// under its mark, and the resumed request finishes removing it.
+	left := filepath.Join(home.PackagesDir(), ".staging", incomplete.RequestID+txepkg.RemovingSuffix, txepkg.FilesDir)
+	require.NoError(t, os.MkdirAll(left, 0o700))
+	third, err := cc1.Resume(context.Background(), incomplete.RequestID)
+	require.NoError(t, err)
+	assert.Equal(t, 3, third.Receipt.Version)
+	assert.Equal(t, first.Receipt.PackageDigest, third.Receipt.PackageDigest)
+	assert.Empty(t, staged())
+
+	_, err = cc1.Store.Verify(jobID, first.Receipt.PackageDigest)
+	require.NoError(t, err)
+	packages, err := filepath.Glob(filepath.Join(home.PackagesDir(), jobID, "sha256-*"))
+	require.NoError(t, err)
+	assert.Len(t, packages, 1)
+	receipts, err := cc1.Journal.Receipts(jobID)
+	require.NoError(t, err)
+	assert.Len(t, receipts, 3)
+}
+
 func TestRegisterRefusals(t *testing.T) {
 	t.Run("ReviewerSession", func(t *testing.T) {
 		f := newFakeRegistry(t)

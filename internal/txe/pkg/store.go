@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gofrs/flock"
+
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
@@ -191,23 +193,144 @@ func (s *Store) LoadStaged(requestID string) (*Staged, error) {
 }
 
 // Commit moves a staged package to its final, read-only location for jobID.
-// Committing a package that is already in place returns it unchanged, so a
-// resumed registration can repeat the call.
+// Committing a package that is already in place returns the one in place and
+// removes the staged copy, so a resumed registration can repeat the call and
+// a request that builds the same package again leaves nothing behind.
 func (s *Store) Commit(staged *Staged, jobID string) (*Package, error) {
 	final, err := s.packageDir(jobID, staged.Digest)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Lstat(final); err == nil {
-		return s.Adopt(jobID, staged.Digest)
+	if _, err := os.Lstat(final); err != nil {
+		if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+			return nil, fmt.Errorf("create package directory: %w", err)
+		}
+		moveErr := os.Rename(staged.Dir, final)
+		if moveErr == nil {
+			return s.Adopt(jobID, staged.Digest)
+		}
+		// Another request may have moved the same package into place since
+		// the check above. Only that is carried on from.
+		if _, err := os.Lstat(final); err != nil {
+			return nil, fmt.Errorf("move package into place: %w", moveErr)
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
-		return nil, fmt.Errorf("create package directory: %w", err)
+	pkg, err := s.Adopt(jobID, staged.Digest)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Rename(staged.Dir, final); err != nil {
-		return nil, fmt.Errorf("move package into place: %w", err)
+	if err := s.dropStaged(staged); err != nil {
+		return nil, fmt.Errorf("the package is in place at %s, but its staged copy was not removed: %w", pkg.Dir, err)
 	}
-	return s.Adopt(jobID, staged.Digest)
+	return pkg, nil
+}
+
+// RemovingSuffix marks a staged copy that was checked against the package in
+// place and is being removed. No request id can end with it, so nothing loads
+// such a directory as a staged package, and a removal that stopped part-way is
+// finished later without checking the remains again.
+const RemovingSuffix = ".removing"
+
+// dropStaged removes the staged copy of a package that is verified in its
+// final place. It removes only a directory of this store's staging area that
+// still holds that package; anything else is left where it is and reported.
+// A staged copy that is already gone was moved into place, or marked for
+// removal, by an earlier call.
+func (s *Store) dropStaged(staged *Staged) error {
+	area := filepath.Join(s.Root, stagingDir)
+	name := filepath.Base(staged.Dir)
+	if filepath.Dir(staged.Dir) != area || !namePattern.MatchString(name) {
+		return fmt.Errorf("%s is not in the staging area %s", staged.Dir, area)
+	}
+	return s.removing(func() error {
+		info, err := os.Lstat(staged.Dir)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return s.finishRemoval(name)
+		case err != nil:
+			return err
+		case !info.IsDir():
+			return fmt.Errorf("%s is not a directory", staged.Dir)
+		}
+		_, digest, err := verifyDir(staged.Dir, false)
+		if err != nil {
+			return err
+		}
+		if digest != staged.Digest {
+			return fmt.Errorf("%w: %s holds a manifest with digest %s", ErrPackageCorrupt, staged.Dir, digest)
+		}
+		// What an earlier removal of this request's copy left under the mark
+		// goes first. Then the checked copy is marked in one step, after
+		// which it is no longer a staged package.
+		if err := s.finishRemoval(name); err != nil {
+			return err
+		}
+		if err := os.Rename(staged.Dir, staged.Dir+RemovingSuffix); err != nil {
+			return err
+		}
+		return s.finishRemoval(name)
+	})
+}
+
+// FinishRemoval removes what is left of a staged copy that Commit checked and
+// marked for removal. A request resumed after the removal stopped part-way
+// calls it; with nothing marked it removes nothing.
+func (s *Store) FinishRemoval(requestID string) error {
+	if !namePattern.MatchString(requestID) {
+		return fmt.Errorf("invalid request id %q", requestID)
+	}
+	if _, err := os.Lstat(filepath.Join(s.Root, stagingDir)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return s.removing(func() error { return s.finishRemoval(requestID) })
+}
+
+// removing runs one removal from the staging area at a time, across
+// processes: two calls for one request must not interleave, or one could
+// remove a copy the other had marked and not yet synced. The lock file is
+// beside the staging area, not in it, where it would look like a staged
+// package.
+func (s *Store) removing(remove func() error) error {
+	lock := flock.New(filepath.Join(s.Root, stagingDir+".lock"))
+	beforeRemovalLock()
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("lock the staging area: %w", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+	return remove()
+}
+
+// beforeRemovalLock is called by a removal that is about to take the lock. A
+// test sets it to learn that a second call has got that far.
+var beforeRemovalLock = func() {}
+
+// syncStagingArea makes the names in the staging area durable. It is a
+// variable so a test can make it fail.
+var syncStagingArea = fileutil.SyncDir
+
+// finishRemoval removes what is under a request's mark. The caller holds the
+// removal lock.
+//
+// The staging area is synced before anything under the mark is removed, so a
+// machine that loses power part-way comes back with the remains under the
+// mark and never under the request's own name. It is synced again afterwards,
+// also when nothing was marked: an earlier call may have removed the copy and
+// stopped before that.
+func (s *Store) finishRemoval(requestID string) error {
+	area := filepath.Join(s.Root, stagingDir)
+	if err := syncStagingArea(area); err != nil {
+		return fmt.Errorf("sync staging area: %w", err)
+	}
+	if err := os.RemoveAll(filepath.Join(area, requestID+RemovingSuffix)); err != nil {
+		return err
+	}
+	if err := syncStagingArea(area); err != nil {
+		return fmt.Errorf("sync staging area: %w", err)
+	}
+	return nil
 }
 
 // Adopt finishes placing a package that is already in its final location: it

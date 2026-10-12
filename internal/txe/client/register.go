@@ -682,6 +682,11 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 		if pkg, err = r.Store.Adopt(entry.JobID, entry.PackageDigest); err != nil {
 			return nil, incomplete(fmt.Errorf("the package is neither staged (%w) nor in place (%w)", stagedErr, err))
 		}
+		// An earlier attempt may have stopped while removing its staged copy
+		// of a package that was already in place.
+		if err := r.Store.FinishRemoval(entry.RequestID); err != nil {
+			return nil, incomplete(fmt.Errorf("the package is in place at %s, but its staged copy was not removed: %w", pkg.Dir, err))
+		}
 	case staged.Digest != entry.PackageDigest:
 		return nil, incomplete(fmt.Errorf("the staged package has digest %s, but %s was registered", staged.Digest, entry.PackageDigest))
 	default:
