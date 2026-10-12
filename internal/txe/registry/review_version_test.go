@@ -143,3 +143,96 @@ func TestUpdateLeavesAnExecutionClaim(t *testing.T) {
 	assert.Equal(t, c.ClaimID, after.Claim.ClaimID)
 	assert.Equal(t, ClaimLive, after.Claim.State)
 }
+
+// A replayed proposal is checked like a new one: naming another read version
+// is refused, and naming the current one returns the stored proposal.
+func TestProposalReplayChecksTheReadVersion(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	job = updateAndReady(t, f, job, 2)
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	id := f.mint(PrefixProposal)
+	put := func(read int) (*Proposal, error) {
+		var p *Proposal
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: id, JobVersion: read, Action: ActionSpec{Name: "resize"}})
+			return err
+		})
+		return p, err
+	}
+	first, err := put(2)
+	require.NoError(t, err)
+	_, err = put(1)
+	assert.Equal(t, CodeVersionConflict, code(t, err), "a retry naming another read version")
+	again, err := put(2)
+	require.NoError(t, err)
+	assert.Equal(t, first.ProposalID, again.ProposalID)
+	assert.Equal(t, 2, again.JobVersion)
+}
+
+// A review recorded before an update is not replayed after it: the replay
+// would be a review of a version it never read, whatever version it names.
+func TestReviewReplayAfterAnUpdateIsRefused(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	review, err := ReviewID(job.JobID, 0)
+	require.NoError(t, err)
+	record := func(claim *Claim, read int) error {
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			return tx.RecordReview(claim.ClaimID, claim.Fence, Review{ReviewID: review, JobVersion: read, Outcome: ReviewContinue})
+		})
+		return err
+	}
+	require.NoError(t, record(c, 0))
+	require.NoError(t, record(c, 0), "a replay before any update is the same review")
+	updateAndReady(t, f, job, 2)
+	c2 := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	for _, read := range []int{0, 1, 2} {
+		assert.Equal(t, CodeVersionConflict, code(t, record(c2, read)), "replay naming version %d", read)
+	}
+}
+
+// A replacement reviewer finishing an episode whose review was recorded
+// before an update labels the checkpoint with the reviewed version and
+// makes the new version due at once; the next episode then reviews it.
+func TestInterruptedEpisodeKeepsItsReviewedVersion(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	review, err := ReviewID(job.JobID, 0)
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.RecordReview(c.ClaimID, c.Fence, Review{ReviewID: review, Outcome: ReviewContinue})
+	})
+	require.NoError(t, err)
+	updateAndReady(t, f, job, 2)
+	c2 := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	advance := func(expected, read int) (*Checkpoint, error) {
+		var cp *Checkpoint
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			cp, err = tx.AdvanceCheckpoint(c2.ClaimID, c2.Fence, expected, Checkpoint{JobVersion: read})
+			return err
+		})
+		return cp, err
+	}
+	_, err = advance(0, 2)
+	assert.Equal(t, CodeVersionConflict, code(t, err), "the episode reviewed version 1, not 2")
+	cp, err := advance(0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cp.JobVersion, "labelled with the version its review read")
+	require.NotNil(t, cp.NextReviewAt)
+	assert.False(t, cp.NextReviewAt.After(f.now), "the new version is due at once")
+
+	next, err := ReviewID(job.JobID, 1)
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.RecordReview(c2.ClaimID, c2.Fence, Review{ReviewID: next, JobVersion: 2, Outcome: ReviewContinue})
+	})
+	require.NoError(t, err)
+	cp, err = advance(1, 2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cp.JobVersion)
+}

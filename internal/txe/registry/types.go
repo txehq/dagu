@@ -776,6 +776,10 @@ type Job struct {
 	// LastRecordedReviewDigest is the latest review's evidence and outcome,
 	// so a replay that differs is refused instead of ignored.
 	LastRecordedReviewDigest string `json:"last_recorded_review_digest,omitempty"`
+	// LastRecordedReviewJobVersion is the job version the latest review was
+	// recorded for: its episode's checkpoint is labelled with it, and a
+	// replay of it after the job moved on is refused.
+	LastRecordedReviewJobVersion int `json:"last_recorded_review_job_version,omitempty"`
 	// ReviewerAvailability is the reviewer's availability, kept apart from
 	// the job's: a reviewer that cannot run does not make the job unavailable.
 	ReviewerAvailability *Availability         `json:"reviewer_availability,omitempty"`

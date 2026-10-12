@@ -554,6 +554,11 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 		if j.LastRecordedReviewDigest != "" && j.LastRecordedReviewDigest != digest {
 			return &Error{Code: CodeReviewConflict, Message: "review " + r.ReviewID + " was recorded with other evidence or outcome", Current: r.ReviewID}
 		}
+		// A replay is the same review only for the version it was recorded
+		// for; after an update it is a review of a version it never read.
+		if recorded := j.LastRecordedReviewJobVersion; recorded != 0 && (recorded != j.Version || (r.JobVersion != 0 && r.JobVersion != recorded)) {
+			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("review %s was recorded for version %d; the job is at version %d", r.ReviewID, recorded, j.Version), Current: j}
+		}
 		return nil
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
@@ -579,6 +584,7 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	}
 	j.LastRecordedReview = r.ReviewID
 	j.LastRecordedReviewDigest = digest
+	j.LastRecordedReviewJobVersion = r.JobVersion
 	return nil
 }
 
@@ -789,8 +795,18 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
 		return nil, err
 	}
-	if err := tx.requireReviewable(cp.JobVersion); err != nil {
+	// The episode is labelled with the version its review read: a review
+	// recorded before an update finishes its episode for the old version,
+	// and the new version is then due at once, never marked reviewed by it.
+	reviewed := j.Version
+	if episode, err := ReviewID(j.JobID, j.Checkpoint.Version); err == nil && j.LastRecordedReview == episode && j.LastRecordedReviewJobVersion != 0 {
+		reviewed = j.LastRecordedReviewJobVersion
+	}
+	if err := tx.requireReviewable(0); err != nil {
 		return nil, err
+	}
+	if cp.JobVersion != 0 && cp.JobVersion != reviewed {
+		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("the review read version %d; this episode reviewed version %d", cp.JobVersion, reviewed), Current: j}
 	}
 	if j.Checkpoint.Version != expectedVersion {
 		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("checkpoint is at %d, not %d", j.Checkpoint.Version, expectedVersion), Current: j.Checkpoint}
@@ -803,8 +819,10 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 		}
 	}
 	cp.Version = expectedVersion + 1
-	if cp.JobVersion == 0 {
-		cp.JobVersion = j.Version
+	cp.JobVersion = reviewed
+	if reviewed != j.Version {
+		now := tx.now
+		cp.NextReviewAt = &now
 	}
 	j.Checkpoint = cp
 	tx.touch()
@@ -844,6 +862,11 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	if err != nil {
 		return nil, err
 	}
+	// Checked before a replay too: a retry naming another read version is
+	// not the proposal already stored.
+	if err := tx.requireReviewable(p.JobVersion); err != nil {
+		return nil, err
+	}
 	if cur, ok := j.Proposals[p.ProposalID]; ok {
 		if cur.BindingDigest == binding {
 			out := *cur
@@ -852,9 +875,6 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 		return nil, &Error{Code: CodeProposalState, Message: "proposal " + p.ProposalID + " exists with another binding", Current: cur}
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
-		return nil, err
-	}
-	if err := tx.requireReviewable(p.JobVersion); err != nil {
 		return nil, err
 	}
 	for _, v := range p.AllowedVerdicts {
