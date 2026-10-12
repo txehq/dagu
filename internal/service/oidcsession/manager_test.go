@@ -573,7 +573,7 @@ func TestSignOutDuringARefresh(t *testing.T) {
 	go func() { refreshing <- f.check(session) }()
 	<-started
 
-	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out"))
+	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out", session.ExpiresAt))
 	close(gate)
 	require.ErrorIs(t, <-refreshing, ErrSessionEnded)
 
@@ -586,9 +586,9 @@ func TestSignOutDuringARefresh(t *testing.T) {
 	require.ErrorIs(t, f.check(session), ErrSessionEnded)
 
 	// Ending it again, or ending one that never existed, is not an error.
-	require.NoError(t, f.manager.End(context.Background(), session.ID, "again"))
-	require.NoError(t, f.manager.End(context.Background(), strings.Repeat("0", 32), "nothing there"))
-	require.NoError(t, f.manager.End(context.Background(), "../../etc/passwd", "not an id"))
+	require.NoError(t, f.manager.End(context.Background(), session.ID, "again", session.ExpiresAt))
+	require.NoError(t, f.manager.End(context.Background(), strings.Repeat("0", 32), "nothing there", time.Time{}))
+	require.NoError(t, f.manager.End(context.Background(), "../../etc/passwd", "not an id", time.Time{}))
 }
 
 // A sign-out ends the session for the very next request, with no provider
@@ -599,7 +599,7 @@ func TestSignOut(t *testing.T) {
 	session := f.signIn()
 	require.NoError(t, f.check(session))
 
-	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out"))
+	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out", session.ExpiresAt))
 	require.ErrorIs(t, f.check(session), ErrSessionEnded)
 	assert.Zero(t, f.provider.calls())
 	assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
@@ -728,7 +728,7 @@ func TestTheRefreshTokenIsNeverInTheClear(t *testing.T) {
 	f.provider.set(refuse("invalid_grant"))
 	f.clock.Advance(4 * time.Minute)
 	say(f.check(other))
-	say(f.manager.End(context.Background(), f.signIn().ID, "signed out"))
+	say(f.manager.End(context.Background(), f.signIn().ID, "signed out", time.Time{}))
 
 	for _, text := range append(said, logs.String(), readAll(t, f.dir)) {
 		assert.NotContains(t, text, secret)
@@ -782,6 +782,9 @@ type failingCollection struct {
 	swap func() error
 	// read, when set, is called before each read.
 	read func()
+	// swapped, when set, is called after each write that was made: an error
+	// from it is reported for a write that did happen.
+	swapped func() error
 }
 
 func (c *failingCollection) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {
@@ -790,7 +793,10 @@ func (c *failingCollection) CompareAndSwap(ctx context.Context, id string, old, 
 			return err
 		}
 	}
-	return c.Collection.CompareAndSwap(ctx, id, old, next)
+	if err := c.Collection.CompareAndSwap(ctx, id, old, next); err != nil || c.swapped == nil {
+		return err
+	}
+	return c.swapped()
 }
 
 // failWrite fails the nth write and no other.
@@ -848,7 +854,7 @@ func TestOldSessionRecordsArePurged(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
 	ended := f.signIn()
-	require.NoError(t, f.manager.End(ctx, ended.ID, "signed out"))
+	require.NoError(t, f.manager.End(ctx, ended.ID, "signed out", ended.ExpiresAt))
 	expired, err := f.manager.Create(ctx, alice, "refresh-token-x", f.clock.Now().Add(time.Hour))
 	require.NoError(t, err)
 	live := f.signIn()

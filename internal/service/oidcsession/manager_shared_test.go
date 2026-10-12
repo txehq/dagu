@@ -161,7 +161,7 @@ func TestSignOutRevokesTheTokenTheSessionHolds(t *testing.T) {
 	require.NoError(t, f.check(session))
 	require.Equal(t, "refresh-token-1", f.heldToken(session))
 
-	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out"))
+	require.NoError(t, f.manager.End(context.Background(), session.ID, "signed out", session.ExpiresAt))
 	assert.Equal(t, []string{"refresh-token-1"}, f.provider.revocations())
 }
 
@@ -180,7 +180,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		f.manager.col = broken
 		heal := broken.failWritesAfter(0)
 
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		require.Nil(t, f.stored(session).EndedAt, "the store still has the session open")
 		require.ErrorIs(t, f.check(session), ErrSessionEnded)
 		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "the token is revoked without waiting for the store")
@@ -212,7 +212,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 			return Renewal{RefreshToken: "refresh-token-new"}, nil
 		})
 
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		require.ErrorIs(t, f.check(session), ErrSessionEnded, "the process that took the sign-out refuses at once")
 		require.NoError(t, other.Check(ctx, session.ID, alice), "the other goes by the store")
 
@@ -237,7 +237,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		refreshing := make(chan error, 1)
 		go func() { refreshing <- f.check(session) }()
 		<-started
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		release()
 		require.ErrorIs(t, <-refreshing, ErrSessionEnded)
 		assert.ElementsMatch(t, []string{"refresh-token-0", "refresh-token-1"}, f.provider.revocations(),
@@ -266,7 +266,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		refreshing := make(chan error, 1)
 		go func() { refreshing <- f.check(session) }()
 		<-started
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		release()
 		require.ErrorIs(t, <-refreshing, ErrSessionEnded)
 		assert.Equal(t, "refresh-token-0", f.heldToken(session), "the renewal was not stored")
@@ -420,6 +420,87 @@ func TestAGrantedRefreshThatCannotBeStored(t *testing.T) {
 		require.NoError(t, f.check(session))
 		assert.Equal(t, []string{"refresh-token-0", "refresh-token-0"}, f.provider.presented())
 		assert.Nil(t, f.stored(session).EndedAt)
+	})
+}
+
+// The store reports an error for a write it has in fact made, as a file store
+// can when it fails after replacing the record. What is stored is read again:
+// a renewal that is there is not thrown away, and its token is not revoked.
+func TestAWriteThatFailedAfterItWasMade(t *testing.T) {
+	t.Parallel()
+
+	t.Run("TheRenewalIsThere", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		writes := 0
+		broken.swapped = func() error {
+			writes++
+			if writes == 2 { // the first write is the claim, the second the renewal
+				return errors.New("the directory could not be synchronised")
+			}
+			return nil
+		}
+		f.clock.Advance(4 * time.Minute)
+		require.NoError(t, f.check(session))
+		stored := f.stored(session)
+		assert.Nil(t, stored.EndedAt)
+		assert.Equal(t, "refresh-token-1", f.heldToken(session))
+		assert.Equal(t, f.clock.Now(), stored.LastConfirmedAt)
+		assert.Empty(t, f.provider.revocations(), "the token in use is not revoked")
+		_, remembered := f.manager.decided(session.ID)
+		assert.False(t, remembered)
+	})
+
+	// The write was made, and the record cannot be read back to find that
+	// out. The new token is revoked, so the session must not be left open
+	// holding it: the end applies to the record whichever token it holds.
+	t.Run("TheRenewalIsThereAndCannotBeReadBack", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		writes := 0
+		broken.swapped = func() error {
+			writes++
+			if writes == 2 {
+				broken.fail = errors.New("disk unavailable")
+				return errors.New("the directory could not be synchronised")
+			}
+			return nil
+		}
+		f.clock.Advance(4 * time.Minute)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		assert.Equal(t, []string{"refresh-token-1"}, f.provider.revocations())
+
+		broken.fail = nil
+		require.Equal(t, "refresh-token-1", f.heldToken(session), "the renewal had been stored")
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt, "a session holding a revoked token is not left open")
+		assert.Equal(t, "the renewed session could not be stored", stored.EndReason)
+		assert.Equal(t, 1, f.provider.calls())
+	})
+
+	// A sign-out whose write was made and reported as failed: the session is
+	// ended in the store, and what was remembered is settled by the next look.
+	t.Run("TheEndIsThere", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		broken.swapped = func() error { return errors.New("the directory could not be synchronised") }
+
+		require.Error(t, f.manager.End(context.Background(), session.ID, "signed out", session.ExpiresAt))
+		require.NotNil(t, f.stored(session).EndedAt)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		_, remembered := f.manager.decided(session.ID)
+		assert.False(t, remembered)
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
 	})
 }
 
@@ -665,7 +746,7 @@ func TestARememberedEnd(t *testing.T) {
 		f := newFixture(t, nil)
 		session := f.signIn()
 		heal := brokenStore(f).failWritesAfter(0)
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 
 		require.ErrorIs(t, f.manager.conclude(ctx, session.ID, decision{reason: "refused", ifToken: "a-token-the-record-no-longer-holds"}), ErrSessionEnded)
 		_, remembered := f.manager.decided(session.ID)
@@ -734,7 +815,7 @@ func TestARememberedEnd(t *testing.T) {
 		other := f.process()
 		heal := brokenStore(f).failWritesAfter(0)
 
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		require.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
 
 		f.clock.Advance(4 * time.Minute)
@@ -756,7 +837,7 @@ func TestARememberedEnd(t *testing.T) {
 		heal := brokenStore(f).failWritesAfter(0)
 		f.provider.failRevocations(errors.New("the provider did not answer"))
 
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		require.Empty(t, f.provider.revocations())
 
 		f.provider.failRevocations(nil)
@@ -774,7 +855,7 @@ func TestARememberedEnd(t *testing.T) {
 		session := f.signIn()
 		broken := brokenStore(f)
 		heal := broken.failWritesAfter(0)
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		f.signIn()
 		require.Nil(t, f.stored(session).EndedAt, "the store still does not take it")
 
@@ -787,12 +868,59 @@ func TestARememberedEnd(t *testing.T) {
 		assert.False(t, remembered)
 	})
 
+	// The session could not even be read when its end was decided. The end is
+	// remembered until the expiry the caller gave, which comes from the hub
+	// token, and not for ever.
+	t.Run("ItIsDroppedAtTheTokensExpiryWhenTheSessionCouldNotBeRead", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := brokenStore(f)
+		broken.fail = errors.New("disk unavailable")
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		d, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered)
+		assert.Equal(t, session.ExpiresAt, d.expires)
+		assert.Empty(t, f.provider.revocations(), "there was no token to revoke: the record could not be read")
+
+		f.clock.Advance(24*time.Hour - time.Second)
+		f.manager.reconcile(ctx, f.clock.Now())
+		_, remembered = f.manager.decided(session.ID)
+		require.True(t, remembered)
+		f.clock.Advance(time.Second)
+		f.manager.reconcile(ctx, f.clock.Now())
+		_, remembered = f.manager.decided(session.ID)
+		assert.False(t, remembered, "the record is still unreadable, and the decision is dropped all the same")
+	})
+
+	// The same for an end decided by a refresh: the session had been read, so
+	// its expiry is known even if the store cannot be read afterwards.
+	t.Run("ARefusalWhenTheStoreCanNoLongerBeRead", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := brokenStore(f)
+		f.provider.set(func(string) (Renewal, error) {
+			broken.fail = errors.New("disk unavailable") // the store goes away while the provider is asked
+			return Renewal{}, &RefusedError{Status: 400, Code: "invalid_grant"}
+		})
+		f.clock.Advance(4 * time.Minute)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		d, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered)
+		assert.Equal(t, session.ExpiresAt, d.expires)
+
+		broken.fail = nil
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		assert.Equal(t, "refused by the identity provider: invalid_grant", f.stored(session).EndReason)
+	})
+
 	t.Run("ItIsDroppedWhenTheHubTokenHasExpired", func(t *testing.T) {
 		t.Parallel()
 		f := newFixture(t, nil)
 		session := f.signIn()
 		brokenStore(f).failWritesAfter(0)
-		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 		f.clock.Advance(24*time.Hour - time.Second)
 		f.signIn()
 		_, remembered := f.manager.decided(session.ID)

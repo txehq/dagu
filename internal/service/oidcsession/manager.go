@@ -48,6 +48,7 @@
 package oidcsession
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -210,6 +211,10 @@ type decision struct {
 	// another hub process since, and what was decided about the old token
 	// says nothing about it.
 	ifToken string
+	// orToken, when set with ifToken, is a second encrypted refresh token
+	// the end applies to: the one a write whose outcome is not known may
+	// have stored.
+	orToken string
 	// revoke says the ended record's refresh token is to be revoked at the
 	// provider.
 	revoke bool
@@ -218,8 +223,9 @@ type decision struct {
 	// not taken the end. A record that holds another one by the time the
 	// store does has that one revoked as well.
 	revoked string
-	// expires is when the session's hub token expires, if that is known.
-	// After it nothing can present the session, and the decision is dropped.
+	// expires is when the session's hub token expires. After it nothing can
+	// present the session, and the decision is dropped. It is zero only when
+	// the caller of End did not say and the session could not be read.
 	expires time.Time
 }
 
@@ -509,10 +515,15 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 		return err
 	}
 	held := session.RefreshToken
+	// ends is the end of this session for a reason that is about the refresh
+	// token it holds now.
+	ends := func(reason string) decision {
+		return decision{reason: reason, ifToken: held, expires: session.ExpiresAt}
+	}
 	refreshToken, err := m.enc.Decrypt(held)
 	if err != nil {
 		// A token that cannot be read can never confirm the session.
-		return m.conclude(ctx, sessionID, decision{reason: "the stored refresh token could not be read", ifToken: held})
+		return m.conclude(ctx, sessionID, ends("the stored refresh token could not be read"))
 	}
 
 	renewal, err := m.provider.Refresh(ctx, refreshToken)
@@ -533,7 +544,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	case errors.As(err, &refused):
 		slog.Info("OIDC session ended: the identity provider refused the refresh",
 			slog.String("session", sessionID), slog.String("oauth_error", refused.Code), slog.Int("status", refused.Status))
-		return m.conclude(ctx, sessionID, decision{reason: "refused by the identity provider: " + refused.Code, ifToken: held})
+		return m.conclude(ctx, sessionID, ends("refused by the identity provider: "+refused.Code))
 	case err != nil:
 		// Only the kind of error is logged. Its text is the provider
 		// client's, and a refresh carries the refresh token.
@@ -550,7 +561,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	if rotated {
 		replacement, err = m.enc.Encrypt(renewal.RefreshToken)
 		if err != nil {
-			return m.abandon(ctx, sessionID, held, renewal.RefreshToken, "the renewed refresh token could not be encrypted")
+			return m.abandon(ctx, sessionID, renewal.RefreshToken, ends("the renewed refresh token could not be encrypted"))
 		}
 	}
 
@@ -563,7 +574,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 		switch {
 		case (err != nil && !unverifiable) || issuer != session.Issuer || subject != session.Subject:
 			m.revokeAtProvider(ctx, renewal.RefreshToken, refreshToken)
-			return m.conclude(ctx, sessionID, decision{reason: "the renewed token is not for this session's identity", ifToken: held})
+			return m.conclude(ctx, sessionID, ends("the renewed token is not for this session's identity"))
 		case unverifiable:
 			// The token names this session's identity and could not be
 			// verified, for example because the provider's signing keys
@@ -576,14 +587,19 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 		}
 	}
 
-	err = m.commit(ctx, sessionID, held, renewal.RefreshToken, rotated, func(stored *Session) {
-		if rotated {
-			stored.RefreshToken = replacement
-		}
-		if confirmed {
-			stored.LastConfirmedAt, stored.ConfirmedBy = m.now().UTC(), m.owner
-			stored.Rotations++
-		}
+	lost := ends("the renewed session could not be stored")
+	lost.orToken = replacement
+	err = m.commit(ctx, sessionID, renewed{
+		held: held, newToken: renewal.RefreshToken, replacement: replacement, lost: lost,
+		apply: func(stored *Session) {
+			if rotated {
+				stored.RefreshToken = replacement
+			}
+			if confirmed {
+				stored.LastConfirmedAt, stored.ConfirmedBy = m.now().UTC(), m.owner
+				stored.Rotations++
+			}
+		},
 	})
 	if err != nil {
 		return err
@@ -663,35 +679,47 @@ func (m *Manager) release(ctx context.Context, sessionID string) {
 	_ = m.col.CompareAndSwap(ctx, sessionID, raw, data)
 }
 
-// commit stores the outcome of a granted refresh. held is the encrypted
-// refresh token that was exchanged, and apply writes the outcome into the
-// record as it is stored now.
+// renewed is the outcome of a granted refresh, to be stored.
+type renewed struct {
+	// held is the encrypted refresh token that was exchanged.
+	held string
+	// newToken is the refresh token the provider returned, and replacement
+	// is the same encrypted. Both are empty when the provider returned the
+	// token it was sent, or none.
+	newToken, replacement string
+	// apply writes the outcome into the record as it is stored now.
+	apply func(*Session)
+	// lost is the end of the session if a new refresh token cannot be kept.
+	lost decision
+}
+
+// commit stores the outcome of a granted refresh.
 //
 // The record may have changed while the provider was being asked. If the
 // session has ended, the token just obtained must not outlive it. If the
 // record no longer holds the token that was exchanged, another hub process
 // renewed the session, and what it stored stands.
-func (m *Manager) commit(ctx context.Context, sessionID, held, newToken string, rotated bool, apply func(*Session)) error {
+func (m *Manager) commit(ctx context.Context, sessionID string, r renewed) error {
 	var failure error
 	for range casAttempts {
 		if _, ok := m.decided(sessionID); ok {
 			// Ended by this process, though the store has not recorded it.
-			m.revokeAtProvider(ctx, newToken)
+			m.revokeAtProvider(ctx, r.newToken)
 			return ErrSessionEnded
 		}
 		session, raw, err := m.load(ctx, sessionID)
 		if errors.Is(err, ErrSessionEnded) || (err == nil && session.EndedAt != nil) {
-			m.revokeAtProvider(ctx, newToken)
+			m.revokeAtProvider(ctx, r.newToken)
 			return ErrSessionEnded
 		}
 		if err != nil {
 			failure = err
 			break
 		}
-		if session.RefreshToken != held {
+		if session.RefreshToken != r.held {
 			return nil
 		}
-		apply(session)
+		r.apply(session)
 		if session.RefreshOwner == m.owner {
 			session.RefreshOwner, session.RefreshUntil = "", nil
 		}
@@ -704,38 +732,53 @@ func (m *Manager) commit(ctx context.Context, sessionID, held, newToken string, 
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, persis.ErrConflict) && !errors.Is(err, persis.ErrNotFound) {
-			failure = fmt.Errorf("oidcsession: store the renewed session: %w", err)
-			break
+		if errors.Is(err, persis.ErrConflict) || errors.Is(err, persis.ErrNotFound) {
+			continue
 		}
+		// A write that reports an error may have been made all the same: the
+		// store can fail after it has replaced the record. What is stored
+		// now says which.
+		if _, stored, readErr := m.load(ctx, sessionID); readErr == nil && bytes.Equal(stored, data) {
+			return nil
+		}
+		failure = fmt.Errorf("oidcsession: store the renewed session: %w", err)
+		break
 	}
 	if failure == nil {
 		failure = errors.New("oidcsession: the session kept changing while its renewal was being stored")
 	}
-	if !rotated {
+	if r.replacement == "" {
 		// Nothing is lost: the stored refresh token is still the session's.
 		return failure
 	}
-	return m.abandon(ctx, sessionID, held, newToken, "the renewed session could not be stored")
+	return m.abandon(ctx, sessionID, r.newToken, r.lost)
 }
 
 // abandon ends a session whose new refresh token could not be kept. The token
 // the store still holds has been used up at the provider, and sending it
 // again would be a replay, so the session cannot be revalidated any more. The
 // new token is revoked, and the user signs in again.
-func (m *Manager) abandon(ctx context.Context, sessionID, held, newToken, reason string) error {
+//
+// The end applies to the record whether it holds the old token or, after a
+// write whose outcome is not known, the new one that has just been revoked.
+// It does not apply to a record another hub process has renewed since.
+func (m *Manager) abandon(ctx context.Context, sessionID, newToken string, lost decision) error {
 	slog.Error("OIDC session ended: its renewed refresh token could not be kept",
-		slog.String("session", sessionID), slog.String("reason", reason))
+		slog.String("session", sessionID), slog.String("reason", lost.reason))
 	m.revokeAtProvider(ctx, newToken)
-	return m.conclude(ctx, sessionID, decision{reason: reason, ifToken: held})
+	return m.conclude(ctx, sessionID, lost)
 }
 
 // End ends a session now, for a sign-out, and asks the provider to end its
 // refresh token. Ending a session that has ended, or that does not exist, is
 // not an error. If the store does not take the end, an error is returned and
 // this process refuses the session all the same.
-func (m *Manager) End(ctx context.Context, sessionID, reason string) error {
-	_, err := m.endAndRevoke(ctx, sessionID, decision{reason: reason, revoke: true})
+//
+// expiresAt is when the hub token that carried the session expires, which the
+// caller knows from the token. It bounds how long the end is remembered if
+// the session cannot even be read.
+func (m *Manager) End(ctx context.Context, sessionID, reason string, expiresAt time.Time) error {
+	_, err := m.endAndRevoke(ctx, sessionID, decision{reason: reason, revoke: true, expires: expiresAt})
 	return err
 }
 
@@ -813,7 +856,7 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 			m.settle(sessionID)
 			return ending{ended: true, applied: d}, nil
 		}
-		if d.ifToken != "" && session.RefreshToken != d.ifToken {
+		if d.ifToken != "" && session.RefreshToken != d.ifToken && (d.orToken == "" || session.RefreshToken != d.orToken) {
 			m.drop(sessionID, d.ifToken)
 			return ending{applied: d}, nil
 		}
@@ -870,7 +913,7 @@ func (m *Manager) remember(sessionID string, d decision) decision {
 	defer m.mu.Unlock()
 	if earlier, ok := m.undone[sessionID]; ok {
 		if earlier.ifToken == "" {
-			d.reason, d.ifToken, d.revoke, d.revoked = earlier.reason, "", earlier.revoke, earlier.revoked
+			d.reason, d.ifToken, d.orToken, d.revoke, d.revoked = earlier.reason, "", "", earlier.revoke, earlier.revoked
 		}
 		if d.expires.IsZero() {
 			d.expires = earlier.expires

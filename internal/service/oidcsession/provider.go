@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -64,15 +65,14 @@ var knownRefusalCodes = map[string]bool{
 	"access_denied":          true,
 }
 
-// refusalsOfTheGrant are the refusal codes that say the provider judged the
-// refresh token itself. A provider judges the grant only after it has
-// accepted the client, so such a refusal also says the client secret was sent
-// in a way the provider takes.
-var refusalsOfTheGrant = map[string]bool{
-	"invalid_grant": true,
-	"invalid_scope": true,
-	"not_allowed":   true,
-	"access_denied": true,
+// aboutTheClient reports whether a refusal says the provider did not accept
+// the client, as opposed to what the client asked for.
+func aboutTheClient(refused *RefusedError) bool {
+	switch refused.Code {
+	case "invalid_client", "unauthorized_client", "invalid_request":
+		return true
+	}
+	return refused.Status == http.StatusUnauthorized
 }
 
 func refusalCode(code string) string {
@@ -91,9 +91,8 @@ const (
 type ClientAuth int32
 
 const (
-	// ClientAuthDetect sends the secret in the Authorization header first,
-	// and in the form if the provider refuses that. It is what the sign-in's
-	// own code exchange does when the provider's way is not known.
+	// ClientAuthDetect finds out which of the two ways the provider takes,
+	// before any refresh token is sent: see HTTPProvider.
 	ClientAuthDetect ClientAuth = iota
 	// ClientAuthForm sends the client id and secret in the form
 	// (client_secret_post).
@@ -119,7 +118,21 @@ type HTTPProviderConfig struct {
 	HTTPClient *http.Client
 }
 
+// probeRefreshToken is sent as a refresh token to find out how the provider
+// takes the client secret. It is not a token, and no provider issued it.
+const probeRefreshToken = "dagu-client-authentication-probe" //nolint:gosec // G101: not a credential; a value no provider issued
+
 // HTTPProvider talks to a provider's token and revocation endpoints.
+//
+// A refusal of a refresh has to be an answer about the refresh token and
+// nothing else, whatever its code. A provider refuses a client that sent its
+// secret the wrong way too, so the way has to be known before a session's
+// token is sent. The sign-in's own code exchange finds it by trying, and does
+// not say what it found. So with ClientAuthDetect the first call here sends a
+// refresh request for a token that is not one, in the header and, if the
+// provider refuses the client that way, in the form. The way the provider
+// judged that request by is its way from then on. Until that is known no
+// session's token is sent, and the call is reported as no answer.
 type HTTPProvider struct {
 	tokenURL      string
 	revocationURL string
@@ -129,6 +142,8 @@ type HTTPProvider struct {
 	// clientAuth is the ClientAuth in use: the configured one, or the one a
 	// provider's answer settled.
 	clientAuth atomic.Int32
+	// settling lets one call at a time find the provider's way.
+	settling sync.Mutex
 }
 
 // NewHTTPProvider validates cfg and returns a provider.
@@ -158,45 +173,59 @@ func NewHTTPProvider(cfg HTTPProviderConfig) (*HTTPProvider, error) {
 
 // Refresh implements Provider.
 func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
-	form := func() url.Values {
-		return url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}
+	auth, err := p.settledClientAuth(ctx)
+	if err != nil {
+		return Renewal{}, err
 	}
-	auth := ClientAuth(p.clientAuth.Load())
-	if p.clientSecret == "" || auth != ClientAuthDetect {
-		return p.refresh(ctx, form(), auth)
+	return p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}, auth)
+}
+
+// settledClientAuth returns the way the provider takes the client secret,
+// finding it out first if it is not known. An error means it could not be
+// found out now, and nothing was learned about any session.
+func (p *HTTPProvider) settledClientAuth(ctx context.Context) (ClientAuth, error) {
+	if auth := ClientAuth(p.clientAuth.Load()); auth != ClientAuthDetect || p.clientSecret == "" {
+		return auth, nil
+	}
+	p.settling.Lock()
+	defer p.settling.Unlock()
+	if auth := ClientAuth(p.clientAuth.Load()); auth != ClientAuthDetect {
+		return auth, nil
 	}
 
-	// The provider's way of taking the secret is not known yet. The header is
-	// tried first. A grant, or a refusal of the refresh token itself, settles
-	// that the header is the provider's way, and is the answer.
-	//
-	// Any other refusal may be about the way the secret was sent and not
-	// about the refresh token, so the form is tried before it is believed. A
-	// refused request has used nothing up, so asking twice is safe. If the
-	// form gets no answer, nothing is known: the first refusal may have been
-	// about the header alone.
-	renewal, err := p.refresh(ctx, form(), ClientAuthHeader)
-	var refused *RefusedError
-	switch {
-	case err == nil:
-		p.clientAuth.Store(int32(ClientAuthHeader))
-		return renewal, nil
-	case !errors.As(err, &refused):
-		return Renewal{}, err
-	case refusalsOfTheGrant[refused.Code]:
-		p.clientAuth.Store(int32(ClientAuthHeader))
-		return Renewal{}, refused
+	probe := func(auth ClientAuth) (acceptedClient bool, err error) {
+		_, err = p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {probeRefreshToken}}, auth)
+		var refused *RefusedError
+		switch {
+		case err == nil:
+			// A provider that grants this grants anything; it took the client.
+			return true, nil
+		case errors.As(err, &refused):
+			return !aboutTheClient(refused), nil
+		default:
+			return false, err
+		}
 	}
-	renewal, err = p.refresh(ctx, form(), ClientAuthForm)
-	var again *RefusedError
-	switch {
-	case err == nil:
-		p.clientAuth.Store(int32(ClientAuthForm))
-		return renewal, nil
-	case errors.As(err, &again) && refusalsOfTheGrant[again.Code]:
-		p.clientAuth.Store(int32(ClientAuthForm))
+	accepted, err := probe(ClientAuthHeader)
+	if err != nil {
+		return ClientAuthDetect, err
 	}
-	return Renewal{}, err
+	auth := ClientAuthHeader
+	if !accepted {
+		// Refused as a client in the header. If the form is taken, the form
+		// is the way. If the client is refused that way too, the way is not
+		// what the provider objects to: the header it is, and the refusal of
+		// a session's token that follows is the provider's answer.
+		accepted, err = probe(ClientAuthForm)
+		if err != nil {
+			return ClientAuthDetect, err
+		}
+		if accepted {
+			auth = ClientAuthForm
+		}
+	}
+	p.clientAuth.Store(int32(auth))
+	return auth, nil
 }
 
 func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth ClientAuth) (Renewal, error) {
@@ -236,18 +265,11 @@ func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string) error {
 	if p.revocationURL == "" {
 		return errors.New("the identity provider has no revocation endpoint")
 	}
-	form := func() url.Values {
-		return url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}
+	auth, err := p.settledClientAuth(ctx)
+	if err != nil {
+		return err
 	}
-	auth := ClientAuth(p.clientAuth.Load())
-	detect := p.clientSecret != "" && auth == ClientAuthDetect
-	if detect {
-		auth = ClientAuthHeader
-	}
-	status, _, err := p.post(ctx, p.revocationURL, form(), auth)
-	if err == nil && status != http.StatusOK && detect {
-		status, _, err = p.post(ctx, p.revocationURL, form(), ClientAuthForm)
-	}
+	status, _, err := p.post(ctx, p.revocationURL, url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}, auth)
 	if err != nil {
 		return err
 	}

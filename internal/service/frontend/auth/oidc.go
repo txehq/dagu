@@ -509,7 +509,7 @@ func issueHubToken(ctx context.Context, cfg *BuiltinOIDCConfig, user *authmodel.
 	tokenResult, err := cfg.AuthService.GenerateSessionToken(user, session.ID, expiresAt)
 	if err != nil {
 		// A session nobody holds a token for is ended, not left behind.
-		_ = cfg.Sessions.End(ctx, session.ID, "the hub token could not be issued")
+		_ = cfg.Sessions.End(ctx, session.ID, "the hub token could not be issued", expiresAt)
 		return nil, err
 	}
 	return tokenResult, nil

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	oidc "github.com/coreos/go-oidc"
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
@@ -79,9 +80,9 @@ func newIDTokenChecker(verifier *oidc.IDTokenVerifier) oidcsession.IDTokenChecke
 // oidcClientAuth is the way the refresh sends the client secret: the way the
 // sign-in's code exchange is configured to, and otherwise what the provider's
 // discovery document settles. A provider that lists the form and not the
-// header takes the form. Anything else is found out as the exchange finds it
-// out: the header first, then the form. A provider may list the header and
-// still refuse it for this client, so the list alone does not settle it.
+// header takes the form. Anything else is found out from the provider before
+// any refresh token is sent. A provider may list the header and still refuse
+// it for this client, so the list alone does not settle it.
 func oidcClientAuth(style oauth2.AuthStyle, supported []string) oidcsession.ClientAuth {
 	switch style {
 	case oauth2.AuthStyleInParams:
@@ -178,7 +179,11 @@ func BuiltinOIDCLogoutHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 		if cfg.Sessions != nil && claims.SessionID != "" {
 			// A sign-out that has arrived is carried out even if the browser
 			// has gone away meanwhile.
-			if err := cfg.Sessions.End(context.WithoutCancel(r.Context()), claims.SessionID, "signed out"); err != nil {
+			var expiresAt time.Time
+			if claims.ExpiresAt != nil {
+				expiresAt = claims.ExpiresAt.Time
+			}
+			if err := cfg.Sessions.End(context.WithoutCancel(r.Context()), claims.SessionID, "signed out", expiresAt); err != nil {
 				logger.Error(r.Context(), "Failed to end OIDC session at sign-out", tag.Error(err))
 				http.Error(w, "The session could not be ended", http.StatusInternalServerError)
 				return
