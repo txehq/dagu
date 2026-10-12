@@ -6,10 +6,13 @@ package txepkg
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -518,6 +521,139 @@ func TestResume(t *testing.T) {
 	second, err := store.Commit(loaded, testJob)
 	require.NoError(t, err)
 	assert.Equal(t, first.Dir, second.Dir)
+}
+
+// staged lists what is left in the staging area.
+func stagedNames(t *testing.T, store *Store) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(store.Root, stagingDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// A later request for the same job often builds the package that is already
+// in place: an update that changes only the schedule or an environment value.
+// Its staged copy is not needed and is not left behind.
+func TestCommitOfAPackageAlreadyInPlaceLeavesNoStagedCopy(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	placed, err := store.Commit(first, testJob)
+	require.NoError(t, err)
+	require.Empty(t, stagedNames(t, store))
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	require.Equal(t, first.Digest, second.Digest)
+	again, err := store.Commit(second, testJob)
+	require.NoError(t, err)
+
+	assert.Equal(t, placed.Dir, again.Dir)
+	assert.Empty(t, stagedNames(t, store), "the staged copy of a package already in place is removed")
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err, "the package in place is untouched")
+
+	// A resumed request repeats the call after its staged copy is gone.
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+}
+
+// Only a staged copy that still holds the package in place is removed. One
+// that changed after it was built is kept where it is and reported, and the
+// package in place stays as it was.
+func TestCommitKeepsAStagedCopyThatChanged(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	changed := filepath.Join(second.Dir, FilesDir, "collect.py")
+	require.NoError(t, os.WriteFile(changed, []byte("#!/bin/sh\n"), 0o700))
+
+	_, err = store.Commit(second, testJob)
+	require.ErrorIs(t, err, ErrPackageCorrupt)
+	require.ErrorContains(t, err, "req-2")
+	assert.Equal(t, []string{"req-2"}, stagedNames(t, store))
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err)
+}
+
+// A staged package that is not a directory of this store's staging area is
+// never removed, whatever it holds.
+func TestCommitRemovesNothingOutsideTheStagingArea(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	elsewhere := filepath.Join(t.TempDir(), "copy")
+	require.NoError(t, os.Rename(second.Dir, elsewhere))
+
+	t.Run("a directory elsewhere", func(t *testing.T) {
+		_, err := store.Commit(&Staged{Dir: elsewhere, Digest: second.Digest, Manifest: second.Manifest}, testJob)
+		require.ErrorContains(t, err, "staging area")
+		assert.DirExists(t, elsewhere)
+	})
+	t.Run("a link in the staging area", func(t *testing.T) {
+		require.NoError(t, os.Symlink(elsewhere, second.Dir))
+		_, err := store.Commit(second, testJob)
+		require.ErrorContains(t, err, "not a directory")
+		assert.DirExists(t, elsewhere)
+		assert.Equal(t, []string{"req-2"}, stagedNames(t, store))
+	})
+}
+
+// Requests that build one package for one job at the same moment all end with
+// that package in place, and none leaves a staged copy.
+func TestCommitOfOnePackageAtTheSameMoment(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	const requests = 8
+	staged := make([]*Staged, requests)
+	for i := range staged {
+		var err error
+		staged[i], err = store.Stage(fmt.Sprintf("req-%d", i), opts)
+		require.NoError(t, err)
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, requests)
+	var wg sync.WaitGroup
+	for i := range staged {
+		wg.Go(func() {
+			<-start
+			_, errs[i] = store.Commit(staged[i], testJob)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "request %d", i)
+	}
+	assert.Empty(t, stagedNames(t, store))
+	_, err := store.Verify(testJob, staged[0].Digest)
+	require.NoError(t, err)
 }
 
 func TestInvalidNames(t *testing.T) {

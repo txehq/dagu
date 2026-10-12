@@ -402,6 +402,24 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	assert.Equal(t, "cc3-s000003", job["updated"].(map[string]any)["by"].(map[string]any)["session"])
 	assert.Equal(t, "ready", job["registration"].(map[string]any)["state"])
 
+	// Session 3 then changes only a setting. The package it builds is the one
+	// already in place, so the update keeps that one and leaves no copy of it
+	// behind. The one staged package left is the refused update's, which its
+	// journal entry accounts for, and the machine still passes its checks.
+	resettled := strings.Replace(fmt.Sprintf(txeITSpec, credential), "SOURCE_DIR: /srv/exports", "SOURCE_DIR: /srv/exports-2", 1)
+	require.NoError(t, os.WriteFile(spec2, []byte(resettled), 0o644)) //nolint:gosec // test file
+	settled, err := cli.json("cc3-s000003", "txe", "update", jobID, "-f", spec2, "--expected-version", "2")
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, settled["receipt"].(map[string]any)["version"])
+	assert.Equal(t, updated["receipt"].(map[string]any)["package_digest"], settled["receipt"].(map[string]any)["package_digest"])
+	staged, err := os.ReadDir(filepath.Join(cli.home, "packages", ".staging"))
+	require.NoError(t, err)
+	require.Len(t, staged, 1, "staged packages left after an update whose package was already in place")
+	assert.Equal(t, stale["request_id"], staged[0].Name())
+	doctor, err = cli.json("cc3-s000003", "txe", "doctor")
+	require.NoError(t, err, "doctor: %v", doctor)
+	assert.Equal(t, true, doctor["ok"])
+
 	// Two sessions register a new job at the same moment. One job exists
 	// afterwards: one session holds its receipt, the other is told which job
 	// exists.

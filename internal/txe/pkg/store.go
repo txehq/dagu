@@ -191,23 +191,71 @@ func (s *Store) LoadStaged(requestID string) (*Staged, error) {
 }
 
 // Commit moves a staged package to its final, read-only location for jobID.
-// Committing a package that is already in place returns it unchanged, so a
-// resumed registration can repeat the call.
+// Committing a package that is already in place returns the one in place and
+// removes the staged copy, so a resumed registration can repeat the call and
+// a request that builds the same package again leaves nothing behind.
 func (s *Store) Commit(staged *Staged, jobID string) (*Package, error) {
 	final, err := s.packageDir(jobID, staged.Digest)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Lstat(final); err == nil {
-		return s.Adopt(jobID, staged.Digest)
+	if _, err := os.Lstat(final); err != nil {
+		if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+			return nil, fmt.Errorf("create package directory: %w", err)
+		}
+		moveErr := os.Rename(staged.Dir, final)
+		if moveErr == nil {
+			return s.Adopt(jobID, staged.Digest)
+		}
+		// Another request may have moved the same package into place since
+		// the check above. Only that is carried on from.
+		if _, err := os.Lstat(final); err != nil {
+			return nil, fmt.Errorf("move package into place: %w", moveErr)
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
-		return nil, fmt.Errorf("create package directory: %w", err)
+	pkg, err := s.Adopt(jobID, staged.Digest)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Rename(staged.Dir, final); err != nil {
-		return nil, fmt.Errorf("move package into place: %w", err)
+	if err := s.dropStaged(staged); err != nil {
+		return nil, fmt.Errorf("the package is in place at %s, but its staged copy was not removed: %w", pkg.Dir, err)
 	}
-	return s.Adopt(jobID, staged.Digest)
+	return pkg, nil
+}
+
+// dropStaged removes the staged copy of a package that is verified in its
+// final place. It removes only a directory of this store's staging area that
+// still holds that package; anything else is left where it is and reported.
+// A staged copy that is already gone was moved into place by an earlier call.
+func (s *Store) dropStaged(staged *Staged) error {
+	area := filepath.Join(s.Root, stagingDir)
+	if filepath.Dir(staged.Dir) != area || !namePattern.MatchString(filepath.Base(staged.Dir)) {
+		return fmt.Errorf("%s is not in the staging area %s", staged.Dir, area)
+	}
+	info, err := os.Lstat(staged.Dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", staged.Dir)
+	}
+	_, digest, err := verifyDir(staged.Dir, false)
+	if err != nil {
+		return err
+	}
+	if digest != staged.Digest {
+		return fmt.Errorf("%w: %s holds a manifest with digest %s", ErrPackageCorrupt, staged.Dir, digest)
+	}
+	if err := os.RemoveAll(staged.Dir); err != nil {
+		return err
+	}
+	if err := fileutil.SyncDir(area); err != nil {
+		return fmt.Errorf("sync staging area: %w", err)
+	}
+	return nil
 }
 
 // Adopt finishes placing a package that is already in its final location: it
