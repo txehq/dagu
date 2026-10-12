@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -350,23 +351,48 @@ func (tx *JobTx) admittedRetry(a *Action, ref string) (*RetryExecution, string, 
 // execution its request admitted. The reviewer writes the same field.
 const admittedExecutionKey = "admitted_execution"
 
+// admittedKey is the field of an action's outcome that says the destination
+// admitted the request; the reviewer reads the execution only with it.
+const admittedKey = "admitted"
+
 // admittedExecutionOf returns the execution an outcome records as admitted,
-// or "" when it records none.
+// or "" when it records none. The field must appear once, spelled exactly:
+// a reader that matches keys loosely, as encoding/json does for structs,
+// must not find another execution than the one checked here.
 func admittedExecutionOf(outcome json.RawMessage) (string, error) {
 	if len(outcome) == 0 {
 		return "", nil
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(outcome, &fields); err != nil {
-		return "", nil //nolint:nilerr // an outcome that is no object records no execution
+	dec := json.NewDecoder(bytes.NewReader(outcome))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
 	}
-	raw, ok := fields[admittedExecutionKey]
-	if !ok {
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return "", nil
 	}
 	var ref string
-	if err := json.Unmarshal(raw, &ref); err != nil {
-		return "", refuse(CodeInvalid, "outcome %s must be an execution reference", admittedExecutionKey)
+	found := false
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
+		}
+		key, _ := tok.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
+		}
+		if !strings.EqualFold(key, admittedExecutionKey) {
+			continue
+		}
+		if key != admittedExecutionKey || found {
+			return "", refuse(CodeInvalid, "outcome names %s more than once or spelled otherwise", admittedExecutionKey)
+		}
+		found = true
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return "", refuse(CodeInvalid, "outcome %s must be an execution reference", admittedExecutionKey)
+		}
 	}
 	return ref, nil
 }
@@ -408,21 +434,54 @@ func (tx *JobTx) recordAdmittedExecution(a *Action, s Settlement) (*Action, erro
 	if execution.Abandoned {
 		return nil, refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran: settle the action as not applied", execution.Ref, execution.Request.ID)
 	}
-	a.Outcome = s.Outcome
+	outcome, err := withAdmittedExecution(s.Outcome, next)
+	if err != nil {
+		return nil, err
+	}
+	a.Outcome = outcome
 	a.Updated = Stamp{At: tx.now, By: tx.actor}
 	tx.touch()
 	out := *a
 	return &out, nil
 }
 
-// keepAdmittedExecution is the outcome a settlement of a records: the
-// execution a recorded as admitted stays in it and binds the settlement.
+// checkNamedExecution refuses a settlement of a retry that names, as the
+// execution its request admitted, one run history does not hold for this
+// attempt's request; an abandoned one only as not applied. Whatever a retry's
+// outcome names as admitted is so verified, on every settlement.
+func (tx *JobTx) checkNamedExecution(a *Action, s Settlement) (string, error) {
+	next, err := admittedExecutionOf(s.Outcome)
+	if err != nil || next == "" {
+		return "", err
+	}
+	execution, _, err := tx.admittedRetry(a, next)
+	if err != nil {
+		return "", err
+	}
+	if execution.Abandoned && s.State != ActionNotApplied {
+		return "", refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, execution.Request.ID)
+	}
+	return next, nil
+}
+
+// keepAdmittedExecution is the outcome a settlement of a retry records: the
+// execution it recorded as admitted stays in it and binds the settlement.
 // Succeeded must name it; not applied needs run history to show it was
 // abandoned, so that nothing ran.
 func (tx *JobTx) keepAdmittedExecution(a *Action, s Settlement) (json.RawMessage, error) {
+	if a.Spec.Name != ActionRetryRun {
+		return s.Outcome, nil
+	}
 	known, err := admittedExecutionOf(a.Outcome)
-	if err != nil || known == "" {
-		return s.Outcome, err
+	if err != nil {
+		return nil, err
+	}
+	if known == "" {
+		next, err := tx.checkNamedExecution(a, s)
+		if err != nil || next == "" {
+			return s.Outcome, err
+		}
+		return withAdmittedExecution(s.Outcome, next)
 	}
 	switch s.State {
 	case ActionSucceeded:
@@ -443,23 +502,41 @@ func (tx *JobTx) keepAdmittedExecution(a *Action, s Settlement) (json.RawMessage
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case next == known:
-		return s.Outcome, nil
-	case next != "":
+	if next != "" && next != known {
 		return nil, refuse(CodeInvalid, "action %s records execution %s as admitted, not %s", a.ActionID, known, next)
 	}
+	return withAdmittedExecution(s.Outcome, known)
+}
+
+// withAdmittedExecution is outcome recording ref as the execution a retry's
+// request admitted, in the form every reader takes as such: the field
+// admitted_execution and admitted true. An outcome must be an object, or
+// absent; one that says admitted is false contradicts the execution.
+func withAdmittedExecution(outcome json.RawMessage, ref string) (json.RawMessage, error) {
 	fields := map[string]json.RawMessage{}
-	if len(s.Outcome) > 0 {
-		if err := json.Unmarshal(s.Outcome, &fields); err != nil {
-			return nil, refuse(CodeInvalid, "action %s records execution %s as admitted; the outcome must be an object that keeps it", a.ActionID, known)
+	if len(outcome) > 0 {
+		if err := json.Unmarshal(outcome, &fields); err != nil {
+			return nil, refuse(CodeInvalid, "an outcome that records %s %s must be an object", admittedExecutionKey, ref)
+		}
+		if fields == nil {
+			fields = map[string]json.RawMessage{}
 		}
 	}
-	ref, err := json.Marshal(known)
+	for key, raw := range fields {
+		if !strings.EqualFold(key, admittedKey) {
+			continue
+		}
+		var admitted bool
+		if key != admittedKey || json.Unmarshal(raw, &admitted) != nil || !admitted {
+			return nil, refuse(CodeInvalid, "an outcome that records %s %s must not say otherwise in %s", admittedExecutionKey, ref, key)
+		}
+	}
+	encoded, err := json.Marshal(ref)
 	if err != nil {
 		return nil, err
 	}
-	fields[admittedExecutionKey] = ref
+	fields[admittedExecutionKey] = encoded
+	fields[admittedKey] = json.RawMessage("true")
 	return json.Marshal(fields)
 }
 

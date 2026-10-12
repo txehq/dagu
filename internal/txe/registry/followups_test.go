@@ -1237,8 +1237,16 @@ func TestRecordedAdmittedExecutionAndAbandonment(t *testing.T) {
 	r2 := newRetryFixture(t)
 	act2, g2, ec2 := r2.uncertainRetry(t)
 	r2.admit(t, act2, r2.params("run-1", "a1"), a2, false, true)
-	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionUncertain, "", admittedOutcome(a2)))
-	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionEscalated, "", `{"detail":"owner"}`))
+	assert.Equal(t, CodeInvalid, code(t, r2.settleOutcome(act2, g2, ec2, ActionUncertain, "", `{"admitted_execution":"`+a2+`","admitted":false}`)), "admitted false contradicts the execution")
+	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionUncertain, "", `{"admitted_execution":"`+a2+`"}`))
+	var stored struct {
+		Admitted bool   `json:"admitted"`
+		Ref      string `json:"admitted_execution"`
+	}
+	require.NoError(t, json.Unmarshal(r2.action(t, act2).Outcome, &stored))
+	assert.Equal(t, a2, stored.Ref)
+	assert.True(t, stored.Admitted, "a reader that needs admitted true finds it")
+	require.NoError(t, r2.settleOutcome(act2, g2, ec2, ActionEscalated, "", `null`), "a null outcome keeps the record")
 	known, err = admittedExecutionOf(r2.action(t, act2).Outcome)
 	require.NoError(t, err)
 	assert.Equal(t, a2, known, "escalation keeps the recorded execution")
@@ -1261,4 +1269,51 @@ func TestOnlyARetryRecordsAnAdmittedExecution(t *testing.T) {
 	}
 	require.NoError(t, settle(ActionUncertain, `{"detail":"lost"}`))
 	assert.Equal(t, CodeActionState, code(t, settle(ActionUncertain, admittedOutcome(ExecutionRef("a2", "")))))
+}
+
+// The admitted execution is read strictly: a second copy of the field, or
+// one spelled otherwise that a loose reader would match, is refused, so no
+// reader finds another execution than the one checked.
+func TestAdmittedExecutionIsReadStrictly(t *testing.T) {
+	a2, x9 := ExecutionRef("a2", ""), ExecutionRef("x9", "")
+	for name, outcome := range map[string]string{
+		"duplicate":      `{"admitted_execution":"` + a2 + `","admitted_execution":"` + x9 + `"}`,
+		"other spelling": `{"admitted_execution":"` + a2 + `","ADMITTED_EXECUTION":"` + x9 + `"}`,
+		"not a string":   `{"admitted_execution":1}`,
+	} {
+		_, err := admittedExecutionOf(json.RawMessage(outcome))
+		assert.Equal(t, CodeInvalid, ErrorCode(err), name)
+	}
+	ref, err := admittedExecutionOf(json.RawMessage(`"text"`))
+	require.NoError(t, err)
+	assert.Empty(t, ref, "an outcome that is no object records none")
+
+	r := newRetryFixture(t)
+	act, g, ec := r.uncertainRetry(t)
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, true)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "",
+		`{"admitted_execution":"`+a2+`","Admitted_Execution":"`+x9+`"}`)))
+}
+
+// Whatever a retry's outcome names as admitted is verified on every
+// settlement, not only when recorded on an uncertain action: an attempt that
+// becomes uncertain cannot be bound to an execution its request did not admit.
+func TestEverySettlementVerifiesTheNamedExecution(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	act, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+	a2 := ExecutionRef("a2", "")
+
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(ExecutionRef("x9", "")))), "not this request's execution")
+	r.admit(t, act, r.params("run-1", "a1"), a2, true, false)
+	assert.Equal(t, CodeInvalid, code(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2))), "abandoned, yet uncertain")
+	r.admit(t, act, r.params("run-1", "a1"), a2, false, true)
+	require.NoError(t, r.settleOutcome(act, g, ec, ActionUncertain, "", admittedOutcome(a2)), "the execution its request admitted")
+	known, err := admittedExecutionOf(r.action(t, act).Outcome)
+	require.NoError(t, err)
+	assert.Equal(t, a2, known)
 }
