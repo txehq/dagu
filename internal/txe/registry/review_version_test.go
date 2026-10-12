@@ -275,3 +275,25 @@ func TestReviewVersionResolvedForAnOlderRecord(t *testing.T) {
 	assert.Equal(t, 1, cp.JobVersion)
 	require.NotNil(t, cp.NextReviewAt)
 }
+
+// A proposal from a review of another version is refused for that, before it
+// is judged against the version the job is now at: what the new version
+// would refuse in it is not the reason the proposal is refused.
+func TestProposalNamingAnotherVersionIsRefusedForThatFirst(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	job = updateAndReady(t, f, job, 2)
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	// A reserved action with no parameters: the job at any version refuses it.
+	put := func(read int) error {
+		_, err := f.tx(job.JobID, agent, func(tx *JobTx) error {
+			_, err := tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: f.mint(PrefixProposal), JobVersion: read, Action: ActionSpec{Name: ActionRetryRun}})
+			return err
+		})
+		return err
+	}
+	assert.Equal(t, CodeVersionConflict, code(t, put(1)), "naming the version the review read")
+	err := put(2)
+	require.Error(t, err)
+	assert.NotEqual(t, CodeVersionConflict, code(t, err), "naming the current version, it is refused for what it is")
+}

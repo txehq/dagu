@@ -887,6 +887,13 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
 	}
+	// Checked first: a proposal from a review of another version is refused
+	// for that, not judged against the version the job is now at. Checked
+	// before a replay too: a retry naming another read version is not the
+	// proposal already stored.
+	if err := tx.requireReviewable(p.JobVersion); err != nil {
+		return nil, err
+	}
 	if err := tx.checkReservedProposal(&p); err != nil {
 		return nil, err
 	}
@@ -895,11 +902,6 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 	}
 	binding, err := BindingDigest(j, p.Action)
 	if err != nil {
-		return nil, err
-	}
-	// Checked before a replay too: a retry naming another read version is
-	// not the proposal already stored.
-	if err := tx.requireReviewable(p.JobVersion); err != nil {
 		return nil, err
 	}
 	if cur, ok := j.Proposals[p.ProposalID]; ok {
