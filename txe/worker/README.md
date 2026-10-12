@@ -39,6 +39,29 @@ txe/worker/status.sh
 The owner id is minted once for the installation (`txe/worker/mint-id.sh own`) and recorded with
 the service. Pass it only on the first install.
 
+Once the hub knows the machine, install its periodic resource check on the hub. The hub schedules
+that check, and this worker runs it.
+
+```sh
+~/.local/share/txe-dagu/bin/dagu txe hub install --dry-run   # shows what would change
+~/.local/share/txe-dagu/bin/dagu txe hub install
+```
+
+Run it again after an upgrade. It rewrites the hub's copy only when the rendered DAG differs.
+
+The installer manages that DAG: it restores its own rendered spec, so do not edit the hub's copy.
+
+It also has limits. Installs from this machine's TXE home run one at a time. The lock does not
+cover a copy of the home on another machine, or another API client writing the DAG.
+
+After it creates or updates the DAG, the installer reads it back. That catches a different write
+landing after the installer's own write: the install then reports an error. An edit landing between
+the installer's first read and its write is overwritten without notice, because the hub's spec API
+has no conditional write.
+
+Keep one owner for installs and updates of this machine's hub DAG. Nothing here prevents
+conflicting writes atomically.
+
 ## Upgrade
 
 Use the same tag as the server image: server and worker must run the same version.

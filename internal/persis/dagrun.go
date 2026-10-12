@@ -76,14 +76,14 @@ type DAGRunCreateAttemptRequest struct {
 	DAGRunID   string
 	AttemptID  string
 	Retry      bool
-	// ExpectLatest, on a retry, creates the attempt only if the run's latest
-	// execution is this one and has finished; otherwise the store returns
-	// ErrLatestExecutionChanged and creates nothing.
-	ExpectLatest *ExpectedExecution
 	// TrackPreparation records the attempt in the store's preparation journal
 	// before creating it, for a caller that will hand it to a worker. See
 	// DAGRunPreparationJournal.
 	TrackPreparation bool
+	// ExpectLatest, on a retry, creates the attempt only if the run's latest
+	// execution is this one and has finished; otherwise the store returns
+	// ErrLatestExecutionChanged and creates nothing.
+	ExpectLatest *ExpectedExecution
 }
 
 // DAGRunLatestAttemptQuery selects the newest visible attempt for a DAG.
@@ -166,13 +166,13 @@ type DAGRunCreateAttemptOptions struct {
 	Retry bool
 	// AttemptID uses a caller-assigned attempt identifier when non-empty.
 	AttemptID string
-	// ExpectLatest makes a retry conditional on the run's latest execution
-	// (see DAGRunCreateAttemptRequest).
-	ExpectLatest *ExpectedExecution
 	// TrackPreparation records the attempt in the preparation journal before
 	// creating it. The caller ends the preparation once the attempt is handed
 	// to a worker or abandoned.
 	TrackPreparation bool
+	// ExpectLatest makes a retry conditional on the run's latest execution
+	// (see DAGRunCreateAttemptRequest).
+	ExpectLatest *ExpectedExecution
 }
 
 // DAGRunLatestAttemptOptions configures a latest-attempt lookup.

@@ -52,6 +52,7 @@ const decideSpec = `steps:
 type txeDecisionFixture struct {
 	server   test.Server
 	jobID    string
+	client   txeHTTPClient
 	decide   string
 	runID    string
 	proposal api.TxeProposal
@@ -61,8 +62,14 @@ type txeDecisionFixture struct {
 // the human task waits, and files a proposal pointing at that task.
 func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 	t.Helper()
-	server := test.SetupServer(t)
-	c := server.Client()
+	server := builtinServer(t)
+	return newTxeDecisionFixtureOn(t, server, txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")})
+}
+
+// newTxeDecisionFixtureOn builds the fixture on server, every request made
+// through c.
+func newTxeDecisionFixtureOn(t *testing.T, server test.Server, c txeHTTPClient) *txeDecisionFixture {
+	t.Helper()
 	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
 
 	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
@@ -121,7 +128,47 @@ func newTxeDecisionFixture(t *testing.T) *txeDecisionFixture {
 		},
 	}).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &proposal)
 
-	return &txeDecisionFixture{server: server, jobID: jobID, decide: decideDAG, runID: started.DagRunId, proposal: proposal}
+	return &txeDecisionFixture{server: server, client: c, jobID: jobID, decide: decideDAG, runID: started.DagRunId, proposal: proposal}
+}
+
+// txeHTTPClient makes the fixture's requests with some credential.
+type txeHTTPClient interface {
+	Get(path string) *test.Request
+	Post(path string, body any) *test.Request
+}
+
+// txeBasicClient sends every request with the hub's one basic credential.
+type txeBasicClient struct {
+	c          *test.APIClient
+	user, pass string
+}
+
+func (b txeBasicClient) Get(path string) *test.Request {
+	return b.c.Get(path).WithBasicAuth(b.user, b.pass)
+}
+func (b txeBasicClient) Post(path string, body any) *test.Request {
+	return b.c.Post(path, body).WithBasicAuth(b.user, b.pass)
+}
+
+// txeNoAuthClient sends requests with no credential, as on a hub without
+// authentication.
+type txeNoAuthClient struct{ c *test.APIClient }
+
+func (n txeNoAuthClient) Get(path string) *test.Request            { return n.c.Get(path) }
+func (n txeNoAuthClient) Post(path string, body any) *test.Request { return n.c.Post(path, body) }
+
+// txeAuthedClient sends every request as a signed-in person: a decision is
+// accepted only from one.
+type txeAuthedClient struct {
+	c     *test.APIClient
+	token string
+}
+
+func (a txeAuthedClient) Get(path string) *test.Request {
+	return a.c.Get(path).WithBearerToken(a.token)
+}
+func (a txeAuthedClient) Post(path string, body any) *test.Request {
+	return a.c.Post(path, body).WithBearerToken(a.token)
 }
 
 func (f *txeDecisionFixture) decisionPath() string {
@@ -142,7 +189,7 @@ func (f *txeDecisionFixture) body(verdict, key string) map[string]any {
 // refuses a second decision bound to the old revision.
 func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 	f := newTxeDecisionFixture(t)
-	c := f.server.Client()
+	c := f.client
 
 	var resp api.TxeDecisionResponse
 	c.Post(f.decisionPath(), f.body("approve", "dashboard-approve-1")).
@@ -205,7 +252,7 @@ func TestTxeDecisionApproveCompletesNativeTask(t *testing.T) {
 // the same request returns the stored decision without a second one.
 func TestTxeDecisionRejectAndReplay(t *testing.T) {
 	f := newTxeDecisionFixture(t)
-	c := f.server.Client()
+	c := f.client
 	var first, again api.TxeDecisionResponse
 	c.Post(f.decisionPath(), f.body("reject", "dashboard-reject-1")).
 		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
@@ -228,10 +275,10 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 	f := newTxeDecisionFixture(t)
 	body := f.body("approve", "reviewer-self-approve")
 	body["actor"] = map[string]any{"kind": "reviewer", "id": "cc5-test"}
-	f.server.Client().Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t)
+	f.client.Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t)
 
 	var list api.TxeDecisionList
-	f.server.Client().Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
+	f.client.Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
 	require.Empty(t, list.Decisions)
 	require.False(t, strings.Contains(fmt.Sprint(list), "reviewer-self-approve"))
 }
@@ -240,11 +287,17 @@ func TestTxeDecisionRefusesAgentActor(t *testing.T) {
 // recording a decision requires.
 func newTxeDecisionAPI(t *testing.T) *apiv1.API {
 	t.Helper()
+	return newTxeDecisionAPIWithAuth(t, config.AuthModeBuiltin)
+}
+
+func newTxeDecisionAPIWithAuth(t *testing.T, mode config.AuthMode) *apiv1.API {
+	t.Helper()
 	dir := t.TempDir()
 	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
 	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
 	require.NoError(t, err)
 	cfg := &config.Config{}
+	cfg.Server.Auth.Mode = mode
 	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
 	return apiv1.New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
 		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
@@ -323,9 +376,8 @@ func TestTxeDecisionChecksWorkspace(t *testing.T) {
 }
 
 // registerTxeJobHTTP registers a ready job over HTTP and returns its ID.
-func registerTxeJobHTTP(t *testing.T, server test.Server) string {
+func registerTxeJobHTTP(t *testing.T, c txeHTTPClient) string {
 	t.Helper()
-	c := server.Client()
 	cli := map[string]any{"kind": "cli", "id": "cc4-test"}
 	owner, machine := mint(t, registry.PrefixOwner), mint(t, registry.PrefixMachine)
 	c.Post("/api/v1/txe/owners", map[string]any{"owner_id": owner, "display_name": "Connor", "actor": cli}).
@@ -373,7 +425,7 @@ func seedFailedTxeRun(t *testing.T, server test.Server, jobID, runID string, opt
 }
 
 // txeExecution reads the run's latest execution as the dashboard shows it.
-func txeExecution(t *testing.T, c *test.APIClient, jobID, runID string) (attemptID, queuedAt string) {
+func txeExecution(t *testing.T, c txeHTTPClient, jobID, runID string) (attemptID, queuedAt string) {
 	t.Helper()
 	var details api.GetDAGRunDetails200JSONResponse
 	c.Get(fmt.Sprintf("/api/v1/dag-runs/%s/%s", jobID, runID)).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &details)
@@ -395,9 +447,9 @@ func retryBody(key string, version int, attemptID, queuedAt string) map[string]a
 // bound to that run; it is idempotent and refuses a stale snapshot or a run
 // that is not the job's.
 func TestTxeRunRetryRequest(t *testing.T) {
-	server := test.SetupServer(t)
-	c := server.Client()
-	jobID := registerTxeJobHTTP(t, server)
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
 	seedFailedTxeRun(t, server, jobID, "run-failed-1")
 	seen, queued := txeExecution(t, c, jobID, "run-failed-1")
 
@@ -490,9 +542,9 @@ func seedRetriedTxeAttempt(t *testing.T, server test.Server, jobID, runID string
 // another failed attempt before the click arrives, the click is refused and
 // records nothing; a request for the new attempt is a decision of its own.
 func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
-	server := test.SetupServer(t)
-	c := server.Client()
-	jobID := registerTxeJobHTTP(t, server)
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
 	seedFailedTxeRun(t, server, jobID, "run-moved-1")
 	seen, queued := txeExecution(t, c, jobID, "run-moved-1")
 
@@ -521,11 +573,74 @@ func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
 
 // Dagu's queued retry keeps the attempt and records a later queue marker in
 // place. A request naming the earlier marker, or none, reviewed another
+// A run whose latest execution is a retry preparation not yet known to be
+// dispatched or abandoned is neither moved on nor unretryable: abandoning
+// the preparation makes the reviewed execution latest again. The person is
+// told to ask again, with the preparation named, and nothing is recorded.
+func TestTxeRunRetryAsksAgainWhileAPreparationIsUnsettled(t *testing.T) {
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
+	seedFailedTxeRun(t, server, jobID, "run-preparing-1")
+	seen, queued := txeExecution(t, c, jobID, "run-preparing-1")
+
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	started := time.Now().Add(3 * time.Second)
+	prepared, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, "run-preparing-1",
+		persis.DAGRunCreateAttemptOptions{Retry: true, TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, prepared.Open(ctx))
+	require.NoError(t, prepared.Write(ctx, ir.NewStatusBuilder(dag).Create("run-preparing-1", ir.NotStarted, 0, started,
+		ir.WithAttemptID(prepared.ID()))))
+	require.NoError(t, prepared.Close(ctx))
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-preparing-1")
+	var apiErr api.Error
+	c.Post(path, retryBody("dashboard-preparing-1", job.Version, seen, queued)).
+		ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &apiErr)
+	require.NotNil(t, apiErr.Details)
+	require.Equal(t, string(registry.CodeNotReady), (*apiErr.Details)["code"])
+	current, ok := (*apiErr.Details)["current"].(map[string]any)
+	require.True(t, ok, "details.current = %v", (*apiErr.Details)["current"])
+	require.Equal(t, "run-preparing-1", current["run_id"])
+	require.Equal(t, registry.ExecutionRef(prepared.ID(), ""), current["execution"])
+
+	var decisions api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &decisions)
+	require.Empty(t, decisions.Decisions)
+
+	// Dagu abandons the preparation: the reviewed execution is latest again,
+	// and asking again with the same request retries it.
+	run := ir.NewDAGRunRef(jobID, "run-preparing-1")
+	expected := persis.ExecutionIdentity{AttemptID: seen, QueuedAt: queued}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = server.DAGRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: persis.AttemptAbandonment{
+		Schema: persis.AttemptAbandonmentSchema, Run: run, RootRun: run, AbandonedAttemptID: prepared.ID(),
+		AbandonedExecution: persis.ExecutionIdentity{AttemptID: prepared.ID()}, ExpectedExecution: &expected,
+		Reason: persis.AbandonedRetryPreparation, DecidedAt: now,
+		Evidence: persis.AbandonmentEvidence{
+			DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+			ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent, ObservedAt: now,
+		},
+	}})
+	require.NoError(t, err)
+	require.NoError(t, server.DAGRunRepository.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: prepared.ID()}))
+	var res api.TxeDecisionResponse
+	c.Post(path, retryBody("dashboard-preparing-1", job.Version, seen, queued)).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
+	require.NotNil(t, res.Proposal)
+	require.Contains(t, string(res.Proposal.Action.Params), `"attempt_id":"`+seen+`"`)
+}
+
 // execution and is refused; one naming the re-queued execution binds it.
 func TestTxeRunRetryRefusesRequeuedExecution(t *testing.T) {
-	server := test.SetupServer(t)
-	c := server.Client()
-	jobID := registerTxeJobHTTP(t, server)
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
 	const q1, q2 = "2026-10-09T12:00:00.000000001Z", "2026-10-09T12:00:05.000000001Z"
 	seedFailedTxeRun(t, server, jobID, "run-queued-1", ir.WithQueuedAt(q1))
 	seen, queued := txeExecution(t, c, jobID, "run-queued-1")
@@ -561,4 +676,126 @@ func TestTxeRunRetryRefusesRequeuedExecution(t *testing.T) {
 	c.Post(path, retryBody("dashboard-queued-3", job.Version, seen, q2)).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
 	require.NotNil(t, res.Proposal)
 	require.Contains(t, string(res.Proposal.Action.Params), `"queued_at":"`+q2+`"`)
+}
+
+// A decision is recorded only for an individually signed-in person. On a hub
+// with no authentication, or with basic auth's one shared credential, a
+// request cannot show it comes from a person rather than a reviewer or a job
+// script holding the hub context, so it is refused and nothing is recorded.
+func TestTxeDecisionNeedsAPersonAuthMode(t *testing.T) {
+	for _, mode := range []config.AuthMode{config.AuthModeNone, config.AuthModeBasic, ""} {
+		t.Run(string(mode), func(t *testing.T) {
+			a := newTxeDecisionAPIWithAuth(t, mode)
+			f := newTxeFixture(t, a, txeAdmin)
+			jobID, err := f.register(txeAdmin, "")
+			require.NoError(t, err)
+			require.NoError(t, f.ready(txeAdmin, jobID))
+			p := fileTxeProposal(t, f, txeAdmin, jobID)
+			err = decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "shared-credential-1", nil)
+			requireStatus(t, err, http.StatusForbidden)
+			var apiErr *apiv1.Error
+			require.ErrorAs(t, err, &apiErr)
+			require.Equal(t, "person_auth_required", apiErr.Details["code"])
+			list, err := a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: jobID, ProposalId: p.ProposalId})
+			require.NoError(t, err)
+			require.Empty(t, list.(api.ListTxeProposalDecisions200JSONResponse).Decisions)
+		})
+	}
+}
+
+// The person is the signed-in user, whatever identity the body claims.
+func TestTxeDecisionActorIsTheSignedInUser(t *testing.T) {
+	a := newTxeDecisionAPI(t)
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	p := fileTxeProposal(t, f, txeAdmin, jobID)
+	require.NoError(t, decideTxe(txeAdmin, f, jobID, p, api.TxeVerdictApprove, "claims-another-1",
+		&api.TxeActor{Kind: api.TxeActorKindHuman, Id: "someone-else"}))
+	list, err := a.ListTxeProposalDecisions(txeAdmin, api.ListTxeProposalDecisionsRequestObject{JobId: jobID, ProposalId: p.ProposalId})
+	require.NoError(t, err)
+	decisions := list.(api.ListTxeProposalDecisions200JSONResponse).Decisions
+	require.Len(t, decisions, 1)
+	user, _ := auth.UserFromContext(txeAdmin)
+	require.Equal(t, user.Username, decisions[0].Actor.Id)
+	// No signed-in user at all is refused.
+	requireStatus(t, decideTxe(context.Background(), f, jobID, p, api.TxeVerdictApprove, "nobody-1", nil), http.StatusForbidden)
+}
+
+// Reproduces the reported attack on the real routes. On a hub with no
+// authentication, or with basic auth where one shared credential is held by
+// the person and the reviewer alike, the reviewer files a proposal and then
+// approves it while claiming to be a person. The approval is refused, no
+// decision is recorded, and the job's native human task keeps waiting.
+func TestTxeDecisionSelfApprovalOutsideBuiltinAuth(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) (test.Server, txeHTTPClient){
+		"none": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) { cfg.Server.Auth.Mode = config.AuthModeNone }))
+			return server, txeNoAuthClient{c: server.Client()}
+		},
+		"basic": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
+				cfg.Server.Auth.Mode = config.AuthModeBasic
+				cfg.Server.Auth.Basic.Username, cfg.Server.Auth.Basic.Password = "shared", "secret"
+			}))
+			return server, txeBasicClient{c: server.Client(), user: "shared", pass: "secret"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, c := setup(t)
+			f := newTxeDecisionFixtureOn(t, server, c)
+			body := f.body("approve", "self-approve-"+name)
+			body["actor"] = map[string]any{"kind": "human", "id": "connor"}
+			var apiErr api.Error
+			c.Post(f.decisionPath(), body).ExpectStatus(http.StatusForbidden).Send(t).Unmarshal(t, &apiErr)
+			require.NotNil(t, apiErr.Details)
+			require.Equal(t, "person_auth_required", (*apiErr.Details)["code"])
+			var list api.TxeDecisionList
+			c.Get(f.decisionPath()).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
+			require.Empty(t, list.Decisions)
+			status := waitForStoredDAGRunStatus(t, server, f.decide, f.runID, 5*time.Second, func(s *ir.DAGRunStatus) bool {
+				return s.Status == ir.Waiting
+			})
+			require.True(t, hasNodeWithStatus(status, "decide", ir.NodeWaiting))
+		})
+	}
+}
+
+// A retry request is a person's decision too: on a hub that cannot tell a
+// person from a reviewer, it is refused before anything is recorded.
+func TestTxeRunRetryNeedsAPerson(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) (test.Server, txeHTTPClient){
+		"none": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) { cfg.Server.Auth.Mode = config.AuthModeNone }))
+			return server, txeNoAuthClient{c: server.Client()}
+		},
+		"basic": func(t *testing.T) (test.Server, txeHTTPClient) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
+				cfg.Server.Auth.Mode = config.AuthModeBasic
+				cfg.Server.Auth.Basic.Username, cfg.Server.Auth.Basic.Password = "shared", "secret"
+			}))
+			return server, txeBasicClient{c: server.Client(), user: "shared", pass: "secret"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, c := setup(t)
+			jobID := registerTxeJobHTTP(t, c)
+			seedFailedTxeRun(t, server, jobID, "run-shared-1")
+			seen, queued := txeExecution(t, c, jobID, "run-shared-1")
+			var job api.TxeJob
+			c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+			body := retryBody("shared-retry-"+name, job.Version, seen, queued)
+			body["actor"] = map[string]any{"kind": "human", "id": "connor"}
+			var apiErr api.Error
+			c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-shared-1"), body).
+				ExpectStatus(http.StatusForbidden).Send(t).Unmarshal(t, &apiErr)
+			require.NotNil(t, apiErr.Details)
+			require.Equal(t, "person_auth_required", (*apiErr.Details)["code"])
+			var proposals api.TxeProposalList
+			c.Get("/api/v1/txe/jobs/"+jobID+"/proposals").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &proposals)
+			require.Empty(t, proposals.Open)
+			require.Empty(t, proposals.Finished)
+		})
+	}
 }

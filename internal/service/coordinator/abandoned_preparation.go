@@ -190,8 +190,15 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
 				tag.RunID(p.Run.ID), tag.AttemptID(record.AbandonedAttemptID))
 		case errors.Is(err, persis.ErrAttemptNotAbandonable), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
-			// Settled: nothing of this preparation is left to abandon.
-			h.endPreparation(ctx, p.Run, p.RootRun, p.AttemptID)
+			// Ended only once nothing of it is left to judge, decided under
+			// the lock abandonments take: while the latest attempt is another
+			// preparation, abandoning that one would make this the latest
+			// again, so its entry stays.
+			if _, err := h.dagRunRepository.EndSettledAttemptPreparation(ctx, p); err != nil &&
+				!errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+				logger.Warn(ctx, "Left an attempt preparation for the next pass",
+					tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
+			}
 		default:
 			logger.Warn(ctx, "Left a prepared attempt for review",
 				tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))

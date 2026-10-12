@@ -13,8 +13,11 @@ import (
 	"time"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/target"
 )
 
 // SpecSchema is the version of the job spec file format.
@@ -95,9 +98,25 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read job spec: %w", err)
 	}
+	file, err := parser.ParseBytes(data, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
+	if err := oneDocument(file); err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
 	var spec JobSpec
 	if err := yaml.UnmarshalWithOptions(data, &spec, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
+	declared, err := markEmptyParamSchemas(data, &spec)
+	if err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
+	if declared {
+		if err := writtenOutInFull(file); err != nil {
+			return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+		}
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -108,6 +127,98 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 		return nil, err
 	}
 	return &spec, nil
+}
+
+// markEmptyParamSchemas marks every permitted action whose spec writes the
+// param_schema key with no value. The YAML decoder leaves such a field as if
+// the key were absent, which would register the action with no bounds on its
+// parameters; marked, Validate refuses it by name.
+//
+// It reports whether any action declares a param_schema at all, in this
+// reading of the file or in the one already made.
+func markEmptyParamSchemas(data []byte, spec *JobSpec) (bool, error) {
+	var raw struct {
+		ReviewPolicy struct {
+			PermittedActions []map[string]any `yaml:"permitted_actions"`
+		} `yaml:"review_policy"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false, err
+	}
+	declared := false
+	for i, action := range raw.ReviewPolicy.PermittedActions {
+		value, written := action["param_schema"]
+		declared = declared || written
+		if written && value == nil && i < len(spec.ReviewPolicy.PermittedActions) {
+			spec.ReviewPolicy.PermittedActions[i].ParamSchema = ParamSchema("null")
+		}
+	}
+	for _, action := range spec.ReviewPolicy.PermittedActions {
+		declared = declared || len(action.ParamSchema) > 0
+	}
+	return declared, nil
+}
+
+// oneDocument refuses a spec file that holds more than one YAML document.
+// Only the first is read, so anything a later one declares, a param_schema
+// included, would be dropped without a word.
+func oneDocument(file *ast.File) error {
+	held := 0
+	for _, doc := range file.Docs {
+		if doc == nil || doc.Body == nil {
+			continue
+		}
+		if _, directive := doc.Body.(*ast.DirectiveNode); !directive {
+			held++
+		}
+	}
+	if held > 1 {
+		return fmt.Errorf("the file holds %d YAML documents (separated by ---); a job spec is one document, and the others would not be read", held)
+	}
+	return nil
+}
+
+// writtenOutInFull refuses a job spec that uses an anchor, a reference or a
+// merge key anywhere. It is asked of a spec that bounds an action's
+// parameters: the decoder resolves a reference before a param_schema is
+// read, and can resolve it to something other than what is written above
+// it (a later anchor of the same name, or nothing), so a bound could be
+// replaced where no check can see it.
+func writtenOutInFull(file *ast.File) error {
+	var found references
+	for _, doc := range file.Docs {
+		ast.Walk(&found, doc)
+	}
+	if found.what == "" {
+		return nil
+	}
+	return fmt.Errorf("line %d uses %s. A job spec that gives an action a param_schema must be written out in full, with no anchors (&name), references (*name) or merge keys (<<): a reference can be read as something other than what is written above it", found.line, found.what)
+}
+
+// references finds the first anchor, reference or merge key in a document.
+type references struct {
+	what string
+	line int
+}
+
+func (r *references) Visit(node ast.Node) ast.Visitor {
+	if r.what != "" {
+		return nil
+	}
+	switch node.(type) {
+	case *ast.AnchorNode:
+		r.what = "an anchor (&name)"
+	case *ast.AliasNode:
+		r.what = "a reference (*name)"
+	case *ast.MergeKeyNode:
+		r.what = "a merge key (<<)"
+	default:
+		return r
+	}
+	if tok := node.GetToken(); tok != nil && tok.Position != nil {
+		r.line = tok.Position.Line
+	}
+	return nil
 }
 
 // SourceRoot returns the absolute directory the package is built from.
@@ -180,6 +291,28 @@ func CheckDeliverablePath(path string) error {
 	return nil
 }
 
+// checkTarget says whether a target can be observed the way it asks to be.
+// A target checked before every run, or by the machine's periodic check, is
+// observed by a probe on this machine: its kind, identity and name must be
+// ones a probe understands, and the job must declare the credential
+// reference the probe reads. A job with a target nothing could observe would
+// be stopped before every run. The rules are the probes' own
+// (internal/txe/target); an event_only target is observed by no probe.
+func checkTarget(t Target, refs []txepkg.CredentialRef) error {
+	switch t.ExistenceCheck {
+	case "", target.CheckPreRun, target.CheckReconcile, target.CheckEventOnly:
+	default:
+		return fmt.Errorf("existence_check %q must be %s, %s or %s", t.ExistenceCheck, target.CheckPreRun, target.CheckReconcile, target.CheckEventOnly)
+	}
+	declared := make([]target.CredentialRef, len(refs))
+	for i, ref := range refs {
+		declared[i] = target.CredentialRef{Name: ref.Name, Kind: ref.Kind, Locator: ref.Locator}
+	}
+	return target.Validate(target.Target{
+		Kind: t.Kind, Environment: t.Environment, StableID: t.StableID, DisplayName: t.DisplayName,
+	}, t.ExistenceCheck, declared)
+}
+
 // Validate checks that the spec carries the context a job needs to outlive
 // its creating session. It reports every problem at once.
 func (s *JobSpec) Validate() error {
@@ -205,6 +338,9 @@ func (s *JobSpec) Validate() error {
 			"targets[%d].stable_id is required: an identity that does not change when a resource is renamed or recreated, such as a UID", i)
 		for key, value := range t.StableID {
 			need(key != "" && value != "", "targets[%d].stable_id has an empty key or value", i)
+		}
+		if err := checkTarget(t, s.CredentialRefs); err != nil {
+			need(false, "targets[%d]: %v", i, err)
 		}
 	}
 
@@ -247,6 +383,7 @@ func (s *JobSpec) Validate() error {
 	for i, a := range s.ReviewPolicy.PermittedActions {
 		need(a.Name != "", "review_policy.permitted_actions[%d].name is required", i)
 		need(a.TimeoutSec > 0, "review_policy.permitted_actions[%d].timeout_sec is required", i)
+		need(a.ParamSchema.isMapping(), "review_policy.permitted_actions[%d].param_schema must be a mapping (a JSON Schema)", i)
 	}
 
 	if len(problems) > 0 {

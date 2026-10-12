@@ -34,10 +34,11 @@ describe('buildInbox', () => {
     ).toBe(true);
   });
 
-  it('omits decided and superseded proposals', () => {
+  it('omits decided, superseded and closed proposals', () => {
     const proposals = [
       fixtureProposal({ state: 'decided' }),
       fixtureProposal({ proposalId: 'prp_2', state: 'superseded' }),
+      fixtureProposal({ proposalId: 'prp_3', state: 'closed' }),
     ];
     expect(buildInbox([fixtureJob()], proposals, now)).toHaveLength(0);
   });

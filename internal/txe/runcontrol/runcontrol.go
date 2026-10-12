@@ -33,6 +33,10 @@ type Control struct {
 	Manager     *runtime.Manager
 	Coordinator Canceller // nil when no coordinator is configured
 	ExecMode    config.ExecutionMode
+
+	// afterLatestRead, in tests, runs between LatestAttempt's first read of
+	// the latest execution and its journal read.
+	afterLatestRead func()
 }
 
 var _ registry.RunControl = (*Control)(nil)
@@ -73,9 +77,44 @@ func (c *Control) RunFinished(ctx context.Context, dagName string, run registry.
 	return status != nil && !status.Status.IsActive() && status.Status != ir.NotStarted, nil
 }
 
+// latestReads bounds how often LatestAttempt reads a run that keeps changing
+// under it.
+const latestReads = 5
+
 // LatestAttempt returns the run's latest attempt: its ID, the digest of its
-// saved DAG, and whether it finished and succeeded.
+// saved DAG, whether it finished and succeeded, and whether it is still a
+// preparation. The preparation is read between two reads of the latest
+// execution, and the answer is kept only if both name the same one: the
+// coordinator hides an abandoned preparation before it removes its journal
+// entry, so a preparation abandoned meanwhile is never reported as
+// dispatched.
 func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (registry.RunAttempt, error) {
+	run := ir.NewDAGRunRef(dagName, runID)
+	for range latestReads {
+		latest, err := c.readLatest(ctx, dagName, runID)
+		if err != nil {
+			return registry.RunAttempt{}, err
+		}
+		if c.afterLatestRead != nil {
+			c.afterLatestRead()
+		}
+		preparing, err := c.preparing(ctx, run, latest.AttemptID)
+		if err != nil {
+			return registry.RunAttempt{}, err
+		}
+		again, err := c.readLatest(ctx, dagName, runID)
+		if err != nil {
+			return registry.RunAttempt{}, err
+		}
+		if again.Ref() == latest.Ref() {
+			latest.Preparing = preparing
+			return latest, nil
+		}
+	}
+	return registry.RunAttempt{}, fmt.Errorf("run %s kept changing while its latest execution was read", runID)
+}
+
+func (c *Control) readLatest(ctx context.Context, dagName, runID string) (registry.RunAttempt, error) {
 	attempt, err := c.Runs.FindAttempt(ctx, ir.NewDAGRunRef(dagName, runID))
 	if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 		return registry.RunAttempt{}, registry.ErrRunNotFound
@@ -113,6 +152,25 @@ func (c *Control) LatestAttempt(ctx context.Context, dagName, runID string) (reg
 		Finished:   !status.Status.IsActive() && status.Status != ir.NotStarted,
 		Succeeded:  status.Status.IsSuccess(),
 	}, nil
+}
+
+// preparing reports whether the root run's attempt is still in the store's
+// preparation journal. Present means its preparation is not known to be
+// settled: it may not have been handed to a worker and may still be
+// abandoned, or it may already be dispatched with its entry not yet ended
+// (reconciliation ends it once the attempt is settled), so the registry
+// treats it as uncertain, never as either. An entry that cannot be read is
+// an error, never evidence of dispatch. A store without a journal never
+// abandons attempts.
+func (c *Control) preparing(ctx context.Context, run ir.DAGRunRef, attemptID string) (bool, error) {
+	prepared, err := c.Runs.AttemptPrepared(ctx, run, run, attemptID)
+	if errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the preparation journal of run %s: %w", run.ID, err)
+	}
+	return prepared, nil
 }
 
 func (c *Control) findAttempt(ctx context.Context, dagName string, run registry.RunRef) (dagrun.Attempt, error) {

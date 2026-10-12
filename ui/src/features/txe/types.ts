@@ -27,8 +27,7 @@ export type ProposalState =
   | 'superseded'
   | 'executed'
   | 'rejected'
-  // Closed by the system, for example when a superseded proposal's decide
-  // task is released; never a person's decision.
+  // closed: an escalation answered with retry; finished, never executed.
   | 'closed';
 
 export type Verdict =

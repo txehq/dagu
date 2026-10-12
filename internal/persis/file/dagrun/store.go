@@ -28,8 +28,8 @@ const defaultRetryCandidateCacheLimit = 2000
 type Store struct {
 	baseDir         string
 	artifactDir     string
-	logDir          string
 	preparationDir  string
+	logDir          string
 	cache           *fileutil.Cache[*ir.DAGRunStatus]
 	retryCandidates retryCandidateCache
 }
@@ -40,8 +40,8 @@ type StoreOption func(*options)
 type options struct {
 	fileCache                *fileutil.Cache[*ir.DAGRunStatus]
 	artifactDir              string
-	logDir                   string
 	preparationDir           string
+	logDir                   string
 	retryCandidateCacheLimit int
 }
 
@@ -93,8 +93,8 @@ func NewStore(baseDir string, opts ...StoreOption) *Store {
 	return &Store{
 		baseDir:         baseDir,
 		artifactDir:     cfg.artifactDir,
-		logDir:          cfg.logDir,
 		preparationDir:  cfg.preparationDir,
+		logDir:          cfg.logDir,
 		cache:           cfg.fileCache,
 		retryCandidates: retryCandidateCache{limit: cfg.retryCandidateCacheLimit},
 	}
@@ -609,19 +609,6 @@ func (store *Store) listRoot(_ context.Context, include string) ([]DataRoot, err
 	return roots, nil
 }
 
-// cloneStatus returns an independent copy of status.
-func cloneStatus(status *ir.DAGRunStatus) (*ir.DAGRunStatus, error) {
-	data, err := json.Marshal(status)
-	if err != nil {
-		return nil, fmt.Errorf("copy status: %w", err)
-	}
-	var out ir.DAGRunStatus
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("copy status: %w", err)
-	}
-	return &out, nil
-}
-
 // checkLatestExecution refuses unless the run's latest execution is want and
 // has finished. It runs under the run's lock, with the attempt creation it
 // guards.
@@ -670,4 +657,17 @@ func claimLatest(ctx context.Context, attempt *Attempt, source *ir.DAGRunStatus)
 		logger.Warn(ctx, "Failed to close a claimed retry attempt", tag.Error(err))
 	}
 	return nil
+}
+
+// cloneStatus returns an independent copy of status.
+func cloneStatus(status *ir.DAGRunStatus) (*ir.DAGRunStatus, error) {
+	data, err := json.Marshal(status)
+	if err != nil {
+		return nil, fmt.Errorf("copy status: %w", err)
+	}
+	var out ir.DAGRunStatus
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("copy status: %w", err)
+	}
+	return &out, nil
 }

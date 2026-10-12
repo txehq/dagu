@@ -70,8 +70,8 @@ func (r *DAGRunRepository) CreateAttempt(
 		DAGRunID:         dagRunID,
 		AttemptID:        options.AttemptID,
 		Retry:            options.Retry,
-		ExpectLatest:     options.ExpectLatest,
 		TrackPreparation: options.TrackPreparation,
+		ExpectLatest:     options.ExpectLatest,
 	})
 	if err != nil {
 		return nil, err

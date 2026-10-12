@@ -42,6 +42,10 @@ type fakeRegistry struct {
 	// listed accepts any execution.
 	latest map[string]Execution
 
+	// capabilities is what the installation record says the registry
+	// enforces. A new fake lists none, as a registry that only stores does.
+	capabilities []string
+
 	// beforeList, when set, runs before a job listing is answered.
 	beforeList func()
 	// loseResponse makes the next matching request take effect and then
@@ -134,6 +138,16 @@ func (f *fakeRegistry) job(id string) Job {
 	return f.jobs[id].Job
 }
 
+// versionCount is how many versions the registry holds for a job.
+func (f *fakeRegistry) versionCount(jobID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if j, ok := f.jobs[jobID]; ok {
+		return len(j.versions)
+	}
+	return 0
+}
+
 func (f *fakeRegistry) jobCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -220,7 +234,10 @@ func (f *fakeRegistry) route(w http.ResponseWriter, r *http.Request, body []byte
 	case r.Method == http.MethodGet && path == "/health":
 		answer(w, 200, Health{Status: "healthy", Version: "2.18.2-txe.test"})
 	case r.Method == http.MethodGet && path == "/txe/installation":
-		answer(w, 200, Installation{Schema: 1, Owners: []Owner{{OwnerID: testOwner, DisplayName: "Connor Wang"}}})
+		f.mu.Lock()
+		capabilities := slices.Clone(f.capabilities)
+		f.mu.Unlock()
+		answer(w, 200, Installation{Schema: 1, Owners: []Owner{{OwnerID: testOwner, DisplayName: "Connor Wang"}}, Capabilities: capabilities})
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/txe/machines/"):
 		f.mu.Lock()
 		m, ok := f.machines[strings.TrimPrefix(path, "/txe/machines/")]

@@ -950,7 +950,7 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 	if err != nil {
 		return nil, err
 	}
-	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, ExpectLatest: expect, TrackPreparation: h.canAbandonPreparations()}
+	opts := persis.DAGRunCreateAttemptOptions{Retry: isRetry, TrackPreparation: h.canAbandonPreparations(), ExpectLatest: expect}
 
 	attempt, err := h.dagRunRepository.CreateAttempt(ctx, dag, time.Now(), task.DagRunId, opts)
 	if err != nil {
@@ -1474,7 +1474,11 @@ func (h *Handler) AckTaskClaim(ctx context.Context, req *coordinatorv1.AckTaskCl
 	if claimed.Task == nil {
 		return &coordinatorv1.AckTaskClaimResponse{Accepted: false, Error: "claim has no task payload"}, nil
 	}
-	refused, reason, err := h.refuseUnadmittedClaim(ctx, req.ClaimToken, claimed.Task)
+	marker := claimed.Task.ExecutionMarker
+	if legacy, convErr := convert.DispatchTaskToProto(claimed.Task); convErr == nil && fillLegacyExecutionMarker(legacy) == nil {
+		marker = legacy.GetExecutionMarker()
+	}
+	refused, reason, err := h.refuseUnadmittedClaim(ctx, req.ClaimToken, claimed.Task, marker)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}

@@ -638,6 +638,22 @@ func cloneDAGRunStatus(status *ir.DAGRunStatus) *ir.DAGRunStatus {
 	return &cloned
 }
 
+// A queued retry is bound to the execution the caller read: a later
+// execution of the same attempt (another queue marker) is not retried in its
+// place.
+func TestPrepareRetryIsBoundToTheExecution(t *testing.T) {
+	status := &ir.DAGRunStatus{Name: "job", DAGRunID: "run", AttemptID: "attempt", Status: ir.Failed, QueuedAt: "q1"}
+	latest := cloneDAGRunStatus(status)
+	latest.QueuedAt = "q2"
+	backend := &stubDAGRunStore{status: latest}
+	repository := persis.NewDAGRunRepository(backend, nil, persis.DAGRunRepositoryOptions{})
+	admission, err := queue.PrepareRetry(t.Context(), repository, nil, status, queue.EnqueueRetryOptions{})
+	require.ErrorIs(t, err, queue.ErrRetryStaleLatest)
+	assert.Nil(t, admission)
+	assert.Equal(t, ir.Failed, backend.status.Status)
+	assert.Equal(t, "q2", backend.status.QueuedAt)
+}
+
 func (s *stubDAGRunStore) ListRetainedExecutions(context.Context, ir.DAGRunRef, ir.DAGRunRef) ([]persis.RetainedExecution, error) {
 	return nil, nil
 }
@@ -649,7 +665,7 @@ func (s *stubDAGRunStore) ReadRetainedExecutionFile(context.Context, ir.DAGRunRe
 // A retry is admitted for the execution the caller saw: a later execution of
 // the same attempt (a later queue marker) is refused, and admission keeps a
 // copy of the finished execution it replaces.
-func TestPrepareRetryIsBoundToTheExecution(t *testing.T) {
+func TestPrepareRetryRetainsTheExecutionItReplaces(t *testing.T) {
 	repository := testutil.NewFileDAGRunRepository(t.TempDir(), persis.DAGRunRepositoryOptions{})
 	dag := &ir.DAG{Name: "manual"}
 	attempt, err := repository.CreateAttempt(t.Context(), dag, time.Now(), "run", persis.DAGRunCreateAttemptOptions{})

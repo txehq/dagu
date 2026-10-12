@@ -248,6 +248,37 @@ type RunAttempt struct {
 	// ArchiveDir is the execution's native artifact directory on the hub,
 	// when Dagu has assigned one.
 	ArchiveDir string
+	// Preparing is true while the coordinator's preparation of the attempt
+	// is not known to be settled (its journal entry is present): the attempt
+	// may not have been handed to a worker and may still be abandoned,
+	// making the previous execution the latest again, or it may already have
+	// been dispatched. Either way its outcome is uncertain until the entry
+	// ends, so nothing is decided on it.
+	Preparing bool
+}
+
+// ExecutionPreparing is the Current of a refusal made because a run's latest
+// execution is not yet known to be dispatched or abandoned (see
+// RunAttempt.Preparing): the caller asks again once that is settled.
+type ExecutionPreparing struct {
+	RunID     string `json:"run_id"`
+	Execution string `json:"execution"`
+}
+
+func preparingRefusal(runID string, latest RunAttempt, what string) error {
+	return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: runID, Execution: latest.Ref()},
+		Message: fmt.Sprintf("run %s's latest execution %s is not yet known to be dispatched or abandoned; %s once that is settled", runID, latest.Ref(), what)}
+}
+
+// isPreparing reports whether err is a refusal made because a run's latest
+// execution is not yet known to be dispatched or abandoned.
+func isPreparing(err error) bool {
+	re, ok := errors.AsType[*Error](err)
+	if !ok {
+		return false
+	}
+	_, ok = re.Current.(ExecutionPreparing)
+	return ok
 }
 
 // ErrRunNotFound is RunFinished's answer for a run Dagu has no record of.

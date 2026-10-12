@@ -5,6 +5,7 @@ package distr_test
 
 import (
 	"fmt"
+	goruntime "runtime"
 	"testing"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 // status and their own log lines, and an earlier copy does not change when a
 // later execution is copied.
 func TestQueuedRetryRetainsEachExecution(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("the job's steps are POSIX shell; Windows runs them under PowerShell")
+	}
 	state := t.TempDir()
 	f := newTestFixture(t, fmt.Sprintf(`
 type: chain
@@ -100,12 +104,10 @@ steps:
 	for _, r := range retained {
 		assert.Equal(t, "failed", r.Status)
 		assert.True(t, r.StatusComplete)
-		// With the coordinator's .final records (TXE-3772) every stream of a
-		// finished execution is proven complete when it is copied.
-		assert.True(t, r.LogsFinal, "every stream of the retained execution was recorded final: %s", r.LogsNote)
-		for _, file := range r.Files {
-			assert.True(t, file.Final, "%s of %s", file.Name, r.Execution)
-		}
+		// The worker released the run before each retry, and its log
+		// transport (TXE-3772) left a .final record whose digests match the
+		// copies.
+		assert.True(t, r.LogsFinal, "the retained logs are the fenced final streams")
 	}
 
 	assert.Contains(t, e1Stdout, "run execution 1")

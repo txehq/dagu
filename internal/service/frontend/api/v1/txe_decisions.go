@@ -5,7 +5,7 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
 )
 
 // DecideTxeProposal records a human decision on one proposal. The decision is
@@ -34,7 +35,7 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 	if err != nil {
 		return nil, err
 	}
-	actor, err := txeDecisionActor(ctx, body.Actor)
+	actor, err := a.txeDecisionActor(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +108,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil {
 		return nil, err
 	}
-	actor, err := txeDecisionActor(ctx, body.Actor)
+	actor, err := a.txeDecisionActor(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +209,8 @@ type txeRun struct {
 // txeRunFacts reads the run of the job's DAG that a retry names: it must
 // exist, be finished and not succeeded, and the caller must be able to see
 // it. Its DAG snapshot digest is computed the way run admission computes it.
+// It authorizes only reading the run: the caller's right to retry it was
+// checked before, by the replay lookup, and is checked again in the commit.
 func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, error) {
 	status, err := a.authorizeHumanTaskMutation(ctx, jobID, runID)
 	if err != nil {
@@ -217,34 +220,41 @@ func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, err
 		return txeRun{}, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
 			Message: fmt.Sprintf("run %s is not a run of job %s", runID, jobID)}
 	}
-	if status.Status.IsActive() || status.Status.IsSuccess() {
+	// A latest execution whose preparation is not settled may still be
+	// abandoned, which makes the reviewed execution latest again. It is
+	// answered the way the registry answers it, ask again with the
+	// preparation named, never as moved on or as not retryable.
+	latest, err := (&runcontrol.Control{Runs: a.dagRunRepository}).LatestAttempt(ctx, jobID, runID)
+	if err != nil {
+		return txeRun{}, txeError(err)
+	}
+	if latest.Preparing {
+		return txeRun{}, txeError(&registry.Error{Code: registry.CodeNotReady,
+			Current: registry.ExecutionPreparing{RunID: runID, Execution: latest.Ref()},
+			Message: fmt.Sprintf("run %s's latest execution %s is not yet known to be dispatched or abandoned; ask again once that is settled", runID, latest.Ref())})
+	}
+	// Every fact below is this one preparation-aware snapshot's: the read
+	// above only authorized seeing the run, and may have been of an
+	// execution that was abandoned since.
+	var snap ir.DAGRunStatus
+	if err := json.Unmarshal(latest.Snapshot, &snap); err != nil {
+		return txeRun{}, fmt.Errorf("decode status of run %s: %w", runID, err)
+	}
+	if snap.Status.IsActive() || snap.Status.IsSuccess() {
 		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
-			Message: fmt.Sprintf("run %s is %s; only a finished, unsuccessful run can be retried", runID, status.Status),
+			Message: fmt.Sprintf("run %s is %s; only a finished, unsuccessful run can be retried", runID, snap.Status),
 			Details: map[string]any{"code": "run_not_retryable"}}
 	}
-	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
-	if err != nil {
-		return txeRun{}, err
-	}
-	dag, err := attempt.ReadDAG(ctx)
-	if err != nil {
-		return txeRun{}, fmt.Errorf("read DAG snapshot of run %s: %w", runID, err)
-	}
-	if len(dag.YamlData) == 0 {
-		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
-			Message: fmt.Sprintf("run %s has no DAG snapshot to compare with the job", runID),
-			Details: map[string]any{"code": string(decision.CodeRunStale)}}
-	}
-	started, err := stringutil.ParseTime(status.StartedAt)
+	started, err := stringutil.ParseTime(snap.StartedAt)
 	if err != nil {
 		return txeRun{}, fmt.Errorf("parse start time of run %s: %w", runID, err)
 	}
-	if status.AttemptID == "" {
+	if snap.AttemptID == "" {
 		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 			Message: fmt.Sprintf("run %s has no attempt identity to bind a retry to", runID),
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
-	return txeRun{attemptID: status.AttemptID, queuedAt: status.QueuedAt, specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
+	return txeRun{attemptID: snap.AttemptID, queuedAt: latest.QueuedAt, specSHA256: latest.SpecSHA256, startedAt: started}, nil
 }
 
 // ListTxeProposalDecisions lists every decision recorded for a proposal,
@@ -293,11 +303,35 @@ var errTxeDecisionNotHuman = &Error{
 // request cannot name another person or decide as an agent: an API key is
 // refused whatever actor it claims, and a client-supplied actor contributes
 // only its session, machine and client details.
-func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
+// errTxePersonAuthRequired refuses a decision on a hub that cannot tell a
+// person from a process: basic auth shares one credential, and with no auth
+// there is no identity at all.
+var errTxePersonAuthRequired = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "a human decision needs a signed-in person; this hub's authentication cannot identify one (use builtin auth)",
+	Details:    map[string]any{"code": "person_auth_required"},
+}
+
+// txeDecisionActor returns the person a decision is made by. Only an
+// individually signed-in person may decide: under builtin auth, a user from
+// a session, never an API key. Basic auth, one shared credential, and no
+// auth cannot tell a person from a reviewer or a job script holding the hub
+// context, so a decision there is refused. The actor id is always the
+// signed-in user's; the request body may add the client and session it came
+// from, never the identity.
+func (a *API) txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
+	if a.config == nil || a.config.Server.Auth.Mode != config.AuthModeBuiltin {
+		return registry.Actor{}, errTxePersonAuthRequired
+	}
 	if _, apiKey := auth.APIKeyFromContext(ctx); apiKey {
 		return registry.Actor{}, errTxeDecisionNotHuman
 	}
-	actor := registry.Actor{Kind: registry.ActorHuman, ID: "unauthenticated", Client: "dashboard"}
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user == nil || user.Username == "" {
+		return registry.Actor{}, errTxePersonAuthRequired
+	}
+	actor := registry.Actor{Kind: registry.ActorHuman, ID: user.Username, Client: "dashboard"}
 	if in != nil {
 		claimed, err := txeConvert[registry.Actor](in)
 		if err != nil {
@@ -310,12 +344,6 @@ func txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.Actor, er
 		if claimed.Client != "" {
 			actor.Client = claimed.Client
 		}
-		if claimed.ID != "" {
-			actor.ID = claimed.ID
-		}
-	}
-	if user, ok := auth.UserFromContext(ctx); ok && user != nil {
-		actor.ID = user.Username
 	}
 	return actor, nil
 }

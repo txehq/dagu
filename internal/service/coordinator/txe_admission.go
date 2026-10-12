@@ -6,6 +6,7 @@ package coordinator
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -30,10 +32,12 @@ type RunAdmitter interface {
 // it. The admission is recorded on the job in the same commit that checks
 // it, so a later retirement knows the run. A refused claim is removed and its
 // queued attempt finalized as aborted, so it is neither executed nor offered
-// again. Child runs are admitted on their own identity: a registered job is
+// again; only the task's own execution is finalized (see abortQueuedAttempt).
+// executionMarker is the task's marker as the claim acknowledgment resolves
+// it. Child runs are admitted on their own identity: a registered job is
 // never exempt because it was called as a subworkflow. It reports whether the
 // claim was refused and why.
-func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, task *dispatch.DispatchTask) (bool, string, error) {
+func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, task *dispatch.DispatchTask, executionMarker string) (bool, string, error) {
 	if h.runAdmitter == nil || task == nil {
 		return false, "", nil
 	}
@@ -61,7 +65,7 @@ func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, 
 	}
 	reason := fmt.Sprintf("txe: job %s %s: %s", adm.JobID, adm.Code, adm.Reason)
 	storeCtx := context.WithoutCancel(ctx)
-	if err := h.abortQueuedAttempt(storeCtx, task, reason); err != nil {
+	if err := h.abortQueuedAttempt(storeCtx, task, executionMarker, reason); err != nil {
 		return false, "", err
 	}
 	if err := h.dispatchTaskStore.DeleteClaim(storeCtx, claimToken); err != nil {
@@ -73,36 +77,71 @@ func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, 
 	return true, reason, nil
 }
 
-func (h *Handler) abortQueuedAttempt(ctx context.Context, task *dispatch.DispatchTask, reason string) error {
+// abortQueuedAttempt finalizes the refused task's own execution as aborted.
+// It holds the root run's write lock, as recording a claim does, so it and
+// the abandonment fence see one state. An abandoned execution is left alone:
+// its stale claim is only removed. So is any other execution the run's
+// latest visible attempt now holds: another attempt, or the same attempt
+// queued again under a new queued-at marker (the rule leases follow).
+func (h *Handler) abortQueuedAttempt(ctx context.Context, task *dispatch.DispatchTask, executionMarker, reason string) error {
 	if h.dagRunRepository == nil {
 		return nil
 	}
+	run := ir.NewDAGRunRef(task.Target, task.DAGRunID)
+	root := ir.DAGRunRef{Name: task.RootDAGRunName, ID: task.RootDAGRunID}
+	if root.Zero() {
+		root = run
+	}
+	defer h.attemptWriteLocks.lock(root)()
 	held := h.runLocks.lock(task.DAGRunID)
 	defer h.runLocks.unlock(task.DAGRunID, held)
+	if err := h.refuseAbandonedExecution(ctx, run, root, task.AttemptID, executionMarker); err != nil {
+		if errors.Is(err, errAttemptAbandoned) {
+			return nil
+		}
+		return err
+	}
 	var attempt dagrun.Attempt
 	var err error
 	if task.RootDAGRunID != "" && task.RootDAGRunID != task.DAGRunID {
-		root := ir.NewDAGRunRef(task.RootDAGRunName, task.RootDAGRunID)
 		attempt, err = h.dagRunRepository.FindSubAttempt(ctx, root, task.DAGRunID)
 	} else {
-		attempt, err = h.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(task.Target, task.DAGRunID))
+		attempt, err = h.dagRunRepository.FindAttempt(ctx, run)
 	}
 	if err != nil {
 		return fmt.Errorf("find attempt of refused run: %w", err)
+	}
+	if attempt.ID() != task.AttemptID {
+		return nil
 	}
 	status, err := attempt.ReadStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("read attempt of refused run: %w", err)
 	}
-	if status == nil || (status.Status != ir.Queued && status.Status != ir.NotStarted) {
+	if status == nil || status.AttemptID != task.AttemptID || (status.Status != ir.Queued && status.Status != ir.NotStarted) {
 		return nil
 	}
-	status.Status = ir.Aborted
-	status.FinishedAt = stringutil.FormatTime(time.Now().UTC())
-	status.Error = reason
-	if err := attempt.Write(ctx, *status); err != nil {
+	if status.Status == ir.Queued && status.QueuedAt != executionMarker {
+		return nil
+	}
+	// The store re-checks the attempt, its status and the marker in the same
+	// write, so an execution that changed after the read is never aborted.
+	aborted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(ctx, run, task.AttemptID, status.Status,
+		func(current *ir.DAGRunStatus) error {
+			if current.Status == ir.Queued && current.QueuedAt != executionMarker {
+				return errExecutionReplaced
+			}
+			current.Status = ir.Aborted
+			current.FinishedAt = stringutil.FormatTime(time.Now().UTC())
+			current.Error = reason
+			return nil
+		}, persis.DAGRunCompareAndSwapOptions{RootDAGRun: root})
+	if errors.Is(err, errExecutionReplaced) || (err == nil && !swapped) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("abort refused run: %w", err)
 	}
-	h.finalizeAdmissionForStatus(ctx, status, attempt.ID())
+	h.finalizeAdmissionForStatus(ctx, aborted, task.AttemptID)
 	return nil
 }

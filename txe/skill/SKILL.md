@@ -25,7 +25,7 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 |---|---|
 | `job_key` | A stable lowercase name for this job within its project, such as `hub-volume-health`. Registering the same key twice is refused. |
 | `title`, `purpose` | What the job is for, written for someone who never saw this conversation. |
-| `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). |
+| `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). See "Targets" below. |
 | `schedule` | `cron` (five fields), `timezone`, `timeout_sec`. Optional: `overlap`, `retry` with `retry_interval_sec`, `catchup_window`. |
 | `package` | `include`: the files and directories the job needs, relative to the spec. `entrypoint`: the command. Uncommitted files are packaged as they are. |
 | `env` | Optional. Literal, non-secret settings for the script. |
@@ -36,6 +36,70 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 | `retirement_rules` | Optional. What happens when the target is deleted or replaced, or the job completes. |
 
 Review cadence is separate from the schedule. A check can run every five minutes and be reviewed once a day.
+
+### Bound what a reviewer may pass to an action
+
+A permitted action that takes parameters should say which ones. Give the action a `param_schema`: a JSON Schema, written as a YAML mapping.
+
+```yaml
+review_policy:
+  permitted_actions:
+    - name: reopen-ticket
+      command: ./reopen.sh
+      timeout_sec: 60
+      param_schema:
+        type: object
+        properties:
+          reason: {type: string, maxLength: 200}
+        required: [reason]
+        additionalProperties: false
+```
+
+- A registry that enforces schemas checks a reviewer's parameters against the schema before it grants an attempt of the action, and refuses parameters that do not match. An action with no `param_schema` has its parameters checked by nothing.
+- Registration refuses a spec with a `param_schema` on a hub whose registry does not say it enforces them, because that registry would store the schema and check nothing. The fix is to upgrade the hub, not to remove the schema.
+- Parameters reach the command as variables named `TXE_PARAM_<NAME>`, each a string. Declare each one as `type: string`, and set `additionalProperties: false` so that nothing undeclared is passed.
+- Such a registry admits JSON Schema draft 2020-12 and only the keywords it enforces exactly. It refuses `format`, `multipleOf`, unknown keywords and references to other documents. A number in the schema must be one it can compare exactly: an integer up to 2^53, or a fraction such as 0.5 that is exact in binary. `pattern` is read as RE2.
+- A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read. So is one that uses a YAML merge key (`<<`), which could replace a bound written beside it: write the schema out in full.
+- Write every number in a `param_schema` in plain decimal, as JSON does: `10`, `-3`, `0.5`. The spec is refused when it is read if what would be sent is not what is written. That covers a number that would be sent as a different one (`0.49999999999999999` would be sent as `0.5`), a spelling YAML reads its own way (`012`, `0x10`, `1_000`, `+5`, `.5`), a YAML tag (`!!float`), and an unquoted value such as `1e3` that would be sent as text. Put a value in quotes when text is meant.
+- A number is accepted only if the JSON number sent for it has the same value. Ordinary integers and short decimals (`10`, `-3`, `0.25`) do. A very long, very large or very small number may not, and is then refused. Do not shorten a refused number to make the spec load: a rounded bound is a different bound. Decide which bound you intend and write that.
+- Reading the spec only makes sure the registry is sent the number you wrote. Whether that number can be a bound is the registry's rule, above: `0.1` is sent as `0.1`, and a registry that compares binary fractions then refuses the registration.
+- Write every key in a `param_schema` as text. A key such as `1`, `1.0` or `true` is refused, because it would be sent as text that may not match what is written: put it in quotes (`"1"`). A key written with `?` is refused too.
+- A spec that gives any action a `param_schema` must be written out in full: no anchors (`&name`), references (`*name`) or merge keys (`<<`) anywhere in the file. A reference can be read as something other than what is written above it, so the spec is refused and the line that uses one is named. A job spec is one YAML document: a file with a second one after `---` is refused, because only the first would be read. A spec with no `param_schema` may use them as before.
+
+## Targets
+
+A target is the resource the job watches or acts on. Give it an identity that survives a rename or a recreation, and say how its existence is observed:
+
+| `existence_check` | Who checks | When |
+|---|---|---|
+| `pre_run` | this machine, before the job's command | every run, retries included; the job does not run when the target is gone or cannot be observed |
+| `reconcile` | this machine's periodic check | between runs |
+| `event_only` (or left out) | nobody; someone records a change in the registry | never automatically |
+
+`pre_run` and `reconcile` work only for kinds a probe knows, and the job must declare the credential the probe reads. Anything else is refused at registration, because a target nobody can observe would stop every run.
+
+```yaml
+targets:
+  - kind: kubernetes.deployment      # also configmap, secret, service, persistentvolumeclaim, statefulset, job, cronjob, namespace
+    environment: dev                 # the cluster's name
+    display_name: my-namespace/my-app   # "namespace/name"; just "name" for kubernetes.namespace
+    stable_id:
+      cluster_uid: <uid of the cluster's kube-system namespace>
+      uid: <the object's metadata.uid>
+    existence_check: pre_run
+  - kind: linear.issue
+    stable_id:
+      id: <the issue's UUID, not TXE-123>
+    existence_check: reconcile
+credential_refs:
+  - {name: TXE_KUBECONFIG, kind: file, locator: /Users/you/.kube/config}   # required for a Kubernetes target
+  - {name: TXE_KUBE_CONTEXT, kind: env, locator: TXE_KUBE_CONTEXT}         # optional: the context to use
+  - {name: LINEAR_API_KEY, kind: file, locator: /Users/you/.config/txe/linear-token}   # required for a Linear target
+```
+
+The three names are fixed: they are what the probe looks up. A reference's name is also the variable your script receives, holding the file's content for a `file` reference. So `TXE_KUBECONFIG` holds the kubeconfig's text, not a path: if your script runs `kubectl`, point it at the file with a setting of your own under `env`, such as `KUBECONFIG: /Users/you/.kube/config`.
+
+A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
 
 ## Write the script for an unattended worker
 
@@ -66,7 +130,7 @@ Rules for the script:
 
 - Do not write a credential into a deliverable or into a file under the output directories. Files are published as they are; only step output is masked.
 - Do not print a multi-line credential one line at a time. A value is masked when it appears whole.
-- For Kubernetes, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig.
+- For your script's own Kubernetes calls, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig. That does not cover a target check: a Kubernetes target with `pre_run` or `reconcile` still needs the `TXE_KUBECONFIG` file reference described under Targets, and registration refuses the job without it.
 
 If the file is missing or unreadable when a run starts, the run fails before the script starts, and the run's log on the hub names the reference. That is a login to repair on this machine, not a reason to retire the job.
 
