@@ -1385,3 +1385,152 @@ func TestTxeAPIRunAbandonmentsUnsupported(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, apiErr.HTTPStatus)
 	assert.Equal(t, "abandonment_history_unsupported", apiErr.Details["code"])
 }
+
+// A run's deliverables are authorized by the workspace the run itself was
+// saved in, not only by the job's current workspace: a job that ran in
+// secret and then moved to ops exposes neither those deliverables nor their
+// executions to an ops-only caller, who also cannot publish for such a run.
+func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	require.NoError(t, store.RebuildResourceIndex(ctx))
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true, config.PermissionRunDAGs: true}
+	a := apiv1.New(repo, runs, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		apiv1.WithTxeRegistry(store), apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, jobID))
+	spec := func(ws string) string {
+		return fmt.Sprintf("labels:\n  - workspace=%s\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", ws, f.machine)
+	}
+	// Two runs in secret: run-1 publishes, run-2 is still running unpublished.
+	runIn := func(runID string) string {
+		runDAG := &ir.DAG{Name: jobID, YamlData: []byte(spec("secret"))}
+		attempt, err := runs.CreateAttempt(ctx, runDAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+		require.NoError(t, err)
+		st := ir.InitialStatus(runDAG)
+		st.DAGRunID, st.AttemptID, st.Status, st.Labels = runID, attempt.ID(), ir.Running, []string{"workspace=secret"}
+		require.NoError(t, attempt.Open(ctx))
+		require.NoError(t, attempt.Write(ctx, st))
+		require.NoError(t, attempt.Close(ctx))
+		return attempt.ID()
+	}
+	publish := func(caller context.Context, runID, attemptID string) error {
+		_, err := a.RecordTxeRunArtifacts(caller, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: runID,
+			Body: &apigen.TxeArtifactManifestRequest{AttemptId: attemptID, JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+		return err
+	}
+	run1 := runIn("run-1")
+	run2 := runIn("run-2")
+	require.NoError(t, publish(txeAdmin, "run-1", run1))
+
+	// The job moves to ops.
+	_, err = a.UpdateTxeJobVersion(txeAdmin, apigen.UpdateTxeJobVersionRequestObject{JobId: jobID, Body: &apigen.TxeVersionRequest{
+		RequestId: "u1", ExpectedVersion: 1,
+		Version: apigen.TxeJobVersionInput{
+			Title: "t", Purpose: "p",
+			Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
+			Dag:     apigen.TxeDAGRef{Spec: spec("ops")},
+		}}})
+	require.NoError(t, err)
+	_, err = a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: jobID})
+	require.NoError(t, err, "the job itself is now visible to ops")
+
+	_, err = a.GetTxeRunArtifacts(txeOps, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
+	requireStatus(t, err, http.StatusNotFound)
+	ref := registry.ExecutionRef(run1, "")
+	_, err = a.GetTxeRunArtifacts(txeOps, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1",
+		Params: apigen.GetTxeRunArtifactsParams{Execution: &ref}})
+	requireStatus(t, err, http.StatusNotFound)
+	err = publish(txeOps, "run-2", run2)
+	require.Error(t, err)
+	var apiErr *apiv1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, []int{http.StatusForbidden, http.StatusNotFound}, apiErr.HTTPStatus)
+
+	got, err := a.GetTxeRunArtifacts(txeAdmin, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
+	require.NoError(t, err, "a caller who sees the run's workspace still reads it")
+	assert.Equal(t, ref, got.(apigen.GetTxeRunArtifacts200JSONResponse).Execution)
+}
+
+// A resource event's reply shows only the jobs the caller can see, as GET
+// does: a reporter who lost access to an affected job's workspace does not
+// get its disposition back by replaying the event.
+func TestTxeAPIResourceEventReplayIsProjected(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	opsJob, err := f.registerTargets(txeAdmin, "ops", txeVolume("v-9"))
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, opsJob))
+
+	eventID := mint(t, registry.PrefixEvent)
+	report := func(caller context.Context) (apigen.TxeResourceEvent, error) {
+		resp, err := a.RecordTxeResourceEvent(caller, apigen.RecordTxeResourceEventRequestObject{Body: &apigen.TxeResourceEventRequest{
+			EventId: &eventID, Target: txeVolume("v-9"), Observation: apigen.TxeResourceObservationUnreachable}})
+		if err != nil {
+			return apigen.TxeResourceEvent{}, err
+		}
+		return apigen.TxeResourceEvent(resp.(apigen.RecordTxeResourceEvent200JSONResponse)), nil
+	}
+	ev, err := report(txeOps)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, opsJob, ev.Dispositions[0].JobId)
+
+	// The same reporter, now without ops, replays the completed event.
+	moved := auth.WithUser(context.Background(), &auth.User{Username: "dev", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "other", Role: auth.RoleDeveloper}},
+	}})
+	replayed, err := report(moved)
+	require.NoError(t, err)
+	assert.Empty(t, replayed.Dispositions, "the job the reporter can no longer see")
+	got, err := a.GetTxeResourceEvent(moved, apigen.GetTxeResourceEventRequestObject{EventId: eventID})
+	require.NoError(t, err)
+	assert.Empty(t, apigen.TxeResourceEvent(got.(apigen.GetTxeResourceEvent200JSONResponse)).Dispositions, "as GET shows it")
+}
+
+// A job or resource event the caller cannot see answers exactly as one that
+// does not exist, so reads confirm nothing about hidden records.
+func TestTxeAPIHiddenAnswersAsAbsent(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	secretJob, err := f.registerTargets(txeAdmin, "secret", txeVolume("v-7"))
+	require.NoError(t, err)
+	require.NoError(t, f.ready(txeAdmin, secretJob))
+	absentJob := mint(t, registry.PrefixJob)
+
+	answer := func(err error, id, absentID string) (int, string, any) {
+		t.Helper()
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		return apiErr.HTTPStatus, strings.ReplaceAll(apiErr.Message, id, absentID), apiErr.Details
+	}
+	_, hiddenErr := a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: secretJob})
+	_, absentErr := a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: absentJob})
+	hs, hm, hd := answer(hiddenErr, secretJob, absentJob)
+	as, am, ad := answer(absentErr, absentJob, absentJob)
+	assert.Equal(t, http.StatusNotFound, hs)
+	assert.Equal(t, as, hs)
+	assert.Equal(t, am, hm)
+	assert.Equal(t, ad, hd)
+
+	eventID := mint(t, registry.PrefixEvent)
+	_, err = a.RecordTxeResourceEvent(txeAdmin, apigen.RecordTxeResourceEventRequestObject{Body: &apigen.TxeResourceEventRequest{
+		EventId: &eventID, Target: txeVolume("v-7"), Observation: apigen.TxeResourceObservationUnreachable}})
+	require.NoError(t, err)
+	absentEvent := mint(t, registry.PrefixEvent)
+	_, hiddenErr = a.GetTxeResourceEvent(txeOps, apigen.GetTxeResourceEventRequestObject{EventId: eventID})
+	_, absentErr = a.GetTxeResourceEvent(txeOps, apigen.GetTxeResourceEventRequestObject{EventId: absentEvent})
+	hs, hm, hd = answer(hiddenErr, eventID, absentEvent)
+	as, am, ad = answer(absentErr, absentEvent, absentEvent)
+	assert.Equal(t, http.StatusNotFound, hs)
+	assert.Equal(t, as, hs)
+	assert.Equal(t, am, hm)
+	assert.Equal(t, ad, hd)
+}

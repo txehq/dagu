@@ -7,6 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1349,4 +1354,36 @@ func TestLegacyTargetExceptionUsesOnlyItsOrigin(t *testing.T) {
 	got, err := f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
 	assert.Equal(t, AvailabilityTargetUnreachable, got.Availability.State, "B's present does not resolve an exception of unknown origin")
+}
+
+// A dependent that fails to apply for a storage reason is recorded with a
+// stable public message, not the raw error and the hub paths it carries.
+func TestResourceFailureCarriesNoStorageDetail(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes do not deny reads on Windows")
+	}
+	f := newFixture(t)
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{target("v-31")} })
+	dataDir := filepath.Join(filepath.Dir(f.dagsDir), "data")
+	var jobFile string
+	require.NoError(t, filepath.WalkDir(dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.Contains(p, string(filepath.Separator)+"jobs"+string(filepath.Separator)+job.JobID) && jobFile == "" {
+			jobFile = p
+		}
+		return nil
+	}))
+	require.NotEmpty(t, jobFile)
+	// The job can be read but not written; the event's own storage stays
+	// writable, so the failure is recorded on the event.
+	jobsDir := filepath.Dir(jobFile)
+	require.NoError(t, os.Chmod(jobsDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(jobsDir, 0o700) })
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-31"), Observation: ResourceUnreachable}, agent)
+	require.NoError(t, err)
+	require.NotEmpty(t, ev.Failures, "the job could not be written")
+	for _, fl := range ev.Failures {
+		assert.NotContains(t, fl.Error, dataDir, "no hub path")
+		assert.NotContains(t, fl.Error, "permission denied", "no raw storage error")
+	}
 }
