@@ -72,11 +72,12 @@ func (h httpTransport) Do(ctx context.Context, method, path string, in, out any)
 		var e struct {
 			Message string `json:"message"`
 			Details struct {
-				Code string `json:"code"`
+				Code    string          `json:"code"`
+				Current json.RawMessage `json:"current"`
 			} `json:"details"`
 		}
 		_ = json.Unmarshal(raw, &e)
-		return &review.TransportError{Status: resp.StatusCode, Code: e.Details.Code, Message: e.Message}
+		return &review.TransportError{Status: resp.StatusCode, Code: e.Details.Code, Message: e.Message, Current: e.Details.Current}
 	}
 	if out == nil || len(raw) == 0 {
 		return nil

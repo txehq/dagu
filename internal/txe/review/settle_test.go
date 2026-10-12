@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -94,6 +97,93 @@ func TestAnActionThatRunsToTheEndOfItsGrantIsStillReviewed(t *testing.T) {
 		require.ErrorIs(t, err, refused)
 	})
 
+	// The registry sends the action as it held it with a refusal about its
+	// state. That account is what is compared, and no read is made.
+	account := func(change func(*review.Action)) func(review.Action) error {
+		return func(held review.Action) error {
+			if change != nil {
+				change(&held)
+			}
+			return &review.TransportError{Status: http.StatusConflict, Code: "action_state", Message: "cannot settle uncertain action as uncertain", CurrentAction: &held}
+		}
+	}
+	t.Run("a refusal that shows this attempt uncertain is its record", func(t *testing.T) {
+		f := newFixture(t)
+		f.effects.run = func(review.Action) (review.EffectResult, bool) {
+			return review.EffectResult{Status: review.EffectUnknown, Detail: "action timed out"}, true
+		}
+		r := f.reviewer("reviewer-a")
+		r.Registry = &settleFails{Registry: f.registry, refuse: account(func(a *review.Action) { a.State = review.ActionUncertain }), unreadable: errors.New("no read is made")}
+		applied, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionUncertain, applied.Executed[0].State)
+		require.Len(t, f.state().Reviews[jobID], 1)
+	})
+	for name, change := range map[string]func(*review.Action){
+		"still executing":         nil,
+		"another attempt":         func(a *review.Action) { a.State = review.ActionUncertain; a.Attempt++ },
+		"another grant":           func(a *review.Action) { a.State = review.ActionUncertain; a.GrantID = "grt_other" },
+		"no grant":                func(a *review.Action) { a.State = review.ActionUncertain; a.GrantID = "" },
+		"another job version":     func(a *review.Action) { a.State = review.ActionUncertain; a.JobVersion++ },
+		"another target":          func(a *review.Action) { a.State = review.ActionUncertain; a.TargetID = "other" },
+		"other parameters":        func(a *review.Action) { a.State = review.ActionUncertain; a.Params = map[string]string{"x": "y"} },
+		"another action":          func(a *review.Action) { a.State = review.ActionUncertain; a.ID = "act_OTHER" },
+		"failed, not uncertain":   func(a *review.Action) { a.State = review.ActionFailed },
+		"an admitted execution":   func(a *review.Action) { a.State = review.ActionUncertain; a.AdmittedRef = "exec-other" },
+		"escalated, not the same": func(a *review.Action) { a.State = review.ActionEscalated },
+	} {
+		t.Run("a refusal that shows the attempt "+name+" is an error", func(t *testing.T) {
+			f := newFixture(t)
+			f.effects.run = func(review.Action) (review.EffectResult, bool) {
+				return review.EffectResult{Status: review.EffectUnknown, Detail: "action timed out"}, true
+			}
+			r := f.reviewer("reviewer-a")
+			s := &settleFails{Registry: f.registry, refuse: account(change)}
+			r.Registry = s
+			_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+			require.ErrorContains(t, err, "action_state")
+			assert.Zero(t, s.reads, "the registry's own account decides; nothing is read to find another")
+			assert.Empty(t, f.state().Reviews[jobID])
+		})
+	}
+
+	// What the attempt was seen to admit is part of its outcome: the same
+	// state without it is not the outcome being recorded.
+	t.Run("the same state without the admitted execution is an error", func(t *testing.T) {
+		f := newFixture(t)
+		f.effects.run = func(review.Action) (review.EffectResult, bool) {
+			return review.EffectResult{Status: review.EffectUnknown, Admitted: true, AdmittedRef: "exec-E"}, true
+		}
+		r := f.reviewer("reviewer-a")
+		// The registry holds the attempt uncertain, with no execution.
+		r.Registry = &settleFails{Registry: f.registry, err: refused, held: func(a *review.Action) { a.State = review.ActionUncertain }}
+		_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+		require.ErrorIs(t, err, refused)
+
+		f = newFixture(t)
+		f.effects.run = func(review.Action) (review.EffectResult, bool) {
+			return review.EffectResult{Status: review.EffectUnknown, Admitted: true, AdmittedRef: "exec-E"}, true
+		}
+		r = f.reviewer("reviewer-a")
+		r.Registry = &settleFails{Registry: f.registry, refuse: account(func(a *review.Action) { a.State = review.ActionUncertain })}
+		_, err = r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+		require.ErrorContains(t, err, "action_state")
+	})
+
+	// A conflict of another kind, and a record that is "not found" for a
+	// reason that is not this action, say nothing about the attempt.
+	t.Run("a conflict of another kind is an error even when the registry holds the outcome", func(t *testing.T) {
+		f := newFixture(t)
+		f.effects.run = func(review.Action) (review.EffectResult, bool) {
+			return review.EffectResult{Status: review.EffectUnknown}, true
+		}
+		conflict := fmt.Errorf("%w: job is at version 2, not 1", review.ErrConflict)
+		r := f.reviewer("reviewer-a")
+		r.Registry = &settleFails{Registry: f.registry, err: conflict, written: true}
+		_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+		require.ErrorIs(t, err, conflict)
+	})
+
 	// Other answers of the registry are not about the action's state, and
 	// are never read as "already recorded", whatever the registry holds.
 	for name, said := range map[string]error{
@@ -159,6 +249,10 @@ type settleFails struct {
 	held       func(*review.Action)
 	unreadable error
 	failed     bool
+	// refuse, when set, makes the failure from the action as it is held.
+	refuse func(review.Action) error
+	// reads counts the reads of the actions made after the failure.
+	reads int
 }
 
 func (s *settleFails) FinishAction(ctx context.Context, req review.FinishRequest) error {
@@ -168,6 +262,17 @@ func (s *settleFails) FinishAction(ctx context.Context, req review.FinishRequest
 		}
 	}
 	s.failed = true
+	if s.refuse != nil {
+		actions, err := s.Registry.Actions(ctx, req.JobID)
+		if err != nil {
+			return err
+		}
+		for _, a := range actions {
+			if a.ID == req.ActionID {
+				return s.refuse(a)
+			}
+		}
+	}
 	return s.err
 }
 
@@ -176,6 +281,7 @@ func (s *settleFails) Actions(ctx context.Context, jobID string) ([]review.Actio
 	if err != nil || !s.failed {
 		return actions, err
 	}
+	s.reads++
 	if s.unreadable != nil {
 		return nil, s.unreadable
 	}
@@ -306,7 +412,18 @@ func TestTheFakeRegistrySettlesLikeTheRegistry(t *testing.T) {
 // that runs past its grant is recorded as the registry already holds it, and
 // a probe that finds its effect settles it with a receipt the registry
 // takes. The effect happens once.
-func TestRemoteATimedOutActionIsRecordedAndSettledByItsProbe(t *testing.T) {
+// exportFixture is a job registered in the real registry with one routine
+// keyed action that has a reconcile probe and a 10 second timeout, bound to
+// this machine, and one attempt of it that applied its effect and ran past
+// its grant: reviewed, and left uncertain.
+type exportFixture struct {
+	f        *remoteFixture
+	id       string
+	reviewer func(holder string) *review.Reviewer
+}
+
+func timedOutExport(t *testing.T) exportFixture {
+	t.Helper()
 	f := newRemoteFixture(t)
 	ctx := context.Background()
 	first := f.job()
@@ -383,16 +500,22 @@ func TestRemoteATimedOutActionIsRecordedAndSettledByItsProbe(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, job.Checkpoint.Version, "the review was recorded")
 	assert.Equal(t, 1, f.fx.count("push_export"))
-
-	// The next review's probe finds the effect and prints nothing.
 	*f.ahead += 2 * time.Hour
+	return exportFixture{f: f, id: id, reviewer: reviewer}
+}
+
+func TestRemoteATimedOutActionIsRecordedAndSettledByItsProbe(t *testing.T) {
+	x := timedOutExport(t)
+	f, id, reviewer, ctx := x.f, x.id, x.reviewer, context.Background()
+
+	// The next review's probe finds the effect.
 	probes := 0
 	f.fx.probe = func(review.Action) review.EffectResult {
 		probes++
 		return review.EffectResult{Status: review.EffectApplied, Receipt: "found with token s3cr3t-value"}
 	}
-	r = reviewer("tick-2")
-	prepared, err = r.Prepare(ctx, id)
+	r := reviewer("tick-2")
+	prepared, err := r.Prepare(ctx, id)
 	require.NoError(t, err, "the job can be prepared again")
 	require.Empty(t, prepared.Skipped)
 	assert.Empty(t, prepared.Packet.UnresolvedActions)
@@ -425,4 +548,280 @@ func TestRemoteATimedOutActionIsRecordedAndSettledByItsProbe(t *testing.T) {
 	assert.NotContains(t, string(whole), "s3cr3t-value")
 	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "done"})
 	require.NoError(t, err)
+}
+
+// A probe is given what the job's commands are given and may print any of
+// it. Nothing it writes leaves the process: not its output, which is only
+// counted into a digest, and not its error output, which an action's
+// command writes to the step's log and a probe's does not.
+func TestCommandEffectorKeepsWhatAProbePrints(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	job := review.Job{ID: "job_A", OwnerID: "own_A", WorkingDir: t.TempDir()}
+	action := review.Action{ID: "act_1", Name: "a", TargetID: "t1"}
+	e := &review.CommandEffector{}
+
+	// The step's log is this process's standard error.
+	logged := func(t *testing.T, run func()) string {
+		t.Helper()
+		read, write, err := os.Pipe()
+		require.NoError(t, err)
+		saved := os.Stderr
+		os.Stderr = write
+		defer func() { os.Stderr = saved }()
+		run()
+		require.NoError(t, write.Close())
+		data, err := io.ReadAll(read)
+		require.NoError(t, err)
+		return string(data)
+	}
+	for name, tc := range map[string]struct {
+		script string
+		status review.EffectStatus
+		stdout string
+	}{
+		"found":         {`echo "token s3cr3t-out"; echo "token s3cr3t-err" >&2; exit 0`, review.EffectApplied, "token s3cr3t-out\n"},
+		"found, silent": {`echo "token s3cr3t-err" >&2; exit 0`, review.EffectApplied, ""},
+		"absent":        {`echo "token s3cr3t-out"; echo "token s3cr3t-err" >&2; exit 3`, review.EffectNotApplied, "token s3cr3t-out\n"},
+		"cannot tell":   {`echo "token s3cr3t-out"; echo "token s3cr3t-err" >&2; exit 1`, review.EffectUnknown, "token s3cr3t-out\n"},
+		"many lines":    {`echo "first s3cr3t-out"; echo; echo "last s3cr3t-out   "; exit 0`, review.EffectApplied, "first s3cr3t-out\n\nlast s3cr3t-out   \n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			probe := shellAction("true", review.IdempotencyNone)
+			probe.Reconcile = []string{"/bin/sh", "-c", tc.script}
+			var res review.EffectResult
+			log := logged(t, func() { res = e.Probe(context.Background(), job, probe, action) })
+			assert.Equal(t, tc.status, res.Status)
+			assert.NotContains(t, log, "s3cr3t", "nothing of the probe is in the step's log")
+			assert.NotContains(t, fmt.Sprintf("%+v", res), "s3cr3t", "nothing of the probe is in its result")
+			assert.Empty(t, res.Receipt)
+			if tc.status == review.EffectApplied {
+				want := ""
+				if tc.stdout != "" {
+					sum := sha256.Sum256([]byte(tc.stdout))
+					want = hex.EncodeToString(sum[:])
+				}
+				assert.Equal(t, want, res.OutputSHA256, "the digest is of everything the probe wrote to its output")
+			}
+		})
+	}
+
+	// An action's own command still writes its error output to the log.
+	log := logged(t, func() {
+		e.Run(context.Background(), job, shellAction(`echo "from the action" >&2; echo receipt`, review.IdempotencyNone), action)
+	})
+	assert.Contains(t, log, "from the action")
+}
+
+// The remaining cases against the real registry over its HTTP API: the
+// refusal it really sends, a record whose answer is lost, an account that is
+// not of this attempt, a read-only attempt, and probes that find nothing or
+// cannot tell. The effect count stays 1 throughout.
+func TestRemoteSettlementAgainstTheRealRegistry(t *testing.T) {
+	ctx := context.Background()
+	type setup struct {
+		f        *remoteFixture
+		reviewer func(holder string) *review.Reviewer
+		notify   review.AgentDecision
+		collect  review.AgentDecision
+	}
+	start := func(t *testing.T) setup {
+		t.Helper()
+		f := newRemoteFixture(t)
+		target := f.targetID()
+		return setup{
+			f: f,
+			reviewer: func(holder string) *review.Reviewer {
+				r := f.reviewer(holder)
+				r.Now = func() time.Time { return time.Now().Add(*f.ahead) }
+				return r
+			},
+			notify:  review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Notify.", Actions: []review.AgentAction{{Name: "notify", TargetID: target, Reason: "r"}}},
+			collect: review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Collect.", Actions: []review.AgentAction{{Name: "collect_diagnostics", TargetID: target, Reason: "r"}}},
+		}
+	}
+	timesOut := func(f *remoteFixture, status review.EffectStatus, happened bool) {
+		f.fx.run = func(review.Action) (review.EffectResult, bool) {
+			*f.ahead += 2 * time.Minute
+			return review.EffectResult{Status: status, Detail: "action timed out"}, happened
+		}
+	}
+	only := func(t *testing.T, f *remoteFixture) review.Action {
+		t.Helper()
+		actions, err := f.remote.Actions(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Len(t, actions, 1)
+		return actions[0]
+	}
+
+	t.Run("the refusal carries the interrupted attempt, and that is what is compared", func(t *testing.T) {
+		s := start(t)
+		timesOut(s.f, review.EffectUnknown, true)
+		var refusal *review.TransportError
+		r := s.reviewer("tick-1")
+		r.Registry = &watchSettle{Registry: s.f.remote, seen: func(err error) error {
+			refusal, _ = errors.AsType[*review.TransportError](err)
+			return err
+		}}
+		prepared, err := r.Prepare(ctx, s.f.jobID)
+		require.NoError(t, err)
+		applied, err := r.Apply(ctx, prepared, s.notify)
+		require.NoError(t, err)
+		require.NotNil(t, refusal, "the registry refused the record")
+		assert.Equal(t, http.StatusConflict, refusal.Status)
+		assert.Equal(t, "action_state", refusal.Code)
+		require.NotNil(t, refusal.CurrentAction, "and sent the action as it held it")
+		assert.Equal(t, review.ActionUncertain, refusal.CurrentAction.State)
+		assert.Equal(t, applied.Executed[0].ID, refusal.CurrentAction.ID)
+		assert.Equal(t, 1, refusal.CurrentAction.Attempt)
+		assert.NotEmpty(t, refusal.CurrentAction.GrantID)
+		// The review's own writes stored the interruption.
+		assert.Equal(t, review.ActionUncertain, only(t, s.f).State)
+		assert.Equal(t, 1, s.f.job().Checkpoint.Version)
+		assert.Equal(t, 1, s.f.fx.count("notify"))
+	})
+
+	for name, change := range map[string]func(*review.Action){
+		"another attempt": func(a *review.Action) { a.Attempt++ },
+		"another action":  func(a *review.Action) { a.ID = "act_OTHER" },
+		"another grant":   func(a *review.Action) { a.GrantID = "grt_other" },
+		"another state":   func(a *review.Action) { a.State = review.ActionEscalated },
+	} {
+		t.Run("an account of "+name+" is not this attempt's record", func(t *testing.T) {
+			s := start(t)
+			timesOut(s.f, review.EffectUnknown, true)
+			r := s.reviewer("tick-1")
+			r.Registry = &watchSettle{Registry: s.f.remote, seen: func(err error) error {
+				if te, ok := errors.AsType[*review.TransportError](err); ok && te.CurrentAction != nil {
+					change(te.CurrentAction)
+				}
+				return err
+			}}
+			prepared, err := r.Prepare(ctx, s.f.jobID)
+			require.NoError(t, err)
+			_, err = r.Apply(ctx, prepared, s.notify)
+			require.ErrorContains(t, err, "action_state")
+			assert.Zero(t, s.f.job().Checkpoint.Version, "the review is not recorded")
+			assert.Equal(t, 1, s.f.fx.count("notify"))
+		})
+	}
+
+	t.Run("a read-only attempt that ran past its grant is closed as failed and reviewed", func(t *testing.T) {
+		s := start(t)
+		timesOut(s.f, review.EffectNotApplied, false)
+		r := s.reviewer("tick-1")
+		prepared, err := r.Prepare(ctx, s.f.jobID)
+		require.NoError(t, err)
+		applied, err := r.Apply(ctx, prepared, s.collect)
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionFailed, applied.Executed[0].State)
+		assert.Equal(t, review.ActionFailed, only(t, s.f).State)
+		assert.Equal(t, 1, s.f.job().Checkpoint.Version)
+	})
+
+	t.Run("a record whose answer is lost is found written, receipt and all", func(t *testing.T) {
+		s := start(t)
+		lost := errors.New("read tcp: connection reset by peer")
+		r := s.reviewer("tick-1")
+		r.Registry = &watchSettle{Registry: s.f.remote, seen: func(err error) error {
+			require.NoError(t, err, "the registry took the record")
+			return lost
+		}}
+		prepared, err := r.Prepare(ctx, s.f.jobID)
+		require.NoError(t, err)
+		applied, err := r.Apply(ctx, prepared, s.notify)
+		require.NoError(t, err)
+		assert.Equal(t, review.ActionSucceeded, applied.Executed[0].State)
+		held := only(t, s.f)
+		assert.Equal(t, review.ActionSucceeded, held.State)
+		assert.Equal(t, "receipt-notify", held.Receipt)
+		assert.Equal(t, 1, s.f.job().Checkpoint.Version)
+		assert.Equal(t, 1, s.f.fx.count("notify"))
+	})
+
+	t.Run("a record that was lost before it was written is an error and nothing runs again", func(t *testing.T) {
+		s := start(t)
+		lost := errors.New("write tcp: broken pipe")
+		r := s.reviewer("tick-1")
+		r.Registry = &watchSettle{Registry: s.f.remote, before: lost}
+		prepared, err := r.Prepare(ctx, s.f.jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(ctx, prepared, s.notify)
+		require.ErrorIs(t, err, lost)
+		assert.Equal(t, review.ActionExecuting, only(t, s.f).State)
+		assert.Zero(t, s.f.job().Checkpoint.Version)
+
+		// The next review finds the attempt interrupted, has no probe for
+		// it, and asks the owner. The effect is not made again.
+		*s.f.ahead += 2 * time.Hour
+		next := s.reviewer("tick-2")
+		recovered, err := next.Prepare(ctx, s.f.jobID)
+		require.NoError(t, err)
+		require.Empty(t, recovered.Skipped)
+		assert.Equal(t, review.ActionEscalated, only(t, s.f).State)
+		_, err = next.Apply(ctx, recovered, s.notify)
+		require.NoError(t, err)
+		assert.Equal(t, 1, s.f.fx.count("notify"), "the effect happened once")
+	})
+}
+
+// watchSettle is a registry that shows a test what the real one answered to
+// a record of an outcome, and lets it change or replace that answer. With
+// before, the record is not sent at all.
+type watchSettle struct {
+	review.Registry
+	seen   func(error) error
+	before error
+}
+
+func (w *watchSettle) FinishAction(ctx context.Context, req review.FinishRequest) error {
+	if w.before != nil {
+		return w.before
+	}
+	return w.seen(w.Registry.FinishAction(ctx, req))
+}
+
+// A probe that cannot tell settles nothing, and one that finds nothing sends
+// the attempt to the owner: against the real registry neither is recorded as
+// done or as not applied, neither gets a receipt, and the effect is not made
+// again.
+func TestRemoteAProbeThatDoesNotFindTheEffectSettlesNothing(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		probe review.EffectResult
+		want  review.ActionState
+	}{
+		"cannot tell":   {review.EffectResult{Status: review.EffectUnknown, Detail: "probe exited with code 1"}, review.ActionEscalated},
+		"finds nothing": {review.EffectResult{Status: review.EffectNotApplied, Detail: "probe found no effect"}, review.ActionEscalated},
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := timedOutExport(t)
+			probes := 0
+			x.f.fx.probe = func(review.Action) review.EffectResult {
+				probes++
+				return tc.probe
+			}
+			r := x.reviewer("tick-2")
+			prepared, err := r.Prepare(ctx, x.id)
+			require.NoError(t, err)
+			require.Empty(t, prepared.Skipped)
+			assert.Equal(t, 1, probes)
+			actions, err := x.f.remote.Actions(ctx, x.id)
+			require.NoError(t, err)
+			require.Len(t, actions, 1)
+			assert.Equal(t, tc.want, actions[0].State)
+			assert.Empty(t, actions[0].Receipt)
+			assert.Equal(t, 1, x.f.fx.count("push_export"), "the effect happened once")
+			job, err := x.f.store.GetJob(ctx, x.id)
+			require.NoError(t, err)
+			open := 0
+			for _, p := range job.Proposals {
+				if p.State == registry.ProposalOpen {
+					open++
+				}
+			}
+			assert.Equal(t, 1, open, "the owner is asked")
+		})
+	}
 }

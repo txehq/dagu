@@ -447,15 +447,25 @@ An attempt settled on its probe is recorded as done, and its record says
 that a probe found it: the receipt is `probe:<action id>:<attempt>:<review
 run>`, naming the attempt and the review run that ran the probe, and the
 outcome carries `confirmed_by: probe`, that run, and a SHA-256 digest of
-the last line the probe printed, if any. Nothing the probe prints is
-stored: an outcome is kept with the action and shown to people, and is not
-masked the way step output is. The attempt is never given the receipt the
-action itself would have printed.
+what the probe wrote to its standard output (of the last 64 KiB of it, if
+it wrote more; absent if it wrote nothing). Nothing a probe prints leaves
+the review process: its output is only counted into that digest, and its
+error output is discarded and not written to the step's log as an
+action's is. A probe is given what the job's commands are given,
+credentials among it, and an outcome is kept with the action and shown to
+people without the masking step output gets. What a probe found is its
+exit code. The attempt is never given the receipt the action itself would
+have printed.
 
 A command that does not return before its timeout is stopped when the
 attempt's grant ends, and the attempt is then uncertain (failed, for a
 `read_only` action). The registry marks an attempt whose grant has ended
-the same way by itself, so the reviewer's record of that outcome can arrive
-second and be refused. The reviewer then reads the attempt back, and the
-review goes on only when the registry shows this same attempt in that
-outcome, or still executing past its grant; any difference fails the step.
+the same way by itself, before it looks at any write, so the reviewer's
+record of that outcome arrives second and is refused. The refusal carries
+the attempt as the registry held it. The review goes on only when that is
+this same attempt (action, grant, attempt number, job version, name,
+target, parameters) in the outcome being recorded, including the execution
+it was seen to admit; any difference fails the step. The same comparison
+is made against a read of the job's actions when the refusal carries no
+attempt, when the registry says the action is no longer in flight, and
+when the record got no answer at all and may have been written.

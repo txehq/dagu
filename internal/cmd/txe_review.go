@@ -107,7 +107,7 @@ func (t txeReviewTransport) Do(ctx context.Context, method, path string, in, out
 	}
 	err := t.client.Do(ctx, method, path, query, in, out)
 	if e, ok := errors.AsType[*txeclient.Error](err); ok {
-		return &review.TransportError{Status: e.Status, Code: e.Code, Message: e.Message}
+		return &review.TransportError{Status: e.Status, Code: e.Code, Message: e.Message, Current: e.Current}
 	}
 	return err
 }

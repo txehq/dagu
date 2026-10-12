@@ -771,7 +771,13 @@ func (s *State) finish(req review.FinishRequest, now time.Time) error {
 				return nil
 			}
 			if !allowed {
-				return fmt.Errorf("%w: action %s cannot go from %s to %s", review.ErrConflict, req.ActionID, actions[i].State, req.State)
+				// As the registry: refused against the action's state, with
+				// the action as it is held in this write.
+				held := actions[i]
+				return errors.Join(
+					fmt.Errorf("%w: action %s cannot go from %s to %s", review.ErrConflict, req.ActionID, held.State, req.State),
+					&review.TransportError{Status: 409, Code: "action_state", Message: fmt.Sprintf("cannot settle %s action as %s", held.State, req.State), CurrentAction: &held},
+				)
 			}
 			if actions[i].Name == review.RetryRunAction && known != "" {
 				// The recorded execution binds every later outcome.

@@ -39,6 +39,13 @@ type TransportError struct {
 	Status  int
 	Code    string
 	Message string
+	// Current is the record the registry sent with a refusal against its
+	// current state, as it sent it.
+	Current json.RawMessage
+	// CurrentAction is that record when the refusal is about an action's
+	// state: the action as the registry held it when it refused, which is
+	// the registry's own statement of the attempt's outcome.
+	CurrentAction *Action
 }
 
 func (e *TransportError) Error() string {
@@ -59,6 +66,7 @@ const (
 	codeActionExists     = "action_exists"
 	codeIntentUnresolved = "intent_unresolved"
 	codeNotReady         = "not_ready"
+	codeActionState      = "action_state"
 	codeReviewConflict   = "review_conflict"
 )
 
@@ -1459,7 +1467,18 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 		}
 		body.Outcome, _ = json.Marshal(outcome)
 	}
-	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
+	err := r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
+	// A refusal about the action's state comes with the action as the
+	// registry held it. It is read into the reviewer's terms here, where the
+	// registry's representation is known.
+	if te, ok := errors.AsType[*TransportError](err); ok && te.Code == codeActionState && len(te.Current) > 0 {
+		var current api.TxeAction
+		if json.Unmarshal(te.Current, &current) == nil && current.ActionId != "" {
+			action := r.actionOf(req.JobID, current)
+			te.CurrentAction = &action
+		}
+	}
+	return err
 }
 
 // CreateProposal implements Registry.
