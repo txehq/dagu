@@ -1764,7 +1764,8 @@ func TestRetryRunTheAdmittedExecutionIsTheReceipt(t *testing.T) {
 	assert.Equal(t, out.Action.Receipt, out.Action.AdmittedRef)
 }
 
-// A service that admits a retry without naming its execution leaves only
+// A service that admits a retry without naming its execution, and gives no
+// record of the request either, leaves only
 // the run to go by, and the run cannot say which execution is this retry's:
 // the one it shows may be another caller's retry of this retry's execution,
 // or of the retried execution itself after this retry's attempt was
@@ -1781,7 +1782,7 @@ func TestRetryRunWithoutANamedAdmissionNothingOnTheRunIsItsReceipt(t *testing.T)
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newRetryFixture(t)
-			f.runs.unnamed = true
+			f.runs.unnamed, f.runs.noRecords = true, true
 			f.runs.afterAdmission = func(runID string) { after(f, runID) }
 			out := f.execute("executor")
 			shown := f.runs.ref("run-1")
@@ -2286,4 +2287,117 @@ func TestRetryRunWaitsWhileAnotherExecutionIsOnlyBeingPrepared(t *testing.T) {
 	g.runs.state["run-1"] = review.RunState{AttemptID: "att-someone-elses", Status: "running", Active: true}
 	assert.NotEmpty(t, g.execute("executor").Skipped)
 	assert.Empty(t, g.runs.requested)
+}
+
+// A retry's answer can be lost after the service admitted it: the request
+// times out, the connection drops, or the service says itself that it does
+// not know. The request is still known, because it is made for one attempt
+// of one action, and the service records it on the execution it admits. That
+// record, for exactly this request, says what became of it. Nothing is sent
+// again in any of these cases.
+func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *testing.T) {
+	lost := errors.New("503 dispatch_uncertain: the retry may or may not have been dispatched")
+	nextReview := func(f *retryFixture) review.Action {
+		f.t.Helper()
+		f.clock.Advance(2 * time.Hour)
+		r := f.executor("reviewer-b")
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(f.t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(f.t, err)
+		return f.state().Actions[jobID][0]
+	}
+	asked := func(f *retryFixture) bool {
+		for _, p := range f.state().Proposals[jobID] {
+			if p.Kind == review.ProposalUncertain {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("admitted and running: recorded at once, with that execution", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer = lost
+		out := f.execute("executor")
+		assert.Equal(t, review.ActionSucceeded, out.Action.State)
+		assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+		assert.Equal(t, f.runs.ref("run-1"), out.Action.AdmittedRef)
+		assert.Contains(t, out.Action.Detail, "the service's record of the retry request")
+		assert.Len(t, f.runs.requested, 1)
+	})
+	t.Run("the record cannot be had now: uncertain, and recovered by the next review", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer, f.runs.noRecords = lost, true
+		out := f.execute("executor")
+		require.Equal(t, review.ActionUncertain, out.Action.State)
+		assert.Empty(t, out.Action.AdmittedRef, "nothing is taken from the run")
+
+		f.runs.noRecords = false
+		action := nextReview(f)
+		assert.Equal(t, review.ActionSucceeded, action.State)
+		assert.Equal(t, f.runs.ref("run-1"), action.Receipt)
+		assert.Equal(t, f.runs.ref("run-1"), action.AdmittedRef, "the recovered execution is written with the outcome")
+		assert.False(t, asked(f), "the owner is not asked what the service's record answers")
+		assert.Len(t, f.runs.requested, 1, "nothing is sent again")
+	})
+	t.Run("admitted and not started: a reservation, waited on like any other", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer = lost
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		out := f.execute("executor")
+		require.Equal(t, review.ActionUncertain, out.Action.State)
+		assert.Equal(t, review.ExecutionRef("att-reserved", ""), out.Action.AdmittedRef)
+
+		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+		action := nextReview(f)
+		assert.Equal(t, review.ActionSucceeded, action.State)
+		assert.Equal(t, review.ExecutionRef("att-reserved", ""), action.Receipt)
+	})
+	t.Run("admitted and abandoned before dispatch: not dispatched", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer, f.runs.noRecords = lost, true
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+
+		// The service abandoned the preparation and hid it again.
+		f.runs.fail("run-1", "att-1")
+		f.runs.abandonedRefs = map[string]bool{review.ExecutionRef("att-reserved", ""): true}
+		f.runs.noRecords = false
+		action := nextReview(f)
+		assert.Equal(t, review.ActionNotApplied, action.State)
+		assert.Contains(t, action.Detail, "not dispatched")
+		assert.Empty(t, action.Receipt)
+		assert.False(t, asked(f))
+	})
+	t.Run("the service has no record of the request: that proves nothing, the owner is asked", func(t *testing.T) {
+		f := newRetryFixture(t)
+		// The request never reached the service, and someone else retried
+		// the run meanwhile: an execution is there, and it is not ours.
+		f.runs.retry = func(string) error { return lost }
+		out := f.execute("executor")
+		require.Equal(t, review.ActionUncertain, out.Action.State)
+		f.runs.start("run-1")
+
+		action := nextReview(f)
+		assert.Equal(t, review.ActionEscalated, action.State)
+		assert.Empty(t, action.Receipt, "another caller's execution is never this retry's")
+		assert.Empty(t, action.AdmittedRef)
+		assert.True(t, asked(f))
+		assert.Len(t, f.runs.retried, 1, "nothing is sent again")
+		assert.Positive(t, f.runs.recovered, "the record was asked for")
+	})
+	t.Run("an answer that names no execution is completed from the record", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.unnamed = true
+		out := f.execute("executor")
+		assert.Equal(t, review.ActionSucceeded, out.Action.State)
+		assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
+	})
 }

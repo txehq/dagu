@@ -480,6 +480,13 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		// its only evidence, whatever version the job is at now.
 		ok = false
 		res = r.probeRetry(ctx, job, action)
+		if res.AdmittedRef != "" {
+			// What the probe established about the request's admission,
+			// from the stored outcome or from the service's record of the
+			// request, is what is written with any outcome below and named
+			// in anything the owner is told.
+			action.Admitted, action.AdmittedRef = true, res.AdmittedRef
+		}
 		if res.Status == EffectUnknown && res.Pending {
 			// The service admitted this retry and its execution has not
 			// been seen started yet: a worker may simply not have taken it.
@@ -1196,7 +1203,37 @@ type RunRetrier interface {
 	// the run named by ref was created and never dispatched. known is false
 	// when its records cannot answer that for this execution.
 	Abandoned(ctx context.Context, jobID, runID, ref string) (abandoned, known bool)
+	// Recover asks the service which execution it recorded the retry
+	// request on: the request made for the given action attempt to retry
+	// expected. It is for a request whose answer was not received. Only the
+	// service's own record of exactly this request is an answer; anything
+	// else, including that the service has no such record, is
+	// RecoveryUnknown.
+	Recover(ctx context.Context, jobID, runID string, expected Execution, request RetryRequest) RetryRecovery
 }
+
+// RetryRecovery is what the service's record of a retry request says.
+type RetryRecovery struct {
+	State RecoveryState
+	// Execution is the execution the request was admitted as, for
+	// RecoveryAdmitted and RecoveryAbandoned.
+	Execution Execution
+}
+
+// RecoveryState says what became of a retry request.
+type RecoveryState int
+
+const (
+	// RecoveryUnknown: the service gave no record of this request. That is
+	// not a record that the request was never admitted: it may still be on
+	// its way to being admitted, or the run's history may be gone.
+	RecoveryUnknown RecoveryState = iota
+	// RecoveryAdmitted: the service admitted the request as Execution.
+	RecoveryAdmitted
+	// RecoveryAbandoned: the service admitted the request as Execution and
+	// abandoned its preparation before dispatch. Nothing ran.
+	RecoveryAbandoned
+)
 
 const (
 	// retryObserveFor is how long a dispatched retry is watched for its new
@@ -1257,7 +1294,11 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		// that it admitted this request, a newer execution on the run may
 		// be another caller's retry, such as the one that made the service
 		// refuse this request in a way this client does not recognise.
-		// The outcome stays unknown and says what was seen.
+		// The service's record of this very request can: it is asked once.
+		// Otherwise the outcome stays unknown and says what was seen.
+		if res, found := r.recoverRetry(ctx, job.ID, runID, bound, request, "the retry of run "+runID+" got no answer ("+err.Error()+")"); found {
+			return res
+		}
 		return EffectResult{Status: EffectUnknown, Detail: "retry of run " + runID + ": " + err.Error() + ". " + r.seenOnRun(ctx, job.ID, runID, bound)}
 	}
 	watch := r.RetryObserve
@@ -1269,6 +1310,10 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		// admitted it as. Then no execution on the run can be recorded as
 		// this retry's: the one seen may be a later one, started by another
 		// caller after this retry's execution finished or was abandoned.
+		// The service's record of the request is asked for it.
+		if res, found := r.recoverRetry(ctx, job.ID, runID, bound, request, "the service accepted a retry of run "+runID+" without naming its execution"); found {
+			return res
+		}
 		return unnamedAdmission(runID, r.seenOnRun(ctx, job.ID, runID, bound))
 	}
 	return r.observeRetry(ctx, job.ID, runID, bound, admitted.Ref(), watch, "the service accepted a retry of run "+runID)
@@ -1424,13 +1469,54 @@ func (r *Reviewer) probeRetry(ctx context.Context, job Job, action Action) Effec
 	if r.Runs == nil || !complete {
 		return EffectResult{Status: EffectUnknown, Detail: "the retry of run " + runID + " cannot be checked against the run"}
 	}
-	if !action.Admitted {
+	if action.AdmittedRef == "" {
+		// The answer to the request was never received, or named no
+		// execution. The request itself is known: it is the one made for
+		// this attempt of this action. The service's record of it says
+		// which execution it was admitted as, if it was.
+		if action.Attempt > 0 && action.BindingDigest != "" {
+			request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest}
+			if res, found := r.recoverRetry(ctx, job.ID, runID, bound, request, ""); found {
+				return res
+			}
+		}
+		if action.Admitted {
+			return unnamedAdmission(runID, r.seenOnRun(ctx, job.ID, runID, bound))
+		}
 		return EffectResult{Status: EffectUnknown, Detail: "it is not known whether the service admitted the retry of run " + runID + ". " + r.seenOnRun(ctx, job.ID, runID, bound)}
 	}
-	if action.AdmittedRef == "" {
-		return unnamedAdmission(runID, r.seenOnRun(ctx, job.ID, runID, bound))
-	}
 	return r.observeRetry(ctx, job.ID, runID, bound, action.AdmittedRef, 0, "")
+}
+
+// recoverRetry settles, from the service's record of the retry request, a
+// retry whose answer was not received. found is false when the service has
+// no record of the request to give: that is not a record that nothing was
+// admitted, and the caller's outcome stays unknown.
+//
+// A record that the request was admitted names its execution, and from
+// there the retry is read like one whose answer arrived: dispatched,
+// reserved, or not this execution any more. A record that the service
+// abandoned that execution's preparation is, for this request, proof that
+// nothing ran.
+func (r *Reviewer) recoverRetry(ctx context.Context, jobID, runID string, bound Execution, request RetryRequest, cause string) (EffectResult, bool) {
+	switch rec := r.Runs.Recover(ctx, jobID, runID, bound, request); rec.State {
+	case RecoveryAdmitted:
+		found := fmt.Sprintf("the service's record of the retry request shows it admitted as execution %s", rec.Execution.Ref())
+		if cause != "" {
+			found = cause + "; " + found
+		}
+		res := r.observeRetry(ctx, jobID, runID, bound, rec.Execution.Ref(), 0, found)
+		if res.Status == EffectApplied {
+			// The record says how the execution is known to be this
+			// retry's: not from an answer, which was not received.
+			res.Detail += "; known to be this retry's from the service's record of the retry request"
+		}
+		return res, true
+	case RecoveryAbandoned:
+		return notDispatched(runID, rec.Execution.Ref()), true
+	case RecoveryUnknown:
+	}
+	return EffectResult{}, false
 }
 
 // leaseCovers reports whether the claim outlives one full attempt of the
