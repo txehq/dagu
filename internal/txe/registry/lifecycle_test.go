@@ -41,6 +41,18 @@ type fakeRuns struct {
 	onUnsuspend func(dag string)
 	// attempts are the latest attempts of runs, by run ID.
 	attempts map[string]RunAttempt
+	// retries are the executions retry requests admitted, by request ID.
+	retries map[string]RetryExecution
+}
+
+func (r *fakeRuns) RetryExecution(_ context.Context, _, _, requestID string) (RetryExecution, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.retries[requestID]
+	if !ok {
+		return RetryExecution{}, ErrRunNotFound
+	}
+	return e, nil
 }
 
 func (r *fakeRuns) LatestAttempt(_ context.Context, _, runID string) (RunAttempt, error) {

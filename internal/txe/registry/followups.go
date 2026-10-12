@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -292,12 +293,14 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 	return nil
 }
 
-// checkRetryReceipt allows a retry to succeed only with the new execution
-// Dagu dispatched: the run's latest execution, not the retried one, and not
-// one whose dispatch is not yet known (it may still be abandoned; once its
-// preparation is settled as dispatched, it runs or fails but is never
-// withdrawn). The receipt names that execution; an accepted request alone
-// is no receipt.
+// checkRetryReceipt allows a retry to succeed only with the execution this
+// action attempt's request admitted: Dagu's run history must hold execution
+// receipt recording the retry request derived from this action attempt, its
+// binding and the retried execution (ir.RetryRequest), so a later retry of
+// the run, by anyone, is never taken for this one. An abandoned preparation
+// is no receipt, and one whose dispatch is not yet known is refused for now
+// (once settled as dispatched it runs or fails, but is never withdrawn). An
+// accepted request alone is no receipt.
 func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	var rp RetryRunParams
 	if err := decodeParams(a.Spec.Params, &rp); err != nil {
@@ -306,16 +309,26 @@ func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	if tx.store.runs == nil {
 		return refuse(CodeNotReady, "run history is not available to check the retry of run %s", rp.RunID)
 	}
-	latest, err := tx.store.runs.LatestAttempt(tx.ctx, tx.Job.JobID, rp.RunID)
+	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(tx.Job.JobID, rp.RunID), rp.AttemptID, rp.QueuedAt,
+		a.ActionID, strconv.Itoa(a.Attempt), a.BindingDigest)
 	if err != nil {
+		return refuse(CodeInvalid, "action %s has no retry request: %v", a.ActionID, err)
+	}
+	execution, err := tx.store.runs.RetryExecution(tx.ctx, tx.Job.JobID, rp.RunID, request.ID)
+	switch {
+	case errors.Is(err, ErrRunNotFound):
+		return refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted; none of the run's executions records request %s", rp.RunID, request.ID)
+	case err != nil:
 		return err
-	}
-	if latest.Preparing && receipt == latest.Ref() {
-		return preparingRefusal(rp.RunID, latest, "settle the retry")
-	}
-	retried := ExecutionRef(rp.AttemptID, rp.QueuedAt)
-	if receipt == retried || receipt != latest.Ref() {
-		return refuse(CodeInvalid, "a retry of run %s succeeds only with the new execution observed on it (latest is %s, retried %s)", rp.RunID, latest.Ref(), retried)
+	case execution.Request != *request:
+		return refuse(CodeInvalid, "execution %s of run %s records another retry request", execution.Ref, rp.RunID)
+	case execution.Ref != receipt:
+		return refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted (%s), not %s", rp.RunID, execution.Ref, receipt)
+	case execution.Abandoned:
+		return refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, request.ID)
+	case execution.Preparing:
+		return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: rp.RunID, Execution: execution.Ref},
+			Message: fmt.Sprintf("execution %s of run %s is not yet known to be dispatched or abandoned; settle the retry once that is settled", execution.Ref, rp.RunID)}
 	}
 	return nil
 }

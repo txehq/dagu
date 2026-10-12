@@ -37,6 +37,9 @@ type Control struct {
 	// afterLatestRead, in tests, runs between LatestAttempt's first read of
 	// the latest execution and its journal read.
 	afterLatestRead func()
+	// afterRetryRead, in tests, runs between RetryExecution's first lookup
+	// and its journal read.
+	afterRetryRead func()
 }
 
 var _ registry.RunControl = (*Control)(nil)
@@ -214,4 +217,56 @@ func (c *Control) IsSuspended(ctx context.Context, dagName string) (bool, error)
 // SetSuspended sets Dagu's suspend flag for the DAG.
 func (c *Control) SetSuspended(ctx context.Context, dagName string, suspended bool) error {
 	return c.DAGs.SetSuspended(ctx, dagName, suspended)
+}
+
+// RetryExecution returns the root run's execution that recorded retry
+// request requestID, with whether it was abandoned or is still a
+// preparation not known to be settled. The preparation is read between two
+// lookups of the execution, and the answer is kept only if both agree: the
+// coordinator hides an abandoned preparation before it ends its journal
+// entry, so one abandoned meanwhile is never reported as dispatched.
+func (c *Control) RetryExecution(ctx context.Context, dagName, runID, requestID string) (registry.RetryExecution, error) {
+	run := ir.NewDAGRunRef(dagName, runID)
+	for range latestReads {
+		match, err := c.retryMatch(ctx, run, requestID)
+		if err != nil {
+			return registry.RetryExecution{}, err
+		}
+		out := registry.RetryExecution{
+			Ref:       ir.ExecutionRef(match.Execution.AttemptID, match.Execution.QueuedAt),
+			Request:   *match.Status.RetryRequest,
+			Abandoned: match.State == persis.RetryRequestAbandoned,
+		}
+		if out.Abandoned || match.Retained {
+			return out, nil
+		}
+		if c.afterRetryRead != nil {
+			c.afterRetryRead()
+		}
+		if out.Preparing, err = c.preparing(ctx, run, match.Execution.AttemptID); err != nil {
+			return registry.RetryExecution{}, err
+		}
+		again, err := c.retryMatch(ctx, run, requestID)
+		if err != nil {
+			return registry.RetryExecution{}, err
+		}
+		if again.State == match.State && again.Execution == match.Execution && again.Retained == match.Retained {
+			return out, nil
+		}
+	}
+	return registry.RetryExecution{}, fmt.Errorf("run %s kept changing while retry request %s was read", runID, requestID)
+}
+
+func (c *Control) retryMatch(ctx context.Context, run ir.DAGRunRef, requestID string) (*persis.RetryRequestMatch, error) {
+	match, err := c.Runs.FindRetryRequest(ctx, run, requestID)
+	if errors.Is(err, persis.ErrNotFound) {
+		return nil, registry.ErrRunNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if match.Status.RetryRequest == nil {
+		return nil, fmt.Errorf("run %s: the matched execution records no retry request", run.ID)
+	}
+	return match, nil
 }

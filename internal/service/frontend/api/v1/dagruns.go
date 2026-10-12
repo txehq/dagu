@@ -3004,6 +3004,9 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 		ref := ir.ExecutionRef(ad.AttemptID, ad.QueuedAt)
 		out.AttemptId, out.QueuedAt, out.ExecutionRef = &ad.AttemptID, &ad.QueuedAt, &ref
 	}
+	if expect != nil && expect.Request != nil {
+		out.RetryRequestId = &expect.Request.ID
+	}
 	return out, nil
 }
 
@@ -3096,6 +3099,17 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	}
 	// A conditional retry needs the expected execution to be the latest and
 	// finished; the admission below checks it again atomically.
+	if err := bindRetryRequest(expect, dag.Name, retryDagRunID); err != nil {
+		return retryDAGRunResult{}, err
+	}
+	// A run executed locally runs a queued retry under a new attempt, which
+	// is not the execution the request admitted; provenance needs a
+	// distributed run, where the admitted execution is the one that runs.
+	if expect != nil && expect.Request != nil && !dispatch.ShouldDispatchToCoordinator(dag, a.coordinatorCli != nil, a.defaultExecMode) {
+		return retryDAGRunResult{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: "a retry request is recorded only for a run executed by a worker; this run executes locally",
+			Details: map[string]any{"code": "conditional_retry_unsupported"}}
+	}
 	if expect != nil && (prevStatus.AttemptID != expect.AttemptID || prevStatus.QueuedAt != expect.QueuedAt ||
 		prevStatus.Status.IsActive() || prevStatus.Status == ir.NotStarted) {
 		return retryDAGRunResult{}, executionChangedError(expect, prevStatus)
@@ -3200,6 +3214,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		}
 		if expect != nil {
 			opts = append(opts, executor.WithRequireLatestIsPrevious(true))
+			if r := expect.Request; r != nil {
+				opts = append(opts, executor.WithRetryRequest(r.ActionID, r.ActionAttempt, r.BindingDigest))
+			}
 		}
 		task := executor.CreateTask(
 			dag.Name,
@@ -3287,6 +3304,9 @@ func retryPathRequestError(err error) error {
 func (a *API) enqueueRetry(ctx context.Context, status *ir.DAGRunStatus, dag *ir.DAG, expect, admitted *persis.ExpectedExecution) error {
 	eventCtx := a.withEventContext(ctx)
 	opts := queue.EnqueueRetryOptions{Processes: a.procRepository, Admitted: admitted}
+	if expect != nil {
+		opts.RetryRequest = expect.Request
+	}
 	if actor := triggerActorFromContext(ctx); actor != "" {
 		opts.TriggerActor = &actor
 	}
@@ -5308,13 +5328,41 @@ func (a *API) refreshBaseSMTP(ctx context.Context, dag *ir.DAG, status *ir.DAGRu
 // request: both fields or neither.
 func retryExpectation(body *api.RetryDAGRunJSONRequestBody) (*persis.ExpectedExecution, error) {
 	if body == nil || (body.ExpectedAttemptId == nil && body.ExpectedQueuedAt == nil) {
+		if body != nil && body.RetryRequest != nil {
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
+				Message: "retryRequest is accepted only on a conditional retry (expectedAttemptId and expectedQueuedAt)"}
+		}
 		return nil, nil
 	}
 	if body.ExpectedAttemptId == nil || body.ExpectedQueuedAt == nil || *body.ExpectedAttemptId == "" {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
 			Message: "expectedAttemptId and expectedQueuedAt are given together, with a non-empty expectedAttemptId"}
 	}
-	return &persis.ExpectedExecution{AttemptID: *body.ExpectedAttemptId, QueuedAt: *body.ExpectedQueuedAt}, nil
+	expect := &persis.ExpectedExecution{AttemptID: *body.ExpectedAttemptId, QueuedAt: *body.ExpectedQueuedAt}
+	if r := body.RetryRequest; r != nil {
+		if r.ActionId == "" || r.ActionAttempt == "" || r.BindingDigest == "" {
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: ir.ErrInvalidRetryRequest.Error()}
+		}
+		// The ID is derived once the run's DAG is known (bindRetryRequest).
+		expect.Request = &ir.RetryRequest{ActionID: r.ActionId, ActionAttempt: r.ActionAttempt, BindingDigest: r.BindingDigest}
+	}
+	return expect, nil
+}
+
+// bindRetryRequest derives a conditional retry's correlation from the action
+// attempt the request names, the run (its DAG's name and ID, as the
+// coordinator derives it from the task) and the expected execution.
+func bindRetryRequest(expect *persis.ExpectedExecution, dagName, dagRunID string) error {
+	if expect == nil || expect.Request == nil {
+		return nil
+	}
+	r := expect.Request
+	bound, err := ir.NewRetryRequest(ir.NewDAGRunRef(dagName, dagRunID), expect.AttemptID, expect.QueuedAt, r.ActionID, r.ActionAttempt, r.BindingDigest)
+	if err != nil {
+		return &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
+	}
+	expect.Request = bound
+	return nil
 }
 
 // executionChangedError refuses a conditional retry whose expected execution
@@ -5328,4 +5376,52 @@ func executionChangedError(expect *persis.ExpectedExecution, latest *ir.DAGRunSt
 	}
 	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 		Message: "the run's latest execution is not the expected one; nothing was retried", Details: details}
+}
+
+// GetDAGRunRetryRequest implements api.StrictServerInterface: the execution
+// of the run that recorded the retry request, wherever it now is.
+func (a *API) GetDAGRunRetryRequest(ctx context.Context, request api.GetDAGRunRetryRequestRequestObject) (api.GetDAGRunRetryRequestResponseObject, error) {
+	run := ir.NewDAGRunRef(request.Name, request.DagRunId)
+	notFound := &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+		Message: fmt.Sprintf("no execution of dag-run %s records retry request %s", request.DagRunId, request.RetryRequestId)}
+	if err := a.requireDAGRunVisible(ctx, run); err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	match, err := a.dagRunRepository.FindRetryRequest(ctx, run, request.RetryRequestId)
+	switch {
+	case errors.Is(err, persis.ErrNotFound):
+		return nil, notFound
+	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		return nil, &Error{HTTPStatus: http.StatusNotImplemented, Code: api.ErrorCodeInternalError,
+			Message: "this run store cannot look up retry requests"}
+	case err != nil:
+		logger.Warn(ctx, "Failed to look up a retry request", tag.RunID(request.DagRunId), tag.Error(err))
+		return nil, &Error{HTTPStatus: http.StatusInternalServerError, Code: api.ErrorCodeInternalError,
+			Message: "the run's executions could not be read to look up the retry request"}
+	}
+	// The execution's own saved workspace, as for retained executions.
+	if err := a.requireDAGRunStatusVisible(ctx, &match.Status); err != nil {
+		return nil, notFound
+	}
+	out := api.GetDAGRunRetryRequest200JSONResponse{
+		State:        api.RetryRequestLookupState(match.State),
+		AttemptId:    match.Execution.AttemptID,
+		QueuedAt:     match.Execution.QueuedAt,
+		ExecutionRef: ir.ExecutionRef(match.Execution.AttemptID, match.Execution.QueuedAt),
+		Retained:     match.Retained,
+		Status:       api.StatusLabel(match.Status.Status.String()),
+		RetryRequest: *toRetryRequest(match.Status.RetryRequest),
+	}
+	if ab := match.Abandonment; ab != nil {
+		out.Abandonment = &struct {
+			DecidedAt *string `json:"decidedAt,omitempty"`
+			Detail    *string `json:"detail,omitempty"`
+			Outcome   *string `json:"outcome,omitempty"`
+			Reason    *string `json:"reason,omitempty"`
+		}{DecidedAt: &ab.DecidedAt, Detail: &ab.Detail, Outcome: &ab.Outcome, Reason: &ab.Reason}
+	}
+	return out, nil
 }

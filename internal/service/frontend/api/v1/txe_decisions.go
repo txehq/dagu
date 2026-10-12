@@ -138,7 +138,18 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	// An identical replay returns the stored decision before the run's
 	// current state is checked: after the retry ran, the run is no longer
 	// retryable, but a client recovering a lost response must still get it.
-	if res, found, err := svc.ReplayRetry(ctx, req.JobId, retry, actor); found || err != nil {
+	// The lookup authorizes the caller's right to retry first. Then, on
+	// every path, the caller must be able to see the run by its own saved
+	// workspace before anything is answered: a job that moved workspace
+	// says nothing about an execution saved in its old one.
+	res, found, err := svc.ReplayRetry(ctx, req.JobId, retry, actor)
+	if err != nil && !found {
+		return nil, txeError(err)
+	}
+	if _, verr := a.authorizeHumanTaskMutation(ctx, req.JobId, req.RunId); verr != nil {
+		return nil, verr
+	}
+	if found {
 		if err != nil {
 			return nil, txeError(err)
 		}
@@ -166,7 +177,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
 	retry.RunSpecSHA256, retry.RunStartedAt = run.specSHA256, run.startedAt
-	res, err := svc.RequestRetry(ctx, req.JobId, retry, actor)
+	res, err = svc.RequestRetry(ctx, req.JobId, retry, actor)
 	if err != nil {
 		if errors.Is(err, decision.ErrInvalid) {
 			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}

@@ -54,6 +54,7 @@ func DispatchTaskToProto(task *dispatch.DispatchTask) (*coordinatorv1.Task, erro
 		IncludeDownstream:          task.IncludeDownstream,
 		BypassPreconditions:        task.BypassPreconditions,
 		RequireLatestIsPrevious:    task.RequireLatestIsPrevious,
+		RetryRequest:               retryRequestToProto(task.RetryRequest),
 		RetryPath:                  task.RetryPath,
 		WorkspaceBundleDigest:      task.WorkspaceBundleDigest,
 		WorkspaceBundleSize:        task.WorkspaceBundleSize,
@@ -116,6 +117,7 @@ func ProtoToDispatchTask(task *coordinatorv1.Task) (*dispatch.DispatchTask, erro
 		IncludeDownstream:          task.IncludeDownstream,
 		BypassPreconditions:        task.BypassPreconditions,
 		RequireLatestIsPrevious:    task.RequireLatestIsPrevious,
+		RetryRequest:               retryRequestFromProto(task.GetRetryRequest()),
 		RetryPath:                  task.RetryPath,
 		WorkspaceBundleDigest:      task.WorkspaceBundleDigest,
 		WorkspaceBundleSize:        task.WorkspaceBundleSize,
@@ -205,4 +207,18 @@ func ProtoToRunningTask(task *coordinatorv1.RunningTask) *dispatch.RunningTask {
 		AttemptKey:       task.AttemptKey,
 		ExecutionMarker:  task.ExecutionMarker,
 	}
+}
+
+func retryRequestToProto(r *dispatch.RetryRequestSpec) *coordinatorv1.RetryRequestProto {
+	if r == nil {
+		return nil
+	}
+	return &coordinatorv1.RetryRequestProto{ActionId: r.ActionID, ActionAttempt: r.ActionAttempt, BindingDigest: r.BindingDigest}
+}
+
+func retryRequestFromProto(r *coordinatorv1.RetryRequestProto) *dispatch.RetryRequestSpec {
+	if r == nil {
+		return nil
+	}
+	return &dispatch.RetryRequestSpec{ActionID: r.GetActionId(), ActionAttempt: r.GetActionAttempt(), BindingDigest: r.GetBindingDigest()}
 }

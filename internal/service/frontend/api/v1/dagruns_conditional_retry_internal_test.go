@@ -255,3 +255,89 @@ func TestConditionalRetryNamesTheAdmittedExecution(t *testing.T) {
 		assert.Nil(t, body.AttemptId)
 	})
 }
+
+// A conditional retry naming an action attempt returns the correlation's ID,
+// the queued execution records it (run details show it), and the lookup
+// finds it; a retry request without an expected execution is refused.
+func TestConditionalRetryRecordsItsRetryRequest(t *testing.T) {
+	ctx := context.Background()
+	t.Run("queued", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, true, false)
+		attemptID, queuedAt := f.attempt, "q1"
+		resp, err := f.api.RetryDAGRun(ctx, openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1", ExpectedAttemptId: &attemptID, ExpectedQueuedAt: &queuedAt,
+				RetryRequest: &openapiv1.RetryRequestSpec{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}}})
+		require.NoError(t, err)
+		want, err := ir.NewRetryRequest(ir.NewDAGRunRef(f.dag.Name, "run-1"), f.attempt, "q1", "act-1", "2", "sha256:d")
+		require.NoError(t, err)
+		admission := resp.(openapiv1.RetryDAGRun200JSONResponse)
+		require.NotNil(t, admission.RetryRequestId)
+		assert.Equal(t, want.ID, *admission.RetryRequestId)
+
+		a, err := f.runs.FindAttempt(ctx, ir.NewDAGRunRef(f.dag.Name, "run-1"))
+		require.NoError(t, err)
+		st, err := a.ReadStatus(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, want, st.RetryRequest)
+		details := ToDAGRunDetails(*st)
+		require.NotNil(t, details.RetryRequest)
+		assert.Equal(t, want.ID, details.RetryRequest.Id)
+		assert.Equal(t, want.RetryOf, details.RetryRequest.RetryOf)
+
+		found, err := f.api.GetDAGRunRetryRequest(ctx, openapiv1.GetDAGRunRetryRequestRequestObject{Name: f.dag.Name, DagRunId: "run-1", RetryRequestId: want.ID})
+		require.NoError(t, err)
+		lookup := found.(openapiv1.GetDAGRunRetryRequest200JSONResponse)
+		assert.Equal(t, openapiv1.RetryRequestLookupStateAdmitted, lookup.State)
+		assert.Equal(t, *admission.AttemptId, lookup.AttemptId)
+		assert.Equal(t, *admission.QueuedAt, lookup.QueuedAt)
+		assert.Equal(t, *admission.ExecutionRef, lookup.ExecutionRef)
+		assert.False(t, lookup.Retained)
+
+		_, err = f.api.GetDAGRunRetryRequest(ctx, openapiv1.GetDAGRunRetryRequestRequestObject{Name: f.dag.Name, DagRunId: "run-1", RetryRequestId: "unknown"})
+		var apiErr *Error
+		require.True(t, errors.As(err, &apiErr), "%v", err)
+		assert.Equal(t, http.StatusNotFound, apiErr.HTTPStatus)
+	})
+	t.Run("distributed", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, false, false)
+		attemptID, queuedAt := f.attempt, "q1"
+		_, err := f.api.RetryDAGRun(ctx, openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1", ExpectedAttemptId: &attemptID, ExpectedQueuedAt: &queuedAt,
+				RetryRequest: &openapiv1.RetryRequestSpec{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}}})
+		require.NoError(t, err)
+		require.Len(t, f.recorder.dispatched, 1)
+		assert.Equal(t, &dispatch.RetryRequestSpec{ActionID: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}, f.recorder.dispatched[0].RetryRequest)
+	})
+	t.Run("not for a run executed locally", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, true, false)
+		// A run of a DAG with no worker selector, which executes locally.
+		local := &ir.DAG{Name: "job", YamlData: []byte("name: job\nsteps:\n  - name: main\n    run: echo hi\n")}
+		attempt, err := f.runs.CreateAttempt(ctx, local, time.Now(), "run-2", persis.DAGRunCreateAttemptOptions{})
+		require.NoError(t, err)
+		status := ir.InitialStatus(local)
+		status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-2", attempt.ID(), ir.Failed, "q1"
+		require.NoError(t, attempt.Open(ctx))
+		require.NoError(t, attempt.Write(ctx, status))
+		require.NoError(t, attempt.Close(ctx))
+		attemptID, queuedAt := attempt.ID(), "q1"
+		_, err = f.api.RetryDAGRun(ctx, openapiv1.RetryDAGRunRequestObject{Name: local.Name, DagRunId: "run-2",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-2", ExpectedAttemptId: &attemptID, ExpectedQueuedAt: &queuedAt,
+				RetryRequest: &openapiv1.RetryRequestSpec{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}}})
+		requireConflictCode(t, err, "conditional_retry_unsupported")
+		items, err := f.queue.List(ctx, local.Name)
+		require.NoError(t, err)
+		assert.Empty(t, items, "nothing was queued")
+	})
+	t.Run("only on a conditional retry", func(t *testing.T) {
+		f := newConditionalRetryFixture(t, true, false)
+		_, err := f.api.RetryDAGRun(ctx, openapiv1.RetryDAGRunRequestObject{Name: f.dag.Name, DagRunId: "run-1",
+			Body: &openapiv1.RetryDAGRunJSONRequestBody{DagRunId: "run-1",
+				RetryRequest: &openapiv1.RetryRequestSpec{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}}})
+		var apiErr *Error
+		require.True(t, errors.As(err, &apiErr), "%v", err)
+		assert.Equal(t, http.StatusBadRequest, apiErr.HTTPStatus)
+		items, err := f.queue.List(ctx, f.dag.Name)
+		require.NoError(t, err)
+		assert.Empty(t, items, "nothing was queued")
+	})
+}

@@ -237,3 +237,134 @@ func TestDispatchReceiptMatchesTheSavedExecution(t *testing.T) {
 		})
 	}
 }
+
+// A conditional retry's coordinator records on the admitted execution's
+// initial status the correlation it derives from the task's action attempt,
+// the run and the previous execution; the caller's own ID is never used.
+func TestDispatchRecordsTheDerivedRetryRequest(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "test-dag"}
+	first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-123", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	s := ir.InitialStatus(dag)
+	s.DAGRunID, s.AttemptID, s.Status, s.QueuedAt = "run-123", first.ID(), ir.Failed, "2026-10-09T12:00:00Z"
+	s.RetryRequest = &ir.RetryRequest{ID: "earlier", ActionID: "act-0", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, s))
+	require.NoError(t, first.Close(ctx))
+	previous, err := convert.DAGRunStatusToProto(&s)
+	require.NoError(t, err)
+
+	dispatchStore := newTestDispatchTaskStore(filepath.Join(dir, "distributed"))
+	heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
+	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
+	h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+	t.Cleanup(func() { h.Close(context.Background()) })
+	task := &coordinatorv1.Task{
+		Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
+		Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
+		PreviousStatus: previous, RequireLatestIsPrevious: true,
+		RetryRequest: &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"},
+	}
+	_, err = h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: task})
+	require.NoError(t, err)
+
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef("test-dag", "run-123"), first.ID(), s.QueuedAt, "act-1", "2", "sha256:d")
+	require.NoError(t, err)
+	latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-123"))
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID(), latest.ID())
+	saved, err := latest.ReadStatus(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, want, saved.RetryRequest, "the initial status records the derived request, not the retried one's")
+
+	// A retry that is not conditional cannot name an action attempt.
+	_, err = admittedRetryRequest(&coordinatorv1.Task{Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
+		RetryRequest: &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "2", BindingDigest: "sha256:d"}})
+	assert.ErrorIs(t, err, ir.ErrInvalidRetryRequest)
+}
+
+// A reported status keeps the stored execution's retry request only when it
+// reports that execution; a report never sets or changes it.
+func TestKeptRetryRequest(t *testing.T) {
+	request := &ir.RetryRequest{ID: "r1", ActionID: "act-1", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
+	stored := &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1", RetryRequest: request}
+	assert.Equal(t, request, keptRetryRequest(stored, &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1"}), "an empty report keeps it")
+	assert.Equal(t, request, keptRetryRequest(stored, &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1",
+		RetryRequest: &ir.RetryRequest{ID: "forged"}}), "a report cannot change it")
+	assert.Nil(t, keptRetryRequest(stored, &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q2"}), "another execution of the attempt")
+	assert.Nil(t, keptRetryRequest(stored, &ir.DAGRunStatus{AttemptID: "a2", QueuedAt: "q1"}), "another attempt")
+	assert.Nil(t, keptRetryRequest(&ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1"}, &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1",
+		RetryRequest: request}), "a report cannot set one")
+}
+
+// A task that names a retry request but is no conditional retry is refused
+// before any attempt is created; the request is never silently dropped.
+func TestDispatchRefusesAStrayRetryRequest(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "test-dag"}
+	first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-123", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	s := ir.InitialStatus(dag)
+	s.DAGRunID, s.AttemptID, s.Status = "run-123", first.ID(), ir.Failed
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, s))
+	require.NoError(t, first.Close(ctx))
+	previous, err := convert.DAGRunStatusToProto(&s)
+	require.NoError(t, err)
+	dispatchStore := newTestDispatchTaskStore(filepath.Join(dir, "distributed"))
+	heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
+	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
+	h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+	t.Cleanup(func() { h.Close(context.Background()) })
+
+	_, err = h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
+		Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
+		PreviousStatus: previous,
+		RetryRequest:   &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "1", BindingDigest: "d"},
+	}})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-123"))
+	require.NoError(t, err)
+	assert.Equal(t, first.ID(), latest.ID(), "no attempt was created")
+}
+
+// Without run storage, Dispatch still refuses a malformed retry request at
+// entry: one on a conditional start, or on a retry with no expected attempt.
+func TestDispatchRefusesAMalformedRetryRequestWithoutStorage(t *testing.T) {
+	ctx := context.Background()
+	failed := ir.DAGRunStatus{Name: "test-dag", DAGRunID: "run-123", AttemptID: "a1", Status: ir.Failed}
+	previous, err := convert.DAGRunStatusToProto(&failed)
+	require.NoError(t, err)
+	noAttempt := failed
+	noAttempt.AttemptID = ""
+	previousNoAttempt, err := convert.DAGRunStatusToProto(&noAttempt)
+	require.NoError(t, err)
+	spec := &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "1", BindingDigest: "d"}
+	for name, task := range map[string]*coordinatorv1.Task{
+		"conditional start":   {Operation: coordinatorv1.Operation_OPERATION_START, PreviousStatus: previous},
+		"no expected attempt": {Operation: coordinatorv1.Operation_OPERATION_RETRY, PreviousStatus: previousNoAttempt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := NewHandler(HandlerConfig{})
+			t.Cleanup(func() { h.Close(context.Background()) })
+			task.DagRunId, task.Target, task.QueueName = "run-123", "test-dag", "test-queue"
+			task.Definition = "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello"
+			task.RequireLatestIsPrevious, task.RetryRequest = true, spec
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: task})
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, status.Convert(err).Message(), ir.ErrInvalidRetryRequest.Error())
+		})
+	}
+}

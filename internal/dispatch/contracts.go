@@ -82,6 +82,9 @@ type DispatchTask struct {
 	// creates its attempt only if the run's latest execution is
 	// PreviousStatus's (AttemptID, QueuedAt) and has finished.
 	RequireLatestIsPrevious bool
+	// RetryRequest, on a conditional retry, names the action attempt it was
+	// made for; the coordinator derives the recorded correlation from it.
+	RetryRequest *RetryRequestSpec
 
 	WorkspaceBundleDigest      string
 	WorkspaceBundleSize        int64
@@ -134,4 +137,11 @@ func (e *DefinitionError) Error() string {
 
 func (e *DefinitionError) Unwrap() error {
 	return e.Err
+}
+
+// RetryRequestSpec names the action attempt a conditional retry was made for.
+type RetryRequestSpec struct {
+	ActionID      string
+	ActionAttempt string
+	BindingDigest string
 }
