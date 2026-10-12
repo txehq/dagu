@@ -154,6 +154,21 @@ func (l *ConfigLoader) resolvePath(fieldName, pathValue string) (string, error) 
 	return resolved, nil
 }
 
+// parseOIDCSessionDuration parses one of the OIDC session durations. A value
+// that is not a duration becomes a negative one, which validation refuses: a
+// bound on how long a user stays in must not be dropped with a warning.
+func parseOIDCSessionDuration(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return -1
+	}
+	return duration
+}
+
 // parseDuration parses a duration string, returning zero and adding a warning if invalid.
 func (l *ConfigLoader) parseDuration(fieldName, value string) time.Duration {
 	if value == "" {
@@ -712,6 +727,12 @@ func (l *ConfigLoader) loadOIDCAuth(cfg *Config, auth *AuthDef) {
 	cfg.Server.Auth.OIDC.AllowedDomains = parseStringList(l.v.Get("auth.oidc.allowed_domains"))
 	cfg.Server.Auth.OIDC.ButtonLabel = oidc.ButtonLabel
 	cfg.Server.Auth.OIDC.PKCE = oidc.PKCE
+	if oidc.Session != nil {
+		cfg.Server.Auth.OIDC.Session = AuthOIDCSession{
+			RevalidateAfter: parseOIDCSessionDuration(oidc.Session.RevalidateAfter),
+			RevalidateLimit: parseOIDCSessionDuration(oidc.Session.RevalidateLimit),
+		}
+	}
 
 	if oidc.AutoSignup != nil {
 		cfg.Server.Auth.OIDC.AutoSignup = *oidc.AutoSignup
@@ -2336,6 +2357,8 @@ var envBindings = []envBinding{
 	{key: "auth.oidc.allowed_domains", env: "AUTH_OIDC_ALLOWED_DOMAINS"},
 	{key: "auth.oidc.button_label", env: "AUTH_OIDC_BUTTON_LABEL"},
 	{key: "auth.oidc.pkce", env: "AUTH_OIDC_PKCE"},
+	{key: "auth.oidc.session.revalidate_after", env: "AUTH_OIDC_SESSION_REVALIDATE_AFTER"},
+	{key: "auth.oidc.session.revalidate_limit", env: "AUTH_OIDC_SESSION_REVALIDATE_LIMIT"},
 	// Auth OIDC Role Mapping
 	{key: "auth.oidc.role_mapping.default_role", env: "AUTH_OIDC_DEFAULT_ROLE"},
 	{key: "auth.oidc.role_mapping.groups_claim", env: "AUTH_OIDC_GROUPS_CLAIM"},

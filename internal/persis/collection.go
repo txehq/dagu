@@ -27,6 +27,7 @@ const (
 	CollectionIncidents             = "incidents"
 	CollectionLicense               = "license"
 	CollectionNotifications         = "notifications"
+	CollectionOIDCSessions          = "oidc_sessions"
 	CollectionProfiles              = "profiles"
 	CollectionQueue                 = "queue"
 	CollectionRemoteNodes           = "remote_nodes"

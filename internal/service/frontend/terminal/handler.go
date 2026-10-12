@@ -5,6 +5,7 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 
@@ -48,6 +49,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Validate token and get user
 	user, err := h.authService.GetUserFromToken(ctx, token)
+	if errors.Is(err, authservice.ErrSessionCheckUnavailable) {
+		frontendauth.WriteSessionCheckUnavailable(w)
+		return
+	}
 	if err != nil {
 		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 		return

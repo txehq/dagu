@@ -51,6 +51,13 @@ var (
 	ErrUserDisabled                      = auth.ErrUserDisabled
 )
 
+// ErrSessionCheckUnavailable means a token's OIDC session could not be
+// confirmed now: it is past the time it may go unconfirmed and the identity
+// provider could not be asked, or the session could not be read. The token is
+// not known to be bad: the request is to be retried, and must not be answered
+// as if the user were signed out.
+var ErrSessionCheckUnavailable = errors.New("the session could not be confirmed now")
+
 const (
 	// defaultBcryptCost is the default cost for bcrypt hashing.
 	defaultBcryptCost = 12
@@ -103,6 +110,18 @@ type Claims struct {
 	// change at token issuance. Zero means the user had never changed their password.
 	// Tokens issued before a subsequent password change are rejected.
 	PasswordChangedAt int64 `json:"pwd_changed_at_ns,omitempty"`
+	// SessionID names the OIDC session the token was issued with, when OIDC
+	// sessions are enabled. A token that carries one is good only while that
+	// session is.
+	SessionID string `json:"sid,omitempty"`
+}
+
+// SessionChecker decides whether a token's OIDC session still lets its user
+// in. It returns nil, ErrInvalidToken when the session has ended, or another
+// error when it could not decide, which is reported to the caller as
+// ErrSessionCheckUnavailable.
+type SessionChecker interface {
+	CheckSession(ctx context.Context, sessionID string, user *auth.User) error
 }
 
 // Service provides authentication and user management functionality.
@@ -112,6 +131,9 @@ type Service struct {
 	webhookStore      auth.WebhookStore
 	config            Config
 	apiKeyMigrationMu sync.Mutex
+
+	// sessions is nil unless OIDC sessions are enabled.
+	sessions SessionChecker
 }
 
 // Option is a functional option for configuring the Service.
@@ -196,15 +218,44 @@ type TokenResult struct {
 	ExpiresAt time.Time
 }
 
+// SetSessionChecker turns on OIDC sessions: from then on a token that carries
+// a session is checked against it, and an OIDC user's token that carries none
+// is refused. It is called once, before the service takes requests. Without
+// it tokens are validated exactly as before.
+func (s *Service) SetSessionChecker(checker SessionChecker) {
+	s.sessions = checker
+}
+
+// TokenTTL returns how long a token issued now lives.
+func (s *Service) TokenTTL() time.Duration {
+	return s.config.TokenTTL
+}
+
+// GenerateSessionToken creates a JWT token that is good only while the named
+// OIDC session is, and that expires at expiresAt.
+func (s *Service) GenerateSessionToken(user *auth.User, sessionID string, expiresAt time.Time) (*TokenResult, error) {
+	if sessionID == "" || expiresAt.IsZero() {
+		return nil, errors.New("a session id and an expiry are required")
+	}
+	return s.generateToken(user, sessionID, expiresAt)
+}
+
 // GenerateToken creates a JWT token for the given user.
 // Returns the token string and its expiry time.
 func (s *Service) GenerateToken(user *auth.User) (*TokenResult, error) {
+	return s.generateToken(user, "", time.Time{})
+}
+
+func (s *Service) generateToken(user *auth.User, sessionID string, sessionExpiry time.Time) (*TokenResult, error) {
 	if !s.config.TokenSecret.IsValid() {
 		return nil, ErrMissingSecret
 	}
 
 	now := time.Now()
 	expiresAt := now.Add(s.config.TokenTTL)
+	if !sessionExpiry.IsZero() {
+		expiresAt = sessionExpiry
+	}
 	var pwdChangedAt int64
 	if user.PasswordChangedAt != nil {
 		pwdChangedAt = user.PasswordChangedAt.UnixNano()
@@ -219,6 +270,7 @@ func (s *Service) GenerateToken(user *auth.User) (*TokenResult, error) {
 		Username:          user.Username,
 		Role:              user.Role,
 		PasswordChangedAt: pwdChangedAt,
+		SessionID:         sessionID,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -287,6 +339,26 @@ func (s *Service) GetUserFromToken(ctx context.Context, tokenString string) (*au
 	// as "before any real password change", so changing password invalidates them.
 	if user.PasswordChangedAt != nil {
 		if claims.PasswordChangedAt < user.PasswordChangedAt.UnixNano() {
+			return nil, ErrInvalidToken
+		}
+	}
+
+	// With OIDC sessions on, an OIDC user is let in only while their session
+	// is. A token of theirs with no session was issued before sessions were
+	// turned on; it would never be revalidated, so it is refused. Every other
+	// kind of user, the builtin administrator included, is untouched.
+	if s.sessions != nil {
+		switch {
+		case claims.SessionID != "":
+			if err := s.sessions.CheckSession(ctx, claims.SessionID, user); err != nil {
+				if errors.Is(err, ErrInvalidToken) {
+					return nil, ErrInvalidToken
+				}
+				// Not an answer about the user: they are not let in, and
+				// they are not told they are signed out.
+				return nil, ErrSessionCheckUnavailable
+			}
+		case user.AuthProvider == auth.AuthProviderOIDC:
 			return nil, ErrInvalidToken
 		}
 	}

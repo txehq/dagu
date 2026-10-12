@@ -32,6 +32,7 @@ import (
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/crypto"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
@@ -63,6 +64,7 @@ import (
 	dagumcp "github.com/dagucloud/dagu/v2/internal/service/mcp"
 	notificationservice "github.com/dagucloud/dagu/v2/internal/service/notification"
 	"github.com/dagucloud/dagu/v2/internal/service/oidcprovision"
+	"github.com/dagucloud/dagu/v2/internal/service/oidcsession"
 	"github.com/dagucloud/dagu/v2/internal/service/resource"
 	"github.com/dagucloud/dagu/v2/internal/service/trustedproxyprovision"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
@@ -489,6 +491,17 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize builtin OIDC: %w", err)
+			}
+			if oidcCfg.Session.Enabled() {
+				sessions, err := newOIDCSessions(cfg, oidcCfg.Session, builtinOIDCCfg, stores.OIDCSessions)
+				if err != nil {
+					return nil, fmt.Errorf("failed to initialize OIDC sessions: %w", err)
+				}
+				builtinOIDCCfg.Sessions = sessions
+				stores.AuthService.SetSessionChecker(auth.OIDCSessionChecker{Manager: sessions})
+				logger.Info(ctx, "OIDC sessions enabled: OIDC users are revalidated at the identity provider",
+					slog.Duration("revalidateAfter", oidcCfg.Session.RevalidateAfter),
+					slog.Duration("revalidateLimit", oidcCfg.Session.RevalidateLimit))
 			}
 
 			logger.Info(ctx, "OIDC enabled for builtin auth mode",
@@ -1210,6 +1223,28 @@ func (srv *Server) setupOIDCRoutes(r *chi.Mux, basePath string) {
 	}
 	r.Get(pathutil.BuildPublicEndpointPath(basePath, "oidc-login"), auth.BuiltinOIDCLoginHandler(srv.builtinOIDCCfg))
 	r.Get(pathutil.BuildPublicEndpointPath(basePath, "oidc-callback"), auth.BuiltinOIDCCallbackHandler(srv.builtinOIDCCfg))
+	// The sign-out route exists only with OIDC sessions on. Without them
+	// there is no session to end and the routes are as they were.
+	if srv.builtinOIDCCfg.Sessions != nil {
+		r.Post(pathutil.BuildPublicEndpointPath(basePath, "oidc-logout"), auth.BuiltinOIDCLogoutHandler(srv.builtinOIDCCfg))
+	}
+}
+
+// newOIDCSessions builds the OIDC session manager, with the refresh tokens it
+// keeps encrypted under the hub's own key.
+func newOIDCSessions(cfg *config.Config, session config.AuthOIDCSession, oidcCfg *auth.BuiltinOIDCConfig, col persis.Collection) (*oidcsession.Manager, error) {
+	if col == nil {
+		return nil, errors.New("the OIDC session store is not available")
+	}
+	key, err := crypto.ResolveKey(cfg.Paths.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the encryption key: %w", err)
+	}
+	encryptor, err := crypto.NewEncryptor(key)
+	if err != nil {
+		return nil, fmt.Errorf("create the encryptor: %w", err)
+	}
+	return auth.NewOIDCSessionManager(session, oidcCfg, col, encryptor)
 }
 
 func (srv *Server) setupAPIRoutes(ctx context.Context, r *chi.Mux, apiV1BasePath string) error {

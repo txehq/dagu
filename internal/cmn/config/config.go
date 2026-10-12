@@ -347,6 +347,44 @@ type AuthOIDC struct {
 	RoleMapping    OIDCRoleMapping
 	// PKCE makes the browser sign-in use PKCE with S256. Default: false.
 	PKCE bool
+	// Session keeps a hub session for each OIDC user and revalidates it at
+	// the provider. Off unless both of its durations are set.
+	Session AuthOIDCSession
+}
+
+// MaxOIDCSessionRevalidateLimit is the longest auth.oidc.session.revalidate_limit
+// accepted: the longest an OIDC user the provider has stopped confirming can
+// still be served.
+const MaxOIDCSessionRevalidateLimit = 5 * time.Minute
+
+// AuthOIDCSession configures OIDC session revalidation.
+type AuthOIDCSession struct {
+	// RevalidateAfter is how long after the provider's last confirmation a
+	// request is served without asking the provider again.
+	RevalidateAfter time.Duration
+	// RevalidateLimit is how long after the provider's last confirmation a
+	// request can be served at all.
+	RevalidateLimit time.Duration
+}
+
+// Enabled reports whether OIDC sessions are configured.
+func (s AuthOIDCSession) Enabled() bool {
+	return s.RevalidateAfter != 0 || s.RevalidateLimit != 0
+}
+
+func (s AuthOIDCSession) validate() error {
+	if !s.Enabled() {
+		return nil
+	}
+	switch {
+	case s.RevalidateAfter <= 0 || s.RevalidateLimit <= 0:
+		return fmt.Errorf("auth.oidc.session.revalidate_after and auth.oidc.session.revalidate_limit must both be set, as positive durations such as 4m and 5m")
+	case s.RevalidateAfter >= s.RevalidateLimit:
+		return fmt.Errorf("auth.oidc.session.revalidate_after must be less than auth.oidc.session.revalidate_limit")
+	case s.RevalidateLimit > MaxOIDCSessionRevalidateLimit:
+		return fmt.Errorf("auth.oidc.session.revalidate_limit must be at most %s", MaxOIDCSessionRevalidateLimit)
+	}
+	return nil
 }
 
 // OIDCPolicy contains the OIDC settings evaluated for each login.
@@ -677,6 +715,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateBuiltinAuth(); err != nil {
+		return err
+	}
+	if err := c.Server.Auth.OIDC.Session.validate(); err != nil {
 		return err
 	}
 	if err := c.validateExecutionMode(); err != nil {
