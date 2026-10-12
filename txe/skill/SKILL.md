@@ -113,7 +113,7 @@ A check that cannot see the target (expired login, unreachable cluster, timeout)
 
 ### Linear: the target check and your script are two things
 
-- **The check of a Linear target** (`existence_check: pre_run` or `reconcile` on a `linear.issue`) is made by the probe, and the probe reads only the credential reference named `LINEAR_API_KEY`. If this machine has no Linear API key to refer to, declare the target `event_only`; registration refuses the other two without the reference. Do not create a key or copy one from elsewhere to get past this: say that the target is not checked, and why.
+- **The check of a Linear target** (`existence_check: pre_run` or `reconcile` on a `linear.issue`) is made by the probe, and the probe reads only the credential reference named `LINEAR_API_KEY`. Make it a `file` reference: the periodic check does not receive one of kind `env`. If this machine has no Linear API key to refer to, declare the target `event_only`; registration refuses the other two without the reference. Do not create a key or copy one from elsewhere to get past this: say that the target is not checked, and why.
 - **Your script reading Linear** does not need that key on a machine where the Orca app runs. The Orca CLI reads Linear through the app's own connection:
 
   ```sh
@@ -122,7 +122,11 @@ A check that cannot see the target (expired login, unreachable cluster, timeout)
 
   The job declares no credential for this. Call the CLI by its full path, and print only the fields you need.
 
-That route is not a credential the worker holds. It works while the Orca app is running and connected to Linear under this machine's login, and not otherwise. When the call fails, have the script say so as a login to repair on this machine and exit non-zero; it is not a deletion and not a reason to retire the job. A job that must keep reading Linear when nobody is logged in needs the API key reference instead.
+That route is not a credential the worker holds, and what is known about it is one observation: on a Mac, a job started by the worker read an issue this way while the Orca app was open and connected to Linear. What happens when the app is closed, or when nobody is logged in to the machine, has not been tested. Do not tell the user the job keeps reading Linear under those conditions; if it matters, check a scheduled run under the conditions the job will really run in.
+
+When the call fails, have the script print a short reason, exit non-zero, and leave it at that: a failed read says nothing about whether the issue still exists, so it is not a deletion and not a reason to retire the job. Call it a login problem only when the failure says so; a missing CLI, a network fault or a wrong issue id fail the same call.
+
+A job that must not depend on the Orca app has to read Linear itself, with the API key from a `LINEAR_API_KEY` reference. Adding the reference to a script that still calls Orca changes nothing.
 
 ## Write the script for an unattended worker
 
