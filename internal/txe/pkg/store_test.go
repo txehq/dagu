@@ -6,11 +6,16 @@ package txepkg
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -518,6 +523,323 @@ func TestResume(t *testing.T) {
 	second, err := store.Commit(loaded, testJob)
 	require.NoError(t, err)
 	assert.Equal(t, first.Dir, second.Dir)
+}
+
+// staged lists what is left in the staging area.
+func stagedNames(t *testing.T, store *Store) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(store.Root, stagingDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// A later request for the same job often builds the package that is already
+// in place: an update that changes only the schedule or an environment value.
+// Its staged copy is not needed and is not left behind.
+func TestCommitOfAPackageAlreadyInPlaceLeavesNoStagedCopy(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	placed, err := store.Commit(first, testJob)
+	require.NoError(t, err)
+	require.Empty(t, stagedNames(t, store))
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	require.Equal(t, first.Digest, second.Digest)
+	again, err := store.Commit(second, testJob)
+	require.NoError(t, err)
+
+	assert.Equal(t, placed.Dir, again.Dir)
+	assert.Empty(t, stagedNames(t, store), "the staged copy of a package already in place is removed")
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err, "the package in place is untouched")
+
+	// A resumed request repeats the call after its staged copy is gone.
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+}
+
+// Only a staged copy that still holds the package in place is removed. One
+// that changed after it was built is kept where it is and reported, and the
+// package in place stays as it was.
+func TestCommitKeepsAStagedCopyThatChanged(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	changed := filepath.Join(second.Dir, FilesDir, "collect.py")
+	require.NoError(t, os.WriteFile(changed, []byte("#!/bin/sh\n"), 0o700))
+
+	_, err = store.Commit(second, testJob)
+	require.ErrorIs(t, err, ErrPackageCorrupt)
+	require.ErrorContains(t, err, "req-2")
+	assert.Equal(t, []string{"req-2"}, stagedNames(t, store))
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err)
+}
+
+// A staged package that is not a directory of this store's staging area is
+// never removed, whatever it holds.
+func TestCommitRemovesNothingOutsideTheStagingArea(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	elsewhere := filepath.Join(t.TempDir(), "copy")
+	require.NoError(t, os.Rename(second.Dir, elsewhere))
+
+	t.Run("a directory elsewhere", func(t *testing.T) {
+		_, err := store.Commit(&Staged{Dir: elsewhere, Digest: second.Digest, Manifest: second.Manifest}, testJob)
+		require.ErrorContains(t, err, "staging area")
+		assert.DirExists(t, elsewhere)
+	})
+	t.Run("a link in the staging area", func(t *testing.T) {
+		require.NoError(t, os.Symlink(elsewhere, second.Dir))
+		_, err := store.Commit(second, testJob)
+		require.ErrorContains(t, err, "not a directory")
+		assert.DirExists(t, elsewhere)
+		assert.Equal(t, []string{"req-2"}, stagedNames(t, store))
+	})
+}
+
+// A removal that stopped part-way leaves its copy under a name no request has.
+// The repeated call removes what is left without needing it to be a package
+// any more, and touches nothing that was not marked.
+func TestCommitFinishesAnInterruptedRemoval(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	// As a stopped removal leaves it: marked, the manifest already gone.
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+	require.NoError(t, os.Rename(second.Dir, marked))
+	require.NoError(t, os.Remove(filepath.Join(marked, ManifestName)))
+	_, err = store.LoadStaged("req-2")
+	require.Error(t, err, "a marked copy is not a staged package")
+
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+	assert.Empty(t, stagedNames(t, store))
+
+	// The same request staged again, with an older marked copy beside it.
+	third, err := store.Stage("req-3", opts)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(third.Dir+RemovingSuffix, FilesDir), 0o700))
+	_, err = store.Commit(third, testJob)
+	require.NoError(t, err)
+	assert.Empty(t, stagedNames(t, store))
+
+	// Finishing a removal never removes a staged package that was not marked.
+	waiting, err := store.Stage("req-4", opts)
+	require.NoError(t, err)
+	require.NoError(t, store.FinishRemoval("req-4"))
+	require.NoError(t, store.FinishRemoval("req-never-staged"))
+	assert.Equal(t, []string{"req-4"}, stagedNames(t, store))
+	_, err = store.LoadStaged("req-4")
+	require.NoError(t, err)
+	assert.DirExists(t, waiting.Dir)
+	require.Error(t, store.FinishRemoval("../req-4"))
+}
+
+// The mark has to be durable before anything under it is removed, and the
+// removal durable before it is reported: a failed sync at either point stops
+// the call, leaves a state the next call finishes, and is tried again then.
+func TestCommitSyncsTheMarkBeforeRemoving(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	// failAt makes the nth sync of the staging area fail, counting from one.
+	var calls, failAt int
+	real := syncStagingArea
+	syncStagingArea = func(dir string) error {
+		calls++
+		if calls == failAt {
+			return errors.New("injected sync failure")
+		}
+		return real(dir)
+	}
+	t.Cleanup(func() { syncStagingArea = real })
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+
+	// The sync that makes the mark durable fails: nothing under it is removed.
+	// It is the third sync of the call; the first two surround the removal of
+	// what an earlier call may have left under the mark.
+	calls, failAt = 0, 3
+	_, err = store.Commit(second, testJob)
+	require.ErrorContains(t, err, "injected sync failure")
+	assert.Equal(t, []string{"req-2" + RemovingSuffix}, stagedNames(t, store))
+	_, digest, err := verifyDir(marked, false)
+	require.NoError(t, err, "the marked copy is still whole")
+	assert.Equal(t, second.Digest, digest)
+
+	// The sync after the removal fails: the call is not reported as done.
+	calls, failAt = 0, 2
+	_, err = store.Commit(second, testJob)
+	require.ErrorContains(t, err, "injected sync failure")
+	assert.Empty(t, stagedNames(t, store))
+
+	// The next call has nothing left to remove and still syncs before it
+	// succeeds.
+	calls, failAt = 0, 0
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	calls, failAt = 0, 1
+	require.ErrorContains(t, store.FinishRemoval("req-2"), "injected sync failure")
+}
+
+// Two calls for one request do not interleave: while one has marked the copy
+// and not yet synced the mark, the other waits and removes nothing.
+func TestCommitOfOneRequestTwiceAtTheSameMoment(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+
+	// The first call stops at its third sync: the copy is marked, the mark
+	// not yet synced. The second call says when it is about to take the lock.
+	var syncs, locks atomic.Int32
+	reached, release, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	realSync, realBefore := syncStagingArea, beforeRemovalLock
+	syncStagingArea = func(dir string) error {
+		if syncs.Add(1) == 3 {
+			close(reached)
+			<-release
+		}
+		return realSync(dir)
+	}
+	beforeRemovalLock = func() {
+		if locks.Add(1) == 2 {
+			close(waiting)
+		}
+	}
+	// Whatever fails below, the stopped call is released and both calls have
+	// returned before the two variables are put back.
+	var running sync.WaitGroup
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		letGo()
+		running.Wait()
+		syncStagingArea, beforeRemovalLock = realSync, realBefore
+	})
+
+	done := make(chan error, 2)
+	commit := func() {
+		_, err := store.Commit(second, testJob)
+		done <- err
+	}
+	await := func(what string, reachedIt <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-reachedIt:
+		case err := <-done:
+			t.Fatalf("a call returned before %s: %v", what, err)
+		case <-time.After(30 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	running.Go(commit)
+	await("the first call marked the copy", reached)
+	running.Go(commit)
+	await("the second call asked for the lock", waiting)
+
+	select {
+	case err := <-done:
+		t.Fatalf("a call finished while the first still held the copy under an unsynced mark: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, digest, err := verifyDir(marked, false)
+	require.NoError(t, err, "the marked copy was touched before its mark was synced")
+	assert.Equal(t, second.Digest, digest)
+
+	letGo()
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+	assert.Empty(t, stagedNames(t, store))
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err)
+}
+
+// A store that has never staged anything has no staging area to sync.
+func TestFinishRemovalWithoutAStagingArea(t *testing.T) {
+	store := newStore(t)
+	require.NoError(t, store.FinishRemoval("req-1"))
+	assert.NoDirExists(t, filepath.Join(store.Root, stagingDir))
+}
+
+// Requests that build one package for one job at the same moment all end with
+// that package in place, and none leaves a staged copy.
+func TestCommitOfOnePackageAtTheSameMoment(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	const requests = 8
+	staged := make([]*Staged, requests)
+	for i := range staged {
+		var err error
+		staged[i], err = store.Stage(fmt.Sprintf("req-%d", i), opts)
+		require.NoError(t, err)
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, requests)
+	var wg sync.WaitGroup
+	for i := range staged {
+		wg.Go(func() {
+			<-start
+			_, errs[i] = store.Commit(staged[i], testJob)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "request %d", i)
+	}
+	assert.Empty(t, stagedNames(t, store))
+	_, err := store.Verify(testJob, staged[0].Digest)
+	require.NoError(t, err)
 }
 
 func TestInvalidNames(t *testing.T) {

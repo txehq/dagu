@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -92,9 +93,14 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 			unfinished = append(unfinished, txeUnfinished{e.RequestID, e.Operation, e.JobID, e.JobKey, e.Step, e.Session, e.Error})
 		}
 	}
-	if orphans, _ := filepath.Glob(filepath.Join(home.PackagesDir(), ".staging", "*")); len(orphans) > len(entries) {
-		add("staged packages", fmt.Errorf("%d staged package(s) but %d journal entr(ies)", len(orphans), len(entries)), "",
-			"a build was interrupted before it was recorded; the directories under "+filepath.Join(home.PackagesDir(), ".staging")+" without a journal entry are unreferenced")
+	// A staged package belongs to the unfinished request it is named after.
+	// Without a readable journal there is nothing to compare against.
+	if err == nil {
+		staging := filepath.Join(home.PackagesDir(), ".staging")
+		if orphans := txeUnreferencedStaging(staging, entries); len(orphans) > 0 {
+			add("staged packages", fmt.Errorf("%d staged package(s) without a journal entry: %s", len(orphans), strings.Join(orphans, ", ")), "",
+				"nothing refers to them: a build was interrupted before it was recorded, or an earlier dagu left its copy of a package that was already in place. One whose name ends in "+txepkg.RemovingSuffix+" is such a copy whose removal was interrupted. They are under "+staging)
+		}
 	}
 
 	client, err := txeClient(ctx)
@@ -124,6 +130,28 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 		}
 	}
 	return txeDoctorReport(ctx, checks, unfinished)
+}
+
+// txeUnreferencedStaging names the staged packages no unfinished request
+// accounts for.
+func txeUnreferencedStaging(staging string, entries []txepkg.Entry) []string {
+	found, err := os.ReadDir(staging)
+	if err != nil {
+		return nil
+	}
+	pending := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		pending[e.RequestID] = true
+	}
+	var orphans []string
+	for _, f := range found {
+		// A copy whose removal stopped part-way is finished when its request
+		// is resumed.
+		if !pending[strings.TrimSuffix(f.Name(), txepkg.RemovingSuffix)] {
+			orphans = append(orphans, f.Name())
+		}
+	}
+	return orphans
 }
 
 func txeDoctorReport(ctx *Context, checks []txeCheck, unfinished []txeUnfinished) error {
