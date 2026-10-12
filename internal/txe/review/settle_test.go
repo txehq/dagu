@@ -170,6 +170,37 @@ func TestAnActionThatRunsToTheEndOfItsGrantIsStillReviewed(t *testing.T) {
 		require.ErrorContains(t, err, "action_state")
 	})
 
+	// So is an admission the service gave without naming an execution.
+	t.Run("the same state without an unnamed admission is an error", func(t *testing.T) {
+		for name, fails := range map[string]func(f *fixture) *settleFails{
+			"read back": func(f *fixture) *settleFails {
+				return &settleFails{Registry: f.registry, err: errors.New("read tcp: connection reset by peer"), held: func(a *review.Action) { a.State = review.ActionUncertain }}
+			},
+			"in the refusal": func(f *fixture) *settleFails {
+				return &settleFails{Registry: f.registry, refuse: account(func(a *review.Action) { a.State = review.ActionUncertain })}
+			},
+		} {
+			f := newFixture(t)
+			f.effects.run = func(review.Action) (review.EffectResult, bool) {
+				return review.EffectResult{Status: review.EffectUnknown, Admitted: true}, true
+			}
+			r := f.reviewer("reviewer-a")
+			r.Registry = fails(f)
+			_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+			require.Error(t, err, name)
+			assert.Empty(t, f.state().Reviews[jobID], name)
+		}
+		// Held with the admission, it is the same outcome.
+		f := newFixture(t)
+		f.effects.run = func(review.Action) (review.EffectResult, bool) {
+			return review.EffectResult{Status: review.EffectUnknown, Admitted: true}, true
+		}
+		r := f.reviewer("reviewer-a")
+		r.Registry = &settleFails{Registry: f.registry, err: errors.New("read tcp: connection reset by peer"), written: true}
+		_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), notify)
+		require.NoError(t, err)
+	})
+
 	// A conflict of another kind, and a record that is "not found" for a
 	// reason that is not this action, say nothing about the attempt.
 	t.Run("a conflict of another kind is an error even when the registry holds the outcome", func(t *testing.T) {

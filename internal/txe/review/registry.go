@@ -117,8 +117,12 @@ type FinishRequest struct {
 type ProbeEvidence struct {
 	// Run is the review run that ran the probe.
 	Run string
-	// OutputSHA256 is the digest of the probe's last line of output, when
-	// it printed one.
+	// OutputSHA256 is the SHA-256 digest of what the probe wrote to its
+	// standard output, untrimmed, as far as the effector kept it (the last
+	// 64 KiB for a command); empty when it wrote nothing. An effector that
+	// hands back a line instead of a digest has that line digested. The
+	// digest is unsalted, so it does not hide a short or guessable output:
+	// a probe states what it found by its exit code, not by what it prints.
 	OutputSHA256 string
 }
 

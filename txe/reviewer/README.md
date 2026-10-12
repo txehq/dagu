@@ -454,7 +454,9 @@ error output is discarded and not written to the step's log as an
 action's is. A probe is given what the job's commands are given,
 credentials among it, and an outcome is kept with the action and shown to
 people without the masking step output gets. What a probe found is its
-exit code. The attempt is never given the receipt the action itself would
+exit code. The digest is not salted, so it does not hide a short or
+guessable output; a probe should print nothing it would mind being
+guessed. The attempt is never given the receipt the action itself would
 have printed.
 
 A command that does not return before its timeout is stopped when the

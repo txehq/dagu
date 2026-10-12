@@ -1298,7 +1298,11 @@ func sameAttempt(held, made Action) bool {
 
 // sameOutcome reports whether held carries the outcome being recorded.
 func sameOutcome(held Action, record FinishRequest) bool {
-	if held.State != record.State || held.AdmittedRef != record.AdmittedRef {
+	// What the attempt was seen to admit is part of its outcome, with or
+	// without a named execution, as the registry stores it.
+	admitted := func(flag bool, ref string) bool { return flag || ref != "" }
+	if held.State != record.State || held.AdmittedRef != record.AdmittedRef ||
+		admitted(held.Admitted, held.AdmittedRef) != admitted(record.Admitted, record.AdmittedRef) {
 		return false
 	}
 	return record.State != ActionSucceeded || record.Receipt != "" && held.Receipt == record.Receipt
