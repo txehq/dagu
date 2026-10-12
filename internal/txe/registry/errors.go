@@ -59,3 +59,9 @@ func ErrorCode(err error) Code {
 func refuse(code Code, format string, args ...any) *Error {
 	return &Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
+
+// DuplicateWinner is the Current of a duplicate refusal that names the job
+// holding the job key, without its record.
+type DuplicateWinner struct {
+	JobID string `json:"job_id"`
+}

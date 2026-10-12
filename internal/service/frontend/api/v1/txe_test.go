@@ -323,6 +323,143 @@ func TestTxeAPIUpdateChecksCommittedVersion(t *testing.T) {
 	requireStatus(t, err, http.StatusConflict)
 }
 
+// A version update is authorized against the job before its expected
+// version is compared: a caller who cannot write a job whose DAG file is
+// missing gets no conflict, and so never the job record a conflict carries.
+func TestTxeAPIUpdateConflictDisclosesNothing(t *testing.T) {
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(dir, "dags", jobID+".yaml")))
+
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	for _, expected := range []int{0, 2} {
+		_, err = a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: jobID, Body: &apigen.TxeVersionRequest{
+			RequestId: "u1", ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		requireStatus(t, err, http.StatusForbidden)
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		assert.NotContains(t, apiErr.Details, "current", "expected_version %d: no job record", expected)
+	}
+
+	// A caller who may write the job still gets the conflict and the job
+	// when its expected version is a committed but stale one.
+	opsJob, err := f.register(txeOps, "ops")
+	require.NoError(t, err)
+	update := func(requestID string, expected int) error {
+		_, err := a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: opsJob, Body: &apigen.TxeVersionRequest{
+			RequestId: requestID, ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		return err
+	}
+	require.NoError(t, update("u2", 1))
+	err = update("u3", 1)
+	requireStatus(t, err, http.StatusConflict)
+	var apiErr *apiv1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Details, "current", "the stale writer re-reads the job")
+}
+
+// A registration that loses deduplication to a job the caller cannot see is
+// refused without that job's ID or record; a visible winner is named.
+func TestTxeAPIDuplicateDisclosesNoHiddenWinner(t *testing.T) {
+	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	registerAs := func(caller context.Context, workspace, jobKey string) (string, error) {
+		spec := fmt.Sprintf("labels:\n  - workspace=%s\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", workspace, f.machine)
+		jobID := mint(t, registry.PrefixJob)
+		_, err := a.RegisterTxeJob(caller, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+			JobId: jobID, RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: jobKey,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			},
+		}})
+		return jobID, err
+	}
+	// The job keys do not contain the winners' IDs, so any mention of an ID
+	// is a disclosure.
+	secretJob, err := registerAs(txeAdmin, "secret", "hidden-key")
+	require.NoError(t, err)
+	opsJob, err := registerAs(txeOps, "ops", "visible-key")
+	require.NoError(t, err)
+	register := func(jobKey string) (string, error) { return registerAs(txeOps, "ops", jobKey) }
+	// mentions reports whether anything the caller reads about its losing
+	// job names id.
+	mentions := func(loser, id string) bool {
+		t.Helper()
+		job, err := a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: loser})
+		require.NoError(t, err)
+		events, err := a.ListTxeJobEvents(txeOps, apigen.ListTxeJobEventsRequestObject{JobId: loser})
+		require.NoError(t, err)
+		list, err := a.ListTxeJobs(txeOps, apigen.ListTxeJobsRequestObject{})
+		require.NoError(t, err)
+		data, err := json.Marshal([]any{job, events, list})
+		require.NoError(t, err)
+		readyErr := f.ready(txeOps, loser)
+		require.Error(t, readyErr, "a duplicate is never made ready")
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, readyErr, &apiErr)
+		refusal, err := json.Marshal(apiErr)
+		require.NoError(t, err)
+		return strings.Contains(string(data), id) || strings.Contains(string(refusal), id) || strings.Contains(apiErr.Message, id)
+	}
+
+	hiddenLoser, err := register("hidden-key")
+	requireStatus(t, err, http.StatusConflict)
+	var apiErr *apiv1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "duplicate", apiErr.Details["code"])
+	assert.NotContains(t, apiErr.Details, "current", "the hidden winner's record")
+	assert.NotContains(t, apiErr.Message, secretJob, "the hidden winner's ID")
+	assert.False(t, mentions(hiddenLoser, secretJob), "nor through the losing job, its history or a readiness refusal")
+	// Nor through any refusal about the losing job: a stale version or
+	// revision, or an update of the duplicate itself.
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	update := func(expected int) error {
+		_, err := a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: hiddenLoser, Body: &apigen.TxeVersionRequest{
+			RequestId: fmt.Sprintf("u%d", expected), ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		return err
+	}
+	revision := int64(99)
+	_, readyErr := a.MarkTxeJobReady(txeOps, apigen.MarkTxeJobReadyRequestObject{JobId: hiddenLoser, Body: &apigen.TxeReadyRequest{
+		ExpectedRevision: &revision,
+		Package:          apigen.TxePackageEvidence{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", MachineId: f.machine}}})
+	for name, err := range map[string]error{"stale version": update(5), "duplicate update": update(1), "stale revision": readyErr} {
+		require.Error(t, err, name)
+		var refusal *apiv1.Error
+		require.ErrorAs(t, err, &refusal, name)
+		data, mErr := json.Marshal(refusal)
+		require.NoError(t, mErr)
+		assert.NotContains(t, string(data), secretJob, name)
+		assert.NotContains(t, refusal.Message, secretJob, name)
+	}
+
+	visibleLoser, err := register("visible-key")
+	requireStatus(t, err, http.StatusConflict)
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Details, "current", "a visible winner is returned")
+	assert.Contains(t, apiErr.Message, opsJob)
+	assert.True(t, mentions(visibleLoser, opsJob), "a visible winner is named, so it can be adopted")
+}
+
 // Only a signed-in person reactivates a retired job. An API key cannot claim
 // to be human, and the descriptive actor fields never make it one.
 func TestTxeAPIReactivateNeedsHumanPrincipal(t *testing.T) {
