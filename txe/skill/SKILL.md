@@ -9,6 +9,16 @@ A job registered here outlives the session that created it. The hub schedules it
 
 A background shell process, a `sleep` loop or a session timer is not a durable job. It stops when the session does.
 
+## Which `dagu` to run
+
+Every command here is written `dagu txe ...`. Run the `dagu` that the worker installer put in the TXE home, by its full path:
+
+```sh
+~/.local/share/txe-dagu/bin/dagu txe doctor
+```
+
+The TXE home is `~/.local/share/txe-dagu` unless `TXE_DAGU_HOME` names another directory, and then the binary is `$TXE_DAGU_HOME/bin/dagu`. That binary is the one this machine's jobs run, so it matches the hub. It is not put on `PATH`: a bare `dagu` may be missing, or may be another build that has no `txe` command.
+
 ## Before you register
 
 1. **Check the machine.** Run `dagu txe doctor`. Fix what it reports before going further; each failed check names the action.
@@ -33,7 +43,7 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 | `expected_outcome` | `success_criteria`: what a good result looks like. `deliverables`: optional, see "Results" below. |
 | `lifetime` | `expires_at`, or `open_ended: true` if the job really has no end date. |
 | `review_policy` | `cadence` (cron) and `brief`: what a reviewer should look for and what it may do. Optional `permitted_actions` and `human_decision_conditions`. |
-| `retirement_rules` | Optional. What happens when the target is deleted or replaced, or the job completes. |
+| `retirement_rules` | Optional. What the registry does when the target is deleted or replaced. See "When the work is over, or the target changes". |
 
 Review cadence is separate from the schedule. A check can run every five minutes and be reviewed once a day.
 
@@ -201,7 +211,7 @@ Say so in the registry, so dependent jobs are reviewed or retired instead of fai
 
 `dagu txe` has no command that retires or pauses a job. What ends one:
 
-- **What the spec said at registration.** A job is not run after `lifetime.expires_at`. `retirement_rules` say what happens when the target is deleted (`on_target_deleted`), replaced (`on_replacement`) or the job completes (`on_completion`); the examples show them. Set these when you register, so the job ends without anyone having to remember it.
+- **What the spec said at registration.** A job is not run after `lifetime.expires_at`. `retirement_rules` say what the registry does when a deletion or a replacement of the target is recorded: `on_target_deleted` and `on_replacement`, each `retire`, `review` (ask a person) or `keep`. Set these when you register, so the job ends without anyone having to remember it. `on_completion` is different: it is recorded for the reviewer and ends nothing by itself. A job that has met its goal is ended by a request to the hub.
 - **The hub.** A job is retired, paused, resumed or completed by a request to the hub: `POST /api/v1/txe/jobs/<job id>/lifecycle` with a body such as `{"op": "retire", "reason": "manual", "detail": "why"}`. It needs a login or API key for the hub, which this CLI does not hand out. If you have none, give the person who runs the hub the job id and the reason. A retired job can be brought back only by a person, so do not retire one to try something out.
 
 Check the result with `dagu txe inspect <job id>`: it shows the lifecycle and, for a retired job, the reason and time.
