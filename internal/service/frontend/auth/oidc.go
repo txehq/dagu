@@ -40,6 +40,15 @@ const (
 	cookieState       = "state"
 	cookieNonce       = "nonce"
 	cookieOriginalURL = "originalURL"
+	// cookiePKCEVerifier holds the PKCE code verifier between the sign-in
+	// redirect and the callback. It is set only when PKCE is enabled.
+	cookiePKCEVerifier = "pkce_verifier"
+)
+
+// A PKCE code verifier is 43 to 128 characters (RFC 7636, section 4.1).
+const (
+	minPKCEVerifierLength = 43
+	maxPKCEVerifierLength = 128
 )
 
 var oidcProviderFactory = func(ctx context.Context, issuer string) (*oidc.Provider, error) {
@@ -179,6 +188,7 @@ func clearOIDCStateCookies(w http.ResponseWriter, r *http.Request) {
 	clearCookie(w, r, cookieState)
 	clearCookie(w, r, cookieNonce)
 	clearCookie(w, r, cookieOriginalURL)
+	clearCookie(w, r, cookiePKCEVerifier)
 }
 
 // BuiltinOIDCConfig holds configuration for OIDC under builtin auth mode.
@@ -192,6 +202,9 @@ type BuiltinOIDCConfig struct {
 	// InitialSetupComplete reports whether builtin administrator bootstrap has completed.
 	InitialSetupComplete func(context.Context) (bool, error)
 	LoginBasePath        string // Base path for login page redirect
+	// PKCE makes the sign-in send an S256 code challenge and the callback
+	// send its verifier (RFC 7636). Off by default.
+	PKCE bool
 }
 
 // InitBuiltinOIDCConfig initializes OIDC for builtin auth mode.
@@ -229,6 +242,7 @@ func InitBuiltinOIDCConfig(ctx context.Context, cfg config.AuthOIDC, authSvc *au
 			return count > 0, nil
 		},
 		LoginBasePath: loginBasePath,
+		PKCE:          cfg.PKCE,
 	}, nil
 }
 
@@ -251,7 +265,16 @@ func BuiltinOIDCLoginHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 		setCookie(w, r, cookieNonce, nonce, stateCookieExpiry)
 		setCookie(w, r, cookieOriginalURL, cfg.LoginBasePath, stateCookieExpiry)
 
-		http.Redirect(w, r, cfg.OAuth2Config.AuthCodeURL(state, oidc.Nonce(nonce)), http.StatusFound)
+		authOptions := []oauth2.AuthCodeOption{oidc.Nonce(nonce)}
+		if cfg.PKCE {
+			// The verifier stays in this browser; only its S256 digest goes
+			// to the provider with the sign-in request.
+			verifier := oauth2.GenerateVerifier()
+			setCookie(w, r, cookiePKCEVerifier, verifier, stateCookieExpiry)
+			authOptions = append(authOptions, oauth2.S256ChallengeOption(verifier))
+		}
+
+		http.Redirect(w, r, cfg.OAuth2Config.AuthCodeURL(state, authOptions...), http.StatusFound)
 	}
 }
 
@@ -291,8 +314,21 @@ func BuiltinOIDCCallbackHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 			return
 		}
 
+		// With PKCE the exchange must carry the verifier this browser was
+		// given at sign-in. Without it the callback is refused here, before
+		// the code is sent anywhere.
+		var exchangeOptions []oauth2.AuthCodeOption
+		if cfg.PKCE {
+			verifierCookie, err := r.Cookie(cookiePKCEVerifier)
+			if err != nil || len(verifierCookie.Value) < minPKCEVerifierLength || len(verifierCookie.Value) > maxPKCEVerifierLength {
+				redirectWithError(w, r, cfg.LoginBasePath, "Authentication failed: PKCE verifier not found")
+				return
+			}
+			exchangeOptions = append(exchangeOptions, oauth2.VerifierOption(verifierCookie.Value))
+		}
+
 		// Exchange code for token
-		oauth2Token, err := cfg.OAuth2Config.Exchange(ctx, r.URL.Query().Get("code"))
+		oauth2Token, err := cfg.OAuth2Config.Exchange(ctx, r.URL.Query().Get("code"), exchangeOptions...)
 		if err != nil {
 			logger.Error(ctx, "OIDC token exchange failed", tag.Error(err))
 			redirectWithError(w, r, cfg.LoginBasePath, "Authentication failed: could not exchange token")
