@@ -275,27 +275,27 @@ func TestParamSchemaRefusesWhatJSONCannotHold(t *testing.T) {
 // A number in a schema is a bound. One that would be sent as a different
 // number, or as text, is refused when the spec is read: the registry checks
 // what it is sent, and cannot know what was written.
-func TestParamSchemaRefusesANumberThatWouldNotArriveAsWritten(t *testing.T) {
+func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 	const (
-		inexact = "cannot be kept exactly"
+		changed = "a different number"
 		spelled = "must be written in plain decimal"
 		tagged  = "uses a YAML tag"
 		text    = "looks like a number but would be sent as text"
 		notOne  = "is not a number JSON can hold"
+		key     = "is not text"
 	)
 	for src, want := range map[string]string{
-		// Rounded by the decoder: each of these was sent as the number in
-		// the comment before this was refused.
-		"maximum: 0.49999999999999999":        inexact, // 0.5
-		"minimum: -0.50000000000000001":       inexact, // -0.5
-		"maximum: 4503599627370496.2":         inexact, // 4503599627370496
-		"maximum: 0.1":                        inexact, // the float64 nearest 0.1
-		"maximum: 1.5e-1":                     inexact,
-		"enum: [0.49999999999999999, 1]":      inexact,
-		"0.49999999999999999: {type: string}": inexact, // the key "0.5"
-		"a: &n 0.49999999999999999\nb: *n":    inexact,
-		`{"maximum": 0.49999999999999999}`:    inexact,
-		"maximum: 9007199254740993.0":         inexact, // 9007199254740992
+		// Rounded by the decoder: each was sent as the number in the comment
+		// before this was refused.
+		"maximum: 0.49999999999999999":     "the number 0.49999999999999999 would be sent as 0.5, " + changed,
+		"minimum: -0.50000000000000001":    "would be sent as -0.5, " + changed,
+		"maximum: 4503599627370496.2":      "would be sent as 4503599627370496, " + changed,
+		"maximum: 9007199254740993.0":      "would be sent as 9007199254740992, " + changed,
+		"enum: [0.49999999999999999, 1]":   changed,
+		"a: &n 0.49999999999999999\nb: *n": changed,
+		`{"maximum": 0.49999999999999999}`: changed,
+		// Exactly a float64, and still not what would be sent: 2^-30.
+		"maximum: 0.000000000931322574615478515625": "would be sent as 9.313225746154785e-10, " + changed,
 		// Read as another number, or by a rule JSON does not have.
 		"maxLength: 012":                        spelled, // 10
 		"maxLength: 0x10":                       spelled,
@@ -305,7 +305,7 @@ func TestParamSchemaRefusesANumberThatWouldNotArriveAsWritten(t *testing.T) {
 		"maxLength: +5":                         spelled,
 		"maximum: .5":                           spelled,
 		"maximum: 5.":                           spelled,
-		"maximum: 0." + strings.Repeat("5", 70): spelled,
+		"maximum: 0." + strings.Repeat("0", 70): "is longer than 64 characters",
 		"maximum: 1.0e-401":                     "has an exponent beyond 400",
 		"maximum: 1.0e-99999999999999999999":    "has an exponent beyond 400",
 		// A tag changes what a value is after it is written.
@@ -315,14 +315,27 @@ func TestParamSchemaRefusesANumberThatWouldNotArriveAsWritten(t *testing.T) {
 		"const: !!str 5":                         tagged,
 		// Sent as text where a number was written.
 		"maximum: 1e3":                    text,
-		"maximum: 1.0e+401":               text, // too large to be read as a number at all
 		"maximum: 1E2":                    text,
+		"maximum: 1.0e+401":               text, // too large to be read as a number at all
 		"maxLength: 18446744073709551616": text,
+		"enum: [0x10000000000000000]":     text,
 		"enum: [1e3]":                     text,
 		"1e3: {type: string}":             text,
 		"maximum: .inf":                   notOne,
 		"minimum: -.inf":                  notOne,
 		"maximum: .nan":                   notOne,
+		// A key is sent as text. One that is not written as text can come
+		// out as another key, and replace the bound written under it.
+		"properties:\n  0.50: {type: string, maxLength: 1}\n  \"0.5\": {type: string, maxLength: 100}": key,
+		"properties:\n  True: {maxLength: 1}\n  \"true\": {maxLength: 100}":                            key,
+		"0.49999999999999999: {type: string}":                                                          key, // the key "0.5"
+		"1: {type: string}":                                                                            key,
+		"1.0: {type: string}":                                                                          key, // the key "1"
+		"null: {type: string}":                                                                         key,
+		"? 1.0\n: {type: string}":                                                                      "writes a key with",
+		"? a\n: {type: string}":                                                                        "writes a key with",
+
+		"{1: {type: string}}": key,
 	} {
 		t.Run(src, func(t *testing.T) {
 			var schema ParamSchema
@@ -331,40 +344,64 @@ func TestParamSchemaRefusesANumberThatWouldNotArriveAsWritten(t *testing.T) {
 		})
 	}
 
+	// A schema may be another action's, by reference: it is read from where
+	// it is written. A part of it may not be, because that part is not in
+	// what is being read.
+	const actions = "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema: &bound {type: object, properties: {reason: &text {type: string, maxLength: 10}}}\n" +
+		"    - name: close-ticket\n      timeout_sec: 60\n      param_schema: "
+	spec, err := LoadJobSpec(specWithActions(t, actions+"*bound\n"))
+	require.NoError(t, err)
+	assert.Equal(t, `{"properties":{"reason":{"maxLength":10,"type":"string"}},"type":"object"}`, string(spec.ReviewPolicy.PermittedActions[1].ParamSchema))
+	_, err = LoadJobSpec(specWithActions(t, actions+"{type: object, properties: {reason: *text}}\n"))
+	require.ErrorContains(t, err, "refers to *text, which is written outside it")
+
 	// A spec file is refused as a whole, and the number is named.
-	_, err := LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
+	_, err = LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
 		"        type: object\n        properties:\n          share:\n            type: number\n            maximum: 0.49999999999999999\n"))
-	require.ErrorContains(t, err, "the number 0.49999999999999999 cannot be kept exactly")
+	require.ErrorContains(t, err, "the number 0.49999999999999999 would be sent as 0.5")
 }
 
-// A number that is exactly what was written is sent as that number, and
-// text that was written as text stays text.
-func TestParamSchemaKeepsExactNumbersAndQuotedText(t *testing.T) {
+// What is written plainly is sent as written, byte for byte in the case of a
+// number: these are compared as text, because comparing them as numbers
+// would round them the way the fault did. Whether a registry can check a
+// number is the registry's rule, not this one: 0.1 is sent as 0.1.
+func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 	for src, want := range map[string]string{
 		"maximum: 0.5":                  `{"maximum":0.5}`,
+		"maximum: 0.1":                  `{"maximum":0.1}`,
 		"maximum: 0.50":                 `{"maximum":0.5}`,
 		"maximum: 2.5e-1":               `{"maximum":0.25}`,
+		"maximum: 1.5e-1":               `{"maximum":0.15}`,
 		"maximum: 1.0e+2":               `{"maximum":100}`,
+		"maximum: 123456789.012345":     `{"maximum":123456789.012345}`,
+		"maximum: 2251799813685248.5":   `{"maximum":2251799813685248.5}`,
 		"minimum: -3":                   `{"minimum":-3}`,
 		"minimum: -0":                   `{"minimum":0}`,
 		"maxLength: 10":                 `{"maxLength":10}`,
-		"maximum: 2251799813685248.5":   `{"maximum":2251799813685248.5}`,
-		"maxLength: 9007199254740993":   `{"maxLength":9007199254740993}`, // exact here; the registry refuses it as beyond 2^53
+		"maxLength: 9007199254740993":   `{"maxLength":9007199254740993}`, // sent as written; the registry refuses it as beyond 2^53
 		"enum: [0.25, 1, -2]":           `{"enum":[0.25,1,-2]}`,
-		"1: {type: string}":             `{"1":{"type":"string"}}`,
-		`const: "0.49999999999999999"`:  `{"const":"0.49999999999999999"}`,
-		`const: "1e3"`:                  `{"const":"1e3"}`,
-		"const: '012'":                  `{"const":"012"}`,
-		"const: 1.2.3":                  `{"const":"1.2.3"}`,
-		"const: 2001-01-01":             `{"const":"2001-01-01"}`,
-		"const: |\n  012\n":             `{"const":"012\n"}`,
 		"a: &n 0.5\nb: *n":              `{"a":0.5,"b":0.5}`,
 		`{"maximum": 0.5, "x": [1, 2]}`: `{"maximum":0.5,"x":[1,2]}`,
+		// Text written as text stays the text it was.
+		`enum: ["1", "0.5", "012", "1e3", "true", "null", "0x10"]`: `{"enum":["1","0.5","012","1e3","true","null","0x10"]}`,
+		"enum: [soft, hard, on, off, yes, no]":                     `{"enum":["soft","hard","on","off","yes","no"]}`,
+		`const: "0.49999999999999999"`:                             `{"const":"0.49999999999999999"}`,
+		"const: '012'":                                             `{"const":"012"}`,
+		"const: 1.2.3":                                             `{"const":"1.2.3"}`,
+		"const: 2001-01-01":                                        `{"const":"2001-01-01"}`,
+		"pattern: |-\n  012":                                       `{"pattern":"012"}`,
+		"pattern: >-\n  1e3":                                       `{"pattern":"1e3"}`,
+		"const: |\n  012\n":                                        `{"const":"012\n"}`,
+		"description: &1e3 hello\nconst: *1e3":                     `{"const":"hello","description":"hello"}`,
+		"const: true":                                              `{"const":true}`,
+		"default: null":                                            `{"default":null}`,
+		// A key written as text is the key sent.
+		`properties: {"1": {type: string}, "0.50": {type: string}, "true": {type: string}}`: `{"properties":{"0.50":{"type":"string"},"1":{"type":"string"},"true":{"type":"string"}}}`,
 	} {
 		t.Run(src, func(t *testing.T) {
 			var schema ParamSchema
 			require.NoError(t, yaml.Unmarshal([]byte(src), &schema))
-			assert.JSONEq(t, want, string(schema))
+			assert.Equal(t, want, string(schema))
 		})
 	}
 }

@@ -16,7 +16,6 @@ import (
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
-	"github.com/goccy/go-yaml/parser"
 	"github.com/goccy/go-yaml/token"
 )
 
@@ -207,24 +206,28 @@ func (p *ParamSchema) UnmarshalJSON(data []byte) error {
 //     beside it;
 //   - a tag (!!float, !!int): it turns text into a number after the numbers
 //     have been checked, or a number into text;
-//   - a number the decoder cannot hold exactly, or one not spelled as JSON
-//     spells it: 0.49999999999999999 would be sent as 0.5, and 012 as 10;
+//   - a number that would be sent as a different number, or one not spelled
+//     as JSON spells it: 0.49999999999999999 would be sent as 0.5, and 012
+//     as 10;
 //   - unquoted text that looks like a number, such as 1e3, which would be
-//     sent as text.
-func (p *ParamSchema) UnmarshalYAML(data []byte) error {
-	file, err := parser.ParseBytes(data, 0)
-	if err != nil {
-		return err
-	}
-	var check schemaYAML
-	for _, doc := range file.Docs {
-		ast.Walk(&check, doc.Body)
-	}
+//     sent as text;
+//   - a key that is not text, such as 1.0, which would be sent as "1";
+//   - a reference (*name) to something written outside the schema.
+//
+// The schema is read from the parsed document itself, not from text rendered
+// back out of it: that rendering is another place a schema could change.
+//
+// This is only about sending what was written. Which numbers a registry can
+// check is the registry's rule: 0.1 is sent as 0.1, and a registry that
+// compares binary fractions refuses it in its own words.
+func (p *ParamSchema) UnmarshalYAML(node ast.Node) error {
+	check := schemaYAML{anchors: map[string]bool{}}
+	ast.Walk(&check, node)
 	if check.err != nil {
 		return check.err
 	}
 	var value any
-	if err := yaml.Unmarshal(data, &value); err != nil {
+	if err := yaml.NodeToValue(node, &value); err != nil {
 		return err
 	}
 	out, err := json.Marshal(value)
@@ -237,26 +240,52 @@ func (p *ParamSchema) UnmarshalYAML(data []byte) error {
 
 // schemaYAML walks a param_schema as it was written and keeps the first
 // thing in it that would not reach the registry as written.
-type schemaYAML struct{ err error }
+type schemaYAML struct {
+	err     error
+	anchors map[string]bool // the names the schema itself gives to its parts
+}
 
 func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
 	if s.err != nil {
 		return s
 	}
 	switch n := node.(type) {
+	case *ast.LiteralNode:
+		return nil // a block scalar is text, whatever it looks like
+	case *ast.AliasNode:
+		// What a name inside the schema stands for is checked where it is
+		// written. Anything else is not part of what is being read.
+		if name := tokenText(n.Value); !s.anchors[name] {
+			s.err = fmt.Errorf("param_schema refers to *%s, which is written outside it; write the schema out in full", clip(name))
+		}
+		return nil
+	case *ast.AnchorNode:
+		s.anchors[tokenText(n.Name)] = true
+		ast.Walk(s, n.Value) // the name is not part of the schema
+		return nil
 	case *ast.MergeKeyNode:
 		s.err = errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
 	case *ast.TagNode:
 		s.err = fmt.Errorf("param_schema uses a YAML tag (%s), which can change what the value beside it is; write the value plainly", tokenText(n))
+	case *ast.MappingValueNode:
+		// A key is sent as text whatever it was written as: 1.0 as "1",
+		// beside a "1" it would then replace or be replaced by.
+		switch n.Key.(type) {
+		case *ast.StringNode, *ast.MergeKeyNode:
+		case *ast.MappingKeyNode:
+			s.err = errors.New("param_schema writes a key with \"?\", which this program does not read; write the key as plain or quoted text before its colon")
+		default:
+			s.err = fmt.Errorf("param_schema: the key %s is not text, and the text sent in its place may not be what is written; put the key in quotes", clip(tokenText(n.Key)))
+		}
 	case *ast.IntegerNode:
-		s.err = exactNumber(tokenText(n), n.Value)
+		s.err = sentAsWritten(tokenText(n), n.Value)
 	case *ast.FloatNode:
-		s.err = exactNumber(tokenText(n), n.Value)
+		s.err = sentAsWritten(tokenText(n), n.Value)
 	case *ast.InfinityNode, *ast.NanNode:
 		s.err = fmt.Errorf("param_schema: %s is not a number JSON can hold", tokenText(n))
 	case *ast.StringNode:
 		if tok := n.GetToken(); tok != nil && tok.Type == token.StringType && numberLike.MatchString(tok.Value) {
-			s.err = fmt.Errorf("param_schema: %s looks like a number but would be sent as text. For a number, write it in plain decimal and no larger than 2^53 (1000, not 1e3); for text, put it in quotes", clip(tok.Value))
+			s.err = fmt.Errorf("param_schema: %s looks like a number but would be sent as text. For a number, write it in plain decimal (1000, not 1e3); for text, put it in quotes", clip(tok.Value))
 		}
 	}
 	return s
@@ -272,7 +301,7 @@ func tokenText(node ast.Node) string {
 
 const (
 	// maxNumberLiteral and maxNumberExponent bound a number before any
-	// exact arithmetic is done on it. They are the registry's own limits.
+	// exact arithmetic is done on it.
 	maxNumberLiteral  = 64
 	maxNumberExponent = 400
 )
@@ -282,15 +311,22 @@ var (
 	jsonNumber = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$`)
 	// numberLike is text a reader would take for a number, whatever the
 	// YAML parser made of it.
-	numberLike = regexp.MustCompile(`^[-+]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9]*)?)([eE][-+]?[0-9]+)?$`)
+	numberLike = regexp.MustCompile(`^[-+]?(` +
+		`(\.[0-9]+|[0-9][0-9_]*(\.[0-9]*)?)([eE][-+]?[0-9]+)?` +
+		`|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+` +
+		`|\.(inf|Inf|INF|nan|NaN|NAN))$`)
 )
 
-// exactNumber refuses a number that would not reach the registry as its
+// sentAsWritten refuses a number that would not reach the registry as its
 // author wrote it. The decoder holds a number as an integer or a float64 and
-// writes that back as JSON, so the spelling must be JSON's, and the value
-// held must be the value written.
-func exactNumber(lit string, held any) error {
-	if len(lit) > maxNumberLiteral || !jsonNumber.MatchString(lit) {
+// that is written back as JSON, so the spelling must be JSON's, and the JSON
+// number sent must be the number written. It does not judge the number: 0.1
+// is sent as 0.1.
+func sentAsWritten(lit string, held any) error {
+	if len(lit) > maxNumberLiteral {
+		return fmt.Errorf("param_schema: the number %s is longer than %d characters", clip(lit), maxNumberLiteral)
+	}
+	if !jsonNumber.MatchString(lit) {
 		return fmt.Errorf("param_schema: the number %s must be written in plain decimal, as JSON writes it. A spelling such as 012, 0x10, 1_000, +5 or .5 can be read as a different number", clip(lit))
 	}
 	if i := strings.IndexAny(lit, "eE"); i >= 0 {
@@ -299,18 +335,19 @@ func exactNumber(lit string, held any) error {
 			return fmt.Errorf("param_schema: the number %s has an exponent beyond %d", lit, maxNumberExponent)
 		}
 	}
-	written, ok := new(big.Rat).SetString(lit)
-	var kept *big.Rat
-	switch v := held.(type) {
-	case int64:
-		kept = new(big.Rat).SetInt64(v)
-	case uint64:
-		kept = new(big.Rat).SetUint64(v)
-	case float64:
-		kept = new(big.Rat).SetFloat64(v) // nil for an infinity or a NaN
+	switch held.(type) {
+	case int64, uint64, float64:
+	default:
+		return fmt.Errorf("param_schema: the number %s cannot be sent as a number", lit)
 	}
-	if !ok || kept == nil || written.Cmp(kept) != 0 {
-		return fmt.Errorf("param_schema: the number %s cannot be kept exactly, so a different number would be sent in its place. Write an integer, or a fraction that is exact in binary such as 0.5", lit)
+	out, err := json.Marshal(held)
+	if err != nil {
+		return fmt.Errorf("param_schema: the number %s cannot be sent as a number: %w", lit, err)
+	}
+	written, ok := new(big.Rat).SetString(lit)
+	sent, sentOK := new(big.Rat).SetString(string(out))
+	if !ok || !sentOK || written.Cmp(sent) != 0 {
+		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number. Write the number you mean with no more than 15 significant digits", lit, out)
 	}
 	return nil
 }

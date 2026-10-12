@@ -68,10 +68,39 @@ func TestTxeClientSchemaNumbersAgainstTheHub(t *testing.T) {
 		return len(jobs)
 	}
 
-	// The spec is refused when it is read: there is no action to send.
+	// grant asks the registry to authorize the action with these parameters.
+	type claim struct {
+		ClaimID string `json:"claim_id"`
+		Fence   int64  `json:"fence"`
+	}
+	grant := func(jobID string, held claim, params string) error {
+		review, err := registry.ReviewID(jobID, 0)
+		require.NoError(t, err)
+		actionID, err := registry.RoutineActionID(review, registry.ActionSpec{Name: "rebalance", Params: json.RawMessage(params)})
+		require.NoError(t, err)
+		return c.Do(ctx, http.MethodPost, "/txe/jobs/"+jobID+"/effect-grants", nil, map[string]any{
+			"action_id": actionID, "job_version": 1, "package_digest": digest,
+			"routine": map[string]any{"review_id": review, "claim_id": held.ClaimID, "fence": held.Fence,
+				"spec": map[string]any{"name": "rebalance", "params": json.RawMessage(params)}},
+		}, nil)
+	}
+	var refused *txeclient.Error
+	// noGrant shows that the parameter the written bound excludes, 0.5, gets
+	// nothing for a job that was never registered.
+	noGrant := func(jobID string) {
+		assert.Zero(t, registered())
+		require.ErrorAs(t, c.Do(ctx, http.MethodPost, "/txe/jobs/"+jobID+"/claims", nil,
+			map[string]any{"kind": "review", "ttl_sec": 600, "reviewer": map[string]any{"machine_id": machine}, "actor": cli}, nil), &refused)
+		assert.Equal(t, http.StatusNotFound, refused.Status)
+		require.ErrorAs(t, grant(jobID, claim{ClaimID: "none", Fence: 1}, `{"share":0.5}`), &refused)
+		assert.Equal(t, http.StatusNotFound, refused.Status)
+	}
+
+	// The spec is refused when it is read: there is no action to send, so
+	// no job, and no grant for the 0.5 the written bound excludes.
 	_, err = action("0.49999999999999999")
-	require.ErrorContains(t, err, "the number 0.49999999999999999 cannot be kept exactly")
-	assert.Zero(t, registered())
+	require.ErrorContains(t, err, "the number 0.49999999999999999 would be sent as 0.5, a different number")
+	noGrant(mint(t, registry.PrefixJob))
 
 	// A schema held as JSON is sent byte for byte, so the registry sees the
 	// number as written and refuses it in its own words.
@@ -79,15 +108,27 @@ func TestTxeClientSchemaNumbersAgainstTheHub(t *testing.T) {
 	require.NoError(t, err)
 	asWritten := exact
 	asWritten.ParamSchema = txeclient.ParamSchema(`{"type":"object","properties":{"share":{"type":"number","minimum":0,"maximum":0.49999999999999999}},"required":["share"],"additionalProperties":false}`)
-	_, err = register(mint(t, registry.PrefixJob), asWritten)
-	var refused *txeclient.Error
+	jobID := mint(t, registry.PrefixJob)
+	_, err = register(jobID, asWritten)
 	require.ErrorAs(t, err, &refused)
 	assert.Equal(t, http.StatusBadRequest, refused.Status)
 	assert.Contains(t, refused.Message, "0.49999999999999999 cannot be checked exactly")
-	assert.Zero(t, registered())
+	noGrant(jobID)
+
+	// The client sends what was written and does not judge it. 0.1 is sent
+	// as 0.1, and this registry, which compares binary fractions, refuses it.
+	tenth, err := action("0.1")
+	require.NoError(t, err)
+	assert.Contains(t, string(tenth.ParamSchema), `"maximum":0.1,"minimum":0,`)
+	jobID = mint(t, registry.PrefixJob)
+	_, err = register(jobID, tenth)
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, http.StatusBadRequest, refused.Status)
+	assert.Contains(t, refused.Message, "0.1 cannot be checked exactly")
+	noGrant(jobID)
 
 	// A bound that is exact is registered as written and enforced as written.
-	jobID := mint(t, registry.PrefixJob)
+	jobID = mint(t, registry.PrefixJob)
 	job, err := register(jobID, exact)
 	require.NoError(t, err)
 	_, err = c.MarkReady(ctx, jobID, txeclient.ReadyRequest{ExpectedRevision: job.Revision,
@@ -97,24 +138,12 @@ func TestTxeClientSchemaNumbersAgainstTheHub(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"type":"object","properties":{"share":{"type":"number","minimum":0,"maximum":0.5}},"required":["share"],"additionalProperties":false}`,
 		string(stored.ReviewPolicy.PermittedActions[0].ParamSchema))
+	assert.Contains(t, string(stored.ReviewPolicy.PermittedActions[0].ParamSchema), `"maximum":0.5`)
 
-	var claim struct {
-		ClaimID string `json:"claim_id"`
-		Fence   int64  `json:"fence"`
-	}
+	var held claim
 	require.NoError(t, c.Do(ctx, http.MethodPost, "/txe/jobs/"+jobID+"/claims", nil,
-		map[string]any{"kind": "review", "ttl_sec": 600, "reviewer": map[string]any{"machine_id": machine}, "actor": cli}, &claim))
-	review, err := registry.ReviewID(jobID, 0)
-	require.NoError(t, err)
-	authorize := func(params string) error {
-		actionID, err := registry.RoutineActionID(review, registry.ActionSpec{Name: "rebalance", Params: json.RawMessage(params)})
-		require.NoError(t, err)
-		return c.Do(ctx, http.MethodPost, "/txe/jobs/"+jobID+"/effect-grants", nil, map[string]any{
-			"action_id": actionID, "job_version": 1, "package_digest": digest,
-			"routine": map[string]any{"review_id": review, "claim_id": claim.ClaimID, "fence": claim.Fence,
-				"spec": map[string]any{"name": "rebalance", "params": json.RawMessage(params)}},
-		}, nil)
-	}
+		map[string]any{"kind": "review", "ttl_sec": 600, "reviewer": map[string]any{"machine_id": machine}, "actor": cli}, &held))
+	authorize := func(params string) error { return grant(jobID, held, params) }
 	var actions json.RawMessage
 	for _, params := range []string{`{"share":0.75}`, `{"share":0.5000000000000001}`, `{"share":-0.25}`} {
 		require.ErrorAs(t, authorize(params), &refused, params)
