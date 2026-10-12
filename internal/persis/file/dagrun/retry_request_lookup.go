@@ -67,7 +67,7 @@ func (store *Store) FindRetryRequest(ctx context.Context, root, dagRun ir.DAGRun
 			return nil, fmt.Errorf("read attempt %s status: %w", att.ID(), err)
 		}
 		if status != nil && status.RetryRequest != nil && status.RetryRequest.ID == id {
-			return matchCurrent(att, status)
+			return matchCurrent(att, status, dagRun, root)
 		}
 		match, err := matchRetained(filepath.Dir(att.file), id)
 		if err != nil || match == nil {
@@ -76,7 +76,7 @@ func (store *Store) FindRetryRequest(ctx context.Context, root, dagRun ir.DAGRun
 			}
 			continue
 		}
-		if err := markExecutionAbandoned(att, match); err != nil {
+		if err := markExecutionAbandoned(att, match, dagRun, root); err != nil {
 			return nil, err
 		}
 		return match, nil
@@ -86,7 +86,7 @@ func (store *Store) FindRetryRequest(ctx context.Context, root, dagRun ir.DAGRun
 
 // matchCurrent reports an attempt's current execution, abandoned when the
 // attempt's abandonment record names that execution.
-func matchCurrent(att *Attempt, status *ir.DAGRunStatus) (*persis.RetryRequestMatch, error) {
+func matchCurrent(att *Attempt, status *ir.DAGRunStatus, dagRun, root ir.DAGRunRef) (*persis.RetryRequestMatch, error) {
 	match := &persis.RetryRequestMatch{
 		State:     persis.RetryRequestAdmitted,
 		Execution: persis.ExecutionIdentity{AttemptID: att.ID(), QueuedAt: status.QueuedAt},
@@ -101,7 +101,7 @@ func matchCurrent(att *Attempt, status *ir.DAGRunStatus) (*persis.RetryRequestMa
 		match.State, match.Abandonment = persis.RetryRequestAbandoned, record
 	}
 	if match.Abandonment == nil {
-		if err := markExecutionAbandoned(att, match); err != nil {
+		if err := markExecutionAbandoned(att, match, dagRun, root); err != nil {
 			return nil, err
 		}
 	}
@@ -115,20 +115,19 @@ func matchCurrent(att *Attempt, status *ir.DAGRunStatus) (*persis.RetryRequestMa
 // execution-scoped record for its execution: one of a reused attempt,
 // abandoned without hiding the attempt. A record that is there but cannot be
 // trusted is an error, never absent.
-func markExecutionAbandoned(att *Attempt, match *persis.RetryRequestMatch) error {
+func markExecutionAbandoned(att *Attempt, match *persis.RetryRequestMatch, dagRun, root ir.DAGRunRef) error {
 	if match.Execution.QueuedAt == "" {
 		return nil
 	}
-	path := executionRecordPath(att.file, match.Execution.QueuedAt)
-	record, err := readRecordFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	case err != nil:
+	record, found, err := lookupExecutionRecord(att, dagRun, root, match.Execution.QueuedAt)
+	if err != nil {
 		return fmt.Errorf("read attempt %s execution abandonment record: %w", att.ID(), err)
-	case record.Scope != persis.AbandonmentScopeExecution || record.AbandonedAttemptID != att.ID() ||
-		record.AbandonedExecution != match.Execution:
-		return fmt.Errorf("attempt %s execution abandonment record %s names another execution", att.ID(), filepath.Base(path))
+	}
+	if !found {
+		return nil
+	}
+	if record.AbandonedExecution != match.Execution {
+		return fmt.Errorf("attempt %s execution abandonment record names another execution", att.ID())
 	}
 	match.State, match.Abandonment = persis.RetryRequestAbandoned, record
 	return nil

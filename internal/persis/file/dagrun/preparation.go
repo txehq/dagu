@@ -187,7 +187,7 @@ func (store *Store) AttemptPrepared(_ context.Context, run, root ir.DAGRunRef, a
 	if err != nil || found {
 		return found, err
 	}
-	matches, err := filepath.Glob(store.executionPreparationGlob(want))
+	matches, err := store.executionPreparationPaths(want)
 	if err != nil {
 		return false, fmt.Errorf("failed to read the attempt preparation: %w", err)
 	}
@@ -357,9 +357,25 @@ func (store *Store) preparationPath(p persis.AttemptPreparation) string {
 	return filepath.Join(store.preparationDir, name+preparationExt)
 }
 
-// executionPreparationGlob matches the entries of an attempt's executions.
-func (store *Store) executionPreparationGlob(p persis.AttemptPreparation) string {
-	return filepath.Join(store.preparationDir, store.attemptPreparationName(p)+"-*"+preparationExt)
+// executionPreparationPaths lists the entries of an attempt's executions by
+// name, reading the literal journal directory: no pattern is applied to the
+// path, and a listing error is returned.
+func (store *Store) executionPreparationPaths(p persis.AttemptPreparation) ([]string, error) {
+	entries, err := os.ReadDir(store.preparationDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := store.attemptPreparationName(p) + "-"
+	var paths []string
+	for _, e := range entries {
+		if name := e.Name(); strings.HasPrefix(name, prefix) && strings.HasSuffix(name, preparationExt) {
+			paths = append(paths, filepath.Join(store.preparationDir, name))
+		}
+	}
+	return paths, nil
 }
 
 func (store *Store) attemptPreparationName(p persis.AttemptPreparation) string {

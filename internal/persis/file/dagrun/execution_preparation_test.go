@@ -4,6 +4,9 @@
 package dagrun
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -324,4 +327,124 @@ func TestExecutionPreparationNameDiffersFromTheAttempts(t *testing.T) {
 	execution := attempt
 	execution.QueuedAt = execQ1
 	assert.NotEqual(t, th.Backend.preparationPath(attempt), th.Backend.preparationPath(execution))
+}
+
+// A status writer cannot land between an execution abandonment's check and
+// its record and Failed status: it waits for the status file's lock, so its
+// write follows the abandonment's.
+func TestAbandonExecutionHoldsTheStatusLock(t *testing.T) {
+	th := setupTestRepository(t)
+	dag := th.DAG("exec_lock_dag").DAG
+	att := createRunAttempt(t, th, dag, false, ir.Queued, execQ1, "")
+	writer, err := th.Repository.FindAttempt(th.Context, runRef(dag))
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	executionAbandonCheckedHook = func(string) {
+		go func() {
+			status := ir.InitialStatus(dag)
+			status.DAGRunID, status.AttemptID, status.Status = abandonRunID, att.ID(), ir.Running
+			status.QueuedAt, status.WorkerID = execQ1, "worker-1"
+			if err := writer.Open(th.Context); err != nil {
+				done <- err
+				return
+			}
+			err := writer.Write(th.Context, status)
+			_ = writer.Close(th.Context)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			t.Errorf("a status write landed inside the abandonment: %v", err)
+			done <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	t.Cleanup(func() { executionAbandonCheckedHook = nil })
+
+	_, err = abandon(th, executionRecord(dag, att.ID(), execQ1))
+	require.NoError(t, err)
+	executionAbandonCheckedHook = nil
+	require.NoError(t, <-done)
+	records, err := th.Repository.ListAttemptAbandonments(th.Context, runRef(dag), ir.DAGRunRef{})
+	require.NoError(t, err)
+	require.Len(t, records, 1, "the abandonment was recorded before the late write")
+}
+
+// Records and entries are found by listing the literal directory: a path
+// with pattern characters still finds them, and a directory that cannot be
+// listed is an error rather than no records.
+func TestExecutionRecordsAndEntriesUseLiteralPaths(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "[prod]*?")
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	status := filepath.Join(dir, "status.jsonl")
+	record := executionRecordPath(status, execQ1)
+	require.NoError(t, os.WriteFile(record, []byte("{}"), 0o600))
+	paths, err := executionRecordPaths(status)
+	require.NoError(t, err)
+	assert.Equal(t, []string{record}, paths)
+
+	th := setupTestRepository(t)
+	th.Backend.preparationDir = filepath.Join(t.TempDir(), "[journal]*")
+	run := ir.NewDAGRunRef("d", "r")
+	entry, err := th.Backend.writePreparation(run, run, "a1", execQ1)
+	require.NoError(t, err)
+	prepared, err := th.Backend.AttemptPrepared(th.Context, run, run, "a1")
+	require.NoError(t, err)
+	assert.True(t, prepared)
+	assert.Equal(t, execQ1, entry.QueuedAt)
+
+	if os.Getuid() != 0 {
+		require.NoError(t, os.Chmod(dir, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+		_, err = executionRecordPaths(status)
+		require.Error(t, err, "an unreadable attempt directory is not an empty one")
+	}
+}
+
+// The lookup trusts an execution record only when it is complete and names
+// this run; one that is malformed, or a dangling link at its name, is an
+// error for the current execution and for a retained copy alike.
+func TestFindRetryRequestRefusesAnUntrustedExecutionRecord(t *testing.T) {
+	t.Parallel()
+	for name, corrupt := range map[string]func(t *testing.T, path string){
+		"no evidence": func(t *testing.T, path string) {
+			var r persis.AttemptAbandonment
+			data, err := os.ReadFile(path) //nolint:gosec // test file
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(data, &r))
+			r.Evidence = persis.AbandonmentEvidence{}
+			data, err = json.Marshal(r)
+			require.NoError(t, err)
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, os.WriteFile(path, data, 0o600))
+		},
+		"dangling link": func(t *testing.T, path string) {
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, os.Symlink(path+".missing", path))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			th := setupTestRepository(t)
+			dag := th.DAG("exec_trust_dag").DAG
+			att := createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+			writeExecution(t, th, dag, att, ir.Queued, execQ1, "", &ir.RetryRequest{ID: "req-1", ActionID: "a", ActionAttempt: "1", BindingDigest: "d"})
+			run := runRef(dag)
+			_, err := abandon(th, executionRecord(dag, att.ID(), execQ1))
+			require.NoError(t, err)
+			corrupt(t, executionRecordPath(att.file, execQ1))
+			_, err = th.Backend.FindRetryRequest(th.Context, run, run, "req-1")
+			require.Error(t, err, "current execution")
+
+			_, _, err = th.Repository.CompareAndSwapLatestAttemptStatus(th.Context, run, att.ID(), ir.Failed,
+				func(s *ir.DAGRunStatus) error {
+					s.Status, s.QueuedAt, s.RetryRequest = ir.Queued, execQ2, nil
+					return nil
+				}, persis.DAGRunCompareAndSwapOptions{RetainBeforeSwap: true})
+			require.NoError(t, err)
+			_, err = th.Backend.FindRetryRequest(th.Context, run, run, "req-1")
+			require.Error(t, err, "retained execution")
+		})
+	}
 }

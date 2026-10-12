@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/gofrs/flock"
 )
 
 // AbandonmentRecordFile is the immutable record written into an abandoned
@@ -37,6 +38,11 @@ var (
 	_ persis.DAGRunAttemptAbandoner           = (*Store)(nil)
 	_ persis.DAGRunExecutionAbandonmentReader = (*Store)(nil)
 )
+
+// executionAbandonCheckedHook, when set by a test, runs after an execution
+// abandonment checked the execution and before it publishes its record,
+// with the status file's lock held.
+var executionAbandonCheckedHook func(statusFile string)
 
 // AbandonAttempt implements persis.DAGRunAttemptAbandoner. It holds the run's
 // data-root lock, the lock CompareAndSwapLatestAttemptStatus and CreateAttempt
@@ -187,6 +193,20 @@ func (store *Store) abandonExecution(ctx context.Context, dagRun, rootRef ir.DAG
 		if latest == nil || latest.ID() != record.AbandonedAttemptID {
 			return fmt.Errorf("%w: attempt %s is not the run's latest", persis.ErrAttemptNotAbandonable, record.AbandonedAttemptID)
 		}
+		// Every status append and compaction holds the status file's lock:
+		// held from the check to the append, no writer lands in between.
+		fileLock := flock.New(statusLockPath(latest.file))
+		if err := fileLock.Lock(); err != nil {
+			return fmt.Errorf("lock attempt %s status: %w", latest.ID(), err)
+		}
+		defer func() {
+			_ = fileLock.Unlock()
+			_ = fileLock.Close()
+		}()
+		status, err := parseLatestStatusFromTail(ctx, latest.file)
+		if err != nil {
+			return fmt.Errorf("read attempt %s status: %w", latest.ID(), err)
+		}
 		recordPath := executionRecordPath(latest.file, marker)
 		existing, err := readRecordFile(recordPath)
 		switch {
@@ -196,14 +216,13 @@ func (store *Store) abandonExecution(ctx context.Context, dagRun, rootRef ir.DAG
 			if err := sameAbandonment(*existing, record); err != nil {
 				return err
 			}
-			if existing.AbandonedExecution != record.AbandonedExecution {
+			if existing.Scope != persis.AbandonmentScopeExecution || existing.AbandonedExecution != record.AbandonedExecution {
 				return fmt.Errorf("%w: existing record names another execution", persis.ErrAttemptAbandonmentConflict)
 			}
 			record = *existing
 		case errors.Is(err, os.ErrNotExist):
-			status, err := readWrittenStatus(ctx, latest)
-			if err != nil {
-				return fmt.Errorf("read attempt %s status: %w", latest.ID(), err)
+			if _, lstatErr := os.Lstat(recordPath); !errors.Is(lstatErr, os.ErrNotExist) {
+				return fmt.Errorf("%w: attempt %s execution %s: unreadable record: %v", persis.ErrAttemptAbandonmentConflict, latest.ID(), marker, err)
 			}
 			if !executionAwaitsDispatch(status, marker) {
 				return fmt.Errorf("%w: attempt %s is not a queued execution marked %s", persis.ErrAttemptNotAbandonable, latest.ID(), marker)
@@ -219,13 +238,16 @@ func (store *Store) abandonExecution(ctx context.Context, dagRun, rootRef ir.DAG
 			record.Outcome = persis.AbandonmentMarkedFailed
 			record.ExpectedExecution = nil
 			record.PredecessorAbsent = predecessor == nil && !retained
+			if executionAbandonCheckedHook != nil {
+				executionAbandonCheckedHook(latest.file)
+			}
 			if err := writeRecordExclusive(recordPath, record); err != nil {
 				return err
 			}
 		default:
 			return fmt.Errorf("%w: attempt %s execution %s: %v", persis.ErrAttemptAbandonmentConflict, latest.ID(), marker, err)
 		}
-		if err := markExecutionNotDispatched(ctx, latest, record); err != nil {
+		if err := markExecutionNotDispatchedLocked(ctx, latest, status, record); err != nil {
 			return err
 		}
 		out = &record
@@ -234,15 +256,14 @@ func (store *Store) abandonExecution(ctx context.Context, dagRun, rootRef ir.DAG
 	return out, err
 }
 
-// markExecutionNotDispatched marks the abandoned execution Failed with the
-// record's reason, keeping the rest of its status. A status already Failed
-// for that execution was marked by an earlier, interrupted call.
-func markExecutionNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptAbandonment) error {
+// markExecutionNotDispatchedLocked marks the abandoned execution Failed with
+// the record's reason, keeping the rest of its status. The caller holds the
+// status file's lock and read status under it, so the append goes through a
+// writer that does not take the lock again. A status already Failed for that
+// execution was marked by an earlier, interrupted call.
+func markExecutionNotDispatchedLocked(ctx context.Context, att *Attempt, status *ir.DAGRunStatus, record persis.AttemptAbandonment) error {
 	marker := record.AbandonedExecution.QueuedAt
-	status, err := readWrittenStatus(ctx, att)
 	switch {
-	case err != nil:
-		return fmt.Errorf("read abandoned attempt status: %w", err)
 	case status != nil && status.QueuedAt == marker && status.Status == ir.Failed:
 		return nil
 	case !executionAwaitsDispatch(status, marker):
@@ -255,15 +276,21 @@ func markExecutionNotDispatched(ctx context.Context, att *Attempt, record persis
 	if next.Error == "" {
 		next.Error = "not dispatched"
 	}
-	if err := att.Open(ctx); err != nil {
+	ir.NormalizeDAGRunConditions(&next)
+	writer := NewWriter(att.file)
+	if err := writer.Open(); err != nil {
 		return fmt.Errorf("open abandoned attempt: %w", err)
 	}
-	writeErr := att.Write(ctx, next)
-	closeErr := att.Close(ctx)
+	writeErr := writer.Write(ctx, next)
+	closeErr := writer.Close(ctx)
 	if writeErr != nil {
 		return fmt.Errorf("mark abandoned execution failed: %w", writeErr)
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	att.afterWriteLocked(ctx, next)
+	return nil
 }
 
 // executionRecordPath names the record of the attempt's execution marked
@@ -292,18 +319,58 @@ func hasRetainedExecutions(statusFile string) (bool, error) {
 }
 
 // readExecutionRecords reads and fully validates every execution-scoped
-// record of an attempt. A record that cannot be trusted is a result with Err.
+// record of an attempt. A record that cannot be trusted is a result with Err;
+// a directory that cannot be listed is an error, never no records.
 func readExecutionRecords(att *Attempt, dagRun, rootDAGRun ir.DAGRunRef) ([]persis.AttemptAbandonmentResult, error) {
-	matches, err := filepath.Glob(filepath.Join(filepath.Dir(att.file), executionRecordPrefix+"*.json"))
+	paths, err := executionRecordPaths(att.file)
 	if err != nil {
 		return nil, err
 	}
 	var results []persis.AttemptAbandonmentResult
-	for _, path := range matches {
+	for _, path := range paths {
 		record, err := readStoredExecutionRecord(path, att, dagRun, rootDAGRun)
 		results = append(results, persis.AttemptAbandonmentResult{AttemptID: att.ID(), Record: record, Err: err})
 	}
 	return results, nil
+}
+
+// executionRecordPaths lists the execution-scoped records beside a status
+// file by name, reading the literal directory: no pattern is applied to the
+// path, and a listing error is returned.
+func executionRecordPaths(statusFile string) ([]string, error) {
+	dir := filepath.Dir(statusFile)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("list attempt directory: %w", err)
+	}
+	var paths []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, executionRecordPrefix) && strings.HasSuffix(name, ".json") {
+			paths = append(paths, filepath.Join(dir, name))
+		}
+	}
+	return paths, nil
+}
+
+// lookupExecutionRecord reads the record of the attempt's execution marked
+// queuedAt: found false only when nothing is at its name (Lstat, so a
+// dangling link is not absent), and fully validated otherwise.
+func lookupExecutionRecord(att *Attempt, dagRun, rootDAGRun ir.DAGRunRef, queuedAt string) (*persis.AttemptAbandonment, bool, error) {
+	path := executionRecordPath(att.file, queuedAt)
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, true, fmt.Errorf("%w: attempt %s: %v", persis.ErrAttemptAbandonmentConflict, att.ID(), err)
+	}
+	record, err := readStoredExecutionRecord(path, att, dagRun, rootDAGRun)
+	if err != nil {
+		return nil, true, err
+	}
+	if record.AbandonedExecution.QueuedAt != queuedAt {
+		return nil, true, fmt.Errorf("%w: attempt %s: record names another execution", persis.ErrAttemptAbandonmentConflict, att.ID())
+	}
+	return record, true, nil
 }
 
 // readStoredExecutionRecord reads one execution-scoped record and checks it
