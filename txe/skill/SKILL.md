@@ -197,7 +197,14 @@ An update names the version it was made against. If another session has updated 
 
 ## When the work is over, or the target changes
 
-Say so in the registry, so dependent jobs are reviewed or retired instead of failing forever. `dagu txe --help` lists the lifecycle commands available in this build (retire, pause, resource events). Record a deletion only when it is confirmed. An unreachable target, a denied permission or an expired login is not a deletion.
+Say so in the registry, so dependent jobs are reviewed or retired instead of failing forever. Record a deletion only when it is confirmed. An unreachable target, a denied permission or an expired login is not a deletion.
+
+`dagu txe` has no command that retires or pauses a job. What ends one:
+
+- **What the spec said at registration.** A job is not run after `lifetime.expires_at`. `retirement_rules` say what happens when the target is deleted (`on_target_deleted`), replaced (`on_replacement`) or the job completes (`on_completion`); the examples show them. Set these when you register, so the job ends without anyone having to remember it.
+- **The hub.** A job is retired, paused, resumed or completed by a request to the hub: `POST /api/v1/txe/jobs/<job id>/lifecycle` with a body such as `{"op": "retire", "reason": "manual", "detail": "why"}`. It needs a login or API key for the hub, which this CLI does not hand out. If you have none, give the person who runs the hub the job id and the reason. A retired job can be brought back only by a person, so do not retire one to try something out.
+
+Check the result with `dagu txe inspect <job id>`: it shows the lifecycle and, for a retired job, the reason and time.
 
 ## Reference
 

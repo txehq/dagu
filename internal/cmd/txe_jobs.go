@@ -92,7 +92,7 @@ func runTXEList(ctx *Context, _ []string) error {
 		table.f("JOB\tKEY\tVERSION\tLIFECYCLE\tREGISTRATION\tCREATED BY\tTITLE\n")
 		for _, r := range rows {
 			table.f("%s\t%s\t%d\t%s\t%s\t%s\t%s\n", r.JobID, r.Registration.JobKey, r.Version,
-				r.Lifecycle, r.Registration.State, r.Created.By.Session, r.Title)
+				r.Lifecycle, r.Registration.State, txeActorName(r.Created.By), r.Title)
 		}
 		if table.err == nil {
 			table.err = tw.Flush()
@@ -187,7 +187,7 @@ func runTXEInspect(ctx *Context, args []string) error {
 		p.f("Job key:       %s\nVersion:       %d (revision %d)\n", job.Registration.JobKey, job.Version, job.Revision)
 		p.f("Owner:         %s\nProject:       %s\nMachine:       %s\n", job.OwnerID, job.ProjectID, job.MachineID)
 		p.f("Created by:    %s on %s\nLast changed:  %s on %s\n",
-			job.Created.By.Session, job.Created.At.Format("2006-01-02 15:04Z07:00"), job.Updated.By.Session, job.Updated.At.Format("2006-01-02 15:04Z07:00"))
+			txeActorName(job.Created.By), job.Created.At.Format("2006-01-02 15:04Z07:00"), txeActorName(job.Updated.By), job.Updated.At.Format("2006-01-02 15:04Z07:00"))
 		p.f("\nLifecycle:     %s", job.Lifecycle)
 		if job.LifecycleReason != "" {
 			p.f(" (%s)", job.LifecycleReason)
@@ -252,4 +252,20 @@ func txeLocalPackage(job *txeclient.Job) txeLocalState {
 	}
 	state.Held, state.PackageDir = true, pkg.Dir
 	return state
+}
+
+// txeActorName names who made a change: the coding session when there was
+// one, otherwise the kind and id the registry recorded. The hub and a
+// worker's own checks change a job without a session.
+func txeActorName(actor txeclient.Actor) string {
+	switch {
+	case actor.Session != "":
+		return actor.Session
+	case actor.Kind != "" && actor.ID != "":
+		return actor.Kind + " " + actor.ID
+	case actor.Kind != "" || actor.ID != "":
+		return actor.Kind + actor.ID
+	default:
+		return "(not recorded)"
+	}
 }
