@@ -15,9 +15,11 @@ import { I18nText } from '@/i18n/I18nText';
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { dagRunPath } from '@/features/txe/components/InboxItemCard';
 import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
+import { RunRetry } from '@/features/txe/components/RunRetry';
 import {
   useJobDetail,
   usePersonDecisions,
+  useRetryStates,
   useTxeApi,
 } from '@/features/txe/hooks';
 import { isProposalActionable } from '@/features/txe/inbox';
@@ -173,6 +175,8 @@ export default function TxeJobPage(): React.ReactElement {
   // A person may decide only where the hub can tell who they are.
   const canDecide = useCanExecute() && personDecisions;
   const { data, error, mutate } = useJobDetail(jobId);
+  const api = useTxeApi();
+  const { data: retries, mutate: mutateRetries } = useRetryStates(jobId);
 
   React.useEffect(() => {
     appBarContext.setTitle(data?.job.title ?? 'Job');
@@ -299,6 +303,34 @@ export default function TxeJobPage(): React.ReactElement {
               {run.error && (
                 <span className="text-destructive"> {run.error}</span>
               )}
+              <RunRetry
+                dagName={run.dagName}
+                runId={run.dagRunId}
+                runStatus={run.status}
+                execution={run.execution}
+                state={retries?.get(run.dagRunId)}
+                canDecide={canDecide}
+                onRequest={async (key) => {
+                  // The button is offered only for a run with a known
+                  // execution; the request names exactly that one.
+                  if (!run.execution) {
+                    return {
+                      ok: false,
+                      status: 0,
+                      message: 'this run has no execution to retry',
+                    };
+                  }
+                  const result = await api.requestRetry(
+                    job.jobId,
+                    run.dagRunId,
+                    run.execution,
+                    job.version,
+                    key
+                  );
+                  await mutateRetries();
+                  return result;
+                }}
+              />
             </li>
           ))}
         </ul>

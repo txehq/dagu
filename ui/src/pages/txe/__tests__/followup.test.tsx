@@ -56,6 +56,8 @@ function baseApi(overrides: Partial<TxeApi> = {}): TxeApi {
     listDecisions: async () => [],
     decide: vi.fn(),
     replayDecision: vi.fn(),
+    requestRetry: vi.fn(),
+    listRetryStates: async () => new Map(),
     ...overrides,
   };
 }
@@ -162,5 +164,206 @@ describe('snooze expiry', () => {
     expect(
       await screen.findByText('Usage is at 92%. Resize the volume to 20Gi?')
     ).toBeInTheDocument();
+  });
+});
+
+describe('run retry', () => {
+  const failedJob = fixtureJob({
+    latestRuns: [
+      {
+        dagName: 'job_volume_monitor',
+        dagRunId: 'run-0003',
+        status: 'failed',
+        execution: {
+          attemptId: 'run-0003-a1',
+          queuedAt: '2026-10-09T12:00:00.000000001Z',
+        },
+      },
+    ],
+  });
+
+  it('asks for a retry of the exact failed execution at the job version', async () => {
+    const requestRetry = vi.fn().mockResolvedValue({ ok: true });
+    renderAt(
+      baseApi({ getJob: async () => failedJob, requestRetry }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Retry this run' })
+    );
+    await waitFor(() => expect(requestRetry).toHaveBeenCalledTimes(1));
+    // The execution the person reviewed is sent so a moved run is refused.
+    expect(requestRetry.mock.calls[0]?.slice(0, 4)).toEqual([
+      'job_volume_monitor',
+      'run-0003',
+      { attemptId: 'run-0003-a1', queuedAt: '2026-10-09T12:00:00.000000001Z' },
+      failedJob.version,
+    ]);
+  });
+
+  // Dagu's queued retry keeps the attempt ID and records a later queue
+  // marker: that is a new execution, so it is offered for a retry again.
+  it('offers a re-queued execution of a retried attempt', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () =>
+          fixtureJob({
+            latestRuns: [
+              {
+                dagName: 'job_volume_monitor',
+                dagRunId: 'run-0003',
+                status: 'failed',
+                execution: {
+                  attemptId: 'run-0003-a1',
+                  queuedAt: '2026-10-09T12:00:05.000000001Z',
+                },
+              },
+            ],
+          }),
+        listRetryStates: async () =>
+          new Map([
+            [
+              'run-0003',
+              {
+                runId: 'run-0003',
+                proposalId: 'prp_r',
+                attemptId: 'run-0003-a1',
+                queuedAt: '2026-10-09T12:00:00.000000001Z',
+                status: 'succeeded' as const,
+                receipt: 'run-0003-a1-8e2c4a1b9f0d3e57',
+              },
+            ],
+          ]),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    expect(
+      await screen.findByRole('button', { name: 'Retry this run' })
+    ).toBeInTheDocument();
+  });
+
+  // Retry states are refreshed in place after a request; the page must show
+  // the new state, not keep the first one it loaded (SWR's default
+  // comparison sees every two Maps as equal).
+  it('shows the recorded request after asking, without a reload', async () => {
+    let recorded = false;
+    renderAt(
+      baseApi({
+        getJob: async () => failedJob,
+        requestRetry: vi.fn(async () => {
+          recorded = true;
+          return { ok: true as const };
+        }),
+        listRetryStates: async () =>
+          recorded
+            ? new Map([
+                [
+                  'run-0003',
+                  {
+                    runId: 'run-0003',
+                    proposalId: 'prp_r',
+                    attemptId: 'run-0003-a1',
+                    queuedAt: '2026-10-09T12:00:00.000000001Z',
+                    status: 'requested' as const,
+                  },
+                ],
+              ])
+            : new Map(),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Retry this run' })
+    );
+    expect(
+      await screen.findByText(
+        'Retry requested; waiting for the reviewer to dispatch it'
+      )
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'Retry this run' })
+      ).not.toBeInTheDocument()
+    );
+  });
+
+  // A recorded request is not a retry: it waits for the reviewer, and the
+  // run is not offered again meanwhile.
+  it('shows a requested retry as waiting, not done', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () => failedJob,
+        listRetryStates: async () =>
+          new Map([
+            [
+              'run-0003',
+              {
+                runId: 'run-0003',
+                proposalId: 'prp_r',
+                attemptId: 'run-0003-a1',
+                queuedAt: '2026-10-09T12:00:00.000000001Z',
+                status: 'requested' as const,
+              },
+            ],
+          ]),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    expect(
+      await screen.findByText(
+        'Retry requested; waiting for the reviewer to dispatch it'
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Retry this run' })
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe('dispatched retry', () => {
+  // The registry accepts a successful dispatch only with the new execution it
+  // observed, so the receipt names a real execution; the run's own status is
+  // shown beside it and never read as the job succeeding.
+  it('names the observed execution and shows the run status separately', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () =>
+          fixtureJob({
+            latestRuns: [
+              {
+                dagName: 'job_volume_monitor',
+                dagRunId: 'run-0003',
+                status: 'running',
+                execution: {
+                  attemptId: 'run-0003-a2',
+                  queuedAt: '',
+                  ref: 'run-0003-a2-0123456789abcdef',
+                },
+              },
+            ],
+          }),
+        listRetryStates: async () =>
+          new Map([
+            [
+              'run-0003',
+              {
+                runId: 'run-0003',
+                proposalId: 'prp_r',
+                attemptId: 'run-0003-a1',
+                queuedAt: '',
+                status: 'succeeded' as const,
+                receipt: 'run-0003-a2-0123456789abcdef',
+              },
+            ],
+          ]),
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    const retry = await screen.findByTestId('txe-run-retry');
+    expect(retry).toHaveTextContent(
+      'Retry dispatched as execution run-0003-a2-0123456789abcdef'
+    );
+    expect(retry).toHaveTextContent('run is now running');
+    expect(retry).not.toHaveTextContent('Retried');
   });
 });
