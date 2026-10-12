@@ -51,6 +51,9 @@ export type Config = {
   setupRequired: boolean;
   oidcEnabled: boolean;
   oidcButtonLabel: string;
+  // OIDC sessions are on: signing out must also end the hub session. Absent
+  // means off, as on hubs without sessions.
+  oidcSessionEnabled?: boolean;
   proxyEnabled: boolean;
   proxyButtonLabel: string;
   terminalEnabled: boolean;

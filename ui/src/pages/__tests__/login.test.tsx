@@ -77,11 +77,11 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
   };
 }
 
-function renderLogin(config: Config) {
+function renderLogin(config: Config, entry = '/login') {
   render(
     <UserPreferencesProvider>
       <I18nProvider>
-        <MemoryRouter initialEntries={['/login']}>
+        <MemoryRouter initialEntries={[entry]}>
           <ConfigContext.Provider value={config}>
             <LoginPage />
           </ConfigContext.Provider>
@@ -151,5 +151,23 @@ describe('LoginPage', () => {
       JSON.parse(localStorage.getItem('user_preferences') ?? '{}')
     ).toEqual(expect.objectContaining({ locale: 'ja' }));
     await waitFor(() => expect(document.documentElement.lang).toBe('ja'));
+  });
+
+  it('says when the hub did not confirm the sign-out', () => {
+    renderLogin(makeConfig(), '/login?signout=unconfirmed');
+
+    expect(screen.getByTestId('signout-unconfirmed')).toHaveTextContent(
+      'the server did not confirm that your session ended'
+    );
+    expect(screen.getByTestId('signout-unconfirmed')).toHaveAttribute(
+      'role',
+      'status'
+    );
+  });
+
+  it('shows no sign-out notice after a confirmed sign-out', () => {
+    renderLogin(makeConfig());
+
+    expect(screen.queryByTestId('signout-unconfirmed')).not.toBeInTheDocument();
   });
 });

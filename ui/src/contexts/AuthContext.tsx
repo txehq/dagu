@@ -7,6 +7,7 @@ import {
   useState,
   useEffect,
   useCallback,
+  useRef,
   ReactNode,
 } from 'react';
 import { mutate as globalMutate } from 'swr';
@@ -39,6 +40,21 @@ type SetupResult = {
   user: User;
 };
 
+// How a sign-out ended at the hub. 'local': only this browser's session was
+// cleared, because OIDC sessions are off or there was no token (as before
+// sessions existed). 'ended': the hub confirmed the session is over.
+// 'unconfirmed': the hub did not confirm it (an error answer, no answer, or
+// no answer in time); this browser is signed out either way, but the session
+// may live on at the hub until its token expires.
+export type LogoutResult = 'local' | 'ended' | 'unconfirmed';
+
+// How long a sign-out waits for the hub before it is reported unconfirmed.
+export const OIDC_LOGOUT_TIMEOUT_MS = 5000;
+
+function oidcLogoutURL(basePath: string): string {
+  return `${basePath.replace(/\/+$/, '')}/oidc-logout`;
+}
+
 type AuthContextType = {
   user: User | null;
   token: string | null;
@@ -47,7 +63,7 @@ type AuthContextType = {
   setupRequired: boolean;
   login: (username: string, password: string) => Promise<void>;
   setup: (username: string, password: string) => Promise<SetupResult>;
-  logout: () => void;
+  logout: () => Promise<LogoutResult>;
   refreshUser: () => Promise<void>;
   completeSetup: (result: SetupResult) => void;
 };
@@ -70,10 +86,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void globalMutate(() => true, undefined, { revalidate: false });
   }, []);
 
-  const logout = useCallback(() => {
-    clearAuthSession('logout');
-    clearLocalSession();
-  }, [clearLocalSession]);
+  // A sign-out already under way: repeated or concurrent calls share it, so
+  // the hub is asked once and the token is cleared once.
+  const logoutInFlight = useRef<Promise<LogoutResult> | null>(null);
+
+  const logout = useCallback((): Promise<LogoutResult> => {
+    if (logoutInFlight.current) {
+      return logoutInFlight.current;
+    }
+    const run = async (): Promise<LogoutResult> => {
+      const storedToken = getAuthToken();
+      try {
+        // With OIDC sessions off the route does not exist: no request.
+        if (!config.oidcSessionEnabled || !storedToken) {
+          return 'local';
+        }
+        try {
+          const response = await fetch(oidcLogoutURL(config.basePath), {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${storedToken}` },
+            keepalive: true,
+            signal: AbortSignal.timeout(OIDC_LOGOUT_TIMEOUT_MS),
+          });
+          return response.status === 204 ? 'ended' : 'unconfirmed';
+        } catch {
+          return 'unconfirmed';
+        }
+      } finally {
+        // This browser is signed out whatever the hub answered.
+        clearAuthSession('logout');
+        clearLocalSession();
+        logoutInFlight.current = null;
+      }
+    };
+    logoutInFlight.current = run();
+    return logoutInFlight.current;
+  }, [clearLocalSession, config.oidcSessionEnabled, config.basePath]);
 
   const refreshUser = useCallback(async () => {
     const storedToken = getAuthToken();

@@ -630,6 +630,7 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			AuthMode:              cfg.Server.Auth.Mode,
 			OIDCEnabled:           oidcEnabled,
 			OIDCButtonLabel:       oidcButtonLabel,
+			OIDCSessionEnabled:    oidcSessionsEnabled(builtinOIDCCfg),
 			ProxyEnabled:          cfg.Server.Auth.Proxy.Enabled,
 			ProxyButtonLabel:      cfg.Server.Auth.Proxy.ButtonLabel,
 			TerminalEnabled:       cfg.Server.Terminal.Enabled && authSvc != nil,
@@ -1225,9 +1226,16 @@ func (srv *Server) setupOIDCRoutes(r *chi.Mux, basePath string) {
 	r.Get(pathutil.BuildPublicEndpointPath(basePath, "oidc-callback"), auth.BuiltinOIDCCallbackHandler(srv.builtinOIDCCfg))
 	// The sign-out route exists only with OIDC sessions on. Without them
 	// there is no session to end and the routes are as they were.
-	if srv.builtinOIDCCfg.Sessions != nil {
+	if oidcSessionsEnabled(srv.builtinOIDCCfg) {
 		r.Post(pathutil.BuildPublicEndpointPath(basePath, "oidc-logout"), auth.BuiltinOIDCLogoutHandler(srv.builtinOIDCCfg))
 	}
+}
+
+// oidcSessionsEnabled reports whether OIDC sessions are on. It decides both
+// whether the oidc-logout route is registered and whether the UI is told to
+// call it, so the two cannot disagree.
+func oidcSessionsEnabled(cfg *auth.BuiltinOIDCConfig) bool {
+	return cfg != nil && cfg.Sessions != nil
 }
 
 // newOIDCSessions builds the OIDC session manager, with the refresh tokens it

@@ -146,6 +146,8 @@ export const messages = {
     'auth.loginWithSso': 'Login with SSO',
     'auth.continueWithSso': 'Continue with SSO',
     'auth.welcomeAccountCreated': 'Welcome! Your account has been created.',
+    'auth.signOutUnconfirmed':
+      'You are signed out on this device, but the server did not confirm that your session ended. If it is still active, it ends when it expires.',
     'auth.signOut': 'Sign Out',
     'auth.changePassword': 'Change Password',
     'auth.currentPassword': 'Current Password',
@@ -304,6 +306,8 @@ export const messages = {
     'auth.loginWithSso': '使用 SSO 登录',
     'auth.continueWithSso': '使用 SSO 继续',
     'auth.welcomeAccountCreated': '欢迎！你的账户已创建。',
+    'auth.signOutUnconfirmed':
+      '你已在此设备上退出，但服务器未确认你的会话已结束。若会话仍有效，将在过期时结束。',
     'auth.signOut': '退出登录',
     'auth.changePassword': '修改密码',
     'auth.currentPassword': '当前密码',
@@ -468,6 +472,8 @@ export const messages = {
     'auth.loginWithSso': 'SSO でログイン',
     'auth.continueWithSso': 'SSO で続行',
     'auth.welcomeAccountCreated': 'ようこそ！アカウントが作成されました。',
+    'auth.signOutUnconfirmed':
+      'このデバイスではサインアウトしましたが、サーバーはセッションの終了を確認していません。セッションがまだ有効な場合は、有効期限で終了します。',
     'auth.signOut': 'ログアウト',
     'auth.changePassword': 'パスワードを変更',
     'auth.currentPassword': '現在のパスワード',

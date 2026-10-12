@@ -34,6 +34,7 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [welcomeMessage, setWelcomeMessage] = useState<string | null>(null);
+  const [signOutNotice, setSignOutNotice] = useState<string | null>(null);
 
   const from = (location.state as { from?: Location })?.from?.pathname || '/';
 
@@ -59,6 +60,9 @@ export default function LoginPage() {
     }
     if (welcomeParam === 'true') {
       setWelcomeMessage(t('auth.welcomeAccountCreated'));
+    }
+    if (searchParams.get('signout') === 'unconfirmed') {
+      setSignOutNotice(t('auth.signOutUnconfirmed'));
     }
   }, [searchParams, location.hash, navigate, from, t]);
 
@@ -114,6 +118,17 @@ export default function LoginPage() {
             <div className="flex items-center gap-2 p-3 text-sm text-green-700 dark:text-green-400 bg-green-100 dark:bg-green-900/30 rounded-md">
               <CheckCircle className="h-4 w-4 flex-shrink-0" />
               <span>{welcomeMessage}</span>
+            </div>
+          )}
+
+          {signOutNotice && (
+            <div
+              role="status"
+              data-testid="signout-unconfirmed"
+              className="flex items-center gap-2 p-3 text-sm text-amber-800 dark:text-amber-300 bg-amber-100 dark:bg-amber-900/30 rounded-md"
+            >
+              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+              <span>{signOutNotice}</span>
             </div>
           )}
 
