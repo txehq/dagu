@@ -232,7 +232,13 @@ files.
   settling a retry of that run, and says to ask again. That answer is never
   read as an outcome. A retry whose admitted execution the run shows
   dispatched, and which the registry does not settle yet, is recorded as
-  uncertain with that execution and settled by a later review. A decision
+  uncertain with that execution and settled by a later review. If the
+  registry still refuses 30 minutes after it granted the attempt (the same
+  two registry times as for a stalled reservation), the exception
+  `retry_settlement_blocked` is reported about that attempt: the cause is
+  the service's record of the execution's preparation on the hub, not an
+  absent worker. It asks for no decision; the action stays uncertain and
+  keeps being probed. A decision
   whose run shows another execution only being prepared is not ended as
   skipped: its step fails and is tried again by its retry policy (five
   times, a minute apart), nothing is journaled and the decision keeps its

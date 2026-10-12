@@ -2235,6 +2235,21 @@ func TestRetryRunARegistryNotReadyToSettleKeepsTheAdmittedExecution(t *testing.T
 		assert.NotEqual(t, review.ProposalUncertain, p.Kind, "the owner is not asked about a retry that is only waiting on the registry")
 	}
 
+	assert.Empty(t, f.state().Exceptions, "and not told yet: ten minutes is not a stall")
+
+	// It lasts. The owner is told once the registry's own times say half
+	// an hour has passed since it granted the attempt, as an exception
+	// about this attempt, and the action is still not ended.
+	f.clock.Advance(30 * time.Minute)
+	lasting := next("reviewer-b2")
+	assert.Equal(t, review.ActionUncertain, lasting.State, "telling the owner does not stop the probing")
+	require.Len(t, f.state().Exceptions, 1)
+	exc := f.state().Exceptions[0]
+	assert.Equal(t, review.ExceptionRetryUnsettled, exc.Kind)
+	assert.Equal(t, lasting.ID, exc.ActionID)
+	assert.Contains(t, exc.Message, admitted)
+	assert.Contains(t, exc.Message, "A worker being absent is not the cause")
+
 	preparing = false
 	settled := next("reviewer-c")
 	assert.Equal(t, review.ActionSucceeded, settled.State)

@@ -546,6 +546,18 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// The registry does not take the execution as dispatched yet.
 			// The action stays as it is, uncertain with its admitted
 			// execution on record, and the next review asks again.
+			//
+			// A refusal that lasts is not left to repeat in silence: after
+			// the same time as a stalled reservation, by the same two
+			// times of the registry's clock, the owner is told. It is an
+			// exception and not a question, so the action is not ended and
+			// keeps being probed. A registry that cannot take the
+			// exception does not stop the review.
+			if escalate && !claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
+				if err := r.raiseUnsettled(ctx, claim, job, action); err != nil {
+					fmt.Fprintf(os.Stderr, "txe review: action %s of %s: %v; the action stays uncertain and the review goes on\n", action.ID, job.ID, err)
+				}
+			}
 			return nil
 		}
 		return err
@@ -599,6 +611,28 @@ func (r *Reviewer) raiseStalled(ctx context.Context, claim Claim, job Job, actio
 				"Nothing is sent again: the reviewer keeps looking and records the retry when that execution starts, or when the service records that its preparation was abandoned. "+
 				"Do not retry the run by hand while the execution can still start, or it may run twice.",
 			action.Params[RetryRunParam], action.ID, action.Attempt, action.AdmittedRef, job.MachineID, action.AttemptStartedAt.UTC().Format(time.RFC3339), action.AdmittedRef),
+	})
+	if err != nil {
+		return fmt.Errorf("raise exception: %w", err)
+	}
+	return nil
+}
+
+// raiseUnsettled files the exception for a retry whose admitted execution
+// the run shows dispatched and the registry still refuses to settle. It
+// names the attempt and the execution and says where to look. It grants
+// nothing and asks for no decision.
+func (r *Reviewer) raiseUnsettled(ctx context.Context, claim Claim, job Job, action Action) error {
+	err := r.Registry.RaiseException(ctx, Exception{
+		JobID: job.ID, Kind: ExceptionRetryUnsettled, MachineID: job.MachineID, Claim: claim,
+		ActionID: action.ID, Attempt: action.Attempt, ReviewID: action.ReviewID,
+		Message: fmt.Sprintf(
+			"The retry of run %s (action %s, attempt %d) was admitted by the service as execution %s, in the attempt granted at %s, and the run shows that execution dispatched. "+
+				"The registry still refuses to record the retry: by its record the preparation of execution %s is not settled as dispatched or abandoned. "+
+				"That record is the service's, on the hub: look at why the preparation of that execution was not cleared. A worker being absent is not the cause. "+
+				"Nothing is sent again: the reviewer keeps asking and records the retry when the registry accepts it. "+
+				"Do not retry the run by hand for this decision, or it may run twice.",
+			action.Params[RetryRunParam], action.ID, action.Attempt, action.AdmittedRef, action.AttemptStartedAt.UTC().Format(time.RFC3339), action.AdmittedRef),
 	})
 	if err != nil {
 		return fmt.Errorf("raise exception: %w", err)

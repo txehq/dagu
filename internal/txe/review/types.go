@@ -554,6 +554,13 @@ const (
 	// being probed; the registry resolves the exception when that attempt
 	// is settled.
 	ExceptionRetryStalled ExceptionKind = "retry_reservation_stalled"
+	// ExceptionRetryUnsettled means the run shows a retry's admitted
+	// execution dispatched and the registry has kept refusing to settle the
+	// retry, because by its own record that execution's preparation is not
+	// settled. It is about one attempt of one action, which stays uncertain
+	// and keeps being probed; the registry resolves the exception when that
+	// attempt is settled.
+	ExceptionRetryUnsettled ExceptionKind = "retry_settlement_blocked"
 	// ExceptionCommandsUnbound means the registry's record of the job's
 	// commands is not what this machine registered, or this machine has no
 	// record of the registration, so none of the job's commands is started.
