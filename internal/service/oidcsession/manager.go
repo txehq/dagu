@@ -49,6 +49,7 @@ package oidcsession
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -244,6 +245,8 @@ type owedRevocation struct {
 	auth  ClientAuth
 	// refusals counts the times the provider answered and did not revoke.
 	refusals int
+	// unanswered counts the times the provider gave no answer to it.
+	unanswered int
 	// since is when the provider first did not take the revocation.
 	since time.Time
 }
@@ -461,6 +464,25 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 			pending[id] = d
 		}
 	}
+	m.mu.Unlock()
+
+	// The ends are written here. Their revocations are not made here: they
+	// join the owed ones, so that every call to the provider a sign-in waits
+	// for goes through the one bounded round below.
+	for id, d := range pending {
+		out, err := m.end(ctx, id, d)
+		if !out.applied.revoke || out.held == "" || out.held == out.applied.revoked {
+			continue
+		}
+		if refreshToken, decryptErr := m.enc.Decrypt(out.held); decryptErr == nil {
+			m.owe(refreshToken, out.auth, errRevocationNotTried)
+			if err != nil {
+				m.noteRevoked(id, out.held)
+			}
+		}
+	}
+
+	m.mu.Lock()
 	owed := make([]owedRevocation, 0, len(m.owed))
 	for digest, revocation := range m.owed {
 		if now.Sub(revocation.since) > purgeAfter {
@@ -476,14 +498,14 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	}
 	m.mu.Unlock()
 
-	for id, d := range pending {
-		_ = m.conclude(ctx, id, d)
-	}
-
-	// The longest owed go first, so that none waits behind newer ones. A
+	// The longest owed go first, so that none waits behind newer ones, but
+	// behind those the provider has left unanswered less often: one that
+	// never gets an answer must not stand in front of the others for good. A
 	// revocation the provider answers no to does not hold up the others: the
 	// provider is there. One it does not answer ends the round.
-	slices.SortFunc(owed, func(a, b owedRevocation) int { return a.since.Compare(b.since) })
+	slices.SortFunc(owed, func(a, b owedRevocation) int {
+		return cmp.Or(cmp.Compare(a.unanswered, b.unanswered), a.since.Compare(b.since))
+	})
 	if len(owed) > reconcilePerSignIn {
 		owed = owed[:reconcilePerSignIn]
 	}
@@ -1073,8 +1095,8 @@ func (m *Manager) remember(sessionID string, d decision) decision {
 }
 
 // noteRevoked notes which refresh token of a remembered end the provider has
-// revoked, so that the same one is not revoked again when the store takes the
-// end.
+// revoked, or is owed the revocation of, so that the same one is not revoked
+// again when the store takes the end.
 func (m *Manager) noteRevoked(sessionID, held string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1139,6 +1161,10 @@ func (m *Manager) revokeAtProvider(ctx context.Context, auth ClientAuth, refresh
 	return all
 }
 
+// errRevocationNotTried is the reason a revocation is owed that the provider
+// has not been asked for yet.
+var errRevocationNotTried = errors.New("oidcsession: the revocation has not been tried yet")
+
 // owe keeps a revocation the provider did not take, to be made again at a
 // later sign-in, and forgets one it has taken. A provider that has no
 // revocation endpoint is owed nothing: asking again would change nothing. One
@@ -1153,10 +1179,13 @@ func (m *Manager) owe(refreshToken string, auth ClientAuth, revokeErr error) {
 	}
 	refused := errors.Is(revokeErr, ErrRevocationRefused)
 	if revocation, ok := m.owed[digest]; ok {
-		if refused {
+		switch {
+		case refused:
 			revocation.refusals++
-			m.owed[digest] = revocation
+		case !errors.Is(revokeErr, errRevocationNotTried):
+			revocation.unanswered++
 		}
+		m.owed[digest] = revocation
 		if revocation.refusals >= maxRevocationRefusals {
 			delete(m.owed, digest)
 		}

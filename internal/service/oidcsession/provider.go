@@ -55,8 +55,9 @@ type Provider interface {
 var ErrRevocationUnsupported = errors.New("the identity provider has no revocation endpoint")
 
 // ErrRevocationRefused is what Revoke returns when the provider answered and
-// did not revoke: a 4xx from the revocation endpoint. The provider is there,
-// and asking it the same thing again is unlikely to change its answer.
+// did not revoke: a 4xx from the revocation endpoint, other than one that
+// says to come back later. The provider is there, and asking it the same
+// thing again is unlikely to change its answer.
 var ErrRevocationRefused = errors.New("the identity provider refused the revocation")
 
 // RefusedError is the provider's definite refusal of a refresh: a 400 or 401
@@ -251,13 +252,15 @@ func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth Client
 
 // Revoke implements Provider. With ClientAuthDetect, which is all that is
 // known of a token whose session was never established, it is asked both
-// ways.
+// ways: the form is tried when the provider has answered no to the header.
+// The answer is then no only if it was no both ways. A way that got no answer
+// may have been the right one, and is reported as no answer.
 func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string, auth ClientAuth) error {
 	if p.revocationURL == "" {
 		return ErrRevocationUnsupported
 	}
 	err := p.revoke(ctx, refreshToken, auth)
-	if err != nil && auth == ClientAuthDetect && p.clientSecret != "" {
+	if errors.Is(err, ErrRevocationRefused) && auth == ClientAuthDetect && p.clientSecret != "" {
 		err = p.revoke(ctx, refreshToken, ClientAuthForm)
 	}
 	return err
@@ -271,6 +274,9 @@ func (p *HTTPProvider) revoke(ctx context.Context, refreshToken string, auth Cli
 	switch {
 	case status == http.StatusOK:
 		return nil
+	case status == http.StatusRequestTimeout, status == http.StatusTooEarly, status == http.StatusTooManyRequests:
+		// Not an answer about the revocation: the provider wants it later.
+		return fmt.Errorf("the revocation endpoint answered %d", status)
 	case status >= 400 && status < 500:
 		return fmt.Errorf("%w: the revocation endpoint answered %d", ErrRevocationRefused, status)
 	default:

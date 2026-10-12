@@ -474,19 +474,34 @@ func TestHTTPProviderRefreshesTheWayItIsTold(t *testing.T) {
 			"a 4xx is the provider's answer, and it is no")
 		assert.Equal(t, []string{"form revoke", "header revoke"}, e.requests(), "a revocation needs nothing found out first")
 
-		unwell := newPickyEndpoint(t, "")
-		unwell.notAcceptedStatus, unwell.notAcceptedBody = http.StatusServiceUnavailable, `starting`
-		err := unwell.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthHeader)
-		require.Error(t, err)
-		require.NotErrorIs(t, err, ErrRevocationRefused, "a 5xx is not an answer")
+		// A 5xx is not an answer, and neither is a 4xx that says to come
+		// back later: the revocation is tried again, not given up.
+		var err error
+		for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests, http.StatusRequestTimeout, http.StatusTooEarly} {
+			unwell := newPickyEndpoint(t, "")
+			unwell.notAcceptedStatus, unwell.notAcceptedBody = status, `later`
+			err = unwell.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthHeader)
+			require.Error(t, err, status)
+			require.NotErrorIs(t, err, ErrRevocationRefused, "%d", status)
+		}
 
 		// A token whose session was never established has no way. It is
 		// asked both ways.
 		require.NoError(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthDetect))
 		assert.Equal(t, []string{"header revoke", "form revoke"}, e.requests()[2:])
 		neither := newPickyEndpoint(t, "")
-		require.Error(t, neither.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthDetect))
+		require.ErrorIs(t, neither.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthDetect), ErrRevocationRefused,
+			"no both ways is the provider's no")
 		assert.Equal(t, []string{"header revoke", "form revoke"}, neither.requests())
+
+		// No answer to the header is not a no. The form is not then tried:
+		// its answer could only hide that the header got none.
+		silent := newPickyEndpoint(t, "")
+		silent.notAcceptedStatus, silent.notAcceptedBody = http.StatusBadGateway, `<html>`
+		err = silent.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthDetect)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrRevocationRefused)
+		assert.Equal(t, []string{"header revoke"}, silent.requests())
 	})
 
 	_, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: "https://issuer.example/token", ClientID: "dagu-web", ClientAuth: 7})

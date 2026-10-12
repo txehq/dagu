@@ -1196,6 +1196,24 @@ func TestARevocationTheProviderDidNotTake(t *testing.T) {
 		assert.Empty(t, f.manager.owed, "given up after the provider answered no that many times")
 	})
 
+	// A provider that says to come back later has not answered no. Such a
+	// revocation is not given up, however often that happens.
+	t.Run("OneTheProviderPutsOffIsNotGivenUp", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.manager.owe("owed-token", ClientAuthHeader, down)
+		f.provider.failRevocations(errors.New("the revocation endpoint answered 429"))
+		for range 3 * maxRevocationRefusals {
+			f.clock.Advance(owedRetryInterval)
+			f.manager.reconcile(ctx, f.clock.Now())
+		}
+		require.Len(t, f.manager.owed, 1)
+		f.provider.failRevocations(nil)
+		f.clock.Advance(owedRetryInterval)
+		f.manager.reconcile(ctx, f.clock.Now())
+		assert.Equal(t, []string{"owed-token"}, f.provider.revocations())
+	})
+
 	// The longest owed are made first, so that none waits behind newer ones.
 	t.Run("TheLongestOwedGoFirst", func(t *testing.T) {
 		t.Parallel()
@@ -1210,6 +1228,72 @@ func TestARevocationTheProviderDidNotTake(t *testing.T) {
 			want[i] = fmt.Sprintf("owed-token-%02d", i)
 		}
 		assert.Equal(t, want, f.provider.revocations())
+	})
+
+	// One the provider never answers does not stand in front of the others
+	// for good: it goes behind those left unanswered less often.
+	t.Run("OneThatNeverGetsAnAnswerDoesNotStandInFront", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.revokeErrFor = map[string]error{"owed-token-0": down}
+		for i := range 3 {
+			f.manager.owe(fmt.Sprintf("owed-token-%d", i), ClientAuthHeader, down)
+			f.clock.Advance(time.Second)
+		}
+		f.manager.reconcile(ctx, f.clock.Now())
+		require.Empty(t, f.provider.revocations(), "the oldest got no answer, and the round ended")
+
+		f.clock.Advance(owedRetryInterval)
+		f.manager.reconcile(ctx, f.clock.Now())
+		assert.Equal(t, []string{"owed-token-1", "owed-token-2"}, f.provider.revocations(), "the others are made first the next time")
+		assert.Len(t, f.manager.owed, 1)
+	})
+
+	// Ends the store did not take have revocations too. A sign-in writes the
+	// ends and does not make their revocations there and then: they join the
+	// owed ones, under the same bound and the same pause.
+	t.Run("TheRevocationsOfRememberedEndsGoThroughTheSameRound", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		sessions := make([]*Session, 2*reconcilePerSignIn)
+		for i := range sessions {
+			// Each user has a refresh token of their own.
+			session, err := f.manager.Create(ctx, alice, fmt.Sprintf("refresh-token-of-%d", i), f.clock.Now().Add(24*time.Hour))
+			require.NoError(t, err)
+			sessions[i] = session
+		}
+		broken.fail = errors.New("disk unavailable") // the sessions cannot even be read, so nothing is revoked yet
+		for _, session := range sessions {
+			require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		}
+		require.Empty(t, f.provider.revocations())
+		broken.fail = nil
+
+		attempts := 0
+		f.provider.mu.Lock()
+		f.provider.onRevoke = func() { attempts++ }
+		f.provider.revokeErr = down
+		f.provider.mu.Unlock()
+		f.signIn()
+		assert.Equal(t, 1, attempts, "sixteen ends were written and one revocation tried: the provider did not answer")
+		assert.Len(t, f.manager.undone, reconcilePerSignIn)
+		assert.Len(t, f.manager.owed, reconcilePerSignIn)
+		f.signIn()
+		assert.Equal(t, 1, attempts, "and no sign-in asks again for a while, though more ends are written")
+		assert.Empty(t, f.manager.undone)
+		assert.Len(t, f.manager.owed, 2*reconcilePerSignIn)
+
+		f.provider.failRevocations(nil)
+		f.clock.Advance(owedRetryInterval)
+		f.signIn()
+		f.signIn()
+		assert.Empty(t, f.manager.owed)
+		assert.Len(t, f.provider.revocations(), 2*reconcilePerSignIn)
+		for _, session := range sessions {
+			assert.NotNil(t, f.stored(session).EndedAt)
+		}
 	})
 
 	// Two sign-ins at once do not both do it: the second has nothing to add
