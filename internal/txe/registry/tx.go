@@ -495,6 +495,36 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }
 
+// requireReviewable refuses a review's write unless the job is ready and,
+// when the write names the job version the review read, still at that
+// version. A review binds its records, proposals and checkpoint to the
+// version it read, never to one it did not.
+func (tx *JobTx) requireReviewable(read int) error {
+	j := tx.Job
+	if j.Registration.State != RegistrationReady {
+		return refuse(CodeNotReady, "job registration is %s", j.Registration.State)
+	}
+	if read != 0 && read != j.Version {
+		return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("the review read version %d; the job is at version %d", read, j.Version), Current: j}
+	}
+	return nil
+}
+
+// endReviewClaim ends a live review claim when the job's version changes:
+// the review read the version before, so none of its later writes may bind
+// to the new one. Actions it left executing are interrupted, as on release.
+// It reports the claim it ended, or "".
+func (tx *JobTx) endReviewClaim() string {
+	c := tx.Job.Claim
+	if c == nil || c.State != ClaimLive || c.Kind != ClaimReview {
+		return ""
+	}
+	c.State = ClaimReleased
+	tx.interruptClaim(c.ClaimID)
+	tx.touch()
+	return c.ClaimID
+}
+
 // ReleaseClaim ends a live claim and interrupts the actions it left
 // executing. Releasing an already released claim with the same fence is a
 // no-op.
@@ -535,6 +565,9 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 	}
 	if r.ReviewID != want {
 		return refuse(CodeClaimStale, "review %s is not the current episode %s", r.ReviewID, want)
+	}
+	if err := tx.requireReviewable(r.JobVersion); err != nil {
+		return err
 	}
 	r.JobVersion = j.Version
 	r.CheckpointVersion = j.Checkpoint.Version
@@ -756,6 +789,9 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
 		return nil, err
 	}
+	if err := tx.requireReviewable(cp.JobVersion); err != nil {
+		return nil, err
+	}
 	if j.Checkpoint.Version != expectedVersion {
 		return nil, &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("checkpoint is at %d, not %d", j.Checkpoint.Version, expectedVersion), Current: j.Checkpoint}
 	}
@@ -816,6 +852,9 @@ func (tx *JobTx) PutProposal(claimID string, fence int64, p Proposal) (*Proposal
 		return nil, &Error{Code: CodeProposalState, Message: "proposal " + p.ProposalID + " exists with another binding", Current: cur}
 	}
 	if err := tx.CheckClaim(claimID, fence, ClaimReview); err != nil {
+		return nil, err
+	}
+	if err := tx.requireReviewable(p.JobVersion); err != nil {
 		return nil, err
 	}
 	for _, v := range p.AllowedVerdicts {

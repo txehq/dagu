@@ -854,6 +854,9 @@ func TestRoutineRetryNeedsSameVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, err = routine(t, f, updated, c, "restart")
+	assert.Equal(t, CodeClaimStale, code(t, err), "the update ended the review claim that read version 1")
+	c2 := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	_, _, err = routine(t, f, updated, c2, "restart")
 	assert.Equal(t, CodeStaleBinding, code(t, err))
 }
 
