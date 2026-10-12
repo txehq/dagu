@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -302,35 +303,246 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 // (once settled as dispatched it runs or fails, but is never withdrawn). An
 // accepted request alone is no receipt.
 func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
-	var rp RetryRunParams
-	if err := decodeParams(a.Spec.Params, &rp); err != nil {
+	execution, runID, err := tx.admittedRetry(a, receipt)
+	if err != nil {
 		return err
 	}
+	switch {
+	case execution.Abandoned:
+		return refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, execution.Request.ID)
+	case execution.Preparing:
+		return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: runID, Execution: execution.Ref},
+			Message: fmt.Sprintf("execution %s of run %s is not yet known to be dispatched or abandoned; settle the retry once that is settled", execution.Ref, runID)}
+	}
+	return nil
+}
+
+// admittedRetry returns the execution this retry attempt's request admitted,
+// refusing unless it is execution ref: the run history must hold ref
+// recording the retry request derived from this action attempt.
+func (tx *JobTx) admittedRetry(a *Action, ref string) (*RetryExecution, string, error) {
+	var rp RetryRunParams
+	if err := decodeParams(a.Spec.Params, &rp); err != nil {
+		return nil, "", err
+	}
 	if tx.store.runs == nil {
-		return refuse(CodeNotReady, "run history is not available to check the retry of run %s", rp.RunID)
+		return nil, rp.RunID, refuse(CodeNotReady, "run history is not available to check the retry of run %s", rp.RunID)
 	}
 	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(tx.Job.JobID, rp.RunID), rp.AttemptID, rp.QueuedAt,
 		a.ActionID, strconv.Itoa(a.Attempt), a.BindingDigest)
 	if err != nil {
-		return refuse(CodeInvalid, "action %s has no retry request: %v", a.ActionID, err)
+		return nil, rp.RunID, refuse(CodeInvalid, "action %s has no retry request: %v", a.ActionID, err)
 	}
 	execution, err := tx.store.runs.RetryExecution(tx.ctx, tx.Job.JobID, rp.RunID, request.ID)
 	switch {
 	case errors.Is(err, ErrRunNotFound):
-		return refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted; none of the run's executions records request %s", rp.RunID, request.ID)
+		return nil, rp.RunID, refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted; none of the run's executions records request %s", rp.RunID, request.ID)
 	case err != nil:
-		return err
+		return nil, rp.RunID, err
 	case execution.Request != *request:
-		return refuse(CodeInvalid, "execution %s of run %s records another retry request", execution.Ref, rp.RunID)
-	case execution.Ref != receipt:
-		return refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted (%s), not %s", rp.RunID, execution.Ref, receipt)
-	case execution.Abandoned:
-		return refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, request.ID)
-	case execution.Preparing:
-		return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: rp.RunID, Execution: execution.Ref},
-			Message: fmt.Sprintf("execution %s of run %s is not yet known to be dispatched or abandoned; settle the retry once that is settled", execution.Ref, rp.RunID)}
+		return nil, rp.RunID, refuse(CodeInvalid, "execution %s of run %s records another retry request", execution.Ref, rp.RunID)
+	case execution.Ref != ref:
+		return nil, rp.RunID, refuse(CodeInvalid, "a retry of run %s succeeds only with the execution its request admitted (%s), not %s", rp.RunID, execution.Ref, ref)
 	}
-	return nil
+	return &execution, rp.RunID, nil
+}
+
+// admittedExecutionKey is the field of an action's outcome that names the
+// execution its request admitted. The reviewer writes the same field.
+const admittedExecutionKey = "admitted_execution"
+
+// admittedKey is the field of an action's outcome that says the destination
+// admitted the request; the reviewer reads the execution only with it.
+const admittedKey = "admitted"
+
+// admittedExecutionOf returns the execution an outcome records as admitted,
+// or "" when it records none. The field must appear once, spelled exactly:
+// a reader that matches keys loosely, as encoding/json does for structs,
+// must not find another execution than the one checked here.
+func admittedExecutionOf(outcome json.RawMessage) (string, error) {
+	if len(outcome) == 0 {
+		return "", nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(outcome))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", nil
+	}
+	var ref string
+	found := false
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
+		}
+		key, _ := tok.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return "", refuse(CodeInvalid, "outcome is not JSON: %v", err)
+		}
+		if !strings.EqualFold(key, admittedExecutionKey) {
+			continue
+		}
+		if key != admittedExecutionKey || found {
+			return "", refuse(CodeInvalid, "outcome names %s more than once or spelled otherwise", admittedExecutionKey)
+		}
+		found = true
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return "", refuse(CodeInvalid, "outcome %s must be an execution reference", admittedExecutionKey)
+		}
+	}
+	return ref, nil
+}
+
+// recordAdmittedExecution settles an uncertain retry of a run as uncertain
+// to record the execution its request admitted, recovered after the answer
+// was lost. Only that: no receipt, the state and attempt stay, and it must
+// be the execution run history holds for this attempt's request, admitted
+// and not abandoned, though possibly not yet dispatched. Once recorded it is
+// never replaced; recording it again changes nothing and needs no lookup, so
+// it survives the run history losing it.
+func (tx *JobTx) recordAdmittedExecution(a *Action, s Settlement) (*Action, error) {
+	if s.Receipt != "" {
+		return nil, refuse(CodeInvalid, "an uncertain action has no receipt")
+	}
+	next, err := admittedExecutionOf(s.Outcome)
+	if err != nil {
+		return nil, err
+	}
+	if next == "" {
+		return nil, refuse(CodeInvalid, "settling an uncertain action as uncertain records only the execution its request admitted (%s)", admittedExecutionKey)
+	}
+	known, err := admittedExecutionOf(a.Outcome)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case known == next:
+		out := *a
+		return &out, nil
+	case known != "":
+		return nil, &Error{Code: CodeInvalid, Current: a,
+			Message: fmt.Sprintf("action %s already records execution %s as admitted, not %s", a.ActionID, known, next)}
+	}
+	execution, _, err := tx.admittedRetry(a, next)
+	if err != nil {
+		return nil, err
+	}
+	if execution.Abandoned {
+		return nil, refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran: settle the action as not applied", execution.Ref, execution.Request.ID)
+	}
+	outcome, err := withAdmittedExecution(s.Outcome, next)
+	if err != nil {
+		return nil, err
+	}
+	a.Outcome = outcome
+	a.Updated = Stamp{At: tx.now, By: tx.actor}
+	tx.touch()
+	out := *a
+	return &out, nil
+}
+
+// checkNamedExecution refuses a settlement of a retry that names, as the
+// execution its request admitted, one run history does not hold for this
+// attempt's request. Nothing ran of an abandoned one, so it is neither
+// uncertain nor succeeded; one not abandoned may have run, so it is not
+// "not applied". Failed and escalated claim neither and take either. Whatever
+// a retry's outcome names as admitted is so verified, on every settlement.
+func (tx *JobTx) checkNamedExecution(a *Action, s Settlement) (string, error) {
+	next, err := admittedExecutionOf(s.Outcome)
+	if err != nil || next == "" {
+		return "", err
+	}
+	execution, _, err := tx.admittedRetry(a, next)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case execution.Abandoned && (s.State == ActionUncertain || s.State == ActionSucceeded):
+		return "", refuse(CodeInvalid, "the execution %s request %s admitted was abandoned before it was dispatched; nothing ran", execution.Ref, execution.Request.ID)
+	case !execution.Abandoned && s.State == ActionNotApplied:
+		return "", refuse(CodeInvalid, "the execution %s request %s admitted was not abandoned; it cannot be settled as not applied", execution.Ref, execution.Request.ID)
+	}
+	return next, nil
+}
+
+// keepAdmittedExecution is the outcome a settlement of a retry records: the
+// execution it recorded as admitted stays in it and binds the settlement.
+// Succeeded must name it; not applied needs run history to show it was
+// abandoned, so that nothing ran.
+func (tx *JobTx) keepAdmittedExecution(a *Action, s Settlement) (json.RawMessage, error) {
+	if a.Spec.Name != ActionRetryRun {
+		return s.Outcome, nil
+	}
+	known, err := admittedExecutionOf(a.Outcome)
+	if err != nil {
+		return nil, err
+	}
+	if known == "" {
+		next, err := tx.checkNamedExecution(a, s)
+		if err != nil || next == "" {
+			return s.Outcome, err
+		}
+		return withAdmittedExecution(s.Outcome, next)
+	}
+	switch s.State {
+	case ActionSucceeded:
+		if s.Receipt != known {
+			return nil, refuse(CodeInvalid, "action %s records execution %s as admitted; it succeeds only with that execution, not %s", a.ActionID, known, s.Receipt)
+		}
+	case ActionNotApplied:
+		execution, _, err := tx.admittedRetry(a, known)
+		if err != nil {
+			return nil, err
+		}
+		if !execution.Abandoned {
+			return nil, refuse(CodeInvalid, "action %s records execution %s as admitted and it was not abandoned; it cannot be settled as not applied", a.ActionID, known)
+		}
+	case ActionExecuting, ActionFailed, ActionUncertain, ActionEscalated:
+	}
+	next, err := admittedExecutionOf(s.Outcome)
+	if err != nil {
+		return nil, err
+	}
+	if next != "" && next != known {
+		return nil, refuse(CodeInvalid, "action %s records execution %s as admitted, not %s", a.ActionID, known, next)
+	}
+	return withAdmittedExecution(s.Outcome, known)
+}
+
+// withAdmittedExecution is outcome recording ref as the execution a retry's
+// request admitted, in the form every reader takes as such: the field
+// admitted_execution and admitted true. An outcome must be an object, or
+// absent; one that says admitted is false contradicts the execution.
+func withAdmittedExecution(outcome json.RawMessage, ref string) (json.RawMessage, error) {
+	fields := map[string]json.RawMessage{}
+	if len(outcome) > 0 {
+		if err := json.Unmarshal(outcome, &fields); err != nil {
+			return nil, refuse(CodeInvalid, "an outcome that records %s %s must be an object", admittedExecutionKey, ref)
+		}
+		if fields == nil {
+			fields = map[string]json.RawMessage{}
+		}
+	}
+	for key, raw := range fields {
+		if !strings.EqualFold(key, admittedKey) {
+			continue
+		}
+		var admitted bool
+		if key != admittedKey || json.Unmarshal(raw, &admitted) != nil || !admitted {
+			return nil, refuse(CodeInvalid, "an outcome that records %s %s must not say otherwise in %s", admittedExecutionKey, ref, key)
+		}
+	}
+	encoded, err := json.Marshal(ref)
+	if err != nil {
+		return nil, err
+	}
+	fields[admittedExecutionKey] = encoded
+	fields[admittedKey] = json.RawMessage("true")
+	return json.Marshal(fields)
 }
 
 // executionsPrefix holds immutable copies of executions' stored status.
