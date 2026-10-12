@@ -6,21 +6,28 @@ package cmd_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/test"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,14 +67,88 @@ func (c *txeCLI) run(session string, args ...string) (string, error) {
 	return stdout.String(), err
 }
 
+// json runs a command with --json and decodes what it printed. It is for the
+// test's own goroutine: it stops the test on output that is not JSON.
 func (c *txeCLI) json(session string, args ...string) (map[string]any, error) {
 	c.t.Helper()
 	out, err := c.run(session, append(args, "--json")...)
+	return c.decode(out), err
+}
+
+func (c *txeCLI) decode(out string) map[string]any {
+	c.t.Helper()
 	var value map[string]any
 	if out != "" {
 		require.NoError(c.t, json.Unmarshal([]byte(out), &value), "output: %s", out)
 	}
-	return value, err
+	return value
+}
+
+// txeJobs returns the jobs a "txe list" answered. An answer with no jobs
+// field is not an empty list.
+func txeJobs(t *testing.T, answer map[string]any) []any {
+	t.Helper()
+	require.Contains(t, answer, "jobs", "answer: %v", answer)
+	jobs, ok := answer["jobs"].([]any)
+	require.True(t, ok, "jobs is not a list: %v", answer["jobs"])
+	return jobs
+}
+
+// txeGate stands between the CLI and the hub and passes every request on.
+// Once armed, it holds each registration request until two have arrived, so
+// that both sessions have already looked the job key up and found nothing,
+// and it is the registry that decides between them.
+type txeGate struct {
+	proxy *httputil.ReverseProxy
+
+	mu      sync.Mutex
+	armed   bool
+	arrived int
+	both    chan struct{}
+}
+
+func newTXEGate(t *testing.T, hub string) (*txeGate, string) {
+	t.Helper()
+	target, err := url.Parse(hub)
+	require.NoError(t, err)
+	gate := &txeGate{proxy: httputil.NewSingleHostReverseProxy(target), both: make(chan struct{})}
+	front := httptest.NewServer(gate)
+	t.Cleanup(front.Close)
+	return gate, front.URL
+}
+
+func (g *txeGate) arm() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.armed = true
+}
+
+func (g *txeGate) registrations() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.arrived
+}
+
+func (g *txeGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/txe/jobs" {
+		g.mu.Lock()
+		held := g.armed
+		if held {
+			g.arrived++
+			if g.arrived == 2 {
+				close(g.both)
+			}
+		}
+		g.mu.Unlock()
+		if held {
+			select {
+			case <-g.both:
+			case <-time.After(30 * time.Second): // the other never came; the test fails on the count
+			case <-r.Context().Done():
+			}
+		}
+	}
+	g.proxy.ServeHTTP(w, r)
 }
 
 // txeDurableHome returns a TXE home that the path policy accepts: outside
@@ -79,6 +160,10 @@ func txeDurableHome(t *testing.T) string {
 	require.NoError(t, os.MkdirAll(cache, 0o700))
 	home, err := os.MkdirTemp(cache, "txe-dagu-test-")
 	require.NoError(t, err)
+	if err := txepkg.DefaultPathPolicy().CheckDurable(home); err != nil {
+		_ = os.RemoveAll(home)
+		t.Skipf("no durable place for a TXE home on this machine: %v", err)
+	}
 	t.Cleanup(func() {
 		_ = filepath.WalkDir(home, func(p string, d fs.DirEntry, err error) error {
 			if err == nil && d.IsDir() {
@@ -157,7 +242,8 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 		t.Skip("job packages are shell scripts run by a Unix worker")
 	}
 	server := test.SetupServer(t)
-	baseURL := fmt.Sprintf("http://%s:%d/api/v1", server.Config.Server.Host, server.Config.Server.Port)
+	gate, front := newTXEGate(t, fmt.Sprintf("http://%s:%d", server.Config.Server.Host, server.Config.Server.Port))
+	baseURL := front + "/api/v1"
 
 	cli := &txeCLI{t: t, binary: server.Config.Paths.Executable, home: txeDurableHome(t), userDir: t.TempDir()}
 	identity := fmt.Sprintf(`{"schema":1,"machine_id":%q,"owner_id":%q,"display_name":"test-mac"}`, txeITMachine, txeITOwner)
@@ -198,7 +284,7 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	assert.Contains(t, plan["dag"], "type: chain")
 	listed, err := cli.json("cc1-s000001", "txe", "list")
 	require.NoError(t, err)
-	assert.Empty(t, listed["jobs"], "a dry run registered nothing")
+	assert.Empty(t, txeJobs(t, listed), "a dry run registered nothing")
 
 	registered, err := cli.json("cc1-s000001", "txe", "register", "-f", spec)
 	require.NoError(t, err)
@@ -212,14 +298,35 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	dagFile, err := os.ReadFile(filepath.Join(server.Config.Paths.DAGsDir, jobID+".yaml"))
 	require.NoError(t, err)
 	assert.Contains(t, string(dagFile), `txe.machine: "`+txeITMachine+`"`)
-	assert.Contains(t, string(dagFile), "txe resource check", "the job's targets are checked before its command")
+	// The job's targets are checked first, in the step that runs the job:
+	// the check is that step's first command and the job's own comes after.
+	var dag struct {
+		Steps []struct {
+			Name    string `yaml:"name"`
+			Command any    `yaml:"command"` // a list in the run step, one line in the publish step
+		} `yaml:"steps"`
+	}
+	require.NoError(t, yaml.Unmarshal(dagFile, &dag))
+	require.NotEmpty(t, dag.Steps)
+	assert.Equal(t, "run", dag.Steps[0].Name)
+	commands, ok := dag.Steps[0].Command.([]any)
+	require.True(t, ok, "the run step's commands: %v", dag.Steps[0].Command)
+	require.NotEmpty(t, commands)
+	assert.Contains(t, commands[0], "txe resource check")
+	assert.Contains(t, commands[0], jobID)
+	own := slices.IndexFunc(commands, func(c any) bool { return strings.Contains(fmt.Sprint(c), "collect.sh") })
+	assert.Positive(t, own, "the job's command comes after the check: %v", commands)
+	// And it is the DAG the registry recorded for version 1.
+	first, err := txeclient.New(baseURL, txeITKey, nil).JobVersion(context.Background(), jobID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("sha256:%x", sha256.Sum256(dagFile)), first.DAG.SpecSHA256)
 	assert.Contains(t, string(dagFile), `key: "`+credential+`"`)
 	assert.NotContains(t, string(dagFile), "txe-sentinel-credential-it")
 
 	// Session 2 finds the job, sees who created it and who owns it.
 	found, err := cli.json("cc2-s000002", "txe", "list", "--job-key", "nightly-collector")
 	require.NoError(t, err)
-	jobs := found["jobs"].([]any)
+	jobs := txeJobs(t, found)
 	require.Len(t, jobs, 1)
 	row := jobs[0].(map[string]any)
 	assert.Equal(t, jobID, row["job_id"])
@@ -301,25 +408,27 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	weekly := strings.Replace(fmt.Sprintf(txeITSpec, credential), "job_key: nightly-collector", "job_key: weekly-collector", 1)
 	require.NoError(t, os.WriteFile(spec3, []byte(weekly), 0o644)) //nolint:gosec // test file
 	type outcome struct {
-		answer map[string]any
-		err    error
+		out string
+		err error
 	}
 	outcomes := make(chan outcome, 2)
+	gate.arm()
 	for _, session := range []string{"cc1-s000001", "cc2-s000002"} {
 		go func() {
-			answer, err := cli.json(session, "txe", "register", "-f", spec3)
-			outcomes <- outcome{answer, err}
+			out, err := cli.run(session, "txe", "register", "-f", spec3, "--json")
+			outcomes <- outcome{out, err}
 		}()
 	}
 	var won, lost []map[string]any
 	for range 2 {
 		o := <-outcomes
 		if o.err == nil {
-			won = append(won, o.answer)
+			won = append(won, cli.decode(o.out))
 		} else {
-			lost = append(lost, o.answer)
+			lost = append(lost, cli.decode(o.out))
 		}
 	}
+	require.Equal(t, 2, gate.registrations(), "both sessions asked the registry to register the job")
 	require.Len(t, won, 1, "exactly one of two simultaneous registrations is given a receipt; refused: %v", lost)
 	require.Len(t, lost, 1)
 	weeklyID := won[0]["receipt"].(map[string]any)["job_id"].(string)
@@ -337,7 +446,7 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	found, err = cli.json("cc3-s000003", "txe", "list", "--job-key", "weekly-collector")
 	require.NoError(t, err)
 	var ready []any
-	for _, entry := range found["jobs"].([]any) {
+	for _, entry := range txeJobs(t, found) {
 		job := entry.(map[string]any)
 		state := job["registration"].(map[string]any)["state"]
 		if state == "ready" {
@@ -361,18 +470,24 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	}
 	bound, err := cli.json("cc1-s000001", "txe", "list", "--job-key", "bounded-collector")
 	require.NoError(t, err)
-	assert.Empty(t, bound["jobs"])
+	assert.Empty(t, txeJobs(t, bound))
 
-	// Nothing the hub stores, and nothing the CLI wrote, holds the credential.
-	for _, root := range []string{server.Config.Paths.DataDir, server.Config.Paths.DAGsDir, filepath.Join(cli.home, "packages"), filepath.Join(cli.home, "receipts")} {
+	// The credential's content is in one file on the machine, the one the
+	// spec points at. Nothing else under the TXE home holds it, and nothing
+	// in the hub's data, DAG and log directories does.
+	for _, root := range []string{cli.home, server.Config.Paths.DataDir, server.Config.Paths.DAGsDir, server.Config.Paths.LogDir} {
+		if _, err := os.Stat(root); os.IsNotExist(err) {
+			continue // this hub wrote no logs to a file
+		}
 		require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || !d.Type().IsRegular() {
+			if err != nil || !d.Type().IsRegular() || p == credential {
 				return err
 			}
-			data, readErr := os.ReadFile(p) //nolint:gosec // test directory
-			if readErr == nil {
-				assert.False(t, strings.Contains(string(data), "txe-sentinel-credential-it"), "%s holds the credential", p)
+			data, err := os.ReadFile(p) //nolint:gosec // test directory
+			if err != nil {
+				return err
 			}
+			assert.False(t, strings.Contains(string(data), "txe-sentinel-credential-it"), "%s holds the credential", p)
 			return nil
 		}))
 	}
