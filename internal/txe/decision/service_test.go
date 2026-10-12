@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/humantask"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
@@ -57,6 +59,8 @@ func (m *memDAGs) WriteSpec(_ context.Context, name string, spec []byte) error {
 type memRuns struct {
 	mu       sync.Mutex
 	attempts map[string]registry.RunAttempt
+	// retries are the executions retry requests admitted, by request ID.
+	retries map[string]registry.RetryExecution
 }
 
 // add records runID with a failed first attempt of the DAG with digest.
@@ -75,6 +79,37 @@ func (m *memRuns) latest(runID string) registry.RunAttempt {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.attempts[runID]
+}
+
+func (m *memRuns) RetryExecution(_ context.Context, _, _, requestID string) (registry.RetryExecution, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.retries[requestID]
+	if !ok {
+		return registry.RetryExecution{}, registry.ErrRunNotFound
+	}
+	return e, nil
+}
+
+// admit records that Dagu admitted execution next of runID for action
+// actionID's retry of execution retried, as the hub records it (TXE-3827).
+func (f *fixture) admit(actionID, runID string, retried, next registry.RunAttempt) {
+	f.t.Helper()
+	j := f.job()
+	a, ok := j.Actions[actionID]
+	if !ok {
+		f.t.Fatalf("no action %s", actionID)
+	}
+	req, err := ir.NewRetryRequest(ir.NewDAGRunRef(f.jobID, runID), retried.AttemptID, retried.QueuedAt, actionID, strconv.Itoa(a.Attempt), a.BindingDigest)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.runs.mu.Lock()
+	defer f.runs.mu.Unlock()
+	if f.runs.retries == nil {
+		f.runs.retries = map[string]registry.RetryExecution{}
+	}
+	f.runs.retries[req.ID] = registry.RetryExecution{Ref: next.Ref(), Request: *req}
 }
 
 func (m *memRuns) LatestAttempt(_ context.Context, _, runID string) (registry.RunAttempt, error) {
@@ -707,6 +742,7 @@ func TestRequestRetryIsGrantedOnce(t *testing.T) {
 	// receipt names that observed execution.
 	j := f.job()
 	next := registry.RunAttempt{AttemptID: "run-0042-a2", SpecSHA256: j.DAGSpecSHA256, Status: "running"}
+	f.admit(actionID, "run-0042", f.runs.latest("run-0042"), next)
 	f.runs.set("run-0042", next)
 	if _, err := f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
 		_, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: claim.ClaimID,
@@ -837,6 +873,7 @@ func (f *fixture) grantAndSettle(res *Result, runID string, next registry.RunAtt
 		return err
 	}
 	next.SpecSHA256, next.Status, next.Finished = f.job().DAGSpecSHA256, "failed", true
+	f.admit(actionID, runID, f.runs.latest(runID), next)
 	f.runs.set(runID, next)
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, executor, func(tx *registry.JobTx) error {
 		if _, err := tx.SettleAction(registry.Settlement{ActionID: actionID, GrantID: g.GrantID, ClaimID: c.ClaimID,
