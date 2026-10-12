@@ -173,9 +173,11 @@ files.
   review claim on such a job, so no agent is started and no action of the
   job is requested;
   the tick names the job and the state in its log and goes on to the next
-  one. A tick that finds only such jobs has no work and succeeds. Actions
-  left open on such a job once it is retired or completed are still
-  settled, as for any ended job: that never starts an action again. A job
+  one. A tick that finds only such jobs has no work and succeeds. This is
+  about review claims only: when the reviewer is handed a job that has
+  ended (retired or completed), it may still take a reconcile claim to
+  settle actions left open on it, whatever its registration, and that
+  never starts an action again. A job
   that cannot be read or claimed for any other reason (the service
   unavailable, a rejected login, a registration state this reviewer does
   not know, a refusal the job's record does not explain) still fails the
