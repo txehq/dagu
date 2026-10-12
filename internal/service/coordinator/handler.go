@@ -507,6 +507,10 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 	if req.Task == nil {
 		return nil, status.Error(codes.InvalidArgument, "task is required")
 	}
+	// Refused on every dispatch path, with or without run storage.
+	if err := refuseStrayRetryRequest(req.Task); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	admissionToken := strings.TrimSpace(req.AdmissionReservationToken)
 
 	// Validate task.Definition is provided - required for distributed execution
