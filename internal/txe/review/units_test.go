@@ -2173,3 +2173,102 @@ func TestUncertainRetryAllowsExactlyOneMoreAttempt(t *testing.T) {
 	assert.Equal(t, 2, f.effects.count("notify"))
 	assert.True(t, f.state().ConsumedResolutions[escalation.ID])
 }
+
+// notYetDispatched is a registry that, while preparing is set, refuses to
+// settle a retry as succeeded: by its own record the execution named as the
+// receipt is not yet known to be dispatched. It says to ask again.
+type notYetDispatched struct {
+	*reviewtest.Registry
+	preparing *bool
+	refused   *int
+}
+
+func (n notYetDispatched) FinishAction(ctx context.Context, req review.FinishRequest) error {
+	if *n.preparing && req.State == review.ActionSucceeded {
+		*n.refused++
+		return fmt.Errorf("%w: run run-1's latest execution is not yet known to be dispatched or abandoned; settle the retry once that is settled", review.ErrNotReady)
+	}
+	return n.Registry.FinishAction(ctx, req)
+}
+
+// The run can show the admitted execution running while the registry does
+// not take it as dispatched yet. That refusal is temporary and says nothing
+// against the retry. The execution the service named is kept on the action,
+// as an outcome not yet settled, and later reviews settle it from exactly
+// that execution: the owner is not asked and nothing is sent again.
+func TestRetryRunARegistryNotReadyToSettleKeepsTheAdmittedExecution(t *testing.T) {
+	f := newRetryFixture(t)
+	preparing, refused := true, 0
+	with := func(holder string) *review.Reviewer {
+		r := f.executor(holder)
+		r.Registry = notYetDispatched{Registry: f.registry, preparing: &preparing, refused: &refused}
+		return r
+	}
+	out, err := with("executor").Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.NoError(t, err, "a temporary refusal to settle is not a failed execution of the decision")
+	admitted := f.runs.ref("run-1")
+	assert.Equal(t, review.ActionUncertain, out.Action.State)
+	assert.Equal(t, 1, refused)
+
+	stored := f.state().Actions[jobID][0]
+	assert.Equal(t, review.ActionUncertain, stored.State)
+	assert.True(t, stored.Admitted, "what the service answered is on record")
+	assert.Equal(t, admitted, stored.AdmittedRef)
+	assert.Empty(t, stored.Receipt, "no receipt the registry did not take")
+	assert.Contains(t, stored.Detail, "does not record execution "+admitted+" as dispatched yet")
+
+	next := func(holder string) review.Action {
+		t.Helper()
+		f.clock.Advance(10 * time.Minute)
+		r := with(holder)
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		return f.state().Actions[jobID][0]
+	}
+	still := next("reviewer-b")
+	assert.Equal(t, review.ActionUncertain, still.State, "asked again and refused again: it stays as it is")
+	assert.Equal(t, admitted, still.AdmittedRef)
+	assert.Equal(t, 2, refused)
+	for _, p := range f.state().Proposals[jobID] {
+		assert.NotEqual(t, review.ProposalUncertain, p.Kind, "the owner is not asked about a retry that is only waiting on the registry")
+	}
+
+	preparing = false
+	settled := next("reviewer-c")
+	assert.Equal(t, review.ActionSucceeded, settled.State)
+	assert.Equal(t, admitted, settled.Receipt)
+	assert.Len(t, f.runs.requested, 1, "one retry request in all")
+}
+
+// Another caller can create an execution on the run before this decision is
+// carried out. Until that execution is handed to a worker the service may
+// abandon it, and the execution the decision is about is then the latest
+// again. So the decision is not ended as skipped while that is open: its
+// step fails and is tried again, nothing is journaled, and the decision
+// keeps its one attempt.
+func TestRetryRunWaitsWhileAnotherExecutionIsOnlyBeingPrepared(t *testing.T) {
+	f := newRetryFixture(t)
+	f.runs.state["run-1"] = review.RunState{AttemptID: "att-someone-elses", Status: "not_started", Active: true}
+
+	out, err := f.executor("executor").Execute(context.Background(), jobID, f.proposal.ID, f.decision.ID)
+	require.ErrorContains(t, err, "not yet dispatched")
+	assert.Empty(t, out.Skipped, "not skipped: a skip ends the decision's run with nothing left to carry it out")
+	assert.Empty(t, f.state().Actions[jobID], "nothing is granted or journaled")
+	assert.Empty(t, f.runs.requested)
+
+	// The service abandoned that preparation: the decision's execution is
+	// the latest again, and the same decision is carried out.
+	f.runs.fail("run-1", "att-1")
+	done := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, done.Action.State)
+	assert.Len(t, f.runs.retried, 1)
+
+	// Had the other execution been dispatched instead, the run has moved
+	// on and the decision is over.
+	g := newRetryFixture(t)
+	g.runs.state["run-1"] = review.RunState{AttemptID: "att-someone-elses", Status: "running", Active: true}
+	assert.NotEmpty(t, g.execute("executor").Skipped)
+	assert.Empty(t, g.runs.requested)
+}

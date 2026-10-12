@@ -541,7 +541,14 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			res.Detail = "the effect was applied"
 		}
 		res.Detail = "reconciled: " + res.Detail
-		return finish(ActionSucceeded, res)
+		err := finish(ActionSucceeded, res)
+		if action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
+			// The registry does not take the execution as dispatched yet.
+			// The action stays as it is, uncertain with its admitted
+			// execution on record, and the next review asks again.
+			return nil
+		}
+		return err
 	case EffectNotApplied:
 		// Only an action with no external effect can be closed as not
 		// applied. For any other, a probe that finds nothing proves only
@@ -966,6 +973,21 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 		Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
 		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
 	})
+	if err != nil && state == ActionSucceeded && action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
+		// The run shows the admitted execution dispatched and the registry
+		// does not take it yet: by its own record that execution's
+		// preparation is not settled. That says nothing against the retry.
+		// What the service answered is recorded now, as an outcome not yet
+		// settled, so that later reviews look at exactly this execution
+		// again; losing it here would leave an attempt nobody can settle.
+		state = ActionUncertain
+		res.Receipt = ""
+		res.Detail = fmt.Sprintf("%s; the registry does not record execution %s as dispatched yet, so the retry is settled by a later review", res.Detail, res.AdmittedRef)
+		err = r.Registry.FinishAction(ctx, FinishRequest{
+			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
+			State: state, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
+		})
+	}
 	if err != nil {
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", action.ID, err)
 	}
@@ -1595,6 +1617,15 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 		state, err := r.Runs.RunState(ctx, jobID, runID)
 		if err != nil {
 			return Executed{}, fmt.Errorf("read run %s: %w", runID, err)
+		}
+		if now := state.Execution(); now.known() && now != bound && state.Status == runNotStarted {
+			// Another execution was created on the run and has not been
+			// handed to a worker. The service may still abandon it, and the
+			// execution this decision is about is then the latest again and
+			// the decision still stands. Ending here as skipped would end
+			// the decision's run with nothing left to carry it out, so this
+			// is an error: the step is tried again.
+			return Executed{}, fmt.Errorf("run %s shows execution %s created and not yet dispatched; whether the decision about execution %s still stands is not settled: tried again", runID, now.Ref(), bound.Ref())
 		}
 		if !state.retryable(bound) {
 			return Executed{Skipped: fmt.Sprintf(

@@ -2804,3 +2804,23 @@ func TestRemoteSupersededDecisionRunsAreClosedAndRecorded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 }
+
+// The registry's 409 not_ready is its "ask again": while an execution of a
+// run is only being prepared it refuses to settle a retry of that
+// run. The adapter passes it on as that, so that no caller takes it for a
+// stale decision, a guard's denial or an outcome.
+func TestRemoteNotReadyIsAskAgainAndNothingElse(t *testing.T) {
+	notReady := &review.TransportError{Status: http.StatusConflict, Code: "not_ready", Message: "run run-1's latest execution att-2@ is not yet known to be dispatched or abandoned; settle the retry once that is settled"}
+	stub := &stubTransport{t: t, fail: map[string]*review.TransportError{"/txe/jobs/job_1/actions/act_1": notReady}}
+	remote := &review.Remote{Transport: stub, MachineID: "mch_1"}
+
+	err := remote.FinishAction(context.Background(), review.FinishRequest{
+		Claim: review.Claim{ID: "clm_1", Fence: 1}, JobID: "job_1", ActionID: "act_1", GrantID: "grt_1",
+		State: review.ActionSucceeded, Receipt: "att-2@", Admitted: true, AdmittedRef: "att-2@",
+	})
+	require.ErrorIs(t, err, review.ErrNotReady)
+	var denied *review.GuardDeniedError
+	assert.NotErrorAs(t, err, &denied, "not a denial: a denial ends the decision's attempt")
+	assert.NotErrorIs(t, err, review.ErrActionExists)
+	assert.NotErrorIs(t, err, review.ErrNotFound)
+}

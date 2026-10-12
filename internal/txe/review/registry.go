@@ -26,6 +26,10 @@ var (
 	// ErrActionExists means the action was already journaled. Nothing may
 	// run on this error; the stored record is authoritative.
 	ErrActionExists = errors.New("txe review: action already journaled")
+	// ErrNotReady means the registry cannot answer yet and says to ask
+	// again: nothing was decided, granted or settled, and the refusal says
+	// nothing about what happened. It is never read as an outcome.
+	ErrNotReady = errors.New("txe review: the registry cannot answer yet")
 	// ErrNotFound means the record does not exist.
 	ErrNotFound = errors.New("txe review: not found")
 )

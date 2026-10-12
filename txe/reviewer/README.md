@@ -227,6 +227,17 @@ files.
   of it. In review evidence a failed run carries `preparation`:
   `abandoned_before_dispatch` when the service recorded that it never
   started, `unknown` when it could not say.
+  While an execution of the run has been created and not yet handed to a
+  worker, the registry answers `409 not_ready` to proposing, granting and
+  settling a retry of that run, and says to ask again. That answer is never
+  read as an outcome. A retry whose admitted execution the run shows
+  dispatched, and which the registry does not settle yet, is recorded as
+  uncertain with that execution and settled by a later review. A decision
+  whose run shows another execution only being prepared is not ended as
+  skipped: its step fails and is tried again by its retry policy (five
+  times, a minute apart), nothing is journaled and the decision keeps its
+  attempt. If the preparation outlasts that, the decision's run ends
+  failed with that reason, visibly, instead of succeeding with nothing done.
   When the owner answers `retry` to the question about an attempt whose
   outcome is unknown, the question's decision run executes the original
   decision once more: for a run retry, with the same expected execution,

@@ -57,6 +57,7 @@ const (
 	codeProposalState    = "proposal_state"
 	codeActionExists     = "action_exists"
 	codeIntentUnresolved = "intent_unresolved"
+	codeNotReady         = "not_ready"
 	codeReviewConflict   = "review_conflict"
 )
 
@@ -370,6 +371,8 @@ func refusal(err error) error {
 		return fmt.Errorf("%w: %s", ErrConflict, te.Message)
 	case codeActionExists:
 		return fmt.Errorf("%w: %s", ErrActionExists, te.Message)
+	case codeNotReady:
+		return fmt.Errorf("%w: %s", ErrNotReady, te.Message)
 	case codeLifecycle:
 		return &GuardDeniedError{Reason: DenyLifecycle, Detail: te.Message}
 	case codeNotPermitted:
