@@ -99,6 +99,7 @@ fi
 DAGU_HOME="$TXE_DAGU_HOME/worker-home" "$bin" version 2>&1 | grep -q -- "$version" || die "$bin does not report version $version"
 ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
+link_dagu_on_path
 
 kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
 [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
