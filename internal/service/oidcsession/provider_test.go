@@ -292,7 +292,6 @@ func (e *pickyEndpoint) sent() []string {
 func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	var refused *RefusedError
 
 	t.Run("FormOnly", func(t *testing.T) {
 		t.Parallel()
@@ -323,6 +322,7 @@ func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
 
 	t.Run("Configured", func(t *testing.T) {
 		t.Parallel()
+		var refused *RefusedError
 		e := newPickyEndpoint(t, "form")
 		_, err := e.provider(t, ClientAuthForm).Refresh(ctx, secretRefreshToken)
 		require.NoError(t, err)
@@ -335,6 +335,7 @@ func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
 	// yet known, so both are tried, and the answer about the token is kept.
 	t.Run("RefusedBothWays", func(t *testing.T) {
 		t.Parallel()
+		var refused *RefusedError
 		for _, takes := range []string{"header", "form"} {
 			e := newPickyEndpoint(t, takes)
 			e.rightWayStatus, e.rightWayBody = http.StatusBadRequest, `{"error":"invalid_grant"}`
@@ -348,6 +349,7 @@ func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
 	// Refused one way and no answer the other: nothing is known.
 	t.Run("RefusedThenNoAnswer", func(t *testing.T) {
 		t.Parallel()
+		var refused *RefusedError
 		e := newPickyEndpoint(t, "form")
 		e.rightWayStatus, e.rightWayBody = http.StatusBadGateway, `<html>`
 		_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)

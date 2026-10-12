@@ -25,6 +25,14 @@
 // by one process at a time; a claim runs out, so a process that died does not
 // hold a session for long.
 //
+// An end the store did not take, because a write failed, is known only to
+// the process that decided it. That process refuses the session from then on
+// and keeps trying to write the end. Another process, and the same one after
+// a restart, go by the store. They stop serving the session when the provider
+// next refuses its refresh token, which a sign-out brings about by revoking
+// the token at once, and in any case they never serve it past the limit
+// without the provider's confirmation.
+//
 // What this package bounds is the next request. A connection that was
 // already open when a session ended, such as an event stream or a terminal
 // WebSocket, was checked when it opened and is not closed by this package.
@@ -626,12 +634,25 @@ func (m *Manager) abandon(ctx context.Context, sessionID, held, newToken, reason
 // not an error. If the store does not take the end, an error is returned and
 // this process refuses the session all the same.
 func (m *Manager) End(ctx context.Context, sessionID, reason string) error {
-	held, _, err := m.end(ctx, sessionID, decision{reason: reason, revoke: true})
-	if err != nil {
-		return err
+	_, err := m.endAndRevoke(ctx, sessionID, decision{reason: reason, revoke: true})
+	return err
+}
+
+// endAndRevoke ends a session and, if the decision says so, revokes the
+// refresh token its record held.
+//
+// The token is revoked even when the store did not take the end. This
+// process refuses the session either way, but another hub process goes by the
+// store, and the revocation is what makes the provider refuse it there.
+func (m *Manager) endAndRevoke(ctx context.Context, sessionID string, d decision) (ended bool, err error) {
+	held, ended, err := m.end(ctx, sessionID, d)
+	if d.revoke && held != "" {
+		m.revokeHeld(ctx, held)
+		if err != nil {
+			m.revocationDone(sessionID)
+		}
 	}
-	m.revokeHeld(ctx, held)
-	return nil
+	return ended, err
 }
 
 // conclude ends a session for good and returns the answer for the request
@@ -639,7 +660,7 @@ func (m *Manager) End(ctx context.Context, sessionID, reason string) error {
 // what is stored now (see decision.ifToken), in which case the caller reads
 // the session again.
 func (m *Manager) conclude(ctx context.Context, sessionID string, d decision) error {
-	held, ended, err := m.end(ctx, sessionID, d)
+	ended, err := m.endAndRevoke(ctx, sessionID, d)
 	if err != nil {
 		// What was decided stands although the store did not take it: this
 		// process refuses the session until it does.
@@ -650,15 +671,13 @@ func (m *Manager) conclude(ctx context.Context, sessionID string, d decision) er
 	if !ended {
 		return nil
 	}
-	if d.revoke {
-		m.revokeHeld(ctx, held)
-	}
 	return ErrSessionEnded
 }
 
 // end marks a session ended, keeping the record without its refresh token.
 // It reports whether the session is ended now, and returns the encrypted
-// refresh token of the record it ended, if it was the one to end it.
+// refresh token of the record it ended, or of the record it read and could
+// not write.
 //
 // A decision the store did not take is remembered, and forgotten once the
 // store holds it or it turns out not to apply.
@@ -700,7 +719,7 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (held s
 			return "", true, nil
 		case !errors.Is(err, persis.ErrConflict):
 			m.remember(sessionID, d)
-			return "", false, fmt.Errorf("oidcsession: end the session: %w", err)
+			return held, false, fmt.Errorf("oidcsession: end the session: %w", err)
 		}
 	}
 	m.remember(sessionID, d)
@@ -723,6 +742,17 @@ func (m *Manager) remember(sessionID string, d decision) {
 		return
 	}
 	m.undone[sessionID] = d
+}
+
+// revocationDone notes that the refresh token of a remembered end has been
+// revoked, so that it is not revoked again when the store takes the end.
+func (m *Manager) revocationDone(sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d, ok := m.undone[sessionID]; ok {
+		d.revoke = false
+		m.undone[sessionID] = d
+	}
 }
 
 func (m *Manager) settle(sessionID string) {

@@ -5,6 +5,7 @@ package oidcsession
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -177,14 +178,44 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
 		require.Nil(t, f.stored(session).EndedAt, "the store still has the session open")
 		require.ErrorIs(t, f.check(session), ErrSessionEnded)
-		assert.Empty(t, f.provider.revocations())
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "the token is revoked without waiting for the store")
 
 		heal()
 		require.ErrorIs(t, f.check(session), ErrSessionEnded)
 		stored := f.stored(session)
 		require.NotNil(t, stored.EndedAt)
 		assert.Equal(t, "signed out", stored.EndReason)
-		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "and not a second time")
+	})
+
+	// Another hub process does not know what this one decided. It goes by
+	// the store, so it serves the session until it next asks the provider,
+	// which refuses the token the sign-out revoked. It never serves it past
+	// the limit.
+	t.Run("AnotherProcessGoesByTheStoreUntilTheProviderRefuses", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		other := f.process()
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		broken.failWritesAfter(0)
+		f.provider.set(func(token string) (Renewal, error) {
+			if slices.Contains(f.provider.revocations(), token) {
+				return Renewal{}, &RefusedError{Status: 400, Code: "invalid_grant"}
+			}
+			return Renewal{RefreshToken: "refresh-token-new"}, nil
+		})
+
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.ErrorIs(t, f.check(session), ErrSessionEnded, "the process that took the sign-out refuses at once")
+		require.NoError(t, other.Check(ctx, session.ID, alice), "the other goes by the store")
+
+		f.clock.Advance(4 * time.Minute)
+		require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrSessionEnded, "until the provider refuses the revoked token")
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt)
+		assert.Equal(t, "refused by the identity provider: invalid_grant", stored.EndReason)
 	})
 
 	t.Run("DuringARefresh", func(t *testing.T) {
@@ -203,8 +234,9 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
 		release()
 		require.ErrorIs(t, <-refreshing, ErrSessionEnded)
-		assert.Equal(t, []string{"refresh-token-1"}, f.provider.revocations(), "the token the refresh brought back")
-		assert.Equal(t, "refresh-token-0", f.heldToken(session), "and it was not stored")
+		assert.ElementsMatch(t, []string{"refresh-token-0", "refresh-token-1"}, f.provider.revocations(),
+			"the token the session held and the one the refresh brought back")
+		assert.Equal(t, "refresh-token-0", f.heldToken(session), "which was not stored")
 
 		heal()
 		require.ErrorIs(t, f.check(session), ErrSessionEnded)
@@ -232,7 +264,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 		release()
 		require.ErrorIs(t, <-refreshing, ErrSessionEnded)
 		assert.Equal(t, "refresh-token-0", f.heldToken(session), "the renewal was not stored")
-		assert.Equal(t, []string{"refresh-token-1"}, f.provider.revocations())
+		assert.ElementsMatch(t, []string{"refresh-token-0", "refresh-token-1"}, f.provider.revocations())
 
 		require.ErrorIs(t, f.check(session), ErrSessionEnded)
 		stored := f.stored(session)
