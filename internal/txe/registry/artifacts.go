@@ -205,12 +205,43 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 	}
 	in.Execution = ExecutionRef(in.AttemptID, in.QueuedAt)
 	in.ProducedIn.Execution = ExecutionRef(in.ProducedIn.AttemptID, in.ProducedIn.QueuedAt)
-	v, err := s.GetVersion(ctx, j.JobID, in.JobVersion)
-	if err != nil {
-		if ErrorCode(err) == CodeNotFound {
-			return nil, refuse(CodeInvalid, "job %s has no version %d", j.JobID, in.JobVersion)
+	// The version is bound to the execution before anything derived from it
+	// is checked or reported, so a report never tells which versions exist
+	// or what they declare. A saved manifest binds a replay to its version;
+	// a first report must come from the running latest execution, which ran
+	// that version.
+	key := artifactKey(j.JobID, runID, in.Execution)
+	var saved ArtifactManifest
+	hasSaved := false
+	switch err := s.getJSON(ctx, key, &saved); {
+	case err == nil:
+		hasSaved = true
+		if saved.JobVersion != in.JobVersion {
+			return nil, &Error{Code: CodeArtifactConflict, Message: "execution " + in.Execution + " of run " + runID + " already reported other deliverables", Current: &saved}
 		}
+	case ErrorCode(err) != CodeNotFound:
 		return nil, err
+	}
+	// What does not depend on the version is checked before the version is
+	// read, so no answer differs by whether a version exists.
+	if !hasSaved {
+		switch {
+		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
+		case !latest.Running:
+			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s is %s, not running; only the running execution publishes", in.Execution, runID, latest.Status)}
+		}
+	}
+	notExecuted := &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
+	v, err := s.GetVersion(ctx, j.JobID, in.JobVersion)
+	switch {
+	case ErrorCode(err) == CodeNotFound:
+		return nil, notExecuted
+	case err != nil:
+		return nil, err
+	}
+	if !hasSaved && (latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256) {
+		return nil, notExecuted
 	}
 	declared := map[string]Deliverable{}
 	for _, d := range v.ExpectedOutcome.Deliverables {
@@ -271,25 +302,13 @@ func (tx *JobTx) RecordArtifacts(ctx context.Context, s *Store, runID string, la
 		}
 		m.Artifacts = append(m.Artifacts, a)
 	}
-	key := artifactKey(j.JobID, runID, in.Execution)
-	var saved ArtifactManifest
-	switch err := s.getJSON(ctx, key, &saved); {
-	case err == nil:
+	switch {
+	case hasSaved:
 		if saved.Digest != digest {
 			return nil, &Error{Code: CodeArtifactConflict, Message: "execution " + in.Execution + " of run " + runID + " already reported other deliverables", Current: &saved}
 		}
 		m = saved
-	case ErrorCode(err) != CodeNotFound:
-		return nil, err
 	default:
-		switch {
-		case latest.AttemptID != in.AttemptID || latest.QueuedAt != in.QueuedAt:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s is not run %s's latest execution (%s); a late publish is not recorded", in.Execution, runID, latest.Ref())}
-		case !latest.Running:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("execution %s of run %s is %s, not running; only the running execution publishes", in.Execution, runID, latest.Status)}
-		case latest.SpecSHA256 == "" || latest.SpecSHA256 != v.DAG.SpecSHA256:
-			return nil, &Error{Code: CodeStaleBinding, Message: fmt.Sprintf("run %s did not execute version %d of job %s", runID, in.JobVersion, j.JobID)}
-		}
 		// The execution's stored status is kept with its manifest: a queued
 		// retry overwrites it in place.
 		if err := s.retainExecution(ctx, j.JobID, runID, latest, EvidencePublication); err != nil {

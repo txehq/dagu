@@ -94,16 +94,20 @@ func TestRecordArtifacts(t *testing.T) {
 		return m
 	}
 	for name, m := range map[string]ArtifactManifest{
-		"undeclared":   bad(func(a *ArtifactRecord) { a.Deliverable = "other" }),
-		"path":         bad(func(a *ArtifactRecord) { a.Path = "elsewhere.json" }),
-		"location":     bad(func(a *ArtifactRecord) { a.Location = DeliveryMachine }),
-		"machine":      bad(func(a *ArtifactRecord) { a.MachineID = "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C" }),
-		"digest":       bad(func(a *ArtifactRecord) { a.SHA256 = "abc" }),
-		"no version 9": {AttemptID: "a1", JobVersion: 9, Artifacts: manifest.Artifacts},
+		"undeclared": bad(func(a *ArtifactRecord) { a.Deliverable = "other" }),
+		"path":       bad(func(a *ArtifactRecord) { a.Path = "elsewhere.json" }),
+		"location":   bad(func(a *ArtifactRecord) { a.Location = DeliveryMachine }),
+		"machine":    bad(func(a *ArtifactRecord) { a.MachineID = "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C" }),
+		"digest":     bad(func(a *ArtifactRecord) { a.SHA256 = "abc" }),
 	} {
 		_, err := record(m)
 		assert.Equal(t, CodeInvalid, code(t, err), name)
 	}
+	// A version the execution did not run, existing or not, is refused the
+	// same way before anything about it is checked, so a report never tells
+	// which versions exist or what they declare.
+	_, err := record(ArtifactManifest{AttemptID: "a1", JobVersion: 9, Artifacts: manifest.Artifacts})
+	assert.Equal(t, CodeStaleBinding, code(t, err), "no version 9")
 
 	got, err := record(manifest)
 	require.NoError(t, err)
