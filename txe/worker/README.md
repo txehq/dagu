@@ -39,6 +39,16 @@ txe/worker/status.sh
 The owner id is minted once for the installation (`txe/worker/mint-id.sh own`) and recorded with
 the service. Pass it only on the first install.
 
+The installer links `~/.local/bin/dagu` to `bin/dagu`, so shells and coding-agent sessions run
+this install as `dagu` (set `TXE_DAGU_LINK_DIR` for another directory). If a `dagu` the installer
+did not create is already there, it is left alone and named in the output; run
+`~/.local/share/txe-dagu/bin/dagu` instead. The installer also says when the link's directory is
+not on your PATH.
+
+A job script can read Linear through the Orca CLI without a Linear key. A job's Linear target check
+is different, and needs one. The skill sets out both: `txe/skill/SKILL.md`, "Linear: the target check
+and your script are two things".
+
 Once the hub knows the machine, install its periodic resource check on the hub. The hub schedules
 that check, and this worker runs it.
 
