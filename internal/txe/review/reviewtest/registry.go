@@ -28,16 +28,19 @@ import (
 // State is the whole fixture registry. It is exported so tests can assert on
 // the durable records directly.
 type State struct {
-	Jobs        map[string]review.Job        `json:"jobs"`
-	Checkpoints map[string]review.Checkpoint `json:"checkpoints"`
-	Claims      map[string]review.Claim      `json:"claims"`
-	Fences      map[string]int               `json:"fences"`
-	Runs        map[string][]review.RunEvidence
-	Decisions   map[string][]review.Decision
-	Proposals   map[string][]review.Proposal
-	Actions     map[string][]review.Action
-	Reviews     map[string][]review.Review
-	Exceptions  []review.Exception
+	Jobs map[string]review.Job `json:"jobs"`
+	// Registrations keeps each job's registration state, which a job does
+	// not carry in its own JSON because the agent is never shown it.
+	Registrations map[string]review.Registration `json:"registrations,omitempty"`
+	Checkpoints   map[string]review.Checkpoint   `json:"checkpoints"`
+	Claims        map[string]review.Claim        `json:"claims"`
+	Fences        map[string]int                 `json:"fences"`
+	Runs          map[string][]review.RunEvidence
+	Decisions     map[string][]review.Decision
+	Proposals     map[string][]review.Proposal
+	Actions       map[string][]review.Action
+	Reviews       map[string][]review.Review
+	Exceptions    []review.Exception
 	// ConsumedResolutions are escalation answers already used by a grant.
 	ConsumedResolutions map[string]bool
 	// Closures are the recorded attempts to close superseded proposals'
@@ -223,6 +226,7 @@ func (r *Registry) Job(_ context.Context, jobID string) (review.Job, error) {
 		if !ok {
 			return review.ErrNotFound
 		}
+		j.Registration = s.Registrations[jobID]
 		job = j
 		return nil
 	})
@@ -252,8 +256,8 @@ func (r *Registry) AcquireClaim(_ context.Context, req review.ClaimRequest) (rev
 			return review.ErrClaimHeld
 		}
 		// As the registry: a review claim needs a ready registration.
-		if job := s.Jobs[req.JobID]; !job.Registration.Claimable() && req.Kind != review.ClaimReconcile {
-			return fmt.Errorf("%w: job registration is %s", review.ErrNotReady, job.Registration)
+		if state := s.Registrations[req.JobID]; !state.Claimable() && req.Kind != review.ClaimReconcile {
+			return fmt.Errorf("%w: job registration is %s", review.ErrNotReady, state)
 		}
 		// A completed or retired job only admits settling what is open.
 		if job := s.Jobs[req.JobID]; !job.Lifecycle.Reviewable() && req.Kind != review.ClaimReconcile {
@@ -831,6 +835,10 @@ func (r *Registry) RaiseException(_ context.Context, exc review.Exception) error
 func (r *Registry) PutJob(job review.Job) error {
 	return r.Update(func(s *State) error {
 		s.Jobs[job.ID] = job
+		if s.Registrations == nil {
+			s.Registrations = map[string]review.Registration{}
+		}
+		s.Registrations[job.ID] = job.Registration
 		proposals := s.Proposals[job.ID]
 		for i := range proposals {
 			p := &proposals[i]

@@ -2782,19 +2782,76 @@ func TestStepsAJobTheRegistryWillNotClaimIsNoWork(t *testing.T) {
 		untouched(t, f)
 	})
 
+	// The fake kept in a file loses nothing of this: the state is stored
+	// beside the job, since the job's own JSON leaves it out for the agent.
+	t.Run("a registry kept in a file refuses the claim as well", func(t *testing.T) {
+		for _, state := range []review.Registration{review.RegistrationDuplicate, review.RegistrationIncomplete} {
+			path := filepath.Join(t.TempDir(), "registry.json")
+			job := fixtureJob()
+			job.Registration = state
+			require.NoError(t, reviewtest.Open(path).PutJob(job))
+
+			reg := reviewtest.Open(path)
+			read, err := reg.Job(ctx, jobID)
+			require.NoError(t, err)
+			assert.Equal(t, state, read.Registration)
+			_, err = reg.AcquireClaim(ctx, review.ClaimRequest{JobID: jobID, Kind: review.ClaimReview, Holder: "tick-1", TTL: time.Minute})
+			require.ErrorIs(t, err, review.ErrNotReady)
+
+			r := newFixture(t).reviewer("tick-1")
+			r.Registry = reg
+			prepared, err := r.Prepare(ctx, jobID)
+			require.NoError(t, err)
+			assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+			reg.View(func(s *reviewtest.State) { assert.Zero(t, s.Fences[jobID]) })
+		}
+	})
+
+	// A state that is none of the known ones is a record that cannot be
+	// read as written, not the registry's answer.
+	t.Run("a registration state the reviewer does not know fails the tick", func(t *testing.T) {
+		f := newFixture(t)
+		withRegistration(f, "garbage")
+		var packet bytes.Buffer
+		err := f.steps("tick-1", t.TempDir()).Prepare(ctx, "tick-1", &packet)
+		require.ErrorContains(t, err, `registration state "garbage"`)
+		assert.Empty(t, packet.String())
+		untouched(t, f)
+
+		// Also when it is what the job reads as after a refused claim.
+		f = newFixture(t)
+		r := f.reviewer("tick-1")
+		r.Registry = &staleRead{Registry: refuseClaims{Registry: f.registry, err: review.ErrNotReady}, then: func() { withRegistration(f, "garbage") }}
+		_, err = r.Prepare(ctx, jobID)
+		require.ErrorIs(t, err, review.ErrNotReady)
+	})
+
+	t.Run("a refused claim whose job cannot be read again fails the tick and says both", func(t *testing.T) {
+		f := newFixture(t)
+		unreadable := errors.New("decode job: unexpected end of JSON input")
+		r := f.reviewer("tick-1")
+		r.Registry = &readOnce{Registry: refuseClaims{Registry: f.registry, err: review.ErrNotReady}, err: unreadable}
+		_, err := r.Prepare(ctx, jobID)
+		require.ErrorIs(t, err, review.ErrNotReady)
+		require.ErrorIs(t, err, unreadable)
+	})
+
 	// The same refusal code is given for other reasons (run history that
 	// cannot be read, an index still being built). The job's record says
 	// its registration is ready, so nothing explains the refusal and it
 	// stays an error: the tick fails and says which job.
 	t.Run("a refusal the job's record does not explain fails the tick", func(t *testing.T) {
-		f := newFixture(t)
-		steps := f.steps("tick-1", t.TempDir())
-		steps.Reviewer.Registry = refuseClaims{Registry: f.registry, err: fmt.Errorf("%w: the resource index is being built; retry shortly", review.ErrNotReady)}
-		var packet bytes.Buffer
-		err := steps.Prepare(ctx, "tick-1", &packet)
-		require.ErrorIs(t, err, review.ErrNotReady)
-		assert.ErrorContains(t, err, "prepare "+jobID)
-		assert.Empty(t, packet.String())
+		for _, state := range []review.Registration{"", review.RegistrationReady} {
+			f := newFixture(t)
+			withRegistration(f, state)
+			steps := f.steps("tick-1", t.TempDir())
+			steps.Reviewer.Registry = refuseClaims{Registry: f.registry, err: fmt.Errorf("%w: the resource index is being built; retry shortly", review.ErrNotReady)}
+			var packet bytes.Buffer
+			err := steps.Prepare(ctx, "tick-1", &packet)
+			require.ErrorIs(t, err, review.ErrNotReady)
+			assert.ErrorContains(t, err, "prepare "+jobID)
+			assert.Empty(t, packet.String())
+		}
 	})
 
 	for name, refusal := range map[string]error{
@@ -2852,4 +2909,19 @@ func (r *staleRead) Job(ctx context.Context, jobID string) (review.Job, error) {
 		r.then = nil
 	}
 	return job, err
+}
+
+// readOnce is a registry whose job records can be read once and not again.
+type readOnce struct {
+	review.Registry
+	err  error
+	read bool
+}
+
+func (r *readOnce) Job(ctx context.Context, jobID string) (review.Job, error) {
+	if r.read {
+		return review.Job{}, r.err
+	}
+	r.read = true
+	return r.Registry.Job(ctx, jobID)
 }

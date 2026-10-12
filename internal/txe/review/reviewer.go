@@ -157,9 +157,13 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		return Prepared{Skipped: SkipNotReviewable}, nil
 	}
 	// A registration that is not ready is the registry's stated answer, not
-	// a failure to answer: no claim is asked for and nothing is reviewed.
-	if !job.Registration.Claimable() {
+	// a failure to answer: no review claim is asked for and nothing is
+	// reviewed. A state that is none of the known ones is not an answer.
+	switch {
+	case job.Registration.Refused():
 		return notRegistered(job), nil
+	case !job.Registration.Claimable():
+		return Prepared{}, fmt.Errorf("job %s has registration state %q, which this reviewer does not know", jobID, job.Registration)
 	}
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimReview, Holder: r.Holder, TTL: r.claimTTL()})
 	if errors.Is(err, ErrClaimHeld) {
@@ -168,8 +172,13 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	if errors.Is(err, ErrNotReady) {
 		// The registration may have stopped being ready after the job was
 		// read. Only the job's own record makes the refusal a skip: a
-		// refusal the record does not explain stays an error.
-		if now, readErr := r.Registry.Job(ctx, jobID); readErr == nil && !now.Registration.Claimable() {
+		// refusal the record does not explain stays an error, and so does
+		// one whose record could not be read again.
+		now, readErr := r.Registry.Job(ctx, jobID)
+		if readErr != nil {
+			return Prepared{}, fmt.Errorf("acquire claim: %w (and the job could not be read again: %w)", err, readErr)
+		}
+		if now.Registration.Refused() {
 			return notRegistered(now), nil
 		}
 	}

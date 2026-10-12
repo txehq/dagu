@@ -52,6 +52,13 @@ func (r Registration) Claimable() bool {
 	return r == "" || r == RegistrationReady
 }
 
+// Refused reports whether this is a state in which the registry has said it
+// grants no review claim. A state this reviewer does not know is neither
+// claimable nor refused: it is a record that cannot be read as written.
+func (r Registration) Refused() bool {
+	return r == RegistrationIncomplete || r == RegistrationDuplicate
+}
+
 // Availability is independent of lifecycle: an offline machine or an expired
 // login is never evidence that a job should retire.
 type Availability string
