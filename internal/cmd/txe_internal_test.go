@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -252,4 +254,34 @@ func TestTXECommandFamily(t *testing.T) {
 	parent.AddCommand(other)
 	root.AddCommand(parent)
 	assert.False(t, isTXECommand(other))
+}
+
+// The execute step exits with the claim-held code for a job claimed by
+// another holder and for nothing else: that code is the only one the
+// decision DAG waits on.
+func TestTXEReviewExecuteExitsWithTheClaimHeldCodeOnlyForAHeldClaim(t *testing.T) {
+	held := fmt.Errorf("acquire execution claim: %w: claim clm_1 is live", review.ErrClaimHeld)
+	coded, ok := errors.AsType[*ExitCodeError](txeReviewExecuteExit(held))
+	require.True(t, ok)
+	assert.Equal(t, review.ExitClaimHeld, coded.Code)
+	assert.Equal(t, 75, coded.Code)
+	require.ErrorIs(t, coded, review.ErrClaimHeld, "the reason is kept")
+	assert.Contains(t, coded.Error(), "clm_1 is live")
+
+	require.NoError(t, txeReviewExecuteExit(nil))
+	for name, err := range map[string]error{
+		"a stale claim":        fmt.Errorf("record outcome: %w", review.ErrStaleFence),
+		"a rejected login":     &review.TransportError{Status: 401, Code: "unauthorized", Message: "invalid api key"},
+		"a forbidden call":     &review.TransportError{Status: 403, Message: "forbidden"},
+		"a lifecycle refusal":  &review.GuardDeniedError{Reason: review.DenyLifecycle, Detail: "retired"},
+		"a binding refusal":    &review.GuardDeniedError{Reason: review.DenyDecisionStale, Detail: "binding changed"},
+		"a not-ready registry": fmt.Errorf("%w: run history is not available", review.ErrNotReady),
+		"an unreachable hub":   errors.New("dial tcp 127.0.0.1:18080: connect: connection refused"),
+		"a bad argument":       errors.New(`invalid job_id "x"`),
+	} {
+		out := txeReviewExecuteExit(err)
+		_, coded := errors.AsType[*ExitCodeError](out)
+		assert.False(t, coded, name)
+		assert.Equal(t, err, out, name)
+	}
 }

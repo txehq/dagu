@@ -219,6 +219,21 @@ files.
 - Duration: a run timeout, a shorter agent step timeout, and a per-action
   timeout. The claim TTL must exceed the run timeout plus the worker's
   disconnect cancellation window.
+- A dead claim: a tick that dies (the worker or the service restarted
+  under it) keeps its job claimed for the claim's whole lifetime, 20
+  minutes. The registry cannot tell a dead holder from a slow one, and no
+  claim is released on the assumption that its holder died. Reviews of
+  that job wait for the claim to end. A decision approved meanwhile waits
+  too, and then runs by itself: the decision DAG's execute step exits 75
+  when the job is claimed by another holder, and is retried on that code
+  alone, once a minute, 22 times, which is longer than a claim lives. Each
+  try reads the decision, the proposal and the job again, so an approval
+  that stopped holding while it waited runs nothing, and the registry
+  grants the action once whatever is tried. Any other failure of the step
+  is not retried and fails the run. If the worker is interrupted again
+  during that wait, or the wait runs out, the decision run ends failed and
+  a person retries it from the dashboard; the approval is not lost and
+  still runs at most once.
 - Attempts: a routine action that failed `max_attempts` times in a row is
   proposed instead of tried again. An action whose outcome is unknown is
   never retried: a declared `reconcile` probe settles it, or the owner
