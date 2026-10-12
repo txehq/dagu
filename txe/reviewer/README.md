@@ -182,6 +182,21 @@ files.
   unavailable, a rejected login, a registration state this reviewer does
   not know, a refusal the job's record does not explain) still fails the
   tick when nothing else was reviewed.
+- Cadence: a job's `review_policy.cadence` is a cron expression, and a
+  job's next review is that expression's next occurrence in the timezone of
+  the job's own schedule (`schedule.timezone`; UTC when a version carries
+  none). An expression that starts with `TZ=` or `CRON_TZ=` is read in the
+  zone it names. A plain duration such as `1h` is accepted as well and is
+  counted from the review. The agent may ask to look again sooner, never
+  later; while more runs are waiting than one review covers, the next
+  review is a minute away; and no review is set less than a minute ahead.
+  A cadence that is neither a cron expression nor a duration is not taken
+  for one: the job is reviewed every hour, and the exception
+  `review_cadence_invalid` says so for that version of the job, quoting
+  what was declared, until the job gets a version whose cadence can be
+  read (`dagu txe update`). A job that declares no cadence at all is
+  reviewed every hour. The reviewer's tick (`--schedule`) is only how
+  often it looks for due jobs.
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,
   plus one fenced claim per job in the registry.
 - Duration: a run timeout, a shorter agent step timeout, and a per-action
