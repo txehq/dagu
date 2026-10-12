@@ -97,6 +97,13 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read job spec: %w", err)
 	}
+	file, err := parser.ParseBytes(data, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
+	if err := oneDocument(file); err != nil {
+		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
 	var spec JobSpec
 	if err := yaml.UnmarshalWithOptions(data, &spec, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
@@ -106,7 +113,7 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
 	}
 	if declared {
-		if err := writtenOutInFull(data); err != nil {
+		if err := writtenOutInFull(file); err != nil {
 			return nil, fmt.Errorf("parse job spec %s: %w", path, err)
 		}
 	}
@@ -151,17 +158,32 @@ func markEmptyParamSchemas(data []byte, spec *JobSpec) (bool, error) {
 	return declared, nil
 }
 
+// oneDocument refuses a spec file that holds more than one YAML document.
+// Only the first is read, so anything a later one declares, a param_schema
+// included, would be dropped without a word.
+func oneDocument(file *ast.File) error {
+	held := 0
+	for _, doc := range file.Docs {
+		if doc == nil || doc.Body == nil {
+			continue
+		}
+		if _, directive := doc.Body.(*ast.DirectiveNode); !directive {
+			held++
+		}
+	}
+	if held > 1 {
+		return fmt.Errorf("the file holds %d YAML documents (separated by ---); a job spec is one document, and the others would not be read", held)
+	}
+	return nil
+}
+
 // writtenOutInFull refuses a job spec that uses an anchor, a reference or a
 // merge key anywhere. It is asked of a spec that bounds an action's
 // parameters: the decoder resolves a reference before a param_schema is
 // read, and can resolve it to something other than what is written above
 // it (a later anchor of the same name, or nothing), so a bound could be
 // replaced where no check can see it.
-func writtenOutInFull(data []byte) error {
-	file, err := parser.ParseBytes(data, 0)
-	if err != nil {
-		return err
-	}
+func writtenOutInFull(file *ast.File) error {
 	var found references
 	for _, doc := range file.Docs {
 		ast.Walk(&found, doc)

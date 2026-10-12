@@ -248,8 +248,21 @@ type schemaYAML struct{ err error }
 
 func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
 	if s.err != nil {
-		return s
+		return nil
 	}
+	next := s.check(node)
+	if s.err != nil {
+		if tok := node.GetToken(); tok != nil && tok.Position != nil {
+			s.err = fmt.Errorf("line %d: %w", tok.Position.Line, s.err)
+		}
+		return nil
+	}
+	return next
+}
+
+// check looks at one node, and returns nil for one whose parts are not to be
+// looked at.
+func (s *schemaYAML) check(node ast.Node) ast.Visitor {
 	switch n := node.(type) {
 	case *ast.LiteralNode:
 		return nil // a block scalar is text, whatever it looks like
@@ -306,7 +319,7 @@ var (
 	// once its digit separators are taken out.
 	numberSpelling = regexp.MustCompile(`^[-+]?(` +
 		`(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?` +
-		`|0[xX][0-9a-fA-F.]+([pP][-+]?[0-9]+)?|0[oO][0-7]+|0[bB][01]+` +
+		`|0[xX]([0-9a-fA-F]+(\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)([pP][-+]?[0-9]+)?|0[oO][0-7]+|0[bB][01]+` +
 		`|\.(inf|Inf|INF|nan|NaN|NAN))$`)
 )
 
@@ -347,7 +360,7 @@ func sentAsWritten(lit string, held any) error {
 	written, ok := new(big.Rat).SetString(lit)
 	sent, sentOK := new(big.Rat).SetString(string(out))
 	if !ok || !sentOK || written.Cmp(sent) != 0 {
-		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number. Write the number you mean with no more than 15 significant digits", lit, out)
+		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number, so the spec is refused. Rounding it would change the bound. Choose the bound you intend from the numbers that are sent exactly: an integer, or a decimal of at most 15 significant digits", lit, out)
 	}
 	return nil
 }

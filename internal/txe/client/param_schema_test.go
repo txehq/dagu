@@ -320,6 +320,7 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		"enum: [0x10000000000000000]":     text,
 		"enum: [1.0e4_01]":                text, // the parser drops the "_" and then cannot hold it
 		"enum: [1.0_0e401]":               text,
+		"enum: [0x1.8p3]":                 text,
 		"enum: [1e3]":                     text,
 		"1e3: {type: string}":             text,
 		"maximum: .inf":                   notOne,
@@ -354,6 +355,10 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 	_, err := LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
 		"        type: object\n        properties:\n          share:\n            type: number\n            maximum: 0.49999999999999999\n"))
 	require.ErrorContains(t, err, "the number 0.49999999999999999 would be sent as 0.5")
+	// The line is the line of the spec file, and the advice is to choose a
+	// bound, never to shorten this one.
+	require.Regexp(t, `line \d\d+: param_schema: the number`, err.Error())
+	require.ErrorContains(t, err, "Rounding it would change the bound")
 }
 
 // What is written plainly is sent with the value it was written with. A
@@ -388,6 +393,8 @@ func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 		"pattern: >-\n  1e3":                                       `{"pattern":"1e3"}`,
 		"const: |\n  012\n":                                        `{"const":"012\n"}`,
 		"const: _1":                                                `{"const":"_1"}`,
+		"pattern: 0x..":                                            `{"pattern":"0x.."}`,
+		"const: 0xZZ":                                              `{"const":"0xZZ"}`,
 		"const: true":                                              `{"const":true}`,
 		"default: null":                                            `{"default":null}`,
 		// A key written as text is the key sent.
@@ -444,6 +451,16 @@ func TestParamSchemaSpecIsWrittenOutInFull(t *testing.T) {
 		"    - name: second\n      timeout_sec: 60\n      command: *run\n"))
 	require.NoError(t, err)
 	assert.Equal(t, "./first.sh", spec.ReviewPolicy.PermittedActions[1].Command)
+	// A second document is not read, so a schema declared in one would be
+	// dropped, and the references above it never looked for.
+	_, err = LoadJobSpec(specWithActions(t, "    - name: first\n      timeout_sec: 60\n      command: &run ./first.sh\n"+
+		"    - name: second\n      timeout_sec: 60\n      command: *run\n"+
+		"---\nreview_policy:\n  permitted_actions:\n    - name: restricted\n      timeout_sec: 60\n      param_schema: {type: object, maxProperties: 0}\n"))
+	require.ErrorContains(t, err, "the file holds 2 YAML documents")
+
+	// An anchor inside a schema is named with its line too.
+	_, err = LoadJobSpec(specWithActions(t, "    - name: first\n      timeout_sec: 60\n      param_schema:\n        const: &value hello\n"))
+	require.Regexp(t, `line \d\d+: param_schema uses an anchor or a reference`, err.Error())
 }
 
 // A schema the registry answers is kept as it was answered, and a version
