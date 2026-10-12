@@ -51,11 +51,12 @@ var (
 	ErrUserDisabled                      = auth.ErrUserDisabled
 )
 
-// ErrIdentityProviderUnavailable means a token's OIDC session is past the
-// time it may go unconfirmed and the identity provider could not be asked.
-// The token is not known to be bad: the request is to be retried, and must
-// not be answered as if the user were signed out.
-var ErrIdentityProviderUnavailable = errors.New("the identity provider is unavailable")
+// ErrSessionCheckUnavailable means a token's OIDC session could not be
+// confirmed now: it is past the time it may go unconfirmed and the identity
+// provider could not be asked, or the session could not be read. The token is
+// not known to be bad: the request is to be retried, and must not be answered
+// as if the user were signed out.
+var ErrSessionCheckUnavailable = errors.New("the session could not be confirmed now")
 
 const (
 	// defaultBcryptCost is the default cost for bcrypt hashing.
@@ -116,9 +117,9 @@ type Claims struct {
 }
 
 // SessionChecker decides whether a token's OIDC session still lets its user
-// in. It returns nil, ErrInvalidToken when the session has ended,
-// ErrIdentityProviderUnavailable when the session is past its limit and the
-// provider could not be asked, or another error when it could not decide.
+// in. It returns nil, ErrInvalidToken when the session has ended, or another
+// error when it could not decide, which is reported to the caller as
+// ErrSessionCheckUnavailable.
 type SessionChecker interface {
 	CheckSession(ctx context.Context, sessionID string, user *auth.User) error
 }
@@ -350,7 +351,12 @@ func (s *Service) GetUserFromToken(ctx context.Context, tokenString string) (*au
 		switch {
 		case claims.SessionID != "":
 			if err := s.sessions.CheckSession(ctx, claims.SessionID, user); err != nil {
-				return nil, err
+				if errors.Is(err, ErrInvalidToken) {
+					return nil, ErrInvalidToken
+				}
+				// Not an answer about the user: they are not let in, and
+				// they are not told they are signed out.
+				return nil, ErrSessionCheckUnavailable
 			}
 		case user.AuthProvider == auth.AuthProviderOIDC:
 			return nil, ErrInvalidToken

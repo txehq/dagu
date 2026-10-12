@@ -41,7 +41,7 @@ func TestTerminal_SessionAnswersAtConnect(t *testing.T) {
 		status     int
 		retryAfter string
 	}{
-		"ProviderUnavailable": {authservice.ErrIdentityProviderUnavailable, http.StatusServiceUnavailable, "5"},
+		"ProviderUnavailable": {authservice.ErrSessionCheckUnavailable, http.StatusServiceUnavailable, "5"},
 		"SessionEnded":        {authservice.ErrInvalidToken, http.StatusUnauthorized, ""},
 	} {
 		t.Run(name, func(t *testing.T) {

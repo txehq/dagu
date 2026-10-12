@@ -100,15 +100,16 @@ func TestSessionDecidesForATokenThatNamesOne(t *testing.T) {
 	_, err = f.svc.GetUserFromToken(ctx, token.Token)
 	require.ErrorIs(t, err, ErrInvalidToken, "an ended session")
 
-	sessions.err = ErrIdentityProviderUnavailable
+	sessions.err = ErrSessionCheckUnavailable
 	_, err = f.svc.GetUserFromToken(ctx, token.Token)
-	require.ErrorIs(t, err, ErrIdentityProviderUnavailable, "an outage is not turned into a bad token")
+	require.ErrorIs(t, err, ErrSessionCheckUnavailable, "an outage is not turned into a bad token")
 	require.NotErrorIs(t, err, ErrInvalidToken)
 
 	storeDown := errors.New("the session store cannot be read")
 	sessions.err = storeDown
 	_, err = f.svc.GetUserFromToken(ctx, token.Token)
-	require.ErrorIs(t, err, storeDown, "a failure is not an answer and lets nobody in")
+	require.ErrorIs(t, err, ErrSessionCheckUnavailable, "a failure is not an answer: nobody is let in, and nobody is told they are signed out")
+	require.NotErrorIs(t, err, ErrInvalidToken)
 }
 
 // With sessions on, an OIDC user's token that names no session is refused: it

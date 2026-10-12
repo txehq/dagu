@@ -5,10 +5,13 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
+	oidc "github.com/coreos/go-oidc"
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -16,6 +19,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	"github.com/dagucloud/dagu/v2/internal/service/oidcsession"
+	"golang.org/x/oauth2"
 )
 
 // NewOIDCSessionManager builds the session manager for the OIDC provider the
@@ -37,22 +41,73 @@ func NewOIDCSessionManager(session config.AuthOIDCSession, oidcCfg *BuiltinOIDCC
 		RevocationURL: endpoints.Revocation,
 		ClientID:      oidcCfg.OAuth2Config.ClientID,
 		ClientSecret:  oidcCfg.OAuth2Config.ClientSecret,
+		ClientAuth:    oidcClientAuth(oidcCfg.OAuth2Config.Endpoint.AuthStyle),
 	})
 	if err != nil {
 		return nil, err
 	}
-	verifier := oidcCfg.Verifier
-	checkID := func(ctx context.Context, rawIDToken string) (string, string, error) {
-		idToken, err := verifier.Verify(ctx, rawIDToken)
-		if err != nil {
-			return "", "", err
-		}
-		return idToken.Issuer, idToken.Subject, nil
-	}
 	return oidcsession.NewManager(oidcsession.Config{
 		RevalidateAfter: session.RevalidateAfter,
 		RevalidateLimit: session.RevalidateLimit,
-	}, col, enc, provider, checkID)
+	}, col, enc, provider, newIDTokenChecker(oidcCfg.Verifier))
+}
+
+// newIDTokenChecker checks a renewed ID token with the verifier the sign-in
+// uses.
+//
+// The verifier reports a token it rejects and signing keys it could not fetch
+// in the same way. So a token that at least is one, and says whom it is for,
+// is reported as not verifiable: the session is then neither confirmed nor
+// ended on that token. If it names another identity the session ends,
+// verified or not.
+func newIDTokenChecker(verifier *oidc.IDTokenVerifier) oidcsession.IDTokenChecker {
+	return func(ctx context.Context, rawIDToken string) (string, string, error) {
+		idToken, err := verifier.Verify(ctx, rawIDToken)
+		if err == nil {
+			return idToken.Issuer, idToken.Subject, nil
+		}
+		issuer, subject, ok := unverifiedIDTokenIdentity(rawIDToken)
+		if !ok {
+			return "", "", err
+		}
+		return issuer, subject, oidcsession.ErrIDTokenUnverifiable
+	}
+}
+
+// oidcClientAuth is the way the sign-in's code exchange sends the client
+// secret, for the refresh to send it the same way.
+func oidcClientAuth(style oauth2.AuthStyle) oidcsession.ClientAuth {
+	switch style {
+	case oauth2.AuthStyleInParams:
+		return oidcsession.ClientAuthForm
+	case oauth2.AuthStyleInHeader:
+		return oidcsession.ClientAuthHeader
+	case oauth2.AuthStyleAutoDetect:
+		return oidcsession.ClientAuthDetect
+	default:
+		return oidcsession.ClientAuthDetect
+	}
+}
+
+// unverifiedIDTokenIdentity reads the issuer and subject a JWT names, without
+// verifying it. What it returns is a claim, never a fact.
+func unverifiedIDTokenIdentity(rawIDToken string) (issuer, subject string, ok bool) {
+	parts := strings.Split(rawIDToken, ".")
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", "", false
+	}
+	var claims struct {
+		Issuer  string `json:"iss"`
+		Subject string `json:"sub"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Issuer == "" || claims.Subject == "" {
+		return "", "", false
+	}
+	return claims.Issuer, claims.Subject, true
 }
 
 // OIDCSessionChecker adapts a session manager to the auth service, which asks
@@ -71,12 +126,14 @@ func (c OIDCSessionChecker) CheckSession(ctx context.Context, sessionID string, 
 		return nil
 	case errors.Is(err, oidcsession.ErrSessionEnded):
 		return authservice.ErrInvalidToken
-	case errors.Is(err, oidcsession.ErrProviderUnavailable):
-		return authservice.ErrIdentityProviderUnavailable
 	default:
-		// The session could not be read. That is not an answer about the
-		// user, and it is not a reason to let them in.
-		return err
+		// The identity provider could not be asked, or the session could not
+		// be read. Neither is an answer about the user: they are not let in,
+		// and they are not signed out.
+		if !errors.Is(err, oidcsession.ErrProviderUnavailable) {
+			logger.Error(ctx, "OIDC session could not be checked", tag.Error(err))
+		}
+		return authservice.ErrSessionCheckUnavailable
 	}
 }
 
@@ -112,7 +169,9 @@ func BuiltinOIDCLogoutHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 			return
 		}
 		if cfg.Sessions != nil && claims.SessionID != "" {
-			if err := cfg.Sessions.End(r.Context(), claims.SessionID, "signed out"); err != nil {
+			// A sign-out that has arrived is carried out even if the browser
+			// has gone away meanwhile.
+			if err := cfg.Sessions.End(context.WithoutCancel(r.Context()), claims.SessionID, "signed out"); err != nil {
 				logger.Error(r.Context(), "Failed to end OIDC session at sign-out", tag.Error(err))
 				http.Error(w, "The session could not be ended", http.StatusInternalServerError)
 				return

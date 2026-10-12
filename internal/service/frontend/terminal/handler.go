@@ -49,8 +49,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Validate token and get user
 	user, err := h.authService.GetUserFromToken(ctx, token)
-	if errors.Is(err, authservice.ErrIdentityProviderUnavailable) {
-		frontendauth.WriteIdentityProviderUnavailable(w)
+	if errors.Is(err, authservice.ErrSessionCheckUnavailable) {
+		frontendauth.WriteSessionCheckUnavailable(w)
 		return
 	}
 	if err != nil {

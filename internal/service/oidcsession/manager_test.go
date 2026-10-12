@@ -59,9 +59,11 @@ type fakeProvider struct {
 	refreshes []string
 	revoked   []string
 	issued    int
+	// ctxErrs is the state of each refresh's context when it was answered.
+	ctxErrs []error
 }
 
-func (p *fakeProvider) Refresh(_ context.Context, refreshToken string) (Renewal, error) {
+func (p *fakeProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
 	p.mu.Lock()
 	p.refreshes = append(p.refreshes, refreshToken)
 	answer, gate, started := p.answer, p.gate, p.started
@@ -75,7 +77,51 @@ func (p *fakeProvider) Refresh(_ context.Context, refreshToken string) (Renewal,
 	if gate != nil {
 		<-gate
 	}
-	return answer(refreshToken)
+	renewal, err := answer(refreshToken)
+	p.mu.Lock()
+	p.ctxErrs = append(p.ctxErrs, ctx.Err())
+	p.mu.Unlock()
+	return renewal, err
+}
+
+func (p *fakeProvider) presented() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.refreshes...)
+}
+
+// hold makes the next refresh wait. It returns a channel that reports the
+// refresh has reached the provider, and a function that lets it go on.
+// Refreshes that start after hold returned are not held.
+func (p *fakeProvider) hold() (started <-chan struct{}, release func()) {
+	gate, reached := make(chan struct{}), make(chan struct{}, 1)
+	p.mu.Lock()
+	p.gate, p.started = gate, reached
+	p.mu.Unlock()
+	return reached, func() { close(gate) }
+}
+
+// free stops holding refreshes that have not started yet.
+func (p *fakeProvider) free() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gate, p.started = nil, nil
+}
+
+// once grants a refresh only for the token it issued last, as a provider
+// that accepts each refresh token once does, and refuses any other.
+func (p *fakeProvider) once(first string) func(string) (Renewal, error) {
+	current := first
+	return func(presented string) (Renewal, error) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if presented != current {
+			return Renewal{}, &RefusedError{Status: 400, Code: "invalid_grant"}
+		}
+		p.issued++
+		current = fmt.Sprintf("refresh-token-%d", p.issued)
+		return Renewal{RefreshToken: current}, nil
+	}
 }
 
 func (p *fakeProvider) Revoke(_ context.Context, refreshToken string) error {
@@ -130,6 +176,8 @@ type fixture struct {
 	provider *fakeProvider
 	manager  *Manager
 	col      persis.Collection
+	enc      Encryptor
+	checkID  IDTokenChecker
 	dir      string
 }
 
@@ -145,12 +193,27 @@ func newFixture(t *testing.T, checkID IDTokenChecker) *fixture {
 	f.col = persisfile.NewCollection(f.dir)
 	enc, err := crypto.NewEncryptor("a-test-key-that-is-long-enough-for-aes")
 	require.NoError(t, err)
+	f.enc, f.checkID = enc, checkID
+	f.manager = f.process()
+	return f
+}
+
+// process is another hub process over the same store, provider and clock.
+func (f *fixture) process() *Manager {
+	f.t.Helper()
 	manager, err := NewManager(Config{
 		RevalidateAfter: 4 * time.Minute, RevalidateLimit: 5 * time.Minute, Now: f.clock.Now,
-	}, f.col, enc, f.provider, checkID)
-	require.NoError(t, err)
-	f.manager = manager
-	return f
+	}, f.col, f.enc, f.provider, f.checkID)
+	require.NoError(f.t, err)
+	return manager
+}
+
+// heldToken is the refresh token the stored session holds, decrypted.
+func (f *fixture) heldToken(session *Session) string {
+	f.t.Helper()
+	token, err := f.enc.Decrypt(f.stored(session).RefreshToken)
+	require.NoError(f.t, err)
+	return token
 }
 
 // signIn starts a session good for a day.
@@ -502,10 +565,13 @@ func TestARenewedTokenForSomeoneElseEndsTheSession(t *testing.T) {
 		err             error
 		ended           bool
 	}{
-		"SameIdentity":     {testIssuer, testSubject, nil, false},
-		"AnotherSubject":   {testIssuer, "subject-2", nil, true},
-		"AnotherIssuer":    {"https://issuer.example/realms/other", testSubject, nil, true},
-		"TokenNotVerified": {"", "", errors.New("bad signature"), true},
+		"SameIdentity":   {testIssuer, testSubject, nil, false},
+		"AnotherSubject": {testIssuer, "subject-2", nil, true},
+		"AnotherIssuer":  {"https://issuer.example/realms/other", testSubject, nil, true},
+		"NotAToken":      {"", "", errors.New("malformed"), true},
+		// A checker that rejects a token outright ends the session whatever
+		// identity it read from it.
+		"RejectedToken": {testIssuer, testSubject, errors.New("rejected"), true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -664,6 +730,55 @@ func TestAStoreFailureIsNotAnAnswer(t *testing.T) {
 type failingCollection struct {
 	persis.Collection
 	fail error
+	// swap, when set, decides each write: an error fails it.
+	swap func() error
+}
+
+func (c *failingCollection) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {
+	if c.swap != nil {
+		if err := c.swap(); err != nil {
+			return err
+		}
+	}
+	return c.Collection.CompareAndSwap(ctx, id, old, next)
+}
+
+// failWrite fails the nth write and no other.
+func (c *failingCollection) failWrite(n int) {
+	var mu sync.Mutex
+	c.swap = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		n--
+		if n == 0 {
+			return errors.New("disk full")
+		}
+		return nil
+	}
+}
+
+// failWritesAfter lets n writes through and fails every one after them,
+// until the returned function is called.
+func (c *failingCollection) failWritesAfter(n int) (heal func()) {
+	var mu sync.Mutex
+	healed := false
+	c.swap = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if healed {
+			return nil
+		}
+		if n > 0 {
+			n--
+			return nil
+		}
+		return errors.New("disk full")
+	}
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		healed = true
+	}
 }
 
 func (c *failingCollection) Get(ctx context.Context, id string) (*persis.Record, error) {

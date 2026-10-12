@@ -225,3 +225,143 @@ func TestHTTPProviderRevoke(t *testing.T) {
 	_, err = NewHTTPProvider(HTTPProviderConfig{TokenURL: e.server.URL})
 	require.Error(t, err)
 }
+
+// pickyEndpoint is a token and revocation endpoint that takes the client
+// secret one way only, and answers the other way as the test says.
+type pickyEndpoint struct {
+	server *httptest.Server
+	mu     sync.Mutex
+	// wrongWay is the answer to a request that sent the secret the way this
+	// provider does not take it.
+	wrongWayStatus int
+	wrongWayBody   string
+	// rightWay is the answer to one that sent it the way it does.
+	rightWayStatus int
+	rightWayBody   string
+	// ways lists how each request sent the secret: "header" or "form".
+	ways []string
+}
+
+func newPickyEndpoint(t *testing.T, takes string) *pickyEndpoint {
+	t.Helper()
+	e := &pickyEndpoint{
+		wrongWayStatus: http.StatusUnauthorized, wrongWayBody: `{"error":"invalid_client"}`,
+		rightWayStatus: http.StatusOK, rightWayBody: `{"access_token":"a","refresh_token":"next"}`,
+	}
+	e.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		way := "form"
+		if r.Header.Get("Authorization") != "" {
+			way = "header"
+		}
+		e.mu.Lock()
+		e.ways = append(e.ways, way)
+		status, body := e.wrongWayStatus, e.wrongWayBody
+		if way == takes && (way == "header" || r.PostForm.Get("client_secret") == "client-secret") {
+			status, body = e.rightWayStatus, e.rightWayBody
+		}
+		e.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(e.server.Close)
+	return e
+}
+
+func (e *pickyEndpoint) provider(t *testing.T, auth ClientAuth) *HTTPProvider {
+	t.Helper()
+	p, err := NewHTTPProvider(HTTPProviderConfig{
+		TokenURL: e.server.URL + "/token", RevocationURL: e.server.URL + "/revoke",
+		ClientID: "dagu-web", ClientSecret: "client-secret", ClientAuth: auth,
+	})
+	require.NoError(t, err)
+	return p
+}
+
+func (e *pickyEndpoint) sent() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.ways...)
+}
+
+// A provider that takes the client secret only in the form accepts the
+// sign-in, whose exchange finds that out by itself. The refresh must find it
+// out too, or the first refresh would be refused as invalid_client and end
+// every session.
+func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var refused *RefusedError
+
+	t.Run("FormOnly", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "form")
+		provider := e.provider(t, ClientAuthDetect)
+
+		renewal, err := provider.Refresh(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, "next", renewal.RefreshToken)
+		assert.Equal(t, []string{"header", "form"}, e.sent())
+
+		_, err = provider.Refresh(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		require.NoError(t, provider.Revoke(ctx, secretRefreshToken))
+		assert.Equal(t, []string{"header", "form", "form", "form"}, e.sent(), "what worked is used from then on")
+	})
+
+	t.Run("HeaderOnly", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "header")
+		provider := e.provider(t, ClientAuthDetect)
+		_, err := provider.Refresh(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		_, err = provider.Refresh(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"header", "header"}, e.sent())
+	})
+
+	t.Run("Configured", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "form")
+		_, err := e.provider(t, ClientAuthForm).Refresh(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		_, err = e.provider(t, ClientAuthHeader).Refresh(ctx, secretRefreshToken)
+		require.ErrorAs(t, err, &refused, "a configured way is not second-guessed")
+		assert.Equal(t, []string{"form", "header"}, e.sent())
+	})
+
+	// The refresh token itself is refused. The way the secret is sent is not
+	// yet known, so both are tried, and the answer about the token is kept.
+	t.Run("RefusedBothWays", func(t *testing.T) {
+		t.Parallel()
+		for _, takes := range []string{"header", "form"} {
+			e := newPickyEndpoint(t, takes)
+			e.rightWayStatus, e.rightWayBody = http.StatusBadRequest, `{"error":"invalid_grant"}`
+			_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+			require.ErrorAs(t, err, &refused)
+			assert.Equal(t, "invalid_grant", refused.Code, "a provider that takes the secret in the %s", takes)
+			assert.Equal(t, []string{"header", "form"}, e.sent())
+		}
+	})
+
+	// Refused one way and no answer the other: nothing is known.
+	t.Run("RefusedThenNoAnswer", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "form")
+		e.rightWayStatus, e.rightWayBody = http.StatusBadGateway, `<html>`
+		_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+		require.Error(t, err)
+		assert.False(t, errors.As(err, &refused), "this is not a refusal: %v", err)
+	})
+
+	t.Run("RevokeBeforeAnyRefresh", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "form")
+		require.NoError(t, e.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken))
+		assert.Equal(t, []string{"header", "form"}, e.sent())
+	})
+
+	_, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: "https://issuer.example/token", ClientID: "dagu-web", ClientAuth: 7})
+	require.Error(t, err)
+}

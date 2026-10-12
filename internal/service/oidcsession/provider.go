@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,6 +76,22 @@ const (
 	maxProviderBody        = 1 << 20
 )
 
+// ClientAuth is how the hub's client secret is sent to the provider.
+type ClientAuth int32
+
+const (
+	// ClientAuthDetect sends the secret in the Authorization header first,
+	// and in the form if the provider refuses that. It is what the sign-in's
+	// own code exchange does when the provider's way is not known.
+	ClientAuthDetect ClientAuth = iota
+	// ClientAuthForm sends the client id and secret in the form
+	// (client_secret_post).
+	ClientAuthForm
+	// ClientAuthHeader sends them in the Authorization header
+	// (client_secret_basic).
+	ClientAuthHeader
+)
+
 // HTTPProviderConfig configures an HTTPProvider.
 type HTTPProviderConfig struct {
 	// TokenURL is the provider's token endpoint.
@@ -84,6 +101,8 @@ type HTTPProviderConfig struct {
 	RevocationURL string
 	ClientID      string
 	ClientSecret  string
+	// ClientAuth is how the secret is sent. The zero value detects it.
+	ClientAuth ClientAuth
 	// HTTPClient makes the calls. Nil means a client with a five-second
 	// timeout. Either way no redirect is followed.
 	HTTPClient *http.Client
@@ -96,6 +115,9 @@ type HTTPProvider struct {
 	clientID      string
 	clientSecret  string
 	client        *http.Client
+	// clientAuth is the ClientAuth in use: the configured one, or the one a
+	// provider's answer settled.
+	clientAuth atomic.Int32
 }
 
 // NewHTTPProvider validates cfg and returns a provider.
@@ -109,21 +131,60 @@ func NewHTTPProvider(cfg HTTPProviderConfig) (*HTTPProvider, error) {
 	}
 	// A redirect could carry the refresh token to another host.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &HTTPProvider{
+	if cfg.ClientAuth < ClientAuthDetect || cfg.ClientAuth > ClientAuthHeader {
+		return nil, errors.New("oidcsession: unknown client authentication method")
+	}
+	provider := &HTTPProvider{
 		tokenURL:      cfg.TokenURL,
 		revocationURL: cfg.RevocationURL,
 		clientID:      cfg.ClientID,
 		clientSecret:  cfg.ClientSecret,
 		client:        &client,
-	}, nil
+	}
+	provider.clientAuth.Store(int32(cfg.ClientAuth))
+	return provider, nil
 }
 
 // Refresh implements Provider.
 func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
-	status, body, err := p.post(ctx, p.tokenURL, url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshToken},
-	})
+	form := func() url.Values {
+		return url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}
+	}
+	auth := ClientAuth(p.clientAuth.Load())
+	if p.clientSecret == "" || auth != ClientAuthDetect {
+		return p.refresh(ctx, form(), auth)
+	}
+
+	// The provider's way of taking the secret is not known yet. The header is
+	// tried first. A refusal may then be about the client and not about the
+	// refresh token, so the form is tried before the refusal is believed. A
+	// refused request has used nothing up, so asking twice is safe. Whichever
+	// way is granted is the provider's way from then on.
+	renewal, err := p.refresh(ctx, form(), ClientAuthHeader)
+	var refused *RefusedError
+	if err == nil {
+		p.clientAuth.Store(int32(ClientAuthHeader))
+		return renewal, nil
+	}
+	if !errors.As(err, &refused) {
+		return Renewal{}, err
+	}
+	renewal, err = p.refresh(ctx, form(), ClientAuthForm)
+	if err == nil {
+		p.clientAuth.Store(int32(ClientAuthForm))
+		return renewal, nil
+	}
+	// Refused both ways. If the header was refused for a reason other than
+	// the client, that reason is the answer about the refresh token.
+	var again *RefusedError
+	if errors.As(err, &again) && refused.Code != "invalid_client" {
+		return Renewal{}, refused
+	}
+	return Renewal{}, err
+}
+
+func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth ClientAuth) (Renewal, error) {
+	status, body, err := p.post(ctx, p.tokenURL, form, auth)
 	if err != nil {
 		return Renewal{}, err
 	}
@@ -159,10 +220,18 @@ func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string) error {
 	if p.revocationURL == "" {
 		return errors.New("the identity provider has no revocation endpoint")
 	}
-	status, _, err := p.post(ctx, p.revocationURL, url.Values{
-		"token":           {refreshToken},
-		"token_type_hint": {"refresh_token"},
-	})
+	form := func() url.Values {
+		return url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}
+	}
+	auth := ClientAuth(p.clientAuth.Load())
+	detect := p.clientSecret != "" && auth == ClientAuthDetect
+	if detect {
+		auth = ClientAuthHeader
+	}
+	status, _, err := p.post(ctx, p.revocationURL, form(), auth)
+	if err == nil && status != http.StatusOK && detect {
+		status, _, err = p.post(ctx, p.revocationURL, form(), ClientAuthForm)
+	}
 	if err != nil {
 		return err
 	}
@@ -175,9 +244,13 @@ func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string) error {
 // post sends a form to the provider as this client. Its errors never contain
 // the form, the response body or anything else the provider said: both can
 // hold the refresh token.
-func (p *HTTPProvider) post(ctx context.Context, endpoint string, form url.Values) (int, []byte, error) {
-	if p.clientSecret == "" {
+func (p *HTTPProvider) post(ctx context.Context, endpoint string, form url.Values, auth ClientAuth) (int, []byte, error) {
+	inHeader := p.clientSecret != "" && auth != ClientAuthForm
+	if !inHeader {
 		form.Set("client_id", p.clientID)
+		if p.clientSecret != "" {
+			form.Set("client_secret", p.clientSecret)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -185,7 +258,7 @@ func (p *HTTPProvider) post(ctx context.Context, endpoint string, form url.Value
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	if p.clientSecret != "" {
+	if inHeader {
 		req.SetBasicAuth(url.QueryEscape(p.clientID), url.QueryEscape(p.clientSecret))
 	}
 	resp, err := p.client.Do(req)

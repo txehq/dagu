@@ -171,10 +171,11 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
-				if errors.Is(err, authservice.ErrIdentityProviderUnavailable) {
+				if errors.Is(err, authservice.ErrSessionCheckUnavailable) {
 					// The token is not known to be bad. Answering 401 would
-					// sign the user out for an outage of the provider.
-					WriteIdentityProviderUnavailable(w)
+					// sign the user out for an outage of the provider or of
+					// the session store.
+					WriteSessionCheckUnavailable(w)
 					return
 				}
 				// JWT validation failed, continue to try other methods
@@ -246,16 +247,16 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 	}
 }
 
-// identityProviderRetryAfterSeconds is how soon a client is told to try again
-// when the identity provider could not be asked.
-const identityProviderRetryAfterSeconds = "5"
+// sessionCheckRetryAfterSeconds is how soon a client is told to try again
+// when its session could not be confirmed.
+const sessionCheckRetryAfterSeconds = "5"
 
-// WriteIdentityProviderUnavailable answers a request whose OIDC session could
-// not be confirmed because the identity provider did not answer: 503 with a
-// Retry-After, and never a 401.
-func WriteIdentityProviderUnavailable(w http.ResponseWriter) {
-	w.Header().Set("Retry-After", identityProviderRetryAfterSeconds)
-	http.Error(w, "The identity provider is unavailable; the session could not be confirmed. Try again shortly.", http.StatusServiceUnavailable)
+// WriteSessionCheckUnavailable answers a request whose OIDC session could
+// not be confirmed, because the identity provider did not answer or the
+// session could not be read: 503 with a Retry-After, and never a 401.
+func WriteSessionCheckUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", sessionCheckRetryAfterSeconds)
+	http.Error(w, "The session could not be confirmed with the identity provider. Try again shortly.", http.StatusServiceUnavailable)
 }
 
 func callDenied(opts Options, r *http.Request, reason string, apiKey *auth.APIKey) {

@@ -5,22 +5,51 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	oidc "github.com/coreos/go-oidc"
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/crypto"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	persiststore "github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	"github.com/dagucloud/dagu/v2/internal/service/oidcsession"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 )
+
+// sessionStore is the session store, which the test can make unreadable or
+// unwritable.
+type sessionStore struct {
+	persis.Collection
+	unreadable atomic.Bool
+	unwritable atomic.Bool
+}
+
+func (s *sessionStore) Get(ctx context.Context, id string) (*persis.Record, error) {
+	if s.unreadable.Load() {
+		return nil, errors.New("disk unavailable")
+	}
+	return s.Collection.Get(ctx, id)
+}
+
+func (s *sessionStore) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {
+	if s.unwritable.Load() {
+		return errors.New("disk full")
+	}
+	return s.Collection.CompareAndSwap(ctx, id, old, next)
+}
 
 // sessionProvider is an identity provider whose answer to a refresh the test
 // sets.
@@ -56,6 +85,7 @@ type sessionEnv struct {
 	now      time.Time
 	mu       sync.Mutex
 	provider *sessionProvider
+	store    *sessionStore
 	sessions *oidcsession.Manager
 	svc      *authservice.Service
 	cfg      *BuiltinOIDCConfig
@@ -88,11 +118,12 @@ func newSessionEnv(t *testing.T) *sessionEnv {
 	svc := authservice.New(store, authservice.Config{TokenSecret: secret, TokenTTL: time.Hour, BcryptCost: 4})
 
 	env := &sessionEnv{t: t, now: time.Now(), provider: &sessionProvider{}, svc: svc}
+	env.store = &sessionStore{Collection: backend.Collection("oidc_sessions")}
 	enc, err := crypto.NewEncryptor("a-test-key-that-is-long-enough-for-aes")
 	require.NoError(t, err)
 	env.sessions, err = oidcsession.NewManager(oidcsession.Config{
 		RevalidateAfter: 4 * time.Minute, RevalidateLimit: 5 * time.Minute, Now: env.clock,
-	}, backend.Collection("oidc_sessions"), enc, env.provider, nil)
+	}, env.store, enc, env.provider, nil)
 	require.NoError(t, err)
 	svc.SetSessionChecker(OIDCSessionChecker{Manager: env.sessions})
 	env.cfg = &BuiltinOIDCConfig{AuthService: svc, Sessions: env.sessions, LoginBasePath: "/"}
@@ -313,7 +344,127 @@ func TestOIDCSessionCheckerMapsTheAnswers(t *testing.T) {
 
 	env.provider.answer(errors.New("no answer"))
 	env.advance(5 * time.Minute)
-	require.ErrorIs(t, checker.CheckSession(ctx, claims.SessionID, env.alice), authservice.ErrIdentityProviderUnavailable)
+	require.ErrorIs(t, checker.CheckSession(ctx, claims.SessionID, env.alice), authservice.ErrSessionCheckUnavailable)
+
+	env.provider.answer(nil)
+	env.store.unreadable.Store(true)
+	err = checker.CheckSession(ctx, claims.SessionID, env.alice)
+	require.ErrorIs(t, err, authservice.ErrSessionCheckUnavailable, "a store that cannot be read is not an answer either")
+	require.NotErrorIs(t, err, authservice.ErrInvalidToken)
+}
+
+// A session store that cannot be read is not the user's doing: the request
+// is answered 503 with Retry-After, not 401, and the same token works when
+// the store is back.
+func TestAnUnreadableSessionStoreIs503(t *testing.T) {
+	t.Parallel()
+	env := newSessionEnv(t)
+	token := env.signIn()
+	require.Equal(t, http.StatusOK, env.get(token).Code)
+
+	env.store.unreadable.Store(true)
+	response := env.get(token)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.Equal(t, "5", response.Header().Get("Retry-After"))
+	assert.Empty(t, response.Header().Get("WWW-Authenticate"), "the user is not told to sign in")
+
+	env.store.unreadable.Store(false)
+	assert.Equal(t, http.StatusOK, env.get(token).Code)
+}
+
+// A sign-out the store did not take is reported as a failure, and is a
+// sign-out all the same: the token is refused from then on.
+func TestASignOutTheStoreDidNotTakeStillSignsOut(t *testing.T) {
+	t.Parallel()
+	env := newSessionEnv(t)
+	token := env.signIn()
+
+	env.store.unwritable.Store(true)
+	assert.Equal(t, http.StatusInternalServerError, signOut(env, http.MethodPost, "Bearer "+token, "/oidc-logout").Code)
+	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
+
+	env.store.unwritable.Store(false)
+	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
+	env.provider.mu.Lock()
+	assert.Equal(t, []string{"provider-refresh-token"}, env.provider.revoked)
+	env.provider.mu.Unlock()
+}
+
+// keys is the provider's signing keys, as the verifier sees them: the test
+// says whether they can be fetched and whether they accept the signature.
+type keys struct {
+	err error
+}
+
+func (k keys) VerifySignature(_ context.Context, jwt string) ([]byte, error) {
+	if k.err != nil {
+		return nil, k.err
+	}
+	return base64.RawURLEncoding.DecodeString(strings.Split(jwt, ".")[1])
+}
+
+// idToken is an ID token with a signature the test's keys decide about.
+func idToken(issuer, subject, audience string, expires time.Time) string {
+	encode := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+	payload := fmt.Sprintf(`{"iss":%q,"sub":%q,"aud":%q,"exp":%d}`, issuer, subject, audience, expires.Unix())
+	return encode(`{"alg":"RS256","typ":"JWT"}`) + "." + encode(payload) + "." + encode("signature")
+}
+
+// What the session is told about a renewed ID token. Only a verified token
+// confirms. A token the verifier did not accept, for whatever reason, is
+// reported as not verifiable together with the identity it names, and
+// something that is not a token at all is an error.
+func TestIDTokenChecker(t *testing.T) {
+	t.Parallel()
+	const issuer, client = "https://issuer.example/realms/test", "dagu-web"
+	ctx := context.Background()
+	soon := time.Now().Add(time.Hour)
+	checker := func(k keys) oidcsession.IDTokenChecker {
+		return newIDTokenChecker(oidc.NewVerifier(issuer, k, &oidc.Config{ClientID: client}))
+	}
+
+	gotIssuer, gotSubject, err := checker(keys{})(ctx, idToken(issuer, "subject-1", client, soon))
+	require.NoError(t, err)
+	assert.Equal(t, issuer, gotIssuer)
+	assert.Equal(t, "subject-1", gotSubject)
+
+	for name, tt := range map[string]struct {
+		keys  keys
+		token string
+	}{
+		"TheKeysCannotBeFetched": {keys{err: errors.New("fetching keys: 503")}, idToken(issuer, "subject-1", client, soon)},
+		"TheSignatureIsWrong":    {keys{err: errors.New("failed to verify id token signature")}, idToken(issuer, "subject-1", client, soon)},
+		"Expired":                {keys{}, idToken(issuer, "subject-1", client, time.Now().Add(-time.Hour))},
+		"ForAnotherClient":       {keys{}, idToken(issuer, "subject-1", "another-client", soon)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			gotIssuer, gotSubject, err := checker(tt.keys)(ctx, tt.token)
+			require.ErrorIs(t, err, oidcsession.ErrIDTokenUnverifiable)
+			assert.Equal(t, issuer, gotIssuer)
+			assert.Equal(t, "subject-1", gotSubject)
+		})
+	}
+
+	// From another issuer: not verifiable, and the issuer it names is not the
+	// session's, which is what ends the session.
+	gotIssuer, _, err = checker(keys{})(ctx, idToken("https://elsewhere.example", "subject-1", client, soon))
+	require.ErrorIs(t, err, oidcsession.ErrIDTokenUnverifiable)
+	assert.Equal(t, "https://elsewhere.example", gotIssuer)
+
+	for _, notAToken := range []string{"", "garbage", "a.b", "a.b.c", idToken("", "subject-1", client, soon), idToken(issuer, "", client, soon)} {
+		_, _, err := checker(keys{err: errors.New("fetching keys: 503")})(ctx, notAToken)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, oidcsession.ErrIDTokenUnverifiable, "%q names nobody", notAToken)
+	}
+}
+
+// The refresh sends the client secret the way the sign-in's exchange does.
+func TestOIDCClientAuthFollowsTheSignIn(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, oidcsession.ClientAuthDetect, oidcClientAuth(oauth2.AuthStyleAutoDetect))
+	assert.Equal(t, oidcsession.ClientAuthForm, oidcClientAuth(oauth2.AuthStyleInParams))
+	assert.Equal(t, oidcsession.ClientAuthHeader, oidcClientAuth(oauth2.AuthStyleInHeader))
 }
 
 // Requests that race with a sign-out are each either served or refused, and
