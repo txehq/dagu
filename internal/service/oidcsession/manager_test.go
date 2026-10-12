@@ -67,11 +67,28 @@ type fakeProvider struct {
 	after    chan struct{}
 	// revokeErr, when set, is what every revocation fails with.
 	revokeErr error
+	// establish, when set, answers Establish. Otherwise the provider takes
+	// the header and exchanges nothing.
+	establish func(refreshToken string) (ClientAuth, Renewal, error)
+	// ways lists the way of each refresh, and revokedWays of each revocation.
+	ways        []ClientAuth
+	revokedWays []ClientAuth
 }
 
-func (p *fakeProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
+func (p *fakeProvider) Establish(_ context.Context, refreshToken string) (ClientAuth, Renewal, error) {
+	p.mu.Lock()
+	establish := p.establish
+	p.mu.Unlock()
+	if establish != nil {
+		return establish(refreshToken)
+	}
+	return ClientAuthHeader, Renewal{}, nil
+}
+
+func (p *fakeProvider) Refresh(ctx context.Context, refreshToken string, auth ClientAuth) (Renewal, error) {
 	p.mu.Lock()
 	p.refreshes = append(p.refreshes, refreshToken)
+	p.ways = append(p.ways, auth)
 	answer, gate, started := p.answer, p.gate, p.started
 	p.mu.Unlock()
 	if started != nil {
@@ -158,13 +175,14 @@ func (p *fakeProvider) once(first string) func(string) (Renewal, error) {
 	}
 }
 
-func (p *fakeProvider) Revoke(_ context.Context, refreshToken string) error {
+func (p *fakeProvider) Revoke(_ context.Context, refreshToken string, auth ClientAuth) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.revokeErr != nil {
 		return p.revokeErr
 	}
 	p.revoked = append(p.revoked, refreshToken)
+	p.revokedWays = append(p.revokedWays, auth)
 	return nil
 }
 
@@ -785,6 +803,15 @@ type failingCollection struct {
 	// swapped, when set, is called after each write that was made: an error
 	// from it is reported for a write that did happen.
 	swapped func() error
+	// create, when set, is what creating a record fails with.
+	create error
+}
+
+func (c *failingCollection) Create(ctx context.Context, rec *persis.Record) error {
+	if c.create != nil {
+		return c.create
+	}
+	return c.Collection.Create(ctx, rec)
 }
 
 func (c *failingCollection) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {

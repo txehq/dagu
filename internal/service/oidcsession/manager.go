@@ -51,6 +51,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -81,6 +82,10 @@ const (
 	// maxClockSkew is how far apart the clocks of hub processes that share a
 	// session store may be. See the package documentation.
 	maxClockSkew = 10 * time.Second
+
+	// maxOwedRevocations is how many revocations the provider did not take
+	// are kept to be made again.
+	maxOwedRevocations = 1024
 
 	// casAttempts is how often a write that lost to another writer is made
 	// again on what that writer stored.
@@ -163,6 +168,10 @@ type Session struct {
 	// LastConfirmedAt is when the provider last granted a refresh, or the
 	// sign-in itself.
 	LastConfirmedAt time.Time `json:"last_confirmed_at"`
+	// ClientAuth is the way the provider takes the client secret, as a
+	// refresh it granted established. Every call to the provider for this
+	// session is made that way.
+	ClientAuth ClientAuth `json:"client_auth"`
 	// ConfirmedBy names the hub process whose clock wrote LastConfirmedAt.
 	ConfirmedBy string `json:"confirmed_by,omitempty"`
 	// Rotations counts the refreshes the provider granted.
@@ -201,6 +210,20 @@ type Manager struct {
 	// undone holds the ends this process has decided and the store has not
 	// recorded. A session in it is refused here whatever the store says.
 	undone map[string]decision
+	// owed holds the revocations the provider did not take, to be made
+	// again, by a digest of the refresh token.
+	owed map[[sha256.Size]byte]owedRevocation
+}
+
+// owedRevocation is a refresh token the provider has still to be asked to
+// revoke.
+type owedRevocation struct {
+	// token is the refresh token, encrypted, and auth the way its session
+	// had with the provider.
+	token string
+	auth  ClientAuth
+	// since is when the provider first did not take the revocation.
+	since time.Time
 }
 
 // decision is the end of a session, as decided.
@@ -260,6 +283,7 @@ func NewManager(cfg Config, col persis.Collection, enc Encryptor, provider Provi
 		cfg: cfg, col: col, enc: enc, provider: provider, checkID: checkID, now: now,
 		owner:   hex.EncodeToString(owner[:]),
 		flights: map[string]*flight{}, failedAt: map[string]time.Time{}, undone: map[string]decision{},
+		owed: map[[sha256.Size]byte]owedRevocation{},
 	}, nil
 }
 
@@ -272,25 +296,48 @@ func (m *Manager) Create(ctx context.Context, who Identity, refreshToken string,
 	if refreshToken == "" {
 		return nil, errors.New("oidcsession: the identity provider returned no refresh token, so the session could not be revalidated")
 	}
+	// The way the provider takes the client secret is established now, while
+	// a refusal can only be about the client: the token is a moment old.
+	auth, renewal, err := m.provider.Establish(ctx, refreshToken)
+	var refused *RefusedError
+	switch {
+	case errors.As(err, &refused):
+		return nil, fmt.Errorf("oidcsession: the identity provider will not refresh the token it has just issued (%s), so the session could not be revalidated", refused.Code)
+	case err != nil:
+		return nil, fmt.Errorf("%w: it did not answer when the session was being started", ErrProviderUnavailable)
+	case auth != ClientAuthForm && auth != ClientAuthHeader:
+		return nil, errors.New("oidcsession: the way the identity provider takes the client secret was not established")
+	}
+	if renewal.RefreshToken != "" {
+		refreshToken = renewal.RefreshToken
+	}
+	// From here on the session holds a token nobody else does. If it cannot
+	// be started, the token is revoked and not left behind.
+	discard := func() { m.revokeAtProvider(ctx, auth, refreshToken) }
 	encrypted, err := m.enc.Encrypt(refreshToken)
 	if err != nil {
+		discard()
 		return nil, errors.New("oidcsession: the refresh token could not be encrypted")
 	}
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
+		discard()
 		return nil, err
 	}
 	now := m.now().UTC()
 	session := &Session{
 		Schema: schemaVersion, ID: hex.EncodeToString(raw[:]),
 		UserID: who.UserID, Issuer: who.Issuer, Subject: who.Subject,
-		RefreshToken: encrypted, CreatedAt: now, ExpiresAt: expiresAt.UTC(), LastConfirmedAt: now, ConfirmedBy: m.owner,
+		RefreshToken: encrypted, ClientAuth: auth,
+		CreatedAt: now, ExpiresAt: expiresAt.UTC(), LastConfirmedAt: now, ConfirmedBy: m.owner,
 	}
 	data, err := encode(session)
 	if err != nil {
+		discard()
 		return nil, err
 	}
 	if err := m.col.Create(ctx, &persis.Record{ID: session.ID, Data: data, CreatedAt: now, UpdatedAt: now}); err != nil {
+		discard()
 		return nil, fmt.Errorf("oidcsession: store the session: %w", err)
 	}
 	m.purge(ctx, now)
@@ -339,9 +386,11 @@ func (m *Manager) purge(ctx context.Context, now time.Time) {
 	}
 }
 
-// reconcile tries again to write the ends the store did not take, and drops
-// those of sessions whose hub token has expired. It runs at sign-in, so that
-// an end is not left waiting for a request that may never come.
+// reconcile tries again to write the ends the store did not take, and to make
+// the revocations the provider did not take. It drops the ends of sessions
+// whose hub token has expired, and revocations that have been owed for a day.
+// It runs at sign-in, so that neither is left waiting for a request that may
+// never come.
 func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	m.mu.Lock()
 	pending := make(map[string]decision, len(m.undone))
@@ -352,9 +401,20 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		}
 		pending[id] = d
 	}
+	owed := make([]owedRevocation, 0, len(m.owed))
+	for digest, revocation := range m.owed {
+		if now.Sub(revocation.since) > purgeAfter {
+			delete(m.owed, digest)
+			continue
+		}
+		owed = append(owed, revocation)
+	}
 	m.mu.Unlock()
 	for id, d := range pending {
 		_ = m.conclude(ctx, id, d)
+	}
+	for _, revocation := range owed {
+		m.revokeHeld(ctx, revocation.token, revocation.auth)
 	}
 }
 
@@ -526,7 +586,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 		return m.conclude(ctx, sessionID, ends("the stored refresh token could not be read"))
 	}
 
-	renewal, err := m.provider.Refresh(ctx, refreshToken)
+	renewal, err := m.provider.Refresh(ctx, refreshToken, session.ClientAuth)
 	var refused *RefusedError
 	switch {
 	case errors.As(err, &refused) && tookOver:
@@ -561,7 +621,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	if rotated {
 		replacement, err = m.enc.Encrypt(renewal.RefreshToken)
 		if err != nil {
-			return m.abandon(ctx, sessionID, renewal.RefreshToken, ends("the renewed refresh token could not be encrypted"))
+			return m.abandon(ctx, sessionID, session.ClientAuth, renewal.RefreshToken, ends("the renewed refresh token could not be encrypted"))
 		}
 	}
 
@@ -573,7 +633,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 		unverifiable := errors.Is(err, ErrIDTokenUnverifiable)
 		switch {
 		case (err != nil && !unverifiable) || issuer != session.Issuer || subject != session.Subject:
-			m.revokeAtProvider(ctx, renewal.RefreshToken, refreshToken)
+			m.revokeAtProvider(ctx, session.ClientAuth, renewal.RefreshToken, refreshToken)
 			return m.conclude(ctx, sessionID, ends("the renewed token is not for this session's identity"))
 		case unverifiable:
 			// The token names this session's identity and could not be
@@ -590,7 +650,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	lost := ends("the renewed session could not be stored")
 	lost.orToken = replacement
 	err = m.commit(ctx, sessionID, renewed{
-		held: held, newToken: renewal.RefreshToken, replacement: replacement, lost: lost,
+		held: held, newToken: renewal.RefreshToken, replacement: replacement, lost: lost, auth: session.ClientAuth,
 		apply: func(stored *Session) {
 			if rotated {
 				stored.RefreshToken = replacement
@@ -691,6 +751,8 @@ type renewed struct {
 	apply func(*Session)
 	// lost is the end of the session if a new refresh token cannot be kept.
 	lost decision
+	// auth is the session's way with the provider.
+	auth ClientAuth
 }
 
 // commit stores the outcome of a granted refresh.
@@ -704,12 +766,12 @@ func (m *Manager) commit(ctx context.Context, sessionID string, r renewed) error
 	for range casAttempts {
 		if _, ok := m.decided(sessionID); ok {
 			// Ended by this process, though the store has not recorded it.
-			m.revokeAtProvider(ctx, r.newToken)
+			m.revokeAtProvider(ctx, r.auth, r.newToken)
 			return ErrSessionEnded
 		}
 		session, raw, err := m.load(ctx, sessionID)
 		if errors.Is(err, ErrSessionEnded) || (err == nil && session.EndedAt != nil) {
-			m.revokeAtProvider(ctx, r.newToken)
+			m.revokeAtProvider(ctx, r.auth, r.newToken)
 			return ErrSessionEnded
 		}
 		if err != nil {
@@ -751,7 +813,7 @@ func (m *Manager) commit(ctx context.Context, sessionID string, r renewed) error
 		// Nothing is lost: the stored refresh token is still the session's.
 		return failure
 	}
-	return m.abandon(ctx, sessionID, r.newToken, r.lost)
+	return m.abandon(ctx, sessionID, r.auth, r.newToken, r.lost)
 }
 
 // abandon ends a session whose new refresh token could not be kept. The token
@@ -762,10 +824,10 @@ func (m *Manager) commit(ctx context.Context, sessionID string, r renewed) error
 // The end applies to the record whether it holds the old token or, after a
 // write whose outcome is not known, the new one that has just been revoked.
 // It does not apply to a record another hub process has renewed since.
-func (m *Manager) abandon(ctx context.Context, sessionID, newToken string, lost decision) error {
+func (m *Manager) abandon(ctx context.Context, sessionID string, auth ClientAuth, newToken string, lost decision) error {
 	slog.Error("OIDC session ended: its renewed refresh token could not be kept",
 		slog.String("session", sessionID), slog.String("reason", lost.reason))
-	m.revokeAtProvider(ctx, newToken)
+	m.revokeAtProvider(ctx, auth, newToken)
 	return m.conclude(ctx, sessionID, lost)
 }
 
@@ -791,7 +853,7 @@ func (m *Manager) End(ctx context.Context, sessionID, reason string, expiresAt t
 func (m *Manager) endAndRevoke(ctx context.Context, sessionID string, d decision) (ended bool, err error) {
 	out, err := m.end(ctx, sessionID, d)
 	if out.applied.revoke && out.held != "" && out.held != out.applied.revoked {
-		if m.revokeHeld(ctx, out.held) && err != nil {
+		if m.revokeHeld(ctx, out.held, out.auth) && err != nil {
 			m.noteRevoked(sessionID, out.held)
 		}
 	}
@@ -807,6 +869,8 @@ type ending struct {
 	held string
 	// applied is the decision end applied.
 	applied decision
+	// auth is the way with the provider of the session whose token held is.
+	auth ClientAuth
 }
 
 // conclude ends a session for good and returns the answer for the request
@@ -839,7 +903,7 @@ func (m *Manager) conclude(ctx context.Context, sessionID string, d decision) er
 // once the record holds another.
 func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending, error) {
 	failure := errors.New("oidcsession: the session kept changing while it was being ended")
-	held := ""
+	held, auth := "", ClientAuthDetect
 	for range casAttempts {
 		d = m.widest(sessionID, d)
 		session, raw, err := m.load(ctx, sessionID)
@@ -860,7 +924,7 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 			m.drop(sessionID, d.ifToken)
 			return ending{applied: d}, nil
 		}
-		held = session.RefreshToken
+		held, auth = session.RefreshToken, session.ClientAuth
 		now := m.now().UTC()
 		session.EndedAt, session.EndReason, session.RefreshToken = &now, d.reason, ""
 		session.RefreshOwner, session.RefreshUntil = "", nil
@@ -872,7 +936,7 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 		err = m.col.CompareAndSwap(ctx, sessionID, raw, data)
 		if err == nil {
 			m.settle(sessionID)
-			return ending{ended: true, held: held, applied: d}, nil
+			return ending{ended: true, held: held, applied: d, auth: auth}, nil
 		}
 		if errors.Is(err, persis.ErrNotFound) {
 			m.settle(sessionID)
@@ -882,9 +946,9 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 			failure = fmt.Errorf("oidcsession: end the session: %w", err)
 			break
 		}
-		held = ""
+		held, auth = "", ClientAuthDetect
 	}
-	return ending{held: held, applied: m.remember(sessionID, d)}, failure
+	return ending{held: held, applied: m.remember(sessionID, d), auth: auth}, failure
 }
 
 func (m *Manager) decided(sessionID string) (decision, bool) {
@@ -957,7 +1021,7 @@ func (m *Manager) drop(sessionID, ifToken string) {
 
 // revokeHeld revokes the refresh token an ended record held, and reports
 // whether the provider took the revocation.
-func (m *Manager) revokeHeld(ctx context.Context, held string) bool {
+func (m *Manager) revokeHeld(ctx context.Context, held string, auth ClientAuth) bool {
 	if held == "" {
 		return false
 	}
@@ -965,13 +1029,14 @@ func (m *Manager) revokeHeld(ctx context.Context, held string) bool {
 	if err != nil {
 		return false
 	}
-	return m.revokeAtProvider(ctx, refreshToken)
+	return m.revokeAtProvider(ctx, auth, refreshToken)
 }
 
 // revokeAtProvider asks the provider to end refresh tokens that must not be
-// used again, and reports whether it took every one. It is best effort: the
-// hub's own record is what ends a session.
-func (m *Manager) revokeAtProvider(ctx context.Context, refreshTokens ...string) bool {
+// used again, and reports whether it took every one. The hub's own record is
+// what ends a session, so a revocation the provider does not take does not
+// hold anything up: it is kept and made again at the next sign-in.
+func (m *Manager) revokeAtProvider(ctx context.Context, auth ClientAuth, refreshTokens ...string) bool {
 	seen := map[string]bool{}
 	all := true
 	for _, token := range refreshTokens {
@@ -979,12 +1044,35 @@ func (m *Manager) revokeAtProvider(ctx context.Context, refreshTokens ...string)
 			continue
 		}
 		seen[token] = true
-		if err := m.provider.Revoke(context.WithoutCancel(ctx), token); err != nil {
+		err := m.provider.Revoke(context.WithoutCancel(ctx), token, auth)
+		m.owe(token, auth, err)
+		if err != nil {
 			all = false
 			slog.Warn("OIDC refresh token could not be revoked at the identity provider", slog.String("cause", fmt.Sprintf("%T", err)))
 		}
 	}
 	return all
+}
+
+// owe keeps a revocation the provider did not take, to be made again at the
+// next sign-in, and forgets one it has taken. A provider that has no
+// revocation endpoint is owed nothing: asking again would change nothing.
+func (m *Manager) owe(refreshToken string, auth ClientAuth, revokeErr error) {
+	digest := sha256.Sum256([]byte(refreshToken))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if revokeErr == nil || errors.Is(revokeErr, ErrRevocationUnsupported) {
+		delete(m.owed, digest)
+		return
+	}
+	if _, ok := m.owed[digest]; ok || len(m.owed) >= maxOwedRevocations {
+		return
+	}
+	encrypted, err := m.enc.Encrypt(refreshToken)
+	if err != nil {
+		return
+	}
+	m.owed[digest] = owedRevocation{token: encrypted, auth: auth, since: m.now()}
 }
 
 // load reads a session and the bytes it is stored as. A session that does not

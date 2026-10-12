@@ -6,11 +6,13 @@ package oidcsession
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -931,5 +933,169 @@ func TestARememberedEnd(t *testing.T) {
 		_, remembered = f.manager.decided(session.ID)
 		assert.False(t, remembered)
 		require.ErrorIs(t, f.check(session), ErrSessionEnded, "an expired session serves nothing whatever is remembered")
+	})
+}
+
+// The way the provider takes the client secret is established when the
+// session starts and kept with it. Every later call for the session is made
+// that way.
+func TestTheWayIsEstablishedWhenTheSessionStarts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	start := func(f *fixture) (*Session, error) {
+		return f.manager.Create(ctx, alice, "refresh-token-0", f.clock.Now().Add(24*time.Hour))
+	}
+	stored := func(f *fixture) int {
+		page, err := f.col.List(ctx, persis.ListQuery{})
+		require.NoError(t, err)
+		return len(page.Records)
+	}
+
+	t.Run("ItIsKeptWithTheSession", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.establish = func(token string) (ClientAuth, Renewal, error) {
+			require.Equal(t, "refresh-token-0", token)
+			return ClientAuthForm, Renewal{RefreshToken: "the-token-establishing-returned"}, nil
+		}
+		session, err := start(f)
+		require.NoError(t, err)
+		assert.Equal(t, ClientAuthForm, f.stored(session).ClientAuth)
+		assert.Equal(t, "the-token-establishing-returned", f.heldToken(session), "the token that was exchanged is not the session's any more")
+
+		f.clock.Advance(4 * time.Minute)
+		require.NoError(t, f.check(session))
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		f.provider.mu.Lock()
+		defer f.provider.mu.Unlock()
+		assert.Equal(t, []string{"the-token-establishing-returned"}, f.provider.refreshes)
+		assert.Equal(t, []ClientAuth{ClientAuthForm}, f.provider.ways)
+		assert.Equal(t, []ClientAuth{ClientAuthForm}, f.provider.revokedWays)
+	})
+
+	t.Run("TheProviderWillNotRefreshWhatItIssued", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.establish = func(string) (ClientAuth, Renewal, error) {
+			return ClientAuthDetect, Renewal{}, &RefusedError{Status: 401, Code: "invalid_client"}
+		}
+		_, err := start(f)
+		require.ErrorContains(t, err, "will not refresh the token it has just issued")
+		require.NotErrorIs(t, err, ErrProviderUnavailable)
+		assert.Zero(t, stored(f), "no session is started that could never be revalidated")
+	})
+
+	t.Run("TheProviderDoesNotAnswer", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.establish = func(string) (ClientAuth, Renewal, error) {
+			return ClientAuthDetect, Renewal{}, errors.New("the identity provider did not answer")
+		}
+		_, err := start(f)
+		require.ErrorIs(t, err, ErrProviderUnavailable)
+		assert.Zero(t, stored(f))
+	})
+
+	t.Run("NotEstablished", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.establish = func(string) (ClientAuth, Renewal, error) { return ClientAuthDetect, Renewal{}, nil }
+		_, err := start(f)
+		require.Error(t, err)
+		assert.Zero(t, stored(f))
+	})
+
+	// The session cannot be stored. The token it would have held is nobody
+	// else's by now, and is revoked.
+	t.Run("ASessionThatCannotBeStoredLeavesNoTokenBehind", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.establish = func(string) (ClientAuth, Renewal, error) {
+			return ClientAuthForm, Renewal{RefreshToken: "the-token-establishing-returned"}, nil
+		}
+		f.manager.col = &failingCollection{Collection: f.col, create: errors.New("disk full")}
+		_, err := start(f)
+		require.Error(t, err)
+		assert.Equal(t, []string{"the-token-establishing-returned"}, f.provider.revocations())
+		f.provider.mu.Lock()
+		defer f.provider.mu.Unlock()
+		assert.Equal(t, []ClientAuth{ClientAuthForm}, f.provider.revokedWays)
+	})
+}
+
+// A revocation the provider did not take is not given up. The session is
+// ended in the hub at once, and the provider is asked again at the next
+// sign-in, for a day.
+func TestARevocationTheProviderDidNotTake(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	down := errors.New("the provider did not answer")
+
+	t.Run("ItIsMadeAgainAtTheNextSignIn", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.failRevocations(down)
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt), "the sign-out itself does not wait for the provider")
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		f.signIn()
+		require.Empty(t, f.provider.revocations())
+
+		f.provider.failRevocations(nil)
+		f.signIn()
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+		f.signIn()
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "and once it is taken, not again")
+	})
+
+	t.Run("ItIsGivenUpAfterADay", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.failRevocations(down)
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		f.clock.Advance(purgeAfter)
+		f.signIn()
+		require.Len(t, f.manager.owed, 1)
+		f.clock.Advance(time.Second)
+		f.signIn()
+		assert.Empty(t, f.manager.owed)
+	})
+
+	t.Run("AProviderWithNoRevocationEndpointIsOwedNothing", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.failRevocations(ErrRevocationUnsupported)
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		assert.Empty(t, f.manager.owed)
+	})
+
+	t.Run("NoMoreThanAFixedNumberAreKept", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		for i := range maxOwedRevocations + 10 {
+			f.manager.owe(fmt.Sprintf("refresh-token-%d", i), ClientAuthHeader, down)
+		}
+		assert.Len(t, f.manager.owed, maxOwedRevocations)
+	})
+
+	// What is kept is encrypted, like the session's own copy, with the way
+	// the session had.
+	t.Run("ItIsKeptEncryptedWithItsWay", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.manager.owe("refresh-token-secret", ClientAuthForm, down)
+		require.Len(t, f.manager.owed, 1)
+		for _, revocation := range f.manager.owed {
+			assert.NotContains(t, revocation.token, "refresh-token-secret")
+			assert.Equal(t, ClientAuthForm, revocation.auth)
+		}
+		f.provider.failRevocations(nil)
+		f.manager.reconcile(ctx, f.clock.Now())
+		f.provider.mu.Lock()
+		defer f.provider.mu.Unlock()
+		assert.Equal(t, []string{"refresh-token-secret"}, f.provider.revoked)
+		assert.Equal(t, []ClientAuth{ClientAuthForm}, f.provider.revokedWays)
 	})
 }

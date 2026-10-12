@@ -60,14 +60,18 @@ type sessionProvider struct {
 	revoked []string
 }
 
-func (p *sessionProvider) Refresh(context.Context, string) (oidcsession.Renewal, error) {
+func (p *sessionProvider) Establish(context.Context, string) (oidcsession.ClientAuth, oidcsession.Renewal, error) {
+	return oidcsession.ClientAuthHeader, oidcsession.Renewal{}, nil
+}
+
+func (p *sessionProvider) Refresh(context.Context, string, oidcsession.ClientAuth) (oidcsession.Renewal, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
 	return oidcsession.Renewal{RefreshToken: "next-refresh-token"}, p.err
 }
 
-func (p *sessionProvider) Revoke(_ context.Context, token string) error {
+func (p *sessionProvider) Revoke(_ context.Context, token string, _ oidcsession.ClientAuth) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.revoked = append(p.revoked, token)

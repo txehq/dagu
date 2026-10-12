@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -33,11 +32,27 @@ type Renewal struct {
 // *RefusedError: the provider answered, and its answer is no. Anything else
 // is any other error: the provider could not be asked, or what came back was
 // not an answer, and nothing is known about the session.
+//
+// A provider refuses a client that sent its secret in a way it does not take
+// just as it refuses a refresh token. So that a refusal is always about the
+// token, the way is established once, at sign-in, by a refresh the provider
+// grants, and kept with the session. Every later call for the session is
+// made that way and no other.
 type Provider interface {
-	Refresh(ctx context.Context, refreshToken string) (Renewal, error)
-	// Revoke asks the provider to end the refresh token. It is best effort.
-	Revoke(ctx context.Context, refreshToken string) error
+	// Establish is asked at sign-in, with the refresh token the provider has
+	// just issued. It returns the way the provider takes the client secret,
+	// and a Renewal when finding that out exchanged the token. A
+	// *RefusedError means the provider will not refresh the token it has just
+	// issued, whichever way it is asked.
+	Establish(ctx context.Context, refreshToken string) (ClientAuth, Renewal, error)
+	Refresh(ctx context.Context, refreshToken string, auth ClientAuth) (Renewal, error)
+	// Revoke asks the provider to end the refresh token.
+	Revoke(ctx context.Context, refreshToken string, auth ClientAuth) error
 }
+
+// ErrRevocationUnsupported is what Revoke returns for a provider that has no
+// revocation endpoint. Asking again later would change nothing.
+var ErrRevocationUnsupported = errors.New("the identity provider has no revocation endpoint")
 
 // RefusedError is the provider's definite refusal of a refresh: a 400 or 401
 // from the token endpoint whose JSON body names an OAuth error. Code is that
@@ -65,16 +80,6 @@ var knownRefusalCodes = map[string]bool{
 	"access_denied":          true,
 }
 
-// aboutTheClient reports whether a refusal says the provider did not accept
-// the client, as opposed to what the client asked for.
-func aboutTheClient(refused *RefusedError) bool {
-	switch refused.Code {
-	case "invalid_client", "unauthorized_client", "invalid_request":
-		return true
-	}
-	return refused.Status == http.StatusUnauthorized
-}
-
 func refusalCode(code string) string {
 	if knownRefusalCodes[code] {
 		return code
@@ -91,8 +96,8 @@ const (
 type ClientAuth int32
 
 const (
-	// ClientAuthDetect finds out which of the two ways the provider takes,
-	// before any refresh token is sent: see HTTPProvider.
+	// ClientAuthDetect is the way not being known: it is established at
+	// sign-in. A session never has it.
 	ClientAuthDetect ClientAuth = iota
 	// ClientAuthForm sends the client id and secret in the form
 	// (client_secret_post).
@@ -111,39 +116,28 @@ type HTTPProviderConfig struct {
 	RevocationURL string
 	ClientID      string
 	ClientSecret  string
-	// ClientAuth is how the secret is sent. The zero value detects it.
+	// ClientAuth is how the secret is sent. The zero value establishes it at
+	// sign-in.
 	ClientAuth ClientAuth
 	// HTTPClient makes the calls. Nil means a client with a five-second
 	// timeout. Either way no redirect is followed.
 	HTTPClient *http.Client
 }
 
-// probeRefreshToken is sent as a refresh token to find out how the provider
-// takes the client secret. It is not a token, and no provider issued it.
-const probeRefreshToken = "dagu-client-authentication-probe" //nolint:gosec // G101: not a credential; a value no provider issued
-
 // HTTPProvider talks to a provider's token and revocation endpoints.
-//
-// A refusal of a refresh has to be an answer about the refresh token and
-// nothing else, whatever its code. A provider refuses a client that sent its
-// secret the wrong way too, so the way has to be known before a session's
-// token is sent. The sign-in's own code exchange finds it by trying, and does
-// not say what it found. So with ClientAuthDetect the first call here sends a
-// refresh request for a token that is not one, in the header and, if the
-// provider refuses the client that way, in the form. The way the provider
-// judged that request by is its way from then on. Until that is known no
-// session's token is sent, and the call is reported as no answer.
 type HTTPProvider struct {
 	tokenURL      string
 	revocationURL string
 	clientID      string
 	clientSecret  string
 	client        *http.Client
-	// clientAuth is the ClientAuth in use: the configured one, or the one a
-	// provider's answer settled.
-	clientAuth atomic.Int32
-	// settling lets one call at a time find the provider's way.
-	settling sync.Mutex
+	// configured is the way the configuration sets, or ClientAuthDetect.
+	configured ClientAuth
+	// granted is the way of the last refresh the provider granted, or
+	// ClientAuthDetect when the last answer by that way was a refusal. It
+	// saves a sign-in from establishing what the last grant already showed.
+	// It is a hint and decides nothing about a session that exists.
+	granted atomic.Int32
 }
 
 // NewHTTPProvider validates cfg and returns a provider.
@@ -166,66 +160,58 @@ func NewHTTPProvider(cfg HTTPProviderConfig) (*HTTPProvider, error) {
 		clientID:      cfg.ClientID,
 		clientSecret:  cfg.ClientSecret,
 		client:        &client,
+		configured:    cfg.ClientAuth,
 	}
-	provider.clientAuth.Store(int32(cfg.ClientAuth))
 	return provider, nil
 }
 
-// Refresh implements Provider.
-func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
-	auth, err := p.settledClientAuth(ctx)
-	if err != nil {
-		return Renewal{}, err
+// Establish implements Provider.
+//
+// The refresh token was issued a moment ago, so a refusal of it is about the
+// client and not about the token. The header is tried, and the form if the
+// provider refuses the header. The way that is granted is the provider's. If
+// neither is granted, the provider will not refresh what it issues, a session
+// could never be revalidated, and the sign-in fails.
+func (p *HTTPProvider) Establish(ctx context.Context, refreshToken string) (ClientAuth, Renewal, error) {
+	switch {
+	case p.clientSecret == "":
+		// A public client has no secret to send. It names itself in the form.
+		return ClientAuthForm, Renewal{}, nil
+	case p.configured != ClientAuthDetect:
+		return p.configured, Renewal{}, nil
 	}
-	return p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}, auth)
+	if auth := ClientAuth(p.granted.Load()); auth != ClientAuthDetect {
+		return auth, Renewal{}, nil
+	}
+	renewal, err := p.Refresh(ctx, refreshToken, ClientAuthHeader)
+	var refused *RefusedError
+	switch {
+	case err == nil:
+		return ClientAuthHeader, renewal, nil
+	case !errors.As(err, &refused):
+		return ClientAuthDetect, Renewal{}, err
+	}
+	renewal, err = p.Refresh(ctx, refreshToken, ClientAuthForm)
+	if err != nil {
+		return ClientAuthDetect, Renewal{}, err
+	}
+	return ClientAuthForm, renewal, nil
 }
 
-// settledClientAuth returns the way the provider takes the client secret,
-// finding it out first if it is not known. An error means it could not be
-// found out now, and nothing was learned about any session.
-func (p *HTTPProvider) settledClientAuth(ctx context.Context) (ClientAuth, error) {
-	if auth := ClientAuth(p.clientAuth.Load()); auth != ClientAuthDetect || p.clientSecret == "" {
-		return auth, nil
+// Refresh implements Provider. It sends the refresh token once, the way it is
+// told to.
+func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string, auth ClientAuth) (Renewal, error) {
+	renewal, err := p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}, auth)
+	var refused *RefusedError
+	switch {
+	case err == nil:
+		p.granted.Store(int32(auth))
+	case errors.As(err, &refused):
+		// Whatever this refusal is about, the way is no longer known to be
+		// granted, and the next sign-in establishes it again.
+		p.granted.CompareAndSwap(int32(auth), int32(ClientAuthDetect))
 	}
-	p.settling.Lock()
-	defer p.settling.Unlock()
-	if auth := ClientAuth(p.clientAuth.Load()); auth != ClientAuthDetect {
-		return auth, nil
-	}
-
-	probe := func(auth ClientAuth) (acceptedClient bool, err error) {
-		_, err = p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {probeRefreshToken}}, auth)
-		var refused *RefusedError
-		switch {
-		case err == nil:
-			// A provider that grants this grants anything; it took the client.
-			return true, nil
-		case errors.As(err, &refused):
-			return !aboutTheClient(refused), nil
-		default:
-			return false, err
-		}
-	}
-	accepted, err := probe(ClientAuthHeader)
-	if err != nil {
-		return ClientAuthDetect, err
-	}
-	auth := ClientAuthHeader
-	if !accepted {
-		// Refused as a client in the header. If the form is taken, the form
-		// is the way. If the client is refused that way too, the way is not
-		// what the provider objects to: the header it is, and the refusal of
-		// a session's token that follows is the provider's answer.
-		accepted, err = probe(ClientAuthForm)
-		if err != nil {
-			return ClientAuthDetect, err
-		}
-		if accepted {
-			auth = ClientAuthForm
-		}
-	}
-	p.clientAuth.Store(int32(auth))
-	return auth, nil
+	return renewal, err
 }
 
 func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth ClientAuth) (Renewal, error) {
@@ -261,13 +247,9 @@ func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth Client
 }
 
 // Revoke implements Provider.
-func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string) error {
+func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string, auth ClientAuth) error {
 	if p.revocationURL == "" {
-		return errors.New("the identity provider has no revocation endpoint")
-	}
-	auth, err := p.settledClientAuth(ctx)
-	if err != nil {
-		return err
+		return ErrRevocationUnsupported
 	}
 	status, _, err := p.post(ctx, p.revocationURL, url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}, auth)
 	if err != nil {

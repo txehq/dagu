@@ -72,7 +72,7 @@ func TestHTTPProviderGrantedRefresh(t *testing.T) {
 	t.Parallel()
 	e := newEndpoint(t)
 
-	renewal, err := e.provider(t, "client-secret").Refresh(context.Background(), secretRefreshToken)
+	renewal, err := e.provider(t, "client-secret").Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 	require.NoError(t, err)
 	assert.Equal(t, Renewal{RefreshToken: "next", IDToken: "id"}, renewal)
 
@@ -84,7 +84,7 @@ func TestHTTPProviderGrantedRefresh(t *testing.T) {
 
 	// A public client names itself in the body and sends no secret.
 	public := newEndpoint(t)
-	_, err = public.provider(t, "").Refresh(context.Background(), secretRefreshToken)
+	_, err = public.provider(t, "").Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 	require.NoError(t, err)
 	assert.Equal(t, "dagu-web", public.forms[0].Get("client_id"))
 	assert.Empty(t, public.auths[0])
@@ -134,7 +134,7 @@ func TestHTTPProviderClassifiesTheAnswer(t *testing.T) {
 			e := newEndpoint(t)
 			e.answer(tt.status, tt.body)
 
-			_, err := e.provider(t, "client-secret").Refresh(context.Background(), secretRefreshToken)
+			_, err := e.provider(t, "client-secret").Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 
 			var refused *RefusedError
 			switch {
@@ -164,7 +164,7 @@ func TestHTTPProviderNoAnswer(t *testing.T) {
 	down := newEndpoint(t)
 	provider := down.provider(t, "client-secret")
 	down.server.Close()
-	_, err := provider.Refresh(context.Background(), secretRefreshToken)
+	_, err := provider.Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 	require.Error(t, err)
 	assert.False(t, errors.As(err, &refused))
 	assert.NotContains(t, err.Error(), secretRefreshToken)
@@ -181,7 +181,7 @@ func TestHTTPProviderNoAnswer(t *testing.T) {
 		TokenURL: slow.URL, ClientID: "dagu-web", HTTPClient: &http.Client{Timeout: 50 * time.Millisecond},
 	})
 	require.NoError(t, err)
-	_, err = timedOut.Refresh(context.Background(), secretRefreshToken)
+	_, err = timedOut.Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 	require.Error(t, err)
 	assert.False(t, errors.As(err, &refused))
 	assert.NotContains(t, err.Error(), secretRefreshToken)
@@ -198,7 +198,7 @@ func TestHTTPProviderFollowsNoRedirect(t *testing.T) {
 	for _, client := range []*http.Client{nil, {}} {
 		provider, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: redirecting.URL, ClientID: "dagu-web", HTTPClient: client})
 		require.NoError(t, err)
-		_, err = provider.Refresh(context.Background(), secretRefreshToken)
+		_, err = provider.Refresh(context.Background(), secretRefreshToken, ClientAuthHeader)
 		require.Error(t, err)
 	}
 	assert.Empty(t, elsewhere.forms, "the refresh token was not sent on")
@@ -209,19 +209,19 @@ func TestHTTPProviderRevoke(t *testing.T) {
 	e := newEndpoint(t)
 	provider := e.provider(t, "client-secret")
 
-	require.NoError(t, provider.Revoke(context.Background(), secretRefreshToken))
+	require.NoError(t, provider.Revoke(context.Background(), secretRefreshToken, ClientAuthHeader))
 	require.Len(t, e.forms, 1)
 	assert.Equal(t, secretRefreshToken, e.forms[0].Get("token"))
 	assert.Equal(t, "refresh_token", e.forms[0].Get("token_type_hint"))
 
 	e.answer(http.StatusServiceUnavailable, `{{token}}`)
-	err := provider.Revoke(context.Background(), secretRefreshToken)
+	err := provider.Revoke(context.Background(), secretRefreshToken, ClientAuthHeader)
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), secretRefreshToken)
 
 	none, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: e.server.URL, ClientID: "dagu-web"})
 	require.NoError(t, err)
-	require.Error(t, none.Revoke(context.Background(), secretRefreshToken), "a provider with no revocation endpoint")
+	require.ErrorIs(t, none.Revoke(context.Background(), secretRefreshToken, ClientAuthHeader), ErrRevocationUnsupported)
 
 	_, err = NewHTTPProvider(HTTPProviderConfig{ClientID: "dagu-web"})
 	require.Error(t, err)
@@ -241,14 +241,10 @@ type pickyEndpoint struct {
 	// notAccepted is the answer to a client that is not accepted.
 	notAcceptedStatus int
 	notAcceptedBody   string
-	// probed is the answer to an accepted client that presents a refresh
-	// token the provider never issued.
-	probedStatus int
-	probedBody   string
-	// answer is the answer to an accepted client that presents secretRefreshToken.
+	// answer is the answer to a refresh by an accepted client.
 	answerStatus int
 	answerBody   string
-	// sent lists each request: the way the secret came, and what it carried.
+	// sent lists each request: the way the secret came, and what it was.
 	sent []string
 }
 
@@ -257,33 +253,24 @@ func newPickyEndpoint(t *testing.T, takes string) *pickyEndpoint {
 	e := &pickyEndpoint{
 		takes:             takes,
 		notAcceptedStatus: http.StatusUnauthorized, notAcceptedBody: `{"error":"invalid_client"}`,
-		probedStatus: http.StatusBadRequest, probedBody: `{"error":"invalid_grant"}`,
 		answerStatus: http.StatusOK, answerBody: `{"access_token":"a","refresh_token":"next"}`,
 	}
 	e.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		way := "form"
+		way, what := "form", "refresh"
 		if r.Header.Get("Authorization") != "" {
 			way = "header"
 		}
-		what := "probe"
-		switch {
-		case r.URL.Path == "/revoke":
+		if r.URL.Path == "/revoke" {
 			what = "revoke"
-		case r.PostForm.Get("refresh_token") == secretRefreshToken:
-			what = "refresh"
 		}
 		e.mu.Lock()
 		e.sent = append(e.sent, way+" "+what)
 		status, body := e.notAcceptedStatus, e.notAcceptedBody
 		if way == e.takes && (way == "header" || r.PostForm.Get("client_secret") == "client-secret") {
-			switch what {
-			case "refresh":
-				status, body = e.answerStatus, e.answerBody
-			case "revoke":
+			status, body = e.answerStatus, e.answerBody
+			if what == "revoke" {
 				status, body = http.StatusOK, ``
-			default:
-				status, body = e.probedStatus, e.probedBody
 			}
 		}
 		e.mu.Unlock()
@@ -311,177 +298,159 @@ func (e *pickyEndpoint) requests() []string {
 	return append([]string(nil), e.sent...)
 }
 
-// A provider refuses a client that sent its secret the wrong way, and a
-// refusal of a refresh must be about the refresh token alone. So the way is
-// found out first, with a refresh token that is not one, and a session's
-// token is sent only once it is known.
-func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
+func (e *pickyEndpoint) set(change func(*pickyEndpoint)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	change(e)
+}
+
+// The way the provider takes the client secret is established at sign-in,
+// with the refresh token the provider has just issued: a refusal of that
+// token can only be about the client. The way a refresh is granted by is the
+// provider's.
+func TestHTTPProviderEstablishesTheWayAtSignIn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
+
+	t.Run("HeaderOnly", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "header")
+		auth, renewal, err := e.provider(t, ClientAuthDetect).Establish(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, ClientAuthHeader, auth)
+		assert.Equal(t, "next", renewal.RefreshToken, "establishing exchanged the token, and the new one is the session's")
+		assert.Equal(t, []string{"header refresh"}, e.requests())
+	})
 
 	t.Run("FormOnly", func(t *testing.T) {
 		t.Parallel()
 		e := newPickyEndpoint(t, "form")
 		provider := e.provider(t, ClientAuthDetect)
-
-		renewal, err := provider.Refresh(ctx, secretRefreshToken)
+		auth, renewal, err := provider.Establish(ctx, secretRefreshToken)
 		require.NoError(t, err)
+		assert.Equal(t, ClientAuthForm, auth)
 		assert.Equal(t, "next", renewal.RefreshToken)
-		assert.Equal(t, []string{"header probe", "form probe", "form refresh"}, e.requests())
+		assert.Equal(t, []string{"header refresh", "form refresh"}, e.requests())
 
-		_, err = provider.Refresh(ctx, secretRefreshToken)
+		// The next sign-in is told what that grant showed, and asks nothing.
+		auth, renewal, err = provider.Establish(ctx, "another-users-token")
 		require.NoError(t, err)
-		require.NoError(t, provider.Revoke(ctx, secretRefreshToken))
-		assert.Equal(t, []string{"header probe", "form probe", "form refresh", "form refresh", "form revoke"}, e.requests(),
-			"what was found is used from then on")
+		assert.Equal(t, ClientAuthForm, auth)
+		assert.Empty(t, renewal.RefreshToken)
+		assert.Len(t, e.requests(), 2)
 	})
 
-	t.Run("HeaderOnly", func(t *testing.T) {
+	// A provider that refuses the wrong way with a code of its own choosing
+	// is no different: what counts is which way is granted.
+	t.Run("WhateverTheRefusalOfTheWrongWayIsCalled", func(t *testing.T) {
 		t.Parallel()
-		e := newPickyEndpoint(t, "header")
-		provider := e.provider(t, ClientAuthDetect)
-		_, err := provider.Refresh(ctx, secretRefreshToken)
-		require.NoError(t, err)
-		_, err = provider.Refresh(ctx, secretRefreshToken)
-		require.NoError(t, err)
-		assert.Equal(t, []string{"header probe", "header refresh", "header refresh"}, e.requests())
+		for _, body := range []string{`{"error":"invalid_request"}`, `{"error":"unauthorized_client"}`, `{"error":"invalid_grant"}`, `{"error":"no_client_id"}`} {
+			e := newPickyEndpoint(t, "form")
+			e.notAcceptedStatus, e.notAcceptedBody = http.StatusBadRequest, body
+			auth, _, err := e.provider(t, ClientAuthDetect).Establish(ctx, secretRefreshToken)
+			require.NoError(t, err, body)
+			assert.Equal(t, ClientAuthForm, auth, body)
+		}
 	})
 
-	t.Run("Configured", func(t *testing.T) {
+	t.Run("ConfiguredOrNotNeeded", func(t *testing.T) {
 		t.Parallel()
-		var refused *RefusedError
 		e := newPickyEndpoint(t, "form")
-		_, err := e.provider(t, ClientAuthForm).Refresh(ctx, secretRefreshToken)
+		for _, configured := range []ClientAuth{ClientAuthForm, ClientAuthHeader} {
+			auth, renewal, err := e.provider(t, configured).Establish(ctx, secretRefreshToken)
+			require.NoError(t, err)
+			assert.Equal(t, configured, auth, "a configured way is not second-guessed")
+			assert.Empty(t, renewal.RefreshToken)
+		}
+		public, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: e.server.URL + "/token", ClientID: "dagu-web"})
 		require.NoError(t, err)
-		_, err = e.provider(t, ClientAuthHeader).Refresh(ctx, secretRefreshToken)
-		require.ErrorAs(t, err, &refused, "a configured way is not second-guessed")
-		assert.Equal(t, []string{"form refresh", "header refresh"}, e.requests())
+		auth, _, err := public.Establish(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, ClientAuthForm, auth, "a public client has no secret; it names itself in the form")
+		assert.Empty(t, e.requests())
 	})
 
-	// Once the way is known, a refusal of a session's token is the answer
-	// whatever its code, and the token is sent once: there is no second
-	// request whose failure could take the refusal back.
-	t.Run("ARefusalIsTheAnswerWhateverItsCode", func(t *testing.T) {
-		t.Parallel()
-		for _, takes := range []string{"header", "form"} {
-			for body, code := range map[string]string{
-				`{"error":"invalid_grant"}`:   "invalid_grant",
-				`{"error":"not_allowed"}`:     "not_allowed",
-				`{"error":"invalid_client"}`:  "invalid_client",
-				`{"error":"session_revoked"}`: "other",
-			} {
-				var refused *RefusedError
-				e := newPickyEndpoint(t, takes)
-				e.answerStatus, e.answerBody = http.StatusBadRequest, body
-				_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
-				require.ErrorAs(t, err, &refused, "%s by a provider that takes the %s", body, takes)
-				assert.Equal(t, code, refused.Code)
-				requests := e.requests()
-				assert.Equal(t, takes+" refresh", requests[len(requests)-1])
-				assert.Equal(t, 1, strings.Count(strings.Join(requests, ","), "refresh"), "the session's token is sent once: %v", requests)
-			}
-		}
-	})
-
-	// The way cannot be found out now. No session's token is sent, and
-	// nothing is concluded about any session.
-	t.Run("NotFoundOutNow", func(t *testing.T) {
-		t.Parallel()
-		for name, arrange := range map[string]func(*pickyEndpoint){
-			"NoAnswerToTheHeader": func(e *pickyEndpoint) {
-				e.takes = "header"
-				e.probedStatus, e.probedBody = http.StatusBadGateway, `<html>`
-			},
-			"TheHeaderIsRefusedAndTheFormGetsNoAnswer": func(e *pickyEndpoint) {
-				e.takes = "form"
-				e.probedStatus, e.probedBody = http.StatusBadGateway, `<html>`
-			},
-		} {
-			var refused *RefusedError
-			e := newPickyEndpoint(t, "")
-			arrange(e)
-			provider := e.provider(t, ClientAuthDetect)
-			_, err := provider.Refresh(ctx, secretRefreshToken)
-			require.Error(t, err, name)
-			assert.False(t, errors.As(err, &refused), "%s is not a refusal: %v", name, err)
-			require.Error(t, provider.Revoke(ctx, secretRefreshToken), name)
-			assert.NotContains(t, strings.Join(e.requests(), ","), "refresh", name)
-			assert.NotContains(t, strings.Join(e.requests(), ","), "revoke", name)
-
-			// When the provider answers again, the way is found and used.
-			e.mu.Lock()
-			e.probedStatus, e.probedBody = http.StatusBadRequest, `{"error":"invalid_grant"}`
-			e.mu.Unlock()
-			_, err = provider.Refresh(ctx, secretRefreshToken)
-			require.NoError(t, err, name)
-		}
-	})
-
-	// The provider accepts this client neither way, as it does for a client
-	// that has been disabled. That is not about the way, and the refusal of
-	// the session's token that follows is the provider's answer.
-	t.Run("TheClientIsRefusedBothWays", func(t *testing.T) {
+	// The provider will not refresh the token it has just issued, whichever
+	// way it is asked. A session could never be revalidated.
+	t.Run("RefusedBothWays", func(t *testing.T) {
 		t.Parallel()
 		var refused *RefusedError
 		e := newPickyEndpoint(t, "")
-		_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+		_, _, err := e.provider(t, ClientAuthDetect).Establish(ctx, secretRefreshToken)
 		require.ErrorAs(t, err, &refused)
-		assert.Equal(t, "invalid_client", refused.Code)
-		assert.Equal(t, []string{"header probe", "form probe", "header refresh"}, e.requests())
+		assert.Equal(t, []string{"header refresh", "form refresh"}, e.requests())
 	})
 
-	// A provider that answers a token it never issued with a code of its own
-	// has still accepted the client.
-	t.Run("AProviderWithItsOwnCodeForAnUnknownToken", func(t *testing.T) {
+	t.Run("NoAnswer", func(t *testing.T) {
 		t.Parallel()
+		for takes, want := range map[string][]string{"header": {"header refresh"}, "form": {"header refresh", "form refresh"}} {
+			var refused *RefusedError
+			e := newPickyEndpoint(t, takes)
+			e.answerStatus, e.answerBody = http.StatusBadGateway, `<html>`
+			_, _, err := e.provider(t, ClientAuthDetect).Establish(ctx, secretRefreshToken)
+			require.Error(t, err)
+			assert.False(t, errors.As(err, &refused), "no answer is not a refusal: %v", err)
+			assert.Equal(t, want, e.requests())
+		}
+	})
+}
+
+// A refresh for a session is sent once, the way the session was established
+// with. A refusal is then the answer whatever its code: there is no second
+// request whose failure could take it back, and no list of codes to be on.
+func TestHTTPProviderRefreshesTheWayItIsTold(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, takes := range []string{"header", "form"} {
+		auth := map[string]ClientAuth{"header": ClientAuthHeader, "form": ClientAuthForm}[takes]
+		for body, code := range map[string]string{
+			`{"error":"invalid_grant"}`:   "invalid_grant",
+			`{"error":"not_allowed"}`:     "not_allowed",
+			`{"error":"invalid_client"}`:  "invalid_client",
+			`{"error":"invalid_request"}`: "invalid_request",
+			`{"error":"session_revoked"}`: "other",
+		} {
+			var refused *RefusedError
+			e := newPickyEndpoint(t, takes)
+			e.answerStatus, e.answerBody = http.StatusBadRequest, body
+			_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken, auth)
+			require.ErrorAs(t, err, &refused, "%s by a provider that takes the %s", body, takes)
+			assert.Equal(t, code, refused.Code)
+			assert.Equal(t, []string{takes + " refresh"}, e.requests())
+		}
+	}
+
+	// The way a session was established with is used even if it is refused:
+	// the provider changed, the session ends, and the next sign-in
+	// establishes the way again.
+	t.Run("TheProviderChangesItsWay", func(t *testing.T) {
+		t.Parallel()
+		var refused *RefusedError
 		e := newPickyEndpoint(t, "header")
-		e.probedStatus, e.probedBody = http.StatusBadRequest, `{"error":"token_not_found"}`
-		_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+		provider := e.provider(t, ClientAuthDetect)
+		auth, _, err := provider.Establish(ctx, secretRefreshToken)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"header probe", "header refresh"}, e.requests())
+		require.Equal(t, ClientAuthHeader, auth)
+
+		e.set(func(e *pickyEndpoint) { e.takes = "form" })
+		_, err = provider.Refresh(ctx, secretRefreshToken, auth)
+		require.ErrorAs(t, err, &refused)
+		assert.Equal(t, []string{"header refresh", "header refresh"}, e.requests(), "the form is not tried for a session established with the header")
+
+		auth, _, err = provider.Establish(ctx, "the-next-sign-ins-token")
+		require.NoError(t, err)
+		assert.Equal(t, ClientAuthForm, auth, "what the last grant showed no longer holds, so it is established again")
+		assert.Equal(t, []string{"header refresh", "form refresh"}, e.requests()[2:])
 	})
 
-	t.Run("RevokeBeforeAnyRefresh", func(t *testing.T) {
-		t.Parallel()
-		e := newPickyEndpoint(t, "form")
-		require.NoError(t, e.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken))
-		assert.Equal(t, []string{"header probe", "form probe", "form revoke"}, e.requests())
-	})
-
-	// Many refreshes at once find the way out once.
-	t.Run("FoundOutOnce", func(t *testing.T) {
+	t.Run("Revoke", func(t *testing.T) {
 		t.Parallel()
 		e := newPickyEndpoint(t, "form")
 		provider := e.provider(t, ClientAuthDetect)
-		var wg sync.WaitGroup
-		for range 20 {
-			wg.Go(func() {
-				_, err := provider.Refresh(ctx, secretRefreshToken)
-				assert.NoError(t, err)
-			})
-		}
-		wg.Wait()
-		assert.Equal(t, 2, strings.Count(strings.Join(e.requests(), ","), "probe"))
-	})
-
-	// The probe carries nothing of a session, and a public client needs none.
-	t.Run("WhatTheProbeCarries", func(t *testing.T) {
-		t.Parallel()
-		e := newEndpoint(t)
-		detecting, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: e.server.URL, ClientID: "dagu-web", ClientSecret: "client-secret"})
-		require.NoError(t, err)
-		_, err = detecting.Refresh(ctx, secretRefreshToken)
-		require.NoError(t, err)
-		require.Len(t, e.forms, 2)
-		assert.Equal(t, probeRefreshToken, e.forms[0].Get("refresh_token"))
-		assert.NotContains(t, e.forms[0].Encode(), secretRefreshToken)
-
-		public := newEndpoint(t)
-		noSecret, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: public.server.URL, ClientID: "dagu-web"})
-		require.NoError(t, err)
-		_, err = noSecret.Refresh(ctx, secretRefreshToken)
-		require.NoError(t, err)
-		require.Len(t, public.forms, 1)
+		require.NoError(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthForm))
+		require.Error(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthHeader))
+		assert.Equal(t, []string{"form revoke", "header revoke"}, e.requests(), "a revocation needs nothing found out first")
 	})
 
 	_, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: "https://issuer.example/token", ClientID: "dagu-web", ClientAuth: 7})
