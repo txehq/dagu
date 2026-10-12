@@ -234,7 +234,7 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		// Preparing writes too (it settles what earlier claims left open),
 		// and the job can change under it as under any review.
-		if reason, changed := r.changedUnder(ctx, job, err); changed {
+		if reason, changed := r.changedUnder(ctx, job); changed {
 			return Prepared{Skipped: SkipJobChanged, SkipDetail: reason}, nil
 		}
 		return Prepared{}, err
@@ -941,11 +941,13 @@ type Applied struct {
 	// Replayed is true when this episode was already applied; nothing ran.
 	Replayed bool `json:"replayed,omitempty"`
 	// Aborted is set when the job changed under the review: the review is
-	// abandoned, no review is recorded and the checkpoint does not move, so
-	// the next tick reviews the job as it now is. Executed and Proposals
-	// then list what was already done before the change was met; an action
-	// among them is in the journal and is settled by a later review, never
-	// run again.
+	// abandoned and the checkpoint does not move, so the next tick reviews
+	// the job as it now is. What was already written stays written: Executed
+	// lists the actions this review journaled, as the registry holds them
+	// (one whose outcome could not be recorded is there as interrupted, is
+	// settled by a later review and is never run again), Proposals the ones
+	// it filed, and a review record written just before the change is kept
+	// and completed by the next review.
 	Aborted   string   `json:"aborted,omitempty"`
 	Review    Review   `json:"review,omitzero"`
 	Executed  []Action `json:"executed,omitempty"`
@@ -1022,14 +1024,26 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 	// ready. Met at any of these writes, that is the job changing under the
 	// review, not a failure of the review.
 	abandoned := func(err error) (Applied, error) {
-		reason, changed := r.changedUnder(ctx, packet.Job, err)
+		reason, changed := r.changedUnder(ctx, packet.Job)
 		if !changed {
 			return Applied{}, err
 		}
 		if releaseErr := r.Registry.ReleaseClaim(ctx, claim); releaseErr != nil && !errors.Is(releaseErr, ErrStaleFence) && !errors.Is(releaseErr, ErrNotFound) {
 			fmt.Fprintf(os.Stderr, "txe review: job %s: release the claim of the abandoned review: %v\n", jobID, releaseErr)
 		}
-		return Applied{Aborted: reason, Executed: result.Executed, Proposals: result.Proposals}, nil
+		fmt.Fprintf(os.Stderr, "txe review: job %s: the review is abandoned (%s); the write that met it: %v\n", jobID, reason, err)
+		out := Applied{Aborted: reason, Executed: result.Executed, Proposals: result.Proposals}
+		// What this review journaled is said as the registry holds it,
+		// including an attempt whose outcome could not be recorded.
+		if journaled, readErr := r.Registry.Actions(ctx, jobID); readErr == nil {
+			out.Executed = nil
+			for _, a := range journaled {
+				if a.ReviewID == packet.ReviewID {
+					out.Executed = append(out.Executed, a)
+				}
+			}
+		}
+		return out, nil
 	}
 	for _, requested := range decision.Actions {
 		if err := r.applyAction(ctx, claim, job, packet, requested, history, decisions, &review, &result); err != nil {
@@ -1042,6 +1056,9 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 
 	if err := r.Registry.RecordReview(ctx, claim, review); err != nil {
 		return abandoned(fmt.Errorf("record review: %w", err))
+	}
+	if err := r.raiseUnavailable(ctx, job, packet, decision); err != nil {
+		return abandoned(err)
 	}
 	next := Checkpoint{
 		JobID:          jobID,
@@ -1067,21 +1084,19 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 	return result, nil
 }
 
-// changedUnder reports whether a write of a review failed because the job
-// changed under it, and says how. It is asked only about the three refusals
-// by which the registry says so: the claim is no longer the job's (the
-// registry ends a review's claim when the job is updated), the write was
-// made against another version than the job's, or the job's registration
-// is not ready. None of them alone proves it, since a claim is also stale
-// when it simply expired and another holder took it; so the job is read
-// again, and only a job that is now at another version than the one this
-// review read, whose registration is not ready, or that is no longer in a
-// reviewable lifecycle, has changed. Anything else, and a job that cannot
-// be read, leaves the failure what it was.
-func (r *Reviewer) changedUnder(ctx context.Context, read Job, failed error) (string, bool) {
-	if !errors.Is(failed, ErrStaleFence) && !errors.Is(failed, ErrConflict) && !errors.Is(failed, ErrNotReady) {
-		return "", false
-	}
+// changedUnder reports whether the job is no longer the job the review
+// read, and says how: it is at another version, its registration is not
+// ready, or it is no longer in a reviewable lifecycle. It is asked when a
+// write of the review failed, whatever the failure was. The registry says
+// that a job changed in more ways than one (it ends the review's claim with
+// an update, refuses a write made against another version, refuses a
+// proposal whose action or target the new version no longer has), and none
+// of those refusals alone proves it: a claim is also stale when it simply
+// expired and another holder took it. So the job is read again and decides.
+// A review of a job that changed is void whatever went wrong in it, and the
+// next review meets anything that is still wrong. A job that did not
+// change, and one that cannot be read, leave the failure what it was.
+func (r *Reviewer) changedUnder(ctx context.Context, read Job) (string, bool) {
 	now, err := r.Registry.Job(ctx, read.ID)
 	if err != nil {
 		return "", false
@@ -1459,15 +1474,28 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomeRetire:
 		return ask("The reviewer recommends retiring this job." + packet.trimmedCaveat())
 	case OutcomePauseUnavailable:
-		err := r.Registry.RaiseException(ctx, Exception{
-			JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,
-			Message:  "The review agent judged the job's target, credentials or machine unreachable. Its reasoning, in its own words (not checked): " + agentText(decision.Reasoning),
-			ReviewID: packet.ReviewID,
-		})
-		if err != nil {
-			return fmt.Errorf("raise exception: %w", err)
-		}
+		// Said by Apply once the review is recorded; see raiseUnavailable.
 	case OutcomeContinue, OutcomeAct:
+	}
+	return nil
+}
+
+// raiseUnavailable tells the owner that the agent judged the job
+// unreachable. The registry does not fence this report by the review's
+// claim or version, so it is made only after the review itself was
+// recorded: that write is refused when the job changed under the review,
+// and a review that is abandoned says nothing about the job as it now is.
+func (r *Reviewer) raiseUnavailable(ctx context.Context, job Job, packet Packet, decision AgentDecision) error {
+	if decision.Outcome != OutcomePauseUnavailable {
+		return nil
+	}
+	err := r.Registry.RaiseException(ctx, Exception{
+		JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,
+		Message:  "The review agent judged the job's target, credentials or machine unreachable. Its reasoning, in its own words (not checked): " + agentText(decision.Reasoning),
+		ReviewID: packet.ReviewID,
+	})
+	if err != nil {
+		return fmt.Errorf("raise exception: %w", err)
 	}
 	return nil
 }
@@ -2053,19 +2081,33 @@ func trailingFailures(history []Action, intent string) int {
 // a missing login is one visible exception instead of a retry loop.
 func (r *Reviewer) Fail(ctx context.Context, prepared Prepared, failure *AgentFailure) error {
 	job := prepared.Packet.Job
-	if err := r.Registry.RaiseException(ctx, Exception{
-		JobID: job.ID, Kind: failure.Kind, MachineID: job.MachineID,
-		Message: failure.Message, ReviewID: prepared.Packet.ReviewID,
-	}); err != nil {
-		return fmt.Errorf("raise exception: %w", err)
+	raise := func() error {
+		if err := r.Registry.RaiseException(ctx, Exception{
+			JobID: job.ID, Kind: failure.Kind, MachineID: job.MachineID,
+			Message: failure.Message, ReviewID: prepared.Packet.ReviewID,
+		}); err != nil {
+			return fmt.Errorf("raise exception: %w", err)
+		}
+		return nil
 	}
+	// The review is put off first, because that write is made under the
+	// review's claim: it is refused when the job changed under the review,
+	// and then the failure is of a review nobody needs any more. Nothing is
+	// said to the owner about it, and the job is due again as it now is.
+	// The exception itself is not fenced by the registry, so it is raised
+	// only once the claim is known to have still been the job's.
 	if err := r.Registry.DeferReview(ctx, prepared.Claim, job.Review.putOff(r.now())); err != nil {
-		if reason, changed := r.changedUnder(ctx, job, err); changed {
-			// The job is due again as it now is; there is nothing to put off.
-			fmt.Fprintf(os.Stderr, "txe review: job %s: the failed review is not put off: %s\n", job.ID, reason)
+		if reason, changed := r.changedUnder(ctx, job); changed {
+			fmt.Fprintf(os.Stderr, "txe review: job %s: the failed review is dropped: %s\n", job.ID, reason)
 			return nil
 		}
+		if raiseErr := raise(); raiseErr != nil {
+			return errors.Join(fmt.Errorf("defer review: %w", err), raiseErr)
+		}
 		return fmt.Errorf("defer review: %w", err)
+	}
+	if err := raise(); err != nil {
+		return err
 	}
 	if err := r.Registry.ReleaseClaim(ctx, prepared.Claim); err != nil {
 		return fmt.Errorf("release claim: %w", err)

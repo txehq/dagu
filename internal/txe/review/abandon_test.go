@@ -139,6 +139,8 @@ func TestAReviewIsAbandonedWhenItsJobChangesUnderIt(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, applied.Aborted, "moved from version 1 to version 2")
 		nothingRecorded(t, f)
+		require.Len(t, applied.Executed, 1, "the attempt that ran is said, as the registry holds it")
+		assert.Equal(t, review.ActionUncertain, applied.Executed[0].State)
 		action := f.state().Actions[jobID][0]
 		assert.Equal(t, review.ActionUncertain, action.State, "the registry interrupted the attempt with the claim")
 		assert.Equal(t, 1, f.effects.count("notify"))
@@ -204,13 +206,80 @@ func TestAReviewIsAbandonedWhenItsJobChangesUnderIt(t *testing.T) {
 		require.ErrorIs(t, err, review.ErrStaleFence)
 	})
 
-	t.Run("an agent that failed on a job that changed leaves nothing to put off", func(t *testing.T) {
+	t.Run("an agent that failed on a job that changed leaves nothing to put off and tells nobody", func(t *testing.T) {
 		f := newFixture(t)
 		prepared := f.prepare("reviewer-a")
 		update(f)()
 		require.NoError(t, f.reviewer("reviewer-a").Fail(ctx, prepared, &review.AgentFailure{Kind: review.ExceptionReviewerFailed, Message: "no output"}))
 		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.IsZero(), "the job is due as it now is")
+		assert.Empty(t, f.state().Exceptions, "no exception about a review nobody needs")
+
+		// On a job that did not change the owner is told, as before.
+		f = newFixture(t)
+		require.NoError(t, f.reviewer("reviewer-a").Fail(ctx, f.prepare("reviewer-a"), &review.AgentFailure{Kind: review.ExceptionReviewerFailed, Message: "no output"}))
+		require.Len(t, f.state().Exceptions, 1)
+		assert.False(t, f.state().Checkpoints[jobID].NextReviewAt.IsZero())
 	})
+
+	// The agent's judgement that the job is unreachable is about the version
+	// it was shown. It is told to the owner only once the review is
+	// recorded, so an abandoned review says nothing about the new version.
+	t.Run("an unreachable verdict on a job that changed tells nobody", func(t *testing.T) {
+		unreachable := review.AgentDecision{Outcome: review.OutcomePauseUnavailable, Reasoning: "the cluster does not answer"}
+		f := newFixture(t)
+		prepared := f.prepare("reviewer-a")
+		r := f.reviewer("reviewer-a")
+		r.Registry = &onWrite{Registry: f.registry, record: update(f)}
+		applied, err := r.Apply(ctx, prepared, unreachable)
+		require.NoError(t, err)
+		assert.NotEmpty(t, applied.Aborted)
+		assert.Empty(t, f.state().Exceptions)
+
+		f = newFixture(t)
+		f.apply("reviewer-a", f.prepare("reviewer-a"), unreachable)
+		require.Len(t, f.state().Exceptions, 1)
+		assert.Equal(t, review.ExceptionUnavailable, f.state().Exceptions[0].Kind)
+		require.Len(t, f.state().Reviews[jobID], 1)
+	})
+
+	// Whatever a write of the review failed with, a job that changed makes
+	// the review void: the registry refuses in more ways than a stale claim.
+	t.Run("any refusal on a job that changed abandons the review", func(t *testing.T) {
+		for name, refusal := range map[string]error{
+			"the action is no longer permitted": &review.GuardDeniedError{Reason: review.DenyNotPermitted, Detail: "action expand_volume is not declared"},
+			"an invalid proposal":               &review.TransportError{Status: 400, Code: "invalid", Message: "proposal id does not match the job's version"},
+			"a stale binding":                   &review.GuardDeniedError{Reason: review.DenyDecisionStale, Detail: "binding changed"},
+		} {
+			f := newFixture(t)
+			prepared := f.prepare("reviewer-a")
+			r := f.reviewer("reviewer-a")
+			r.Registry = &refuseProposals{Registry: f.registry, err: refusal, before: update(f)}
+			applied, err := r.Apply(ctx, prepared, expand)
+			require.NoError(t, err, name)
+			assert.NotEmpty(t, applied.Aborted, name)
+
+			// The same refusal on a job that did not change is an error.
+			f = newFixture(t)
+			prepared = f.prepare("reviewer-a")
+			r = f.reviewer("reviewer-a")
+			r.Registry = &refuseProposals{Registry: f.registry, err: refusal}
+			_, err = r.Apply(ctx, prepared, expand)
+			require.Error(t, err, name)
+		}
+	})
+}
+
+// refuseProposals is a registry that refuses every proposal with err, after
+// doing before once.
+type refuseProposals struct {
+	review.Registry
+	err    error
+	before func()
+}
+
+func (r *refuseProposals) CreateProposal(context.Context, review.Claim, review.Proposal) (review.Proposal, error) {
+	once(&r.before)
+	return review.Proposal{}, r.err
 }
 
 // failReadsAfter is a registry whose job cannot be read once fail is set.
@@ -237,6 +306,7 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 		f          *remoteFixture
 		id, target string
 		update     func()
+		updateTo   func(change func(*apigen.TxeJobVersionInput), markReady bool)
 		reviewer   func(holder string) *review.Reviewer
 	}
 	start := func(t *testing.T) world {
@@ -293,6 +363,18 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 					Actor: actor, ExpectedVersion: 1, RequestId: "abandon-2", Version: local[2],
 				}, nil))
 				ready()
+			},
+			updateTo: func(change func(*apigen.TxeJobVersionInput), markReady bool) {
+				v2 := version("Watch free space and inodes.")
+				change(&v2)
+				local[2] = v2
+				latest = 2
+				require.NoError(t, f.remote.Transport.Do(ctx, http.MethodPost, "/txe/jobs/"+id+"/versions", apigen.TxeVersionRequest{
+					Actor: actor, ExpectedVersion: 1, RequestId: "abandon-2", Version: v2,
+				}, nil))
+				if markReady {
+					ready()
+				}
 			},
 			reviewer: func(holder string) *review.Reviewer { return f.reviewer(holder) },
 		}
@@ -386,6 +468,8 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, applied.Aborted, "moved from version 1 to version 2")
 		assert.Equal(t, 1, w.f.fx.count("notify"))
+		require.Len(t, applied.Executed, 1, "the attempt that ran is said, as the registry holds it")
+		assert.Equal(t, review.ActionUncertain, applied.Executed[0].State)
 		actions, err := w.f.remote.Actions(ctx, w.id)
 		require.NoError(t, err)
 		require.Len(t, actions, 1)
@@ -400,6 +484,67 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 		_, err = next.Apply(ctx, again, notify(w))
 		require.NoError(t, err)
 		assert.Equal(t, 1, w.f.fx.count("notify"), "the effect happened once")
+	})
+
+	// The new version no longer declares the action the review asks a
+	// person about: the registry refuses the proposal for that reason, not
+	// as a stale claim, and the review is abandoned all the same.
+	t.Run("updated to a version without the proposed action", func(t *testing.T) {
+		w := start(t)
+		r := w.reviewer("tick-1")
+		prepared, err := r.Prepare(ctx, w.id)
+		require.NoError(t, err)
+		r.Registry = &onWrite{Registry: w.f.remote, proposal: func() {
+			w.updateTo(func(v *apigen.TxeJobVersionInput) {
+				kept := (*v.ReviewPolicy.PermittedActions)[:1]
+				v.ReviewPolicy.PermittedActions = &kept
+			}, true)
+		}}
+		applied, err := r.Apply(ctx, prepared, expand(w))
+		require.NoError(t, err)
+		assert.Contains(t, applied.Aborted, "moved from version 1 to version 2")
+		job := stored(t, w)
+		assert.Zero(t, job.Checkpoint.Version)
+		assert.Empty(t, job.Exceptions)
+		assert.Empty(t, job.Proposals)
+	})
+
+	// An update that is not finished leaves the registration not ready: the
+	// review is abandoned, and the job is then skipped until it is.
+	t.Run("updated and not yet ready", func(t *testing.T) {
+		w := start(t)
+		r := w.reviewer("tick-1")
+		prepared, err := r.Prepare(ctx, w.id)
+		require.NoError(t, err)
+		r.Registry = &onWrite{Registry: w.f.remote, record: func() {
+			w.updateTo(func(*apigen.TxeJobVersionInput) {}, false)
+		}}
+		applied, err := r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "fine"})
+		require.NoError(t, err)
+		assert.NotEmpty(t, applied.Aborted)
+		job := stored(t, w)
+		assert.Equal(t, registry.RegistrationIncomplete, job.Registration.State)
+		assert.Zero(t, job.Checkpoint.Version)
+		assert.Empty(t, job.Exceptions)
+		again, err := w.reviewer("tick-2").Prepare(ctx, w.id)
+		require.NoError(t, err)
+		assert.Equal(t, review.SkipNotRegistered, again.Skipped)
+	})
+
+	// The agent's verdict that the job is unreachable is not told to the
+	// owner of a job that changed under the review.
+	t.Run("an unreachable verdict on a job that changed tells nobody", func(t *testing.T) {
+		w := start(t)
+		r := w.reviewer("tick-1")
+		prepared, err := r.Prepare(ctx, w.id)
+		require.NoError(t, err)
+		r.Registry = &onWrite{Registry: w.f.remote, record: w.update}
+		applied, err := r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomePauseUnavailable, Reasoning: "the cluster does not answer"})
+		require.NoError(t, err)
+		assert.NotEmpty(t, applied.Aborted)
+		job := stored(t, w)
+		assert.Empty(t, job.Exceptions)
+		assert.Equal(t, registry.AvailabilityReady, job.Availability.State)
 	})
 
 	t.Run("a claim that expired and was taken, on an unchanged job, is still an error", func(t *testing.T) {
