@@ -425,6 +425,32 @@ func TestTxeAPIDuplicateDisclosesNoHiddenWinner(t *testing.T) {
 	assert.NotContains(t, apiErr.Details, "current", "the hidden winner's record")
 	assert.NotContains(t, apiErr.Message, secretJob, "the hidden winner's ID")
 	assert.False(t, mentions(hiddenLoser, secretJob), "nor through the losing job, its history or a readiness refusal")
+	// Nor through any refusal about the losing job: a stale version or
+	// revision, or an update of the duplicate itself.
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	update := func(expected int) error {
+		_, err := a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: hiddenLoser, Body: &apigen.TxeVersionRequest{
+			RequestId: fmt.Sprintf("u%d", expected), ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		return err
+	}
+	revision := int64(99)
+	_, readyErr := a.MarkTxeJobReady(txeOps, apigen.MarkTxeJobReadyRequestObject{JobId: hiddenLoser, Body: &apigen.TxeReadyRequest{
+		ExpectedRevision: &revision,
+		Package:          apigen.TxePackageEvidence{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", MachineId: f.machine}}})
+	for name, err := range map[string]error{"stale version": update(5), "duplicate update": update(1), "stale revision": readyErr} {
+		require.Error(t, err, name)
+		var refusal *apiv1.Error
+		require.ErrorAs(t, err, &refusal, name)
+		data, mErr := json.Marshal(refusal)
+		require.NoError(t, mErr)
+		assert.NotContains(t, string(data), secretJob, name)
+		assert.NotContains(t, refusal.Message, secretJob, name)
+	}
 
 	visibleLoser, err := register("visible-key")
 	requireStatus(t, err, http.StatusConflict)

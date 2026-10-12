@@ -537,7 +537,7 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 			case RegistrationReady:
 				return nil
 			case RegistrationDuplicate:
-				return refuse(CodeDuplicate, "job is a duplicate of %s", j.Registration.DuplicateOf)
+				return &Error{Code: CodeDuplicate, Message: "job is a duplicate of " + j.Registration.DuplicateOf, Current: DuplicateWinner{JobID: j.Registration.DuplicateOf}}
 			case RegistrationIncomplete:
 			}
 			if j.Version != job.Version {
@@ -622,7 +622,7 @@ func (s *Store) UpdateVersion(ctx context.Context, jobID, requestID string, expe
 			return &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle) + "; reactivate it first", Current: j}
 		}
 		if j.Registration.State == RegistrationDuplicate {
-			return refuse(CodeDuplicate, "job is a duplicate of %s", j.Registration.DuplicateOf)
+			return &Error{Code: CodeDuplicate, Message: "job is a duplicate of " + j.Registration.DuplicateOf, Current: DuplicateWinner{JobID: j.Registration.DuplicateOf}}
 		}
 		nv := v
 		nv.OwnerID = j.OwnerID

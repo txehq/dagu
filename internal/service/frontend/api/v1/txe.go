@@ -190,7 +190,7 @@ func (a *API) txeRequireJobWrite(ctx context.Context, tx *registry.JobTx) error 
 // before the change is.
 func (a *API) txeCheckVersion(ctx context.Context, s *registry.Store, job *registry.Job, version int, check func(context.Context, string) error) error {
 	if version < 1 || version > job.Version {
-		return txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at version %d, not %d", job.Version, version), Current: job})
+		return txeError(a.txeVisibleRefusal(ctx, s, &registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at version %d, not %d", job.Version, version), Current: job}))
 	}
 	v, err := s.GetVersion(ctx, job.JobID, version)
 	if err != nil {
@@ -594,7 +594,7 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 		explicit := valueOf(body.ExpectedRevision)
 		pinned := explicit != 0 && !txeAlreadyReady(job, pkg)
 		if pinned && explicit != job.Revision {
-			return nil, txeError(&registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, explicit), Current: job})
+			return nil, txeError(a.txeVisibleRefusal(ctx, s, &registry.Error{Code: registry.CodeVersionConflict, Message: fmt.Sprintf("job is at revision %d, not %d", job.Revision, explicit), Current: job}))
 		}
 		receipt, err = s.MarkReady(ctx, req.JobId, job.Revision, pkg, actor)
 		if err == nil {
