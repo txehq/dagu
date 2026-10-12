@@ -285,12 +285,20 @@ files.
   This is a known limitation with a manual recovery: nothing runs the
   decision again by itself. The decision is kept as it is in the registry,
   decided and not carried out, and no action is journaled for it. To carry
-  it out, retry the failed decision run (`txe-decide-...`) in Dagu once the
-  other execution is dispatched or abandoned: the `execute` step runs
-  again, reads the registry's decision, and either retries the run or
-  ends as skipped because the run has moved on. Do not record the decision
-  as done by hand. That recovery follows from how the step is written; it
-  has not been exercised on a live hub yet.
+  it out, retry the failed decision run (`txe-decide-...`) once the other
+  execution is dispatched or abandoned, from the dashboard (Retry on the
+  run) or the service's API
+  (`POST /dag-runs/{name}/{dagRunId}/retry` with the JSON body
+  `{"dagRunId": "<the same run id>"}`). Either way it takes a signed-in
+  person who may run DAGs in the run's workspace, on a service that
+  allows running DAGs; a viewer is refused. The `dagu retry` command
+  does not do it: it refuses a DAG that has a worker selector, which the
+  decision DAG has. The `execute` step then runs again, reads the
+  registry's decision, and either retries the run or ends as skipped
+  because the run has moved on. Do not record the decision as done by
+  hand. This recovery was exercised on a local hub through the API, with
+  the other execution simulated in the reviewer's view of the run; it has
+  not been exercised against a real preparation by another caller.
   When the owner answers `retry` to the question about an attempt whose
   outcome is unknown, the question's decision run executes the original
   decision once more: for a run retry, with the same expected execution,
