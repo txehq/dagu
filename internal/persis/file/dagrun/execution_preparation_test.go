@@ -282,3 +282,46 @@ func TestFindRetryRequestSeesAnAbandonedExecution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, persis.RetryRequestAdmitted, match.State, "the new execution is not covered")
 }
+
+// A crash after an execution's record and before its status was marked: the
+// next call completes it from the record; if the execution moved on in the
+// meantime, the record authorizes nothing and the call is a conflict.
+func TestAbandonExecutionCompletesAfterACrash(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	dag := th.DAG("exec_crash_dag").DAG
+	att := createRunAttempt(t, th, dag, false, ir.Queued, execQ1, "")
+	record := executionRecord(dag, att.ID(), execQ1)
+	record.Outcome, record.PredecessorAbsent = persis.AbandonmentMarkedFailed, true
+	require.NoError(t, writeRecordExclusive(executionRecordPath(att.file, execQ1), record))
+
+	got, err := abandon(th, executionRecord(dag, att.ID(), execQ1))
+	require.NoError(t, err)
+	assert.Equal(t, record.DecidedAt, got.DecidedAt, "the record already on disk stands")
+	status, err := att.ReadStatusUncached(th.Context)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, status.Status)
+
+	moved := createRunAttempt(t, th, dag, true, ir.Queued, execQ2, "")
+	require.NoError(t, writeRecordExclusive(executionRecordPath(moved.file, execQ2), func() persis.AttemptAbandonment {
+		r := executionRecord(dag, moved.ID(), execQ2)
+		r.Outcome = persis.AbandonmentMarkedFailed
+		return r
+	}()))
+	writeExecution(t, th, dag, moved, ir.Running, execQ2, "worker-1", nil)
+	_, err = abandon(th, executionRecord(dag, moved.ID(), execQ2))
+	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, "the execution was handed to a worker after the record")
+}
+
+// An entry written for one execution is not read as an attempt's entry by
+// the listing of a build that keys entries by attempt only: its file name
+// does not match, so such a build skips it instead of acting on it.
+func TestExecutionPreparationNameDiffersFromTheAttempts(t *testing.T) {
+	t.Parallel()
+	th := setupTestRepository(t)
+	run := ir.NewDAGRunRef("d", "r")
+	attempt := persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: "a1"}
+	execution := attempt
+	execution.QueuedAt = execQ1
+	assert.NotEqual(t, th.Backend.preparationPath(attempt), th.Backend.preparationPath(execution))
+}
