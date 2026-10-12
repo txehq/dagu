@@ -2,8 +2,10 @@ package review_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +29,11 @@ func TestReadCadence(t *testing.T) {
 		"a daily cron in the schedule's zone":  {declared: "0 9 * * *", timezone: "Australia/Perth", cron: "CRON_TZ=Australia/Perth 0 9 * * *"},
 		"an annual cron":                       {declared: "0 0 1 1 *", timezone: "UTC", cron: "CRON_TZ=UTC 0 0 1 1 *"},
 		"no zone given is UTC":                 {declared: "*/10 * * * *", cron: "CRON_TZ=UTC */10 * * * *"},
-		"a cron that names its own zone":       {declared: "CRON_TZ=Asia/Tokyo 0 9 * * *", timezone: "Australia/Perth", cron: "CRON_TZ=Asia/Tokyo 0 9 * * *"},
+		"a cron that names its own zone":       {declared: "CRON_TZ=Asia/Tokyo 0 9 * * *", timezone: "Australia/Perth", reason: "names a timezone of its own"},
+		"the same zone as the schedule's":      {declared: "TZ=Australia/Perth 0 9 * * *", timezone: "Australia/Perth", reason: "names a timezone of its own"},
+		"a field of only a comma":              {declared: ", * * * *", timezone: "UTC", reason: "lists an empty value"},
+		"a field with an empty item":           {declared: "0 9 * 1,,2 *", timezone: "UTC", reason: "lists an empty value"},
+		"a trailing comma":                     {declared: "0, 9 * * *", timezone: "UTC", reason: "lists an empty value"},
 		"a descriptor":                         {declared: "@daily", timezone: "Australia/Perth", cron: "CRON_TZ=Australia/Perth @daily"},
 		"an interval descriptor takes no zone": {declared: "@every 30m", timezone: "Australia/Perth", cron: "@every 30m"},
 		"extra spaces":                         {declared: "  0  9 * * *  ", timezone: "UTC", cron: "CRON_TZ=UTC 0 9 * * *"},
@@ -39,10 +45,10 @@ func TestReadCadence(t *testing.T) {
 		"a field out of range":                 {declared: "0 25 * * *", timezone: "UTC", reason: "neither a cron expression nor a duration"},
 		"a zero duration":                      {declared: "0s", reason: "not a positive duration"},
 		"a negative duration":                  {declared: "-1h", reason: "not a positive duration"},
-		"a zone prefix and nothing else":       {declared: "TZ=UTC", reason: "a timezone prefix with no expression after it"},
-		"a longer zone prefix and nothing":     {declared: "CRON_TZ=Australia/Perth", timezone: "UTC", reason: "a timezone prefix with no expression after it"},
-		"an empty zone prefix is UTC":          {declared: "CRON_TZ= 0 9 * * *", cron: "CRON_TZ= 0 9 * * *"},
-		"a zone prefix that names no zone":     {declared: "TZ=Mars/Olympus 0 9 * * *", reason: "neither a cron expression nor a duration"},
+		"a zone prefix and nothing else":       {declared: "TZ=UTC", reason: "names a timezone of its own"},
+		"a longer zone prefix and nothing":     {declared: "CRON_TZ=Australia/Perth", timezone: "UTC", reason: "names a timezone of its own"},
+		"an empty zone prefix":                 {declared: "CRON_TZ= 0 9 * * *", reason: "names a timezone of its own"},
+		"a zone prefix that names no zone":     {declared: "TZ=Mars/Olympus 0 9 * * *", reason: "names a timezone of its own"},
 		"a zone that escapes the zone files":   {declared: "0 9 * * *", timezone: "../../etc/passwd", reason: "cannot be read in the schedule's timezone"},
 		"a date that never comes":              {declared: "0 0 31 2 *", timezone: "UTC", reason: "never occurs"},
 		"a zone that does not exist":           {declared: "0 9 * * *", timezone: "Mars/Olympus", reason: "cannot be read in the schedule's timezone"},
@@ -108,6 +114,35 @@ func TestNextReviewFollowsTheDeclaredCron(t *testing.T) {
 		f := cadenceFixture(t, reviewed, cronPolicy("*/10 * * * *", "UTC"))
 		assert.True(t, next(t, f, carryOn).Equal(time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)))
 	})
+	t.Run("an interval is followed on its grid", func(t *testing.T) {
+		f := cadenceFixture(t, reviewed, cronPolicy("@every 30m", "Australia/Perth"))
+		assert.True(t, next(t, f, carryOn).Equal(time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)))
+	})
+	t.Run("a zone that changes its clocks keeps the declared local hour", func(t *testing.T) {
+		// New York leaves daylight time on 1 November 2026: 09:00 there is
+		// 13:00Z the day before and 14:00Z on the day.
+		before := time.Date(2026, 10, 30, 20, 0, 0, 0, time.UTC)
+		f := cadenceFixture(t, before, cronPolicy("0 9 * * *", "America/New_York"))
+		assert.True(t, next(t, f, carryOn).Equal(time.Date(2026, 10, 31, 13, 0, 0, 0, time.UTC)))
+		f = cadenceFixture(t, before.AddDate(0, 0, 1), cronPolicy("0 9 * * *", "America/New_York"))
+		assert.True(t, next(t, f, carryOn).Equal(time.Date(2026, 11, 1, 14, 0, 0, 0, time.UTC)))
+	})
+	t.Run("more runs waiting than one review covers brings the next one to a minute", func(t *testing.T) {
+		f := cadenceFixture(t, reviewed, cronPolicy("0 9 * * *", "Australia/Perth"))
+		for i := range 60 {
+			f.addRun(fmt.Sprintf("run-%03d", i), "succeeded")
+		}
+		prepared := f.prepare("reviewer-a")
+		require.True(t, prepared.Packet.MoreRunsPending)
+		f.apply("reviewer-a", prepared, carryOn)
+		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.Equal(reviewed.Add(time.Minute)))
+	})
+	t.Run("a number of seconds too large to be an instant is not sooner", func(t *testing.T) {
+		f := cadenceFixture(t, reviewed, cronPolicy("0 9 * * *", "Australia/Perth"))
+		huge := carryOn
+		huge.NextReviewAfterSec = 1 << 62
+		assert.True(t, next(t, f, huge).Equal(time.Date(2026, 10, 13, 1, 0, 0, 0, time.UTC)))
+	})
 	t.Run("a duration is counted from the review", func(t *testing.T) {
 		f := cadenceFixture(t, reviewed, cronPolicy("6h", "Australia/Perth"))
 		assert.True(t, next(t, f, carryOn).Equal(reviewed.Add(6*time.Hour)))
@@ -135,13 +170,41 @@ func TestNextReviewFollowsTheDeclaredCron(t *testing.T) {
 		assert.True(t, next(t, f, hurry).Equal(reviewed.Add(time.Minute)))
 	})
 
-	t.Run("a job that cannot be reviewed is put off to the cron's next occurrence", func(t *testing.T) {
-		f := cadenceFixture(t, reviewed, func(p *review.ReviewPolicy) {
-			cronPolicy("0 9 * * *", "Australia/Perth")(p)
-		})
-		prepared := f.prepare("reviewer-a")
+	// The agent step failed: the review is put off by the prepared review
+	// as the next step process reads it back from its file.
+	fail := func(t *testing.T, f *fixture) time.Time {
+		t.Helper()
+		data, err := json.Marshal(f.prepare("reviewer-a"))
+		require.NoError(t, err)
+		var prepared review.Prepared
+		require.NoError(t, json.Unmarshal(data, &prepared))
 		require.NoError(t, f.reviewer("reviewer-a").Fail(context.Background(), prepared, &review.AgentFailure{Kind: review.ExceptionReviewerAuth, Message: "login expired"}))
-		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.Equal(time.Date(2026, 10, 13, 1, 0, 0, 0, time.UTC)))
+		return f.state().Checkpoints[jobID].NextReviewAt
+	}
+	t.Run("a review that failed is put off to the cron's next occurrence", func(t *testing.T) {
+		f := cadenceFixture(t, reviewed, cronPolicy("0 9 * * *", "Australia/Perth"))
+		assert.True(t, fail(t, f).Equal(time.Date(2026, 10, 13, 1, 0, 0, 0, time.UTC)))
+	})
+	t.Run("and never by less than a minute", func(t *testing.T) {
+		f := cadenceFixture(t, time.Date(2026, 10, 12, 12, 0, 59, 0, time.UTC), cronPolicy("* * * * *", "UTC"))
+		assert.True(t, fail(t, f).Equal(time.Date(2026, 10, 12, 12, 1, 59, 0, time.UTC)))
+	})
+	t.Run("a job too large to review is put off the same way", func(t *testing.T) {
+		at := time.Date(2026, 10, 12, 12, 0, 59, 0, time.UTC)
+		for cadence, want := range map[string]time.Time{
+			"* * * * *": at.Add(time.Minute),
+			"0 9 * * *": time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC),
+		} {
+			f := cadenceFixture(t, at, func(p *review.ReviewPolicy) { cronPolicy(cadence, "UTC")(p) })
+			job, err := f.registry.Job(context.Background(), jobID)
+			require.NoError(t, err)
+			job.Purpose = strings.Repeat("p", 300<<10)
+			require.NoError(t, f.registry.PutJob(job))
+			prepared, err := f.reviewer("reviewer-a").Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			require.Equal(t, review.SkipUnreviewable, prepared.Skipped)
+			assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.Equal(want), cadence)
+		}
 	})
 }
 

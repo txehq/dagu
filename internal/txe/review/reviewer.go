@@ -22,7 +22,10 @@ const (
 	defaultCadence     = time.Hour
 	defaultMaxAttempts = 3
 	minReviewInterval  = time.Minute
-	decideStepID       = "decide"
+	// maxSoonerSec bounds the agent's "look again in" so that it stays a
+	// number of seconds that can be added to a time.
+	maxSoonerSec = 10 * 366 * 24 * 3600
+	decideStepID = "decide"
 	// leaseMargin separates the end of an attempt from anyone else drawing
 	// conclusions about it, to absorb clock and scheduling slack.
 	leaseMargin     = 30 * time.Second
@@ -414,7 +417,7 @@ func (r *Reviewer) unreviewable(ctx context.Context, claim Claim, job Job, cause
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, fmt.Errorf("raise exception: %w", err)
 	}
-	if err := r.Registry.DeferReview(ctx, claim, job.Review.nextReview(r.now())); err != nil {
+	if err := r.Registry.DeferReview(ctx, claim, job.Review.putOff(r.now())); err != nil {
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, fmt.Errorf("defer review: %w", err)
 	}
@@ -1015,16 +1018,16 @@ func (r *Reviewer) nextReviewAt(job Job, decision AgentDecision, packet Packet) 
 	now := r.now()
 	next := job.Review.nextReview(now)
 	// The agent may ask to look again sooner, never later than the cadence.
-	if s := time.Duration(decision.NextReviewAfterSec) * time.Second; s > 0 && now.Add(s).Before(next) {
-		next = now.Add(s)
+	// A number of seconds too large to be an instant is not sooner.
+	if sec := decision.NextReviewAfterSec; sec > 0 && sec <= maxSoonerSec {
+		if sooner := now.Add(time.Duration(sec) * time.Second); sooner.Before(next) {
+			next = sooner
+		}
 	}
 	if packet.MoreRunsPending {
 		next = now.Add(minReviewInterval)
 	}
-	if floor := now.Add(minReviewInterval); next.Before(floor) {
-		next = floor
-	}
-	return next
+	return notBefore(next, now.Add(minReviewInterval))
 }
 
 // applyAction runs a requested action when the saved policy makes it
@@ -1868,7 +1871,7 @@ func (r *Reviewer) Fail(ctx context.Context, prepared Prepared, failure *AgentFa
 	}); err != nil {
 		return fmt.Errorf("raise exception: %w", err)
 	}
-	if err := r.Registry.DeferReview(ctx, prepared.Claim, job.Review.nextReview(r.now())); err != nil {
+	if err := r.Registry.DeferReview(ctx, prepared.Claim, job.Review.putOff(r.now())); err != nil {
 		return fmt.Errorf("defer review: %w", err)
 	}
 	if err := r.Registry.ReleaseClaim(ctx, prepared.Claim); err != nil {

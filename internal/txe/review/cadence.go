@@ -9,10 +9,10 @@ import (
 )
 
 // ReadCadence reads a job's declared review cadence. A job declares it as a
-// cron expression, read in the timezone of the job's own schedule (UTC when
-// that is not given); an expression that names its own zone with a TZ= or
-// CRON_TZ= prefix keeps it. A plain duration such as "1h" is accepted too,
-// as jobs registered before the cadence was read as a cron carry one.
+// cron expression, and it is read in the timezone of the job's own schedule
+// (UTC when that is not given): the cadence does not name a zone of its own.
+// A plain duration such as "1h" is accepted too, as jobs registered before
+// the cadence was read as a cron carry one.
 //
 // Exactly one of the results is set, or none when no cadence is declared:
 // seconds for a duration, the cron expression with its zone, or the reason
@@ -28,8 +28,15 @@ func ReadCadence(declared, timezone string) (seconds int, cron, reason string) {
 		}
 		return int(d / time.Second), "", ""
 	}
+	if strings.HasPrefix(text, "TZ=") || strings.HasPrefix(text, "CRON_TZ=") {
+		return 0, "", fmt.Sprintf("review_policy.cadence %q names a timezone of its own; it is read in the job's schedule.timezone", declared)
+	}
+	if err := wholeFields(text); err != nil {
+		return 0, "", fmt.Sprintf("review_policy.cadence %q is neither a cron expression nor a duration: %v", declared, err)
+	}
 	expr := text
-	if !strings.HasPrefix(text, "TZ=") && !strings.HasPrefix(text, "CRON_TZ=") && !strings.HasPrefix(text, "@every ") {
+	// "@every" is an interval on a fixed grid and takes no zone.
+	if !strings.HasPrefix(text, "@every ") {
 		zone := strings.TrimSpace(timezone)
 		if zone == "" {
 			zone = "UTC"
@@ -49,6 +56,25 @@ func ReadCadence(declared, timezone string) (seconds int, cron, reason string) {
 		return 0, "", fmt.Sprintf("review_policy.cadence %q never occurs", declared)
 	}
 	return 0, expr, ""
+}
+
+// wholeFields refuses a cron expression with a field that lists nothing,
+// such as "," or "1,,2". The cron library reads a field of only commas as a
+// field no value satisfies, without an error, and looking for the next
+// occurrence of such an expression walks minute by minute through years.
+// The text comes from the registry's record, so it is refused before then.
+func wholeFields(expr string) error {
+	if strings.HasPrefix(expr, "@") {
+		return nil
+	}
+	for _, field := range strings.Fields(expr) {
+		for _, item := range strings.Split(field, ",") {
+			if item == "" {
+				return fmt.Errorf("the field %q lists an empty value", field)
+			}
+		}
+	}
+	return nil
 }
 
 // parseCron reads a cron expression with the scheduler's parser. The text
@@ -88,4 +114,17 @@ func (p ReviewPolicy) nextReview(from time.Time) time.Time {
 		return from.Add(time.Duration(p.CadenceSec) * time.Second)
 	}
 	return from.Add(defaultCadence)
+}
+
+// putOff is when a job that could not be reviewed now is looked at again:
+// at its cadence, and never less than the minimum interval ahead.
+func (p ReviewPolicy) putOff(now time.Time) time.Time {
+	return notBefore(p.nextReview(now), now.Add(minReviewInterval))
+}
+
+func notBefore(t, floor time.Time) time.Time {
+	if t.Before(floor) {
+		return floor
+	}
+	return t
 }

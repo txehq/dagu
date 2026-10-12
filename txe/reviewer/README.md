@@ -185,11 +185,13 @@ files.
 - Cadence: a job's `review_policy.cadence` is a cron expression, and a
   job's next review is that expression's next occurrence in the timezone of
   the job's own schedule (`schedule.timezone`; UTC when a version carries
-  none). An expression that starts with `TZ=` or `CRON_TZ=` is read in the
-  zone it names. A plain duration such as `1h` is accepted as well and is
+  none). The cadence names no zone of its own: one that starts with `TZ=`
+  or `CRON_TZ=` is refused as unreadable. A plain duration such as `1h` is accepted as well and is
   counted from the review. The agent may ask to look again sooner, never
   later; while more runs are waiting than one review covers, the next
-  review is a minute away; and no review is set less than a minute ahead.
+  review is a minute away; and no review is set less than a minute ahead,
+  also when one is put off because the job could not be reviewed or the
+  agent failed.
   A cadence that is neither a cron expression nor a duration, or a cron
   expression that never occurs (31 February), is not taken for one: the job is reviewed every hour, and the exception
   `review_cadence_invalid` says so for that version of the job, quoting
