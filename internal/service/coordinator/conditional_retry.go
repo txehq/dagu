@@ -84,9 +84,23 @@ func admittedQueuedAt(task *coordinatorv1.Task) string {
 	return task.GetExecutionMarker()
 }
 
+// refuseStrayRetryRequest refuses a task that names a retry request but is
+// no root conditional retry, or whose request is invalid.
+func refuseStrayRetryRequest(task *coordinatorv1.Task) error {
+	if task.GetRetryRequest() == nil {
+		return nil
+	}
+	isRoot := task.GetParentDagRunId() == "" && (task.GetRootDagRunId() == "" || task.GetRootDagRunId() == task.GetDagRunId())
+	if !isRoot {
+		return fmt.Errorf("%w: a sub-DAG run cannot name an action attempt", ir.ErrInvalidRetryRequest)
+	}
+	_, err := admittedRetryRequest(task)
+	return err
+}
+
 // initialRetryRequest is the correlation the coordinator's initial status of
-// a conditional retry records; expectedLatest has already refused a task
-// whose request is invalid.
+// a conditional retry records; prepareAttemptForDispatch has already refused
+// a task whose request is invalid (refuseStrayRetryRequest).
 func initialRetryRequest(task *coordinatorv1.Task) *ir.RetryRequest {
 	request, err := admittedRetryRequest(task)
 	if err != nil {

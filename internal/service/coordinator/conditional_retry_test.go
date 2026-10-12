@@ -300,3 +300,39 @@ func TestKeptRetryRequest(t *testing.T) {
 	assert.Nil(t, keptRetryRequest(&ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1"}, &ir.DAGRunStatus{AttemptID: "a1", QueuedAt: "q1",
 		RetryRequest: request}), "a report cannot set one")
 }
+
+// A task that names a retry request but is no conditional retry is refused
+// before any attempt is created; the request is never silently dropped.
+func TestDispatchRefusesAStrayRetryRequest(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := testutil.NewFileDAGRunRepository(filepath.Join(dir, "runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "test-dag"}
+	first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-123", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	s := ir.InitialStatus(dag)
+	s.DAGRunID, s.AttemptID, s.Status = "run-123", first.ID(), ir.Failed
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, s))
+	require.NoError(t, first.Close(ctx))
+	previous, err := convert.DAGRunStatusToProto(&s)
+	require.NoError(t, err)
+	dispatchStore := newTestDispatchTaskStore(filepath.Join(dir, "distributed"))
+	heartbeatStore := newTestWorkerHeartbeatStore(filepath.Join(dir, "distributed"))
+	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{WorkerID: "worker-1", LastHeartbeatAt: time.Now().UTC().UnixMilli()}))
+	h := NewHandler(HandlerConfig{DAGRunRepository: repo, DispatchTaskStore: dispatchStore, WorkerHeartbeatStore: heartbeatStore})
+	t.Cleanup(func() { h.Close(context.Background()) })
+
+	_, err = h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		Operation: coordinatorv1.Operation_OPERATION_RETRY, DagRunId: "run-123", Target: "test-dag",
+		Definition: "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello", QueueName: "test-queue",
+		PreviousStatus: previous,
+		RetryRequest:   &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "1", BindingDigest: "d"},
+	}})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-123"))
+	require.NoError(t, err)
+	assert.Equal(t, first.ID(), latest.ID(), "no attempt was created")
+}

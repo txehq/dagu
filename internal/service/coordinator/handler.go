@@ -1133,6 +1133,12 @@ func (h *Handler) prepareAttemptForDispatch(ctx context.Context, task *coordinat
 	if task == nil {
 		return nil, fmt.Errorf("task is required")
 	}
+	// A task naming a retry request is admitted only as a root conditional
+	// retry with a valid request, before any attempt exists; it is never
+	// admitted with the request silently dropped.
+	if err := refuseStrayRetryRequest(task); err != nil {
+		return nil, err
+	}
 	if h.dagRunRepository == nil {
 		h.ensureTaskAttemptMetadata(task)
 		return nil, nil
@@ -1234,6 +1240,9 @@ func prepareAttemptErrorCode(err error) codes.Code {
 	}
 	if errors.Is(err, persis.ErrLatestExecutionChanged) {
 		return codes.Aborted
+	}
+	if errors.Is(err, ir.ErrInvalidRetryRequest) {
+		return codes.InvalidArgument
 	}
 	return codes.Internal
 }
