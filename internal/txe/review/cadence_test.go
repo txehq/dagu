@@ -39,6 +39,12 @@ func TestReadCadence(t *testing.T) {
 		"a field out of range":                 {declared: "0 25 * * *", timezone: "UTC", reason: "neither a cron expression nor a duration"},
 		"a zero duration":                      {declared: "0s", reason: "not a positive duration"},
 		"a negative duration":                  {declared: "-1h", reason: "not a positive duration"},
+		"a zone prefix and nothing else":       {declared: "TZ=UTC", reason: "a timezone prefix with no expression after it"},
+		"a longer zone prefix and nothing":     {declared: "CRON_TZ=Australia/Perth", timezone: "UTC", reason: "a timezone prefix with no expression after it"},
+		"an empty zone prefix is UTC":          {declared: "CRON_TZ= 0 9 * * *", cron: "CRON_TZ= 0 9 * * *"},
+		"a zone prefix that names no zone":     {declared: "TZ=Mars/Olympus 0 9 * * *", reason: "neither a cron expression nor a duration"},
+		"a zone that escapes the zone files":   {declared: "0 9 * * *", timezone: "../../etc/passwd", reason: "cannot be read in the schedule's timezone"},
+		"a date that never comes":              {declared: "0 0 31 2 *", timezone: "UTC", reason: "never occurs"},
 		"a zone that does not exist":           {declared: "0 9 * * *", timezone: "Mars/Olympus", reason: "cannot be read in the schedule's timezone"},
 	} {
 		t.Run(name, func(t *testing.T) {

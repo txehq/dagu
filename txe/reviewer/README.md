@@ -190,8 +190,8 @@ files.
   counted from the review. The agent may ask to look again sooner, never
   later; while more runs are waiting than one review covers, the next
   review is a minute away; and no review is set less than a minute ahead.
-  A cadence that is neither a cron expression nor a duration is not taken
-  for one: the job is reviewed every hour, and the exception
+  A cadence that is neither a cron expression nor a duration, or a cron
+  expression that never occurs (31 February), is not taken for one: the job is reviewed every hour, and the exception
   `review_cadence_invalid` says so for that version of the job, quoting
   what was declared, until the job gets a version whose cadence can be
   read (`dagu txe update`). A job that declares no cadence at all is

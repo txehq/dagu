@@ -39,10 +39,36 @@ func ReadCadence(declared, timezone string) (seconds int, cron, reason string) {
 		}
 		expr = "CRON_TZ=" + zone + " " + text
 	}
-	if _, err := ir.NewCronSchedule(expr); err != nil {
+	schedule, err := parseCron(expr)
+	if err != nil {
 		return 0, "", fmt.Sprintf("review_policy.cadence %q is neither a cron expression nor a duration: %v", declared, err)
 	}
+	// An expression can be well formed and name no instant at all, such as
+	// 31 February. That is not a cadence either.
+	if !schedule.Next(time.Now()).After(time.Time{}) {
+		return 0, "", fmt.Sprintf("review_policy.cadence %q never occurs", declared)
+	}
 	return 0, expr, ""
+}
+
+// parseCron reads a cron expression with the scheduler's parser. The text
+// comes from the registry's record of a job, which is not this machine's:
+// the cron library indexes past the end of a zone prefix that is not
+// followed by an expression ("TZ=UTC"), so that shape is refused here, and
+// any other fault inside the parser is returned as an error instead of
+// ending the review process for every job.
+func parseCron(expr string) (schedule ir.Schedule, err error) {
+	if strings.HasPrefix(expr, "TZ=") || strings.HasPrefix(expr, "CRON_TZ=") {
+		if _, rest, found := strings.Cut(expr, " "); !found || strings.TrimSpace(rest) == "" {
+			return ir.Schedule{}, fmt.Errorf("a timezone prefix with no expression after it")
+		}
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			schedule, err = ir.Schedule{}, fmt.Errorf("the cron parser could not read it: %v", r)
+		}
+	}()
+	return ir.NewCronSchedule(expr)
 }
 
 // nextReview is when the policy's cadence next asks for a review after
@@ -52,7 +78,7 @@ func ReadCadence(declared, timezone string) (seconds int, cron, reason string) {
 // job (see ExceptionCadenceInvalid), so that default is never silent.
 func (p ReviewPolicy) nextReview(from time.Time) time.Time {
 	if p.Cadence != "" {
-		if s, err := ir.NewCronSchedule(p.Cadence); err == nil {
+		if s, err := parseCron(p.Cadence); err == nil {
 			if next := s.Next(from); next.After(from) {
 				return next
 			}
