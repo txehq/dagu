@@ -20,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
 )
 
 // DecideTxeProposal records a human decision on one proposal. The decision is
@@ -208,6 +209,8 @@ type txeRun struct {
 // txeRunFacts reads the run of the job's DAG that a retry names: it must
 // exist, be finished and not succeeded, and the caller must be able to see
 // it. Its DAG snapshot digest is computed the way run admission computes it.
+// It authorizes only reading the run: the caller's right to retry it was
+// checked before, by the replay lookup, and is checked again in the commit.
 func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, error) {
 	status, err := a.authorizeHumanTaskMutation(ctx, jobID, runID)
 	if err != nil {
@@ -216,6 +219,19 @@ func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, err
 	if status.Name != jobID {
 		return txeRun{}, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
 			Message: fmt.Sprintf("run %s is not a run of job %s", runID, jobID)}
+	}
+	// A latest execution whose preparation is not settled may still be
+	// abandoned, which makes the reviewed execution latest again. It is
+	// answered the way the registry answers it, ask again with the
+	// preparation named, never as moved on or as not retryable.
+	latest, err := (&runcontrol.Control{Runs: a.dagRunRepository}).LatestAttempt(ctx, jobID, runID)
+	if err != nil {
+		return txeRun{}, txeError(err)
+	}
+	if latest.Preparing {
+		return txeRun{}, txeError(&registry.Error{Code: registry.CodeNotReady,
+			Current: registry.ExecutionPreparing{RunID: runID, Execution: latest.Ref()},
+			Message: fmt.Sprintf("run %s's latest execution %s is not yet known to be dispatched or abandoned; ask again once that is settled", runID, latest.Ref())})
 	}
 	if status.Status.IsActive() || status.Status.IsSuccess() {
 		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,

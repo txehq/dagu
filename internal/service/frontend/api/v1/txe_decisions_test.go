@@ -573,6 +573,47 @@ func TestTxeRunRetryRefusesMovedAttempt(t *testing.T) {
 
 // Dagu's queued retry keeps the attempt and records a later queue marker in
 // place. A request naming the earlier marker, or none, reviewed another
+// A run whose latest execution is a retry preparation not yet known to be
+// dispatched or abandoned is neither moved on nor unretryable: abandoning
+// the preparation makes the reviewed execution latest again. The person is
+// told to ask again, with the preparation named, and nothing is recorded.
+func TestTxeRunRetryAsksAgainWhileAPreparationIsUnsettled(t *testing.T) {
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
+	seedFailedTxeRun(t, server, jobID, "run-preparing-1")
+	seen, queued := txeExecution(t, c, jobID, "run-preparing-1")
+
+	ctx := t.Context()
+	dag, err := server.DAGRepository.GetDetails(ctx, jobID, persis.DAGLoadOptions{})
+	require.NoError(t, err)
+	started := time.Now().Add(3 * time.Second)
+	prepared, err := server.DAGRunRepository.CreateAttempt(ctx, dag, started, "run-preparing-1",
+		persis.DAGRunCreateAttemptOptions{Retry: true, TrackPreparation: true})
+	require.NoError(t, err)
+	require.NoError(t, prepared.Open(ctx))
+	require.NoError(t, prepared.Write(ctx, ir.NewStatusBuilder(dag).Create("run-preparing-1", ir.NotStarted, 0, started,
+		ir.WithAttemptID(prepared.ID()))))
+	require.NoError(t, prepared.Close(ctx))
+
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	path := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-preparing-1")
+	var apiErr api.Error
+	c.Post(path, retryBody("dashboard-preparing-1", job.Version, seen, queued)).
+		ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &apiErr)
+	require.NotNil(t, apiErr.Details)
+	require.Equal(t, string(registry.CodeNotReady), (*apiErr.Details)["code"])
+	current, ok := (*apiErr.Details)["current"].(map[string]any)
+	require.True(t, ok, "details.current = %v", (*apiErr.Details)["current"])
+	require.Equal(t, "run-preparing-1", current["run_id"])
+	require.Equal(t, registry.ExecutionRef(prepared.ID(), ""), current["execution"])
+
+	var decisions api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &decisions)
+	require.Empty(t, decisions.Decisions)
+}
+
 // execution and is refused; one naming the re-queued execution binds it.
 func TestTxeRunRetryRefusesRequeuedExecution(t *testing.T) {
 	server := builtinServer(t)
