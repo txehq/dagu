@@ -951,13 +951,14 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		if err := h.beginQueuedExecutionPreparation(ctx, ref, task); err != nil {
 			return nil, err
 		}
-		if err := existingAttempt.Open(ctx); err != nil {
+		// A duplicate dispatch of the same execution shares the attempt an
+		// earlier dispatch left open; opening a second handle and overwriting
+		// the cached one would leak the first.
+		opened, err := h.replaceOpenAttempt(ctx, task.DagRunId, existingAttempt, existingAttempt.ID())
+		if err != nil {
 			return nil, fmt.Errorf("failed to open existing attempt: %w", err)
 		}
-
-		h.attemptsMu.Lock()
-		h.openAttempts[task.DagRunId] = existingAttempt
-		h.attemptsMu.Unlock()
+		existingAttempt = opened
 
 		logger.Info(ctx, "Reusing existing queued attempt for dispatched task",
 			tag.RunID(task.DagRunId),
@@ -1019,9 +1020,14 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 // only an acknowledged claim or that execution's abandonment ends it. The
 // caller holds the run's write lock. An execution that is no longer the queued
 // one is a stale dispatch; any other failure fails the dispatch, which the
-// queue retries, so a queued execution is never published unjournaled.
+// queue retries, so a marked queued execution is never published unjournaled.
+//
+// A queued status without a marker (one written before markers existed, or by
+// a writer that sets none) names no execution to journal or abandon. It is
+// published unjournaled, as before journaling existed, and reconciliation
+// never fails it: refusing it would discard its queue item and strand the run.
 func (h *Handler) beginQueuedExecutionPreparation(ctx context.Context, run ir.DAGRunRef, task *coordinatorv1.Task) error {
-	if !h.canAbandonPreparations() {
+	if !h.canAbandonPreparations() || task.ExecutionMarker == "" {
 		return nil
 	}
 	_, err := h.dagRunRepository.BeginAttemptPreparation(ctx, run, run, task.AttemptId, task.ExecutionMarker)

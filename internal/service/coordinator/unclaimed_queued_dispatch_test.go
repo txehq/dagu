@@ -223,6 +223,47 @@ func TestAFailedDuplicateDispatchKeepsThePublishedExecutionsEntry(t *testing.T) 
 	require.NotNil(t, record, "the expired execution is failed, not left queued")
 }
 
+// A queued status without a marker names no execution to journal. Its
+// dispatch is published as before journaling existed, not refused as stale,
+// which would discard its queue item and strand the run queued.
+func TestAQueuedExecutionWithoutAMarkerIsDispatchedUnjournaled(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newShortReservationFixture(t)
+	f.writeQueued(t, "", "")
+
+	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+	assert.Empty(t, f.preparationEntries(t))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the task is published")
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Empty(t, f.records(t))
+}
+
+// A second dispatch of the same queued execution shares the attempt the first
+// left open instead of opening another handle over it, which would leak the
+// first: on Windows the leaked handle keeps the status file from being removed.
+func TestADuplicateQueuedDispatchSharesTheOpenAttempt(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newStrandedFixture(t, nil)
+	f.writeQueued(t, "", "2026-10-12T17:45:00+08:00")
+
+	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+	f.h.attemptsMu.Lock()
+	first := f.h.openAttempts[strandedRun]
+	f.h.attemptsMu.Unlock()
+	require.NotNil(t, first)
+
+	_, err = f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+	f.h.attemptsMu.Lock()
+	second := f.h.openAttempts[strandedRun]
+	f.h.attemptsMu.Unlock()
+	assert.Same(t, first, second)
+}
+
 // A queued execution that a worker claims and acknowledges ends its entry and
 // is never failed by reconciliation.
 func TestAnAcknowledgedQueuedExecutionEndsItsEntry(t *testing.T) {
