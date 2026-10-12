@@ -519,6 +519,20 @@ func (a *API) txePublicEvents(ctx context.Context, s *registry.Store, events []*
 	return out
 }
 
+// txeVisibleResult returns a job record read after the caller was
+// authorized only if the caller can still see it; otherwise the job is not
+// found to the caller.
+func (a *API) txeVisibleResult(ctx context.Context, s *registry.Store, job *registry.Job) (*registry.Job, error) {
+	if err := a.txeJobVisible(ctx, s, job); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "job " + job.JobID + " not found"})
+		}
+		return nil, err
+	}
+	return job, nil
+}
+
 // txeVisibleRefusal keeps a refusal from disclosing a job the caller cannot
 // see: a record read after the caller was authorized (a job moved meanwhile,
 // a duplicate's winner) is returned, and named, only if it is visible now.
@@ -690,6 +704,12 @@ func (a *API) TransitionTxeJob(ctx context.Context, req api.TransitionTxeJobRequ
 	committed, err := s.ChangeLifecycle(ctx, req.JobId, t, actor)
 	if err != nil {
 		return nil, txeError(a.txeVisibleRefusal(ctx, s, err))
+	}
+	// The result is re-read after the change's effects; the job may have
+	// moved to a workspace the caller cannot see meanwhile.
+	committed, err = a.txeVisibleResult(ctx, s, committed)
+	if err != nil {
+		return nil, err
 	}
 	job, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, committed))
 	return api.TransitionTxeJob200JSONResponse(job), err

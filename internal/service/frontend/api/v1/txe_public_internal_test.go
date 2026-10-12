@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,6 +96,16 @@ func TestTxeVisibleRefusalHidesAJobThatMoved(t *testing.T) {
 	require.True(t, ok)
 	assert.NotNil(t, re.Current, "a caller who sees the job gets it")
 	assert.Equal(t, refused.Message, re.Message)
+
+	// A successful change's result, re-read after it, is likewise returned
+	// only to a caller who can see it now.
+	_, err = a.txeVisibleResult(ops, store, job)
+	var apiErr *Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusNotFound, apiErr.HTTPStatus)
+	got, err := a.txeVisibleResult(admin, store, job)
+	require.NoError(t, err)
+	assert.Equal(t, job.JobID, got.JobID)
 }
 
 func mustID(t *testing.T, p registry.Prefix) string {
