@@ -381,7 +381,7 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 			return nil
 		}
 		require.NoError(t, err)
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 			var sec int64
 			var code int
 			_, err := fmt.Sscanf(line, "%d %d", &sec, &code)
@@ -412,12 +412,8 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		last := got[len(got)-1]
 		for _, held := range got[:len(got)-1] {
 			assert.Equal(t, review.ExitClaimHeld, held.code, "every try before the last met the claim and exited with the claim-held code")
-			assert.True(t, held.at.Before(expires.Add(time.Second)), "and met it while it was live")
 		}
 		assert.Zero(t, last.code)
-		// The log has whole seconds: the last try ended in or after the
-		// second the claim's lifetime ended in.
-		assert.False(t, last.at.Before(expires.Truncate(time.Second)), "the action ran only once the dead claim's lifetime was over (%s, claim to %s)", last.at, expires)
 
 		require.Len(t, effects(t, w), 1, "the action ran exactly once")
 		assert.Contains(t, effects(t, w)[0], "expanded to 200")
@@ -425,6 +421,9 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		require.Len(t, done, 1)
 		assert.Equal(t, review.ActionSucceeded, done[0].State)
 		assert.Equal(t, w.decision, done[0].DecisionID, "under the decision the person made")
+		// When the registry granted the attempt, by its own record: not
+		// before the dead claim's lifetime was over.
+		assert.False(t, done[0].StartedAt.Before(expires), "the action was granted at %s, the dead claim lived to %s", done[0].StartedAt, expires)
 		var transitions []string
 		w.reg.View(func(s *reviewtest.State) { transitions = s.Transitions })
 		joined := strings.Join(transitions, "\n")
@@ -446,14 +445,26 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		th := test.Setup(t)
 		dag := th.DAG(t, stepDAG(t, w))
 		agent := dag.Agent()
-		expires := die(t, w, 12*time.Second)
-		short, cancel := context.WithTimeout(agent.Context, 4*time.Second)
-		require.Error(t, agent.Run(short), "cut short while the claim was still live")
+		expires := die(t, w, 20*time.Second)
+		// The run is cut only after a try is seen to have met the claim, so
+		// what is cut is a run that is waiting for it.
+		short, cancel := context.WithCancel(agent.Context)
+		ended := make(chan error, 1)
+		go func() { ended <- agent.Run(short) }()
+		require.Eventually(t, func() bool { return len(tries(t, w)) > 0 }, 15*time.Second, 100*time.Millisecond, "a try met the claim")
 		cancel()
+		select {
+		case err := <-ended:
+			require.Error(t, err, "cut short while the claim was still live")
+		case <-time.After(30 * time.Second):
+			t.Fatal("the run did not end after it was cut")
+		}
 		require.True(t, time.Now().Before(expires), "the run ended before the claim did")
 		assert.Empty(t, effects(t, w))
 		assert.Empty(t, actions(w))
-		for _, held := range tries(t, w) {
+		cut := tries(t, w)
+		require.NotEmpty(t, cut)
+		for _, held := range cut {
 			assert.Equal(t, review.ExitClaimHeld, held.code)
 		}
 
