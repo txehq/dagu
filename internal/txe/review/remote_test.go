@@ -442,11 +442,18 @@ type stubTransport struct {
 	// path falls back to replies.
 	seq   map[string][]string
 	calls []string
-	fail  map[string]*review.TransportError
+	// bodies are the request bodies sent, in order.
+	bodies [][]byte
+	fail   map[string]*review.TransportError
 }
 
-func (s *stubTransport) Do(_ context.Context, method, path string, _, out any) error {
+func (s *stubTransport) Do(_ context.Context, method, path string, in, out any) error {
 	s.calls = append(s.calls, method+" "+path)
+	if in != nil {
+		body, err := json.Marshal(in)
+		require.NoError(s.t, err)
+		s.bodies = append(s.bodies, body)
+	}
 	if e, ok := s.fail[path]; ok {
 		return e
 	}
@@ -2927,6 +2934,100 @@ func TestRemoteALostRetryAnswerIsRecoveredAndSettledByTheRegistry(t *testing.T) 
 	open, err := f.remote.OpenProposals(ctx, f.jobID)
 	require.NoError(t, err)
 	assert.Empty(t, open, "the owner is not asked")
+}
+
+// A reservation recovered from the service's record of the request is
+// stored by the real registry, on the uncertain action, and from then on the
+// retry is read by that execution: the record can be lost to the reviewer and
+// the retry is still neither sent again, nor put to the owner as unknown, nor
+// taken for one that had no effect.
+func TestRemoteARecoveredReservationIsStoredAndOutlivesTheRecord(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	service.fail("run-7", "att-1")
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		_, _, err := tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "run-7", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-run-7")
+		return err
+	})
+	require.NoError(t, err)
+	review1 := func(holder string) review.Action {
+		t.Helper()
+		*f.ahead += 5 * time.Minute
+		r := f.retrying(holder, service)
+		prepared, err := r.Prepare(ctx, f.jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		actions, err := f.remote.Actions(ctx, f.jobID)
+		require.NoError(t, err)
+		require.Len(t, actions, 1)
+		open, err := f.remote.OpenProposals(ctx, f.jobID)
+		require.NoError(t, err)
+		assert.Empty(t, open, "the owner is not asked")
+		return actions[0]
+	}
+
+	// The service admits the retry as an execution no worker has taken yet;
+	// the answer is lost, and its record cannot be had at that moment.
+	service.loseAnswer = &review.TransportError{Status: http.StatusServiceUnavailable, Code: "dispatch_uncertain", Message: "the retry may or may not have been dispatched"}
+	service.noRecords = true
+	service.retry = func(runID string) error {
+		service.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+		return nil
+	}
+	done, err := f.retrying("tick-1", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	require.Equal(t, review.ActionUncertain, done[0].Executed.Action.State)
+	require.Empty(t, done[0].Executed.Action.AdmittedRef)
+	reserved := review.ExecutionRef("att-reserved", "")
+
+	// The next review finds the record, and the registry stores what it names.
+	service.loseAnswer, service.noRecords = nil, false
+	kept := review1("reviewer-b")
+	assert.Equal(t, review.ActionUncertain, kept.State)
+	assert.True(t, kept.Admitted)
+	assert.Equal(t, reserved, kept.AdmittedRef)
+	assert.Empty(t, kept.Receipt)
+
+	// The record is gone for the reviewer, then unreadable. The stored
+	// execution is what it goes by, and nothing is looked up for it.
+	service.recordsGone = true
+	lookups := service.recovered
+	waiting := review1("reviewer-c")
+	assert.Equal(t, review.ActionUncertain, waiting.State)
+	assert.Equal(t, reserved, waiting.AdmittedRef)
+	service.recordsGone, service.noRecords = false, true
+	assert.Equal(t, review.ActionUncertain, review1("reviewer-d").State)
+	assert.Equal(t, lookups, service.recovered)
+
+	// A worker takes it: recorded by the registry with exactly that execution.
+	service.state["run-7"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+	settled := review1("reviewer-e")
+	assert.Equal(t, review.ActionSucceeded, settled.State)
+	assert.Equal(t, reserved, settled.Receipt)
+	assert.Equal(t, reserved, settled.AdmittedRef)
+	assert.Len(t, service.retried, 1, "one retry request in all")
+}
+
+// An outcome that only names the admitted execution is still written, and
+// as admitted: the registry stores it so and refuses one that says otherwise.
+func TestRemoteFinishActionWritesAnAdmittedExecutionOnItsOwn(t *testing.T) {
+	stub := &stubTransport{t: t, replies: map[string]string{"/txe/jobs/job/actions/act-1": `{}`}}
+	remote := &review.Remote{Transport: stub}
+	require.NoError(t, remote.FinishAction(context.Background(), review.FinishRequest{
+		JobID: "job", ActionID: "act-1", GrantID: "g", State: review.ActionUncertain, AdmittedRef: "a2-0000000000000000",
+	}))
+	require.Len(t, stub.bodies, 1)
+	var sent struct {
+		Outcome map[string]any `json:"outcome"`
+	}
+	require.NoError(t, json.Unmarshal(stub.bodies[0], &sent))
+	assert.Equal(t, map[string]any{"admitted": true, "admitted_execution": "a2-0000000000000000"}, sent.Outcome)
 }
 
 // The service's record of a retry request answers only when all of it is

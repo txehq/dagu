@@ -667,8 +667,31 @@ func (r *Registry) FinishAction(_ context.Context, req review.FinishRequest) err
 			if actions[i].GrantID != req.GrantID {
 				return fmt.Errorf("%w: wrong grant for action %s", review.ErrConflict, req.ActionID)
 			}
+			known := actions[i].AdmittedRef
+			if actions[i].Name == review.RetryRunAction && actions[i].State == review.ActionUncertain && req.State == review.ActionUncertain {
+				// As the registry does: an uncertain retry is settled as
+				// uncertain again only to record the execution its request
+				// admitted, once, and never to replace it.
+				switch {
+				case req.AdmittedRef == "" || req.Receipt != "":
+					return fmt.Errorf("%w: an uncertain action %s is settled as uncertain only to record its admitted execution", review.ErrConflict, req.ActionID)
+				case known == "":
+					actions[i].Detail = req.Detail
+					actions[i].Admitted, actions[i].AdmittedRef = true, req.AdmittedRef
+				case known != req.AdmittedRef:
+					return fmt.Errorf("%w: action %s already records execution %s as admitted, not %s", review.ErrConflict, req.ActionID, known, req.AdmittedRef)
+				}
+				return nil
+			}
 			if !allowed {
 				return fmt.Errorf("%w: action %s cannot go from %s to %s", review.ErrConflict, req.ActionID, actions[i].State, req.State)
+			}
+			if actions[i].Name == review.RetryRunAction && known != "" {
+				// The recorded execution binds every later outcome.
+				if req.AdmittedRef != "" && req.AdmittedRef != known || req.State == review.ActionSucceeded && req.Receipt != known {
+					return fmt.Errorf("%w: action %s records execution %s as admitted", review.ErrConflict, req.ActionID, known)
+				}
+				req.Admitted, req.AdmittedRef = true, known
 			}
 			actions[i].State = req.State
 			if req.State != review.ActionUncertain {

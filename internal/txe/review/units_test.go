@@ -2403,6 +2403,7 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 		require.NoError(f.t, err)
 		return f.state().Actions[jobID][0]
 	}
+	reserved := review.ExecutionRef("att-reserved", "")
 	t.Run("the record cannot be read for a while: the owner is not asked until it has been long", func(t *testing.T) {
 		f := newRetryFixture(t)
 		f.runs.loseAnswer, f.runs.noRecords = lost, true
@@ -2473,20 +2474,211 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 		}
 		require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
 
-		// Recovered as a reservation: waited on, the owner is not asked.
+		// Recovered as a reservation: waited on, the owner is not asked,
+		// and the execution the record named is now on the action.
 		f.runs.noRecords = false
-		assert.Equal(t, review.ActionUncertain, soon(f, "reviewer-b").State)
+		kept := soon(f, "reviewer-b")
+		assert.Equal(t, review.ActionUncertain, kept.State)
+		assert.True(t, kept.Admitted)
+		assert.Equal(t, reserved, kept.AdmittedRef)
+		assert.Empty(t, kept.Receipt)
 		assert.False(t, asked(f))
-		// The record is unreadable for a review: still not asked.
+		// The record is unreadable for a review: still not asked, and it
+		// was not even needed.
 		f.runs.noRecords = true
+		before := f.runs.recovered
 		assert.Equal(t, review.ActionUncertain, soon(f, "reviewer-c").State)
 		assert.False(t, asked(f))
-		// Readable again, and the execution has started: settled.
-		f.runs.noRecords = false
+		assert.Equal(t, before, f.runs.recovered, "the stored execution is read from the run, not looked up again")
+		// The execution has started: settled, with the record still
+		// unreadable.
 		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
 		done := soon(f, "reviewer-d")
 		assert.Equal(t, review.ActionSucceeded, done.State)
-		assert.Equal(t, review.ExecutionRef("att-reserved", ""), done.Receipt)
+		assert.Equal(t, reserved, done.Receipt)
+		assert.Len(t, f.runs.requested, 1)
+	})
+	t.Run("a recovered reservation outlives the service's record of the request", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			then  func(f *retryFixture)
+			state review.ActionState
+		}{
+			"it starts: recorded with that execution": {
+				then: func(f *retryFixture) {
+					f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+				},
+				state: review.ActionSucceeded,
+			},
+			"its preparation is abandoned: not dispatched": {
+				then:  func(f *retryFixture) { f.runs.abandonedRefs = map[string]bool{reserved: true} },
+				state: review.ActionNotApplied,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.loseAnswer, f.runs.noRecords = lost, true
+				f.runs.retry = func(runID string) error {
+					f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+					return nil
+				}
+				require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+				f.runs.noRecords = false
+				require.Equal(t, reserved, soon(f, "reviewer-b").AdmittedRef)
+
+				// The service now says it has no record of the request. Before
+				// the execution was stored that sent the retry to the owner as
+				// one nothing is known about. Now it is still the reservation
+				// it was seen to be: waited on, not asked about, not sent again.
+				f.runs.recordsGone = true
+				for _, holder := range []string{"reviewer-c", "reviewer-d"} {
+					waiting := soon(f, holder)
+					assert.Equal(t, review.ActionUncertain, waiting.State)
+					assert.Equal(t, reserved, waiting.AdmittedRef)
+					assert.False(t, asked(f))
+				}
+				tc.then(f)
+				settled := soon(f, "reviewer-e")
+				assert.Equal(t, tc.state, settled.State)
+				assert.Equal(t, reserved, settled.AdmittedRef)
+				if tc.state == review.ActionSucceeded {
+					assert.Equal(t, reserved, settled.Receipt)
+				} else {
+					assert.Empty(t, settled.Receipt)
+				}
+				assert.False(t, asked(f))
+				assert.Len(t, f.runs.requested, 1, "one retry request in all")
+			})
+		}
+	})
+	t.Run("a known reservation whose run cannot be read is waited on, not asked about", func(t *testing.T) {
+		for name, recovered := range map[string]bool{
+			"named by the answer":           false,
+			"named by the service's record": true,
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.retry = func(runID string) error {
+					f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+					return nil
+				}
+				if recovered {
+					f.runs.loseAnswer, f.runs.noRecords = lost, true
+				}
+				require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+				// When the record names the execution, it does so in the very
+				// review in which the run cannot be read, and it is kept all
+				// the same.
+				f.runs.noRecords = false
+				f.runs.unreadable = map[string]error{"run-1": errors.New("500 could not read the run")}
+				for _, holder := range []string{"reviewer-b", "reviewer-c"} {
+					waiting := soon(f, holder)
+					assert.Equal(t, review.ActionUncertain, waiting.State)
+					assert.Equal(t, reserved, waiting.AdmittedRef)
+					assert.False(t, asked(f), "an unreadable run says nothing about the execution")
+					assert.Empty(t, f.state().Exceptions)
+				}
+				// Past half an hour of the registry's time the owner is
+				// told, about this execution, and is still asked nothing.
+				lasting := nextReview(f)
+				assert.Equal(t, review.ActionUncertain, lasting.State)
+				assert.False(t, asked(f))
+				require.Len(t, f.state().Exceptions, 1)
+				assert.Equal(t, review.ExceptionRetryRunUnreadable, f.state().Exceptions[0].Kind)
+				assert.Contains(t, f.state().Exceptions[0].Message, "admitted by the service as execution "+reserved)
+				assert.Contains(t, f.state().Exceptions[0].Message, "the run cannot be read")
+
+				f.runs.unreadable = nil
+				f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+				done := soon(f, "reviewer-e")
+				assert.Equal(t, review.ActionSucceeded, done.State)
+				assert.Equal(t, reserved, done.Receipt)
+				assert.Len(t, f.runs.requested, 1, "one retry request in all")
+			})
+		}
+	})
+	t.Run("a known reservation whose run the service no longer has goes to the owner", func(t *testing.T) {
+		for name, gone := range map[string]error{
+			"no such run":           fmt.Errorf("%w: dag-run run-1 not found", review.ErrNotFound),
+			"not allowed to see it": &review.TransportError{Status: 403, Message: "forbidden"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.retry = func(runID string) error {
+					f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+					return nil
+				}
+				require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+
+				// That is the service's answer, not a read that failed: the
+				// run will not come back, so waiting would never end. The
+				// owner is asked, with the execution named; nothing is
+				// recorded as not applied and nothing is sent again.
+				f.runs.unreadable = map[string]error{"run-1": gone}
+				asking := soon(f, "reviewer-b")
+				assert.Equal(t, review.ActionEscalated, asking.State)
+				assert.Equal(t, reserved, asking.AdmittedRef)
+				assert.Empty(t, asking.Receipt)
+				assert.True(t, asked(f))
+				assert.Len(t, f.runs.requested, 1)
+			})
+		}
+	})
+	t.Run("the unreadable record was reported, then the record names an execution whose run is unreadable: reported again, as that", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer, f.runs.noRecords = lost, true
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+		require.Equal(t, review.ActionUncertain, nextReview(f).State)
+		require.Len(t, f.state().Exceptions, 1)
+		require.Equal(t, review.ExceptionRetryRecordUnreadable, f.state().Exceptions[0].Kind)
+
+		// The record is readable now and names the execution; the run is not.
+		// The first exception says admission is not known and points at the
+		// lookup, which is no longer true: the owner is told what is.
+		f.runs.noRecords = false
+		f.runs.unreadable = map[string]error{"run-1": errors.New("500 could not read the run")}
+		waiting := soon(f, "reviewer-c")
+		assert.Equal(t, review.ActionUncertain, waiting.State)
+		assert.Equal(t, reserved, waiting.AdmittedRef)
+		assert.False(t, asked(f))
+		kinds := []review.ExceptionKind{}
+		for _, e := range f.state().Exceptions {
+			kinds = append(kinds, e.Kind)
+		}
+		assert.Equal(t, []review.ExceptionKind{review.ExceptionRetryRecordUnreadable, review.ExceptionRetryRunUnreadable}, kinds)
+		assert.Contains(t, f.state().Exceptions[1].Message, "admitted by the service as execution "+reserved)
+	})
+	t.Run("a registry that will not store the recovered execution stops nothing", func(t *testing.T) {
+		f := newRetryFixture(t)
+		f.runs.loseAnswer, f.runs.noRecords = lost, true
+		f.runs.retry = func(runID string) error {
+			f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+			return nil
+		}
+		require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+		f.runs.noRecords = false
+
+		// As a registry older than the record does: the review goes on, the
+		// action is as it was, and the next review reads the record again.
+		f.clock.Advance(5 * time.Minute)
+		r := f.executor("reviewer-b")
+		r.Registry = refuseUncertainAgain{f.registry}
+		prepared, err := r.Prepare(context.Background(), jobID)
+		require.NoError(t, err)
+		_, err = r.Apply(context.Background(), prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+		require.NoError(t, err)
+		left := f.state().Actions[jobID][0]
+		assert.Equal(t, review.ActionUncertain, left.State)
+		assert.Empty(t, left.AdmittedRef)
+		assert.False(t, asked(f))
+
+		f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+		done := soon(f, "reviewer-c")
+		assert.Equal(t, review.ActionSucceeded, done.State)
+		assert.Equal(t, reserved, done.Receipt)
 		assert.Len(t, f.runs.requested, 1)
 	})
 	t.Run("an answer that names no execution is completed from the record", func(t *testing.T) {
@@ -2496,4 +2688,15 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 		assert.Equal(t, review.ActionSucceeded, out.Action.State)
 		assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
 	})
+}
+
+// refuseUncertainAgain is a registry that does not take an uncertain action
+// settled as uncertain, as one older than the recorded admitted execution.
+type refuseUncertainAgain struct{ review.Registry }
+
+func (r refuseUncertainAgain) FinishAction(ctx context.Context, req review.FinishRequest) error {
+	if req.State == review.ActionUncertain && req.AdmittedRef != "" {
+		return &review.TransportError{Status: 409, Code: "action_state", Message: "cannot settle uncertain action as uncertain"}
+	}
+	return r.Registry.FinishAction(ctx, req)
 }
