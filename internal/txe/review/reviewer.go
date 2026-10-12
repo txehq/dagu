@@ -460,6 +460,8 @@ func (r *Reviewer) finishInterrupted(ctx context.Context, claim Claim, cp Checkp
 		DecisionCursor: cp.DecisionCursor,
 		LastReviewID:   stored.ID,
 		NextReviewAt:   r.now(),
+		// The version the stored review was of, as the registry holds it.
+		JobVersion: stored.JobVersion,
 	}
 	switch n := len(stored.CoveredRuns); {
 	case stored.RunCursor != "":
@@ -988,7 +990,7 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 	review := Review{
 		ID:                packet.ReviewID,
 		JobID:             jobID,
-		JobVersion:        job.Version,
+		JobVersion:        packet.Job.Version,
 		Episode:           packet.Episode,
 		Outcome:           decision.Outcome,
 		Reasoning:         decision.Reasoning,
@@ -1057,9 +1059,6 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 	if err := r.Registry.RecordReview(ctx, claim, review); err != nil {
 		return abandoned(fmt.Errorf("record review: %w", err))
 	}
-	if err := r.raiseUnavailable(ctx, job, packet, decision); err != nil {
-		return abandoned(err)
-	}
 	next := Checkpoint{
 		JobID:          jobID,
 		Version:        cp.Version + 1,
@@ -1067,6 +1066,7 @@ func (r *Reviewer) Apply(ctx context.Context, prepared Prepared, decision AgentD
 		DecisionCursor: cp.DecisionCursor,
 		LastReviewID:   review.ID,
 		NextReviewAt:   r.nextReviewAt(job, decision, packet),
+		JobVersion:     packet.Job.Version,
 	}
 	if review.RunCursor != "" {
 		next.RunCursor = review.RunCursor
@@ -1474,28 +1474,21 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 	case OutcomeRetire:
 		return ask("The reviewer recommends retiring this job." + packet.trimmedCaveat())
 	case OutcomePauseUnavailable:
-		// Said by Apply once the review is recorded; see raiseUnavailable.
+		// Told to the owner before the review is recorded, so that a report
+		// that cannot be made fails the review as a whole and the next tick
+		// makes it again. The report is about the job's target, not about a
+		// version of the job, and the registry takes it without a claim: if
+		// the job is updated in the same moment, the review is abandoned
+		// and the report stands until the next review's finding replaces it.
+		err := r.Registry.RaiseException(ctx, Exception{
+			JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,
+			Message:  "The review agent judged the job's target, credentials or machine unreachable. Its reasoning, in its own words (not checked): " + agentText(decision.Reasoning),
+			ReviewID: packet.ReviewID,
+		})
+		if err != nil {
+			return fmt.Errorf("raise exception: %w", err)
+		}
 	case OutcomeContinue, OutcomeAct:
-	}
-	return nil
-}
-
-// raiseUnavailable tells the owner that the agent judged the job
-// unreachable. The registry does not fence this report by the review's
-// claim or version, so it is made only after the review itself was
-// recorded: that write is refused when the job changed under the review,
-// and a review that is abandoned says nothing about the job as it now is.
-func (r *Reviewer) raiseUnavailable(ctx context.Context, job Job, packet Packet, decision AgentDecision) error {
-	if decision.Outcome != OutcomePauseUnavailable {
-		return nil
-	}
-	err := r.Registry.RaiseException(ctx, Exception{
-		JobID: job.ID, Kind: ExceptionUnavailable, MachineID: job.MachineID,
-		Message:  "The review agent judged the job's target, credentials or machine unreachable. Its reasoning, in its own words (not checked): " + agentText(decision.Reasoning),
-		ReviewID: packet.ReviewID,
-	})
-	if err != nil {
-		return fmt.Errorf("raise exception: %w", err)
 	}
 	return nil
 }
@@ -2081,33 +2074,34 @@ func trailingFailures(history []Action, intent string) int {
 // a missing login is one visible exception instead of a retry loop.
 func (r *Reviewer) Fail(ctx context.Context, prepared Prepared, failure *AgentFailure) error {
 	job := prepared.Packet.Job
-	raise := func() error {
-		if err := r.Registry.RaiseException(ctx, Exception{
-			JobID: job.ID, Kind: failure.Kind, MachineID: job.MachineID,
-			Message: failure.Message, ReviewID: prepared.Packet.ReviewID,
-		}); err != nil {
-			return fmt.Errorf("raise exception: %w", err)
+	dropped := func() bool {
+		reason, changed := r.changedUnder(ctx, job)
+		if changed {
+			// The failure is of a review nobody needs any more. Nothing is
+			// said to the owner about it, and the job is due as it now is.
+			fmt.Fprintf(os.Stderr, "txe review: job %s: the failed review is dropped: %s\n", job.ID, reason)
 		}
+		return changed
+	}
+	// The exception is not fenced by the registry, so the job is looked at
+	// first: for one that changed under the review, nothing is raised.
+	if dropped() {
 		return nil
 	}
-	// The review is put off first, because that write is made under the
-	// review's claim: it is refused when the job changed under the review,
-	// and then the failure is of a review nobody needs any more. Nothing is
-	// said to the owner about it, and the job is due again as it now is.
-	// The exception itself is not fenced by the registry, so it is raised
-	// only once the claim is known to have still been the job's.
+	// The owner is told before the review is put off, so that a job is
+	// never put off in silence: if the exception cannot be raised nothing
+	// is put off, and the next tick tries the review again.
+	if err := r.Registry.RaiseException(ctx, Exception{
+		JobID: job.ID, Kind: failure.Kind, MachineID: job.MachineID,
+		Message: failure.Message, ReviewID: prepared.Packet.ReviewID,
+	}); err != nil {
+		return fmt.Errorf("raise exception: %w", err)
+	}
 	if err := r.Registry.DeferReview(ctx, prepared.Claim, job.Review.putOff(r.now())); err != nil {
-		if reason, changed := r.changedUnder(ctx, job); changed {
-			fmt.Fprintf(os.Stderr, "txe review: job %s: the failed review is dropped: %s\n", job.ID, reason)
+		if dropped() {
 			return nil
 		}
-		if raiseErr := raise(); raiseErr != nil {
-			return errors.Join(fmt.Errorf("defer review: %w", err), raiseErr)
-		}
 		return fmt.Errorf("defer review: %w", err)
-	}
-	if err := raise(); err != nil {
-		return err
 	}
 	if err := r.Registry.ReleaseClaim(ctx, prepared.Claim); err != nil {
 		return fmt.Errorf("release claim: %w", err)

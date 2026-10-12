@@ -289,6 +289,10 @@ type Checkpoint struct {
 	DecisionCursor string    `json:"decision_cursor,omitempty"`
 	LastReviewID   string    `json:"last_review_id,omitempty"`
 	NextReviewAt   time.Time `json:"next_review_at,omitzero"`
+	// JobVersion is, on a checkpoint being written, the job version the
+	// review that advances it read. The registry refuses the write when
+	// that is not the version it holds as reviewed.
+	JobVersion int `json:"job_version,omitempty"`
 }
 
 // RunEvidence is one finished run of the job's own script.

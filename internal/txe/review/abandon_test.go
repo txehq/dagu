@@ -214,32 +214,22 @@ func TestAReviewIsAbandonedWhenItsJobChangesUnderIt(t *testing.T) {
 		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.IsZero(), "the job is due as it now is")
 		assert.Empty(t, f.state().Exceptions, "no exception about a review nobody needs")
 
+		// On a job that did not change, an exception that cannot be raised
+		// puts nothing off: the job stays due and the claim is not kept
+		// past this tick's own handling.
+		f = newFixture(t)
+		prepared = f.prepare("reviewer-a")
+		silent := errors.New("observation endpoint unavailable")
+		r := f.reviewer("reviewer-a")
+		r.Registry = &failExceptions{Registry: f.registry, err: silent}
+		require.ErrorIs(t, r.Fail(ctx, prepared, &review.AgentFailure{Kind: review.ExceptionReviewerAuth, Message: "login expired"}), silent)
+		assert.True(t, f.state().Checkpoints[jobID].NextReviewAt.IsZero(), "not put off in silence")
+
 		// On a job that did not change the owner is told, as before.
 		f = newFixture(t)
 		require.NoError(t, f.reviewer("reviewer-a").Fail(ctx, f.prepare("reviewer-a"), &review.AgentFailure{Kind: review.ExceptionReviewerFailed, Message: "no output"}))
 		require.Len(t, f.state().Exceptions, 1)
 		assert.False(t, f.state().Checkpoints[jobID].NextReviewAt.IsZero())
-	})
-
-	// The agent's judgement that the job is unreachable is about the version
-	// it was shown. It is told to the owner only once the review is
-	// recorded, so an abandoned review says nothing about the new version.
-	t.Run("an unreachable verdict on a job that changed tells nobody", func(t *testing.T) {
-		unreachable := review.AgentDecision{Outcome: review.OutcomePauseUnavailable, Reasoning: "the cluster does not answer"}
-		f := newFixture(t)
-		prepared := f.prepare("reviewer-a")
-		r := f.reviewer("reviewer-a")
-		r.Registry = &onWrite{Registry: f.registry, record: update(f)}
-		applied, err := r.Apply(ctx, prepared, unreachable)
-		require.NoError(t, err)
-		assert.NotEmpty(t, applied.Aborted)
-		assert.Empty(t, f.state().Exceptions)
-
-		f = newFixture(t)
-		f.apply("reviewer-a", f.prepare("reviewer-a"), unreachable)
-		require.Len(t, f.state().Exceptions, 1)
-		assert.Equal(t, review.ExceptionUnavailable, f.state().Exceptions[0].Kind)
-		require.Len(t, f.state().Reviews[jobID], 1)
 	})
 
 	// Whatever a write of the review failed with, a job that changed makes
@@ -280,6 +270,26 @@ type refuseProposals struct {
 func (r *refuseProposals) CreateProposal(context.Context, review.Claim, review.Proposal) (review.Proposal, error) {
 	once(&r.before)
 	return review.Proposal{}, r.err
+}
+
+// failExceptions is a registry that takes no exception.
+type failExceptions struct {
+	review.Registry
+	err error
+}
+
+func (r *failExceptions) RaiseException(context.Context, review.Exception) error { return r.err }
+
+// hookClaim is a registry that does something once, right before the first
+// claim is asked for: the moment between a job being read and claimed.
+type hookClaim struct {
+	review.Registry
+	before func()
+}
+
+func (h *hookClaim) AcquireClaim(ctx context.Context, req review.ClaimRequest) (review.Claim, error) {
+	once(&h.before)
+	return h.Registry.AcquireClaim(ctx, req)
 }
 
 // failReadsAfter is a registry whose job cannot be read once fail is set.
@@ -531,20 +541,51 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 		assert.Equal(t, review.SkipNotRegistered, again.Skipped)
 	})
 
-	// The agent's verdict that the job is unreachable is not told to the
-	// owner of a job that changed under the review.
-	t.Run("an unreachable verdict on a job that changed tells nobody", func(t *testing.T) {
+	// The job is read and then claimed. An update in between ends no claim,
+	// so the review holds a claim on the new version and a packet of the
+	// old one. Its review and checkpoint name the version it read, and the
+	// registry refuses them.
+	t.Run("updated between the job being read and claimed", func(t *testing.T) {
 		w := start(t)
 		r := w.reviewer("tick-1")
+		r.Registry = &hookClaim{Registry: w.f.remote, before: w.update}
 		prepared, err := r.Prepare(ctx, w.id)
 		require.NoError(t, err)
-		r.Registry = &onWrite{Registry: w.f.remote, record: w.update}
-		applied, err := r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomePauseUnavailable, Reasoning: "the cluster does not answer"})
+		require.Empty(t, prepared.Skipped)
+		require.Equal(t, 1, prepared.Packet.Job.Version, "the packet is of the version that was read")
+		require.Equal(t, 2, stored(t, w).Version)
+
+		// What the registry itself answers to a review and a checkpoint of
+		// the version that was read, under this live claim.
+		err = w.f.remote.RecordReview(ctx, prepared.Claim, review.Review{
+			ID: prepared.Packet.ReviewID, JobID: w.id, JobVersion: 1, Outcome: review.OutcomeContinue, Reasoning: "fine",
+		})
+		require.ErrorIs(t, err, review.ErrConflict, "a review of version 1 is refused")
+		err = w.f.remote.AdvanceCheckpoint(ctx, prepared.Claim, review.Checkpoint{JobID: w.id, Version: 1, JobVersion: 1, NextReviewAt: time.Now().Add(time.Hour)}, 0)
+		require.Error(t, err, "a checkpoint of version 1 is refused")
+
+		applied, err := r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "fine"})
 		require.NoError(t, err)
 		assert.NotEmpty(t, applied.Aborted)
 		job := stored(t, w)
+		assert.Zero(t, job.Checkpoint.Version, "the checkpoint does not move")
 		assert.Empty(t, job.Exceptions)
-		assert.Equal(t, registry.AvailabilityReady, job.Availability.State)
+		var reviews struct {
+			Reviews []json.RawMessage `json:"reviews"`
+		}
+		require.NoError(t, w.f.remote.Transport.Do(ctx, http.MethodGet, "/txe/jobs/"+w.id+"/reviews", nil, &reviews))
+		assert.Empty(t, reviews.Reviews, "no review is recorded")
+
+		next := w.reviewer("tick-2")
+		again, err := next.Prepare(ctx, w.id)
+		require.NoError(t, err)
+		require.Empty(t, again.Skipped)
+		assert.Equal(t, 2, again.Packet.Job.Version)
+		_, err = next.Apply(ctx, again, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "fine"})
+		require.NoError(t, err)
+		job = stored(t, w)
+		assert.Equal(t, 1, job.Checkpoint.Version)
+		assert.Equal(t, 2, job.Checkpoint.JobVersion, "the checkpoint says version 2 was reviewed")
 	})
 
 	t.Run("a claim that expired and was taken, on an unchanged job, is still an error", func(t *testing.T) {

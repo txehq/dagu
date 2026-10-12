@@ -184,8 +184,8 @@ files.
   tick when nothing else was reviewed.
 - Updates: a job updated while it is being reviewed ends that review. The
   registry ends the review's claim with the update and refuses a write
-  made against another version than the job's, and every proposal is sent
-  with the version its review read. A review that meets this at any of
+  made against another version than the job's, and every proposal, review
+  and checkpoint is sent with the version the review read. A review that meets this at any of
   its writes is abandoned: it leaves the checkpoint where it was, raises
   no exception, and its run succeeds, saying why (`aborted`) and what it
   had already written, which stays written (a review record made just
