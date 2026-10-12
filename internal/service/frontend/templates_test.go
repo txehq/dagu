@@ -206,3 +206,46 @@ func TestDefaultFunctionsExposeConfiguredLicenseFailure(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, licenseError(), "License token verification failed")
 }
+
+// The fork policy opens the SSO gate in the page configuration and is
+// reported as a policy, never as a license.
+func TestDefaultFunctionsForkPolicy(t *testing.T) {
+	t.Parallel()
+
+	call := func(funcs template.FuncMap, name string) string {
+		fn, ok := funcs[name].(func() string)
+		require.True(t, ok, name)
+		return fn()
+	}
+
+	policy := license.NewManager(license.ManagerConfig{
+		ForkPolicy: license.ForkPolicy{Features: []string{license.FeatureSSO}},
+	}, nil, nil, nil)
+	funcs := defaultFunctions(&funcsConfig{
+		OIDCEnabled:    true,
+		ProxyEnabled:   true,
+		LicenseChecker: policy.Checker(),
+		LicenseManager: policy,
+	})
+	assert.Equal(t, "true", call(funcs, "oidcEnabled"))
+	assert.Equal(t, "true", call(funcs, "proxyEnabled"))
+	assert.Equal(t, "true", call(funcs, "licenseCommunity"))
+	assert.Equal(t, "false", call(funcs, "licenseValid"))
+	assert.Empty(t, call(funcs, "licensePlan"))
+	assert.Equal(t, `["sso"]`, call(funcs, "licenseFeatures"))
+	assert.Equal(t, license.ForkPolicySource, call(funcs, "licenseSource"))
+
+	// The same server with no policy keeps the gate shut.
+	none := license.NewManager(license.ManagerConfig{}, nil, nil, nil)
+	funcs = defaultFunctions(&funcsConfig{
+		OIDCEnabled:    true,
+		ProxyEnabled:   true,
+		LicenseChecker: none.Checker(),
+		LicenseManager: none,
+	})
+	assert.Equal(t, "false", call(funcs, "oidcEnabled"))
+	assert.Equal(t, "false", call(funcs, "proxyEnabled"))
+	assert.Equal(t, "true", call(funcs, "licenseCommunity"))
+	assert.Equal(t, "[]", call(funcs, "licenseFeatures"))
+	assert.Empty(t, call(funcs, "licenseSource"))
+}

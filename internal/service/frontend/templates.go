@@ -298,14 +298,7 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 			return licenseStatus().Failure
 		},
 		"licenseSource": func() string {
-			source := licenseStatus().Source
-			if source.IsEnv() {
-				return "env"
-			}
-			if source == license.SourceNone {
-				return ""
-			}
-			return "file"
+			return licenseStatus().PublicSource()
 		},
 
 		// Path configuration functions

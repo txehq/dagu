@@ -133,6 +133,31 @@ const TunnelProviderTailscale = "tailscale"
 type LicenseConfig struct {
 	Key      string
 	CloudURL string
+	// ForkPolicy is this fork's own setting for license-gated features. It is
+	// not a license and its zero value keeps the upstream behaviour.
+	ForkPolicy LicenseForkPolicyConfig
+}
+
+// Feature names a fork policy may list. They match the license package's
+// feature constants, which cannot be imported here.
+const (
+	LicenseForkFeatureAudit = "audit"
+	LicenseForkFeatureRBAC  = "rbac"
+	LicenseForkFeatureSSO   = "sso"
+)
+
+// LicenseForkFeatures returns the feature names a fork policy may list.
+func LicenseForkFeatures() []string {
+	return []string{LicenseForkFeatureAudit, LicenseForkFeatureRBAC, LicenseForkFeatureSSO}
+}
+
+// LicenseForkPolicyConfig opens license-gated features without a license.
+type LicenseForkPolicyConfig struct {
+	// Features lists the gates to open.
+	Features []string
+	// MaxAPIKeys replaces the community API key limit when set. Zero means no
+	// limit. Nil keeps the community limit.
+	MaxAPIKeys *int
 }
 
 // ExecutionMode represents the default execution mode for DAGs.
@@ -1343,6 +1368,19 @@ func (c *Config) validateLicense() error {
 		if u.Scheme != "https" {
 			return fmt.Errorf("license cloud URL must use HTTPS")
 		}
+	}
+	return c.License.ForkPolicy.validate()
+}
+
+func (p LicenseForkPolicyConfig) validate() error {
+	allowed := LicenseForkFeatures()
+	for _, feature := range p.Features {
+		if !slices.Contains(allowed, feature) {
+			return fmt.Errorf("license.fork_policy.features: unknown feature %q (allowed: %s)", feature, strings.Join(allowed, ", "))
+		}
+	}
+	if p.MaxAPIKeys != nil && *p.MaxAPIKeys < 0 {
+		return fmt.Errorf("license.fork_policy.max_api_keys must be 0 (no limit) or a positive number, got %d", *p.MaxAPIKeys)
 	}
 	return nil
 }

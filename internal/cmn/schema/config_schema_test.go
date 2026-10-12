@@ -503,3 +503,81 @@ func mustResolveConfigSchema(t *testing.T) *jsonschema.Resolved {
 	require.NoError(t, err)
 	return resolved
 }
+
+func TestConfigSchemaLicenseForkPolicy(t *testing.T) {
+	t.Parallel()
+
+	resolved := mustResolveConfigSchema(t)
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{
+			name: "FeaturesAndLimit",
+			spec: `
+license:
+  fork_policy:
+    features: [sso, rbac, audit]
+    max_api_keys: 0
+`,
+		},
+		{
+			name: "FeaturesAsOneString",
+			spec: `
+license:
+  fork_policy:
+    features: "sso,rbac"
+`,
+		},
+		{
+			name: "UnknownFeature",
+			spec: `
+license:
+  fork_policy:
+    features: [sso, incidents]
+`,
+			wantErr: true,
+		},
+		{
+			name: "UnknownKey",
+			spec: `
+license:
+  fork_policy:
+    incidents: true
+`,
+			wantErr: true,
+		},
+		{
+			name: "NegativeLimit",
+			spec: `
+license:
+  fork_policy:
+    max_api_keys: -1
+`,
+			wantErr: true,
+		},
+		{
+			name: "FractionalLimit",
+			spec: `
+license:
+  fork_policy:
+    max_api_keys: 2.5
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := resolved.Validate(mustParseYAMLDocument(t, tt.spec))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

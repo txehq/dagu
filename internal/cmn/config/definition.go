@@ -556,6 +556,15 @@ type TunnelRateLimitDef struct {
 
 // LicenseDef configures license activation.
 type LicenseDef struct {
-	Key      string `mapstructure:"key"`
-	CloudURL string `mapstructure:"cloud_url"`
+	Key        string                `mapstructure:"key"`
+	CloudURL   string                `mapstructure:"cloud_url"`
+	ForkPolicy *LicenseForkPolicyDef `mapstructure:"fork_policy"`
+}
+
+// LicenseForkPolicyDef configures this fork's policy for license-gated
+// features. The values are read strictly by the loader, so they are left
+// untyped here: a typed field would let a wrong value be converted silently.
+type LicenseForkPolicyDef struct {
+	Features   any `mapstructure:"features"`
+	MaxAPIKeys any `mapstructure:"max_api_keys"`
 }

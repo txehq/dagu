@@ -6,8 +6,11 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/license"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
@@ -104,6 +107,9 @@ func licenseCheck() *cobra.Command {
 			defer mgr.Stop()
 
 			checker := mgr.Checker()
+			if policy := mgr.ForkPolicy(); !policy.IsZero() {
+				defer printForkPolicy(policy)
+			}
 			if checker.IsCommunity() {
 				fmt.Println("License: Community mode (no license)")
 				return nil
@@ -136,9 +142,48 @@ func newLicenseManager(ctx *Context, configKey string) (*license.Manager, error)
 
 	licenseDir := file.LicenseDir(ctx.Config)
 	store := file.NewLicenseStore(ctx, ctx.backend.Collection(persis.CollectionLicense))
+	forkPolicy := licenseForkPolicy(ctx.Config)
+	if err := forkPolicy.Validate(); err != nil {
+		return nil, err
+	}
 	return license.NewManager(license.ManagerConfig{
 		LicenseDir: licenseDir,
 		ConfigKey:  configKey,
 		CloudURL:   ctx.Config.License.CloudURL,
+		ForkPolicy: forkPolicy,
 	}, pubKey, store, slog.Default()), nil
+}
+
+// licenseForkPolicy converts the configured fork policy for the license
+// package, which the config package cannot import.
+func licenseForkPolicy(cfg *config.Config) license.ForkPolicy {
+	policy := license.ForkPolicy{Features: slices.Clone(cfg.License.ForkPolicy.Features)}
+	if cfg.License.ForkPolicy.MaxAPIKeys != nil {
+		limit := *cfg.License.ForkPolicy.MaxAPIKeys
+		policy.MaxAPIKeys = &limit
+	}
+	return policy
+}
+
+func forkPolicyAPIKeyLimitText(policy license.ForkPolicy) string {
+	switch {
+	case policy.MaxAPIKeys == nil:
+		return "community limit"
+	case *policy.MaxAPIKeys == 0:
+		return "no limit"
+	default:
+		return strconv.Itoa(*policy.MaxAPIKeys)
+	}
+}
+
+// printForkPolicy reports the fork policy beside the license status, so the
+// output never reads as if a license enabled what the policy enabled.
+func printForkPolicy(policy license.ForkPolicy) {
+	features := "none"
+	if len(policy.Features) > 0 {
+		features = strings.Join(policy.Features, ", ")
+	}
+	fmt.Printf("Fork policy (not a license)\n")
+	fmt.Printf("  Features:     %s\n", features)
+	fmt.Printf("  API keys:     %s\n", forkPolicyAPIKeyLimitText(policy))
 }

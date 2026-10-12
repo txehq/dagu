@@ -1624,6 +1624,37 @@
         "cloud_url": {
           "type": "string",
           "description": "License service URL."
+        },
+        "fork_policy": {
+          "$ref": "#/definitions/LicenseForkPolicyDef"
+        }
+      }
+    },
+    "LicenseForkPolicyDef": {
+      "type": "object",
+      "description": "This fork's policy for license-gated features. It is not a license. Leaving it out keeps the upstream behaviour.",
+      "additionalProperties": false,
+      "properties": {
+        "features": {
+          "description": "Feature gates to open without a license: a list, or one comma-separated string.",
+          "oneOf": [
+            {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": ["audit", "rbac", "sso"]
+              }
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "max_api_keys": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many API keys may exist when no license is active. 0 means no limit. Leaving it out keeps the community limit."
         }
       }
     }

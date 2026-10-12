@@ -3,7 +3,10 @@
 
 package license
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // Status describes the current license state without exposing license credentials.
 type Status struct {
@@ -17,6 +20,25 @@ type Status struct {
 	Source      DiscoverySource
 	WarningCode string
 	Failure     string
+	// ForkPolicy is true when a fork policy is configured. Community stays
+	// true and Plan stays empty unless a license is loaded as well.
+	ForkPolicy bool
+}
+
+// PublicSource returns the source category shown to clients. It names the
+// fork policy only when no license is loaded, so a loaded license keeps
+// reporting where it came from.
+func (s Status) PublicSource() string {
+	switch {
+	case s.Community && s.ForkPolicy:
+		return ForkPolicySource
+	case s.Source.IsEnv():
+		return "env"
+	case s.Source == SourceNone:
+		return ""
+	default:
+		return "file"
+	}
 }
 
 // StatusFor returns the current status reported by checker.
@@ -50,10 +72,18 @@ func StatusFor(checker Checker) Status {
 	return status
 }
 
-// Status returns the current license status.
+// Status returns the current license status. Features opened by the fork
+// policy are listed with the license's own, because both are enabled.
 func (m *Manager) Status() Status {
 	status := StatusFor(m.Checker())
 	status.Source = m.Source()
 	status.Failure = m.Failure()
+	policy := m.cfg.ForkPolicy
+	status.ForkPolicy = !policy.IsZero()
+	for _, feature := range policy.Features {
+		if !slices.Contains(status.Features, feature) {
+			status.Features = append(status.Features, feature)
+		}
+	}
 	return status
 }

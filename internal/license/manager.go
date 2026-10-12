@@ -32,6 +32,9 @@ type ManagerConfig struct {
 	LicenseDir string
 	ConfigKey  string
 	CloudURL   string
+	// ForkPolicy opens the feature gates it lists without a license. It takes
+	// no part in discovery, activation or verification.
+	ForkPolicy ForkPolicy
 }
 
 // ActivationResult is returned after a successful activation.
@@ -45,6 +48,7 @@ type ActivationResult struct {
 type Manager struct {
 	cfg    ManagerConfig
 	state  *State
+	gates  Checker // state, with the fork policy applied
 	store  ActivationStore
 	client *CloudClient
 	pubKey ed25519.PublicKey
@@ -67,9 +71,12 @@ func NewManager(cfg ManagerConfig, pubKey ed25519.PublicKey, store ActivationSto
 	if logger == nil {
 		logger = slog.Default()
 	}
+	cfg.ForkPolicy = cfg.ForkPolicy.normalized()
+	state := &State{}
 	return &Manager{
 		cfg:    cfg,
-		state:  &State{},
+		state:  state,
+		gates:  WithForkPolicy(state, cfg.ForkPolicy),
 		store:  store,
 		client: NewCloudClient(cfg.CloudURL),
 		pubKey: pubKey,
@@ -77,9 +84,15 @@ func NewManager(cfg ManagerConfig, pubKey ed25519.PublicKey, store ActivationSto
 	}
 }
 
-// Checker returns the Checker interface backed by the manager's state.
+// Checker returns the Checker interface backed by the manager's state, with
+// the fork policy applied when one is configured.
 func (m *Manager) Checker() Checker {
-	return m.state
+	return m.gates
+}
+
+// ForkPolicy returns the fork policy the manager was built with.
+func (m *Manager) ForkPolicy() ForkPolicy {
+	return m.cfg.ForkPolicy.clone()
 }
 
 // Source returns the discovery source of the current license.

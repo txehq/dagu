@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
@@ -362,20 +363,44 @@ func (a *API) requireCommunityAPIKeyLimit(ctx context.Context) error {
 		return nil
 	}
 
+	limit, fromForkPolicy := a.unlicensedAPIKeyLimit()
+	if limit == 0 {
+		return nil
+	}
+
 	keys, err := a.authService.ListAPIKeys(ctx)
 	if err != nil {
 		return err
 	}
-	if len(keys) < communityAPIKeyLimit {
+	if len(keys) < limit {
 		return nil
 	}
 
+	if fromForkPolicy {
+		return &Error{
+			Code: api.ErrorCodeForbidden,
+			Message: fmt.Sprintf("This server allows up to %d API keys (license.fork_policy.max_api_keys). "+
+				"Delete an existing key to create another.", limit),
+			HTTPStatus: http.StatusForbidden,
+		}
+	}
 	return &Error{
 		Code: api.ErrorCodeForbidden,
 		Message: "Community edition supports up to 2 API keys. " +
 			"Delete an existing key or configure a license to create more.",
 		HTTPStatus: http.StatusForbidden,
 	}
+}
+
+// unlicensedAPIKeyLimit returns how many API keys may exist when no license is
+// active, and whether the fork policy set that number. Zero means no limit.
+func (a *API) unlicensedAPIKeyLimit() (limit int, fromForkPolicy bool) {
+	if a.licenseManager != nil {
+		if configured := a.licenseManager.ForkPolicy().MaxAPIKeys; configured != nil {
+			return *configured, true
+		}
+	}
+	return communityAPIKeyLimit, false
 }
 
 func (a *API) isCommunityLicense() bool {
