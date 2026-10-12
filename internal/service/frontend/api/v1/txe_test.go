@@ -348,6 +348,27 @@ func TestTxeAPIUpdateConflictDisclosesNothing(t *testing.T) {
 		require.ErrorAs(t, err, &apiErr)
 		assert.NotContains(t, apiErr.Details, "current", "expected_version %d: no job record", expected)
 	}
+
+	// A caller who may write the job still gets the conflict and the job
+	// when its expected version is a committed but stale one.
+	opsJob, err := f.register(txeOps, "ops")
+	require.NoError(t, err)
+	update := func(requestID string, expected int) error {
+		_, err := a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: opsJob, Body: &apigen.TxeVersionRequest{
+			RequestId: requestID, ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		return err
+	}
+	require.NoError(t, update("u2", 1))
+	err = update("u3", 1)
+	requireStatus(t, err, http.StatusConflict)
+	var apiErr *apiv1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Details, "current", "the stale writer re-reads the job")
 }
 
 // A registration that loses deduplication to a job the caller cannot see is
@@ -355,37 +376,62 @@ func TestTxeAPIUpdateConflictDisclosesNothing(t *testing.T) {
 func TestTxeAPIDuplicateDisclosesNoHiddenWinner(t *testing.T) {
 	a := newTxeTestAPI(t, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
 	f := newTxeFixture(t, a, txeAdmin)
-	secretJob, err := f.register(txeAdmin, "secret")
-	require.NoError(t, err)
-	opsJob, err := f.register(txeOps, "ops")
-	require.NoError(t, err)
-
-	register := func(jobKey string) error {
-		spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
-		_, err := a.RegisterTxeJob(txeOps, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
-			JobId: mint(t, registry.PrefixJob), RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: jobKey,
+	registerAs := func(caller context.Context, workspace, jobKey string) (string, error) {
+		spec := fmt.Sprintf("labels:\n  - workspace=%s\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", workspace, f.machine)
+		jobID := mint(t, registry.PrefixJob)
+		_, err := a.RegisterTxeJob(caller, apigen.RegisterTxeJobRequestObject{Body: &apigen.TxeRegisterRequest{
+			JobId: jobID, RequestId: "r1", OwnerId: f.owner, ProjectId: f.project, MachineId: f.machine, JobKey: jobKey,
 			Version: apigen.TxeJobVersionInput{
 				Title: "t", Purpose: "p",
 				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 7), Path: "/pkg", Entrypoint: "run.sh"},
 				Dag:     apigen.TxeDAGRef{Spec: spec},
 			},
 		}})
-		return err
+		return jobID, err
+	}
+	// The job keys do not contain the winners' IDs, so any mention of an ID
+	// is a disclosure.
+	secretJob, err := registerAs(txeAdmin, "secret", "hidden-key")
+	require.NoError(t, err)
+	opsJob, err := registerAs(txeOps, "ops", "visible-key")
+	require.NoError(t, err)
+	register := func(jobKey string) (string, error) { return registerAs(txeOps, "ops", jobKey) }
+	// mentions reports whether anything the caller reads about its losing
+	// job names id.
+	mentions := func(loser, id string) bool {
+		t.Helper()
+		job, err := a.GetTxeJob(txeOps, apigen.GetTxeJobRequestObject{JobId: loser})
+		require.NoError(t, err)
+		events, err := a.ListTxeJobEvents(txeOps, apigen.ListTxeJobEventsRequestObject{JobId: loser})
+		require.NoError(t, err)
+		list, err := a.ListTxeJobs(txeOps, apigen.ListTxeJobsRequestObject{})
+		require.NoError(t, err)
+		data, err := json.Marshal([]any{job, events, list})
+		require.NoError(t, err)
+		readyErr := f.ready(txeOps, loser)
+		require.Error(t, readyErr, "a duplicate is never made ready")
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, readyErr, &apiErr)
+		refusal, err := json.Marshal(apiErr)
+		require.NoError(t, err)
+		return strings.Contains(string(data), id) || strings.Contains(string(refusal), id) || strings.Contains(apiErr.Message, id)
 	}
 
-	err = register("key:" + secretJob)
+	hiddenLoser, err := register("hidden-key")
 	requireStatus(t, err, http.StatusConflict)
 	var apiErr *apiv1.Error
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, "duplicate", apiErr.Details["code"])
 	assert.NotContains(t, apiErr.Details, "current", "the hidden winner's record")
 	assert.NotContains(t, apiErr.Message, secretJob, "the hidden winner's ID")
+	assert.False(t, mentions(hiddenLoser, secretJob), "nor through the losing job, its history or a readiness refusal")
 
-	err = register("key:" + opsJob)
+	visibleLoser, err := register("visible-key")
 	requireStatus(t, err, http.StatusConflict)
 	require.ErrorAs(t, err, &apiErr)
 	assert.Contains(t, apiErr.Details, "current", "a visible winner is returned")
 	assert.Contains(t, apiErr.Message, opsJob)
+	assert.True(t, mentions(visibleLoser, opsJob), "a visible winner is named, so it can be adopted")
 }
 
 // Only a signed-in person reactivates a retired job. An API key cannot claim

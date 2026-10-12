@@ -4,13 +4,24 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -39,4 +50,56 @@ func TestTxeRefusalReturnsTheAPIShape(t *testing.T) {
 	apiErr, ok = err.(*Error)
 	require.True(t, ok)
 	assert.Equal(t, other, apiErr.Details["current"], "other records unchanged")
+}
+
+// A refusal whose record the registry read after the caller was authorized
+// (the job moved to a workspace the caller cannot see meanwhile) neither
+// returns nor names it; a caller who can see the job still gets it.
+func TestTxeVisibleRefusalHidesAJobThatMoved(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := persis.NewDAGRepository(dag.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{})
+	store, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(registry.NewDAGStore(repo)))
+	require.NoError(t, err)
+	cfg := &config.Config{}
+	cfg.Server.Permissions = map[config.Permission]bool{config.PermissionWriteDAGs: true}
+	a := New(repo, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil,
+		WithTxeRegistry(store), WithAuthService(struct{ AuthService }{}))
+	admin := auth.WithUser(ctx, &auth.User{Username: "admin", Role: auth.RoleAdmin, WorkspaceAccess: auth.AllWorkspaceAccess()})
+	ops := auth.WithUser(ctx, &auth.User{Username: "dev", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
+		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleDeveloper}}}})
+
+	cli := registry.Actor{Kind: registry.ActorCLI, ID: "test"}
+	owner, machine := mustID(t, registry.PrefixOwner), mustID(t, registry.PrefixMachine)
+	_, err = store.CreateOwner(admin, registry.Owner{OwnerID: owner, DisplayName: "o"}, cli)
+	require.NoError(t, err)
+	_, err = store.CreateMachine(admin, registry.Machine{MachineID: machine, OwnerID: owner, DisplayName: "m"}, cli)
+	require.NoError(t, err)
+	project, err := store.EnsureProject(admin, owner, "github.com/x/y", "y", cli)
+	require.NoError(t, err)
+	jobID := mustID(t, registry.PrefixJob)
+	job, err := store.Register(admin, registry.RegisterInput{JobID: jobID, RequestID: "r", OwnerID: owner, ProjectID: project.ProjectID,
+		MachineID: machine, JobKey: "k", Version: registry.JobVersion{Title: "t", Purpose: "p",
+			Package: registry.Package{Digest: "sha256:" + strings.Repeat("0", 64), Path: "/pkg", Entrypoint: "run.sh"},
+			DAG:     registry.DAGRef{Spec: "labels:\n  - workspace=secret\nworker_selector:\n  txe.machine: " + machine + "\nsteps:\n  - name: run\n    run: /pkg/run.sh\n"}}}, cli)
+	require.NoError(t, err)
+
+	refused := &registry.Error{Code: registry.CodeVersionConflict, Message: "job is at version 2, not 1", Current: job}
+	re, ok := a.txeVisibleRefusal(ops, store, refused).(*registry.Error)
+	require.True(t, ok)
+	assert.Equal(t, registry.CodeVersionConflict, re.Code)
+	assert.Nil(t, re.Current, "the moved job's record")
+	assert.NotContains(t, re.Message, "version 2")
+
+	re, ok = a.txeVisibleRefusal(admin, store, refused).(*registry.Error)
+	require.True(t, ok)
+	assert.NotNil(t, re.Current, "a caller who sees the job gets it")
+	assert.Equal(t, refused.Message, re.Message)
+}
+
+func mustID(t *testing.T, p registry.Prefix) string {
+	t.Helper()
+	id, err := registry.NewID(p, time.Now())
+	require.NoError(t, err)
+	return id
 }

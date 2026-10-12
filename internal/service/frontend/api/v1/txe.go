@@ -75,8 +75,8 @@ func txeError(err error) error {
 
 // txePublicCurrent is the record a refusal returns, in its API shape: a
 // registry record can carry fields the API never publishes (a manifest's
-// absolute archive directory, a registration's request hash), so known
-// records are converted and a record that cannot be is left out.
+// absolute archive directory), so known records are converted and a record
+// that cannot be is left out.
 func txePublicCurrent(current any) any {
 	var (
 		out any
@@ -322,9 +322,9 @@ func (a *API) txeTx(ctx context.Context, jobID string, in *api.TxeActor, fn func
 		return fn(tx)
 	})
 	if err != nil {
-		return api.TxeJob{}, txeError(err)
+		return api.TxeJob{}, txeError(a.txeVisibleRefusal(ctx, s, err))
 	}
-	return txeConvert[api.TxeJob](job)
+	return txeConvert[api.TxeJob](a.txePublicJob(ctx, s, job))
 }
 
 func (a *API) GetTxeInstallation(ctx context.Context, _ api.GetTxeInstallationRequestObject) (api.GetTxeInstallationResponseObject, error) {
@@ -450,7 +450,7 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 	jobs := make([]*registry.Job, 0, len(all))
 	for _, job := range all {
 		if a.txeJobVisible(ctx, s, job) == nil {
-			jobs = append(jobs, job)
+			jobs = append(jobs, a.txePublicJob(ctx, s, job))
 		}
 	}
 	out, err := txeConvert[[]api.TxeJob](jobs)
@@ -481,28 +481,71 @@ func (a *API) RegisterTxeJob(ctx context.Context, req api.RegisterTxeJobRequestO
 		MachineID: body.MachineId, JobKey: body.JobKey, Version: v,
 	}, actor)
 	if err != nil {
-		return nil, txeError(a.txeHideDuplicateWinner(ctx, s, err))
+		return nil, txeError(a.txeVisibleRefusal(ctx, s, err))
 	}
-	out, err := txeConvert[api.TxeJob](job)
+	out, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, job))
 	return api.RegisterTxeJob201JSONResponse(out), err
 }
 
-// txeHideDuplicateWinner keeps a duplicate refusal from disclosing a winner
-// the caller cannot see: the refusal then names neither its ID nor its
-// record. A visible winner is returned as before, so its owner can adopt it.
-func (a *API) txeHideDuplicateWinner(ctx context.Context, s *registry.Store, err error) error {
-	re, ok := errors.AsType[*registry.Error](err)
-	if !ok || re.Code != registry.CodeDuplicate {
-		return err
+// txeCanSeeJob reports whether the caller can see job jobID.
+func (a *API) txeCanSeeJob(ctx context.Context, s *registry.Store, jobID string) bool {
+	_, err := a.txeVisibleJob(ctx, s, jobID)
+	return err == nil
+}
+
+// txePublicJob is job as the caller may see it: a duplicate names the job
+// holding its key only to a caller who can see that job.
+func (a *API) txePublicJob(ctx context.Context, s *registry.Store, job *registry.Job) *registry.Job {
+	if job == nil || job.Registration.DuplicateOf == "" || a.txeCanSeeJob(ctx, s, job.Registration.DuplicateOf) {
+		return job
 	}
-	winner, ok := re.Current.(*registry.Job)
+	out := *job
+	out.Registration.DuplicateOf = ""
+	return &out
+}
+
+// txePublicEvents names a duplicate's winner in its history only to a
+// caller who can see the winner.
+func (a *API) txePublicEvents(ctx context.Context, s *registry.Store, events []*registry.Event) []*registry.Event {
+	out := make([]*registry.Event, len(events))
+	for i, e := range events {
+		out[i] = e
+		if e != nil && e.Kind == registry.EventDuplicate && e.To != "" && !a.txeCanSeeJob(ctx, s, e.To) {
+			hidden := *e
+			hidden.To = ""
+			out[i] = &hidden
+		}
+	}
+	return out
+}
+
+// txeVisibleRefusal keeps a refusal from disclosing a job the caller cannot
+// see: a record read after the caller was authorized (a job moved meanwhile,
+// a duplicate's winner) is returned, and named, only if it is visible now.
+func (a *API) txeVisibleRefusal(ctx context.Context, s *registry.Store, err error) error {
+	re, ok := errors.AsType[*registry.Error](err)
 	if !ok {
 		return err
 	}
-	if visErr := a.txeJobVisible(ctx, s, winner); visErr == nil {
-		return err
+	switch c := re.Current.(type) {
+	case *registry.Job:
+		if a.txeJobVisible(ctx, s, c) != nil {
+			return &registry.Error{Code: re.Code, Message: txeHiddenRefusal(re.Code)}
+		}
+		return &registry.Error{Code: re.Code, Message: re.Message, Current: a.txePublicJob(ctx, s, c)}
+	case registry.DuplicateWinner:
+		if !a.txeCanSeeJob(ctx, s, c.JobID) {
+			return &registry.Error{Code: re.Code, Message: txeHiddenRefusal(re.Code)}
+		}
 	}
-	return &registry.Error{Code: registry.CodeDuplicate, Message: "job key already registered"}
+	return err
+}
+
+func txeHiddenRefusal(code registry.Code) string {
+	if code == registry.CodeDuplicate {
+		return "job key already registered"
+	}
+	return "refused against the job's current state"
 }
 
 func (a *API) GetTxeJob(ctx context.Context, req api.GetTxeJobRequestObject) (api.GetTxeJobResponseObject, error) {
@@ -514,7 +557,7 @@ func (a *API) GetTxeJob(ctx context.Context, req api.GetTxeJobRequestObject) (ap
 	if err != nil {
 		return nil, err
 	}
-	out, err := txeConvert[api.TxeJob](job)
+	out, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, job))
 	return api.GetTxeJob200JSONResponse(out), err
 }
 
@@ -558,7 +601,7 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 			break
 		}
 		if pinned || registry.ErrorCode(err) != registry.CodeVersionConflict || attempt == 4 {
-			return nil, txeError(err)
+			return nil, txeError(a.txeVisibleRefusal(ctx, s, err))
 		}
 	}
 	out, err := txeConvert[api.TxeReceipt](receipt)
@@ -599,9 +642,9 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	}
 	job, err := s.UpdateVersion(ctx, req.JobId, body.RequestId, body.ExpectedVersion, v, actor)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, txeError(a.txeVisibleRefusal(ctx, s, err))
 	}
-	out, err := txeConvert[api.TxeJob](job)
+	out, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, job))
 	return api.UpdateTxeJobVersion200JSONResponse(out), err
 }
 
@@ -646,9 +689,9 @@ func (a *API) TransitionTxeJob(ctx context.Context, req api.TransitionTxeJobRequ
 	t.Authorize = func(tx *registry.JobTx) error { return a.txeRequireJobWrite(ctx, tx) }
 	committed, err := s.ChangeLifecycle(ctx, req.JobId, t, actor)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, txeError(a.txeVisibleRefusal(ctx, s, err))
 	}
-	job, err := txeConvert[api.TxeJob](committed)
+	job, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, committed))
 	return api.TransitionTxeJob200JSONResponse(job), err
 }
 
@@ -664,7 +707,7 @@ func (a *API) ListTxeJobEvents(ctx context.Context, req api.ListTxeJobEventsRequ
 	}); err != nil {
 		return nil, err
 	}
-	out, err := txeConvert[[]api.TxeEvent](events)
+	out, err := txeConvert[[]api.TxeEvent](a.txePublicEvents(ctx, s, events))
 	if out == nil {
 		out = []api.TxeEvent{}
 	}

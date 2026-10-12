@@ -521,7 +521,7 @@ func (s *Store) MarkReady(ctx context.Context, jobID string, expectedRevision in
 			return err
 		}
 		if winner.JobID != jobID {
-			return refuse(CodeDuplicate, "job key is registered as %s", winner.JobID)
+			return &Error{Code: CodeDuplicate, Message: "job key is registered as " + winner.JobID, Current: DuplicateWinner(winner)}
 		}
 		specSHA, err := s.publishDAG(ctx, job)
 		if err != nil {
