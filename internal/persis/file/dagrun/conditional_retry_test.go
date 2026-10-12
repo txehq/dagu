@@ -109,3 +109,46 @@ func TestConditionalAttemptIsVisibleAtCreation(t *testing.T) {
 	assert.Empty(t, got.FinishedAt)
 	assert.Empty(t, got.Error, "the retried execution's error is not the claim's")
 }
+
+// A conditional retry's claim records the request it was admitted for, and
+// never the retried execution's.
+func TestConditionalClaimRecordsItsOwnRetryRequest(t *testing.T) {
+	ctx := context.Background()
+	repo := testutil.NewFileDAGRunRepository(filepath.Join(t.TempDir(), "runs"), persis.DAGRunRepositoryOptions{})
+	dag := &ir.DAG{Name: "job"}
+	first, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.InitialStatus(dag)
+	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = "run-1", first.ID(), ir.Failed, "q1"
+	status.RetryRequest = &ir.RetryRequest{ID: "earlier", ActionID: "act-0", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, status))
+	require.NoError(t, first.Close(ctx))
+
+	for _, tc := range []struct {
+		name    string
+		request *ir.RetryRequest
+	}{
+		{"with a request", &ir.RetryRequest{ID: "r1", ActionID: "act-1", ActionAttempt: "1", BindingDigest: "d", RetryOf: ir.ExecutionRef(first.ID(), "q1")}},
+		{"without", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			latest, err := repo.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, "run-1"))
+			require.NoError(t, err)
+			prev, err := latest.ReadStatus(ctx)
+			require.NoError(t, err)
+			prev.Status = ir.Failed
+			if latest.ID() != first.ID() {
+				require.NoError(t, latest.Open(ctx))
+				require.NoError(t, latest.Write(ctx, *prev))
+				require.NoError(t, latest.Close(ctx))
+			}
+			next, err := repo.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{Retry: true,
+				ExpectLatest: &persis.ExpectedExecution{AttemptID: prev.AttemptID, QueuedAt: prev.QueuedAt, Request: tc.request}})
+			require.NoError(t, err)
+			claimed, err := next.ReadStatus(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.request, claimed.RetryRequest)
+		})
+	}
+}

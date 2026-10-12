@@ -453,6 +453,7 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		Error:                  runError,
 		ProfileName:            toRuntimeProfileName(s.ProfileName),
 		QueuedAt:               ptrOf(s.QueuedAt),
+		RetryRequest:           toRetryRequest(s.RetryRequest),
 		AutoRetryCount:         s.AutoRetryCount,
 		AutoRetryLimit:         autoRetryLimit,
 		Conditions:             toDAGRunConditions(s.Status, s.Conditions),
@@ -1081,4 +1082,13 @@ func runExecutionRef(s ir.DAGRunStatus) *string {
 		return nil
 	}
 	return ptrOf(registry.ExecutionRef(s.AttemptID, s.QueuedAt))
+}
+
+// toRetryRequest is the conditional retry that admitted the execution, when
+// it recorded one.
+func toRetryRequest(r *ir.RetryRequest) *api.RetryRequest {
+	if r == nil {
+		return nil
+	}
+	return &api.RetryRequest{Id: r.ID, ActionId: r.ActionID, ActionAttempt: r.ActionAttempt, BindingDigest: r.BindingDigest, RetryOf: r.RetryOf}
 }

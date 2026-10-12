@@ -239,6 +239,9 @@ type DAGRunStatus struct {
 	Preconditions      []ConditionResult     `json:"preconditions,omitempty"`
 	Labels             []string              `json:"labels,omitempty"`
 	LeaseAt            int64                 `json:"leaseAt,omitempty"` // Unix millis; stamped by coordinator on observed run liveness
+	// RetryRequest is the conditional retry that admitted this execution,
+	// set by the hub on its first status and kept on every later one.
+	RetryRequest *RetryRequest `json:"retryRequest,omitempty"`
 }
 
 // EffectiveClaimKey returns ClaimKey, falling back to AttemptKey when no claim

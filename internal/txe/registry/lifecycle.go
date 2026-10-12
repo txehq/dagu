@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // AdmitCode says why a run of a registered job was refused.
@@ -223,6 +225,24 @@ type RunControl interface {
 	// LatestAttempt returns a root run's latest attempt as Dagu stored it,
 	// or ErrRunNotFound.
 	LatestAttempt(ctx context.Context, dagName, runID string) (RunAttempt, error)
+	// RetryExecution returns the root run's execution whose status records
+	// retry request requestID (ir.RetryRequest), or ErrRunNotFound when no
+	// execution does.
+	RetryExecution(ctx context.Context, dagName, runID, requestID string) (RetryExecution, error)
+}
+
+// RetryExecution is the execution a conditional retry request admitted, as
+// Dagu stored it.
+type RetryExecution struct {
+	// Ref is the execution's ExecutionRef.
+	Ref     string
+	Request ir.RetryRequest
+	// Abandoned is true when it was a preparation the coordinator abandoned:
+	// nothing ran.
+	Abandoned bool
+	// Preparing is true while it is a preparation not known to be settled
+	// (see RunAttempt.Preparing).
+	Preparing bool
 }
 
 // RunAttempt is the latest execution of a run as Dagu stored it. A direct

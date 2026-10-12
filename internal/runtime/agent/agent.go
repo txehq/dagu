@@ -1550,6 +1550,7 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 				ir.WithQueuedAt(source.QueuedAt),
 				ir.WithCreatedAt(source.CreatedAt),
 				ir.WithAgentSessions(source.AgentSessions),
+				ir.WithRetryRequest(a.ownRetryRequest(source)),
 			)
 			if source.ScheduleTime != "" {
 				statusOpts = append(statusOpts, ir.WithScheduleTime(source.ScheduleTime))
@@ -1614,6 +1615,7 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 			ir.WithQueuedAt(source.QueuedAt),
 			ir.WithCreatedAt(source.CreatedAt),
 			ir.WithAgentSessions(source.AgentSessions),
+			ir.WithRetryRequest(a.ownRetryRequest(source)),
 		)
 		if source.ScheduleTime != "" {
 			opts = append(opts, ir.WithScheduleTime(source.ScheduleTime))
@@ -1655,6 +1657,19 @@ func (a *Agent) currentAutoRetryCount() int {
 
 func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 	return a.retryTarget
+}
+
+// ownRetryRequest is the retry request this execution's statuses keep: the
+// source status's only when it is the queued status that admitted this very
+// execution, the same attempt run again under its queue marker. A direct
+// retry's source is the earlier, finished execution, and a local queued
+// retry that runs under a new attempt is a different execution than the one
+// the request admitted; neither keeps it.
+func (a *Agent) ownRetryRequest(source *ir.DAGRunStatus) *ir.RetryRequest {
+	if source == nil || source.Status != ir.Queued || source.AttemptID == "" || source.AttemptID != a.dagRunAttemptID {
+		return nil
+	}
+	return source.RetryRequest
 }
 
 // contextQueuedAt is the queue marker of this execution: the queuedAt every

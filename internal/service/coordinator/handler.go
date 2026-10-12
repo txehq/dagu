@@ -507,6 +507,10 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 	if req.Task == nil {
 		return nil, status.Error(codes.InvalidArgument, "task is required")
 	}
+	// Refused on every dispatch path, with or without run storage.
+	if err := refuseStrayRetryRequest(req.Task); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	admissionToken := strings.TrimSpace(req.AdmissionReservationToken)
 
 	// Validate task.Definition is provided - required for distributed execution
@@ -1093,6 +1097,7 @@ func (h *Handler) writeInitialStatus(ctx context.Context, attempt dagrun.Attempt
 		AttemptKey:   task.AttemptKey,
 		Status:       ir.NotStarted,
 		QueuedAt:     admittedQueuedAt(task),
+		RetryRequest: initialRetryRequest(task),
 		StartedAt:    time.Now().UTC().Format(time.RFC3339),
 		Root:         root,
 		Labels:       labels,
@@ -1131,6 +1136,12 @@ func splitTaskLabels(raw string) []string {
 func (h *Handler) prepareAttemptForDispatch(ctx context.Context, task *coordinatorv1.Task) (*preparedDispatchAttempt, error) {
 	if task == nil {
 		return nil, fmt.Errorf("task is required")
+	}
+	// A task naming a retry request is admitted only as a root conditional
+	// retry with a valid request, before any attempt exists; it is never
+	// admitted with the request silently dropped.
+	if err := refuseStrayRetryRequest(task); err != nil {
+		return nil, err
 	}
 	if h.dagRunRepository == nil {
 		h.ensureTaskAttemptMetadata(task)
@@ -1233,6 +1244,9 @@ func prepareAttemptErrorCode(err error) codes.Code {
 	}
 	if errors.Is(err, persis.ErrLatestExecutionChanged) {
 		return codes.Aborted
+	}
+	if errors.Is(err, ir.ErrInvalidRetryRequest) {
+		return codes.InvalidArgument
 	}
 	return codes.Internal
 }
@@ -2092,6 +2106,9 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	if h.dagRunLeaseStore == nil {
 		dagRunStatus.LeaseAt = time.Now().UnixMilli()
 	}
+	// A report never sets the retry request; the stored execution's is kept
+	// below.
+	dagRunStatus.RetryRequest = nil
 
 	// Acquire per-run mutex to serialize with markRunFailed
 	held := h.runLocks.lock(dagRunStatus.DAGRunID)
@@ -2143,19 +2160,21 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 		}
 		return nil, status.Error(codes.Internal, "failed to resolve latest attempt: "+err.Error())
 	}
+	dagRunStatus.RetryRequest = keptRetryRequest(latestStatus, dagRunStatus)
 
 	ownership := h.attemptOwnership()
 	if leaseMissing && latestStatus.Status != ir.NotStarted && !isTerminalRunStatus(latestStatus.Status) {
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedLeaseInactive)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedLeaseInactive}, nil
 	}
-	// A terminal attempt's lease is gone, so there is no marker to check. The
-	// stored status was written by the execution that finished, and every
-	// execution's status echoes its own queued-at, which a queued retry always
-	// advances. A terminal report with a different queued-at is therefore an
-	// earlier execution's and must not overwrite the result. A replay from the
-	// finished execution matches and is still accepted.
-	if leaseMissing && isTerminalRunStatus(latestStatus.Status) && !isSubDAGStatus(dagRunStatus) &&
+	// Every execution's status echoes its own queued-at (the coordinator's
+	// initial status uses the worker's rule), and a queued retry always
+	// advances it. A report for the same attempt with a different queued-at
+	// therefore belongs to another execution and must not overwrite the
+	// stored identity, or the retry request it records; this holds with or
+	// without a lease, whatever the stored status. A replay from the
+	// execution that finished matches and is still accepted.
+	if !isSubDAGStatus(dagRunStatus) &&
 		dagRunStatus.AttemptID == latestStatus.AttemptID && dagRunStatus.QueuedAt != latestStatus.QueuedAt {
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil

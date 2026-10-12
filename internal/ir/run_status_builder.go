@@ -45,6 +45,13 @@ func WithQueuedAt(formattedTime string) StatusOption {
 	}
 }
 
+// WithRetryRequest sets the retry request the execution records.
+func WithRetryRequest(request *RetryRequest) StatusOption {
+	return func(status *DAGRunStatus) {
+		status.RetryRequest = request.Clone()
+	}
+}
+
 // WithCreatedAt sets the creation time, defaulting to the current time when zero.
 func WithCreatedAt(createdAt int64) StatusOption {
 	return func(status *DAGRunStatus) {

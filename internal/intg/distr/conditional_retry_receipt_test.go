@@ -17,6 +17,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
 )
 
@@ -91,14 +92,14 @@ func (r *receiptFixture) startDirect(t *testing.T) {
 	require.NoError(t, r.f.coord.GetCoordinatorClient(t).Dispatch(r.f.coord.Context, dispatch.DispatchRequest{Task: task}))
 }
 
-// retry dispatches a conditional direct retry of previous and returns the
-// execution the coordinator admitted.
+// retry dispatches a conditional direct retry of previous, made for action
+// attempt "1" of act-1, and returns the execution the coordinator admitted.
 func (r *receiptFixture) retry(t *testing.T, previous ir.DAGRunStatus) (*dispatch.AdmittedExecution, error) {
 	t.Helper()
 	dag := r.f.dagWrapper.DAG
 	task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, previous.DAGRunID,
 		executor.WithWorkerSelector(dag.WorkerSelector), executor.WithPreviousStatus(&previous),
-		executor.WithRequireLatestIsPrevious(true))
+		executor.WithRequireLatestIsPrevious(true), executor.WithRetryRequest("act-1", "1", "sha256:binding"))
 	admitted := &dispatch.AdmittedExecution{}
 	err := r.f.coord.GetCoordinatorClient(t).Dispatch(r.f.coord.Context, dispatch.DispatchRequest{Task: task, Admitted: admitted})
 	return admitted, err
@@ -112,6 +113,15 @@ func (r *receiptFixture) seen(t *testing.T, n int) (string, string) {
 	parts := strings.Split(string(data), "|")
 	require.Len(t, parts, 2, "record %q", data)
 	return parts[0], parts[1]
+}
+
+// wantRetryRequest is the correlation the hub derives for retry's request of
+// previous.
+func wantRetryRequest(t *testing.T, previous ir.DAGRunStatus) *ir.RetryRequest {
+	t.Helper()
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef(previous.Name, previous.DAGRunID), previous.AttemptID, previous.QueuedAt, "act-1", "1", "sha256:binding")
+	require.NoError(t, err)
+	return want
 }
 
 func assertSavedIsReceipt(t *testing.T, admitted *dispatch.AdmittedExecution, saved ir.DAGRunStatus, when string) {
@@ -137,17 +147,21 @@ func receiptThroughExecution(t *testing.T, r *receiptFixture, previous ir.DAGRun
 	saved, err := r.f.latestStatus()
 	require.NoError(t, err)
 	assertSavedIsReceipt(t, admitted, saved, "right after admission")
+	want := wantRetryRequest(t, previous)
+	assert.Equal(t, want, saved.RetryRequest, "the admitted execution records its request")
 
 	running := r.waitStatus(t, "running under the admitted attempt", func(s ir.DAGRunStatus) bool {
 		return s.AttemptID == admitted.AttemptID && s.Status == ir.Running
 	})
 	assertSavedIsReceipt(t, admitted, running, "while running")
+	assert.Equal(t, want, running.RetryRequest, "the worker's running reports keep it")
 
 	r.remove(t, "hold")
 	done := r.waitStatus(t, "succeeded", func(s ir.DAGRunStatus) bool {
 		return s.AttemptID == admitted.AttemptID && s.Status == ir.Succeeded
 	})
 	assertSavedIsReceipt(t, admitted, done, "at the terminal status")
+	assert.Equal(t, want, done.RetryRequest, "the worker's terminal report keeps it")
 	attempt, marker := r.seen(t, 2)
 	assert.Equal(t, admitted.AttemptID, attempt, "the step ran under the admitted attempt")
 	assert.Equal(t, admitted.QueuedAt, marker, "the step saw the admitted execution's marker")
@@ -216,7 +230,39 @@ func TestConditionalRetryReceiptWhenTheWorkerCannotLoad(t *testing.T) {
 		return s.AttemptID == admitted.AttemptID && s.Status == ir.Failed
 	})
 	assertSavedIsReceipt(t, admitted, failed, "at the load-failure status")
+	assert.Equal(t, wantRetryRequest(t, first), failed.RetryRequest, "the load-failure report keeps it")
 	_, err = os.Stat(filepath.Join(r.dir, "seen.2"))
 	assert.True(t, os.IsNotExist(err), "the retry's step ran; the worker loaded the DAG and the test proves nothing")
 	t.Logf("load-failure status error: %q", failed.Error)
+}
+
+// A queued conditional retry records its request when it is queued, and the
+// worker that runs the queued execution keeps it on every report, while the
+// retried execution keeps its own (none).
+func TestQueuedRetryKeepsItsRetryRequest(t *testing.T) {
+	r := newReceiptFixture(t)
+	require.NoError(t, r.f.enqueue())
+	r.f.waitForQueued()
+	r.f.startScheduler(120 * time.Second)
+
+	first := r.waitStatus(t, "failed", func(s ir.DAGRunStatus) bool { return s.Status == ir.Failed })
+	require.Nil(t, first.RetryRequest)
+	r.f.waitForRunReleasedFromWorkers(first.DAGRunID, distrTestTimeout(30*time.Second))
+	want := wantRetryRequest(t, first)
+	r.touch(t, "hold")
+	r.touch(t, "succeed")
+	added, err := queue.EnqueueRetry(r.f.coord.Context, r.f.coord.DAGRunRepository, r.f.coord.QueueStore, r.f.dagWrapper.DAG, &first,
+		queue.EnqueueRetryOptions{RetryRequest: want})
+	require.NoError(t, err)
+	require.True(t, added)
+
+	running := r.waitStatus(t, "running again", func(s ir.DAGRunStatus) bool {
+		return s.Status == ir.Running && s.QueuedAt != first.QueuedAt
+	})
+	assert.Equal(t, want, running.RetryRequest, "running reports keep it")
+	r.remove(t, "hold")
+	done := r.waitStatus(t, "succeeded", func(s ir.DAGRunStatus) bool {
+		return s.Status == ir.Succeeded && s.QueuedAt == running.QueuedAt
+	})
+	assert.Equal(t, want, done.RetryRequest, "the terminal report keeps it")
 }

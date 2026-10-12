@@ -185,6 +185,18 @@ message Task {
   // and has finished; otherwise the dispatch fails with ABORTED and nothing
   // is created.
   bool require_latest_is_previous = 43;
+  // On a conditional retry, the action attempt it was made for. The
+  // coordinator records on the admitted execution the correlation it derives
+  // from this, the run and previous_status's execution; workers ignore it.
+  RetryRequestProto retry_request = 44;
+}
+
+// RetryRequestProto names the action attempt a conditional retry was made
+// for.
+message RetryRequestProto {
+  string action_id = 1;
+  string action_attempt = 2;
+  string binding_digest = 3;
 }
 
 enum Operation {
