@@ -63,7 +63,7 @@ review_policy:
 - Write every number in a `param_schema` in plain decimal, as JSON does: `10`, `-3`, `0.5`. The spec is refused when it is read if what would be sent is not what is written. That covers a number that would be sent as a different one (`0.49999999999999999` would be sent as `0.5`; keep to 15 significant digits), a spelling YAML reads its own way (`012`, `0x10`, `1_000`, `+5`, `.5`), a YAML tag (`!!float`), and an unquoted value such as `1e3` that would be sent as text. Put a value in quotes when text is meant.
 - Reading the spec only makes sure the registry is sent the number you wrote. Whether that number can be a bound is the registry's rule, above: `0.1` is sent as `0.1`, and a registry that compares binary fractions then refuses the registration.
 - Write every key in a `param_schema` as text. A key such as `1`, `1.0` or `true` is refused, because it would be sent as text that may not match what is written: put it in quotes (`"1"`). A key written with `?` is refused too.
-- One action may reuse another's whole schema by reference (`param_schema: *name`). A reference inside a schema to something written outside it is refused.
+- A spec that gives any action a `param_schema` must be written out in full: no anchors (`&name`), references (`*name`) or merge keys (`<<`) anywhere in the file. A reference can be read as something other than what is written above it, so the spec is refused and the line that uses one is named. A spec with no `param_schema` may use them as before.
 
 ## Write the script for an unattended worker
 

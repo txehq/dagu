@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -99,8 +101,14 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 	if err := yaml.UnmarshalWithOptions(data, &spec, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
 	}
-	if err := markEmptyParamSchemas(data, &spec); err != nil {
+	declared, err := markEmptyParamSchemas(data, &spec)
+	if err != nil {
 		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+	}
+	if declared {
+		if err := writtenOutInFull(data); err != nil {
+			return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+		}
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -117,19 +125,75 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 // param_schema key with no value. The YAML decoder leaves such a field as if
 // the key were absent, which would register the action with no bounds on its
 // parameters; marked, Validate refuses it by name.
-func markEmptyParamSchemas(data []byte, spec *JobSpec) error {
+//
+// It reports whether any action declares a param_schema at all, in this
+// reading of the file or in the one already made.
+func markEmptyParamSchemas(data []byte, spec *JobSpec) (bool, error) {
 	var raw struct {
 		ReviewPolicy struct {
 			PermittedActions []map[string]any `yaml:"permitted_actions"`
 		} `yaml:"review_policy"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return err
+		return false, err
 	}
+	declared := false
 	for i, action := range raw.ReviewPolicy.PermittedActions {
-		if value, declared := action["param_schema"]; declared && value == nil && i < len(spec.ReviewPolicy.PermittedActions) {
+		value, written := action["param_schema"]
+		declared = declared || written
+		if written && value == nil && i < len(spec.ReviewPolicy.PermittedActions) {
 			spec.ReviewPolicy.PermittedActions[i].ParamSchema = ParamSchema("null")
 		}
+	}
+	for _, action := range spec.ReviewPolicy.PermittedActions {
+		declared = declared || len(action.ParamSchema) > 0
+	}
+	return declared, nil
+}
+
+// writtenOutInFull refuses a job spec that uses an anchor, a reference or a
+// merge key anywhere. It is asked of a spec that bounds an action's
+// parameters: the decoder resolves a reference before a param_schema is
+// read, and can resolve it to something other than what is written above
+// it (a later anchor of the same name, or nothing), so a bound could be
+// replaced where no check can see it.
+func writtenOutInFull(data []byte) error {
+	file, err := parser.ParseBytes(data, 0)
+	if err != nil {
+		return err
+	}
+	var found references
+	for _, doc := range file.Docs {
+		ast.Walk(&found, doc)
+	}
+	if found.what == "" {
+		return nil
+	}
+	return fmt.Errorf("line %d uses %s. A job spec that gives an action a param_schema must be written out in full, with no anchors (&name), references (*name) or merge keys (<<): a reference can be read as something other than what is written above it", found.line, found.what)
+}
+
+// references finds the first anchor, reference or merge key in a document.
+type references struct {
+	what string
+	line int
+}
+
+func (r *references) Visit(node ast.Node) ast.Visitor {
+	if r.what != "" {
+		return nil
+	}
+	switch node.(type) {
+	case *ast.AnchorNode:
+		r.what = "an anchor (&name)"
+	case *ast.AliasNode:
+		r.what = "a reference (*name)"
+	case *ast.MergeKeyNode:
+		r.what = "a merge key (<<)"
+	default:
+		return r
+	}
+	if tok := node.GetToken(); tok != nil && tok.Position != nil {
+		r.line = tok.Position.Line
 	}
 	return nil
 }

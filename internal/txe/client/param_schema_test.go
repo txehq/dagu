@@ -249,9 +249,9 @@ func TestParamSchemaRefusesMergeKeys(t *testing.T) {
 	_, err := LoadJobSpec(specWithActions(t, action+"          reason:\n            maxLength: 10\n            <<: {type: string, maxLength: 200}\n"))
 	require.ErrorContains(t, err, "merge key")
 
-	spec, err := LoadJobSpec(specWithActions(t, action+"          \"<<\": &text {type: string, maxLength: 10}\n          reason: *text\n"))
+	spec, err := LoadJobSpec(specWithActions(t, action+"          \"<<\": {type: string, maxLength: 10}\n"))
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"type":"object","properties":{"<<":{"type":"string","maxLength":10},"reason":{"type":"string","maxLength":10}}}`,
+	assert.JSONEq(t, `{"type":"object","properties":{"<<":{"type":"string","maxLength":10}}}`,
 		string(spec.ReviewPolicy.PermittedActions[0].ParamSchema))
 }
 
@@ -292,7 +292,6 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		"maximum: 4503599627370496.2":      "would be sent as 4503599627370496, " + changed,
 		"maximum: 9007199254740993.0":      "would be sent as 9007199254740992, " + changed,
 		"enum: [0.49999999999999999, 1]":   changed,
-		"a: &n 0.49999999999999999\nb: *n": changed,
 		`{"maximum": 0.49999999999999999}`: changed,
 		// Exactly a float64, and still not what would be sent: 2^-30.
 		"maximum: 0.000000000931322574615478515625": "would be sent as 9.313225746154785e-10, " + changed,
@@ -319,6 +318,8 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		"maximum: 1.0e+401":               text, // too large to be read as a number at all
 		"maxLength: 18446744073709551616": text,
 		"enum: [0x10000000000000000]":     text,
+		"enum: [1.0e4_01]":                text, // the parser drops the "_" and then cannot hold it
+		"enum: [1.0_0e401]":               text,
 		"enum: [1e3]":                     text,
 		"1e3: {type: string}":             text,
 		"maximum: .inf":                   notOne,
@@ -336,6 +337,11 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		"? a\n: {type: string}":                                                                        "writes a key with",
 
 		"{1: {type: string}}": key,
+		// A reference can be read as nothing, or as something else.
+		"const: &obj\n  a: &x 1\n  b: *x": "uses an anchor or a reference", // b was sent as null
+		"const: &x [*x]":                  "uses an anchor or a reference", // sent as [null]
+		"a: &n 0.5\nb: *n":                "uses an anchor or a reference",
+		"description: &1e3 hello":         "uses an anchor or a reference",
 	} {
 		t.Run(src, func(t *testing.T) {
 			var schema ParamSchema
@@ -344,27 +350,17 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		})
 	}
 
-	// A schema may be another action's, by reference: it is read from where
-	// it is written. A part of it may not be, because that part is not in
-	// what is being read.
-	const actions = "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema: &bound {type: object, properties: {reason: &text {type: string, maxLength: 10}}}\n" +
-		"    - name: close-ticket\n      timeout_sec: 60\n      param_schema: "
-	spec, err := LoadJobSpec(specWithActions(t, actions+"*bound\n"))
-	require.NoError(t, err)
-	assert.Equal(t, `{"properties":{"reason":{"maxLength":10,"type":"string"}},"type":"object"}`, string(spec.ReviewPolicy.PermittedActions[1].ParamSchema))
-	_, err = LoadJobSpec(specWithActions(t, actions+"{type: object, properties: {reason: *text}}\n"))
-	require.ErrorContains(t, err, "refers to *text, which is written outside it")
-
 	// A spec file is refused as a whole, and the number is named.
-	_, err = LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
+	_, err := LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
 		"        type: object\n        properties:\n          share:\n            type: number\n            maximum: 0.49999999999999999\n"))
 	require.ErrorContains(t, err, "the number 0.49999999999999999 would be sent as 0.5")
 }
 
-// What is written plainly is sent as written, byte for byte in the case of a
-// number: these are compared as text, because comparing them as numbers
-// would round them the way the fault did. Whether a registry can check a
-// number is the registry's rule, not this one: 0.1 is sent as 0.1.
+// What is written plainly is sent with the value it was written with. A
+// number may be respelled (0.50 is sent as 0.5), never changed. What is sent
+// is compared here as text, because comparing it as a number would round it
+// the way the fault did. Whether a registry can check a number is the
+// registry's rule, not this one: 0.1 is sent as 0.1.
 func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 	for src, want := range map[string]string{
 		"maximum: 0.5":                  `{"maximum":0.5}`,
@@ -380,7 +376,6 @@ func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 		"maxLength: 10":                 `{"maxLength":10}`,
 		"maxLength: 9007199254740993":   `{"maxLength":9007199254740993}`, // sent as written; the registry refuses it as beyond 2^53
 		"enum: [0.25, 1, -2]":           `{"enum":[0.25,1,-2]}`,
-		"a: &n 0.5\nb: *n":              `{"a":0.5,"b":0.5}`,
 		`{"maximum": 0.5, "x": [1, 2]}`: `{"maximum":0.5,"x":[1,2]}`,
 		// Text written as text stays the text it was.
 		`enum: ["1", "0.5", "012", "1e3", "true", "null", "0x10"]`: `{"enum":["1","0.5","012","1e3","true","null","0x10"]}`,
@@ -392,7 +387,7 @@ func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 		"pattern: |-\n  012":                                       `{"pattern":"012"}`,
 		"pattern: >-\n  1e3":                                       `{"pattern":"1e3"}`,
 		"const: |\n  012\n":                                        `{"const":"012\n"}`,
-		"description: &1e3 hello\nconst: *1e3":                     `{"const":"hello","description":"hello"}`,
+		"const: _1":                                                `{"const":"_1"}`,
 		"const: true":                                              `{"const":true}`,
 		"default: null":                                            `{"default":null}`,
 		// A key written as text is the key sent.
@@ -404,6 +399,51 @@ func TestParamSchemaSendsNumbersAndTextAsWritten(t *testing.T) {
 			assert.Equal(t, want, string(schema))
 		})
 	}
+}
+
+// A reference is resolved before a param_schema is read, where no check can
+// see it, and the decoder can resolve it to something other than what is
+// written above it. So a spec that bounds an action's parameters uses none,
+// anywhere. A spec that bounds nothing reads as it always did.
+func TestParamSchemaSpecIsWrittenOutInFull(t *testing.T) {
+	const full = "must be written out in full"
+	for name, tc := range map[string]struct{ actions, want string }{
+		"a whole schema by reference": {
+			"    - name: first\n      timeout_sec: 60\n      param_schema: &bound {type: object, maxProperties: 0}\n" +
+				"    - name: second\n      timeout_sec: 60\n      param_schema: *bound\n", full},
+		// The second action was given the third's schema, which bounds nothing.
+		"a reference read as a later anchor of the same name": {
+			"    - name: first\n      timeout_sec: 60\n      param_schema:\n        type: object\n        $defs:\n          bound: &bound {type: object, maxProperties: 0}\n" +
+				"    - name: second\n      timeout_sec: 60\n      param_schema: *bound\n" +
+				"    - name: third\n      timeout_sec: 60\n      param_schema:\n        type: object\n        $defs:\n          bound: &bound {type: object}\n", "uses an anchor or a reference"},
+		"a reference somewhere else in the file": {
+			"    - name: first\n      timeout_sec: 60\n      command: &run ./first.sh\n" +
+				"    - name: second\n      timeout_sec: 60\n      command: *run\n      param_schema: {type: object}\n", full},
+		"a schema merged in": {
+			"    - name: first\n      timeout_sec: 60\n      <<: &shared {param_schema: {type: object}}\n" +
+				"    - name: second\n      timeout_sec: 60\n      <<: *shared\n", full},
+		"a text value standing in for a schema": {
+			"    - name: first\n      timeout_sec: 60\n      command: &text '{\"type\":\"object\"}'\n" +
+				"    - name: second\n      timeout_sec: 60\n      param_schema: *text\n", full},
+		"an empty schema by reference": {
+			"    - name: first\n      timeout_sec: 60\n      command: &none ''\n" +
+				"    - name: second\n      timeout_sec: 60\n      param_schema: *none\n", full},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadJobSpec(specWithActions(t, tc.actions))
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+
+	_, err := LoadJobSpec(specWithActions(t, "    - name: first\n      timeout_sec: 60\n      command: &run ./first.sh\n"+
+		"    - name: second\n      timeout_sec: 60\n      command: *run\n      param_schema: {type: object}\n"))
+	require.ErrorContains(t, err, "uses an anchor (&name). A job spec that gives an action a param_schema")
+	require.Regexp(t, `line \d+ uses`, err.Error())
+
+	spec, err := LoadJobSpec(specWithActions(t, "    - name: first\n      timeout_sec: 60\n      command: &run ./first.sh\n"+
+		"    - name: second\n      timeout_sec: 60\n      command: *run\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "./first.sh", spec.ReviewPolicy.PermittedActions[1].Command)
 }
 
 // A schema the registry answers is kept as it was answered, and a version

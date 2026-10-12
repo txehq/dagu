@@ -212,16 +212,20 @@ func (p *ParamSchema) UnmarshalJSON(data []byte) error {
 //   - unquoted text that looks like a number, such as 1e3, which would be
 //     sent as text;
 //   - a key that is not text, such as 1.0, which would be sent as "1";
-//   - a reference (*name) to something written outside the schema.
+//   - an anchor or a reference (&name, *name): the decoder can read a
+//     reference as nothing at all, or as something other than what is
+//     written above it.
 //
 // The schema is read from the parsed document itself, not from text rendered
-// back out of it: that rendering is another place a schema could change.
+// back out of it: that rendering is another place a schema could change. A
+// reference that stands for the whole schema is resolved before this is
+// called and cannot be seen here; LoadJobSpec refuses it.
 //
 // This is only about sending what was written. Which numbers a registry can
 // check is the registry's rule: 0.1 is sent as 0.1, and a registry that
 // compares binary fractions refuses it in its own words.
 func (p *ParamSchema) UnmarshalYAML(node ast.Node) error {
-	check := schemaYAML{anchors: map[string]bool{}}
+	var check schemaYAML
 	ast.Walk(&check, node)
 	if check.err != nil {
 		return check.err
@@ -240,10 +244,7 @@ func (p *ParamSchema) UnmarshalYAML(node ast.Node) error {
 
 // schemaYAML walks a param_schema as it was written and keeps the first
 // thing in it that would not reach the registry as written.
-type schemaYAML struct {
-	err     error
-	anchors map[string]bool // the names the schema itself gives to its parts
-}
+type schemaYAML struct{ err error }
 
 func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
 	if s.err != nil {
@@ -252,16 +253,8 @@ func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
 	switch n := node.(type) {
 	case *ast.LiteralNode:
 		return nil // a block scalar is text, whatever it looks like
-	case *ast.AliasNode:
-		// What a name inside the schema stands for is checked where it is
-		// written. Anything else is not part of what is being read.
-		if name := tokenText(n.Value); !s.anchors[name] {
-			s.err = fmt.Errorf("param_schema refers to *%s, which is written outside it; write the schema out in full", clip(name))
-		}
-		return nil
-	case *ast.AnchorNode:
-		s.anchors[tokenText(n.Name)] = true
-		ast.Walk(s, n.Value) // the name is not part of the schema
+	case *ast.AnchorNode, *ast.AliasNode:
+		s.err = errors.New("param_schema uses an anchor or a reference (&name, *name), which can be read as something other than what is written; write the schema out in full")
 		return nil
 	case *ast.MergeKeyNode:
 		s.err = errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
@@ -284,7 +277,7 @@ func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
 	case *ast.InfinityNode, *ast.NanNode:
 		s.err = fmt.Errorf("param_schema: %s is not a number JSON can hold", tokenText(n))
 	case *ast.StringNode:
-		if tok := n.GetToken(); tok != nil && tok.Type == token.StringType && numberLike.MatchString(tok.Value) {
+		if tok := n.GetToken(); tok != nil && tok.Type == token.StringType && numberLike(tok.Value) {
 			s.err = fmt.Errorf("param_schema: %s looks like a number but would be sent as text. For a number, write it in plain decimal (1000, not 1e3); for text, put it in quotes", clip(tok.Value))
 		}
 	}
@@ -309,13 +302,20 @@ const (
 var (
 	// jsonNumber is a number as JSON spells it.
 	jsonNumber = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$`)
-	// numberLike is text a reader would take for a number, whatever the
-	// YAML parser made of it.
-	numberLike = regexp.MustCompile(`^[-+]?(` +
-		`(\.[0-9]+|[0-9][0-9_]*(\.[0-9]*)?)([eE][-+]?[0-9]+)?` +
-		`|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+` +
+	// numberSpelling is a number in any of the spellings YAML has for one,
+	// once its digit separators are taken out.
+	numberSpelling = regexp.MustCompile(`^[-+]?(` +
+		`(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?` +
+		`|0[xX][0-9a-fA-F.]+([pP][-+]?[0-9]+)?|0[oO][0-7]+|0[bB][01]+` +
 		`|\.(inf|Inf|INF|nan|NaN|NAN))$`)
 )
+
+// numberLike reports whether text is something a reader would take for a
+// number, whatever the YAML parser made of it. The parser drops "_" from a
+// number before it reads it, and leaves as text a number it cannot hold.
+func numberLike(text string) bool {
+	return !strings.HasPrefix(text, "_") && numberSpelling.MatchString(strings.ReplaceAll(text, "_", ""))
+}
 
 // sentAsWritten refuses a number that would not reach the registry as its
 // author wrote it. The decoder holds a number as an integer or a float64 and
