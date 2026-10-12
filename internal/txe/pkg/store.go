@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gofrs/flock"
+
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
@@ -240,14 +242,16 @@ func (s *Store) dropStaged(staged *Staged) error {
 	if filepath.Dir(staged.Dir) != area || !namePattern.MatchString(name) {
 		return fmt.Errorf("%s is not in the staging area %s", staged.Dir, area)
 	}
-	info, err := os.Lstat(staged.Dir)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return err
-	case !info.IsDir():
-		return fmt.Errorf("%s is not a directory", staged.Dir)
-	default:
+	return s.removing(func() error {
+		info, err := os.Lstat(staged.Dir)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return s.finishRemoval(name)
+		case err != nil:
+			return err
+		case !info.IsDir():
+			return fmt.Errorf("%s is not a directory", staged.Dir)
+		}
 		_, digest, err := verifyDir(staged.Dir, false)
 		if err != nil {
 			return err
@@ -255,44 +259,63 @@ func (s *Store) dropStaged(staged *Staged) error {
 		if digest != staged.Digest {
 			return fmt.Errorf("%w: %s holds a manifest with digest %s", ErrPackageCorrupt, staged.Dir, digest)
 		}
-		// The checked copy is marked in one step, after which it is no longer
-		// a staged package. What an earlier removal of this request's copy
-		// left under the mark goes first.
-		marked := staged.Dir + RemovingSuffix
-		if err := os.RemoveAll(marked); err != nil {
+		// What an earlier removal of this request's copy left under the mark
+		// goes first. Then the checked copy is marked in one step, after
+		// which it is no longer a staged package.
+		if err := s.finishRemoval(name); err != nil {
 			return err
 		}
-		if err := os.Rename(staged.Dir, marked); err != nil {
+		if err := os.Rename(staged.Dir, staged.Dir+RemovingSuffix); err != nil {
 			return err
 		}
+		return s.finishRemoval(name)
+	})
+}
+
+// FinishRemoval removes what is left of a staged copy that Commit checked and
+// marked for removal. A request resumed after the removal stopped part-way
+// calls it; with nothing marked it removes nothing.
+func (s *Store) FinishRemoval(requestID string) error {
+	if !namePattern.MatchString(requestID) {
+		return fmt.Errorf("invalid request id %q", requestID)
 	}
-	return s.FinishRemoval(name)
+	if _, err := os.Lstat(filepath.Join(s.Root, stagingDir)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return s.removing(func() error { return s.finishRemoval(requestID) })
+}
+
+// removing runs one removal from the staging area at a time, across
+// processes: two calls for one request must not interleave, or one could
+// remove a copy the other had marked and not yet synced. The lock file is
+// beside the staging area, not in it, where it would look like a staged
+// package.
+func (s *Store) removing(remove func() error) error {
+	lock := flock.New(filepath.Join(s.Root, stagingDir+".lock"))
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("lock the staging area: %w", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+	return remove()
 }
 
 // syncStagingArea makes the names in the staging area durable. It is a
 // variable so a test can make it fail.
 var syncStagingArea = fileutil.SyncDir
 
-// FinishRemoval removes what is left of a staged copy that Commit checked and
-// marked for removal. A request resumed after the removal stopped part-way
-// calls it; with nothing marked it removes nothing.
+// finishRemoval removes what is under a request's mark. The caller holds the
+// removal lock.
 //
 // The staging area is synced before anything under the mark is removed, so a
 // machine that loses power part-way comes back with the remains under the
 // mark and never under the request's own name. It is synced again afterwards,
 // also when nothing was marked: an earlier call may have removed the copy and
 // stopped before that.
-func (s *Store) FinishRemoval(requestID string) error {
-	if !namePattern.MatchString(requestID) {
-		return fmt.Errorf("invalid request id %q", requestID)
-	}
+func (s *Store) finishRemoval(requestID string) error {
 	area := filepath.Join(s.Root, stagingDir)
-	if _, err := os.Lstat(area); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
 	if err := syncStagingArea(area); err != nil {
 		return fmt.Errorf("sync staging area: %w", err)
 	}

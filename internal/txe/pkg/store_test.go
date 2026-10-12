@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -695,7 +697,9 @@ func TestCommitSyncsTheMarkBeforeRemoving(t *testing.T) {
 	marked := second.Dir + RemovingSuffix
 
 	// The sync that makes the mark durable fails: nothing under it is removed.
-	calls, failAt = 0, 1
+	// It is the third sync of the call; the first two surround the removal of
+	// what an earlier call may have left under the mark.
+	calls, failAt = 0, 3
 	_, err = store.Commit(second, testJob)
 	require.ErrorContains(t, err, "injected sync failure")
 	assert.Equal(t, []string{"req-2" + RemovingSuffix}, stagedNames(t, store))
@@ -717,6 +721,59 @@ func TestCommitSyncsTheMarkBeforeRemoving(t *testing.T) {
 	assert.Equal(t, 2, calls)
 	calls, failAt = 0, 1
 	require.ErrorContains(t, store.FinishRemoval("req-2"), "injected sync failure")
+}
+
+// Two calls for one request do not interleave: while one has marked the copy
+// and not yet synced the mark, the other waits and removes nothing.
+func TestCommitOfOneRequestTwiceAtTheSameMoment(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+
+	// The first call stops at its third sync: the copy is marked, the mark
+	// not yet synced.
+	var calls atomic.Int32
+	reached, release := make(chan struct{}), make(chan struct{})
+	real := syncStagingArea
+	syncStagingArea = func(dir string) error {
+		if calls.Add(1) == 3 {
+			close(reached)
+			<-release
+		}
+		return real(dir)
+	}
+	t.Cleanup(func() { syncStagingArea = real })
+
+	done := make(chan error, 2)
+	commit := func() {
+		_, err := store.Commit(second, testJob)
+		done <- err
+	}
+	go commit()
+	<-reached
+	go commit()
+
+	select {
+	case err := <-done:
+		t.Fatalf("a call finished while the first still held the copy under an unsynced mark: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, digest, err := verifyDir(marked, false)
+	require.NoError(t, err, "the marked copy was touched before its mark was synced")
+	assert.Equal(t, second.Digest, digest)
+
+	close(release)
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+	assert.Empty(t, stagedNames(t, store))
+	_, err = store.Verify(testJob, first.Digest)
+	require.NoError(t, err)
 }
 
 // A store that has never staged anything has no staging area to sync.
