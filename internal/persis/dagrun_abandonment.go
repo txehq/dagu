@@ -28,9 +28,18 @@ const (
 	AbandonmentHidden = "hidden"
 	// AbandonmentMarkedFailed: the run had no earlier execution, so the
 	// attempt stays visible, marked Failed with a not-dispatched reason. The
-	// record, not the status, says nothing ran.
+	// record, not the status, says nothing ran. An execution-scoped
+	// abandonment (AbandonmentScopeExecution) always has this outcome.
 	AbandonmentMarkedFailed = "marked_failed"
 )
+
+// AbandonmentScopeExecution scopes a record to one execution of a reused
+// attempt: a queued run or a queued retry dispatched from an attempt that
+// already existed. Hiding such an attempt would hide the attempt, not the
+// execution, so the execution is marked Failed instead; earlier executions'
+// records and retained history are kept, and a later execution (another
+// queued-at marker) is never covered.
+const AbandonmentScopeExecution = "execution"
 
 // Evidence values for each authoritative lookup an abandonment rests on.
 const (
@@ -91,11 +100,16 @@ type AttemptAbandonment struct {
 	// store sets it. A later retry that re-queues the same attempt is a
 	// different execution, which the record does not cover.
 	AbandonedExecution ExecutionIdentity `json:"abandonedExecution"`
+	// Scope is empty for an abandoned attempt, or AbandonmentScopeExecution
+	// for one execution of a reused attempt, named by AbandonedExecution.
+	Scope string `json:"scope,omitempty"`
 	// Outcome is AbandonmentHidden or AbandonmentMarkedFailed.
 	Outcome string `json:"outcome"`
 	// ExpectedExecution is the execution that is the latest again after a
 	// hide. PredecessorAbsent is true, and ExpectedExecution nil, when the
-	// run had none.
+	// run had none. An execution-scoped record hides nothing: it has no
+	// ExpectedExecution, and PredecessorAbsent says whether the run had any
+	// execution before this one.
 	ExpectedExecution  *ExecutionIdentity  `json:"expectedExecution,omitempty"`
 	PredecessorAbsent  bool                `json:"predecessorAbsent"`
 	RequestCorrelation *RequestCorrelation `json:"requestCorrelation,omitempty"`
@@ -115,11 +129,12 @@ func (a AttemptAbandonment) Attributable() bool {
 }
 
 // Covers reports whether a claim of attemptID whose task carries
-// executionMarker claims the abandoned execution. Only a newly created
-// attempt is ever abandoned, and its task's marker is empty, even when its
-// status inherits the queued-at of the execution it retries; the recorded
-// queued-at names it too. A retry that re-queues the attempt afterwards has a
-// marker strictly later than any before it, so it is another execution.
+// executionMarker claims the abandoned execution. A newly created attempt's
+// task has an empty marker, even when its status inherits the queued-at of
+// the execution it retries; the recorded queued-at names it too. A retry
+// that re-queues the attempt afterwards has a marker strictly later than any
+// before it, so it is another execution. An execution-scoped record names
+// its execution's marker; an empty marker is covered too, failing closed.
 func (a AttemptAbandonment) Covers(attemptID, executionMarker string) bool {
 	return a.AbandonedAttemptID == attemptID &&
 		(executionMarker == "" || executionMarker == a.AbandonedExecution.QueuedAt)
@@ -127,11 +142,17 @@ func (a AttemptAbandonment) Covers(attemptID, executionMarker string) bool {
 
 // AbandonAttemptRequest asks the store to record and hide the run's latest
 // attempt, which must still be the named, never-dispatched attempt.
+//
+// With Record.Scope AbandonmentScopeExecution it asks instead to abandon one
+// execution of a reused attempt, named by Record.AbandonedExecution (its
+// attempt and exact queued-at marker): the attempt must be the run's latest,
+// its status Queued or NotStarted with exactly that marker and no worker.
 type AbandonAttemptRequest struct {
 	DAGRun     ir.DAGRunRef
 	RootDAGRun ir.DAGRunRef
 	// Record is written as given, except Outcome, ExpectedExecution and
-	// PredecessorAbsent, which the store sets from the run under its lock.
+	// PredecessorAbsent, which the store sets from the run under its lock,
+	// and, for an attempt, AbandonedExecution.
 	Record AttemptAbandonment
 }
 
@@ -151,17 +172,29 @@ type DAGRunAttemptAbandoner interface {
 	// cannot read, so it serves history, never authorization.
 	ListAttemptAbandonments(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonment, error)
 	// ReadAttemptAbandonment returns the record of one attempt, or nil when the
-	// attempt has none. A record that exists but cannot be read, or names
+	// attempt has none. Execution-scoped records are read with
+	// ReadExecutionAbandonment (DAGRunExecutionAbandonmentReader). A record that exists but cannot be read, or names
 	// another attempt, is an error, so a caller deciding whether to authorize
 	// an execution fails closed.
 	ReadAttemptAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID string) (*AttemptAbandonment, error)
 	// ListAttemptAbandonmentsStrict reads every record of a run as
-	// ReadAttemptAbandonment reads one: one result per attempt that has a
-	// record, in the store's attempt order (newest first within an attempt
+	// ReadAttemptAbandonment reads one: one result per record, an attempt's
+	// own and each of its execution-scoped ones, in the store's attempt order (newest first within an attempt
 	// directory format). A record that cannot be trusted is a
 	// result with Err, never dropped and never hiding the others. The call
 	// fails only when the run cannot be found, listed or locked.
 	ListAttemptAbandonmentsStrict(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef) ([]AttemptAbandonmentResult, error)
+}
+
+// DAGRunExecutionAbandonmentReader is implemented by stores that keep
+// execution-scoped abandonment records.
+type DAGRunExecutionAbandonmentReader interface {
+	// ReadExecutionAbandonment returns the record that covers a claim of
+	// attemptID carrying executionMarker (see AttemptAbandonment.Covers),
+	// the attempt's own or an execution-scoped one, or nil when none does.
+	// Like ReadAttemptAbandonment it fails closed on a record it cannot
+	// trust.
+	ReadExecutionAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID, executionMarker string) (*AttemptAbandonment, error)
 }
 
 // AttemptAbandonmentResult is one attempt's record from a strict listing:
@@ -195,6 +228,15 @@ func (r *DAGRunRepository) ReadAttemptAbandonment(ctx context.Context, dagRun, r
 		rootDAGRun = dagRun
 	}
 	return abandoner.ReadAttemptAbandonment(ctx, dagRun, rootDAGRun, attemptID)
+}
+
+// ReadExecutionAbandonment reads the record covering one execution's claim.
+func (r *DAGRunRepository) ReadExecutionAbandonment(ctx context.Context, dagRun, rootDAGRun ir.DAGRunRef, attemptID, executionMarker string) (*AttemptAbandonment, error) {
+	reader, ok := r.store.(DAGRunExecutionAbandonmentReader)
+	if !ok {
+		return nil, ErrAttemptAbandonmentUnsupported
+	}
+	return reader.ReadExecutionAbandonment(ctx, dagRun, rootDAGRun, attemptID, executionMarker)
 }
 
 // ListAttemptAbandonmentsStrict lists a run's abandonment records, reporting
@@ -235,8 +277,34 @@ type AttemptPreparation struct {
 	Run       ir.DAGRunRef `json:"run"`
 	RootRun   ir.DAGRunRef `json:"rootRun"`
 	AttemptID string       `json:"attemptId"`
+	// QueuedAt is set for one execution of a reused attempt: the exact
+	// queued-at marker its status carried when the dispatch began
+	// (BeginAttemptPreparation). Empty for a newly created attempt.
+	QueuedAt string `json:"queuedAt,omitempty"`
 	// PreparedAt is when the entry was written, RFC 3339 in UTC.
 	PreparedAt string `json:"preparedAt"`
+}
+
+// DAGRunPreparationBeginner is implemented by journals that can journal one
+// execution of a reused attempt, as a dispatch of a queued run or a queued
+// retry does.
+type DAGRunPreparationBeginner interface {
+	// BeginAttemptPreparation journals the execution of attemptID marked
+	// queuedAt, under the run's data-root lock. It is refused, wrapping
+	// ErrAttemptNotAbandonable, unless the attempt is the run's latest and
+	// its status is Queued or NotStarted with exactly that marker and no
+	// worker. Beginning an entry that exists returns it unchanged.
+	BeginAttemptPreparation(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt string) (AttemptPreparation, error)
+}
+
+// BeginAttemptPreparation journals one execution of a reused attempt (see
+// DAGRunPreparationBeginner).
+func (r *DAGRunRepository) BeginAttemptPreparation(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt string) (AttemptPreparation, error) {
+	beginner, ok := r.store.(DAGRunPreparationBeginner)
+	if !ok {
+		return AttemptPreparation{}, ErrAttemptAbandonmentUnsupported
+	}
+	return beginner.BeginAttemptPreparation(ctx, run, root, attemptID, queuedAt)
 }
 
 // DAGRunPreparationJournal is implemented by stores that journal attempts
@@ -254,7 +322,8 @@ type DAGRunPreparationJournal interface {
 // attempt strictly, unlike ListAttemptPreparations, which skips entries it
 // cannot read.
 type DAGRunPreparationLookup interface {
-	// AttemptPrepared reports whether the journal holds the attempt's entry:
+	// AttemptPrepared reports whether the journal holds an entry for the
+	// attempt, its own or one of its executions':
 	// false when it holds none, an error when the entry exists but cannot be
 	// read or names another attempt.
 	AttemptPrepared(ctx context.Context, run, root ir.DAGRunRef, attemptID string) (bool, error)
@@ -280,7 +349,10 @@ type DAGRunPreparationSettler interface {
 	// and has started, or when another attempt is the latest and is not
 	// itself a preparation. It keeps the entry, and reports false, while the
 	// attempt is the latest and not started, or the latest is another
-	// preparation that may yet be abandoned, restoring this one.
+	// preparation that may yet be abandoned, restoring this one. An entry for
+	// one execution of a reused attempt (QueuedAt set) is settled once the
+	// attempt is gone or hidden, its status names another execution, or the
+	// execution was handed to a worker or started.
 	EndSettledAttemptPreparation(ctx context.Context, preparation AttemptPreparation) (bool, error)
 }
 

@@ -70,9 +70,16 @@ func (store *Store) FindRetryRequest(ctx context.Context, root, dagRun ir.DAGRun
 			return matchCurrent(att, status)
 		}
 		match, err := matchRetained(filepath.Dir(att.file), id)
-		if err != nil || match != nil {
-			return match, err
+		if err != nil || match == nil {
+			if err != nil {
+				return nil, err
+			}
+			continue
 		}
+		if err := markExecutionAbandoned(att, match); err != nil {
+			return nil, err
+		}
+		return match, nil
 	}
 	return nil, persis.ErrNotFound
 }
@@ -93,10 +100,38 @@ func matchCurrent(att *Attempt, status *ir.DAGRunStatus) (*persis.RetryRequestMa
 	case record.AbandonedAttemptID == att.ID() && record.AbandonedExecution.QueuedAt == status.QueuedAt:
 		match.State, match.Abandonment = persis.RetryRequestAbandoned, record
 	}
+	if match.Abandonment == nil {
+		if err := markExecutionAbandoned(att, match); err != nil {
+			return nil, err
+		}
+	}
 	if att.Hidden() && match.Abandonment == nil {
 		return nil, fmt.Errorf("attempt %s is hidden without an abandonment record for its execution", att.ID())
 	}
 	return match, nil
+}
+
+// markExecutionAbandoned reports match abandoned when the attempt holds an
+// execution-scoped record for its execution: one of a reused attempt,
+// abandoned without hiding the attempt. A record that is there but cannot be
+// trusted is an error, never absent.
+func markExecutionAbandoned(att *Attempt, match *persis.RetryRequestMatch) error {
+	if match.Execution.QueuedAt == "" {
+		return nil
+	}
+	path := executionRecordPath(att.file, match.Execution.QueuedAt)
+	record, err := readRecordFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("read attempt %s execution abandonment record: %w", att.ID(), err)
+	case record.Scope != persis.AbandonmentScopeExecution || record.AbandonedAttemptID != att.ID() ||
+		record.AbandonedExecution != match.Execution:
+		return fmt.Errorf("attempt %s execution abandonment record %s names another execution", att.ID(), filepath.Base(path))
+	}
+	match.State, match.Abandonment = persis.RetryRequestAbandoned, record
+	return nil
 }
 
 // matchRetained looks for id in the retained copies of one attempt
