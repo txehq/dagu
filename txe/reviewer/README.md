@@ -287,8 +287,11 @@ files.
   decided and not carried out, and no action is journaled for it. To carry
   it out, retry the failed decision run (`txe-decide-...`) once the other
   execution is dispatched or abandoned, from the dashboard (Retry on the
-  run) or the service's API as a signed-in person
-  (`POST /dag-runs/{name}/{dagRunId}/retry`). The `dagu retry` command
+  run) or the service's API
+  (`POST /dag-runs/{name}/{dagRunId}/retry` with the JSON body
+  `{"dagRunId": "<the same run id>"}`). Either way it takes a signed-in
+  person who may run DAGs in the run's workspace, on a service that
+  allows running DAGs; a viewer is refused. The `dagu retry` command
   does not do it: it refuses a DAG that has a worker selector, which the
   decision DAG has. The `execute` step then runs again, reads the
   registry's decision, and either retries the run or ends as skipped
