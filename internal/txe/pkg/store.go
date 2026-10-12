@@ -269,25 +269,37 @@ func (s *Store) dropStaged(staged *Staged) error {
 	return s.FinishRemoval(name)
 }
 
+// syncStagingArea makes the names in the staging area durable. It is a
+// variable so a test can make it fail.
+var syncStagingArea = fileutil.SyncDir
+
 // FinishRemoval removes what is left of a staged copy that Commit checked and
 // marked for removal. A request resumed after the removal stopped part-way
-// calls it; with nothing marked it does nothing.
+// calls it; with nothing marked it removes nothing.
+//
+// The staging area is synced before anything under the mark is removed, so a
+// machine that loses power part-way comes back with the remains under the
+// mark and never under the request's own name. It is synced again afterwards,
+// also when nothing was marked: an earlier call may have removed the copy and
+// stopped before that.
 func (s *Store) FinishRemoval(requestID string) error {
 	if !namePattern.MatchString(requestID) {
 		return fmt.Errorf("invalid request id %q", requestID)
 	}
 	area := filepath.Join(s.Root, stagingDir)
-	marked := filepath.Join(area, requestID+RemovingSuffix)
-	if _, err := os.Lstat(marked); err != nil {
+	if _, err := os.Lstat(area); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
-	if err := os.RemoveAll(marked); err != nil {
+	if err := syncStagingArea(area); err != nil {
+		return fmt.Errorf("sync staging area: %w", err)
+	}
+	if err := os.RemoveAll(filepath.Join(area, requestID+RemovingSuffix)); err != nil {
 		return err
 	}
-	if err := fileutil.SyncDir(area); err != nil {
+	if err := syncStagingArea(area); err != nil {
 		return fmt.Errorf("sync staging area: %w", err)
 	}
 	return nil

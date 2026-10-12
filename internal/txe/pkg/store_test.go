@@ -667,6 +667,65 @@ func TestCommitFinishesAnInterruptedRemoval(t *testing.T) {
 	require.Error(t, store.FinishRemoval("../req-4"))
 }
 
+// The mark has to be durable before anything under it is removed, and the
+// removal durable before it is reported: a failed sync at either point stops
+// the call, leaves a state the next call finishes, and is tried again then.
+func TestCommitSyncsTheMarkBeforeRemoving(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	// failAt makes the nth sync of the staging area fail, counting from one.
+	var calls, failAt int
+	real := syncStagingArea
+	syncStagingArea = func(dir string) error {
+		calls++
+		if calls == failAt {
+			return errors.New("injected sync failure")
+		}
+		return real(dir)
+	}
+	t.Cleanup(func() { syncStagingArea = real })
+
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+
+	// The sync that makes the mark durable fails: nothing under it is removed.
+	calls, failAt = 0, 1
+	_, err = store.Commit(second, testJob)
+	require.ErrorContains(t, err, "injected sync failure")
+	assert.Equal(t, []string{"req-2" + RemovingSuffix}, stagedNames(t, store))
+	_, digest, err := verifyDir(marked, false)
+	require.NoError(t, err, "the marked copy is still whole")
+	assert.Equal(t, second.Digest, digest)
+
+	// The sync after the removal fails: the call is not reported as done.
+	calls, failAt = 0, 2
+	_, err = store.Commit(second, testJob)
+	require.ErrorContains(t, err, "injected sync failure")
+	assert.Empty(t, stagedNames(t, store))
+
+	// The next call has nothing left to remove and still syncs before it
+	// succeeds.
+	calls, failAt = 0, 0
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	calls, failAt = 0, 1
+	require.ErrorContains(t, store.FinishRemoval("req-2"), "injected sync failure")
+}
+
+// A store that has never staged anything has no staging area to sync.
+func TestFinishRemovalWithoutAStagingArea(t *testing.T) {
+	store := newStore(t)
+	require.NoError(t, store.FinishRemoval("req-1"))
+	assert.NoDirExists(t, filepath.Join(store.Root, stagingDir))
+}
+
 // Requests that build one package for one job at the same moment all end with
 // that package in place, and none leaves a staged copy.
 func TestCommitOfOnePackageAtTheSameMoment(t *testing.T) {
