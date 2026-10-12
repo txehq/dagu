@@ -1494,6 +1494,12 @@ func (r *Remote) CreateProposal(ctx context.Context, claim Claim, draft Proposal
 	if draft.ReviewID != "" {
 		in.ReviewId = &draft.ReviewID
 	}
+	// The version the review read. The registry refuses the proposal when
+	// the job is no longer at it, so a proposal is never bound to a version
+	// its review did not see.
+	if draft.JobVersion > 0 {
+		in.JobVersion = &draft.JobVersion
+	}
 	if !draft.ObservedAt.IsZero() {
 		in.Evidence.ObservedAt = &draft.ObservedAt
 	}
@@ -1551,6 +1557,12 @@ func (r *Remote) RecordReview(ctx context.Context, claim Claim, rev Review) erro
 			PacketArtifact: optional(rev.PacketArtifact), DecisionArtifact: optional(rev.DecisionArtifact),
 			PacketBytes: count(rev.PacketBytes), AgentInputTokens: count(rev.AgentInputTokens), AgentOutputTokens: count(rev.AgentOutputTokens),
 		},
+	}
+	// The version the review read. The registry refuses the record when the
+	// job is no longer at it, so a review is never recorded as being of a
+	// version it did not see.
+	if rev.JobVersion > 0 {
+		body.Review.JobVersion = &rev.JobVersion
 	}
 	if err := r.do(ctx, http.MethodPost, jobPath(rev.JobID, "reviews"), body, nil); err != nil {
 		return err
@@ -1611,6 +1623,9 @@ func (r *Remote) AdvanceCheckpoint(ctx context.Context, claim Claim, next Checkp
 	}
 	if !next.NextReviewAt.IsZero() {
 		cp.NextReviewAt = &next.NextReviewAt
+	}
+	if next.JobVersion > 0 {
+		cp.JobVersion = &next.JobVersion
 	}
 	body := api.TxeCheckpointRequest{
 		Actor: r.actor(), Checkpoint: cp, ClaimId: claim.ID, ExpectedVersion: expectedVersion, Fence: int64(claim.Fence),

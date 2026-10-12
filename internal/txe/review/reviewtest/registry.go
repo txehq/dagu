@@ -919,6 +919,23 @@ func (r *Registry) RaiseException(_ context.Context, exc review.Exception) error
 // matches, as the registry does on a material change.
 func (r *Registry) PutJob(job review.Job) error {
 	return r.Update(func(s *State) error {
+		// As the registry: a job moved to another version ends a live
+		// review claim, and what that claim left executing is interrupted.
+		if old, ok := s.Jobs[job.ID]; ok && old.Version != job.Version {
+			if claim, held := s.Claims[job.ID]; held && claim.Kind == review.ClaimReview {
+				actions := s.Actions[job.ID]
+				for i := range actions {
+					if actions[i].State == review.ActionExecuting && actions[i].ClaimID == claim.ID {
+						actions[i].State = review.ActionUncertain
+						if s.ReadOnlyAttempts[actions[i].ID] {
+							actions[i].State = review.ActionFailed
+						}
+					}
+				}
+				delete(s.Claims, job.ID)
+				s.Transitions = append(s.Transitions, fmt.Sprintf("claim %s fence %d ended by version %d", claim.ID, claim.Fence, job.Version))
+			}
+		}
 		s.Jobs[job.ID] = job
 		if s.Registrations == nil {
 			s.Registrations = map[string]review.Registration{}
