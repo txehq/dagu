@@ -192,6 +192,47 @@ func TestLoad_LicenseForkPolicyRefused(t *testing.T) {
 			want: `license.fork_policy.max_api_keys must be a whole number (0 means no limit), got " "`,
 		},
 		{
+			// An empty variable is invisible to the loader and would leave
+			// the file's limit, or the community limit, in force unnoticed.
+			name: "EmptyLimitFromEnvOverFile",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: 1\n",
+			env:  map[string]string{"DAGU_LICENSE_FORK_MAX_API_KEYS": ""},
+			want: "DAGU_LICENSE_FORK_MAX_API_KEYS is set but empty",
+		},
+		{
+			name: "EmptyLimitFromEnv",
+			env:  map[string]string{"DAGU_LICENSE_FORK_MAX_API_KEYS": ""},
+			want: "DAGU_LICENSE_FORK_MAX_API_KEYS is set but empty",
+		},
+		{
+			// Setting the variable to nothing must not leave SSO open.
+			name: "EmptyFeaturesFromEnvOverFile",
+			yaml: "license:\n  fork_policy:\n    features: [sso]\n",
+			env:  map[string]string{"DAGU_LICENSE_FORK_FEATURES": ""},
+			want: "DAGU_LICENSE_FORK_FEATURES is set but empty",
+		},
+		{
+			name: "EmptyFeaturesFromEnv",
+			env:  map[string]string{"DAGU_LICENSE_FORK_FEATURES": ""},
+			want: "DAGU_LICENSE_FORK_FEATURES is set but empty",
+		},
+		{
+			// This is read as the float 2, exactly.
+			name: "FractionThatRoundsToAWholeNumber",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: 2.0000000000000001\n",
+			want: "license.fork_policy.max_api_keys must be a whole number",
+		},
+		{
+			name: "WholeNumberWrittenAsAFloat",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: 2.0\n",
+			want: "license.fork_policy.max_api_keys must be a whole number",
+		},
+		{
+			name: "ExponentLimit",
+			yaml: "license:\n  fork_policy:\n    max_api_keys: 1e1\n",
+			want: "license.fork_policy.max_api_keys must be a whole number",
+		},
+		{
 			name: "BlankFeatures",
 			yaml: "license:\n  fork_policy:\n    features: \"\"\n",
 			want: "license.fork_policy.features is blank",

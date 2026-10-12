@@ -1720,6 +1720,9 @@ const (
 	licenseForkPolicyKey     = "license.fork_policy"
 	licenseForkFeaturesKey   = licenseForkPolicyKey + ".features"
 	licenseForkMaxAPIKeysKey = licenseForkPolicyKey + ".max_api_keys"
+
+	licenseForkFeaturesEnv   = "LICENSE_FORK_FEATURES"
+	licenseForkMaxAPIKeysEnv = "LICENSE_FORK_MAX_API_KEYS"
 )
 
 // loadLicenseForkPolicy reads the fork policy from the raw values rather than
@@ -1727,6 +1730,17 @@ const (
 // becomes 2), and a policy that opens gates must not be read from a value the
 // operator did not write. A value that cannot be read exactly is an error.
 func (l *ConfigLoader) loadLicenseForkPolicy(cfg *Config) error {
+	// An environment variable that is set to nothing is invisible to the
+	// loader, which reads it as unset everywhere else. Here that would leave a
+	// policy from the config file in force when the operator set the variable
+	// to empty to switch it off, so it is refused instead.
+	for _, env := range []string{licenseForkFeaturesEnv, licenseForkMaxAPIKeysEnv} {
+		name := strings.ToUpper(AppSlug) + "_" + env
+		if value, set := os.LookupEnv(name); set && value == "" {
+			return fmt.Errorf("%s is set but empty: unset it, or give it a value", name)
+		}
+	}
+
 	for key := range l.v.GetStringMap(licenseForkPolicyKey) {
 		if key != "features" && key != "max_api_keys" {
 			return fmt.Errorf("%s: unknown key %q (allowed: features, max_api_keys)", licenseForkPolicyKey, key)
@@ -1816,11 +1830,10 @@ func parseLicenseForkMaxAPIKeys(input any) (*int, error) {
 			return invalid()
 		}
 		limit = int(v)
-	case float64:
-		if v != math.Trunc(v) || math.Abs(v) > math.MaxInt32 {
-			return invalid()
-		}
-		limit = int(v)
+	case float32, float64:
+		// A whole number in YAML arrives as an integer. A float is refused
+		// even when it looks whole: 2.0000000000000001 is read as exactly 2.
+		return invalid()
 	case string:
 		// A blank string is refused like any other non-number: reading it as
 		// "unset" would let it replace a configured limit with the community one.
@@ -2433,8 +2446,8 @@ var envBindings = []envBinding{
 	// License
 	{key: "license.key", env: "LICENSE_KEY"},
 	{key: "license.cloud_url", env: "LICENSE_CLOUD_URL"},
-	{key: licenseForkFeaturesKey, env: "LICENSE_FORK_FEATURES"},
-	{key: licenseForkMaxAPIKeysKey, env: "LICENSE_FORK_MAX_API_KEYS"},
+	{key: licenseForkFeaturesKey, env: licenseForkFeaturesEnv},
+	{key: licenseForkMaxAPIKeysKey, env: licenseForkMaxAPIKeysEnv},
 
 	// GitSync
 	{key: "git_sync.enabled", env: "GITSYNC_ENABLED"},
