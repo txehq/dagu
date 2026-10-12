@@ -26,7 +26,9 @@ export type ProposalState =
   | 'decided'
   | 'superseded'
   | 'executed'
-  | 'rejected';
+  | 'rejected'
+  // closed: an escalation answered with retry; finished, never executed.
+  | 'closed';
 
 export type Verdict =
   | 'approve'
