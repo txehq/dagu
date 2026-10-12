@@ -408,6 +408,9 @@ func TestAQueueItemPublishedAfterThePassReadIsNotMissed(t *testing.T) {
 	run := f.writeQueuedRun(t, "late-item-run", marker, strandedDAG)
 	entries := f.preparationEntries(t)
 	require.Len(t, entries, 1)
+	// The queue already holds another run, so only its revision, not the set
+	// of queue names, tells the check that the queue changed.
+	require.NoError(t, queues.Enqueue(t.Context(), strandedDAG, queue.QueuePriorityLow, ir.NewDAGRunRef(strandedDAG, "other-run")))
 
 	snapshot := f.h.readQueueSnapshot(t.Context())
 	require.NoError(t, snapshot.err)
@@ -423,8 +426,12 @@ func TestAQueueItemPublishedAfterThePassReadIsNotMissed(t *testing.T) {
 	// Control: once the item is gone, a fresh pass abandons the execution.
 	items, err := queues.List(t.Context(), strandedDAG)
 	require.NoError(t, err)
-	_, err = queues.DeleteByItemIDs(t.Context(), strandedDAG, []string{items[0].ID()})
-	require.NoError(t, err)
+	for _, item := range items {
+		if ref, err := item.Data(); err == nil && *ref == run {
+			_, err = queues.DeleteByItemIDs(t.Context(), strandedDAG, []string{item.ID()})
+			require.NoError(t, err)
+		}
+	}
 	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
 	records, err = f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
 	require.NoError(t, err)
