@@ -511,33 +511,36 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		// its only evidence, whatever version the job is at now.
 		ok = false
 		res = r.probeRetry(ctx, job, action)
-		if res.Status == EffectUnknown && res.Unasked {
-			// The one thing that could say what became of the request
-			// could not be read this time. That is not the service having
-			// no record of it, and it says nothing about the retry. The
-			// owner is not asked a question: a question ends the probing,
-			// and an execution the record named in an earlier review would
-			// be lost with it, since it can only be written with an
-			// outcome. The action stays uncertain and every review reads
-			// again.
-			//
-			// It does not repeat in silence either. When it has lasted as
-			// long as a stalled reservation is allowed, by the registry's
-			// own two times, the owner is told with an exception about
-			// this attempt, which asks for no decision.
-			if escalate && !claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
-				if err := r.raiseUnreadable(ctx, claim, job, action); err != nil {
-					fmt.Fprintf(os.Stderr, "txe review: action %s of %s: %v; the action stays uncertain and the review goes on\n", action.ID, job.ID, err)
-				}
-			}
-			return nil
-		}
 		if res.AdmittedRef != "" {
 			// What the probe established about the request's admission,
 			// from the stored outcome or from the service's record of the
 			// request, is what is written with any outcome below and named
 			// in anything the owner is told.
 			action.Admitted, action.AdmittedRef = true, res.AdmittedRef
+		}
+		if res.Status == EffectUnknown && res.Unasked {
+			// What could say what became of the retry could not be read
+			// this time: the service's record of the request, or the run
+			// of an execution already known. That is not the service
+			// having no record, or the run showing nothing, and it says
+			// nothing about the retry. The owner is not asked a question:
+			// a question ends the probing. The action stays uncertain and
+			// every review reads again. An execution the record named in
+			// this review is kept.
+			//
+			// It does not repeat in silence either. When it has lasted as
+			// long as a stalled reservation is allowed, by the registry's
+			// own two times, the owner is told with an exception about
+			// this attempt, which asks for no decision.
+			if err := keep(res.Detail); err != nil {
+				return err
+			}
+			if escalate && !claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
+				if err := r.raiseUnreadable(ctx, claim, job, action); err != nil {
+					fmt.Fprintf(os.Stderr, "txe review: action %s of %s: %v; the action stays uncertain and the review goes on\n", action.ID, job.ID, err)
+				}
+			}
+			return nil
 		}
 		if res.Status == EffectUnknown && res.Pending {
 			// The service admitted this retry and its execution has not
@@ -686,20 +689,30 @@ func (r *Reviewer) raiseStalled(ctx context.Context, claim Claim, job Job, actio
 	return nil
 }
 
-// raiseUnreadable files the exception for a retry whose answer was lost
-// and whose record at the service has not been readable for too long. It
-// names the attempt and says where to look. It grants nothing and asks for
-// no decision.
+// raiseUnreadable files the exception for a retry that could not be read
+// for too long: one whose answer was lost and whose record at the service is
+// unreadable, or one admitted as a known execution whose run is unreadable.
+// It names the attempt and says where to look. It grants nothing and asks
+// for no decision.
 func (r *Reviewer) raiseUnreadable(ctx context.Context, claim Claim, job Job, action Action) error {
+	message := fmt.Sprintf(
+		"The answer to the retry of run %s (action %s, attempt %d, granted at %s) was not received, and the service's record of that retry request cannot be read. "+
+			"Whether the retry was admitted is not known. The reviewer reads the record again in every review and records the retry when the record says what became of it. "+
+			"Check that the service's API can read the run's executions (the retry-requests lookup of the run fails or returns something unreadable). "+
+			"Nothing is sent again. Do not retry the run by hand for this decision while that is not known, or it may run twice.",
+		action.Params[RetryRunParam], action.ID, action.Attempt, action.AttemptStartedAt.UTC().Format(time.RFC3339))
+	if action.AdmittedRef != "" {
+		message = fmt.Sprintf(
+			"The retry of run %s (action %s, attempt %d, granted at %s) was admitted by the service as execution %s, and the run cannot be read. "+
+				"Whether that execution started is not known. The reviewer reads the run again in every review and records the retry when the run shows what became of that execution. "+
+				"Check that the service's API can read the run. "+
+				"Nothing is sent again. Do not retry the run by hand for this decision while that is not known, or it may run twice.",
+			action.Params[RetryRunParam], action.ID, action.Attempt, action.AttemptStartedAt.UTC().Format(time.RFC3339), action.AdmittedRef)
+	}
 	err := r.Registry.RaiseException(ctx, Exception{
 		JobID: job.ID, Kind: ExceptionRetryRecordUnreadable, MachineID: job.MachineID, Claim: claim,
 		ActionID: action.ID, Attempt: action.Attempt, ReviewID: action.ReviewID,
-		Message: fmt.Sprintf(
-			"The answer to the retry of run %s (action %s, attempt %d, granted at %s) was not received, and the service's record of that retry request cannot be read. "+
-				"Whether the retry was admitted is not known. The reviewer reads the record again in every review and records the retry when the record says what became of it. "+
-				"Check that the service's API can read the run's executions (the retry-requests lookup of the run fails or returns something unreadable). "+
-				"Nothing is sent again. Do not retry the run by hand for this decision while that is not known, or it may run twice.",
-			action.Params[RetryRunParam], action.ID, action.Attempt, action.AttemptStartedAt.UTC().Format(time.RFC3339)),
+		Message: message,
 	})
 	if err != nil {
 		return fmt.Errorf("raise exception: %w", err)
@@ -1453,8 +1466,11 @@ func (r *Reviewer) seenOnRun(ctx context.Context, jobID, runID string, bound Exe
 func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound Execution, named string, watch time.Duration, cause string) EffectResult {
 	until := time.Now().Add(watch)
 	reserved := ""
+	read := false
+	var readErr error
 	for {
 		state, err := r.Runs.RunState(ctx, jobID, runID)
+		read, readErr = read || err == nil, err
 		if now := state.Execution(); err == nil && now.known() && now != bound {
 			ref := now.Ref()
 			switch {
@@ -1508,6 +1524,17 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 	// gone, does not.
 	if was, _ := r.Runs.Abandoned(ctx, jobID, runID, named); was {
 		return notDispatched(runID, named)
+	}
+	if !read {
+		// The run could not be read at all. That is not the run showing
+		// nothing: it says nothing about the execution, which can be a
+		// reservation still. It is read again, and the owner is not asked a
+		// question that would end the reading.
+		detail := fmt.Sprintf("the service admitted the retry of run %s as execution %s, and the run could not be read (%v); it is read again", runID, named, readErr)
+		if cause != "" {
+			detail = cause + ": " + detail
+		}
+		return EffectResult{Status: EffectUnknown, Unasked: true, Detail: detail, Admitted: true, AdmittedRef: named}
 	}
 	detail := fmt.Sprintf("no execution of run %s after %s was seen queued or started", runID, bound.Ref())
 	if reserved != "" {

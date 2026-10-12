@@ -2550,6 +2550,52 @@ func TestRetryRunALostAnswerIsRecoveredFromTheServicesRecordOfTheRequest(t *test
 			})
 		}
 	})
+	t.Run("a known reservation whose run cannot be read is waited on, not asked about", func(t *testing.T) {
+		for name, recovered := range map[string]bool{
+			"named by the answer":           false,
+			"named by the service's record": true,
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.retry = func(runID string) error {
+					f.runs.state[runID] = review.RunState{AttemptID: "att-reserved", Status: "not_started", Active: true}
+					return nil
+				}
+				if recovered {
+					f.runs.loseAnswer, f.runs.noRecords = lost, true
+				}
+				require.Equal(t, review.ActionUncertain, f.execute("executor").Action.State)
+				// When the record names the execution, it does so in the very
+				// review in which the run cannot be read, and it is kept all
+				// the same.
+				f.runs.noRecords = false
+				f.runs.unreadable = map[string]error{"run-1": errors.New("500 could not read the run")}
+				for _, holder := range []string{"reviewer-b", "reviewer-c"} {
+					waiting := soon(f, holder)
+					assert.Equal(t, review.ActionUncertain, waiting.State)
+					assert.Equal(t, reserved, waiting.AdmittedRef)
+					assert.False(t, asked(f), "an unreadable run says nothing about the execution")
+					assert.Empty(t, f.state().Exceptions)
+				}
+				// Past half an hour of the registry's time the owner is
+				// told, about this execution, and is still asked nothing.
+				lasting := nextReview(f)
+				assert.Equal(t, review.ActionUncertain, lasting.State)
+				assert.False(t, asked(f))
+				require.Len(t, f.state().Exceptions, 1)
+				assert.Equal(t, review.ExceptionRetryRecordUnreadable, f.state().Exceptions[0].Kind)
+				assert.Contains(t, f.state().Exceptions[0].Message, "admitted by the service as execution "+reserved)
+				assert.Contains(t, f.state().Exceptions[0].Message, "the run cannot be read")
+
+				f.runs.unreadable = nil
+				f.runs.state["run-1"] = review.RunState{AttemptID: "att-reserved", Status: "running", Active: true}
+				done := soon(f, "reviewer-e")
+				assert.Equal(t, review.ActionSucceeded, done.State)
+				assert.Equal(t, reserved, done.Receipt)
+				assert.Len(t, f.runs.requested, 1, "one retry request in all")
+			})
+		}
+	})
 	t.Run("a registry that will not store the recovered execution stops nothing", func(t *testing.T) {
 		f := newRetryFixture(t)
 		f.runs.loseAnswer, f.runs.noRecords = lost, true
