@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"path/filepath"
 	"sort"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -1094,6 +1097,15 @@ func (s *DispatchTaskStore) recycleExpiredPending(ctx context.Context) error {
 			return err
 		}
 		s.index.removePending(id)
+		// No worker claimed the task in time and nothing requeues it: say so,
+		// because the run will not start from this dispatch.
+		if task := payload.Task; task != nil {
+			logger.Warn(ctx, "Expired an unclaimed dispatch task; no worker claimed it within the reservation time",
+				tag.RunID(task.DAGRunID), tag.Target(task.Target), tag.AttemptID(task.AttemptID),
+				tag.AttemptKey(task.AttemptKey), slog.Duration("reservation_ttl", s.reservationTTL))
+		} else {
+			logger.Warn(ctx, "Expired an unclaimed dispatch task with no payload", tag.Name(id))
+		}
 	}
 	return nil
 }

@@ -657,9 +657,10 @@ func TestDispatchPreparationLeftBehindIsReconciled(t *testing.T) {
 	assert.Equal(t, prepared, records[0].AbandonedAttemptID)
 }
 
-// A successful dispatch journals its attempt while preparing it and ends the
-// entry once the task is published.
-func TestDispatchEndsItsPreparationOncePublished(t *testing.T) {
+// A successful dispatch journals its attempt while preparing it, keeps the
+// entry once the task is published, and ends it only when a worker's claim is
+// acknowledged. A claimed and acknowledged attempt is then never abandoned.
+func TestDispatchKeepsItsPreparationUntilTheClaimIsAcknowledged(t *testing.T) {
 	registerCommandExecutorCapsForCoordinatorTest()
 	f := newStrandedFixture(t, nil)
 	var during []string
@@ -670,16 +671,38 @@ func TestDispatchEndsItsPreparationOncePublished(t *testing.T) {
 	}
 	t.Cleanup(func() { dispatchPublishHook = nil })
 
-	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+	_, err := f.h.Dispatch(t.Context(), retryTask())
+	require.NoError(t, err)
+	attempt := f.latest(t)
+	assert.Equal(t, []string{attempt}, during)
+	assert.Equal(t, []string{attempt}, f.preparations(t), "a published task is not yet a worker's")
+
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, []string{attempt}, f.preparations(t), "an unacknowledged claim is not yet a worker's")
+
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(attempt),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, resp.Error)
+	assert.Empty(t, f.preparations(t), "the acknowledged claim ends the entry")
+
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Equal(t, attempt, f.latest(t))
+	assert.Empty(t, f.records(t), "a claimed attempt is never abandoned")
+}
+
+// retryTask is a retry of the stranded run, dispatched to any worker.
+func retryTask() *coordinatorv1.DispatchRequest {
+	return &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
 		DagRunId:   strandedRun,
 		Target:     strandedDAG,
 		Operation:  coordinatorv1.Operation_OPERATION_RETRY,
 		Definition: "name: " + strandedDAG + "\nsteps:\n  - name: step1\n    run: echo hello",
 		QueueName:  "q",
-	}})
-	require.NoError(t, err)
-	assert.Equal(t, []string{f.latest(t)}, during)
-	assert.Empty(t, f.preparations(t))
+	}}
 }
 
 // When handing a sub-DAG run's task to a worker fails, nothing ran: the

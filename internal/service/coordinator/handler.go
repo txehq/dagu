@@ -157,6 +157,12 @@ type Handler struct {
 	heartbeats        map[string]*heartbeatInfo // workerID -> heartbeat info
 	owner             dispatch.CoordinatorEndpoint
 
+	// inFlightPreparations names the journal entries whose attempt the last
+	// reconciliation pass found possibly with a worker, so each is reported
+	// once rather than on every pass.
+	inFlightPreparationsMu sync.Mutex
+	inFlightPreparations   map[string]struct{}
+
 	dispatchWakeMu          sync.Mutex
 	dispatchWakeCh          chan struct{}
 	dispatchWakeGeneration  int64
@@ -604,9 +610,10 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
-	if prepared != nil && prepared.newlyCreated {
-		h.endPreparation(ctx, ir.NewDAGRunRef(req.Task.GetTarget(), req.Task.GetDagRunId()), taskRootRef(req.Task), req.Task.GetAttemptId())
-	}
+	// The preparation entry stays until a worker's claim is acknowledged
+	// (recordTaskClaim): a published task that no worker claims expires from
+	// the dispatch store, and the entry is then what lets reconciliation
+	// abandon the attempt instead of leaving it waiting for nothing.
 	unlockRun()
 	h.notifyDispatchAvailable()
 	return admittedResponse(req.Task, prepared), nil
@@ -1549,10 +1556,22 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 		root = ir.DAGRunRef{Name: task.GetTarget(), ID: task.GetDagRunId()}
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	if err := h.refuseAbandonedExecution(ctx, ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
+	run := ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId())
+	if err := h.refuseAbandonedExecution(ctx, run, root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
 		return err
 	}
-	return h.attemptOwnership().recordTaskClaim(ctx, task, workerID)
+	if err := h.attemptOwnership().recordTaskClaim(ctx, task, workerID); err != nil {
+		return err
+	}
+	// The execution now has a lease, so it can no longer be proven
+	// undispatched: end its preparation entry under the same lock that
+	// abandonment takes. If ending fails, or the coordinator stops first, the
+	// lease keeps reconciliation from abandoning it and the entry is ended once
+	// the attempt has progressed.
+	if h.canAbandonPreparations() {
+		h.endPreparation(ctx, run, root, task.GetAttemptId())
+	}
+	return nil
 }
 
 // ClaimAgentSessionCleanup reserves deferred provider cleanup for its owning worker.

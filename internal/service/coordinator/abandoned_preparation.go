@@ -24,7 +24,13 @@ import (
 // preparation that another coordinator, for example one draining during a
 // rolling replacement, may still be about to publish. The claim check below
 // refuses such a publication anyway.
-const abandonedPreparationMinAge = 10 * time.Minute
+//
+// It also stays above the longest an unacknowledged dispatch can remain
+// reserved: a pending task expires after the reservation TTL, and a claim
+// never acknowledged is released to pending after one TTL and then expires
+// after another. Both TTLs are dagrun.DefaultStaleLeaseThreshold, so the bound
+// is derived from it and grows with it.
+const abandonedPreparationMinAge = max(10*time.Minute, 2*dagrun.DefaultStaleLeaseThreshold+time.Minute)
 
 // errAttemptAbandoned refuses a claim of an attempt that has an abandonment
 // record: it was proven never dispatched and is hidden.
@@ -38,6 +44,12 @@ var errEvidenceUnknown = errors.New("dispatch evidence unknown")
 func (h *Handler) canAbandonPreparations() bool {
 	return h.dagRunRepository != nil && h.dispatchTaskStore != nil && h.dagRunLeaseStore != nil
 }
+
+// errDispatchInFlight means the attempt may be with a worker: a task is pending
+// or claimed, or a lease or active-run record exists. The attempt is not
+// abandoned, and its entry stays until the attempt settles: a worker that has
+// acknowledged its claim reports progress, and an unacknowledged task expires.
+var errDispatchInFlight = errors.New("dispatch may be in flight")
 
 // errAbandonmentUnavailable means this coordinator is not configured to
 // prove absence of dispatch at all, as without a dispatch or lease store.
@@ -59,16 +71,16 @@ func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey string
 		return evidence, fmt.Errorf("%w: dispatch store: %v", errEvidenceUnknown, err)
 	}
 	if outstanding {
-		return evidence, errors.New("a dispatch task is pending or claimed")
+		return evidence, fmt.Errorf("%w: a dispatch task is pending or claimed", errDispatchInFlight)
 	}
 	if _, err := h.dagRunLeaseStore.Get(ctx, attemptKey); err == nil {
-		return evidence, errors.New("a lease exists")
+		return evidence, fmt.Errorf("%w: a lease exists", errDispatchInFlight)
 	} else if !errors.Is(err, dispatch.ErrDAGRunLeaseNotFound) {
 		return evidence, fmt.Errorf("%w: lease store: %v", errEvidenceUnknown, err)
 	}
 	if h.activeDistributedRunStore != nil {
 		if _, err := h.activeDistributedRunStore.Get(ctx, attemptKey); err == nil {
-			return evidence, errors.New("an active run record exists")
+			return evidence, fmt.Errorf("%w: an active run record exists", errDispatchInFlight)
 		} else if !errors.Is(err, dispatch.ErrActiveRunNotFound) {
 			return evidence, fmt.Errorf("%w: active run store: %v", errEvidenceUnknown, err)
 		}
@@ -175,6 +187,7 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		}
 		return
 	}
+	inFlight := make(map[string]struct{})
 	for _, p := range preparations {
 		if ctx.Err() != nil {
 			return
@@ -183,12 +196,20 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		if err != nil || now.Sub(preparedAt) < abandonedPreparationMinAge {
 			continue
 		}
-		record, err := h.abandonNeverDispatched(ctx, p.Run, p.RootRun, p.AttemptID,
-			"not dispatched: no dispatch task, claim, lease or worker after the coordinator stopped")
+		record, err := h.abandonNeverDispatched(ctx, p.Run, p.RootRun, p.AttemptID, abandonedPreparationDetail)
 		switch {
 		case err == nil:
 			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
 				tag.RunID(p.Run.ID), tag.AttemptID(record.AbandonedAttemptID))
+		case errors.Is(err, errDispatchInFlight):
+			// The attempt may be with a worker. Its entry ends once the
+			// attempt settles; say so once, not on every pass.
+			key := preparationKey(p)
+			inFlight[key] = struct{}{}
+			if !h.wasInFlight(key) {
+				logger.Info(ctx, "Left a prepared attempt that may be with a worker until it settles",
+					tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
+			}
 		case errors.Is(err, persis.ErrAttemptNotAbandonable), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
 			// Ended only once nothing of it is left to judge, decided under
 			// the lock abandonments take: while the latest attempt is another
@@ -204,6 +225,29 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 				tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
 		}
 	}
+	h.inFlightPreparationsMu.Lock()
+	h.inFlightPreparations = inFlight
+	h.inFlightPreparationsMu.Unlock()
+}
+
+// abandonedPreparationDetail is the reason an abandoned attempt records and
+// its run shows. It covers both ways a prepared attempt is never handed to a
+// worker, and tells the owner the run may be started again.
+const abandonedPreparationDetail = "not dispatched: no worker claimed it before its dispatch expired, " +
+	"or the coordinator stopped before publishing it; nothing ran, so it can be started again"
+
+// preparationKey identifies a journal entry for in-memory bookkeeping.
+func preparationKey(p persis.AttemptPreparation) string {
+	return p.RootRun.Name + "\x00" + p.RootRun.ID + "\x00" + p.Run.Name + "\x00" + p.Run.ID + "\x00" + p.AttemptID
+}
+
+// wasInFlight reports whether the previous reconciliation pass found the entry
+// possibly with a worker.
+func (h *Handler) wasInFlight(key string) bool {
+	h.inFlightPreparationsMu.Lock()
+	defer h.inFlightPreparationsMu.Unlock()
+	_, ok := h.inFlightPreparations[key]
+	return ok
 }
 
 // refuseAbandonedClaim refuses a claim of an attempt's execution that was
