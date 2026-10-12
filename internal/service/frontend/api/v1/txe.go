@@ -255,13 +255,32 @@ func (a *API) txeJobVisible(ctx context.Context, s *registry.Store, job *registr
 // txeVisibleJob returns the committed job if the caller can see it.
 func (a *API) txeVisibleJob(ctx context.Context, s *registry.Store, jobID string) (*registry.Job, error) {
 	job, err := s.GetJob(ctx, jobID)
+	if registry.ErrorCode(err) == registry.CodeNotFound {
+		return nil, txeJobNotFound(jobID)
+	}
 	if err != nil {
 		return nil, txeError(err)
 	}
 	if err := a.txeJobVisible(ctx, s, job); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return nil, txeJobNotFound(jobID)
+		}
 		return nil, err
 	}
 	return job, nil
+}
+
+// txeJobNotFound is the one answer for a job that does not exist and for
+// one the caller cannot see, so a read confirms nothing about hidden jobs.
+func txeJobNotFound(jobID string) error {
+	return txeError(&registry.Error{Code: registry.CodeNotFound, Message: "job " + jobID + " not found"})
+}
+
+// txeResourceEventNotFound is the one answer for a resource event that does
+// not exist and for one the caller cannot see.
+func txeResourceEventNotFound(eventID string) error {
+	return txeError(&registry.Error{Code: registry.CodeNotFound, Message: "resource event " + eventID + " not found"})
 }
 
 // txeReadHistory authorizes a job and runs read, which reads its history,
@@ -526,7 +545,7 @@ func (a *API) txeVisibleResult(ctx context.Context, s *registry.Store, job *regi
 	if err := a.txeJobVisible(ctx, s, job); err != nil {
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
-			return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "job " + job.JobID + " not found"})
+			return nil, txeJobNotFound(job.JobID)
 		}
 		return nil, err
 	}
@@ -1186,11 +1205,25 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	recorded, err := s.RecordResourceEvent(ctx, ev, actor, writable)
 	if err != nil {
 		// A save failure after the event exists is a 409 "incomplete" that
-		// carries the event, so the reporter can resume it by its event_id.
+		// carries only the event's ID, so the reporter can resume it.
 		return nil, txeError(err)
 	}
-	out, err := txeConvert[api.TxeResourceEvent](recorded)
+	// A reply, a replay of a completed event included, shows only the jobs
+	// the caller can see now, as GET does.
+	shown := cloneResourceEvent(recorded)
+	a.txeShowResourceEvent(ctx, s, shown)
+	out, err := txeConvert[api.TxeResourceEvent](shown)
 	return api.RecordTxeResourceEvent200JSONResponse(out), err
+}
+
+// cloneResourceEvent copies ev, with its own lists, so a reply can be
+// filtered without touching the stored event.
+func cloneResourceEvent(ev *registry.ResourceEvent) *registry.ResourceEvent {
+	out := *ev
+	out.Dispositions = slices.Clone(ev.Dispositions)
+	out.Pending = slices.Clone(ev.Pending)
+	out.Failures = slices.Clone(ev.Failures)
+	return &out
 }
 
 // txeShowResourceEvent keeps only the parts of ev about jobs the caller can
@@ -1266,11 +1299,14 @@ func (a *API) GetTxeResourceEvent(ctx context.Context, req api.GetTxeResourceEve
 		return nil, err
 	}
 	ev, err := s.GetResourceEvent(ctx, req.EventId)
+	if registry.ErrorCode(err) == registry.CodeNotFound {
+		return nil, txeResourceEventNotFound(req.EventId)
+	}
 	if err != nil {
 		return nil, txeError(err)
 	}
 	if !a.txeShowResourceEvent(ctx, s, ev) {
-		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "resource event " + req.EventId + " not found"})
+		return nil, txeResourceEventNotFound(req.EventId)
 	}
 	out, err := txeConvert[api.TxeResourceEvent](ev)
 	return api.GetTxeResourceEvent200JSONResponse(out), err
@@ -1333,22 +1369,58 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if err != nil {
 		return nil, ErrInvalidRequestBody
 	}
-	s, err := a.txeStore()
+	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
 		return nil, err
 	}
 	var m *registry.ArtifactManifest
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
-		// The run is looked up only after txeTx checked that the caller may
-		// write this job, so its existence is never disclosed to others.
-		latest, _, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
+	// A run publishes in the workspace it was saved in, which may not be the
+	// job's current one (the job may have moved while it ran): publishing
+	// needs write access to the run's saved workspace. A caller who cannot
+	// write the job is refused with the job's own denial whenever the run
+	// does not authorize it, so nothing tells them which runs exist.
+	if _, err := s.WithJobTx(ctx, req.JobId, actor, func(tx *registry.JobTx) error {
+		jobErr := a.txeRequireJobWrite(ctx, tx)
+		latest, status, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
 		if err != nil {
+			if jobErr != nil {
+				return jobErr
+			}
 			return err
+		}
+		if err := a.txeRequireWorkspaceWrite(ctx, statusWorkspaceName(status)); err != nil {
+			if jobErr != nil {
+				return jobErr
+			}
+			return err
+		}
+		// A report naming an earlier execution can only be a replay or a
+		// conflict, and either returns that execution's manifest: it must be
+		// one the caller can see, by its own saved workspace.
+		if ref := registry.ExecutionRef(in.AttemptID, in.QueuedAt); ref != latest.Ref() {
+			ok, err := a.txeArtifactExecutionVisible(ctx, s, req.JobId, req.RunId, ref, latest, status)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+					Message: "execution " + ref + " of run " + req.RunId + " not found"}
+			}
 		}
 		m, err = tx.RecordArtifacts(ctx, s, req.RunId, latest, in)
 		return err
 	}); err != nil {
-		return nil, err
+		// The publisher was authorized by the run, not the job: a refusal
+		// never returns the job's record.
+		if re, ok := errors.AsType[*registry.Error](err); ok {
+			if _, isJob := re.Current.(*registry.Job); isJob {
+				err = &registry.Error{Code: re.Code, Message: re.Message}
+			}
+		}
+		if _, ok := errors.AsType[*Error](err); ok {
+			return nil, err
+		}
+		return nil, txeError(err)
 	}
 	out, err := txeConvert[api.TxeArtifactManifest](m)
 	return api.RecordTxeRunArtifacts200JSONResponse(out), err
@@ -1382,6 +1454,14 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 	if err != nil {
 		return nil, txeError(err)
 	}
+	visible := func(ref string) (bool, error) {
+		return a.txeArtifactExecutionVisible(ctx, s, req.JobId, req.RunId, ref, latest, status)
+	}
+	if ok, err := visible(m.Execution); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound, Message: "job " + req.JobId + " has no deliverables for run " + req.RunId}
+	}
 	pending := slices.ContainsFunc(m.Artifacts, func(r registry.ArtifactRecord) bool { return r.Status == registry.ArtifactPendingUpload })
 	if pending && status != nil {
 		dir, ended, known := m.ArchiveDir, true, m.ArchiveDir != ""
@@ -1413,10 +1493,57 @@ func (a *API) GetTxeRunArtifacts(ctx context.Context, req api.GetTxeRunArtifacts
 	out, err := txeConvert[api.TxeArtifactManifest](m)
 	executions := make([]string, 0, len(all))
 	for _, x := range all {
-		executions = append(executions, x.Execution)
+		ok, err := visible(x.Execution)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			executions = append(executions, x.Execution)
+		}
 	}
 	out.Executions = &executions
 	return api.GetTxeRunArtifacts200JSONResponse(out), err
+}
+
+// txeArtifactExecutionVisible reports whether the caller can see the
+// workspace one execution of a run was saved in, as the native run
+// endpoints judge a run: the run's latest status for its current execution,
+// else the status the registry kept when that execution published, else
+// its retained native copy. An execution with none of these is not visible.
+func (a *API) txeArtifactExecutionVisible(ctx context.Context, s *registry.Store, jobID, runID, ref string,
+	latest registry.RunAttempt, status *ir.DAGRunStatus) (bool, error) {
+	if a.authService == nil {
+		return true, nil
+	}
+	saved := status
+	if latest.AttemptID == "" || ref != latest.Ref() {
+		data, err := s.GetRetainedExecution(ctx, jobID, runID, ref, registry.EvidencePublication)
+		switch {
+		case err == nil:
+			var st ir.DAGRunStatus
+			if json.Unmarshal(data, &st) != nil {
+				return false, nil
+			}
+			saved = &st
+		case registry.ErrorCode(err) != registry.CodeNotFound:
+			return false, txeError(err)
+		case a.dagRunRepository != nil:
+			return a.txeRetainedVisible(ctx, ir.NewDAGRunRef(jobID, runID), ref)
+		default:
+			return false, nil
+		}
+	}
+	if saved == nil {
+		return false, nil
+	}
+	if err := a.requireDAGRunStatusVisible(ctx, saved); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // txeLatestRunAttempt returns the latest attempt of a run of the job as

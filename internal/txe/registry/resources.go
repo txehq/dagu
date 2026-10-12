@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 )
 
@@ -149,6 +152,18 @@ type ResourceDependent struct {
 type ResourceFailure struct {
 	JobID string `json:"job_id"`
 	Error string `json:"error"`
+}
+
+// publicFailure is what a failed dependent records and the API returns: a
+// registry refusal's code and message, or a stable message for anything
+// else (a storage error carries hub paths), whose cause is logged.
+func publicFailure(ctx context.Context, eventID, jobID string, err error) string {
+	if re, ok := errors.AsType[*Error](err); ok {
+		return string(re.Code) + ": " + re.Message
+	}
+	logger.Warn(ctx, "TXE resource event could not be applied to a job", tag.Error(err),
+		slog.String("event_id", eventID), slog.String("job_id", jobID))
+	return "the change could not be saved; it is applied again when the event is resumed"
 }
 
 const (
@@ -327,7 +342,7 @@ func (s *Store) applyPending(ctx context.Context, ev *ResourceEvent, by Actor, p
 			}
 			if err != nil {
 				still = append(still, p)
-				failures = append(failures, ResourceFailure{JobID: p.JobID, Error: err.Error()})
+				failures = append(failures, ResourceFailure{JobID: p.JobID, Error: publicFailure(ctx, ev.EventID, p.JobID, err)})
 				continue
 			}
 			if d != nil {
