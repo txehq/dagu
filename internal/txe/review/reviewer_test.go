@@ -158,8 +158,11 @@ type runs struct {
 	// the service did everything, and the caller gets this error.
 	loseAnswer error
 	// noRecords makes the service unable to give its record of a retry
-	// request, as when it cannot be reached or has none.
+	// request this time, as when it cannot be reached.
 	noRecords bool
+	// recordsGone makes the service answer that it has no record of any
+	// retry request, as after the run's history was removed.
+	recordsGone bool
 	// recovered counts the requests for a retry request's record.
 	recovered int
 	// recorded is the retry request the service recorded on each execution
@@ -290,7 +293,13 @@ func (r *runs) Recover(_ context.Context, jobID, runID string, expected review.E
 	defer r.mu.Unlock()
 	r.recovered++
 	want, err := ir.NewRetryRequest(ir.NewDAGRunRef(jobID, runID), expected.AttemptID, expected.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest)
-	if err != nil || r.noRecords {
+	if err != nil {
+		return review.RetryRecovery{}
+	}
+	if r.noRecords {
+		return review.RetryRecovery{State: review.RecoveryUnavailable}
+	}
+	if r.recordsGone {
 		return review.RetryRecovery{}
 	}
 	rec, ok := r.recorded[want.ID]

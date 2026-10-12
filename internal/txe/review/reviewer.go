@@ -449,6 +449,9 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef,
 		})
 	}
+	// probed is the reading of a retry's run taken before its interrupted
+	// attempt is recorded, when one is taken; it is not taken twice.
+	var probed *EffectResult
 	if action.State == ActionExecuting {
 		// Until its grant has run out, the attempt's holder may still be
 		// about to perform the effect. A probe now could see nothing and
@@ -456,6 +459,19 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		// left alone and stays in the packet as unresolved.
 		if r.now().Before(action.GrantExpiresAt.Add(leaseMargin)) {
 			return nil
+		}
+		if action.Name == RetryRunAction {
+			// A registry takes what is known about a request's admission
+			// only together with an outcome, and an uncertain outcome is
+			// written once. So the service's record of the request is read
+			// before that write: an execution it names is then on the
+			// action from here on, whatever a later read of the record
+			// gives.
+			res := r.probeRetry(ctx, job, action)
+			probed = &res
+			if res.AdmittedRef != "" {
+				action.Admitted, action.AdmittedRef = true, res.AdmittedRef
+			}
 		}
 		// The interrupted attempt is recorded as uncertain before anything
 		// else, so the journal never shows a dead attempt as still running.
@@ -479,7 +495,20 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		// The reserved retry is not a declared command: the run itself is
 		// its only evidence, whatever version the job is at now.
 		ok = false
-		res = r.probeRetry(ctx, job, action)
+		if probed != nil {
+			res = *probed
+		} else {
+			res = r.probeRetry(ctx, job, action)
+		}
+		if res.Status == EffectUnknown && res.Unasked && escalate && claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
+			// The one thing that could say what became of the request
+			// could not be read this time. That is not the service having
+			// no record of it. The owner is not asked yet, because a
+			// question ends the probing: the next review reads again. It
+			// is bounded like a stalled reservation, by the registry's own
+			// two times, after which the owner is asked as before.
+			return nil
+		}
 		if res.AdmittedRef != "" {
 			// What the probe established about the request's admission,
 			// from the stored outcome or from the service's record of the
@@ -1228,6 +1257,10 @@ const (
 	// not a record that the request was never admitted: it may still be on
 	// its way to being admitted, or the run's history may be gone.
 	RecoveryUnknown RecoveryState = iota
+	// RecoveryUnavailable: the service could not be asked, or could not
+	// read its records, this time. It says nothing about the request and
+	// is asked again.
+	RecoveryUnavailable
 	// RecoveryAdmitted: the service admitted the request as Execution.
 	RecoveryAdmitted
 	// RecoveryAbandoned: the service admitted the request as Execution and
@@ -1312,6 +1345,8 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		// caller after this retry's execution finished or was abandoned.
 		// The service's record of the request is asked for it.
 		if res, found := r.recoverRetry(ctx, job.ID, runID, bound, request, "the service accepted a retry of run "+runID+" without naming its execution"); found {
+			// Whatever the record gave, the service did admit the request.
+			res.Admitted = true
 			return res
 		}
 		return unnamedAdmission(runID, r.seenOnRun(ctx, job.ID, runID, bound))
@@ -1477,6 +1512,7 @@ func (r *Reviewer) probeRetry(ctx context.Context, job Job, action Action) Effec
 		if action.Attempt > 0 && action.BindingDigest != "" {
 			request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest}
 			if res, found := r.recoverRetry(ctx, job.ID, runID, bound, request, ""); found {
+				res.Admitted = res.Admitted || action.Admitted
 				return res
 			}
 		}
@@ -1514,6 +1550,12 @@ func (r *Reviewer) recoverRetry(ctx context.Context, jobID, runID string, bound 
 		return res, true
 	case RecoveryAbandoned:
 		return notDispatched(runID, rec.Execution.Ref()), true
+	case RecoveryUnavailable:
+		detail := "the service's record of the retry request for run " + runID + " could not be read; it is asked for again. " + r.seenOnRun(ctx, jobID, runID, bound)
+		if cause != "" {
+			detail = cause + "; " + detail
+		}
+		return EffectResult{Status: EffectUnknown, Unasked: true, Detail: detail}, true
 	case RecoveryUnknown:
 	}
 	return EffectResult{}, false

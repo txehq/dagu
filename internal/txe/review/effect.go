@@ -46,6 +46,10 @@ type EffectResult struct {
 	// Pending is true for an unknown outcome that later looks can still
 	// settle: the admitted effect has not shown up yet and still may.
 	Pending bool
+	// Unasked is true for an unknown outcome whose one source of an answer
+	// could not be asked this time, as distinct from one that was asked and
+	// had none. It is asked again before the owner is.
+	Unasked bool
 }
 
 // Effector performs declared actions on the local machine.

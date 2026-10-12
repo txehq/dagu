@@ -207,10 +207,22 @@ files.
   or `abandoned`. `admitted` names the retry's execution, which is then
   read like one whose answer arrived. `abandoned` is proof, for this
   request, that nothing ran: the retry is recorded as not dispatched.
-  No record (404), a read that fails, or a record that is not this
+  No record (404), a refusal to show it, or a record that is not this
   request's is no answer, and never proof that nothing was admitted: the
   request may still be admitted later, or the run's history may be gone.
   The retry then stays unknown and goes to the owner, as before.
+  A read that fails (the service unreachable, a server error, a reply
+  that cannot be decoded) is different: the service was not asked. The
+  owner is not asked yet, because a question ends the probing; the next
+  review reads again, until 30 minutes after the registry granted the
+  attempt, and then the owner is asked.
+  An execution the record names is written on the action with the next
+  outcome the registry accepts. For an attempt found interrupted, the
+  record is read before the attempt is written as uncertain, so the
+  execution is on the action from then on. The registry does not take a
+  second uncertain outcome for the same attempt, so an execution first
+  recovered for an attempt already written as uncertain is held only
+  for that review and read again by the next.
   What is recorded: done, only when the service admitted the request,
   named the execution it admitted it as, and that execution is seen on
   the run queued, running or over, with its reference as receipt and its
