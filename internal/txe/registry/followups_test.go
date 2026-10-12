@@ -6,11 +6,14 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 func TestReservedActionNames(t *testing.T) {
@@ -314,6 +317,26 @@ func newRetryFixture(t *testing.T) *retryFixture {
 	return &retryFixture{f: f, rc: rc, job: f.ready("k")}
 }
 
+// admit records in Dagu's run history that execution ref was admitted by
+// the retry request of action actionID's current attempt, as the hub derives
+// it from the action, its binding and the retried execution (params).
+func (r *retryFixture) admit(t *testing.T, actionID string, params RetryRunParams, ref string, abandoned, preparing bool) {
+	t.Helper()
+	job, err := r.f.store.GetJob(r.f.ctx, r.job.JobID)
+	require.NoError(t, err)
+	a, ok := job.Actions[actionID]
+	require.True(t, ok, "action %s", actionID)
+	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(r.job.JobID, params.RunID), params.AttemptID, params.QueuedAt,
+		a.ActionID, strconv.Itoa(a.Attempt), a.BindingDigest)
+	require.NoError(t, err)
+	r.rc.mu.Lock()
+	defer r.rc.mu.Unlock()
+	if r.rc.retries == nil {
+		r.rc.retries = map[string]RetryExecution{}
+	}
+	r.rc.retries[request.ID] = RetryExecution{Ref: ref, Request: *request, Abandoned: abandoned, Preparing: preparing}
+}
+
 func (r *retryFixture) params(run, attempt string) RetryRunParams {
 	return RetryRunParams{RunID: run, AttemptID: attempt, RunSpecSHA256: r.job.DAGSpecSHA256, PackageDigest: r.job.PackageDigest}
 }
@@ -369,6 +392,7 @@ func TestRetryIsBoundToTheFailedAttempt(t *testing.T) {
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a1", ""))), "the retried execution is no receipt")
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a9", ""))), "an execution not observed is no receipt")
 	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a2", SpecSHA256: r.job.DAGSpecSHA256, Status: "queued"}
+	r.admit(t, act1, r.params("run-1", "a1"), ExecutionRef("a2", ""), false, false)
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act1, g1, ec, ActionSucceeded, "a2")), "the receipt is the execution reference")
 	require.NoError(t, r.settle(act1, g1, ec, ActionSucceeded, ExecutionRef("a2", "")))
 
@@ -480,6 +504,7 @@ func TestQueuedRetryIsANewExecution(t *testing.T) {
 
 	// Dagu re-queues a1 in place.
 	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a1", QueuedAt: "2026-10-09T12:00:00.000000002Z", SpecSHA256: r.job.DAGSpecSHA256, Status: "queued"}
+	r.admit(t, act, params, ExecutionRef("a1", "2026-10-09T12:00:00.000000002Z"), false, false)
 	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, failed.Ref())), "the retried execution is no receipt")
 	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a1", "2026-10-09T12:00:00.000000002Z")))
 
@@ -1060,8 +1085,34 @@ func TestAPreparationNeitherSupersedesNorSatisfiesARetry(t *testing.T) {
 	require.NoError(t, err)
 
 	// The retry's own attempt a3 is still being prepared: no receipt yet.
-	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a3", SpecSHA256: r.job.DAGSpecSHA256, Status: "not_started", Preparing: true}
+	r.admit(t, act, r.params("run-1", "a1"), ExecutionRef("a3", ""), false, true)
 	assert.Equal(t, CodeNotReady, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", ""))), "a preparation is no receipt")
-	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a3", SpecSHA256: r.job.DAGSpecSHA256, Status: "not_started"}
+	r.admit(t, act, r.params("run-1", "a1"), ExecutionRef("a3", ""), false, false)
 	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", "")), "dispatched to a worker, it is")
+}
+
+// A retry succeeds only with the execution its own request admitted, read
+// from Dagu's run history by the request the registry derives: not the
+// run's latest execution when that is another retry's, still when a later
+// retry has moved the run on, and never an abandoned preparation.
+func TestRetryReceiptIsTheExecutionItsRequestAdmitted(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	p, d, err := r.propose(r.params("run-1", "a1"), "key-1")
+	require.NoError(t, err)
+	ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+	act, g, err := r.authorize(p, d, ec)
+	require.NoError(t, err)
+
+	// Someone else's retry is the latest; this request admitted nothing yet.
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "x9", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("x9", ""))), "another retry's execution, though latest")
+
+	// This request admitted a2, then a later retry moved the run on to a3.
+	r.admit(t, act, r.params("run-1", "a1"), ExecutionRef("a2", ""), true, false)
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a2", ""))), "abandoned: nothing ran")
+	r.admit(t, act, r.params("run-1", "a1"), ExecutionRef("a2", ""), false, false)
+	r.rc.attempts["run-1"] = RunAttempt{AttemptID: "a3", SpecSHA256: r.job.DAGSpecSHA256, Status: "running"}
+	assert.Equal(t, CodeInvalid, code(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a3", ""))), "the latest, but not this request's")
+	require.NoError(t, r.settle(act, g, ec, ActionSucceeded, ExecutionRef("a2", "")), "its own execution, though no longer latest")
 }

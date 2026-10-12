@@ -53,7 +53,7 @@ func NewRetryRequest(run DAGRunRef, expectedAttemptID, expectedQueuedAt, actionI
 		BindingDigest string   `json:"bindingDigest"`
 		Expected      expected `json:"expected"`
 		Run           runRef   `json:"run"`
-	}{actionAttempt, actionID, bindingDigest, expected{expectedAttemptID, expectedQueuedAt}, runRef{run.Name, run.ID}})
+	}{actionAttempt, actionID, bindingDigest, expected{expectedAttemptID, expectedQueuedAt}, runRef(run)})
 	if err != nil {
 		return nil, err
 	}

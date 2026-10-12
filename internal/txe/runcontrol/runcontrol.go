@@ -215,3 +215,31 @@ func (c *Control) IsSuspended(ctx context.Context, dagName string) (bool, error)
 func (c *Control) SetSuspended(ctx context.Context, dagName string, suspended bool) error {
 	return c.DAGs.SetSuspended(ctx, dagName, suspended)
 }
+
+// RetryExecution returns the root run's execution that recorded retry
+// request requestID, with whether it was abandoned or is still a
+// preparation not known to be settled.
+func (c *Control) RetryExecution(ctx context.Context, dagName, runID, requestID string) (registry.RetryExecution, error) {
+	run := ir.NewDAGRunRef(dagName, runID)
+	match, err := c.Runs.FindRetryRequest(ctx, run, requestID)
+	if errors.Is(err, persis.ErrNotFound) {
+		return registry.RetryExecution{}, registry.ErrRunNotFound
+	}
+	if err != nil {
+		return registry.RetryExecution{}, err
+	}
+	if match.Status.RetryRequest == nil {
+		return registry.RetryExecution{}, fmt.Errorf("run %s: the matched execution records no retry request", runID)
+	}
+	out := registry.RetryExecution{
+		Ref:       ir.ExecutionRef(match.Execution.AttemptID, match.Execution.QueuedAt),
+		Request:   *match.Status.RetryRequest,
+		Abandoned: match.State == persis.RetryRequestAbandoned,
+	}
+	if !out.Abandoned && !match.Retained {
+		if out.Preparing, err = c.preparing(ctx, run, match.Execution.AttemptID); err != nil {
+			return registry.RetryExecution{}, err
+		}
+	}
+	return out, nil
+}

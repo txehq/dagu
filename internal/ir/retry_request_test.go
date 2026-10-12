@@ -19,7 +19,11 @@ func TestNewRetryRequest(t *testing.T) {
 	again, err := NewRetryRequest(run, "a1", "q1", "act-1", "1", "sha256:d")
 	require.NoError(t, err)
 	assert.Equal(t, a, again)
-	assert.Len(t, a.ID, 64)
+	// The canonical form, pinned: sha256 of
+	// {"actionAttempt":"1","actionId":"act-1","bindingDigest":"sha256:d",
+	//  "expected":{"attemptId":"a1","queuedAt":"q1"},"run":{"name":"job","id":"run-1"}}
+	// with no whitespace.
+	assert.Equal(t, "1bd70964d76fb1639b8f3478358ee7f851890711cee34452fb45887115296024", a.ID)
 	assert.Equal(t, ExecutionRef("a1", "q1"), a.RetryOf)
 	assert.Equal(t, RetryRequest{ID: a.ID, ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d", RetryOf: a.RetryOf}, *a)
 
