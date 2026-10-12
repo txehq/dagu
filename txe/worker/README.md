@@ -74,8 +74,14 @@ Upgrade while no job is running, because restarting the worker ends its running 
 
 ## Limits
 
-- **Sleep or offline.** Scheduled runs wait in the service's queue, and further ticks of that job
-  are skipped until the worker reconnects.
+- **Sleep or offline.** Once the service has noticed the worker is gone, a run that comes due waits
+  in the service's queue, and further ticks of that job are skipped until the worker reconnects. A
+  run handed to the worker just before it went away is different. If no worker claims its task
+  within 90 seconds, the task expires. A claim that is never confirmed is released after about 90
+  seconds, and the task then expires after another 90 seconds if nobody claims it. Once the hand-out
+  is 10 minutes old, the service's next check (every 45 seconds) marks the run failed with the
+  reason "not dispatched". Nothing ran, so start it again. There is no guarantee that queued work
+  survives hours offline.
 - **Tunnel drop.** If the tunnel is down for more than 90 seconds, the worker cancels any task it
   is running. launchd restarts the tunnel within seconds after a Pod replacement or network change.
 - **Credential expiry.** The tunnel credential expires (`status.sh` shows when). Rerun

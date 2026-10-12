@@ -157,6 +157,16 @@ type Handler struct {
 	heartbeats        map[string]*heartbeatInfo // workerID -> heartbeat info
 	owner             dispatch.CoordinatorEndpoint
 
+	// inFlightPreparations names the journal entries whose attempt the last
+	// reconciliation pass found possibly with a worker, so each is reported
+	// once rather than on every pass.
+	inFlightPreparationsMu sync.Mutex
+	inFlightPreparations   map[string]struct{}
+
+	// queueStore lets reconciliation see that a queued execution is still
+	// owned by its queue; see HandlerConfig.QueueStore.
+	queueStore queue.QueueStore
+
 	dispatchWakeMu          sync.Mutex
 	dispatchWakeCh          chan struct{}
 	dispatchWakeGeneration  int64
@@ -261,6 +271,11 @@ type HandlerConfig struct {
 	// AgentSessionCleanupQueue stores provider cleanup claimed by owning workers.
 	AgentSessionCleanupQueue *agentsession.CleanupQueue
 
+	// QueueStore is read by reconciliation: a queued execution whose run is
+	// still in its queue is not failed as undispatched, since the queue will
+	// dispatch it again. Optional - when nil, that check is skipped.
+	QueueStore queue.QueueStore
+
 	// StaleHeartbeatThreshold is the duration after which a worker's heartbeat
 	// is considered stale. Defaults to 30 seconds if not set.
 	StaleHeartbeatThreshold time.Duration
@@ -323,6 +338,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		secretStore:               cfg.SecretStore,
 		profileStore:              cfg.ProfileStore,
 		agentSessionCleanupQueue:  cfg.AgentSessionCleanupQueue,
+		queueStore:                cfg.QueueStore,
 		staleHeartbeatThreshold:   cfg.StaleHeartbeatThreshold,
 		staleLeaseThreshold:       cfg.StaleLeaseThreshold,
 		eventService:              cfg.EventService,
@@ -604,9 +620,10 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		h.releaseAdmissionToken(ctx, admissionToken)
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
-	if prepared != nil && prepared.newlyCreated {
-		h.endPreparation(ctx, ir.NewDAGRunRef(req.Task.GetTarget(), req.Task.GetDagRunId()), taskRootRef(req.Task), req.Task.GetAttemptId())
-	}
+	// The preparation entry stays until a worker's claim is acknowledged
+	// (recordTaskClaim): a published task that no worker claims expires from
+	// the dispatch store, and the entry is then what lets reconciliation
+	// abandon the attempt instead of leaving it waiting for nothing.
 	unlockRun()
 	h.notifyDispatchAvailable()
 	return admittedResponse(req.Task, prepared), nil
@@ -931,13 +948,17 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 		// marker is what distinguishes this execution from the earlier ones.
 		task.ExecutionMarker = existingStatus.QueuedAt
 
-		if err := existingAttempt.Open(ctx); err != nil {
+		if err := h.beginQueuedExecutionPreparation(ctx, ref, task); err != nil {
+			return nil, err
+		}
+		// A duplicate dispatch of the same execution shares the attempt an
+		// earlier dispatch left open; opening a second handle and overwriting
+		// the cached one would leak the first.
+		opened, err := h.replaceOpenAttempt(ctx, task.DagRunId, existingAttempt, existingAttempt.ID())
+		if err != nil {
 			return nil, fmt.Errorf("failed to open existing attempt: %w", err)
 		}
-
-		h.attemptsMu.Lock()
-		h.openAttempts[task.DagRunId] = existingAttempt
-		h.attemptsMu.Unlock()
+		existingAttempt = opened
 
 		logger.Info(ctx, "Reusing existing queued attempt for dispatched task",
 			tag.RunID(task.DagRunId),
@@ -989,6 +1010,35 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 	)
 
 	return &preparedDispatchAttempt{attempt: attempt, newlyCreated: true}, nil
+}
+
+// beginQueuedExecutionPreparation journals the execution a queued dispatch is
+// about to publish, keyed by its queued-at marker, so that if no worker claims
+// its task before it expires, reconciliation fails that execution with a
+// record instead of leaving the run queued with nothing left to run it. The
+// entry is idempotent: every dispatch of the same execution shares it, and
+// only an acknowledged claim or that execution's abandonment ends it. The
+// caller holds the run's write lock. An execution that is no longer the queued
+// one is a stale dispatch; any other failure fails the dispatch, which the
+// queue retries, so a marked queued execution is never published unjournaled.
+//
+// A queued status without a marker (one written before markers existed, or by
+// a writer that sets none) names no execution to journal or abandon. It is
+// published unjournaled, as before journaling existed, and reconciliation
+// never fails it: refusing it would discard its queue item and strand the run.
+func (h *Handler) beginQueuedExecutionPreparation(ctx context.Context, run ir.DAGRunRef, task *coordinatorv1.Task) error {
+	if !h.canAbandonPreparations() || task.ExecutionMarker == "" {
+		return nil
+	}
+	_, err := h.dagRunRepository.BeginAttemptPreparation(ctx, run, run, task.AttemptId, task.ExecutionMarker)
+	switch {
+	case err == nil, errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		return nil
+	case errors.Is(err, persis.ErrAttemptNotAbandonable):
+		return staleQueueDispatchError("queued execution changed before dispatch")
+	default:
+		return fmt.Errorf("failed to journal the queued execution: %w", err)
+	}
 }
 
 // generateRootAttemptKey creates an AttemptKey for root-level tasks (self-referential hierarchy).
@@ -1261,6 +1311,11 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	defer h.releasePreparedDispatchAttempt(context.WithoutCancel(ctx), dagRunID, prepared.attempt)
 
 	if !prepared.newlyCreated {
+		// A reused attempt's execution stays queued and the queue dispatches
+		// it again, under the same journal entry. The entry is kept: it may
+		// be an earlier dispatch's, and a failed publication can still have
+		// left a task behind. If no dispatch of it is ever claimed,
+		// reconciliation fails the execution with a record.
 		return
 	}
 
@@ -1273,7 +1328,7 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	if h.dispatchTaskStore != nil {
 		h.releasePreparedDispatchAttempt(storeCtx, dagRunID, prepared.attempt)
 		_, abandonErr := h.abandonExecutionLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId), taskRootRef(task),
-			prepared.attempt.ID(), "not dispatched: handing the task to a worker failed: "+dispatchErr.Error())
+			prepared.attempt.ID(), "", "not dispatched: handing the task to a worker failed: "+dispatchErr.Error(), nil)
 		switch {
 		case abandonErr == nil:
 			return
@@ -1549,10 +1604,28 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 		root = ir.DAGRunRef{Name: task.GetTarget(), ID: task.GetDagRunId()}
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	if err := h.refuseAbandonedExecution(ctx, ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
+	run := ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId())
+	if err := h.refuseAbandonedExecution(ctx, run, root, task.GetAttemptId(), task.GetExecutionMarker()); err != nil {
 		return err
 	}
-	return h.attemptOwnership().recordTaskClaim(ctx, task, workerID)
+	if err := h.attemptOwnership().recordTaskClaim(ctx, task, workerID); err != nil {
+		return err
+	}
+	// The execution now has a lease, so it can no longer be proven
+	// undispatched: end its preparation entry under the same lock that
+	// abandonment takes. If ending fails, or the coordinator stops first, the
+	// lease keeps reconciliation from abandoning it and the entry is ended once
+	// the attempt has progressed. The acknowledgement may carry a marker filled
+	// in for a legacy queued task even when this dispatch created the attempt,
+	// so both the attempt's entry and the execution's are ended; a missing one
+	// is no error.
+	if h.canAbandonPreparations() {
+		h.endPreparation(ctx, run, root, task.GetAttemptId(), "")
+		if marker := task.GetExecutionMarker(); marker != "" {
+			h.endPreparation(ctx, run, root, task.GetAttemptId(), marker)
+		}
+	}
+	return nil
 }
 
 // ClaimAgentSessionCleanup reserves deferred provider cleanup for its owning worker.
