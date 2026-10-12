@@ -5,6 +5,8 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,10 @@ type Steps struct {
 	// StateDir holds the hand-off between a run's steps. It must be durable
 	// and outside any worktree.
 	StateDir string
+	// ArtifactDir, when set, is the run's artifact directory. The packet
+	// and the decision are written there by this process, so they are kept
+	// with the run on the service without redirecting any step output.
+	ArtifactDir string
 	// AuthCheck is an optional command that reports whether the agent CLI
 	// is logged in, without calling a model. It runs only after an agent
 	// produced nothing, to tell a missing login from any other failure.
@@ -56,6 +62,26 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 	if err != nil {
 		return err
 	}
+	// Dead waits are closed on every tick, due job or not. A failure is
+	// logged for the run and does not stop reviews: the pending list keeps
+	// what was not closed.
+	closures, closeErr := s.Reviewer.CloseSuperseded(ctx, s.MachineID)
+	for _, c := range closures {
+		fmt.Fprintf(os.Stderr, "txe review: superseded proposal %s of %s: %s %s\n", c.ProposalID, c.JobID, c.Outcome, c.Detail)
+	}
+	if closeErr != nil {
+		fmt.Fprintln(os.Stderr, "txe review: closing superseded proposals:", closeErr)
+	}
+	// Retries a person requested directly have no run of their own to
+	// execute them, so the tick does. A failure here does not stop reviews
+	// either: an unattempted retry is listed again on the next tick.
+	retries, retryErr := s.Reviewer.RunRequestedRetries(ctx, s.MachineID)
+	for _, rt := range retries {
+		fmt.Fprintf(os.Stderr, "txe review: requested retry %s of %s: state=%s skipped=%q error=%q\n", rt.ProposalID, rt.JobID, rt.Executed.Action.State, rt.Executed.Skipped, rt.Error)
+	}
+	if retryErr != nil {
+		fmt.Fprintln(os.Stderr, "txe review: executing requested retries:", retryErr)
+	}
 	due, err := s.Reviewer.Registry.DueJobs(ctx, s.MachineID, s.Reviewer.now())
 	if err != nil {
 		return fmt.Errorf("list due jobs: %w", err)
@@ -76,6 +102,15 @@ func (s *Steps) Prepare(ctx context.Context, runID string, stdout io.Writer) err
 			// Without the hand-off the claim could never be used.
 			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
 			return fmt.Errorf("save prepared review: %w", err)
+		}
+		// A job that could not be prepared is not dropped silently just
+		// because another one was: it is named in this run's log.
+		if failed != nil {
+			fmt.Fprintln(os.Stderr, "txe review: jobs that could not be prepared:", failed)
+		}
+		if err := s.saveArtifact(packetArtifact, prepared.Packet); err != nil {
+			_ = s.Reviewer.Registry.ReleaseClaim(ctx, prepared.Claim)
+			return fmt.Errorf("save packet artifact: %w", err)
 		}
 		return json.NewEncoder(stdout).Encode(prepared.Packet)
 	}
@@ -119,12 +154,21 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 
 	result := StepResult{JobID: prepared.Packet.Job.ID, ReviewID: prepared.Packet.ReviewID}
 	reviewer := *s.Reviewer
+	sum := sha256.Sum256(data)
+	reviewer.Handoff = LocalFile{MachineID: s.MachineID, Path: path, SHA256: hex.EncodeToString(sum[:])}
 	if models := AgentModels(raw); len(models) > 0 {
 		reviewer.AgentClient = strings.TrimSpace(reviewer.AgentClient + " " + strings.Join(models, ","))
 	}
 	reviewer.AgentInputTokens, reviewer.AgentOutputTokens = AgentUsage(raw)
 
 	decision, err := ParseAgentOutput(raw)
+	if err == nil && s.ArtifactDir != "" {
+		if saveErr := s.saveArtifact(decisionArtifact, decision); saveErr != nil {
+			s.release(ctx, prepared.Claim)
+			return fmt.Errorf("save decision artifact: %w", saveErr)
+		}
+		reviewer.PacketArtifact, reviewer.DecisionArtifact = packetArtifact, decisionArtifact
+	}
 	if err != nil && strings.TrimSpace(string(raw)) == "" {
 		failure := ClassifyAgentFailure(readLogTail(agentLog))
 		if failure.Kind != ExceptionReviewerAuth && !s.agentLoggedIn(ctx) {
@@ -144,12 +188,35 @@ func (s *Steps) Apply(ctx context.Context, runID string, agentOutput io.Reader, 
 		}
 		result.Failure = failure.Error()
 	case err != nil:
+		// Nothing retries this step, so the claim would otherwise hold the
+		// job until it expired. What was done is in the journal and the
+		// checkpoint has not moved: the next review takes the same episode
+		// up again and repeats nothing.
+		s.release(ctx, prepared.Claim)
 		return err
 	default:
 		result.Applied = &applied
 	}
 	return json.NewEncoder(stdout).Encode(result)
 }
+
+// release gives up the claim of a review that cannot be completed in this
+// step. It is given its own short time, so it still happens when the step's
+// context is already over, and a failure to release only means the claim
+// runs out by itself.
+func (s *Steps) release(ctx context.Context, claim Claim) {
+	if claim.ID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if err := s.Reviewer.Registry.ReleaseClaim(ctx, claim); err != nil {
+		fmt.Fprintf(os.Stderr, "txe review: releasing the claim on %s: %v\n", claim.JobID, err)
+	}
+}
+
+// releaseTimeout bounds giving up a claim after a failed step.
+const releaseTimeout = 15 * time.Second
 
 // Execute runs the single effect an approve decision authorizes.
 func (s *Steps) Execute(ctx context.Context, jobID, proposalID, decisionID string, stdout io.Writer) error {
@@ -187,6 +254,20 @@ func (s *Steps) agentLoggedIn(ctx context.Context) bool {
 		return true
 	}
 	return *status.LoggedIn
+}
+
+const (
+	packetArtifact   = "txe-review/packet.json"
+	decisionArtifact = "txe-review/decision.json"
+)
+
+// saveArtifact writes v into the run's artifact directory. It does nothing
+// when the run has none.
+func (s *Steps) saveArtifact(name string, v any) error {
+	if s.ArtifactDir == "" {
+		return nil
+	}
+	return writeJSONFile(filepath.Join(s.ArtifactDir, filepath.FromSlash(name)), v)
 }
 
 // readLogTail returns the end of a log file, or nothing if it is unreadable.
@@ -227,10 +308,41 @@ type EnqueueFunc func(ctx context.Context, dag, runID string, params map[string]
 // an earlier attempt.
 var ErrRunExists = errors.New("txe review: run already exists")
 
+// CompleteFunc completes a waiting human task of one run with the given
+// input. It returns ErrTaskAnswered when the task was already completed with
+// another input and ErrRunMissing when the service knows no such run. An
+// identical earlier completion is a success.
+type CompleteFunc func(ctx context.Context, task TaskLocator, input map[string]string) error
+
+var (
+	// ErrTaskAnswered means the task already holds a different answer.
+	ErrTaskAnswered = errors.New("txe review: task already answered")
+	// ErrTaskEnded means the task can no longer be answered because its
+	// run or its step ended without the step completing: nobody answered.
+	ErrTaskEnded = errors.New("txe review: task ended before it was answered")
+	// ErrTaskOver means the task's step finished in a state it can hold an
+	// answer in and the service records nobody as having completed it. That is not proof that nobody
+	// answered: a service that does not record who completed a task shows
+	// an answered one the same way.
+	ErrTaskOver = errors.New("txe review: task is over with no completion on record")
+	// ErrRunMissing means the service has no such run.
+	ErrRunMissing = errors.New("txe review: run not found")
+)
+
+const (
+	// NoDecisionID is the decision pointer given to a decision run that the
+	// system closes. It names no decision in the registry.
+	NoDecisionID = "dec_superseded"
+	// VerdictSuperseded is the task input the system uses when it closes a
+	// run. It is not a human verdict and no Decision record carries it.
+	VerdictSuperseded = "superseded"
+)
+
 // RunOpener makes a proposal answerable by enqueueing its own run of the
 // decision DAG. The run stops at a native human task and holds no process.
 type RunOpener struct {
-	Enqueue EnqueueFunc
+	Enqueue  EnqueueFunc
+	Complete CompleteFunc
 }
 
 var _ DecisionOpener = (*RunOpener)(nil)
@@ -246,4 +358,32 @@ func (o *RunOpener) OpenDecision(ctx context.Context, proposal Proposal) error {
 		return nil
 	}
 	return err
+}
+
+// CloseDecision implements DecisionOpener. The wait is ended the only way
+// the service offers: the task is completed, with a system marker in place of
+// a decision. What may run is decided by the registry's record of the
+// proposal, which is superseded, so the run ends without an effect.
+func (o *RunOpener) CloseDecision(ctx context.Context, proposal Proposal) (ClosureOutcome, error) {
+	if o.Complete == nil {
+		return ClosureFailed, errors.New("no way to complete a task is configured")
+	}
+	err := o.Complete(ctx, proposal.NativeTask, map[string]string{
+		"decision_id": NoDecisionID,
+		"verdict":     VerdictSuperseded,
+	})
+	switch {
+	case err == nil:
+		return ClosureClosed, nil
+	case errors.Is(err, ErrTaskAnswered):
+		return ClosureAnswered, nil
+	case errors.Is(err, ErrTaskEnded):
+		return ClosureEnded, nil
+	case errors.Is(err, ErrTaskOver):
+		return ClosureOver, nil
+	case errors.Is(err, ErrRunMissing):
+		return ClosureMissing, nil
+	default:
+		return ClosureFailed, err
+	}
 }

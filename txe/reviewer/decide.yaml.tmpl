@@ -27,7 +27,9 @@ steps:
             type: string
           verdict:
             type: string
-            enum: [approve, reject, redirect, retry, pause, snooze, retire]
+            # superseded is written only by the system when it closes the run
+            # of a proposal nobody can answer any more. It is not a verdict.
+            enum: [approve, reject, redirect, retry, pause, snooze, retire, superseded]
         required: [decision_id, verdict]
 
   # The task input only points at the decision. The registry's own record of
@@ -46,4 +48,4 @@ steps:
       - TXE_JOB_ID: ${JOB_ID}
       - TXE_PROPOSAL_ID: ${PROPOSAL_ID}
       - TXE_DECISION_ID: ${steps.decide.outputs.decision_id}
-    run: {{.ReviewCommand}} execute --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"
+    run: {{.ReviewCommand}} execute --machine {{.MachineID}} --run-id ${DAG_RUN_ID} --job "$TXE_JOB_ID" --proposal "$TXE_PROPOSAL_ID" --decision "$TXE_DECISION_ID"

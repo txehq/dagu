@@ -186,7 +186,7 @@ func (d AgentDecision) validate(p Packet) error {
 		return errors.New("reasoning is required")
 	}
 	for _, id := range d.EvidenceRunIDs {
-		if !p.hasRun(id) {
+		if _, shown := p.run(id); !shown {
 			return fmt.Errorf("evidence run %q is not in the packet", id)
 		}
 	}

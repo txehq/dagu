@@ -4,29 +4,20 @@
 package review
 
 import (
-	"crypto/sha256"
-	"encoding/base32"
-	"encoding/json"
 	"strings"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
-// crockford is the alphabet shared with the registry's minted ULIDs, so a
-// derived id has the same shape as a minted one.
-var crockford = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
-
-const derivedIDLen = 26
-
-// derivedID returns prefix_ plus the first 26 Crockford base32 characters of
-// the SHA-256 of the JSON array of parts. Maps marshal with sorted keys, so
-// equal params always derive equal ids.
+// derivedID derives an id with the registry's own function, so the reviewer
+// and the registry cannot disagree about an id either of them computes.
 func derivedID(prefix string, parts ...any) string {
-	b, err := json.Marshal(parts)
+	id, err := registry.DerivedID(registry.Prefix(prefix), parts...)
 	if err != nil {
 		// Only strings, ints and string maps are hashed.
 		panic(err)
 	}
-	sum := sha256.Sum256(b)
-	return prefix + "_" + crockford.EncodeToString(sum[:])[:derivedIDLen]
+	return id
 }
 
 func normalizeParams(params map[string]string) map[string]string {
@@ -66,12 +57,18 @@ func ProposalID(reviewID string, kind ProposalKind, name, targetID string, param
 	return derivedID("prp", reviewID, string(kind), name, targetID, normalizeParams(params), question)
 }
 
-// UncertainProposalID identifies the escalation of one action as asked
-// about one version of its job. An answer is tied to the job as it was when
-// the owner gave it: after the job changes, the question has a new id and
-// the old answer no longer applies.
-func UncertainProposalID(actionID string, jobVersion int) string {
-	return derivedID("prp", "uncertain", actionID, jobVersion)
+// UncertainProposalID identifies the escalation of one attempt of an action
+// as asked about one version of its job. An answer is tied to the attempt
+// it was given about and to the job as it was then: after another attempt,
+// or after the job changes, the question has a new id and the old answer no
+// longer applies.
+func UncertainProposalID(actionID string, attempt, jobVersion int) string {
+	id, err := registry.EscalationProposalID(actionID, attempt, jobVersion)
+	if err != nil {
+		// Only a string and ints are hashed.
+		panic(err)
+	}
+	return id
 }
 
 // DecisionRunID is the id of the native run that carries a proposal's human
@@ -79,4 +76,34 @@ func UncertainProposalID(actionID string, jobVersion int) string {
 // instead of opening a second task.
 func DecisionRunID(proposalID string) string {
 	return "txe-" + strings.ToLower(strings.TrimPrefix(proposalID, "prp_"))
+}
+
+// Execution identifies one execution of a run the way the service does: by
+// the attempt and by when that attempt was last queued. A retry keeps the
+// run id. Dagu either starts a new attempt for it, or queues the latest
+// attempt again under the same attempt id with a later queued time, so
+// neither part alone names an execution.
+type Execution struct {
+	AttemptID string `json:"attempt_id"`
+	// QueuedAt is the service's stored value, byte for byte; empty for an
+	// attempt that was never queued.
+	QueuedAt string `json:"queued_at,omitempty"`
+}
+
+// known reports whether the service identified the execution at all.
+func (e Execution) known() bool {
+	return e.AttemptID != ""
+}
+
+// Ref is the portable reference to the execution: the one form used in
+// records, receipts and cursors.
+func (e Execution) Ref() string {
+	return ExecutionRef(e.AttemptID, e.QueuedAt)
+}
+
+// ExecutionRef is the registry's reference of an execution. The reviewer
+// never derives one itself: a receipt it records has to be the one the
+// registry observes.
+func ExecutionRef(attemptID, queuedAt string) string {
+	return registry.ExecutionRef(attemptID, queuedAt)
 }
