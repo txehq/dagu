@@ -737,27 +737,52 @@ func TestCommitOfOneRequestTwiceAtTheSameMoment(t *testing.T) {
 	marked := second.Dir + RemovingSuffix
 
 	// The first call stops at its third sync: the copy is marked, the mark
-	// not yet synced.
-	var calls atomic.Int32
-	reached, release := make(chan struct{}), make(chan struct{})
-	real := syncStagingArea
+	// not yet synced. The second call says when it is about to take the lock.
+	var syncs, locks atomic.Int32
+	reached, release, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	realSync, realBefore := syncStagingArea, beforeRemovalLock
 	syncStagingArea = func(dir string) error {
-		if calls.Add(1) == 3 {
+		if syncs.Add(1) == 3 {
 			close(reached)
 			<-release
 		}
-		return real(dir)
+		return realSync(dir)
 	}
-	t.Cleanup(func() { syncStagingArea = real })
+	beforeRemovalLock = func() {
+		if locks.Add(1) == 2 {
+			close(waiting)
+		}
+	}
+	// Whatever fails below, the stopped call is released and both calls have
+	// returned before the two variables are put back.
+	var running sync.WaitGroup
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		letGo()
+		running.Wait()
+		syncStagingArea, beforeRemovalLock = realSync, realBefore
+	})
 
 	done := make(chan error, 2)
 	commit := func() {
 		_, err := store.Commit(second, testJob)
 		done <- err
 	}
-	go commit()
-	<-reached
-	go commit()
+	await := func(what string, reachedIt <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-reachedIt:
+		case err := <-done:
+			t.Fatalf("a call returned before %s: %v", what, err)
+		case <-time.After(30 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	running.Go(commit)
+	await("the first call marked the copy", reached)
+	running.Go(commit)
+	await("the second call asked for the lock", waiting)
 
 	select {
 	case err := <-done:
@@ -768,7 +793,7 @@ func TestCommitOfOneRequestTwiceAtTheSameMoment(t *testing.T) {
 	require.NoError(t, err, "the marked copy was touched before its mark was synced")
 	assert.Equal(t, second.Digest, digest)
 
-	close(release)
+	letGo()
 	require.NoError(t, <-done)
 	require.NoError(t, <-done)
 	assert.Empty(t, stagedNames(t, store))

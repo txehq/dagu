@@ -295,12 +295,17 @@ func (s *Store) FinishRemoval(requestID string) error {
 // package.
 func (s *Store) removing(remove func() error) error {
 	lock := flock.New(filepath.Join(s.Root, stagingDir+".lock"))
+	beforeRemovalLock()
 	if err := lock.Lock(); err != nil {
 		return fmt.Errorf("lock the staging area: %w", err)
 	}
 	defer func() { _ = lock.Unlock() }()
 	return remove()
 }
+
+// beforeRemovalLock is called by a removal that is about to take the lock. A
+// test sets it to learn that a second call has got that far.
+var beforeRemovalLock = func() {}
 
 // syncStagingArea makes the names in the staging area durable. It is a
 // variable so a test can make it fail.
