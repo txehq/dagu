@@ -17,7 +17,7 @@ Every command here is written `dagu txe ...`. Run the `dagu` that the worker ins
 ~/.local/share/txe-dagu/bin/dagu txe doctor
 ```
 
-The TXE home is `~/.local/share/txe-dagu` unless `TXE_DAGU_HOME` names another directory, and then the binary is `$TXE_DAGU_HOME/bin/dagu`. That binary is the one this machine's jobs run, so it matches the hub. It is not put on `PATH`: a bare `dagu` may be missing, or may be another build that has no `txe` command.
+The TXE home is `~/.local/share/txe-dagu` unless `TXE_DAGU_HOME` names another directory, and then the binary is `$TXE_DAGU_HOME/bin/dagu`. That binary is the one this machine's jobs run. Nothing makes it the same build as the hub: `dagu txe doctor` prints both builds, and if they differ, tell the user before you register. It is not put on `PATH`: a bare `dagu` may be missing, or may be another build that has no `txe` command.
 
 ## Before you register
 
