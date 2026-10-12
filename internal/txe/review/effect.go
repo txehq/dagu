@@ -5,8 +5,11 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -50,6 +53,10 @@ type EffectResult struct {
 	// could not be asked this time, as distinct from one that was asked and
 	// had none. It is asked again before the owner is.
 	Unasked bool
+	// OutputSHA256 is, for a probe, the digest of what it wrote to its
+	// standard output, as far as that was kept (see maxActionOutput). It is
+	// empty when the probe wrote nothing. The text itself is not returned.
+	OutputSHA256 string
 }
 
 // Effector performs declared actions on the local machine.
@@ -86,7 +93,7 @@ var _ Effector = (*CommandEffector)(nil)
 
 // Run implements Effector.
 func (e *CommandEffector) Run(ctx context.Context, job Job, declared DeclaredAction, action Action) EffectResult {
-	code, out, err := e.exec(ctx, job, declared.Command, declared, action)
+	code, out, err := e.exec(ctx, job, declared.Command, declared, action, os.Stderr)
 	switch {
 	case err == nil && code == 0:
 		return EffectResult{Status: EffectApplied, Receipt: receiptFrom(out)}
@@ -111,15 +118,24 @@ func (e *CommandEffector) Run(ctx context.Context, job Job, declared DeclaredAct
 	}
 }
 
-// Probe implements Effector.
+// Probe implements Effector. Nothing a probe writes leaves this process: a
+// probe is given what the job's commands are given, credentials among it,
+// and may print any of it. Its standard output is only counted into a
+// digest, and its standard error is discarded and not written to the step's
+// log as an action's is. What it found is its exit code.
 func (e *CommandEffector) Probe(ctx context.Context, job Job, declared DeclaredAction, action Action) EffectResult {
 	if len(declared.Reconcile) == 0 {
 		return EffectResult{Status: EffectUnknown, Detail: "no reconcile probe is declared"}
 	}
-	code, out, err := e.exec(ctx, job, declared.Reconcile, declared, action)
+	code, out, err := e.exec(ctx, job, declared.Reconcile, declared, action, io.Discard)
+	digest := ""
+	if out != "" {
+		sum := sha256.Sum256([]byte(out))
+		digest = hex.EncodeToString(sum[:])
+	}
 	switch {
 	case err == nil && code == 0:
-		return EffectResult{Status: EffectApplied, Receipt: receiptFrom(out)}
+		return EffectResult{Status: EffectApplied, OutputSHA256: digest}
 	case err == nil && code == exitNotApplied:
 		return EffectResult{Status: EffectNotApplied, Detail: "probe found no effect"}
 	case err == nil:
@@ -133,7 +149,7 @@ var errNotStarted = errors.New("process did not start")
 
 // exec returns the exit code and stdout of a process that ran to completion.
 // err is non-nil when the process never started, was killed or timed out.
-func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, declared DeclaredAction, action Action) (int, string, error) {
+func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, declared DeclaredAction, action Action, stderr io.Writer) (int, string, error) {
 	if len(argv) == 0 {
 		return 0, "", fmt.Errorf("%w: action %q declares no command", errNotStarted, declared.Name)
 	}
@@ -167,7 +183,7 @@ func (e *CommandEffector) exec(ctx context.Context, job Job, argv []string, decl
 	// reviewer's memory with what comes before it.
 	stdout := tailBuffer{limit: maxActionOutput}
 	cmd.Stdout = &stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = stderr
 
 	proc, err := cmdutil.StartManagedProcess(cmd)
 	if err != nil {

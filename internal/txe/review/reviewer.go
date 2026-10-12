@@ -5,6 +5,8 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -487,7 +489,17 @@ func (r *Reviewer) reconcile(ctx context.Context, claim Claim, job Job, escalate
 	return nil
 }
 
+// probeReceipt is the receipt of an attempt settled on a reconcile probe.
+// It names the attempt it is about and the review run that ran the probe,
+// so it cannot be read as the receipt the action itself would have printed,
+// and it carries nothing the probe printed.
+func probeReceipt(action Action, run string) string {
+	return fmt.Sprintf("probe:%s:%d:%s", action.ID, action.Attempt, run)
+}
+
 func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, action Action, escalate bool) error {
+	// probed is set when the attempt is settled on what a probe found.
+	var probed *ProbeEvidence
 	finish := func(state ActionState, res EffectResult) error {
 		return r.Registry.FinishAction(ctx, FinishRequest{
 			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
@@ -495,6 +507,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// The registry replaces the stored outcome, so what is known
 			// about the request's admission is written again with it.
 			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef,
+			Probe: probed,
 		})
 	}
 	// stored is the execution the registry holds as admitted for this
@@ -660,6 +673,24 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			res.Detail = "the effect was applied"
 		}
 		res.Detail = "reconciled: " + res.Detail
+		if action.Name != RetryRunAction {
+			// The attempt is done on a probe's word, not on the action's
+			// own receipt, and its record says so. A probe states that the
+			// effect is there by its exit code and need print nothing; what
+			// it does print is not stored, because an outcome is kept with
+			// the action and shown to people, and a probe may print what it
+			// was given to look with. The receipt names this attempt and
+			// the review run that ran the probe, and the record keeps only
+			// a digest of what the probe printed.
+			probed = &ProbeEvidence{Run: r.Holder, OutputSHA256: res.OutputSHA256}
+			if probed.OutputSHA256 == "" && res.Receipt != "" {
+				// An effector that hands back a line instead of a digest.
+				sum := sha256.Sum256([]byte(res.Receipt))
+				probed.OutputSHA256 = hex.EncodeToString(sum[:])
+			}
+			res.Receipt = probeReceipt(action, r.Holder)
+			res.Detail = "reconciled: a probe found the effect present"
+		}
 		err := finish(ActionSucceeded, res)
 		if action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
 			// The registry does not take the execution as dispatched yet.
@@ -1169,10 +1200,11 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 	case EffectUnknown:
 		state = ActionUncertain
 	}
-	err := r.Registry.FinishAction(ctx, FinishRequest{
+	record := FinishRequest{
 		Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
 		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
-	})
+	}
+	err := r.Registry.FinishAction(ctx, record)
 	if err != nil && state == ActionSucceeded && action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
 		// The run shows the admitted execution dispatched and the registry
 		// does not take it yet: by its own record that execution's
@@ -1183,10 +1215,15 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 		state = ActionUncertain
 		res.Receipt = ""
 		res.Detail = fmt.Sprintf("%s; the registry does not record execution %s as dispatched yet, so the retry is settled by a later review", res.Detail, res.AdmittedRef)
-		err = r.Registry.FinishAction(ctx, FinishRequest{
+		record = FinishRequest{
 			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
 			State: state, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
-		})
+		}
+		err = r.Registry.FinishAction(ctx, record)
+	}
+	if err != nil && r.outcomeHeld(ctx, action, record, err) {
+		// The registry holds this outcome of this attempt; see outcomeHeld.
+		err = nil
 	}
 	if err != nil {
 		return Action{}, fmt.Errorf("record outcome of action %s: %w", action.ID, err)
@@ -1194,6 +1231,98 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 	action.State, action.Receipt, action.Detail = state, res.Receipt, res.Detail
 	action.Admitted, action.AdmittedRef = res.Admitted, res.AdmittedRef
 	return action, nil
+}
+
+// outcomeHeld reports whether an outcome whose record failed is the outcome
+// the registry holds for exactly this attempt. Only then is the failure not
+// an error. The failure alone proves nothing: what the registry holds is
+// read from the registry, and it must be the same attempt in every respect
+// the reviewer knows (the action, the attempt and its grant, the job
+// version, its name, target and parameters, and the binding digest when the
+// reviewer was given one) with the same outcome (the state, for a success
+// the same receipt, and the same admitted execution). Anything that differs,
+// an action that is not there, and a registry that cannot be read all leave
+// the failure an error.
+//
+// What the registry holds is taken from one of two places.
+//
+// The refusal itself. The registry refuses a record made from a state it
+// cannot be made from, and sends the action as it held it. That is what
+// happens to an attempt that ran to the end of its grant: the command is
+// stopped when the grant ends, and the registry interrupts an attempt whose
+// grant has ended before it looks at any write, making it uncertain, or
+// failed when the attempt was granted as read-only. A record of that same
+// outcome is then refused with the interrupted action attached. That is the
+// registry's own account, by its own clock, of this attempt's outcome. The
+// refused write is not stored, and the interruption is applied again and
+// stored by the next write the registry takes for the job, whoever makes
+// it: an attempt whose grant has ended has no other future.
+//
+// Or a read of the job's actions, when the refusal came without the action,
+// when the registry said the action is not in flight any more, and when the
+// registry did not answer at all (the record may have been written and its
+// answer lost).
+//
+// Any other answer of the registry (a claim that is no longer this
+// review's, a grant that is not the action's, a refused value, a conflict
+// of another kind) is about something else and stays what it is.
+func (r *Reviewer) outcomeHeld(ctx context.Context, action Action, record FinishRequest, failed error) bool {
+	te, answered := errors.AsType[*TransportError](failed)
+	stateRefusal := answered && te.Status == http.StatusConflict && te.Code == codeActionState
+	switch {
+	case stateRefusal && te.CurrentAction != nil:
+		return sameAttempt(*te.CurrentAction, action) && sameOutcome(*te.CurrentAction, record)
+	case stateRefusal, errors.Is(failed, ErrNotFound), !registryAnswered(failed):
+	default:
+		return false
+	}
+	actions, err := r.Registry.Actions(ctx, record.JobID)
+	if err != nil {
+		return false
+	}
+	for _, held := range actions {
+		if held.ID == action.ID {
+			return sameAttempt(held, action) && sameOutcome(held, record)
+		}
+	}
+	return false
+}
+
+// sameAttempt reports whether held is the attempt the reviewer made.
+func sameAttempt(held, made Action) bool {
+	return held.ID == made.ID && held.GrantID != "" && held.GrantID == made.GrantID && held.Attempt == made.Attempt &&
+		held.JobVersion == made.JobVersion && held.Name == made.Name && held.TargetID == made.TargetID &&
+		maps.Equal(held.Params, made.Params) &&
+		(made.BindingDigest == "" || held.BindingDigest == made.BindingDigest)
+}
+
+// sameOutcome reports whether held carries the outcome being recorded.
+func sameOutcome(held Action, record FinishRequest) bool {
+	// What the attempt was seen to admit is part of its outcome, with or
+	// without a named execution, as the registry stores it.
+	admitted := func(flag bool, ref string) bool { return flag || ref != "" }
+	if held.State != record.State || held.AdmittedRef != record.AdmittedRef ||
+		admitted(held.Admitted, held.AdmittedRef) != admitted(record.Admitted, record.AdmittedRef) {
+		return false
+	}
+	return record.State != ActionSucceeded || record.Receipt != "" && held.Receipt == record.Receipt
+}
+
+// registryAnswered reports whether err is something the registry said, as
+// opposed to a request whose answer never arrived.
+func registryAnswered(err error) bool {
+	if _, ok := errors.AsType[*TransportError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*GuardDeniedError](err); ok {
+		return true
+	}
+	for _, said := range []error{ErrClaimHeld, ErrStaleFence, ErrConflict, ErrActionExists, ErrNotReady, ErrNotFound} {
+		if errors.Is(err, said) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Reviewer) propose(ctx context.Context, claim Claim, job Job, packet Packet, kind ProposalKind, requested AgentAction, question string, review *Review, result *Applied) error {

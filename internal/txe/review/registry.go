@@ -106,6 +106,24 @@ type FinishRequest struct {
 	// named for it, if it named one.
 	Admitted    bool
 	AdmittedRef string
+	// Probe is set when the outcome is a success found by a reconcile
+	// probe and not reported by the action itself.
+	Probe *ProbeEvidence
+}
+
+// ProbeEvidence says what found an interrupted attempt's effect present.
+// It carries nothing the probe printed: an outcome is stored with the
+// action, shown to people and kept, and is not masked as step output is.
+type ProbeEvidence struct {
+	// Run is the review run that ran the probe.
+	Run string
+	// OutputSHA256 is the SHA-256 digest of what the probe wrote to its
+	// standard output, untrimmed, as far as the effector kept it (the last
+	// 64 KiB for a command); empty when it wrote nothing. An effector that
+	// hands back a line instead of a digest has that line digested. The
+	// digest is unsalted, so it does not hide a short or guessable output:
+	// a probe states what it found by its exit code, not by what it prints.
+	OutputSHA256 string
 }
 
 // Registry is the part of the TXE job registry the reviewer consumes. The

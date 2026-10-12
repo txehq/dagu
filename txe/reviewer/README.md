@@ -442,3 +442,32 @@ A `reconcile` probe exits `0` if the effect is present at the destination,
 settles an interrupted attempt. Absence does not prove a request already
 sent will not still take effect, so the attempt goes to the owner instead of
 being closed as not applied.
+
+An attempt settled on its probe is recorded as done, and its record says
+that a probe found it: the receipt is `probe:<action id>:<attempt>:<review
+run>`, naming the attempt and the review run that ran the probe, and the
+outcome carries `confirmed_by: probe`, that run, and a SHA-256 digest of
+what the probe wrote to its standard output (of the last 64 KiB of it, if
+it wrote more; absent if it wrote nothing). Nothing a probe prints leaves
+the review process: its output is only counted into that digest, and its
+error output is discarded and not written to the step's log as an
+action's is. A probe is given what the job's commands are given,
+credentials among it, and an outcome is kept with the action and shown to
+people without the masking step output gets. What a probe found is its
+exit code. The digest is not salted, so it does not hide a short or
+guessable output; a probe should print nothing it would mind being
+guessed. The attempt is never given the receipt the action itself would
+have printed.
+
+A command that does not return before its timeout is stopped when the
+attempt's grant ends, and the attempt is then uncertain (failed, for a
+`read_only` action). The registry marks an attempt whose grant has ended
+the same way by itself, before it looks at any write, so the reviewer's
+record of that outcome arrives second and is refused. The refusal carries
+the attempt as the registry held it. The review goes on only when that is
+this same attempt (action, grant, attempt number, job version, name,
+target, parameters) in the outcome being recorded, including the execution
+it was seen to admit; any difference fails the step. The same comparison
+is made against a read of the job's actions when the refusal carries no
+attempt, when the registry says the action is no longer in flight, and
+when the record got no answer at all and may have been written.
