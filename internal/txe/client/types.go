@@ -8,11 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
 	"github.com/goccy/go-yaml/parser"
+	"github.com/goccy/go-yaml/token"
 )
 
 // The types in this file are the bodies of the registry calls the CLI makes.
@@ -194,20 +199,29 @@ func (p *ParamSchema) UnmarshalJSON(data []byte) error {
 // kept, so that Validate can refuse a value that is not a mapping and name
 // the action it belongs to.
 //
-// A YAML merge key (<<) is refused: the decoder lets a merged entry replace
-// one written beside it, so a schema could carry a looser bound than the one
-// its author wrote out.
+// A schema is a set of bounds, and the registry must be sent the bounds its
+// author wrote. YAML can say several things that would arrive as something
+// else, so each is refused here, before anything is sent:
+//
+//   - a merge key (<<): the decoder lets a merged entry replace one written
+//     beside it;
+//   - a tag (!!float, !!int): it turns text into a number after the numbers
+//     have been checked, or a number into text;
+//   - a number the decoder cannot hold exactly, or one not spelled as JSON
+//     spells it: 0.49999999999999999 would be sent as 0.5, and 012 as 10;
+//   - unquoted text that looks like a number, such as 1e3, which would be
+//     sent as text.
 func (p *ParamSchema) UnmarshalYAML(data []byte) error {
 	file, err := parser.ParseBytes(data, 0)
 	if err != nil {
 		return err
 	}
-	var found mergeKeys
+	var check schemaYAML
 	for _, doc := range file.Docs {
-		ast.Walk(&found, doc.Body)
+		ast.Walk(&check, doc.Body)
 	}
-	if found {
-		return errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
+	if check.err != nil {
+		return check.err
 	}
 	var value any
 	if err := yaml.Unmarshal(data, &value); err != nil {
@@ -221,14 +235,92 @@ func (p *ParamSchema) UnmarshalYAML(data []byte) error {
 	return nil
 }
 
-// mergeKeys records whether a YAML node holds a merge key.
-type mergeKeys bool
+// schemaYAML walks a param_schema as it was written and keeps the first
+// thing in it that would not reach the registry as written.
+type schemaYAML struct{ err error }
 
-func (m *mergeKeys) Visit(node ast.Node) ast.Visitor {
-	if _, ok := node.(*ast.MergeKeyNode); ok {
-		*m = true
+func (s *schemaYAML) Visit(node ast.Node) ast.Visitor {
+	if s.err != nil {
+		return s
 	}
-	return m
+	switch n := node.(type) {
+	case *ast.MergeKeyNode:
+		s.err = errors.New("param_schema uses a YAML merge key (<<), which can replace a bound written beside it; write the schema out in full")
+	case *ast.TagNode:
+		s.err = fmt.Errorf("param_schema uses a YAML tag (%s), which can change what the value beside it is; write the value plainly", tokenText(n))
+	case *ast.IntegerNode:
+		s.err = exactNumber(tokenText(n), n.Value)
+	case *ast.FloatNode:
+		s.err = exactNumber(tokenText(n), n.Value)
+	case *ast.InfinityNode, *ast.NanNode:
+		s.err = fmt.Errorf("param_schema: %s is not a number JSON can hold", tokenText(n))
+	case *ast.StringNode:
+		if tok := n.GetToken(); tok != nil && tok.Type == token.StringType && numberLike.MatchString(tok.Value) {
+			s.err = fmt.Errorf("param_schema: %s looks like a number but would be sent as text. For a number, write it in plain decimal and no larger than 2^53 (1000, not 1e3); for text, put it in quotes", clip(tok.Value))
+		}
+	}
+	return s
+}
+
+// tokenText is a YAML node as its author spelled it.
+func tokenText(node ast.Node) string {
+	if tok := node.GetToken(); tok != nil {
+		return tok.Value
+	}
+	return node.String()
+}
+
+const (
+	// maxNumberLiteral and maxNumberExponent bound a number before any
+	// exact arithmetic is done on it. They are the registry's own limits.
+	maxNumberLiteral  = 64
+	maxNumberExponent = 400
+)
+
+var (
+	// jsonNumber is a number as JSON spells it.
+	jsonNumber = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$`)
+	// numberLike is text a reader would take for a number, whatever the
+	// YAML parser made of it.
+	numberLike = regexp.MustCompile(`^[-+]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9]*)?)([eE][-+]?[0-9]+)?$`)
+)
+
+// exactNumber refuses a number that would not reach the registry as its
+// author wrote it. The decoder holds a number as an integer or a float64 and
+// writes that back as JSON, so the spelling must be JSON's, and the value
+// held must be the value written.
+func exactNumber(lit string, held any) error {
+	if len(lit) > maxNumberLiteral || !jsonNumber.MatchString(lit) {
+		return fmt.Errorf("param_schema: the number %s must be written in plain decimal, as JSON writes it. A spelling such as 012, 0x10, 1_000, +5 or .5 can be read as a different number", clip(lit))
+	}
+	if i := strings.IndexAny(lit, "eE"); i >= 0 {
+		exp, err := strconv.Atoi(strings.TrimPrefix(lit[i+1:], "+"))
+		if err != nil || exp > maxNumberExponent || exp < -maxNumberExponent {
+			return fmt.Errorf("param_schema: the number %s has an exponent beyond %d", lit, maxNumberExponent)
+		}
+	}
+	written, ok := new(big.Rat).SetString(lit)
+	var kept *big.Rat
+	switch v := held.(type) {
+	case int64:
+		kept = new(big.Rat).SetInt64(v)
+	case uint64:
+		kept = new(big.Rat).SetUint64(v)
+	case float64:
+		kept = new(big.Rat).SetFloat64(v) // nil for an infinity or a NaN
+	}
+	if !ok || kept == nil || written.Cmp(kept) != 0 {
+		return fmt.Errorf("param_schema: the number %s cannot be kept exactly, so a different number would be sent in its place. Write an integer, or a fraction that is exact in binary such as 0.5", lit)
+	}
+	return nil
+}
+
+// clip shortens text quoted in an error.
+func clip(s string) string {
+	if len(s) > maxNumberLiteral {
+		return s[:20] + "..."
+	}
+	return s
 }
 
 // isMapping reports whether the schema is absent or exactly one JSON object.

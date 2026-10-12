@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -258,7 +259,7 @@ func TestParamSchemaRefusesMergeKeys(t *testing.T) {
 // sent as something else.
 func TestParamSchemaRefusesWhatJSONCannotHold(t *testing.T) {
 	for name, tc := range map[string]struct{ schema, want string }{
-		"a number that is not one": {"        maximum: .nan\n", "param_schema cannot be written as JSON"},
+		"a number that is not one": {"        maximum: .nan\n", "is not a number JSON can hold"},
 		"a keyword given twice":    {"        type: object\n        type: string\n", `"type" already defined`},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -267,6 +268,103 @@ func TestParamSchemaRefusesWhatJSONCannotHold(t *testing.T) {
 			require.ErrorContains(t, err, tc.want)
 			var missing *MissingContextError
 			assert.NotErrorAs(t, err, &missing)
+		})
+	}
+}
+
+// A number in a schema is a bound. One that would be sent as a different
+// number, or as text, is refused when the spec is read: the registry checks
+// what it is sent, and cannot know what was written.
+func TestParamSchemaRefusesANumberThatWouldNotArriveAsWritten(t *testing.T) {
+	const (
+		inexact = "cannot be kept exactly"
+		spelled = "must be written in plain decimal"
+		tagged  = "uses a YAML tag"
+		text    = "looks like a number but would be sent as text"
+		notOne  = "is not a number JSON can hold"
+	)
+	for src, want := range map[string]string{
+		// Rounded by the decoder: each of these was sent as the number in
+		// the comment before this was refused.
+		"maximum: 0.49999999999999999":        inexact, // 0.5
+		"minimum: -0.50000000000000001":       inexact, // -0.5
+		"maximum: 4503599627370496.2":         inexact, // 4503599627370496
+		"maximum: 0.1":                        inexact, // the float64 nearest 0.1
+		"maximum: 1.5e-1":                     inexact,
+		"enum: [0.49999999999999999, 1]":      inexact,
+		"0.49999999999999999: {type: string}": inexact, // the key "0.5"
+		"a: &n 0.49999999999999999\nb: *n":    inexact,
+		`{"maximum": 0.49999999999999999}`:    inexact,
+		"maximum: 9007199254740993.0":         inexact, // 9007199254740992
+		// Read as another number, or by a rule JSON does not have.
+		"maxLength: 012":                        spelled, // 10
+		"maxLength: 0x10":                       spelled,
+		"maxLength: 0o17":                       spelled,
+		"maxLength: 0b11":                       spelled,
+		"maxLength: 1_000":                      spelled,
+		"maxLength: +5":                         spelled,
+		"maximum: .5":                           spelled,
+		"maximum: 5.":                           spelled,
+		"maximum: 0." + strings.Repeat("5", 70): spelled,
+		"maximum: 1.0e-401":                     "has an exponent beyond 400",
+		"maximum: 1.0e-99999999999999999999":    "has an exponent beyond 400",
+		// A tag changes what a value is after it is written.
+		`maximum: !!float "0.49999999999999999"`: tagged, // 0.5
+		`maxLength: !!int "7"`:                   tagged,
+		"maximum: !!float 0.5":                   tagged,
+		"const: !!str 5":                         tagged,
+		// Sent as text where a number was written.
+		"maximum: 1e3":                    text,
+		"maximum: 1.0e+401":               text, // too large to be read as a number at all
+		"maximum: 1E2":                    text,
+		"maxLength: 18446744073709551616": text,
+		"enum: [1e3]":                     text,
+		"1e3: {type: string}":             text,
+		"maximum: .inf":                   notOne,
+		"minimum: -.inf":                  notOne,
+		"maximum: .nan":                   notOne,
+	} {
+		t.Run(src, func(t *testing.T) {
+			var schema ParamSchema
+			require.ErrorContains(t, yaml.Unmarshal([]byte(src), &schema), want)
+			assert.Empty(t, schema)
+		})
+	}
+
+	// A spec file is refused as a whole, and the number is named.
+	_, err := LoadJobSpec(specWithActions(t, "    - name: reopen-ticket\n      timeout_sec: 60\n      param_schema:\n"+
+		"        type: object\n        properties:\n          share:\n            type: number\n            maximum: 0.49999999999999999\n"))
+	require.ErrorContains(t, err, "the number 0.49999999999999999 cannot be kept exactly")
+}
+
+// A number that is exactly what was written is sent as that number, and
+// text that was written as text stays text.
+func TestParamSchemaKeepsExactNumbersAndQuotedText(t *testing.T) {
+	for src, want := range map[string]string{
+		"maximum: 0.5":                  `{"maximum":0.5}`,
+		"maximum: 0.50":                 `{"maximum":0.5}`,
+		"maximum: 2.5e-1":               `{"maximum":0.25}`,
+		"maximum: 1.0e+2":               `{"maximum":100}`,
+		"minimum: -3":                   `{"minimum":-3}`,
+		"minimum: -0":                   `{"minimum":0}`,
+		"maxLength: 10":                 `{"maxLength":10}`,
+		"maximum: 2251799813685248.5":   `{"maximum":2251799813685248.5}`,
+		"maxLength: 9007199254740993":   `{"maxLength":9007199254740993}`, // exact here; the registry refuses it as beyond 2^53
+		"enum: [0.25, 1, -2]":           `{"enum":[0.25,1,-2]}`,
+		"1: {type: string}":             `{"1":{"type":"string"}}`,
+		`const: "0.49999999999999999"`:  `{"const":"0.49999999999999999"}`,
+		`const: "1e3"`:                  `{"const":"1e3"}`,
+		"const: '012'":                  `{"const":"012"}`,
+		"const: 1.2.3":                  `{"const":"1.2.3"}`,
+		"const: 2001-01-01":             `{"const":"2001-01-01"}`,
+		"const: |\n  012\n":             `{"const":"012\n"}`,
+		"a: &n 0.5\nb: *n":              `{"a":0.5,"b":0.5}`,
+		`{"maximum": 0.5, "x": [1, 2]}`: `{"maximum":0.5,"x":[1,2]}`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			var schema ParamSchema
+			require.NoError(t, yaml.Unmarshal([]byte(src), &schema))
+			assert.JSONEq(t, want, string(schema))
 		})
 	}
 }

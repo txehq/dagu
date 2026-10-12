@@ -60,6 +60,7 @@ review_policy:
 - Parameters reach the command as variables named `TXE_PARAM_<NAME>`, each a string. Declare each one as `type: string`, and set `additionalProperties: false` so that nothing undeclared is passed.
 - Such a registry admits JSON Schema draft 2020-12 and only the keywords it enforces exactly. It refuses `format`, `multipleOf`, unknown keywords and references to other documents. A number in the schema must be one it can compare exactly: an integer up to 2^53, or a fraction such as 0.5 that is exact in binary. `pattern` is read as RE2.
 - A `param_schema` that is a list, a single value, or a key left with no value is refused when the spec is read. So is one that uses a YAML merge key (`<<`), which could replace a bound written beside it: write the schema out in full.
+- Write every number in a `param_schema` in plain decimal, as JSON does: `10`, `-3`, `0.5`. The spec is refused when it is read if a number would reach the registry as a different one. That covers a fraction that is not exact in binary (`0.1`, or `0.49999999999999999`, which would be sent as `0.5`), a spelling YAML reads its own way (`012`, `0x10`, `1_000`, `+5`, `.5`), a number written with a YAML tag (`!!float`), and an unquoted value such as `1e3` that would be sent as text. Put a value in quotes when text is meant.
 
 ## Write the script for an unattended worker
 
