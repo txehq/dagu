@@ -395,3 +395,38 @@ func TestReconcileReadsEachQueueOncePerPass(t *testing.T) {
 	assert.Equal(t, 1, queues.lists, "one queue, read once in the pass")
 	assert.Len(t, f.preparationEntries(t), 3, "all still queued")
 }
+
+// A retry commits its queued marker before publishing its queue item, so an
+// item for the very execution being judged can appear after the pass read the
+// queues. The abandonment revalidates the queues and leaves the execution.
+func TestAQueueItemPublishedAfterThePassReadIsNotMissed(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	queues := store.NewQueueStore(file.NewCollection(filepath.Join(t.TempDir(), "queue")))
+	f.h.queueStore = queues
+	const marker = "2026-10-12T17:00:00+08:00"
+	run := f.writeQueuedRun(t, "late-item-run", marker, strandedDAG)
+	entries := f.preparationEntries(t)
+	require.Len(t, entries, 1)
+
+	snapshot := f.h.readQueueSnapshot(t.Context())
+	require.NoError(t, snapshot.err)
+	require.NoError(t, queues.Enqueue(t.Context(), strandedDAG, queue.QueuePriorityLow, run))
+
+	_, err := f.h.abandonPreparation(t.Context(), entries[0], abandonedPreparationDetail, snapshot)
+	require.ErrorIs(t, err, errDispatchInFlight)
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Empty(t, records)
+	assert.Len(t, f.preparationEntries(t), 1)
+
+	// Control: once the item is gone, a fresh pass abandons the execution.
+	items, err := queues.List(t.Context(), strandedDAG)
+	require.NoError(t, err)
+	_, err = queues.DeleteByItemIDs(t.Context(), strandedDAG, []string{items[0].ID()})
+	require.NoError(t, err)
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+	records, err = f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Len(t, records, 1)
+}

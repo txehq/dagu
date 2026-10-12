@@ -156,8 +156,11 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	if err != nil {
 		return nil, err
 	}
-	if queuedAt != "" {
+	if queuedAt != "" && queued != nil {
 		if err := queued.refuse(run); err != nil {
+			return nil, err
+		}
+		if err := h.queueSnapshotCurrent(ctx, queued); err != nil {
 			return nil, err
 		}
 	}
@@ -190,13 +193,20 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 // reconciliation pass. A dispatch that failed leaves its run's queue item, and
 // the queue dispatches it again under the same journal entry, so a queued
 // execution whose run a queue holds is not failed as undispatched. Every queue
-// is read, so a status that does not name its queue is still covered. A run
-// queued after the read is a new execution with a new marker, which the store
-// refuses to abandon in this one's place. A queue or item that cannot be read
-// makes the whole snapshot unknown, never empty.
+// is read, so a status that does not name its queue is still covered. A queue
+// or item that cannot be read makes the whole snapshot unknown, never empty.
+//
+// A queue item can be published after the read for the same queued execution
+// (a retry commits its marker before publishing its item), so the snapshot is
+// revalidated against each queue's revision just before an abandonment; any
+// change leaves the execution for the next pass. The remaining window between
+// that check and the abandonment's write needs a fence between queue
+// publication and abandonment (see TXE-3979); within it, the outcome is a
+// recorded "not dispatched" failure, never an execution that runs.
 type queueSnapshot struct {
-	runs map[ir.DAGRunRef]struct{}
-	err  error
+	runs      map[ir.DAGRunRef]struct{}
+	revisions map[string]int64
+	err       error
 }
 
 // readQueueSnapshot reads every queue, or returns nil when this coordinator
@@ -205,13 +215,19 @@ func (h *Handler) readQueueSnapshot(ctx context.Context) *queueSnapshot {
 	if h.queueStore == nil {
 		return nil
 	}
-	snap := &queueSnapshot{runs: make(map[ir.DAGRunRef]struct{})}
+	snap := &queueSnapshot{runs: make(map[ir.DAGRunRef]struct{}), revisions: make(map[string]int64)}
 	names, err := h.queueStore.QueueList(ctx)
 	if err != nil {
 		snap.err = err
 		return snap
 	}
 	for _, name := range names {
+		revision, err := h.queueStore.Revision(ctx, name)
+		if err != nil {
+			snap.err = fmt.Errorf("queue %s: %w", name, err)
+			return snap
+		}
+		snap.revisions[name] = revision
 		items, err := h.queueStore.List(ctx, name)
 		if err != nil {
 			snap.err = fmt.Errorf("queue %s: %w", name, err)
@@ -229,6 +245,32 @@ func (h *Handler) readQueueSnapshot(ctx context.Context) *queueSnapshot {
 		}
 	}
 	return snap
+}
+
+// queueSnapshotCurrent reports whether no queue has changed since the snapshot
+// was read: the same queues, each at the same revision. It reads no items.
+func (h *Handler) queueSnapshotCurrent(ctx context.Context, snap *queueSnapshot) error {
+	names, err := h.queueStore.QueueList(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: queues: %v", errEvidenceUnknown, err)
+	}
+	if len(names) != len(snap.revisions) {
+		return fmt.Errorf("%w: the queues changed since this pass read them", errDispatchInFlight)
+	}
+	for _, name := range names {
+		was, ok := snap.revisions[name]
+		if !ok {
+			return fmt.Errorf("%w: the queues changed since this pass read them", errDispatchInFlight)
+		}
+		revision, err := h.queueStore.Revision(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%w: queue %s: %v", errEvidenceUnknown, name, err)
+		}
+		if revision != was {
+			return fmt.Errorf("%w: the queues changed since this pass read them", errDispatchInFlight)
+		}
+	}
+	return nil
 }
 
 // refuse reports whether an execution of run must be left because a queue may
