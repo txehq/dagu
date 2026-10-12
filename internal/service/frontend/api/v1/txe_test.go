@@ -1490,7 +1490,20 @@ func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
 	secretOnly := auth.WithUser(context.Background(), &auth.User{Username: "sec", Role: auth.RoleDeveloper, WorkspaceAccess: &auth.WorkspaceAccess{
 		Grants: []auth.WorkspaceGrant{{Workspace: "secret", Role: auth.RoleDeveloper}},
 	}})
-	require.NoError(t, publish(secretOnly, "run-2", run2), "the run's own workspace authorizes publishing")
+	// It cannot probe the job's hidden version 2 through validation: a
+	// version its execution did not run is refused the same way, whatever
+	// the report says about it.
+	_, err = a.RecordTxeRunArtifacts(secretOnly, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-2",
+		Body: &apigen.TxeArtifactManifestRequest{AttemptId: run2, JobVersion: 2,
+			Artifacts: []apigen.TxeArtifactRecordInput{{Deliverable: "report", Path: "guess.txt", Missing: new(true)}}}})
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "stale_binding", apiErr.Details["code"])
+	assert.Contains(t, apiErr.Message, "did not execute version 2")
+	assert.NotContains(t, apiErr.Message, "declared")
+	_, err = a.RecordTxeRunArtifacts(secretOnly, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-2",
+		Body: &apigen.TxeArtifactManifestRequest{AttemptId: run2, JobVersion: 9, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Message, "did not execute version 9", "a missing version answers the same")
 }
 
 // A resource event's reply shows only the jobs the caller can see, as GET
