@@ -34,19 +34,31 @@ die() { printf 'txe-dagu: %s\n' "$*" >&2; exit 1; }
 # something else: it is named and left alone, never replaced. Neither case fails
 # the install; the binary is always reachable by its full path.
 link_dagu_on_path() {
-  local target="$TXE_DAGU_HOME/bin/dagu" link="$TXE_DAGU_LINK_DIR/dagu"
+  local target="$TXE_DAGU_HOME/bin/dagu" link="$TXE_DAGU_LINK_DIR/dagu" made
+  # A link stores its target as written, and a relative one resolves from the
+  # link's own directory, so the target is made absolute first.
+  case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
   if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
     printf 'path     %s -> %s\n' "$link" "$target"
-  elif [ -e "$link" ] || [ -L "$link" ]; then
-    printf 'path     not linked: %s is not this install'"'"'s link; run %s, or remove it and install again\n' \
-      "$link" "$target" >&2
-    return 0
-  elif mkdir -p "$TXE_DAGU_LINK_DIR" && ln -s "$target" "$link"; then
-    # ln -s refuses an existing name, so a dagu that appears meanwhile is kept.
-    printf 'path     %s -> %s\n' "$link" "$target"
   else
-    printf 'path     not linked: could not create %s; run %s\n' "$link" "$target" >&2
-    return 0
+    # os.symlink creates exactly this pathname or fails: an existing file,
+    # symlink or directory there, even one that appeared a moment ago, is never
+    # written into or replaced (ln -s would put the link inside a directory).
+    made="$(mkdir -p "$TXE_DAGU_LINK_DIR" 2>/dev/null && python3 -I -c '
+import os, sys
+try:
+    os.symlink(sys.argv[1], sys.argv[2])
+    print("made")
+except FileExistsError:
+    print("exists")
+except OSError:
+    print("failed")' "$target" "$link" 2>/dev/null)" || made=failed
+    case "$made" in
+      made) printf 'path     %s -> %s\n' "$link" "$target" ;;
+      exists) printf 'path     not linked: %s is not this install'"'"'s link; run %s, or remove it and install again\n' \
+                "$link" "$target" >&2 ;;
+      *) printf 'path     not linked: could not create %s; run %s\n' "$link" "$target" >&2 ;;
+    esac
   fi
   case ":$PATH:" in
     *":$TXE_DAGU_LINK_DIR:"*) ;;

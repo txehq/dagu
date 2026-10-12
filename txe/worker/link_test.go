@@ -35,10 +35,19 @@ func newLinkEnv(t *testing.T) linkEnv {
 // run sources lib.sh and calls link_dagu_on_path with path as the shell's PATH.
 func (e linkEnv) run(t *testing.T, path string) (stdout, stderr string) {
 	t.Helper()
+	return e.runIn(t, "", e.txeHome, path)
+}
+
+// runIn is run from working directory dir, with txeHome as TXE_DAGU_HOME.
+func (e linkEnv) runIn(t *testing.T, dir, txeHome, path string) (stdout, stderr string) {
+	t.Helper()
 	bash, err := exec.LookPath("bash")
 	require.NoError(t, err)
-	cmd := exec.Command(bash, "-c", `set -euo pipefail; . ./lib.sh; link_dagu_on_path`)
-	cmd.Env = []string{"HOME=" + e.home, "TXE_DAGU_HOME=" + e.txeHome, "TXE_DAGU_LINK_DIR=" + e.linkDir, "PATH=" + path}
+	lib, err := filepath.Abs("lib.sh")
+	require.NoError(t, err)
+	cmd := exec.Command(bash, "-c", `set -euo pipefail; . "$1"; link_dagu_on_path`, "bash", lib)
+	cmd.Dir = dir
+	cmd.Env = []string{"HOME=" + e.home, "TXE_DAGU_HOME=" + txeHome, "TXE_DAGU_LINK_DIR=" + e.linkDir, "PATH=" + path}
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	require.NoError(t, cmd.Run(), "link_dagu_on_path must not fail the install: %s", errOut.String())
@@ -83,6 +92,15 @@ func TestLinkDaguOnPathLeavesAForeignDaguAlone(t *testing.T) {
 		assert.Equal(t, "#!/bin/sh\necho other\n", string(data))
 		assert.Contains(t, errOut, "not linked: "+e.link)
 	})
+	t.Run("directory", func(t *testing.T) {
+		e := newLinkEnv(t)
+		require.NoError(t, os.MkdirAll(e.link, 0o755))
+		_, errOut := e.run(t, sysPath(e.linkDir))
+		entries, err := os.ReadDir(e.link)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "nothing is written inside a directory named dagu")
+		assert.Contains(t, errOut, "not linked: "+e.link)
+	})
 	t.Run("symlink elsewhere", func(t *testing.T) {
 		e := newLinkEnv(t)
 		require.NoError(t, os.MkdirAll(e.linkDir, 0o755))
@@ -93,6 +111,34 @@ func TestLinkDaguOnPathLeavesAForeignDaguAlone(t *testing.T) {
 		assert.Equal(t, "/opt/other/dagu", got)
 		assert.Contains(t, errOut, "not linked: "+e.link)
 	})
+}
+
+// A relative TXE_DAGU_HOME still gives a link that resolves to the binary: the
+// stored target is absolute, not relative to the link's directory.
+func TestLinkDaguOnPathMakesARelativeHomeAbsolute(t *testing.T) {
+	e := newLinkEnv(t)
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.target), 0o755))
+	require.NoError(t, os.WriteFile(e.target, []byte("#!/bin/sh\n"), 0o755))
+	_, errOut := e.runIn(t, e.home, "txe", sysPath(e.linkDir))
+	assert.Empty(t, errOut)
+	got, err := os.Readlink(e.link)
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(got), "stored target %q", got)
+	resolved, err := filepath.EvalSymlinks(e.link)
+	require.NoError(t, err)
+	want, err := filepath.EvalSymlinks(e.target)
+	require.NoError(t, err)
+	assert.Equal(t, want, resolved)
+}
+
+// A foreign dagu in a directory missing from PATH gets both messages.
+func TestLinkDaguOnPathNamesAMissingPathEvenWhenNotLinked(t *testing.T) {
+	e := newLinkEnv(t)
+	require.NoError(t, os.MkdirAll(e.linkDir, 0o755))
+	require.NoError(t, os.WriteFile(e.link, []byte("other"), 0o755))
+	_, errOut := e.run(t, sysPath())
+	assert.Contains(t, errOut, "not linked: "+e.link)
+	assert.Contains(t, errOut, e.linkDir+" is not on this shell's PATH")
 }
 
 // The link is still made when its directory is not on PATH, and the operator is
