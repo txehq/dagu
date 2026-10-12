@@ -223,33 +223,68 @@ func (s *Store) Commit(staged *Staged, jobID string) (*Package, error) {
 	return pkg, nil
 }
 
+// RemovingSuffix marks a staged copy that was checked against the package in
+// place and is being removed. No request id can end with it, so nothing loads
+// such a directory as a staged package, and a removal that stopped part-way is
+// finished later without checking the remains again.
+const RemovingSuffix = ".removing"
+
 // dropStaged removes the staged copy of a package that is verified in its
 // final place. It removes only a directory of this store's staging area that
 // still holds that package; anything else is left where it is and reported.
-// A staged copy that is already gone was moved into place by an earlier call.
+// A staged copy that is already gone was moved into place, or marked for
+// removal, by an earlier call.
 func (s *Store) dropStaged(staged *Staged) error {
 	area := filepath.Join(s.Root, stagingDir)
-	if filepath.Dir(staged.Dir) != area || !namePattern.MatchString(filepath.Base(staged.Dir)) {
+	name := filepath.Base(staged.Dir)
+	if filepath.Dir(staged.Dir) != area || !namePattern.MatchString(name) {
 		return fmt.Errorf("%s is not in the staging area %s", staged.Dir, area)
 	}
 	info, err := os.Lstat(staged.Dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
 		return err
-	}
-	if !info.IsDir() {
+	case !info.IsDir():
 		return fmt.Errorf("%s is not a directory", staged.Dir)
+	default:
+		_, digest, err := verifyDir(staged.Dir, false)
+		if err != nil {
+			return err
+		}
+		if digest != staged.Digest {
+			return fmt.Errorf("%w: %s holds a manifest with digest %s", ErrPackageCorrupt, staged.Dir, digest)
+		}
+		// The checked copy is marked in one step, after which it is no longer
+		// a staged package. What an earlier removal of this request's copy
+		// left under the mark goes first.
+		marked := staged.Dir + RemovingSuffix
+		if err := os.RemoveAll(marked); err != nil {
+			return err
+		}
+		if err := os.Rename(staged.Dir, marked); err != nil {
+			return err
+		}
 	}
-	_, digest, err := verifyDir(staged.Dir, false)
-	if err != nil {
+	return s.FinishRemoval(name)
+}
+
+// FinishRemoval removes what is left of a staged copy that Commit checked and
+// marked for removal. A request resumed after the removal stopped part-way
+// calls it; with nothing marked it does nothing.
+func (s *Store) FinishRemoval(requestID string) error {
+	if !namePattern.MatchString(requestID) {
+		return fmt.Errorf("invalid request id %q", requestID)
+	}
+	area := filepath.Join(s.Root, stagingDir)
+	marked := filepath.Join(area, requestID+RemovingSuffix)
+	if _, err := os.Lstat(marked); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
-	if digest != staged.Digest {
-		return fmt.Errorf("%w: %s holds a manifest with digest %s", ErrPackageCorrupt, staged.Dir, digest)
-	}
-	if err := os.RemoveAll(staged.Dir); err != nil {
+	if err := os.RemoveAll(marked); err != nil {
 		return err
 	}
 	if err := fileutil.SyncDir(area); err != nil {

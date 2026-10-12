@@ -99,7 +99,7 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 		staging := filepath.Join(home.PackagesDir(), ".staging")
 		if orphans := txeUnreferencedStaging(staging, entries); len(orphans) > 0 {
 			add("staged packages", fmt.Errorf("%d staged package(s) without a journal entry: %s", len(orphans), strings.Join(orphans, ", ")), "",
-				"nothing refers to them: a build was interrupted before it was recorded, or an earlier dagu left its copy of a package that was already in place. They are under "+staging)
+				"nothing refers to them: a build was interrupted before it was recorded, or an earlier dagu left its copy of a package that was already in place. One whose name ends in "+txepkg.RemovingSuffix+" is such a copy whose removal was interrupted. They are under "+staging)
 		}
 	}
 
@@ -145,7 +145,9 @@ func txeUnreferencedStaging(staging string, entries []txepkg.Entry) []string {
 	}
 	var orphans []string
 	for _, f := range found {
-		if !pending[f.Name()] {
+		// A copy whose removal stopped part-way is finished when its request
+		// is resumed.
+		if !pending[strings.TrimSuffix(f.Name(), txepkg.RemovingSuffix)] {
 			orphans = append(orphans, f.Name())
 		}
 	}

@@ -622,6 +622,51 @@ func TestCommitRemovesNothingOutsideTheStagingArea(t *testing.T) {
 	})
 }
 
+// A removal that stopped part-way leaves its copy under a name no request has.
+// The repeated call removes what is left without needing it to be a package
+// any more, and touches nothing that was not marked.
+func TestCommitFinishesAnInterruptedRemoval(t *testing.T) {
+	store := newStore(t)
+	_, opts := collectorSource(t)
+
+	first, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	_, err = store.Commit(first, testJob)
+	require.NoError(t, err)
+
+	// As a stopped removal leaves it: marked, the manifest already gone.
+	second, err := store.Stage("req-2", opts)
+	require.NoError(t, err)
+	marked := second.Dir + RemovingSuffix
+	require.NoError(t, os.Rename(second.Dir, marked))
+	require.NoError(t, os.Remove(filepath.Join(marked, ManifestName)))
+	_, err = store.LoadStaged("req-2")
+	require.Error(t, err, "a marked copy is not a staged package")
+
+	_, err = store.Commit(second, testJob)
+	require.NoError(t, err)
+	assert.Empty(t, stagedNames(t, store))
+
+	// The same request staged again, with an older marked copy beside it.
+	third, err := store.Stage("req-3", opts)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(third.Dir+RemovingSuffix, FilesDir), 0o700))
+	_, err = store.Commit(third, testJob)
+	require.NoError(t, err)
+	assert.Empty(t, stagedNames(t, store))
+
+	// Finishing a removal never removes a staged package that was not marked.
+	waiting, err := store.Stage("req-4", opts)
+	require.NoError(t, err)
+	require.NoError(t, store.FinishRemoval("req-4"))
+	require.NoError(t, store.FinishRemoval("req-never-staged"))
+	assert.Equal(t, []string{"req-4"}, stagedNames(t, store))
+	_, err = store.LoadStaged("req-4")
+	require.NoError(t, err)
+	assert.DirExists(t, waiting.Dir)
+	require.Error(t, store.FinishRemoval("../req-4"))
+}
+
 // Requests that build one package for one job at the same moment all end with
 // that package in place, and none leaves a staged copy.
 func TestCommitOfOnePackageAtTheSameMoment(t *testing.T) {

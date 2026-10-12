@@ -689,8 +689,8 @@ func TestUpdateWithAnUnchangedPackage(t *testing.T) {
 	assert.Empty(t, staged(), "the update's staged copy of the package in place is removed")
 	assert.Empty(t, pendingSteps(t, cc1.Journal))
 
-	// The hub fails while marking version 3 ready: the package step is done,
-	// and the resumed request finds its staged copy already gone.
+	// The hub fails while marking version 3 ready: the package step is done
+	// and the staged copy removed.
 	spec.Env = map[string]string{"MAX_AGE_SEC": "1800"}
 	f.mu.Lock()
 	f.failNextReady = true
@@ -700,6 +700,10 @@ func TestUpdateWithAnUnchangedPackage(t *testing.T) {
 	require.ErrorAs(t, err, &incomplete)
 	assert.Equal(t, txepkg.StepCommitted, incomplete.Step)
 	assert.Empty(t, staged())
+	// As if the removal of that copy had stopped part-way: what is left is
+	// under its mark, and the resumed request finishes removing it.
+	left := filepath.Join(home.PackagesDir(), ".staging", incomplete.RequestID+txepkg.RemovingSuffix, txepkg.FilesDir)
+	require.NoError(t, os.MkdirAll(left, 0o700))
 	third, err := cc1.Resume(context.Background(), incomplete.RequestID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, third.Receipt.Version)
