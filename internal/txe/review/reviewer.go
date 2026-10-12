@@ -109,6 +109,11 @@ const (
 	SkipClaimHeld    SkipReason = "claim_held"
 	// SkipUnreviewable means the job was raised as an exception instead.
 	SkipUnreviewable SkipReason = "unreviewable"
+	// SkipNotRegistered means the registry reports the job's registration
+	// as not ready (an update that was interrupted, or the losing record of
+	// a registration made twice). The registry grants no claim on it, so
+	// there is nothing to review until that changes.
+	SkipNotRegistered SkipReason = "registration_not_ready"
 )
 
 // onThisMachine reports whether the job is registered on the machine this
@@ -120,12 +125,19 @@ func (r *Reviewer) onThisMachine(job Job) bool {
 // Prepared is the hand-off from Prepare to the agent and to Apply.
 type Prepared struct {
 	Skipped SkipReason `json:"skipped,omitempty"`
-	Claim   Claim      `json:"claim,omitzero"`
-	Packet  Packet     `json:"packet,omitzero"`
+	// SkipDetail says what the registry reported, for the run's log.
+	SkipDetail string `json:"skip_detail,omitempty"`
+	Claim      Claim  `json:"claim,omitzero"`
+	Packet     Packet `json:"packet,omitzero"`
 	// RunCursor is where the checkpoint moves to once the packet's runs
 	// are covered: exactly those runs and nothing after them. It is the
 	// reviewer's own bookkeeping and is not part of what the agent is shown.
 	RunCursor string `json:"run_cursor,omitempty"`
+}
+
+// notRegistered is the skip for a job the registry will grant no claim on.
+func notRegistered(job Job) Prepared {
+	return Prepared{Skipped: SkipNotRegistered, SkipDetail: "registration is " + string(job.Registration)}
 }
 
 // Prepare claims the job, settles effects left open by earlier claims, and
@@ -144,9 +156,22 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 		}
 		return Prepared{Skipped: SkipNotReviewable}, nil
 	}
+	// A registration that is not ready is the registry's stated answer, not
+	// a failure to answer: no claim is asked for and nothing is reviewed.
+	if !job.Registration.Claimable() {
+		return notRegistered(job), nil
+	}
 	claim, err := r.Registry.AcquireClaim(ctx, ClaimRequest{JobID: jobID, Kind: ClaimReview, Holder: r.Holder, TTL: r.claimTTL()})
 	if errors.Is(err, ErrClaimHeld) {
 		return Prepared{Skipped: SkipClaimHeld}, nil
+	}
+	if errors.Is(err, ErrNotReady) {
+		// The registration may have stopped being ready after the job was
+		// read. Only the job's own record makes the refusal a skip: a
+		// refusal the record does not explain stays an error.
+		if now, readErr := r.Registry.Job(ctx, jobID); readErr == nil && !now.Registration.Claimable() {
+			return notRegistered(now), nil
+		}
 	}
 	if err != nil {
 		return Prepared{}, fmt.Errorf("acquire claim: %w", err)

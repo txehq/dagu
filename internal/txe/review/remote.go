@@ -586,6 +586,7 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 		Version: doc.Version, PackageDigest: doc.PackageDigest,
 		WorkingDir: deref(v.Package.WorkingDir), Title: v.Title, Purpose: v.Purpose,
 		Lifecycle: Lifecycle(doc.Lifecycle), Availability: Availability(doc.Availability.State),
+		Registration: Registration(doc.Registration.State),
 	}
 	if job.WorkingDir == "" {
 		job.WorkingDir = v.Package.Path

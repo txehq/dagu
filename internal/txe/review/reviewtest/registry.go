@@ -251,6 +251,10 @@ func (r *Registry) AcquireClaim(_ context.Context, req review.ClaimRequest) (rev
 		if _, held := s.liveClaim(req.JobID, now); held {
 			return review.ErrClaimHeld
 		}
+		// As the registry: a review claim needs a ready registration.
+		if job := s.Jobs[req.JobID]; !job.Registration.Claimable() && req.Kind != review.ClaimReconcile {
+			return fmt.Errorf("%w: job registration is %s", review.ErrNotReady, job.Registration)
+		}
 		// A completed or retired job only admits settling what is open.
 		if job := s.Jobs[req.JobID]; !job.Lifecycle.Reviewable() && req.Kind != review.ClaimReconcile {
 			return &review.GuardDeniedError{Reason: review.DenyLifecycle, Detail: string(job.Lifecycle)}

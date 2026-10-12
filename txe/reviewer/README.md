@@ -167,6 +167,15 @@ files.
   enqueued for the wrong machine or by a mistaken call, it claims nothing
   and runs nothing, whatever decision exists: the job's commands, package
   and credentials are that machine's.
+- Registration: a job whose registration is not `ready` is not reviewed. That
+  is an update that was interrupted (until `dagu txe resume` finishes it) or
+  the losing record of a registration made twice. The registry grants no
+  claim on such a job, so no agent is started and nothing of the job's runs;
+  the tick names the job and the state in its log and goes on to the next
+  one. A tick that finds only such jobs has no work and succeeds. A job
+  that cannot be read or claimed for any other reason (the service
+  unavailable, a rejected login, a refusal the job's record does not
+  explain) still fails the tick when nothing else was reviewed.
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,
   plus one fenced claim per job in the registry.
 - Duration: a run timeout, a shorter agent step timeout, and a per-action
