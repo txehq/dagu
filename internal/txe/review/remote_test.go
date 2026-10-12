@@ -2874,3 +2874,132 @@ func TestRetryRequestIDIsTheServicesDerivation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "1bd70964d76fb1639b8f3478358ee7f851890711cee34452fb45887115296024", derived.ID)
 }
+
+// Against the real registry: a retry whose answer was lost is recovered from
+// the service's record of the request, and the registry, which takes an
+// execution for a retry's only by that same record, settles it. The request
+// the reviewer asks the record for is the one the registry derives from its
+// own action: the same three values, or the registry would refuse.
+func TestRemoteALostRetryAnswerIsRecoveredAndSettledByTheRegistry(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	service := f.service
+	service.fail("run-7", "att-1")
+	var proposal *registry.Proposal
+	var decided *registry.Decision
+	_, err := f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) (err error) {
+		proposal, decided, err = tx.ProposeRetry(registry.RetryRunParams{
+			RunID: "run-7", AttemptID: "att-1", RunSpecSHA256: job.DAGSpecSHA256, PackageDigest: job.PackageDigest,
+		}, "retry-run-7")
+		return err
+	})
+	require.NoError(t, err)
+
+	// The service admits the retry and records it; the answer is lost, and
+	// its record cannot be had at that moment either.
+	service.loseAnswer = &review.TransportError{Status: http.StatusServiceUnavailable, Code: "dispatch_uncertain", Message: "the retry may or may not have been dispatched"}
+	service.noRecords = true
+	done, err := f.retrying("tick-1", service).RunRequestedRetries(ctx, f.remote.MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	require.Equal(t, review.ActionUncertain, done[0].Executed.Action.State)
+	assert.Empty(t, done[0].Executed.Action.Receipt)
+	admitted := service.ref("run-7")
+
+	// The next review asks for the record of the request and finds it.
+	service.loseAnswer, service.noRecords = nil, false
+	*f.ahead += 5 * time.Minute
+	r := f.retrying("reviewer-b", service)
+	prepared, err := r.Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting"})
+	require.NoError(t, err)
+
+	actions, err := f.remote.Actions(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, actions, 1)
+	assert.Equal(t, review.ActionSucceeded, actions[0].State, "the registry accepted the recovered execution as this retry's")
+	assert.Equal(t, admitted, actions[0].Receipt)
+	assert.Equal(t, proposal.ProposalID, actions[0].ProposalID)
+	assert.Equal(t, decided.DecisionID, actions[0].DecisionID)
+	assert.Len(t, service.retried, 1, "one retry request in all")
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	assert.Empty(t, open, "the owner is not asked")
+}
+
+// The service's record of a retry request answers only when all of it is
+// this request's. Everything else is no answer: not "admitted", not
+// "abandoned", and never "nothing was admitted".
+func TestRemoteRecoverTakesOnlyTheRequestsOwnRecord(t *testing.T) {
+	expected := review.Execution{AttemptID: "a1", QueuedAt: "q1"}
+	request := review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d"}
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef("job", "run-1"), "a1", "q1", "act-1", "1", "sha256:d")
+	require.NoError(t, err)
+	path := "/dag-runs/job/run-1/retry-requests/" + want.ID
+	admitted := review.Execution{AttemptID: "a2", QueuedAt: "q2"}
+	record := func(edit func(m map[string]any)) string {
+		m := map[string]any{
+			"state": "admitted", "attemptId": "a2", "queuedAt": "q2", "executionRef": admitted.Ref(), "retained": false, "status": "running",
+			"retryRequest": map[string]any{"id": want.ID, "actionId": "act-1", "actionAttempt": "1", "bindingDigest": "sha256:d", "retryOf": expected.Ref()},
+		}
+		if edit != nil {
+			edit(m)
+		}
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		return string(raw)
+	}
+	req := func(m map[string]any) map[string]any { return m["retryRequest"].(map[string]any) }
+	none := review.RetryRecovery{}
+	for name, tc := range map[string]struct {
+		reply string
+		fail  *review.TransportError
+		want  review.RetryRecovery
+	}{
+		"admitted": {reply: record(nil), want: review.RetryRecovery{State: review.RecoveryAdmitted, Execution: admitted}},
+		"abandoned before dispatch": {
+			reply: record(func(m map[string]any) { m["state"] = "abandoned"; m["status"] = "failed" }),
+			want:  review.RetryRecovery{State: review.RecoveryAbandoned, Execution: admitted},
+		},
+		"a retained copy is still the admitted execution": {
+			reply: record(func(m map[string]any) { m["retained"] = true }),
+			want:  review.RetryRecovery{State: review.RecoveryAdmitted, Execution: admitted},
+		},
+		"no record: never proof that nothing was admitted": {fail: &review.TransportError{Status: http.StatusNotFound, Code: "not_found", Message: "no execution records it"}, want: none},
+		// Not asked, as distinct from asked and unanswered: asked again.
+		"the run's executions could not be read":              {fail: &review.TransportError{Status: http.StatusInternalServerError, Message: "could not be read"}, want: review.RetryRecovery{State: review.RecoveryUnavailable}},
+		"the service is unavailable":                          {fail: &review.TransportError{Status: http.StatusServiceUnavailable, Message: "unavailable"}, want: review.RetryRecovery{State: review.RecoveryUnavailable}},
+		"a store that cannot look requests up":                {fail: &review.TransportError{Status: http.StatusNotImplemented, Message: "cannot look up"}, want: none},
+		"not allowed to see it":                               {fail: &review.TransportError{Status: http.StatusForbidden, Message: "forbidden"}, want: none},
+		"a record that is not JSON":                           {reply: `{"state":`, want: review.RetryRecovery{State: review.RecoveryUnavailable}},
+		"another request's id":                                {reply: record(func(m map[string]any) { req(m)["id"] = strings.Repeat("0", 64) }), want: none},
+		"another action":                                      {reply: record(func(m map[string]any) { req(m)["actionId"] = "act-2" }), want: none},
+		"another attempt of the action":                       {reply: record(func(m map[string]any) { req(m)["actionAttempt"] = "2" }), want: none},
+		"another binding":                                     {reply: record(func(m map[string]any) { req(m)["bindingDigest"] = "sha256:e" }), want: none},
+		"a retry of another execution":                        {reply: record(func(m map[string]any) { req(m)["retryOf"] = admitted.Ref() }), want: none},
+		"no request on the record":                            {reply: record(func(m map[string]any) { delete(m, "retryRequest") }), want: none},
+		"a reference its attempt and queued time do not give": {reply: record(func(m map[string]any) { m["executionRef"] = "a2-0000000000000000" }), want: none},
+		"no attempt":                                          {reply: record(func(m map[string]any) { m["attemptId"] = "" }), want: none},
+		"the retried execution itself":                        {reply: record(func(m map[string]any) { m["attemptId"], m["queuedAt"], m["executionRef"] = "a1", "q1", expected.Ref() }), want: none},
+		"a state the service does not define":                 {reply: record(func(m map[string]any) { m["state"] = "unknown" }), want: none},
+		"no state":                                            {reply: record(func(m map[string]any) { delete(m, "state") }), want: none},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub := &stubTransport{t: t, replies: map[string]string{}}
+			if tc.fail != nil {
+				stub.fail = map[string]*review.TransportError{path: tc.fail}
+			} else {
+				stub.replies[path] = tc.reply
+			}
+			assert.Equal(t, tc.want, review.RemoteRuns(stub).Recover(context.Background(), "job", "run-1", expected, request))
+			assert.Equal(t, []string{"GET " + path}, stub.calls)
+		})
+	}
+
+	// A request that names no action attempt has no id to ask for.
+	stub := &stubTransport{t: t}
+	assert.Equal(t, none, review.RemoteRuns(stub).Recover(context.Background(), "job", "run-1", expected, review.RetryRequest{ActionID: "act-1"}))
+	assert.Empty(t, stub.calls)
+}

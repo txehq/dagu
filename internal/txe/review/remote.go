@@ -1889,6 +1889,56 @@ func (r remoteRuns) Abandoned(ctx context.Context, jobID, runID, ref string) (bo
 	return abandoned(ctx, r.t, jobID, runID, ref)
 }
 
+// Recover implements RunRetrier. It reads the service's record of the retry
+// request, by the id the service derives for it.
+//
+// The record answers only when all of it is the request's: it carries the
+// same request (id, action, attempt, binding digest, and the retried
+// execution), its execution reference is the one its attempt and queued
+// time give, and its state is one of the two the service defines. A 404 is
+// never an answer: the request may be admitted later, or the run's history
+// may be gone. Neither is a record of another request, or one that does not
+// hold together. A read that fails is told apart from those as
+// RecoveryUnavailable: the service was not asked, so it is asked again.
+func (r remoteRuns) Recover(ctx context.Context, jobID, runID string, expected Execution, request RetryRequest) RetryRecovery {
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef(jobID, runID), expected.AttemptID, expected.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest)
+	if err != nil {
+		return RetryRecovery{}
+	}
+	var found struct {
+		State        string          `json:"state"`
+		AttemptID    string          `json:"attemptId"`
+		QueuedAt     string          `json:"queuedAt"`
+		ExecutionRef string          `json:"executionRef"`
+		RetryRequest ir.RetryRequest `json:"retryRequest"`
+	}
+	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry-requests/" + url.PathEscape(want.ID)
+	if err := r.t.Do(ctx, http.MethodGet, path, nil, &found); err != nil {
+		if te, ok := errors.AsType[*TransportError](err); ok {
+			switch te.Status {
+			case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotImplemented:
+				// The service looked and has no record of the request, or
+				// will not or cannot give one to this caller. Asking again
+				// would get the same.
+				return RetryRecovery{}
+			}
+		}
+		// It could not be asked, or could not read its records, this time.
+		return RetryRecovery{State: RecoveryUnavailable}
+	}
+	admitted := Execution{AttemptID: found.AttemptID, QueuedAt: found.QueuedAt}
+	if found.RetryRequest != *want || !admitted.known() || found.ExecutionRef != admitted.Ref() || admitted == expected {
+		return RetryRecovery{}
+	}
+	switch found.State {
+	case "admitted":
+		return RetryRecovery{State: RecoveryAdmitted, Execution: admitted}
+	case "abandoned":
+		return RetryRecovery{State: RecoveryAbandoned, Execution: admitted}
+	}
+	return RetryRecovery{}
+}
+
 // RetryRun implements RunRetrier. The request names the execution the retry
 // is for, and the service admits it only while that is the run's latest
 // execution and has finished, checking it together with the admission.

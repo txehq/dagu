@@ -154,6 +154,17 @@ type runs struct {
 	// afterAdmission runs once a retry is admitted, before its answer
 	// reaches the caller, with the fake's lock held.
 	afterAdmission func(runID string)
+	// loseAnswer makes an admitted retry's answer fail to reach the caller:
+	// the service did everything, and the caller gets this error.
+	loseAnswer error
+	// noRecords makes the service unable to give its record of a retry
+	// request this time, as when it cannot be reached.
+	noRecords bool
+	// recordsGone makes the service answer that it has no record of any
+	// retry request, as after the run's history was removed.
+	recordsGone bool
+	// recovered counts the requests for a retry request's record.
+	recovered int
 	// recorded is the retry request the service recorded on each execution
 	// it admitted, by the request's id.
 	recorded map[string]recordedRetry
@@ -162,8 +173,9 @@ type runs struct {
 
 // recordedRetry is an admitted execution and the request recorded on it.
 type recordedRetry struct {
-	ref     string
-	request ir.RetryRequest
+	ref       string
+	execution review.Execution
+	request   ir.RetryRequest
 }
 
 func newRuns() *runs {
@@ -262,13 +274,43 @@ func (r *runs) RetryRun(_ context.Context, jobID, runID string, expected review.
 			if r.recorded == nil {
 				r.recorded = map[string]recordedRetry{}
 			}
-			r.recorded[recorded.ID] = recordedRetry{ref: now.Ref(), request: *recorded}
+			r.recorded[recorded.ID] = recordedRetry{ref: now.Ref(), execution: now, request: *recorded}
 		}
 	}
 	if r.afterAdmission != nil {
 		r.afterAdmission(runID)
 	}
+	if r.loseAnswer != nil {
+		return review.Execution{}, r.loseAnswer
+	}
 	return admitted, nil
+}
+
+// Recover is the service's record of a retry request, by the id it derives
+// for the request.
+func (r *runs) Recover(_ context.Context, jobID, runID string, expected review.Execution, request review.RetryRequest) review.RetryRecovery {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recovered++
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef(jobID, runID), expected.AttemptID, expected.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest)
+	if err != nil {
+		return review.RetryRecovery{}
+	}
+	if r.noRecords {
+		return review.RetryRecovery{State: review.RecoveryUnavailable}
+	}
+	if r.recordsGone {
+		return review.RetryRecovery{}
+	}
+	rec, ok := r.recorded[want.ID]
+	if !ok {
+		return review.RetryRecovery{}
+	}
+	state := review.RecoveryAdmitted
+	if r.abandonedRefs[rec.ref] {
+		state = review.RecoveryAbandoned
+	}
+	return review.RetryRecovery{State: state, Execution: rec.execution}
 }
 
 type fixture struct {

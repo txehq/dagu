@@ -565,6 +565,12 @@ const (
 	// and keeps being probed; the registry resolves the exception when that
 	// attempt is settled.
 	ExceptionRetryUnsettled ExceptionKind = "retry_settlement_blocked"
+	// ExceptionRetryRecordUnreadable means the answer to a retry was not
+	// received and the service's record of that request has stayed
+	// unreadable. It is about one attempt of one action, which stays
+	// uncertain and keeps being probed; the registry resolves the exception
+	// when that attempt is settled.
+	ExceptionRetryRecordUnreadable ExceptionKind = "retry_record_unreadable"
 	// ExceptionCommandsUnbound means the registry's record of the job's
 	// commands is not what this machine registered, or this machine has no
 	// record of the registration, so none of the job's commands is started.

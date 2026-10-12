@@ -195,9 +195,35 @@ files.
   record gives no attempt or binding digest for is not sent. The answer
   names this request's execution only if it carries the request's id
   (`retryRequestId`, derived by the service's own function); an answer
-  without it, or with another id, names none. Finding the execution again
-  by that id after an answer was lost is not done yet: such a retry is
-  unknown and goes to the owner.
+  without it, or with another id, names none.
+  When the answer is lost (the request fails, the service says the
+  dispatch is uncertain, the reviewer dies first, or the answer names no
+  execution), the reviewer asks the service for its record of the request
+  by that id (`GET /dag-runs/{name}/{dagRunId}/retry-requests/{id}`), at
+  once and again in every later review while the attempt is unresolved.
+  The record answers only when all of it is this request's: the same id,
+  action, attempt, binding digest and retried execution, an execution
+  reference its attempt and queued time give, and a state of `admitted`
+  or `abandoned`. `admitted` names the retry's execution, which is then
+  read like one whose answer arrived. `abandoned` is proof, for this
+  request, that nothing ran: the retry is recorded as not dispatched.
+  No record (404), a refusal to show it, or a record that is not this
+  request's is no answer, and never proof that nothing was admitted: the
+  request may still be admitted later, or the run's history may be gone.
+  The retry then stays unknown and goes to the owner, as before.
+  A read that fails (the service unreachable, a server error, a reply
+  that cannot be decoded) is different: the service was not asked. The
+  owner is not asked a question, because a question ends the probing; the
+  action stays uncertain and every review reads again. If that lasts 30
+  minutes from the registry's grant of the attempt, the exception
+  `retry_record_unreadable` is reported about that attempt: check that the
+  service's API can read the run's executions. It asks for no decision.
+  An execution the record names is written on the action with the outcome
+  that settles it. The registry does not take a second uncertain outcome
+  for the same attempt, so while a recovered execution is still a
+  reservation it is not stored: every review reads the record again. If
+  the service then says it has no record of the request at all, the
+  retry goes to the owner.
   What is recorded: done, only when the service admitted the request,
   named the execution it admitted it as, and that execution is seen on
   the run queued, running or over, with its reference as receipt and its
@@ -220,13 +246,13 @@ files.
   the attempt is settled. Any other execution on the run is not this retry's,
   even a newer one: the admitted execution may have finished and been
   retried by someone else. That, and an admission that names no
-  execution (a service without the answer body
-  `{attemptId, queuedAt, executionRef}`), go to the owner; nothing on the
-  run is recorded as the retry.
+  execution from a service that has no record of the request either, go
+  to the owner; nothing on the run is recorded as the retry.
   One whose answer was never known, such
   as a failed request or a reviewer that died first, is not settled from
-  the run, because a newer execution may be someone else's retry: it goes
-  to the owner. Nothing is ever sent again because time passed.
+  the run, because a newer execution may be someone else's retry: without
+  the service's record of the request it goes to the owner. Nothing is
+  ever sent again because time passed.
   The service can admit a retry, create its execution and then abandon
   the preparation without dispatching it; it records that. A retry is
   settled as not dispatched only by that record for exactly the admitted
@@ -256,6 +282,15 @@ files.
   times, a minute apart), nothing is journaled and the decision keeps its
   attempt. If the preparation outlasts that, the decision's run ends
   failed with that reason, visibly, instead of succeeding with nothing done.
+  This is a known limitation with a manual recovery: nothing runs the
+  decision again by itself. The decision is kept as it is in the registry,
+  decided and not carried out, and no action is journaled for it. To carry
+  it out, retry the failed decision run (`txe-decide-...`) in Dagu once the
+  other execution is dispatched or abandoned: the `execute` step runs
+  again, reads the registry's decision, and either retries the run or
+  ends as skipped because the run has moved on. Do not record the decision
+  as done by hand. That recovery follows from how the step is written; it
+  has not been exercised on a live hub yet.
   When the owner answers `retry` to the question about an attempt whose
   outcome is unknown, the question's decision run executes the original
   decision once more: for a run retry, with the same expected execution,
