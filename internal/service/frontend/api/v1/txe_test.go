@@ -1457,6 +1457,27 @@ func TestTxeAPIRunArtifactsFollowTheRunsWorkspace(t *testing.T) {
 	got, err := a.GetTxeRunArtifacts(txeAdmin, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
 	require.NoError(t, err, "a caller who sees the run's workspace still reads it")
 	assert.Equal(t, ref, got.(apigen.GetTxeRunArtifacts200JSONResponse).Execution)
+
+	// run-1 runs again after the move, in ops. Naming its earlier, secret
+	// execution in a report discloses nothing of that execution's manifest.
+	runDAG := &ir.DAG{Name: jobID, YamlData: []byte(spec("ops"))}
+	again, err := runs.CreateAttempt(ctx, runDAG, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{Retry: true})
+	require.NoError(t, err)
+	st := ir.InitialStatus(runDAG)
+	st.DAGRunID, st.AttemptID, st.Status, st.Labels = "run-1", again.ID(), ir.Running, []string{"workspace=ops"}
+	require.NoError(t, again.Open(ctx))
+	require.NoError(t, again.Write(ctx, st))
+	require.NoError(t, again.Close(ctx))
+	_, err = a.RecordTxeRunArtifacts(txeOps, apigen.RecordTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1",
+		Body: &apigen.TxeArtifactManifestRequest{AttemptId: run1, JobVersion: 2, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+	require.Error(t, err)
+	require.ErrorAs(t, err, &apiErr)
+	assert.NotEqual(t, http.StatusConflict, apiErr.HTTPStatus, "no conflict carrying the secret manifest")
+	assert.NotContains(t, apiErr.Details, "current")
+	listed, err := a.GetTxeRunArtifacts(txeOps, apigen.GetTxeRunArtifactsRequestObject{JobId: jobID, RunId: "run-1"})
+	if err == nil {
+		assert.NotContains(t, *listed.(apigen.GetTxeRunArtifacts200JSONResponse).Executions, ref, "the secret execution is not listed")
+	}
 }
 
 // A resource event's reply shows only the jobs the caller can see, as GET

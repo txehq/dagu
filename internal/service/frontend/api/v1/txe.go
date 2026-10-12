@@ -1394,6 +1394,19 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 		if err := a.txeRequireWorkspaceWrite(ctx, statusWorkspaceName(status)); err != nil {
 			return err
 		}
+		// A report naming an earlier execution can only be a replay or a
+		// conflict, and either returns that execution's manifest: it must be
+		// one the caller can see, by its own saved workspace.
+		if ref := registry.ExecutionRef(in.AttemptID, in.QueuedAt); ref != latest.Ref() {
+			ok, err := a.txeArtifactExecutionVisible(ctx, s, req.JobId, req.RunId, ref, latest, status)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+					Message: "execution " + ref + " of run " + req.RunId + " not found"}
+			}
+		}
 		m, err = tx.RecordArtifacts(ctx, s, req.RunId, latest, in)
 		return err
 	}); err != nil {
