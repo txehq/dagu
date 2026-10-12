@@ -151,8 +151,14 @@ type DeclaredAction struct {
 
 // ReviewPolicy is the saved review contract of a job.
 type ReviewPolicy struct {
-	Brief                   string           `json:"brief"`
+	Brief string `json:"brief"`
+	// CadenceSec is the cadence when the job declares a duration. Cadence
+	// is the cadence when it declares a cron expression, with the zone it
+	// is read in. CadenceInvalid is why the declared cadence is neither;
+	// the default interval is then used, and the owner is told.
 	CadenceSec              int              `json:"cadence_sec"`
+	Cadence                 string           `json:"cadence,omitempty"`
+	CadenceInvalid          string           `json:"cadence_invalid,omitempty"`
 	MaxAttempts             int              `json:"max_attempts"`
 	Actions                 []DeclaredAction `json:"actions,omitempty"`
 	HumanDecisionConditions []string         `json:"human_decision_conditions,omitempty"`
@@ -608,6 +614,12 @@ const (
 	// commands is not what this machine registered, or this machine has no
 	// record of the registration, so none of the job's commands is started.
 	ExceptionCommandsUnbound ExceptionKind = "job_commands_unbound"
+	// ExceptionCadenceInvalid means the job's declared review cadence is
+	// neither a cron expression nor a duration, so the job is reviewed at
+	// the default interval. It is about one version of the job, like
+	// ExceptionCommandsUnbound: it ends when the job gets a version whose
+	// cadence can be read.
+	ExceptionCadenceInvalid ExceptionKind = "review_cadence_invalid"
 )
 
 // Exception is an actionable condition surfaced on the dashboard.

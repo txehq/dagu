@@ -801,7 +801,7 @@ func (r *Registry) DeferReview(_ context.Context, claim review.Claim, until time
 // RaiseException implements review.Registry.
 func (r *Registry) RaiseException(_ context.Context, exc review.Exception) error {
 	return r.Update(func(s *State) error {
-		if exc.Kind == review.ExceptionCommandsUnbound {
+		if exc.Kind == review.ExceptionCommandsUnbound || exc.Kind == review.ExceptionCadenceInvalid {
 			// One open per version of the job; ended by the reviewer, not by
 			// a review.
 			for i := range s.Exceptions {
@@ -839,6 +839,16 @@ func (r *Registry) PutJob(job review.Job) error {
 			s.Registrations = map[string]review.Registration{}
 		}
 		s.Registrations[job.ID] = job.Registration
+		// As the registry: an exception about one version of the job ends
+		// when the job moves to another version.
+		for i := range s.Exceptions {
+			e := &s.Exceptions[i]
+			versioned := e.Kind == review.ExceptionCommandsUnbound || e.Kind == review.ExceptionCadenceInvalid
+			if versioned && e.ResolvedAt == nil && e.JobID == job.ID && e.JobVersion != job.Version {
+				now := r.now()
+				e.ResolvedAt = &now
+			}
+		}
 		proposals := s.Proposals[job.ID]
 		for i := range proposals {
 			p := &proposals[i]

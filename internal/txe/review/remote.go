@@ -529,17 +529,6 @@ func paramNames(schema any) []string {
 	return names
 }
 
-func cadenceSeconds(cadence *string) int {
-	if cadence == nil {
-		return 0
-	}
-	d, err := time.ParseDuration(*cadence)
-	if err != nil || d <= 0 {
-		return 0
-	}
-	return int(d / time.Second)
-}
-
 func (r *Remote) jobDoc(ctx context.Context, jobID string) (api.TxeJob, error) {
 	var doc api.TxeJob
 	err := r.do(ctx, http.MethodGet, jobPath(jobID), nil, &doc)
@@ -624,9 +613,14 @@ func (r *Remote) Job(ctx context.Context, jobID string) (Job, error) {
 	}
 	if rp := v.ReviewPolicy; rp != nil {
 		job.Review = ReviewPolicy{
-			Brief: deref(rp.Brief), CadenceSec: cadenceSeconds(rp.Cadence), MaxAttempts: deref(rp.MaxAttempts),
+			Brief: deref(rp.Brief), MaxAttempts: deref(rp.MaxAttempts),
 			HumanDecisionConditions: deref(rp.HumanDecisionConditions),
 		}
+		timezone := ""
+		if v.Schedule != nil {
+			timezone = deref(v.Schedule.Timezone)
+		}
+		job.Review.CadenceSec, job.Review.Cadence, job.Review.CadenceInvalid = ReadCadence(deref(rp.Cadence), timezone)
 		for _, pa := range deref(rp.PermittedActions) {
 			job.Review.Actions = append(job.Review.Actions, DeclaredAction{
 				Name: pa.Name, Routine: pa.Routine, Command: shellCommand(pa.Command),
@@ -1546,9 +1540,9 @@ func count(n int) *int64 {
 // hasOpenBindingException reports whether the job has an unresolved
 // exception of the binding scope about the given version. Scope, kind and
 // version decide, never its text.
-func hasOpenBindingException(doc api.TxeJob, version int) bool {
+func hasOpenBindingException(doc api.TxeJob, kind ExceptionKind, version int) bool {
 	for _, e := range deref(doc.Exceptions) {
-		if e.ResolvedAt == nil && deref(e.Scope) == string(api.TxeObservationRequestScopeBinding) && e.Kind == string(ExceptionCommandsUnbound) && deref(e.JobVersion) == version {
+		if e.ResolvedAt == nil && deref(e.Scope) == string(api.TxeObservationRequestScopeBinding) && e.Kind == string(kind) && deref(e.JobVersion) == version {
 			return true
 		}
 	}
@@ -1632,7 +1626,7 @@ func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 		}
 		return r.do(ctx, http.MethodPost, jobPath(exc.JobID, "observations"), body, nil)
 	}
-	if exc.Kind == ExceptionCommandsUnbound {
+	if exc.Kind == ExceptionCommandsUnbound || exc.Kind == ExceptionCadenceInvalid {
 		// A job whose commands are not bound to this machine's registration
 		// has an exception of its own scope, about one version of the job.
 		// It changes no availability, a recorded review does not resolve
@@ -1648,7 +1642,7 @@ func (r *Remote) RaiseException(ctx context.Context, exc Exception) error {
 			if err != nil {
 				return err
 			}
-			if !hasOpenBindingException(doc, exc.JobVersion) {
+			if !hasOpenBindingException(doc, exc.Kind, exc.JobVersion) {
 				return nil
 			}
 			state = api.TxeAvailabilityState(registry.AvailabilityReady)

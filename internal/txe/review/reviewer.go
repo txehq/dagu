@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"slices"
@@ -22,7 +23,11 @@ const (
 	defaultCadence     = time.Hour
 	defaultMaxAttempts = 3
 	minReviewInterval  = time.Minute
-	decideStepID       = "decide"
+	// maxSoonerSec is the largest number of seconds that is still a
+	// duration: the agent's "look again in" is checked against it before
+	// it is made one, so a larger number never wraps into a small one.
+	maxSoonerSec = int64(math.MaxInt64 / time.Second)
+	decideStepID = "decide"
 	// leaseMargin separates the end of an attempt from anyone else drawing
 	// conclusions about it, to absorb clock and scheduling slack.
 	leaseMargin     = 30 * time.Second
@@ -198,6 +203,18 @@ func (r *Reviewer) Prepare(ctx context.Context, jobID string) (Prepared, error) 
 	}
 	if err := r.Registry.RaiseException(ctx, binding); err != nil {
 		fmt.Fprintf(os.Stderr, "txe review: job %s: report on the binding of its commands: %v; the review goes on\n", job.ID, err)
+	}
+	// The same for a declared cadence that cannot be read: the job is then
+	// reviewed at the default interval, and the owner is told that it is,
+	// until the job gets a version whose cadence can be read.
+	cadence := Exception{JobID: job.ID, Kind: ExceptionCadenceInvalid, MachineID: job.MachineID, Claim: claim, JobVersion: job.Version}
+	if job.Review.CadenceInvalid != "" {
+		cadence.Message = job.Review.CadenceInvalid + "; the job is reviewed every " + defaultCadence.String() + " until its cadence is corrected"
+	} else {
+		cadence.Cleared, cadence.Message = true, "the job's review cadence can be read"
+	}
+	if err := r.Registry.RaiseException(ctx, cadence); err != nil {
+		fmt.Fprintf(os.Stderr, "txe review: job %s: report on its review cadence: %v; the review goes on\n", job.ID, err)
 	}
 	packet, err := r.prepareClaimed(ctx, claim, job)
 	if errors.Is(err, ErrPacketTooLarge) {
@@ -402,11 +419,7 @@ func (r *Reviewer) unreviewable(ctx context.Context, claim Claim, job Job, cause
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, fmt.Errorf("raise exception: %w", err)
 	}
-	interval := defaultCadence
-	if job.Review.CadenceSec > 0 {
-		interval = time.Duration(job.Review.CadenceSec) * time.Second
-	}
-	if err := r.Registry.DeferReview(ctx, claim, r.now().Add(interval)); err != nil {
+	if err := r.Registry.DeferReview(ctx, claim, job.Review.putOff(r.now())); err != nil {
 		_ = r.Registry.ReleaseClaim(ctx, claim)
 		return Prepared{}, fmt.Errorf("defer review: %w", err)
 	}
@@ -1004,21 +1017,19 @@ func (r *Reviewer) abort(ctx context.Context, claim Claim, reason string) (Appli
 }
 
 func (r *Reviewer) nextReviewAt(job Job, decision AgentDecision, packet Packet) time.Time {
-	interval := defaultCadence
-	if job.Review.CadenceSec > 0 {
-		interval = time.Duration(job.Review.CadenceSec) * time.Second
-	}
+	now := r.now()
+	next := job.Review.nextReview(now)
 	// The agent may ask to look again sooner, never later than the cadence.
-	if s := time.Duration(decision.NextReviewAfterSec) * time.Second; s > 0 && s < interval {
-		interval = s
+	// A number of seconds too large to be a duration is not sooner.
+	if sec := int64(decision.NextReviewAfterSec); sec > 0 && sec <= maxSoonerSec {
+		if sooner := now.Add(time.Duration(sec) * time.Second); sooner.Before(next) {
+			next = sooner
+		}
 	}
 	if packet.MoreRunsPending {
-		interval = minReviewInterval
+		next = now.Add(minReviewInterval)
 	}
-	if interval < minReviewInterval {
-		interval = minReviewInterval
-	}
-	return r.now().Add(interval)
+	return notBefore(next, now.Add(minReviewInterval))
 }
 
 // applyAction runs a requested action when the saved policy makes it
@@ -1862,11 +1873,7 @@ func (r *Reviewer) Fail(ctx context.Context, prepared Prepared, failure *AgentFa
 	}); err != nil {
 		return fmt.Errorf("raise exception: %w", err)
 	}
-	interval := defaultCadence
-	if job.Review.CadenceSec > 0 {
-		interval = time.Duration(job.Review.CadenceSec) * time.Second
-	}
-	if err := r.Registry.DeferReview(ctx, prepared.Claim, r.now().Add(interval)); err != nil {
+	if err := r.Registry.DeferReview(ctx, prepared.Claim, job.Review.putOff(r.now())); err != nil {
 		return fmt.Errorf("defer review: %w", err)
 	}
 	if err := r.Registry.ReleaseClaim(ctx, prepared.Claim); err != nil {
