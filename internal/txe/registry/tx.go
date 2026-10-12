@@ -495,6 +495,31 @@ func (tx *JobTx) CheckClaim(claimID string, fence int64, kinds ...ClaimKind) err
 	return &Error{Code: CodeClaimStale, Message: fmt.Sprintf("claim %s is a %s claim", claimID, c.Kind), Current: c}
 }
 
+// lastRecordedReviewVersion is the job version the last recorded review
+// read: the job's cached copy, or for a review recorded before the copy
+// existed, the version the immutable review itself was stamped with. The
+// review chain's head is that review; anything else fails closed.
+func (tx *JobTx) lastRecordedReviewVersion() (int, error) {
+	j := tx.Job
+	if j.LastRecordedReview == "" {
+		return 0, nil
+	}
+	if j.LastRecordedReviewJobVersion != 0 {
+		return j.LastRecordedReviewJobVersion, nil
+	}
+	if j.Chains.Reviews == "" {
+		return 0, fmt.Errorf("registry: review %s is recorded but the review history is empty", j.LastRecordedReview)
+	}
+	var r Review
+	if err := tx.store.getJSON(tx.ctx, j.Chains.Reviews, &r); err != nil {
+		return 0, fmt.Errorf("registry: history %s: %w", j.Chains.Reviews, err)
+	}
+	if r.ReviewID != j.LastRecordedReview {
+		return 0, fmt.Errorf("registry: the latest review in history is %s, not %s", r.ReviewID, j.LastRecordedReview)
+	}
+	return r.JobVersion, nil
+}
+
 // requireReviewable refuses a review's write unless the job is ready and,
 // when the write names the job version the review read, still at that
 // version. A review binds its records, proposals and checkpoint to the
@@ -556,7 +581,11 @@ func (tx *JobTx) RecordReview(claimID string, fence int64, r Review) error {
 		}
 		// A replay is the same review only for the version it was recorded
 		// for; after an update it is a review of a version it never read.
-		if recorded := j.LastRecordedReviewJobVersion; recorded != 0 && (recorded != j.Version || (r.JobVersion != 0 && r.JobVersion != recorded)) {
+		recorded, err := tx.lastRecordedReviewVersion()
+		if err != nil {
+			return err
+		}
+		if recorded != 0 && (recorded != j.Version || (r.JobVersion != 0 && r.JobVersion != recorded)) {
 			return &Error{Code: CodeVersionConflict, Message: fmt.Sprintf("review %s was recorded for version %d; the job is at version %d", r.ReviewID, recorded, j.Version), Current: j}
 		}
 		return nil
@@ -799,8 +828,14 @@ func (tx *JobTx) AdvanceCheckpoint(claimID string, fence int64, expectedVersion 
 	// recorded before an update finishes its episode for the old version,
 	// and the new version is then due at once, never marked reviewed by it.
 	reviewed := j.Version
-	if episode, err := ReviewID(j.JobID, j.Checkpoint.Version); err == nil && j.LastRecordedReview == episode && j.LastRecordedReviewJobVersion != 0 {
-		reviewed = j.LastRecordedReviewJobVersion
+	if episode, err := ReviewID(j.JobID, j.Checkpoint.Version); err == nil && j.LastRecordedReview == episode {
+		recorded, err := tx.lastRecordedReviewVersion()
+		if err != nil {
+			return nil, err
+		}
+		if recorded != 0 {
+			reviewed = recorded
+		}
 	}
 	if err := tx.requireReviewable(0); err != nil {
 		return nil, err

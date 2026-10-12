@@ -236,3 +236,42 @@ func TestInterruptedEpisodeKeepsItsReviewedVersion(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, cp.JobVersion)
 }
+
+// A review recorded before the job cached its version (an older aggregate
+// without last_recorded_review_job_version) is resolved from the stored
+// review itself: its replay after an update is refused, and its episode
+// keeps the version it read.
+func TestReviewVersionResolvedForAnOlderRecord(t *testing.T) {
+	f := newFixture(t)
+	job := f.ready("k")
+	c := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	review, err := ReviewID(job.JobID, 0)
+	require.NoError(t, err)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		if err := tx.RecordReview(c.ClaimID, c.Fence, Review{ReviewID: review, Outcome: ReviewContinue}); err != nil {
+			return err
+		}
+		tx.Job.LastRecordedReviewJobVersion = 0 // as written before the field existed
+		return nil
+	})
+	require.NoError(t, err)
+	stored, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	require.Zero(t, stored.LastRecordedReviewJobVersion)
+
+	updateAndReady(t, f, job, 2)
+	c2 := acquire(t, f, job.JobID, ClaimReview, time.Hour)
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		return tx.RecordReview(c2.ClaimID, c2.Fence, Review{ReviewID: review, Outcome: ReviewContinue})
+	})
+	assert.Equal(t, CodeVersionConflict, code(t, err), "the old review is not replayed for version 2")
+	var cp *Checkpoint
+	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error {
+		var err error
+		cp, err = tx.AdvanceCheckpoint(c2.ClaimID, c2.Fence, 0, Checkpoint{JobVersion: 1})
+		return err
+	})
+	require.NoError(t, err, "naming the version the episode reviewed")
+	assert.Equal(t, 1, cp.JobVersion)
+	require.NotNil(t, cp.NextReviewAt)
+}
