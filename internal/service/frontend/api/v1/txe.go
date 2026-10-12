@@ -545,7 +545,7 @@ func (a *API) txeVisibleResult(ctx context.Context, s *registry.Store, job *regi
 	if err := a.txeJobVisible(ctx, s, job); err != nil {
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
-			return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "job " + job.JobID + " not found"})
+			return nil, txeJobNotFound(job.JobID)
 		}
 		return nil, err
 	}
