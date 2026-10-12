@@ -152,15 +152,19 @@ func (g *txeGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // txeDurableHome returns a TXE home that the path policy accepts: outside
-// the system temporary directories and outside any working tree.
-func txeDurableHome(t *testing.T) string {
+// the system temporary directories and outside any working tree. The policy
+// asked is the one the CLI will apply when it runs with userDir as its HOME
+// and no TMPDIR, as txeCLI.run starts it. Where that policy refuses the
+// place this machine offers, the test is skipped.
+func txeDurableHome(t *testing.T, userDir string) string {
 	t.Helper()
 	cache, err := os.UserCacheDir()
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(cache, 0o700))
 	home, err := os.MkdirTemp(cache, "txe-dagu-test-")
 	require.NoError(t, err)
-	if err := txepkg.DefaultPathPolicy().CheckDurable(home); err != nil {
+	policy := txepkg.PathPolicy{TempRoots: []string{"/tmp", "/var/tmp", "/var/folders"}, HomeDir: userDir}
+	if err := policy.CheckDurable(home); err != nil {
 		_ = os.RemoveAll(home)
 		t.Skipf("no durable place for a TXE home on this machine: %v", err)
 	}
@@ -245,7 +249,8 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	gate, front := newTXEGate(t, fmt.Sprintf("http://%s:%d", server.Config.Server.Host, server.Config.Server.Port))
 	baseURL := front + "/api/v1"
 
-	cli := &txeCLI{t: t, binary: server.Config.Paths.Executable, home: txeDurableHome(t), userDir: t.TempDir()}
+	userDir := t.TempDir()
+	cli := &txeCLI{t: t, binary: server.Config.Paths.Executable, home: txeDurableHome(t, userDir), userDir: userDir}
 	identity := fmt.Sprintf(`{"schema":1,"machine_id":%q,"owner_id":%q,"display_name":"test-mac"}`, txeITMachine, txeITOwner)
 	require.NoError(t, os.WriteFile(filepath.Join(cli.home, "machine.json"), []byte(identity), 0o600))
 
