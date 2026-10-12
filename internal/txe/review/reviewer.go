@@ -2079,7 +2079,12 @@ func (r *Reviewer) Fail(ctx context.Context, prepared Prepared, failure *AgentFa
 		if changed {
 			// The failure is of a review nobody needs any more. Nothing is
 			// said to the owner about it, and the job is due as it now is.
+			// The claim may still be live (an update that came before the
+			// claim ended none), so it is given back for the next tick.
 			fmt.Fprintf(os.Stderr, "txe review: job %s: the failed review is dropped: %s\n", job.ID, reason)
+			if err := r.Registry.ReleaseClaim(ctx, prepared.Claim); err != nil && !errors.Is(err, ErrStaleFence) && !errors.Is(err, ErrNotFound) {
+				fmt.Fprintf(os.Stderr, "txe review: job %s: release the claim of the dropped review: %v\n", job.ID, err)
+			}
 		}
 		return changed
 	}

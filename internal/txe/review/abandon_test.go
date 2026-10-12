@@ -588,6 +588,26 @@ func TestRemoteAnUpdateUnderAReviewAbandonsIt(t *testing.T) {
 		assert.Equal(t, 2, job.Checkpoint.JobVersion, "the checkpoint says version 2 was reviewed")
 	})
 
+	// The same window with an agent that failed: the claim is live, because
+	// the update came before it. The failed review is dropped without an
+	// exception, and the claim is given back so the next tick reviews at once.
+	t.Run("updated between the job being read and claimed, and the agent fails", func(t *testing.T) {
+		w := start(t)
+		r := w.reviewer("tick-1")
+		r.Registry = &hookClaim{Registry: w.f.remote, before: w.update}
+		prepared, err := r.Prepare(ctx, w.id)
+		require.NoError(t, err)
+		require.Empty(t, prepared.Skipped)
+		require.NoError(t, r.Fail(ctx, prepared, &review.AgentFailure{Kind: review.ExceptionReviewerFailed, Message: "no output"}))
+		job := stored(t, w)
+		assert.Empty(t, job.Exceptions)
+		assert.Nil(t, job.Checkpoint.NextReviewAt, "nothing is put off")
+		again, err := w.reviewer("tick-2").Prepare(ctx, w.id)
+		require.NoError(t, err)
+		require.Empty(t, again.Skipped, "the job is claimed again at once")
+		assert.Equal(t, 2, again.Packet.Job.Version)
+	})
+
 	t.Run("a claim that expired and was taken, on an unchanged job, is still an error", func(t *testing.T) {
 		w := start(t)
 		prepared, err := w.reviewer("tick-1").Prepare(ctx, w.id)

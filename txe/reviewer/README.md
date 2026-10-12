@@ -187,9 +187,11 @@ files.
   made against another version than the job's, and every proposal, review
   and checkpoint is sent with the version the review read. A review that meets this at any of
   its writes is abandoned: it leaves the checkpoint where it was, raises
-  no exception, and its run succeeds, saying why (`aborted`) and what it
+  no exception about being abandoned, and its run succeeds, saying why (`aborted`) and what it
   had already written, which stays written (a review record made just
-  before the update is kept and completed by the next review). The next tick reviews the job
+  before the update is kept and completed by the next review; a report
+  that the job's target is unreachable, already made, stands until the
+  next review's finding replaces it). The next tick reviews the job
   as it now is. An action already begun is in the journal: the registry
   interrupts it with the claim, a later review settles it, and it is never
   run again. A claim that is stale for another reason (it expired and was
