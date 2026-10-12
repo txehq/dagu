@@ -186,6 +186,18 @@ files.
   before. A retry the reviewer proposes runs from its decision run once the
   owner answers `retry`; one the owner requests directly is already decided
   and is run by the next tick. Either way it is sent at most once.
+  The request also says which attempt of which action it is made for
+  (`retryRequest`: the registry's action id, the attempt number, the
+  action's binding digest, all taken from the registry's record). The
+  service records that on the execution it admits, and the registry takes
+  an execution for this retry's only by that record, so a later retry of
+  the run by anyone is never taken for this one. A retry the registry's
+  record gives no attempt or binding digest for is not sent. The answer
+  names this request's execution only if it carries the request's id
+  (`retryRequestId`, derived by the service's own function); an answer
+  without it, or with another id, names none. Finding the execution again
+  by that id after an answer was lost is not done yet: such a retry is
+  unknown and goes to the owner.
   What is recorded: done, only when the service admitted the request,
   named the execution it admitted it as, and that execution is seen on
   the run queued, running or over, with its reference as receipt and its

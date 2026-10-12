@@ -369,6 +369,10 @@ type Action struct {
 	// Attempt is the registry's count of attempts of this action. An
 	// owner's answer about an unknown outcome is about one attempt.
 	Attempt int `json:"attempt,omitempty"`
+	// BindingDigest is the registry's digest of what this action is bound
+	// to. With the action's id and attempt it identifies, at the service,
+	// the request a retry of a run is made for.
+	BindingDigest string `json:"binding_digest,omitempty"`
 	// IntentKey identifies the same intent across review episodes.
 	IntentKey  string      `json:"intent_key"`
 	ReviewID   string      `json:"review_id,omitempty"`

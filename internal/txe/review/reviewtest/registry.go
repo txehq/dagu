@@ -545,6 +545,7 @@ func (r *Registry) BeginAction(_ context.Context, req review.BeginRequest) (revi
 			IntentKey: req.IntentKey, ReviewID: req.ReviewID,
 			ProposalID: req.ProposalID, DecisionID: req.DecisionID,
 			State: review.ActionExecuting, ClaimID: req.Claim.ID, StartedAt: now, AttemptStartedAt: now,
+			Attempt: 1, BindingDigest: "sha256:" + req.IntentKey,
 			GrantID:        s.nextID("grt"),
 			GrantExpiresAt: now.Add(grantTimeout(req.Timeout)),
 		}

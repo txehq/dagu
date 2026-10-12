@@ -22,6 +22,7 @@ import (
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -1270,6 +1271,7 @@ func (r *Remote) actionOf(jobID string, a api.TxeAction) Action {
 		ReviewID: deref(a.ReviewId), ProposalID: deref(a.ProposalId), DecisionID: deref(a.DecisionId),
 		State: ActionState(a.State), Receipt: deref(a.Receipt), ClaimID: deref(a.ClaimId),
 		StartedAt: a.Created.At, FinishedAt: a.Updated.At, Attempt: a.Attempt, MaxAttempts: a.MaxAttempts,
+		BindingDigest: a.BindingDigest,
 	}
 	// An action written before the registry recorded attempts' grants has
 	// only its creation time.
@@ -1900,36 +1902,54 @@ func (r remoteRuns) Abandoned(ctx context.Context, jobID, runID, ref string) (bo
 // the service says itself that the retry may have been dispatched, any
 // other status, and a failure of the transport. An unknown outcome is
 // settled by looking at the run, never by assuming.
-func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution) (Execution, error) {
+func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected Execution, request RetryRequest) (Execution, error) {
+	// The service records, on the execution it admits, which action attempt
+	// asked for it, under an id it derives from the request. The registry
+	// later takes an execution for this retry's only by that record. The id
+	// is derived here by the service's own function, so that the answer can
+	// be checked against it; nothing of the derivation is repeated.
+	want, err := ir.NewRetryRequest(ir.NewDAGRunRef(jobID, runID), expected.AttemptID, expected.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest)
+	if err != nil {
+		// Nothing is sent: a retry the service cannot attribute to this
+		// attempt could never be recorded as its effect.
+		return Execution{}, fmt.Errorf("%w: the retry of run %s names no action attempt: %v", ErrRunNotRetryable, runID, err)
+	}
 	path := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID) + "/retry"
-	body := map[string]string{"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt}
+	body := map[string]any{
+		"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt,
+		"retryRequest": map[string]string{"actionId": request.ActionID, "actionAttempt": request.ActionAttempt, "bindingDigest": request.BindingDigest},
+	}
 	var answer json.RawMessage
-	err := r.t.Do(ctx, http.MethodPost, path, body, &answer)
+	err = r.t.Do(ctx, http.MethodPost, path, body, &answer)
 	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusConflict && retryRefusedBeforeEffect[te.Code] {
 		return Execution{}, fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
 	if err != nil {
 		return Execution{}, err
 	}
-	return admittedExecution(answer), nil
+	return admittedExecution(answer, want.ID), nil
 }
 
 // admittedExecution reads the execution the service says it admitted a
-// conditional retry as: {attemptId, queuedAt, executionRef} in the answer.
-// A service that answers without it, or with something that does not hold
-// together, has named no execution: the zero Execution is returned, and the
-// caller records nothing from the run.
-func admittedExecution(answer json.RawMessage) Execution {
+// conditional retry as: {attemptId, queuedAt, executionRef, retryRequestId}
+// in the answer. The execution is this request's only if the service also
+// says it recorded this request on it: retryRequestId must be the id
+// derived for the request. A service that answers without either, with
+// another request's id, or with something that does not hold together, has
+// named no execution for this request: the zero Execution is returned, and
+// the caller records nothing from the run.
+func admittedExecution(answer json.RawMessage, requestID string) Execution {
 	var named struct {
-		AttemptID    string `json:"attemptId"`
-		QueuedAt     string `json:"queuedAt"`
-		ExecutionRef string `json:"executionRef"`
+		AttemptID      string `json:"attemptId"`
+		QueuedAt       string `json:"queuedAt"`
+		ExecutionRef   string `json:"executionRef"`
+		RetryRequestID string `json:"retryRequestId"`
 	}
 	if len(answer) == 0 || json.Unmarshal(answer, &named) != nil || named.AttemptID == "" {
 		return Execution{}
 	}
 	admitted := Execution{AttemptID: named.AttemptID, QueuedAt: named.QueuedAt}
-	if named.ExecutionRef != admitted.Ref() {
+	if named.ExecutionRef != admitted.Ref() || requestID == "" || named.RetryRequestID != requestID {
 		return Execution{}
 	}
 	return admitted

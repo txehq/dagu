@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/dagucloud/dagu/v2/internal/txe/review/reviewtest"
 	"github.com/stretchr/testify/assert"
@@ -153,7 +154,16 @@ type runs struct {
 	// afterAdmission runs once a retry is admitted, before its answer
 	// reaches the caller, with the fake's lock held.
 	afterAdmission func(runID string)
-	seq            int
+	// recorded is the retry request the service recorded on each execution
+	// it admitted, by the request's id.
+	recorded map[string]recordedRetry
+	seq      int
+}
+
+// recordedRetry is an admitted execution and the request recorded on it.
+type recordedRetry struct {
+	ref     string
+	request ir.RetryRequest
 }
 
 func newRuns() *runs {
@@ -221,7 +231,7 @@ func (r *runs) Abandoned(_ context.Context, _, _, ref string) (bool, bool) {
 // RetryRun is the service's conditional retry: it is admitted only while
 // expected is the run's latest execution, and that is checked here, at the
 // service, at the moment of admission.
-func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Execution) (review.Execution, error) {
+func (r *runs) RetryRun(_ context.Context, jobID, runID string, expected review.Execution, request review.RetryRequest) (review.Execution, error) {
 	// The hook runs before the lock is taken: it changes the run through
 	// the fake's own methods, which lock.
 	if r.beforeAdmission != nil {
@@ -244,6 +254,16 @@ func (r *runs) RetryRun(_ context.Context, _, runID string, expected review.Exec
 	var admitted review.Execution
 	if now := r.state[runID].Execution(); !r.unnamed && now != expected {
 		admitted = now
+	}
+	// As the service does: the request is recorded on the execution it
+	// admitted, under the id derived from it, whatever the caller is told.
+	if now := r.state[runID].Execution(); now != expected {
+		if recorded, err := ir.NewRetryRequest(ir.NewDAGRunRef(jobID, runID), expected.AttemptID, expected.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest); err == nil {
+			if r.recorded == nil {
+				r.recorded = map[string]recordedRetry{}
+			}
+			r.recorded[recorded.ID] = recordedRetry{ref: now.Ref(), request: *recorded}
+		}
 	}
 	if r.afterAdmission != nil {
 		r.afterAdmission(runID)

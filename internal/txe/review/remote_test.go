@@ -29,6 +29,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/humantask"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
@@ -251,6 +252,19 @@ func (c *runControl) LatestAttempt(ctx context.Context, job, runID string) (regi
 		AttemptID: state.AttemptID, QueuedAt: state.QueuedAt, SpecSHA256: c.spec, Status: state.Status,
 		Finished: !state.Active, Succeeded: state.Succeeded,
 	}, nil
+}
+
+// RetryExecution is the service's record of which execution a retry
+// request admitted. Preparation is not modelled here: an execution the fake
+// admitted is dispatched unless the fake recorded it as abandoned.
+func (c *runControl) RetryExecution(_ context.Context, _, _, requestID string) (registry.RetryExecution, error) {
+	c.runs.mu.Lock()
+	defer c.runs.mu.Unlock()
+	rec, ok := c.runs.recorded[requestID]
+	if !ok {
+		return registry.RetryExecution{}, registry.ErrRunNotFound
+	}
+	return registry.RetryExecution{Ref: rec.ref, Request: rec.request, Abandoned: c.runs.abandonedRefs[rec.ref]}, nil
 }
 
 func writeAPIError(w http.ResponseWriter, _ *http.Request, err error) {
@@ -1552,45 +1566,73 @@ func TestRemoteEnqueueTreatsConflictAsOpened(t *testing.T) {
 	require.Error(t, enqueue(context.Background(), "txe-decide-X", "txe-abc", nil))
 }
 
-// The native retry is sent with the execution it is for, and each of the
-// service's refusals is "nothing started", never "unknown".
+// The native retry is sent with the execution it is for and the action
+// attempt it is made for, and each of the service's refusals is "nothing
+// started", never "unknown".
 func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	path := "/dag-runs/job_1/run-1/retry"
 	stub := &stubTransport{t: t, replies: map[string]string{path: `{}`}}
-	var sent map[string]string
+	var sent map[string]any
 	runs := review.RemoteRuns(captureTransport{Transport: stub, path: path, into: &sent})
 	queued := review.Execution{AttemptID: "a1", QueuedAt: "2026-10-09T16:36:43.039647Z"}
-	admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+	request := review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d"}
+	// The id is the service's own derivation, not one written here.
+	derived, err := ir.NewRetryRequest(ir.NewDAGRunRef("job_1", "run-1"), queued.AttemptID, queued.QueuedAt, "act-1", "1", "sha256:d")
+	require.NoError(t, err)
+	id := derived.ID
+
+	admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 	require.NoError(t, err)
 	assert.Equal(t, review.Execution{}, admitted, "the service's answer names no execution")
 
-	// The execution the service names is returned only when its parts hold
-	// together; anything else names none.
+	// The execution the service names is this request's only when its parts
+	// hold together and the service says it recorded this request on it.
 	next := review.Execution{AttemptID: "a2", QueuedAt: "2026-10-09T16:40:00Z"}
 	for answer, want := range map[string]review.Execution{
-		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `"}`:  next,
-		`{"attemptId":"a3","executionRef":"` + review.ExecutionRef("a3", "") + `"}`:                 {AttemptID: "a3"},
-		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"a2-0000000000000000"}`: {},
-		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z"}`:                                      {},
-		`{"executionRef":"` + next.Ref() + `"}`:                                                     {},
-		`[]`:                                                                                        {},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `","retryRequestId":"` + id + `"}`:  next,
+		`{"attemptId":"a3","executionRef":"` + review.ExecutionRef("a3", "") + `","retryRequestId":"` + id + `"}`:                 {AttemptID: "a3"},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"a2-0000000000000000","retryRequestId":"` + id + `"}`: {},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","retryRequestId":"` + id + `"}`:                                      {},
+		`{"executionRef":"` + next.Ref() + `","retryRequestId":"` + id + `"}`:                                                     {},
+		// An execution named without the request, or with another one's
+		// id, is not known to be this request's.
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `"}`:                                                    {},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `","retryRequestId":""}`:                                {},
+		`{"attemptId":"a2","queuedAt":"2026-10-09T16:40:00Z","executionRef":"` + next.Ref() + `","retryRequestId":"` + strings.Repeat("0", 64) + `"}`: {},
+		`[]`: {},
 	} {
 		stub.replies[path] = answer
-		admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+		admitted, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 		require.NoError(t, err, answer)
 		assert.Equal(t, want, admitted, answer)
 	}
 	stub.replies[path] = `{}`
-	assert.Equal(t, map[string]string{"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z"}, sent)
+	assert.Equal(t, map[string]any{
+		"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z",
+		"retryRequest": map[string]any{"actionId": "act-1", "actionAttempt": "1", "bindingDigest": "sha256:d"},
+	}, sent)
 
 	// An execution that was never queued is named with an empty marker,
 	// which is a value the service compares, not an omitted field.
 	sent = nil
-	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", review.Execution{AttemptID: "a1"})
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", review.Execution{AttemptID: "a1"}, request)
 	require.NoError(t, err)
 	marker, named := sent["expectedQueuedAt"]
 	assert.True(t, named)
 	assert.Empty(t, marker)
+
+	// A request that names no action attempt is not sent at all: the
+	// service could not attribute what it started.
+	for name, incomplete := range map[string]review.RetryRequest{
+		"no action":         {ActionAttempt: "1", BindingDigest: "sha256:d"},
+		"no attempt":        {ActionID: "act-1", BindingDigest: "sha256:d"},
+		"no binding digest": {ActionID: "act-1", ActionAttempt: "1"},
+	} {
+		before := len(stub.calls)
+		_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, incomplete)
+		require.ErrorIs(t, err, review.ErrRunNotRetryable, name)
+		assert.Len(t, stub.calls, before, name+": nothing reached the service")
+	}
 
 	// Only the refusals the service documents as made before anything is
 	// queued or created mean "nothing started".
@@ -1600,7 +1642,7 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.fail = map[string]*review.TransportError{path: refusal}
-			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 			require.ErrorIs(t, err, review.ErrRunNotRetryable)
 		})
 	}
@@ -1617,7 +1659,7 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub.fail = map[string]*review.TransportError{path: failure}
-			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued)
+			_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 			require.Error(t, err)
 			require.NotErrorIs(t, err, review.ErrRunNotRetryable, "whether a retry started is unknown")
 		})
@@ -2823,4 +2865,12 @@ func TestRemoteNotReadyIsAskAgainAndNothingElse(t *testing.T) {
 	assert.NotErrorAs(t, err, &denied, "not a denial: a denial ends the decision's attempt")
 	assert.NotErrorIs(t, err, review.ErrActionExists)
 	assert.NotErrorIs(t, err, review.ErrNotFound)
+}
+
+// The request id is the one the service derives: the value agreed with the
+// service's owner for a fixed request, computed by the service's function.
+func TestRetryRequestIDIsTheServicesDerivation(t *testing.T) {
+	derived, err := ir.NewRetryRequest(ir.NewDAGRunRef("job", "run-1"), "a1", "q1", "act-1", "1", "sha256:d")
+	require.NoError(t, err)
+	assert.Equal(t, "1bd70964d76fb1639b8f3478358ee7f851890711cee34452fb45887115296024", derived.ID)
 }

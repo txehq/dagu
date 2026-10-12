@@ -1124,6 +1124,16 @@ func (r *Reviewer) applyOutcome(ctx context.Context, claim Claim, job Job, packe
 // retry starts a run, so an unknown outcome is uncertain, not harmless.
 var retryRunDeclaration = DeclaredAction{Name: RetryRunAction, Idempotency: IdempotencyNone, TimeoutSec: 60}
 
+// RetryRequest names the action attempt a retry of a run is made for, in
+// the registry's terms: the action's id, the number of the attempt, and
+// the action's binding digest. The service records it on the execution it
+// admits.
+type RetryRequest struct {
+	ActionID      string
+	ActionAttempt string
+	BindingDigest string
+}
+
 // RunState is what the service reports about one run of a job.
 type RunState struct {
 	// AttemptID and QueuedAt identify the run's latest execution. A native
@@ -1181,7 +1191,7 @@ type RunRetrier interface {
 	// With no error the service admitted the request. admitted is then the
 	// execution the service says it admitted it as, or the zero Execution
 	// when the service does not name one.
-	RetryRun(ctx context.Context, jobID, runID string, expected Execution) (admitted Execution, err error)
+	RetryRun(ctx context.Context, jobID, runID string, expected Execution, request RetryRequest) (admitted Execution, err error)
 	// Abandoned reports whether the service recorded that the execution of
 	// the run named by ref was created and never dispatched. known is false
 	// when its records cannot answer that for this execution.
@@ -1229,7 +1239,15 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 		return EffectResult{Status: EffectNotApplied, Detail: fmt.Sprintf(
 			"not dispatched: the decision is about execution %s of run %s, and the run is now at %s (%s)", bound.Ref(), runID, before.Execution().Ref(), before.Status)}
 	}
-	admitted, err := r.Runs.RetryRun(ctx, job.ID, runID, bound)
+	// The request says which attempt of which action it is made for, in the
+	// registry's own terms. The registry settles the retry only with the
+	// execution the service recorded this request on, so a retry sent
+	// without them could run and never be recorded: it is not sent.
+	request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest}
+	if action.Attempt <= 0 || action.BindingDigest == "" {
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the registry's record of action " + action.ID + " gives no attempt number or binding digest to make the retry of run " + runID + " for"}
+	}
+	admitted, err := r.Runs.RetryRun(ctx, job.ID, runID, bound, request)
 	if err != nil {
 		if errors.Is(err, ErrRunNotRetryable) {
 			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: " + err.Error()}
@@ -1455,21 +1473,21 @@ func retryDecided(decisions []Decision, proposalID string) bool {
 
 // verifyGranted compares the action the registry journaled for an approval
 // with the proposal the reviewer is about to act on.
-func (r *Reviewer) verifyGranted(ctx context.Context, jobID string, action Action, proposal Proposal) error {
+func (r *Reviewer) verifyGranted(ctx context.Context, jobID string, action Action, proposal Proposal) (Action, error) {
 	stored, err := r.Registry.Actions(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("read granted action: %w", err)
+		return Action{}, fmt.Errorf("read granted action: %w", err)
 	}
 	for _, a := range slices.Backward(stored) {
 		if a.ID != action.ID {
 			continue
 		}
 		if a.Name != proposal.ActionName || a.TargetID != proposal.TargetID || !maps.Equal(normalizeParams(a.Params), normalizeParams(proposal.Params)) {
-			return errors.New("the granted action is not the action of the approved proposal")
+			return Action{}, errors.New("the granted action is not the action of the approved proposal")
 		}
-		return nil
+		return a, nil
 	}
-	return errors.New("the granted action is not in the journal")
+	return Action{}, errors.New("the granted action is not in the journal")
 }
 
 // maxAgentText bounds how much of the agent's own text a question carries.
@@ -1722,7 +1740,13 @@ func (r *Reviewer) executeClaimed(ctx context.Context, claim Claim, job Job, dec
 	// What runs is what the registry granted, not what this process read
 	// earlier. If the journaled action differs from the proposal as read,
 	// nothing runs and the attempt is closed as not applied.
-	if err := r.verifyGranted(ctx, job.ID, action, proposal); err != nil {
+	journaled, err := r.verifyGranted(ctx, job.ID, action, proposal)
+	if err == nil {
+		// Which attempt this is, and what the action is bound to, are the
+		// registry's to say: they are taken from its record of the action.
+		action.Attempt, action.MaxAttempts, action.BindingDigest = journaled.Attempt, journaled.MaxAttempts, journaled.BindingDigest
+	}
+	if err != nil {
 		finishErr := r.Registry.FinishAction(ctx, FinishRequest{
 			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
 			State: ActionFailed, Detail: err.Error(),
