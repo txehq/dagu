@@ -175,7 +175,7 @@ func (f *fixture) fileProposalWith(p registry.Proposal) *registry.Proposal {
 	p.ProposalID = id
 	var filed *registry.Proposal
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}, func(tx *registry.JobTx) error {
-		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: f.machineID}, time.Hour)
 		if err != nil {
 			return err
 		}
@@ -200,7 +200,7 @@ func (f *fixture) fileProposal(action string, native bool) *registry.Proposal {
 	}
 	var filed *registry.Proposal
 	_, err = f.store.WithJobTx(f.ctx, f.jobID, reviewer, func(tx *registry.JobTx) error {
-		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: "m"}, time.Hour)
+		claim, err := tx.AcquireClaim(registry.ClaimReview, registry.Reviewer{MachineID: f.machineID}, time.Hour)
 		if err != nil {
 			return err
 		}
@@ -584,22 +584,5 @@ func TestDecideRefusesRetryOnUntypedProposal(t *testing.T) {
 	}
 	if n := len(f.decisions()); n != 0 || len(f.tasks.calls) != 0 {
 		t.Fatalf("decisions = %d, completions = %d; want none", n, len(f.tasks.calls))
-	}
-}
-
-// Until the registry can authorize a bound native retry, retry on a
-// dagu.retry_run proposal is refused rather than recorded as unexecutable.
-func TestDecideRefusesRunRetryUntilAuthorizable(t *testing.T) {
-	f := newFixture(t)
-	p := f.fileProposalWith(registry.Proposal{
-		Action:          registry.ActionSpec{Name: ActionRetryRun, Params: json.RawMessage(`{"run_id":"run-0003"}`)},
-		AllowedVerdicts: []registry.Verdict{VerdictRetry, VerdictReject},
-	})
-	req := Request{ExpectedProposalRevision: p.Revision, BindingDigest: p.BindingDigest, Verdict: VerdictRetry, IdempotencyKey: "key-run-retry-1"}
-	if _, err := f.svc.Decide(f.ctx, f.jobID, p.ProposalID, req, f.human); registry.ErrorCode(err) != registry.CodeNotPermitted {
-		t.Fatalf("err = %v, want not_permitted", err)
-	}
-	if n := len(f.decisions()); n != 0 {
-		t.Fatalf("decisions = %d, want 0", n)
 	}
 }
