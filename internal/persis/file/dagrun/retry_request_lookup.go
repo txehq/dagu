@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -99,19 +100,44 @@ func matchCurrent(att *Attempt, status *ir.DAGRunStatus) (*persis.RetryRequestMa
 }
 
 // matchRetained looks for id in the retained copies of one attempt
-// directory.
+// directory. Unlike the manifest listing, which skips what it cannot read,
+// it is strict: a copies directory or a copy that cannot be read is an
+// error, never absent, so a lost response is never reported as unknown.
 func matchRetained(attemptDir, id string) (*persis.RetryRequestMatch, error) {
-	copies := listRetainedIn(attemptDir)
-	if len(copies) == 0 {
-		return nil, nil
-	}
 	attRoot, err := os.OpenRoot(attemptDir)
 	if err != nil {
 		return nil, fmt.Errorf("open attempt directory: %w", err)
 	}
 	defer func() { _ = attRoot.Close() }()
-	for _, m := range copies {
-		data, err := readPlain(attRoot, filepath.Join(retainedExecutionsDir, m.Execution, retainedStatusFile))
+	execRoot, err := openSubRoot(attRoot, retainedExecutionsDir, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open retained executions: %w", err)
+	}
+	defer func() { _ = execRoot.Close() }()
+	entries, err := readDirRoot(execRoot)
+	if err != nil {
+		return nil, fmt.Errorf("list retained executions: %w", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			// A copy still being written (temp + rename).
+			continue
+		}
+		if !e.IsDir() {
+			return nil, fmt.Errorf("retained execution %s is not a directory", e.Name())
+		}
+		data, err := readPlain(execRoot, filepath.Join(e.Name(), retainedManifestFile))
+		if err != nil {
+			return nil, fmt.Errorf("read retained execution %s manifest: %w", e.Name(), err)
+		}
+		var m persis.RetainedExecution
+		if err := json.Unmarshal(data, &m); err != nil || m.Execution != e.Name() {
+			return nil, fmt.Errorf("retained execution %s has an invalid manifest", e.Name())
+		}
+		data, err = readPlain(execRoot, filepath.Join(e.Name(), retainedStatusFile))
 		if err != nil {
 			return nil, fmt.Errorf("read retained execution %s: %w", m.Execution, err)
 		}

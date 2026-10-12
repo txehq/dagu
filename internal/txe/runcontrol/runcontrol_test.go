@@ -210,3 +210,52 @@ func TestRetryExecution(t *testing.T) {
 	_, err = c.RetryExecution(ctx, "job", "run-1", "unknown")
 	assert.ErrorIs(t, err, registry.ErrRunNotFound)
 }
+
+// The coordinator abandons the request's preparation between the lookup and
+// the journal read (it hides the attempt, then ends the entry): the
+// execution is reported abandoned, never dispatched.
+func TestRetryExecutionNeverReportsAnAbandonedPreparationAsDispatched(t *testing.T) {
+	ctx := t.Context()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(t.TempDir(), "runs"), persis.DAGRunRepositoryOptions{})
+	c := &Control{Runs: runs}
+	dag := &ir.DAG{Name: "job", YamlData: []byte("steps:\n  - name: s\n    run: true\n")}
+	first, err := runs.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	status := ir.InitialStatus(dag)
+	status.DAGRunID, status.AttemptID, status.Status = "run-1", first.ID(), ir.Failed
+	require.NoError(t, first.Open(ctx))
+	require.NoError(t, first.Write(ctx, status))
+	require.NoError(t, first.Close(ctx))
+	run := ir.NewDAGRunRef("job", "run-1")
+	request, err := ir.NewRetryRequest(run, first.ID(), "", "act-1", "1", "d")
+	require.NoError(t, err)
+	prep, err := runs.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{Retry: true, TrackPreparation: true,
+		ExpectLatest: &persis.ExpectedExecution{AttemptID: first.ID(), Request: request}})
+	require.NoError(t, err)
+
+	abandoned := false
+	c.afterRetryRead = func() {
+		if abandoned {
+			return
+		}
+		abandoned = true
+		expected := persis.ExecutionIdentity{AttemptID: first.ID()}
+		_, err := runs.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: persis.AttemptAbandonment{
+			Schema: persis.AttemptAbandonmentSchema, Run: run, RootRun: run, AbandonedAttemptID: prep.ID(),
+			AbandonedExecution: persis.ExecutionIdentity{AttemptID: prep.ID()}, ExpectedExecution: &expected,
+			Reason: persis.AbandonedRetryPreparation, DecidedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Evidence: persis.AbandonmentEvidence{
+				DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+				ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent,
+				ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		}})
+		require.NoError(t, err)
+		require.NoError(t, runs.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: prep.ID()}))
+	}
+	got, err := c.RetryExecution(ctx, "job", "run-1", request.ID)
+	require.NoError(t, err)
+	assert.True(t, abandoned)
+	assert.True(t, got.Abandoned, "abandoned meanwhile, read again")
+	assert.False(t, got.Preparing)
+}

@@ -3102,6 +3102,14 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err := bindRetryRequest(expect, dag.Name, retryDagRunID); err != nil {
 		return retryDAGRunResult{}, err
 	}
+	// A run executed locally runs a queued retry under a new attempt, which
+	// is not the execution the request admitted; provenance needs a
+	// distributed run, where the admitted execution is the one that runs.
+	if expect != nil && expect.Request != nil && !dispatch.ShouldDispatchToCoordinator(dag, a.coordinatorCli != nil, a.defaultExecMode) {
+		return retryDAGRunResult{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: "a retry request is recorded only for a run executed by a worker; this run executes locally",
+			Details: map[string]any{"code": "conditional_retry_unsupported"}}
+	}
 	if expect != nil && (prevStatus.AttemptID != expect.AttemptID || prevStatus.QueuedAt != expect.QueuedAt ||
 		prevStatus.Status.IsActive() || prevStatus.Status == ir.NotStarted) {
 		return retryDAGRunResult{}, executionChangedError(expect, prevStatus)

@@ -12,12 +12,14 @@ import (
 )
 
 // An execution keeps the retry request of its source status only when that
-// status is the queued status that admitted it; a direct retry's source is
-// the earlier, finished execution, whose request is not this execution's.
+// status is its own attempt's queued admission; a direct retry's source is
+// the earlier, finished execution, and another attempt's admission is
+// another execution.
 func TestOwnRetryRequest(t *testing.T) {
 	request := &ir.RetryRequest{ID: "r1", ActionID: "act-1", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
 	a := &Agent{dagRunAttemptID: "a1"}
-	assert.Equal(t, request, a.ownRetryRequest(&ir.DAGRunStatus{AttemptID: "a0", Status: ir.Queued, RetryRequest: request}), "run from its queued admission")
+	assert.Equal(t, request, a.ownRetryRequest(&ir.DAGRunStatus{AttemptID: "a1", Status: ir.Queued, RetryRequest: request}), "run from its own queued admission")
+	assert.Nil(t, a.ownRetryRequest(&ir.DAGRunStatus{AttemptID: "a0", Status: ir.Queued, RetryRequest: request}), "another attempt's admission: another execution")
 	assert.Nil(t, a.ownRetryRequest(&ir.DAGRunStatus{AttemptID: "a0", Status: ir.Failed, RetryRequest: request}), "a direct retry's earlier execution")
 	assert.Nil(t, a.ownRetryRequest(&ir.DAGRunStatus{AttemptID: "a1", Status: ir.Failed, RetryRequest: request}), "a finished execution, even of this attempt")
 	assert.Nil(t, a.ownRetryRequest(nil))

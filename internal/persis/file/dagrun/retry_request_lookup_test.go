@@ -5,6 +5,7 @@ package dagrun
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -93,6 +94,15 @@ func TestFindRetryRequest(t *testing.T) {
 
 	_, err = find("unknown")
 	assert.ErrorIs(t, err, persis.ErrNotFound)
+
+	// A retained copy whose manifest cannot be read is an error, not absent.
+	bogus := filepath.Join(filepath.Dir(second.file), retainedExecutionsDir, "bogus")
+	require.NoError(t, os.MkdirAll(bogus, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(bogus, retainedManifestFile), []byte("{"), 0o600))
+	_, err = find("unknown")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, persis.ErrNotFound, "an unreadable copy is not absent")
+	require.NoError(t, os.RemoveAll(bogus))
 
 	// An unreadable status is an error, never "not found".
 	require.NoError(t, os.WriteFile(first.file, []byte("{not json\n"), 0o600))

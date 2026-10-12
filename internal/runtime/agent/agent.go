@@ -1660,12 +1660,13 @@ func (a *Agent) statusSourceTarget() *ir.DAGRunStatus {
 }
 
 // ownRetryRequest is the retry request this execution's statuses keep: the
-// source status's when it is the queued status that admitted this execution
-// (a queued retry runs from it, and keeps its queue marker too). A direct
-// retry's source is the earlier, finished execution, whose request is not
-// this execution's.
+// source status's only when it is the queued status that admitted this very
+// execution, the same attempt run again under its queue marker. A direct
+// retry's source is the earlier, finished execution, and a local queued
+// retry that runs under a new attempt is a different execution than the one
+// the request admitted; neither keeps it.
 func (a *Agent) ownRetryRequest(source *ir.DAGRunStatus) *ir.RetryRequest {
-	if source == nil || source.Status != ir.Queued {
+	if source == nil || source.Status != ir.Queued || source.AttemptID == "" || source.AttemptID != a.dagRunAttemptID {
 		return nil
 	}
 	return source.RetryRequest

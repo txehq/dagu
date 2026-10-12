@@ -650,9 +650,10 @@ func readFileContent(t *testing.T, path string) string {
 	return string(data)
 }
 
-// A queued retry run locally records the retry request it was queued with
-// on every status its execution writes, through the terminal one.
-func TestLocalQueuedRetryKeepsItsRetryRequest(t *testing.T) {
+// A queued retry run locally executes under a new attempt, which is not the
+// execution its queued status admitted, so that execution's statuses do not
+// take the request (the API refuses a retry request for such a run).
+func TestLocalQueuedRetryDoesNotMoveItsRetryRequest(t *testing.T) {
 	dir := t.TempDir()
 	gate := test.ShellPath(filepath.Join(dir, "gate"))
 	work := test.ForOS(
@@ -684,5 +685,9 @@ steps:
 
 	f.WaitForStatus(runID, ir.Succeeded, 25*time.Second)
 	done := f.MustStatus(runID)
-	assert.Equal(t, request, done.RetryRequest, "the local agent's statuses keep it")
+	if done.AttemptID != failed.AttemptID {
+		assert.Nil(t, done.RetryRequest, "another attempt is another execution")
+	} else {
+		assert.Equal(t, request, done.RetryRequest, "the admitted execution itself keeps it")
+	}
 }

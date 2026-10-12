@@ -968,3 +968,36 @@ func TestExecutionMarkerStreamArtifacts(t *testing.T) {
 		assert.Equal(t, "second", string(content), "E1's upload must not replace E2's file")
 	})
 }
+
+// A report for the stored attempt under another queued-at is another
+// execution's, with or without a lease and whatever the stored status: it is
+// refused, and the stored identity and retry request stand. The next
+// execution after a re-queue, reporting the new queued-at, is accepted.
+func TestReportOfAnotherExecutionNeverOverwritesTheStoredOne(t *testing.T) {
+	request := &ir.RetryRequest{ID: "r1", ActionID: "act-1", ActionAttempt: "1", BindingDigest: "d", RetryOf: "x"}
+	for _, tc := range []struct {
+		name               string
+		stored             ir.Status
+		storedQueuedAt     string
+		lease, reported    string
+		report             ir.Status
+		accepted           bool
+		wantStoredQueuedAt string
+	}{
+		{"running, valid lease and marker, another queued-at", ir.Running, markerQ1, markerQ1, markerQ2, ir.Running, false, markerQ1},
+		{"the coordinator's initial status, another queued-at", ir.NotStarted, markerQ1, markerQ1, markerQ2, ir.Running, false, markerQ1},
+		{"the next execution after a re-queue", ir.Queued, markerQ2, markerQ2, markerQ2, ir.Running, true, markerQ2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMarkerFixture(t, &ir.DAGRunStatus{Status: tc.stored, QueuedAt: tc.storedQueuedAt, RetryRequest: request}, new(tc.lease))
+			resp := f.report(t, tc.report, tc.reported, tc.lease)
+			assert.Equal(t, tc.accepted, resp.Accepted, resp.Error)
+			if !tc.accepted {
+				assert.Equal(t, remoteAttemptRejectedSuperseded, resp.Error)
+			}
+			stored := f.stored(t)
+			assert.Equal(t, tc.wantStoredQueuedAt, stored.QueuedAt)
+			assert.Equal(t, request, stored.RetryRequest, "the retry request stands")
+		})
+	}
+}

@@ -2154,13 +2154,14 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedLeaseInactive)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedLeaseInactive}, nil
 	}
-	// A terminal attempt's lease is gone, so there is no marker to check. The
-	// stored status was written by the execution that finished, and every
-	// execution's status echoes its own queued-at, which a queued retry always
-	// advances. A terminal report with a different queued-at is therefore an
-	// earlier execution's and must not overwrite the result. A replay from the
-	// finished execution matches and is still accepted.
-	if leaseMissing && isTerminalRunStatus(latestStatus.Status) && !isSubDAGStatus(dagRunStatus) &&
+	// Every execution's status echoes its own queued-at (the coordinator's
+	// initial status uses the worker's rule), and a queued retry always
+	// advances it. A report for the same attempt with a different queued-at
+	// therefore belongs to another execution and must not overwrite the
+	// stored identity, or the retry request it records; this holds with or
+	// without a lease, whatever the stored status. A replay from the
+	// execution that finished matches and is still accepted.
+	if !isSubDAGStatus(dagRunStatus) &&
 		dagRunStatus.AttemptID == latestStatus.AttemptID && dagRunStatus.QueuedAt != latestStatus.QueuedAt {
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
