@@ -6,6 +6,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -320,4 +321,77 @@ func TestReconcileLeavesAQueuedExecutionItsQueueStillHolds(t *testing.T) {
 	record, err = f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
 	require.NoError(t, err)
 	require.NotNil(t, record, "with the queue no longer holding it, the execution is failed")
+}
+
+// writeQueuedRun writes a queued execution of another run of the DAG, naming
+// procGroup as its queue (empty for a status that does not name it), and
+// journals it as a dispatch would.
+func (f *strandedFixture) writeQueuedRun(t *testing.T, runID, queuedAt, procGroup string) ir.DAGRunRef {
+	t.Helper()
+	dag := &ir.DAG{Name: strandedDAG}
+	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	require.NoError(t, attempt.Open(t.Context()))
+	status := ir.InitialStatus(dag)
+	status.DAGRunID = runID
+	status.AttemptID = attempt.ID()
+	status.AttemptKey = ir.GenerateAttemptKey(strandedDAG, runID, strandedDAG, runID, attempt.ID())
+	status.Status = ir.Queued
+	status.QueuedAt = queuedAt
+	status.ProcGroup = procGroup
+	require.NoError(t, attempt.Write(t.Context(), status))
+	require.NoError(t, attempt.Close(t.Context()))
+	run := ir.NewDAGRunRef(strandedDAG, runID)
+	_, err = f.repository.BeginAttemptPreparation(t.Context(), run, run, attempt.ID(), queuedAt)
+	require.NoError(t, err)
+	return run
+}
+
+// countingQueueStore counts full queue reads.
+type countingQueueStore struct {
+	queue.QueueStore
+	lists int
+}
+
+func (s *countingQueueStore) List(ctx context.Context, name string) ([]queue.QueuedItemData, error) {
+	s.lists++
+	return s.QueueStore.List(ctx, name)
+}
+
+// A queued execution whose status does not name its queue, as a retry placed
+// in its DAG's fallback queue, is still found in that queue and left for it.
+func TestReconcileLeavesAQueuedExecutionWhoseStatusNamesNoQueue(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	queues := store.NewQueueStore(file.NewCollection(filepath.Join(t.TempDir(), "queue")))
+	f.h.queueStore = queues
+	const marker = "2026-10-12T16:40:00+08:00"
+	run := f.writeQueuedRun(t, "unnamed-queue-run", marker, "")
+	require.NoError(t, queues.Enqueue(t.Context(), "fallback-queue", queue.QueuePriorityLow, run))
+
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+
+	assert.Len(t, f.preparationEntries(t), 1, "the queue still holds the run")
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+// A pass reads each queue once, however many queued executions it judges, so
+// a backlog does not turn into a full queue read per execution.
+func TestReconcileReadsEachQueueOncePerPass(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	queues := &countingQueueStore{QueueStore: store.NewQueueStore(file.NewCollection(filepath.Join(t.TempDir(), "queue")))}
+	f.h.queueStore = queues
+	for i, id := range []string{"backlog-a", "backlog-b", "backlog-c"} {
+		run := f.writeQueuedRun(t, id, fmt.Sprintf("2026-10-12T16:5%d:00+08:00", i), strandedDAG)
+		require.NoError(t, queues.Enqueue(t.Context(), strandedDAG, queue.QueuePriorityLow, run))
+	}
+	require.Len(t, f.preparationEntries(t), 3)
+
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+
+	assert.Equal(t, 1, queues.lists, "one queue, read once in the pass")
+	assert.Len(t, f.preparationEntries(t), 3, "all still queued")
 }

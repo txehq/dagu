@@ -1322,7 +1322,7 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	if h.dispatchTaskStore != nil {
 		h.releasePreparedDispatchAttempt(storeCtx, dagRunID, prepared.attempt)
 		_, abandonErr := h.abandonExecutionLocked(storeCtx, ir.NewDAGRunRef(task.Target, task.DagRunId), taskRootRef(task),
-			prepared.attempt.ID(), "", "not dispatched: handing the task to a worker failed: "+dispatchErr.Error())
+			prepared.attempt.ID(), "", "not dispatched: handing the task to a worker failed: "+dispatchErr.Error(), nil)
 		switch {
 		case abandonErr == nil:
 			return

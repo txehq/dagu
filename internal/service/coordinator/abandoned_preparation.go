@@ -121,25 +121,27 @@ func (h *Handler) abandonNeverDispatched(ctx context.Context, run, root ir.DAGRu
 		root = run
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	return h.abandonExecutionLocked(ctx, run, root, attemptID, "", detail)
+	return h.abandonExecutionLocked(ctx, run, root, attemptID, "", detail, nil)
 }
 
 // abandonPreparation abandons what one preparation journal entry names: a
 // newly created attempt, or one execution of a reused attempt when the entry
 // carries its queued-at marker.
-func (h *Handler) abandonPreparation(ctx context.Context, p persis.AttemptPreparation, detail string) (*persis.AttemptAbandonment, error) {
+// queued is the pass's view of the queues; an execution whose run a queue
+// still holds is left for the queue to dispatch.
+func (h *Handler) abandonPreparation(ctx context.Context, p persis.AttemptPreparation, detail string, queued *queueSnapshot) (*persis.AttemptAbandonment, error) {
 	root := p.RootRun
 	if root.Zero() {
 		root = p.Run
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	return h.abandonExecutionLocked(ctx, p.Run, root, p.AttemptID, p.QueuedAt, detail)
+	return h.abandonExecutionLocked(ctx, p.Run, root, p.AttemptID, p.QueuedAt, detail, queued)
 }
 
 // abandonExecutionLocked abandons the attempt, or with queuedAt one execution
 // of a reused attempt, and once its record is on disk ends its preparation
 // journal entry. The caller holds the root run's write lock.
-func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt, detail string) (*persis.AttemptAbandonment, error) {
+func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt, detail string, queued *queueSnapshot) (*persis.AttemptAbandonment, error) {
 	ctx = context.WithoutCancel(ctx)
 	h.closeCachedAttemptForRun(ctx, ctx, run.ID, attemptID)
 
@@ -155,7 +157,7 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 		return nil, err
 	}
 	if queuedAt != "" {
-		if err := h.refuseWhileQueued(ctx, run, status); err != nil {
+		if err := queued.refuse(run); err != nil {
 			return nil, err
 		}
 	}
@@ -184,26 +186,62 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	return abandoned, nil
 }
 
-// refuseWhileQueued keeps a queued execution from being failed as undispatched
-// while its run is still in its queue: a dispatch that failed leaves the queue
-// item, and the queue dispatches it again under the same journal entry. A
-// queue that cannot be read is unknown, never empty.
-func (h *Handler) refuseWhileQueued(ctx context.Context, run ir.DAGRunRef, status *ir.DAGRunStatus) error {
-	if h.queueStore == nil || status == nil || status.ProcGroup == "" {
+// queueSnapshot is the set of runs some queue holds, read once per
+// reconciliation pass. A dispatch that failed leaves its run's queue item, and
+// the queue dispatches it again under the same journal entry, so a queued
+// execution whose run a queue holds is not failed as undispatched. Every queue
+// is read, so a status that does not name its queue is still covered. A run
+// queued after the read is a new execution with a new marker, which the store
+// refuses to abandon in this one's place. A queue or item that cannot be read
+// makes the whole snapshot unknown, never empty.
+type queueSnapshot struct {
+	runs map[ir.DAGRunRef]struct{}
+	err  error
+}
+
+// readQueueSnapshot reads every queue, or returns nil when this coordinator
+// has no queue store, which skips the check.
+func (h *Handler) readQueueSnapshot(ctx context.Context) *queueSnapshot {
+	if h.queueStore == nil {
 		return nil
 	}
-	items, err := h.queueStore.List(ctx, status.ProcGroup)
+	snap := &queueSnapshot{runs: make(map[ir.DAGRunRef]struct{})}
+	names, err := h.queueStore.QueueList(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: queue: %v", errEvidenceUnknown, err)
+		snap.err = err
+		return snap
 	}
-	for _, item := range items {
-		ref, err := item.Data()
+	for _, name := range names {
+		items, err := h.queueStore.List(ctx, name)
 		if err != nil {
-			return fmt.Errorf("%w: queue item %s: %v", errEvidenceUnknown, item.ID(), err)
+			snap.err = fmt.Errorf("queue %s: %w", name, err)
+			return snap
 		}
-		if ref != nil && *ref == run {
-			return fmt.Errorf("%w: the run is still in its queue", errDispatchInFlight)
+		for _, item := range items {
+			ref, err := item.Data()
+			if err != nil {
+				snap.err = fmt.Errorf("queue %s item %s: %w", name, item.ID(), err)
+				return snap
+			}
+			if ref != nil {
+				snap.runs[*ref] = struct{}{}
+			}
 		}
+	}
+	return snap
+}
+
+// refuse reports whether an execution of run must be left because a queue may
+// still dispatch it.
+func (s *queueSnapshot) refuse(run ir.DAGRunRef) error {
+	if s == nil {
+		return nil
+	}
+	if s.err != nil {
+		return fmt.Errorf("%w: queues: %v", errEvidenceUnknown, s.err)
+	}
+	if _, ok := s.runs[run]; ok {
+		return fmt.Errorf("%w: the run is still in a queue", errDispatchInFlight)
 	}
 	return nil
 }
@@ -246,6 +284,8 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		return
 	}
 	inFlight := make(map[string]struct{})
+	var queued *queueSnapshot
+	queuedRead := false
 	for _, p := range preparations {
 		if ctx.Err() != nil {
 			return
@@ -254,7 +294,10 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		if err != nil || now.Sub(preparedAt) < abandonedPreparationMinAge {
 			continue
 		}
-		record, err := h.abandonPreparation(ctx, p, abandonedPreparationDetail)
+		if p.QueuedAt != "" && !queuedRead {
+			queued, queuedRead = h.readQueueSnapshot(ctx), true
+		}
+		record, err := h.abandonPreparation(ctx, p, abandonedPreparationDetail, queued)
 		switch {
 		case err == nil:
 			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
@@ -355,7 +398,7 @@ func (h *Handler) abandonFailedPreparation(ctx context.Context, prepErr error) {
 		root = failed.run
 	}
 	if _, err := h.abandonExecutionLocked(ctx, failed.run, root, failed.attemptID, "",
-		"not dispatched: preparing the attempt failed: "+failed.err.Error()); err != nil {
+		"not dispatched: preparing the attempt failed: "+failed.err.Error(), nil); err != nil {
 		logger.Warn(ctx, "Left an attempt whose preparation failed for review",
 			tag.RunID(failed.run.ID), tag.AttemptID(failed.attemptID), tag.Error(err))
 	}
