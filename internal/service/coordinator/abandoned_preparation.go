@@ -57,12 +57,17 @@ var errAbandonmentUnavailable = errors.New("abandonment requires dispatch and le
 
 // neverDispatchedEvidence establishes, for one attempt, that nothing was ever
 // handed to a worker. Any lookup that fails is unknown, never absent.
-func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey string, status *ir.DAGRunStatus) (persis.AbandonmentEvidence, error) {
+//
+// queuedAt names one execution of a reused attempt (empty for a newly created
+// attempt): its status may then still read Queued, with exactly that marker.
+func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey, queuedAt string, status *ir.DAGRunStatus) (persis.AbandonmentEvidence, error) {
 	var evidence persis.AbandonmentEvidence
 	if h.dispatchTaskStore == nil || h.dagRunLeaseStore == nil {
 		return evidence, errAbandonmentUnavailable
 	}
-	if status != nil && (status.WorkerID != "" || status.Status != ir.NotStarted) {
+	waiting := status != nil && (status.Status == ir.NotStarted ||
+		(queuedAt != "" && status.Status == ir.Queued && status.QueuedAt == queuedAt))
+	if status != nil && (status.WorkerID != "" || !waiting) {
 		return evidence, fmt.Errorf("%w: attempt is %s with worker %q",
 			persis.ErrAttemptNotAbandonable, status.Status, status.WorkerID)
 	}
@@ -110,13 +115,25 @@ func (h *Handler) abandonNeverDispatched(ctx context.Context, run, root ir.DAGRu
 		root = run
 	}
 	defer h.attemptWriteLocks.lock(root)()
-	return h.abandonExecutionLocked(ctx, run, root, attemptID, detail)
+	return h.abandonExecutionLocked(ctx, run, root, attemptID, "", detail)
 }
 
-// abandonExecutionLocked abandons the attempt and, once its record is on
-// disk, ends its preparation journal entry. The caller holds the root run's
-// write lock.
-func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRunRef, attemptID, detail string) (*persis.AttemptAbandonment, error) {
+// abandonPreparation abandons what one preparation journal entry names: a
+// newly created attempt, or one execution of a reused attempt when the entry
+// carries its queued-at marker.
+func (h *Handler) abandonPreparation(ctx context.Context, p persis.AttemptPreparation, detail string) (*persis.AttemptAbandonment, error) {
+	root := p.RootRun
+	if root.Zero() {
+		root = p.Run
+	}
+	defer h.attemptWriteLocks.lock(root)()
+	return h.abandonExecutionLocked(ctx, p.Run, root, p.AttemptID, p.QueuedAt, detail)
+}
+
+// abandonExecutionLocked abandons the attempt, or with queuedAt one execution
+// of a reused attempt, and once its record is on disk ends its preparation
+// journal entry. The caller holds the root run's write lock.
+func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt, detail string) (*persis.AttemptAbandonment, error) {
 	ctx = context.WithoutCancel(ctx)
 	h.closeCachedAttemptForRun(ctx, ctx, run.ID, attemptID)
 
@@ -127,7 +144,7 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 		}
 	}
 	attemptKey := ir.GenerateAttemptKey(root.Name, root.ID, run.Name, run.ID, attemptID)
-	evidence, err := h.neverDispatchedEvidence(ctx, attemptKey, status)
+	evidence, err := h.neverDispatchedEvidence(ctx, attemptKey, queuedAt, status)
 	if err != nil {
 		return nil, err
 	}
@@ -142,11 +159,17 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 		CoordinatorID:      h.owner.ID,
 		Evidence:           evidence,
 	}
+	if queuedAt != "" {
+		// One execution of a reused attempt: the store marks it Failed and
+		// keeps the attempt's earlier executions and their records.
+		record.Scope = persis.AbandonmentScopeExecution
+		record.AbandonedExecution = persis.ExecutionIdentity{AttemptID: attemptID, QueuedAt: queuedAt}
+	}
 	abandoned, err := h.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, RootDAGRun: root, Record: record})
 	if err != nil {
 		return nil, err
 	}
-	h.endPreparation(ctx, run, root, attemptID)
+	h.endPreparation(ctx, run, root, attemptID, queuedAt)
 	return abandoned, nil
 }
 
@@ -161,8 +184,8 @@ func (h *Handler) findRunAttempt(ctx context.Context, run, root ir.DAGRunRef) (d
 // endPreparation removes the attempt's preparation journal entry once the
 // attempt was handed to a worker or abandoned. An entry left behind is
 // re-examined by reconciliation, which ends it when the attempt is settled.
-func (h *Handler) endPreparation(ctx context.Context, run, root ir.DAGRunRef, attemptID string) {
-	err := h.dagRunRepository.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: root, AttemptID: attemptID})
+func (h *Handler) endPreparation(ctx context.Context, run, root ir.DAGRunRef, attemptID, queuedAt string) {
+	err := h.dagRunRepository.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: root, AttemptID: attemptID, QueuedAt: queuedAt})
 	if err != nil && !errors.Is(err, persis.ErrAttemptAbandonmentUnsupported) {
 		logger.Warn(ctx, "Failed to end an attempt preparation",
 			tag.RunID(run.ID), tag.AttemptID(attemptID), tag.Error(err))
@@ -196,7 +219,7 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		if err != nil || now.Sub(preparedAt) < abandonedPreparationMinAge {
 			continue
 		}
-		record, err := h.abandonNeverDispatched(ctx, p.Run, p.RootRun, p.AttemptID, abandonedPreparationDetail)
+		record, err := h.abandonPreparation(ctx, p, abandonedPreparationDetail)
 		switch {
 		case err == nil:
 			logger.Warn(ctx, "Abandoned a never-dispatched attempt",
@@ -238,7 +261,7 @@ const abandonedPreparationDetail = "not dispatched: no worker claimed it before 
 
 // preparationKey identifies a journal entry for in-memory bookkeeping.
 func preparationKey(p persis.AttemptPreparation) string {
-	return p.RootRun.Name + "\x00" + p.RootRun.ID + "\x00" + p.Run.Name + "\x00" + p.Run.ID + "\x00" + p.AttemptID
+	return p.RootRun.Name + "\x00" + p.RootRun.ID + "\x00" + p.Run.Name + "\x00" + p.Run.ID + "\x00" + p.AttemptID + "\x00" + p.QueuedAt
 }
 
 // wasInFlight reports whether the previous reconciliation pass found the entry
@@ -260,7 +283,7 @@ func (h *Handler) refuseAbandonedExecution(ctx context.Context, run, root ir.DAG
 	if h.dagRunRepository == nil {
 		return nil
 	}
-	record, err := h.dagRunRepository.ReadAttemptAbandonment(ctx, run, root, attemptID)
+	record, err := h.dagRunRepository.ReadExecutionAbandonment(ctx, run, root, attemptID, executionMarker)
 	switch {
 	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
 		return nil
@@ -296,7 +319,7 @@ func (h *Handler) abandonFailedPreparation(ctx context.Context, prepErr error) {
 	if root.Zero() {
 		root = failed.run
 	}
-	if _, err := h.abandonExecutionLocked(ctx, failed.run, root, failed.attemptID,
+	if _, err := h.abandonExecutionLocked(ctx, failed.run, root, failed.attemptID, "",
 		"not dispatched: preparing the attempt failed: "+failed.err.Error()); err != nil {
 		logger.Warn(ctx, "Left an attempt whose preparation failed for review",
 			tag.RunID(failed.run.ID), tag.AttemptID(failed.attemptID), tag.Error(err))
