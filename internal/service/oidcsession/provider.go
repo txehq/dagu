@@ -54,6 +54,11 @@ type Provider interface {
 // revocation endpoint. Asking again later would change nothing.
 var ErrRevocationUnsupported = errors.New("the identity provider has no revocation endpoint")
 
+// ErrRevocationRefused is what Revoke returns when the provider answered and
+// did not revoke: a 4xx from the revocation endpoint. The provider is there,
+// and asking it the same thing again is unlikely to change its answer.
+var ErrRevocationRefused = errors.New("the identity provider refused the revocation")
+
 // RefusedError is the provider's definite refusal of a refresh: a 400 or 401
 // from the token endpoint whose JSON body names an OAuth error. Code is that
 // error, kept only if it is one a provider is known to send here.
@@ -134,9 +139,9 @@ type HTTPProvider struct {
 	// configured is the way the configuration sets, or ClientAuthDetect.
 	configured ClientAuth
 	// granted is the way of the last refresh the provider granted, or
-	// ClientAuthDetect when the last answer by that way was a refusal. It
-	// saves a sign-in from establishing what the last grant already showed.
-	// It is a hint and decides nothing about a session that exists.
+	// ClientAuthDetect before there was one. It is the way a sign-in tries
+	// first, and decides nothing by itself: a session's way is the one its
+	// own token was granted by.
 	granted atomic.Int32
 }
 
@@ -168,10 +173,13 @@ func NewHTTPProvider(cfg HTTPProviderConfig) (*HTTPProvider, error) {
 // Establish implements Provider.
 //
 // The refresh token was issued a moment ago, so a refusal of it is about the
-// client and not about the token. The header is tried, and the form if the
-// provider refuses the header. The way that is granted is the provider's. If
-// neither is granted, the provider will not refresh what it issues, a session
-// could never be revalidated, and the sign-in fails.
+// client and not about the token. It is refreshed one way, and the other if
+// the provider refuses the first. The way it is granted by is the provider's,
+// for this session. If neither is granted, the provider will not refresh what
+// it issues, a session could never be revalidated, and the sign-in fails.
+//
+// The way the last refresh was granted by is tried first. It is not taken on
+// trust: the provider may have been changed since.
 func (p *HTTPProvider) Establish(ctx context.Context, refreshToken string) (ClientAuth, Renewal, error) {
 	switch {
 	case p.clientSecret == "":
@@ -180,36 +188,31 @@ func (p *HTTPProvider) Establish(ctx context.Context, refreshToken string) (Clie
 	case p.configured != ClientAuthDetect:
 		return p.configured, Renewal{}, nil
 	}
-	if auth := ClientAuth(p.granted.Load()); auth != ClientAuthDetect {
-		return auth, Renewal{}, nil
+	first, second := ClientAuthHeader, ClientAuthForm
+	if ClientAuth(p.granted.Load()) == ClientAuthForm {
+		first, second = second, first
 	}
-	renewal, err := p.Refresh(ctx, refreshToken, ClientAuthHeader)
+	renewal, err := p.Refresh(ctx, refreshToken, first)
 	var refused *RefusedError
 	switch {
 	case err == nil:
-		return ClientAuthHeader, renewal, nil
+		return first, renewal, nil
 	case !errors.As(err, &refused):
 		return ClientAuthDetect, Renewal{}, err
 	}
-	renewal, err = p.Refresh(ctx, refreshToken, ClientAuthForm)
+	renewal, err = p.Refresh(ctx, refreshToken, second)
 	if err != nil {
 		return ClientAuthDetect, Renewal{}, err
 	}
-	return ClientAuthForm, renewal, nil
+	return second, renewal, nil
 }
 
 // Refresh implements Provider. It sends the refresh token once, the way it is
 // told to.
 func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string, auth ClientAuth) (Renewal, error) {
 	renewal, err := p.refresh(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken}}, auth)
-	var refused *RefusedError
-	switch {
-	case err == nil:
+	if err == nil {
 		p.granted.Store(int32(auth))
-	case errors.As(err, &refused):
-		// Whatever this refusal is about, the way is no longer known to be
-		// granted, and the next sign-in establishes it again.
-		p.granted.CompareAndSwap(int32(auth), int32(ClientAuthDetect))
 	}
 	return renewal, err
 }
@@ -246,19 +249,33 @@ func (p *HTTPProvider) refresh(ctx context.Context, form url.Values, auth Client
 	return Renewal{RefreshToken: granted.RefreshToken, IDToken: granted.IDToken}, nil
 }
 
-// Revoke implements Provider.
+// Revoke implements Provider. With ClientAuthDetect, which is all that is
+// known of a token whose session was never established, it is asked both
+// ways.
 func (p *HTTPProvider) Revoke(ctx context.Context, refreshToken string, auth ClientAuth) error {
 	if p.revocationURL == "" {
 		return ErrRevocationUnsupported
 	}
+	err := p.revoke(ctx, refreshToken, auth)
+	if err != nil && auth == ClientAuthDetect && p.clientSecret != "" {
+		err = p.revoke(ctx, refreshToken, ClientAuthForm)
+	}
+	return err
+}
+
+func (p *HTTPProvider) revoke(ctx context.Context, refreshToken string, auth ClientAuth) error {
 	status, _, err := p.post(ctx, p.revocationURL, url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}, auth)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusOK {
+	switch {
+	case status == http.StatusOK:
+		return nil
+	case status >= 400 && status < 500:
+		return fmt.Errorf("%w: the revocation endpoint answered %d", ErrRevocationRefused, status)
+	default:
 		return fmt.Errorf("the revocation endpoint answered %d", status)
 	}
-	return nil
 }
 
 // post sends a form to the provider as this client. Its errors never contain

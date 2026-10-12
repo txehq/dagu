@@ -57,7 +57,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -86,6 +88,19 @@ const (
 	// maxOwedRevocations is how many revocations the provider did not take
 	// are kept to be made again.
 	maxOwedRevocations = 1024
+
+	// owedRetryInterval is the least time between two rounds of making owed
+	// revocations again, after one the provider did not take.
+	owedRetryInterval = time.Minute
+
+	// maxRevocationRefusals is how often the provider may answer no to one
+	// revocation before it is given up. A provider that answers is not held
+	// to be down, and what it will not revoke it will not revoke.
+	maxRevocationRefusals = 3
+
+	// reconcilePerSignIn is how many remembered ends, and how many owed
+	// revocations, one sign-in tries again. A sign-in is somebody waiting.
+	reconcilePerSignIn = 16
 
 	// casAttempts is how often a write that lost to another writer is made
 	// again on what that writer stored.
@@ -213,6 +228,11 @@ type Manager struct {
 	// owed holds the revocations the provider did not take, to be made
 	// again, by a digest of the refresh token.
 	owed map[[sha256.Size]byte]owedRevocation
+	// owedFailedAt is when the provider last did not take an owed
+	// revocation.
+	owedFailedAt time.Time
+	// reconciling is set while one sign-in is doing the reconciling.
+	reconciling atomic.Bool
 }
 
 // owedRevocation is a refresh token the provider has still to be asked to
@@ -222,6 +242,8 @@ type owedRevocation struct {
 	// had with the provider.
 	token string
 	auth  ClientAuth
+	// refusals counts the times the provider answered and did not revoke.
+	refusals int
 	// since is when the provider first did not take the revocation.
 	since time.Time
 }
@@ -298,22 +320,46 @@ func (m *Manager) Create(ctx context.Context, who Identity, refreshToken string,
 	}
 	// The way the provider takes the client secret is established now, while
 	// a refusal can only be about the client: the token is a moment old.
+	//
+	// Whatever happens from here on, the token is not left behind: if the
+	// session cannot be started the provider is asked to revoke it.
 	auth, renewal, err := m.provider.Establish(ctx, refreshToken)
 	var refused *RefusedError
 	switch {
 	case errors.As(err, &refused):
+		// The provider answers, so it is asked now. The way is not known,
+		// and it is asked both ways.
+		m.revokeAtProvider(ctx, ClientAuthDetect, refreshToken)
 		return nil, fmt.Errorf("oidcsession: the identity provider will not refresh the token it has just issued (%s), so the session could not be revalidated", refused.Code)
 	case err != nil:
+		// The provider does not answer, so it is not asked now: the
+		// revocation is owed, and made at a later sign-in.
+		m.owe(refreshToken, ClientAuthDetect, err)
 		return nil, fmt.Errorf("%w: it did not answer when the session was being started", ErrProviderUnavailable)
 	case auth != ClientAuthForm && auth != ClientAuthHeader:
+		m.revokeAtProvider(ctx, ClientAuthDetect, refreshToken)
 		return nil, errors.New("oidcsession: the way the identity provider takes the client secret was not established")
 	}
 	if renewal.RefreshToken != "" {
 		refreshToken = renewal.RefreshToken
 	}
-	// From here on the session holds a token nobody else does. If it cannot
-	// be started, the token is revoked and not left behind.
 	discard := func() { m.revokeAtProvider(ctx, auth, refreshToken) }
+
+	// Establishing may have been a refresh, and a refresh that returns an ID
+	// token is held to what every later one is: the token must be for this
+	// identity, and one that cannot be verified is not a confirmation. A
+	// session does not start on either.
+	if renewal.IDToken != "" && m.checkID != nil {
+		issuer, subject, err := m.checkID(ctx, renewal.IDToken)
+		switch {
+		case errors.Is(err, ErrIDTokenUnverifiable) && issuer == who.Issuer && subject == who.Subject:
+			discard()
+			return nil, fmt.Errorf("%w: the token it returned when the session was being started could not be verified", ErrProviderUnavailable)
+		case err != nil || issuer != who.Issuer || subject != who.Subject:
+			discard()
+			return nil, errors.New("oidcsession: the identity provider returned a token for another identity when the session was being started")
+		}
+	}
 	encrypted, err := m.enc.Encrypt(refreshToken)
 	if err != nil {
 		discard()
@@ -391,15 +437,29 @@ func (m *Manager) purge(ctx context.Context, now time.Time) {
 // whose hub token has expired, and revocations that have been owed for a day.
 // It runs at sign-in, so that neither is left waiting for a request that may
 // never come.
+//
+// A sign-in is somebody waiting, so what sign-ins do is bounded. One at a
+// time does it. It does a few of each, and no more revocations once the
+// provider has not answered one, after which no sign-in asks again for
+// owedRetryInterval. The rest wait for a later sign-in.
 func (m *Manager) reconcile(ctx context.Context, now time.Time) {
+	// One sign-in at a time does this. Another that arrives meanwhile has
+	// nothing to add and does not wait.
+	if !m.reconciling.CompareAndSwap(false, true) {
+		return
+	}
+	defer m.reconciling.Store(false)
+
 	m.mu.Lock()
-	pending := make(map[string]decision, len(m.undone))
+	pending := make(map[string]decision, reconcilePerSignIn)
 	for id, d := range m.undone {
 		if !d.expires.IsZero() && !now.Before(d.expires) {
 			delete(m.undone, id)
 			continue
 		}
-		pending[id] = d
+		if len(pending) < reconcilePerSignIn {
+			pending[id] = d
+		}
 	}
 	owed := make([]owedRevocation, 0, len(m.owed))
 	for digest, revocation := range m.owed {
@@ -409,12 +469,37 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		}
 		owed = append(owed, revocation)
 	}
+	// A provider that did not answer a moment ago is not asked again by every
+	// sign-in: each would wait for it in turn.
+	if !m.owedFailedAt.IsZero() && now.Sub(m.owedFailedAt) < owedRetryInterval {
+		owed = nil
+	}
 	m.mu.Unlock()
+
 	for id, d := range pending {
 		_ = m.conclude(ctx, id, d)
 	}
+
+	// The longest owed go first, so that none waits behind newer ones. A
+	// revocation the provider answers no to does not hold up the others: the
+	// provider is there. One it does not answer ends the round.
+	slices.SortFunc(owed, func(a, b owedRevocation) int { return a.since.Compare(b.since) })
+	if len(owed) > reconcilePerSignIn {
+		owed = owed[:reconcilePerSignIn]
+	}
 	for _, revocation := range owed {
-		m.revokeHeld(ctx, revocation.token, revocation.auth)
+		refreshToken, err := m.enc.Decrypt(revocation.token)
+		if err != nil {
+			continue
+		}
+		err = m.provider.Revoke(context.WithoutCancel(ctx), refreshToken, revocation.auth)
+		m.owe(refreshToken, revocation.auth, err)
+		if err != nil && !errors.Is(err, ErrRevocationRefused) && !errors.Is(err, ErrRevocationUnsupported) {
+			m.mu.Lock()
+			m.owedFailedAt = now
+			m.mu.Unlock()
+			break
+		}
 	}
 }
 
@@ -1054,9 +1139,10 @@ func (m *Manager) revokeAtProvider(ctx context.Context, auth ClientAuth, refresh
 	return all
 }
 
-// owe keeps a revocation the provider did not take, to be made again at the
-// next sign-in, and forgets one it has taken. A provider that has no
-// revocation endpoint is owed nothing: asking again would change nothing.
+// owe keeps a revocation the provider did not take, to be made again at a
+// later sign-in, and forgets one it has taken. A provider that has no
+// revocation endpoint is owed nothing: asking again would change nothing. One
+// the provider has answered no to maxRevocationRefusals times is given up.
 func (m *Manager) owe(refreshToken string, auth ClientAuth, revokeErr error) {
 	digest := sha256.Sum256([]byte(refreshToken))
 	m.mu.Lock()
@@ -1065,14 +1151,29 @@ func (m *Manager) owe(refreshToken string, auth ClientAuth, revokeErr error) {
 		delete(m.owed, digest)
 		return
 	}
-	if _, ok := m.owed[digest]; ok || len(m.owed) >= maxOwedRevocations {
+	refused := errors.Is(revokeErr, ErrRevocationRefused)
+	if revocation, ok := m.owed[digest]; ok {
+		if refused {
+			revocation.refusals++
+			m.owed[digest] = revocation
+		}
+		if revocation.refusals >= maxRevocationRefusals {
+			delete(m.owed, digest)
+		}
+		return
+	}
+	if len(m.owed) >= maxOwedRevocations {
 		return
 	}
 	encrypted, err := m.enc.Encrypt(refreshToken)
 	if err != nil {
 		return
 	}
-	m.owed[digest] = owedRevocation{token: encrypted, auth: auth, since: m.now()}
+	revocation := owedRevocation{token: encrypted, auth: auth, since: m.now()}
+	if refused {
+		revocation.refusals = 1
+	}
+	m.owed[digest] = revocation
 }
 
 // load reads a session and the bytes it is stored as. A session that does not

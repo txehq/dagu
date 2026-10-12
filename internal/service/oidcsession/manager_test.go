@@ -67,6 +67,10 @@ type fakeProvider struct {
 	after    chan struct{}
 	// revokeErr, when set, is what every revocation fails with.
 	revokeErr error
+	// onRevoke, when set, is called for every revocation asked for.
+	onRevoke func()
+	// revokeErrFor is what the revocation of one token fails with.
+	revokeErrFor map[string]error
 	// establish, when set, answers Establish. Otherwise the provider takes
 	// the header and exchanges nothing.
 	establish func(refreshToken string) (ClientAuth, Renewal, error)
@@ -178,8 +182,14 @@ func (p *fakeProvider) once(first string) func(string) (Renewal, error) {
 func (p *fakeProvider) Revoke(_ context.Context, refreshToken string, auth ClientAuth) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.onRevoke != nil {
+		p.onRevoke()
+	}
 	if p.revokeErr != nil {
 		return p.revokeErr
+	}
+	if err := p.revokeErrFor[refreshToken]; err != nil {
+		return err
 	}
 	p.revoked = append(p.revoked, refreshToken)
 	p.revokedWays = append(p.revokedWays, auth)

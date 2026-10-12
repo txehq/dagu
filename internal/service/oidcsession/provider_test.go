@@ -332,12 +332,33 @@ func TestHTTPProviderEstablishesTheWayAtSignIn(t *testing.T) {
 		assert.Equal(t, "next", renewal.RefreshToken)
 		assert.Equal(t, []string{"header refresh", "form refresh"}, e.requests())
 
-		// The next sign-in is told what that grant showed, and asks nothing.
+		// The next sign-in tries first the way that grant showed. It still
+		// asks: its own token has to be granted that way.
 		auth, renewal, err = provider.Establish(ctx, "another-users-token")
 		require.NoError(t, err)
 		assert.Equal(t, ClientAuthForm, auth)
-		assert.Empty(t, renewal.RefreshToken)
-		assert.Len(t, e.requests(), 2)
+		assert.Equal(t, "next", renewal.RefreshToken)
+		assert.Equal(t, []string{"header refresh", "form refresh", "form refresh"}, e.requests())
+	})
+
+	// The provider is changed to take the secret another way, and a user
+	// signs in before any session has met the change. What the last grant
+	// showed is tried first and refused, and the session is established with
+	// the way that is granted now.
+	t.Run("TheProviderWasChangedSinceTheLastGrant", func(t *testing.T) {
+		t.Parallel()
+		e := newPickyEndpoint(t, "form")
+		provider := e.provider(t, ClientAuthDetect)
+		auth, _, err := provider.Establish(ctx, secretRefreshToken)
+		require.NoError(t, err)
+		require.Equal(t, ClientAuthForm, auth)
+
+		e.set(func(e *pickyEndpoint) { e.takes = "header" })
+		auth, renewal, err := provider.Establish(ctx, "the-next-sign-ins-token")
+		require.NoError(t, err)
+		assert.Equal(t, ClientAuthHeader, auth)
+		assert.Equal(t, "next", renewal.RefreshToken)
+		assert.Equal(t, []string{"form refresh", "header refresh"}, e.requests()[2:])
 	})
 
 	// A provider that refuses the wrong way with a code of its own choosing
@@ -440,7 +461,7 @@ func TestHTTPProviderRefreshesTheWayItIsTold(t *testing.T) {
 
 		auth, _, err = provider.Establish(ctx, "the-next-sign-ins-token")
 		require.NoError(t, err)
-		assert.Equal(t, ClientAuthForm, auth, "what the last grant showed no longer holds, so it is established again")
+		assert.Equal(t, ClientAuthForm, auth, "the next sign-in is established with the way that is granted now")
 		assert.Equal(t, []string{"header refresh", "form refresh"}, e.requests()[2:])
 	})
 
@@ -449,8 +470,23 @@ func TestHTTPProviderRefreshesTheWayItIsTold(t *testing.T) {
 		e := newPickyEndpoint(t, "form")
 		provider := e.provider(t, ClientAuthDetect)
 		require.NoError(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthForm))
-		require.Error(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthHeader))
+		require.ErrorIs(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthHeader), ErrRevocationRefused,
+			"a 4xx is the provider's answer, and it is no")
 		assert.Equal(t, []string{"form revoke", "header revoke"}, e.requests(), "a revocation needs nothing found out first")
+
+		unwell := newPickyEndpoint(t, "")
+		unwell.notAcceptedStatus, unwell.notAcceptedBody = http.StatusServiceUnavailable, `starting`
+		err := unwell.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthHeader)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrRevocationRefused, "a 5xx is not an answer")
+
+		// A token whose session was never established has no way. It is
+		// asked both ways.
+		require.NoError(t, provider.Revoke(ctx, secretRefreshToken, ClientAuthDetect))
+		assert.Equal(t, []string{"header revoke", "form revoke"}, e.requests()[2:])
+		neither := newPickyEndpoint(t, "")
+		require.Error(t, neither.provider(t, ClientAuthDetect).Revoke(ctx, secretRefreshToken, ClientAuthDetect))
+		assert.Equal(t, []string{"header revoke", "form revoke"}, neither.requests())
 	})
 
 	_, err := NewHTTPProvider(HTTPProviderConfig{TokenURL: "https://issuer.example/token", ClientID: "dagu-web", ClientAuth: 7})

@@ -973,6 +973,8 @@ func TestTheWayIsEstablishedWhenTheSessionStarts(t *testing.T) {
 		assert.Equal(t, []ClientAuth{ClientAuthForm}, f.provider.revokedWays)
 	})
 
+	// A sign-in that fails does not leave the token the provider issued for
+	// it behind. The way is not known, so the provider is asked both ways.
 	t.Run("TheProviderWillNotRefreshWhatItIssued", func(t *testing.T) {
 		t.Parallel()
 		f := newFixture(t, nil)
@@ -983,17 +985,31 @@ func TestTheWayIsEstablishedWhenTheSessionStarts(t *testing.T) {
 		require.ErrorContains(t, err, "will not refresh the token it has just issued")
 		require.NotErrorIs(t, err, ErrProviderUnavailable)
 		assert.Zero(t, stored(f), "no session is started that could never be revalidated")
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+		f.provider.mu.Lock()
+		defer f.provider.mu.Unlock()
+		assert.Equal(t, []ClientAuth{ClientAuthDetect}, f.provider.revokedWays)
 	})
 
+	// The provider does not answer. It is not asked to revoke now, when it
+	// would not answer that either: the revocation is owed.
 	t.Run("TheProviderDoesNotAnswer", func(t *testing.T) {
 		t.Parallel()
 		f := newFixture(t, nil)
 		f.provider.establish = func(string) (ClientAuth, Renewal, error) {
 			return ClientAuthDetect, Renewal{}, errors.New("the identity provider did not answer")
 		}
+		attempts := 0
+		f.provider.onRevoke = func() { attempts++ }
 		_, err := start(f)
 		require.ErrorIs(t, err, ErrProviderUnavailable)
 		assert.Zero(t, stored(f))
+		assert.Zero(t, attempts)
+		require.Len(t, f.manager.owed, 1)
+
+		f.provider.establish = nil
+		f.signIn()
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "made at the next sign-in")
 	})
 
 	t.Run("NotEstablished", func(t *testing.T) {
@@ -1003,6 +1019,49 @@ func TestTheWayIsEstablishedWhenTheSessionStarts(t *testing.T) {
 		_, err := start(f)
 		require.Error(t, err)
 		assert.Zero(t, stored(f))
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+	})
+
+	// Establishing may be a refresh, and the ID token it returns is held to
+	// what every later one is. A session does not start on a token for
+	// someone else, or on one that cannot be verified.
+	t.Run("TheIDTokenEstablishingReturned", func(t *testing.T) {
+		t.Parallel()
+		for name, tt := range map[string]struct {
+			issuer, subject string
+			err             error
+			started         bool
+			unavailable     bool
+		}{
+			"ForThisIdentity":         {testIssuer, testSubject, nil, true, false},
+			"ForAnotherSubject":       {testIssuer, "subject-2", nil, false, false},
+			"ForAnotherIssuer":        {"https://issuer.example/realms/other", testSubject, nil, false, false},
+			"Rejected":                {testIssuer, testSubject, errors.New("rejected"), false, false},
+			"NotVerifiable":           {testIssuer, testSubject, ErrIDTokenUnverifiable, false, true},
+			"NotVerifiableAndAnother": {testIssuer, "subject-2", ErrIDTokenUnverifiable, false, false},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				f := newFixture(t, func(_ context.Context, raw string) (string, string, error) {
+					require.Equal(t, "the-id-token-establishing-returned", raw)
+					return tt.issuer, tt.subject, tt.err
+				})
+				f.provider.establish = func(string) (ClientAuth, Renewal, error) {
+					return ClientAuthForm, Renewal{RefreshToken: "the-token-establishing-returned", IDToken: "the-id-token-establishing-returned"}, nil
+				}
+				session, err := start(f)
+				if tt.started {
+					require.NoError(t, err)
+					assert.Equal(t, "the-token-establishing-returned", f.heldToken(session))
+					assert.Empty(t, f.provider.revocations())
+					return
+				}
+				require.Error(t, err)
+				assert.Equal(t, tt.unavailable, errors.Is(err, ErrProviderUnavailable), "%v", err)
+				assert.Zero(t, stored(f))
+				assert.Equal(t, []string{"the-token-establishing-returned"}, f.provider.revocations(), "the token is not left behind")
+			})
+		}
 	})
 
 	// The session cannot be stored. The token it would have held is nobody
@@ -1041,7 +1100,12 @@ func TestARevocationTheProviderDidNotTake(t *testing.T) {
 		f.signIn()
 		require.Empty(t, f.provider.revocations())
 
+		// The provider did not take it at that sign-in either, so it is not
+		// asked again for a while.
 		f.provider.failRevocations(nil)
+		f.signIn()
+		require.Empty(t, f.provider.revocations())
+		f.clock.Advance(owedRetryInterval)
 		f.signIn()
 		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
 		f.signIn()
@@ -1078,6 +1142,106 @@ func TestARevocationTheProviderDidNotTake(t *testing.T) {
 			f.manager.owe(fmt.Sprintf("refresh-token-%d", i), ClientAuthHeader, down)
 		}
 		assert.Len(t, f.manager.owed, maxOwedRevocations)
+	})
+
+	// A sign-in is somebody waiting. It makes a few of the owed revocations
+	// again, and stops at the first the provider does not take.
+	t.Run("ASignInDoesABoundedAmount", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		for i := range 3 * reconcilePerSignIn {
+			f.manager.owe(fmt.Sprintf("owed-token-%d", i), ClientAuthHeader, down)
+		}
+
+		attempts := 0
+		f.provider.mu.Lock()
+		f.provider.onRevoke = func() { attempts++ }
+		f.provider.revokeErr = down
+		f.provider.mu.Unlock()
+		f.signIn()
+		assert.Equal(t, 1, attempts, "the provider did not take the first, so the others are not tried now")
+		f.signIn()
+		f.signIn()
+		assert.Equal(t, 1, attempts, "nor by the sign-ins that follow, for a while")
+
+		f.provider.failRevocations(nil)
+		f.clock.Advance(owedRetryInterval)
+		f.signIn()
+		assert.Len(t, f.provider.revocations(), reconcilePerSignIn)
+		assert.Len(t, f.manager.owed, 2*reconcilePerSignIn)
+		f.signIn()
+		f.signIn()
+		assert.Empty(t, f.manager.owed, "the rest are made at the sign-ins that follow")
+	})
+
+	// The provider answers, and will not revoke one of them. That one does not
+	// hold up the others, and is given up after a few such answers.
+	t.Run("OneTheProviderAnswersNoToDoesNotHoldUpTheOthers", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.provider.revokeErrFor = map[string]error{"owed-token-0": fmt.Errorf("%w: 400", ErrRevocationRefused)}
+		for i := range 3 {
+			f.manager.owe(fmt.Sprintf("owed-token-%d", i), ClientAuthHeader, down)
+			f.clock.Advance(time.Second)
+		}
+		f.manager.reconcile(ctx, f.clock.Now())
+		assert.Equal(t, []string{"owed-token-1", "owed-token-2"}, f.provider.revocations(), "the oldest was refused, and the others were still made")
+		require.Len(t, f.manager.owed, 1)
+
+		for range maxRevocationRefusals - 2 {
+			f.manager.reconcile(ctx, f.clock.Now())
+			require.Len(t, f.manager.owed, 1)
+		}
+		f.manager.reconcile(ctx, f.clock.Now())
+		assert.Empty(t, f.manager.owed, "given up after the provider answered no that many times")
+	})
+
+	// The longest owed are made first, so that none waits behind newer ones.
+	t.Run("TheLongestOwedGoFirst", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		for i := range reconcilePerSignIn + 4 {
+			f.manager.owe(fmt.Sprintf("owed-token-%02d", i), ClientAuthHeader, down)
+			f.clock.Advance(time.Second)
+		}
+		f.manager.reconcile(ctx, f.clock.Now())
+		want := make([]string, reconcilePerSignIn)
+		for i := range want {
+			want[i] = fmt.Sprintf("owed-token-%02d", i)
+		}
+		assert.Equal(t, want, f.provider.revocations())
+	})
+
+	// Two sign-ins at once do not both do it: the second has nothing to add
+	// and does not wait for the first.
+	t.Run("OneSignInAtATimeDoesIt", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		f.manager.owe("owed-token", ClientAuthHeader, down)
+		f.manager.reconciling.Store(true) // another sign-in is at it
+		f.manager.reconcile(ctx, f.clock.Now())
+		require.Empty(t, f.provider.revocations())
+		f.manager.reconciling.Store(false)
+		f.manager.reconcile(ctx, f.clock.Now())
+		assert.Equal(t, []string{"owed-token"}, f.provider.revocations())
+		assert.False(t, f.manager.reconciling.Load())
+	})
+
+	t.Run("ASignInWritesABoundedNumberOfRememberedEnds", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		heal := broken.failWritesAfter(0)
+		for range 2 * reconcilePerSignIn {
+			session := f.signIn()
+			require.Error(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		}
+		heal()
+		f.signIn()
+		assert.Len(t, f.manager.undone, reconcilePerSignIn)
+		f.signIn()
+		assert.Empty(t, f.manager.undone)
 	})
 
 	// What is kept is encrypted, like the session's own copy, with the way
