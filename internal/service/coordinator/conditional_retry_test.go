@@ -336,3 +336,35 @@ func TestDispatchRefusesAStrayRetryRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, first.ID(), latest.ID(), "no attempt was created")
 }
+
+// Without run storage, Dispatch still refuses a malformed retry request at
+// entry: one on a conditional start, or on a retry with no expected attempt.
+func TestDispatchRefusesAMalformedRetryRequestWithoutStorage(t *testing.T) {
+	ctx := context.Background()
+	failed := ir.DAGRunStatus{Name: "test-dag", DAGRunID: "run-123", AttemptID: "a1", Status: ir.Failed}
+	previous, err := convert.DAGRunStatusToProto(&failed)
+	require.NoError(t, err)
+	noAttempt := failed
+	noAttempt.AttemptID = ""
+	previousNoAttempt, err := convert.DAGRunStatusToProto(&noAttempt)
+	require.NoError(t, err)
+	spec := &coordinatorv1.RetryRequestProto{ActionId: "act-1", ActionAttempt: "1", BindingDigest: "d"}
+	for name, task := range map[string]*coordinatorv1.Task{
+		"conditional start":   {Operation: coordinatorv1.Operation_OPERATION_START, PreviousStatus: previous},
+		"no expected attempt": {Operation: coordinatorv1.Operation_OPERATION_RETRY, PreviousStatus: previousNoAttempt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := NewHandler(HandlerConfig{})
+			t.Cleanup(func() { h.Close(context.Background()) })
+			task.DagRunId, task.Target, task.QueueName = "run-123", "test-dag", "test-queue"
+			task.Definition = "name: test-dag\nsteps:\n  - name: step1\n    run: echo hello"
+			task.RequireLatestIsPrevious, task.RetryRequest = true, spec
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: task})
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, status.Convert(err).Message(), ir.ErrInvalidRetryRequest.Error())
+		})
+	}
+}

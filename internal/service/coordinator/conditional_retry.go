@@ -45,14 +45,14 @@ func admittedRetryRequest(task *coordinatorv1.Task) (*ir.RetryRequest, error) {
 	if spec == nil {
 		return nil, nil
 	}
-	if !task.GetRequireLatestIsPrevious() {
+	if !task.GetRequireLatestIsPrevious() || task.GetOperation() != coordinatorv1.Operation_OPERATION_RETRY {
 		return nil, fmt.Errorf("%w: only a conditional retry names an action attempt", ir.ErrInvalidRetryRequest)
 	}
 	prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus)
 	if err != nil {
 		return nil, err
 	}
-	if prev == nil {
+	if prev == nil || prev.AttemptID == "" {
 		return nil, fmt.Errorf("%w: no previous execution", ir.ErrInvalidRetryRequest)
 	}
 	return ir.NewRetryRequest(ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), prev.AttemptID, prev.QueuedAt,
