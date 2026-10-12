@@ -235,6 +235,7 @@ func newCoordinator(
 		SecretStore:               secretStore,
 		ProfileStore:              profileStore,
 		AgentSessionCleanupQueue:  persistence.AgentSessionCleanupQueue,
+		QueueStore:                persistence.QueueStore,
 		EventService:              ctx.event,
 		EventSourceInstance:       ctx.EventSourceInstance,
 	})

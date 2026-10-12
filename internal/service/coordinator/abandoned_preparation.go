@@ -154,6 +154,11 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	if err != nil {
 		return nil, err
 	}
+	if queuedAt != "" {
+		if err := h.refuseWhileQueued(ctx, run, status); err != nil {
+			return nil, err
+		}
+	}
 	record := persis.AttemptAbandonment{
 		Schema:             persis.AttemptAbandonmentSchema,
 		Run:                run,
@@ -177,6 +182,30 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	}
 	h.endPreparation(ctx, run, root, attemptID, queuedAt)
 	return abandoned, nil
+}
+
+// refuseWhileQueued keeps a queued execution from being failed as undispatched
+// while its run is still in its queue: a dispatch that failed leaves the queue
+// item, and the queue dispatches it again under the same journal entry. A
+// queue that cannot be read is unknown, never empty.
+func (h *Handler) refuseWhileQueued(ctx context.Context, run ir.DAGRunRef, status *ir.DAGRunStatus) error {
+	if h.queueStore == nil || status == nil || status.ProcGroup == "" {
+		return nil
+	}
+	items, err := h.queueStore.List(ctx, status.ProcGroup)
+	if err != nil {
+		return fmt.Errorf("%w: queue: %v", errEvidenceUnknown, err)
+	}
+	for _, item := range items {
+		ref, err := item.Data()
+		if err != nil {
+			return fmt.Errorf("%w: queue item %s: %v", errEvidenceUnknown, item.ID(), err)
+		}
+		if ref != nil && *ref == run {
+			return fmt.Errorf("%w: the run is still in its queue", errDispatchInFlight)
+		}
+	}
+	return nil
 }
 
 // findRunAttempt finds the latest attempt of a root run or of a sub-DAG run.

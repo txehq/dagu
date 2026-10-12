@@ -163,6 +163,10 @@ type Handler struct {
 	inFlightPreparationsMu sync.Mutex
 	inFlightPreparations   map[string]struct{}
 
+	// queueStore lets reconciliation see that a queued execution is still
+	// owned by its queue; see HandlerConfig.QueueStore.
+	queueStore queue.QueueStore
+
 	dispatchWakeMu          sync.Mutex
 	dispatchWakeCh          chan struct{}
 	dispatchWakeGeneration  int64
@@ -267,6 +271,11 @@ type HandlerConfig struct {
 	// AgentSessionCleanupQueue stores provider cleanup claimed by owning workers.
 	AgentSessionCleanupQueue *agentsession.CleanupQueue
 
+	// QueueStore is read by reconciliation: a queued execution whose run is
+	// still in its queue is not failed as undispatched, since the queue will
+	// dispatch it again. Optional - when nil, that check is skipped.
+	QueueStore queue.QueueStore
+
 	// StaleHeartbeatThreshold is the duration after which a worker's heartbeat
 	// is considered stale. Defaults to 30 seconds if not set.
 	StaleHeartbeatThreshold time.Duration
@@ -329,6 +338,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		secretStore:               cfg.SecretStore,
 		profileStore:              cfg.ProfileStore,
 		agentSessionCleanupQueue:  cfg.AgentSessionCleanupQueue,
+		queueStore:                cfg.QueueStore,
 		staleHeartbeatThreshold:   cfg.StaleHeartbeatThreshold,
 		staleLeaseThreshold:       cfg.StaleLeaseThreshold,
 		eventService:              cfg.EventService,

@@ -20,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
@@ -278,4 +279,45 @@ func TestALiveClaimOfAFailedQueuedExecutionIsRefused(t *testing.T) {
 	assert.Equal(t, errAttemptAbandoned.Error(), resp.Error)
 	_, err = f.leases.Get(t.Context(), f.attemptKey(queued))
 	require.ErrorIs(t, err, dispatch.ErrDAGRunLeaseNotFound, "no lease is recorded")
+}
+
+// A queued execution's dispatch fails and the run stays in its queue, which
+// will dispatch it again, possibly long after (its worker may be away). Its
+// journal entry is kept, and reconciliation, however late, does not fail the
+// execution while the queue still holds the run. Once the queue no longer
+// holds it and nothing claimed it, the execution is failed with a record.
+func TestReconcileLeavesAQueuedExecutionItsQueueStillHolds(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	dispatches := &scriptedEnqueueStore{DispatchTaskStore: newTestDispatchTaskStore(filepath.Join(t.TempDir(), "d")), fail: map[int]bool{0: true}}
+	f := newStrandedFixture(t, dispatches)
+	queues := store.NewQueueStore(file.NewCollection(filepath.Join(t.TempDir(), "queue")))
+	f.h.queueStore = queues
+	const marker = "2026-10-12T16:30:00+08:00"
+	queued := f.writeQueued(t, "", marker)
+	found, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	st, err := found.ReadStatus(t.Context())
+	require.NoError(t, err)
+	require.NotEmpty(t, st.ProcGroup)
+	require.NoError(t, queues.Enqueue(t.Context(), st.ProcGroup, queue.QueuePriorityLow, f.ref))
+
+	_, err = f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.Error(t, err)
+	require.Len(t, f.preparationEntries(t), 1)
+
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+	assert.Len(t, f.preparationEntries(t), 1, "the queue still owns the execution")
+	assert.Empty(t, f.records(t))
+	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
+	require.NoError(t, err)
+	assert.Nil(t, record)
+
+	items, err := queues.List(t.Context(), st.ProcGroup)
+	require.NoError(t, err)
+	_, err = queues.DeleteByItemIDs(t.Context(), st.ProcGroup, []string{items[0].ID()})
+	require.NoError(t, err)
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+	record, err = f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
+	require.NoError(t, err)
+	require.NotNil(t, record, "with the queue no longer holding it, the execution is failed")
 }
