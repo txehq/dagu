@@ -15,6 +15,7 @@ import (
 	"time"
 
 	oidc "github.com/coreos/go-oidc"
+	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -23,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/license"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	"github.com/dagucloud/dagu/v2/internal/service/oidcprovision"
+	"github.com/dagucloud/dagu/v2/internal/service/oidcsession"
 	"golang.org/x/oauth2"
 )
 
@@ -245,6 +247,10 @@ type BuiltinOIDCConfig struct {
 	// PKCE makes the sign-in send an S256 code challenge and the callback
 	// send its verifier (RFC 7636). Off by default.
 	PKCE bool
+	// Sessions keeps a session per signed-in user and revalidates it at the
+	// provider. Nil, the default, means the hub token alone decides, as
+	// before.
+	Sessions *oidcsession.Manager
 }
 
 // InitBuiltinOIDCConfig initializes OIDC for builtin auth mode.
@@ -465,7 +471,7 @@ func BuiltinOIDCCallbackHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 		}
 
 		// Generate JWT token
-		tokenResult, err := cfg.AuthService.GenerateToken(user)
+		tokenResult, err := issueHubToken(ctx, cfg, user, oauth2Token.RefreshToken)
 		if err != nil {
 			logger.Error(ctx, "Failed to generate JWT token", tag.Error(err))
 			redirectWithError(w, r, cfg.LoginBasePath, "Authentication failed: could not create session")
@@ -485,6 +491,28 @@ func BuiltinOIDCCallbackHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 		redirectURL += "#token=" + url.QueryEscape(tokenResult.Token)
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 	}
+}
+
+// issueHubToken issues the hub token for a user who has just signed in. With
+// sessions on, it first starts the session the token will be tied to, from
+// the provider's refresh token; if the provider gave none, the sign-in fails,
+// because such a session could never be revalidated.
+func issueHubToken(ctx context.Context, cfg *BuiltinOIDCConfig, user *authmodel.User, refreshToken string) (*authservice.TokenResult, error) {
+	if cfg.Sessions == nil {
+		return cfg.AuthService.GenerateToken(user)
+	}
+	expiresAt := time.Now().Add(cfg.AuthService.TokenTTL())
+	session, err := cfg.Sessions.Create(ctx, oidcSessionIdentity(user), refreshToken, expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	tokenResult, err := cfg.AuthService.GenerateSessionToken(user, session.ID, expiresAt)
+	if err != nil {
+		// A session nobody holds a token for is ended, not left behind.
+		_ = cfg.Sessions.End(ctx, session.ID, "the hub token could not be issued")
+		return nil, err
+	}
+	return tokenResult, nil
 }
 
 func allowOIDCAfterInitialSetup(w http.ResponseWriter, r *http.Request, cfg *BuiltinOIDCConfig) bool {

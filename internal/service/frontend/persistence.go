@@ -10,6 +10,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/eventstore"
 	"github.com/dagucloud/dagu/v2/internal/incident"
 	"github.com/dagucloud/dagu/v2/internal/notification"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/profile"
 	"github.com/dagucloud/dagu/v2/internal/remotenode"
 	"github.com/dagucloud/dagu/v2/internal/secret"
@@ -23,9 +24,12 @@ import (
 
 // Stores contains the persistence dependencies used by the frontend server.
 type Stores struct {
-	WorkspaceBaseConfig  dagsettings.BaseConfigProvider
-	BaseConfig           dagsettings.BaseConfigStore
-	AuthService          *authservice.Service
+	WorkspaceBaseConfig dagsettings.BaseConfigProvider
+	BaseConfig          dagsettings.BaseConfigStore
+	AuthService         *authservice.Service
+	// OIDCSessions holds OIDC session records. It is nil unless
+	// auth.oidc.session is configured.
+	OIDCSessions         persis.Collection
 	UserStore            authmodel.UserStore
 	AuthSetupRequired    bool
 	RemoteNode           remotenode.Store

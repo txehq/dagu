@@ -192,6 +192,15 @@ type AuthOIDCDef struct {
 	RoleMapping    *OIDCRoleMappingDef `mapstructure:"role_mapping"`
 	// PKCE enables PKCE (S256) on the browser sign-in. Default: false.
 	PKCE bool `mapstructure:"pkce"`
+	// Session keeps a hub session per OIDC user, revalidated at the provider.
+	Session *AuthOIDCSessionDef `mapstructure:"session"`
+}
+
+// AuthOIDCSessionDef configures OIDC session revalidation. Both durations
+// must be set to enable it.
+type AuthOIDCSessionDef struct {
+	RevalidateAfter string `mapstructure:"revalidate_after"`
+	RevalidateLimit string `mapstructure:"revalidate_limit"`
 }
 
 // OIDCRoleMappingDef maps OIDC claims to Dagu roles.

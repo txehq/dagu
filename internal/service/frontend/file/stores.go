@@ -87,6 +87,9 @@ func initStores(ctx context.Context, cfg *config.Config, backend persis.Backend,
 			return fmt.Errorf("failed to initialize builtin auth service: %w", err)
 		}
 		stores.AuthService = builtinAuth.service
+		if cfg.Server.Auth.OIDC.Session.Enabled() {
+			stores.OIDCSessions = backend.Collection(persis.CollectionOIDCSessions)
+		}
 		stores.UserStore = builtinAuth.userStore
 		stores.AuthSetupRequired = builtinAuth.setupRequired
 	}

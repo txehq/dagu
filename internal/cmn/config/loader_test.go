@@ -2766,3 +2766,68 @@ auth:
 		assert.Contains(t, err.Error(), "pkce")
 	})
 }
+
+func TestLoad_OIDCSession(t *testing.T) {
+	const base = `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu
+`
+	t.Run("DefaultOff", func(t *testing.T) {
+		cfg := loadFromYAML(t, base)
+		assert.False(t, cfg.Server.Auth.OIDC.Session.Enabled())
+		assert.Zero(t, cfg.Server.Auth.OIDC.Session.RevalidateAfter)
+		assert.Zero(t, cfg.Server.Auth.OIDC.Session.RevalidateLimit)
+	})
+
+	t.Run("FromYAML", func(t *testing.T) {
+		cfg := loadFromYAML(t, base+`
+    session:
+      revalidate_after: 4m
+      revalidate_limit: 5m
+`)
+		assert.True(t, cfg.Server.Auth.OIDC.Session.Enabled())
+		assert.Equal(t, 4*time.Minute, cfg.Server.Auth.OIDC.Session.RevalidateAfter)
+		assert.Equal(t, 5*time.Minute, cfg.Server.Auth.OIDC.Session.RevalidateLimit)
+	})
+
+	t.Run("FromEnv", func(t *testing.T) {
+		cfg := loadWithEnv(t, base, map[string]string{
+			"DAGU_AUTH_OIDC_SESSION_REVALIDATE_AFTER": "90s",
+			"DAGU_AUTH_OIDC_SESSION_REVALIDATE_LIMIT": "2m",
+		})
+		assert.Equal(t, 90*time.Second, cfg.Server.Auth.OIDC.Session.RevalidateAfter)
+		assert.Equal(t, 2*time.Minute, cfg.Server.Auth.OIDC.Session.RevalidateLimit)
+	})
+
+	// A bound on how long a user stays in is never dropped with a warning:
+	// a value that cannot be used stops the load.
+	refused := map[string]struct{ after, limit, want string }{
+		"OnlyAfter":        {"4m", "", "must both be set"},
+		"OnlyLimit":        {"", "5m", "must both be set"},
+		"AfterEqualsLimit": {"5m", "5m", "must be less than"},
+		"AfterOverLimit":   {"5m", "4m", "must be less than"},
+		"LimitOverFive":    {"4m", "5m1s", "at most 5m0s"},
+		"ThirtyMinutes":    {"4m", "30m", "at most 5m0s"},
+		"NotADuration":     {"soon", "5m", "must both be set"},
+		"ABareNumber":      {"240", "300", "must both be set"},
+		"Negative":         {"-4m", "5m", "must both be set"},
+		"ZeroAfter":        {"0s", "5m", "must both be set"},
+	}
+	for name, tt := range refused {
+		t.Run(name, func(t *testing.T) {
+			yaml := base + "    session:\n"
+			if tt.after != "" {
+				yaml += "      revalidate_after: \"" + tt.after + "\"\n"
+			}
+			if tt.limit != "" {
+				yaml += "      revalidate_limit: \"" + tt.limit + "\"\n"
+			}
+			err := loadWithErrorFromYAML(t, yaml)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "auth.oidc.session")
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}

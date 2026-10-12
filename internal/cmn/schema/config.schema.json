@@ -392,6 +392,21 @@
           "description": "Use PKCE (S256) on the browser sign-in. Needed for a provider client that requires it. Default: false.",
           "default": false
         },
+        "session": {
+          "type": "object",
+          "description": "Keep a hub session for each OIDC user and revalidate it at the provider. Off unless both durations are set.",
+          "additionalProperties": false,
+          "properties": {
+            "revalidate_after": {
+              "type": "string",
+              "description": "How long after the provider's last confirmation a request is served without asking again, for example 4m."
+            },
+            "revalidate_limit": {
+              "type": "string",
+              "description": "How long after the provider's last confirmation a request can be served at all, for example 5m. At most 5m."
+            }
+          }
+        },
         "role_mapping": {
           "$ref": "#/definitions/OIDCRoleMappingDef"
         }
