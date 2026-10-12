@@ -391,12 +391,25 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal,
 		return Principal{}, refuse(ReasonExpired, "")
 	}
 
+	// The session is reported, not required. Present, it must be text: a
+	// caller that ties a credential to a session must never be handed a
+	// value this package had to coerce.
+	session := ""
+	if raw, present := claims["sid"]; present {
+		text, ok := raw.(string)
+		if !ok || text == "" {
+			return Principal{}, refuse(ReasonMalformed, "the token's session is not text")
+		}
+		session = text
+	}
+
 	return Principal{
-		Identity: Identity{Issuer: v.issuer, Subject: subject},
-		Class:    class,
-		ClientID: client,
-		IssuedAt: issuedAt,
-		Expires:  expires,
+		Identity:  Identity{Issuer: v.issuer, Subject: subject},
+		Class:     class,
+		ClientID:  client,
+		SessionID: session,
+		IssuedAt:  issuedAt,
+		Expires:   expires,
 	}, nil
 }
 

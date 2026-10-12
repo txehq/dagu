@@ -78,6 +78,13 @@ type Principal struct {
 	Class Class
 	// ClientID is the provider client the token was issued to.
 	ClientID string
+	// SessionID is the provider session the token belongs to (its "sid"
+	// claim), or "" when the token names none. Tokens obtained by one
+	// sign-in share it, and two sign-ins by the same subject differ in it,
+	// which is what lets a credential be tied to one enrolled machine.
+	// Nothing in this package relies on it: a caller that does must require
+	// it to be present.
+	SessionID string
 	// IssuedAt and Expires bound the token the principal came from. A
 	// principal must not be used at or after Expires.
 	IssuedAt time.Time

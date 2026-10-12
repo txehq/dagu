@@ -106,7 +106,7 @@ type RemoteKeySetConfig struct {
 //
 // A set is replaced when it reaches its maximum age and something needs a key
 // from it. Nothing runs in the background, so a set nobody uses is not
-// replaced, however old it gets.
+// replaced, however old it gets, unless the host calls Refresh.
 //
 // While the issuer cannot be reached, the last set fetched stays in use for a
 // bounded time, so that an outage does not stop tokens that are still within
@@ -123,6 +123,14 @@ type RemoteKeySetConfig struct {
 // issuer would vouch for them. Without a bound, a key the issuer withdrew
 // would stay trusted for as long as fetches could be made to fail, and
 // whoever held it could keep signing tokens with fresh times.
+//
+// How firm that is depends on Refresh. Left to requests alone, a process
+// nobody has asked for a key learns that a fetch fails only when the next
+// request arrives, so the grace can start long after the set went stale and
+// after the issuer withdrew a key. A host that calls Refresh on a timer finds
+// out when the issuer stops answering: the fetch fails while the set is still
+// young, and the set is then used for no longer than its maximum age plus
+// StaleKeyGrace after it was last fetched, however idle the process is.
 //
 // A process that has never fetched a set can verify nothing.
 type RemoteKeySet struct {
@@ -244,6 +252,29 @@ func (s *RemoteKeySet) Status() KeySetStatus {
 		status.LastError = s.lastErr.Error()
 	}
 	return status
+}
+
+// Refresh replaces the set when that is due, and returns the error of the
+// last fetch, or nil if it succeeded. It is due when there is no set, when
+// the set has reached half its maximum age, or when the last fetch failed.
+// Like every fetch it happens at most once a minute, so a host may call
+// Refresh as often as it likes; once a minute is enough.
+//
+// Calling it is optional. See RemoteKeySet for what it buys.
+func (s *RemoteKeySet) Refresh(ctx context.Context) error {
+	s.fetchMu.Lock()
+	defer s.fetchMu.Unlock()
+
+	s.mu.RLock()
+	due := s.fetchedAt.IsZero() || !s.failingSince.IsZero() || s.now().Sub(s.fetchedAt) >= s.maxAge/2
+	s.mu.RUnlock()
+	if due {
+		s.refreshIfDue(ctx)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastErr
 }
 
 // Key implements KeySource.

@@ -52,6 +52,34 @@ func TestVerifyAcceptsAnAccessTokenPerClass(t *testing.T) {
 	}
 }
 
+// The provider's session id is reported as it is in the token, and never
+// invented. Two sign-ins by one subject to one client differ only in it.
+func TestVerifyReportsTheSession(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+
+	first, err := f.verifier.Verify(context.Background(), f.token(t, map[string]any{"azp": testWorker, "sid": "session-a"}))
+	require.NoError(t, err)
+	second, err := f.verifier.Verify(context.Background(), f.token(t, map[string]any{"azp": testWorker, "sid": "session-b"}))
+	require.NoError(t, err)
+	assert.Equal(t, "session-a", first.SessionID)
+	assert.Equal(t, "session-b", second.SessionID)
+	assert.Equal(t, first.Identity, second.Identity)
+	assert.Equal(t, first.Class, second.Class)
+	assert.Equal(t, first.ClientID, second.ClientID)
+
+	none, err := f.verifier.Verify(context.Background(), f.token(t, nil))
+	require.NoError(t, err, "a token that names no session is still an access token")
+	assert.Empty(t, none.SessionID)
+
+	for name, sid := range map[string]any{"Number": 7, "List": []string{"session-a"}, "Empty": "", "Object": map[string]any{"id": "session-a"}} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRefused(t, f, f.token(t, map[string]any{"sid": sid}), ReasonMalformed)
+		})
+	}
+}
+
 // Email, username and display name never identify anyone: equal ones with a
 // different subject, or the same subject from a different issuer, are
 // different identities.
