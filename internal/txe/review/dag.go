@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/txe/reviewer"
@@ -46,6 +47,41 @@ type DAGConfig struct {
 	TimeoutSec int
 	// AgentTimeoutSec bounds the agent step.
 	AgentTimeoutSec int
+	// ClaimWaitIntervalSec is how long the decision DAG's execute step
+	// waits before it tries again for a job that is claimed by another
+	// holder. The number of tries is derived from it, so that together they
+	// outlast the longest a claim lives without its holder.
+	ClaimWaitIntervalSec int
+}
+
+// claimWaitMargin is how much longer than a claim's lifetime the execute
+// step keeps trying: room for the two clocks and for the try that is running
+// when the claim ends.
+const claimWaitMargin = 2 * time.Minute
+
+// DecideTimeoutSec bounds the decision run's process once a person has
+// answered: all the waits for a claimed job, one whole try of the execute
+// step, and room to end. It is rendered into the decision DAG so that the
+// run has a timeout of its own and never inherits a shorter one from a
+// base configuration, which would end the wait before the claim does.
+// Waiting for the person holds no process and is not bounded by it.
+func (c DAGConfig) DecideTimeoutSec() int {
+	return c.ClaimWaitRetries()*c.ClaimWaitIntervalSec + c.TimeoutSec + int(decideEndMargin/time.Second)
+}
+
+// decideEndMargin is the room the decision run has beyond its waits and one
+// try of the execute step.
+const decideEndMargin = 5 * time.Minute
+
+// ClaimWaitRetries is how many times the execute step is retried while the
+// job is claimed by another holder: enough that the waits alone, without
+// counting the tries, last longer than MaxClaimTTL plus a margin.
+func (c DAGConfig) ClaimWaitRetries() int {
+	interval := time.Duration(c.ClaimWaitIntervalSec) * time.Second
+	if interval <= 0 {
+		return 0
+	}
+	return int((MaxClaimTTL + claimWaitMargin + interval - 1) / interval)
 }
 
 // RenderedDAGs are the two DAG documents to install on the service.
@@ -117,6 +153,18 @@ func (c DAGConfig) withDefaults() (DAGConfig, error) {
 	if c.AgentTimeoutSec >= c.TimeoutSec {
 		return c, errors.New("agent timeout must be shorter than the run timeout")
 	}
+	// A run must end before its claim does, so that a claim never outlives
+	// a holder that is still working, and an execution claim covers one
+	// whole try of the execute step.
+	if time.Duration(c.TimeoutSec)*time.Second >= MaxClaimTTL {
+		return c, fmt.Errorf("run timeout must be shorter than the claim lifetime (%s)", MaxClaimTTL)
+	}
+	if c.ClaimWaitIntervalSec <= 0 {
+		c.ClaimWaitIntervalSec = 60
+	}
+	if c.ClaimWaitIntervalSec > 600 {
+		return c, errors.New("claim wait interval must be at most 600 seconds")
+	}
 	return c, nil
 }
 
@@ -158,7 +206,11 @@ func RenderDAGs(cfg DAGConfig) (RenderedDAGs, error) {
 		Prompt string
 		Schema string
 		Vars   []envVar
-	}{cfg, strings.TrimSpace(unixLines(reviewer.Prompt)), schema.String(), vars}
+		// ExitClaimHeld and MaxClaimTTLSec are the reviewer's own constants,
+		// rendered so that the DAG and the steps it calls cannot disagree.
+		ExitClaimHeld  int
+		MaxClaimTTLSec int
+	}{cfg, strings.TrimSpace(unixLines(reviewer.Prompt)), schema.String(), vars, ExitClaimHeld, int(MaxClaimTTL / time.Second)}
 
 	out := RenderedDAGs{
 		ReviewerName: ReviewerDAGName(cfg.MachineID),

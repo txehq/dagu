@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	defaultClaimTTL    = 20 * time.Minute
+	defaultClaimTTL    = MaxClaimTTL
 	defaultCadence     = time.Hour
 	defaultMaxAttempts = 3
 	minReviewInterval  = time.Minute
@@ -97,6 +97,36 @@ func (r *Reviewer) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
+}
+
+// MaxClaimTTL is the longest a claim taken by this reviewer lives without
+// its holder: the lifetime of a review claim and of an execution claim. A
+// tick that dies keeps its job claimed for this long, because the registry
+// cannot tell a dead holder from a slow one and nobody releases a claim on
+// the assumption that its holder died. Whatever has to wait for such a claim
+// (the decision DAG's execute step) is rendered to wait longer than this.
+const MaxClaimTTL = 20 * time.Minute
+
+// ExitClaimHeld is the exit code of a step that could not act because the
+// job is claimed by another holder. It is the one failure a step is retried
+// on: every other one is a statement about the job or the service that
+// waiting does not change. It is the conventional code for a temporary
+// failure.
+const ExitClaimHeld = 75
+
+// StepExitCode is the exit code of a step process that ended with err: the
+// claim-held code when the job is claimed by another holder, and the
+// ordinary failure code for anything else. Every command that runs the
+// execute step uses it, so the code the decision DAG waits on means one
+// thing wherever the step comes from.
+func StepExitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, ErrClaimHeld):
+		return ExitClaimHeld
+	}
+	return 1
 }
 
 func (r *Reviewer) claimTTL() time.Duration {
@@ -2222,7 +2252,11 @@ func (r *Reviewer) Execute(ctx context.Context, jobID, proposalID, decisionID st
 		return Executed{Skipped: "denied by the guard: " + string(refused.Reason)}, nil
 	}
 	if err != nil {
-		// A held claim is retried by the step's retry policy.
+		// A held claim is waited for by the step's retry policy, which
+		// retries on that alone (ExitClaimHeld). Each retry is a new run of
+		// this function from its first line, so the proposal, the decision
+		// and the job are read again and an approval that stopped holding
+		// during the wait runs nothing.
 		return Executed{}, fmt.Errorf("acquire execution claim: %w", err)
 	}
 	executed, err := r.executeClaimed(ctx, claim, job, declared, proposal, decision)

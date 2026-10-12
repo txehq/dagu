@@ -256,7 +256,18 @@ func runTXEReviewExecute(ctx *Context, _ []string) error {
 	if err != nil {
 		return err
 	}
-	return steps.Execute(ctx, job, proposal, decision, ctx.Command.OutOrStdout())
+	return txeReviewExecuteExit(steps.Execute(ctx, job, proposal, decision, ctx.Command.OutOrStdout()))
+}
+
+// txeReviewExecuteExit gives the execute step its exit code. A job claimed
+// by another holder is the one failure the decision DAG waits out, so it
+// alone exits with review.ExitClaimHeld; every other failure keeps the
+// ordinary failure code and is not retried.
+func txeReviewExecuteExit(err error) error {
+	if code := review.StepExitCode(err); code == review.ExitClaimHeld {
+		return &ExitCodeError{Code: code, Err: err}
+	}
+	return err
 }
 
 func runTXEReviewRender(ctx *Context, _ []string) error {

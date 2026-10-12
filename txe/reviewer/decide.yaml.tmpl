@@ -5,6 +5,11 @@
 # refused instead of creating a second task. Waiting holds no process and no
 # worker slot, and unanswered proposals do not block each other.
 description: Human decision for one TXE proposal on {{.MachineID}}
+# The run's process, once a person has answered, may last as long as every
+# wait of the execute step below plus one whole try of it. The timeout is
+# stated here so that the run never inherits a shorter one from a base
+# configuration. Waiting for the person holds no process and is not counted.
+timeout_sec: {{.DecideTimeoutSec}}
 working_dir: {{yaml .StateDir}}
 worker_selector:
   txe.machine: {{yaml .MachineID}}
@@ -39,9 +44,16 @@ steps:
   - id: execute
     depends: decide
     timeout_sec: {{.TimeoutSec}}
+    # A job claimed by another holder is waited for, and nothing else is
+    # retried: the command exits {{.ExitClaimHeld}} for that alone. A review that died
+    # keeps its claim for up to {{.MaxClaimTTLSec}} seconds, and the waits below add up to
+    # more than that, so an approved action runs by itself once the claim
+    # is gone. Each try reads the decision and the job again. If the wait
+    # runs out the run fails and can be retried from the dashboard.
     retry_policy:
-      limit: 5
-      interval_sec: 60
+      limit: {{.ClaimWaitRetries}}
+      interval_sec: {{.ClaimWaitIntervalSec}}
+      exit_code: [{{.ExitClaimHeld}}]
     # Parameters and task input reach the command only as quoted variables,
     # never as shell text.
     env:
