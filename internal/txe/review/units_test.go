@@ -2700,3 +2700,228 @@ func (r refuseUncertainAgain) FinishAction(ctx context.Context, req review.Finis
 	}
 	return r.Registry.FinishAction(ctx, req)
 }
+
+// A job whose registration is not ready is one the registry has said it will
+// grant no claim on: the losing record of a registration made twice, or an
+// update that was interrupted. That is an answer, not a failure, so a tick
+// that finds nothing else due has no work and does not fail. Anything the
+// job's own record does not explain is still an error of the tick.
+func TestStepsAJobTheRegistryWillNotClaimIsNoWork(t *testing.T) {
+	ctx := context.Background()
+	withRegistration := func(f *fixture, state review.Registration) {
+		job := fixtureJob()
+		job.Registration = state
+		require.NoError(t, f.registry.PutJob(job))
+	}
+	untouched := func(t *testing.T, f *fixture) {
+		t.Helper()
+		s := f.state()
+		assert.Zero(t, s.Fences[jobID], "no claim was granted")
+		assert.Empty(t, s.Reviews[jobID])
+		assert.Empty(t, s.Actions[jobID])
+		assert.Empty(t, s.Proposals[jobID])
+		assert.Empty(t, s.Exceptions)
+	}
+
+	for _, state := range []review.Registration{review.RegistrationDuplicate, review.RegistrationIncomplete} {
+		t.Run("an idle tick with only a "+string(state)+" job has no work", func(t *testing.T) {
+			f := newFixture(t)
+			withRegistration(f, state)
+			f.addRun("run-1", "failed")
+
+			dir := t.TempDir()
+			var packet bytes.Buffer
+			require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &packet))
+			assert.Empty(t, packet.String(), "no packet, so no agent is started")
+			var out bytes.Buffer
+			require.NoError(t, f.steps("tick-1", dir).Apply(ctx, "tick-1", strings.NewReader("anything"), "", &out))
+			assert.Empty(t, out.String())
+			untouched(t, f)
+
+			prepared, err := f.reviewer("tick-2").Prepare(ctx, jobID)
+			require.NoError(t, err)
+			assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+			assert.Equal(t, "registration is "+string(state), prepared.SkipDetail)
+		})
+	}
+
+	t.Run("a job that can be reviewed is reviewed beside one that cannot", func(t *testing.T) {
+		f := newFixture(t)
+		withRegistration(f, review.RegistrationDuplicate)
+		other := fixtureJob()
+		other.ID = "job_01HZX0000000000000000000ZZ"
+		require.NoError(t, f.registry.PutJob(other))
+
+		var packet bytes.Buffer
+		require.NoError(t, f.steps("tick-1", t.TempDir()).Prepare(ctx, "tick-1", &packet))
+		assert.Contains(t, packet.String(), other.ID)
+		untouched(t, f)
+		assert.Equal(t, 1, f.state().Fences[other.ID])
+	})
+
+	t.Run("a registration that becomes ready is reviewed on the next tick", func(t *testing.T) {
+		f := newFixture(t)
+		withRegistration(f, review.RegistrationIncomplete)
+		dir := t.TempDir()
+		var packet bytes.Buffer
+		require.NoError(t, f.steps("tick-1", dir).Prepare(ctx, "tick-1", &packet))
+		require.Empty(t, packet.String())
+
+		withRegistration(f, review.RegistrationReady)
+		require.NoError(t, f.steps("tick-2", dir).Prepare(ctx, "tick-2", &packet))
+		assert.Contains(t, packet.String(), jobID)
+	})
+
+	t.Run("a registration that stops being ready between the read and the claim is a skip", func(t *testing.T) {
+		f := newFixture(t)
+		r := f.reviewer("tick-1")
+		r.Registry = &staleRead{Registry: f.registry, then: func() { withRegistration(f, review.RegistrationIncomplete) }}
+		prepared, err := r.Prepare(ctx, jobID)
+		require.NoError(t, err)
+		assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+		untouched(t, f)
+	})
+
+	// The fake kept in a file loses nothing of this: the state is stored
+	// beside the job, since the job's own JSON leaves it out for the agent.
+	t.Run("a registry kept in a file refuses the claim as well", func(t *testing.T) {
+		for _, state := range []review.Registration{review.RegistrationDuplicate, review.RegistrationIncomplete} {
+			path := filepath.Join(t.TempDir(), "registry.json")
+			job := fixtureJob()
+			job.Registration = state
+			require.NoError(t, reviewtest.Open(path).PutJob(job))
+
+			reg := reviewtest.Open(path)
+			read, err := reg.Job(ctx, jobID)
+			require.NoError(t, err)
+			assert.Equal(t, state, read.Registration)
+			_, err = reg.AcquireClaim(ctx, review.ClaimRequest{JobID: jobID, Kind: review.ClaimReview, Holder: "tick-1", TTL: time.Minute})
+			require.ErrorIs(t, err, review.ErrNotReady)
+
+			r := newFixture(t).reviewer("tick-1")
+			r.Registry = reg
+			prepared, err := r.Prepare(ctx, jobID)
+			require.NoError(t, err)
+			assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+			reg.View(func(s *reviewtest.State) { assert.Zero(t, s.Fences[jobID]) })
+		}
+	})
+
+	// A state that is none of the known ones is a record that cannot be
+	// read as written, not the registry's answer.
+	t.Run("a registration state the reviewer does not know fails the tick", func(t *testing.T) {
+		f := newFixture(t)
+		withRegistration(f, "garbage")
+		var packet bytes.Buffer
+		err := f.steps("tick-1", t.TempDir()).Prepare(ctx, "tick-1", &packet)
+		require.ErrorContains(t, err, `registration state "garbage"`)
+		assert.Empty(t, packet.String())
+		untouched(t, f)
+
+		// Also when it is what the job reads as after a refused claim.
+		f = newFixture(t)
+		r := f.reviewer("tick-1")
+		r.Registry = &staleRead{Registry: refuseClaims{Registry: f.registry, err: review.ErrNotReady}, then: func() { withRegistration(f, "garbage") }}
+		_, err = r.Prepare(ctx, jobID)
+		require.ErrorIs(t, err, review.ErrNotReady)
+	})
+
+	t.Run("a refused claim whose job cannot be read again fails the tick and says both", func(t *testing.T) {
+		f := newFixture(t)
+		unreadable := errors.New("decode job: unexpected end of JSON input")
+		r := f.reviewer("tick-1")
+		r.Registry = &readOnce{Registry: refuseClaims{Registry: f.registry, err: review.ErrNotReady}, err: unreadable}
+		_, err := r.Prepare(ctx, jobID)
+		require.ErrorIs(t, err, review.ErrNotReady)
+		require.ErrorIs(t, err, unreadable)
+	})
+
+	// The same refusal code is given for other reasons (run history that
+	// cannot be read, an index still being built). The job's record says
+	// its registration is ready, so nothing explains the refusal and it
+	// stays an error: the tick fails and says which job.
+	t.Run("a refusal the job's record does not explain fails the tick", func(t *testing.T) {
+		for _, state := range []review.Registration{"", review.RegistrationReady} {
+			f := newFixture(t)
+			withRegistration(f, state)
+			steps := f.steps("tick-1", t.TempDir())
+			steps.Reviewer.Registry = refuseClaims{Registry: f.registry, err: fmt.Errorf("%w: the resource index is being built; retry shortly", review.ErrNotReady)}
+			var packet bytes.Buffer
+			err := steps.Prepare(ctx, "tick-1", &packet)
+			require.ErrorIs(t, err, review.ErrNotReady)
+			assert.ErrorContains(t, err, "prepare "+jobID)
+			assert.Empty(t, packet.String())
+		}
+	})
+
+	for name, refusal := range map[string]error{
+		"an unavailable registry":   &review.TransportError{Status: 503, Message: "service unavailable"},
+		"a rejected credential":     &review.TransportError{Status: 401, Code: "unauthorized", Message: "invalid api key"},
+		"a record that is not read": errors.New("decode job: unexpected end of JSON input"),
+	} {
+		t.Run(name+" fails the tick even when the job is not ready", func(t *testing.T) {
+			f := newFixture(t)
+			steps := f.steps("tick-1", t.TempDir())
+			// The claim is never reached for a job known not to be ready,
+			// so the failure is put where such a tick meets it: the read.
+			steps.Reviewer.Registry = failReads{Registry: f.registry, err: refusal}
+			var packet bytes.Buffer
+			err := steps.Prepare(ctx, "tick-1", &packet)
+			require.ErrorIs(t, err, refusal)
+			assert.Empty(t, packet.String())
+
+			steps.Reviewer.Registry = refuseClaims{Registry: f.registry, err: refusal}
+			err = steps.Prepare(ctx, "tick-1", &packet)
+			require.ErrorIs(t, err, refusal)
+			assert.Empty(t, packet.String())
+		})
+	}
+}
+
+// refuseClaims is a registry that refuses every claim with one error.
+type refuseClaims struct {
+	review.Registry
+	err error
+}
+
+func (r refuseClaims) AcquireClaim(context.Context, review.ClaimRequest) (review.Claim, error) {
+	return review.Claim{}, r.err
+}
+
+// failReads is a registry whose job records cannot be read.
+type failReads struct {
+	review.Registry
+	err error
+}
+
+func (r failReads) Job(context.Context, string) (review.Job, error) { return review.Job{}, r.err }
+
+// staleRead is a registry whose job changes right after it is first read.
+type staleRead struct {
+	review.Registry
+	then func()
+}
+
+func (r *staleRead) Job(ctx context.Context, jobID string) (review.Job, error) {
+	job, err := r.Registry.Job(ctx, jobID)
+	if r.then != nil {
+		r.then()
+		r.then = nil
+	}
+	return job, err
+}
+
+// readOnce is a registry whose job records can be read once and not again.
+type readOnce struct {
+	review.Registry
+	err  error
+	read bool
+}
+
+func (r *readOnce) Job(ctx context.Context, jobID string) (review.Job, error) {
+	if r.read {
+		return review.Job{}, r.err
+	}
+	r.read = true
+	return r.Registry.Job(ctx, jobID)
+}

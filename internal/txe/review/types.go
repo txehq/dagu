@@ -34,6 +34,31 @@ func (l Lifecycle) Reviewable() bool {
 	return l == LifecycleActive || l == LifecycleNeedsHuman
 }
 
+// Registration is the state of a job's registration as the registry reports
+// it. A registration that is not ready is not a fault of the service: the
+// registry has said the job cannot be claimed, and why.
+type Registration string
+
+const (
+	RegistrationReady      Registration = "ready"
+	RegistrationIncomplete Registration = "incomplete"
+	RegistrationDuplicate  Registration = "duplicate"
+)
+
+// Claimable reports whether the registry grants review claims on a job in
+// this state. A Registry that reports no state leaves it empty, and the
+// claim itself then decides.
+func (r Registration) Claimable() bool {
+	return r == "" || r == RegistrationReady
+}
+
+// Refused reports whether this is a state in which the registry has said it
+// grants no review claim. A state this reviewer does not know is neither
+// claimable nor refused: it is a record that cannot be read as written.
+func (r Registration) Refused() bool {
+	return r == RegistrationIncomplete || r == RegistrationDuplicate
+}
+
 // Availability is independent of lifecycle: an offline machine or an expired
 // login is never evidence that a job should retire.
 type Availability string
@@ -164,6 +189,9 @@ type Job struct {
 	Lifecycle        Lifecycle    `json:"lifecycle"`
 	Availability     Availability `json:"availability"`
 	Review           ReviewPolicy `json:"review"`
+	// Registration is the reviewer's own reading of whether the job can be
+	// claimed. It is not part of what the agent is shown.
+	Registration Registration `json:"-"`
 	// CredentialRefs are the credentials the job declares: where each is
 	// found on the job's machine and the variable its commands read it
 	// from. They are resolved on that machine when a command of the job is

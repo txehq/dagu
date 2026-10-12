@@ -3104,3 +3104,59 @@ func TestRemoteRecoverTakesOnlyTheRequestsOwnRecord(t *testing.T) {
 	assert.Equal(t, none, review.RemoteRuns(stub).Recover(context.Background(), "job", "run-1", expected, review.RetryRequest{ActionID: "act-1"}))
 	assert.Empty(t, stub.calls)
 }
+
+// Against the real registry: a job registered but not yet marked ready is
+// listed as due, is refused a review claim, and the reviewer reads that from
+// the job's own record and leaves it alone without an error. Marked ready, it
+// is claimed.
+func TestRemoteAJobWhoseRegistrationIsNotReadyIsSkippedNotFailed(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	first := f.job()
+	second, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	actor := &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "cc5-test"}
+	digest := fmt.Sprintf("sha256:%064x", 8)
+	dir := t.TempDir()
+	spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/other.sh\n", first.MachineID)
+	require.NoError(t, f.remote.Transport.Do(ctx, http.MethodPost, "/txe/jobs", apigen.TxeRegisterRequest{
+		JobId: second, RequestId: "r2", OwnerId: first.OwnerID, ProjectId: first.ProjectID, MachineId: first.MachineID, JobKey: "volume:vol-2",
+		Version: apigen.TxeJobVersionInput{
+			Title: "Second monitor", Purpose: "Registered, its package not yet in place.",
+			Package:      apigen.TxePackage{Digest: digest, Path: dir, Entrypoint: "other.sh"},
+			Dag:          apigen.TxeDAGRef{Spec: spec},
+			Targets:      &[]apigen.TxeTarget{{Kind: "fixture.volume", StableId: map[string]string{"cluster_uid": "c-1", "uid": "vol-2"}}},
+			ReviewPolicy: &apigen.TxeReviewPolicy{Brief: new("Check usage."), Cadence: new("1h")},
+		},
+		Actor: actor,
+	}, nil))
+
+	due, err := f.remote.DueJobs(ctx, first.MachineID, time.Now())
+	require.NoError(t, err)
+	assert.Contains(t, due, second, "the registry lists it as due")
+
+	// What the registry itself answers to the claim.
+	_, err = f.remote.AcquireClaim(ctx, review.ClaimRequest{JobID: second, Kind: review.ClaimReview, Holder: "tick-1", TTL: time.Minute})
+	require.ErrorIs(t, err, review.ErrNotReady)
+
+	job, err := f.remote.Job(ctx, second)
+	require.NoError(t, err)
+	assert.Equal(t, review.RegistrationIncomplete, job.Registration)
+
+	prepared, err := f.reviewer("tick-1").Prepare(ctx, second)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+	assert.Equal(t, "registration is incomplete", prepared.SkipDetail)
+	stored, err := f.store.GetJob(ctx, second)
+	require.NoError(t, err)
+	assert.Nil(t, stored.Claim, "no claim was taken")
+	assert.Zero(t, stored.Checkpoint.Version)
+
+	require.NoError(t, f.remote.Transport.Do(ctx, http.MethodPost, "/txe/jobs/"+second+"/ready", apigen.TxeReadyRequest{
+		Package: apigen.TxePackageEvidence{Digest: digest, Path: dir, MachineId: first.MachineID}, Actor: actor,
+	}, nil))
+	prepared, err = f.reviewer("tick-2").Prepare(ctx, second)
+	require.NoError(t, err)
+	assert.Empty(t, prepared.Skipped)
+	assert.Equal(t, second, prepared.Claim.JobID)
+}
