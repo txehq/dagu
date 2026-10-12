@@ -130,7 +130,7 @@ Rules for the script:
 
 - Do not write a credential into a deliverable or into a file under the output directories. Files are published as they are; only step output is masked.
 - Do not print a multi-line credential one line at a time. A value is masked when it appears whole.
-- For Kubernetes, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig.
+- For your script's own Kubernetes calls, prefer `kubectl --context <name>` over a credential reference. The worker's `HOME` holds the kubeconfig. That does not cover a target check: a Kubernetes target with `pre_run` or `reconcile` still needs the `TXE_KUBECONFIG` file reference described under Targets, and registration refuses the job without it.
 
 If the file is missing or unreadable when a run starts, the run fails before the script starts, and the run's log on the hub names the reference. That is a login to repair on this machine, not a reason to retire the job.
 
