@@ -449,6 +449,37 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			Admitted: action.Admitted, AdmittedRef: action.AdmittedRef,
 		})
 	}
+	// stored is the execution the registry holds as admitted for this
+	// attempt. keep writes one the probe recovered from the service's record
+	// of the request, when the action stays uncertain: the registry takes
+	// it once, never replaces it, and binds every later outcome to it. From
+	// then on the retry is read from the run by that execution alone, so a
+	// record the service later loses or cannot read no longer decides
+	// anything, and the owner is never told that nothing is known of a retry
+	// the service was seen to admit.
+	//
+	// A registry that refuses it stops nothing: the action is as it was, and
+	// the next review reads the service's record again. Only a claim that is
+	// no longer this review's ends the review.
+	stored := action.AdmittedRef
+	keep := func(detail string) error {
+		if action.Name != RetryRunAction || action.AdmittedRef == "" || action.AdmittedRef == stored {
+			return nil
+		}
+		err := r.Registry.FinishAction(ctx, FinishRequest{
+			Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
+			State: ActionUncertain, Detail: detail, Admitted: true, AdmittedRef: action.AdmittedRef,
+		})
+		switch {
+		case err == nil:
+			stored = action.AdmittedRef
+		case errors.Is(err, ErrStaleFence), errors.Is(err, ErrClaimHeld):
+			return err
+		default:
+			fmt.Fprintf(os.Stderr, "txe review: action %s of %s: execution %s, which the service's record of the retry request names, was not recorded: %v; the action stays uncertain and the record is read again\n", action.ID, job.ID, action.AdmittedRef, err)
+		}
+		return nil
+	}
 	if action.State == ActionExecuting {
 		// Until its grant has run out, the attempt's holder may still be
 		// about to perform the effect. A probe now could see nothing and
@@ -531,6 +562,9 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// start of the review; both only round the half hour. The time
 			// decides when the owner is told and nothing else: it never
 			// dispatches, settles or re-opens anything.
+			if err := keep(res.Detail); err != nil {
+				return err
+			}
 			if escalate && !claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
 				// Telling the owner must not stop the review: a registry
 				// that cannot take the exception would otherwise keep the
@@ -581,6 +615,12 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 			// exception and not a question, so the action is not ended and
 			// keeps being probed. A registry that cannot take the
 			// exception does not stop the review.
+			//
+			// An execution recovered from the service's record in this
+			// review is not on record yet: it is written now.
+			if err := keep(fmt.Sprintf("%s; the registry does not record execution %s as dispatched yet, so the retry is settled by a later review", res.Detail, action.AdmittedRef)); err != nil {
+				return err
+			}
 			if escalate && !claim.AcquiredAt.Before(action.AttemptStartedAt.Add(reservationStalledAfter)) {
 				if err := r.raiseUnsettled(ctx, claim, job, action); err != nil {
 					fmt.Fprintf(os.Stderr, "txe review: action %s of %s: %v; the action stays uncertain and the review goes on\n", action.ID, job.ID, err)
@@ -609,7 +649,7 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 	case EffectUnknown:
 	}
 	if !escalate {
-		return nil
+		return keep(res.Detail)
 	}
 	// Still unknown: ask a human once, then stop probing this action.
 	if err := r.escalate(ctx, claim, job, action, res.Detail); err != nil {

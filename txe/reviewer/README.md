@@ -218,12 +218,22 @@ files.
   minutes from the registry's grant of the attempt, the exception
   `retry_record_unreadable` is reported about that attempt: check that the
   service's API can read the run's executions. It asks for no decision.
-  An execution the record names is written on the action with the outcome
-  that settles it. The registry does not take a second uncertain outcome
-  for the same attempt, so while a recovered execution is still a
-  reservation it is not stored: every review reads the record again. If
-  the service then says it has no record of the request at all, the
-  retry goes to the owner.
+  An execution the record names is written on the action: with the
+  outcome that settles it, or, while the action stays uncertain (the
+  execution is still a reservation, or the registry does not take it as
+  dispatched yet), on its own. The registry checks it against the run's
+  history for this attempt's request, stores it once and never replaces
+  it, and holds every later outcome of the attempt to it. From then on
+  the retry is read from the run by that execution, and the record of
+  the request is not asked for again: if the service later loses the
+  record or cannot read it, the retry is still the reservation it was
+  seen to be. It is not sent again, not put to the owner as unknown, and
+  not taken for a retry that had no effect.
+  If the registry refuses to store it (an execution abandoned in the
+  meantime, or a registry older than this), the review goes on, the
+  refusal is printed in the step's log, and the next review reads the
+  record again. Only until it is stored can the service saying it has no
+  record of the request send the retry to the owner.
   What is recorded: done, only when the service admitted the request,
   named the execution it admitted it as, and that execution is seen on
   the run queued, running or over, with its reference as receipt and its

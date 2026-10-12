@@ -1447,8 +1447,11 @@ func (r *Remote) FinishAction(ctx context.Context, req FinishRequest) error {
 	if req.Receipt != "" {
 		body.Receipt = &req.Receipt
 	}
-	if req.Detail != "" || req.Admitted {
-		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: req.Admitted, AdmittedRef: req.AdmittedRef})
+	// An execution the destination named is written whenever it is known,
+	// and always as admitted: the registry stores it that way, and refuses
+	// one that says otherwise.
+	if admitted := req.Admitted || req.AdmittedRef != ""; req.Detail != "" || admitted {
+		body.Outcome, _ = json.Marshal(actionOutcome{Detail: req.Detail, Admitted: admitted, AdmittedRef: req.AdmittedRef})
 	}
 	return r.do(ctx, http.MethodPut, jobPath(req.JobID, "actions", req.ActionID), body, nil)
 }
