@@ -331,22 +331,41 @@ func TestHTTPProviderFindsHowTheProviderTakesTheSecret(t *testing.T) {
 		assert.Equal(t, []string{"form", "header"}, e.sent())
 	})
 
-	// The refresh token itself is refused. The way the secret is sent is not
-	// yet known, so both are tried, and the answer about the token is kept.
-	t.Run("RefusedBothWays", func(t *testing.T) {
+	// The refresh token itself is refused. A provider judges the token only
+	// once it has accepted the client, so that refusal is the answer, the
+	// other way is not tried, and nothing that happens to another request
+	// can take the refusal back.
+	t.Run("TheTokenIsRefused", func(t *testing.T) {
 		t.Parallel()
 		var refused *RefusedError
-		for _, takes := range []string{"header", "form"} {
+		for takes, want := range map[string][]string{"header": {"header"}, "form": {"header", "form"}} {
 			e := newPickyEndpoint(t, takes)
 			e.rightWayStatus, e.rightWayBody = http.StatusBadRequest, `{"error":"invalid_grant"}`
-			_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+			provider := e.provider(t, ClientAuthDetect)
+			_, err := provider.Refresh(ctx, secretRefreshToken)
 			require.ErrorAs(t, err, &refused)
 			assert.Equal(t, "invalid_grant", refused.Code, "a provider that takes the secret in the %s", takes)
-			assert.Equal(t, []string{"header", "form"}, e.sent())
+			assert.Equal(t, want, e.sent())
+
+			_, err = provider.Refresh(ctx, secretRefreshToken)
+			require.ErrorAs(t, err, &refused)
+			assert.Equal(t, append(want, takes), e.sent(), "the way the provider judged the token by is its way from then on")
 		}
 	})
 
-	// Refused one way and no answer the other: nothing is known.
+	t.Run("TheTokenIsRefusedAndTheOtherWayWouldGetNoAnswer", func(t *testing.T) {
+		t.Parallel()
+		var refused *RefusedError
+		e := newPickyEndpoint(t, "header")
+		e.rightWayStatus, e.rightWayBody = http.StatusBadRequest, `{"error":"invalid_grant"}`
+		e.wrongWayStatus, e.wrongWayBody = http.StatusBadGateway, `<html>`
+		_, err := e.provider(t, ClientAuthDetect).Refresh(ctx, secretRefreshToken)
+		require.ErrorAs(t, err, &refused, "a definite refusal is not turned into no answer")
+		assert.Equal(t, []string{"header"}, e.sent())
+	})
+
+	// The client is refused one way and there is no answer the other: nothing
+	// is known, because the refusal may have been about the way alone.
 	t.Run("RefusedThenNoAnswer", func(t *testing.T) {
 		t.Parallel()
 		var refused *RefusedError

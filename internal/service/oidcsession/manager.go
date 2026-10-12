@@ -25,13 +25,22 @@
 // by one process at a time; a claim runs out, so a process that died does not
 // hold a session for long.
 //
+// Processes that share a store compare times written by each other's clocks.
+// Those clocks are required to agree to within maxClockSkew, and every such
+// comparison is made against the process's interest by that much: a session
+// another process confirmed counts as that much older, and another process's
+// claim as holding that much longer. Clocks further apart than that are a
+// deployment fault this package cannot see, and they shorten or lengthen the
+// times here by the excess.
+//
 // An end the store did not take, because a write failed, is known only to
 // the process that decided it. That process refuses the session from then on
-// and keeps trying to write the end. Another process, and the same one after
-// a restart, go by the store. They stop serving the session when the provider
-// next refuses its refresh token, which a sign-out brings about by revoking
-// the token at once, and in any case they never serve it past the limit
-// without the provider's confirmation.
+// and tries to write the end again at each request for the session and at
+// each sign-in. Another process, and the same one after a restart, go by the
+// store. They stop serving the session when the provider next refuses its
+// refresh token, which a sign-out brings about by revoking the token at once,
+// and in any case they never serve it past the limit without the provider's
+// confirmation.
 //
 // What this package bounds is the next request. A connection that was
 // already open when a session ended, such as an event stream or a terminal
@@ -67,6 +76,10 @@ const (
 	// holds. It is longer than a provider call takes, so that only a process
 	// that died holds a claim until it runs out.
 	refreshClaim = 20 * time.Second
+
+	// maxClockSkew is how far apart the clocks of hub processes that share a
+	// session store may be. See the package documentation.
+	maxClockSkew = 10 * time.Second
 
 	// casAttempts is how often a write that lost to another writer is made
 	// again on what that writer stored.
@@ -149,6 +162,8 @@ type Session struct {
 	// LastConfirmedAt is when the provider last granted a refresh, or the
 	// sign-in itself.
 	LastConfirmedAt time.Time `json:"last_confirmed_at"`
+	// ConfirmedBy names the hub process whose clock wrote LastConfirmedAt.
+	ConfirmedBy string `json:"confirmed_by,omitempty"`
 	// Rotations counts the refreshes the provider granted.
 	Rotations int `json:"rotations"`
 	// EndedAt and EndReason are set once, when the session ends.
@@ -198,6 +213,14 @@ type decision struct {
 	// revoke says the ended record's refresh token is to be revoked at the
 	// provider.
 	revoke bool
+	// revoked is the encrypted refresh token the provider has already been
+	// asked, successfully, to revoke for this decision, while the store had
+	// not taken the end. A record that holds another one by the time the
+	// store does has that one revoked as well.
+	revoked string
+	// expires is when the session's hub token expires, if that is known.
+	// After it nothing can present the session, and the decision is dropped.
+	expires time.Time
 }
 
 // flight is one refresh in progress, which other requests for the same
@@ -255,7 +278,7 @@ func (m *Manager) Create(ctx context.Context, who Identity, refreshToken string,
 	session := &Session{
 		Schema: schemaVersion, ID: hex.EncodeToString(raw[:]),
 		UserID: who.UserID, Issuer: who.Issuer, Subject: who.Subject,
-		RefreshToken: encrypted, CreatedAt: now, ExpiresAt: expiresAt.UTC(), LastConfirmedAt: now,
+		RefreshToken: encrypted, CreatedAt: now, ExpiresAt: expiresAt.UTC(), LastConfirmedAt: now, ConfirmedBy: m.owner,
 	}
 	data, err := encode(session)
 	if err != nil {
@@ -285,6 +308,7 @@ func (m *Manager) purge(ctx context.Context, now time.Time) {
 		}
 	}
 	m.mu.Unlock()
+	m.reconcile(ctx, now)
 
 	cursor := ""
 	for {
@@ -309,17 +333,53 @@ func (m *Manager) purge(ctx context.Context, now time.Time) {
 	}
 }
 
+// reconcile tries again to write the ends the store did not take, and drops
+// those of sessions whose hub token has expired. It runs at sign-in, so that
+// an end is not left waiting for a request that may never come.
+func (m *Manager) reconcile(ctx context.Context, now time.Time) {
+	m.mu.Lock()
+	pending := make(map[string]decision, len(m.undone))
+	for id, d := range m.undone {
+		if !d.expires.IsZero() && !now.Before(d.expires) {
+			delete(m.undone, id)
+			continue
+		}
+		pending[id] = d
+	}
+	m.mu.Unlock()
+	for id, d := range pending {
+		_ = m.conclude(ctx, id, d)
+	}
+}
+
 // Check decides whether a request carrying this session may be served now.
 // It returns nil, ErrSessionEnded, ErrProviderUnavailable, or an error from
 // the store, which the caller must treat as a failure and not as an answer.
 func (m *Manager) Check(ctx context.Context, sessionID string, who Identity) error {
-	if d, ok := m.decided(sessionID); ok {
-		// The session's end was decided and the store did not take it. It is
-		// tried again, and the session is refused whether or not it takes.
-		if err := m.conclude(ctx, sessionID, d); err != nil {
-			return err
-		}
+	if err := m.refuseIfDecided(ctx, sessionID); err != nil {
+		return err
 	}
+	if err := m.check(ctx, sessionID, who); err != nil {
+		return err
+	}
+	// An end may have been decided while this request was being checked, by
+	// a sign-out whose write failed. It is not served on what the store says.
+	return m.refuseIfDecided(ctx, sessionID)
+}
+
+// refuseIfDecided refuses a session whose end this process has decided and
+// the store has not taken. The write is tried again, and the session is
+// refused whether or not it takes. It returns nil when there is no such
+// decision, or when the one there was does not apply to what is stored now.
+func (m *Manager) refuseIfDecided(ctx context.Context, sessionID string) error {
+	d, ok := m.decided(sessionID)
+	if !ok {
+		return nil
+	}
+	return m.conclude(ctx, sessionID, d)
+}
+
+func (m *Manager) check(ctx context.Context, sessionID string, who Identity) error {
 	session, _, err := m.load(ctx, sessionID)
 	if err != nil {
 		return err
@@ -328,7 +388,7 @@ func (m *Manager) Check(ctx context.Context, sessionID string, who Identity) err
 	if err := usable(session, who, now); err != nil {
 		return err
 	}
-	age := now.Sub(session.LastConfirmedAt)
+	age := m.age(session, now)
 	if age < m.cfg.RevalidateAfter {
 		return nil
 	}
@@ -361,6 +421,22 @@ func (m *Manager) Check(ctx context.Context, sessionID string, who Identity) err
 	return m.afterRefresh(ctx, sessionID, who, current.err)
 }
 
+// age is how long ago the provider confirmed a session, as this process must
+// count it. A time another process's clock wrote may be ahead of this one's
+// by maxClockSkew, so such a session counts as that much older. A time that
+// is in the future even so cannot be trusted at all, and the session counts
+// as past its limit: nothing is served until the provider confirms it.
+func (m *Manager) age(session *Session, now time.Time) time.Duration {
+	age := now.Sub(session.LastConfirmedAt)
+	if session.ConfirmedBy != m.owner {
+		age += maxClockSkew
+	}
+	if age < 0 {
+		return m.cfg.RevalidateLimit
+	}
+	return age
+}
+
 // afterRefresh turns the outcome of a refresh into the answer for a request.
 // It reads the session again: what counts is what is stored now.
 func (m *Manager) afterRefresh(ctx context.Context, sessionID string, who Identity, refreshErr error) error {
@@ -375,7 +451,7 @@ func (m *Manager) afterRefresh(ctx context.Context, sessionID string, who Identi
 	if err := usable(session, who, now); err != nil {
 		return err
 	}
-	if now.Sub(session.LastConfirmedAt) >= m.cfg.RevalidateLimit {
+	if m.age(session, now) >= m.cfg.RevalidateLimit {
 		return ErrProviderUnavailable
 	}
 	return nil
@@ -425,7 +501,7 @@ func (m *Manager) finish(sessionID string, current *flight) {
 
 // refresh asks the provider once and records the answer.
 func (m *Manager) refresh(ctx context.Context, sessionID string) error {
-	session, err := m.claim(ctx, sessionID)
+	session, tookOver, err := m.claim(ctx, sessionID)
 	if errors.Is(err, errFresh) {
 		return nil
 	}
@@ -442,6 +518,18 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	renewal, err := m.provider.Refresh(ctx, refreshToken)
 	var refused *RefusedError
 	switch {
+	case errors.As(err, &refused) && tookOver:
+		// This process took the session over from one whose claim had run
+		// out. That process may have exchanged the same refresh token a
+		// moment ago and not stored the new one yet, and a provider that
+		// accepts each token once refuses this one for that reason alone. So
+		// this refusal is not believed. The claim is given up, the other
+		// process's result goes in if it comes, and the next attempt, which
+		// takes nothing over, is believed.
+		slog.Warn("OIDC session not revalidated: the refresh was refused after taking over another hub process's claim",
+			slog.String("session", sessionID), slog.String("oauth_error", refused.Code))
+		m.release(ctx, sessionID)
+		return errNothingUsable
 	case errors.As(err, &refused):
 		slog.Info("OIDC session ended: the identity provider refused the refresh",
 			slog.String("session", sessionID), slog.String("oauth_error", refused.Code), slog.Int("status", refused.Status))
@@ -493,7 +581,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 			stored.RefreshToken = replacement
 		}
 		if confirmed {
-			stored.LastConfirmedAt = m.now().UTC()
+			stored.LastConfirmedAt, stored.ConfirmedBy = m.now().UTC(), m.owner
 			stored.Rotations++
 		}
 	})
@@ -507,43 +595,56 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 }
 
 // claim takes a session's refresh for this process, in the session's record,
-// and returns the session as claimed. It returns errFresh when the session
-// has been confirmed since the caller looked, and errClaimedElsewhere when
-// another hub process holds a claim that has not run out.
-func (m *Manager) claim(ctx context.Context, sessionID string) (*Session, error) {
+// and returns the session as claimed. tookOver reports that the record named
+// another process whose claim had run out. It returns errFresh when the
+// session has been confirmed since the caller looked, and errClaimedElsewhere
+// when another hub process holds a claim that has not run out.
+func (m *Manager) claim(ctx context.Context, sessionID string) (session *Session, tookOver bool, err error) {
 	for range casAttempts {
 		session, raw, err := m.load(ctx, sessionID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if session.EndedAt != nil {
-			return nil, ErrSessionEnded
+			return nil, false, ErrSessionEnded
 		}
 		now := m.now()
-		if now.Sub(session.LastConfirmedAt) < m.cfg.RevalidateAfter {
-			return nil, errFresh
+		if m.age(session, now) < m.cfg.RevalidateAfter {
+			return nil, false, errFresh
 		}
-		if session.RefreshOwner != "" && session.RefreshOwner != m.owner &&
-			session.RefreshUntil != nil && now.Before(*session.RefreshUntil) {
-			return nil, errClaimedElsewhere
+		tookOver := session.RefreshOwner != "" && session.RefreshOwner != m.owner
+		if tookOver && claimHolds(session.RefreshUntil, now) {
+			return nil, false, errClaimedElsewhere
 		}
 		until := now.Add(refreshClaim).UTC()
 		session.RefreshOwner, session.RefreshUntil = m.owner, &until
 		data, err := encode(session)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		err = m.col.CompareAndSwap(ctx, sessionID, raw, data)
 		switch {
 		case err == nil:
-			return session, nil
+			return session, tookOver, nil
 		case errors.Is(err, persis.ErrNotFound):
-			return nil, ErrSessionEnded
+			return nil, false, ErrSessionEnded
 		case !errors.Is(err, persis.ErrConflict):
-			return nil, fmt.Errorf("oidcsession: claim the session: %w", err)
+			return nil, false, fmt.Errorf("oidcsession: claim the session: %w", err)
 		}
 	}
-	return nil, errors.New("oidcsession: the session kept changing while it was being claimed")
+	return nil, false, errors.New("oidcsession: the session kept changing while it was being claimed")
+}
+
+// claimHolds reports whether another process's claim, good until the given
+// time by that process's clock, still holds by this one's. That clock may be
+// behind this one by maxClockSkew, so the claim holds that much longer. A
+// claim that would end later than any claim made now could is not one a
+// process within that skew made, and does not hold.
+func claimHolds(until *time.Time, now time.Time) bool {
+	if until == nil {
+		return false
+	}
+	return now.Before(until.Add(maxClockSkew)) && !until.After(now.Add(refreshClaim+maxClockSkew))
 }
 
 // release gives up this process's claim after a provider call that told it
@@ -638,21 +739,31 @@ func (m *Manager) End(ctx context.Context, sessionID, reason string) error {
 	return err
 }
 
-// endAndRevoke ends a session and, if the decision says so, revokes the
-// refresh token its record held.
+// endAndRevoke ends a session and, if the decision that was applied says so,
+// revokes the refresh token its record held.
 //
 // The token is revoked even when the store did not take the end. This
 // process refuses the session either way, but another hub process goes by the
 // store, and the revocation is what makes the provider refuse it there.
 func (m *Manager) endAndRevoke(ctx context.Context, sessionID string, d decision) (ended bool, err error) {
-	held, ended, err := m.end(ctx, sessionID, d)
-	if d.revoke && held != "" {
-		m.revokeHeld(ctx, held)
-		if err != nil {
-			m.revocationDone(sessionID)
+	out, err := m.end(ctx, sessionID, d)
+	if out.applied.revoke && out.held != "" && out.held != out.applied.revoked {
+		if m.revokeHeld(ctx, out.held) && err != nil {
+			m.noteRevoked(sessionID, out.held)
 		}
 	}
-	return ended, err
+	return out.ended, err
+}
+
+// ending is what end did.
+type ending struct {
+	// ended reports whether the session is ended in the store now.
+	ended bool
+	// held is the encrypted refresh token of the record end ended, or of the
+	// record it read and could not write.
+	held string
+	// applied is the decision end applied.
+	applied decision
 }
 
 // conclude ends a session for good and returns the answer for the request
@@ -675,55 +786,62 @@ func (m *Manager) conclude(ctx context.Context, sessionID string, d decision) er
 }
 
 // end marks a session ended, keeping the record without its refresh token.
-// It reports whether the session is ended now, and returns the encrypted
-// refresh token of the record it ended, or of the record it read and could
-// not write.
 //
-// A decision the store did not take is remembered, and forgotten once the
-// store holds it or it turns out not to apply.
-func (m *Manager) end(ctx context.Context, sessionID string, d decision) (held string, ended bool, err error) {
+// The decision applied is the one given, unless this process has decided a
+// sign-out for the session that the store has not taken: that one is wider
+// and is applied instead.
+//
+// A decision the store did not take is remembered. It is forgotten once the
+// session is ended in the store, or, for a decision about one refresh token,
+// once the record holds another.
+func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending, error) {
+	failure := errors.New("oidcsession: the session kept changing while it was being ended")
+	held := ""
 	for range casAttempts {
+		d = m.widest(sessionID, d)
 		session, raw, err := m.load(ctx, sessionID)
 		if errors.Is(err, ErrSessionEnded) {
 			m.settle(sessionID)
-			return "", true, nil
+			return ending{ended: true, applied: d}, nil
 		}
 		if err != nil {
-			m.remember(sessionID, d)
-			return "", false, err
+			failure = err
+			break
 		}
+		d.expires = session.ExpiresAt
 		if session.EndedAt != nil {
 			m.settle(sessionID)
-			return "", true, nil
+			return ending{ended: true, applied: d}, nil
 		}
 		if d.ifToken != "" && session.RefreshToken != d.ifToken {
-			m.settle(sessionID)
-			return "", false, nil
+			m.drop(sessionID, d.ifToken)
+			return ending{applied: d}, nil
 		}
-		held := session.RefreshToken
+		held = session.RefreshToken
 		now := m.now().UTC()
 		session.EndedAt, session.EndReason, session.RefreshToken = &now, d.reason, ""
 		session.RefreshOwner, session.RefreshUntil = "", nil
 		data, err := encode(session)
 		if err != nil {
-			m.remember(sessionID, d)
-			return "", false, err
+			failure = err
+			break
 		}
 		err = m.col.CompareAndSwap(ctx, sessionID, raw, data)
-		switch {
-		case err == nil:
+		if err == nil {
 			m.settle(sessionID)
-			return held, true, nil
-		case errors.Is(err, persis.ErrNotFound):
-			m.settle(sessionID)
-			return "", true, nil
-		case !errors.Is(err, persis.ErrConflict):
-			m.remember(sessionID, d)
-			return held, false, fmt.Errorf("oidcsession: end the session: %w", err)
+			return ending{ended: true, held: held, applied: d}, nil
 		}
+		if errors.Is(err, persis.ErrNotFound) {
+			m.settle(sessionID)
+			return ending{ended: true, applied: d}, nil
+		}
+		if !errors.Is(err, persis.ErrConflict) {
+			failure = fmt.Errorf("oidcsession: end the session: %w", err)
+			break
+		}
+		held = ""
 	}
-	m.remember(sessionID, d)
-	return "", false, errors.New("oidcsession: the session kept changing while it was being ended")
+	return ending{held: held, applied: m.remember(sessionID, d)}, failure
 }
 
 func (m *Manager) decided(sessionID string) (decision, bool) {
@@ -733,28 +851,49 @@ func (m *Manager) decided(sessionID string) (decision, bool) {
 	return d, ok
 }
 
-// remember keeps a decision the store did not take. A sign-out is never
-// replaced by a narrower decision.
-func (m *Manager) remember(sessionID string, d decision) {
+// widest returns the decision to apply to a session: the one given, or the
+// sign-out this process has decided for it and the store has not taken.
+func (m *Manager) widest(sessionID string, d decision) decision {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if earlier, ok := m.undone[sessionID]; ok && earlier.ifToken == "" {
-		return
+		return earlier
 	}
-	m.undone[sessionID] = d
+	return d
 }
 
-// revocationDone notes that the refresh token of a remembered end has been
-// revoked, so that it is not revoked again when the store takes the end.
-func (m *Manager) revocationDone(sessionID string) {
+// remember keeps a decision the store did not take and returns what is kept.
+// A sign-out is never replaced by a decision about one refresh token, and
+// what is known about a kept decision is not lost.
+func (m *Manager) remember(sessionID string, d decision) decision {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if earlier, ok := m.undone[sessionID]; ok {
+		if earlier.ifToken == "" {
+			d.reason, d.ifToken, d.revoke, d.revoked = earlier.reason, "", earlier.revoke, earlier.revoked
+		}
+		if d.expires.IsZero() {
+			d.expires = earlier.expires
+		}
+	}
+	m.undone[sessionID] = d
+	return d
+}
+
+// noteRevoked notes which refresh token of a remembered end the provider has
+// revoked, so that the same one is not revoked again when the store takes the
+// end.
+func (m *Manager) noteRevoked(sessionID, held string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if d, ok := m.undone[sessionID]; ok {
-		d.revoke = false
+		d.revoked = held
 		m.undone[sessionID] = d
 	}
 }
 
+// settle forgets whatever was remembered about a session that is ended in the
+// store.
 func (m *Manager) settle(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -762,29 +901,47 @@ func (m *Manager) settle(sessionID string) {
 	delete(m.failedAt, sessionID)
 }
 
-// revokeHeld revokes the refresh token an ended record held.
-func (m *Manager) revokeHeld(ctx context.Context, held string) {
-	if held == "" {
-		return
-	}
-	if refreshToken, err := m.enc.Decrypt(held); err == nil {
-		m.revokeAtProvider(ctx, refreshToken)
+// drop forgets a remembered decision about one refresh token, which the
+// record no longer holds. A sign-out decided meanwhile is not that decision,
+// and stays.
+func (m *Manager) drop(sessionID, ifToken string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d, ok := m.undone[sessionID]; ok && d.ifToken == ifToken {
+		delete(m.undone, sessionID)
 	}
 }
 
+// revokeHeld revokes the refresh token an ended record held, and reports
+// whether the provider took the revocation.
+func (m *Manager) revokeHeld(ctx context.Context, held string) bool {
+	if held == "" {
+		return false
+	}
+	refreshToken, err := m.enc.Decrypt(held)
+	if err != nil {
+		return false
+	}
+	return m.revokeAtProvider(ctx, refreshToken)
+}
+
 // revokeAtProvider asks the provider to end refresh tokens that must not be
-// used again. It is best effort: the hub's own record is what ends a session.
-func (m *Manager) revokeAtProvider(ctx context.Context, refreshTokens ...string) {
+// used again, and reports whether it took every one. It is best effort: the
+// hub's own record is what ends a session.
+func (m *Manager) revokeAtProvider(ctx context.Context, refreshTokens ...string) bool {
 	seen := map[string]bool{}
+	all := true
 	for _, token := range refreshTokens {
 		if token == "" || seen[token] {
 			continue
 		}
 		seen[token] = true
 		if err := m.provider.Revoke(context.WithoutCancel(ctx), token); err != nil {
+			all = false
 			slog.Warn("OIDC refresh token could not be revoked at the identity provider", slog.String("cause", fmt.Sprintf("%T", err)))
 		}
 	}
+	return all
 }
 
 // load reads a session and the bytes it is stored as. A session that does not

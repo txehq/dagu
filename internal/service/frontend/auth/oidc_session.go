@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	oidc "github.com/coreos/go-oidc"
@@ -30,7 +31,8 @@ func NewOIDCSessionManager(session config.AuthOIDCSession, oidcCfg *BuiltinOIDCC
 		return nil, errors.New("OIDC sessions need the OIDC sign-in to be configured")
 	}
 	var endpoints struct {
-		Revocation string `json:"revocation_endpoint"`
+		Revocation  string   `json:"revocation_endpoint"`
+		AuthMethods []string `json:"token_endpoint_auth_methods_supported"`
 	}
 	// A provider without a revocation endpoint is not an error: sign-out
 	// still ends the hub's session, which is what lets nobody in.
@@ -41,7 +43,7 @@ func NewOIDCSessionManager(session config.AuthOIDCSession, oidcCfg *BuiltinOIDCC
 		RevocationURL: endpoints.Revocation,
 		ClientID:      oidcCfg.OAuth2Config.ClientID,
 		ClientSecret:  oidcCfg.OAuth2Config.ClientSecret,
-		ClientAuth:    oidcClientAuth(oidcCfg.OAuth2Config.Endpoint.AuthStyle),
+		ClientAuth:    oidcClientAuth(oidcCfg.OAuth2Config.Endpoint.AuthStyle, endpoints.AuthMethods),
 	})
 	if err != nil {
 		return nil, err
@@ -74,19 +76,24 @@ func newIDTokenChecker(verifier *oidc.IDTokenVerifier) oidcsession.IDTokenChecke
 	}
 }
 
-// oidcClientAuth is the way the sign-in's code exchange sends the client
-// secret, for the refresh to send it the same way.
-func oidcClientAuth(style oauth2.AuthStyle) oidcsession.ClientAuth {
+// oidcClientAuth is the way the refresh sends the client secret: the way the
+// sign-in's code exchange is configured to, and otherwise what the provider's
+// discovery document settles. A provider that lists the form and not the
+// header takes the form. Anything else is found out as the exchange finds it
+// out: the header first, then the form. A provider may list the header and
+// still refuse it for this client, so the list alone does not settle it.
+func oidcClientAuth(style oauth2.AuthStyle, supported []string) oidcsession.ClientAuth {
 	switch style {
 	case oauth2.AuthStyleInParams:
 		return oidcsession.ClientAuthForm
 	case oauth2.AuthStyleInHeader:
 		return oidcsession.ClientAuthHeader
 	case oauth2.AuthStyleAutoDetect:
-		return oidcsession.ClientAuthDetect
-	default:
-		return oidcsession.ClientAuthDetect
 	}
+	if slices.Contains(supported, "client_secret_post") && !slices.Contains(supported, "client_secret_basic") {
+		return oidcsession.ClientAuthForm
+	}
+	return oidcsession.ClientAuthDetect
 }
 
 // unverifiedIDTokenIdentity reads the issuer and subject a JWT names, without

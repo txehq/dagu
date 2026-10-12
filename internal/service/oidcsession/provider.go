@@ -64,6 +64,17 @@ var knownRefusalCodes = map[string]bool{
 	"access_denied":          true,
 }
 
+// refusalsOfTheGrant are the refusal codes that say the provider judged the
+// refresh token itself. A provider judges the grant only after it has
+// accepted the client, so such a refusal also says the client secret was sent
+// in a way the provider takes.
+var refusalsOfTheGrant = map[string]bool{
+	"invalid_grant": true,
+	"invalid_scope": true,
+	"not_allowed":   true,
+	"access_denied": true,
+}
+
 func refusalCode(code string) string {
 	if knownRefusalCodes[code] {
 		return code
@@ -156,29 +167,34 @@ func (p *HTTPProvider) Refresh(ctx context.Context, refreshToken string) (Renewa
 	}
 
 	// The provider's way of taking the secret is not known yet. The header is
-	// tried first. A refusal may then be about the client and not about the
-	// refresh token, so the form is tried before the refusal is believed. A
-	// refused request has used nothing up, so asking twice is safe. Whichever
-	// way is granted is the provider's way from then on.
+	// tried first. A grant, or a refusal of the refresh token itself, settles
+	// that the header is the provider's way, and is the answer.
+	//
+	// Any other refusal may be about the way the secret was sent and not
+	// about the refresh token, so the form is tried before it is believed. A
+	// refused request has used nothing up, so asking twice is safe. If the
+	// form gets no answer, nothing is known: the first refusal may have been
+	// about the header alone.
 	renewal, err := p.refresh(ctx, form(), ClientAuthHeader)
 	var refused *RefusedError
-	if err == nil {
+	switch {
+	case err == nil:
 		p.clientAuth.Store(int32(ClientAuthHeader))
 		return renewal, nil
-	}
-	if !errors.As(err, &refused) {
+	case !errors.As(err, &refused):
 		return Renewal{}, err
+	case refusalsOfTheGrant[refused.Code]:
+		p.clientAuth.Store(int32(ClientAuthHeader))
+		return Renewal{}, refused
 	}
 	renewal, err = p.refresh(ctx, form(), ClientAuthForm)
-	if err == nil {
+	var again *RefusedError
+	switch {
+	case err == nil:
 		p.clientAuth.Store(int32(ClientAuthForm))
 		return renewal, nil
-	}
-	// Refused both ways. If the header was refused for a reason other than
-	// the client, that reason is the answer about the refresh token.
-	var again *RefusedError
-	if errors.As(err, &again) && refused.Code != "invalid_client" {
-		return Renewal{}, refused
+	case errors.As(err, &again) && refusalsOfTheGrant[again.Code]:
+		p.clientAuth.Store(int32(ClientAuthForm))
 	}
 	return Renewal{}, err
 }

@@ -462,9 +462,16 @@ func TestIDTokenChecker(t *testing.T) {
 // The refresh sends the client secret the way the sign-in's exchange does.
 func TestOIDCClientAuthFollowsTheSignIn(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, oidcsession.ClientAuthDetect, oidcClientAuth(oauth2.AuthStyleAutoDetect))
-	assert.Equal(t, oidcsession.ClientAuthForm, oidcClientAuth(oauth2.AuthStyleInParams))
-	assert.Equal(t, oidcsession.ClientAuthHeader, oidcClientAuth(oauth2.AuthStyleInHeader))
+	both := []string{"client_secret_basic", "client_secret_post", "private_key_jwt"}
+	assert.Equal(t, oidcsession.ClientAuthForm, oidcClientAuth(oauth2.AuthStyleInParams, both))
+	assert.Equal(t, oidcsession.ClientAuthHeader, oidcClientAuth(oauth2.AuthStyleInHeader, []string{"client_secret_post"}))
+
+	// Not configured: what the provider's discovery document settles.
+	assert.Equal(t, oidcsession.ClientAuthForm, oidcClientAuth(oauth2.AuthStyleAutoDetect, []string{"client_secret_post", "private_key_jwt"}))
+	assert.Equal(t, oidcsession.ClientAuthDetect, oidcClientAuth(oauth2.AuthStyleAutoDetect, both),
+		"a provider that lists the header may still refuse it for this client")
+	assert.Equal(t, oidcsession.ClientAuthDetect, oidcClientAuth(oauth2.AuthStyleAutoDetect, []string{"client_secret_basic"}))
+	assert.Equal(t, oidcsession.ClientAuthDetect, oidcClientAuth(oauth2.AuthStyleAutoDetect, nil))
 }
 
 // Requests that race with a sign-out are each either served or refused, and

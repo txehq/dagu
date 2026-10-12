@@ -61,6 +61,12 @@ type fakeProvider struct {
 	issued    int
 	// ctxErrs is the state of each refresh's context when it was answered.
 	ctxErrs []error
+	// answered and after, when set, hold a refresh once the provider has
+	// decided its answer: answered reports it, and after lets it return.
+	answered chan struct{}
+	after    chan struct{}
+	// revokeErr, when set, is what every revocation fails with.
+	revokeErr error
 }
 
 func (p *fakeProvider) Refresh(ctx context.Context, refreshToken string) (Renewal, error) {
@@ -80,8 +86,36 @@ func (p *fakeProvider) Refresh(ctx context.Context, refreshToken string) (Renewa
 	renewal, err := answer(refreshToken)
 	p.mu.Lock()
 	p.ctxErrs = append(p.ctxErrs, ctx.Err())
+	answered, after := p.answered, p.after
 	p.mu.Unlock()
+	if after != nil {
+		answered <- struct{}{}
+		<-after
+	}
 	return renewal, err
+}
+
+// holdAnswer makes the next refresh wait after the provider has decided its
+// answer and before the hub receives it: the grant is issued and not yet
+// known. Refreshes that start after unhold are not held.
+func (p *fakeProvider) holdAnswer() (answered <-chan struct{}, deliver func()) {
+	reached, gate := make(chan struct{}, 1), make(chan struct{})
+	p.mu.Lock()
+	p.answered, p.after = reached, gate
+	p.mu.Unlock()
+	return reached, func() { close(gate) }
+}
+
+func (p *fakeProvider) unhold() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.answered, p.after = nil, nil
+}
+
+func (p *fakeProvider) failRevocations(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.revokeErr = err
 }
 
 func (p *fakeProvider) presented() []string {
@@ -127,6 +161,9 @@ func (p *fakeProvider) once(first string) func(string) (Renewal, error) {
 func (p *fakeProvider) Revoke(_ context.Context, refreshToken string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.revokeErr != nil {
+		return p.revokeErr
+	}
 	p.revoked = append(p.revoked, refreshToken)
 	return nil
 }
@@ -206,6 +243,17 @@ func (f *fixture) process() *Manager {
 	}, f.col, f.enc, f.provider, f.checkID)
 	require.NoError(f.t, err)
 	return manager
+}
+
+// rewrite changes the stored session directly, as another hub process would.
+func (f *fixture) rewrite(session *Session, change func(*Session)) {
+	f.t.Helper()
+	stored, raw, err := f.manager.load(context.Background(), session.ID)
+	require.NoError(f.t, err)
+	change(stored)
+	data, err := encode(stored)
+	require.NoError(f.t, err)
+	require.NoError(f.t, f.col.CompareAndSwap(context.Background(), session.ID, raw, data))
 }
 
 // heldToken is the refresh token the stored session holds, decrypted.
@@ -732,6 +780,8 @@ type failingCollection struct {
 	fail error
 	// swap, when set, decides each write: an error fails it.
 	swap func() error
+	// read, when set, is called before each read.
+	read func()
 }
 
 func (c *failingCollection) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {
@@ -782,6 +832,9 @@ func (c *failingCollection) failWritesAfter(n int) (heal func()) {
 }
 
 func (c *failingCollection) Get(ctx context.Context, id string) (*persis.Record, error) {
+	if c.read != nil {
+		c.read()
+	}
 	if c.fail != nil {
 		return nil, c.fail
 	}

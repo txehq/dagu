@@ -5,6 +5,7 @@ package oidcsession
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -25,7 +26,7 @@ func TestTwoHubProcessesAskTheProviderOnce(t *testing.T) {
 	f.provider.set(f.provider.once("refresh-token-0"))
 	other := f.process()
 	started, release := f.provider.hold()
-	f.clock.Advance(4*time.Minute + 50*time.Second)
+	f.clock.Advance(4*time.Minute + 30*time.Second)
 
 	first := make(chan error, 1)
 	go func() { first <- f.check(session) }()
@@ -34,7 +35,9 @@ func TestTwoHubProcessesAskTheProviderOnce(t *testing.T) {
 	require.NoError(t, other.Check(ctx, session.ID, alice), "inside the limit the other process serves")
 	assert.Equal(t, 1, f.provider.calls(), "and does not present the same refresh token")
 
-	f.clock.Advance(15 * time.Second)
+	// The other process counts a session it did not confirm as maxClockSkew
+	// older, and the first one's claim as holding maxClockSkew longer.
+	f.clock.Advance(25 * time.Second)
 	require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrProviderUnavailable, "past the limit it does not serve")
 	assert.Equal(t, 1, f.provider.calls())
 	assert.Nil(t, f.stored(session).EndedAt)
@@ -70,9 +73,11 @@ func TestAClaimThatRanOutIsTakenOver(t *testing.T) {
 		f.provider.free()
 
 		require.NoError(t, other.Check(ctx, session.ID, alice), "the claim still holds, and the session is inside its limit")
+		f.clock.Advance(refreshClaim)
+		require.NoError(t, other.Check(ctx, session.ID, alice), "it holds maxClockSkew longer for a process that did not make it")
 		assert.Equal(t, 1, f.provider.calls())
 
-		f.clock.Advance(refreshClaim)
+		f.clock.Advance(maxClockSkew)
 		require.NoError(t, other.Check(ctx, session.ID, alice))
 		assert.Equal(t, 2, f.provider.calls(), "the claim ran out, so the other process asked")
 		assert.Equal(t, "refresh-token-1", f.heldToken(session))
@@ -99,7 +104,7 @@ func TestAClaimThatRanOutIsTakenOver(t *testing.T) {
 		go func() { first <- f.check(session) }()
 		<-started
 		f.provider.free()
-		f.clock.Advance(refreshClaim)
+		f.clock.Advance(refreshClaim + maxClockSkew)
 		require.NoError(t, other.Check(ctx, session.ID, alice))
 		require.Equal(t, "refresh-token-1", f.heldToken(session))
 
@@ -129,7 +134,7 @@ func TestAClaimThatRanOutIsTakenOver(t *testing.T) {
 		<-firstStarted
 
 		secondStarted, releaseSecond := f.provider.hold()
-		f.clock.Advance(refreshClaim)
+		f.clock.Advance(refreshClaim + maxClockSkew)
 		second := make(chan error, 1)
 		go func() { second <- other.Check(ctx, session.ID, alice) }()
 		<-secondStarted
@@ -213,6 +218,7 @@ func TestASignOutTheStoreDidNotTake(t *testing.T) {
 
 		f.clock.Advance(4 * time.Minute)
 		require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrSessionEnded, "until the provider refuses the revoked token")
+		require.Equal(t, 1, f.provider.calls())
 		stored := f.stored(session)
 		require.NotNil(t, stored.EndedAt)
 		assert.Equal(t, "refused by the identity provider: invalid_grant", stored.EndReason)
@@ -495,4 +501,307 @@ func TestARefreshOutlivesTheRequestThatStartedIt(t *testing.T) {
 	assert.Equal(t, "refresh-token-1", f.heldToken(session), "and its answer was stored")
 	require.NoError(t, f.check(session))
 	assert.Equal(t, 1, f.provider.calls())
+}
+
+// The provider issued a grant to one process, which has not stored it yet,
+// when another process that took its claim over is refused the same refresh
+// token. A provider that accepts each token once refuses for that reason
+// alone, so the refusal is not believed, and the first process's new token
+// goes in when it arrives.
+func TestARefusalAfterTakingAClaimOverIsNotBelievedAtOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("TheFirstProcessHadBeenGranted", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.set(f.provider.once("refresh-token-0"))
+		other := f.process()
+		answered, deliver := f.provider.holdAnswer()
+		f.clock.Advance(4 * time.Minute)
+
+		first := make(chan error, 1)
+		go func() { first <- f.check(session) }()
+		<-answered // the provider has exchanged the token; the first process does not know yet
+		f.provider.unhold()
+
+		f.clock.Advance(refreshClaim + maxClockSkew)
+		require.NoError(t, other.Check(ctx, session.ID, alice), "refused, not believed, and still inside the limit")
+		require.Equal(t, []string{"refresh-token-0", "refresh-token-0"}, f.provider.presented())
+		stored := f.stored(session)
+		require.Nil(t, stored.EndedAt, "the session is not ended on that refusal")
+		assert.Empty(t, stored.RefreshOwner, "and the claim is given up")
+
+		deliver()
+		require.NoError(t, <-first)
+		assert.Equal(t, "refresh-token-1", f.heldToken(session), "the grant the first process was issued is stored")
+		assert.Nil(t, f.stored(session).EndedAt)
+		require.NoError(t, other.Check(ctx, session.ID, alice))
+		assert.Equal(t, 2, f.provider.calls())
+		assert.Empty(t, f.provider.revocations())
+	})
+
+	// The process that held the claim died. The refresh token really is
+	// refused. The first refusal is not believed, the next one is, and the
+	// session is not served past its limit in between.
+	t.Run("TheFirstProcessDied", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.set(refuse("invalid_grant"))
+		f.clock.Advance(4 * time.Minute)
+		f.rewrite(session, func(stored *Session) {
+			until := f.clock.Now().Add(-time.Minute)
+			stored.RefreshOwner, stored.RefreshUntil = "a-process-that-died", &until
+		})
+
+		require.NoError(t, f.check(session), "inside the limit")
+		require.Nil(t, f.stored(session).EndedAt)
+
+		f.clock.Advance(defaultRetryInterval)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		require.NotNil(t, f.stored(session).EndedAt)
+		assert.Equal(t, 2, f.provider.calls())
+	})
+
+	t.Run("TheFirstProcessDiedAndTheSessionIsPastItsLimit", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.set(refuse("invalid_grant"))
+		f.clock.Advance(6 * time.Minute)
+		f.rewrite(session, func(stored *Session) {
+			until := f.clock.Now().Add(-time.Minute)
+			stored.RefreshOwner, stored.RefreshUntil = "a-process-that-died", &until
+		})
+		require.ErrorIs(t, f.check(session), ErrProviderUnavailable, "not served, and not yet told it is signed out")
+		f.clock.Advance(defaultRetryInterval)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+	})
+}
+
+// A time another hub process wrote may come from a clock that is ahead. A
+// session it confirmed counts as maxClockSkew older, so that it is not served
+// past the limit in real time, and a time that is in the future even so is
+// not trusted at all.
+func TestTimesFromAnotherProcessAreCountedAgainstTheSession(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("OlderByTheAllowance", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		other := f.process()
+		f.provider.set(unavailable)
+
+		f.clock.Advance(4*time.Minute - maxClockSkew - time.Second)
+		require.NoError(t, other.Check(ctx, session.ID, alice))
+		require.Zero(t, f.provider.calls())
+		require.NoError(t, f.check(session))
+		require.Zero(t, f.provider.calls())
+
+		f.clock.Advance(time.Second)
+		require.NoError(t, other.Check(ctx, session.ID, alice))
+		assert.Equal(t, 1, f.provider.calls(), "the other process asks the provider maxClockSkew early")
+
+		// Four minutes fifty: the process that confirmed the session is ten
+		// seconds inside its limit, and the other one counts it as past.
+		f.clock.Advance(time.Minute)
+		require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrProviderUnavailable, "the other process stops serving maxClockSkew early")
+		require.NoError(t, f.check(session), "the process that confirmed it still serves")
+		assert.Nil(t, f.stored(session).EndedAt)
+	})
+
+	t.Run("ConfirmedInTheFuture", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.provider.set(unavailable)
+		f.rewrite(session, func(stored *Session) {
+			stored.LastConfirmedAt, stored.ConfirmedBy = f.clock.Now().Add(time.Hour), "a-process-with-a-fast-clock"
+		})
+		require.ErrorIs(t, f.check(session), ErrProviderUnavailable, "not served on a confirmation dated an hour from now")
+		assert.Equal(t, 1, f.provider.calls())
+
+		f.provider.set(f.provider.rotate())
+		f.clock.Advance(defaultRetryInterval)
+		require.NoError(t, f.check(session))
+		stored := f.stored(session)
+		assert.Equal(t, f.clock.Now(), stored.LastConfirmedAt, "the provider's confirmation is dated by this process")
+		assert.Equal(t, f.manager.owner, stored.ConfirmedBy)
+	})
+
+	t.Run("AClaim", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+		at := func(d time.Duration) *time.Time { until := now.Add(d); return &until }
+		assert.False(t, claimHolds(nil, now))
+		assert.True(t, claimHolds(at(time.Second), now))
+		assert.True(t, claimHolds(at(refreshClaim), now))
+		assert.True(t, claimHolds(at(-maxClockSkew+time.Second), now), "run out by a clock that may be behind")
+		assert.False(t, claimHolds(at(-maxClockSkew), now))
+		assert.True(t, claimHolds(at(refreshClaim+maxClockSkew), now), "made just now by a clock that may be ahead")
+		assert.False(t, claimHolds(at(refreshClaim+maxClockSkew+time.Second), now), "no process within the allowance made this")
+		assert.False(t, claimHolds(at(24*time.Hour), now), "a claim dated a day ahead does not hold the session for a day")
+	})
+}
+
+// What this process remembers of an end the store did not take.
+func TestARememberedEnd(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	brokenStore := func(f *fixture) *failingCollection {
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		return broken
+	}
+
+	// A sign-out is not dropped because an older decision, about a refresh
+	// token the record no longer holds, turns out not to apply.
+	t.Run("ASignOutOutlivesAnOlderDecisionAboutAToken", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		heal := brokenStore(f).failWritesAfter(0)
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+
+		require.ErrorIs(t, f.manager.conclude(ctx, session.ID, decision{reason: "refused", ifToken: "a-token-the-record-no-longer-holds"}), ErrSessionEnded)
+		_, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+
+		heal()
+		require.ErrorIs(t, f.manager.conclude(ctx, session.ID, decision{reason: "refused", ifToken: "a-token-the-record-no-longer-holds"}), ErrSessionEnded)
+		assert.Equal(t, "signed out", f.stored(session).EndReason, "the sign-out is what is applied")
+	})
+
+	// The sign-out is decided while that older decision is being looked at.
+	// The older decision does not apply to what is stored, and is dropped;
+	// the sign-out is not dropped with it.
+	t.Run("ASignOutDecidedWhileAnOlderDecisionIsDropped", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := brokenStore(f)
+		reads := 0
+		broken.read = func() {
+			reads++
+			if reads == 1 {
+				f.manager.remember(session.ID, decision{reason: "signed out", revoke: true})
+			}
+		}
+		require.NoError(t, f.manager.conclude(ctx, session.ID, decision{reason: "refused", ifToken: "a-token-the-record-no-longer-holds"}))
+		_, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered, "the sign-out is still remembered")
+
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		assert.Equal(t, "signed out", f.stored(session).EndReason)
+	})
+
+	// A sign-out whose write fails at the very moment a refresh is storing
+	// its renewal: the renewal goes in, and the request is refused all the
+	// same, the session ended and the renewed token revoked.
+	t.Run("ASignOutDecidedWhileARenewalIsBeingStored", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := brokenStore(f)
+		writes := 0
+		broken.swap = func() error {
+			writes++
+			if writes == 2 { // the first write is the claim, the second the renewal
+				f.manager.remember(session.ID, decision{reason: "signed out", revoke: true})
+			}
+			return nil
+		}
+		f.clock.Advance(4 * time.Minute)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt)
+		assert.Equal(t, "signed out", stored.EndReason)
+		assert.Equal(t, []string{"refresh-token-1"}, f.provider.revocations())
+	})
+
+	// Another hub process renews the session after the sign-out revoked its
+	// token and before the store takes the end. The token that process stored
+	// is revoked when the end is written.
+	t.Run("AnotherProcessRenewedBeforeTheStoreTookASignOut", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		other := f.process()
+		heal := brokenStore(f).failWritesAfter(0)
+
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+
+		f.clock.Advance(4 * time.Minute)
+		require.NoError(t, other.Check(ctx, session.ID, alice))
+		require.Equal(t, "refresh-token-1", f.heldToken(session))
+
+		heal()
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		require.NotNil(t, f.stored(session).EndedAt)
+		assert.Equal(t, []string{"refresh-token-0", "refresh-token-1"}, f.provider.revocations())
+		require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrSessionEnded)
+	})
+
+	// A revocation the provider did not take is not counted as done.
+	t.Run("ARevocationThatFailedIsMadeAgain", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		heal := brokenStore(f).failWritesAfter(0)
+		f.provider.failRevocations(errors.New("the provider did not answer"))
+
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		require.Empty(t, f.provider.revocations())
+
+		f.provider.failRevocations(nil)
+		heal()
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+	})
+
+	// The end is written at the next sign-in, by anyone, without a request
+	// for the session, and a decision about a session whose hub token has
+	// expired is dropped.
+	t.Run("ItIsWrittenAtTheNextSignIn", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := brokenStore(f)
+		heal := broken.failWritesAfter(0)
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		f.signIn()
+		require.Nil(t, f.stored(session).EndedAt, "the store still does not take it")
+
+		heal()
+		f.signIn()
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt)
+		assert.Equal(t, "signed out", stored.EndReason)
+		_, remembered := f.manager.decided(session.ID)
+		assert.False(t, remembered)
+	})
+
+	t.Run("ItIsDroppedWhenTheHubTokenHasExpired", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		brokenStore(f).failWritesAfter(0)
+		require.Error(t, f.manager.End(ctx, session.ID, "signed out"))
+		f.clock.Advance(24*time.Hour - time.Second)
+		f.signIn()
+		_, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered, "the hub token is still good for a second")
+
+		f.clock.Advance(time.Second)
+		f.signIn()
+		_, remembered = f.manager.decided(session.ID)
+		assert.False(t, remembered)
+		require.ErrorIs(t, f.check(session), ErrSessionEnded, "an expired session serves nothing whatever is remembered")
+	})
 }
