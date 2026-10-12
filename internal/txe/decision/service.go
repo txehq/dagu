@@ -186,10 +186,11 @@ func (s *Service) Decide(ctx context.Context, jobID, proposalID string, req Requ
 			return nil, err
 		}
 		if d.ProposalID != proposalID || !req.SameAs(requestOf(d)) {
+			// The stored decision is not returned: the key may be a retry's,
+			// of a run the caller cannot see.
 			return nil, &registry.Error{
 				Code:    CodeIdempotencyMismatch,
 				Message: "idempotency key was used for a different decision",
-				Current: d,
 			}
 		}
 		result.Decision, result.AlreadyRecorded = d, true

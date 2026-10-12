@@ -461,8 +461,27 @@ func TestTxeRunRetryReplayFollowsTheRunsWorkspace(t *testing.T) {
 		WorkspaceAccess: &api.WorkspaceAccess{All: false, Grants: []api.WorkspaceGrant{{Workspace: "ops", Role: api.UserRoleOperator}}}}).
 		WithBearerToken(token).ExpectStatus(http.StatusCreated).Send(t)
 	ops := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "opsdev", "opsdevpass1")}
+	server.Client().Post("/api/v1/users", api.CreateUserRequest{Username: "opsview", Password: "opsviewpass1", Role: api.UserRoleViewer,
+		WorkspaceAccess: &api.WorkspaceAccess{All: false, Grants: []api.WorkspaceGrant{{Workspace: "ops", Role: api.UserRoleViewer}}}}).
+		WithBearerToken(token).ExpectStatus(http.StatusCreated).Send(t)
+	viewer := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "opsview", "opsviewpass1")}
 
-	resp := ops.Post(secretPath, body).ExpectStatus(http.StatusNotFound).Send(t)
+	// Someone who may not retry is refused for that, before the run is read.
+	resp := viewer.Post(secretPath, body).ExpectStatus(http.StatusForbidden).Send(t)
+	require.NotContains(t, resp.Body, first.Decision.DecisionId)
+	resp = ops.Post(secretPath, body).ExpectStatus(http.StatusNotFound).Send(t)
+	require.NotContains(t, resp.Body, first.Decision.DecisionId)
+
+	// The key reused through the proposal decision endpoint is refused
+	// without the stored decision either.
+	resp = ops.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/proposals/%s/decisions", jobID, first.Proposal.ProposalId), map[string]any{
+		"expected_proposal_revision": first.Proposal.Revision, "binding_digest": first.Proposal.BindingDigest,
+		"verdict": "reject", "idempotency_key": "moved-retry-1",
+	}).ExpectStatus(http.StatusConflict).Send(t)
+	var reused api.Error
+	resp.Unmarshal(t, &reused)
+	require.NotNil(t, reused.Details)
+	require.Equal(t, string(decision.CodeIdempotencyMismatch), (*reused.Details)["code"])
 	require.NotContains(t, resp.Body, first.Decision.DecisionId)
 
 	// A run saved in ops is one the person can see; the key names another

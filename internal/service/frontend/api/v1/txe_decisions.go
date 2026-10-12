@@ -134,18 +134,20 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err := retry.ValidateShape(); err != nil {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
 	}
-	// Whatever is answered, the caller must be able to see the run, by its
-	// own saved workspace: a job that moved workspace says nothing about an
-	// execution saved in its old one, so a stored retry of it is not
-	// returned to someone who cannot see that execution.
-	if _, err := a.authorizeHumanTaskMutation(ctx, req.JobId, req.RunId); err != nil {
-		return nil, err
-	}
 	svc := a.txeDecisionService(store)
 	// An identical replay returns the stored decision before the run's
 	// current state is checked: after the retry ran, the run is no longer
 	// retryable, but a client recovering a lost response must still get it.
+	// The lookup authorizes the caller's right to retry first. Whatever it
+	// found is then answered only if the caller can see the run, by its own
+	// saved workspace: a job that moved workspace says nothing about an
+	// execution saved in its old one.
 	if res, found, err := svc.ReplayRetry(ctx, req.JobId, retry, actor); found || err != nil {
+		if found {
+			if _, verr := a.authorizeHumanTaskMutation(ctx, req.JobId, req.RunId); verr != nil {
+				return nil, verr
+			}
+		}
 		if err != nil {
 			return nil, txeError(err)
 		}
