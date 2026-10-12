@@ -360,7 +360,7 @@ func sentAsWritten(lit string, held any) error {
 	written, ok := new(big.Rat).SetString(lit)
 	sent, sentOK := new(big.Rat).SetString(string(out))
 	if !ok || !sentOK || written.Cmp(sent) != 0 {
-		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number, so the spec is refused. Rounding it would change the bound. Choose the bound you intend from the numbers that are sent exactly: an integer, or a decimal of at most 15 significant digits", lit, out)
+		return fmt.Errorf("param_schema: the number %s would be sent as %s, a different number, so the spec is refused. Rounding it would change the bound: choose the bound you intend, and write one that is sent as the same number", lit, out)
 	}
 	return nil
 }

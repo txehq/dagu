@@ -305,6 +305,7 @@ func TestParamSchemaRefusesWhatWouldNotArriveAsWritten(t *testing.T) {
 		"maximum: .5":                           spelled,
 		"maximum: 5.":                           spelled,
 		"maximum: 0." + strings.Repeat("0", 70): "is longer than 64 characters",
+		"maximum: 1.0e-324":                     "would be sent as 0, " + changed, // short, and still too small to hold
 		"maximum: 1.0e-401":                     "has an exponent beyond 400",
 		"maximum: 1.0e-99999999999999999999":    "has an exponent beyond 400",
 		// A tag changes what a value is after it is written.
