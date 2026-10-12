@@ -1317,3 +1317,27 @@ func TestEverySettlementVerifiesTheNamedExecution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, a2, known)
 }
+
+// Not applied names an admitted execution only when run history shows it
+// abandoned, whether or not one was recorded before: an execution that is
+// preparing or was dispatched may run, so its effect is not "not applied".
+func TestNotAppliedNamesOnlyAnAbandonedExecution(t *testing.T) {
+	a2 := ExecutionRef("a2", "")
+	for name, tc := range map[string]struct{ abandoned, preparing, ok bool }{
+		"preparing":  {preparing: true},
+		"dispatched": {},
+		"abandoned":  {abandoned: true, ok: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRetryFixture(t)
+			act, g, ec := r.uncertainRetry(t)
+			r.admit(t, act, r.params("run-1", "a1"), a2, tc.abandoned, tc.preparing)
+			err := r.settleOutcome(act, g, ec, ActionNotApplied, "", admittedOutcome(a2))
+			if tc.ok {
+				require.NoError(t, err)
+				return
+			}
+			assert.Equal(t, CodeInvalid, code(t, err))
+		})
+	}
+}
