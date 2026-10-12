@@ -5,7 +5,7 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -233,34 +233,28 @@ func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, err
 			Current: registry.ExecutionPreparing{RunID: runID, Execution: latest.Ref()},
 			Message: fmt.Sprintf("run %s's latest execution %s is not yet known to be dispatched or abandoned; ask again once that is settled", runID, latest.Ref())})
 	}
-	if status.Status.IsActive() || status.Status.IsSuccess() {
+	// Every fact below is this one preparation-aware snapshot's: the read
+	// above only authorized seeing the run, and may have been of an
+	// execution that was abandoned since.
+	var snap ir.DAGRunStatus
+	if err := json.Unmarshal(latest.Snapshot, &snap); err != nil {
+		return txeRun{}, fmt.Errorf("decode status of run %s: %w", runID, err)
+	}
+	if snap.Status.IsActive() || snap.Status.IsSuccess() {
 		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
-			Message: fmt.Sprintf("run %s is %s; only a finished, unsuccessful run can be retried", runID, status.Status),
+			Message: fmt.Sprintf("run %s is %s; only a finished, unsuccessful run can be retried", runID, snap.Status),
 			Details: map[string]any{"code": "run_not_retryable"}}
 	}
-	attempt, err := a.dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(jobID, runID))
-	if err != nil {
-		return txeRun{}, err
-	}
-	dag, err := attempt.ReadDAG(ctx)
-	if err != nil {
-		return txeRun{}, fmt.Errorf("read DAG snapshot of run %s: %w", runID, err)
-	}
-	if len(dag.YamlData) == 0 {
-		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
-			Message: fmt.Sprintf("run %s has no DAG snapshot to compare with the job", runID),
-			Details: map[string]any{"code": string(decision.CodeRunStale)}}
-	}
-	started, err := stringutil.ParseTime(status.StartedAt)
+	started, err := stringutil.ParseTime(snap.StartedAt)
 	if err != nil {
 		return txeRun{}, fmt.Errorf("parse start time of run %s: %w", runID, err)
 	}
-	if status.AttemptID == "" {
+	if snap.AttemptID == "" {
 		return txeRun{}, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 			Message: fmt.Sprintf("run %s has no attempt identity to bind a retry to", runID),
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
-	return txeRun{attemptID: status.AttemptID, queuedAt: status.QueuedAt, specSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(dag.YamlData)), startedAt: started}, nil
+	return txeRun{attemptID: snap.AttemptID, queuedAt: latest.QueuedAt, specSHA256: latest.SpecSHA256, startedAt: started}, nil
 }
 
 // ListTxeProposalDecisions lists every decision recorded for a proposal,

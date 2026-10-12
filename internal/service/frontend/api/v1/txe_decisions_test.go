@@ -612,6 +612,28 @@ func TestTxeRunRetryAsksAgainWhileAPreparationIsUnsettled(t *testing.T) {
 	var decisions api.TxeDecisionList
 	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &decisions)
 	require.Empty(t, decisions.Decisions)
+
+	// Dagu abandons the preparation: the reviewed execution is latest again,
+	// and asking again with the same request retries it.
+	run := ir.NewDAGRunRef(jobID, "run-preparing-1")
+	expected := persis.ExecutionIdentity{AttemptID: seen, QueuedAt: queued}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = server.DAGRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{DAGRun: run, Record: persis.AttemptAbandonment{
+		Schema: persis.AttemptAbandonmentSchema, Run: run, RootRun: run, AbandonedAttemptID: prepared.ID(),
+		AbandonedExecution: persis.ExecutionIdentity{AttemptID: prepared.ID()}, ExpectedExecution: &expected,
+		Reason: persis.AbandonedRetryPreparation, DecidedAt: now,
+		Evidence: persis.AbandonmentEvidence{
+			DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+			ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent, ObservedAt: now,
+		},
+	}})
+	require.NoError(t, err)
+	require.NoError(t, server.DAGRunRepository.EndAttemptPreparation(ctx, persis.AttemptPreparation{Run: run, RootRun: run, AttemptID: prepared.ID()}))
+	var res api.TxeDecisionResponse
+	c.Post(path, retryBody("dashboard-preparing-1", job.Version, seen, queued)).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &res)
+	require.NotNil(t, res.Proposal)
+	require.Contains(t, string(res.Proposal.Action.Params), `"attempt_id":"`+seen+`"`)
 }
 
 // execution and is refused; one naming the re-queued execution binds it.
