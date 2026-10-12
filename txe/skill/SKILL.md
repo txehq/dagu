@@ -111,6 +111,19 @@ The three names are fixed: they are what the probe looks up. A reference's name 
 
 A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
 
+### Linear: the target check and your script are two things
+
+- **The check of a Linear target** (`existence_check: pre_run` or `reconcile` on a `linear.issue`) is made by the probe, and the probe reads only the credential reference named `LINEAR_API_KEY`. If this machine has no Linear API key to refer to, declare the target `event_only`; registration refuses the other two without the reference. Do not create a key or copy one from elsewhere to get past this: say that the target is not checked, and why.
+- **Your script reading Linear** does not need that key on a machine where the Orca app runs. The Orca CLI reads Linear through the app's own connection:
+
+  ```sh
+  /Applications/Orca.app/Contents/Resources/bin/orca linear issue <issue id> --json
+  ```
+
+  The job declares no credential for this. Call the CLI by its full path, and print only the fields you need.
+
+That route is not a credential the worker holds. It works while the Orca app is running and connected to Linear under this machine's login, and not otherwise. When the call fails, have the script say so as a login to repair on this machine and exit non-zero; it is not a deletion and not a reason to retire the job. A job that must keep reading Linear when nobody is logged in needs the API key reference instead.
+
 ## Write the script for an unattended worker
 
 The script runs on this machine, started by the worker, not by a shell you have open. Three things differ from running it yourself.
