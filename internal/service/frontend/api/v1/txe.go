@@ -540,12 +540,19 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	if err := a.txeRequireSpecWrite(ctx, req.JobId, v.DAG.Spec); err != nil {
 		return nil, err
 	}
-	// The update is accepted only against expected_version, so that is the
-	// committed version the caller must be able to write.
+	// The caller must be able to write the job as committed before anything
+	// about it is compared: a conflict carries the job record, so it is only
+	// for a caller who may write the job (a job whose DAG file is missing
+	// was checked above only against the caller's own spec).
 	cur, err := s.GetJob(ctx, req.JobId)
 	if err != nil {
 		return nil, txeError(err)
 	}
+	if err := a.txeCheckVersion(ctx, s, cur, cur.Version, a.requireDAGWriteForWorkspace); err != nil {
+		return nil, err
+	}
+	// The update is accepted only against expected_version, so that is the
+	// committed version the caller must be able to write too.
 	if err := a.txeCheckVersion(ctx, s, cur, body.ExpectedVersion, a.requireDAGWriteForWorkspace); err != nil {
 		return nil, err
 	}

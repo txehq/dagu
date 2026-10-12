@@ -323,6 +323,33 @@ func TestTxeAPIUpdateChecksCommittedVersion(t *testing.T) {
 	requireStatus(t, err, http.StatusConflict)
 }
 
+// A version update is authorized against the job before its expected
+// version is compared: a caller who cannot write a job whose DAG file is
+// missing gets no conflict, and so never the job record a conflict carries.
+func TestTxeAPIUpdateConflictDisclosesNothing(t *testing.T) {
+	dir := t.TempDir()
+	a := newTxeTestAPIAt(t, dir, true, apiv1.WithAuthService(struct{ apiv1.AuthService }{}))
+	f := newTxeFixture(t, a, txeAdmin)
+	jobID, err := f.register(txeAdmin, "secret")
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(dir, "dags", jobID+".yaml")))
+
+	spec := fmt.Sprintf("labels:\n  - workspace=ops\nworker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/run.sh\n", f.machine)
+	for _, expected := range []int{0, 2} {
+		_, err = a.UpdateTxeJobVersion(txeOps, apigen.UpdateTxeJobVersionRequestObject{JobId: jobID, Body: &apigen.TxeVersionRequest{
+			RequestId: "u1", ExpectedVersion: expected,
+			Version: apigen.TxeJobVersionInput{
+				Title: "t", Purpose: "p",
+				Package: apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 8), Path: "/pkg", Entrypoint: "run.sh"},
+				Dag:     apigen.TxeDAGRef{Spec: spec},
+			}}})
+		requireStatus(t, err, http.StatusForbidden)
+		var apiErr *apiv1.Error
+		require.ErrorAs(t, err, &apiErr)
+		assert.NotContains(t, apiErr.Details, "current", "expected_version %d: no job record", expected)
+	}
+}
+
 // Only a signed-in person reactivates a retired job. An API key cannot claim
 // to be human, and the descriptive actor fields never make it one.
 func TestTxeAPIReactivateNeedsHumanPrincipal(t *testing.T) {
