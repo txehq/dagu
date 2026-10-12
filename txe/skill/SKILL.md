@@ -113,7 +113,7 @@ A check that cannot see the target (expired login, unreachable cluster, timeout)
 
 ### Linear: the target check and your script are two things
 
-- **The check of a Linear target** (`existence_check: pre_run` or `reconcile` on a `linear.issue`) is made by the probe, and the probe reads only the credential reference named `LINEAR_API_KEY`. Make it a `file` reference: the periodic check does not receive one of kind `env`. If this machine has no Linear API key to refer to, declare the target `event_only`; registration refuses the other two without the reference. Do not create a key or copy one from elsewhere to get past this: say that the target is not checked, and why.
+- **The check of a Linear target** (`existence_check: pre_run` or `reconcile` on a `linear.issue`) is made by the probe, and the probe reads only the credential reference named `LINEAR_API_KEY`. For `reconcile`, make it a `file` reference: the periodic check does not receive one of kind `env`. For `pre_run`, either kind works, as long as the worker can resolve it. If this machine has no Linear API key to refer to, declare the target `event_only`; registration refuses the other two without the reference. Do not create a key or copy one from elsewhere to get past this: say that the target is not checked, and why.
 - **Your script reading Linear** does not need that key on a machine where the Orca app runs. The Orca CLI reads Linear through the app's own connection:
 
   ```sh
