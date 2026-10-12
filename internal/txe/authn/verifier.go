@@ -155,18 +155,18 @@ type Verifier struct {
 
 // NewVerifier validates cfg and returns a Verifier.
 func NewVerifier(cfg Config) (*Verifier, error) {
-	if cfg.Issuer == "" || cfg.Issuer != strings.TrimSpace(cfg.Issuer) {
-		return nil, errors.New("authn: issuer is required and must have no surrounding space")
+	if !exactConfigText(cfg.Issuer) {
+		return nil, errors.New("authn: issuer is required, and must be valid text with no surrounding space")
 	}
-	if cfg.Audience == "" || cfg.Audience != strings.TrimSpace(cfg.Audience) {
-		return nil, errors.New("authn: audience is required and must have no surrounding space")
+	if !exactConfigText(cfg.Audience) {
+		return nil, errors.New("authn: audience is required, and must be valid text with no surrounding space")
 	}
 	if len(cfg.Clients) == 0 {
 		return nil, errors.New("authn: at least one client is required")
 	}
 	for client, class := range cfg.Clients {
-		if client == "" || client != strings.TrimSpace(client) {
-			return nil, errors.New("authn: a client id is empty or has surrounding space")
+		if !exactConfigText(client) {
+			return nil, errors.New("authn: a client id is empty, is not valid text or has surrounding space")
 		}
 		if !class.Bearer() {
 			return nil, fmt.Errorf("authn: client %q maps to class %q, which a bearer token may not yield", client, class)
@@ -424,6 +424,13 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Principal,
 // and a value holding that character is refused, not compared.
 func exactText(text string) bool {
 	return !strings.ContainsRune(text, utf8.RuneError)
+}
+
+// exactConfigText reports whether a configured value can be compared exactly
+// with a claim. It must not be something the decoder could produce from text
+// the token did not contain.
+func exactConfigText(text string) bool {
+	return text != "" && text == strings.TrimSpace(text) && utf8.ValidString(text) && exactText(text)
 }
 
 // audienceContains reports whether an "aud" claim, a string or a list of

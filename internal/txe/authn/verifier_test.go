@@ -528,6 +528,13 @@ func TestNewVerifierRefusesConfig(t *testing.T) {
 		{"NoIssuer", func(c *Config) { c.Issuer = "" }, "issuer"},
 		{"IssuerWithSpace", func(c *Config) { c.Issuer = testIssuer + " " }, "issuer"},
 		{"NoAudience", func(c *Config) { c.Audience = "" }, "audience"},
+		// A configured value holding U+FFFD would equal what the decoder makes
+		// of an unpaired surrogate escape in a signed claim.
+		{"IssuerWithReplacementCharacter", func(c *Config) { c.Issuer = testIssuer + "\ufffd" }, "issuer"},
+		{"IssuerNotUTF8", func(c *Config) { c.Issuer = testIssuer + "\xff" }, "issuer"},
+		{"AudienceWithReplacementCharacter", func(c *Config) { c.Audience = "hub-\ufffd" }, "audience"},
+		{"ClientWithReplacementCharacter", func(c *Config) { c.Clients = map[string]Class{"worker-\ufffd": ClassWorker} }, "client"},
+		{"ClientNotUTF8", func(c *Config) { c.Clients = map[string]Class{"worker-\xff": ClassWorker} }, "client"},
 		{"NoClients", func(c *Config) { c.Clients = nil }, "client"},
 		{"EmptyClientID", func(c *Config) { c.Clients = map[string]Class{"": ClassCLI} }, "client"},
 		// A token must never be able to yield a person or the administrator.
