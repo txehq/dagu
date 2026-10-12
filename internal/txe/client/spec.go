@@ -91,6 +91,21 @@ type SpecLifetime struct {
 	OpenEnded bool   `yaml:"open_ended"`
 }
 
+// SpecSyntaxError reports a job spec file that could not be read as a spec:
+// it is not YAML, or it has a field a spec does not have. The YAML reader
+// lays its message out over several lines, with the lines of the file around
+// the place it points at.
+type SpecSyntaxError struct {
+	Path string
+	Err  error
+}
+
+func (e *SpecSyntaxError) Error() string {
+	return fmt.Sprintf("parse job spec %s: %v", e.Path, e.Err)
+}
+
+func (e *SpecSyntaxError) Unwrap() error { return e.Err }
+
 // LoadJobSpec reads and validates a job spec file. Unknown keys are refused,
 // so a misspelt field is not silently dropped.
 func LoadJobSpec(path string) (*JobSpec, error) {
@@ -100,14 +115,14 @@ func LoadJobSpec(path string) (*JobSpec, error) {
 	}
 	file, err := parser.ParseBytes(data, 0)
 	if err != nil {
-		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+		return nil, &SpecSyntaxError{Path: path, Err: err}
 	}
 	if err := oneDocument(file); err != nil {
-		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+		return nil, &SpecSyntaxError{Path: path, Err: err}
 	}
 	var spec JobSpec
 	if err := yaml.UnmarshalWithOptions(data, &spec, yaml.Strict()); err != nil {
-		return nil, fmt.Errorf("parse job spec %s: %w", path, err)
+		return nil, &SpecSyntaxError{Path: path, Err: err}
 	}
 	declared, err := markEmptyParamSchemas(data, &spec)
 	if err != nil {

@@ -791,6 +791,13 @@ func TestJobSpecUnknownKey(t *testing.T) {
 
 	_, err := LoadJobSpec(path)
 	require.ErrorContains(t, err, "titel")
+	// The reader's message points at the line, over several lines; the
+	// error's type is what lets a command print it laid out.
+	var syntax *SpecSyntaxError
+	require.ErrorAs(t, err, &syntax)
+	assert.Equal(t, path, syntax.Path)
+	assert.Contains(t, err.Error(), "\n")
+	assert.True(t, strings.HasPrefix(err.Error(), "parse job spec "+path+": "))
 }
 
 // registerWithoutLookup sends a registration as a session would after losing

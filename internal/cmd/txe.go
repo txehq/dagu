@@ -130,9 +130,12 @@ type txeShownError struct {
 
 func (e *txeShownError) Error() string {
 	// A spec's list of gaps is laid out over several lines by this program;
-	// its values are quoted when they are formatted.
+	// its values are quoted when they are formatted. A spec the YAML reader
+	// refused is laid out by that reader, around lines of the caller's own
+	// file. In both, everything but line breaks and tabs is still escaped.
 	var missing *txeclient.MissingContextError
-	return txeclient.CleanText(e.err.Error(), errors.As(e.err, &missing))
+	var syntax *txeclient.SpecSyntaxError
+	return txeclient.CleanText(e.err.Error(), errors.As(e.err, &missing) || errors.As(e.err, &syntax))
 }
 
 func (e *txeShownError) Unwrap() error { return e.err }

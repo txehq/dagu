@@ -495,6 +495,16 @@ func TestTXECLIAgainstRegistry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, txeJobs(t, bound))
 
+	// A spec with a field a spec does not have is refused with the YAML
+	// reader's message as that reader laid it out: the field, then the lines
+	// of the file around it, each on a line of its own.
+	misspelt := strings.Replace(weekly, "job_key: weekly-collector", "job_key: misspelt-collector", 1) + "retirement_rules:\n  on_complete: retire\n"
+	require.NoError(t, os.WriteFile(spec3, []byte(misspelt), 0o644)) //nolint:gosec // test file
+	_, err = cli.run("cc1-s000001", "txe", "register", "-f", spec3, "--dry-run")
+	require.ErrorContains(t, err, `unknown field "on_complete"`+"\n")
+	require.ErrorContains(t, err, "\n>")
+	assert.NotContains(t, err.Error(), `\x0a`)
+
 	// The credential's content is in one file on the machine, the one the
 	// spec points at. Nothing else under the TXE home holds it, and nothing
 	// in the hub's data, DAG and log directories does.
