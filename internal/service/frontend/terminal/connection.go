@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/dagucloud/dagu/v2/internal/audit"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/google/uuid"
 )
 
@@ -29,6 +31,9 @@ const (
 	auditTimeout              = 5 * time.Second
 	processShutdownGrace      = 3 * time.Second
 	processExitDetectionDelay = 250 * time.Millisecond
+	// ioDrainGrace is how long the output of a shell that is gone is waited
+	// for before its pty is closed.
+	ioDrainGrace = 3 * time.Second
 )
 
 type terminalEndReason string
@@ -353,13 +358,37 @@ func (c *Connection) cleanup(cancel context.CancelFunc, ioWG *sync.WaitGroup, pr
 	cancel()
 	c.interruptTransport(gracefulClose)
 
-	ioWG.Wait()
+	// The shell is ended before its output is waited for. A read of the pty
+	// cannot be interrupted: it returns when the shell writes or when the
+	// pty is hung up, and an idle shell does neither until it is ended. A
+	// shell that has exited by itself is found gone here, and what it wrote
+	// last is drained below as before.
+	err := c.terminateProcess(processDone)
+
+	// With the shell gone the pty reader ends, unless something the shell
+	// started still holds the pty. That is not waited for without end: the
+	// pty is closed, and the reader ends when its last holder does.
+	if !waitForGroup(ioWG, ioDrainGrace) {
+		logger.Warn(context.Background(), "Terminal output reader did not end with the shell; a process it started still holds the terminal",
+			slog.String("session_id", c.ID))
+	}
 
 	if c.ptmx != nil {
 		_ = c.ptmx.Close()
 	}
 
-	return c.terminateProcess(processDone)
+	return err
+}
+
+// waitForGroup waits for a group for at most timeout and reports whether it
+// finished.
+func waitForGroup(group *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	return waitForSignal(done, timeout)
 }
 
 func (c *Connection) terminateProcess(processDone <-chan struct{}) error {
