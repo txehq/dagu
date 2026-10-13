@@ -584,6 +584,7 @@ func TestAnEndTheRecordDidNotTake(t *testing.T) {
 		f := newFixture(t, nil)
 		session := f.signIn()
 		other := f.process()
+		other.spawn = func(func()) {} // no round runs on it, so that only the refresh can find the marker
 		unwritable(f, f.manager)
 		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 
@@ -597,7 +598,30 @@ func TestAnEndTheRecordDidNotTake(t *testing.T) {
 		assert.Equal(t, "signed out", stored.EndReason)
 		_, markers := f.records()
 		assert.Zero(t, markers, "the marker is gone once the record holds the end")
-		assert.Empty(t, f.owedTokens(), "and the token was revoked, by the process that could write")
+		assert.Equal(t, []string{"refresh-token-0"}, f.owedTokens(), "and the token is owed in the record, for the next round")
+		f.round(f.process())
+		assert.Empty(t, f.owedTokens())
+	})
+
+	// A round on another process finds the marker sooner than its next
+	// refresh of the session would: rounds are started by any request, at most
+	// once a minute.
+	t.Run("ARoundOnAnotherProcessAppliesItSooner", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		someoneElse := f.signIn()
+		other := f.process()
+		f.round(other)
+		unwritable(f, f.manager)
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+
+		require.NoError(t, other.Check(ctx, session.ID, alice), "a round ran a moment ago, and the session is inside revalidate_after")
+		f.clock.Advance(reconcileInterval)
+		require.NoError(t, other.Check(ctx, someoneElse.ID, alice), "a request for another session starts the round")
+		require.NotNil(t, f.stored(session).EndedAt)
+		require.ErrorIs(t, other.Check(ctx, session.ID, alice), ErrSessionEnded, "one minute after the sign-out, not four")
+		assert.Zero(t, f.provider.calls())
 	})
 
 	// The process that took the sign-out is restarted. What it remembered is
@@ -967,8 +991,31 @@ func TestWhenAnOwedRevocationIsTried(t *testing.T) {
 		assert.Equal(t, 1, attempts)
 		stored := f.stored(session)
 		require.Len(t, stored.Owed, 2)
-		assert.Equal(t, 1, stored.Owed[0].Attempts)
-		assert.Zero(t, stored.Owed[1].Attempts)
+		assert.Equal(t, 1, stored.Owed[0].Attempts+stored.Owed[1].Attempts, "one of the two was tried, and the round ended there")
+	})
+
+	// Two entries in one record. The provider never answers for the first.
+	// The second is not left waiting behind it: an entry that was tried is
+	// due later than one that was not, so the other goes first next time.
+	t.Run("OneThatNeverGetsAnAnswerDoesNotBlockItsNeighbour", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.owing("refresh-token-a")
+		second, err := f.enc.Encrypt("refresh-token-b")
+		require.NoError(t, err)
+		later := f.manager.newOwed(second, ClientAuthHeader)
+		later.NextAttempt = later.NextAttempt.Add(time.Second) // due just after the first
+		require.NoError(t, f.manager.appendOwed(ctx, session.ID, later))
+		f.provider.mu.Lock()
+		f.provider.revokeErrFor = map[string]error{"refresh-token-a": errProviderDown}
+		f.provider.mu.Unlock()
+
+		f.clock.Advance(time.Second)
+		f.round(f.manager) // the first is tried, gets no answer, and the round ends
+		require.Empty(t, f.provider.revocations())
+		f.clock.Advance(owedRetryInterval)
+		f.round(f.manager)
+		assert.Equal(t, []string{"refresh-token-b"}, f.provider.revocations(), "the second came due before the first is due again")
 	})
 }
 
@@ -1151,6 +1198,33 @@ func TestWhatAProcessRemembersWhileTheStoreTakesNothing(t *testing.T) {
 		assert.False(t, remembered)
 	})
 
+	// A remembered end that brings a token of its own, one that is in no
+	// record, is not forgotten with the token: the token gets a record first.
+	t.Run("ATokenItBringsIsNotForgottenWithIt", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		brought, err := f.enc.Encrypt("a-token-only-this-process-knows-of")
+		require.NoError(t, err)
+		f.manager.remember(session.ID, decision{
+			reason: "the renewed session could not be stored", ifToken: "x", expires: session.ExpiresAt,
+			owe: []Owed{f.manager.newOwed(brought, ClientAuthForm)},
+		})
+		broken, heal := deaf(f)
+		_ = broken
+
+		f.clock.Advance(25 * time.Hour)
+		f.round(f.manager)
+		_, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered, "the store takes nothing, so the token has no record yet")
+
+		heal()
+		f.round(f.manager)
+		_, remembered = f.manager.decided(session.ID)
+		assert.False(t, remembered)
+		assert.Contains(t, f.provider.revocations(), "a-token-only-this-process-knows-of")
+	})
+
 	// A restart in this state loses what was remembered. That is the limit:
 	// nothing can be made to last in a store that takes no write.
 	t.Run("ARestartLosesIt", func(t *testing.T) {
@@ -1164,4 +1238,151 @@ func TestWhatAProcessRemembersWhileTheStoreTakesNothing(t *testing.T) {
 			"the restarted process goes by the store, which never took the end; the provider was asked to revoke the token, which is what stops it at the next refresh")
 		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
 	})
+}
+
+// A round reads the whole collection and may wait for the provider. It runs
+// beside the request that started it, and the request is answered on what is
+// true when it is answered.
+func TestARoundRunsBesideTheRequest(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// The provider is slow to answer a revocation. The request that started
+	// the round does not wait for it.
+	t.Run("TheRequestDoesNotWaitForIt", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.owing("refresh-token-a")
+		beside, err := NewManager(Config{RevalidateAfter: 4 * time.Minute, RevalidateLimit: 5 * time.Minute, Now: f.clock.Now},
+			f.col, f.enc, f.provider, nil) // as a hub runs it: rounds in their own goroutine
+		require.NoError(t, err)
+		reached, release := make(chan struct{}), make(chan struct{})
+		f.provider.mu.Lock()
+		f.provider.onRevoke = func() {
+			f.provider.mu.Unlock()
+			close(reached)
+			<-release
+			f.provider.mu.Lock()
+		}
+		f.provider.mu.Unlock()
+
+		require.NoError(t, beside.Check(ctx, session.ID, alice), "answered while the round is still at the provider")
+		<-reached
+		require.Equal(t, []string{"refresh-token-a"}, f.owedTokens())
+		close(release)
+		require.Eventually(t, func() bool { return !beside.reconciling.Load() && len(f.owedTokens()) == 0 }, 10*time.Second, 5*time.Millisecond)
+	})
+
+	// The decision is made after the round is started, not before it. Here
+	// the round is made to run first and to take two seconds, across the
+	// session's limit: the request is not served on an answer from before.
+	t.Run("TheAnswerIsNotFromBeforeTheRound", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.owing("refresh-token-a")
+		f.provider.set(unavailable)
+		f.provider.mu.Lock()
+		f.provider.onRevoke = func() { f.clock.Advance(2 * time.Second) }
+		f.provider.mu.Unlock()
+
+		f.clock.Advance(4*time.Minute + 59*time.Second)
+		require.ErrorIs(t, f.check(session), ErrProviderUnavailable, "five minutes and one second after the last confirmation")
+	})
+
+	// Many requests at the moment a round is due start one round, not many.
+	t.Run("OneRoundIsStarted", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		started := 0
+		f.manager.spawn = func(func()) { started++ }
+		f.clock.Advance(reconcileInterval)
+		for range 20 {
+			require.NoError(t, f.check(session))
+		}
+		assert.Equal(t, 1, started)
+		f.clock.Advance(reconcileInterval)
+		require.NoError(t, f.check(session))
+		assert.Equal(t, 2, started)
+	})
+}
+
+// A session whose end was marked, and whose process stopped before it asked
+// the provider, is found a long time later, after the hub token has expired.
+// Its record is not removed with its token unrevoked.
+func TestAMarkedEndFoundLongAfterwards(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("TheSessionWasNeverEndedInItsRecord", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		broken.failWritesAfter(0)
+		f.provider.failRevocations(errProviderDown)
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt), "marked")
+		require.Empty(t, f.provider.revocations())
+		f.provider.failRevocations(nil)
+
+		f.clock.Advance(3 * 24 * time.Hour)
+		restarted := f.process()
+		f.round(restarted)
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt, "the record is ended, not removed")
+		assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations())
+		assert.Empty(t, stored.Owed)
+		require.Len(t, stored.Revocations, 1)
+		_, markers := f.records()
+		assert.Zero(t, markers)
+	})
+
+	// The record ended long ago, and a marker beside it still carries a token
+	// that is in no record. The record is not removed before the token is in
+	// it.
+	t.Run("AMarkerStillCarriesAToken", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		carried, err := f.enc.Encrypt("a-token-the-marker-carries")
+		require.NoError(t, err)
+		f.clock.Advance(3 * 24 * time.Hour)
+		require.True(t, f.manager.mark(ctx, session.ID, decision{
+			reason: "the renewed session could not be stored", ifToken: "x", owe: []Owed{f.manager.newOwed(carried, ClientAuthHeader)},
+		}))
+
+		f.round(f.process())
+		assert.Contains(t, f.provider.revocations(), "a-token-the-marker-carries")
+		_, markers := f.records()
+		assert.Zero(t, markers)
+	})
+}
+
+// A refresh comes back granted with no new token for a session that ended as
+// refused, and the record cannot be written. The token is not left good at
+// the provider without a word: the provider is asked directly.
+func TestAGrantWithNoNewTokenThatCannotBeRecorded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	session := f.signIn()
+	f.provider.set(func(string) (Renewal, error) { return Renewal{}, nil })
+	started, release := f.provider.hold()
+	f.clock.Advance(4 * time.Minute)
+
+	refreshing := make(chan error, 1)
+	go func() { refreshing <- f.check(session) }()
+	<-started
+	_, err := f.manager.end(ctx, session.ID, decision{reason: "refused by the identity provider: invalid_grant", expires: session.ExpiresAt})
+	require.NoError(t, err)
+	broken := &failingCollection{Collection: f.col}
+	f.manager.col = broken
+	broken.failWritesAfter(0)
+	release()
+	require.ErrorIs(t, <-refreshing, ErrSessionEnded)
+	assert.Equal(t, []string{"refresh-token-0"}, f.provider.revocations(), "it could not be recorded, so the provider was asked there and then")
 }

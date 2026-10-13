@@ -265,6 +265,13 @@ func newFixture(t *testing.T, checkID IDTokenChecker) *fixture {
 	return f
 }
 
+// inline makes a hub process run its rounds inside the call that starts
+// them, so that a test sees what a round did when the call returns.
+func inline(m *Manager) *Manager {
+	m.spawn = func(round func()) { round() }
+	return m
+}
+
 // process is another hub process over the same store, provider and clock.
 func (f *fixture) process() *Manager {
 	f.t.Helper()
@@ -272,7 +279,7 @@ func (f *fixture) process() *Manager {
 		RevalidateAfter: 4 * time.Minute, RevalidateLimit: 5 * time.Minute, Now: f.clock.Now,
 	}, f.col, f.enc, f.provider, f.checkID)
 	require.NoError(f.t, err)
-	return manager
+	return inline(manager)
 }
 
 // rewrite changes the stored session directly, as another hub process would.
@@ -940,8 +947,10 @@ func (c *failingCollection) Get(ctx context.Context, id string) (*persis.Record,
 	return c.Collection.Get(ctx, id)
 }
 
-// Records of sessions that ended or expired more than a day ago are removed
-// at the next sign-in.
+// The record of a session that ended more than a day ago, and owes nothing,
+// is removed. A session whose hub token has expired is ended first, so that
+// its refresh token is revoked and not simply forgotten, and its record goes
+// a day after that.
 func TestOldSessionRecordsArePurged(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil)
@@ -951,20 +960,30 @@ func TestOldSessionRecordsArePurged(t *testing.T) {
 	expired, err := f.manager.Create(ctx, alice, "refresh-token-x", f.clock.Now().Add(time.Hour))
 	require.NoError(t, err)
 	live := f.signIn()
+	revoked := f.provider.revocations()
 
 	f.clock.Advance(23 * time.Hour)
 	f.signIn()
 	_, _, err = f.manager.load(ctx, ended.ID)
 	require.NoError(t, err, "kept for a day")
+	lapsed := f.stored(expired)
+	require.NotNil(t, lapsed.EndedAt, "a session whose hub token has expired is ended")
+	assert.Equal(t, "the hub token expired", lapsed.EndReason)
+	assert.Equal(t, append(revoked, "refresh-token-x"), f.provider.revocations(), "and its refresh token is revoked")
 
 	f.clock.Advance(2*time.Hour + time.Minute)
 	f.signIn()
 	_, _, err = f.manager.load(ctx, ended.ID)
 	require.ErrorIs(t, err, ErrSessionEnded)
 	_, _, err = f.manager.load(ctx, expired.ID)
-	require.ErrorIs(t, err, ErrSessionEnded)
+	require.NoError(t, err, "it ended two hours ago, and is kept for a day from then")
 	_, _, err = f.manager.load(ctx, live.ID)
-	require.NoError(t, err, "a session that is neither ended nor long expired is kept")
+	require.NoError(t, err, "a session that is neither ended nor expired is kept")
+
+	f.clock.Advance(22 * time.Hour)
+	f.signIn()
+	_, _, err = f.manager.load(ctx, expired.ID)
+	require.ErrorIs(t, err, ErrSessionEnded)
 }
 
 func TestConfigValidate(t *testing.T) {

@@ -209,6 +209,10 @@ func (m *Manager) mark(ctx context.Context, sessionID string, d decision) bool {
 			}
 		}
 		merged.Owe = addOwed(slices.Clone(kept.Owe), d.owe...)
+		if merged.IfToken == kept.IfToken && merged.Revoke == kept.Revoke && len(merged.Owe) == len(kept.Owe) {
+			// What is marked already says this. It is not written again.
+			return true
+		}
 		data, encodeErr := json.Marshal(merged) //nolint:gosec // G117: the tokens in it are ciphertext
 		if encodeErr != nil {
 			return false
@@ -421,19 +425,26 @@ func (m *Manager) attemptNow(ctx context.Context, sessionID string) {
 }
 
 // attemptOwed makes up to limit of the revocations a session owes that are
-// due, and writes what came of each into the session's record. It returns how
-// many it attempted, and whether the provider left one unanswered, at which
-// it stops.
+// due, the ones that came due first going first, and writes what came of
+// each into the session's record. It returns how many it attempted, and
+// whether the provider left one unanswered, at which it stops.
 func (m *Manager) attemptOwed(ctx context.Context, sessionID string, limit int) (attempted int, unanswered bool) {
 	session, _, err := m.load(ctx, sessionID)
 	if err != nil {
 		return 0, false
 	}
 	now := m.now()
-	outcomes := map[string]string{}
+	due := make([]Owed, 0, len(session.Owed))
 	for _, entry := range session.Owed {
-		if attempted >= limit || entry.NextAttempt.After(now) {
-			continue
+		if !entry.NextAttempt.After(now) {
+			due = append(due, entry)
+		}
+	}
+	slices.SortStableFunc(due, func(a, b Owed) int { return cmp.Or(a.NextAttempt.Compare(b.NextAttempt), a.Since.Compare(b.Since)) })
+	outcomes := map[string]string{}
+	for _, entry := range due {
+		if attempted >= limit || unanswered {
+			break
 		}
 		attempted++
 		refreshToken, err := m.enc.Decrypt(entry.Token)
@@ -457,9 +468,6 @@ func (m *Manager) attemptOwed(ctx context.Context, sessionID string, limit int) 
 				slog.String("session", sessionID), slog.String("cause", fmt.Sprintf("%T", err)))
 			outcomes[entry.Token] = attemptUnanswered
 			unanswered = true
-		}
-		if unanswered {
-			break
 		}
 	}
 	if len(outcomes) > 0 {
@@ -551,32 +559,49 @@ func owedBackoff(attempts int) time.Duration {
 // kick starts a round of reconciling if one is due. A sign-in always starts
 // one; an ordinary request starts one at most every reconcileInterval. So the
 // rounds do not depend on anybody signing in.
+//
+// The round does not run inside the request. It reads the whole collection,
+// and may wait for the provider, and neither is something for a request to
+// wait for, or for the answer to a request to grow stale during. It runs
+// beside it, on its own, and ends by itself.
 func (m *Manager) kick(ctx context.Context, now time.Time, signIn bool) {
 	last := m.lastRound.Load()
 	if !signIn && last != 0 && now.Sub(time.Unix(0, last)) < reconcileInterval {
 		return
 	}
-	m.reconcile(ctx, now)
+	// One request starts the round that is due; the others that arrive at
+	// the same moment see that it has been started.
+	if !m.lastRound.CompareAndSwap(last, now.UnixNano()) && !signIn {
+		return
+	}
+	background := context.WithoutCancel(ctx)
+	m.spawn(func() { m.reconcile(background, now) })
 }
 
-// dueSession is a session whose record owes a revocation that is due.
-type dueSession struct {
-	id string
-	// due is when its earliest due revocation came due.
-	due time.Time
+// dueEntry is a revocation that is owed and due, and the session whose record
+// holds it.
+type dueEntry struct {
+	session string
+	token   string
+	// due is when it came due, and since when it was first owed.
+	due, since time.Time
 }
 
 // reconcile does what is left over: it writes the session ends the store did
-// not take, applies the end markers other writes left, makes the revocations
-// that are due, and removes the records of sessions that ended or expired
-// more than a day ago and owe nothing.
+// not take, applies the end markers other writes left, ends the sessions
+// whose hub token has expired, makes the revocations that are due, and
+// removes the records of sessions that ended more than a day ago and owe
+// nothing.
 //
-// It runs inside a request, so it is bounded. One at a time does it, and
-// another that arrives meanwhile does not wait. A round deals with
-// reconcilePerRound of each kind. The revocations that came due first go
-// first. One the provider answers no to does not hold up the others, because
-// the provider is there; one it does not answer ends the round, and no round
-// asks again for owedRetryInterval.
+// One at a time does it, and another that is started meanwhile returns at
+// once. A round deals with reconcilePerRound of each kind. The revocations
+// that came due first go first, whichever records they are in. One the
+// provider answers no to does not hold up the others, because the provider is
+// there; one it does not answer ends the round, and no round asks again for
+// owedRetryInterval.
+//
+// A round reads every record of the collection once. That is the store's
+// cost of listing, and why a round does not run inside a request.
 func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	if !m.reconciling.CompareAndSwap(false, true) {
 		return
@@ -592,10 +617,15 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		}
 	}
 	pending := make(map[string]decision, reconcilePerRound)
+	expired := map[string]decision{}
 	for id, d := range m.undone {
 		if !d.expires.IsZero() && !now.Before(d.expires) {
-			// The hub token has expired: nothing can present the session.
-			delete(m.undone, id)
+			// The hub token has expired: nothing can present the session, so
+			// its end need not be remembered. The session's own refresh token
+			// is dealt with below, where every expired session is ended. The
+			// tokens the decision itself brings are in no record, and are
+			// given one before the decision is forgotten.
+			expired[id] = d
 			continue
 		}
 		if len(pending) < reconcilePerRound {
@@ -603,6 +633,14 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		}
 	}
 	m.mu.Unlock()
+	for id, d := range expired {
+		if len(d.owe) > 0 && m.stub(ctx, d.reason, d.owe) != nil {
+			continue
+		}
+		m.mu.Lock()
+		delete(m.undone, id)
+		m.mu.Unlock()
+	}
 	// A session that is ended in this round may owe a revocation from that
 	// moment. It is looked at again below, so that the revocation does not
 	// wait for the next round.
@@ -614,8 +652,8 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	}
 
 	// What the store holds.
-	var due []dueSession
-	marks := 0
+	var due []dueEntry
+	marks, lapsed := 0, 0
 	cursor := ""
 	for {
 		page, err := m.col.List(ctx, persis.ListQuery{Cursor: cursor})
@@ -636,16 +674,24 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 			if json.Unmarshal(rec.Data, &session) != nil {
 				continue
 			}
-			if len(session.Owed) > 0 {
+			switch {
+			case len(session.Owed) > 0:
 				// A record that owes a revocation is kept, however old.
-				if first, ok := earliestDue(session.Owed, now); ok {
-					due = append(due, dueSession{id: rec.ID, due: first})
+				due = appendDue(due, rec.ID, session.Owed, now)
+			case session.EndedAt == nil && !now.Before(session.ExpiresAt):
+				// The hub token has expired and the session was never ended.
+				// The hub will not use its refresh token again, and the token
+				// is still good at the provider. The session is ended now, so
+				// that the token becomes owed and is revoked like any other.
+				if lapsed < reconcilePerRound {
+					lapsed++
+					out, err := m.end(ctx, rec.ID, decision{reason: "the hub token expired", revoke: true, expires: session.ExpiresAt, passive: true})
+					if err == nil && out.owes {
+						justEnded = append(justEnded, rec.ID)
+					}
 				}
-				continue
-			}
-			gone := now.Sub(session.ExpiresAt) > purgeAfter || (session.EndedAt != nil && now.Sub(*session.EndedAt) > purgeAfter)
-			if gone {
-				_ = m.col.CompareAndDelete(ctx, rec)
+			case session.EndedAt != nil && now.Sub(*session.EndedAt) > purgeAfter:
+				m.purge(ctx, rec)
 			}
 		}
 		if page.NextCursor == "" {
@@ -655,35 +701,61 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	}
 
 	for _, id := range justEnded {
-		if slices.ContainsFunc(due, func(d dueSession) bool { return d.id == id }) {
+		if slices.ContainsFunc(due, func(d dueEntry) bool { return d.session == id }) {
 			continue
 		}
 		if session, _, err := m.load(ctx, id); err == nil {
-			if first, ok := earliestDue(session.Owed, now); ok {
-				due = append(due, dueSession{id: id, due: first})
-			}
+			due = appendDue(due, id, session.Owed, now)
 		}
 	}
 	if len(due) == 0 || m.providerPaused(now) {
 		return
 	}
-	// The ones that came due first go first. An entry's wait is capped, so
-	// an old one comes due again and is then ahead of every newer one.
-	slices.SortFunc(due, func(a, b dueSession) int { return cmp.Or(a.due.Compare(b.due), cmp.Compare(a.id, b.id)) })
-	budget := reconcilePerRound
-	for _, session := range due {
-		if budget <= 0 {
-			break
-		}
-		attempted, unanswered := m.attemptOwed(ctx, session.id, budget)
-		budget -= attempted
-		if unanswered {
+	// The ones that came due first go first, whichever records they are in.
+	// An entry's wait is capped, so an old one comes due again and is then
+	// ahead of every one that came due after it; and one the provider keeps
+	// leaving unanswered moves behind the others each time it is tried.
+	slices.SortFunc(due, func(a, b dueEntry) int {
+		return cmp.Or(a.due.Compare(b.due), a.since.Compare(b.since), cmp.Compare(a.session, b.session), cmp.Compare(a.token, b.token))
+	})
+	if len(due) > reconcilePerRound {
+		due = due[:reconcilePerRound]
+	}
+	// Each is made by asking its record for the one that came due first
+	// there, which is this one unless another process has made it meanwhile.
+	for _, entry := range due {
+		if _, unanswered := m.attemptOwed(ctx, entry.session, 1); unanswered {
 			m.mu.Lock()
 			m.owedFailedAt = now
 			m.mu.Unlock()
 			break
 		}
 	}
+}
+
+// appendDue adds a record's owed revocations that are due to a list.
+func appendDue(due []dueEntry, sessionID string, owed []Owed, now time.Time) []dueEntry {
+	for _, entry := range owed {
+		if !entry.NextAttempt.After(now) {
+			due = append(due, dueEntry{session: sessionID, token: entry.Token, due: entry.NextAttempt, since: entry.Since})
+		}
+	}
+	return due
+}
+
+// purge removes the record of a session that ended more than a day ago and
+// owes nothing. A record whose end is still marked beside it is not removed:
+// the marker may be about to move the session's refresh token into the
+// record's owed list, and removing the record first would lose the token.
+//
+// No marker can be written for such a record after this look. A marker is
+// written when a write that ends a session fails, and a session that ended a
+// day ago is not ended again.
+func (m *Manager) purge(ctx context.Context, rec *persis.Record) {
+	if _, mark, err := m.marked(ctx, rec.ID); err != nil || mark != nil {
+		return
+	}
+	_ = m.col.CompareAndDelete(ctx, rec)
 }
 
 // earliestDue returns when the earliest of the entries that are due came due.
@@ -719,7 +791,8 @@ func (m *Manager) reconcileMark(ctx context.Context, rec *persis.Record, now tim
 	if _, written, _ := m.applyMark(ctx, marker.Session); written {
 		return marker.Session, true
 	}
-	if _, stillThere, err := m.marked(ctx, marker.Session); err != nil || stillThere == nil {
+	_, current, err := m.marked(ctx, marker.Session)
+	if err != nil || current == nil {
 		return "", false
 	}
 	if !marker.Expires.IsZero() && now.Sub(marker.Expires) > purgeAfter {
@@ -730,7 +803,8 @@ func (m *Manager) reconcileMark(ctx context.Context, rec *persis.Record, now tim
 		}
 		slog.Error("OIDC session end could never be written into its record; the record's refresh token was not revoked",
 			slog.String("session", marker.Session))
-		_ = m.col.CompareAndDelete(ctx, rec)
+		// The marker as it is now, not as the listing saw it.
+		m.unmark(ctx, current)
 	}
 	return "", false
 }

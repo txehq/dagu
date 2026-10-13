@@ -211,9 +211,11 @@ type Manager struct {
 	// owedFailedAt is when the provider last left a revocation unanswered.
 	owedFailedAt time.Time
 	// reconciling is set while a round of reconciling runs, and lastRound is
-	// when the last one started, in Unix nanoseconds.
+	// when the last one was started, in Unix nanoseconds.
 	reconciling atomic.Bool
 	lastRound   atomic.Int64
+	// spawn runs a round beside the request that started it.
+	spawn func(func())
 }
 
 // decision is the end of a session, as decided.
@@ -235,6 +237,10 @@ type decision struct {
 	// owe lists further refresh tokens to be revoked with this end, as
 	// entries ready to go into the record.
 	owe []Owed
+	// passive marks an end nothing depends on: that of a session whose hub
+	// token has expired, which serves nothing either way. If its write
+	// fails it is not marked or remembered; a later round tries again.
+	passive bool
 	// expires is when the session's hub token expires. After it nothing can
 	// present the session, and the decision is dropped. It is zero only when
 	// the caller of End did not say and the session could not be read.
@@ -272,6 +278,7 @@ func NewManager(cfg Config, col persis.Collection, enc Encryptor, provider Provi
 		cfg: cfg, col: col, enc: enc, provider: provider, checkID: checkID, now: now,
 		owner:   hex.EncodeToString(owner[:]),
 		flights: map[string]*flight{}, failedAt: map[string]time.Time{}, undone: map[string]decision{},
+		spawn: func(round func()) { go round() },
 	}, nil
 }
 
@@ -376,12 +383,13 @@ const purgeAfter = 24 * time.Hour
 // It returns nil, ErrSessionEnded, ErrProviderUnavailable, or an error from
 // the store, which the caller must treat as a failure and not as an answer.
 func (m *Manager) Check(ctx context.Context, sessionID string, who Identity) error {
-	err := m.decide(ctx, sessionID, who)
-	// What is left over is dealt with by requests, whatever their own
-	// answer, at most once in a while. It does not wait for somebody to sign
-	// in.
+	// What is left over is dealt with at the prompting of requests, whatever
+	// their own answer, at most once in a while, so that it does not wait for
+	// somebody to sign in. It is started before the request is decided and
+	// runs beside it: the answer below is made on what is true when it is
+	// given, not on what was true before a round.
 	m.kick(ctx, m.now(), false)
-	return err
+	return m.decide(ctx, sessionID, who)
 }
 
 func (m *Manager) decide(ctx context.Context, sessionID string, who Identity) error {
@@ -623,7 +631,7 @@ func (m *Manager) refresh(ctx context.Context, sessionID string) error {
 	lost := ends("the renewed session could not be stored")
 	lost.orToken = replacement
 	err = m.commit(ctx, sessionID, renewed{
-		held: held, newToken: renewal.RefreshToken, replacement: replacement, lost: lost, auth: session.ClientAuth,
+		held: held, sent: refreshToken, newToken: renewal.RefreshToken, replacement: replacement, lost: lost, auth: session.ClientAuth,
 		apply: func(stored *Session) {
 			if rotated {
 				stored.RefreshToken = replacement
@@ -726,8 +734,9 @@ func (m *Manager) release(ctx context.Context, sessionID string) {
 
 // renewed is the outcome of a granted refresh, to be stored.
 type renewed struct {
-	// held is the encrypted refresh token that was exchanged.
-	held string
+	// held is the encrypted refresh token that was exchanged, and sent is
+	// that token as it was sent.
+	held, sent string
 	// newToken is the refresh token the provider returned, and replacement
 	// is the same encrypted. Both are empty when the provider returned the
 	// token it was sent, or none.
@@ -813,9 +822,7 @@ func (m *Manager) oweRenewed(ctx context.Context, sessionID string, r renewed) {
 	// the session held is still good at the provider. A session that ended
 	// by sign-out owes it already, and it is not recorded twice. One that
 	// ended on a refusal erased it as refused, which this grant contradicts.
-	if err := m.appendOwed(ctx, sessionID, m.newOwed(r.held, r.auth)); err == nil {
-		m.attemptNow(ctx, sessionID)
-	}
+	_ = m.oweToken(ctx, sessionID, r.auth, r.sent, r.held)
 }
 
 // abandon ends a session whose new refresh token could not be kept. The token
@@ -1040,6 +1047,9 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 			break
 		}
 		out.held = ""
+	}
+	if d.passive {
+		return out, failure
 	}
 	out.marked = m.mark(ctx, sessionID, d)
 	m.remember(sessionID, d)
