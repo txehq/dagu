@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -192,4 +193,24 @@ func (f *fakeWebSocketConn) Close(status websocket.StatusCode, reason string) er
 func (f *fakeWebSocketConn) CloseNow() error {
 	f.closeNowCalls++
 	return nil
+}
+
+// A shell that has not exited after the hang-up and the kill is not waited
+// for without end: cleanup reports it and returns, and goes on to close the
+// pty. The process here never reports that it is done.
+func TestConnection_CleanupReportsAShellThatDoesNotGo(t *testing.T) {
+	t.Parallel()
+
+	conn := &Connection{ID: "stuck", cmd: exec.Command("true")}
+	_, cancel := context.WithCancel(context.Background())
+	var ioWG sync.WaitGroup
+	never := make(chan struct{})
+
+	started := time.Now()
+	err := conn.cleanup(cancel, &ioWG, never, false)
+
+	require.ErrorIs(t, err, errShellNotReaped)
+	took := time.Since(started)
+	require.GreaterOrEqual(t, took, processShutdownGrace+processKillGrace)
+	require.Less(t, took, processShutdownGrace+processKillGrace+ioDrainGrace)
 }

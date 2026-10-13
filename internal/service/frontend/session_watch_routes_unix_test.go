@@ -9,10 +9,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"testing"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,6 +33,13 @@ func init() {
 
 // openTerminal opens a terminal WebSocket, with a shell behind it.
 func (h *routeHub) openTerminal(token string) openConnection {
+	conn, _ := h.openTerminalShell(token)
+	return conn
+}
+
+// openTerminalShell is openTerminal, with a function that types a command
+// into the shell.
+func (h *routeHub) openTerminalShell(token string) (openConnection, func(command string)) {
 	h.t.Helper()
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -91,5 +104,37 @@ func (h *routeHub) openTerminal(token string) openConnection {
 		return false
 	}
 	require.True(h.t, alive(), "the shell did not start")
-	return openConnection{closed: closed, alive: alive, hangUp: func() { _ = conn.CloseNow() }}
+	return openConnection{closed: closed, alive: alive, hangUp: func() { _ = conn.CloseNow() }}, run
+}
+
+// The shell behind a terminal does not outlive the session: when the
+// terminal is closed for it, the shell process is ended too.
+func TestTerminalShellEndsWithItsOIDCSession(t *testing.T) {
+	t.Parallel()
+	hub := newRouteHub(t, true)
+	token := hub.signIn()
+	conn, run := hub.openTerminalShell(token)
+	hub.armed()
+
+	pidFile := filepath.Join(t.TempDir(), "shell.pid")
+	run("echo $$ > " + pidFile)
+	var pid int
+	require.Eventually(t, func() bool {
+		raw, err := os.ReadFile(pidFile)
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+		return err == nil && pid > 0
+	}, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, syscall.Kill(pid, 0), "the shell is running")
+
+	hub.signOut(token)
+	hub.clock.advance(15 * time.Second)
+	requireClosed(t, conn)
+
+	// The hub hangs the shell up, and kills it if it does not go.
+	require.Eventually(t, func() bool {
+		return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	}, 10*time.Second, 20*time.Millisecond, "the shell is still running")
 }

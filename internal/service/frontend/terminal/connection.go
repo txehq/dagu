@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +21,8 @@ import (
 	"github.com/creack/pty"
 	"github.com/dagucloud/dagu/v2/internal/audit"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/google/uuid"
 )
 
@@ -29,7 +32,17 @@ const (
 	auditTimeout              = 5 * time.Second
 	processShutdownGrace      = 3 * time.Second
 	processExitDetectionDelay = 250 * time.Millisecond
+	// processKillGrace is how long a shell that has been killed is waited
+	// for.
+	processKillGrace = 3 * time.Second
+	// ioDrainGrace is how long the output of a shell that is gone is waited
+	// for before its pty is closed.
+	ioDrainGrace = 3 * time.Second
 )
+
+// errShellNotReaped is reported by a terminal's cleanup when its shell was
+// killed and had still not exited after processKillGrace.
+var errShellNotReaped = errors.New("the terminal's shell did not exit after it was killed")
 
 type terminalEndReason string
 
@@ -353,13 +366,46 @@ func (c *Connection) cleanup(cancel context.CancelFunc, ioWG *sync.WaitGroup, pr
 	cancel()
 	c.interruptTransport(gracefulClose)
 
-	ioWG.Wait()
+	// The shell is ended before its output is waited for. A read of the pty
+	// cannot be interrupted: it returns when the shell writes or when the
+	// pty is hung up, and an idle shell does neither until it is ended. A
+	// shell that has exited by itself is found gone here, and its reader is
+	// waited for below as it was before.
+	err := c.terminateProcess(processDone)
+	if err != nil {
+		// Nothing above this keeps the error, and once cleanup returns the
+		// terminal manager no longer knows the connection: this line is the
+		// record that a shell may have been left behind.
+		logger.Error(context.Background(), "Terminal shell could not be ended",
+			slog.String("session_id", c.ID), slog.Bool("still_running", errors.Is(err, errShellNotReaped)), tag.Error(err))
+	}
+
+	// With the shell gone the pty reader ends, unless something the shell
+	// started still holds the pty. That is not waited for without end. The
+	// pty is closed here all the same, which takes effect when the read
+	// returns: until that last holder exits or writes, the reader and the
+	// pty's descriptor stay.
+	if !waitForGroup(ioWG, ioDrainGrace) {
+		logger.Warn(context.Background(), "Terminal output reader has not ended; the shell or a process it started still holds the terminal",
+			slog.String("session_id", c.ID))
+	}
 
 	if c.ptmx != nil {
 		_ = c.ptmx.Close()
 	}
 
-	return c.terminateProcess(processDone)
+	return err
+}
+
+// waitForGroup waits for a group for at most timeout and reports whether it
+// finished.
+func waitForGroup(group *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	return waitForSignal(done, timeout)
 }
 
 func (c *Connection) terminateProcess(processDone <-chan struct{}) error {
@@ -381,7 +427,12 @@ func (c *Connection) terminateProcess(processDone <-chan struct{}) error {
 	if err := forceKillProcess(c.cmd); err != nil {
 		errs = append(errs, err)
 	}
-	<-processDone
+	// A killed process is gone at once, unless it is held in the kernel.
+	// That is not waited for without end either: the goroutine that waits
+	// for the process stays and reaps it when it goes.
+	if !waitForSignal(processDone, processKillGrace) {
+		errs = append(errs, errShellNotReaped)
+	}
 	return errors.Join(errs...)
 }
 
