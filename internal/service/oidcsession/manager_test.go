@@ -6,11 +6,13 @@ package oidcsession
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -282,6 +284,55 @@ func (f *fixture) rewrite(session *Session, change func(*Session)) {
 	data, err := encode(stored)
 	require.NoError(f.t, err)
 	require.NoError(f.t, f.col.CompareAndSwap(context.Background(), session.ID, raw, data))
+}
+
+// records returns every session record in the store, and how many end
+// markers lie beside them.
+func (f *fixture) records() (sessions []*Session, markers int) {
+	f.t.Helper()
+	page, err := f.col.List(context.Background(), persis.ListQuery{})
+	require.NoError(f.t, err)
+	require.Empty(f.t, page.NextCursor)
+	for _, rec := range page.Records {
+		if strings.HasPrefix(rec.ID, endMarkerPrefix) {
+			markers++
+			continue
+		}
+		var session Session
+		require.NoError(f.t, json.Unmarshal(rec.Data, &session))
+		sessions = append(sessions, &session)
+	}
+	return sessions, markers
+}
+
+// openSessions is how many sessions in the store have not ended.
+func (f *fixture) openSessions() int {
+	f.t.Helper()
+	sessions, _ := f.records()
+	open := 0
+	for _, session := range sessions {
+		if session.EndedAt == nil {
+			open++
+		}
+	}
+	return open
+}
+
+// owedTokens returns the refresh tokens the store's records owe the
+// revocation of, decrypted and sorted.
+func (f *fixture) owedTokens() []string {
+	f.t.Helper()
+	sessions, _ := f.records()
+	owed := []string{}
+	for _, session := range sessions {
+		for _, entry := range session.Owed {
+			token, err := f.enc.Decrypt(entry.Token)
+			require.NoError(f.t, err)
+			owed = append(owed, token)
+		}
+	}
+	slices.Sort(owed)
+	return owed
 }
 
 // heldToken is the refresh token the stored session holds, decrypted.
@@ -806,6 +857,8 @@ func TestAStoreFailureIsNotAnAnswer(t *testing.T) {
 type failingCollection struct {
 	persis.Collection
 	fail error
+	// failFor is what reading one record fails with.
+	failFor map[string]error
 	// swap, when set, decides each write: an error fails it.
 	swap func() error
 	// read, when set, is called before each read.
@@ -880,6 +933,9 @@ func (c *failingCollection) Get(ctx context.Context, id string) (*persis.Record,
 	}
 	if c.fail != nil {
 		return nil, c.fail
+	}
+	if err := c.failFor[id]; err != nil {
+		return nil, err
 	}
 	return c.Collection.Get(ctx, id)
 }

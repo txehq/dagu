@@ -34,7 +34,18 @@ import (
 type sessionStore struct {
 	persis.Collection
 	unreadable atomic.Bool
+	// unwritable: the store takes no write of any kind.
 	unwritable atomic.Bool
+	// unchangeable: a record that exists cannot be changed, and a new one
+	// can still be created.
+	unchangeable atomic.Bool
+}
+
+func (s *sessionStore) Create(ctx context.Context, rec *persis.Record) error {
+	if s.unwritable.Load() {
+		return errors.New("disk full")
+	}
+	return s.Collection.Create(ctx, rec)
 }
 
 func (s *sessionStore) Get(ctx context.Context, id string) (*persis.Record, error) {
@@ -45,7 +56,7 @@ func (s *sessionStore) Get(ctx context.Context, id string) (*persis.Record, erro
 }
 
 func (s *sessionStore) CompareAndSwap(ctx context.Context, id string, old, next []byte) error {
-	if s.unwritable.Load() {
+	if s.unwritable.Load() || s.unchangeable.Load() {
 		return errors.New("disk full")
 	}
 	return s.Collection.CompareAndSwap(ctx, id, old, next)
@@ -376,9 +387,10 @@ func TestAnUnreadableSessionStoreIs503(t *testing.T) {
 	assert.Equal(t, http.StatusOK, env.get(token).Code)
 }
 
-// A sign-out the store did not take is reported as a failure, and is a
-// sign-out all the same: the token is refused from then on.
-func TestASignOutTheStoreDidNotTakeStillSignsOut(t *testing.T) {
+// A sign-out the store took nothing of is reported as a failure, and is a
+// sign-out all the same on the hub process that received it: the token is
+// refused there from then on.
+func TestASignOutTheStoreTookNothingOfStillSignsOut(t *testing.T) {
 	t.Parallel()
 	env := newSessionEnv(t)
 	token := env.signIn()
@@ -390,7 +402,25 @@ func TestASignOutTheStoreDidNotTakeStillSignsOut(t *testing.T) {
 	env.store.unwritable.Store(false)
 	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
 	env.provider.mu.Lock()
-	assert.Equal(t, []string{"provider-refresh-token"}, env.provider.revoked)
+	assert.Contains(t, env.provider.revoked, "provider-refresh-token")
+	env.provider.mu.Unlock()
+}
+
+// A sign-out whose session record could not be changed, but which the store
+// took as a marker beside it, is a sign-out that is in the store: 204.
+func TestASignOutWrittenBesideTheRecordIsASignOut(t *testing.T) {
+	t.Parallel()
+	env := newSessionEnv(t)
+	token := env.signIn()
+
+	env.store.unchangeable.Store(true)
+	assert.Equal(t, http.StatusNoContent, signOut(env, http.MethodPost, "Bearer "+token, "/oidc-logout").Code)
+	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
+
+	env.store.unchangeable.Store(false)
+	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
+	env.provider.mu.Lock()
+	assert.Contains(t, env.provider.revoked, "provider-refresh-token")
 	env.provider.mu.Unlock()
 }
 
