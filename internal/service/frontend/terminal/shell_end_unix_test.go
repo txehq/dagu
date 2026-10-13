@@ -188,14 +188,15 @@ func TestTerminal_AShellThatIgnoresTheHangUpIsKilled(t *testing.T) {
 
 // Something the shell started in the background can keep the pty open after
 // the shell is gone. The terminal's cleanup does not wait for it: the shell
-// is ended and the handler returns.
+// is ended and the handler returns, and the job is left as it is.
 func TestTerminal_ABackgroundJobDoesNotHoldTheTerminalOpen(t *testing.T) {
 	t.Parallel()
 	terminal := openShellTerminal(t)
-	pidFile := filepath.Join(t.TempDir(), "job.pid")
-	// It ignores the hang-up, keeps the terminal as its output, and is
-	// stopped by the test at the end.
-	terminal.run(t, "(trap '' HUP; sleep 60) & echo $! > "+pidFile)
+	dir := t.TempDir()
+	pidFile, ready := filepath.Join(dir, "job.pid"), filepath.Join(dir, "ready")
+	// The job ignores the hang-up, says so, and then becomes a sleep with
+	// the terminal still as its output. It is killed by the test at the end.
+	terminal.run(t, "(trap '' HUP; touch "+ready+"; exec sleep 120) & echo $! > "+pidFile)
 	var job int
 	require.Eventually(t, func() bool {
 		raw, err := os.ReadFile(pidFile)
@@ -206,6 +207,8 @@ func TestTerminal_ABackgroundJobDoesNotHoldTheTerminalOpen(t *testing.T) {
 		return err == nil && job > 0
 	}, 10*time.Second, 10*time.Millisecond)
 	t.Cleanup(func() { _ = syscall.Kill(job, syscall.SIGKILL) })
+	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 10*time.Second, 10*time.Millisecond,
+		"the job did not get as far as ignoring the hang-up")
 
 	terminal.cancel()
 	require.Eventually(t, func() bool { return processGone(terminal.pid) }, 8*time.Second, 20*time.Millisecond,
@@ -215,4 +218,6 @@ func TestTerminal_ABackgroundJobDoesNotHoldTheTerminalOpen(t *testing.T) {
 	case <-time.After(12 * time.Second):
 		require.FailNow(t, "the handler did not return: cleanup is waiting for the background job")
 	}
+	// The job was there throughout: it is what cleanup did not wait for.
+	require.NoError(t, syscall.Kill(job, 0), "the background job did not outlive the shell, so nothing held the terminal")
 }
