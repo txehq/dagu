@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
@@ -213,10 +214,14 @@ func namesASession(token string) bool {
 // session's hub token in the Authorization header. It goes after the
 // middleware that authenticates the request.
 //
+// A request whose session stopped letting it be served between its
+// authentication and here is refused and not handed on.
+//
 // A handler is expected to end when its request's context does. One that is
 // held in a write to a client that does not read, or in a read of the
-// request, would not see that, so when the watch closes a request its
-// connection's deadlines are set to now as well.
+// request, would not see that. So when the watch closes a request, its
+// connection's deadlines are set to now as well, and they stay there: a
+// handler that sets a deadline of its own afterwards gets now.
 func (w *SessionWatch) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if w == nil {
@@ -229,18 +234,93 @@ func (w *SessionWatch) Middleware() func(http.Handler) http.Handler {
 				next.ServeHTTP(rw, r)
 				return
 			}
-			controller := http.NewResponseController(rw)
+			if ctx.Err() != nil {
+				WriteSessionWatchRefusal(ctx, rw)
+				return
+			}
+			watched := &watchedWriter{ResponseWriter: rw}
+			interrupted := make(chan struct{})
 			stopInterrupt := context.AfterFunc(ctx, func() {
+				defer close(interrupted)
 				if SessionWatchClosed(ctx) {
-					now := time.Now()
-					_ = controller.SetWriteDeadline(now)
-					_ = controller.SetReadDeadline(now)
+					watched.interrupt()
 				}
 			})
-			defer stopInterrupt()
-			next.ServeHTTP(rw, r.WithContext(ctx))
+			// The response writer is not to be touched once the handler has
+			// returned, so an interruption that has started is waited for.
+			defer func() {
+				if !stopInterrupt() {
+					<-interrupted
+				}
+			}()
+			next.ServeHTTP(watched, r.WithContext(ctx))
 		})
 	}
+}
+
+// WriteSessionWatchRefusal answers a request that a watch closed before it
+// was served, as the authentication would have answered it a moment later:
+// 401 when the session has ended or the token is no longer good, and
+// otherwise 503 with a Retry-After, because the session could not be
+// confirmed or read.
+func WriteSessionWatchRefusal(ctx context.Context, w http.ResponseWriter) {
+	cause := context.Cause(ctx)
+	for _, ended := range []error{
+		oidcsession.ErrSessionEnded, authservice.ErrInvalidToken, authservice.ErrTokenExpired, authservice.ErrUserDisabled,
+	} {
+		if errors.Is(cause, ended) {
+			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+			return
+		}
+	}
+	WriteSessionCheckUnavailable(w)
+}
+
+// watchedWriter is the response writer of a watched request. Once it has
+// been interrupted, every deadline set through it is now.
+type watchedWriter struct {
+	http.ResponseWriter
+	mu          sync.Mutex
+	interrupted bool
+}
+
+// Unwrap lets http.ResponseController reach what this writer does not do
+// itself.
+func (w *watchedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush implements http.Flusher, which a stream's handler asks for.
+func (w *watchedWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// SetWriteDeadline is found by http.ResponseController.
+func (w *watchedWriter) SetWriteDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.interrupted {
+		deadline = time.Now()
+	}
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
+}
+
+// SetReadDeadline is found by http.ResponseController.
+func (w *watchedWriter) SetReadDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.interrupted {
+		deadline = time.Now()
+	}
+	return http.NewResponseController(w.ResponseWriter).SetReadDeadline(deadline)
+}
+
+func (w *watchedWriter) interrupt() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.interrupted = true
+	controller := http.NewResponseController(w.ResponseWriter)
+	now := time.Now()
+	_ = controller.SetWriteDeadline(now)
+	_ = controller.SetReadDeadline(now)
 }
 
 // SessionWatchClosed reports whether ctx was cancelled by a watch.

@@ -786,3 +786,121 @@ func TestUntilNextCheckIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// fixedWindows answers every read of a session's window the same way.
+type fixedWindows struct {
+	window oidcsession.Window
+	err    error
+}
+
+func (f fixedWindows) Window(context.Context, string) (oidcsession.Window, error) {
+	return f.window, f.err
+}
+
+// A request whose session stopped letting it be served between its
+// authentication and the watch is refused, and its handler is not run: 401
+// when the session has ended, 503 when it could not be read or confirmed.
+func TestSessionWatchMiddlewareRefusesWhatIsAlreadyOver(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
+		token := env.signIn()
+		now := time.Now()
+
+		for name, tc := range map[string]struct {
+			windows    SessionWindows
+			status     int
+			retryAfter string
+		}{
+			"Ended":      {fixedWindows{err: oidcsession.ErrSessionEnded}, http.StatusUnauthorized, ""},
+			"Unreadable": {fixedWindows{err: errors.New("disk unavailable")}, http.StatusServiceUnavailable, "5"},
+			"AtItsLimit": {fixedWindows{window: oidcsession.Window{RevalidateAt: now.Add(-time.Minute), ServedUntil: now}}, http.StatusServiceUnavailable, "5"},
+		} {
+			ran := false
+			handler := NewSessionWatch(env.svc, tc.windows, nil).Middleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				ran = true
+			}))
+			request := httptest.NewRequest(http.MethodPost, "/mcp", nil).WithContext(t.Context())
+			request.Header.Set("Authorization", "Bearer "+token)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+
+			assert.False(t, ran, name)
+			assert.Equal(t, tc.status, recorder.Code, name)
+			assert.Equal(t, tc.retryAfter, recorder.Header().Get("Retry-After"), name)
+		}
+	})
+}
+
+// deadlineRecorder is a response writer that records the deadlines set on it.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	mu     sync.Mutex
+	writes []time.Time
+	reads  []time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.writes = append(d.writes, deadline)
+	return nil
+}
+
+func (d *deadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.reads = append(d.reads, deadline)
+	return nil
+}
+
+// When the watch closes a request, the deadlines of its connection are set
+// to now, and a handler cannot move them again: a stream that gives each
+// write a deadline of its own, as the event stream does, gets now. The
+// handler's stream interfaces still work through the watched writer.
+func TestSessionWatchMiddlewareInterruptionCannotBeUndone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
+		token := env.signIn()
+		writer := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+		closed, extended := make(chan struct{}), make(chan struct{})
+		handler := env.watch.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			controller := http.NewResponseController(w)
+			// Before: the handler's own deadlines are the handler's.
+			assert.NoError(t, controller.SetWriteDeadline(time.Now().Add(time.Hour)))
+			_, flushes := w.(http.Flusher)
+			assert.True(t, flushes)
+			assert.NoError(t, controller.Flush())
+
+			<-r.Context().Done()
+			close(closed)
+			<-extended
+			// After: it asks for another hour and gets none.
+			assert.NoError(t, controller.SetWriteDeadline(time.Now().Add(time.Hour)))
+			assert.NoError(t, controller.SetReadDeadline(time.Time{}))
+		}))
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/events/stream", nil).WithContext(t.Context())
+		request.Header.Set("Authorization", "Bearer "+token)
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			handler.ServeHTTP(writer, request)
+		}()
+
+		synctest.Wait()
+		opened := time.Now()
+		env.signOut(token)
+		<-closed
+		synctest.Wait() // the interruption has been made
+		closedAt := time.Now()
+		require.Equal(t, sessionWatchPoll, closedAt.Sub(opened))
+		close(extended)
+		<-served
+
+		writer.mu.Lock()
+		defer writer.mu.Unlock()
+		require.Equal(t, []time.Time{opened.Add(time.Hour), closedAt, closedAt}, writer.writes)
+		require.Equal(t, []time.Time{closedAt, closedAt}, writer.reads)
+		assert.True(t, writer.Flushed)
+	})
+}

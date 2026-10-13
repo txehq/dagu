@@ -75,6 +75,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The token has just been checked. It is watched from here on, before
+	// anything is set up for the terminal, so that the terminal does not
+	// outlive the session. A session that has stopped letting its user in
+	// since the check gets no terminal.
+	watchedCtx, stopWatch := h.sessionWatch.Watch(ctx, token)
+	defer stopWatch()
+	if watchedCtx.Err() != nil {
+		frontendauth.WriteSessionWatchRefusal(watchedCtx, w)
+		return
+	}
+
 	// Get client IP address
 	ipAddress := frontendauth.GetClientIP(r)
 
@@ -102,11 +113,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-
-	// The token was checked when the terminal was opened. It is watched from
-	// here on, so that the terminal does not outlive the session.
-	watchedCtx, stopWatch := h.sessionWatch.Watch(ctx, token)
-	defer stopWatch()
 
 	// Create and run connection
 	tc := NewConnection(user, h.shell, conn, ipAddress)
