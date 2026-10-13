@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/audit"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/google/uuid"
 )
 
@@ -371,6 +372,13 @@ func (c *Connection) cleanup(cancel context.CancelFunc, ioWG *sync.WaitGroup, pr
 	// shell that has exited by itself is found gone here, and its reader is
 	// waited for below as it was before.
 	err := c.terminateProcess(processDone)
+	if err != nil {
+		// Nothing above this keeps the error, and once cleanup returns the
+		// terminal manager no longer knows the connection: this line is the
+		// record that a shell may have been left behind.
+		logger.Error(context.Background(), "Terminal shell could not be ended",
+			slog.String("session_id", c.ID), slog.Bool("still_running", errors.Is(err, errShellNotReaped)), tag.Error(err))
+	}
 
 	// With the shell gone the pty reader ends, unless something the shell
 	// started still holds the pty. That is not waited for without end. The
@@ -378,7 +386,7 @@ func (c *Connection) cleanup(cancel context.CancelFunc, ioWG *sync.WaitGroup, pr
 	// returns: until that last holder exits or writes, the reader and the
 	// pty's descriptor stay.
 	if !waitForGroup(ioWG, ioDrainGrace) {
-		logger.Warn(context.Background(), "Terminal output reader did not end with the shell; a process it started still holds the terminal",
+		logger.Warn(context.Background(), "Terminal output reader has not ended; the shell or a process it started still holds the terminal",
 			slog.String("session_id", c.ID))
 	}
 
