@@ -86,15 +86,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void globalMutate(() => true, undefined, { revalidate: false });
   }, []);
 
-  // A sign-out already under way: repeated or concurrent calls share it, so
-  // the hub is asked once.
-  const logoutInFlight = useRef<Promise<LogoutResult> | null>(null);
+  // The hub sign-out under way, with the token it ends. A repeated or
+  // concurrent call for that same session shares it, so the hub is asked
+  // once; a session signed in since then is signed out on its own.
+  const logoutInFlight = useRef<{
+    token: string;
+    request: Promise<LogoutResult>;
+  } | null>(null);
 
   const logout = useCallback((): Promise<LogoutResult> => {
-    if (logoutInFlight.current) {
-      return logoutInFlight.current;
-    }
     const storedToken = getAuthToken();
+    const inFlight = logoutInFlight.current;
+    if (inFlight && (!storedToken || storedToken === inFlight.token)) {
+      return inFlight.request;
+    }
     // This browser is signed out first, whatever the hub answers: a tab
     // closed while the hub is asked must not leave the token behind.
     clearAuthSession('logout');
@@ -116,9 +121,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return 'unconfirmed';
       }
     })();
-    logoutInFlight.current = request;
+    const entry = { token: storedToken, request };
+    logoutInFlight.current = entry;
     void request.finally(() => {
-      if (logoutInFlight.current === request) {
+      if (logoutInFlight.current === entry) {
         logoutInFlight.current = null;
       }
     });

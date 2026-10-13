@@ -242,6 +242,50 @@ describe('AuthProvider logout', () => {
     expect(logoutCalls(fetchMock)).toHaveLength(1);
   });
 
+  it('signs out a session signed in while an earlier sign-out is still waiting for the hub', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchMock = installFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          answers.push(resolve);
+        })
+    );
+    await renderSignedIn();
+
+    let first: Promise<LogoutResult> | undefined;
+    act(() => {
+      first = auth!.logout();
+    });
+    expect(getAuthToken()).toBeNull();
+
+    // Signed in again before the hub answered the first sign-out.
+    act(() => setAuthSession('second-token', FAR_FUTURE, 'login'));
+    await waitFor(() => expect(auth?.isAuthenticated).toBe(true));
+
+    let second: Promise<LogoutResult> | undefined;
+    act(() => {
+      second = auth!.logout();
+    });
+    expect(second).not.toBe(first);
+    expect(getAuthToken()).toBeNull();
+    expect(auth!.isAuthenticated).toBe(false);
+
+    const calls = logoutCalls(fetchMock);
+    expect(calls.map(([, init]) => init?.headers)).toEqual([
+      { Authorization: `Bearer ${TOKEN}` },
+      { Authorization: 'Bearer second-token' },
+    ]);
+
+    let results: LogoutResult[] = [];
+    await act(async () => {
+      answers[1]!(new Response(null, { status: 204 }));
+      answers[0]!(new Response(null, { status: 500 }));
+      results = await Promise.all([first!, second!]);
+    });
+    expect(results).toEqual(['unconfirmed', 'ended']);
+    expect(getAuthToken()).toBeNull();
+  });
+
   it.each([
     ['/dagu', '/dagu/oidc-logout'],
     ['/dagu/', '/dagu/oidc-logout'],
