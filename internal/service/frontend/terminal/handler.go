@@ -23,6 +23,9 @@ type Handler struct {
 	licenseChecker license.Checker
 	manager        *Manager
 	shell          string
+	// sessionWatch closes a terminal whose OIDC session stopped letting its
+	// user in. Nil watches nothing.
+	sessionWatch *frontendauth.SessionWatch
 }
 
 // NewHandler creates a new terminal handler.
@@ -34,6 +37,14 @@ func NewHandler(authSvc *authservice.Service, auditSvc *audit.Service, licenseCh
 		manager:        manager,
 		shell:          shell,
 	}
+}
+
+// SetSessionWatch makes the handler close a terminal that was opened with an
+// OIDC session's hub token once that session stops letting its user in. It
+// is called before the handler serves. Without it, or with nil, a terminal
+// stays open until it is closed, as before.
+func (h *Handler) SetSessionWatch(watch *frontendauth.SessionWatch) {
+	h.sessionWatch = watch
 }
 
 // ServeHTTP handles WebSocket upgrade and terminal connection.
@@ -61,6 +72,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check admin role
 	if !user.Role.IsAdmin() {
 		http.Error(w, "Admin access required", http.StatusForbidden)
+		return
+	}
+
+	// The token has just been checked. It is watched from here on, before
+	// anything is set up for the terminal, so that the terminal does not
+	// outlive the session. A session that has stopped letting its user in
+	// since the check gets no terminal.
+	watchedCtx, stopWatch := h.sessionWatch.Watch(ctx, token)
+	defer stopWatch()
+	if watchedCtx.Err() != nil {
+		frontendauth.WriteSessionWatchRefusal(watchedCtx, w)
 		return
 	}
 
@@ -94,6 +116,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Create and run connection
 	tc := NewConnection(user, h.shell, conn, ipAddress)
+	// The watch is over as soon as the terminal is, and not only when its
+	// cleanup is, which can take as long as the shell does.
+	tc.onSessionEnd = stopWatch
 	if lease != nil {
 		if err := lease.Activate(tc); err != nil {
 			_ = conn.Close(websocket.StatusTryAgainLater, "terminal unavailable")
@@ -103,14 +128,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the potentially slow cleanup (process kill, I/O drain). The
 		// connection stays in the sessions map for shutdown/force-kill
 		// until defer lease.Release() runs after cleanup completes.
-		tc.onSessionEnd = lease.ReleaseSlot
+		tc.onSessionEnd = func() {
+			stopWatch()
+			lease.ReleaseSlot()
+		}
 	}
 
 	var managerCtx context.Context
 	if h.manager != nil {
 		managerCtx = h.manager.Context()
 	}
-	runCtx, cancelRun := mergeSessionContext(ctx, managerCtx)
+	runCtx, cancelRun := mergeSessionContext(watchedCtx, managerCtx)
 	defer cancelRun()
 	auditSvc := h.auditService
 	if h.licenseChecker != nil && !h.licenseChecker.IsFeatureEnabled(license.FeatureAudit) {
