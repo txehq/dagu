@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -361,6 +362,55 @@ type hangingTokens struct {
 func (h hangingTokens) GetUserFromToken(context.Context, string) (*authmodel.User, error) {
 	<-h.hang
 	return nil, errors.New("too late")
+}
+
+// A read of the session that never comes back is the same, at any point: the
+// connection is closed at the limit the watch last knew, and one whose
+// session could not be read at all when it was opened is closed after
+// sessionWatchFirstRead.
+func TestSessionWatchClosesWhenTheSessionReadHangs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
+		token := env.signIn()
+		windows := &hangingWindows{SessionWindows: env.sessions, release: make(chan struct{})}
+		watch := NewSessionWatch(env.svc, windows, nil)
+
+		// Read once when it is opened and once after the check at 15 s. The
+		// third read, after the check at 30 s, hangs.
+		windows.hangFrom.Store(3)
+		ctx, stop := watch.Watch(t.Context(), token)
+		defer stop()
+		stillOpen(t, ctx, 5*time.Minute-time.Nanosecond)
+		assert.Equal(t, time.Nanosecond, closedIn(t, ctx))
+		require.ErrorIs(t, context.Cause(ctx), errSessionWatchPastLimit)
+
+		windows.calls.Store(0)
+		windows.hangFrom.Store(1)
+		opened, stopOpened := watch.Watch(t.Context(), env.signIn())
+		defer stopOpened()
+		stillOpen(t, opened, sessionWatchFirstRead-time.Nanosecond)
+		assert.Equal(t, time.Nanosecond, closedIn(t, opened))
+		require.ErrorIs(t, context.Cause(opened), errSessionWatchUnread)
+
+		close(windows.release)
+	})
+}
+
+// hangingWindows reads a session's window until its hangFrom-th call, and
+// from then on does not come back until it is released.
+type hangingWindows struct {
+	SessionWindows
+	calls    atomic.Int64
+	hangFrom atomic.Int64
+	release  chan struct{}
+}
+
+func (h *hangingWindows) Window(ctx context.Context, sessionID string) (oidcsession.Window, error) {
+	if h.calls.Add(1) >= h.hangFrom.Load() {
+		<-h.release
+		return oidcsession.Window{}, errors.New("too late")
+	}
+	return h.SessionWindows.Window(ctx, sessionID)
 }
 
 // A session configured to be due at the provider very shortly before its

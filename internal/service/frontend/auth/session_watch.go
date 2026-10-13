@@ -31,6 +31,11 @@ const (
 	// provider calls.
 	sessionWatchRetry = 5 * time.Second
 
+	// sessionWatchFirstRead is how long the first read of a session's window
+	// may take, when a connection is opened. A connection whose session
+	// cannot be read in that time is closed.
+	sessionWatchFirstRead = 5 * time.Second
+
 	// sessionWatchMinStep is the least time between two checks, whatever the
 	// configuration, so that a watch never spins. Only a session configured
 	// with a limit shorter than this can reach it with no check made.
@@ -41,6 +46,10 @@ const (
 // when its OIDC session stopped letting the user in. The reason is wrapped
 // with it.
 var ErrSessionWatchClosed = errors.New("the OIDC session no longer lets this connection be served")
+
+// errSessionWatchUnread is the reason for a connection closed because its
+// session could not be read in sessionWatchFirstRead when it was opened.
+var errSessionWatchUnread = errors.New("the session could not be read when the connection was opened")
 
 // errSessionWatchPastLimit is the reason for a connection closed because its
 // session reached the time a new request would be refused, with no
@@ -91,7 +100,8 @@ func (systemWatchClock) After(d time.Duration) (<-chan time.Time, func()) {
 //   - at the time the session manager would refuse a new request unless the
 //     provider confirms the session first (oidcsession.Window.ServedUntil),
 //     if no check has moved that time by then. This is a timer, not a poll:
-//     a check that is slow or stuck does not hold the connection open.
+//     a check or a read of the session that is slow or stuck does not hold
+//     the connection open.
 //
 // The token is checked again every sessionWatchPoll at the latest, and at
 // the time the session is next due at the provider, so that a connection
@@ -170,23 +180,65 @@ func (w *SessionWatch) run(ctx context.Context, cancel context.CancelCauseFunc, 
 		logger.Info(ctx, "Closed an open connection: its OIDC session no longer lets it be served", tag.Error(reason))
 	}
 
-	// The request that opened the connection was checked just now.
-	lastCheck := w.clock.Now()
-	for {
-		window, err := w.windows.Window(ctx, sessionID)
-		if err != nil {
-			closeFor(err)
-			return
-		}
-		now := w.clock.Now()
-		left := window.ServedUntil.Sub(now)
-		if left <= 0 {
-			closeFor(errSessionWatchPastLimit)
-			return
-		}
-		limit, stopLimit := w.clock.After(left)
+	// read asks for the session's window, after checking the token again
+	// when check is set. It runs beside the timer that bounds it, so that a
+	// check or a read that does not come back cannot keep the connection
+	// open.
+	type reading struct {
+		window oidcsession.Window
+		err    error
+	}
+	read := func(check bool) <-chan reading {
+		out := make(chan reading, 1)
+		go func() {
+			if check {
+				if _, err := w.tokens.GetUserFromToken(ctx, token); err != nil {
+					out <- reading{err: err}
+					return
+				}
+			}
+			window, err := w.windows.Window(ctx, sessionID)
+			out <- reading{window: window, err: err}
+		}()
+		return out
+	}
 
-		wait := max(untilNextCheck(now, window), lastCheck.Add(sessionWatchMinStep).Sub(now))
+	// The request that opened the connection was checked just now. Until the
+	// session's window has been read once, nothing says how long it may be
+	// served, so that first read is given a short time of its own.
+	lastCheck := w.clock.Now()
+	pending := read(false)
+	limit, stopLimit := w.clock.After(sessionWatchFirstRead)
+	pastLimit := errSessionWatchUnread
+	for {
+		var got reading
+		select {
+		case <-ctx.Done():
+			stopLimit()
+			return
+		case <-limit:
+			closeFor(pastLimit)
+			return
+		case got = <-pending:
+		}
+		stopLimit()
+		if got.err != nil {
+			closeFor(got.err)
+			return
+		}
+
+		// From here the limit is the session's own, as stored: a check that
+		// succeeded without a new confirmation has not moved it.
+		pastLimit = errSessionWatchPastLimit
+		now := w.clock.Now()
+		left := got.window.ServedUntil.Sub(now)
+		if left <= 0 {
+			closeFor(pastLimit)
+			return
+		}
+		limit, stopLimit = w.clock.After(left)
+
+		wait := max(untilNextCheck(now, got.window), lastCheck.Add(sessionWatchMinStep).Sub(now))
 		if wait >= left {
 			// No check fits before the limit. The last one did not move it,
 			// so the connection is over when it comes.
@@ -194,7 +246,7 @@ func (w *SessionWatch) run(ctx context.Context, cancel context.CancelCauseFunc, 
 			case <-ctx.Done():
 				stopLimit()
 			case <-limit:
-				closeFor(errSessionWatchPastLimit)
+				closeFor(pastLimit)
 			}
 			return
 		}
@@ -206,34 +258,16 @@ func (w *SessionWatch) run(ctx context.Context, cancel context.CancelCauseFunc, 
 			return
 		case <-limit:
 			stopDue()
-			closeFor(errSessionWatchPastLimit)
+			closeFor(pastLimit)
 			return
 		case <-due:
 		}
 		stopDue()
 
-		// The check runs beside the limit, so that one that does not come
-		// back cannot keep the connection open past it.
+		// The limit stays set while the token is checked and the window read
+		// again.
 		lastCheck = w.clock.Now()
-		checked := make(chan error, 1)
-		go func() {
-			_, err := w.tokens.GetUserFromToken(ctx, token)
-			checked <- err
-		}()
-		select {
-		case <-ctx.Done():
-			stopLimit()
-			return
-		case <-limit:
-			closeFor(errSessionWatchPastLimit)
-			return
-		case err := <-checked:
-			stopLimit()
-			if err != nil {
-				closeFor(err)
-				return
-			}
-		}
+		pending = read(true)
 	}
 }
 
