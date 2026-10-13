@@ -221,7 +221,8 @@ type TokenResult struct {
 // SetSessionChecker turns on OIDC sessions: from then on a token that carries
 // a session is checked against it, and an OIDC user's token that carries none
 // is refused. It is called once, before the service takes requests. Without
-// it tokens are validated exactly as before.
+// it a token that carries no session is validated exactly as before, and one
+// that carries a session is refused.
 func (s *Service) SetSessionChecker(checker SessionChecker) {
 	s.sessions = checker
 }
@@ -285,7 +286,10 @@ func (s *Service) generateToken(user *auth.User, sessionID string, sessionExpiry
 	}, nil
 }
 
-// ValidateToken validates a JWT token and returns the claims.
+// ValidateToken validates a JWT token and returns the claims. It checks the
+// signature and the expiry only. It does not look up the user or ask the
+// token's OIDC session, so its result alone lets nobody in: GetUserFromToken
+// decides that.
 func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	if !s.config.TokenSecret.IsValid() {
 		return nil, ErrMissingSecret
@@ -343,24 +347,31 @@ func (s *Service) GetUserFromToken(ctx context.Context, tokenString string) (*au
 		}
 	}
 
-	// With OIDC sessions on, an OIDC user is let in only while their session
-	// is. A token of theirs with no session was issued before sessions were
-	// turned on; it would never be revalidated, so it is refused. Every other
-	// kind of user, the builtin administrator included, is untouched.
-	if s.sessions != nil {
-		switch {
-		case claims.SessionID != "":
-			if err := s.sessions.CheckSession(ctx, claims.SessionID, user); err != nil {
-				if errors.Is(err, ErrInvalidToken) {
-					return nil, ErrInvalidToken
-				}
-				// Not an answer about the user: they are not let in, and
-				// they are not told they are signed out.
-				return nil, ErrSessionCheckUnavailable
-			}
-		case user.AuthProvider == auth.AuthProviderOIDC:
+	switch {
+	case claims.SessionID != "":
+		// A token that names an OIDC session is good only while that session
+		// is, whoever it was issued to. With OIDC sessions off nothing can
+		// say that the session has not ended, so the token is refused and its
+		// holder signs in again: it never becomes an ordinary token. Only a
+		// hub that had sessions on has issued such a token.
+		if s.sessions == nil {
 			return nil, ErrInvalidToken
 		}
+		if err := s.sessions.CheckSession(ctx, claims.SessionID, user); err != nil {
+			if errors.Is(err, ErrInvalidToken) {
+				return nil, ErrInvalidToken
+			}
+			// Not an answer about the user: they are not let in, and they
+			// are not told they are signed out.
+			return nil, ErrSessionCheckUnavailable
+		}
+	case s.sessions != nil && user.AuthProvider == auth.AuthProviderOIDC:
+		// With OIDC sessions on, an OIDC user is let in only while their
+		// session is. A token of theirs with no session was issued before
+		// sessions were turned on; it would never be revalidated, so it is
+		// refused. Every other kind of user, the builtin administrator
+		// included, is untouched.
+		return nil, ErrInvalidToken
 	}
 
 	return user, nil
