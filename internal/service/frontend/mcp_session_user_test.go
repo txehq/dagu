@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -253,4 +254,99 @@ func TestMCPSessionsOnAHubWithBasicAuthentication(t *testing.T) {
 	hub.works(basic, session)
 	require.Equal(t, http.StatusUnauthorized, hub.ask(http.MethodPost, "", session, mcpListTools).status)
 	require.Equal(t, http.StatusNoContent, hub.ask(http.MethodDelete, basic, session, "").status)
+}
+
+// The adapter by itself, with whatever is in front of it failing to say who
+// the caller is: it refuses, in every mode, and what is behind it is not run.
+func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []config.AuthMode{config.AuthModeBuiltin, config.AuthModeBasic, config.AuthModeNone, config.AuthMode("another")} {
+		cases := map[string]context.Context{
+			"Nothing":      context.Background(),
+			"NoUser":       authmodel.WithUser(context.Background(), nil),
+			"UserWithNoID": authmodel.WithUser(context.Background(), &authmodel.User{Username: "nobody"}),
+			// A key with no id is not its owner: the owner's name is not
+			// fallen back to.
+			"KeyWithNoID": authmodel.WithAPIKey(authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{}),
+		}
+		if mode == config.AuthMode("another") {
+			// A mode the adapter does not know has no callers it can name.
+			cases["AUserInAnUnknownMode"] = authmodel.WithUser(context.Background(), &authmodel.User{ID: "someone"})
+		}
+		for name, ctx := range cases {
+			ran := false
+			handler := mcpSessionUserMiddleware(mode)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
+			request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(mcpInitialize)).WithContext(ctx)
+			request.Header.Set("Authorization", "Bearer a-real-looking-token")
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+
+			assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%s %s", mode, name)
+			assert.False(t, ran, "%s %s", mode, name)
+		}
+	}
+}
+
+// Who owns a session is taken from what authentication put in the context,
+// with a prefix for each kind of caller, so that no two kinds share a name:
+// a user whose id reads like a key's is still a user.
+func TestMCPSessionOwnerNames(t *testing.T) {
+	t.Parallel()
+	user := func(id string) context.Context {
+		return authmodel.WithUser(context.Background(), &authmodel.User{ID: id})
+	}
+	key := func(id, ownerID string) context.Context {
+		return authmodel.WithAPIKey(user(ownerID), &authmodel.APIKey{ID: id})
+	}
+
+	for _, tc := range []struct {
+		ctx   context.Context
+		mode  config.AuthMode
+		owner string
+	}{
+		{user("u1"), config.AuthModeBuiltin, "user:u1"},
+		{user("apikey:k1"), config.AuthModeBuiltin, "user:apikey:k1"},
+		{key("k1", "u1"), config.AuthModeBuiltin, "apikey:k1"},
+		{key("k2", "u1"), config.AuthModeBuiltin, "apikey:k2"},
+		{user("operator"), config.AuthModeBasic, "basic:operator"},
+		{user("admin"), config.AuthModeNone, "default:admin"},
+	} {
+		owner, ok := mcpSessionOwner(tc.ctx, tc.mode)
+		require.True(t, ok, tc.owner)
+		assert.Equal(t, tc.owner, owner)
+	}
+}
+
+// What the adapter hands on: the caller's name for the library, and a copy of
+// the request whose Authorization header is the placeholder, whatever the
+// request came with. The request it was given is left as it was.
+func TestMCPSessionAdapterHandsOnNoCredential(t *testing.T) {
+	t.Parallel()
+
+	for name, authorization := range map[string]string{
+		"HubToken": "Bearer a-real-hub-token", "APIKey": "Bearer dagu_a-real-key", "Basic": "Basic b3BlcmF0b3I6cGFzcw==", "None": "",
+	} {
+		var seen string
+		var info *mcpauth.TokenInfo
+		handler := mcpSessionUserMiddleware(config.AuthModeBuiltin)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Get("Authorization")
+			info = mcpauth.TokenInfoFromContext(r.Context())
+		}))
+		request := httptest.NewRequest(http.MethodPost, "/mcp", nil).
+			WithContext(authmodel.WithUser(context.Background(), &authmodel.User{ID: "u1"}))
+		if authorization != "" {
+			request.Header.Set("Authorization", authorization)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+
+		require.Equal(t, http.StatusOK, recorder.Code, name)
+		assert.Equal(t, mcpPlaceholderBearer, seen, name)
+		assert.Equal(t, authorization, request.Header.Get("Authorization"), name)
+		require.NotNil(t, info, name)
+		assert.Equal(t, "user:u1", info.UserID, name)
+		assert.Empty(t, info.Scopes, name)
+		assert.Empty(t, info.Extra, name)
+	}
 }
