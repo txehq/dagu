@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -251,10 +252,8 @@ func (h *routeHub) openStream(target string, header http.Header) openConnection 
 	ctx, cancel := context.WithCancel(context.Background())
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.http.URL+target, nil)
 	require.NoError(h.t, err)
-	for name, values := range header {
-		request.Header[name] = values
-	}
-	response, err := h.http.Client().Do(request)
+	maps.Copy(request.Header, header)
+	response, err := h.http.Client().Do(request) //nolint:bodyclose // closed by the reader below, when the stream ends
 	require.NoError(h.t, err)
 	require.Equal(h.t, http.StatusOK, response.StatusCode, target)
 	require.True(h.t, strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream"), response.Header.Get("Content-Type"))
@@ -285,7 +284,7 @@ func (h *routeHub) openMCPStream(token string) openConnection {
 	header.Set("Accept", "application/json, text/event-stream")
 	header.Set("Content-Type", "application/json")
 
-	post := func(body string, sessionID string) *http.Response {
+	post := func(body string, sessionID string) (status int, mcpSession string, answer string) {
 		request, err := http.NewRequest(http.MethodPost, h.http.URL+"/mcp", strings.NewReader(body))
 		require.NoError(h.t, err)
 		request.Header = header.Clone()
@@ -294,18 +293,16 @@ func (h *routeHub) openMCPStream(token string) openConnection {
 		}
 		response, err := h.http.Client().Do(request)
 		require.NoError(h.t, err)
-		h.t.Cleanup(func() { _ = response.Body.Close() })
-		return response
+		defer func() { _ = response.Body.Close() }()
+		raw, err := io.ReadAll(response.Body)
+		require.NoError(h.t, err)
+		return response.StatusCode, response.Header.Get("Mcp-Session-Id"), string(raw)
 	}
-	initialized := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"route-test","version":"0"}}}`, "")
-	body, err := io.ReadAll(initialized.Body)
-	require.NoError(h.t, err)
-	require.Equal(h.t, http.StatusOK, initialized.StatusCode, string(body))
-	sessionID := initialized.Header.Get("Mcp-Session-Id")
+	status, sessionID, answer := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"route-test","version":"0"}}}`, "")
+	require.Equal(h.t, http.StatusOK, status, answer)
 	require.NotEmpty(h.t, sessionID)
-	accepted := post(`{"jsonrpc":"2.0","method":"notifications/initialized"}`, sessionID)
-	_, _ = io.Copy(io.Discard, accepted.Body)
-	require.Less(h.t, accepted.StatusCode, 300)
+	status, _, answer = post(`{"jsonrpc":"2.0","method":"notifications/initialized"}`, sessionID)
+	require.Less(h.t, status, 300, answer)
 
 	// The two requests above were watched and are over: nothing of theirs is
 	// left on the clock.
