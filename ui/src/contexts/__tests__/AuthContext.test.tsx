@@ -242,6 +242,41 @@ describe('AuthProvider logout', () => {
     expect(logoutCalls(fetchMock)).toHaveLength(1);
   });
 
+  it('still clears the browser when the same token is restored during a pending sign-out', async () => {
+    let answer: (response: Response) => void = () => {};
+    const fetchMock = installFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        })
+    );
+    await renderSignedIn();
+
+    let first: Promise<LogoutResult> | undefined;
+    act(() => {
+      first = auth!.logout();
+    });
+
+    // A second sign-in can be issued the very same token.
+    act(() => setAuthSession(TOKEN, FAR_FUTURE, 'login'));
+    await waitFor(() => expect(auth?.isAuthenticated).toBe(true));
+
+    let second: Promise<LogoutResult> | undefined;
+    act(() => {
+      second = auth!.logout();
+    });
+    expect(second).toBe(first);
+    expect(getAuthToken()).toBeNull();
+    expect(auth!.isAuthenticated).toBe(false);
+    expect(logoutCalls(fetchMock)).toHaveLength(1);
+
+    await act(async () => {
+      answer(new Response(null, { status: 204 }));
+      await first;
+    });
+    expect(getAuthToken()).toBeNull();
+  });
+
   it('signs out a session signed in while an earlier sign-out is still waiting for the hub', async () => {
     const answers: Array<(response: Response) => void> = [];
     const fetchMock = installFetch(

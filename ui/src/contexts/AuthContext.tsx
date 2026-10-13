@@ -87,8 +87,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // The hub sign-out under way, with the token it ends. A repeated or
-  // concurrent call for that same session shares it, so the hub is asked
-  // once; a session signed in since then is signed out on its own.
+  // concurrent call for that same token shares the request, so the hub is
+  // asked once; a session signed in since then gets its own request.
   const logoutInFlight = useRef<{
     token: string;
     request: Promise<LogoutResult>;
@@ -96,14 +96,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback((): Promise<LogoutResult> => {
     const storedToken = getAuthToken();
+    // This browser is signed out first, on every call and whatever the hub
+    // answers: a tab closed while the hub is asked must not leave the token
+    // behind.
+    clearAuthSession('logout');
+    clearLocalSession();
     const inFlight = logoutInFlight.current;
     if (inFlight && (!storedToken || storedToken === inFlight.token)) {
       return inFlight.request;
     }
-    // This browser is signed out first, whatever the hub answers: a tab
-    // closed while the hub is asked must not leave the token behind.
-    clearAuthSession('logout');
-    clearLocalSession();
     // With OIDC sessions off the route does not exist: no request.
     if (!config.oidcSessionEnabled || !storedToken) {
       return Promise.resolve('local');
