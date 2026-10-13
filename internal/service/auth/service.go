@@ -287,9 +287,9 @@ func (s *Service) generateToken(user *auth.User, sessionID string, sessionExpiry
 }
 
 // ValidateToken validates a JWT token and returns the claims. It checks the
-// signature and the expiry only. It does not look up the user or ask the
-// token's OIDC session, so its result alone lets nobody in: GetUserFromToken
-// decides that.
+// signature and the token's registered claims, such as its expiry. It does
+// not look up the user or ask the token's OIDC session, so its result alone
+// lets nobody in: GetUserFromToken decides that.
 func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	if !s.config.TokenSecret.IsValid() {
 		return nil, ErrMissingSecret
