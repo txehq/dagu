@@ -734,7 +734,7 @@ func TestSessionWatchMiddleware(t *testing.T) {
 			}
 			got := make(chan context.Context, 1)
 			served = make(chan struct{})
-			handler := watch.Middleware()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			handler := watch.Middleware(Options{})(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				got <- r.Context()
 				// A stream: it ends when its context does.
 				<-r.Context().Done()
@@ -799,7 +799,8 @@ func (f fixedWindows) Window(context.Context, string) (oidcsession.Window, error
 
 // A request whose session stopped letting it be served between its
 // authentication and the watch is refused, and its handler is not run: 401
-// when the session has ended, 503 when it could not be read or confirmed.
+// when the session has ended, 503 when it could not be read or confirmed,
+// each as the authentication middleware answers.
 func TestSessionWatchMiddlewareRefusesWhatIsAlreadyOver(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
@@ -816,7 +817,12 @@ func TestSessionWatchMiddlewareRefusesWhatIsAlreadyOver(t *testing.T) {
 			"AtItsLimit": {fixedWindows{window: oidcsession.Window{RevalidateAt: now.Add(-time.Minute), ServedUntil: now}}, http.StatusServiceUnavailable, "5"},
 		} {
 			ran := false
-			handler := NewSessionWatch(env.svc, tc.windows, nil).Middleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			var denied []string
+			opts := Options{Realm: "Dagu MCP", OnDenied: func(_ *http.Request, reason string, apiKey *authmodel.APIKey) {
+				assert.Nil(t, apiKey)
+				denied = append(denied, reason)
+			}}
+			handler := NewSessionWatch(env.svc, tc.windows, nil).Middleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 				ran = true
 			}))
 			request := httptest.NewRequest(http.MethodPost, "/mcp", nil).WithContext(t.Context())
@@ -827,6 +833,16 @@ func TestSessionWatchMiddlewareRefusesWhatIsAlreadyOver(t *testing.T) {
 			assert.False(t, ran, name)
 			assert.Equal(t, tc.status, recorder.Code, name)
 			assert.Equal(t, tc.retryAfter, recorder.Header().Get("Retry-After"), name)
+			// A 401 is the authentication middleware's own: the challenge
+			// for the route's realm, and reported as a denial. A 503 is not
+			// a denial there either.
+			if tc.status == http.StatusUnauthorized {
+				assert.Equal(t, `Bearer realm="Dagu MCP"`, recorder.Header().Get("WWW-Authenticate"), name)
+				assert.Equal(t, []string{DenialReasonAuthFailed}, denied, name)
+			} else {
+				assert.Empty(t, recorder.Header().Get("WWW-Authenticate"), name)
+				assert.Empty(t, denied, name)
+			}
 		}
 	})
 }
@@ -864,7 +880,7 @@ func TestSessionWatchMiddlewareInterruptionCannotBeUndone(t *testing.T) {
 		writer := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 
 		closed, extended := make(chan struct{}), make(chan struct{})
-		handler := env.watch.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler := env.watch.Middleware(Options{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			controller := http.NewResponseController(w)
 			// Before: the handler's own deadlines are the handler's.
 			assert.NoError(t, controller.SetWriteDeadline(time.Now().Add(time.Hour)))

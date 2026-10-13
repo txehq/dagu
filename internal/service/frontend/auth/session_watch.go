@@ -215,14 +215,16 @@ func namesASession(token string) bool {
 // middleware that authenticates the request.
 //
 // A request whose session stopped letting it be served between its
-// authentication and here is refused and not handed on.
+// authentication and here is refused and not handed on. It is refused as the
+// authentication middleware with the same opts refuses: a 401 carries the
+// Bearer challenge for opts.Realm and is reported to opts.OnDenied.
 //
 // A handler is expected to end when its request's context does. One that is
 // held in a write to a client that does not read, or in a read of the
 // request, would not see that. So when the watch closes a request, its
 // connection's deadlines are set to now as well, and they stay there: a
 // handler that sets a deadline of its own afterwards gets now.
-func (w *SessionWatch) Middleware() func(http.Handler) http.Handler {
+func (w *SessionWatch) Middleware(opts Options) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if w == nil {
 			return next
@@ -235,7 +237,12 @@ func (w *SessionWatch) Middleware() func(http.Handler) http.Handler {
 				return
 			}
 			if ctx.Err() != nil {
-				WriteSessionWatchRefusal(ctx, rw)
+				if sessionWatchRefusalIsUnauthorized(ctx) {
+					callDenied(opts, r, DenialReasonAuthFailed, nil)
+					requireBearerAuth(rw, opts.Realm)
+					return
+				}
+				WriteSessionCheckUnavailable(rw)
 				return
 			}
 			watched := &watchedWriter{ResponseWriter: rw}
@@ -262,18 +269,29 @@ func (w *SessionWatch) Middleware() func(http.Handler) http.Handler {
 // was served, as the authentication would have answered it a moment later:
 // 401 when the session has ended or the token is no longer good, and
 // otherwise 503 with a Retry-After, because the session could not be
-// confirmed or read.
+// confirmed or read. It is for a handler that authenticates by itself, as
+// the terminal does; the middleware answers for the routes it is on.
 func WriteSessionWatchRefusal(ctx context.Context, w http.ResponseWriter) {
+	if sessionWatchRefusalIsUnauthorized(ctx) {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+	WriteSessionCheckUnavailable(w)
+}
+
+// sessionWatchRefusalIsUnauthorized reports whether a watch was closed for
+// something that is an answer about the user, and not for a session that
+// could not be confirmed or read.
+func sessionWatchRefusalIsUnauthorized(ctx context.Context) bool {
 	cause := context.Cause(ctx)
 	for _, ended := range []error{
 		oidcsession.ErrSessionEnded, authservice.ErrInvalidToken, authservice.ErrTokenExpired, authservice.ErrUserDisabled,
 	} {
 		if errors.Is(cause, ended) {
-			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
-			return
+			return true
 		}
 	}
-	WriteSessionCheckUnavailable(w)
+	return false
 }
 
 // watchedWriter is the response writer of a watched request. Once it has

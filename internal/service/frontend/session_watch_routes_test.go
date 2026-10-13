@@ -491,7 +491,7 @@ func TestAWriteToAClientThatDoesNotReadIsCutShort(t *testing.T) {
 
 	var written atomic.Int64
 	returned := make(chan struct{})
-	stream := httptest.NewServer(hub.srv.sessionWatch().Middleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	stream := httptest.NewServer(hub.srv.sessionWatch().Middleware(frontendauth.Options{})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		defer close(returned)
 		chunk := make([]byte, 64<<10)
 		// It never looks at its context: only a failed write ends it.

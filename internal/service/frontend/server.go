@@ -1340,7 +1340,7 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 
 		// The stream stays open, so it is closed when its OIDC session ends.
-		r.With(srv.sessionWatch().Middleware()).Get("/stream", multiplexHandler.HandleStream)
+		r.With(srv.sessionWatch().Middleware(authOpts)).Get("/stream", multiplexHandler.HandleStream)
 		r.Post("/stream/topics", multiplexHandler.HandleTopicMutation)
 	})
 
@@ -1430,7 +1430,7 @@ func (srv *Server) setupMCPRoute(ctx context.Context, r *chi.Mux) {
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 		// An MCP request may stay open as a stream, so it is closed when its
 		// OIDC session ends.
-		r.Use(srv.sessionWatch().Middleware())
+		r.Use(srv.sessionWatch().Middleware(authOpts))
 		r.Use(srv.mcpAuditSubjectMiddleware())
 		r.Use(clearWriteDeadlineMiddleware)
 		r.Handle(mcpPath, mcpHandler)
