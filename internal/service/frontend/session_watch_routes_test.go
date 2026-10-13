@@ -8,10 +8,12 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -476,4 +478,53 @@ func requireStaysOpen(t *testing.T, conn openConnection) {
 var openers = map[string]func(*routeHub, string) openConnection{
 	"EventStream": (*routeHub).openEventStream,
 	"MCPStream":   (*routeHub).openMCPStream,
+}
+
+// A handler held in a write to a client that has stopped reading does not
+// see its context end. When the watch closes its request, the write is cut
+// short as well, so the connection does not stay for as long as the client
+// likes.
+func TestAWriteToAClientThatDoesNotReadIsCutShort(t *testing.T) {
+	t.Parallel()
+	hub := newRouteHub(t, true)
+	token := hub.signIn()
+
+	var written atomic.Int64
+	returned := make(chan struct{})
+	stream := httptest.NewServer(hub.srv.sessionWatch().Middleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		defer close(returned)
+		chunk := make([]byte, 64<<10)
+		// It never looks at its context: only a failed write ends it.
+		for {
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	})))
+	t.Cleanup(stream.Close)
+
+	// A client that asks and then reads nothing.
+	conn, err := net.Dial("tcp", strings.TrimPrefix(stream.URL, "http://"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer " + token + "\r\n\r\n"))
+	require.NoError(t, err)
+
+	// The handler fills the socket and is then held in a write.
+	hub.armed()
+	require.Eventually(t, func() bool {
+		before := written.Load()
+		time.Sleep(200 * time.Millisecond)
+		return before > 0 && written.Load() == before
+	}, 20*time.Second, 10*time.Millisecond, "the handler is not held in a write")
+
+	hub.signOut(token)
+	hub.clock.advance(15 * time.Second)
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the handler is still held in its write after the watch closed the request")
+	}
 }

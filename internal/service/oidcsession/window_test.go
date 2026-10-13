@@ -115,8 +115,48 @@ func TestWindowEndsWithTheHubToken(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, expires, window.ServedUntil)
 
-	f.clock.Advance(90 * time.Second)
+	// At the expiry there is no window, as there is no request served.
+	f.clock.Advance(90*time.Second - time.Nanosecond)
+	_, err = f.manager.Window(context.Background(), session.ID)
+	require.NoError(t, err)
+	require.NoError(t, f.check(session))
+	f.clock.Advance(time.Nanosecond)
+	_, err = f.manager.Window(context.Background(), session.ID)
+	require.ErrorIs(t, err, ErrSessionEnded)
 	require.ErrorIs(t, f.check(session), ErrSessionEnded)
+}
+
+// A confirmation by another process moves the window as that process's clock
+// is allowed for, which can put it earlier than the window before.
+func TestWindowAfterAnotherProcessConfirms(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	session := f.signIn()
+	start := f.clock.Now()
+	before, err := f.manager.Window(context.Background(), session.ID)
+	require.NoError(t, err)
+	require.Equal(t, start.Add(5*time.Minute), before.ServedUntil)
+
+	// Another process confirms the session four seconds later.
+	f.clock.Advance(4 * time.Second)
+	f.rewrite(session, func(stored *Session) {
+		stored.LastConfirmedAt = f.clock.Now()
+		stored.ConfirmedBy = "another-process"
+	})
+	after, err := f.manager.Window(context.Background(), session.ID)
+	require.NoError(t, err)
+	assert.Equal(t, start.Add(4*time.Second+5*time.Minute-maxClockSkew), after.ServedUntil)
+	assert.True(t, after.ServedUntil.Before(before.ServedUntil), "six seconds earlier than before")
+
+	// And Check refuses from there when the provider gives nothing.
+	f.provider.set(unavailable)
+	f.clock.Advance(after.ServedUntil.Sub(f.clock.Now()) - time.Nanosecond)
+	require.NoError(t, f.check(session))
+	f.manager.mu.Lock()
+	clear(f.manager.failedAt)
+	f.manager.mu.Unlock()
+	f.clock.Advance(time.Nanosecond)
+	require.ErrorIs(t, f.check(session), ErrProviderUnavailable)
 }
 
 // A confirmation dated in the future, beyond what clocks may differ by, is

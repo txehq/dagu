@@ -26,18 +26,27 @@ type Window struct {
 // is. In particular it does not look at who presents the session, and it does
 // not see an end this process has decided and the store has not recorded.
 //
+// The result is a snapshot of what is stored. It is to be read again after
+// every Check, never kept across one: a Check may confirm the session, which
+// moves the window, or end it. A later window can be earlier than the one
+// before by the allowance for another process's clock. An end that was
+// written beside the record, and not into it, is not in the window until a
+// round or a refresh of this process has applied it.
+//
 // It reads the session and nothing else: it asks the provider nothing, writes
-// nothing, and starts no round. A session that does not exist or has ended is
-// ErrSessionEnded; any other error is from the store.
+// nothing, and starts no round, so a session nobody calls Check for is not
+// confirmed and runs out at ServedUntil. A session that does not exist, has
+// ended, or whose hub token has expired is ErrSessionEnded; any other error
+// is from the store.
 func (m *Manager) Window(ctx context.Context, sessionID string) (Window, error) {
 	session, _, err := m.load(ctx, sessionID)
 	if err != nil {
 		return Window{}, err
 	}
-	if session.EndedAt != nil {
+	now := m.now()
+	if session.EndedAt != nil || !now.Before(session.ExpiresAt) {
 		return Window{}, ErrSessionEnded
 	}
-	now := m.now()
 	// The same allowance as age makes: a time another process's clock wrote
 	// counts as that much earlier, and one that is in the future even so
 	// counts as past the limit.

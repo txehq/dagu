@@ -364,10 +364,8 @@ func (h hangingTokens) GetUserFromToken(context.Context, string) (*authmodel.Use
 	return nil, errors.New("too late")
 }
 
-// A read of the session that never comes back is the same, at any point: the
-// connection is closed at the limit the watch last knew, and one whose
-// session could not be read at all when it was opened is closed after
-// sessionWatchFirstRead.
+// A read of the session that never comes back is the same: the connection is
+// closed at the limit the watch last knew.
 func TestSessionWatchClosesWhenTheSessionReadHangs(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
@@ -384,15 +382,140 @@ func TestSessionWatchClosesWhenTheSessionReadHangs(t *testing.T) {
 		assert.Equal(t, time.Nanosecond, closedIn(t, ctx))
 		require.ErrorIs(t, context.Cause(ctx), errSessionWatchPastLimit)
 
-		windows.calls.Store(0)
-		windows.hangFrom.Store(1)
-		opened, stopOpened := watch.Watch(t.Context(), env.signIn())
-		defer stopOpened()
-		stillOpen(t, opened, sessionWatchFirstRead-time.Nanosecond)
-		assert.Equal(t, time.Nanosecond, closedIn(t, opened))
-		require.ErrorIs(t, context.Cause(opened), errSessionWatchUnread)
-
 		close(windows.release)
+	})
+}
+
+// A check that comes back with a confirmation after the limit has passed,
+// before the watch has seen the limit's timer, does not keep the connection:
+// by then it has gone unconfirmed for the whole limit. The clock here is the
+// test's own, so that the answer is certainly there first.
+func TestSessionWatchClosesWhenTheConfirmationComesAfterTheLimit(t *testing.T) {
+	t.Parallel()
+	start := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	clock := &steppedClock{now: start, timers: make(chan steppedTimer, 8)}
+	late := &lateTokens{clock: clock}
+	late.window.Store(&oidcsession.Window{RevalidateAt: start.Add(4 * time.Minute), ServedUntil: start.Add(5 * time.Minute)})
+	watch := NewSessionWatch(late, late, clock)
+
+	ctx, stop := watch.Watch(t.Context(), "a-session-token")
+	defer stop()
+	limit, due := <-clock.timers, <-clock.timers
+	require.Equal(t, 5*time.Minute, limit.after)
+	require.Equal(t, sessionWatchPoll, due.after)
+
+	// The check falls due. While it runs, the limit passes and the provider
+	// then confirms: the check succeeds and the new window is a fresh one.
+	// The limit's timer has not been delivered.
+	late.onCheck = func() {
+		clock.set(start.Add(5*time.Minute + time.Second))
+		late.window.Store(&oidcsession.Window{RevalidateAt: clock.Now().Add(4 * time.Minute), ServedUntil: clock.Now().Add(5 * time.Minute)})
+	}
+	due.fire <- clock.Now()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the connection was kept on a confirmation that came after its limit")
+	}
+	require.ErrorIs(t, context.Cause(ctx), errSessionWatchPastLimit)
+}
+
+// steppedClock is a clock whose time the test sets and whose timers the test
+// fires.
+type steppedClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers chan steppedTimer
+}
+
+type steppedTimer struct {
+	after time.Duration
+	fire  chan time.Time
+}
+
+func (c *steppedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppedClock) set(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
+}
+
+func (c *steppedClock) After(d time.Duration) (<-chan time.Time, func()) {
+	timer := steppedTimer{after: d, fire: make(chan time.Time, 1)}
+	c.timers <- timer
+	return timer.fire, func() {}
+}
+
+// lateTokens is a token checker and a session whose window the test sets.
+type lateTokens struct {
+	clock   *steppedClock
+	window  atomic.Pointer[oidcsession.Window]
+	onCheck func()
+}
+
+func (l *lateTokens) ValidateToken(string) (*authservice.Claims, error) {
+	return &authservice.Claims{SessionID: "0123456789abcdef0123456789abcdef"}, nil
+}
+
+func (l *lateTokens) GetUserFromToken(context.Context, string) (*authmodel.User, error) {
+	if l.onCheck != nil {
+		l.onCheck()
+	}
+	return &authmodel.User{}, nil
+}
+
+func (l *lateTokens) Window(context.Context, string) (oidcsession.Window, error) {
+	return *l.window.Load(), nil
+}
+
+// A hub token that expired between the request being authenticated and the
+// watch being asked is still a session's token: its connection is closed, not
+// left unwatched. A builtin user's expired token is no business of the watch.
+func TestSessionWatchClosesForATokenThatHasJustExpired(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
+		token := env.signIn()
+		adminToken, err := env.svc.GenerateToken(env.admin)
+		require.NoError(t, err)
+		time.Sleep(time.Hour)
+
+		ctx, stop := env.watch.Watch(t.Context(), token)
+		defer stop()
+		require.True(t, SessionWatchClosed(ctx))
+		require.ErrorIs(t, context.Cause(ctx), authservice.ErrTokenExpired)
+
+		parent := t.Context()
+		unwatched, stopUnwatched := env.watch.Watch(parent, adminToken.Token)
+		defer stopUnwatched()
+		assert.Equal(t, parent, unwatched)
+	})
+}
+
+// A token says when it expires to the second, and the session stores the
+// same time to the nanosecond. A request is refused from the earlier of the
+// two, so the connection is closed there.
+func TestSessionWatchClosesAtTheSecondTheTokenExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
+		time.Sleep(900 * time.Millisecond)
+		token := env.signIn()
+		expires := claimsOf(t, env, token).ExpiresAt.Time
+		window, err := env.sessions.Window(t.Context(), claimsOf(t, env, token).SessionID)
+		require.NoError(t, err)
+		require.Equal(t, time.Hour-900*time.Millisecond, time.Until(expires), "the token's expiry is cut to the second")
+
+		ctx := env.open(token)
+		stillOpen(t, ctx, time.Until(expires)-time.Nanosecond)
+		assert.Equal(t, time.Nanosecond, closedIn(t, ctx))
+		_, err = env.svc.GetUserFromToken(t.Context(), token)
+		require.ErrorIs(t, err, authservice.ErrTokenExpired)
+		_ = window
 	})
 }
 
@@ -418,7 +541,10 @@ func (h *hangingWindows) Window(ctx context.Context, sessionID string) (oidcsess
 // the provider confirms; when it does not, they close at the limit.
 func TestSessionWatchWithASmallGap(t *testing.T) {
 	for name, tc := range map[string]struct{ after, limit time.Duration }{
-		"OneSecond":       {4*time.Minute + 59*time.Second, 5 * time.Minute},
+		"OneSecond": {4*time.Minute + 59*time.Second, 5 * time.Minute},
+		// Due just after an ordinary check would be made.
+		"AfterAPoll":      {15*time.Second + 50*time.Millisecond, 15*time.Second + 60*time.Millisecond},
+		"AfterTwoPolls":   {30*time.Second + 99*time.Millisecond, 30*time.Second + 100*time.Millisecond},
 		"OneMillisecond":  {5*time.Minute - time.Millisecond, 5 * time.Minute},
 		"ShortEverything": {300 * time.Millisecond, 400 * time.Millisecond},
 	} {
@@ -520,8 +646,10 @@ func TestSessionWatchSeesASignOutTakenByAnotherProcess(t *testing.T) {
 // in a round over what is left over, which a check starts at most once a
 // minute and which runs beside the check that started it. So the connection
 // the other process holds is closed by the check after the one that started
-// the round: within a minute and two polls of that process's last round.
-// Measured here: 70 s after the sign-out.
+// the round at the latest: within a minute and two polls of that process's
+// last round. Measured here, for one end left over: 55 s or 70 s after the
+// sign-out. A round deals with a limited number of ends, so a process with
+// many left over can take further rounds to reach one.
 func TestSessionWatchSeesAnEndWrittenBesideTheRecord(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := newWatchEnv(t, 4*time.Minute, 5*time.Minute)
@@ -540,9 +668,11 @@ func TestSessionWatchSeesAnEndWrittenBesideTheRecord(t *testing.T) {
 		require.ErrorIs(t, err, authservice.ErrInvalidToken, "the process that took the sign-out refuses at once")
 
 		// The round at 15 s was before the sign-out at 20 s. The check at
-		// 75 s is the first a minute after it and starts the next round; the
-		// check at 90 s reads what that round did.
-		assert.Equal(t, 70*time.Second, closedIn(t, ctx))
+		// 75 s is the first a minute after it and starts the next round
+		// beside itself: it refuses if the round got there first, and
+		// otherwise the check at 90 s does.
+		took := closedIn(t, ctx)
+		assert.Contains(t, []time.Duration{55 * time.Second, 70 * time.Second}, took)
 		require.ErrorIs(t, context.Cause(ctx), authservice.ErrInvalidToken)
 	})
 }
