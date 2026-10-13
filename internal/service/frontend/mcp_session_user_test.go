@@ -6,6 +6,7 @@ package frontend
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	apiv1 "github.com/dagucloud/dagu/v2/internal/service/frontend/api/v1"
+	frontendauth "github.com/dagucloud/dagu/v2/internal/service/frontend/auth"
 )
 
 // mcpHub is the hub's real MCP route in one authentication mode.
@@ -235,9 +237,22 @@ func TestAnMCPSessionOfAnAPIKeyIsNotItsOwnersSession(t *testing.T) {
 
 // A hub that authenticates nobody has one caller, and its MCP route works as
 // it did: the request carries no bearer token, and a session carries on.
+// That is a hub in mode none, which gives every request its default user,
+// and a hub with no mode set and nothing to authenticate with, which gives a
+// request no user at all and is what the conformance suite's server is.
 func TestMCPSessionsOnAHubWithoutAuthentication(t *testing.T) {
 	t.Parallel()
-	hub := newMCPHub(t, config.AuthModeNone)
+	for name, mode := range map[string]config.AuthMode{"ModeNone": config.AuthModeNone, "NoModeSet": ""} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			hubWithoutAuthentication(t, mode)
+		})
+	}
+}
+
+func hubWithoutAuthentication(t *testing.T, mode config.AuthMode) {
+	t.Helper()
+	hub := newMCPHub(t, mode)
 
 	session := hub.open("")
 	hub.works("", session)
@@ -261,12 +276,34 @@ func TestMCPSessionsOnAHubWithBasicAuthentication(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, hub.ask(http.MethodDelete, basic, session, "").status)
 }
 
-// The adapter by itself, with whatever is in front of it failing to say who
-// the caller is: it refuses, in every mode, and what is behind it is not run.
+// stubValidator stands for an authentication method the route has.
+type stubValidator struct{}
+
+func (stubValidator) GetUserFromToken(context.Context, string) (*authmodel.User, error) {
+	return nil, errors.New("not used")
+}
+
+func (stubValidator) ValidateAPIKey(context.Context, string) (*authmodel.APIKey, error) {
+	return nil, errors.New("not used")
+}
+
+// The routes the adapter is used on, by how they authenticate.
+var (
+	builtinRoute         = frontendauth.Options{AuthRequired: true, JWTValidator: stubValidator{}, APIKeyValidator: stubValidator{}}
+	builtinRouteNoKeys   = frontendauth.Options{AuthRequired: true, JWTValidator: stubValidator{}}
+	basicRoute           = frontendauth.Options{AuthRequired: true, BasicAuthEnabled: true}
+	unauthenticatedRoute = frontendauth.Options{}
+)
+
+// The adapter by itself, on a route that authenticates, with whatever is in
+// front of it failing to say who the caller is: it refuses, and what is
+// behind it is not run.
 func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []config.AuthMode{config.AuthModeBuiltin, config.AuthModeBasic, config.AuthModeNone, config.AuthMode("another")} {
+	for route, opts := range map[string]frontendauth.Options{
+		"Builtin": builtinRoute, "BuiltinNoKeys": builtinRouteNoKeys, "Basic": basicRoute,
+	} {
 		cases := map[string]context.Context{
 			"Nothing":      context.Background(),
 			"NoUser":       authmodel.WithUser(context.Background(), nil),
@@ -275,31 +312,34 @@ func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
 			// fallen back to.
 			"KeyWithNoID": authmodel.WithAPIKey(authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{}),
 		}
-		if mode == config.AuthMode("another") {
-			// A mode the adapter does not know has no callers it can name.
-			cases["AUserInAnUnknownMode"] = authmodel.WithUser(context.Background(), &authmodel.User{ID: "someone"})
-		}
-		if mode != config.AuthModeBuiltin {
-			// Keys exist in builtin mode only.
-			cases["AKeyOutsideBuiltinMode"] = authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k1"})
+		if opts.APIKeyValidator == nil {
+			// A key is a caller only where keys are checked.
+			cases["AKeyWhereNoneAreChecked"] = authmodel.WithAPIKey(
+				authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{ID: "k1"})
 		}
 		for name, ctx := range cases {
 			ran := false
-			handler := mcpSessionUserMiddleware(mode)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
+			handler := mcpSessionUserMiddleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
 			request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(mcpInitialize)).WithContext(ctx)
 			request.Header.Set("Authorization", "Bearer a-real-looking-token")
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, request)
 
-			assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%s %s", mode, name)
-			assert.False(t, ran, "%s %s", mode, name)
+			assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%s %s", route, name)
+			assert.False(t, ran, "%s %s", route, name)
 		}
 	}
+
+	// Even a route that authenticates nobody does not take a key for a
+	// caller: nothing checked it.
+	_, ok := mcpSessionOwner(authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k1"}), unauthenticatedRoute)
+	assert.False(t, ok)
 }
 
 // Who owns a session is taken from what authentication put in the context,
 // with a prefix for each kind of caller, so that no two kinds share a name:
-// a user whose id reads like a key's is still a user.
+// a user whose id reads like a key's is still a user. A route that
+// authenticates nobody has the one default caller, said outright.
 func TestMCPSessionOwnerNames(t *testing.T) {
 	t.Parallel()
 	user := func(id string) context.Context {
@@ -311,19 +351,24 @@ func TestMCPSessionOwnerNames(t *testing.T) {
 
 	for _, tc := range []struct {
 		ctx   context.Context
-		mode  config.AuthMode
+		route frontendauth.Options
 		owner string
 	}{
-		{user("u1"), config.AuthModeBuiltin, "user:u1"},
-		{user("apikey:k1"), config.AuthModeBuiltin, "user:apikey:k1"},
-		{key("k1", "u1"), config.AuthModeBuiltin, "apikey:k1"},
-		{key("k2", "u1"), config.AuthModeBuiltin, "apikey:k2"},
+		{user("u1"), builtinRoute, "user:u1"},
+		{user("u1"), builtinRouteNoKeys, "user:u1"},
+		{user("apikey:k1"), builtinRoute, "user:apikey:k1"},
+		{user("basic:operator"), builtinRoute, "user:basic:operator"},
+		{key("k1", "u1"), builtinRoute, "apikey:k1"},
+		{key("k2", "u1"), builtinRoute, "apikey:k2"},
 		// A key is a caller by itself, with no user beside it.
-		{authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k3"}), config.AuthModeBuiltin, "apikey:k3"},
-		{user("operator"), config.AuthModeBasic, "basic:operator"},
-		{user("admin"), config.AuthModeNone, "default:admin"},
+		{authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k3"}), builtinRoute, "apikey:k3"},
+		{user("operator"), basicRoute, "basic:operator"},
+		// Mode none gives every request its default user.
+		{user("admin"), unauthenticatedRoute, "default:admin"},
+		// A hub with nothing to authenticate with gives it nobody.
+		{context.Background(), unauthenticatedRoute, "default:"},
 	} {
-		owner, ok := mcpSessionOwner(tc.ctx, tc.mode)
+		owner, ok := mcpSessionOwner(tc.ctx, tc.route)
 		require.True(t, ok, tc.owner)
 		assert.Equal(t, tc.owner, owner)
 	}
@@ -341,7 +386,7 @@ func TestMCPSessionAdapterHandsOnNoCredential(t *testing.T) {
 	} {
 		var seen, query, uri string
 		var info *mcpauth.TokenInfo
-		handler := mcpSessionUserMiddleware(config.AuthModeBuiltin)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		handler := mcpSessionUserMiddleware(builtinRoute)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 			seen, query, uri = r.Header.Get("Authorization"), r.URL.RawQuery, r.RequestURI
 			info = mcpauth.TokenInfoFromContext(r.Context())
 		}))

@@ -11,7 +11,7 @@ import (
 	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 
 	authmodel "github.com/dagucloud/dagu/v2/internal/auth"
-	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/service/frontend/auth"
 )
 
 // mcpPlaceholderBearer is what the MCP library is given in place of the
@@ -35,21 +35,24 @@ const mcpPlaceholderBearer = "Bearer authenticated-by-the-hub"
 // to hand that name over. The library then records it when a session is
 // created and refuses the session to any other caller with 403.
 //
-// A request that reaches here with no caller is refused. In the modes that
-// authenticate, that would be a fault in what comes before; a hub that
-// authenticates nobody gives every request its one default user first.
+// A request that reaches here with no caller is refused, on a route that
+// authenticates: that would be a fault in what comes before, and a session
+// is not created for nobody. A route that authenticates nobody at all has
+// one caller, the default one, whoever asks.
 //
 // The library's middleware takes a bearer token and an expiry. Neither is
 // used to decide anything: the token it is shown is always the placeholder,
 // on a copy of the request with any token taken out of its query string, so
 // the credential the request came with is not handed to the library or to
-// the tools behind it; and the expiry only has
-// to be in the future, the hub having checked the credential a moment ago
-// and checking it again on every request.
-func mcpSessionUserMiddleware(mode config.AuthMode) func(http.Handler) http.Handler {
+// the tools behind it; and the expiry only has to be in the future, the hub
+// having checked the credential a moment ago and checking it again on every
+// request.
+//
+// opts are the options the route's authentication was built with.
+func mcpSessionUserMiddleware(opts auth.Options) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		bound := mcpauth.RequireBearerToken(func(ctx context.Context, _ string, _ *http.Request) (*mcpauth.TokenInfo, error) {
-			owner, ok := mcpSessionOwner(ctx, mode)
+			owner, ok := mcpSessionOwner(ctx, opts)
 			if !ok {
 				// Not reached: the request was refused below.
 				return nil, mcpauth.ErrInvalidToken
@@ -58,7 +61,7 @@ func mcpSessionUserMiddleware(mode config.AuthMode) func(http.Handler) http.Hand
 		}, nil)(next)
 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if _, ok := mcpSessionOwner(r.Context(), mode); !ok {
+			if _, ok := mcpSessionOwner(r.Context(), opts); !ok {
 				http.Error(w, "MCP needs a caller the hub has authenticated", http.StatusUnauthorized)
 				return
 			}
@@ -90,26 +93,33 @@ func withoutCredential(r *http.Request) *http.Request {
 // An API key owns its sessions itself. A request made with one carries a user
 // as well, the key's owner or service account, for attribution; that user
 // did not make the request, and a key's sessions are not theirs.
-func mcpSessionOwner(ctx context.Context, mode config.AuthMode) (string, bool) {
+//
+// A route that authenticates nobody, because the hub's mode is none or
+// because nothing was configured to authenticate with, lets every request
+// through: its callers are one, the default caller. That is said here and
+// not left to whether a user happens to be in the context.
+func mcpSessionOwner(ctx context.Context, opts auth.Options) (string, bool) {
+	authenticates := opts.BasicAuthEnabled || opts.JWTValidator != nil || opts.APIKeyValidator != nil
+
 	if apiKey, ok := authmodel.APIKeyFromContext(ctx); ok && apiKey != nil {
-		// Keys exist in builtin mode only.
-		if apiKey.ID == "" || mode != config.AuthModeBuiltin {
+		// A key is a caller only where keys are checked.
+		if apiKey.ID == "" || opts.APIKeyValidator == nil {
 			return "", false
 		}
 		return "apikey:" + apiKey.ID, true
 	}
-	user, ok := authmodel.UserFromContext(ctx)
-	if !ok || user == nil || user.ID == "" {
+	user, _ := authmodel.UserFromContext(ctx)
+	if !authenticates {
+		if user != nil && user.ID != "" {
+			return "default:" + user.ID, true
+		}
+		return "default:", true
+	}
+	if user == nil || user.ID == "" {
 		return "", false
 	}
-	switch mode {
-	case config.AuthModeBuiltin:
-		return "user:" + user.ID, true
-	case config.AuthModeBasic:
+	if opts.BasicAuthEnabled && opts.JWTValidator == nil {
 		return "basic:" + user.ID, true
-	case config.AuthModeNone:
-		return "default:" + user.ID, true
-	default:
-		return "", false
 	}
+	return "user:" + user.ID, true
 }
