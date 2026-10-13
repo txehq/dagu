@@ -1122,6 +1122,32 @@ func TestWhatARoundDoesNotLose(t *testing.T) {
 		require.NotNil(t, f.stored(session).EndedAt)
 	})
 
+	// The end of an expired session is housekeeping: the session serves
+	// nothing either way. If its write fails, nothing is marked beside the
+	// record and nothing is remembered; a later round tries again.
+	t.Run("TheEndOfAnExpiredSessionThatCannotBeWrittenLeavesNothingBehind", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session, err := f.manager.Create(ctx, alice, "refresh-token-a", f.clock.Now().Add(time.Hour))
+		require.NoError(t, err)
+		broken := &failingCollection{Collection: f.col}
+		f.manager.col = broken
+		heal := broken.failWritesAfter(0)
+
+		f.clock.Advance(time.Hour + maxClockSkew)
+		f.round(f.manager)
+		require.Nil(t, f.stored(session).EndedAt)
+		_, markers := f.records()
+		assert.Zero(t, markers)
+		_, remembered := f.manager.decided(session.ID)
+		assert.False(t, remembered)
+
+		heal()
+		f.round(f.manager)
+		require.NotNil(t, f.stored(session).EndedAt)
+		assert.Equal(t, []string{"refresh-token-a"}, f.provider.revocations())
+	})
+
 	// A remembered end has expired and is about to be forgotten. Between the
 	// round looking at it and forgetting it, a request adds a token to it.
 	// It is not forgotten with that token.
