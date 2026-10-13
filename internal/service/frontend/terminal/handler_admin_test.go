@@ -44,9 +44,9 @@ func newAdminOnlyHub(t *testing.T) *adminOnlyHub {
 		handler: terminalpkg.NewHandler(svc, nil, nil, manager, "/bin/sh")}
 }
 
-// ask asks for a terminal with a token. The recorder cannot be upgraded to a
-// WebSocket, so a request that got as far as the upgrade is not answered
-// with any of the refusals below.
+// ask asks for a terminal with a token, by a plain request. One that gets as
+// far as the upgrade to a WebSocket is answered 426, which is none of the
+// refusals below.
 func (h *adminOnlyHub) ask(token string) *httptest.ResponseRecorder {
 	target := "/api/v1/terminal/ws"
 	if token != "" {
@@ -57,12 +57,25 @@ func (h *adminOnlyHub) ask(token string) *httptest.ResponseRecorder {
 	return recorder
 }
 
-// slotIsFree reports that the hub's one terminal slot was not taken.
+// slotIsFree reports that no refused request has kept the hub's one
+// terminal slot.
 func (h *adminOnlyHub) slotIsFree() {
 	h.t.Helper()
 	lease, err := h.manager.Acquire()
-	require.NoError(h.t, err, "a refused request took the terminal slot")
+	require.NoError(h.t, err, "a refused request kept the terminal slot")
 	lease.Release()
+}
+
+// withTheSlotTaken runs ask while the hub's one slot is held by someone
+// else. A request that is refused for what its user is must be refused that
+// way all the same: one that got as far as asking for a slot would be told
+// the hub is full instead.
+func (h *adminOnlyHub) withTheSlotTaken(ask func()) {
+	h.t.Helper()
+	lease, err := h.manager.Acquire()
+	require.NoError(h.t, err)
+	defer lease.Release()
+	ask()
 }
 
 func (h *adminOnlyHub) builtin(name string, role authmodel.Role) *authmodel.User {
@@ -79,42 +92,53 @@ func (h *adminOnlyHub) token(user *authmodel.User) string {
 	return token.Token
 }
 
-// The terminal is a shell as the hub's own account. Only an administrator
-// gets one: every other role is refused before a slot is taken, the
-// connection upgraded or a shell started, however they signed in.
+// The web terminal is a shell as the hub's own account. Only an
+// administrator gets one: every other role is refused before a slot is asked
+// for, the connection upgraded or a shell started, however they signed in.
+// This is about the web terminal, not about every way a command can be run
+// on the hub's host: a workflow runs commands too, under its own rules.
 func TestTerminal_OnlyAnAdministratorGetsATerminal(t *testing.T) {
 	t.Parallel()
 	hub := newAdminOnlyHub(t)
 
-	for _, role := range []authmodel.Role{
-		authmodel.RoleManager, authmodel.RoleDeveloper, authmodel.RoleOperator, authmodel.RoleViewer,
-	} {
-		response := hub.ask(hub.token(hub.builtin("builtin-"+role.String(), role)))
-		assert.Equal(t, http.StatusForbidden, response.Code, "builtin %s", role)
-		hub.slotIsFree()
+	// Every role there is, so that a new one has to be decided here.
+	ordinary := 0
+	for _, role := range authmodel.AllRoles() {
+		if role == authmodel.RoleAdmin {
+			require.True(t, role.IsAdmin())
+			continue
+		}
+		ordinary++
+		require.False(t, role.IsAdmin(), "%s", role)
 
+		builtin := hub.token(hub.builtin("builtin-"+role.String(), role))
 		// The same role, signed in through OIDC with a session in order.
 		user := authmodel.NewUser("oidc-"+role.String(), "", role)
 		user.AuthProvider = authmodel.AuthProviderOIDC
 		require.NoError(t, hub.users.Create(context.Background(), user))
-		token, err := hub.svc.GenerateSessionToken(user, "0123456789abcdef0123456789abcdef", time.Now().Add(time.Hour))
+		session, err := hub.svc.GenerateSessionToken(user, "0123456789abcdef0123456789abcdef", time.Now().Add(time.Hour))
 		require.NoError(t, err)
-		response = hub.ask(token.Token)
-		assert.Equal(t, http.StatusForbidden, response.Code, "OIDC %s", role)
-		hub.slotIsFree()
-	}
 
-	// Every role there is was tried: a new one has to be decided here.
-	for _, role := range []authmodel.Role{
-		authmodel.RoleAdmin, authmodel.RoleManager, authmodel.RoleDeveloper, authmodel.RoleOperator, authmodel.RoleViewer,
+		for how, token := range map[string]string{"builtin": builtin, "OIDC": session.Token} {
+			assert.Equal(t, http.StatusForbidden, hub.ask(token).Code, "%s %s", how, role)
+			hub.slotIsFree()
+			hub.withTheSlotTaken(func() {
+				assert.Equal(t, http.StatusForbidden, hub.ask(token).Code, "%s %s, with the hub full", how, role)
+			})
+		}
+	}
+	require.Equal(t, 4, ordinary, "manager, developer, operator and viewer")
+
+	// What is not a signed-in user at all is not let in either, and is told
+	// so before a slot is asked for.
+	for what, token := range map[string]string{
+		"no token": "", "an API key": "dagu_0123456789abcdef0123456789abcdef", "not a token": "not-a-token",
 	} {
-		assert.Equal(t, role == authmodel.RoleAdmin, role.IsAdmin(), "%s", role)
+		assert.Equal(t, http.StatusUnauthorized, hub.ask(token).Code, what)
+		hub.withTheSlotTaken(func() {
+			assert.Equal(t, http.StatusUnauthorized, hub.ask(token).Code, "%s, with the hub full", what)
+		})
 	}
-
-	// What is not a signed-in user at all is not let in either.
-	assert.Equal(t, http.StatusUnauthorized, hub.ask("").Code, "no token")
-	assert.Equal(t, http.StatusUnauthorized, hub.ask("dagu_0123456789abcdef0123456789abcdef").Code, "an API key")
-	assert.Equal(t, http.StatusUnauthorized, hub.ask("not-a-token").Code, "not a token")
 	hub.slotIsFree()
 }
 
@@ -127,16 +151,21 @@ func TestTerminal_ADemotedAdministratorGetsNoNewTerminal(t *testing.T) {
 	admin := hub.builtin("admin", authmodel.RoleAdmin)
 	token := hub.token(admin)
 
-	// As an administrator the request gets past the role check, as far as
-	// the upgrade, which a recorder cannot do.
-	asAdmin := hub.ask(token)
-	require.NotEqual(t, http.StatusForbidden, asAdmin.Code)
-	require.NotEqual(t, http.StatusUnauthorized, asAdmin.Code)
+	// As an administrator the request gets past the role check and takes a
+	// slot: it gets as far as the upgrade, which this plain request is not,
+	// and with the hub full it is told so.
+	require.Equal(t, http.StatusUpgradeRequired, hub.ask(token).Code)
+	hub.withTheSlotTaken(func() {
+		require.Equal(t, http.StatusTooManyRequests, hub.ask(token).Code)
+	})
 
 	viewer := authmodel.RoleViewer
 	_, err := hub.svc.UpdateUser(context.Background(), admin.ID, authservice.UpdateUserInput{Role: &viewer})
 	require.NoError(t, err)
 
 	assert.Equal(t, http.StatusForbidden, hub.ask(token).Code)
+	hub.withTheSlotTaken(func() {
+		assert.Equal(t, http.StatusForbidden, hub.ask(token).Code)
+	})
 	hub.slotIsFree()
 }
