@@ -188,6 +188,11 @@ func TestAnMCPSessionBelongsToTheCallerWhoCreatedIt(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, hub.ask(http.MethodDelete, again, session, "").status)
 	require.Equal(t, http.StatusNotFound, hub.ask(http.MethodPost, aliceToken, session, mcpListTools).status)
 
+	// The placeholder the hub shows the MCP library is not a credential: sent
+	// by a client, it is refused like any other string that is not one.
+	require.Equal(t, http.StatusUnauthorized, hub.ask(http.MethodPost, mcpPlaceholderBearer, session, mcpListTools).status)
+	require.Equal(t, http.StatusUnauthorized, hub.ask(http.MethodPost, mcpPlaceholderBearer, "", mcpInitialize).status)
+
 	// A session bob opens is bob's.
 	bobs := hub.open(bobToken)
 	hub.works(bobToken, bobs)
@@ -274,6 +279,10 @@ func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
 			// A mode the adapter does not know has no callers it can name.
 			cases["AUserInAnUnknownMode"] = authmodel.WithUser(context.Background(), &authmodel.User{ID: "someone"})
 		}
+		if mode != config.AuthModeBuiltin {
+			// Keys exist in builtin mode only.
+			cases["AKeyOutsideBuiltinMode"] = authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k1"})
+		}
 		for name, ctx := range cases {
 			ran := false
 			handler := mcpSessionUserMiddleware(mode)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
@@ -309,6 +318,8 @@ func TestMCPSessionOwnerNames(t *testing.T) {
 		{user("apikey:k1"), config.AuthModeBuiltin, "user:apikey:k1"},
 		{key("k1", "u1"), config.AuthModeBuiltin, "apikey:k1"},
 		{key("k2", "u1"), config.AuthModeBuiltin, "apikey:k2"},
+		// A key is a caller by itself, with no user beside it.
+		{authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k3"}), config.AuthModeBuiltin, "apikey:k3"},
 		{user("operator"), config.AuthModeBasic, "basic:operator"},
 		{user("admin"), config.AuthModeNone, "default:admin"},
 	} {
@@ -320,20 +331,23 @@ func TestMCPSessionOwnerNames(t *testing.T) {
 
 // What the adapter hands on: the caller's name for the library, and a copy of
 // the request whose Authorization header is the placeholder, whatever the
-// request came with. The request it was given is left as it was.
+// request came with, and whose query string has no token in it. The request
+// it was given is left as it was.
 func TestMCPSessionAdapterHandsOnNoCredential(t *testing.T) {
 	t.Parallel()
 
 	for name, authorization := range map[string]string{
 		"HubToken": "Bearer a-real-hub-token", "APIKey": "Bearer dagu_a-real-key", "Basic": "Basic b3BlcmF0b3I6cGFzcw==", "None": "",
 	} {
-		var seen string
+		var seen, query, uri string
 		var info *mcpauth.TokenInfo
 		handler := mcpSessionUserMiddleware(config.AuthModeBuiltin)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-			seen = r.Header.Get("Authorization")
+			seen, query, uri = r.Header.Get("Authorization"), r.URL.RawQuery, r.RequestURI
 			info = mcpauth.TokenInfoFromContext(r.Context())
 		}))
-		request := httptest.NewRequest(http.MethodPost, "/mcp", nil).
+		// The hub takes a token from the query string too.
+		const target = "/mcp?token=a-real-hub-token&workspace=ops"
+		request := httptest.NewRequest(http.MethodPost, target, nil).
 			WithContext(authmodel.WithUser(context.Background(), &authmodel.User{ID: "u1"}))
 		if authorization != "" {
 			request.Header.Set("Authorization", authorization)
@@ -344,6 +358,9 @@ func TestMCPSessionAdapterHandsOnNoCredential(t *testing.T) {
 		require.Equal(t, http.StatusOK, recorder.Code, name)
 		assert.Equal(t, mcpPlaceholderBearer, seen, name)
 		assert.Equal(t, authorization, request.Header.Get("Authorization"), name)
+		assert.Equal(t, "workspace=ops", query, name)
+		assert.Equal(t, "/mcp?workspace=ops", uri, name)
+		assert.Equal(t, target, request.URL.RequestURI(), name)
 		require.NotNil(t, info, name)
 		assert.Equal(t, "user:u1", info.UserID, name)
 		assert.Empty(t, info.Scopes, name)

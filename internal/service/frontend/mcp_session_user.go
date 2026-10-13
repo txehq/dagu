@@ -41,8 +41,9 @@ const mcpPlaceholderBearer = "Bearer authenticated-by-the-hub"
 //
 // The library's middleware takes a bearer token and an expiry. Neither is
 // used to decide anything: the token it is shown is always the placeholder,
-// on a copy of the request, so the credential the request came with is not
-// handed to the library or to the tools behind it; and the expiry only has
+// on a copy of the request with any token taken out of its query string, so
+// the credential the request came with is not handed to the library or to
+// the tools behind it; and the expiry only has
 // to be in the future, the hub having checked the credential a moment ago
 // and checking it again on every request.
 func mcpSessionUserMiddleware(mode config.AuthMode) func(http.Handler) http.Handler {
@@ -61,11 +62,23 @@ func mcpSessionUserMiddleware(mode config.AuthMode) func(http.Handler) http.Hand
 				http.Error(w, "MCP needs a caller the hub has authenticated", http.StatusUnauthorized)
 				return
 			}
-			internal := r.Clone(r.Context())
-			internal.Header.Set("Authorization", mcpPlaceholderBearer)
-			bound.ServeHTTP(w, internal)
+			bound.ServeHTTP(w, withoutCredential(r))
 		})
 	}
+}
+
+// withoutCredential returns a copy of an authenticated request that carries
+// no credential: the placeholder in its Authorization header, and no token in
+// its query string, which is the other place the hub takes one from.
+func withoutCredential(r *http.Request) *http.Request {
+	internal := r.Clone(r.Context())
+	internal.Header.Set("Authorization", mcpPlaceholderBearer)
+	if query := internal.URL.Query(); query.Has("token") {
+		query.Del("token")
+		internal.URL.RawQuery = query.Encode()
+		internal.RequestURI = internal.URL.RequestURI()
+	}
+	return internal
 }
 
 // mcpSessionOwner names the caller a request was authenticated as, for the
@@ -79,7 +92,8 @@ func mcpSessionUserMiddleware(mode config.AuthMode) func(http.Handler) http.Hand
 // did not make the request, and a key's sessions are not theirs.
 func mcpSessionOwner(ctx context.Context, mode config.AuthMode) (string, bool) {
 	if apiKey, ok := authmodel.APIKeyFromContext(ctx); ok && apiKey != nil {
-		if apiKey.ID == "" {
+		// Keys exist in builtin mode only.
+		if apiKey.ID == "" || mode != config.AuthModeBuiltin {
 			return "", false
 		}
 		return "apikey:" + apiKey.ID, true
