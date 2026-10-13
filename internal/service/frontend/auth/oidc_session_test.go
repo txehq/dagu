@@ -295,8 +295,14 @@ func TestSignOutEndsTheSession(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, env.get(token).Code)
 	assert.Equal(t, http.StatusOK, env.get(other).Code, "another session of the same user is not ended")
+	// At least once: a round running beside the sign-out may ask for the same
+	// revocation before either has recorded that it is done. A revocation can
+	// be asked for twice.
 	env.provider.mu.Lock()
-	assert.Equal(t, []string{"provider-refresh-token"}, env.provider.revoked)
+	require.NotEmpty(t, env.provider.revoked)
+	for _, revoked := range env.provider.revoked {
+		assert.Equal(t, "provider-refresh-token", revoked)
+	}
 	assert.Zero(t, env.provider.calls)
 	env.provider.mu.Unlock()
 

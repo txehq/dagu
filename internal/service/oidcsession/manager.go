@@ -206,8 +206,10 @@ type Manager struct {
 	// failedAt is when a session's last provider call got nothing usable.
 	failedAt map[string]time.Time
 	// undone holds the ends this process has decided and the store has not
-	// recorded. A session in it is refused here whatever the store says.
+	// recorded. A session in it is refused here whatever the store says. seq
+	// numbers each change to it.
 	undone map[string]decision
+	seq    uint64
 	// owedFailedAt is when the provider last left a revocation unanswered.
 	owedFailedAt time.Time
 	// reconciling is set while a round of reconciling runs, and lastRound is
@@ -237,6 +239,10 @@ type decision struct {
 	// owe lists further refresh tokens to be revoked with this end, as
 	// entries ready to go into the record.
 	owe []Owed
+	// seq numbers the decision as this process remembers it. It changes
+	// whenever what is remembered changes, so that a round forgets only the
+	// decision it looked at.
+	seq uint64
 	// passive marks an end nothing depends on: that of a session whose hub
 	// token has expired, which serves nothing either way. If its write
 	// fails it is not marked or remembered; a later round tries again.
@@ -361,7 +367,7 @@ func (m *Manager) Create(ctx context.Context, who Identity, refreshToken string,
 	if err := m.col.Create(ctx, &persis.Record{ID: session.ID, Data: data, CreatedAt: now, UpdatedAt: now}); err != nil {
 		return nil, discard(fmt.Errorf("oidcsession: store the session: %w", err))
 	}
-	m.kick(ctx, now, true)
+	m.kick(ctx, now)
 	return session, nil
 }
 
@@ -388,7 +394,7 @@ func (m *Manager) Check(ctx context.Context, sessionID string, who Identity) err
 	// somebody to sign in. It is started before the request is decided and
 	// runs beside it: the answer below is made on what is true when it is
 	// given, not on what was true before a round.
-	m.kick(ctx, m.now(), false)
+	m.kick(ctx, m.now())
 	return m.decide(ctx, sessionID, who)
 }
 
@@ -1152,6 +1158,8 @@ func (m *Manager) remember(sessionID string, d decision) {
 		}
 		d.owe = addOwed(slices.Clone(earlier.owe), d.owe...)
 	}
+	m.seq++
+	d.seq = m.seq
 	m.undone[sessionID] = d
 }
 

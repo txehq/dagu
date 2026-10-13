@@ -873,11 +873,16 @@ type failingCollection struct {
 	// swapped, when set, is called after each write that was made: an error
 	// from it is reported for a write that did happen.
 	swapped func() error
-	// create, when set, is what creating a record fails with.
-	create error
+	// create, when set, is what creating a record fails with, and onCreate
+	// is called before each creation.
+	create   error
+	onCreate func()
 }
 
 func (c *failingCollection) Create(ctx context.Context, rec *persis.Record) error {
+	if c.onCreate != nil {
+		c.onCreate()
+	}
 	if c.create != nil {
 		return c.create
 	}

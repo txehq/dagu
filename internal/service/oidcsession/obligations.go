@@ -71,8 +71,8 @@ const (
 	// request, and somebody is waiting for that request.
 	reconcilePerRound = 16
 
-	// reconcileInterval is the least time between two rounds started by
-	// ordinary requests. A sign-in always starts one.
+	// reconcileInterval is the least time between two rounds on one hub
+	// process.
 	reconcileInterval = time.Minute
 
 	endMarkerPrefix = "end-"
@@ -556,22 +556,23 @@ func owedBackoff(attempts int) time.Duration {
 	return wait
 }
 
-// kick starts a round of reconciling if one is due. A sign-in always starts
-// one; an ordinary request starts one at most every reconcileInterval. So the
-// rounds do not depend on anybody signing in.
+// kick starts a round of reconciling if one is due: at most one every
+// reconcileInterval per hub process, at the prompting of any request or
+// sign-in. So the rounds do not depend on anybody signing in, and a burst of
+// sign-ins does not start a burst of rounds.
 //
 // The round does not run inside the request. It reads the whole collection,
 // and may wait for the provider, and neither is something for a request to
 // wait for, or for the answer to a request to grow stale during. It runs
 // beside it, on its own, and ends by itself.
-func (m *Manager) kick(ctx context.Context, now time.Time, signIn bool) {
+func (m *Manager) kick(ctx context.Context, now time.Time) {
 	last := m.lastRound.Load()
-	if !signIn && last != 0 && now.Sub(time.Unix(0, last)) < reconcileInterval {
+	if last != 0 && now.Sub(time.Unix(0, last)) < reconcileInterval {
 		return
 	}
 	// One request starts the round that is due; the others that arrive at
 	// the same moment see that it has been started.
-	if !m.lastRound.CompareAndSwap(last, now.UnixNano()) && !signIn {
+	if !m.lastRound.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
 	background := context.WithoutCancel(ctx)
@@ -607,7 +608,6 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		return
 	}
 	defer m.reconciling.Store(false)
-	m.lastRound.Store(now.UnixNano())
 
 	// What this process remembers.
 	m.mu.Lock()
@@ -637,8 +637,13 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 		if len(d.owe) > 0 && m.stub(ctx, d.reason, d.owe) != nil {
 			continue
 		}
+		// Forgotten only as it was when it was looked at. If the request
+		// path has added a token to it meanwhile, it stays, and the next
+		// round sees what it holds then.
 		m.mu.Lock()
-		delete(m.undone, id)
+		if current, ok := m.undone[id]; ok && current.seq == d.seq {
+			delete(m.undone, id)
+		}
 		m.mu.Unlock()
 	}
 	// A session that is ended in this round may owe a revocation from that
@@ -674,22 +679,25 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 			if json.Unmarshal(rec.Data, &session) != nil {
 				continue
 			}
-			switch {
-			case len(session.Owed) > 0:
-				// A record that owes a revocation is kept, however old.
-				due = appendDue(due, rec.ID, session.Owed, now)
-			case session.EndedAt == nil && !now.Before(session.ExpiresAt):
+			if session.EndedAt == nil && !now.Before(session.ExpiresAt.Add(maxClockSkew)) && lapsed < reconcilePerRound {
 				// The hub token has expired and the session was never ended.
 				// The hub will not use its refresh token again, and the token
 				// is still good at the provider. The session is ended now, so
 				// that the token becomes owed and is revoked like any other.
-				if lapsed < reconcilePerRound {
-					lapsed++
-					out, err := m.end(ctx, rec.ID, decision{reason: "the hub token expired", revoke: true, expires: session.ExpiresAt, passive: true})
-					if err == nil && out.owes {
-						justEnded = append(justEnded, rec.ID)
-					}
+				// This is so whether or not the record owes something
+				// already. The expiry was written by the clock of the process
+				// that took the sign-in, so it is given that clock's
+				// allowance.
+				lapsed++
+				out, err := m.end(ctx, rec.ID, decision{reason: "the hub token expired", revoke: true, expires: session.ExpiresAt, passive: true})
+				if err == nil && out.owes {
+					justEnded = append(justEnded, rec.ID)
 				}
+			}
+			switch {
+			case len(session.Owed) > 0:
+				// A record that owes a revocation is kept, however old.
+				due = appendDue(due, rec.ID, session.Owed, now)
 			case session.EndedAt != nil && now.Sub(*session.EndedAt) > purgeAfter:
 				m.purge(ctx, rec)
 			}
@@ -701,12 +709,14 @@ func (m *Manager) reconcile(ctx context.Context, now time.Time) {
 	}
 
 	for _, id := range justEnded {
-		if slices.ContainsFunc(due, func(d dueEntry) bool { return d.session == id }) {
+		session, _, err := m.load(ctx, id)
+		if err != nil {
 			continue
 		}
-		if session, _, err := m.load(ctx, id); err == nil {
-			due = appendDue(due, id, session.Owed, now)
-		}
+		// What the listing saw of this record is replaced by what it holds
+		// now, which includes what its end has just made owed.
+		due = slices.DeleteFunc(due, func(d dueEntry) bool { return d.session == id })
+		due = appendDue(due, id, session.Owed, now)
 	}
 	if len(due) == 0 || m.providerPaused(now) {
 		return
@@ -791,19 +801,21 @@ func (m *Manager) reconcileMark(ctx context.Context, rec *persis.Record, now tim
 	if _, written, _ := m.applyMark(ctx, marker.Session); written {
 		return marker.Session, true
 	}
-	_, current, err := m.marked(ctx, marker.Session)
+	// What follows is about the marker as it is now, not as the listing saw
+	// it: another process may have added a token to it since. The version
+	// whose tokens are kept is the version that is removed, and no other.
+	latest, current, err := m.marked(ctx, marker.Session)
 	if err != nil || current == nil {
 		return "", false
 	}
-	if !marker.Expires.IsZero() && now.Sub(marker.Expires) > purgeAfter {
+	if !latest.expires.IsZero() && now.Sub(latest.expires) > purgeAfter {
 		// The tokens the marker itself carries can still be revoked. They
 		// get a record of their own before the marker goes.
-		if len(marker.Owe) > 0 && m.stub(ctx, marker.Reason, marker.Owe) != nil {
+		if len(latest.owe) > 0 && m.stub(ctx, latest.reason, latest.owe) != nil {
 			return "", false
 		}
 		slog.Error("OIDC session end could never be written into its record; the record's refresh token was not revoked",
 			slog.String("session", marker.Session))
-		// The marker as it is now, not as the listing saw it.
 		m.unmark(ctx, current)
 	}
 	return "", false

@@ -612,7 +612,7 @@ func TestAnEndTheRecordDidNotTake(t *testing.T) {
 		session := f.signIn()
 		someoneElse := f.signIn()
 		other := f.process()
-		f.round(other)
+		other.kick(ctx, f.clock.Now()) // a round ran on it a moment ago
 		unwritable(f, f.manager)
 		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
 
@@ -671,6 +671,7 @@ func TestAnEndTheRecordDidNotTake(t *testing.T) {
 		f := newFixture(t, nil)
 		session := f.signIn()
 		other := f.process()
+		other.spawn = func(func()) {} // no round runs on it: it is the refresh that meets the marker
 		unwritable(f, f.manager)
 		unwritable(f, other)
 		require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
@@ -975,6 +976,36 @@ func TestWhenAnOwedRevocationIsTried(t *testing.T) {
 		assert.Equal(t, []string{"refresh-token-a", "refresh-token-b"}, f.provider.revocations())
 	})
 
+	// The attempt a caller makes right after recording one is held to the
+	// same two rules: only what is due, and no further once the provider has
+	// left one unanswered.
+	t.Run("TheAttemptRightAfterRecording", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.owing("refresh-token-a")
+		later, err := f.enc.Encrypt("refresh-token-b")
+		require.NoError(t, err)
+		notYet := f.manager.newOwed(later, ClientAuthHeader)
+		notYet.NextAttempt = f.clock.Now().Add(time.Hour)
+		require.NoError(t, f.manager.appendOwed(ctx, session.ID, notYet))
+		f.manager.attemptNow(ctx, session.ID)
+		assert.Equal(t, []string{"refresh-token-a"}, f.provider.revocations(), "the one that is not due is not tried")
+
+		two := f.owing("refresh-token-c")
+		also, err := f.enc.Encrypt("refresh-token-d")
+		require.NoError(t, err)
+		require.NoError(t, f.manager.appendOwed(ctx, two.ID, f.manager.newOwed(also, ClientAuthHeader)))
+		attempts := 0
+		f.provider.mu.Lock()
+		f.provider.onRevoke = func() { attempts++ }
+		f.provider.revokeErr = errProviderDown
+		f.provider.mu.Unlock()
+		f.manager.attemptNow(ctx, two.ID)
+		assert.Equal(t, 1, attempts, "the provider did not answer the first, and is not asked the second")
+		f.manager.attemptNow(ctx, two.ID)
+		assert.Equal(t, 1, attempts, "nor again at once")
+	})
+
 	t.Run("ASessionWithTwoStopsAtTheFirstUnanswered", func(t *testing.T) {
 		t.Parallel()
 		f := newFixture(t, nil)
@@ -1017,6 +1048,171 @@ func TestWhenAnOwedRevocationIsTried(t *testing.T) {
 		f.round(f.manager)
 		assert.Equal(t, []string{"refresh-token-b"}, f.provider.revocations(), "the second came due before the first is due again")
 	})
+}
+
+// A token is owed once. A sign-out makes the session's token owed; a refresh
+// that then comes back granted, with no new token, shows the same token to be
+// good, and does not record it a second time.
+func TestATokenIsOwedOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t, nil)
+	session := f.signIn()
+	f.provider.set(func(string) (Renewal, error) { return Renewal{}, nil })
+	started, release := f.provider.hold()
+	f.clock.Advance(4 * time.Minute)
+
+	refreshing := make(chan error, 1)
+	go func() { refreshing <- f.check(session) }()
+	<-started
+	f.provider.failRevocations(errProviderDown)
+	require.NoError(t, f.manager.End(ctx, session.ID, "signed out", session.ExpiresAt))
+	release()
+	require.ErrorIs(t, <-refreshing, ErrSessionEnded)
+	assert.Len(t, f.stored(session).Owed, 1)
+	assert.Equal(t, []string{"refresh-token-0"}, f.owedTokens())
+}
+
+// An expired session is ended, so that its refresh token is revoked, whether
+// or not its record owes something already; and what a round forgets or
+// removes, it forgets or removes as it is, not as it was when it looked.
+func TestWhatARoundDoesNotLose(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// A live session can owe a token: a late refresh's, when another process
+	// had renewed the session. The provider never answers for that one. The
+	// session then expires. Its own refresh token still becomes owed.
+	t.Run("AnExpiredSessionThatAlreadyOwesSomething", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session, err := f.manager.Create(ctx, alice, "the-sessions-own-token", f.clock.Now().Add(time.Hour))
+		require.NoError(t, err)
+		stale, err := f.enc.Encrypt("a-token-from-a-late-refresh")
+		require.NoError(t, err)
+		require.NoError(t, f.manager.appendOwed(ctx, session.ID, f.manager.newOwed(stale, ClientAuthHeader)))
+		f.provider.mu.Lock()
+		f.provider.revokeErrFor = map[string]error{"a-token-from-a-late-refresh": errProviderDown}
+		f.provider.mu.Unlock()
+
+		f.clock.Advance(time.Hour + maxClockSkew)
+		f.round(f.manager)
+		stored := f.stored(session)
+		require.NotNil(t, stored.EndedAt)
+		assert.Equal(t, "the hub token expired", stored.EndReason)
+		f.clock.Advance(maxOwedBackoff)
+		f.round(f.manager)
+		assert.Contains(t, f.provider.revocations(), "the-sessions-own-token")
+		assert.Equal(t, []string{"a-token-from-a-late-refresh"}, f.owedTokens())
+	})
+
+	// The expiry was written by another clock, which may be ahead of the hub
+	// process that reads it. A session is not ended as expired before that
+	// allowance has passed.
+	t.Run("ASessionIsNotEndedAsExpiredEarly", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session, err := f.manager.Create(ctx, alice, "refresh-token-a", f.clock.Now().Add(time.Hour))
+		require.NoError(t, err)
+		f.clock.Advance(time.Hour + maxClockSkew - time.Second)
+		f.round(f.manager)
+		require.Nil(t, f.stored(session).EndedAt)
+		f.clock.Advance(time.Second)
+		f.round(f.manager)
+		require.NotNil(t, f.stored(session).EndedAt)
+	})
+
+	// A remembered end has expired and is about to be forgotten. Between the
+	// round looking at it and forgetting it, a request adds a token to it.
+	// It is not forgotten with that token.
+	t.Run("ARememberedEndThatChangedWhileTheRoundLooked", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		first, err := f.enc.Encrypt("a-token-it-held-when-the-round-looked")
+		require.NoError(t, err)
+		added, err := f.enc.Encrypt("a-token-added-while-the-round-looked")
+		require.NoError(t, err)
+		f.manager.remember(session.ID, decision{
+			reason: "signed out", revoke: true, expires: f.clock.Now().Add(-time.Minute),
+			owe: []Owed{f.manager.newOwed(first, ClientAuthHeader)},
+		})
+		interposed := &failingCollection{Collection: f.col}
+		f.manager.col = interposed
+		interposed.create = nil
+		created := false
+		interposed.onCreate = func() {
+			// The round is writing the record for the first token. A request
+			// adds the second one to what is remembered.
+			if !created {
+				created = true
+				f.manager.remember(session.ID, decision{reason: "signed out", revoke: true, owe: []Owed{f.manager.newOwed(added, ClientAuthHeader)}})
+			}
+		}
+		f.provider.failRevocations(errProviderDown)
+		f.round(f.manager)
+		d, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered, "it changed, so it is not the one the round looked at")
+		assert.Len(t, d.owe, 2)
+
+		f.provider.failRevocations(nil)
+		f.clock.Advance(maxOwedBackoff)
+		f.round(f.manager)
+		f.round(f.manager)
+		assert.Subset(t, f.provider.revocations(), []string{"a-token-it-held-when-the-round-looked", "a-token-added-while-the-round-looked"})
+	})
+
+	// A marker for a record that cannot be read is being closed, and its
+	// tokens moved into a record of their own. Another process adds a token to
+	// the marker between the round's listing and the closing. The marker that
+	// is removed is the one whose tokens were moved, with the new one in it.
+	t.Run("AMarkerThatChangedAfterTheListingIsClosedAsItIsNow", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		broken := &failingCollection{Collection: f.col, failFor: map[string]error{session.ID: errors.New("bad sector")}}
+		f.manager.col = broken
+		first, err := f.enc.Encrypt("a-token-the-listing-saw")
+		require.NoError(t, err)
+		added, err := f.enc.Encrypt("a-token-added-after-the-listing")
+		require.NoError(t, err)
+		require.True(t, f.manager.mark(ctx, session.ID, decision{
+			reason: "signed out", revoke: true, expires: f.clock.Now().Add(time.Hour),
+			owe: []Owed{f.manager.newOwed(first, ClientAuthHeader)},
+		}))
+		f.clock.Advance(time.Hour + purgeAfter + time.Second)
+
+		other := f.process()
+		listed := false
+		broken.read = func() {
+			// The first read of the round is of this marker, after the
+			// listing. Another process adds a token to it then.
+			if !listed {
+				listed = true
+				require.True(t, other.mark(ctx, session.ID, decision{reason: "refused", ifToken: "x", owe: []Owed{other.newOwed(added, ClientAuthHeader)}}))
+			}
+		}
+		f.round(f.manager)
+		_, markers := f.records()
+		require.Zero(t, markers)
+		assert.Equal(t, []string{"a-token-added-after-the-listing", "a-token-the-listing-saw"}, f.owedTokens(), "both are in a record of their own")
+	})
+}
+
+// Rounds are started at most once a minute on a hub process, by sign-ins as
+// by requests: a burst of sign-ins does not start a burst of rounds.
+func TestSignInsDoNotStartABurstOfRounds(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	started := 0
+	f.manager.spawn = func(func()) { started++ }
+	for range 10 {
+		f.signIn()
+	}
+	assert.Equal(t, 1, started)
+	f.clock.Advance(reconcileInterval)
+	f.signIn()
+	assert.Equal(t, 2, started)
 }
 
 // Nothing of a refresh token is in the clear in a record that owes one, or in
