@@ -1162,6 +1162,74 @@ func TestWhatARoundDoesNotLose(t *testing.T) {
 		assert.Subset(t, f.provider.revocations(), []string{"a-token-it-held-when-the-round-looked", "a-token-added-while-the-round-looked"})
 	})
 
+	// A process remembers a sign-out the store did not take. The session has
+	// meanwhile been ended in its record by another process, and this one is
+	// about to clear what it remembers. Between reading it and clearing it, a
+	// request adds a token to it. It is not cleared with that token.
+	t.Run("WhatIsRememberedChangedWhileItWasBeingCleared", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		f.manager.remember(session.ID, decision{reason: "signed out", revoke: true, expires: session.ExpiresAt})
+		other := f.process()
+		require.NoError(t, other.End(ctx, session.ID, "signed out", session.ExpiresAt))
+		added, err := f.enc.Encrypt("a-token-added-while-it-was-being-cleared")
+		require.NoError(t, err)
+
+		interposed := &failingCollection{Collection: f.col}
+		f.manager.col = interposed
+		reads := 0
+		interposed.read = func() {
+			reads++
+			// The first read looks for a marker; what is remembered is read
+			// next; the second read is of the session's record.
+			if reads == 2 {
+				f.manager.remember(session.ID, decision{reason: "signed out", revoke: true, owe: []Owed{f.manager.newOwed(added, ClientAuthHeader)}})
+			}
+		}
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		d, remembered := f.manager.decided(session.ID)
+		require.True(t, remembered, "what was added since is not what was read")
+		require.Len(t, d.owe, 1)
+
+		require.ErrorIs(t, f.check(session), ErrSessionEnded)
+		_, remembered = f.manager.decided(session.ID)
+		assert.False(t, remembered)
+		assert.Contains(t, f.provider.revocations(), "a-token-added-while-it-was-being-cleared")
+	})
+
+	// The same for a remembered decision about one refresh token that turns
+	// out not to apply any more and is being dropped.
+	t.Run("ADecisionAboutATokenChangedWhileItWasBeingDropped", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, nil)
+		session := f.signIn()
+		stale := decision{reason: "refused", ifToken: "a-token-the-record-no-longer-holds", expires: session.ExpiresAt}
+		f.manager.remember(session.ID, stale)
+		added, err := f.enc.Encrypt("a-token-added-while-it-was-being-dropped")
+		require.NoError(t, err)
+
+		interposed := &failingCollection{Collection: f.col}
+		f.manager.col = interposed
+		reads := 0
+		interposed.read = func() {
+			reads++
+			if reads == 2 {
+				withToken := stale
+				withToken.owe = []Owed{f.manager.newOwed(added, ClientAuthHeader)}
+				f.manager.remember(session.ID, withToken)
+			}
+		}
+		require.NoError(t, f.check(session), "the decision does not apply: the session was renewed since")
+		// The version that was read is dropped. The one remembered since is
+		// met by the look the request takes before it is answered, and its
+		// token goes into the session's record.
+		assert.Contains(t, f.provider.revocations(), "a-token-added-while-it-was-being-dropped")
+		_, remembered := f.manager.decided(session.ID)
+		assert.False(t, remembered)
+		assert.Nil(t, f.stored(session).EndedAt, "and the session, which the decision was not about, goes on")
+	})
+
 	// A marker for a record that cannot be read is being closed, and its
 	// tokens moved into a record of their own. Another process adds a token to
 	// the marker between the round's listing and the closing. The marker that

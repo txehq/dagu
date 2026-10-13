@@ -987,7 +987,7 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 					break
 				}
 			}
-			m.settle(sessionID)
+			m.settle(sessionID, beside.remembered)
 			m.unmark(ctx, mark)
 			return ending{ended: true}, nil
 		}
@@ -1010,9 +1010,9 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 		}
 		if (already || !applies) && len(d.owe) == 0 {
 			if already {
-				m.settle(sessionID)
+				m.settle(sessionID, beside.remembered)
 			} else {
-				m.drop(sessionID, d.ifToken)
+				m.drop(sessionID, d.ifToken, beside.remembered)
 			}
 			m.unmark(ctx, mark)
 			_, due := earliestDue(session.Owed, m.now())
@@ -1037,9 +1037,9 @@ func (m *Manager) end(ctx context.Context, sessionID string, d decision) (ending
 		if err == nil {
 			ended := already || applies
 			if ended {
-				m.settle(sessionID)
+				m.settle(sessionID, beside.remembered)
 			} else {
-				m.drop(sessionID, d.ifToken)
+				m.drop(sessionID, d.ifToken, beside.remembered)
 			}
 			m.unmark(ctx, mark)
 			_, due := earliestDue(session.Owed, m.now())
@@ -1109,8 +1109,10 @@ func (m *Manager) widest(ctx context.Context, sessionID string, d decision) (dec
 	remembered, ok := m.undone[sessionID]
 	m.mu.Unlock()
 	kept := []decision{}
+	var seq uint64
 	if ok {
 		kept = append(kept, remembered)
+		seq = remembered.seq
 	}
 	if mark != nil {
 		kept = append(kept, marked)
@@ -1125,14 +1127,18 @@ func (m *Manager) widest(ctx context.Context, sessionID string, d decision) (dec
 		}
 		d.owe = owe
 	}
-	return d, markedEnd{decision: marked, rec: mark}, nil
+	return d, markedEnd{decision: marked, rec: mark, remembered: seq}, nil
 }
 
-// markedEnd is an end marker as it was read: the decision in it, and its
-// record, which is nil when there is no marker.
+// markedEnd is what was folded into a decision that is being applied: the end
+// marker as it was read, with the decision in it and its record, which is nil
+// when there is no marker; and which version of what this process remembers
+// was read, zero when it remembered nothing. What is cleared once the
+// decision is in the record is these, and nothing that came after them.
 type markedEnd struct {
-	decision decision
-	rec      *persis.Record
+	decision   decision
+	rec        *persis.Record
+	remembered uint64
 }
 
 // appliesTo reports whether the decision is about the session as its record
@@ -1163,22 +1169,27 @@ func (m *Manager) remember(sessionID string, d decision) {
 	m.undone[sessionID] = d
 }
 
-// settle clears what this process remembers about a session that is ended in
-// its record.
-func (m *Manager) settle(sessionID string) {
+// settle clears what this process remembered about a session, now that the
+// session is ended in its record. It clears the version that was read and
+// folded into what was written. One remembered since, which may bring a token
+// that is in no record yet, stays, and is applied by the next request or
+// round.
+func (m *Manager) settle(sessionID string, seq uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.undone, sessionID)
 	delete(m.failedAt, sessionID)
+	if d, ok := m.undone[sessionID]; ok && d.seq == seq {
+		delete(m.undone, sessionID)
+	}
 }
 
 // drop clears a remembered decision about one refresh token, which the record
-// no longer holds. A sign-out decided meanwhile is not that decision, and
-// stays.
-func (m *Manager) drop(sessionID, ifToken string) {
+// no longer holds, if it is the version that was read. A sign-out decided
+// meanwhile is not that decision, and stays.
+func (m *Manager) drop(sessionID, ifToken string, seq uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if d, ok := m.undone[sessionID]; ok && d.ifToken == ifToken {
+	if d, ok := m.undone[sessionID]; ok && d.seq == seq && d.ifToken == ifToken {
 		delete(m.undone, sessionID)
 	}
 }
