@@ -109,6 +109,7 @@ type Server struct {
 	httpServer           *http.Server
 	funcsConfig          funcsConfig
 	builtinOIDCCfg       *auth.BuiltinOIDCConfig
+	sessionWatchClock    auth.SessionWatchClock // nil is the system clock; tests set another
 	trustedProxyCfg      *auth.TrustedProxyLoginConfig
 	authService          *authservice.Service
 	auditService         *audit.Service
@@ -1238,6 +1239,17 @@ func oidcSessionsEnabled(cfg *auth.BuiltinOIDCConfig) bool {
 	return cfg != nil && cfg.Sessions != nil
 }
 
+// sessionWatch returns what closes a connection that was opened with an OIDC
+// session's hub token and is still open when that session stops letting its
+// user in: the event stream, the MCP route and the terminal. Without OIDC
+// sessions it is nil, which watches nothing and starts nothing.
+func (srv *Server) sessionWatch() *auth.SessionWatch {
+	if !oidcSessionsEnabled(srv.builtinOIDCCfg) || srv.authService == nil {
+		return nil
+	}
+	return auth.NewSessionWatch(srv.authService, srv.builtinOIDCCfg.Sessions, srv.sessionWatchClock)
+}
+
 // newOIDCSessions builds the OIDC session manager, with the refresh tokens it
 // keeps encrypted under the hub's own key.
 func newOIDCSessions(cfg *config.Config, session config.AuthOIDCSession, oidcCfg *auth.BuiltinOIDCConfig, col persis.Collection) (*oidcsession.Manager, error) {
@@ -1283,6 +1295,7 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 		auditChecker = srv.licenseManager.Checker()
 	}
 	termHandler := terminal.NewHandler(srv.authService, srv.auditService, auditChecker, srv.terminalManager, shell)
+	termHandler.SetSessionWatch(srv.sessionWatch())
 	wsPath := path.Join(apiV1BasePath, "terminal/ws")
 	r.Get(wsPath, termHandler.ServeHTTP)
 	logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
@@ -1326,7 +1339,8 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(auth.Middleware(authOpts))
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 
-		r.Get("/stream", multiplexHandler.HandleStream)
+		// The stream stays open, so it is closed when its OIDC session ends.
+		r.With(srv.sessionWatch().Middleware()).Get("/stream", multiplexHandler.HandleStream)
 		r.Post("/stream/topics", multiplexHandler.HandleTopicMutation)
 	})
 
@@ -1414,6 +1428,9 @@ func (srv *Server) setupMCPRoute(ctx context.Context, r *chi.Mux) {
 		r.Use(auth.ClientIPMiddleware())
 		r.Use(auth.Middleware(authOpts))
 		r.Use(srv.injectDefaultStreamUserMiddleware())
+		// An MCP request may stay open as a stream, so it is closed when its
+		// OIDC session ends.
+		r.Use(srv.sessionWatch().Middleware())
 		r.Use(srv.mcpAuditSubjectMiddleware())
 		r.Use(clearWriteDeadlineMiddleware)
 		r.Handle(mcpPath, mcpHandler)
