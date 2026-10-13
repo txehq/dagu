@@ -103,6 +103,8 @@ type sessionEnv struct {
 	store    *sessionStore
 	sessions *oidcsession.Manager
 	svc      *authservice.Service
+	users    authmodel.UserStore
+	secret   authmodel.TokenSecret
 	cfg      *BuiltinOIDCConfig
 	alice    *authmodel.User
 	admin    *authmodel.User
@@ -132,7 +134,7 @@ func newSessionEnv(t *testing.T) *sessionEnv {
 	require.NoError(t, err)
 	svc := authservice.New(store, authservice.Config{TokenSecret: secret, TokenTTL: time.Hour, BcryptCost: 4})
 
-	env := &sessionEnv{t: t, now: time.Now(), provider: &sessionProvider{}, svc: svc}
+	env := &sessionEnv{t: t, now: time.Now(), provider: &sessionProvider{}, svc: svc, users: store, secret: secret}
 	env.store = &sessionStore{Collection: backend.Collection("oidc_sessions")}
 	enc, err := crypto.NewEncryptor("a-test-key-that-is-long-enough-for-aes")
 	require.NoError(t, err)
@@ -164,7 +166,17 @@ func (e *sessionEnv) signIn() string {
 // get sends a request with the token through the real authentication
 // middleware and returns the response.
 func (e *sessionEnv) get(token string) *httptest.ResponseRecorder {
-	handler := Middleware(Options{AuthRequired: true, JWTValidator: e.svc, Realm: "restricted"})(
+	return getWith(e.svc, token)
+}
+
+// restartedWithSessionsOff is the hub restarted with auth.oidc.session unset:
+// the same users and the same signing key, and no session checker.
+func (e *sessionEnv) restartedWithSessionsOff() *authservice.Service {
+	return authservice.New(e.users, authservice.Config{TokenSecret: e.secret, TokenTTL: time.Hour, BcryptCost: 4})
+}
+
+func getWith(svc *authservice.Service, token string) *httptest.ResponseRecorder {
+	handler := Middleware(Options{AuthRequired: true, JWTValidator: svc, Realm: "restricted"})(
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/dags", nil)
 	request.Header.Set("Authorization", "Bearer "+token)
@@ -242,6 +254,58 @@ func TestBuiltinUsersAreUntouchedBySessions(t *testing.T) {
 	old, err := env.svc.GenerateToken(env.alice)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, env.get(old.Token).Code)
+}
+
+// Turning sessions off does not let anyone back in. A hub restarted with
+// sessions off refuses, with a 401, every hub token issued under a session:
+// the one whose user signed out, the one the provider refused, and one whose
+// session was still good. The administrator's token, and the token an OIDC
+// user gets by signing in again, work as they always did.
+func TestSessionsTurnedOffRefuseEveryTokenOfASession(t *testing.T) {
+	t.Parallel()
+	env := newSessionEnv(t)
+	signedOut, refused, live := env.signIn(), env.signIn(), env.signIn()
+	adminToken, err := env.svc.GenerateToken(env.admin)
+	require.NoError(t, err)
+	for _, token := range []string{signedOut, refused, live, adminToken.Token} {
+		require.Equal(t, http.StatusOK, env.get(token).Code)
+	}
+
+	require.Equal(t, http.StatusNoContent, signOut(env, http.MethodPost, "Bearer "+signedOut, "/oidc-logout").Code)
+	claims, err := env.svc.ValidateToken(refused)
+	require.NoError(t, err)
+	require.NoError(t, env.sessions.End(context.Background(), claims.SessionID, "refused by the provider", time.Time{}))
+	require.Equal(t, http.StatusUnauthorized, env.get(signedOut).Code)
+	require.Equal(t, http.StatusUnauthorized, env.get(refused).Code)
+	require.Equal(t, http.StatusOK, env.get(live).Code)
+
+	off := env.restartedWithSessionsOff()
+	env.provider.mu.Lock()
+	calls := env.provider.calls
+	env.provider.mu.Unlock()
+	for name, token := range map[string]string{"signed out": signedOut, "refused": refused, "live": live} {
+		response := getWith(off, token)
+		assert.Equal(t, http.StatusUnauthorized, response.Code, name)
+		assert.NotEmpty(t, response.Header().Get("WWW-Authenticate"), name+": the holder is told to sign in")
+		assert.Empty(t, response.Header().Get("Retry-After"), name+": not an outage to wait out")
+	}
+	assert.Equal(t, http.StatusOK, getWith(off, adminToken.Token).Code, "the administrator is not affected")
+	env.provider.mu.Lock()
+	assert.Equal(t, calls, env.provider.calls, "with sessions off the provider is not asked")
+	env.provider.mu.Unlock()
+
+	// Signing in again with sessions off issues an ordinary token.
+	again, err := issueHubToken(context.Background(), &BuiltinOIDCConfig{AuthService: off}, env.alice, "")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, getWith(off, again.Token).Code)
+
+	// Sessions on again: the ended sessions are still ended, the live one
+	// is still good, and the token from the time sessions were off is the
+	// OIDC token with no session that a hub with sessions on refuses.
+	assert.Equal(t, http.StatusUnauthorized, env.get(signedOut).Code)
+	assert.Equal(t, http.StatusUnauthorized, env.get(refused).Code)
+	assert.Equal(t, http.StatusOK, env.get(live).Code)
+	assert.Equal(t, http.StatusUnauthorized, env.get(again.Token).Code)
 }
 
 // The token the callback issues is tied to a new session and expires with
