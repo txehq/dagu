@@ -32,15 +32,22 @@ export function UserMenu({ isCollapsed = false }: UserMenuProps) {
   const config = useConfig();
   const navigate = useNavigate();
   const [showChangePassword, setShowChangePassword] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   // Don't show if auth is not builtin or user is not authenticated
   if (config.authMode !== 'builtin' || !isAuthenticated || !user) {
     return null;
   }
 
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
+  const handleLogout = async () => {
+    if (signingOut) {
+      return;
+    }
+    setSigningOut(true);
+    const result = await logout();
+    // This browser is signed out in every case; the login page says so when
+    // the hub did not confirm that the session ended.
+    navigate(result === 'unconfirmed' ? '/login?signout=unconfirmed' : '/login');
   };
 
   return (
@@ -92,7 +99,8 @@ export function UserMenu({ isCollapsed = false }: UserMenuProps) {
             </>
           )}
           <DropdownMenuItem
-            onClick={handleLogout}
+            onClick={() => void handleLogout()}
+            disabled={signingOut}
             className="text-error focus:text-error"
           >
             <LogOut className="h-4 w-4 mr-2" />

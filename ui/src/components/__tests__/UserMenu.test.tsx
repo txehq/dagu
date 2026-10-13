@@ -3,7 +3,7 @@
 
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { UserAuthProvider, UserRole } from '@/api/v1/schema';
@@ -21,7 +21,15 @@ vi.mock('@/contexts/ConfigContext', () => ({
   useConfig: () => ({ authMode: 'builtin' }),
 }));
 
-function renderMenu(authProvider: UserAuthProvider) {
+function LoginProbe() {
+  const location = useLocation();
+  return <div data-testid="login-page">{location.search}</div>;
+}
+
+function renderMenu(
+  authProvider: UserAuthProvider,
+  logout: () => Promise<string> = vi.fn(() => Promise.resolve('local'))
+) {
   mocks.useAuth.mockReturnValue({
     user: {
       id: 'user-id',
@@ -32,13 +40,16 @@ function renderMenu(authProvider: UserAuthProvider) {
       createdAt: '2026-07-20T00:00:00Z',
       updatedAt: '2026-07-20T00:00:00Z',
     },
-    logout: vi.fn(),
+    logout,
     isAuthenticated: true,
   });
 
   render(
-    <MemoryRouter>
-      <UserMenu />
+    <MemoryRouter initialEntries={['/']}>
+      <Routes>
+        <Route path="/" element={<UserMenu />} />
+        <Route path="/login" element={<LoginProbe />} />
+      </Routes>
     </MemoryRouter>
   );
 }
@@ -80,5 +91,55 @@ describe('UserMenu', () => {
     expect(
       screen.getByRole('menuitem', { name: 'Change Password' })
     ).toBeVisible();
+  });
+
+  it.each([
+    ['local', ''],
+    ['ended', ''],
+    ['unconfirmed', '?signout=unconfirmed'],
+  ])(
+    'goes to the login page after a %s sign-out',
+    async (result, search) => {
+      const user = userEvent.setup();
+      const logout = vi.fn(() => Promise.resolve(result));
+      renderMenu(UserAuthProvider.oidc, logout);
+
+      await user.click(screen.getByRole('button', { name: 'test-user' }));
+      await user.click(screen.getByRole('menuitem', { name: 'Sign Out' }));
+
+      expect(await screen.findByTestId('login-page')).toHaveTextContent(
+        search
+      );
+      expect(screen.getByTestId('login-page').textContent).toBe(search);
+      expect(logout).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('stays put and disables Sign Out until the hub has answered', async () => {
+    const user = userEvent.setup();
+    let answer: (result: string) => void = () => {};
+    const logout = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          answer = resolve;
+        })
+    );
+    renderMenu(UserAuthProvider.oidc, logout);
+
+    await user.click(screen.getByRole('button', { name: 'test-user' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Sign Out' }));
+
+    expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
+    expect(logout).toHaveBeenCalledTimes(1);
+
+    // Reopen the menu while the request is pending: the item cannot fire again.
+    await user.click(screen.getByRole('button', { name: 'test-user' }));
+    const item = screen.getByRole('menuitem', { name: 'Sign Out' });
+    expect(item).toHaveAttribute('aria-disabled', 'true');
+    await user.click(item);
+    expect(logout).toHaveBeenCalledTimes(1);
+
+    answer('ended');
+    expect(await screen.findByTestId('login-page')).toBeInTheDocument();
   });
 });

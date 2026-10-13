@@ -135,6 +135,7 @@ type funcsConfig struct {
 	AuthMode              config.AuthMode
 	OIDCEnabled           bool
 	OIDCButtonLabel       string
+	OIDCSessionEnabled    bool // sign-out also ends the hub session; see oidcSessionsEnabled
 	ProxyEnabled          bool
 	ProxyButtonLabel      string
 	TerminalEnabled       bool
@@ -220,6 +221,7 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 			}
 			return "true"
 		},
+		"oidcSessionEnabled": func() string { return boolStr(cfg.OIDCSessionEnabled) },
 		"proxyEnabled": func() string {
 			if !cfg.ProxyEnabled {
 				return "false"
