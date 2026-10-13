@@ -1433,6 +1433,9 @@ func (srv *Server) setupMCPRoute(ctx context.Context, r *chi.Mux) {
 		r.Use(srv.sessionWatch().Middleware(authOpts))
 		r.Use(srv.mcpAuditSubjectMiddleware())
 		r.Use(clearWriteDeadlineMiddleware)
+		// Last: the caller the hub has authenticated is who an MCP session
+		// belongs to.
+		r.Use(mcpSessionUserMiddleware(authOpts))
 		r.Handle(mcpPath, mcpHandler)
 	})
 
