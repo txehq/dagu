@@ -6,11 +6,13 @@ package oidcsession
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -263,6 +265,13 @@ func newFixture(t *testing.T, checkID IDTokenChecker) *fixture {
 	return f
 }
 
+// inline makes a hub process run its rounds inside the call that starts
+// them, so that a test sees what a round did when the call returns.
+func inline(m *Manager) *Manager {
+	m.spawn = func(round func()) { round() }
+	return m
+}
+
 // process is another hub process over the same store, provider and clock.
 func (f *fixture) process() *Manager {
 	f.t.Helper()
@@ -270,7 +279,7 @@ func (f *fixture) process() *Manager {
 		RevalidateAfter: 4 * time.Minute, RevalidateLimit: 5 * time.Minute, Now: f.clock.Now,
 	}, f.col, f.enc, f.provider, f.checkID)
 	require.NoError(f.t, err)
-	return manager
+	return inline(manager)
 }
 
 // rewrite changes the stored session directly, as another hub process would.
@@ -282,6 +291,55 @@ func (f *fixture) rewrite(session *Session, change func(*Session)) {
 	data, err := encode(stored)
 	require.NoError(f.t, err)
 	require.NoError(f.t, f.col.CompareAndSwap(context.Background(), session.ID, raw, data))
+}
+
+// records returns every session record in the store, and how many end
+// markers lie beside them.
+func (f *fixture) records() (sessions []*Session, markers int) {
+	f.t.Helper()
+	page, err := f.col.List(context.Background(), persis.ListQuery{})
+	require.NoError(f.t, err)
+	require.Empty(f.t, page.NextCursor)
+	for _, rec := range page.Records {
+		if strings.HasPrefix(rec.ID, endMarkerPrefix) {
+			markers++
+			continue
+		}
+		var session Session
+		require.NoError(f.t, json.Unmarshal(rec.Data, &session))
+		sessions = append(sessions, &session)
+	}
+	return sessions, markers
+}
+
+// openSessions is how many sessions in the store have not ended.
+func (f *fixture) openSessions() int {
+	f.t.Helper()
+	sessions, _ := f.records()
+	open := 0
+	for _, session := range sessions {
+		if session.EndedAt == nil {
+			open++
+		}
+	}
+	return open
+}
+
+// owedTokens returns the refresh tokens the store's records owe the
+// revocation of, decrypted and sorted.
+func (f *fixture) owedTokens() []string {
+	f.t.Helper()
+	sessions, _ := f.records()
+	owed := []string{}
+	for _, session := range sessions {
+		for _, entry := range session.Owed {
+			token, err := f.enc.Decrypt(entry.Token)
+			require.NoError(f.t, err)
+			owed = append(owed, token)
+		}
+	}
+	slices.Sort(owed)
+	return owed
 }
 
 // heldToken is the refresh token the stored session holds, decrypted.
@@ -806,6 +864,8 @@ func TestAStoreFailureIsNotAnAnswer(t *testing.T) {
 type failingCollection struct {
 	persis.Collection
 	fail error
+	// failFor is what reading one record fails with.
+	failFor map[string]error
 	// swap, when set, decides each write: an error fails it.
 	swap func() error
 	// read, when set, is called before each read.
@@ -813,11 +873,16 @@ type failingCollection struct {
 	// swapped, when set, is called after each write that was made: an error
 	// from it is reported for a write that did happen.
 	swapped func() error
-	// create, when set, is what creating a record fails with.
-	create error
+	// create, when set, is what creating a record fails with, and onCreate
+	// is called before each creation.
+	create   error
+	onCreate func()
 }
 
 func (c *failingCollection) Create(ctx context.Context, rec *persis.Record) error {
+	if c.onCreate != nil {
+		c.onCreate()
+	}
 	if c.create != nil {
 		return c.create
 	}
@@ -881,11 +946,16 @@ func (c *failingCollection) Get(ctx context.Context, id string) (*persis.Record,
 	if c.fail != nil {
 		return nil, c.fail
 	}
+	if err := c.failFor[id]; err != nil {
+		return nil, err
+	}
 	return c.Collection.Get(ctx, id)
 }
 
-// Records of sessions that ended or expired more than a day ago are removed
-// at the next sign-in.
+// The record of a session that ended more than a day ago, and owes nothing,
+// is removed. A session whose hub token has expired is ended first, so that
+// its refresh token is revoked and not simply forgotten, and its record goes
+// a day after that.
 func TestOldSessionRecordsArePurged(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil)
@@ -895,20 +965,30 @@ func TestOldSessionRecordsArePurged(t *testing.T) {
 	expired, err := f.manager.Create(ctx, alice, "refresh-token-x", f.clock.Now().Add(time.Hour))
 	require.NoError(t, err)
 	live := f.signIn()
+	revoked := f.provider.revocations()
 
 	f.clock.Advance(23 * time.Hour)
 	f.signIn()
 	_, _, err = f.manager.load(ctx, ended.ID)
 	require.NoError(t, err, "kept for a day")
+	lapsed := f.stored(expired)
+	require.NotNil(t, lapsed.EndedAt, "a session whose hub token has expired is ended")
+	assert.Equal(t, "the hub token expired", lapsed.EndReason)
+	assert.Equal(t, append(revoked, "refresh-token-x"), f.provider.revocations(), "and its refresh token is revoked")
 
 	f.clock.Advance(2*time.Hour + time.Minute)
 	f.signIn()
 	_, _, err = f.manager.load(ctx, ended.ID)
 	require.ErrorIs(t, err, ErrSessionEnded)
 	_, _, err = f.manager.load(ctx, expired.ID)
-	require.ErrorIs(t, err, ErrSessionEnded)
+	require.NoError(t, err, "it ended two hours ago, and is kept for a day from then")
 	_, _, err = f.manager.load(ctx, live.ID)
-	require.NoError(t, err, "a session that is neither ended nor long expired is kept")
+	require.NoError(t, err, "a session that is neither ended nor expired is kept")
+
+	f.clock.Advance(22 * time.Hour)
+	f.signIn()
+	_, _, err = f.manager.load(ctx, expired.ID)
+	require.ErrorIs(t, err, ErrSessionEnded)
 }
 
 func TestConfigValidate(t *testing.T) {
