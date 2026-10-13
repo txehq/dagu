@@ -33,6 +33,8 @@ type mcpHub struct {
 	t    *testing.T
 	svc  *authservice.Service
 	http *httptest.Server
+	// opts are the options the route's authentication was built with.
+	opts frontendauth.Options
 }
 
 func newMCPHub(t *testing.T, mode config.AuthMode) *mcpHub {
@@ -56,6 +58,7 @@ func newMCPHub(t *testing.T, mode config.AuthMode) *mcpHub {
 	}
 	router := chi.NewMux()
 	srv.setupMCPRoute(testContext(t), router)
+	hub.opts = srv.buildStreamAuthOptions("Dagu MCP")
 	hub.http = httptest.NewServer(router)
 	t.Cleanup(func() {
 		hub.http.CloseClientConnections()
@@ -295,38 +298,63 @@ var (
 	unauthenticatedRoute = frontendauth.Options{}
 )
 
-// The adapter by itself, on a route that authenticates, with whatever is in
-// front of it failing to say who the caller is: it refuses, and what is
-// behind it is not run.
+// authenticatingRoutes is every way a route can authenticate: each of hub
+// tokens, API keys and basic, alone and together.
+func authenticatingRoutes() map[string]frontendauth.Options {
+	routes := map[string]frontendauth.Options{}
+	for bits := 1; bits < 8; bits++ {
+		opts, name := frontendauth.Options{AuthRequired: true}, ""
+		if bits&1 != 0 {
+			opts.JWTValidator, name = stubValidator{}, name+"Tokens"
+		}
+		if bits&2 != 0 {
+			opts.APIKeyValidator, name = stubValidator{}, name+"Keys"
+		}
+		if bits&4 != 0 {
+			opts.BasicAuthEnabled, name = true, name+"Basic"
+		}
+		routes[name] = opts
+	}
+	return routes
+}
+
+// The adapter by itself, on every kind of route that authenticates, with
+// whatever is in front of it failing to say who the caller is: it refuses,
+// and what is behind it is not run. That holds whether or not the route
+// requires authentication.
 func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
 	t.Parallel()
 
-	for route, opts := range map[string]frontendauth.Options{
-		"Builtin": builtinRoute, "BuiltinNoKeys": builtinRouteNoKeys, "Basic": basicRoute,
-	} {
-		cases := map[string]context.Context{
-			"Nothing":      context.Background(),
-			"NoUser":       authmodel.WithUser(context.Background(), nil),
-			"UserWithNoID": authmodel.WithUser(context.Background(), &authmodel.User{Username: "nobody"}),
-			// A key with no id is not its owner: the owner's name is not
-			// fallen back to.
-			"KeyWithNoID": authmodel.WithAPIKey(authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{}),
-		}
-		if opts.APIKeyValidator == nil {
-			// A key is a caller only where keys are checked.
-			cases["AKeyWhereNoneAreChecked"] = authmodel.WithAPIKey(
-				authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{ID: "k1"})
-		}
-		for name, ctx := range cases {
-			ran := false
-			handler := mcpSessionUserMiddleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
-			request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(mcpInitialize)).WithContext(ctx)
-			request.Header.Set("Authorization", "Bearer a-real-looking-token")
-			recorder := httptest.NewRecorder()
-			handler.ServeHTTP(recorder, request)
+	routes := authenticatingRoutes()
+	require.Len(t, routes, 7)
+	for route, required := range routes {
+		optional := required
+		optional.AuthRequired = false
+		for _, opts := range []frontendauth.Options{required, optional} {
+			cases := map[string]context.Context{
+				"Nothing":      context.Background(),
+				"NoUser":       authmodel.WithUser(context.Background(), nil),
+				"UserWithNoID": authmodel.WithUser(context.Background(), &authmodel.User{Username: "nobody"}),
+				// A key with no id is not its owner: the owner's name is not
+				// fallen back to.
+				"KeyWithNoID": authmodel.WithAPIKey(authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{}),
+			}
+			if opts.APIKeyValidator == nil {
+				// A key is a caller only where keys are checked.
+				cases["AKeyWhereNoneAreChecked"] = authmodel.WithAPIKey(
+					authmodel.WithUser(context.Background(), &authmodel.User{ID: "owner"}), &authmodel.APIKey{ID: "k1"})
+			}
+			for name, ctx := range cases {
+				ran := false
+				handler := mcpSessionUserMiddleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
+				request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(mcpInitialize)).WithContext(ctx)
+				request.Header.Set("Authorization", "Bearer a-real-looking-token")
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, request)
 
-			assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%s %s", route, name)
-			assert.False(t, ran, "%s %s", route, name)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%s required=%v %s", route, opts.AuthRequired, name)
+				assert.False(t, ran, "%s required=%v %s", route, opts.AuthRequired, name)
+			}
 		}
 	}
 
@@ -334,6 +362,82 @@ func TestMCPSessionAdapterRefusesARequestWithNoCaller(t *testing.T) {
 	// caller: nothing checked it.
 	_, ok := mcpSessionOwner(authmodel.WithAPIKey(context.Background(), &authmodel.APIKey{ID: "k1"}), unauthenticatedRoute)
 	assert.False(t, ok)
+}
+
+// The adapter decides that a route authenticates nobody exactly when the
+// route's own authentication does. A request with no credential is sent
+// through the real authentication middleware and then the adapter, built
+// from the same options, for every combination of methods: it comes out the
+// other end, as the default caller, only when the middleware has nothing to
+// authenticate with. With any method at all it is stopped, by the middleware
+// when authentication is required, and by the adapter when it is not.
+func TestMCPSessionAdapterAgreesWithTheRoutesAuthentication(t *testing.T) {
+	t.Parallel()
+
+	for bits := range 16 {
+		opts := frontendauth.Options{Realm: "Dagu MCP", AuthRequired: bits&8 != 0, Creds: map[string]string{"operator": "basic-password"}}
+		if bits&1 != 0 {
+			opts.JWTValidator = stubValidator{}
+		}
+		if bits&2 != 0 {
+			opts.APIKeyValidator = stubValidator{}
+		}
+		opts.BasicAuthEnabled = bits&4 != 0
+		authenticates := bits&7 != 0
+
+		var owner string
+		ran := false
+		chain := frontendauth.Middleware(opts)(mcpSessionUserMiddleware(opts)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			ran = true
+			owner = mcpauth.TokenInfoFromContext(r.Context()).UserID
+		})))
+		recorder := httptest.NewRecorder()
+		chain.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(mcpInitialize)))
+
+		if authenticates {
+			assert.False(t, ran, "%+v", opts)
+			assert.Equal(t, http.StatusUnauthorized, recorder.Code, "%+v", opts)
+			continue
+		}
+		assert.True(t, ran, "%+v", opts)
+		assert.Equal(t, "default:", owner, "%+v", opts)
+	}
+}
+
+// What each mode's MCP route does with a request that carries no credential,
+// on the route as the server builds it. Only a hub that authenticates nobody
+// serves it. A mode the configuration loader does not know never gets this
+// far as itself: the loader makes it builtin (see the loader's tests), and
+// the configuration's own validation refuses it.
+func TestMCPRouteWithNoCredentialInEachMode(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		mode          config.AuthMode
+		authenticates bool
+	}{
+		"Builtin": {config.AuthModeBuiltin, true},
+		"Basic":   {config.AuthModeBasic, true},
+		"None":    {config.AuthModeNone, false},
+		// The conformance suite's server: no mode, nothing to authenticate
+		// with. Its route authenticates nobody, as it did before.
+		"NoModeSet": {"", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			hub := newMCPHub(t, tc.mode)
+			require.Equal(t, tc.authenticates, hub.opts.Authenticates())
+
+			answer := hub.ask(http.MethodPost, "", "", mcpInitialize)
+			if tc.authenticates {
+				assert.Equal(t, http.StatusUnauthorized, answer.status, answer.body)
+				assert.Empty(t, answer.session)
+				return
+			}
+			assert.Equal(t, http.StatusOK, answer.status, answer.body)
+			assert.NotEmpty(t, answer.session)
+		})
+	}
 }
 
 // Who owns a session is taken from what authentication put in the context,

@@ -57,6 +57,15 @@ type Options struct {
 	AuthRequired bool
 }
 
+// Authenticates reports whether a route with these options has anything to
+// authenticate a request with. When it has not, Middleware lets every request
+// through, whatever AuthRequired says. A handler behind the middleware that
+// has to know whether its callers were authenticated asks this, so that it
+// and the middleware cannot disagree.
+func (o Options) Authenticates() bool {
+	return o.BasicAuthEnabled || o.JWTValidator != nil || o.APIKeyValidator != nil
+}
+
 const (
 	DenialReasonAPIKeySurfaceDenied = "api_key_surface_denied"
 	DenialReasonAuthFailed          = "auth_failed"
@@ -127,7 +136,7 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 
 	jwtEnabled := opts.JWTValidator != nil
 	apiKeyEnabled := opts.APIKeyValidator != nil
-	anyAuthEnabled := opts.BasicAuthEnabled || jwtEnabled || apiKeyEnabled
+	anyAuthEnabled := opts.Authenticates()
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

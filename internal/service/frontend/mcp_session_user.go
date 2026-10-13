@@ -97,9 +97,12 @@ func withoutCredential(r *http.Request) *http.Request {
 // A route that authenticates nobody, because the hub's mode is none or
 // because nothing was configured to authenticate with, lets every request
 // through: its callers are one, the default caller. That is said here and
-// not left to whether a user happens to be in the context.
+// not left to whether a user happens to be in the context. Whether a route
+// authenticates is asked of the options its authentication middleware was
+// built with, not worked out from the name of the hub's mode.
 func mcpSessionOwner(ctx context.Context, opts auth.Options) (string, bool) {
-	authenticates := opts.BasicAuthEnabled || opts.JWTValidator != nil || opts.APIKeyValidator != nil
+	// The middleware's own account of whether it authenticates anybody.
+	authenticates := opts.Authenticates()
 
 	if apiKey, ok := authmodel.APIKeyFromContext(ctx); ok && apiKey != nil {
 		// A key is a caller only where keys are checked.
