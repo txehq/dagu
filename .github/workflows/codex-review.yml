@@ -33,24 +33,47 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: codex-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 env:
   REVIEW_MODEL: openai/gpt-6-astra
   REVIEW_EFFORT: medium
   CODEX_VERSION: 0.157.1
 
 jobs:
-  review:
+  # Only an eligible event from authorized actors reaches the review job's concurrency group, so
+  # an unrelated label, or an event from anyone else, cannot cancel a review in progress.
+  gate:
     if: >-
       github.event.pull_request.state == 'open'
         && !github.event.pull_request.draft
         && github.event.pull_request.head.repo.full_name == github.repository
         && (github.event.action != 'labeled' || github.event.label.name == 'codex-review-again')
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main's review scripts (never the PR's)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/codex-review
+      - name: Authorize the PR's author and this event's actors
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING: ${{ github.triggering_actor }}
+        run: bash trusted/.github/codex-review/authorize.sh trusted/.github/codex-review/authorized-actors.txt "$AUTHOR" "$SENDER" "$ACTOR" "$TRIGGERING"
+
+  review:
+    needs: gate
+    runs-on: ubuntu-24.04
     environment: codex-review
+    concurrency:
+      group: codex-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     timeout-minutes: 40
     permissions:
       contents: read
