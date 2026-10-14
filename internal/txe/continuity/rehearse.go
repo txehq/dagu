@@ -240,7 +240,7 @@ type ApplyOptions struct {
 	Transform Transform
 	// Interrupt, when set, is called at every point a crash could stop the
 	// transition: per step "before_write", "staged", "installed" and
-	// "after_write", and with step -1 "staging_init" and
+	// "after_write", and with step -1 "target_created", "staging_init" and
 	// "staging_teardown". An error stops Apply there as a crash would,
 	// with nothing after it done.
 	Interrupt func(step int, point string) error
@@ -300,7 +300,7 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 	}
 	defer func() { _ = src.Close() }()
 	if !inPlace {
-		if err := mkdirDurable(opts.TargetData); err != nil {
+		if err := mkdirDurable(opts.TargetData, func() error { return interrupt(opts, -1, "target_created") }); err != nil {
 			return nil, err
 		}
 	}
@@ -802,23 +802,37 @@ func physicalPath(p string) (string, error) {
 	}
 }
 
-// mkdirDurable creates dir and any missing parents, syncing each new entry
-// into its parent so the tree survives a crash.
-func mkdirDurable(dir string) error {
+// mkdirDurable creates dir and any missing parents, and makes the entry of
+// dir and of every directory above it durable in its parent. That is done
+// on every run, also for directories that already exist: one may have been
+// created by a run that stopped before it synced the parent. created is
+// called after each directory this run creates, before its parent is
+// synced.
+func mkdirDurable(dir string, created func() error) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(abs); err == nil {
-		return nil
-	}
-	if err := mkdirDurable(filepath.Dir(abs)); err != nil {
+	if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 		return err
 	}
-	if err := os.Mkdir(abs, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := os.Mkdir(abs, 0o750); err == nil {
+		if err := created(); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	return fileutil.SyncDir(filepath.Dir(abs))
+	for d := abs; ; {
+		parent := filepath.Dir(d)
+		if parent == d {
+			return nil
+		}
+		if err := fileutil.SyncDir(parent); err != nil {
+			return err
+		}
+		d = parent
+	}
 }
 
 // noLinks refuses a path whose existing parent directories under root are

@@ -671,3 +671,22 @@ func TestInterruptedStagingTeardownResumes(t *testing.T) {
 		})
 	}
 }
+
+// A crash right after an import created its target root leaves nothing
+// that stops the import from resuming and completing.
+func TestInterruptedTargetCreationResumes(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+		if i == -1 && p == "target_created" {
+			return errCrash
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, errCrash)
+	require.DirExists(t, r.target)
+	res, err := r.apply(context.Background(), continuity.Identity, nil)
+	require.NoError(t, err)
+	assert.Equal(t, len(r.plan.Steps), res.Written)
+	assert.Empty(t, r.verify(t).Issues)
+}
