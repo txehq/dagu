@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -313,7 +314,7 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 	}
 	token := rawDigest([]byte(plan.Source + "\x00" + journalPath))[len("sha256:"):][:16]
 	staging := stagingPrefix + "-" + token
-	if err := resetStaging(dst, staging, token); err != nil {
+	if err := resetStaging(dst, staging, token, opts); err != nil {
 		return nil, err
 	}
 	journal, err := openJournal(opts.Journal)
@@ -344,28 +345,29 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 }
 
 // resetStaging clears what an earlier run of this transition staged, and
-// refuses a staging directory it cannot show is this transition's.
-func resetStaging(root *os.Root, staging, token string) error {
-	info, err := root.Lstat(staging)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return err
-	case !info.IsDir() || info.Mode()&fs.ModeSymlink != 0:
-		return fmt.Errorf("%w: %s is not this transition's staging directory", ErrConflict, staging)
-	default:
-		owner, err := root.ReadFile(staging + "/" + ownerMarker)
-		if err != nil || string(owner) != token {
-			return fmt.Errorf("%w: %s exists and was not made by this transition; it is left as it is", ErrConflict, staging)
-		}
-		if err := root.RemoveAll(staging); err != nil {
-			return err
-		}
-	}
-	if err := mkdirAllDurable(root, staging); err != nil {
+// refuses a staging directory it cannot show is this transition's. A new
+// staging directory is prepared under a temporary name, with its owner
+// marker written and synced, and only then given its name, so a crash
+// while preparing it never leaves an unmarked staging directory behind.
+func resetStaging(root *os.Root, staging, token string, opts ApplyOptions) error {
+	if err := removeOwned(root, staging, token, false); err != nil {
 		return err
 	}
-	f, err := root.OpenFile(staging+"/"+ownerMarker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	init := staging + ".init"
+	// An interrupted preparation holds at most this transition's marker.
+	if err := removeOwned(root, init, token, true); err != nil {
+		return err
+	}
+	if err := root.Mkdir(init, 0o750); err != nil {
+		return err
+	}
+	if err := syncRootDir(root, "."); err != nil {
+		return err
+	}
+	if err := interrupt(opts, -1, "staging_init"); err != nil {
+		return err
+	}
+	f, err := root.OpenFile(init+"/"+ownerMarker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -380,7 +382,47 @@ func resetStaging(root *os.Root, staging, token string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return syncRootDir(root, staging)
+	if err := syncRootDir(root, init); err != nil {
+		return err
+	}
+	if err := root.Rename(init, staging); err != nil {
+		return err
+	}
+	return syncRootDir(root, ".")
+}
+
+// removeOwned removes dir if it is this transition's: a plain directory
+// whose owner marker holds token. With partial set, a directory holding
+// nothing, or only an incomplete prefix of the marker, also counts: it is
+// a preparation this transition started. Anything else is a conflict and
+// is left as it is.
+func removeOwned(root *os.Root, dir, token string, partial bool) error {
+	info, err := root.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	case !info.IsDir() || info.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%w: %s is not this transition's staging directory", ErrConflict, dir)
+	}
+	entries, err := fs.ReadDir(root.FS(), dir)
+	if err != nil {
+		return err
+	}
+	owned := false
+	switch owner, err := root.ReadFile(dir + "/" + ownerMarker); {
+	case err == nil && string(owner) == token:
+		owned = true
+	case partial && len(entries) == 0:
+		owned = true
+	case partial && err == nil && len(entries) == 1 && strings.HasPrefix(token, string(owner)):
+		owned = true
+	}
+	if !owned {
+		return fmt.Errorf("%w: %s exists and was not made by this transition; it is left as it is", ErrConflict, dir)
+	}
+	return root.RemoveAll(dir)
 }
 
 // applyStep carries out one step; done reports it was already applied.
@@ -589,6 +631,9 @@ func checkRoots(source, target, journal string, inPlace bool) error {
 		if in, err := within(journal, tgtInfo); err != nil || in {
 			return fmt.Errorf("continuity: the journal %s is inside the target", journal)
 		}
+	} else if in, err := underPath(journal, target); err != nil || in {
+		// The target does not exist yet: compare where both would be.
+		return fmt.Errorf("continuity: the journal %s would be inside the target", journal)
 	}
 	// The journal file itself must be a plain file of its own: a link, or a
 	// second name of another file, could be a file of a store.
@@ -623,6 +668,28 @@ func within(p string, dir fs.FileInfo) (bool, error) {
 		}
 		cur = parent
 	}
+}
+
+// underPath reports whether p would be dir or inside it, comparing their
+// physical paths; it is for a dir that does not exist yet. Letter case is
+// ignored where file systems usually ignore it.
+func underPath(p, dir string) (bool, error) {
+	pp, err := physicalPath(p)
+	if err != nil {
+		return false, err
+	}
+	dp, err := physicalPath(dir)
+	if err != nil {
+		return false, err
+	}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		pp, dp = strings.ToLower(pp), strings.ToLower(dp)
+	}
+	rel, err := filepath.Rel(dp, pp)
+	if err != nil {
+		return false, nil
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
 }
 
 // physicalPath resolves the longest existing prefix of p and appends the

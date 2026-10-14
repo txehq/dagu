@@ -604,3 +604,35 @@ func TestForeignStagingIsLeftAlone(t *testing.T) {
 	require.ErrorIs(t, err, continuity.ErrConflict)
 	assert.FileExists(t, matches[0], "the foreign staging directory is kept")
 }
+
+// A crash while the staging directory is being prepared leaves nothing that
+// stops the transition from resuming.
+func TestInterruptedStagingPreparationResumes(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+		if i == -1 && p == "staging_init" {
+			return errCrash
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, errCrash)
+	_, err = r.apply(context.Background(), continuity.Identity, nil)
+	require.NoError(t, err)
+	left, err := filepath.Glob(filepath.Join(r.target, ".txe-transition-staging*"))
+	require.NoError(t, err)
+	assert.Empty(t, left)
+	assert.Empty(t, r.verify(t).Issues)
+}
+
+// A journal inside an import target that does not exist yet is refused
+// before the target is created.
+func TestJournalInsideANewTargetIsRefused(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	require.NoDirExists(t, r.target)
+	_, err := continuity.Apply(context.Background(), r.plan, continuity.ApplyOptions{SourceData: r.l.DataDir, TargetData: r.target,
+		Journal: filepath.Join(r.target, "journal.jsonl")})
+	assert.ErrorContains(t, err, "inside the target")
+	assert.NoDirExists(t, r.target, "nothing was created")
+}
