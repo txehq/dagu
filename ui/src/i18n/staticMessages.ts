@@ -2340,6 +2340,12 @@ const english = {
   "Job not found": "Job not found",
   "This job does not exist, or it has not been shared with you.": "This job does not exist, or it has not been shared with you.",
   "Shared with you by {owner}": "Shared with you by {owner}",
+  // TXE identity wiring (TXE-4246).
+  "Ask the platform administrator to give your account access.": "Ask the platform administrator to give your account access.",
+  "Not available yet": "Not available yet",
+  "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.",
+  "Go to the job inbox": "Go to the job inbox",
+  "Acting for {owner}": "Acting for {owner}",
 } as const;
 
 export type StaticMessage = keyof typeof english;
@@ -4622,6 +4628,12 @@ const chinese = {
   "Job not found": "未找到作业",
   "This job does not exist, or it has not been shared with you.": "此作业不存在，或尚未共享给你。",
   "Shared with you by {owner}": "由 {owner} 共享给你",
+  // TXE identity wiring (TXE-4246).
+  "Ask the platform administrator to give your account access.": "请平台管理员为你的账户授予访问权限。",
+  "Not available yet": "暂不可用",
+  "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "通过单点登录登录的账户暂时无法使用此页面。你的作业在作业收件箱中。",
+  "Go to the job inbox": "前往作业收件箱",
+  "Acting for {owner}": "代表 {owner}",
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
@@ -6985,6 +6997,12 @@ const japanese = {
   "Job not found": "ジョブが見つかりません",
   "This job does not exist, or it has not been shared with you.": "このジョブは存在しないか、あなたと共有されていません。",
   "Shared with you by {owner}": "{owner} から共有",
+  // TXE identity wiring (TXE-4246).
+  "Ask the platform administrator to give your account access.": "プラットフォーム管理者に、あなたのアカウントへのアクセス権の付与を依頼してください。",
+  "Not available yet": "まだ利用できません",
+  "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "シングルサインオンでサインインしたアカウントでは、このページはまだ利用できません。あなたのジョブはジョブ受信箱にあります。",
+  "Go to the job inbox": "ジョブ受信箱へ移動",
+  "Acting for {owner}": "{owner} として操作中",
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {

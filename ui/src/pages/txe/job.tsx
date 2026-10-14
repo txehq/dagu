@@ -16,6 +16,8 @@ import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { dagRunPath } from '@/features/txe/components/InboxItemCard';
 import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
 import { RunRetry } from '@/features/txe/components/RunRetry';
+import { NotFoundOrNotShared } from '@/features/txe/components/identity/NotFoundOrNotShared';
+import { TxeApiError } from '@/features/txe/api';
 import {
   useJobDetail,
   usePersonDecisions,
@@ -182,6 +184,15 @@ export default function TxeJobPage(): React.ReactElement {
     appBarContext.setTitle(data?.job.title ?? 'Job');
   }, [appBarContext, data?.job.title]);
 
+  // The hub answers the same 404 for a job that does not exist and one the
+  // caller may not see, so the page does not tell them apart either.
+  if (error instanceof TxeApiError && error.status === 404) {
+    return (
+      <div className="p-4">
+        <NotFoundOrNotShared />
+      </div>
+    );
+  }
   if (error) {
     return (
       <Alert variant="destructive" className="m-4">

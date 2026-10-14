@@ -14,9 +14,17 @@ import {
 import { User, LogOut, Key } from 'lucide-react';
 import { ChangePasswordModal } from './ChangePasswordModal';
 import { useI18n } from '@/i18n/I18nProvider';
+import { I18nText } from '@/i18n/I18nText';
 
 type UserMenuProps = {
   isCollapsed?: boolean;
+  // side is where the menu opens: above the trigger at the foot of the
+  // sidebar, below it in a top bar.
+  side?: 'top' | 'bottom';
+  // actingFor is the display name of the owner a person signed in through
+  // the identity provider acts for. A person's hub role decides nothing, so
+  // it is shown instead of the role.
+  actingFor?: string;
 };
 
 /**
@@ -26,7 +34,11 @@ type UserMenuProps = {
  *
  * @returns The user menu JSX element when shown, or `null` when authentication is not available.
  */
-export function UserMenu({ isCollapsed = false }: UserMenuProps) {
+export function UserMenu({
+  isCollapsed = false,
+  side = 'top',
+  actingFor,
+}: UserMenuProps) {
   const { t } = useI18n();
   const { user, logout, isAuthenticated } = useAuth();
   const config = useConfig();
@@ -76,15 +88,27 @@ export function UserMenu({ isCollapsed = false }: UserMenuProps) {
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isCollapsed ? 'center' : 'end'}
-          side="top"
+          side={side}
           className="w-56"
         >
           <DropdownMenuLabel className="font-normal">
             <div className="flex flex-col space-y-1">
               <p className="text-sm font-medium">{user.username}</p>
-              <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground capitalize w-fit">
-                {user.role}
-              </span>
+              {actingFor !== undefined ? (
+                <p
+                  className="text-xs text-muted-foreground"
+                  data-testid="user-menu-owner"
+                >
+                  <I18nText
+                    text="Acting for {owner}"
+                    values={{ owner: actingFor }}
+                  />
+                </p>
+              ) : (
+                <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground capitalize w-fit">
+                  {user.role}
+                </span>
+              )}
             </div>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />

@@ -31,6 +31,8 @@ import {
   useUserPreferences,
 } from './contexts/UserPreference';
 import Layout from './layouts/Layout';
+import { PersonLayout } from '@/features/txe/components/identity/PersonLayout';
+import { NotAvailableYet } from '@/features/txe/components/identity/NotAvailableYet';
 import fetchJson from './lib/fetchJson';
 import { fetchWithTimeout, shouldRetryQueryError } from './lib/requestTimeout';
 import { useClient } from './hooks/api';
@@ -323,6 +325,30 @@ function LazyRoutes({
         <Routes>{children}</Routes>
       </React.Suspense>
     </LazyRouteErrorBoundary>
+  );
+}
+
+// PersonApp is the dashboard of a person signed in through the identity
+// provider and acting for an owner: the TXE pages only. The hub refuses a
+// person every other route, so those show a placeholder instead of failing.
+function PersonApp(): React.ReactElement {
+  return (
+    <PersonLayout>
+      <LazyRoutes>
+        <Route path="/" element={<Navigate to="/txe" replace />} />
+        <Route path="/txe" element={<TxeInboxPage />} />
+        <Route path="/txe/jobs" element={<Navigate to="/txe" replace />} />
+        <Route path="/txe/jobs/:jobId" element={<TxeJobPage />} />
+        <Route
+          path="*"
+          element={
+            <div className="mx-auto max-w-lg p-8">
+              <NotAvailableYet />
+            </div>
+          }
+        />
+      </LazyRoutes>
+    </PersonLayout>
   );
 }
 
@@ -639,7 +665,7 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                             <Route
                               path="/*"
                               element={
-                                <ProtectedRoute>
+                                <ProtectedRoute personApp={<PersonApp />}>
                                   <Layout navbarColor={config.navbarColor}>
                                     <LazyRoutes>
                                       <Route

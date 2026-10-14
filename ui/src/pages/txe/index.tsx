@@ -17,6 +17,8 @@ import {
   usePersonDecisions,
   useTxeApi,
 } from '@/features/txe/hooks';
+import { EmptyPrivateInbox } from '@/features/txe/components/identity/EmptyPrivateInbox';
+import { useTxeIdentity } from '@/features/txe/identity';
 import { buildInbox } from '@/features/txe/inbox';
 
 const CLOCK_TICK_MS = 15_000;
@@ -30,6 +32,7 @@ export default function TxeInboxPage(): React.ReactElement {
   const canDecide = useCanExecute() && personDecisions;
   const api = useTxeApi();
   const { data, error, isLoading, mutate } = useInboxData();
+  const { identity } = useTxeIdentity();
   // A refused decision usually removes its card on reload (the proposal was
   // superseded or closed), so the refusal is reported at page level.
   const [refused, setRefused] = React.useState<{
@@ -52,6 +55,9 @@ export default function TxeInboxPage(): React.ReactElement {
     () => (data ? buildInbox(data.jobs, data.proposals, now) : []),
     [data, now]
   );
+  // A person with no jobs of their own, and none shared, is told where jobs
+  // will come from rather than that nothing needs attention.
+  const noJobsYet = identity?.is_person === true && data?.jobs.length === 0;
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4">
@@ -89,7 +95,8 @@ export default function TxeInboxPage(): React.ReactElement {
           <I18nText text="Loading…" />
         </p>
       )}
-      {data && items.length === 0 && (
+      {data && noJobsYet && <EmptyPrivateInbox />}
+      {data && items.length === 0 && !noJobsYet && (
         <p
           className="text-sm text-muted-foreground"
           data-testid="txe-inbox-empty"

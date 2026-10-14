@@ -240,8 +240,20 @@ function calculateRetryDelay(retryCount: number): number {
   return Math.min(1000 * 2 ** retryCount, MAX_RETRY_DELAY_MS);
 }
 
+// The state a subscriber sees while streams are refused for this caller: no
+// connection, so a page polls instead.
+const REFUSED_STATE: SSEConnectionState = {
+  isConnected: false,
+  isConnecting: false,
+  shouldUseFallback: true,
+  error: null,
+};
+
 export class SSEManager {
   private connections = new Map<string, ManagedConnection>();
+  // refused is set for a caller the hub refuses every event stream, such as a
+  // person signed in through the identity provider: no stream is opened.
+  private refused = false;
 
   constructor() {
     addAuthSessionListener((change) => {
@@ -431,6 +443,11 @@ export class SSEManager {
   }
 
   private connect(conn: ManagedConnection): void {
+    // The subscription is kept, so it connects once streams are allowed.
+    if (this.refused) {
+      this.updateState(conn, REFUSED_STATE);
+      return;
+    }
     if (conn.topics.size === 0) {
       return;
     }
@@ -813,6 +830,50 @@ export class SSEManager {
   disposeAll(): void {
     for (const conn of Array.from(this.connections.values())) {
       this.disposeConnection(conn);
+    }
+  }
+
+  // closeStream ends a connection's stream but keeps its subscribers.
+  private closeStream(conn: ManagedConnection): void {
+    if (conn.eventSource) {
+      conn.eventSource.close();
+      conn.eventSource = null;
+    }
+    if (conn.retryTimeout) {
+      clearTimeout(conn.retryTimeout);
+      conn.retryTimeout = null;
+    }
+    if (conn.connectTimeout) {
+      clearTimeout(conn.connectTimeout);
+      conn.connectTimeout = null;
+    }
+    if (conn.mutationTimeout) {
+      clearTimeout(conn.mutationTimeout);
+      conn.mutationTimeout = null;
+    }
+    conn.sessionId = null;
+    conn.retryCount = 0;
+    conn.serverTopics.clear();
+    conn.pendingAdd.clear();
+    conn.pendingRemove.clear();
+  }
+
+  // setRefused stops this browser opening any event stream while true, and
+  // closes the ones open; subscribers fall back to polling. When streams are
+  // allowed again, every connection that still has subscribers reconnects.
+  setRefused(refused: boolean): void {
+    if (this.refused === refused) {
+      return;
+    }
+    this.refused = refused;
+    for (const conn of Array.from(this.connections.values())) {
+      if (refused) {
+        this.closeStream(conn);
+        this.updateState(conn, REFUSED_STATE);
+      } else {
+        this.updateState(conn, { shouldUseFallback: false, error: null });
+        this.ensureConnected(conn);
+      }
     }
   }
 }

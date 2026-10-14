@@ -27,6 +27,11 @@ vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
 
+// The caller is not a person signed in through the identity provider.
+vi.mock('@/features/txe/identity', () => ({
+  useTxeIdentity: () => ({ identity: undefined }),
+}));
+
 // The hub signs people in individually, so decisions are offered.
 const authMode = vi.hoisted(() => ({ value: 'builtin' }));
 vi.mock('@/contexts/ConfigContext', () => ({

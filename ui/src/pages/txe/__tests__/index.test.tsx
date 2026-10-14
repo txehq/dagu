@@ -20,6 +20,15 @@ vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
 
+// Who the hub takes the caller to be; unset is a caller that is not a person
+// signed in through the identity provider.
+const identity = vi.hoisted(() => ({
+  value: undefined as { is_person: boolean } | undefined,
+}));
+vi.mock('@/features/txe/identity', () => ({
+  useTxeIdentity: () => ({ identity: identity.value }),
+}));
+
 // The hub signs people in individually, so decisions are offered.
 const authMode = vi.hoisted(() => ({ value: 'builtin' }));
 vi.mock('@/contexts/ConfigContext', () => ({
@@ -160,5 +169,28 @@ describe('TxeInboxPage without person authentication', () => {
     expect(
       screen.queryByTestId('txe-decision-auth-notice')
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('TxeInboxPage for a person with no jobs', () => {
+  function noJobs(): TxeApi {
+    return { ...fakeApi([]).api, listJobs: async () => [] };
+  }
+
+  it('tells a person where jobs will come from', async () => {
+    identity.value = { is_person: true };
+    try {
+      renderPage(noJobs());
+      expect(await screen.findByTestId('txe-inbox-first')).toBeInTheDocument();
+      expect(screen.queryByTestId('txe-inbox-empty')).not.toBeInTheDocument();
+    } finally {
+      identity.value = undefined;
+    }
+  });
+
+  it('keeps the usual empty text for any other caller', async () => {
+    renderPage(noJobs());
+    expect(await screen.findByTestId('txe-inbox-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('txe-inbox-first')).not.toBeInTheDocument();
   });
 });

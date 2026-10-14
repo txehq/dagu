@@ -28,7 +28,8 @@ function LoginProbe() {
 
 function renderMenu(
   authProvider: UserAuthProvider,
-  logout: () => Promise<string> = vi.fn(() => Promise.resolve('local'))
+  logout: () => Promise<string> = vi.fn(() => Promise.resolve('local')),
+  actingFor?: string
 ) {
   mocks.useAuth.mockReturnValue({
     user: {
@@ -47,7 +48,7 @@ function renderMenu(
   render(
     <MemoryRouter initialEntries={['/']}>
       <Routes>
-        <Route path="/" element={<UserMenu />} />
+        <Route path="/" element={<UserMenu actingFor={actingFor} />} />
         <Route path="/login" element={<LoginProbe />} />
       </Routes>
     </MemoryRouter>
@@ -69,6 +70,28 @@ describe('UserMenu', () => {
       screen.queryByRole('menuitem', { name: 'Change Password' })
     ).not.toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: 'Sign Out' })).toBeVisible();
+  });
+
+  it('shows the role of a caller that acts for no owner', async () => {
+    const user = userEvent.setup();
+    renderMenu(UserAuthProvider.builtin);
+
+    await user.click(screen.getByRole('button', { name: 'test-user' }));
+
+    expect(screen.getByText(UserRole.viewer)).toBeVisible();
+    expect(screen.queryByTestId('user-menu-owner')).not.toBeInTheDocument();
+  });
+
+  it('shows the owner a person acts for instead of the hub role', async () => {
+    const user = userEvent.setup();
+    renderMenu(UserAuthProvider.oidc, undefined, 'Ada Lovelace');
+
+    await user.click(screen.getByRole('button', { name: 'test-user' }));
+
+    expect(screen.getByTestId('user-menu-owner')).toHaveTextContent(
+      'Acting for Ada Lovelace'
+    );
+    expect(screen.queryByText(UserRole.viewer)).not.toBeInTheDocument();
   });
 
   it('does not offer password changes to proxy users', async () => {
