@@ -6,6 +6,8 @@ package coordinator
 import (
 	"time"
 
+	"google.golang.org/grpc/credentials"
+
 	appconfig "github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
 
@@ -29,6 +31,10 @@ type Config struct {
 	// Retry configuration
 	MaxRetries    int           // Max dispatch retries (default: 3)
 	RetryInterval time.Duration // Base retry interval (default: 1s)
+
+	// Credentials is sent on every call: a worker machine's token or the
+	// hub's key. Nil sends none, as before coordinator authentication.
+	Credentials credentials.PerRPCCredentials
 }
 
 // DefaultConfig returns a Config with default values

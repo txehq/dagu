@@ -633,6 +633,7 @@ type Coordinator struct {
 	Advertise  string // Registry address (auto-detected if empty)
 	Port       int
 	HealthPort int // HTTP health check port (default: 8091, 0 disables)
+	Auth       CoordinatorAuth
 }
 
 // Worker represents the worker configuration.
@@ -643,6 +644,7 @@ type Worker struct {
 	Coordinators  []string          // Static discovery addresses (host:port)
 	HealthPort    int               // HTTP health check port (default: 8092, 0 disables)
 	PostgresPool  PostgresPoolConfig
+	Auth          WorkerAuth
 }
 
 // Proc represents local proc-file heartbeat configuration.
@@ -737,6 +739,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateTXE(); err != nil {
+		return err
+	}
+	if err := c.validateTransportAuth(); err != nil {
 		return err
 	}
 	if err := c.validateProc(); err != nil {

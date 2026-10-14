@@ -122,6 +122,11 @@ func allLoopback(uris []string) bool {
 	return true
 }
 
+// IsLoopbackHost reports whether an address, a host, or a URL names this
+// machine's loopback interface: a loopback IP or "localhost". A host name that
+// merely resolves to loopback does not count.
+func IsLoopbackHost(raw string) bool { return isLoopback(raw) }
+
 func isLoopback(raw string) bool {
 	host := raw
 	if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" {

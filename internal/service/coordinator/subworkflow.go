@@ -22,24 +22,28 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/secret/providers"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator/subflow"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
+	"google.golang.org/grpc/credentials"
 )
 
 // SubWorkflowRunnerConfig contains dependencies for child workflow execution.
 type SubWorkflowRunnerConfig struct {
 	// Dispatcher is caller-owned and remains live after a child runner is cleaned up.
-	Dispatcher         dispatch.Dispatcher
-	DAGRunMgr          runtime.Manager
-	DAGRepository      *persis.DAGRepository
-	DAGRunRepository   *persis.DAGRunRepository
-	RunStateStore      runstate.Store
-	QueueStore         queue.QueueStore
-	StateStore         dagrun.StateStore
-	SecretStore        secret.Store
-	SecretResolver     func(*ir.DAG) providers.ReferenceResolver
-	ProfileStore       profile.Store
-	ProfileResolver    func(*ir.DAG) profile.RuntimeResolver
-	ServiceRegistry    serviceregistry.ServiceRegistry
-	PeerConfig         config.Peer
+	Dispatcher       dispatch.Dispatcher
+	DAGRunMgr        runtime.Manager
+	DAGRepository    *persis.DAGRepository
+	DAGRunRepository *persis.DAGRunRepository
+	RunStateStore    runstate.Store
+	QueueStore       queue.QueueStore
+	StateStore       dagrun.StateStore
+	SecretStore      secret.Store
+	SecretResolver   func(*ir.DAG) providers.ReferenceResolver
+	ProfileStore     profile.Store
+	ProfileResolver  func(*ir.DAG) profile.RuntimeResolver
+	ServiceRegistry  serviceregistry.ServiceRegistry
+	PeerConfig       config.Peer
+	// Credentials is what the dispatcher made here presents to the
+	// coordinator. It is not used when Dispatcher is given.
+	Credentials        credentials.PerRPCCredentials
 	WorkspaceBundleDir string
 	DefaultExecMode    config.ExecutionMode
 	StatusPusher       runtime.StatusPusher
@@ -59,7 +63,7 @@ func NewSubWorkflowRunnerFactory(cfg SubWorkflowRunnerConfig) func(context.Conte
 		var runnerOpts []subflow.Option
 		if dispatcher == nil {
 			var err error
-			dispatcher, err = NewRuntimeDispatcher(cfg.ServiceRegistry, cfg.PeerConfig, cfg.WorkspaceBundleDir)
+			dispatcher, err = NewRuntimeDispatcher(cfg.ServiceRegistry, cfg.PeerConfig, cfg.WorkspaceBundleDir, cfg.Credentials)
 			if err != nil {
 				return nil, err
 			}

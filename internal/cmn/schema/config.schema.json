@@ -1175,6 +1175,23 @@
           "description": "Coordinator HTTP health check port. Default: 8091. Set to 0 to disable.",
           "minimum": 0,
           "maximum": 65535
+        },
+        "auth": {
+          "type": "object",
+          "description": "Coordinator caller authentication (TXE-3414). Off unless set: workers then present an enrolled machine's provider token and the hub's own processes a hub key. Needs txe.authn.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["off", "observe", "enforce"],
+              "description": "off (default) installs nothing; observe logs what enforce would refuse; enforce refuses."
+            },
+            "hub_key_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Absolute path of the hub key. Default: <data_dir>/coordinator/hub.key, created owner-only when absent."
+            }
+          }
         }
       }
     },
@@ -1226,6 +1243,18 @@
           "description": "Worker HTTP health check port. Default: 8092. Set to 0 to disable.",
           "minimum": 0,
           "maximum": 65535
+        },
+        "auth": {
+          "type": "object",
+          "description": "How this worker proves which machine it is (TXE-3414).",
+          "additionalProperties": false,
+          "properties": {
+            "credential_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Absolute path of the machine credential written at enrolment (mode 0600). Unset: the worker presents no credential."
+            }
+          }
         },
         "labels": {
           "oneOf": [

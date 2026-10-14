@@ -192,6 +192,12 @@ func newCoordinator(
 		serverOpts = append(serverOpts, grpc.Creds(creds))
 	}
 
+	authOpts, err := coordinatorAuthOptions(ctx, cfg, advertiseAddr)
+	if err != nil {
+		return nil, nil, err
+	}
+	serverOpts = append(serverOpts, authOpts...)
+
 	// Create gRPC server with options
 	grpcServer := grpc.NewServer(serverOpts...)
 

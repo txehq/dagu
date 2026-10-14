@@ -6,6 +6,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"syscall"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/worker"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	"github.com/spf13/cobra"
 )
 
@@ -94,6 +97,12 @@ func runWorker(ctx *Context, _ []string) error {
 
 	maxActiveRuns := ctx.Config.Worker.MaxActiveRuns
 	labels := ctx.Config.Worker.Labels
+	if path := ctx.Config.Worker.Auth.CredentialFile; path != "" {
+		var err error
+		if workerID, labels, err = machineWorkerIdentity(path, ctx.Config.Worker.ID, workerID, labels); err != nil {
+			return err
+		}
+	}
 
 	coordinatorCli, err := createCoordinatorClient(ctx)
 	if err != nil {
@@ -154,4 +163,33 @@ func runWorker(ctx *Context, _ []string) error {
 // createCoordinatorClient creates the worker coordinator client.
 func createCoordinatorClient(ctx *Context) (coordinator.Client, error) {
 	return worker.NewCoordinatorClient(ctx.Context, ctx.Config)
+}
+
+// machineWorkerIdentity checks, before the worker starts, that its id and
+// labels name the machine its credential was enrolled for: a coordinator that
+// authenticates refuses every call that names another machine. A worker with
+// no configured id is named after the machine; a missing machine label is
+// added. A configured value that names another machine is an error.
+func machineWorkerIdentity(credentialFile, configuredID, workerID string, labels map[string]string) (string, map[string]string, error) {
+	credential, err := transportauth.ReadMachineCredential(credentialFile)
+	if err != nil {
+		return "", nil, fmt.Errorf("worker.auth.credential_file: %w; enrol this machine again to replace it", err)
+	}
+	machine := credential.MachineID
+	if configuredID == "" {
+		workerID = machine + "@" + workerID
+	} else if !transportauth.WorkerIDBelongsTo(configuredID, machine) {
+		return "", nil, fmt.Errorf("worker.id %q does not name machine %s, which worker.auth.credential_file is enrolled for: use %q or %q",
+			configuredID, machine, machine, machine+"@<suffix>")
+	}
+	merged := make(map[string]string, len(labels)+1)
+	maps.Copy(merged, labels)
+	switch label, ok := merged[txepkg.LabelMachine]; {
+	case !ok:
+		merged[txepkg.LabelMachine] = machine
+	case label != machine:
+		return "", nil, fmt.Errorf("worker label %s=%s does not name machine %s, which worker.auth.credential_file is enrolled for",
+			txepkg.LabelMachine, label, machine)
+	}
+	return workerID, merged, nil
 }
