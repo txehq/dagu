@@ -1767,6 +1767,9 @@ func getDialOptions(config *Config) ([]grpc.DialOption, error) {
 		grpc.MaxCallRecvMsgSize(grpcMaxMsgSize),
 		grpc.MaxCallSendMsgSize(grpcMaxMsgSize),
 	))
+	if config.Credentials != nil {
+		opts = append(opts, grpc.WithPerRPCCredentials(config.Credentials))
+	}
 
 	if config.Insecure {
 		// Use insecure connection (h2c)

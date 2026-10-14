@@ -351,6 +351,9 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 			return nil, err
 		}
 	}
+	if err := l.loadTransportAuthConfig(&cfg); err != nil {
+		return nil, err
+	}
 
 	l.loadCacheConfig(&cfg, def)
 	l.loadWebhooksConfig(&cfg, def)
@@ -2437,6 +2440,8 @@ var envBindings = []envBinding{
 	{key: "coordinator.advertise", env: "COORDINATOR_ADVERTISE"},
 	{key: "coordinator.port", env: "COORDINATOR_PORT"},
 	{key: "coordinator.health_port", env: "COORDINATOR_HEALTH_PORT"},
+	{key: coordinatorAuthModeKey, env: coordinatorAuthModeEnv},
+	{key: coordinatorAuthHubKeyFileKey, env: coordinatorAuthHubKeyFileEnv},
 
 	// Worker
 	{key: "worker.id", env: "WORKER_ID"},
@@ -2444,6 +2449,7 @@ var envBindings = []envBinding{
 	{key: "worker.labels", env: "WORKER_LABELS"},
 	{key: "worker.coordinators", env: "WORKER_COORDINATORS"},
 	{key: "worker.health_port", env: "WORKER_HEALTH_PORT"},
+	{key: workerAuthCredentialFileKey, env: workerAuthCredentialFileEnv},
 
 	// Peer
 	{key: "peer.cert_file", env: "PEER_CERT_FILE"},

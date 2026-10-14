@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/artifactpath"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -39,6 +40,7 @@ import (
 	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -534,6 +536,10 @@ func isProgressOutputCommand(cmdName string) bool {
 
 // NewCoordinatorClient creates a new coordinator client using the global peer configuration.
 // Returns a nil client when the coordinator is disabled via configuration.
+//
+// It is the client of the hub's own processes. When coordinator.auth is on it
+// presents the hub's key; otherwise it presents nothing, as before. A worker
+// builds its client with worker.NewCoordinatorClient and never this one.
 func (c *Context) NewCoordinatorClient() (coordinator.Client, error) {
 	if !c.Config.Coordinator.Enabled {
 		return nil, nil
@@ -543,7 +549,25 @@ func (c *Context) NewCoordinatorClient() (coordinator.Client, error) {
 	if err := clientConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
 	}
+	credentials, err := hubCoordinatorCredentials(c.Config)
+	if err != nil {
+		return nil, err
+	}
+	clientConfig.Credentials = credentials
 	return coordinator.New(c.Persistence.ServiceRegistry, clientConfig), nil
+}
+
+// hubCoordinatorCredentials returns what a hub process presents to the
+// coordinator: the hub key when coordinator.auth is on, and nil when it is off.
+func hubCoordinatorCredentials(cfg *config.Config) (credentials.PerRPCCredentials, error) {
+	if !cfg.Coordinator.Auth.Enabled() {
+		return nil, nil
+	}
+	key, err := transportauth.LoadOrCreateHubKey(cfg.CoordinatorHubKeyFile())
+	if err != nil {
+		return nil, fmt.Errorf("coordinator.auth: %w", err)
+	}
+	return transportauth.NewHubCredentials(key), nil
 }
 
 func (c *Context) SubWorkflowRunnerFactory() func(context.Context) (runtimeexec.SubWorkflowRunner, error) {

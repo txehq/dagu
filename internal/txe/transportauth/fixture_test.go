@@ -178,6 +178,7 @@ type fixtureOptions struct {
 	mode      transportauth.Mode
 	keys      authn.KeySource
 	resources transportauth.ResourceAuthorizer
+	hubKey    []byte
 }
 
 func newFixture(t *testing.T, opts fixtureOptions) *fixture {
@@ -219,7 +220,7 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 		Mode:      opts.mode,
 		Verifier:  verifier,
 		Machines:  store,
-		HubKey:    testHubKey,
+		HubKey:    hubKeyOr(opts.hubKey),
 		Resources: opts.resources,
 		Observe: func(_ context.Context, d transportauth.Decision) {
 			f.mu.Lock()
@@ -417,3 +418,12 @@ func (s *recordingService) GetWorkspaceBundle(_ *coordinatorv1.GetWorkspaceBundl
 	}
 	return nil
 }
+
+func hubKeyOr(key []byte) []byte {
+	if key != nil {
+		return key
+	}
+	return testHubKey
+}
+
+func dispatchRequest() *coordinatorv1.DispatchRequest { return &coordinatorv1.DispatchRequest{} }
