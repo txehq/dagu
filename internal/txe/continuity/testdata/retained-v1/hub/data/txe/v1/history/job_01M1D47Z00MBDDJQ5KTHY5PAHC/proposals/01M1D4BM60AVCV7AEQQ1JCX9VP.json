@@ -1,0 +1,45 @@
+{
+  "proposal_id": "prp_01M1D47Z005PNVX1148X1Z84J4",
+  "job_version": 1,
+  "package_digest": "sha256:c18bbfb690fdac6788ae3c616b439c6828892e889494990f22b8809bb8857d92",
+  "question": "Resize the volume?",
+  "rationale": "fixture",
+  "evidence": {},
+  "action": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+  "revision": 3,
+  "state": "executed",
+  "decision": {
+    "decision_id": "dec_01M1D47Z00VFXN6N6YBV47RFRD",
+    "proposal_id": "prp_01M1D47Z005PNVX1148X1Z84J4",
+    "proposal_revision": 1,
+    "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+    "verdict": "approve",
+    "actor": {
+      "kind": "human",
+      "id": "fixture-person"
+    },
+    "decided_at": "2026-09-01T00:00:00Z",
+    "idempotency_key": "key-prp_01M1D47Z005PNVX1148X1Z84J4-approve"
+  },
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:02:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "prev": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/proposals/01M1D47Z00D4SC3GEGZZAE5K3D"
+}

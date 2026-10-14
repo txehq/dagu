@@ -1,0 +1,380 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1D8BSR0BMJF2PJF41HR9FR5",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H01990MFGG4J36Z0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 15,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1D8BSR0BMJF2PJF41HR9FR5/versions/01M1D8BSR0Q7XTWE7KR2BC2TWW"
+  ],
+  "package_digest": "sha256:57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "data-collector",
+    "dedupe_key": "10c513e9413ab0f11a677357d35e8a01b3b7703faead4089b19df81b663caf5b",
+    "request_id": "req-job_01M1D8BSR0BMJF2PJF41HR9FR5",
+    "request_hash": "sha256:a32cbf4c65e9f101e1321060d5dd12f75d29e3f0f96663f03ced0a17a7b7133d",
+    "package": {
+      "digest": "sha256:57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1D8BSR0BMJF2PJF41HR9FR5/sha256-57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T01:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T01:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "proposals": {
+    "prp_01M1D8BSR06A60XHMMEGA8K3QZ": {
+      "proposal_id": "prp_01M1D8BSR06A60XHMMEGA8K3QZ",
+      "job_version": 1,
+      "package_digest": "sha256:57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+      "question": "Rebuild the index?",
+      "rationale": "fixture",
+      "evidence": {},
+      "action": {
+        "name": "resize",
+        "params": {
+          "size": "20Gi"
+        }
+      },
+      "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+      "revision": 2,
+      "state": "decided",
+      "decision": {
+        "decision_id": "dec_01M1D8BSR0HHQ21BZ158KN8YAZ",
+        "proposal_id": "prp_01M1D8BSR06A60XHMMEGA8K3QZ",
+        "proposal_revision": 1,
+        "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+        "verdict": "approve",
+        "actor": {
+          "kind": "human",
+          "id": "fixture-person"
+        },
+        "decided_at": "2026-09-01T01:12:00Z",
+        "idempotency_key": "key-prp_01M1D8BSR06A60XHMMEGA8K3QZ-approve",
+        "prev": "history/job_01M1D8BSR0BMJF2PJF41HR9FR5/decisions/01M1D8BSR03N2GVT1WH46VJDCB"
+      },
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "human",
+          "id": "fixture-person"
+        }
+      }
+    },
+    "prp_01M1D8BSR0WSEMATWH2XWHAQQM": {
+      "proposal_id": "prp_01M1D8BSR0WSEMATWH2XWHAQQM",
+      "job_version": 1,
+      "package_digest": "sha256:57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+      "question": "Prune the cache?",
+      "rationale": "fixture",
+      "evidence": {},
+      "action": {
+        "name": "resize",
+        "params": {
+          "size": "20Gi"
+        }
+      },
+      "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+      "revision": 2,
+      "state": "snoozed",
+      "snooze_until": "2026-09-04T01:12:00Z",
+      "decision": {
+        "decision_id": "dec_01M1D8BSR03V18C6G1ZVHDZ5VA",
+        "proposal_id": "prp_01M1D8BSR0WSEMATWH2XWHAQQM",
+        "proposal_revision": 1,
+        "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+        "verdict": "snooze",
+        "snooze_until": "2026-09-04T01:12:00Z",
+        "actor": {
+          "kind": "human",
+          "id": "fixture-person"
+        },
+        "decided_at": "2026-09-01T01:12:00Z",
+        "idempotency_key": "key-prp_01M1D8BSR0WSEMATWH2XWHAQQM-snooze"
+      },
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "human",
+          "id": "fixture-person"
+        }
+      }
+    },
+    "prp_01M1D8BSR0Y5M2R1ZFB1ZZQ8T0": {
+      "proposal_id": "prp_01M1D8BSR0Y5M2R1ZFB1ZZQ8T0",
+      "job_version": 1,
+      "package_digest": "sha256:57abf60ffe754e29d7846d065adcb82e6d3ceec302dc9e5b156cf0745e4007b2",
+      "question": "Grow the volume?",
+      "rationale": "fixture",
+      "evidence": {},
+      "action": {
+        "name": "resize",
+        "params": {
+          "size": "20Gi"
+        }
+      },
+      "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+      "revision": 1,
+      "state": "open",
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      }
+    }
+  },
+  "claim": {
+    "claim_id": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+    "kind": "review",
+    "reviewer": {
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "dag_run_id": "fixture-review-run"
+    },
+    "fence": 1,
+    "acquired_at": "2026-09-01T01:12:00Z",
+    "expires_at": "2026-09-02T01:12:00Z",
+    "state": "live"
+  },
+  "fence": 1,
+  "checkpoint": {
+    "version": 0
+  },
+  "actions": {
+    "act_15DVWA0FX9PXG2YM723GQXQRTK": {
+      "action_id": "act_15DVWA0FX9PXG2YM723GQXQRTK",
+      "kind": "routine",
+      "job_version": 1,
+      "review_id": "rev_6GD6QT51HQJEPFQY0D2EKRVX2D",
+      "claim_id": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "spec": {
+        "name": "restart",
+        "params": {
+          "n": 3
+        }
+      },
+      "binding_digest": "sha256:aaf3b27c5fce564525fa96d7e1fb39d46f0dab2c92a7df60c7882fdd2cad4c4a",
+      "state": "not_applied",
+      "attempt": 1,
+      "max_attempts": 2,
+      "attempt_started_at": "2026-09-01T01:12:00Z",
+      "grant": {
+        "grant_id": "grt_63CRJJRQ1HZTQDWTSHXG7VKT31",
+        "action_id": "act_15DVWA0FX9PXG2YM723GQXQRTK",
+        "attempt": 1,
+        "expires_at": "2026-09-01T01:13:00Z"
+      },
+      "outcome": {
+        "fixture": true
+      },
+      "settled_under_claim": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      }
+    },
+    "act_2VZW7YRB9CBBP5JQJEQ3YSNDT4": {
+      "action_id": "act_2VZW7YRB9CBBP5JQJEQ3YSNDT4",
+      "kind": "routine",
+      "job_version": 1,
+      "review_id": "rev_6GD6QT51HQJEPFQY0D2EKRVX2D",
+      "claim_id": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "spec": {
+        "name": "restart",
+        "params": {
+          "n": 1
+        }
+      },
+      "binding_digest": "sha256:3c9846c998a4bd8a7a033abb4bf460a3226f070c0bc9805d471264a60fef7927",
+      "state": "uncertain",
+      "attempt": 1,
+      "max_attempts": 2,
+      "attempt_started_at": "2026-09-01T01:12:00Z",
+      "grant": {
+        "grant_id": "grt_7WA7C2GD9GGRWDZ9WFVETKMQWW",
+        "action_id": "act_2VZW7YRB9CBBP5JQJEQ3YSNDT4",
+        "attempt": 1,
+        "expires_at": "2026-09-01T01:13:00Z"
+      },
+      "outcome": {
+        "fixture": true
+      },
+      "settled_under_claim": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      }
+    },
+    "act_5VMH47MX81V0X01Q47MC236CXG": {
+      "action_id": "act_5VMH47MX81V0X01Q47MC236CXG",
+      "kind": "routine",
+      "job_version": 1,
+      "review_id": "rev_6GD6QT51HQJEPFQY0D2EKRVX2D",
+      "claim_id": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "spec": {
+        "name": "diagnose",
+        "params": {
+          "n": 4
+        }
+      },
+      "binding_digest": "sha256:d5a5dffc30e6c3f0f740e9037ea96848cf76421abaa955df67466bc1a496c75b",
+      "state": "executing",
+      "attempt": 1,
+      "max_attempts": 2,
+      "attempt_started_at": "2026-09-01T01:12:00Z",
+      "grant": {
+        "grant_id": "grt_69KD2GQT4AHNCPPG0YYS71G9RS",
+        "action_id": "act_5VMH47MX81V0X01Q47MC236CXG",
+        "attempt": 1,
+        "expires_at": "2026-09-01T01:13:00Z"
+      },
+      "read_only": true,
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      }
+    },
+    "act_79ZZEN1ZD4EZVN1E2DSGSVN990": {
+      "action_id": "act_79ZZEN1ZD4EZVN1E2DSGSVN990",
+      "kind": "routine",
+      "job_version": 1,
+      "review_id": "rev_6GD6QT51HQJEPFQY0D2EKRVX2D",
+      "claim_id": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "spec": {
+        "name": "restart",
+        "params": {
+          "n": 2
+        }
+      },
+      "binding_digest": "sha256:92847b4bf1867fb9993eb26b8b3bdd6dffe71b96c7b6b4fdc3caed0cf8d384ad",
+      "state": "failed",
+      "attempt": 1,
+      "max_attempts": 2,
+      "attempt_started_at": "2026-09-01T01:12:00Z",
+      "grant": {
+        "grant_id": "grt_14YKVY877TKZWD30BG0E9R2X40",
+        "action_id": "act_79ZZEN1ZD4EZVN1E2DSGSVN990",
+        "attempt": 1,
+        "expires_at": "2026-09-01T01:13:00Z"
+      },
+      "outcome": {
+        "fixture": true
+      },
+      "settled_under_claim": "clm_01M1D8BSR071HNA1BEDTVWWF2M",
+      "created": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      },
+      "updated": {
+        "at": "2026-09-01T01:12:00Z",
+        "by": {
+          "kind": "reviewer",
+          "id": "fixture-reviewer"
+        }
+      }
+    }
+  },
+  "decision_keys": {
+    "key-prp_01M1D8BSR06A60XHMMEGA8K3QZ-approve": "dec_01M1D8BSR0HHQ21BZ158KN8YAZ",
+    "key-prp_01M1D8BSR0WSEMATWH2XWHAQQM-snooze": "dec_01M1D8BSR03V18C6G1ZVHDZ5VA"
+  },
+  "intents": {
+    "sha256:9d1f9613c4c3d41247cce12fb6350471c6a7cc00e6663f16fce72cdf4113267f": {
+      "action_id": "act_5VMH47MX81V0X01Q47MC236CXG",
+      "state": "executing",
+      "updated": "2026-09-01T01:12:00Z"
+    },
+    "sha256:d7e4c6e3beb4ea9104c4f5c06b5e93ecd03d5727c7ced7664dd7ef6aca0a8737": {
+      "action_id": "act_2VZW7YRB9CBBP5JQJEQ3YSNDT4",
+      "state": "uncertain",
+      "updated": "2026-09-01T01:12:00Z"
+    }
+  },
+  "chains": {
+    "events": "history/job_01M1D8BSR0BMJF2PJF41HR9FR5/events/01M1D8BSR0AG0DEYHZNQFQ8EYY",
+    "decisions": "history/job_01M1D8BSR0BMJF2PJF41HR9FR5/decisions/01M1D8BSR035960QKJTQG4SNQJ"
+  },
+  "created": {
+    "at": "2026-09-01T01:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T01:12:00Z",
+    "by": {
+      "kind": "human",
+      "id": "fixture-person"
+    }
+  }
+}

@@ -4,6 +4,7 @@
 package continuity
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,9 +47,13 @@ func Compare(before, after *Inventory) *Report {
 	}
 
 	later := map[string]*Record{}
+	laterRegistry := map[string]*Record{}
 	for i := range after.Records {
 		r := &after.Records[i]
 		later[r.Store+"/"+r.ID] = r
+		if r.Store == "registry" {
+			laterRegistry[r.ID] = r
+		}
 	}
 	earlier := map[string]bool{}
 	for i := range before.Records {
@@ -80,6 +85,7 @@ func Compare(before, after *Inventory) *Report {
 		}
 		if b.Class == ClassJob {
 			compareJob(b, a, key, add)
+			compareChains(b, a, key, laterRegistry, add)
 		}
 	}
 	for i := range after.Records {
@@ -103,10 +109,10 @@ func Compare(before, after *Inventory) *Report {
 			continue
 		case !ok:
 			add("file_missing", "file", key, "the retained file is no longer present")
-		case a.SHA256 == b.SHA256 && a.Link == b.Link:
+		case a.SHA256 == b.SHA256 && a.Link == b.Link && (b.Policy != PolicyImmutable || a.Mode == b.Mode):
 		case b.Policy == PolicyImmutable:
 			rep.Changed = append(rep.Changed, key)
-			add("immutable_changed", "file", key, "an immutable file changed from "+b.SHA256+" to "+a.SHA256)
+			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
 		default:
 			rep.Changed = append(rep.Changed, key)
 		}
@@ -139,5 +145,35 @@ func compareJob(b, a *Record, key string, add func(code, class, id, detail strin
 	bv, av := b.Attrs["version_refs"], a.Attrs["version_refs"]
 	if bv != "" && av != bv && !strings.HasPrefix(av, bv+",") {
 		add("versions_rewritten", ClassJob, key, "the job's earlier versions are not kept as they were")
+	}
+}
+
+// compareChains checks that every history record the job had committed is
+// still in its history: each earlier chain head must be reachable from the
+// later head. A record left on disk but no longer reachable is gone from
+// the registry's history.
+func compareChains(b, a *Record, key string, records map[string]*Record, add func(code, class, id, detail string)) {
+	for _, kind := range chainKinds {
+		head := b.Attrs["chain_"+kind]
+		if head == "" {
+			continue
+		}
+		found := false
+		seen := map[string]bool{}
+		for id := a.Attrs["chain_"+kind]; id != "" && !seen[id]; {
+			if id == head {
+				found = true
+				break
+			}
+			seen[id] = true
+			r := records[id]
+			if r == nil {
+				break
+			}
+			id = r.Attrs["prev"]
+		}
+		if !found {
+			add("history_unreachable", ClassJob, key, "the job's "+kind+" history no longer reaches "+head+", which it had committed")
+		}
 	}
 }

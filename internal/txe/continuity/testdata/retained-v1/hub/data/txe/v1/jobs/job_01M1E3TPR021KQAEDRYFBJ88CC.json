@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1E3TPR021KQAEDRYFBJ88CC",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H01990MFGG4J36Z0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 3,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1E3TPR021KQAEDRYFBJ88CC/versions/01M1E3TPR086V2EWRXJFX40SRA"
+  ],
+  "package_digest": "sha256:c10c3d2647dd0d899cfcef1e48e9969fafdc73fbbd57147d2611a06a5840c23a",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "artifact-producer",
+    "dedupe_key": "6f867d1967ad986083681b4855ad75a34deb1021467739a4a7c02c4ebe6bbc42",
+    "request_id": "req-job_01M1E3TPR021KQAEDRYFBJ88CC",
+    "request_hash": "sha256:181c872a7d52b580a80ca243e98a6929f63bcfbc59e4c8ebacfc0f04f981dfac",
+    "package": {
+      "digest": "sha256:c10c3d2647dd0d899cfcef1e48e9969fafdc73fbbd57147d2611a06a5840c23a",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1E3TPR021KQAEDRYFBJ88CC/sha256-c10c3d2647dd0d899cfcef1e48e9969fafdc73fbbd57147d2611a06a5840c23a",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T09:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T09:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "exceptions": {
+    "exc_01M1E3TPR09TXJ505AAACH9144": {
+      "exception_id": "exc_01M1E3TPR09TXJ505AAACH9144",
+      "kind": "deliverable_missing",
+      "detail": "run run-art-1 execution att-art-1-fb6a335260f7b38c did not produce required deliverable notes (notes.txt)",
+      "evidence": [
+        "artifact:run-art-1/att-art-1-fb6a335260f7b38c/notes"
+      ],
+      "created": {
+        "at": "2026-09-01T09:12:00Z",
+        "by": {
+          "kind": "cli",
+          "id": "fixture-cli",
+          "session": "fixture-session"
+        }
+      }
+    }
+  },
+  "chains": {
+    "events": "history/job_01M1E3TPR021KQAEDRYFBJ88CC/events/01M1E3TPR08CQJX26FD0S3VF9E"
+  },
+  "created": {
+    "at": "2026-09-01T09:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T09:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

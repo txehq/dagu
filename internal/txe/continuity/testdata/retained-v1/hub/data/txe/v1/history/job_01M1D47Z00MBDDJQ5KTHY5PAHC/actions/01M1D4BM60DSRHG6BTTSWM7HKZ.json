@@ -1,0 +1,45 @@
+{
+  "action_id": "act_7EDTD66CR0G2KRXAG4HW671CNG",
+  "kind": "approved",
+  "job_version": 1,
+  "claim_id": "clm_01M1D4BM60T93YX8CHX6VC94SJ",
+  "proposal_id": "prp_01M1D47Z005PNVX1148X1Z84J4",
+  "decision_id": "dec_01M1D47Z00VFXN6N6YBV47RFRD",
+  "spec": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+  "state": "succeeded",
+  "attempt": 1,
+  "max_attempts": 2,
+  "attempt_started_at": "2026-09-01T00:02:00Z",
+  "grant": {
+    "grant_id": "grt_0TZ4EZKXB4QJP58WAZH2ZDX3W5",
+    "action_id": "act_7EDTD66CR0G2KRXAG4HW671CNG",
+    "attempt": 1,
+    "expires_at": "2026-09-01T00:04:00Z"
+  },
+  "receipt": "resized",
+  "outcome": {
+    "fixture": true
+  },
+  "settled_under_claim": "clm_01M1D4BM60T93YX8CHX6VC94SJ",
+  "created": {
+    "at": "2026-09-01T00:02:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:02:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "prev": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/actions/01M1D47Z00NGWMGDXJANWTKNPA"
+}

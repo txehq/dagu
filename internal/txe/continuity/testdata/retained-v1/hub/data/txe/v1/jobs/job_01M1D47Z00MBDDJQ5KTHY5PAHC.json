@@ -1,0 +1,111 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1D47Z00MBDDJQ5KTHY5PAHC",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H01990MFGG4J36Z0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 24,
+  "version": 2,
+  "version_refs": [
+    "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/versions/01M1D47Z00C43YTRZKPJSC1M30",
+    "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/versions/01M1D4XY40GD5BRYN7M97708B4"
+  ],
+  "package_digest": "sha256:67602765dc5a8819a8a5af64fe16fa7049b56f006a9f2f6c8cd1b848f3ea70c2",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "health-check",
+    "dedupe_key": "164cd2eb42e569e3d248d33a1d4b280c78ea8fe127416004734d84b8f78f8dd1",
+    "request_id": "upd-job_01M1D47Z00MBDDJQ5KTHY5PAHC",
+    "request_hash": "sha256:253bd68df9f3d093dff5002585f4c6337fbc5460cb90526c514039c6bb853f6f",
+    "package": {
+      "digest": "sha256:67602765dc5a8819a8a5af64fe16fa7049b56f006a9f2f6c8cd1b848f3ea70c2",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1D47Z00MBDDJQ5KTHY5PAHC/sha256-67602765dc5a8819a8a5af64fe16fa7049b56f006a9f2f6c8cd1b848f3ea70c2",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T00:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T00:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "auth_required",
+    "detail": "fixture credential expired",
+    "observed_at": "2026-09-01T00:12:00Z",
+    "reporter": {
+      "kind": "reconciler",
+      "id": "fixture-reconciler"
+    }
+  },
+  "claim": {
+    "claim_id": "clm_01M1D4BM60MKRQZ5SM5HZTJJMJ",
+    "kind": "review",
+    "reviewer": {
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "dag_run_id": "fixture-review-run"
+    },
+    "fence": 3,
+    "acquired_at": "2026-09-01T00:02:00Z",
+    "expires_at": "2026-09-01T00:03:00Z",
+    "state": "released"
+  },
+  "fence": 3,
+  "checkpoint": {
+    "version": 1,
+    "job_version": 1,
+    "run_cursor": "run-hc-1",
+    "last_review_id": "rev_2R3RSDNG6QJRXF9FK7MKWGB48W",
+    "next_review_at": "2026-09-01T00:30:00Z"
+  },
+  "last_recorded_review": "rev_2R3RSDNG6QJRXF9FK7MKWGB48W",
+  "last_recorded_review_digest": "sha256:f1920b868be44c2d36be8a5af3f9b79e6b0c059eddd733b47aba88af880e6979",
+  "last_recorded_review_job_version": 1,
+  "exceptions": {
+    "exc_01M1D4XY40GTPRFV48SXCAYYTE": {
+      "exception_id": "exc_01M1D4XY40GTPRFV48SXCAYYTE",
+      "kind": "auth",
+      "state": "auth_required",
+      "detail": "fixture credential expired",
+      "created": {
+        "at": "2026-09-01T00:12:00Z",
+        "by": {
+          "kind": "reconciler",
+          "id": "fixture-reconciler"
+        }
+      }
+    }
+  },
+  "decision_keys": {
+    "key-prp_01M1D47Z005PNVX1148X1Z84J4-approve": "dec_01M1D47Z00VFXN6N6YBV47RFRD",
+    "key-prp_01M1D47Z00E2450KTCTBG0SA7W-reject": "dec_01M1D47Z00GCB5ADH64E2B96ZM",
+    "key-prp_01M1D47Z00FKEDTRW0Z7DJ5726-redirect": "dec_01M1D47Z00PAX6MYV8W3N6WTH3",
+    "key-prp_01M1D47Z00ZJS2HPHQHYPSE9YE-snooze": "dec_01M1D47Z0077FVQXZ0C8NQJDX8"
+  },
+  "chains": {
+    "events": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/events/01M1D4XY40TDN5Q1R2J6PG1NSA",
+    "decisions": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/decisions/01M1D47Z0070A44EM3RD4XGEW5",
+    "reviews": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/reviews/01M1D47Z00BP7BN03SYCW4V9WW",
+    "actions": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/actions/01M1D4BM60DSRHG6BTTSWM7HKZ",
+    "proposals": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/proposals/01M1D4XY40Q34XP2G7N1XEKXZR"
+  },
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:12:00Z",
+    "by": {
+      "kind": "reconciler",
+      "id": "fixture-reconciler"
+    }
+  }
+}

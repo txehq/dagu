@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "class": "worker",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "issuer": "https://idp.fixture.invalid/realms/fixture",
+  "subject": "subject-owner",
+  "key": {
+    "issuer": "https://idp.fixture.invalid/realms/fixture",
+    "client_id": "dagu-worker-fixture-laptop"
+  },
+  "generation": 1,
+  "state": "active",
+  "enrolled": {
+    "at": "2026-09-01T12:13:00Z",
+    "by": {
+      "kind": "person",
+      "issuer": "https://idp.fixture.invalid/realms/fixture",
+      "subject": "subject-owner",
+      "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR"
+    }
+  }
+}

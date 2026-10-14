@@ -1,0 +1,14 @@
+{
+  "decision_id": "dec_01M1D8BSR0HHQ21BZ158KN8YAZ",
+  "proposal_id": "prp_01M1D8BSR06A60XHMMEGA8K3QZ",
+  "proposal_revision": 1,
+  "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+  "verdict": "approve",
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "decided_at": "2026-09-01T01:12:00Z",
+  "idempotency_key": "key-prp_01M1D8BSR06A60XHMMEGA8K3QZ-approve",
+  "prev": "history/job_01M1D8BSR0BMJF2PJF41HR9FR5/decisions/01M1D8BSR03N2GVT1WH46VJDCB"
+}

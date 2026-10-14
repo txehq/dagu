@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "machine_id": "mch_01M1D47Z00N9XV7DQJ02EKYB0Z",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "display_name": "fixture-linux-worker",
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

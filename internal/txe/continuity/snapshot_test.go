@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -32,11 +34,42 @@ type snapshotFacts struct {
 	Counts   map[string]int `json:"counts"`
 }
 
-func snapshotRoots(hubMount string) []continuity.Root {
+func snapshotRoots(dir, hubMount string) []continuity.Root {
 	return []continuity.Root{
-		{Area: continuity.AreaHubData, Path: filepath.Join(snapshotDir, "hub", "data"), Label: "hub-data", Mount: hubMount},
-		{Area: continuity.AreaDAGs, Path: filepath.Join(snapshotDir, "hub", "dags"), Label: "hub-dags"},
-		{Area: continuity.AreaMachineHome, Path: filepath.Join(snapshotDir, "machine", "txe-dagu"), Label: "laptop-home"},
+		{Area: continuity.AreaHubData, Path: filepath.Join(dir, "hub", "data"), Label: "hub-data", Mount: hubMount},
+		{Area: continuity.AreaDAGs, Path: filepath.Join(dir, "hub", "dags"), Label: "hub-dags"},
+		{Area: continuity.AreaMachineHome, Path: filepath.Join(dir, "machine", "txe-dagu"), Label: "laptop-home"},
+	}
+}
+
+// sealPackages removes write permission from every committed package, as
+// the package store does.
+func sealPackages(t *testing.T, root string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	var dirs []string
+	require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		if strings.Count(filepath.ToSlash(rel), "/") < 1 || strings.HasPrefix(rel, ".staging") {
+			return nil // the store root, a job directory, or the staging area
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return os.Chmod(p, info.Mode().Perm()&^0o222)
+	}))
+	for _, dir := range slices.Backward(dirs) {
+		require.NoError(t, os.Chmod(dir, 0o555))
 	}
 }
 
@@ -53,8 +86,7 @@ func TestSnapshotStaysReadable(t *testing.T) {
 	var facts snapshotFacts
 	require.NoError(t, json.Unmarshal(data, &facts))
 
-	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: snapshotRoots(facts.HubMount), ExpectedOwner: fixture.StableOwner})
-	require.NoError(t, err)
+	inv := scanSnapshot(t, facts.HubMount)
 	for _, i := range continuity.Blocking(continuity.Validate(inv, continuity.Policy{})) {
 		t.Errorf("the phase-one snapshot no longer validates: %s %s: %s", i.Code, i.ID, i.Detail)
 	}
@@ -71,8 +103,7 @@ func writeSnapshot(t *testing.T) {
 	// Only the jobs' DAGs: the rest of the DAG directory is upstream's
 	// examples, which a new DAG store writes.
 	copyTree(t, l.DAGsDir, filepath.Join(snapshotDir, "hub", "dags"), func(rel string) bool { return strings.HasPrefix(rel, "job_") })
-	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: snapshotRoots(l.HubMount), ExpectedOwner: fixture.StableOwner})
-	require.NoError(t, err)
+	inv := scanSnapshot(t, l.HubMount)
 	out, err := json.MarshalIndent(snapshotFacts{HubMount: l.HubMount, Counts: inv.Counts}, "", "  ")
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(snapshotDir, "facts.json"), append(out, '\n'), 0o600))
@@ -105,4 +136,18 @@ func copyTree(t *testing.T, from, to string, keep func(rel string) bool) {
 		}
 		return os.WriteFile(dst, data, info.Mode().Perm()|0o600)
 	}))
+}
+
+// scanSnapshot scans a sealed copy of the committed snapshot. A retained
+// store's packages are sealed; git keeps no write bits, so the snapshot is
+// copied and sealed again before it is scanned.
+func scanSnapshot(t *testing.T, hubMount string) *continuity.Inventory {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "retained-v1")
+	t.Cleanup(func() { _ = fixture.Unseal(dir) })
+	copyPreserving(t, snapshotDir, dir, nil)
+	sealPackages(t, filepath.Join(dir, "machine", "txe-dagu", "packages"))
+	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: snapshotRoots(dir, hubMount), ExpectedOwner: fixture.StableOwner})
+	require.NoError(t, err)
+	return inv
 }

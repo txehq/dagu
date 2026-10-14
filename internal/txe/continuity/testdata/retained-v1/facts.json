@@ -1,12 +1,14 @@
 {
-  "hub_mount": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-1851776116/root/hub/data",
+  "hub_mount": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/hub/data",
   "counts": {
     "action": 2,
     "artifact_manifest": 1,
     "binding": 1,
     "binding_request": 2,
-    "decision": 4,
+    "decision": 6,
     "dedupe": 14,
+    "enrolment": 1,
+    "enrolment_key": 1,
     "event": 40,
     "execution_evidence": 1,
     "file:hub-dags": 14,

@@ -4,6 +4,7 @@
 package continuity
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -17,7 +18,15 @@ import (
 // machineIdentity reads the machine's machine.json. It names the machine
 // whose packages and outputs the home holds.
 func (s *scanner) machineIdentity() error {
-	data, err := os.ReadFile(filepath.Join(s.root.Path, "machine.json"))
+	p := filepath.Join(s.root.Path, "machine.json")
+	if ok, err := regular(p); err != nil || !ok {
+		if err != nil {
+			return err
+		}
+		s.issue("unsupported_file", ClassMachineIdentity, s.root.Label+"/machine.json", "machine.json is not a regular file; it was not read")
+		return nil
+	}
+	data, err := os.ReadFile(p) //nolint:gosec // a fixed name under the scanned root
 	if err != nil {
 		return err
 	}
@@ -53,6 +62,9 @@ func (s *scanner) packages() error {
 	}
 	for _, j := range jobs {
 		name := j.Name()
+		if s.symlink("packages/"+name, j) {
+			continue
+		}
 		switch {
 		case name == ".staging":
 			if err := s.files("packages/.staging", PolicyMutable); err != nil {
@@ -75,6 +87,13 @@ func (s *scanner) packages() error {
 			return err
 		}
 		for _, d := range digests {
+			if s.symlink("packages/"+name+"/"+d.Name(), d) {
+				continue
+			}
+			if !d.IsDir() {
+				s.issue("unsupported_file", ClassPackage, s.root.Label+"/packages/"+name+"/"+d.Name(), "packages/%s/%s is not a package directory", name, d.Name())
+				continue
+			}
 			if err := s.pkg(name, d.Name()); err != nil {
 				return err
 			}
@@ -98,7 +117,15 @@ func (s *scanner) pkg(jobID, dirName string) error {
 		b.block("invalid_id", "%s is not named by a package digest", rel)
 	}
 	b.attr("digest", digest)
-	manifest, err := os.ReadFile(filepath.Join(dir, txepkg.ManifestName)) //nolint:gosec // a path under the scanned root
+	manifestPath := filepath.Join(dir, txepkg.ManifestName)
+	var manifest []byte
+	isRegular, err := regular(manifestPath)
+	if err == nil && !isRegular {
+		err = errors.New("it is not a regular file")
+	}
+	if err == nil {
+		manifest, err = os.ReadFile(manifestPath) //nolint:gosec // a path under the scanned root
+	}
 	switch {
 	case err != nil:
 		b.block("package_corrupt", "%s has no readable manifest: %v", rel, err)
@@ -115,6 +142,7 @@ func (s *scanner) pkg(jobID, dirName string) error {
 				b.block("unsupported_schema", "package manifest schema %d is not supported", m.Schema)
 			}
 			s.checkPayload(b, dir, rel, m.Files)
+			checkSealed(b, rel, dir, manifestPath)
 		}
 	}
 	// The package's own bytes are inventoried too, so a later inventory
@@ -142,6 +170,10 @@ func (s *scanner) checkPayload(b *builder, dir, rel string, files []txepkg.File)
 		listed[f.Path] = f
 	}
 	payload := filepath.Join(dir, txepkg.FilesDir)
+	if info, err := os.Lstat(payload); err != nil || !info.IsDir() {
+		b.block("package_corrupt", "%s has no payload directory", rel)
+		return
+	}
 	err := filepath.WalkDir(payload, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -165,8 +197,18 @@ func (s *scanner) checkPayload(b *builder, dir, rel string, files []txepkg.File)
 		if err != nil {
 			return err
 		}
-		if size != want.Size || sum != want.SHA256 {
+		// The package store records a payload hash as bare hex.
+		if size != want.Size || strings.TrimPrefix(sum, "sha256:") != strings.TrimPrefix(want.SHA256, "sha256:") {
 			b.block("package_corrupt", "%s/files/%s does not match its manifest entry", rel, r)
+		}
+		if hasModeBits {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if (info.Mode().Perm()&0o111 != 0) != want.Executable {
+				b.block("package_corrupt", "the executable bit of %s/files/%s is not as packaged", rel, r)
+			}
 		}
 		return nil
 	})
@@ -180,5 +222,31 @@ func (s *scanner) checkPayload(b *builder, dir, rel string, files []txepkg.File)
 	sort.Strings(missing)
 	for _, p := range missing {
 		b.block("package_corrupt", "%s/files/%s is in the manifest but missing", rel, p)
+	}
+}
+
+// checkSealed refuses a package that is writable, as the package store's
+// own verification does: a package is sealed when it is committed.
+func checkSealed(b *builder, rel, dir, manifest string) {
+	if !hasModeBits {
+		return
+	}
+	writable := false
+	for _, p := range []string{dir, manifest} {
+		if info, err := os.Lstat(p); err != nil || info.Mode().Perm()&0o222 != 0 {
+			writable = true
+		}
+	}
+	_ = filepath.WalkDir(filepath.Join(dir, txepkg.FilesDir), func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // a read failure is reported by checkPayload
+		}
+		if info, err := d.Info(); err == nil && info.Mode().Perm()&0o222 != 0 {
+			writable = true
+		}
+		return nil
+	})
+	if writable {
+		b.block("package_corrupt", "%s is writable; a committed package is sealed", rel)
 	}
 }

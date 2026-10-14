@@ -1,0 +1,14 @@
+{
+  "event_id": "evt_01M1DBSNC0ZJT1T65WJTWKHZN3",
+  "job_id": "job_01M1DBSNC0AQ4MGHH1S920MYGW",
+  "revision": 1,
+  "kind": "registered",
+  "to": "incomplete",
+  "detail": "job key manual-retire",
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T02:12:00Z"
+}

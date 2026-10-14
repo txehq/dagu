@@ -1,0 +1,14 @@
+{
+  "decision_id": "dec_01M1D8BSR03V18C6G1ZVHDZ5VA",
+  "proposal_id": "prp_01M1D8BSR0WSEMATWH2XWHAQQM",
+  "proposal_revision": 1,
+  "binding_digest": "sha256:bdfffb105e892c7e7bbbad34692fc82fad304db7c3a6a7ea34e0f3fceb741417",
+  "verdict": "snooze",
+  "snooze_until": "2026-09-04T01:12:00Z",
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "decided_at": "2026-09-01T01:12:00Z",
+  "idempotency_key": "key-prp_01M1D8BSR0WSEMATWH2XWHAQQM-snooze"
+}

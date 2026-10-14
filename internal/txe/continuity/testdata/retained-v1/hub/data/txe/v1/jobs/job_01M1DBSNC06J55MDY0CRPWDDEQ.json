@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DBSNC06J55MDY0CRPWDDEQ",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 5,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DBSNC06J55MDY0CRPWDDEQ/versions/01M1DBSNC0V145M0E08N1H4YYZ"
+  ],
+  "package_digest": "sha256:222f540019ab8fbe15e36d5c7e5b35611d27f603206600ebd0dd2da9553f3afc",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "validation",
+    "dedupe_key": "98c41dcd20b86b86830ec0794559835614458ceaae0f0ec77a3ed1cd3a1f7d55",
+    "request_id": "req-job_01M1DBSNC06J55MDY0CRPWDDEQ",
+    "request_hash": "sha256:7736b8742f901e766a022cd668e50f3e40acf5e32ae29546d4716ebeea241970",
+    "package": {
+      "digest": "sha256:222f540019ab8fbe15e36d5c7e5b35611d27f603206600ebd0dd2da9553f3afc",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DBSNC06J55MDY0CRPWDDEQ/sha256-222f540019ab8fbe15e36d5c7e5b35611d27f603206600ebd0dd2da9553f3afc",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T02:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T02:12:00Z"
+  },
+  "lifecycle": "completed",
+  "lifecycle_reason": "completed",
+  "availability": {
+    "state": "ready"
+  },
+  "retirement": {
+    "reason": "completed",
+    "detail": "success criteria met",
+    "evidence": [
+      "run:fixture-v-9"
+    ],
+    "actor": {
+      "kind": "human",
+      "id": "fixture-person"
+    },
+    "at": "2026-09-01T02:12:00Z",
+    "active_run_policy": "finish"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "suspend_gen": 1,
+  "suspended_by_registry": true,
+  "chains": {
+    "events": "history/job_01M1DBSNC06J55MDY0CRPWDDEQ/events/01M1DBSNC0449P4T7WV0A596NX"
+  },
+  "created": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "reconciler",
+      "id": "registry"
+    }
+  }
+}

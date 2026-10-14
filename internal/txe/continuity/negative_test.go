@@ -4,12 +4,14 @@
 package continuity_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -113,14 +115,13 @@ func TestBreaksAreBlocking(t *testing.T) {
 			edit(t, regPath(l, head), func(m map[string]any) { m["prev"] = head })
 		}, "chain_cycle"},
 		{"a package file changed", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
-			id := f.Jobs["validation"]
-			name, err := digestDir(f.Packages[id][0])
-			require.NoError(t, err)
-			p := filepath.Join(l.MachineHome, "packages", id, name, "files", "run.sh")
-			require.NoError(t, os.Chmod(p, 0o600))
-			require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\necho changed\n"), 0o600))
+			p := packageFile(l, f, "validation")
+			require.NoError(t, os.Chmod(p, 0o700))
+			require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\necho changed\n"), 0o700))
+			require.NoError(t, os.Chmod(p, 0o555))
 		}, "package_corrupt"},
 		{"a package lost from its machine", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			require.NoError(t, fixture.Unseal(filepath.Join(l.MachineHome, "packages", f.Jobs["manual-retire"])))
 			require.NoError(t, os.RemoveAll(filepath.Join(l.MachineHome, "packages", f.Jobs["manual-retire"])))
 		}, "package_missing"},
 		{"a hub artifact's bytes changed", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
@@ -154,6 +155,39 @@ func TestBreaksAreBlocking(t *testing.T) {
 			require.NoError(t, err)
 			edit(t, filepath.Join(dir, entries[0].Name()), func(m map[string]any) { m["subject"] = "" })
 		}, "missing_field"},
+		{"a job holding a null proposal", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			edit(t, regPath(l, "jobs/"+f.Jobs["health-check"]), func(m map[string]any) {
+				m["proposals"] = map[string]any{"prp_01M4ZZZZZZZZZZZZZZZZZZZZZZ": nil}
+			})
+		}, "corrupt_entry"},
+		{"records in a hidden directory of the store", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
+			p := regPath(l, ".future/x")
+			require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+			require.NoError(t, os.WriteFile(p, []byte(`{}`), 0o600))
+		}, "unsupported_record"},
+		{"machine.json is a link into the client directory", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
+			skipWithoutSymlinks(t)
+			secret := filepath.Join(l.MachineHome, "client", "token.json")
+			require.NoError(t, os.MkdirAll(filepath.Dir(secret), 0o750))
+			require.NoError(t, os.WriteFile(secret, []byte(`{"schema":1,"machine_id":"fixture-secret"}`), 0o600))
+			p := filepath.Join(l.MachineHome, "machine.json")
+			require.NoError(t, os.Remove(p))
+			require.NoError(t, os.Symlink(secret, p))
+		}, "unsupported_file"},
+		{"a package directory is a link", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			skipWithoutSymlinks(t)
+			id := f.Jobs["validation"]
+			dir := filepath.Join(l.MachineHome, "packages", id)
+			require.NoError(t, fixture.Unseal(dir))
+			name := digestDir(f.Packages[id][0])
+			require.NoError(t, os.Rename(filepath.Join(dir, name), filepath.Join(l.Root, "moved")))
+			require.NoError(t, os.Symlink(filepath.Join(l.Root, "moved"), filepath.Join(dir, name)))
+		}, "unsupported_file"},
+		{"an area of the data directory is a link", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
+			skipWithoutSymlinks(t)
+			require.NoError(t, os.MkdirAll(filepath.Join(l.Root, "elsewhere"), 0o750))
+			require.NoError(t, os.Symlink(filepath.Join(l.Root, "elsewhere"), filepath.Join(l.DataDir, "views")))
+		}, "unsupported_file"},
 		{"the expected owner's record lost", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
 			require.NoError(t, os.Remove(regPath(l, "owners/"+fixture.StableOwner)))
 		}, "owner_missing"},
@@ -170,8 +204,75 @@ func TestBreaksAreBlocking(t *testing.T) {
 	}
 }
 
-func digestDir(digest string) (string, error) {
-	return strings.Replace(digest, ":", "-", 1), nil
+func digestDir(digest string) string {
+	return strings.Replace(digest, ":", "-", 1)
+}
+
+// packageFile is the entrypoint of the first package of a fixture job.
+func packageFile(l *fixture.Layout, f *fixture.Facts, job string) string {
+	id := f.Jobs[job]
+	return filepath.Join(l.MachineHome, "packages", id, digestDir(f.Packages[id][0]), "files", "run.sh")
+}
+
+// A copy that keeps a package's bytes but not its permissions leaves a
+// package the store refuses to run: lost execute bit, or not sealed.
+func TestPackagePermissionsAreChecked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no permission bits")
+	}
+	for name, mode := range map[string]os.FileMode{"execute bit lost": 0o444, "left writable": 0o755} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			l, f := build(t)
+			before := scan(t, l)
+			require.NoError(t, os.Chmod(packageFile(l, f, "validation"), mode))
+			after := scan(t, l)
+			assert.Positive(t, codes(continuity.Validate(after, continuity.Policy{}), continuity.SeverityBlock)["package_corrupt"])
+			assert.Positive(t, codes(continuity.Compare(before, after).Issues, continuity.SeverityBlock)["immutable_changed"])
+		})
+	}
+}
+
+// Scanning the same store twice gives the same inventory, byte for byte.
+func TestInventoryIsDeterministic(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	first := scan(t, l)
+	for range 5 {
+		assert.Equal(t, first.Digest, scan(t, l).Digest)
+	}
+}
+
+// A store written on Windows records archive paths with backslashes; they
+// are matched to the scanned root and the bytes are checked, not skipped.
+func TestWindowsArchivePathsAreChecked(t *testing.T) {
+	t.Parallel()
+	l, f := build(t)
+	const mount = `C:\dagu\data`
+	dir := filepath.Join(registry.Dir(l.DataDir), "artifacts")
+	var manifest string
+	require.NoError(t, filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			manifest = p
+		}
+		return err
+	}))
+	edit(t, manifest, func(m map[string]any) {
+		rel := strings.TrimPrefix(m["archive_dir"].(string), filepath.ToSlash(l.HubMount))
+		m["archive_dir"] = mount + strings.ReplaceAll(rel, "/", `\`)
+	})
+	rs := roots(l)
+	rs[0].Mount = mount
+	scanWith := func() map[string]int {
+		inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
+		require.NoError(t, err)
+		issues := continuity.Validate(inv, continuity.Policy{})
+		assert.Zero(t, codes(issues, continuity.SeverityWarn)["artifact_unverified"])
+		return codes(issues, continuity.SeverityBlock)
+	}
+	assert.Empty(t, scanWith())
+	require.NoError(t, os.Remove(filepath.Join(l.DataDir, filepath.FromSlash(f.HubArtifacts[0]))))
+	assert.Positive(t, scanWith()["artifact_missing"])
 }
 
 // Ownership is only ever an owner_id field. A person who signed in first
@@ -301,4 +402,10 @@ func TestInventoryRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	_, err = continuity.Decode(tampered)
 	assert.ErrorContains(t, err, "format")
+}
+
+func skipWithoutSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs a privilege on Windows")
+	}
 }

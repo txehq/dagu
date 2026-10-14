@@ -1,0 +1,33 @@
+{
+  "proposal_id": "prp_01M1E0CV40PP5V01T033HZJK1T",
+  "job_version": 1,
+  "package_digest": "sha256:d6c345eaa50a43417871dc1cfcfcfe03e1492f53725ec0ae2cd051bd424a322a",
+  "question": "Resize before the update?",
+  "rationale": "fixture",
+  "evidence": {},
+  "action": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:46c16701e909e5c0df3a50fbc3982955e082f22c5d7b3ab95e85c979b7eb21be",
+  "revision": 2,
+  "state": "superseded",
+  "reasoning": "job version changed",
+  "created": {
+    "at": "2026-09-01T08:12:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T08:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

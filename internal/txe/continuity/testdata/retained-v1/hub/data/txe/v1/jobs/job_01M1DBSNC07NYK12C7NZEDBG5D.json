@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DBSNC07NYK12C7NZEDBG5D",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 5,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DBSNC07NYK12C7NZEDBG5D/versions/01M1DBSNC003F4RAX266CWBVCX"
+  ],
+  "package_digest": "sha256:cc2113ccbcd87ff7807513a9bd40853bf0fe1e653009561ac230ca83bff8a807",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "paused",
+    "dedupe_key": "a7a9dc5bcf71adb2edc202814060a5ab6fca515382e9f1133dcc47d52d9090a2",
+    "request_id": "req-job_01M1DBSNC07NYK12C7NZEDBG5D",
+    "request_hash": "sha256:20a5fccd2b696b45733124814e6b9ac86732a864607d2ed50f13a449b2c21306",
+    "package": {
+      "digest": "sha256:cc2113ccbcd87ff7807513a9bd40853bf0fe1e653009561ac230ca83bff8a807",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DBSNC07NYK12C7NZEDBG5D/sha256-cc2113ccbcd87ff7807513a9bd40853bf0fe1e653009561ac230ca83bff8a807",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T02:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T02:12:00Z"
+  },
+  "lifecycle": "paused",
+  "lifecycle_reason": "fixture pause",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "suspend_gen": 1,
+  "suspended_by_registry": true,
+  "chains": {
+    "events": "history/job_01M1DBSNC07NYK12C7NZEDBG5D/events/01M1DBSNC0D3X9GAPZ4D9W48T2"
+  },
+  "created": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "reconciler",
+      "id": "registry"
+    }
+  }
+}

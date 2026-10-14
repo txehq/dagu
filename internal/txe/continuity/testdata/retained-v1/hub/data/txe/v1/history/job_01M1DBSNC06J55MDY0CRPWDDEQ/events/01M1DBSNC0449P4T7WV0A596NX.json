@@ -1,0 +1,19 @@
+{
+  "event_id": "evt_01M1DBSNC0SECR11RR01C8YY07",
+  "job_id": "job_01M1DBSNC06J55MDY0CRPWDDEQ",
+  "revision": 3,
+  "kind": "lifecycle",
+  "from": "active",
+  "to": "completed",
+  "reason": "completed",
+  "detail": "success criteria met",
+  "evidence": [
+    "run:fixture-v-9"
+  ],
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "at": "2026-09-01T02:12:00Z",
+  "prev": "history/job_01M1DBSNC06J55MDY0CRPWDDEQ/events/01M1DBSNC0YAR2QY6BPHQSERWH"
+}

@@ -114,6 +114,13 @@ func (b *builder) decode(data []byte, v any) bool {
 }
 
 func (b *builder) done() (*Record, []Issue) {
+	sort.Slice(b.rec.Defines, func(i, k int) bool {
+		x, y := b.rec.Defines[i], b.rec.Defines[k]
+		if x.Kind != y.Kind {
+			return x.Kind < y.Kind
+		}
+		return x.ID < y.ID
+	})
 	sort.Slice(b.rec.Refs, func(i, k int) bool {
 		x, y := b.rec.Refs[i], b.rec.Refs[k]
 		if x.Rel != y.Rel {
@@ -284,6 +291,10 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 		}
 	}
 	for id, p := range j.Proposals {
+		if p == nil {
+			b.block("corrupt_entry", "proposal %s is null", id)
+			continue
+		}
 		if p.ProposalID != id {
 			b.block("id_mismatch", "proposal %s is held as %s", p.ProposalID, id)
 		}
@@ -291,6 +302,10 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 		proposalRefs(b, p)
 	}
 	for id, a := range j.Actions {
+		if a == nil {
+			b.block("corrupt_entry", "action %s is null", id)
+			continue
+		}
 		if a.ActionID != id {
 			b.block("id_mismatch", "action %s is held as %s", a.ActionID, id)
 		}
@@ -304,22 +319,38 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 	for key, d := range j.DecisionKeys {
 		b.ref("decision_key:"+key, KindDecision, d)
 	}
-	for _, r := range j.NativeResumes {
+	for id, r := range j.NativeResumes {
+		if r == nil {
+			b.block("corrupt_entry", "native resume %s is null", id)
+			continue
+		}
 		b.ref("native_resume_decision", KindDecision, r.DecisionID)
 		b.ref("native_resume_proposal", KindProposal, r.ProposalID)
 	}
-	for _, r := range j.UncertainResolutions {
+	for id, r := range j.UncertainResolutions {
+		if r == nil {
+			b.block("corrupt_entry", "uncertain resolution %s is null", id)
+			continue
+		}
 		b.ref("uncertain_action", KindAction, r.ActionID)
 		b.ref("uncertain_decision", KindDecision, r.DecisionID)
 	}
-	for _, c := range j.PendingClosures {
+	for id, c := range j.PendingClosures {
+		if c == nil {
+			b.block("corrupt_entry", "pending closure %s is null", id)
+			continue
+		}
 		b.ref("pending_closure", KindProposal, c.ProposalID)
 		b.ref("pending_closure_machine", KindMachine, c.MachineID)
 		if c.JobID != j.JobID {
 			b.block("foreign_job", "pending closure of proposal %s names job %s", c.ProposalID, c.JobID)
 		}
 	}
-	for _, in := range j.Intents {
+	for key, in := range j.Intents {
+		if in == nil {
+			b.block("corrupt_entry", "intent %s is null", key)
+			continue
+		}
 		b.ref("intent", KindAction, in.ActionID)
 	}
 	if j.Checkpoint.LastReviewID != "" {
@@ -528,7 +559,7 @@ func artifactRecord(jobID, runID, execution string, data []byte) (*Record, []Iss
 			f := ArtifactFact{Deliverable: a.Deliverable, Path: a.Path, Location: a.Location, Status: string(a.Status),
 				SHA256: a.SHA256, Bytes: a.Bytes, MachineID: a.MachineID}
 			if a.Location == registry.DeliveryHub && m.ArchiveDir != "" {
-				f.HubPath = path.Join(m.ArchiveDir, registry.HubCopyPath(m.Execution, a.Path))
+				f.HubPath = path.Join(slashPath(m.ArchiveDir), registry.HubCopyPath(m.Execution, a.Path))
 			}
 			if a.Location == registry.DeliveryMachine {
 				f.MachinePath = path.Join("outputs", jobID, "runs", runID, "executions", produced, a.Path)
@@ -632,8 +663,8 @@ func classifyAuthz(id string, data []byte) (*Record, []Issue) {
 		}
 		return b.done()
 	case "enrolment_keys":
+		// A key is claimed once, for good, by one machine and class.
 		b := newBuilder(ClassEnrolmentKey)
-		b.rec.Mutable = true
 		var r struct {
 			Schema    int                `json:"schema"`
 			Key       authz.EnrolmentKey `json:"key"`
@@ -657,4 +688,10 @@ func identity(b *builder, issuer, subject string) {
 	if issuer == "" || subject == "" {
 		b.block("missing_field", "the record does not name both an issuer and a subject")
 	}
+}
+
+// slashPath writes a stored path with forward slashes, whichever system
+// stored it: a store written on Windows is checked on any system.
+func slashPath(p string) string {
+	return strings.ReplaceAll(p, `\`, "/")
 }

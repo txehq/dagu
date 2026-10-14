@@ -1,0 +1,45 @@
+{
+  "proposal_id": "prp_01M1D47Z00E2450KTCTBG0SA7W",
+  "job_version": 1,
+  "package_digest": "sha256:c18bbfb690fdac6788ae3c616b439c6828892e889494990f22b8809bb8857d92",
+  "question": "Delete old snapshots?",
+  "rationale": "fixture",
+  "evidence": {},
+  "action": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+  "revision": 2,
+  "state": "rejected",
+  "decision": {
+    "decision_id": "dec_01M1D47Z00GCB5ADH64E2B96ZM",
+    "proposal_id": "prp_01M1D47Z00E2450KTCTBG0SA7W",
+    "proposal_revision": 1,
+    "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+    "verdict": "reject",
+    "actor": {
+      "kind": "human",
+      "id": "fixture-person"
+    },
+    "decided_at": "2026-09-01T00:00:00Z",
+    "idempotency_key": "key-prp_01M1D47Z00E2450KTCTBG0SA7W-reject",
+    "prev": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/decisions/01M1D47Z007YG33GPSKJE6CQ10"
+  },
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "human",
+      "id": "fixture-person"
+    }
+  }
+}

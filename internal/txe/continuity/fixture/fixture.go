@@ -20,8 +20,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -88,7 +90,7 @@ type builder struct {
 	mu     sync.Mutex
 	now    time.Time
 	facts  *Facts
-	err    error
+	pkgs   int
 }
 
 // Build writes the fixture under root, which must be empty or absent.
@@ -205,32 +207,52 @@ func (b *builder) machineIdentity() error {
 	return os.WriteFile(filepath.Join(b.layout.MachineHome, "machine.json"), data, 0o600)
 }
 
-// pkg writes a sealed package for job into the machine home and returns its
-// digest, as the CLI's package store lays it out.
+// pkg builds and commits a package for job in the machine home through the
+// package store, sealed as the CLI leaves it, and returns its digest and
+// directory. The store builds packages only on Unix; on Windows the package
+// is written in the store's format, unsealed, as no permission bits apply.
 func (b *builder) pkg(jobID string, script string) (string, string, error) {
 	content := []byte("#!/bin/sh\n" + script + "\n")
+	b.pkgs++
+	src := filepath.Join(b.layout.Root, "src", fmt.Sprintf("pkg-%d", b.pkgs))
+	if err := os.MkdirAll(src, 0o750); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(src, "run.sh"), content, 0o700); err != nil { //nolint:gosec // a fixture script
+		return "", "", err
+	}
+	prov := txepkg.Provenance{Repository: "github.com/fixture/app", SourceRoot: src, Uncommitted: []string{"run.sh"}, Session: "fixture-session"}
+	store := &txepkg.Store{Root: filepath.Join(b.layout.MachineHome, "packages")}
+	if runtime.GOOS != "windows" {
+		staged, err := store.Stage(fmt.Sprintf("req-%d", b.pkgs), txepkg.BuildOptions{SourceRoot: src, Include: []string{"run.sh"},
+			Entrypoint: []string{"./run.sh"}, Provenance: prov})
+		if err != nil {
+			return "", "", fmt.Errorf("stage package: %w", err)
+		}
+		p, err := store.Commit(staged, jobID)
+		if err != nil {
+			return "", "", fmt.Errorf("commit package: %w", err)
+		}
+		b.facts.Packages[jobID] = append(b.facts.Packages[jobID], p.Digest)
+		return p.Digest, p.Dir, nil
+	}
 	sum := sha256.Sum256(content)
-	files := []txepkg.File{{Path: "run.sh", Size: int64(len(content)), SHA256: "sha256:" + hex.EncodeToString(sum[:]), Executable: true}}
-	m := txepkg.Manifest{Schema: txepkg.ManifestSchema, Entrypoint: []string{"run.sh"}, Files: files, ContentSHA256: hex.EncodeToString(sum[:]),
-		Provenance: txepkg.Provenance{Repository: "github.com/fixture/app", SourceRoot: "/fixture/src", Session: "fixture-session"}}
+	files := []txepkg.File{{Path: "run.sh", Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:]), Executable: true}}
+	m := txepkg.Manifest{Schema: txepkg.ManifestSchema, Entrypoint: []string{"./run.sh"}, Files: files, ContentSHA256: hex.EncodeToString(sum[:]), Provenance: prov}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return "", "", err
 	}
 	data = append(data, '\n')
 	digest := txepkg.Digest(data)
-	name, err := txepkg.DigestDirName(digest)
+	dir, err := store.PackageDir(jobID, digest)
 	if err != nil {
 		return "", "", err
 	}
-	dir := filepath.Join(b.layout.MachineHome, "packages", jobID, name)
-	if err := os.MkdirAll(filepath.Join(dir, txepkg.FilesDir), 0o750); err != nil {
+	if err := writeFile(filepath.Join(dir, txepkg.FilesDir, "run.sh"), content); err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(filepath.Join(dir, txepkg.ManifestName), data, 0o600); err != nil {
-		return "", "", err
-	}
-	if err := os.WriteFile(filepath.Join(dir, txepkg.FilesDir, "run.sh"), content, 0o700); err != nil { //nolint:gosec // a fixture script
+	if err := writeFile(filepath.Join(dir, txepkg.ManifestName), data); err != nil {
 		return "", "", err
 	}
 	b.facts.Packages[jobID] = append(b.facts.Packages[jobID], digest)
@@ -447,7 +469,6 @@ func (b *builder) activeWithHistory() error {
 	if _, err := b.propose(job, c, "Archive last month?"); err != nil {
 		return err
 	}
-	b.facts.ProposalStates[registry.ProposalOpen]++
 	if err := b.release(job.JobID, c); err != nil {
 		return err
 	}
@@ -464,6 +485,8 @@ func (b *builder) activeWithHistory() error {
 		return fmt.Errorf("redirect: %w", err)
 	}
 	until := b.clock().Add(48 * time.Hour)
+	// The open and snoozed proposals here are superseded by the update
+	// below; pendingDecisions leaves live ones on another job.
 	if _, err := b.decide(job.JobID, snooze, registry.VerdictSnooze, registry.ProposalSnoozed, func(d *registry.Decision) { d.SnoozeUntil = &until }); err != nil {
 		return fmt.Errorf("snooze: %w", err)
 	}
@@ -554,6 +577,27 @@ func (b *builder) uncertainEffect() error {
 		return fmt.Errorf("executing: %w", err)
 	}
 	b.facts.ActionStates[registry.ActionExecuting]++
+	// Pending human decisions: one open, one snoozed, one approved and not
+	// yet executed.
+	if _, err := b.propose(job, c, "Grow the volume?"); err != nil {
+		return err
+	}
+	b.facts.ProposalStates[registry.ProposalOpen]++
+	snooze, err := b.propose(job, c, "Prune the cache?")
+	if err != nil {
+		return err
+	}
+	approve, err := b.propose(job, c, "Rebuild the index?")
+	if err != nil {
+		return err
+	}
+	until := b.clock().Add(72 * time.Hour)
+	if _, err := b.decide(job.JobID, snooze, registry.VerdictSnooze, registry.ProposalSnoozed, func(d *registry.Decision) { d.SnoozeUntil = &until }); err != nil {
+		return fmt.Errorf("snooze: %w", err)
+	}
+	if _, err := b.decide(job.JobID, approve, registry.VerdictApprove, registry.ProposalDecided); err != nil {
+		return fmt.Errorf("approve: %w", err)
+	}
 	b.facts.Lifecycles[job.JobID] = registry.LifecycleActive
 	return nil
 }
@@ -754,6 +798,9 @@ func (b *builder) secondMachine() error {
 	}
 	// The package was written to this home by register; it belongs on the
 	// other machine, so it is moved out of the scanned home.
+	if err := Unseal(filepath.Join(b.layout.MachineHome, "packages", job.JobID)); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(filepath.Join(b.layout.MachineHome, "packages", job.JobID)); err != nil {
 		return err
 	}
@@ -797,6 +844,18 @@ func (b *builder) authz() error {
 	}
 	if _, err := z.ApproveBinding(b.ctx, authz.PlatformAdmin("fixture-admin"), owner.Identity, StableOwner); err != nil {
 		return fmt.Errorf("approve: %w", err)
+	}
+	// The owner's laptop enrolled as a worker, through the provider client
+	// that exists for that machine and class.
+	scope, err := z.Resolve(b.ctx, owner)
+	if err != nil {
+		return fmt.Errorf("resolve owner: %w", err)
+	}
+	worker := owner
+	worker.Class = authn.ClassWorker
+	worker.ClientID = "dagu-worker-fixture-laptop"
+	if _, err := z.Enrol(b.ctx, scope, authz.EnrolmentRequest{MachineID: b.facts.Machine, Credential: worker}); err != nil {
+		return fmt.Errorf("enrol: %w", err)
 	}
 	return nil
 }
@@ -916,4 +975,22 @@ func (r *runs) LatestAttempt(context.Context, string, string) (registry.RunAttem
 
 func (r *runs) RetryExecution(context.Context, string, string, string) (registry.RetryExecution, error) {
 	return registry.RetryExecution{}, registry.ErrRunNotFound
+}
+
+// Unseal makes a sealed package tree writable again, so that a test can
+// change or remove it.
+func Unseal(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return os.Chmod(p, info.Mode().Perm()|0o200)
+	})
 }

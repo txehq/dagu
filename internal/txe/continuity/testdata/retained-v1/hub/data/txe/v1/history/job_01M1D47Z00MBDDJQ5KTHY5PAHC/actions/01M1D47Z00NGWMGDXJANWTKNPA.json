@@ -1,0 +1,44 @@
+{
+  "action_id": "act_1N4MRN03F8P1RYNHRZSTFCGKEF",
+  "kind": "routine",
+  "job_version": 1,
+  "review_id": "rev_2R3RSDNG6QJRXF9FK7MKWGB48W",
+  "claim_id": "clm_01M1D47Z00990C0GA6E9YXXW45",
+  "spec": {
+    "name": "diagnose",
+    "params": {
+      "n": 1
+    }
+  },
+  "binding_digest": "sha256:8dc4e145919406d960a5e41b116e3caac1d0d65e4a87c0066fe256a6f17248e8",
+  "state": "succeeded",
+  "attempt": 1,
+  "max_attempts": 2,
+  "attempt_started_at": "2026-09-01T00:00:00Z",
+  "grant": {
+    "grant_id": "grt_1HCGXQYCRKKGR3XNT3KZZMGMWP",
+    "action_id": "act_1N4MRN03F8P1RYNHRZSTFCGKEF",
+    "attempt": 1,
+    "expires_at": "2026-09-01T00:01:00Z"
+  },
+  "receipt": "diagnosed",
+  "outcome": {
+    "fixture": true
+  },
+  "settled_under_claim": "clm_01M1D47Z00990C0GA6E9YXXW45",
+  "read_only": true,
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  }
+}

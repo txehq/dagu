@@ -5,6 +5,7 @@ package continuity_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -103,6 +104,25 @@ func TestCompareBreaksAreBlocking(t *testing.T) {
 		}, "file_missing"},
 		{"a machine output changed", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
 			require.NoError(t, os.WriteFile(filepath.Join(l.MachineHome, filepath.FromSlash(f.MachineArtifacts[1])), []byte("x"), 0o600))
+		}, "immutable_changed"},
+		{"a job's history rewound to an earlier head", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			p := regPath(l, "jobs/"+f.Jobs["health-check"])
+			head := job(t, l, f.Jobs["health-check"])["chains"].(map[string]any)["events"].(string)
+			data, err := os.ReadFile(regPath(l, head))
+			require.NoError(t, err)
+			var e registry.Event
+			require.NoError(t, json.Unmarshal(data, &e))
+			edit(t, p, func(m map[string]any) {
+				m["chains"].(map[string]any)["events"] = e.Prev
+				m["revision"] = m["revision"].(float64) + 1
+			})
+		}, "history_unreachable"},
+		{"an enrolment key handed to another machine", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			dir := filepath.Join(l.DataDir, "txe", "authz", "v1", "enrolment_keys")
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			edit(t, filepath.Join(dir, entries[0].Name()), func(m map[string]any) { m["machine_id"] = f.Machine2 })
 		}, "immutable_changed"},
 		{"the store reset to empty", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
 			require.NoError(t, os.RemoveAll(filepath.Join(l.DataDir, "txe")))

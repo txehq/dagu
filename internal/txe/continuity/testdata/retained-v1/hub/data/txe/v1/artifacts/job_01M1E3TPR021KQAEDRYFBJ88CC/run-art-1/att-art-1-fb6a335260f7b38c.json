@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1E3TPR021KQAEDRYFBJ88CC",
+  "run_id": "run-art-1",
+  "attempt_id": "att-art-1",
+  "queued_at": "",
+  "execution": "att-art-1-fb6a335260f7b38c",
+  "produced_in": {
+    "attempt_id": "att-art-1",
+    "queued_at": "",
+    "execution": "att-art-1-fb6a335260f7b38c"
+  },
+  "job_version": 1,
+  "artifacts": [
+    {
+      "deliverable": "snapshot",
+      "path": "snapshot.json",
+      "sha256": "sha256:0a98974220d589e9faa1ec7f77d0b9f124b69fb7a05a93ca97157165d4a94c87",
+      "bytes": 17,
+      "location": "hub",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "status": "verified",
+      "checked_at": "2026-09-01T09:12:00Z"
+    },
+    {
+      "deliverable": "raw",
+      "path": "raw/export.csv",
+      "sha256": "sha256:492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470",
+      "bytes": 8,
+      "location": "machine",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "status": "stored_on_machine"
+    },
+    {
+      "deliverable": "empty",
+      "path": "empty.txt",
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "location": "machine",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "status": "stored_on_machine"
+    },
+    {
+      "deliverable": "notes",
+      "path": "notes.txt",
+      "missing": true,
+      "status": "missing"
+    }
+  ],
+  "archive_dir": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/hub/data/artifacts/job_01M1E3TPR021KQAEDRYFBJ88CC/run-art-1/att-art-1",
+  "digest": "sha256:0330461aa0856276d7ba7762bcace26702d219e96eeccea85fdad20c406ba3d1",
+  "recorded": {
+    "at": "2026-09-01T09:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

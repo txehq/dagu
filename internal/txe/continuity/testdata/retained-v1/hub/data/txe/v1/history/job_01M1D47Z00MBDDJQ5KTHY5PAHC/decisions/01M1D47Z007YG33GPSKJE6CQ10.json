@@ -1,0 +1,13 @@
+{
+  "decision_id": "dec_01M1D47Z00VFXN6N6YBV47RFRD",
+  "proposal_id": "prp_01M1D47Z005PNVX1148X1Z84J4",
+  "proposal_revision": 1,
+  "binding_digest": "sha256:bca85d3919358a4451897ab78944dc1f4d79fb4af225447865e9372198a2c68f",
+  "verdict": "approve",
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "decided_at": "2026-09-01T00:00:00Z",
+  "idempotency_key": "key-prp_01M1D47Z005PNVX1148X1Z84J4-approve"
+}

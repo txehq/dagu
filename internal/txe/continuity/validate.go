@@ -6,7 +6,6 @@ package continuity
 import (
 	"fmt"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -189,7 +188,7 @@ func (v *validator) chains() {
 		for _, ref := range splitList(r.Attrs["version_refs"]) {
 			reached[ref] = true
 		}
-		for _, kind := range []string{"events", "decisions", "reviews", "actions", "proposals", "closures"} {
+		for _, kind := range chainKinds {
 			id := r.Attrs["chain_"+kind]
 			seen := map[string]bool{}
 			for id != "" {
@@ -362,10 +361,13 @@ func (v *validator) resolveHub(p string) (string, string, bool) {
 		if base == "" {
 			base = root.Path
 		}
-		base = strings.TrimSuffix(filepath.ToSlash(base), "/")
+		base = strings.TrimSuffix(slashPath(base), "/")
 		if after, ok := strings.CutPrefix(p, base+"/"); ok {
 			return root.Label, after, true
 		}
 	}
 	return "", "", false
 }
+
+// chainKinds are the job history chains, by their names in a job's chains.
+var chainKinds = []string{"events", "decisions", "reviews", "actions", "proposals", "closures"}

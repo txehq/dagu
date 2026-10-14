@@ -201,6 +201,8 @@ type File struct {
 	SHA256 string `json:"sha256,omitempty"`
 	// Link is a symbolic link's target; links are never followed.
 	Link string `json:"link,omitempty"`
+	// Mode is the file's permission bits, where the file system has them.
+	Mode uint32 `json:"mode,omitempty"`
 	// Policy says how a later inventory may differ: immutable, mutable or
 	// operational.
 	Policy string `json:"policy"`
@@ -332,6 +334,9 @@ func sortIssues(issues []Issue) {
 		if a.Class != b.Class {
 			return a.Class < b.Class
 		}
-		return a.ID < b.ID
+		if a.ID != b.ID {
+			return a.ID < b.ID
+		}
+		return a.Detail < b.Detail
 	})
 }

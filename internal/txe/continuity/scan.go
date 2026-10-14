@@ -14,9 +14,19 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 )
+
+// recordLockDirectoryName is the file collection's per-record lock
+// directory (internal/persis/file).
+const recordLockDirectoryName = ".dagu_record_locks"
+
+// hasModeBits is false where the file system has no Unix permission bits.
+const hasModeBits = runtime.GOOS != "windows"
 
 // Root is a directory to scan, as one area.
 type Root struct {
@@ -162,6 +172,9 @@ func (s *scanner) hubData() error {
 	}
 	for _, e := range entries {
 		name := e.Name()
+		if s.symlink(name, e) {
+			continue
+		}
 		switch {
 		case name == "txe":
 			if err := s.txe(); err != nil {
@@ -187,6 +200,9 @@ func (s *scanner) txe() error {
 		return err
 	}
 	for _, e := range entries {
+		if s.symlink("txe/"+e.Name(), e) {
+			continue
+		}
 		switch name := e.Name(); name {
 		case "v1":
 			if err := s.store("registry", filepath.Join(dir, "v1"), classifyRegistry); err != nil {
@@ -198,6 +214,9 @@ func (s *scanner) txe() error {
 				return err
 			}
 			for _, a := range sub {
+				if s.symlink("txe/authz/"+a.Name(), a) {
+					continue
+				}
 				if a.Name() == "v1" {
 					if err := s.store("authz", filepath.Join(dir, "authz", "v1"), classifyAuthz); err != nil {
 						return err
@@ -230,8 +249,8 @@ func (s *scanner) store(store, dir string, classify func(id string, data []byte)
 		}
 		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
-			// The file collection keeps per-record lock directories here.
-			if strings.HasPrefix(d.Name(), ".") && rel != "." {
+			// The file collection's own lock directories, as it skips them.
+			if rel != "." && (d.Name() == recordLockDirectoryName || dirlock.IsLockDirectoryName(d.Name())) {
 				s.exclude(store+"/"+rel, "collection lock directory; operational")
 				return filepath.SkipDir
 			}
@@ -289,6 +308,13 @@ func (s *scanner) files(rel, policy string) error {
 			return err
 		}
 		f := File{Root: s.root.Label, Path: filepath.ToSlash(r), Policy: policy}
+		if hasModeBits {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			f.Mode = uint32(info.Mode().Perm())
+		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			target, err := os.Readlink(p)
 			if err != nil {
@@ -318,6 +344,9 @@ func (s *scanner) machineHome() error {
 	}
 	for _, e := range entries {
 		name := e.Name()
+		if s.symlink(name, e) {
+			continue
+		}
 		switch {
 		case name == "machine.json":
 			if err := s.machineIdentity(); err != nil {
@@ -352,4 +381,23 @@ func fileDigest(p string) (int64, string, error) {
 		return 0, "", err
 	}
 	return n, "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// symlink reports, and refuses to follow, a directory entry that is a
+// symbolic link: a link could lead the scan into a credential-bearing area.
+func (s *scanner) symlink(rel string, e fs.DirEntry) bool {
+	if e.Type()&fs.ModeSymlink == 0 {
+		return false
+	}
+	s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is a symbolic link; links are not followed, so what it points to was not inventoried", s.root.Label, rel)
+	return true
+}
+
+// regular reports whether p is a regular file, without following a link.
+func regular(p string) (bool, error) {
+	info, err := os.Lstat(p)
+	if err != nil {
+		return false, err
+	}
+	return info.Mode().IsRegular(), nil
 }

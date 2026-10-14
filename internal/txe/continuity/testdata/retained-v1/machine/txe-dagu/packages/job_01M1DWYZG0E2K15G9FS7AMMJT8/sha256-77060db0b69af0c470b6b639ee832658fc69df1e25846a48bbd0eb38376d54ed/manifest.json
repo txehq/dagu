@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "entrypoint": [
+    "./run.sh"
+  ],
+  "files": [
+    {
+      "path": "run.sh",
+      "size": 30,
+      "sha256": "2c72c0276a634c451b17d46de2843a67c1d5e4e809eab47de31fae27f4e79dde",
+      "executable": true
+    }
+  ],
+  "content_sha256": "cc66bfe81ce83017c11fba7bb52fabd143976cbca3e5447a7d70b08c7bae53f9",
+  "provenance": {
+    "repository": "github.com/fixture/app",
+    "source_root": "/private/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/src/pkg-13",
+    "uncommitted": [
+      "run.sh"
+    ],
+    "session": "fixture-session"
+  }
+}
