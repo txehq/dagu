@@ -28,7 +28,8 @@ vi.mock('@/hooks/api', () => ({
 }));
 
 // The caller is not a person signed in through the identity provider.
-vi.mock('@/features/txe/identity', () => ({
+vi.mock('@/features/txe/identity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/features/txe/identity')>()),
   useTxeIdentity: () => ({ identity: undefined }),
 }));
 

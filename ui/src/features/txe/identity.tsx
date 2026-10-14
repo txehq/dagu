@@ -5,7 +5,11 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import useSWR from 'swr';
 
-import { TxeIdentityState, type components } from '@/api/v1/schema';
+import {
+  TxeIdentityPrincipalClass,
+  TxeIdentityState,
+  type components,
+} from '@/api/v1/schema';
 import { useAuth } from '@/contexts/AuthContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useClient } from '@/hooks/api';
@@ -15,6 +19,14 @@ import { AccessRequestPending } from './components/identity/AccessRequestPending
 import { NoAccessYet } from './components/identity/NoAccessYet';
 
 export type TxeIdentity = components['schemas']['TxeIdentity'];
+
+// isTxePerson reports a person signed in through the identity provider, bound
+// or not: the caller the hub refuses every route but /txe and every stream.
+// It is the principal's class, as the hub decides it. is_person is narrower:
+// a person acting for an owner, whose decisions count as a person's.
+export function isTxePerson(identity: TxeIdentity | undefined): boolean {
+  return identity?.principal.class === TxeIdentityPrincipalClass.person;
+}
 
 // How often a person waiting for access asks again, so an approval shows
 // without a reload.
@@ -46,7 +58,7 @@ export function useTxeIdentity(): {
     },
     {
       refreshInterval: (latest) =>
-        latest?.is_person && latest.state !== TxeIdentityState.bound
+        isTxePerson(latest) && latest?.state !== TxeIdentityState.bound
           ? WAITING_REFRESH_MS
           : 0,
     }
@@ -74,7 +86,7 @@ export function TxePersonGate({
   // identity of the current session only, so a late answer for an earlier
   // session cannot set it, and a caller whose identity could not be read
   // gets streams as before.
-  const isPerson = identity?.is_person === true;
+  const isPerson = isTxePerson(identity);
   React.useEffect(() => {
     if (!isLoading) {
       sseManager.setRefused(isPerson);
@@ -91,7 +103,7 @@ export function TxePersonGate({
   if (isLoading) {
     return null;
   }
-  if (!identity?.is_person) {
+  if (!identity || !isPerson) {
     return <>{children}</>;
   }
   if (identity.state === TxeIdentityState.bound) {
