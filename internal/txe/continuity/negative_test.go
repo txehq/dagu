@@ -228,7 +228,8 @@ func TestPackagePermissionsAreChecked(t *testing.T) {
 			require.NoError(t, os.Chmod(packageFile(l, f, "validation"), mode))
 			after := scan(t, l)
 			assert.Positive(t, codes(continuity.Validate(after, continuity.Policy{}), continuity.SeverityBlock)["package_corrupt"])
-			assert.Positive(t, codes(continuity.Compare(before, after).Issues, continuity.SeverityBlock)["immutable_changed"])
+			assert.Positive(t, codes(continuity.CompareProgress(before, after).Issues, continuity.SeverityBlock)["immutable_changed"])
+			assert.Positive(t, codes(continuity.Compare(before, after, continuity.CompareOptions{}).Issues, continuity.SeverityBlock)["file_changed"])
 		})
 	}
 }

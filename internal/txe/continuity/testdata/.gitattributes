@@ -1,0 +1,2 @@
+# The snapshot is compared by digest: keep its bytes exactly as written.
+* -text

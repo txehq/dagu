@@ -6,7 +6,9 @@ package continuity_test
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 	"time"
@@ -28,10 +30,11 @@ func TestCompareUnchanged(t *testing.T) {
 	t.Parallel()
 	l, _ := build(t)
 	before := scan(t, l)
-	rep := continuity.Compare(before, scan(t, l))
-	assert.Empty(t, rep.Issues)
-	assert.Empty(t, rep.Added)
-	assert.Empty(t, rep.Changed)
+	for _, rep := range []*continuity.Report{continuity.Compare(before, scan(t, l), continuity.CompareOptions{}), continuity.CompareProgress(before, scan(t, l))} {
+		assert.Empty(t, rep.Issues)
+		assert.Empty(t, rep.Added)
+		assert.Empty(t, rep.Changed)
+	}
 }
 
 // Work done after the earlier inventory, through the registry, is reported
@@ -50,18 +53,30 @@ func TestCompareLaterWorkIsReported(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, "dag-runs", "new-run.jsonl"), []byte("{}\n"), 0o600))
 
 	after := scan(t, l)
-	rep := continuity.Compare(before, after)
+	rep := continuity.CompareProgress(before, after)
 	assert.Empty(t, rep.Issues)
 	assert.Contains(t, rep.Changed, "registry/jobs/"+jobID)
 	assert.Contains(t, rep.Added, "hub-data/dag-runs/new-run.jsonl")
 	added := 0
 	for _, a := range rep.Added {
-		if filepath.Dir(filepath.Dir(a)) == "registry/history/"+jobID {
+		if path.Dir(path.Dir(a)) == "registry/history/"+jobID {
 			added++
 		}
 	}
 	assert.Positive(t, added, "the resume's history is added")
 	assert.Empty(t, continuity.Blocking(continuity.Validate(after, continuity.Policy{})))
+
+	// At a freeze point the same work blocks, until each change is named as
+	// reconciled; then it compares clean.
+	strict := continuity.Compare(before, after, continuity.CompareOptions{})
+	assert.Positive(t, compareCodes(strict)["record_changed"])
+	assert.Positive(t, compareCodes(strict)["record_added"])
+	assert.Positive(t, compareCodes(strict)["file_added"])
+	reconciled := map[string]bool{}
+	for _, k := range append(append([]string{}, rep.Changed...), rep.Added...) {
+		reconciled[k] = true
+	}
+	assert.Empty(t, continuity.Compare(before, after, continuity.CompareOptions{Reconciled: reconciled}).Issues)
 }
 
 // Each loss or rewrite between two inventories blocks.
@@ -182,6 +197,21 @@ func TestCompareBreaksAreBlocking(t *testing.T) {
 				m["revision"] = m["revision"].(float64) + 1
 			})
 		}, "live_entry_lost"},
+		{"an unresolved intent dropped", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			edit(t, regPath(l, "jobs/"+f.Jobs["data-collector"]), func(m map[string]any) {
+				require.NotEmpty(t, m["intents"])
+				delete(m, "intents")
+				m["revision"] = m["revision"].(float64) + 1
+			})
+		}, "live_entry_lost"},
+		{"a completed run's status and log emptied", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
+			require.NoError(t, filepath.WalkDir(filepath.Join(l.DataDir, "dag-runs"), func(p string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					return os.WriteFile(p, nil, 0o600)
+				}
+				return err
+			}))
+		}, "file_truncated"},
 		{"the store reset to empty", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
 			require.NoError(t, os.RemoveAll(filepath.Join(l.DataDir, "txe")))
 		}, "record_missing"},
@@ -192,8 +222,10 @@ func TestCompareBreaksAreBlocking(t *testing.T) {
 			l, f := build(t)
 			before := scan(t, l)
 			tc.break_(t, l, f)
-			got := compareCodes(continuity.Compare(before, scan(t, l)))
-			assert.Positive(t, got[tc.want], "want %s, got %v", tc.want, got)
+			after := scan(t, l)
+			got := compareCodes(continuity.CompareProgress(before, after))
+			assert.Positive(t, got[tc.want], "progress: want %s, got %v", tc.want, got)
+			assert.NotEmpty(t, continuity.Compare(before, after, continuity.CompareOptions{}).Issues, "the freeze comparison blocks every break")
 		})
 	}
 }
@@ -205,7 +237,8 @@ func TestCompareRefusesAnotherOwner(t *testing.T) {
 	before := scan(t, l)
 	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: roots(l), ExpectedOwner: impostor, Now: before.ScannedAt.Local})
 	require.NoError(t, err)
-	assert.Positive(t, compareCodes(continuity.Compare(before, after))["owner_changed"])
+	assert.Positive(t, compareCodes(continuity.Compare(before, after, continuity.CompareOptions{}))["owner_changed"])
+	assert.Positive(t, compareCodes(continuity.CompareProgress(before, after))["owner_changed"])
 	assert.Positive(t, codes(continuity.Validate(after, continuity.Policy{}), continuity.SeverityBlock)["owner_mismatch"])
 }
 
@@ -252,7 +285,7 @@ func TestCompareAcceptsArchiving(t *testing.T) {
 		return err
 	})
 	require.NoError(t, err)
-	rep := continuity.Compare(before, scan(t, l))
+	rep := continuity.CompareProgress(before, scan(t, l))
 	assert.Empty(t, rep.Issues)
 	assert.Contains(t, rep.Changed, "registry/jobs/"+jobID)
 }
@@ -266,5 +299,5 @@ func TestCompareIgnoresUnknownModes(t *testing.T) {
 	for i := range before.Files {
 		before.Files[i].Mode = 0
 	}
-	assert.Empty(t, continuity.Compare(before, scan(t, l)).Issues)
+	assert.Empty(t, continuity.Compare(before, scan(t, l), continuity.CompareOptions{}).Issues)
 }

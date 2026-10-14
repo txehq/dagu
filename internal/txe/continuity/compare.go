@@ -23,29 +23,83 @@ type Report struct {
 	Issues  []Issue  `json:"issues,omitempty"`
 }
 
-// Compare checks that everything the earlier inventory holds is still held
-// later: no record or retained file is missing, nothing immutable changed,
-// and a job aggregate changed only by moving forward with its identity
-// intact.
-func Compare(before, after *Inventory) *Report {
-	rep := &Report{Before: before.Digest, After: after.Digest, Counts: map[string][2]int{}}
-	add := func(code, class, id, detail string) {
-		rep.Issues = append(rep.Issues, Issue{Code: code, Severity: SeverityBlock, Class: class, ID: id, Detail: detail})
-	}
-	for k, n := range before.Counts {
-		c := rep.Counts[k]
-		c[0] = n
-		rep.Counts[k] = c
-	}
-	for k, n := range after.Counts {
-		c := rep.Counts[k]
-		c[1] = n
-		rep.Counts[k] = c
-	}
-	if before.ExpectedOwner != after.ExpectedOwner {
-		add("owner_changed", "", "", "the expected owner changed from "+before.ExpectedOwner+" to "+after.ExpectedOwner)
-	}
+// CompareOptions configure Compare.
+type CompareOptions struct {
+	// Reconciled are the records ("<store>/<id>") and files ("<root>/<path>")
+	// that may differ between the two inventories, because a recorded step
+	// changed them (a transition's journal). Nothing else may.
+	Reconciled map[string]bool
+}
 
+// Compare is the transition gate. It compares the inventory taken at the
+// freeze point with the one taken after the transition, before dispatch
+// resumes: nothing may be missing, added or changed. Every retained record
+// must keep its canonical digest, and every file that is not operational
+// its bytes, link and permission bits (where both scans have them), unless
+// opts.Reconciled names it; even a reconciled record keeps its class and
+// owner. Nothing about which changes are harmless is inferred.
+func Compare(before, after *Inventory, opts CompareOptions) *Report {
+	rep, add := newReport(before, after)
+	later := map[string]*Record{}
+	for i := range after.Records {
+		r := &after.Records[i]
+		later[r.Store+"/"+r.ID] = r
+	}
+	earlier := map[string]bool{}
+	for i := range before.Records {
+		b := &before.Records[i]
+		key := b.Store + "/" + b.ID
+		earlier[key] = true
+		a := later[key]
+		switch {
+		case a == nil:
+			add("record_missing", b.Class, key, "the record is no longer present")
+			continue
+		case a.SHA256 == b.SHA256:
+			continue
+		}
+		rep.Changed = append(rep.Changed, key)
+		switch {
+		case a.Class != b.Class:
+			add("class_changed", b.Class, key, "the record changed from a "+b.Class+" to a "+a.Class)
+		case a.Owner != b.Owner:
+			add("owner_changed", b.Class, key, "the record's owner changed from "+b.Owner+" to "+a.Owner)
+		case !opts.Reconciled[key]:
+			add("record_changed", b.Class, key, "the record changed from "+b.SHA256+" to "+a.SHA256+" and no recorded step changed it")
+		}
+	}
+	for i := range after.Records {
+		r := &after.Records[i]
+		if key := r.Store + "/" + r.ID; !earlier[key] {
+			rep.Added = append(rep.Added, key)
+			if !opts.Reconciled[key] {
+				add("record_added", r.Class, key, "the record was added and no recorded step added it")
+			}
+		}
+	}
+	compareFiles(before, after, rep, add, func(b, a File, key string) {
+		if !opts.Reconciled[key] {
+			add("file_changed", "file", key, fmt.Sprintf("the file changed from %s mode %o to %s mode %o and no recorded step changed it", b.SHA256, b.Mode, a.SHA256, a.Mode))
+		}
+	}, func(f File, key string) {
+		if !opts.Reconciled[key] {
+			add("file_added", "file", key, "the file was added and no recorded step added it")
+		}
+	})
+	sortReport(rep)
+	return rep
+}
+
+// CompareProgress reports what changed between an earlier inventory and a
+// later one while the installation was in use, such as a test snapshot and
+// the latest freeze point, so the additions can be reconciled. It blocks
+// only what it can tell is a loss: a missing record or retained file, a
+// changed immutable record or file, a shrunken run or log file, a job that
+// lost its identity, versions, committed history, live entries, decision
+// keys or unresolved intents, or went backward. It is not a preservation
+// proof for mutable state; Compare at the freeze point is.
+func CompareProgress(before, after *Inventory) *Report {
+	rep, add := newReport(before, after)
 	later := map[string]*Record{}
 	laterRegistry := map[string]*Record{}
 	for i := range after.Records {
@@ -88,6 +142,7 @@ func Compare(before, after *Inventory) *Report {
 			compareJob(b, a, key, add)
 			compareChains(b, a, key, laterRegistry, add)
 			compareLive(b, a, key, laterJobEntities, add)
+			compareIntents(b, a, key, add)
 		}
 	}
 	for i := range after.Records {
@@ -96,7 +151,43 @@ func Compare(before, after *Inventory) *Report {
 			rep.Added = append(rep.Added, key)
 		}
 	}
+	compareFiles(before, after, rep, add, func(b, a File, key string) {
+		switch {
+		case b.Policy == PolicyImmutable:
+			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
+		case a.Size < b.Size:
+			// Run status and logs only grow; a shorter file lost content.
+			add("file_truncated", "file", key, fmt.Sprintf("the retained file shrank from %d to %d bytes", b.Size, a.Size))
+		}
+	}, func(File, string) {})
+	sortReport(rep)
+	return rep
+}
 
+func newReport(before, after *Inventory) (*Report, func(code, class, id, detail string)) {
+	rep := &Report{Before: before.Digest, After: after.Digest, Counts: map[string][2]int{}}
+	add := func(code, class, id, detail string) {
+		rep.Issues = append(rep.Issues, Issue{Code: code, Severity: SeverityBlock, Class: class, ID: id, Detail: detail})
+	}
+	for k, n := range before.Counts {
+		c := rep.Counts[k]
+		c[0] = n
+		rep.Counts[k] = c
+	}
+	for k, n := range after.Counts {
+		c := rep.Counts[k]
+		c[1] = n
+		rep.Counts[k] = c
+	}
+	if before.ExpectedOwner != after.ExpectedOwner {
+		add("owner_changed", "", "", "the expected owner changed from "+before.ExpectedOwner+" to "+after.ExpectedOwner)
+	}
+	return rep, add
+}
+
+// compareFiles reports missing retained files, and hands each changed and
+// each added file that is not operational to changed and added.
+func compareFiles(before, after *Inventory, rep *Report, add func(code, class, id, detail string), changed func(b, a File, key string), added func(f File, key string)) {
 	// Modes are compared only when both scans had permission bits.
 	modes := before.ModeBits && after.ModeBits
 	laterFiles := map[string]File{}
@@ -107,29 +198,31 @@ func Compare(before, after *Inventory) *Report {
 	for _, b := range before.Files {
 		key := b.Root + "/" + b.Path
 		earlierFiles[key] = true
+		if b.Policy == PolicyOperational {
+			continue
+		}
 		a, ok := laterFiles[key]
 		switch {
-		case b.Policy == PolicyOperational:
-			continue
 		case !ok:
 			add("file_missing", "file", key, "the retained file is no longer present")
-		case a.SHA256 == b.SHA256 && a.Link == b.Link && (b.Policy != PolicyImmutable || !modes || a.Mode == b.Mode):
-		case b.Policy == PolicyImmutable:
-			rep.Changed = append(rep.Changed, key)
-			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
+		case a.SHA256 == b.SHA256 && a.Link == b.Link && (!modes || a.Mode == b.Mode):
 		default:
 			rep.Changed = append(rep.Changed, key)
+			changed(b, a, key)
 		}
 	}
 	for _, f := range after.Files {
-		if key := f.Root + "/" + f.Path; !earlierFiles[key] {
+		if key := f.Root + "/" + f.Path; !earlierFiles[key] && f.Policy != PolicyOperational {
 			rep.Added = append(rep.Added, key)
+			added(f, key)
 		}
 	}
+}
+
+func sortReport(rep *Report) {
 	sort.Strings(rep.Added)
 	sort.Strings(rep.Changed)
 	sortIssues(rep.Issues)
-	return rep
 }
 
 // compareJob checks that a job aggregate kept its identity and moved
@@ -243,4 +336,24 @@ func committedEntities(records map[string]*Record) map[string]bool {
 		}
 	}
 	return out
+}
+
+// compareIntents checks that an intent whose action was unresolved is not
+// dropped while that action is still held unresolved: the intent is what
+// stops a later episode from starting the same effect again.
+func compareIntents(b, a *Record, key string, add func(code, class, id, detail string)) {
+	held := map[string]bool{}
+	for _, r := range a.Refs {
+		if strings.HasPrefix(r.Rel, "intent:") {
+			held[r.Rel] = true
+		}
+	}
+	for _, r := range b.Refs {
+		if !strings.HasPrefix(r.Rel, "intent:") || held[r.Rel] {
+			continue
+		}
+		if st := a.Attrs["action_state:"+r.ID]; st == "executing" || st == "uncertain" {
+			add("live_entry_lost", ClassJob, key, "the job's "+r.Rel+" was dropped while its action "+r.ID+" is still "+st)
+		}
+	}
 }

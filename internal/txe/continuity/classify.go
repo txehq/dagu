@@ -310,6 +310,7 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 			b.block("id_mismatch", "action %s is held as %s", a.ActionID, id)
 		}
 		b.define(KindAction, id)
+		b.attr("action_state:"+id, string(a.State))
 		actionRefs(b, a)
 	}
 	for id, e := range j.Exceptions {
@@ -358,7 +359,7 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 			b.block("corrupt_entry", "intent %s is null", key)
 			continue
 		}
-		b.ref("intent", KindAction, in.ActionID)
+		b.ref("intent:"+key, KindAction, in.ActionID)
 	}
 	if j.Checkpoint.LastReviewID != "" {
 		b.ref("checkpoint_review", KindReview, j.Checkpoint.LastReviewID)
