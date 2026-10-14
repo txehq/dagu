@@ -246,6 +246,11 @@ func (a *API) workspaceFilterForContext(ctx context.Context) *workspace.Workspac
 	if a.authService == nil {
 		return nil
 	}
+	if a.txeNativeOwnerOnly(ctx) {
+		// Held to its owner: a list shows only what a list filters by
+		// owner itself.
+		return txeNothingFilter()
+	}
 	user, ok := auth.UserFromContext(ctx)
 	if !ok {
 		return &workspace.WorkspaceFilter{Enabled: true}
@@ -413,19 +418,19 @@ func (a *API) requireDAGRunVisible(ctx context.Context, dagRun ir.DAGRunRef) err
 	if err != nil {
 		return err
 	}
-	return a.requireWorkspaceVisible(ctx, workspaceName)
+	return a.requireNamedDAGVisible(ctx, dagRun.Name, workspaceName)
 }
 
 func (a *API) requireDAGRunStatusVisible(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil
 	}
-	return a.requireWorkspaceVisible(ctx, statusWorkspaceName(status))
+	return a.requireNamedDAGVisible(ctx, txeNativeOwnerDAG(status), statusWorkspaceName(status))
 }
 
 func (a *API) requireDAGRunStatusExecute(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil
 	}
-	return a.requireExecuteForWorkspace(ctx, statusWorkspaceName(status))
+	return a.requireNamedDAGExecute(ctx, txeNativeOwnerDAG(status), statusWorkspaceName(status))
 }

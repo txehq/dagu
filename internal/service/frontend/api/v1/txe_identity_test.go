@@ -112,11 +112,18 @@ func TestTxeIdentityOverHTTP(t *testing.T) {
 	require.Equal(t, api.TxeIdentityStateUnbound, got.State)
 	require.Empty(t, got.Owners)
 
-	// Every route outside /txe refuses it, the native ones included, so it
-	// inherits no global access.
-	for _, path := range []string{"/api/v1/dags", "/api/v1/dag-runs", "/api/v1/users", "/api/v1/queues", "/api/v1/workers"} {
+	// Routes that do not answer by owner refuse it outright, so it inherits
+	// no global access.
+	for _, path := range []string{"/api/v1/users", "/api/v1/workers", "/api/v1/audit", "/api/v1/settings/base-config"} {
 		server.Client().Get(path).WithBearerToken(tok).ExpectStatus(http.StatusForbidden).Send(t)
 	}
+	// The native lists answer by owner: an unbound token sees nothing.
+	var dags api.ListDAGs200JSONResponse
+	server.Client().Get("/api/v1/dags").WithBearerToken(tok).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &dags)
+	require.Empty(t, dags.Dags)
+	var runs api.ListDAGRuns200JSONResponse
+	server.Client().Get("/api/v1/dag-runs").WithBearerToken(tok).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &runs)
+	require.Empty(t, runs.DagRuns)
 	// On /txe it acts for nobody: it sees nothing and may change nothing.
 	var jobs api.ListTxeJobs200JSONResponse
 	server.Client().Get("/api/v1/txe/jobs").WithBearerToken(tok).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &jobs)
@@ -140,7 +147,7 @@ func TestTxeCliAuthDiscovery(t *testing.T) {
 	server := setupProviderTokenServer(t)
 	var got api.TxeCliAuth
 	server.Client().Get("/api/v1/txe/auth/cli").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &got)
-	require.Equal(t, api.TxeCliAuth{Contract: 1, Issuer: providerIssuer, ClientId: providerCLI, Scopes: []string{"openid"}, Use: "txe"}, got)
+	require.Equal(t, api.TxeCliAuth{Contract: 1, Issuer: providerIssuer, ClientId: providerCLI, Scopes: []string{"openid"}, Use: "all"}, got)
 
 	// A hub that accepts no provider tokens says so.
 	plain := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {

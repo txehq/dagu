@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 // DecideTxeProposal records a human decision on one proposal. The decision is
@@ -345,6 +346,11 @@ func (a *API) txeDecisionActor(ctx context.Context, in *api.TxeActor) (registry.
 		return registry.Actor{}, errTxePersonAuthRequired
 	}
 	if _, apiKey := auth.APIKeyFromContext(ctx); apiKey {
+		return registry.Actor{}, errTxeDecisionNotHuman
+	}
+	if txeauth.Classify(ctx).Kind == txeauth.KindToken {
+		// A token carries a hub user on its way through the server; it is
+		// still an agent, never a person.
 		return registry.Actor{}, errTxeDecisionNotHuman
 	}
 	user, ok := auth.UserFromContext(ctx)
