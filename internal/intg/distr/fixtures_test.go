@@ -35,6 +35,8 @@ import (
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 type fixtureConfig struct {
@@ -52,6 +54,20 @@ type fixtureConfig struct {
 	staleHeartbeatThreshold time.Duration
 	staleLeaseThreshold     time.Duration
 	zombieDetectionInterval time.Duration
+	transportAuth           *transportAuthConfig
+}
+
+// transportAuthConfig makes the coordinator authenticate its callers: the
+// scheduler and the fixture present hub credentials, the worker its own.
+type transportAuthConfig struct {
+	serverOptions []grpc.ServerOption
+	hub           credentials.PerRPCCredentials
+	worker        credentials.PerRPCCredentials
+	workerID      string
+}
+
+func withTransportAuth(auth *transportAuthConfig) fixtureOption {
+	return func(c *fixtureConfig) { c.transportAuth = auth }
 }
 
 type procConfig struct {
@@ -139,11 +155,14 @@ func withZombieDetectionInterval(interval time.Duration) fixtureOption {
 }
 
 type testFixture struct {
-	t                   *testing.T
-	coord               *test.Coordinator
-	h                   intgharness.Harness
-	dagWrapper          *test.DAG
-	coordinatorClient   coordinator.Client
+	t                 *testing.T
+	coord             *test.Coordinator
+	h                 intgharness.Harness
+	dagWrapper        *test.DAG
+	coordinatorClient coordinator.Client
+	// workerClient, when set, is what workers use instead of
+	// coordinatorClient: their own credentials under transport auth.
+	workerClient        coordinator.Client
 	workerMaxActiveRuns int
 	workers             []*worker.Worker
 	scheduler           *scheduler.Scheduler
@@ -199,6 +218,9 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 	for _, mutate := range cfg.configMutators {
 		coordOpts = append(coordOpts, test.WithConfigMutator(mutate))
 	}
+	if cfg.transportAuth != nil {
+		coordOpts = append(coordOpts, test.WithCoordinatorServerOptions(cfg.transportAuth.serverOptions...))
+	}
 
 	coord := test.SetupCoordinator(t, coordOpts...)
 	coord.Config.Queues.Enabled = true
@@ -210,9 +232,16 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 		coordinatorClient:   coord.GetCoordinatorClient(t),
 		workerMaxActiveRuns: cfg.workerMaxActiveRuns,
 	}
+	if cfg.transportAuth != nil {
+		f.coordinatorClient = coord.GetCoordinatorClientWithCredentials(t, cfg.transportAuth.hub)
+		f.workerClient = coord.GetCoordinatorClientWithCredentials(t, cfg.transportAuth.worker)
+	}
 
 	for i := range cfg.workerCount {
 		workerID := fmt.Sprintf("worker-%d", i+1)
+		if cfg.transportAuth != nil && cfg.transportAuth.workerID != "" {
+			workerID = cfg.transportAuth.workerID
+		}
 		w := f.setupWorkerMode(workerID, cfg.workerLabels, cfg.workerBaseConfigPath, cfg.isolatedWorker, nil)
 		f.workers = append(f.workers, w)
 	}
@@ -273,9 +302,13 @@ func (f *testFixture) setupWorkerMode(
 		workerConfig = &cfgCopy
 	}
 
+	workerClient := f.coordinatorClient
+	if f.workerClient != nil {
+		workerClient = f.workerClient
+	}
 	handlerCfg := worker.RemoteTaskHandlerConfig{
 		WorkerID:          workerID,
-		CoordinatorClient: f.coordinatorClient,
+		CoordinatorClient: workerClient,
 		PeerConfig:        f.coord.Config.Core.Peer,
 		Config:            workerConfig,
 	}
@@ -285,7 +318,7 @@ func (f *testFixture) setupWorkerMode(
 		handlerCfg.ServiceRegistry = f.coord.ServiceRegistry
 	}
 
-	w := worker.NewWorker(workerID, f.workerMaxActiveRuns, f.coordinatorClient, labels, workerConfig)
+	w := worker.NewWorker(workerID, f.workerMaxActiveRuns, workerClient, labels, workerConfig)
 	w.SetHandler(worker.NewRemoteTaskHandler(handlerCfg))
 	if afterAckHook != nil {
 		w.SetAfterTaskAckHook(afterAckHook)
