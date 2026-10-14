@@ -23,9 +23,10 @@ vi.mock('@/hooks/api', () => ({
 // Who the hub takes the caller to be; unset is a caller that is not a person
 // signed in through the identity provider.
 const identity = vi.hoisted(() => ({
-  value: undefined as { is_person: boolean } | undefined,
+  value: undefined as unknown,
 }));
-vi.mock('@/features/txe/identity', () => ({
+vi.mock('@/features/txe/identity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/features/txe/identity')>()),
   useTxeIdentity: () => ({ identity: identity.value }),
 }));
 
@@ -178,7 +179,12 @@ describe('TxeInboxPage for a person with no jobs', () => {
   }
 
   it('tells a person where jobs will come from', async () => {
-    identity.value = { is_person: true };
+    // What the hub answers for a person bound to an owner with no jobs yet.
+    identity.value = {
+      principal: { class: 'person', shown: {} },
+      state: 'bound',
+      is_person: true,
+    };
     try {
       renderPage(noJobs());
       expect(await screen.findByTestId('txe-inbox-first')).toBeInTheDocument();

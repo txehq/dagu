@@ -18,7 +18,7 @@ import {
   useTxeApi,
 } from '@/features/txe/hooks';
 import { EmptyPrivateInbox } from '@/features/txe/components/identity/EmptyPrivateInbox';
-import { useTxeIdentity } from '@/features/txe/identity';
+import { isTxePerson, useTxeIdentity } from '@/features/txe/identity';
 import { buildInbox } from '@/features/txe/inbox';
 
 const CLOCK_TICK_MS = 15_000;
@@ -57,7 +57,7 @@ export default function TxeInboxPage(): React.ReactElement {
   );
   // A person with no jobs of their own, and none shared, is told where jobs
   // will come from rather than that nothing needs attention.
-  const noJobsYet = identity?.is_person === true && data?.jobs.length === 0;
+  const noJobsYet = isTxePerson(identity) && data?.jobs.length === 0;
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4">

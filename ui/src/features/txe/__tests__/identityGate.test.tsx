@@ -57,7 +57,9 @@ function identity(overrides: Partial<TxeIdentity>): TxeIdentity {
     owners: [],
     scope: { kind: TxeIdentityScopeKind.unbound, unbound_reason: 'unbound' },
     platform_admin: false,
-    is_person: true,
+    // The hub answers is_person only for a person bound to an owner; a
+    // person who acts for nobody is still a person by class.
+    is_person: false,
     ...overrides,
   };
 }
@@ -145,6 +147,7 @@ describe('TxePersonGate', () => {
         state: TxeIdentityState.bound,
         owners: [{ owner_id: 'own_a', display_name: 'Ada' }],
         scope: { kind: TxeIdentityScopeKind.owner },
+        is_person: true,
       })
     );
     renderGate();
