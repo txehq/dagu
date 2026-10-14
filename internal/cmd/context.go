@@ -570,9 +570,17 @@ func hubCoordinatorCredentials(cfg *config.Config) (credentials.PerRPCCredential
 	return transportauth.NewHubCredentials(key), nil
 }
 
+// SubWorkflowRunnerFactory runs child workflows of a run this process
+// executes. A child dispatched to a worker goes through a dispatcher that
+// presents the hub key, as NewCoordinatorClient does.
 func (c *Context) SubWorkflowRunnerFactory() func(context.Context) (runtimeexec.SubWorkflowRunner, error) {
+	creds, err := hubCoordinatorCredentials(c.Config)
+	if err != nil {
+		return func(context.Context) (runtimeexec.SubWorkflowRunner, error) { return nil, err }
+	}
 	stores := c.runtimeStores()
 	return coordinator.NewSubWorkflowRunnerFactory(coordinator.SubWorkflowRunnerConfig{
+		Credentials:        creds,
 		DAGRunMgr:          c.DAGRunMgr,
 		DAGRepository:      c.Persistence.DAGRepository,
 		DAGRunRepository:   c.Persistence.DAGRunRepository,

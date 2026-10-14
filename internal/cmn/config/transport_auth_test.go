@@ -95,15 +95,17 @@ func TestLoad_TransportAuthEmptyEnvIsRefused(t *testing.T) {
 }
 
 func TestLoad_TransportAuthIsReadForTheServicesThatUseIt(t *testing.T) {
-	yaml := "coordinator:\n  auth:\n    mode: enforce\nworker:\n  auth:\n    credential_file: /etc/dagu/machine.json\n"
+	credential := filepath.Join(t.TempDir(), "machine.json")
+	yaml := "coordinator:\n  auth:\n    mode: enforce\nworker:\n  auth:\n    credential_file: " + credential + "\n"
 
 	// The hub's processes read the coordinator's mode, to know whether to
-	// present the hub key.
-	for _, service := range []Service{ServiceCoordinator, ServiceServer, ServiceScheduler} {
+	// present the hub key; so does a run the hub starts, for the child
+	// workflows it dispatches.
+	for _, service := range []Service{ServiceCoordinator, ServiceServer, ServiceScheduler, ServiceAgent} {
 		cfg := loadFromYAMLForService(t, service, yaml)
 		assert.Equal(t, TXEAuthzModeEnforce, cfg.Coordinator.Auth.Mode, service)
 		assert.Empty(t, cfg.Worker.Auth.CredentialFile, service)
 	}
 	cfg := loadFromYAMLForService(t, ServiceWorker, yaml)
-	assert.Equal(t, "/etc/dagu/machine.json", cfg.Worker.Auth.CredentialFile)
+	assert.Equal(t, credential, cfg.Worker.Auth.CredentialFile)
 }

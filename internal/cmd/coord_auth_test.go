@@ -108,6 +108,11 @@ func (s *authTestCoordinator) Heartbeat(ctx context.Context, _ *coordinatorv1.He
 	return &coordinatorv1.HeartbeatResponse{}, nil
 }
 
+func (s *authTestCoordinator) GetDAGRunStatus(ctx context.Context, _ *coordinatorv1.GetDAGRunStatusRequest) (*coordinatorv1.GetDAGRunStatusResponse, error) {
+	s.record(ctx)
+	return &coordinatorv1.GetDAGRunStatusResponse{}, nil
+}
+
 func (s *authTestCoordinator) GetWorkers(ctx context.Context, _ *coordinatorv1.GetWorkersRequest) (*coordinatorv1.GetWorkersResponse, error) {
 	s.record(ctx)
 	return &coordinatorv1.GetWorkersResponse{}, nil
@@ -177,7 +182,7 @@ func newAuthTestHub(t *testing.T, mode string) *authTestHub {
 	_, err = svc.Store().Enrol(ctx, scope, authz.EnrolmentRequest{MachineID: machine, Credential: credential})
 	require.NoError(t, err)
 
-	opts, err := coordinatorAuthOptions(ctx, cfg, txeauth.WithKeySource(p.keys()))
+	opts, err := coordinatorAuthOptions(ctx, cfg, "127.0.0.1", txeauth.WithKeySource(p.keys()))
 	require.NoError(t, err)
 	require.Len(t, opts, 2)
 
@@ -254,7 +259,7 @@ func TestCoordinatorAuthOffInstallsNothingAndSendsNothing(t *testing.T) {
 		cfg := &config.Config{}
 		cfg.Paths.DataDir = t.TempDir()
 		cfg.Coordinator.Auth.Mode = mode
-		opts, err := coordinatorAuthOptions(context.Background(), cfg)
+		opts, err := coordinatorAuthOptions(context.Background(), cfg, "dagu-hub.example")
 		require.NoError(t, err)
 		assert.Nil(t, opts)
 		creds, err := hubCoordinatorCredentials(cfg)
@@ -267,12 +272,34 @@ func TestCoordinatorAuthNeedsProviderTokenSettings(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Paths.DataDir = t.TempDir()
 	cfg.Coordinator.Auth.Mode = config.TXEAuthzModeEnforce
-	_, err := coordinatorAuthOptions(context.Background(), cfg)
+	_, err := coordinatorAuthOptions(context.Background(), cfg, "127.0.0.1")
 	require.ErrorContains(t, err, "txe.authn is not configured")
 
 	cfg.Paths.DataDir = ""
-	_, err = coordinatorAuthOptions(context.Background(), cfg)
+	_, err = coordinatorAuthOptions(context.Background(), cfg, "127.0.0.1")
 	require.ErrorContains(t, err, "data directory")
+}
+
+func TestCoordinatorAuthWithoutTLSNeedsALoopbackAdvertisement(t *testing.T) {
+	for _, mode := range []string{config.TXEAuthzModeObserve, config.TXEAuthzModeEnforce} {
+		cfg := &config.Config{}
+		cfg.Paths.DataDir = t.TempDir()
+		cfg.Coordinator.Auth.Mode = mode
+		for _, advertise := range []string{"", "dagu-hub", "dagu-hub.example", "10.0.0.7", "[::ffff:10.0.0.7]"} {
+			_, err := coordinatorAuthOptions(context.Background(), cfg, advertise)
+			require.ErrorContains(t, err, "loopback", "mode %s, advertise %q", mode, advertise)
+		}
+		// A loopback advertisement passes this check and fails on the
+		// next, the missing provider settings.
+		for _, advertise := range []string{"127.0.0.1", "localhost", "::1"} {
+			_, err := coordinatorAuthOptions(context.Background(), cfg, advertise)
+			require.ErrorContains(t, err, "txe.authn is not configured", advertise)
+		}
+		// With TLS the credential may go to a named host.
+		cfg.Core.Peer.CertFile, cfg.Core.Peer.KeyFile = "/etc/dagu/tls.crt", "/etc/dagu/tls.key"
+		_, err := coordinatorAuthOptions(context.Background(), cfg, "dagu-hub.example")
+		require.ErrorContains(t, err, "txe.authn is not configured")
+	}
 }
 
 func TestEnforcedCoordinatorLetsInTheHubAndTheEnrolledMachineOnly(t *testing.T) {
@@ -312,6 +339,25 @@ func TestEnforcedCoordinatorLetsInTheHubAndTheEnrolledMachineOnly(t *testing.T) 
 		// on disk; only the purpose differs. The worker presents nothing.
 		client := h.workerClient(t, "")
 		_, err := client.Heartbeat(ctx, heartbeat(h.machine))
+		assert.Equal(t, codes.Unauthenticated, grpcCode(t, err))
+	})
+
+	t.Run("a child workflow dispatched by a hub run", func(t *testing.T) {
+		// The dispatcher a run's child workflows go through, built as
+		// Context.SubWorkflowRunnerFactory builds it.
+		creds, err := hubCoordinatorCredentials(h.cfg)
+		require.NoError(t, err)
+		reg, err := coordinator.NewStaticRegistry([]string{h.addr})
+		require.NoError(t, err)
+		dispatcher, err := coordinator.NewRuntimeDispatcher(reg, h.cfg.Core.Peer, "", creds)
+		require.NoError(t, err)
+		_, err = dispatcher.GetDAGRunStatus(ctx, "child", "run-1", nil)
+		require.NoError(t, err)
+		assert.Equal(t, transportauth.CallerHub, h.service.last().Kind)
+
+		unauthenticated, err := coordinator.NewRuntimeDispatcher(reg, h.cfg.Core.Peer, "", nil)
+		require.NoError(t, err)
+		_, err = unauthenticated.GetDAGRunStatus(ctx, "child", "run-1", nil)
 		assert.Equal(t, codes.Unauthenticated, grpcCode(t, err))
 	})
 

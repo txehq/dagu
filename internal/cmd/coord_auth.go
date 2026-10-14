@@ -27,11 +27,22 @@ import (
 // (txe.authn) and found through its enrolment in the TXE owner store. The
 // hub's own processes present the hub key. Anything this cannot set up is an
 // error, so a coordinator asked to authenticate never starts without doing so.
-func coordinatorAuthOptions(ctx context.Context, cfg *config.Config, opts ...txeauth.Option) ([]grpc.ServerOption, error) {
+//
+// advertise is the address the coordinator registers for the hub's processes
+// and gives workers as its own. Without TLS a credential is sent only to a
+// loopback address, so that address must be one; otherwise every
+// authenticated call would fail in the client, observe mode included.
+func coordinatorAuthOptions(ctx context.Context, cfg *config.Config, advertise string, opts ...txeauth.Option) ([]grpc.ServerOption, error) {
 	if !cfg.Coordinator.Auth.Enabled() {
 		return nil, nil
 	}
 	mode := authz.Mode(cfg.Coordinator.Auth.Mode)
+	tls := cfg.Core.Peer.CertFile != "" && cfg.Core.Peer.KeyFile != ""
+	if !tls && !transportauth.IsLoopbackHost(advertise) {
+		return nil, fmt.Errorf("coordinator.auth.mode is %s without TLS, so credentials are sent only to a loopback address, "+
+			"but the coordinator advertises %q: set coordinator.advertise to 127.0.0.1 (workers reach it through a tunnel), "+
+			"or configure peer TLS", mode, advertise)
+	}
 	if cfg.Paths.DataDir == "" {
 		return nil, errors.New("coordinator.auth needs the data directory, where the TXE owner store and the hub key live")
 	}

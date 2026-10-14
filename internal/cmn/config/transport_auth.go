@@ -61,7 +61,7 @@ func (l *ConfigLoader) loadTransportAuthConfig(cfg *Config) error {
 		{SectionCoordinator, coordinatorAuthKey, []string{"mode", "hub_key_file"}, []string{coordinatorAuthModeEnv, coordinatorAuthHubKeyFileEnv}},
 		{SectionWorker, workerAuthKey, []string{"credential_file"}, []string{workerAuthCredentialFileEnv}},
 	} {
-		if !l.requires(s.requires) {
+		if !l.readsTransportAuth(s.requires) {
 			continue
 		}
 		for _, env := range s.envs {
@@ -80,7 +80,7 @@ func (l *ConfigLoader) loadTransportAuthConfig(cfg *Config) error {
 	}
 
 	var err error
-	if l.requires(SectionCoordinator) {
+	if l.readsTransportAuth(SectionCoordinator) {
 		if cfg.Coordinator.Auth.Mode, err = l.txeString(coordinatorAuthModeKey); err != nil {
 			return err
 		}
@@ -88,12 +88,23 @@ func (l *ConfigLoader) loadTransportAuthConfig(cfg *Config) error {
 			return err
 		}
 	}
-	if l.requires(SectionWorker) {
+	if l.readsTransportAuth(SectionWorker) {
 		if cfg.Worker.Auth.CredentialFile, err = l.txeString(workerAuthCredentialFileKey); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// readsTransportAuth reports whether this service reads the auth settings of
+// section. A run started by the hub (the agent service) reads the
+// coordinator's, because a child workflow it dispatches to a worker goes to
+// the coordinator with the hub key.
+func (l *ConfigLoader) readsTransportAuth(section ConfigSection) bool {
+	if section == SectionCoordinator && l.service == ServiceAgent {
+		return true
+	}
+	return l.requires(section)
 }
 
 // validateTransportAuth checks coordinator.auth and worker.auth.

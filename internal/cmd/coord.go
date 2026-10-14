@@ -192,7 +192,7 @@ func newCoordinator(
 		serverOpts = append(serverOpts, grpc.Creds(creds))
 	}
 
-	authOpts, err := coordinatorAuthOptions(ctx, cfg)
+	authOpts, err := coordinatorAuthOptions(ctx, cfg, advertiseAddr)
 	if err != nil {
 		return nil, nil, err
 	}

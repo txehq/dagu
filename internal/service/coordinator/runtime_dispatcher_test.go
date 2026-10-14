@@ -20,7 +20,7 @@ func TestNewRuntimeDispatcherValidatesPeerConfig(t *testing.T) {
 	registry, err := coord.NewStaticRegistry([]string{"127.0.0.1:50055"})
 	require.NoError(t, err)
 
-	dispatcher, err := coord.NewRuntimeDispatcher(registry, config.Peer{}, "")
+	dispatcher, err := coord.NewRuntimeDispatcher(registry, config.Peer{}, "", nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, coord.ErrMissingTLSConfig))
 	assert.Nil(t, dispatcher)
@@ -29,7 +29,7 @@ func TestNewRuntimeDispatcherValidatesPeerConfig(t *testing.T) {
 func TestNewRuntimeDispatcherAllowsMissingRegistry(t *testing.T) {
 	t.Parallel()
 
-	dispatcher, err := coord.NewRuntimeDispatcher(nil, config.Peer{}, "")
+	dispatcher, err := coord.NewRuntimeDispatcher(nil, config.Peer{}, "", nil)
 	require.NoError(t, err)
 	assert.Nil(t, dispatcher)
 }
@@ -44,7 +44,7 @@ func TestNewRuntimeDispatcherForwardsPeerRetryConfig(t *testing.T) {
 		Insecure:      true,
 		MaxRetries:    7,
 		RetryInterval: 3 * time.Second,
-	}, "")
+	}, "", nil)
 	require.NoError(t, err)
 	require.NotNil(t, dispatcher)
 
@@ -61,7 +61,7 @@ func TestNewRuntimeDispatcherSetsWorkspaceBundleDir(t *testing.T) {
 	require.NoError(t, err)
 
 	bundleDir := t.TempDir()
-	dispatcher, err := coord.NewRuntimeDispatcher(registry, config.Peer{Insecure: true}, bundleDir)
+	dispatcher, err := coord.NewRuntimeDispatcher(registry, config.Peer{Insecure: true}, bundleDir, nil)
 	require.NoError(t, err)
 	require.NotNil(t, dispatcher)
 
