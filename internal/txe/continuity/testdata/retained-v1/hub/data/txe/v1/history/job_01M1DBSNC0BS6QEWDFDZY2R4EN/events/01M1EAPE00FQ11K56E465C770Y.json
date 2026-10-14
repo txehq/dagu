@@ -1,0 +1,13 @@
+{
+  "event_id": "evt_01M1EAPE00MEWC2E5J3GAV6EX2",
+  "job_id": "job_01M1DBSNC0BS6QEWDFDZY2R4EN",
+  "revision": 0,
+  "kind": "lifecycle",
+  "from": "paused",
+  "to": "active",
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "at": "2026-09-01T11:12:00Z"
+}

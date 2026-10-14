@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "issuer": "https://idp.fixture.invalid/realms/fixture",
+  "subject": "subject-other-person",
+  "shown": {
+    "username": "connor",
+    "email": "connor@fixture.invalid",
+    "name": "Connor Wang"
+  },
+  "state": "pending",
+  "requested_at": "2026-09-01T12:12:00Z",
+  "generation": 1
+}

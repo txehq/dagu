@@ -1,0 +1,15 @@
+{
+  "event_id": "evt_01M1DF7H0098M1JJG5Q0DTHHX1",
+  "job_id": "job_01M1DF7H00NGK1RZKAZRJ7RE1V",
+  "revision": 2,
+  "kind": "duplicate",
+  "to": "job_01M1DF7H006ATHSZ07P7D6W41F",
+  "reason": "job key already registered",
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T03:12:00Z",
+  "prev": "history/job_01M1DF7H00NGK1RZKAZRJ7RE1V/events/01M1DF7H00NQ3ZQ7SQJH36ZR60"
+}

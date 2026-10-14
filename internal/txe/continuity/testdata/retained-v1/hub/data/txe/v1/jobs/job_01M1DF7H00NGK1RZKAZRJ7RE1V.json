@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DF7H00NGK1RZKAZRJ7RE1V",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00RF3E96K5NYSBRS67",
+  "machine_id": "mch_01M1D47Z00RCYGHC03NAJJPKSW",
+  "revision": 2,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DF7H00NGK1RZKAZRJ7RE1V/versions/01M1DF7H00QJ1PY44BD6CZQEW9"
+  ],
+  "package_digest": "sha256:afaf81260065d02483a13d2a136aa24cdbf763b09c35ec93f39f224ede5d1dc7",
+  "dag_spec_sha256": "sha256:48c717b1508f61196a7872908dfcbf9cc26f0c2c44d34b9c02c844773c73175d",
+  "registration": {
+    "state": "duplicate",
+    "job_key": "collector-dup",
+    "dedupe_key": "c5fba7688b2564cd76a84b514e8ba35f8a24080c959846bf0c6f88d843153f64",
+    "request_id": "req-job_01M1DF7H00NGK1RZKAZRJ7RE1V",
+    "request_hash": "sha256:b753c4e83d7999795cf96f0bc02ecd6900d88b2db9ea750fd422945d70bb9d0b",
+    "duplicate_of": "job_01M1DF7H006ATHSZ07P7D6W41F",
+    "dag_verified": false
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1DF7H00NGK1RZKAZRJ7RE1V/events/01M1DF7H00DZ41R0SPGR8CPKT0"
+  },
+  "created": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

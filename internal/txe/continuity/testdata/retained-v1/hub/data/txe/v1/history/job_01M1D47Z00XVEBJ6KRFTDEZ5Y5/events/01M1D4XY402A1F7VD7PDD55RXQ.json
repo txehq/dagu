@@ -1,0 +1,26 @@
+{
+  "event_id": "evt_01M1D4XY40PXZK604PYFGCZVQM",
+  "job_id": "job_01M1D47Z00XVEBJ6KRFTDEZ5Y5",
+  "revision": 22,
+  "kind": "version",
+  "from": "1",
+  "to": "2",
+  "detail": "ended review claim clm_01M1D4BM60VP3JYR1ZGB0M0WEZ: it read version 1",
+  "affected": [
+    {
+      "proposal_id": "prp_01M1D47Z00AZ1V01NWN5B2DACX",
+      "disposition": "superseded"
+    },
+    {
+      "proposal_id": "prp_01M1D47Z00HQXD78C3WD5FCMXT",
+      "disposition": "superseded"
+    }
+  ],
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T00:12:00Z",
+  "prev": "history/job_01M1D47Z00XVEBJ6KRFTDEZ5Y5/events/01M1D47Z004EJWWGQ6VM8VQJSD"
+}

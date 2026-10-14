@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DWYZG08B0P2FKYQAQRYJM1",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "version": 1,
+  "title": "fixture job",
+  "purpose": "Exercise retained-data continuity",
+  "origin": {
+    "repo": "github.com/fixture/app",
+    "commit": "0000000000000000000000000000000000000000",
+    "session": "fixture-session"
+  },
+  "package": {
+    "digest": "sha256:f578a182aa0a9f30440dff08a122981cf395a52540036bdbde3f506c9dd28893",
+    "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-1851776116/root/machine/txe-dagu/packages/job_01M1DWYZG08B0P2FKYQAQRYJM1/sha256-f578a182aa0a9f30440dff08a122981cf395a52540036bdbde3f506c9dd28893",
+    "entrypoint": "run.sh"
+  },
+  "dag": {
+    "name": "job_01M1DWYZG08B0P2FKYQAQRYJM1",
+    "spec": "worker_selector:\n  txe.machine: mch_01M1D47Z00RCYGHC03NAJJPKSW\nsteps:\n  - name: run\n    run: ./run.sh\n",
+    "spec_sha256": "sha256:48c717b1508f61196a7872908dfcbf9cc26f0c2c44d34b9c02c844773c73175d"
+  },
+  "schedule": {
+    "cron": "*/30 * * * *",
+    "timezone": "Australia/Perth",
+    "missed_run": "skip"
+  },
+  "targets": [
+    {
+      "kind": "fixture.volume",
+      "environment": "dev",
+      "stable_id": {
+        "uid": "vol-gone"
+      },
+      "display_name": "fixture-gone"
+    }
+  ],
+  "expected_outcome": {
+    "success_criteria": [
+      "the fixture volume is healthy"
+    ]
+  },
+  "lifetime": {},
+  "retirement_rules": {
+    "on_target_deleted": "retire",
+    "on_replacement": "review",
+    "on_completion": "retire",
+    "active_run_policy": "finish"
+  },
+  "review_policy": {
+    "max_attempts": 2,
+    "brief": "Review the fixture results.",
+    "permitted_actions": [
+      {
+        "name": "diagnose",
+        "idempotency": "read_only",
+        "timeout_sec": 60,
+        "routine": true
+      },
+      {
+        "name": "restart",
+        "idempotency": "none",
+        "timeout_sec": 60,
+        "routine": true
+      },
+      {
+        "name": "resize",
+        "timeout_sec": 120,
+        "routine": false
+      }
+    ]
+  },
+  "created": {
+    "at": "2026-09-01T07:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

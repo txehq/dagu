@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "entrypoint": [
+    "run.sh"
+  ],
+  "files": [
+    {
+      "path": "run.sh",
+      "size": 26,
+      "sha256": "sha256:c0b28a1eea082ce05c1d033068697bb85bdc0b069d4327f899c8ebe2f8213b90",
+      "executable": true
+    }
+  ],
+  "content_sha256": "c0b28a1eea082ce05c1d033068697bb85bdc0b069d4327f899c8ebe2f8213b90",
+  "provenance": {
+    "repository": "github.com/fixture/app",
+    "source_root": "/fixture/src",
+    "session": "fixture-session"
+  }
+}

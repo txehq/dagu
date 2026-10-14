@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1E78JC0AZSZCMGYPJCDGZC2",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00RF3E96K5NYSBRS67",
+  "machine_id": "mch_01M1D47Z00SAH7PQA5GRP0KWJH",
+  "revision": 2,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1E78JC0AZSZCMGYPJCDGZC2/versions/01M1E78JC0BD7C82K1EB4KD1CQ"
+  ],
+  "package_digest": "sha256:8a7b8971b46f15f6bd629a38a88d0b5be68ddc30148e83e961072b4bfb2edf6e",
+  "dag_spec_sha256": "sha256:4ed803453614afde613ed31898e5de28a34c54334a225c01a74241b4bd93e7cd",
+  "registration": {
+    "state": "ready",
+    "job_key": "linux-worker-job",
+    "dedupe_key": "4389a5f1120f519f04eb0368322f16311e2189338676a5ef93ce2bd636b10b34",
+    "request_id": "req-job_01M1E78JC0AZSZCMGYPJCDGZC2",
+    "request_hash": "sha256:4b3909d8d1a6253712af66a16316158ea465f6546153aa374db51fb41a66e58f",
+    "package": {
+      "digest": "sha256:8a7b8971b46f15f6bd629a38a88d0b5be68ddc30148e83e961072b4bfb2edf6e",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-1851776116/root/machine/txe-dagu/packages/job_01M1E78JC0AZSZCMGYPJCDGZC2/sha256-8a7b8971b46f15f6bd629a38a88d0b5be68ddc30148e83e961072b4bfb2edf6e",
+      "machine_id": "mch_01M1D47Z00SAH7PQA5GRP0KWJH",
+      "asserted_at": "2026-09-01T10:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T10:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1E78JC0AZSZCMGYPJCDGZC2/events/01M1E78JC0PWGQW1SHEHEE4EZX"
+  },
+  "created": {
+    "at": "2026-09-01T10:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T10:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

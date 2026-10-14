@@ -1,0 +1,15 @@
+{
+  "decision_id": "dec_01M1D47Z006GQ5DNX1YAXMCE72",
+  "proposal_id": "prp_01M1D47Z005YGTRFQ0ZPWF7251",
+  "proposal_revision": 1,
+  "binding_digest": "sha256:179f5916aeb5447f35efbfc21e51cf2ed39a7cd2603d77bda99bb24815416942",
+  "verdict": "redirect",
+  "instructions": "Check the exporter's config first.",
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "decided_at": "2026-09-01T00:00:00Z",
+  "idempotency_key": "key-prp_01M1D47Z005YGTRFQ0ZPWF7251-redirect",
+  "prev": "history/job_01M1D47Z00XVEBJ6KRFTDEZ5Y5/decisions/01M1D47Z009WWMNJVXG3CBC41G"
+}

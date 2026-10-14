@@ -1,0 +1,30 @@
+{
+  "hub_mount": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-1851776116/root/hub/data",
+  "counts": {
+    "action": 2,
+    "artifact_manifest": 1,
+    "binding": 1,
+    "binding_request": 2,
+    "decision": 4,
+    "dedupe": 14,
+    "event": 40,
+    "execution_evidence": 1,
+    "file:hub-dags": 14,
+    "file:hub-data": 8,
+    "file:laptop-home": 35,
+    "job": 15,
+    "machine": 2,
+    "machine_identity": 1,
+    "owner": 1,
+    "package": 16,
+    "project": 2,
+    "project_key": 2,
+    "proposal": 6,
+    "resource_event": 1,
+    "resource_id": 16,
+    "resource_index_ready": 1,
+    "resource_name": 15,
+    "review": 1,
+    "version": 17
+  }
+}

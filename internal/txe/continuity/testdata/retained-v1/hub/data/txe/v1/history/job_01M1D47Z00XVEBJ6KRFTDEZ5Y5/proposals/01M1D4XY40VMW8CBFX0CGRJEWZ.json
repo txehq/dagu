@@ -1,0 +1,34 @@
+{
+  "proposal_id": "prp_01M1D47Z00HQXD78C3WD5FCMXT",
+  "job_version": 1,
+  "package_digest": "sha256:18040f22dfa183a1eb4b0c1c8fb602048daada31fe01142c98e96ac820b0bd74",
+  "question": "Archive last month?",
+  "rationale": "fixture",
+  "evidence": {},
+  "action": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:179f5916aeb5447f35efbfc21e51cf2ed39a7cd2603d77bda99bb24815416942",
+  "revision": 2,
+  "state": "superseded",
+  "reasoning": "job version changed",
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "prev": "history/job_01M1D47Z00XVEBJ6KRFTDEZ5Y5/proposals/01M1D4XY404HQBZCM2E3JEK00N"
+}

@@ -1,0 +1,20 @@
+{
+  "event_id": "evt_01M1DWYZG09PDXBMVT6C4BN384",
+  "job_id": "job_01M1DWYZG08B0P2FKYQAQRYJM1",
+  "revision": 3,
+  "kind": "lifecycle",
+  "from": "active",
+  "to": "retired",
+  "reason": "target_deleted",
+  "detail": "target fixture.volume fixture-gone {uid=vol-gone} deleted",
+  "evidence": [
+    "resource_event:evt_01M1DWYZG0EN2BWEW9QEKMD8CR",
+    "fixture: NotFound uid vol-gone"
+  ],
+  "actor": {
+    "kind": "reconciler",
+    "id": "fixture-reconciler"
+  },
+  "at": "2026-09-01T07:12:00Z",
+  "prev": "history/job_01M1DWYZG08B0P2FKYQAQRYJM1/events/01M1DWYZG0K9102XF530H41SEK"
+}

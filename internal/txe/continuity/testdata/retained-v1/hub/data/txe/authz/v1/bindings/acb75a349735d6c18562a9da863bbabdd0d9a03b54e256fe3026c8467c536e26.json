@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "issuer": "https://idp.fixture.invalid/realms/fixture",
+  "subject": "subject-owner",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "generation": 1,
+  "request_generation": 1,
+  "state": "active",
+  "bound": {
+    "at": "2026-09-01T12:13:00Z",
+    "by": {
+      "kind": "platform_admin",
+      "name": "fixture-admin"
+    }
+  },
+  "shown": {
+    "username": "owner",
+    "name": "Fixture Owner"
+  }
+}

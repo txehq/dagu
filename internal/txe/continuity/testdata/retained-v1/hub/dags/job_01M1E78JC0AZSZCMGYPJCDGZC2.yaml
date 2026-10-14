@@ -1,0 +1,5 @@
+worker_selector:
+  txe.machine: mch_01M1D47Z00SAH7PQA5GRP0KWJH
+steps:
+  - name: run
+    run: ./run.sh

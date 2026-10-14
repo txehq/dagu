@@ -1,0 +1,50 @@
+{
+  "proposal_id": "prp_01M1D47Z00AZ1V01NWN5B2DACX",
+  "job_version": 1,
+  "package_digest": "sha256:18040f22dfa183a1eb4b0c1c8fb602048daada31fe01142c98e96ac820b0bd74",
+  "question": "Rotate the logs?",
+  "rationale": "fixture",
+  "evidence": {},
+  "action": {
+    "name": "resize",
+    "params": {
+      "size": "20Gi"
+    }
+  },
+  "binding_digest": "sha256:179f5916aeb5447f35efbfc21e51cf2ed39a7cd2603d77bda99bb24815416942",
+  "revision": 3,
+  "state": "superseded",
+  "snooze_until": "2026-09-03T00:00:00Z",
+  "reasoning": "job version changed",
+  "decision": {
+    "decision_id": "dec_01M1D47Z00CJGJAQ8KZX62ZVVS",
+    "proposal_id": "prp_01M1D47Z00AZ1V01NWN5B2DACX",
+    "proposal_revision": 1,
+    "binding_digest": "sha256:179f5916aeb5447f35efbfc21e51cf2ed39a7cd2603d77bda99bb24815416942",
+    "verdict": "snooze",
+    "snooze_until": "2026-09-03T00:00:00Z",
+    "actor": {
+      "kind": "human",
+      "id": "fixture-person"
+    },
+    "decided_at": "2026-09-01T00:00:00Z",
+    "idempotency_key": "key-prp_01M1D47Z00AZ1V01NWN5B2DACX-snooze",
+    "prev": "history/job_01M1D47Z00XVEBJ6KRFTDEZ5Y5/decisions/01M1D47Z00BSCGVQ1SFNWBGBXP"
+  },
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T00:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "prev": "history/job_01M1D47Z00XVEBJ6KRFTDEZ5Y5/proposals/01M1D4BM60RC17SJZB6WAPM8RX"
+}

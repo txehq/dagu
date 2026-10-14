@@ -1,0 +1,14 @@
+{
+  "event_id": "evt_01M1E0CV40R2VPHAPKAB5YPWX0",
+  "job_id": "job_01M1E0CV40NCVY6KQMFRPZYAYY",
+  "revision": 1,
+  "kind": "registered",
+  "to": "incomplete",
+  "detail": "job key superseded",
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T08:12:00Z"
+}
