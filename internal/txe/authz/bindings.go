@@ -6,6 +6,7 @@ package authz
 import (
 	"context"
 	"encoding/json"
+	"slices"
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
@@ -107,6 +108,22 @@ func (s *Store) PendingRequest(ctx context.Context, id authn.Identity) (*Binding
 // Approving for a different owner while a binding stands is refused with
 // CodeConflict and changes nothing.
 func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity, ownerID string) (*Binding, error) {
+	return s.approveBinding(ctx, by, id, ownerID, 0)
+}
+
+// ApproveBindingRequest is ApproveBinding for one request: the approval
+// names the generation of the request the administrator read, and is
+// refused with CodeConflict if the identity's request is now another one.
+// A request the identity made after the administrator looked is therefore
+// never consumed by that approval.
+func (s *Store) ApproveBindingRequest(ctx context.Context, by Scope, id authn.Identity, ownerID string, requestGeneration int) (*Binding, error) {
+	if requestGeneration < 1 {
+		return nil, refuse(CodeInvalid, "the request generation is required")
+	}
+	return s.approveBinding(ctx, by, id, ownerID, requestGeneration)
+}
+
+func (s *Store) approveBinding(ctx context.Context, by Scope, id authn.Identity, ownerID string, requestGeneration int) (*Binding, error) {
 	if by.Kind() != ScopePlatformAdmin {
 		return nil, refuse(CodeForbidden, "only the platform administrator binds an identity to an owner")
 	}
@@ -129,6 +146,9 @@ func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity,
 			return nil, err
 		}
 		if found && current.State == StateActive {
+			if requestGeneration != 0 && current.RequestGeneration != requestGeneration {
+				return nil, &Error{Code: CodeConflict, Message: "the identity is bound by another request", Current: &current}
+			}
 			if current.OwnerID != ownerID {
 				return nil, &Error{
 					Code:    CodeConflict,
@@ -155,6 +175,9 @@ func (s *Store) ApproveBinding(ctx context.Context, by Scope, id authn.Identity,
 		}
 		if !requested || (found && current.RequestGeneration >= request.Generation) {
 			return nil, refuse(CodeNotFound, "the identity has no unused binding request; it must sign in and ask first")
+		}
+		if requestGeneration != 0 && request.Generation != requestGeneration {
+			return nil, &Error{Code: CodeConflict, Message: "the identity's binding request has changed since it was read", Current: &request}
 		}
 
 		next := Binding{
@@ -314,4 +337,40 @@ func (s *Store) each(ctx context.Context, prefix string, fn func(data []byte) er
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// PendingRequests returns every binding request no binding has consumed,
+// oldest first, for the platform administrator to decide.
+func (s *Store) PendingRequests(ctx context.Context) ([]*BindingRequest, error) {
+	var all []*BindingRequest
+	err := s.each(ctx, requestsPrefix, func(data []byte) error {
+		var request BindingRequest
+		if err := json.Unmarshal(data, &request); err != nil {
+			return err
+		}
+		all = append(all, &request)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []*BindingRequest
+	for _, request := range all {
+		pending, err := s.PendingRequest(ctx, authn.Identity{Issuer: request.Issuer, Subject: request.Subject})
+		if err != nil {
+			return nil, err
+		}
+		if pending != nil {
+			out = append(out, pending)
+		}
+	}
+	slices.SortStableFunc(out, func(a, b *BindingRequest) int { return a.RequestedAt.Compare(b.RequestedAt) })
+	return out, nil
+}
+
+// BindingID is the opaque id a binding is named by outside this package. It
+// is derived from the identity, so it names the identity's one binding
+// record, whatever its generation.
+func BindingID(id authn.Identity) string {
+	return identityDigest(id)
 }

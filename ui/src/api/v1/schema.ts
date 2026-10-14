@@ -3841,6 +3841,200 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/binding-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List binding requests
+         * @description The binding requests no binding has used, oldest first. Platform administrator only.
+         */
+        get: operations["listTxeBindingRequests"];
+        put?: never;
+        /**
+         * Ask to be bound to an owner
+         * @description Records that the person signed in asks to be bound. Only a person signed in through the browser may ask, for their own identity; a token of any class is refused. It grants nothing. Asking again while pending returns the same request.
+         */
+        post: operations["requestTxeBinding"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/owners/{ownerId}/bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List an owner's bindings
+         * @description The identities bound to the owner, revoked ones included. The platform administrator, or a person of that owner.
+         */
+        get: operations["listTxeOwnerBindings"];
+        put?: never;
+        /**
+         * Bind an identity to an owner
+         * @description Approves the identity's pending request for an existing owner. Platform administrator only. The request generation must be the one the administrator read. No owner is created here.
+         */
+        post: operations["approveTxeBinding"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/owners/{ownerId}/bindings/{bindingId}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+                bindingId: components["parameters"]["TxeBindingId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a binding
+         * @description Ends a binding from the next request on, and every machine enrolled under it. Platform administrator only.
+         */
+        post: operations["revokeTxeBinding"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/shares": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the caller's shares
+         * @description Shares the caller's owner has granted and received, revoked ones included.
+         */
+        get: operations["listTxeShares"];
+        put?: never;
+        /**
+         * Share a job or project
+         * @description Lets another owner, named by its exact owner id, use one job or project with the named permissions. A person of the resource's owner only. administer is never shared, and nothing is shared with a machine.
+         */
+        post: operations["grantTxeShare"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/shares/{shareId}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                shareId: components["parameters"]["TxeShareId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a share
+         * @description Ends a share from the next request on. A person of the granting owner.
+         */
+        post: operations["revokeTxeShare"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/machines/{machineId}/enrolment-applications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a machine's enrolment applications
+         * @description A person of the machine's owner.
+         */
+        get: operations["listTxeEnrolmentApplications"];
+        put?: never;
+        /**
+         * Apply to enrol this machine
+         * @description Called by the machine with the token of its own worker or reviewer client, whose identity must be bound to the machine's owner; any other machine is not found. Records the application with the credential's expiry, and grants nothing. The machine applies again, at most every minute, to keep a live credential on file until its owner approves.
+         */
+        post: operations["applyTxeEnrolment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/machines/{machineId}/enrolments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List a machine's enrolments
+         * @description The machine's owner (a person or its CLI), or the platform administrator.
+         */
+        get: operations["listTxeEnrolments"];
+        put?: never;
+        /**
+         * Enrol a machine from its application
+         * @description A person of the machine's owner approves the application of one class and client. 409 credential_stale when the application's credential has expired: the machine applies again.
+         */
+        post: operations["enrolTxeMachine"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/machines/{machineId}/enrolments/{class}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+                class: components["parameters"]["TxeEnrolmentClass"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a machine's enrolment
+         * @description Ends one class of the machine's enrolment from the next request on. A person of the machine's owner, or the platform administrator.
+         */
+        post: operations["revokeTxeEnrolment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/installation": {
         parameters: {
             query?: never;
@@ -8119,6 +8313,139 @@ export interface components {
             requested_at: string;
             generation: number;
         };
+        /** @description Who made an access change: the platform administrator by account name, or a person by issuer and subject. */
+        TxeAccessActor: {
+            /** @enum {string} */
+            kind: TxeAccessActorKind;
+            name?: string;
+            issuer?: string;
+            subject?: string;
+            owner_id?: string;
+        };
+        TxeAccessStamp: {
+            /** Format: date-time */
+            at: string;
+            by: components["schemas"]["TxeAccessActor"];
+        };
+        TxeAccessRevocation: {
+            /** Format: date-time */
+            at: string;
+            by: components["schemas"]["TxeAccessActor"];
+            reason: string;
+        };
+        TxeBindingRequest: {
+            issuer: string;
+            subject: string;
+            shown: components["schemas"]["TxeIdentityShown"];
+            /** @enum {string} */
+            state: TxeBindingRequestState;
+            /** Format: date-time */
+            requested_at: string;
+            generation: number;
+        };
+        TxeBindingRequestList: {
+            requests: components["schemas"]["TxeBindingRequest"][];
+        };
+        TxeBinding: {
+            /** @description Opaque; names the identity's one binding record. */
+            binding_id: string;
+            issuer: string;
+            subject: string;
+            owner_id: string;
+            generation: number;
+            request_generation: number;
+            /** @enum {string} */
+            state: TxeBindingState;
+            bound: components["schemas"]["TxeAccessStamp"];
+            shown: components["schemas"]["TxeIdentityShown"];
+            revoked?: components["schemas"]["TxeAccessRevocation"];
+        };
+        TxeBindingList: {
+            bindings: components["schemas"]["TxeBinding"][];
+        };
+        TxeBindingApproveRequest: {
+            issuer: string;
+            subject: string;
+            request_generation: number;
+        };
+        TxeRevokeRequest: {
+            reason: string;
+        };
+        TxeAccessResource: {
+            /** @enum {string} */
+            kind: TxeAccessResourceKind;
+            id: string;
+        };
+        /** @enum {string} */
+        TxeAccessPermission: TxeAccessPermission;
+        TxeShareGrantRequest: {
+            resource: components["schemas"]["TxeAccessResource"];
+            grantee_owner_id: string;
+            permissions: components["schemas"]["TxeAccessPermission"][];
+        };
+        TxeShare: {
+            share_id: string;
+            owner_id: string;
+            resource: components["schemas"]["TxeAccessResource"];
+            grantee: components["schemas"]["TxeIdentityOwner"];
+            permissions: components["schemas"]["TxeAccessPermission"][];
+            generation: number;
+            /** @enum {string} */
+            state: TxeShareState;
+            granted: components["schemas"]["TxeAccessStamp"];
+            revoked?: components["schemas"]["TxeAccessRevocation"];
+        };
+        TxeShareList: {
+            granted: components["schemas"]["TxeShare"][];
+            received: components["schemas"]["TxeShare"][];
+        };
+        TxeEnrolmentApplication: {
+            machine_id: string;
+            /** @enum {string} */
+            class: TxeEnrolmentApplicationClass;
+            issuer: string;
+            subject: string;
+            client_id: string;
+            /** Format: date-time */
+            received_at: string;
+            /** Format: date-time */
+            credential_expires: string;
+        };
+        TxeEnrolmentApplicationList: {
+            applications: components["schemas"]["TxeEnrolmentApplication"][];
+        };
+        /** @description The application to approve, and the identity read on it. If the application on file is now another identity's, the approval is refused with 409 conflict. */
+        TxeEnrolRequest: {
+            /** @enum {string} */
+            class: TxeEnrolRequestClass;
+            client_id: string;
+            issuer: string;
+            subject: string;
+        };
+        TxeEnrolment: {
+            machine_id: string;
+            /** @enum {string} */
+            class: TxeEnrolmentClass;
+            owner_id: string;
+            issuer: string;
+            subject: string;
+            client_id: string;
+            generation: number;
+            /** @enum {string} */
+            state: TxeEnrolmentState;
+            enrolled: components["schemas"]["TxeAccessStamp"];
+            revoked?: components["schemas"]["TxeAccessRevocation"];
+        };
+        TxeEnrolmentList: {
+            enrolments: components["schemas"]["TxeEnrolment"][];
+        };
+        /** @description How the caller reaches this job. A label for the UI; never an authority. */
+        TxeJobAccess: {
+            /** @enum {string} */
+            via: TxeJobAccessVia;
+            shared_by?: components["schemas"]["TxeIdentityOwner"];
+            permissions: components["schemas"]["TxeAccessPermission"][];
+        };
         TxeInstallation: {
             schema: number;
             owners: components["schemas"]["TxeOwner"][];
@@ -8549,6 +8876,7 @@ export interface components {
         };
         /** @description The job aggregate: every mutable fact about one job, changed only by atomic compare-and-swap */
         TxeJob: {
+            access?: components["schemas"]["TxeJobAccess"];
             schema: number;
             job_id: string;
             owner_id: string;
@@ -9047,6 +9375,9 @@ export interface components {
         Stream: components["schemas"]["Stream"];
         /** @description The unique identifier of the remote node */
         RemoteNodeId: string;
+        TxeBindingId: string;
+        TxeShareId: string;
+        TxeEnrolmentClass: ComponentsParametersTxeEnrolmentClass;
         TxeOwnerId: string;
         TxeProjectId: string;
         TxeMachineId: string;
@@ -22000,6 +22331,895 @@ export interface operations {
             };
         };
     };
+    listTxeBindingRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List binding requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeBindingRequestList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    requestTxeBinding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ask to be bound to an owner */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeBindingRequest"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeOwnerBindings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List an owner's bindings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeBindingList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    approveTxeBinding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeBindingApproveRequest"];
+            };
+        };
+        responses: {
+            /** @description Bind an identity to an owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeBinding"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeTxeBinding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ownerId: components["parameters"]["TxeOwnerId"];
+                bindingId: components["parameters"]["TxeBindingId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRevokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoke a binding */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeBinding"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeShares: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List the caller's shares */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeShareList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    grantTxeShare: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeShareGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Share a job or project */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeShare"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeTxeShare: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                shareId: components["parameters"]["TxeShareId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRevokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoke a share */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeShare"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeEnrolmentApplications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List a machine's enrolment applications */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEnrolmentApplicationList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    applyTxeEnrolment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Apply to enrol this machine */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEnrolmentApplication"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeEnrolments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List a machine's enrolments */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEnrolmentList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    enrolTxeMachine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeEnrolRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrol a machine from its application */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEnrolment"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeTxeEnrolment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                machineId: components["parameters"]["TxeMachineId"];
+                class: components["parameters"]["TxeEnrolmentClass"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRevokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoke a machine's enrolment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeEnrolment"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not allowed (details.code forbidden or unbound) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found, or not the caller's to see */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Refused against what is recorded (details.code conflict or credential_stale) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getTxeInstallation: {
         parameters: {
             query?: never;
@@ -25249,6 +26469,55 @@ export enum TxeIdentityRequestState {
     pending = "pending",
     approved = "approved"
 }
+export enum TxeAccessActorKind {
+    platform_admin = "platform_admin",
+    person = "person"
+}
+export enum TxeBindingRequestState {
+    pending = "pending",
+    approved = "approved"
+}
+export enum TxeBindingState {
+    active = "active",
+    revoked = "revoked"
+}
+export enum TxeAccessResourceKind {
+    job = "job",
+    project = "project"
+}
+export enum TxeAccessPermission {
+    view = "view",
+    author = "author",
+    execute = "execute",
+    approve = "approve",
+    administer = "administer"
+}
+export enum TxeShareState {
+    active = "active",
+    revoked = "revoked"
+}
+export enum TxeEnrolmentApplicationClass {
+    worker = "worker",
+    reviewer = "reviewer"
+}
+export enum TxeEnrolRequestClass {
+    worker = "worker",
+    reviewer = "reviewer"
+}
+export enum TxeEnrolmentClass {
+    worker = "worker",
+    reviewer = "reviewer"
+}
+export enum TxeEnrolmentState {
+    pending = "pending",
+    active = "active",
+    revoked = "revoked"
+}
+export enum TxeJobAccessVia {
+    owner = "owner",
+    share = "share",
+    platform_admin = "platform_admin"
+}
 export enum TxeTargetExistence_check {
     pre_run = "pre_run",
     reconcile = "reconcile",
@@ -25438,4 +26707,8 @@ export enum TxeAbandonmentOutcome {
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",
     cursor = "cursor"
+}
+export enum ComponentsParametersTxeEnrolmentClass {
+    worker = "worker",
+    reviewer = "reviewer"
 }

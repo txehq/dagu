@@ -10564,6 +10564,631 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/binding-requests:
+    post:
+      summary: "Ask to be bound to an owner"
+      description: "Records that the person signed in asks to be bound. Only a person signed in through the browser may ask, for their own identity; a token of any class is refused. It grants nothing. Asking again while pending returns the same request."
+      operationId: "requestTxeBinding"
+      tags:
+        - "txe"
+      responses:
+        "201":
+          description: "Ask to be bound to an owner"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeBindingRequest"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: "List binding requests"
+      description: "The binding requests no binding has used, oldest first. Platform administrator only."
+      operationId: "listTxeBindingRequests"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "List binding requests"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeBindingRequestList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/owners/{ownerId}/bindings:
+    parameters:
+      - $ref: "#/components/parameters/TxeOwnerId"
+    get:
+      summary: "List an owner's bindings"
+      description: "The identities bound to the owner, revoked ones included. The platform administrator, or a person of that owner."
+      operationId: "listTxeOwnerBindings"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "List an owner's bindings"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeBindingList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Bind an identity to an owner"
+      description: "Approves the identity's pending request for an existing owner. Platform administrator only. The request generation must be the one the administrator read. No owner is created here."
+      operationId: "approveTxeBinding"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeBindingApproveRequest"
+      responses:
+        "200":
+          description: "Bind an identity to an owner"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeBinding"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/owners/{ownerId}/bindings/{bindingId}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/TxeOwnerId"
+      - $ref: "#/components/parameters/TxeBindingId"
+    post:
+      summary: "Revoke a binding"
+      description: "Ends a binding from the next request on, and every machine enrolled under it. Platform administrator only."
+      operationId: "revokeTxeBinding"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRevokeRequest"
+      responses:
+        "200":
+          description: "Revoke a binding"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeBinding"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/shares:
+    get:
+      summary: "List the caller's shares"
+      description: "Shares the caller's owner has granted and received, revoked ones included."
+      operationId: "listTxeShares"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "List the caller's shares"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeShareList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Share a job or project"
+      description: "Lets another owner, named by its exact owner id, use one job or project with the named permissions. A person of the resource's owner only. administer is never shared, and nothing is shared with a machine."
+      operationId: "grantTxeShare"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeShareGrantRequest"
+      responses:
+        "201":
+          description: "Share a job or project"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeShare"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/shares/{shareId}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/TxeShareId"
+    post:
+      summary: "Revoke a share"
+      description: "Ends a share from the next request on. A person of the granting owner."
+      operationId: "revokeTxeShare"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRevokeRequest"
+      responses:
+        "200":
+          description: "Revoke a share"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeShare"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/machines/{machineId}/enrolment-applications:
+    parameters:
+      - $ref: "#/components/parameters/TxeMachineId"
+    post:
+      summary: "Apply to enrol this machine"
+      description: "Called by the machine with the token of its own worker or reviewer client, whose identity must be bound to the machine's owner; any other machine is not found. Records the application with the credential's expiry, and grants nothing. The machine applies again, at most every minute, to keep a live credential on file until its owner approves."
+      operationId: "applyTxeEnrolment"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Apply to enrol this machine"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEnrolmentApplication"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: "List a machine's enrolment applications"
+      description: "A person of the machine's owner."
+      operationId: "listTxeEnrolmentApplications"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "List a machine's enrolment applications"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEnrolmentApplicationList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/machines/{machineId}/enrolments:
+    parameters:
+      - $ref: "#/components/parameters/TxeMachineId"
+    get:
+      summary: "List a machine's enrolments"
+      description: "The machine's owner (a person or its CLI), or the platform administrator."
+      operationId: "listTxeEnrolments"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "List a machine's enrolments"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEnrolmentList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: "Enrol a machine from its application"
+      description: "A person of the machine's owner approves the application of one class and client. 409 credential_stale when the application's credential has expired: the machine applies again."
+      operationId: "enrolTxeMachine"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeEnrolRequest"
+      responses:
+        "200":
+          description: "Enrol a machine from its application"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEnrolment"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /txe/machines/{machineId}/enrolments/{class}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/TxeMachineId"
+      - $ref: "#/components/parameters/TxeEnrolmentClass"
+    post:
+      summary: "Revoke a machine's enrolment"
+      description: "Ends one class of the machine's enrolment from the next request on. A person of the machine's owner, or the platform administrator."
+      operationId: "revokeTxeEnrolment"
+      tags:
+        - "txe"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxeRevokeRequest"
+      responses:
+        "200":
+          description: "Revoke a machine's enrolment"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeEnrolment"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Not allowed (details.code forbidden or unbound)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Not found, or not the caller's to see"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "Refused against what is recorded (details.code conflict or credential_stale)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/installation:
     get:
       summary: "Get the TXE registry installation"
@@ -13001,6 +13626,25 @@ components:
       schema:
         type: string
 
+    TxeBindingId:
+      name: bindingId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeShareId:
+      name: shareId
+      in: path
+      required: true
+      schema:
+        type: string
+    TxeEnrolmentClass:
+      name: class
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [worker, reviewer]
     TxeOwnerId:
       name: ownerId
       in: path
@@ -19855,6 +20499,296 @@ components:
           type: integer
       required: [state, requested_at, generation]
 
+    TxeAccessActor:
+      type: object
+      description: "Who made an access change: the platform administrator by account name, or a person by issuer and subject."
+      properties:
+        kind:
+          type: string
+          enum: [platform_admin, person]
+        name:
+          type: string
+        issuer:
+          type: string
+        subject:
+          type: string
+        owner_id:
+          type: string
+      required: [kind]
+
+    TxeAccessStamp:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+        by:
+          $ref: "#/components/schemas/TxeAccessActor"
+      required: [at, by]
+
+    TxeAccessRevocation:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+        by:
+          $ref: "#/components/schemas/TxeAccessActor"
+        reason:
+          type: string
+      required: [at, by, reason]
+
+    TxeBindingRequest:
+      type: object
+      properties:
+        issuer:
+          type: string
+        subject:
+          type: string
+        shown:
+          $ref: "#/components/schemas/TxeIdentityShown"
+        state:
+          type: string
+          enum: [pending, approved]
+        requested_at:
+          type: string
+          format: date-time
+        generation:
+          type: integer
+      required: [issuer, subject, shown, state, requested_at, generation]
+
+    TxeBindingRequestList:
+      type: object
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeBindingRequest"
+      required: [requests]
+
+    TxeBinding:
+      type: object
+      properties:
+        binding_id:
+          type: string
+          description: "Opaque; names the identity's one binding record."
+        issuer:
+          type: string
+        subject:
+          type: string
+        owner_id:
+          type: string
+        generation:
+          type: integer
+        request_generation:
+          type: integer
+        state:
+          type: string
+          enum: [active, revoked]
+        bound:
+          $ref: "#/components/schemas/TxeAccessStamp"
+        shown:
+          $ref: "#/components/schemas/TxeIdentityShown"
+        revoked:
+          $ref: "#/components/schemas/TxeAccessRevocation"
+      required: [binding_id, issuer, subject, owner_id, generation, request_generation, state, bound, shown]
+
+    TxeBindingList:
+      type: object
+      properties:
+        bindings:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeBinding"
+      required: [bindings]
+
+    TxeBindingApproveRequest:
+      type: object
+      properties:
+        issuer:
+          type: string
+        subject:
+          type: string
+        request_generation:
+          type: integer
+          minimum: 1
+      required: [issuer, subject, request_generation]
+
+    TxeRevokeRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          minLength: 1
+      required: [reason]
+
+    TxeAccessResource:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [job, project]
+        id:
+          type: string
+      required: [kind, id]
+
+    TxeAccessPermission:
+      type: string
+      enum: [view, author, execute, approve, administer]
+
+    TxeShareGrantRequest:
+      type: object
+      properties:
+        resource:
+          $ref: "#/components/schemas/TxeAccessResource"
+        grantee_owner_id:
+          type: string
+        permissions:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/TxeAccessPermission"
+      required: [resource, grantee_owner_id, permissions]
+
+    TxeShare:
+      type: object
+      properties:
+        share_id:
+          type: string
+        owner_id:
+          type: string
+        resource:
+          $ref: "#/components/schemas/TxeAccessResource"
+        grantee:
+          $ref: "#/components/schemas/TxeIdentityOwner"
+        permissions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAccessPermission"
+        generation:
+          type: integer
+        state:
+          type: string
+          enum: [active, revoked]
+        granted:
+          $ref: "#/components/schemas/TxeAccessStamp"
+        revoked:
+          $ref: "#/components/schemas/TxeAccessRevocation"
+      required: [share_id, owner_id, resource, grantee, permissions, generation, state, granted]
+
+    TxeShareList:
+      type: object
+      properties:
+        granted:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeShare"
+        received:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeShare"
+      required: [granted, received]
+
+    TxeEnrolmentApplication:
+      type: object
+      properties:
+        machine_id:
+          type: string
+        class:
+          type: string
+          enum: [worker, reviewer]
+        issuer:
+          type: string
+        subject:
+          type: string
+        client_id:
+          type: string
+        received_at:
+          type: string
+          format: date-time
+        credential_expires:
+          type: string
+          format: date-time
+      required: [machine_id, class, issuer, subject, client_id, received_at, credential_expires]
+
+    TxeEnrolmentApplicationList:
+      type: object
+      properties:
+        applications:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeEnrolmentApplication"
+      required: [applications]
+
+    TxeEnrolRequest:
+      type: object
+      description: "The application to approve, and the identity read on it. If the application on file is now another identity's, the approval is refused with 409 conflict."
+      properties:
+        class:
+          type: string
+          enum: [worker, reviewer]
+        client_id:
+          type: string
+          minLength: 1
+        issuer:
+          type: string
+          minLength: 1
+        subject:
+          type: string
+          minLength: 1
+      required: [class, client_id, issuer, subject]
+
+    TxeEnrolment:
+      type: object
+      properties:
+        machine_id:
+          type: string
+        class:
+          type: string
+          enum: [worker, reviewer]
+        owner_id:
+          type: string
+        issuer:
+          type: string
+        subject:
+          type: string
+        client_id:
+          type: string
+        generation:
+          type: integer
+        state:
+          type: string
+          enum: [pending, active, revoked]
+        enrolled:
+          $ref: "#/components/schemas/TxeAccessStamp"
+        revoked:
+          $ref: "#/components/schemas/TxeAccessRevocation"
+      required: [machine_id, class, owner_id, issuer, subject, client_id, generation, state, enrolled]
+
+    TxeEnrolmentList:
+      type: object
+      properties:
+        enrolments:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeEnrolment"
+      required: [enrolments]
+
+    TxeJobAccess:
+      type: object
+      description: "How the caller reaches this job. A label for the UI; never an authority."
+      properties:
+        via:
+          type: string
+          enum: [owner, share, platform_admin]
+        shared_by:
+          $ref: "#/components/schemas/TxeIdentityOwner"
+        permissions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeAccessPermission"
+      required: [via, permissions]
+
     TxeInstallation:
       type: object
       properties:
@@ -20735,6 +21669,8 @@ components:
       type: object
       description: "The job aggregate: every mutable fact about one job, changed only by atomic compare-and-swap"
       properties:
+        access:
+          $ref: "#/components/schemas/TxeJobAccess"
         schema:
           type: integer
         job_id:
