@@ -77,8 +77,11 @@ changes its owner.
   `hist_retention_days` or `hist_retention_runs`. A run dispatched to a worker does not delete
   history, because the worker keeps no run store of its own. A job version registered before this
   change declares nothing, and a run snapshot keeps the retention it was recorded with. Neither
-  is pruned either: a run started with local storage skips automatic retention for every DAG whose
-  worker selector has `txe.machine` (`internal/persis/runstate.go`), whatever retention it carries.
+  is pruned either: a run started with local storage skips automatic retention for a DAG TXE rendered
+  (`internal/persis/runstate.go`), whatever retention it carries. That is a DAG routed by
+  `txe.machine` that is either a job's DAG, naming itself in its `txe.job` label, or that machine's
+  `txe-reviewer-`, `txe-decide-` or `txe-probe-` DAG. Another DAG routed to a TXE machine keeps its
+  own retention. The history of a TXE DAG run as a child of another DAG goes with its parent's.
 
 ## Registry (CC3)
 

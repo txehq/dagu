@@ -130,37 +130,44 @@ func TestRunStateStoreBeginAttemptIgnoresRetentionCleanupFailure(t *testing.T) {
 	require.Equal(t, persis.NewUTC(runStateStoreNow.AddDate(0, 0, -7)), store.removeOldCalls[0].OlderThan)
 }
 
-// TXE's run history is only ever deleted by a person. A DAG with TXE's machine
-// selector is not pruned, whatever retention it carries: a copy rendered
-// before TXE declared its own, or a run snapshot recorded from one, still has
-// Dagu's default.
+// A DAG TXE rendered is not pruned, whatever retention it carries: a copy
+// rendered before TXE declared its own, or a run snapshot recorded from one,
+// still has Dagu's default. Another DAG keeps its own retention, also one
+// routed to a TXE machine.
 func TestRunStateStoreBeginAttemptKeepsTXEHistory(t *testing.T) {
-	selector := map[string]string{"txe.machine": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C"}
-	for name, dag := range map[string]*ir.DAG{
-		"days": {Name: "job_1", WorkerSelector: selector, HistRetentionDays: 30},
-		"runs": {Name: "job_1", WorkerSelector: selector, HistRetentionRuns: 3},
-		"zero": {Name: "job_1", WorkerSelector: selector},
+	const machine = "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C"
+	selector := map[string]string{"txe.machine": machine}
+	jobLabels := ir.NewLabels([]string{"txe.job=job_01k7a5zq8m3n4p5r6s7t8v9w01"})
+	for name, tc := range map[string]struct {
+		dag   *ir.DAG
+		prune bool
+	}{
+		"job, days":                {&ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", Labels: jobLabels, WorkerSelector: selector, HistRetentionDays: 30}, false},
+		"job, runs":                {&ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", Labels: jobLabels, WorkerSelector: selector, HistRetentionRuns: 3}, false},
+		"job, zero":                {&ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", Labels: jobLabels, WorkerSelector: selector}, false},
+		"reviewer":                 {&ir.DAG{Name: "txe-reviewer-01K7A5ZQ8M3N4P5R6S7T8V9W0C", WorkerSelector: selector, HistRetentionDays: 30}, false},
+		"decide":                   {&ir.DAG{Name: "txe-decide-01K7A5ZQ8M3N4P5R6S7T8V9W0C", WorkerSelector: selector, HistRetentionDays: 30}, false},
+		"probe":                    {&ir.DAG{Name: "txe-probe-01K7A5ZQ8M3N4P5R6S7T8V9W0C", WorkerSelector: selector, HistRetentionDays: 30}, false},
+		"other machine":            {&ir.DAG{Name: "txe-probe-01K7A5ZQ8M3N4P5R6S7T8V9W0D", WorkerSelector: selector, HistRetentionDays: 30}, true},
+		"routed there":             {&ir.DAG{Name: "maintenance", WorkerSelector: selector, HistRetentionRuns: 3}, true},
+		"job label of another DAG": {&ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W02", Labels: jobLabels, WorkerSelector: selector, HistRetentionDays: 30}, true},
+		"no TXE machine":           {&ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", Labels: jobLabels, WorkerSelector: map[string]string{"gpu": "true"}, HistRetentionDays: 30}, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := &recordingRunStateBackend{createAttempt: newRecordingAttempt("attempt-1")}
 			_, err := persis.NewRunStateStore(testDAGRunRepository(store), nil).BeginAttempt(context.Background(), runstate.BeginAttemptRequest{
-				DAG:   dag,
+				DAG:   tc.dag,
 				RunID: "run-1",
 			})
 			require.NoError(t, err)
 			require.Equal(t, 1, store.createCalls)
-			require.Empty(t, store.removeOldCalls)
+			if tc.prune {
+				require.Len(t, store.removeOldCalls, 1)
+			} else {
+				require.Empty(t, store.removeOldCalls)
+			}
 		})
 	}
-
-	// Another selector is not TXE's.
-	store := &recordingRunStateBackend{createAttempt: newRecordingAttempt("attempt-1")}
-	_, err := persis.NewRunStateStore(testDAGRunRepository(store), nil).BeginAttempt(context.Background(), runstate.BeginAttemptRequest{
-		DAG:   &ir.DAG{Name: "other", WorkerSelector: map[string]string{"gpu": "true"}, HistRetentionDays: 30},
-		RunID: "run-1",
-	})
-	require.NoError(t, err)
-	require.Len(t, store.removeOldCalls, 1)
 }
 
 func TestRunStateStoreOpenChildAttemptReturnsAttemptState(t *testing.T) {
