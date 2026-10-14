@@ -73,6 +73,9 @@ type ConfigLoader struct {
 	trustedProxyWorkspaceMappings    map[string][]TrustedProxyWorkspaceGrant
 	trustedProxyWorkspaceMappingsSet bool
 	legacySuspendFlagsDir            string
+	// txeConfigFiles are the configuration files read, which the txe section
+	// is checked in for a key written with no value.
+	txeConfigFiles []string
 }
 
 // ConfigLoaderOption defines a functional option for configuring a ConfigLoader.
@@ -269,6 +272,7 @@ func (l *ConfigLoader) Load() (*Config, error) {
 	}
 	l.applyTrustedProxyMappings(&def)
 
+	l.txeConfigFiles = configFilesUsed
 	cfg, err := l.buildConfig(def)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build config: %w", err)

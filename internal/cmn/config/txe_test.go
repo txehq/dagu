@@ -78,6 +78,8 @@ func TestLoad_TXERefusals(t *testing.T) {
 		"UnknownMode":      {"auth:\n  mode: builtin\ntxe:\n  authz:\n    mode: enforcing\n", "unknown mode"},
 		"NotAString":       {"txe:\n  authz:\n    mode: 1\n", "must be a string"},
 		"ScalarTXE":        {"txe: enforce\n", "expected a map"},
+		"NullTXE":          {"txe: null\n", "is empty"},
+		"BareTXE":          {"auth:\n  mode: builtin\ntxe:\n", "is empty"},
 		"ScalarAuthz":      {"txe:\n  authz: enforce\n", "must be a mapping"},
 		"ScalarAuthn":      {"txe:\n  authn: https://a.example/r\n", "must be a mapping"},
 		"EmptyModeString":  {"txe:\n  authz:\n    mode: \"\"\n", "is empty"},

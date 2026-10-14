@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TXEConfig configures who may do what to whose TXE data on this server.
@@ -187,12 +189,17 @@ func (l *ConfigLoader) txeString(key string) (string, error) {
 // txeWrittenEmpty reports whether key is written with no value (YAML null),
 // which the loader otherwise cannot tell from a key that is absent.
 func (l *ConfigLoader) txeWrittenEmpty(key string) bool {
-	if l.v.IsSet(key) && l.v.Get(key) == nil {
+	if l.v.Get(key) != nil {
+		return false
+	}
+	if l.v.IsSet(key) || l.v.InConfig(key) {
 		return true
 	}
 	i := strings.LastIndex(key, ".")
 	if i < 0 {
-		return false
+		// The loader drops a top-level key written with no value, so the
+		// files themselves are asked.
+		return l.txeTopLevelNull(key)
 	}
 	parent, ok := l.v.Get(key[:i]).(map[string]any)
 	if !ok {
@@ -200,6 +207,25 @@ func (l *ConfigLoader) txeWrittenEmpty(key string) bool {
 	}
 	v, present := parent[key[i+1:]]
 	return present && v == nil
+}
+
+// txeTopLevelNull reports whether a configuration file read writes key at
+// its top level with no value.
+func (l *ConfigLoader) txeTopLevelNull(key string) bool {
+	for _, file := range l.txeConfigFiles {
+		data, err := os.ReadFile(file) //nolint:gosec // the configuration file the loader already read
+		if err != nil {
+			continue
+		}
+		var top map[string]any
+		if yaml.Unmarshal(data, &top) != nil {
+			continue
+		}
+		if v, present := top[key]; present && v == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func onlyKeys(m map[string]any, section string, allowed ...string) error {
