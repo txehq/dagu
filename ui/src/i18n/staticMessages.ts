@@ -2325,6 +2325,21 @@ const english = {
   'Revoke Profile Token': 'Revoke Profile Token',
   'Applications using this token will immediately lose access.':
     'Applications using this token will immediately lose access.',
+  // TXE identity and access states (TXE-4210).
+  "You have no access yet": "You have no access yet",
+  "You are signed in as {who}, but this server has not given your account access to any jobs.": "You are signed in as {who}, but this server has not given your account access to any jobs.",
+  "You are signed in, but this server has not given your account access to any jobs.": "You are signed in, but this server has not given your account access to any jobs.",
+  "Request access, and the platform administrator can approve it.": "Request access, and the platform administrator can approve it.",
+  "The request was not recorded: {message}": "The request was not recorded: {message}",
+  "Requesting…": "Requesting…",
+  "Access requested": "Access requested",
+  "Your request was recorded {time}. The platform administrator has to approve it before this server shows you any jobs.": "Your request was recorded {time}. The platform administrator has to approve it before this server shows you any jobs.",
+  "You have no jobs yet": "You have no jobs yet",
+  "Jobs you register appear here, and so do jobs another engineer shares with you.": "Jobs you register appear here, and so do jobs another engineer shares with you.",
+  "Job inbox": "Job inbox",
+  "Job not found": "Job not found",
+  "This job does not exist, or it has not been shared with you.": "This job does not exist, or it has not been shared with you.",
+  "Shared with you by {owner}": "Shared with you by {owner}",
 } as const;
 
 export type StaticMessage = keyof typeof english;
@@ -4592,6 +4607,21 @@ const chinese = {
   'Revoke Profile Token': '撤销配置文件令牌',
   'Applications using this token will immediately lose access.':
     '使用此令牌的应用将立即失去访问权限。',
+  // TXE identity and access states (TXE-4210).
+  "You have no access yet": "你还没有访问权限",
+  "You are signed in as {who}, but this server has not given your account access to any jobs.": "你已以 {who} 的身份登录，但此服务器尚未授予你的账户访问任何作业的权限。",
+  "You are signed in, but this server has not given your account access to any jobs.": "你已登录，但此服务器尚未授予你的账户访问任何作业的权限。",
+  "Request access, and the platform administrator can approve it.": "申请访问权限后，平台管理员可以批准。",
+  "The request was not recorded: {message}": "申请未被记录：{message}",
+  "Requesting…": "正在申请…",
+  "Access requested": "已申请访问权限",
+  "Your request was recorded {time}. The platform administrator has to approve it before this server shows you any jobs.": "你的申请已于 {time}记录。平台管理员批准后，此服务器才会向你显示作业。",
+  "You have no jobs yet": "你还没有作业",
+  "Jobs you register appear here, and so do jobs another engineer shares with you.": "你注册的作业会显示在这里，其他工程师共享给你的作业也会显示在这里。",
+  "Job inbox": "作业收件箱",
+  "Job not found": "未找到作业",
+  "This job does not exist, or it has not been shared with you.": "此作业不存在，或尚未共享给你。",
+  "Shared with you by {owner}": "由 {owner} 共享给你",
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
@@ -6940,6 +6970,21 @@ const japanese = {
   'Revoke Profile Token': 'プロファイルトークンを失効',
   'Applications using this token will immediately lose access.':
     'このトークンを使っているアプリケーションは直ちにアクセスできなくなります。',
+  // TXE identity and access states (TXE-4210).
+  "You have no access yet": "まだアクセス権がありません",
+  "You are signed in as {who}, but this server has not given your account access to any jobs.": "{who} としてサインインしていますが、このサーバーはまだあなたのアカウントにジョブへのアクセスを許可していません。",
+  "You are signed in, but this server has not given your account access to any jobs.": "サインインしていますが、このサーバーはまだあなたのアカウントにジョブへのアクセスを許可していません。",
+  "Request access, and the platform administrator can approve it.": "アクセスをリクエストすると、プラットフォーム管理者が承認できます。",
+  "The request was not recorded: {message}": "リクエストは記録されませんでした: {message}",
+  "Requesting…": "リクエスト中…",
+  "Access requested": "アクセスをリクエストしました",
+  "Your request was recorded {time}. The platform administrator has to approve it before this server shows you any jobs.": "リクエストは {time}に記録されました。プラットフォーム管理者が承認するまで、このサーバーにはジョブが表示されません。",
+  "You have no jobs yet": "まだジョブがありません",
+  "Jobs you register appear here, and so do jobs another engineer shares with you.": "登録したジョブと、ほかのエンジニアから共有されたジョブがここに表示されます。",
+  "Job inbox": "ジョブ受信箱",
+  "Job not found": "ジョブが見つかりません",
+  "This job does not exist, or it has not been shared with you.": "このジョブは存在しないか、あなたと共有されていません。",
+  "Shared with you by {owner}": "{owner} から共有",
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {
