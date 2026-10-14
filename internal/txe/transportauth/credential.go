@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -63,6 +64,10 @@ var (
 	errNoOwnerOnlyFiles   = errors.New("transportauth: a machine credential cannot be kept on Windows: this package cannot check there that only its owner can read it")
 	errCredentialReplaced = errors.New("transportauth: the machine credential file now holds a different credential; restart the worker")
 )
+
+// syncCredentialDir makes a rename in the credential file's directory
+// durable. It is a variable so a test can make it fail.
+var syncCredentialDir = fileutil.SyncDir
 
 // revokingErrors are the OAuth error codes that are a verdict on the
 // machine's credential. Every other code says nothing about it.
@@ -176,20 +181,28 @@ func ReadMachineCredential(path string) (MachineCredential, error) {
 // readable by its owner only. It is refused on Windows, where owner-only
 // access cannot be set by a file mode.
 func WriteMachineCredential(path string, credential MachineCredential) error {
+	_, err := writeMachineCredential(path, credential)
+	return err
+}
+
+// writeMachineCredential is WriteMachineCredential that also says whether
+// the new file was renamed into place, which it can be although the
+// directory sync after it failed.
+func writeMachineCredential(path string, credential MachineCredential) (renamed bool, err error) {
 	if runtime.GOOS == "windows" {
-		return errNoOwnerOnlyFiles
+		return false, errNoOwnerOnlyFiles
 	}
 	if err := credential.Validate(); err != nil {
-		return err
+		return false, err
 	}
 	raw, err := json.MarshalIndent(credential, "", "  ") //nolint:gosec // writing the refresh token to its owner-only file is the point
 	if err != nil {
-		return err
+		return false, err
 	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
 	if err != nil {
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	tmpName := tmp.Name()
 	committed := false
@@ -200,27 +213,27 @@ func WriteMachineCredential(path string, credential MachineCredential) error {
 	}()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	if _, err := tmp.Write(append(raw, '\n')); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("transportauth: write machine credential: %w", err)
+		return false, fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	committed = true
-	if err := fileutil.SyncDir(dir); err != nil {
-		return fmt.Errorf("transportauth: write machine credential: the directory could not be synced: %w", err)
+	if err := syncCredentialDir(dir); err != nil {
+		return true, fmt.Errorf("transportauth: write machine credential: the directory could not be synced: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // RefreshingSource gives a worker machine's access token, renewing it from
@@ -246,11 +259,13 @@ type sourceState struct {
 	access     string
 	expires    time.Time
 	revoked    bool
-	// unsaved is set while the credential file may hold an older refresh
-	// token than this source: previous, the one this source rotated away
-	// from. saveAfter is when saving is tried again.
+	// inFile is the refresh token this source last knew the credential
+	// file to hold: the one it read there, or the last one it renamed into
+	// place.
+	inFile string
+	// unsaved is set while the file may not durably hold the credential's
+	// refresh token; saveAfter is when saving is tried again.
 	unsaved   error
-	previous  string
 	saveAfter time.Time
 }
 
@@ -290,7 +305,7 @@ func NewRefreshingSource(path string, opts ...SourceOption) (*RefreshingSource, 
 		now:       time.Now,
 		fileLock:  flock.New(path + ".lock"),
 		renewing:  make(chan struct{}, 1),
-		state:     &sourceState{credential: credential},
+		state:     &sourceState{credential: credential, inFile: credential.RefreshToken},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -402,53 +417,66 @@ func (s *RefreshingSource) unexpiredOr(err error) (string, error) {
 //
 //   - The file holds this source's refresh token: if it was recorded as
 //     unsaved, the rename landed, and only the directory sync is retried.
-//   - The file holds the refresh token this source rotated away from and
-//     could not save: the save is retried.
-//   - The file holds another refresh token of the same enrolment: another
+//   - The file holds the refresh token this source last knew to be there,
+//     and this source holds a newer one it could not save: the save is
+//     retried.
+//   - The file holds any other refresh token of the same enrolment: another
 //     process rotated it, and this source adopts it. Nothing is written.
-//   - The file holds another enrolment: it is refused.
+//   - The file holds another enrolment, or cannot be read: it is refused
+//     and kept. Only a file that does not exist is written anew.
 func (s *RefreshingSource) reconcile() error {
 	st := s.state
 	st.mu.Lock()
-	held, previous, unsaved := st.credential, st.previous, st.unsaved != nil
+	held, inFile, unsaved := st.credential, st.inFile, st.unsaved != nil
 	st.mu.Unlock()
 
 	onDisk, readErr := ReadMachineCredential(s.path)
 	switch {
-	case readErr != nil && !unsaved:
-		return readErr
+	case readErr != nil && unsaved && errors.Is(readErr, fs.ErrNotExist):
+		s.save(held)
 	case readErr != nil:
-		// The file is gone or unusable and only this source holds the
-		// current refresh token: write it.
-		s.recordSave(WriteMachineCredential(s.path, held))
+		return readErr
 	case !onDisk.sameEnrolment(held):
 		return errCredentialReplaced
 	case onDisk.RefreshToken == held.RefreshToken:
+		st.mu.Lock()
+		st.inFile = held.RefreshToken
+		st.mu.Unlock()
 		if unsaved {
-			s.recordSave(fileutil.SyncDir(filepath.Dir(s.path)))
+			s.recordSave(held.RefreshToken, false, syncCredentialDir(filepath.Dir(s.path)))
 		}
-	case unsaved && onDisk.RefreshToken == previous:
-		s.recordSave(WriteMachineCredential(s.path, held))
+	case unsaved && onDisk.RefreshToken == inFile:
+		s.save(held)
 	default:
 		st.mu.Lock()
-		st.credential = onDisk
-		st.previous, st.unsaved, st.saveAfter = "", nil, time.Time{}
+		st.credential, st.inFile = onDisk, onDisk.RefreshToken
+		st.unsaved, st.saveAfter = nil, time.Time{}
 		st.mu.Unlock()
 	}
 	return nil
 }
 
-// recordSave records the outcome of saving the held credential.
-func (s *RefreshingSource) recordSave(err error) {
+// save writes credential, the held one, to the file and records the outcome.
+func (s *RefreshingSource) save(credential MachineCredential) {
+	renamed, err := writeMachineCredential(s.path, credential)
+	s.recordSave(credential.RefreshToken, renamed, err)
+}
+
+// recordSave records the outcome of saving refresh, the held refresh token:
+// whether it was renamed into the file, and whether the save is complete.
+func (s *RefreshingSource) recordSave(refresh string, renamed bool, err error) {
 	st := s.state
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if renamed {
+		st.inFile = refresh
+	}
 	if err != nil {
 		st.unsaved = fmt.Errorf("transportauth: a renewed refresh token could not be saved: %w", err)
 		st.saveAfter = s.now().Add(saveRetryInterval)
 		return
 	}
-	st.previous, st.unsaved, st.saveAfter = "", nil, time.Time{}
+	st.unsaved, st.saveAfter = nil, time.Time{}
 }
 
 // install records the outcome of a renewal and decides what Token returns.
@@ -464,10 +492,6 @@ func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err erro
 		if answer.refresh != "" && answer.refresh != st.credential.RefreshToken {
 			// The provider may already have retired the old refresh token,
 			// so the new one is kept in memory even when it cannot be saved.
-			// previous is what the file holds until a save lands.
-			if st.unsaved == nil {
-				st.previous = st.credential.RefreshToken
-			}
 			st.credential.RefreshToken = answer.refresh
 			next := st.credential
 			rotated = &next
@@ -475,7 +499,7 @@ func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err erro
 	}
 	st.mu.Unlock()
 	if rotated != nil {
-		s.recordSave(WriteMachineCredential(s.path, *rotated))
+		s.save(*rotated)
 	}
 
 	st.mu.Lock()

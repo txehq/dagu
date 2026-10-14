@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -673,4 +674,113 @@ func TestASaveRetryNeverOverwritesANewerRefreshToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "offline-2", saved.RefreshToken)
 	})
+}
+
+func TestAnUnreadableFileIsKeptWhileASaveIsPending(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{}
+	source, path := newSource(t, endpoint, c)
+	ctx := context.Background()
+	_, err := source.Token(ctx)
+	require.NoError(t, err)
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-2" })
+	c.Advance(5 * time.Minute)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.Error(t, source.Unsaved())
+	require.NoError(t, os.Chmod(dir, 0o700))
+
+	// Another process saved offline-3, and the file is now refused as too
+	// widely readable. It is kept as it is, not replaced with offline-2.
+	credential, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	credential.RefreshToken = "offline-3"
+	require.NoError(t, transportauth.WriteMachineCredential(path, credential))
+	require.NoError(t, os.Chmod(path, 0o644))
+	c.Advance(10 * time.Second)
+	_, err = source.Token(ctx)
+	require.NoError(t, err, "the held token is still unexpired")
+	require.Error(t, source.Unsaved())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "offline-3")
+}
+
+func TestRepeatedSaveFailuresNeverAdoptARetiredToken(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	syncFails := true
+	var syncMu sync.Mutex
+	restore := transportauth.SetSyncCredentialDir(func(string) error {
+		syncMu.Lock()
+		defer syncMu.Unlock()
+		if syncFails {
+			return errors.New("sync failed")
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	setSyncFails := func(fails bool) { syncMu.Lock(); syncFails = fails; syncMu.Unlock() }
+
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{}
+	setSyncFails(false)
+	source, path := newSource(t, endpoint, c)
+	ctx := context.Background()
+	_, err := source.Token(ctx)
+	require.NoError(t, err)
+	dir := filepath.Dir(path)
+	saved := func() string {
+		credential, err := transportauth.ReadMachineCredential(path)
+		require.NoError(t, err)
+		return credential.RefreshToken
+	}
+
+	// offline-2 is renamed into place, but the directory sync fails, and
+	// fails again when retried.
+	setSyncFails(true)
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-2" })
+	c.Advance(5 * time.Minute)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.Error(t, source.Unsaved())
+	assert.Equal(t, "offline-2", saved())
+	c.Advance(10 * time.Second)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.Error(t, source.Unsaved())
+
+	// offline-3 cannot even be written.
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-3" })
+	c.Advance(5 * time.Minute)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.Error(t, source.Unsaved())
+	assert.Equal(t, "offline-2", saved())
+
+	// The disk recovers: offline-3 is saved, not replaced by offline-2.
+	require.NoError(t, os.Chmod(dir, 0o700))
+	setSyncFails(false)
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "" })
+	c.Advance(10 * time.Second)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.NoError(t, source.Unsaved())
+	assert.Equal(t, "offline-3", saved())
+
+	c.Advance(5 * time.Minute)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	endpoint.mu.Lock()
+	assert.Equal(t, "offline-3", endpoint.seen[len(endpoint.seen)-1])
+	endpoint.mu.Unlock()
 }
