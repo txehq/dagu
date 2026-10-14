@@ -575,8 +575,14 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 	}
 	jobs := make([]*registry.Job, 0, len(all))
 	for _, job := range all {
-		if a.txeJobVisible(ctx, s, job) == nil {
+		switch err := a.txeJobVisible(ctx, s, job); {
+		case err == nil:
 			jobs = append(jobs, a.txePublicJob(ctx, s, job))
+		case errors.Is(err, errTxeAuthzUnavailable):
+			// An owner store that cannot be read is an outage, not a list
+			// with jobs missing. Any other refusal hides the job, as
+			// before.
+			return nil, err
 		}
 	}
 	out, err := txeConvert[[]api.TxeJob](jobs)
@@ -1479,6 +1485,10 @@ func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxePro
 	return api.RecordTxeProposalClosure200JSONResponse(out), err
 }
 
+// txeBeforeArtifactTx, when set by a test, runs between the first owner
+// decision on an artifact report and the job transaction that decides again.
+var txeBeforeArtifactTx func()
+
 func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArtifactsRequestObject) (api.RecordTxeRunArtifactsResponseObject, error) {
 	body, err := txeBody(req.Body)
 	if err != nil {
@@ -1503,6 +1513,9 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionExecute, txeMachineNeed); err != nil {
 		return nil, err
 	}
+	if txeBeforeArtifactTx != nil {
+		txeBeforeArtifactTx()
+	}
 	var m *registry.ArtifactManifest
 	// A run publishes in the workspace it was saved in, which may not be the
 	// job's current one (the job may have moved while it ran): publishing
@@ -1511,6 +1524,13 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	// does not authorize it, so nothing tells them which runs exist.
 	if _, err := s.WithJobTx(ctx, req.JobId, actor, func(tx *registry.JobTx) error {
 		jobErr := a.txeRequireJobChange(ctx, tx, authz.PermissionExecute, txeMachineNeed)
+		if jobErr != nil && a.txeOwnerOnly(ctx) {
+			// A caller held to its owner is authorized by the owner alone,
+			// decided again in this transaction; no run's workspace stands
+			// in for a refusal, a revocation since the first check or a
+			// store that cannot be read.
+			return jobErr
+		}
 		latest, status, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
 		if err != nil {
 			if jobErr != nil {

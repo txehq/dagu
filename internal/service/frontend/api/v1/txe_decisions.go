@@ -155,7 +155,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil && !found {
 		return nil, txeError(err)
 	}
-	if _, verr := a.authorizeHumanTaskMutation(ctx, req.JobId, req.RunId); verr != nil {
+	if _, verr := a.txeJobRunStatus(ctx, req.JobId, req.RunId); verr != nil {
 		return nil, verr
 	}
 	if found {
@@ -382,6 +382,13 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 			// one; it is decided on the job as it is in this transaction.
 			if err := a.txeAuthorizeJob(ctx, tx.Job.JobID, authz.PermissionApprove, txeNeed{}); err != nil {
 				return err
+			}
+			if a.txeOwnerOnly(ctx) {
+				// For a caller held to its owner, approve covers every
+				// verdict, pausing and retiring included: a person the owner
+				// shares approve with may decide them without authoring the
+				// job. Workspaces do not apply to such a caller.
+				return nil
 			}
 			switch verdict {
 			case registry.VerdictPause, registry.VerdictRetire:

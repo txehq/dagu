@@ -39,6 +39,7 @@ type twoOwners struct {
 	api     *API
 	svc     *txeauth.Service
 	reg     *registry.Store
+	runs    *persis.DAGRunRepository
 	dataDir string
 
 	ownerA, ownerB     string
@@ -393,6 +394,9 @@ func TestTxeOwnersStoreFailureInEnforceIs503(t *testing.T) {
 	err := w.getJob(w.cliA, w.jobA)
 	require.Equal(t, http.StatusServiceUnavailable, statusOf(err))
 	require.Equal(t, "authz_unavailable", detailOf(err))
+	// A list is not shortened by an outage: it fails.
+	_, err = w.api.ListTxeJobs(w.cliA, apigen.ListTxeJobsRequestObject{})
+	require.Equal(t, http.StatusServiceUnavailable, statusOf(err))
 	// A legacy key in mode off does not touch the store.
 	require.NoError(t, w.getJob(w.legacy, w.jobA))
 }
@@ -578,24 +582,12 @@ func TestTxeOwnersSharedApproveNeedsNoMachine(t *testing.T) {
 func TestTxeOwnersRetryReadsTheRunByTheJobNotTheWorkspace(t *testing.T) {
 	w := newTwoOwners(t, "")
 	ctx := context.Background()
-	dir := t.TempDir()
-	runs := persis.NewDAGRunRepository(filedagrun.NewStore(filepath.Join(dir, "runs")),
-		filedagrun.NewWorkDirStore(filepath.Join(dir, "work"), filepath.Join(dir, "runs")), persis.DAGRunRepositoryOptions{})
-	d := &ir.DAG{Name: w.jobA, YamlData: []byte("steps:\n  - name: run\n    run: /pkg/run.sh\n")}
-	attempt, err := runs.CreateAttempt(ctx, d, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
-	require.NoError(t, err)
-	status := ir.InitialStatus(d)
-	status.DAGRunID, status.AttemptID, status.Status = "run-1", attempt.ID(), ir.Failed
-	status.Labels = []string{"workspace=production"}
-	require.NoError(t, attempt.Open(ctx))
-	require.NoError(t, attempt.Write(ctx, status))
-	require.NoError(t, attempt.Close(ctx))
-	w.api.dagRunRepository = runs
+	attemptID := w.addRun(w.jobA, "run-1", "production")
 
 	// The person has no Dagu grant for production; the owner decides.
 	got, err := w.api.txeJobRunStatus(w.personA, w.jobA, "run-1")
 	require.NoError(t, err)
-	require.Equal(t, attempt.ID(), got.AttemptID)
+	require.Equal(t, attemptID, got.AttemptID)
 	_, err = w.api.txeJobRunStatus(w.personA, w.jobA, "run-2")
 	require.Equal(t, http.StatusNotFound, statusOf(err))
 
@@ -604,4 +596,93 @@ func TestTxeOwnersRetryReadsTheRunByTheJobNotTheWorkspace(t *testing.T) {
 		Grants: []auth.WorkspaceGrant{{Workspace: "ops", Role: auth.RoleDeveloper}}}})
 	_, err = w.api.txeJobRunStatus(opsOnly, w.jobA, "run-1")
 	require.Equal(t, http.StatusNotFound, statusOf(err))
+}
+
+// addRun saves a failed run of a job in a workspace, in a run repository the
+// API reads, and returns its attempt id.
+func (w *twoOwners) addRun(jobID, runID, workspace string) string {
+	w.t.Helper()
+	ctx := context.Background()
+	if w.runs == nil {
+		dir := w.t.TempDir()
+		w.runs = persis.NewDAGRunRepository(filedagrun.NewStore(filepath.Join(dir, "runs")),
+			filedagrun.NewWorkDirStore(filepath.Join(dir, "work"), filepath.Join(dir, "runs")), persis.DAGRunRepositoryOptions{})
+		w.api.dagRunRepository = w.runs
+	}
+	d := &ir.DAG{Name: jobID, YamlData: []byte("steps:\n  - name: run\n    run: /pkg/run.sh\n")}
+	attempt, err := w.runs.CreateAttempt(ctx, d, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(w.t, err)
+	status := ir.InitialStatus(d)
+	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = runID, attempt.ID(), ir.Failed, "q1"
+	status.StartedAt, status.FinishedAt = time.Now().Add(-time.Minute).Format(time.RFC3339), time.Now().Format(time.RFC3339)
+	status.Labels = []string{"workspace=" + workspace}
+	require.NoError(w.t, attempt.Open(ctx))
+	require.NoError(w.t, attempt.Write(ctx, status))
+	require.NoError(w.t, attempt.Close(ctx))
+	return attempt.ID()
+}
+
+// An artifact report decided again in its transaction is refused there for
+// a caller held to its owner, even though the run's workspace would let a
+// legacy caller through: the enrolment is revoked between the two checks.
+func TestTxeOwnersArtifactTransactionRefusalStands(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.markReady(w.jobA, w.machineA)
+	attemptID := w.addRun(w.jobA, "run-1", "production")
+	t.Cleanup(func() { txeBeforeArtifactTx = nil })
+	txeBeforeArtifactTx = func() {
+		_, err := w.svc.Store().RevokeEnrolment(context.Background(), authz.PlatformAdmin("admin"), w.machineA, authn.ClassWorker, "lost")
+		require.NoError(t, err)
+	}
+	_, err := w.api.RecordTxeRunArtifacts(w.workerA, apigen.RecordTxeRunArtifactsRequestObject{JobId: w.jobA, RunId: "run-1",
+		Body: &apigen.RecordTxeRunArtifactsJSONRequestBody{AttemptId: attemptID, QueuedAt: "q1", JobVersion: 1, Artifacts: []apigen.TxeArtifactRecordInput{}}})
+	require.Equal(t, http.StatusForbidden, statusOf(err))
+	require.Equal(t, "unbound", detailOf(err))
+	manifests, err := w.reg.ListArtifacts(context.Background(), w.jobA, "run-1")
+	require.NoError(t, err)
+	require.Empty(t, manifests)
+}
+
+// A retry request by a bound person reads the run by the job, not by the
+// person's workspaces: it is not refused as not found.
+func TestTxeOwnersRetryRequestByAPersonIsNotAWorkspaceQuestion(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.markReady(w.jobA, w.machineA)
+	attemptID := w.addRun(w.jobA, "run-1", "production")
+	queued := "q1"
+	_, err := w.api.RequestTxeRunRetry(w.personA, apigen.RequestTxeRunRetryRequestObject{JobId: w.jobA, RunId: "run-1",
+		Body: &apigen.RequestTxeRunRetryJSONRequestBody{AttemptId: &attemptID, QueuedAt: &queued, ExpectedJobVersion: 1, IdempotencyKey: "k1"}})
+	require.NotEqual(t, http.StatusNotFound, statusOf(err), "%v", err)
+	// Another owner's person is not told the run exists.
+	_, err = w.api.RequestTxeRunRetry(w.personB, apigen.RequestTxeRunRetryRequestObject{JobId: w.jobA, RunId: "run-1",
+		Body: &apigen.RequestTxeRunRetryJSONRequestBody{AttemptId: &attemptID, QueuedAt: &queued, ExpectedJobVersion: 1, IdempotencyKey: "k2"}})
+	require.Equal(t, http.StatusNotFound, statusOf(err))
+}
+
+// A person the owner shares approve with may decide every verdict, pausing
+// and retiring included, without being an author of the job.
+func TestTxeOwnersSharedApproverMayPauseAndRetire(t *testing.T) {
+	w := newTwoOwners(t, "")
+	scopeA, err := w.svc.Scope(w.personA, txeauth.Classify(w.personA))
+	require.NoError(t, err)
+	_, err = w.svc.Store().GrantShare(context.Background(), scopeA, authz.ShareGrant{
+		Resource: authz.ResourceRef{Kind: authz.KindJob, ID: w.jobA}, GranteeOwnerID: w.ownerB,
+		Permissions: []authz.Permission{authz.PermissionView, authz.PermissionApprove}})
+	require.NoError(t, err)
+
+	svc := w.api.txeDecisionService(w.reg)
+	decide := func(ctx context.Context, verdict registry.Verdict) error {
+		_, err := w.reg.WithJobTx(context.Background(), w.jobA, registry.Actor{Kind: registry.ActorHuman, ID: "b"}, func(tx *registry.JobTx) error {
+			if err := svc.AuthorizeDecision(ctx, tx, verdict); err != nil {
+				return err
+			}
+			return errors.New("stop: authorized")
+		})
+		return err
+	}
+	for _, verdict := range []registry.Verdict{registry.VerdictPause, registry.VerdictRetire, registry.VerdictApprove} {
+		require.EqualError(t, decide(w.personB, verdict), "stop: authorized", verdict)
+	}
+	// A CLI token of the same owner holds no approve, shared or not.
+	require.Equal(t, http.StatusForbidden, statusOf(decide(w.cliA, registry.VerdictPause)))
 }
