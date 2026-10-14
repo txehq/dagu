@@ -88,6 +88,15 @@ export type JobException = {
   createdAt: string;
 };
 
+// JobAccess is how the caller reaches a job, as the hub labels it: as its
+// owner, through a share, or as the platform administrator. A label for the
+// screen only; the hub decides every request.
+export type JobAccess = {
+  via: 'owner' | 'share' | 'platform_admin';
+  sharedBy?: { ownerId: string; displayName: string };
+  permissions: string[];
+};
+
 export type TxeJob = {
   jobId: string;
   ownerId: string;
@@ -111,6 +120,7 @@ export type TxeJob = {
   latestRuns: RunRef[];
   machineId?: string;
   retirement?: { reason: string; at: string; actor?: string };
+  access?: JobAccess;
 };
 
 export type Proposal = {

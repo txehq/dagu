@@ -2366,6 +2366,15 @@ const english = {
   // TXE switch account (TXE-4267).
   "Use a different account": "Use a different account",
   "Switch account": "Switch account",
+||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
+  // TXE sharing (TXE-4266).
+  "Owner id": "Owner id",
+  "Share": "Share",
+  "Share this job with another owner by their exact owner id. Sharing never transfers ownership, and you can revoke it.": "Share this job with another owner by their exact owner id. Sharing never transfers ownership, and you can revoke it.",
+  "Shared with {owner}.": "Shared with {owner}.",
+  "Sharing": "Sharing",
+  "The job was not shared: {message}": "The job was not shared: {message}",
+  "This job is not shared.": "This job is not shared.",
 } as const;
 
 export type StaticMessage = keyof typeof english;
@@ -4674,6 +4683,15 @@ const chinese = {
   // TXE switch account (TXE-4267).
   "Use a different account": "使用其他账户",
   "Switch account": "切换账户",
+||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
+  // TXE sharing (TXE-4266).
+  "Owner id": "所有者 ID",
+  "Share": "共享",
+  "Share this job with another owner by their exact owner id. Sharing never transfers ownership, and you can revoke it.": "通过对方的确切所有者 ID 将此作业共享给其他所有者。共享不会转移所有权，并且可以撤销。",
+  "Shared with {owner}.": "已共享给 {owner}。",
+  "Sharing": "共享",
+  "The job was not shared: {message}": "作业未共享：{message}",
+  "This job is not shared.": "此作业未共享。",
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
@@ -7063,6 +7081,15 @@ const japanese = {
   // TXE switch account (TXE-4267).
   "Use a different account": "別のアカウントを使用",
   "Switch account": "アカウントを切り替え",
+||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
+  // TXE sharing (TXE-4266).
+  "Owner id": "オーナー ID",
+  "Share": "共有",
+  "Share this job with another owner by their exact owner id. Sharing never transfers ownership, and you can revoke it.": "正確なオーナー ID を指定して、このジョブを別のオーナーと共有します。共有で所有権は移らず、取り消すこともできます。",
+  "Shared with {owner}.": "{owner} と共有しました。",
+  "Sharing": "共有",
+  "The job was not shared: {message}": "ジョブは共有されませんでした: {message}",
+  "This job is not shared.": "このジョブは共有されていません。",
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {

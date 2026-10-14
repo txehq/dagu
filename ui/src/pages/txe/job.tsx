@@ -17,7 +17,10 @@ import { dagRunPath } from '@/features/txe/components/InboxItemCard';
 import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
 import { RunRetry } from '@/features/txe/components/RunRetry';
 import { NotFoundOrNotShared } from '@/features/txe/components/identity/NotFoundOrNotShared';
+import { mayDecide } from '@/features/txe/access';
 import { TxeApiError } from '@/features/txe/api';
+import { SharingPanel } from '@/features/txe/components/SharingPanel';
+import { SharedWithYou } from '@/features/txe/components/identity/SharedWithYou';
 import {
   useJobDetail,
   usePersonDecisions,
@@ -174,9 +177,11 @@ export default function TxeJobPage(): React.ReactElement {
   const { jobId } = useParams<{ jobId: string }>();
   const appBarContext = React.useContext(AppBarContext);
   const personDecisions = usePersonDecisions();
-  // A person may decide only where the hub can tell who they are.
-  const canDecide = useCanExecute() && personDecisions;
+  const roleCanExecute = useCanExecute();
   const { data, error, mutate } = useJobDetail(jobId);
+  // A person may decide only where the hub can tell who they are, and only
+  // with approve on this job where the hub labels the caller's access.
+  const canDecide = personDecisions && mayDecide(data?.job, roleCanExecute);
   const api = useTxeApi();
   const { data: retries, mutate: mutateRetries } = useRetryStates(jobId);
 
@@ -233,6 +238,13 @@ export default function TxeJobPage(): React.ReactElement {
           <Badge variant={job.availability === 'ready' ? 'success' : 'warning'}>
             {job.availability}
           </Badge>
+          {job.access?.via === 'share' && job.access.sharedBy && (
+            <SharedWithYou
+              ownerName={
+                job.access.sharedBy.displayName || job.access.sharedBy.ownerId
+              }
+            />
+          )}
           <span className="text-muted-foreground">
             {job.jobId} · v{job.version} · {job.packageDigest.slice(0, 19)}…
           </span>
@@ -366,6 +378,8 @@ export default function TxeJobPage(): React.ReactElement {
           />
         ))}
       </section>
+
+      {job.access?.via === 'owner' && <SharingPanel jobId={job.jobId} />}
     </div>
   );
 }

@@ -8,6 +8,8 @@ import { Badge } from '@/components/ui/badge';
 import { RelativeTime } from '@/components/ui/relative-time';
 import { I18nText } from '@/i18n/I18nText';
 
+import { SharedWithYou } from './identity/SharedWithYou';
+
 import type { InboxItem, WaitingOn } from '../types';
 
 const WAITING_LABELS: Record<WaitingOn, string> = {
@@ -65,6 +67,13 @@ export function InboxItemCard({ item, children }: Props): React.ReactElement {
         <Badge variant={item.waitingOn === 'person' ? 'warning' : 'secondary'}>
           <I18nText text={WAITING_LABELS[item.waitingOn]} />
         </Badge>
+        {job.access?.via === 'share' && job.access.sharedBy && (
+          <SharedWithYou
+            ownerName={
+              job.access.sharedBy.displayName || job.access.sharedBy.ownerId
+            }
+          />
+        )}
         <span className="text-xs text-muted-foreground">
           {job.lifecycle} · v{job.version}
         </span>

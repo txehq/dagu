@@ -77,6 +77,9 @@ function fakeAccess(overrides: Partial<TxeAccessApi> = {}) {
     approve: vi.fn(async () => binding('bnd_1', TxeBindingState.active)),
     listBindings: vi.fn(async () => [binding('bnd_0', TxeBindingState.active)]),
     revoke: vi.fn(async () => undefined),
+    listShares: vi.fn(async () => ({ granted: [], received: [] })),
+    shareJob: vi.fn(),
+    revokeShare: vi.fn(),
     ...overrides,
   };
   return api;
