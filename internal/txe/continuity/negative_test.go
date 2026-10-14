@@ -325,6 +325,11 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 		filepath.Join(l.DataDir, "users", "admin.json"),
 		filepath.Join(l.DataDir, "apikeys", "key.json"),
 		filepath.Join(l.DataDir, "contexts", "remote.json"),
+		filepath.Join(l.DataDir, "auth", "encryption_key"),
+		filepath.Join(l.DataDir, "tailscale", "tailscaled.state"),
+		filepath.Join(l.DataDir, "license", "license.json"),
+		filepath.Join(l.DataDir, "gitsync", "repo", ".git", "config"),
+		filepath.Join(l.DataDir, "browser", "cache", "dag", "step.json"),
 		filepath.Join(l.MachineHome, "client", "contexts", "hub.yaml"),
 	} {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
@@ -340,7 +345,8 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 	for _, e := range inv.Excluded {
 		excluded[e.Root+"/"+e.Path] = true
 	}
-	for _, p := range []string{"hub-data/users", "hub-data/apikeys", "hub-data/contexts", "laptop-home/client"} {
+	for _, p := range []string{"hub-data/users", "hub-data/apikeys", "hub-data/contexts", "hub-data/auth", "hub-data/tailscale",
+		"hub-data/license", "hub-data/gitsync/repo", "hub-data/browser/cache", "laptop-home/client"} {
 		assert.True(t, excluded[p], p)
 	}
 	out, err := json.Marshal(inv)
@@ -446,4 +452,47 @@ func TestPackageOnTheWrongMachine(t *testing.T) {
 	}
 	assert.NotEmpty(t, missing, "the validation job's version has no package on its own machine")
 	assert.Empty(t, corrupt, "the moved package itself verifies")
+}
+
+// Every area upstream Dagu writes in its data directory is classified, so
+// a real hub's freeze inventory does not stop on one it does not know.
+func TestUpstreamDataAreasAreClassified(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	for _, area := range []string{"incidents", "notifications", "wiki", "docs", "workspace-bundles", "cache",
+		"browser/sessions", "computer/sessions", "xlsx/sessions", "computer/cache"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, area, "x"), 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, area, "x", "f.json"), []byte(`{}`), 0o600))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, "tunnel_url"), []byte("https://fixture.invalid\n"), 0o600))
+	inv := scan(t, l)
+	assert.Empty(t, continuity.Blocking(continuity.Validate(inv, continuity.Policy{})))
+	assert.Positive(t, inv.Counts["file:hub-data"])
+}
+
+// Retained state inside a mixed area is inventoried: losing gitsync's sync
+// state or a paused host session record blocks a transition, while the
+// clone and the replay caches beside them are not read.
+func TestMixedAreasKeepTheirState(t *testing.T) {
+	for _, p := range []string{"gitsync/state.json", "browser/sessions/run-1.json", "computer/sessions/run-1.json"} {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+			l, _ := build(t)
+			full := filepath.Join(l.DataDir, filepath.FromSlash(p))
+			require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o750))
+			require.NoError(t, os.WriteFile(full, []byte(`{"cursor":3}`), 0o600))
+			require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, "gitsync", "repo"), 0o750))
+			before := scan(t, l)
+			assert.Empty(t, continuity.Blocking(continuity.Validate(before, continuity.Policy{})))
+			require.NoError(t, os.Remove(full))
+			after := scan(t, l)
+			assert.Positive(t, codes(continuity.Compare(before, after, continuity.CompareOptions{}).Issues, continuity.SeverityBlock)["file_missing"])
+		})
+	}
+	t.Run("an unknown entry of a mixed area", func(t *testing.T) {
+		t.Parallel()
+		l, _ := build(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, "browser", "profiles"), 0o750))
+		assert.Positive(t, codes(continuity.Validate(scan(t, l), continuity.Policy{}), continuity.SeverityBlock)["unclassified_area"])
+	})
 }
