@@ -98,11 +98,14 @@ const (
 	// RefusedCallsStopAfter bounds how long a run keeps executing locally
 	// once its owner coordinator definitively refuses this worker: its
 	// credential was refused, revoked or does not match the machine. The
-	// local step is cancelled on the first heartbeat tick at least
-	// RefusedCallsStopAfter minus one heartbeat interval after the first
-	// refusal, so no later than RefusedCallsStopAfter after it. A refusal
-	// is a verdict, unlike an unreachable coordinator or identity provider,
-	// which keeps the stale-lease rule (ownerHeartbeatTimeout).
+	// bound runs from the first refusal the worker receives and is cleared
+	// only by an accepted heartbeat; outages after a refusal do not suspend
+	// it. The deadline is checked once a heartbeat interval, apart from the
+	// heartbeat calls themselves, and the local step is cancelled at the
+	// first check at least RefusedCallsStopAfter minus one interval after
+	// the refusal, so no later than RefusedCallsStopAfter after it. A
+	// refusal is a verdict, unlike an unreachable coordinator or identity
+	// provider, which keeps the stale-lease rule (ownerHeartbeatTimeout).
 	RefusedCallsStopAfter = 60 * time.Second
 )
 
@@ -262,6 +265,9 @@ func (w *Worker) Start(ctx context.Context) (err error) {
 	})
 	wg.Go(func() {
 		w.sendRunHeartbeats(internalCtx)
+	})
+	wg.Go(func() {
+		w.enforceRefusalDeadlines(internalCtx)
 	})
 	wg.Go(func() {
 		w.cleanupAgentSessions(pollCtx)
@@ -723,7 +729,7 @@ func (w *Worker) sendOwnerRunHeartbeats(ctx context.Context) {
 
 		if err != nil {
 			if isDefinitiveRefusal(err) {
-				w.cancelTasksForRefusal(ctx, group.owner, group.tasks, err)
+				w.recordRefusal(ctx, group.owner, group.tasks, err)
 			}
 			w.cancelTasksForOwnerTimeout(ctx, group.owner, group.tasks, lastSeen)
 			continue
@@ -769,39 +775,82 @@ func isDefinitiveRefusal(err error) bool {
 	return code == codes.Unauthenticated || code == codes.PermissionDenied
 }
 
-// cancelTasksForRefusal records a definitive refusal of these runs'
-// heartbeat and cancels each run that has been refused, with no accepted
-// heartbeat since, for RefusedCallsStopAfter less one heartbeat interval.
-func (w *Worker) cancelTasksForRefusal(ctx context.Context, owner serviceregistry.HostInfo, tasks []*coordinatorv1.RunningTask, cause error) {
+// recordRefusal records the first definitive refusal of these runs'
+// heartbeat since the owner last accepted it. enforceRefusalDeadlines
+// cancels each run whose refusal is older than the bound.
+func (w *Worker) recordRefusal(ctx context.Context, owner serviceregistry.HostInfo, tasks []*coordinatorv1.RunningTask, cause error) {
 	now := w.clock()
-	var refused []*coordinatorv1.CancelledRun
+	var first []string
 	w.pollersMu.Lock()
 	for _, task := range tasks {
 		if task == nil {
 			continue
 		}
 		state, ok := w.runningTasks[task.AttemptKey]
-		if !ok || state == nil {
+		if !ok || state == nil || !state.firstRefusedAt.IsZero() {
 			continue
 		}
-		if state.firstRefusedAt.IsZero() {
-			state.firstRefusedAt = now
+		state.firstRefusedAt = now
+		first = append(first, task.AttemptKey)
+	}
+	w.pollersMu.Unlock()
+
+	for _, attemptKey := range first {
+		logger.Warn(ctx, "Owner coordinator refuses this worker; the run stops unless a heartbeat is accepted",
+			tag.WorkerID(w.id),
+			tag.AttemptKey(attemptKey),
+			slog.String("owner-id", owner.ID),
+			tag.Host(owner.Host),
+			tag.Port(owner.Port),
+			slog.Duration("stop-after", RefusedCallsStopAfter),
+			tag.Error(cause),
+		)
+	}
+}
+
+// enforceRefusalDeadlines checks the refusal deadlines once a heartbeat
+// interval, on its own ticker, so a heartbeat call that blocks cannot delay
+// the stop.
+func (w *Worker) enforceRefusalDeadlines(ctx context.Context) {
+	ticker := time.NewTicker(runHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.cancelExpiredRefusals(ctx)
+		}
+	}
+}
+
+// cancelExpiredRefusals cancels each run refused, with no accepted heartbeat
+// since, for RefusedCallsStopAfter less one heartbeat interval.
+func (w *Worker) cancelExpiredRefusals(ctx context.Context) {
+	now := w.clock()
+	var refused []*coordinatorv1.CancelledRun
+	w.pollersMu.Lock()
+	for attemptKey, state := range w.runningTasks {
+		if state == nil || state.firstRefusedAt.IsZero() {
+			continue
 		}
 		if now.Sub(state.firstRefusedAt) < RefusedCallsStopAfter-runHeartbeatInterval {
 			continue
 		}
-		refused = append(refused, &coordinatorv1.CancelledRun{AttemptKey: task.AttemptKey})
+		run := &coordinatorv1.CancelledRun{AttemptKey: attemptKey}
+		if state.task != nil && state.task.ExecutionMarker != "" {
+			run.SetExecutionMarker(state.task.ExecutionMarker)
+		}
+		refused = append(refused, run)
 	}
 	w.pollersMu.Unlock()
 
 	for _, run := range refused {
-		logger.Warn(ctx, "Owner coordinator refuses this worker; cancelling distributed run",
+		logger.Warn(ctx, "Owner coordinator refused this worker for the whole bound; cancelling distributed run",
 			tag.WorkerID(w.id),
 			tag.AttemptKey(run.AttemptKey),
-			slog.String("owner-id", owner.ID),
-			tag.Host(owner.Host),
-			tag.Port(owner.Port),
-			tag.Error(cause),
+			slog.Duration("stop-after", RefusedCallsStopAfter),
 		)
 	}
 	if len(refused) > 0 {

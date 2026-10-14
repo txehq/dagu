@@ -21,11 +21,13 @@ import (
 )
 
 // runHeartbeatClient answers RunHeartbeatTo with whatever error the test
-// sets, nil meaning accepted.
+// sets, nil meaning accepted. While block is set, a call waits for it to be
+// closed or for its context to end.
 type runHeartbeatClient struct {
 	coordinator.Client
-	mu  sync.Mutex
-	err error
+	mu    sync.Mutex
+	err   error
+	block chan struct{}
 }
 
 func (c *runHeartbeatClient) set(err error) {
@@ -34,24 +36,54 @@ func (c *runHeartbeatClient) set(err error) {
 	c.err = err
 }
 
-func (c *runHeartbeatClient) RunHeartbeatTo(context.Context, serviceregistry.HostInfo, *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+func (c *runHeartbeatClient) RunHeartbeatTo(ctx context.Context, _ serviceregistry.HostInfo, _ *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.err != nil {
-		return nil, c.err
+	block, err := c.block, c.err
+	c.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	return &coordinatorv1.RunHeartbeatResponse{}, nil
 }
 
 // refusalHarness is a worker with one running task, driven tick by tick on a
-// hand-moved clock, as sendRunHeartbeats drives it once a second.
+// hand-moved clock, as sendRunHeartbeats and enforceRefusalDeadlines drive it
+// once a second.
 type refusalHarness struct {
 	t         *testing.T
 	worker    *Worker
 	client    *runHeartbeatClient
+	mu        sync.Mutex
 	now       time.Time
 	start     time.Time
 	cancelled time.Duration // elapsed when the task's context was cancelled, or -1
+}
+
+func (h *refusalHarness) clock() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.now
+}
+
+func (h *refusalHarness) advance(d time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.now = h.now.Add(d)
+}
+
+func (h *refusalHarness) elapsed() time.Duration { return h.clock().Sub(h.start) }
+
+func (h *refusalHarness) cancelledAt() time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cancelled
 }
 
 func newRefusalHarness(t *testing.T) *refusalHarness {
@@ -60,13 +92,15 @@ func newRefusalHarness(t *testing.T) *refusalHarness {
 	h.start = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 	h.now = h.start
 	h.worker = NewWorker("mch_A@host@1", 1, h.client, nil, nil)
-	h.worker.now = func() time.Time { return h.now }
+	h.worker.now = h.clock
 	h.worker.runningTasks["attempt-1"] = &runningTaskState{
 		task:                 &coordinatorv1.RunningTask{AttemptKey: "attempt-1", DagRunId: "run-1", DagName: "job"},
 		owner:                serviceregistry.HostInfo{ID: "coord-1", Host: "127.0.0.1", Port: 50055},
 		lastOwnerHeartbeatAt: h.start,
 	}
 	h.worker.cancelFuncs["attempt-1"] = func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
 		if h.cancelled < 0 {
 			h.cancelled = h.now.Sub(h.start)
 		}
@@ -74,14 +108,16 @@ func newRefusalHarness(t *testing.T) *refusalHarness {
 	return h
 }
 
-// runFor ticks once a second, answering each heartbeat with answer(elapsed),
-// until d has elapsed or the task is cancelled.
+// runFor ticks once a second, answering each heartbeat with answer(elapsed)
+// and then checking the refusal deadlines, until d has elapsed or the task
+// is cancelled.
 func (h *refusalHarness) runFor(d time.Duration, answer func(elapsed time.Duration) error) {
 	h.t.Helper()
-	for elapsed := h.now.Sub(h.start); elapsed <= d && h.cancelled < 0; elapsed = h.now.Sub(h.start) {
+	for elapsed := h.elapsed(); elapsed <= d && h.cancelledAt() < 0; elapsed = h.elapsed() {
 		h.client.set(answer(elapsed))
 		h.worker.sendOwnerRunHeartbeats(context.Background())
-		h.now = h.now.Add(runHeartbeatInterval)
+		h.worker.cancelExpiredRefusals(context.Background())
+		h.advance(runHeartbeatInterval)
 	}
 }
 
@@ -156,7 +192,7 @@ func TestAnUnreachableCoordinatorOrProviderKeepsTheLeaseRule(t *testing.T) {
 	}
 }
 
-func TestOutagesAfterARefusalDoNotRestartTheRefusalClock(t *testing.T) {
+func TestOutagesAfterARefusalDoNotSuspendTheBound(t *testing.T) {
 	h := newRefusalHarness(t)
 	// One refusal, then the coordinator is unreachable. Only an accepted
 	// heartbeat clears a refusal, so the bound runs from that refusal.
@@ -167,7 +203,46 @@ func TestOutagesAfterARefusalDoNotRestartTheRefusalClock(t *testing.T) {
 		return errUnreachable
 	})
 	require.GreaterOrEqual(t, h.cancelled, time.Duration(0))
-	assert.Greater(t, h.cancelled, ownerHeartbeatTimeout, "outages alone still need the stale-lease threshold")
+	assert.LessOrEqual(t, h.cancelled, RefusedCallsStopAfter, "an outage after the refusal must not delay the stop")
+	assert.GreaterOrEqual(t, h.cancelled, RefusedCallsStopAfter-runHeartbeatInterval)
+}
+
+func TestARefusedRunStopsWhileAHeartbeatCallIsBlocked(t *testing.T) {
+	h := newRefusalHarness(t)
+	// Refused at t=0.
+	h.runFor(0, func(time.Duration) error { return errRefused })
+	require.Equal(t, time.Duration(-1), h.cancelledAt())
+
+	// The next heartbeat call blocks, as a slow coordinator or another
+	// owner's slow call would; the deadline is checked on its own.
+	h.client.mu.Lock()
+	h.client.block = make(chan struct{})
+	h.client.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.worker.sendOwnerRunHeartbeats(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	for h.cancelledAt() < 0 && h.elapsed() <= 2*time.Minute {
+		h.advance(runHeartbeatInterval)
+		h.worker.cancelExpiredRefusals(context.Background())
+	}
+	select {
+	case <-done:
+		t.Fatal("the heartbeat call returned; the test needs it in flight")
+	default:
+	}
+	cancelled := h.cancelledAt()
+	require.GreaterOrEqual(t, cancelled, time.Duration(0), "the step was never cancelled")
+	assert.LessOrEqual(t, cancelled, RefusedCallsStopAfter)
+	assert.GreaterOrEqual(t, cancelled, RefusedCallsStopAfter-runHeartbeatInterval)
 }
 
 func TestOutagesThenRefusalsStopByWhicheverRuleComesFirst(t *testing.T) {
