@@ -11,6 +11,11 @@ overlap_policy: skip
 artifacts:
   enabled: true
 max_active_runs: 1
+# Runs are kept with their logs and artifacts. Without this the run
+# history would get Dagu's 30-day default, or a base configuration's, and
+# a run started with local storage would remove older runs. Deleting them
+# takes a person's decision.
+hist_retention_days: {{.HistRetentionDays}}
 timeout_sec: {{.TimeoutSec}}
 working_dir: {{yaml .StateDir}}
 worker_selector:

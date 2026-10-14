@@ -14,6 +14,7 @@ import (
 	"text/template"
 	"time"
 
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/txe/reviewer"
 )
@@ -210,7 +211,9 @@ func RenderDAGs(cfg DAGConfig) (RenderedDAGs, error) {
 		// rendered so that the DAG and the steps it calls cannot disagree.
 		ExitClaimHeld  int
 		MaxClaimTTLSec int
-	}{cfg, strings.TrimSpace(unixLines(reviewer.Prompt)), schema.String(), vars, ExitClaimHeld, int(MaxClaimTTL / time.Second)}
+		// HistRetentionDays is the run history every TXE DAG keeps.
+		HistRetentionDays int
+	}{cfg, strings.TrimSpace(unixLines(reviewer.Prompt)), schema.String(), vars, ExitClaimHeld, int(MaxClaimTTL / time.Second), txepkg.HistRetentionDays}
 
 	out := RenderedDAGs{
 		ReviewerName: ReviewerDAGName(cfg.MachineID),

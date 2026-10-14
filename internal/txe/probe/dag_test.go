@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	_ "github.com/dagucloud/dagu/v2/internal/runtime/builtin" // the loader needs the command executor registered
 	"github.com/dagucloud/dagu/v2/internal/spec"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
 
 const testMachine = "mch_01JTXE0000000000000000F1X3"
@@ -42,9 +44,20 @@ func TestRenderReconcileDAG(t *testing.T) {
 	if len(dag.Steps) != 1 {
 		t.Fatalf("steps = %d, want 1", len(dag.Steps))
 	}
+	// Its runs are kept, also over a base configuration that keeps fewer.
+	inherited, err := spec.LoadYAML(t.Context(), out, spec.WithName(name), spec.WithoutEval(),
+		spec.WithBaseConfigContent([]byte("hist_retention_runs: 2\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []*ir.DAG{dag, inherited} {
+		if d.HistRetentionDays != txepkg.HistRetentionDays || d.HistRetentionRuns != 0 {
+			t.Fatalf("history = %d days, %d runs; want %d days", d.HistRetentionDays, d.HistRetentionRuns, txepkg.HistRetentionDays)
+		}
+	}
 	text := string(out)
 	for _, want := range []string{
-		"txe-probe-dag-version: 1",
+		"txe-probe-dag-version: 2",
 		`schedule: "*/15 * * * *"`,
 		"overlap_policy: skip",
 		"max_active_runs: 1",

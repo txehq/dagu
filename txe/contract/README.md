@@ -68,6 +68,15 @@ changes its owner.
 - The review cadence is its own reviewer DAG, not the job's schedule.
 - Retiring a job records it in the registry and suspends the DAG. The DAG file and its run history
   are kept.
+- `hist_retention_days: 36500`: runs are kept, with their logs and artifacts. A DAG that declares
+  no retention gets Dagu's 30 days, or what a base configuration sets, and a run started with local
+  storage (`dagu start`, `retry` or `restart` on a host that holds the run store) then deletes the
+  older finished runs. Dagu refuses a negative value and reads 0 as its default, so 100 years is the
+  longest a DAG can declare. A value the DAG declares replaces the base configuration's
+  `hist_retention_days` or `hist_retention_runs`. A run dispatched to a worker does not delete
+  history, because the worker keeps no run store of its own. Deleting history takes a person's
+  decision. A job version registered before this change declares nothing; the job's next version
+  does.
 
 ## Registry (CC3)
 

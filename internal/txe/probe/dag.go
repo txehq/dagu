@@ -11,11 +11,13 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
 
 // ReconcileDAGVersion changes whenever the rendered DAG's shape changes, so
 // an installer can tell its copy is stale.
-const ReconcileDAGVersion = 1
+const ReconcileDAGVersion = 2
 
 // Defaults for a rendered reconcile DAG.
 const (
@@ -77,6 +79,8 @@ description: {{yaml .Description}}
 schedule: {{yaml .Schedule}}
 overlap_policy: skip
 max_active_runs: 1
+# Runs are kept with their logs: deleting them takes a person's decision.
+hist_retention_days: {{.HistRetentionDays}}
 timeout_sec: {{.TimeoutSec}}
 worker_selector:
   txe.machine: {{yaml .MachineID}}
@@ -146,6 +150,8 @@ func RenderReconcileDAG(cfg ReconcileDAGConfig) (string, []byte, error) {
 		"TimeoutSec":  timeout,
 		"Vars":        vars,
 		"Command":     command,
+		// HistRetentionDays is the run history every TXE DAG keeps.
+		"HistRetentionDays": txepkg.HistRetentionDays,
 	}); err != nil {
 		return "", nil, fmt.Errorf("probe: render reconcile DAG: %w", err)
 	}
