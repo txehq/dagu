@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -140,8 +141,13 @@ func openToOthers(sd *windows.SECURITY_DESCRIPTOR, trusted sids) (bool, error) {
 // closeToOthers gives path a protected DACL that only trusted may use,
 // inherited by everything created in it.
 func closeToOthers(path string, trusted sids) error {
+	// A TrusteeValue is an address the collector does not see, so each SID
+	// is pinned until the ACL is built from it.
+	var pins runtime.Pinner
+	defer pins.Unpin()
 	entries := make([]windows.EXPLICIT_ACCESS, 0, len(trusted))
 	for _, sid := range trusted {
+		pins.Pin(sid)
 		entries = append(entries, windows.EXPLICIT_ACCESS{
 			AccessPermissions: windows.GENERIC_ALL,
 			AccessMode:        windows.GRANT_ACCESS,
