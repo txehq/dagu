@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -290,4 +291,44 @@ func TestProviderAnswersAreBounded(t *testing.T) {
 		// go-oidc keeps only the text of the cause.
 		assert.Contains(t, err.Error(), errResponseTooLarge.Error(), issuer)
 	}
+}
+
+// RFC 7519 allows a fractional exp; it must not hide the token's subject.
+func TestAuthorizeRefusesAccessTokenForAnotherIdentityWithFractionalExpiry(t *testing.T) {
+	f := cliauthtest.New(t)
+	f.AccessClaims = map[string]any{"sub": "someone-else", "exp": float64(time.Now().Add(time.Minute).Unix()) + 0.5}
+	_, err := authorize(t, f, AuthorizeOptions{})
+	assert.ErrorIs(t, err, ErrIdentityChanged)
+}
+
+func TestUnverifiedClaims(t *testing.T) {
+	jwtOf := func(payload string) string {
+		return "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
+	}
+	want := Identity{Issuer: "https://idp.example", Subject: "s"}
+	cases := []struct {
+		payload string
+		changed bool
+	}{
+		{`{"iss":"https://idp.example","sub":"s","exp":1791979200.5}`, false},
+		{`{"iss":"https://idp.example","sub":"other","exp":1791979200.5}`, true},
+		{`{"iss":"https://other.example","exp":"soon"}`, true},
+		{`{"sub":42}`, true},
+		{`{"exp":1791979200}`, false},
+		{`[1,2]`, false},
+	}
+	for _, tc := range cases {
+		err := checkTokenIdentity(jwtOf(tc.payload), want)
+		if tc.changed {
+			assert.ErrorIs(t, err, ErrIdentityChanged, tc.payload)
+		} else {
+			assert.NoError(t, err, tc.payload)
+		}
+	}
+	assert.NoError(t, checkTokenIdentity("opaque-token", want))
+
+	sent := time.Unix(1791970000, 0)
+	assert.Equal(t, time.Unix(1791979200, 0), expiry(sent, 0, jwtOf(`{"exp":1791979200.9}`)))
+	assert.Equal(t, sent.Add(time.Minute), expiry(sent, 60, jwtOf(`{"exp":1e300}`)))
+	assert.Equal(t, sent, expiry(sent, 0, jwtOf(`{"exp":"never"}`)))
 }

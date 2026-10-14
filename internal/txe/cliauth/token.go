@@ -234,43 +234,71 @@ var ErrIdentityChanged = errors.New("the identity provider returned tokens for a
 
 // checkTokenIdentity reads a token's iss and sub without verifying it (the
 // hub verifies an access token; an ID token is verified after this) and
-// refuses a token that names another identity. A token that is not a
-// readable JWT, or carries neither claim, is accepted: the provider is not
-// required to issue JWT access tokens.
+// refuses a token that names another identity, or names one in a form that
+// is not a string. A token that is not a readable JWT, or carries neither
+// claim, is accepted: the provider is not required to issue JWT access
+// tokens.
 func checkTokenIdentity(token string, want Identity) error {
 	claims, ok := unverifiedClaims(token)
 	if !ok {
 		return nil
 	}
-	if claims.Issuer != "" && claims.Issuer != want.Issuer {
-		return ErrIdentityChanged
-	}
-	if claims.Subject != "" && claims.Subject != want.Subject {
+	if !claims.allows("iss", want.Issuer) || !claims.allows("sub", want.Subject) {
 		return ErrIdentityChanged
 	}
 	return nil
 }
 
-type jwtClaims struct {
-	Issuer  string `json:"iss"`
-	Subject string `json:"sub"`
-	Expiry  int64  `json:"exp"`
-}
+// jwtClaims is a JWT's payload, read without verification. Each claim is
+// read on its own, so that one in an unexpected form (a fractional exp,
+// which RFC 7519 allows) cannot hide another.
+type jwtClaims map[string]json.RawMessage
 
 func unverifiedClaims(token string) (jwtClaims, bool) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return jwtClaims{}, false
+		return nil, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return jwtClaims{}, false
+		return nil, false
 	}
 	var c jwtClaims
-	if err := json.Unmarshal(payload, &c); err != nil {
-		return jwtClaims{}, false
+	if err := json.Unmarshal(payload, &c); err != nil || c == nil {
+		return nil, false
 	}
 	return c, true
+}
+
+// allows reports whether the claim is absent, empty, or the string want.
+func (c jwtClaims) allows(name, want string) bool {
+	raw, ok := c[name]
+	if !ok {
+		return true
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	return v == "" || v == want
+}
+
+// maxExpiry is beyond any real exp; a larger one is treated as absent
+// rather than converted.
+const maxExpiry = 1 << 40
+
+// expiry returns the exp claim, rounded down to the second, when it is a
+// positive number.
+func (c jwtClaims) expiry() (time.Time, bool) {
+	raw, ok := c["exp"]
+	if !ok {
+		return time.Time{}, false
+	}
+	var exp float64
+	if err := json.Unmarshal(raw, &exp); err != nil || exp <= 0 || exp > maxExpiry {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(exp), 0), true
 }
 
 // expiry is the earlier of expires_in counted from when the request was
@@ -281,9 +309,8 @@ func expiry(sent time.Time, expiresIn int64, accessToken string) time.Time {
 	if expiresIn > 0 {
 		at = sent.Add(time.Duration(expiresIn) * time.Second)
 	}
-	if c, ok := unverifiedClaims(accessToken); ok && c.Expiry > 0 {
-		exp := time.Unix(c.Expiry, 0)
-		if at.IsZero() || exp.Before(at) {
+	if c, ok := unverifiedClaims(accessToken); ok {
+		if exp, ok := c.expiry(); ok && (at.IsZero() || exp.Before(at)) {
 			at = exp
 		}
 	}

@@ -338,6 +338,19 @@ func TestStoreAccessTokenRenewal(t *testing.T) {
 		assert.ErrorIs(t, err, ErrNotSignedIn)
 	})
 
+	t.Run("another identity behind a fractional expiry ends the sign-in", func(t *testing.T) {
+		f := cliauthtest.New(t)
+		s := newTestStore(t)
+		_, err := s.Replace(ctx, entryFor(f, signIn(t, f)))
+		require.NoError(t, err)
+		expire(t, s, -time.Second)
+		f.AccessClaims = map[string]any{"sub": "someone-else", "exp": float64(time.Now().Add(time.Minute).Unix()) + 0.5}
+		_, err = s.AccessToken(ctx, testHub, nil)
+		require.ErrorIs(t, err, ErrIdentityChanged)
+		_, err = s.Load(testHub)
+		assert.ErrorIs(t, err, ErrNotSignedIn)
+	})
+
 	t.Run("no verdict keeps the sign-in and a still valid token", func(t *testing.T) {
 		f := cliauthtest.New(t)
 		s := newTestStore(t)

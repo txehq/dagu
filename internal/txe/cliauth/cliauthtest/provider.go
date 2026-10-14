@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,7 @@ type Provider struct {
 	IDIssuer        string                           // issuer of the ID token, when not the issuer
 	JWKSURI         string                           // jwks_uri stated in discovery, when not its own
 	AccessSubject   string                           // subject of access tokens, when not subject
+	AccessClaims    map[string]any                   // claims of access tokens over the usual ones
 	SignWith        *rsa.PrivateKey                  // key that signs tokens, when not key
 	RefreshHandler  func(w http.ResponseWriter) bool // answers a refresh instead, when it returns true
 	Rotate          bool                             // issue a new refresh token on renewal
@@ -175,10 +177,12 @@ func (f *Provider) issue(w http.ResponseWriter, subject, nonce string, withID bo
 	if f.AccessSubject != "" {
 		accessSub = f.AccessSubject
 	}
-	access := f.sign(jwt.MapClaims{
+	accessClaims := jwt.MapClaims{
 		"iss": f.Issuer(), "sub": accessSub, "aud": "dagu-hub", "azp": f.ClientID, "typ": "Bearer",
 		"iat": now.Unix(), "exp": now.Add(f.AccessLifetime).Unix(), "jti": f.nextID("at-"),
-	})
+	}
+	maps.Copy(accessClaims, f.AccessClaims)
+	access := f.sign(accessClaims)
 	body := map[string]any{
 		"access_token": access,
 		"token_type":   "Bearer",
