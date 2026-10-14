@@ -71,8 +71,10 @@ jobs:
     needs: gate
     runs-on: ubuntu-24.04
     environment: codex-review
+    # Per head: gates finish out of order, so a late gate for an older head must not cancel the
+    # newer head's review. A review of a head that is no longer the PR's skips at its live read.
     concurrency:
-      group: codex-review-${{ github.event.pull_request.number }}
+      group: codex-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
       cancel-in-progress: true
     timeout-minutes: 40
     permissions:

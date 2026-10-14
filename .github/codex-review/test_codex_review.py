@@ -281,6 +281,9 @@ class Workflow(unittest.TestCase):
         self.assertNotIn("concurrency", gate)
         self.assertIn("needs: gate", review)
         self.assertIn("cancel-in-progress: true", review)
+        # Keyed by head: a late gate for an older head cannot cancel the newer head's review.
+        group = next(x for x in jobs["review"] if x.strip().startswith("group:"))
+        self.assertIn("${{ github.event.pull_request.head.sha }}", group)
         self.assertNotIn("secrets.", gate)
 
 if __name__ == "__main__":
