@@ -61,6 +61,11 @@ func (s *Store) ApplyForEnrolment(ctx context.Context, p authn.Principal, machin
 	if p.IsZero() || p.ClientID == "" {
 		return nil, refuse(CodeInvalid, "the credential names no issuer, subject or client")
 	}
+	if p.Expires.IsZero() {
+		// A stored credential with no expiry would never go stale, and
+		// could be approved at any time later.
+		return nil, refuse(CodeInvalid, "the credential carries no expiry")
+	}
 	if expired(p, s.clock()) {
 		return nil, refuse(CodeForbidden, "the credential has expired")
 	}
@@ -185,7 +190,7 @@ func (s *Store) EnrolFromApplication(ctx context.Context, by Scope, machineID st
 		Class:    application.Class, ClientID: application.ClientID, SessionID: application.SessionID,
 		IssuedAt: application.CredentialIssuedAt, Expires: application.CredentialExpires,
 	}
-	if expired(credential, s.clock()) {
+	if credential.Expires.IsZero() || expired(credential, s.clock()) {
 		return nil, &Error{Code: CodeStale, Message: "the application's credential has expired; the machine must apply again", Current: &application}
 	}
 	return s.Enrol(ctx, by, EnrolmentRequest{MachineID: machineID, Credential: credential})

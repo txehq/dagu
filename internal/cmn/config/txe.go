@@ -41,6 +41,32 @@ type TXEAuthnConfig struct {
 	Clients []TXEAuthnClient
 	// MaxLifetime caps a token's lifetime. Zero is the verifier's cap.
 	MaxLifetime time.Duration
+	// CLIClient names the cli client the server advertises to the command
+	// line. Empty means the only cli client, if there is exactly one.
+	CLIClient string
+}
+
+// AdvertisedCLIClient returns the cli client the server tells the command
+// line to sign in with, or "" when there is none to tell: no cli client, or
+// several and none named.
+func (c TXEAuthnConfig) AdvertisedCLIClient() string {
+	if !c.Enabled() {
+		return ""
+	}
+	if c.CLIClient != "" {
+		return c.CLIClient
+	}
+	var found string
+	for _, client := range c.Clients {
+		if client.Class != "cli" {
+			continue
+		}
+		if found != "" {
+			return ""
+		}
+		found = client.ID
+	}
+	return found
 }
 
 // TXEAuthnClient is one provider client and the class of caller it is.
@@ -71,20 +97,21 @@ const (
 var txeAuthnClasses = []string{"cli", "worker", "reviewer"}
 
 const (
-	txeKey              = "txe"
-	txeAuthzKey         = "txe.authz"
-	txeAuthzModeKey     = "txe.authz.mode"
-	txeAuthnKey         = "txe.authn"
-	txeAuthnIssuerKey   = "txe.authn.issuer"
-	txeAuthnAudienceKey = "txe.authn.audience"
-	txeAuthnJWKSKey     = "txe.authn.jwks_url"
-	txeAuthnClientsKey  = "txe.authn.clients"
-	txeAuthnLifetimeKey = "txe.authn.max_lifetime"
-	txeAuthzModeEnv     = "TXE_AUTHZ_MODE"
-	txeAuthnIssuerEnv   = "TXE_AUTHN_ISSUER"
-	txeAuthnAudienceEnv = "TXE_AUTHN_AUDIENCE"
-	txeAuthnJWKSEnv     = "TXE_AUTHN_JWKS_URL"
-	txeAuthnLifetimeEnv = "TXE_AUTHN_MAX_LIFETIME"
+	txeKey               = "txe"
+	txeAuthzKey          = "txe.authz"
+	txeAuthzModeKey      = "txe.authz.mode"
+	txeAuthnKey          = "txe.authn"
+	txeAuthnIssuerKey    = "txe.authn.issuer"
+	txeAuthnAudienceKey  = "txe.authn.audience"
+	txeAuthnJWKSKey      = "txe.authn.jwks_url"
+	txeAuthnCLIClientKey = "txe.authn.cli_client"
+	txeAuthnClientsKey   = "txe.authn.clients"
+	txeAuthnLifetimeKey  = "txe.authn.max_lifetime"
+	txeAuthzModeEnv      = "TXE_AUTHZ_MODE"
+	txeAuthnIssuerEnv    = "TXE_AUTHN_ISSUER"
+	txeAuthnAudienceEnv  = "TXE_AUTHN_AUDIENCE"
+	txeAuthnJWKSEnv      = "TXE_AUTHN_JWKS_URL"
+	txeAuthnLifetimeEnv  = "TXE_AUTHN_MAX_LIFETIME"
 )
 
 // loadTXEConfig reads the txe section from the raw values, as the fork
@@ -112,7 +139,7 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 	}{
 		{txeKey, []string{"authz", "authn"}},
 		{txeAuthzKey, []string{"mode"}},
-		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime"}},
+		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime", "cli_client"}},
 	} {
 		m, err := l.txeSection(section.key)
 		if err != nil {
@@ -140,6 +167,9 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 		return fmt.Errorf("%s is empty: remove it, or list the clients", txeAuthnClientsKey)
 	}
 	if cfg.TXE.Authn.Clients, err = parseTXEAuthnClients(l.v.Get(txeAuthnClientsKey)); err != nil {
+		return err
+	}
+	if cfg.TXE.Authn.CLIClient, err = l.txeString(txeAuthnCLIClientKey); err != nil {
 		return err
 	}
 	lifetime, err := l.txeString(txeAuthnLifetimeKey)
@@ -311,7 +341,7 @@ func (c *Config) validateTXE() error {
 
 func (a TXEAuthnConfig) validate() error {
 	if !a.Enabled() {
-		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 {
+		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 || a.CLIClient != "" {
 			return fmt.Errorf("%s: an issuer is required when any other value is set", txeAuthnKey)
 		}
 		return nil
@@ -341,6 +371,9 @@ func (a TXEAuthnConfig) validate() error {
 		if !slices.Contains(txeAuthnClasses, client.Class) {
 			return fmt.Errorf("%s[%d].class: %q is not a token class (%s)", txeAuthnClientsKey, i, client.Class, strings.Join(txeAuthnClasses, ", "))
 		}
+	}
+	if a.CLIClient != "" && !slices.ContainsFunc(a.Clients, func(c TXEAuthnClient) bool { return c.ID == a.CLIClient && c.Class == "cli" }) {
+		return fmt.Errorf("%s: %q is not a client of class cli", txeAuthnCLIClientKey, a.CLIClient)
 	}
 	if a.MaxLifetime < 0 || a.MaxLifetime > txeAuthnMaxLifetime {
 		return fmt.Errorf("%s must be between 0 and %s, got %s", txeAuthnLifetimeKey, txeAuthnMaxLifetime, a.MaxLifetime)

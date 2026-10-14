@@ -134,3 +134,17 @@ func TestEnrolmentApplications(t *testing.T) {
 	_, err = f.store.EnrolFromApplication(ctx, a, machineA1, authn.ClassReviewer, "dagu-worker-a1", worker.Identity)
 	require.Equal(t, CodeNotFound, CodeOf(err))
 }
+
+// A credential with no expiry would never go stale: it is not stored, and
+// not approved.
+func TestEnrolmentApplicationNeedsAnExpiry(t *testing.T) {
+	f := newFixture(t)
+	f.bind("alice", ownerA)
+	forever := f.token(authn.ClassWorker, "alice", "dagu-worker-a1", "s1")
+	forever.Expires = time.Time{}
+	_, err := f.store.ApplyForEnrolment(context.Background(), forever, machineA1)
+	require.Equal(t, CodeInvalid, CodeOf(err))
+	apps, err := f.store.EnrolmentApplications(context.Background(), machineA1)
+	require.NoError(t, err)
+	require.Empty(t, apps)
+}

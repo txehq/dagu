@@ -730,6 +730,8 @@ func (a *API) buildAuthOptions(mountedAPIPath string) (frontendauth.Options, err
 		pathutil.BuildPublicEndpointPath(mountedAPIPath, "health"),
 		pathutil.BuildPublicEndpointPath(mountedAPIPath, "auth/login"),
 		pathutil.BuildPublicEndpointPath(mountedAPIPath, "auth/setup"),
+		// How the command line signs in: public, nothing secret.
+		pathutil.BuildPublicEndpointPath(mountedAPIPath, "txe/auth/cli"),
 	}
 	if a.config.Server.Metrics == config.MetricsAccessPublic {
 		publicPaths = append(publicPaths, pathutil.BuildPublicEndpointPath(mountedAPIPath, "metrics"))

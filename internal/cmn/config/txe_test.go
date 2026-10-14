@@ -179,3 +179,26 @@ func TestLoad_TXENullInAdminYAMLIsRefused(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "is empty")
 }
+
+func TestTXEAdvertisedCLIClient(t *testing.T) {
+	base := TXEAuthnConfig{Issuer: "https://a.example/r", Audience: "h", JWKSURL: "https://a.example/k"}
+	with := func(cli string, clients ...TXEAuthnClient) TXEAuthnConfig {
+		c := base
+		c.Clients, c.CLIClient = clients, cli
+		return c
+	}
+	assert.Empty(t, TXEAuthnConfig{}.AdvertisedCLIClient())
+	assert.Empty(t, with("", TXEAuthnClient{ID: "w", Class: "worker"}).AdvertisedCLIClient())
+	assert.Equal(t, "cli", with("", TXEAuthnClient{ID: "cli", Class: "cli"}, TXEAuthnClient{ID: "w", Class: "worker"}).AdvertisedCLIClient())
+	// Several cli clients and none named: nothing is advertised.
+	two := with("", TXEAuthnClient{ID: "cli-a", Class: "cli"}, TXEAuthnClient{ID: "cli-b", Class: "cli"})
+	assert.Empty(t, two.AdvertisedCLIClient())
+	two.CLIClient = "cli-b"
+	assert.Equal(t, "cli-b", two.AdvertisedCLIClient())
+	require.NoError(t, two.validate())
+
+	bad := with("w", TXEAuthnClient{ID: "w", Class: "worker"})
+	require.ErrorContains(t, bad.validate(), "not a client of class cli")
+	cfg := loadFromYAML(t, txeAuthnYAML+"    cli_client: dagu-cli\n")
+	assert.Equal(t, "dagu-cli", cfg.TXE.Authn.CLIClient)
+}

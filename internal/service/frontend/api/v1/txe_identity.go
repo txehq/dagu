@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
@@ -41,6 +42,35 @@ var errTxeAuthzUnavailable = &Error{
 // contract 1, section 3). Every other route refuses such a token before its
 // handler runs.
 const txeTokenRoutePrefix = "txe"
+
+// txeTokenUse is what GET /txe/auth/cli tells the command line about where
+// its token is accepted. It follows txeTokenRoutePrefix: every /txe route.
+const txeTokenUse = "txe"
+
+// txeCLIScopes are the scopes the command line asks the provider for.
+var txeCLIScopes = []string{"openid"}
+
+// GetTxeCliAuth tells the command line how to sign in. It is public: the
+// answer is the server's configured issuer and cli client, nothing secret.
+func (a *API) GetTxeCliAuth(_ context.Context, _ api.GetTxeCliAuthRequestObject) (api.GetTxeCliAuthResponseObject, error) {
+	if a.txeAuth == nil || !a.txeAuth.AcceptsTokens() || a.config == nil {
+		return nil, txeCLIAuthNotFound
+	}
+	client := a.config.TXE.Authn.AdvertisedCLIClient()
+	if client == "" {
+		return nil, txeCLIAuthNotFound
+	}
+	return api.GetTxeCliAuth200JSONResponse{
+		Contract: txeAuthContract,
+		Issuer:   a.config.TXE.Authn.Issuer,
+		ClientId: client,
+		Scopes:   slices.Clone(txeCLIScopes),
+		Use:      txeTokenUse,
+	}, nil
+}
+
+var txeCLIAuthNotFound = &Error{HTTPStatus: http.StatusNotFound, Code: api.ErrorCodeNotFound,
+	Message: "this server accepts no command-line sign-in"}
 
 // txeTokenRoute says whether a request may be made with a provider token. A
 // request for a remote node is never admitted: it would be forwarded with a

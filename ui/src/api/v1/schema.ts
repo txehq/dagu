@@ -3821,6 +3821,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/auth/cli": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How the command line signs in
+         * @description Public and non-secret: what the command line needs to sign in with the identity provider, built only from the server's txe.authn configuration. use says which routes accept the resulting token: txe (the /txe routes) or all; any other value is to be read as identity (GET /txe/identity only). 404 when the server accepts no provider tokens, or names no single cli client.
+         */
+        get: operations["getTxeCliAuth"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/identity": {
         parameters: {
             query?: never;
@@ -8253,6 +8273,15 @@ export interface components {
             display_name: string;
             provenance?: string;
             actor?: components["schemas"]["TxeActor"];
+        };
+        TxeCliAuth: {
+            /** @description Version of this shape. 1. */
+            contract: number;
+            issuer: string;
+            client_id: string;
+            scopes: string[];
+            /** @description Which routes accept a cli token: txe, all, or (read any other value as) identity. */
+            use: string;
         };
         /** @description Who the hub takes the caller to be (TXE-3415 contract 1). */
         TxeIdentity: {
@@ -22265,6 +22294,44 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTxeCliAuth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sign-in parameters */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeCliAuth"];
+                };
+            };
+            /** @description Provider tokens are not accepted here */
             404: {
                 headers: {
                     [name: string]: unknown;

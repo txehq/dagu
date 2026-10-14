@@ -304,6 +304,23 @@ func BuiltinOIDCLoginHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 			return
 		}
 
+		// A sign-in may ask the provider to show its sign-in page even
+		// when the browser already has a session there, so a person can
+		// switch accounts. Only the two prompts that do that are passed on.
+		// The value sent is always one of these constants, never the
+		// request's own text.
+		var prompt string
+		switch r.URL.Query().Get("prompt") {
+		case "":
+		case "login":
+			prompt = "login"
+		case "select_account":
+			prompt = "select_account"
+		default:
+			redirectWithError(w, r, cfg.LoginBasePath, "unsupported sign-in prompt")
+			return
+		}
+
 		state := stringutil.RandomString(16)
 		nonce := stringutil.RandomString(16)
 
@@ -318,6 +335,9 @@ func BuiltinOIDCLoginHandler(cfg *BuiltinOIDCConfig) http.HandlerFunc {
 			verifier := oauth2.GenerateVerifier()
 			setCookie(w, r, cookiePKCEVerifier, verifier, stateCookieExpiry)
 			authOptions = append(authOptions, oauth2.S256ChallengeOption(verifier))
+		}
+		if prompt != "" {
+			authOptions = append(authOptions, oauth2.SetAuthURLParam("prompt", prompt))
 		}
 
 		http.Redirect(w, r, cfg.OAuth2Config.AuthCodeURL(state, authOptions...), http.StatusFound)
