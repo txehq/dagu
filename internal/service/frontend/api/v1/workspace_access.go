@@ -17,6 +17,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -425,12 +426,12 @@ func (a *API) requireDAGRunStatusVisible(ctx context.Context, status *ir.DAGRunS
 	if status == nil {
 		return nil
 	}
-	return a.requireNamedDAGVisible(ctx, txeNativeOwnerDAG(status), statusWorkspaceName(status))
+	return a.requireRunStatus(ctx, status, authz.PermissionView, a.requireNamedDAGVisible)
 }
 
 func (a *API) requireDAGRunStatusExecute(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil
 	}
-	return a.requireNamedDAGExecute(ctx, txeNativeOwnerDAG(status), statusWorkspaceName(status))
+	return a.requireRunStatus(ctx, status, authz.PermissionExecute, a.requireNamedDAGExecute)
 }

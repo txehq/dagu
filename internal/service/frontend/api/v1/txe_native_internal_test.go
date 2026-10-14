@@ -13,6 +13,7 @@ import (
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
@@ -192,4 +193,20 @@ func TestTxeNativeValidateIsClosedToOwnerHeldCallers(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, statusOf(err))
 	_, err = w.api.ValidateDAGSpec(w.legacy, apigen.ValidateDAGSpecRequestObject{Body: &apigen.ValidateDAGSpecJSONRequestBody{Spec: spec}})
 	require.NoError(t, err)
+}
+
+// A run of another owner's job DAG, called as a sub-DAG from one's own job,
+// is not one's own: it is decided by its own DAG's owner too.
+func TestTxeNativeSubRunOfAnotherOwnersDAG(t *testing.T) {
+	w := newTwoOwners(t, "")
+	sub := &ir.DAGRunStatus{Name: w.jobB, Root: ir.NewDAGRunRef(w.jobA, "run-1")}
+	require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGRunStatusVisible(neutral(w.personA), sub)))
+	require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGRunStatusVisible(neutral(w.personB), sub)))
+
+	// A sub-run of a DAG with no owner, under one's own job, is one's own.
+	own := &ir.DAGRunStatus{Name: "shared-helper", Root: ir.NewDAGRunRef(w.jobA, "run-1")}
+	require.NoError(t, w.api.requireDAGRunStatusVisible(neutral(w.personA), own))
+	require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGRunStatusVisible(neutral(w.personB), own)))
+	// A legacy key in mode off is decided by workspace alone, as before.
+	require.NoError(t, w.api.requireDAGRunStatusVisible(w.legacy, sub))
 }

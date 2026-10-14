@@ -217,3 +217,30 @@ func txeNativeRoute(mountedAPIPath string, p string) bool {
 	}
 	return false
 }
+
+// requireRunStatus decides a run by its root DAG, whose owner a run of it
+// belongs to, and, when the run is of another DAG that has an owner of its
+// own (a sub-run of a job or machine DAG called from another's run), by
+// that DAG as well: calling another owner's DAG from one's own job does not
+// make its runs one's own.
+func (a *API) requireRunStatus(ctx context.Context, status *ir.DAGRunStatus, permission authz.Permission,
+	check func(ctx context.Context, dagName, workspaceName string) error) error {
+	root := txeNativeOwnerDAG(status)
+	if err := check(ctx, root, statusWorkspaceName(status)); err != nil {
+		return err
+	}
+	if status.Name == root || a.txeAuth == nil {
+		return nil
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return err
+	}
+	if c.mode == authz.ModeOff {
+		return nil
+	}
+	if _, owned, err := a.txeNativeResource(ctx, status.Name); err != nil || owned {
+		return a.txeNativeCheck(ctx, status.Name, permission, func() error { return nil })
+	}
+	return nil
+}
