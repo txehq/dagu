@@ -96,33 +96,45 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 			return fmt.Errorf("%s is set but empty: unset it, or give it a value", name)
 		}
 	}
-	if err := onlyKeys(l.v.GetStringMap(txeKey), txeKey, "authz", "authn"); err != nil {
-		return err
-	}
-	if err := onlyKeys(l.v.GetStringMap(txeAuthzKey), txeAuthzKey, "mode"); err != nil {
-		return err
-	}
-	if err := onlyKeys(l.v.GetStringMap(txeAuthnKey), txeAuthnKey, "issuer", "audience", "jwks_url", "clients", "max_lifetime"); err != nil {
-		return err
+	// A section is a mapping or absent. A scalar in its place is refused:
+	// read as an empty mapping it would switch everything off.
+	for _, section := range []struct {
+		key     string
+		allowed []string
+	}{
+		{txeKey, []string{"authz", "authn"}},
+		{txeAuthzKey, []string{"mode"}},
+		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime"}},
+	} {
+		m, err := l.txeSection(section.key)
+		if err != nil {
+			return err
+		}
+		if err := onlyKeys(m, section.key, section.allowed...); err != nil {
+			return err
+		}
 	}
 
 	var err error
-	if cfg.TXE.Authz.Mode, err = exactString(l.v.Get(txeAuthzModeKey), txeAuthzModeKey); err != nil {
+	if cfg.TXE.Authz.Mode, err = l.txeString(txeAuthzModeKey); err != nil {
 		return err
 	}
-	if cfg.TXE.Authn.Issuer, err = exactString(l.v.Get(txeAuthnIssuerKey), txeAuthnIssuerKey); err != nil {
+	if cfg.TXE.Authn.Issuer, err = l.txeString(txeAuthnIssuerKey); err != nil {
 		return err
 	}
-	if cfg.TXE.Authn.Audience, err = exactString(l.v.Get(txeAuthnAudienceKey), txeAuthnAudienceKey); err != nil {
+	if cfg.TXE.Authn.Audience, err = l.txeString(txeAuthnAudienceKey); err != nil {
 		return err
 	}
-	if cfg.TXE.Authn.JWKSURL, err = exactString(l.v.Get(txeAuthnJWKSKey), txeAuthnJWKSKey); err != nil {
+	if cfg.TXE.Authn.JWKSURL, err = l.txeString(txeAuthnJWKSKey); err != nil {
 		return err
+	}
+	if l.txeWrittenEmpty(txeAuthnClientsKey) {
+		return fmt.Errorf("%s is empty: remove it, or list the clients", txeAuthnClientsKey)
 	}
 	if cfg.TXE.Authn.Clients, err = parseTXEAuthnClients(l.v.Get(txeAuthnClientsKey)); err != nil {
 		return err
 	}
-	lifetime, err := exactString(l.v.Get(txeAuthnLifetimeKey), txeAuthnLifetimeKey)
+	lifetime, err := l.txeString(txeAuthnLifetimeKey)
 	if err != nil {
 		return err
 	}
@@ -134,6 +146,60 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 		cfg.TXE.Authn.MaxLifetime = d
 	}
 	return nil
+}
+
+// txeSection reads a section, which must be a mapping when it is present.
+func (l *ConfigLoader) txeSection(key string) (map[string]any, error) {
+	switch v := l.v.Get(key).(type) {
+	case nil:
+		if l.txeWrittenEmpty(key) {
+			return nil, fmt.Errorf("%s is empty: remove it, or give it its settings", key)
+		}
+		return nil, nil
+	case map[string]any:
+		return v, nil
+	default:
+		return nil, fmt.Errorf("%s must be a mapping of settings, got %v", key, v)
+	}
+}
+
+// txeString reads a setting that must be a non-empty string when it is
+// present. Written empty, it is refused rather than read as "not set":
+// an empty mode would otherwise mean off.
+func (l *ConfigLoader) txeString(key string) (string, error) {
+	v := l.v.Get(key)
+	if v == nil {
+		if l.txeWrittenEmpty(key) {
+			return "", fmt.Errorf("%s is empty: remove it, or give it a value", key)
+		}
+		return "", nil
+	}
+	s, err := exactString(v, key)
+	if err != nil {
+		return "", err
+	}
+	if s == "" {
+		return "", fmt.Errorf("%s is empty: remove it, or give it a value", key)
+	}
+	return s, nil
+}
+
+// txeWrittenEmpty reports whether key is written with no value (YAML null),
+// which the loader otherwise cannot tell from a key that is absent.
+func (l *ConfigLoader) txeWrittenEmpty(key string) bool {
+	if l.v.IsSet(key) && l.v.Get(key) == nil {
+		return true
+	}
+	i := strings.LastIndex(key, ".")
+	if i < 0 {
+		return false
+	}
+	parent, ok := l.v.Get(key[:i]).(map[string]any)
+	if !ok {
+		return false
+	}
+	v, present := parent[key[i+1:]]
+	return present && v == nil
 }
 
 func onlyKeys(m map[string]any, section string, allowed ...string) error {
