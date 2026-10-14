@@ -12,8 +12,9 @@ type Props = {
   // shown as text. Nothing is matched or decided on it.
   username?: string;
   // onRequestAccess records a request for the signed-in account. It runs only
-  // when the person presses the button, never on display.
-  onRequestAccess: () => void;
+  // when the person presses the button, never on display. Without it there is
+  // no button, and the person is told to ask the administrator.
+  onRequestAccess?: () => void;
   requesting?: boolean;
   // requestError is why the last request was not recorded.
   requestError?: string;
@@ -47,7 +48,11 @@ export function NoAccessYet({
         )}
       </p>
       <p className="text-sm text-muted-foreground">
-        <I18nText text="Request access, and the platform administrator can approve it." />
+        {onRequestAccess ? (
+          <I18nText text="Request access, and the platform administrator can approve it." />
+        ) : (
+          <I18nText text="Ask the platform administrator to give your account access." />
+        )}
       </p>
       {requestError && (
         <p
@@ -62,13 +67,15 @@ export function NoAccessYet({
         </p>
       )}
       <div className="flex gap-2">
-        <Button onClick={onRequestAccess} disabled={requesting}>
-          {requesting ? (
-            <I18nText text="Requesting…" />
-          ) : (
-            <I18nText text="Request access" />
-          )}
-        </Button>
+        {onRequestAccess && (
+          <Button onClick={onRequestAccess} disabled={requesting}>
+            {requesting ? (
+              <I18nText text="Requesting…" />
+            ) : (
+              <I18nText text="Request access" />
+            )}
+          </Button>
+        )}
         <Button variant="outline" onClick={onSignOut}>
           {t('auth.signOut')}
         </Button>

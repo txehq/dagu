@@ -714,3 +714,63 @@ describe('SSEManager', () => {
     unsubscribe();
   });
 });
+
+describe('SSEManager for a caller the hub refuses streams', () => {
+  beforeEach(() => {
+    MockEventSource.instances = [];
+    vi.stubGlobal('EventSource', MockEventSource);
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  const subscribe = (manager: SSEManager, states: SSEConnectionState[]) =>
+    manager.subscribe('/events/dags/example.yaml', 'local', '/api/v1', {
+      onData: () => undefined,
+      onStateChange: (state) => states.push(snapshotState(state)),
+    });
+
+  it('opens no stream and tells the subscriber to poll', () => {
+    const manager = new SSEManager();
+    manager.setRefused(true);
+    const states: SSEConnectionState[] = [];
+    const unsubscribe = subscribe(manager, states);
+
+    expect(MockEventSource.instances).toHaveLength(0);
+    expect(lastState(states)).toEqual({
+      isConnected: false,
+      isConnecting: false,
+      shouldUseFallback: true,
+      error: null,
+    });
+    unsubscribe();
+  });
+
+  it('closes a stream that is open when streams become refused', () => {
+    setAuthSession('token-a', undefined, 'login');
+    const manager = new SSEManager();
+    const states: SSEConnectionState[] = [];
+    subscribe(manager, states);
+    const eventSource = lastEventSource();
+    expect(eventSource).toBeDefined();
+
+    manager.setRefused(true);
+
+    expect(eventSource!.close).toHaveBeenCalled();
+    expect(lastState(states)?.shouldUseFallback).toBe(true);
+    expect(lastState(states)?.isConnected).toBe(false);
+  });
+
+  it('opens streams again once they are allowed', () => {
+    setAuthSession('token-a', undefined, 'login');
+    const manager = new SSEManager();
+    manager.setRefused(true);
+    manager.setRefused(false);
+    subscribe(manager, []);
+
+    expect(MockEventSource.instances).toHaveLength(1);
+  });
+});

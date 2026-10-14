@@ -240,8 +240,20 @@ function calculateRetryDelay(retryCount: number): number {
   return Math.min(1000 * 2 ** retryCount, MAX_RETRY_DELAY_MS);
 }
 
+// The state a subscriber sees while streams are refused for this caller: no
+// connection, so a page polls instead.
+const REFUSED_STATE: SSEConnectionState = {
+  isConnected: false,
+  isConnecting: false,
+  shouldUseFallback: true,
+  error: null,
+};
+
 export class SSEManager {
   private connections = new Map<string, ManagedConnection>();
+  // refused is set for a caller the hub refuses every event stream, such as a
+  // person signed in through the identity provider: no stream is opened.
+  private refused = false;
 
   constructor() {
     addAuthSessionListener((change) => {
@@ -277,6 +289,10 @@ export class SSEManager {
     apiURL: string,
     callbacks: SubscriberCallbacks
   ): () => void {
+    if (this.refused) {
+      callbacks.onStateChange(REFUSED_STATE);
+      return () => {};
+    }
     const key = buildConnectionKey(apiURL, remoteNode);
     const subscriberId = String(++subscriberIdCounter);
     const conn = this.getOrCreateConnection(key, apiURL, remoteNode);
@@ -431,6 +447,9 @@ export class SSEManager {
   }
 
   private connect(conn: ManagedConnection): void {
+    if (this.refused) {
+      return;
+    }
     if (conn.topics.size === 0) {
       return;
     }
@@ -813,6 +832,21 @@ export class SSEManager {
   disposeAll(): void {
     for (const conn of Array.from(this.connections.values())) {
       this.disposeConnection(conn);
+    }
+  }
+
+  // setRefused stops this browser opening any event stream while true, and
+  // closes the ones open. Subscribers fall back to polling.
+  setRefused(refused: boolean): void {
+    if (this.refused === refused) {
+      return;
+    }
+    this.refused = refused;
+    if (refused) {
+      for (const conn of Array.from(this.connections.values())) {
+        this.updateState(conn, REFUSED_STATE);
+      }
+      this.disposeAll();
     }
   }
 }
