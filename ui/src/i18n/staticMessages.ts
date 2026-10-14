@@ -2363,6 +2363,9 @@ const english = {
   "State": "State",
   "The request changed since this page read it ({reason}). The list has been read again; approve again.": "The request changed since this page read it ({reason}). The list has been read again; approve again.",
   "Waiting for approval": "Waiting for approval",
+  // TXE switch account (TXE-4267).
+  "Use a different account": "Use a different account",
+  "Switch account": "Switch account",
 } as const;
 
 export type StaticMessage = keyof typeof english;
@@ -4668,6 +4671,9 @@ const chinese = {
   "State": "状态",
   "The request changed since this page read it ({reason}). The list has been read again; approve again.": "此页面读取后请求已更改（{reason}）。列表已重新读取，请再次批准。",
   "Waiting for approval": "等待批准",
+  // TXE switch account (TXE-4267).
+  "Use a different account": "使用其他账户",
+  "Switch account": "切换账户",
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
@@ -7054,6 +7060,9 @@ const japanese = {
   "State": "状態",
   "The request changed since this page read it ({reason}). The list has been read again; approve again.": "このページの読み込み後にリクエストが変更されました（{reason}）。一覧を読み込み直しました。もう一度承認してください。",
   "Waiting for approval": "承認待ち",
+  // TXE switch account (TXE-4267).
+  "Use a different account": "別のアカウントを使用",
+  "Switch account": "アカウントを切り替え",
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {
