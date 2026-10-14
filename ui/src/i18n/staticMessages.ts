@@ -2366,7 +2366,6 @@ const english = {
   // TXE switch account (TXE-4267).
   "Use a different account": "Use a different account",
   "Switch account": "Switch account",
-||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
   // TXE sharing (TXE-4266).
   "Owner id": "Owner id",
   "Share": "Share",
@@ -4683,7 +4682,6 @@ const chinese = {
   // TXE switch account (TXE-4267).
   "Use a different account": "使用其他账户",
   "Switch account": "切换账户",
-||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
   // TXE sharing (TXE-4266).
   "Owner id": "所有者 ID",
   "Share": "共享",
@@ -7081,7 +7079,6 @@ const japanese = {
   // TXE switch account (TXE-4267).
   "Use a different account": "別のアカウントを使用",
   "Switch account": "アカウントを切り替え",
-||||||| parent of 366582e95 (feat(ui): TXE-4266 an owner shares a job with another owner by exact owner id, revokes it, and shared jobs say who shared them)
   // TXE sharing (TXE-4266).
   "Owner id": "オーナー ID",
   "Share": "共有",
