@@ -325,6 +325,10 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 		filepath.Join(l.DataDir, "users", "admin.json"),
 		filepath.Join(l.DataDir, "apikeys", "key.json"),
 		filepath.Join(l.DataDir, "contexts", "remote.json"),
+		filepath.Join(l.DataDir, "auth", "encryption_key"),
+		filepath.Join(l.DataDir, "tailscale", "tailscaled.state"),
+		filepath.Join(l.DataDir, "license", "license.json"),
+		filepath.Join(l.DataDir, "gitsync", "repo", ".git", "config"),
 		filepath.Join(l.MachineHome, "client", "contexts", "hub.yaml"),
 	} {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
@@ -340,7 +344,8 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 	for _, e := range inv.Excluded {
 		excluded[e.Root+"/"+e.Path] = true
 	}
-	for _, p := range []string{"hub-data/users", "hub-data/apikeys", "hub-data/contexts", "laptop-home/client"} {
+	for _, p := range []string{"hub-data/users", "hub-data/apikeys", "hub-data/contexts", "hub-data/auth", "hub-data/tailscale",
+		"hub-data/license", "hub-data/gitsync", "laptop-home/client"} {
 		assert.True(t, excluded[p], p)
 	}
 	out, err := json.Marshal(inv)
@@ -446,4 +451,19 @@ func TestPackageOnTheWrongMachine(t *testing.T) {
 	}
 	assert.NotEmpty(t, missing, "the validation job's version has no package on its own machine")
 	assert.Empty(t, corrupt, "the moved package itself verifies")
+}
+
+// Every area upstream Dagu writes in its data directory is classified, so
+// a real hub's freeze inventory does not stop on one it does not know.
+func TestUpstreamDataAreasAreClassified(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	for _, area := range []string{"incidents", "notifications", "wiki", "docs", "workspace-bundles", "cache", "browser", "computer", "xlsx"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, area, "x"), 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, area, "x", "f.json"), []byte(`{}`), 0o600))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, "tunnel_url"), []byte("https://fixture.invalid\n"), 0o600))
+	inv := scan(t, l)
+	assert.Empty(t, continuity.Blocking(continuity.Validate(inv, continuity.Policy{})))
+	assert.Positive(t, inv.Counts["file:hub-data"])
 }

@@ -55,17 +55,22 @@ type Options struct {
 // one of these, or the scan reports it as unclassified and blocks.
 var hubDataAreas = map[string]string{
 	// Retained execution history and state: present later, may change.
-	"dag-runs":   PolicyMutable,
-	"dag-state":  PolicyMutable,
-	"artifacts":  PolicyImmutable,
-	"suspend":    PolicyMutable,
-	"workspaces": PolicyMutable,
-	"views":      PolicyMutable,
-	"gitsync":    PolicyMutable,
+	"dag-runs":          PolicyMutable,
+	"dag-state":         PolicyMutable,
+	"artifacts":         PolicyImmutable,
+	"suspend":           PolicyMutable,
+	"workspaces":        PolicyMutable,
+	"views":             PolicyMutable,
+	"incidents":         PolicyMutable,
+	"notifications":     PolicyMutable,
+	"wiki":              PolicyMutable,
+	"docs":              PolicyMutable,
+	"workspace-bundles": PolicyMutable,
 	// Operational state that is rebuilt or consumed.
 	"queue":            PolicyOperational,
 	"proc":             PolicyOperational,
 	"service-registry": PolicyOperational,
+	"tunnel_url":       PolicyOperational,
 }
 
 // Areas of the data directory that are never read.
@@ -75,9 +80,17 @@ var hubDataExcluded = map[string]string{
 	"webhooks":         "holds webhook secrets; not read",
 	"contexts":         "holds remote context credentials; not read",
 	"remote-nodes":     "holds remote node credentials; not read",
+	"auth":             "holds the encryption key; not read",
+	"tailscale":        "holds tailscale node keys; not read",
+	"license":          "holds license material; not read",
+	"gitsync":          "a clone of a remote whose git config can carry credentials; reproducible from the remote, not read",
 	"dag-run-work":     "per-run scratch working directories; operational, not retained",
 	"tools":            "downloaded tool binaries; reinstalled, not retained data",
 	"materializations": "derived caches; rebuilt",
+	"cache":            "derived caches (the DAG index); rebuilt",
+	"browser":          "browser host replay cache; rebuilt",
+	"computer":         "computer host replay cache; rebuilt",
+	"xlsx":             "workbook replay cache; rebuilt",
 }
 
 // Areas of a machine's TXE home.
