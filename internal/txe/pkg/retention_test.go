@@ -64,22 +64,30 @@ func TestRenderDAGKeepsRunHistoryOverABaseConfig(t *testing.T) {
 }
 
 // A run started with local storage removes the DAG's older finished runs,
-// with their logs and artifacts. Dagu's default removes a run whose last
-// write was 40 days ago; the job's DAG keeps it.
+// with their logs and artifacts. Without TXE, Dagu's default removes a run
+// whose last write was 40 days ago. The job's DAG keeps it, and so does a copy
+// rendered before the DAG declared its retention, which still has the 30-day
+// default: persistence keeps the history of every DAG with TXE's machine
+// selector.
 func TestRenderedDAGKeepsOldRunsWhenARunStarts(t *testing.T) {
 	s := testDAGSpec()
 	rendered, err := RenderDAG(s)
 	require.NoError(t, err)
-	withoutRetention := bytes.Replace(rendered, []byte(retentionLine), nil, 1)
-	require.NotEqual(t, rendered, withoutRetention)
+	legacy := bytes.Replace(rendered, []byte(retentionLine), nil, 1)
+	require.NotEqual(t, rendered, legacy)
+	selector := "worker_selector:\n  " + LabelMachine + ": " + quote(s.MachineID) + "\n"
+	notTXE := bytes.Replace(legacy, []byte(selector), nil, 1)
+	require.NotEqual(t, legacy, notTXE)
 
 	for _, tc := range []struct {
 		name     string
 		data     []byte
+		wantDays int
 		wantKept bool
 	}{
-		{"rendered", rendered, true},
-		{"Dagu default", withoutRetention, false},
+		{"rendered", rendered, HistRetentionDays, true},
+		{"rendered before the retention", legacy, 30, true},
+		{"not a TXE DAG", notTXE, 30, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -90,11 +98,7 @@ func TestRenderedDAGKeepsOldRunsWhenARunStarts(t *testing.T) {
 			require.NoError(t, os.WriteFile(file, tc.data, 0o600))
 			dag, err := spec.Load(ctx, file, spec.WithoutEval())
 			require.NoError(t, err)
-			wantDays := 30
-			if tc.wantKept {
-				wantDays = HistRetentionDays
-			}
-			require.Equal(t, wantDays, dag.HistRetentionDays)
+			require.Equal(t, tc.wantDays, dag.HistRetentionDays)
 
 			runsDir := filepath.Join(root, "dag-runs")
 			artifactsDir := filepath.Join(root, "artifacts")

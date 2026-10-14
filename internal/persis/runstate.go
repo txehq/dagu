@@ -25,8 +25,23 @@ type runStateStore struct {
 	prepared   dagrun.Attempt
 }
 
+// txeMachineLabel is the worker selector label every DAG TXE renders carries
+// (txepkg.LabelMachine). It is spelled out here because persistence does not
+// depend on TXE.
+const txeMachineLabel = "txe.machine"
+
+// keepsHistory reports whether a DAG's run history is exempt from automatic
+// removal. TXE's run history, logs and artifacts are only ever deleted by a
+// person: the DAGs TXE renders declare a 100-year retention, but a copy
+// rendered before they did, and every run snapshot recorded from one, still
+// carries Dagu's default. They all carry TXE's machine selector.
+func keepsHistory(dag *ir.DAG) bool {
+	return dag.WorkerSelector[txeMachineLabel] != ""
+}
+
 func (s *runStateStore) BeginAttempt(ctx context.Context, req runstate.BeginAttemptRequest) (runstate.Attempt, error) {
-	if req.DAG != nil && req.DAG.HistRetentionRuns == 0 {
+	prune := req.DAG != nil && !keepsHistory(req.DAG)
+	if prune && req.DAG.HistRetentionRuns == 0 {
 		if _, err := s.repository.RemoveOldDAGRuns(ctx, req.DAG.Name, req.DAG.HistRetentionDays, DAGRunRetentionOptions{}); err != nil {
 			logger.Error(ctx, "DAG runs data cleanup failed", tag.Error(err))
 		}
@@ -50,7 +65,7 @@ func (s *runStateStore) BeginAttempt(ctx context.Context, req runstate.BeginAtte
 		attempt = created
 	}
 
-	if req.DAG != nil && req.DAG.HistRetentionRuns > 0 {
+	if prune && req.DAG.HistRetentionRuns > 0 {
 		retentionRuns := req.DAG.HistRetentionRuns
 		if _, err := s.repository.RemoveOldDAGRuns(ctx, req.DAG.Name, 0, DAGRunRetentionOptions{
 			RetentionRuns: &retentionRuns,
