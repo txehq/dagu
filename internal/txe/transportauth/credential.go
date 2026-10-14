@@ -263,6 +263,9 @@ type sourceState struct {
 	access     string
 	expires    time.Time
 	revoked    bool
+	// replaced is set once the credential file is found to hold another
+	// enrolment. Like revoked, it does not change.
+	replaced bool
 	// inFile is the refresh token this source last knew the credential
 	// file to hold: the one it read there, or the last one it renamed into
 	// place.
@@ -404,6 +407,9 @@ func (s *RefreshingSource) cached() (token string, done bool, err error) {
 	if st.revoked {
 		return "", true, ErrRevoked
 	}
+	if st.replaced {
+		return "", true, errCredentialReplaced
+	}
 	now := s.now()
 	if st.unsaved != nil && !now.Before(st.saveAfter) {
 		return "", false, nil
@@ -420,7 +426,7 @@ func (s *RefreshingSource) unexpiredOr(err error) (string, error) {
 	st := s.state
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if !st.revoked && st.access != "" && s.now().Before(st.expires) {
+	if !st.revoked && !st.replaced && st.access != "" && s.now().Before(st.expires) {
 		return st.access, nil
 	}
 	return "", err
@@ -452,6 +458,14 @@ func (s *RefreshingSource) reconcile() error {
 	case readErr != nil:
 		return readErr
 	case !onDisk.sameEnrolment(held):
+		// This source can no longer make progress. Nothing is written over
+		// the new enrolment, and the pending save is dropped so the file
+		// lock is released.
+		st.mu.Lock()
+		st.replaced = true
+		st.access, st.expires = "", time.Time{}
+		st.unsaved, st.saveAfter = nil, time.Time{}
+		st.mu.Unlock()
 		return errCredentialReplaced
 	case onDisk.RefreshToken == held.RefreshToken:
 		st.mu.Lock()
@@ -529,8 +543,11 @@ func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err erro
 		st.access, st.expires = "", time.Time{}
 		return "", fmt.Errorf("%w: the renewed token expired before it could be used", ErrProviderUnavailable)
 	case errors.Is(err, ErrRevoked):
+		// A revoked credential has nothing left to save; dropping the
+		// pending save releases the file lock to other processes.
 		st.revoked = true
 		st.access, st.expires = "", time.Time{}
+		st.unsaved, st.saveAfter = nil, time.Time{}
 		return "", err
 	default:
 		// The provider gave no verdict. A token that has not expired is

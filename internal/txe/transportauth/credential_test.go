@@ -868,3 +868,77 @@ func TestARotationIsKeptWhenItsAccessTokenIsRefused(t *testing.T) {
 	assert.Equal(t, "offline-2", endpoint.seen[len(endpoint.seen)-1])
 	endpoint.mu.Unlock()
 }
+
+func TestASourceThatCannotGoOnReleasesTheCredentialLock(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	// pending gives a source holding the lock over a rotation it could not
+	// save, and a second source on the same file.
+	pending := func(t *testing.T) (first, second *transportauth.RefreshingSource, endpoint *tokenEndpoint, c *clock, path string) {
+		c = &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+		endpoint = &tokenEndpoint{}
+		first, path = newSource(t, endpoint, c)
+		second, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+		require.NoError(t, err)
+		_, err = first.Token(context.Background())
+		require.NoError(t, err)
+		dir := filepath.Dir(path)
+		require.NoError(t, os.Chmod(dir, 0o500))
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-2" })
+		c.Advance(5 * time.Minute)
+		_, err = first.Token(context.Background())
+		require.NoError(t, err)
+		require.Error(t, first.Unsaved())
+		endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "" })
+		return first, second, endpoint, c, path
+	}
+	short := func(t *testing.T) context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+		return ctx
+	}
+
+	t.Run("revocation", func(t *testing.T) {
+		first, second, endpoint, c, _ := pending(t)
+		endpoint.set(func(e *tokenEndpoint) {
+			e.status, e.ctype, e.body = http.StatusBadRequest, "application/json", `{"error":"invalid_grant"}`
+		})
+		c.Advance(5 * time.Minute)
+		_, err := first.Token(context.Background())
+		require.ErrorIs(t, err, transportauth.ErrRevoked)
+
+		// The second source takes the lock and asks the provider itself.
+		calls := endpoint.callCount()
+		_, err = second.Token(short(t))
+		require.ErrorIs(t, err, transportauth.ErrRevoked)
+		assert.Equal(t, calls+1, endpoint.callCount())
+	})
+
+	t.Run("re-enrolment", func(t *testing.T) {
+		first, _, _, c, path := pending(t)
+		require.NoError(t, os.Chmod(filepath.Dir(path), 0o700))
+		replacement := transportauth.MachineCredential{
+			Schema: 1, Issuer: testIssuer, TokenEndpoint: "http://127.0.0.1:1/token", ClientID: clientA2Worker,
+			Class: authn.ClassWorker, MachineID: machineA2, RefreshToken: "offline-new",
+		}
+		require.NoError(t, transportauth.WriteMachineCredential(path, replacement))
+		c.Advance(10 * time.Second)
+		_, err := first.Token(context.Background())
+		require.ErrorContains(t, err, "different credential")
+		_, err = first.Token(context.Background())
+		require.ErrorContains(t, err, "different credential", "for good")
+		require.NoError(t, first.Unsaved())
+		saved, err := transportauth.ReadMachineCredential(path)
+		require.NoError(t, err)
+		assert.Equal(t, replacement.RefreshToken, saved.RefreshToken, "nothing was written over it")
+
+		// A source on the new credential takes the lock.
+		fresh, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+		require.NoError(t, err)
+		_, err = fresh.Token(short(t))
+		require.ErrorIs(t, err, transportauth.ErrProviderUnavailable, "the lock was free; the replacement's provider is not reachable here")
+		require.NotErrorIs(t, err, context.DeadlineExceeded)
+	})
+}
