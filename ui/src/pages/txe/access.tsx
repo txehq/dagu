@@ -9,6 +9,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { RefreshButton } from '@/components/ui/refresh-button';
 import { RelativeTime } from '@/components/ui/relative-time';
 import {
   Table,
@@ -28,6 +29,9 @@ import { useTxeAccessApi } from '@/features/txe/hooks';
 
 // NEW_OWNER is the owner choice that creates an owner before binding.
 const NEW_OWNER = '__new__';
+
+// How often the page re-reads requests and bindings while it is open.
+const REFRESH_MS = 15_000;
 
 const selectClass =
   'h-8 rounded-md border border-border bg-surface px-2 text-xs text-foreground focus:border-ring focus:outline-none';
@@ -60,11 +64,12 @@ function Identity({
 function RequestRow({
   request,
   owners,
-  onApproved,
+  onChanged,
 }: {
   request: BindingRequest;
   owners: Owner[];
-  onApproved: () => Promise<void>;
+  // onChanged re-reads the page, after an approval or a conflict.
+  onChanged: () => Promise<void>;
 }): React.ReactElement {
   const { ts } = useI18n();
   const access = useTxeAccessApi();
@@ -91,16 +96,22 @@ function RequestRow({
         target = owner.owner_id;
       }
       await access.approve(target, request);
-      await onApproved();
+      await onChanged();
     } catch (err) {
+      const conflict = err instanceof TxeApiError && err.status === 409;
       setError(
-        err instanceof TxeApiError && err.status === 409
+        conflict
           ? ts(
-              'The request changed since this page read it ({reason}). Reload and approve again.',
-              { reason: err.message }
+              'The request changed since this page read it ({reason}). The list has been read again; approve again.',
+              { reason: (err as TxeApiError).message }
             )
           : errorText(err)
       );
+      // A conflict means the request moved on: the next attempt must use the
+      // generation the hub holds now.
+      if (conflict) {
+        await onChanged().catch(() => undefined);
+      }
     } finally {
       setBusy(false);
     }
@@ -285,7 +296,8 @@ export default function TxeAccessPage(): React.ReactElement {
         await Promise.all(owners.map((o) => access.listBindings(o.owner_id)))
       ).flat();
       return { requests, owners, bindings };
-    }
+    },
+    { refreshInterval: REFRESH_MS }
   );
   const reload = async () => {
     await mutate();
@@ -300,9 +312,12 @@ export default function TxeAccessPage(): React.ReactElement {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 p-4">
-      <h1 className="text-lg font-semibold">
-        <I18nText text="Access requests" />
-      </h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold">
+          <I18nText text="Access requests" />
+        </h1>
+        <RefreshButton onRefresh={reload} />
+      </div>
       {error && (
         <Alert variant="destructive">
           <AlertDescription>{errorText(error)}</AlertDescription>
@@ -344,10 +359,10 @@ export default function TxeAccessPage(): React.ReactElement {
                 <TableBody>
                   {data.requests.map((request) => (
                     <RequestRow
-                      key={`${request.issuer}|${request.subject}|${request.generation}`}
+                      key={`${request.issuer}|${request.subject}`}
                       request={request}
                       owners={data.owners}
-                      onApproved={reload}
+                      onChanged={reload}
                     />
                   ))}
                 </TableBody>

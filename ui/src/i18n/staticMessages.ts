@@ -2361,7 +2361,7 @@ const english = {
   "Requested": "Requested",
   "Revoked": "Revoked",
   "State": "State",
-  "The request changed since this page read it ({reason}). Reload and approve again.": "The request changed since this page read it ({reason}). Reload and approve again.",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "The request changed since this page read it ({reason}). The list has been read again; approve again.",
   "Waiting for approval": "Waiting for approval",
 } as const;
 
@@ -4666,7 +4666,7 @@ const chinese = {
   "Requested": "申请时间",
   "Revoked": "已撤销",
   "State": "状态",
-  "The request changed since this page read it ({reason}). Reload and approve again.": "此页面读取后请求已更改（{reason}）。请重新加载后再次批准。",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "此页面读取后请求已更改（{reason}）。列表已重新读取，请再次批准。",
   "Waiting for approval": "等待批准",
 } as const satisfies Record<StaticMessage, string>;
 
@@ -7052,7 +7052,7 @@ const japanese = {
   "Requested": "リクエスト日時",
   "Revoked": "取り消し済み",
   "State": "状態",
-  "The request changed since this page read it ({reason}). Reload and approve again.": "このページの読み込み後にリクエストが変更されました（{reason}）。再読み込みしてもう一度承認してください。",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "このページの読み込み後にリクエストが変更されました（{reason}）。一覧を読み込み直しました。もう一度承認してください。",
   "Waiting for approval": "承認待ち",
 } as const satisfies Record<StaticMessage, string>;
 

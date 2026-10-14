@@ -1,7 +1,13 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SWRConfig } from 'swr';
 import { describe, expect, it, vi } from 'vitest';
@@ -111,12 +117,18 @@ describe('TxeAccessPage', () => {
     await waitFor(() => expect(api.listRequests).toHaveBeenCalledTimes(2));
   });
 
-  it('creates a new owner first, and reuses it when binding is retried', async () => {
+  it('creates a new owner first, and on a conflict re-reads and retries with the same owner', async () => {
     const approve = vi
       .fn()
       .mockRejectedValueOnce(new TxeApiError(409, 'stale_generation'))
       .mockResolvedValueOnce(binding('bnd_1', TxeBindingState.active));
-    const api = fakeAccess({ approve });
+    // The hub moved the request on: the re-read carries a new generation.
+    const moved = { ...request, generation: 4 };
+    const listRequests = vi
+      .fn()
+      .mockResolvedValueOnce([request])
+      .mockResolvedValue([moved]);
+    const api = fakeAccess({ approve, listRequests });
     renderPage(api);
 
     await screen.findByTestId('txe-access-request');
@@ -133,11 +145,49 @@ describe('TxeAccessPage', () => {
     );
     expect(api.createOwner).toHaveBeenCalledWith('Ada Lovelace');
     expect(approve).toHaveBeenLastCalledWith('own_NEW', request);
+    await waitFor(() => expect(listRequests).toHaveBeenCalledTimes(2));
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
     await waitFor(() => expect(approve).toHaveBeenCalledTimes(2));
     expect(api.createOwner).toHaveBeenCalledTimes(1);
-    expect(approve).toHaveBeenLastCalledWith('own_NEW', request);
+    expect(approve).toHaveBeenLastCalledWith('own_NEW', moved);
+  });
+
+  it('shows a request that arrives while the page is open', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const listRequests = vi
+        .fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValue([request]);
+      renderPage(fakeAccess({ listRequests }));
+
+      expect(
+        await screen.findByTestId('txe-access-no-requests')
+      ).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+
+      expect(await screen.findByTestId('txe-access-request')).toHaveTextContent(
+        'ada'
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads the page again on Refresh', async () => {
+    const listRequests = vi
+      .fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([request]);
+    renderPage(fakeAccess({ listRequests }));
+
+    await screen.findByTestId('txe-access-no-requests');
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
+
+    expect(await screen.findByTestId('txe-access-request')).toBeInTheDocument();
   });
 
   it('revokes a binding only with a reason', async () => {
