@@ -48,6 +48,10 @@ const (
 	// fileLockRetryDelay is how often a renewal waiting for another process
 	// to finish its own renewal tries the lock again.
 	fileLockRetryDelay = 20 * time.Millisecond
+	// fileLockWait bounds that wait: longer than one renewal takes, so a
+	// renewal in progress is waited for, and short enough that a process
+	// holding the lock over an unsaved rotation is reported as an outage.
+	fileLockWait = defaultHTTPTimeout + 15*time.Second
 )
 
 var (
@@ -352,14 +356,25 @@ func (s *RefreshingSource) Token(ctx context.Context) (string, error) {
 	}
 	defer func() { <-s.renewing }()
 
-	locked, err := s.fileLock.TryLockContext(ctx, fileLockRetryDelay)
+	lockCtx, cancel := context.WithTimeout(ctx, fileLockWait)
+	locked, err := s.fileLock.TryLockContext(lockCtx, fileLockRetryDelay)
+	cancel()
 	if err != nil || !locked {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return s.unexpiredOr(ctxErr)
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return s.unexpiredOr(fmt.Errorf("%w: another worker process holds the machine credential", ErrProviderUnavailable))
+		}
 		return s.unexpiredOr(fmt.Errorf("transportauth: the machine credential cannot be locked for renewal: %w", err))
 	}
-	defer func() { _ = s.fileLock.Unlock() }()
+	defer func() {
+		// While a rotated refresh token is unsaved, this source keeps the
+		// lock, so no other process presents the token it rotated away from.
+		if s.Unsaved() == nil {
+			_ = s.fileLock.Unlock()
+		}
+	}()
 
 	// The file is settled first: a rotation this source could not save, or
 	// one another process made, decides which refresh token is presented.
@@ -489,13 +504,14 @@ func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err erro
 		// The expiry is counted from before the request was sent, so it is
 		// never later than the provider's.
 		st.access, st.expires = answer.access, startedAt.Add(answer.lifetime)
-		if answer.refresh != "" && answer.refresh != st.credential.RefreshToken {
-			// The provider may already have retired the old refresh token,
-			// so the new one is kept in memory even when it cannot be saved.
-			st.credential.RefreshToken = answer.refresh
-			next := st.credential
-			rotated = &next
-		}
+	}
+	if answer.refresh != "" && answer.refresh != st.credential.RefreshToken {
+		// The provider may already have retired the old refresh token, so
+		// the new one is kept, in memory even when it cannot be saved, and
+		// also when the access token of the same answer is refused.
+		st.credential.RefreshToken = answer.refresh
+		next := st.credential
+		rotated = &next
 	}
 	st.mu.Unlock()
 	if rotated != nil {
@@ -585,16 +601,22 @@ func (s *RefreshingSource) exchange(ctx context.Context, credential MachineCrede
 	if resp.StatusCode != http.StatusOK {
 		return renewal{}, fmt.Errorf("%w: HTTP %d", ErrProviderUnavailable, resp.StatusCode)
 	}
-	if !isJSON || answer.AccessToken == "" || !strings.EqualFold(answer.TokenType, "Bearer") {
+	if !isJSON {
 		return renewal{}, fmt.Errorf("%w: the token endpoint's answer is not a bearer token", ErrProviderUnavailable)
+	}
+	// A successful answer may rotate the refresh token even when its access
+	// token cannot be used; the rotation is kept either way.
+	rotated := renewal{refresh: answer.RefreshToken}
+	if answer.AccessToken == "" || !strings.EqualFold(answer.TokenType, "Bearer") {
+		return rotated, fmt.Errorf("%w: the token endpoint's answer is not a bearer token", ErrProviderUnavailable)
 	}
 	lifetime, ok := expiresIn(answer.ExpiresIn)
 	if !ok || lifetime <= 0 {
-		return renewal{}, fmt.Errorf("%w: the token endpoint's answer has no usable expiry", ErrProviderUnavailable)
+		return rotated, fmt.Errorf("%w: the token endpoint's answer has no usable expiry", ErrProviderUnavailable)
 	}
 	if lifetime > authn.MaxTokenLifetime {
 		// The hub refuses such a token; holding it would only fail later.
-		return renewal{}, fmt.Errorf("%w: the provider issued a token living longer than %s; the machine's client must be limited to it",
+		return rotated, fmt.Errorf("%w: the provider issued a token living longer than %s; the machine's client must be limited to it",
 			ErrProviderUnavailable, authn.MaxTokenLifetime)
 	}
 	return renewal{access: answer.AccessToken, lifetime: lifetime, refresh: answer.RefreshToken}, nil

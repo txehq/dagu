@@ -414,6 +414,38 @@ func TestADownloadStopsWhenItsTokenExpiresOrItsEnrolmentIsRevoked(t *testing.T) 
 	})
 }
 
+// slowResolver moves the clock while it reads the enrolment.
+type slowResolver struct {
+	transportauth.MachineResolver
+	clock *clock
+	by    time.Duration
+}
+
+func (r slowResolver) ResolveMachine(ctx context.Context, p authn.Principal) (authz.Machine, authz.Reason, error) {
+	machine, reason, err := r.MachineResolver.ResolveMachine(ctx, p)
+	r.clock.Advance(r.by)
+	return machine, reason, err
+}
+
+func TestATokenExpiringDuringItsEnrolmentReadIsRefused(t *testing.T) {
+	f := newFixture(t, fixtureOptions{})
+	f.bindAndEnrol(subjectA, ownerA, clientA1Worker, machineA1)
+	token := f.token(subjectA, clientA1Worker)
+	f.clock.Advance(5*time.Minute - time.Second)
+	server, err := transportauth.NewServer(transportauth.ServerConfig{
+		Mode: authz.ModeEnforce, Verifier: f.verifier, HubKey: testHubKey, Now: f.clock.Now,
+		Machines: slowResolver{MachineResolver: f.store, clock: f.clock, by: time.Second},
+	})
+	require.NoError(t, err)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+	ran := false
+	_, err = server.UnaryInterceptor()(ctx, poll(machineA1, machineA1),
+		&grpc.UnaryServerInfo{FullMethod: coordinatorv1.CoordinatorService_Poll_FullMethodName},
+		func(context.Context, any) (any, error) { ran = true; return nil, nil })
+	assert.Equal(t, codes.Unauthenticated, codeOf(t, err))
+	assert.False(t, ran)
+}
+
 // refuseQuoting is an authorizer whose refusal quotes the request.
 type refuseQuoting struct{}
 

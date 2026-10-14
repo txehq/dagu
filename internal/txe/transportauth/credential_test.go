@@ -784,3 +784,87 @@ func TestRepeatedSaveFailuresNeverAdoptARetiredToken(t *testing.T) {
 	assert.Equal(t, "offline-3", endpoint.seen[len(endpoint.seen)-1])
 	endpoint.mu.Unlock()
 }
+
+func TestAnUnsavedRotationKeepsOtherProcessesFromTheRetiredToken(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	var mu sync.Mutex
+	current, next, reused := "offline-1", 1, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Form.Get("refresh_token") != current {
+			reused++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		next++
+		current = fmt.Sprintf("offline-%d", next)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": fmt.Sprintf("access-%d", next), "token_type": "Bearer", "expires_in": 300, "refresh_token": current,
+		})
+	}))
+	t.Cleanup(server.Close)
+	path := writeCredential(t, t.TempDir(), server.URL+"/token")
+	first, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+	require.NoError(t, err)
+	second, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+	require.NoError(t, err)
+	ctx := context.Background()
+	_, err = first.Token(ctx)
+	require.NoError(t, err)
+
+	// The first source rotates offline-2 to offline-3 and cannot save it.
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	c.Advance(5 * time.Minute)
+	_, err = first.Token(ctx)
+	require.NoError(t, err)
+	require.Error(t, first.Unsaved())
+
+	// The second source cannot renew meanwhile, and presents nothing.
+	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	_, err = second.Token(short)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Once the first source saves, the second renews from offline-3.
+	require.NoError(t, os.Chmod(dir, 0o700))
+	c.Advance(10 * time.Second)
+	_, err = first.Token(ctx)
+	require.NoError(t, err)
+	require.NoError(t, first.Unsaved())
+	_, err = second.Token(ctx)
+	require.NoError(t, err)
+	mu.Lock()
+	assert.Zero(t, reused, "no retired refresh token was presented")
+	mu.Unlock()
+}
+
+func TestARotationIsKeptWhenItsAccessTokenIsRefused(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{
+		status: http.StatusOK, ctype: "application/json",
+		body: `{"access_token":"a","token_type":"Bearer","expires_in":3600,"refresh_token":"offline-2"}`,
+	}
+	source, path := newSource(t, endpoint, c)
+	ctx := context.Background()
+	_, err := source.Token(ctx)
+	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable, "a token living an hour is refused")
+	saved, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	assert.Equal(t, "offline-2", saved.RefreshToken, "but the rotated refresh token is kept")
+
+	endpoint.set(func(e *tokenEndpoint) { e.status = 0 })
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	endpoint.mu.Lock()
+	assert.Equal(t, "offline-2", endpoint.seen[len(endpoint.seen)-1])
+	endpoint.mu.Unlock()
+}

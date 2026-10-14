@@ -334,6 +334,11 @@ func (s *Server) evaluate(ctx context.Context, method string, surface Surface, k
 	if err := s.checkRequest(ctx, method, surface, caller.Machine, req, d); err != nil {
 		return Caller{}, err
 	}
+	// The request check may have taken time; the token must still be
+	// unexpired when the handler runs.
+	if err := s.unexpired(caller.Principal, d); err != nil {
+		return Caller{}, err
+	}
 	return caller, nil
 }
 
@@ -394,11 +399,20 @@ func (s *Server) machine(ctx context.Context, token string, d *Decision) (Caller
 	return Caller{Kind: CallerMachine, Machine: machine, Principal: principal}, nil
 }
 
-// resolve reads the enrolment of a verified worker principal.
-func (s *Server) resolve(ctx context.Context, principal authn.Principal, d *Decision) (authz.Machine, error) {
+// unexpired refuses a token at or after its expiry, by the clock read now.
+func (s *Server) unexpired(principal authn.Principal, d *Decision) error {
 	if !s.now().Before(principal.Expires) {
 		d.Reason = ReasonExpired
-		return authz.Machine{}, status.Error(codes.Unauthenticated, "transportauth: the token has expired")
+		return status.Error(codes.Unauthenticated, "transportauth: the token has expired")
+	}
+	return nil
+}
+
+// resolve reads the enrolment of a verified worker principal. The token is
+// checked to be unexpired before the read and again after it.
+func (s *Server) resolve(ctx context.Context, principal authn.Principal, d *Decision) (authz.Machine, error) {
+	if err := s.unexpired(principal, d); err != nil {
+		return authz.Machine{}, err
 	}
 	machine, reason, err := s.machines.ResolveMachine(ctx, principal)
 	if err != nil {
@@ -410,6 +424,9 @@ func (s *Server) resolve(ctx context.Context, principal authn.Principal, d *Deci
 		return authz.Machine{}, status.Error(codes.Unauthenticated, "transportauth: the credential is not enrolled for a worker machine")
 	}
 	d.MachineID, d.OwnerID = machine.MachineID, machine.OwnerID
+	if err := s.unexpired(principal, d); err != nil {
+		return authz.Machine{}, err
+	}
 	return machine, nil
 }
 
@@ -507,6 +524,9 @@ func (c *checkedStream) RecvMsg(m any) error {
 	if refusal == nil {
 		surface, _ := SurfaceOf(c.method)
 		refusal = c.server.checkRequest(c.ctx, c.method, surface, c.caller.Machine, m, &decision)
+	}
+	if refusal == nil {
+		refusal = c.server.unexpired(c.caller.Principal, &decision)
 	}
 	_, err := c.server.settle(c.ctx, c.caller, refusal, decision)
 	return err
