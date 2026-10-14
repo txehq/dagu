@@ -64,7 +64,7 @@ head_tree="$(tree_path "$head_tree" head)"
 base_tree="$(tree_path "$base_tree" base)"
 [ "$head_tree" != "$base_tree" ] || fail "the head and base trees are the same directory"
 reader="$here/lib/repo_read.py"
-plain_path "$reader" && [ -f "$reader" ] || fail "lib/repo_read.py is missing or its path is not plain"
+if ! plain_path "$reader" || [ ! -f "$reader" ]; then fail "lib/repo_read.py is missing or its path is not plain"; fi
 python_bin="$(command -v python3)" || fail "no python3"
 plain_path "$python_bin" || fail "python3's path is not plain"
 
@@ -471,7 +471,7 @@ if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then
   [ "$rc" -eq 0 ] || why="exit $rc"
   if may_retry "$started" "the review turn" "$why"; then review_turn; fi
 fi
-[ "$rc" -eq 0 ] && [ -s "$work/last.txt" ] || fail "Codex produced no review"
+if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then fail "Codex produced no review"; fi
 refuse_turn
 # A turn that read nothing is said, not refused (TXE-3493): it is the packet-only review that ran
 # before TXE-3469, and refusing it posted no review at all on four passes of other PRs.
