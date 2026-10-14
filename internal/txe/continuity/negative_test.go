@@ -329,6 +329,7 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 		filepath.Join(l.DataDir, "tailscale", "tailscaled.state"),
 		filepath.Join(l.DataDir, "license", "license.json"),
 		filepath.Join(l.DataDir, "gitsync", "repo", ".git", "config"),
+		filepath.Join(l.DataDir, "browser", "cache", "dag", "step.json"),
 		filepath.Join(l.MachineHome, "client", "contexts", "hub.yaml"),
 	} {
 		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
@@ -345,7 +346,7 @@ func TestCredentialAreasAreNotRead(t *testing.T) {
 		excluded[e.Root+"/"+e.Path] = true
 	}
 	for _, p := range []string{"hub-data/users", "hub-data/apikeys", "hub-data/contexts", "hub-data/auth", "hub-data/tailscale",
-		"hub-data/license", "hub-data/gitsync", "laptop-home/client"} {
+		"hub-data/license", "hub-data/gitsync/repo", "hub-data/browser/cache", "laptop-home/client"} {
 		assert.True(t, excluded[p], p)
 	}
 	out, err := json.Marshal(inv)
@@ -458,7 +459,8 @@ func TestPackageOnTheWrongMachine(t *testing.T) {
 func TestUpstreamDataAreasAreClassified(t *testing.T) {
 	t.Parallel()
 	l, _ := build(t)
-	for _, area := range []string{"incidents", "notifications", "wiki", "docs", "workspace-bundles", "cache", "browser", "computer", "xlsx"} {
+	for _, area := range []string{"incidents", "notifications", "wiki", "docs", "workspace-bundles", "cache",
+		"browser/sessions", "computer/sessions", "xlsx/sessions", "computer/cache"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, area, "x"), 0o750))
 		require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, area, "x", "f.json"), []byte(`{}`), 0o600))
 	}
@@ -466,4 +468,31 @@ func TestUpstreamDataAreasAreClassified(t *testing.T) {
 	inv := scan(t, l)
 	assert.Empty(t, continuity.Blocking(continuity.Validate(inv, continuity.Policy{})))
 	assert.Positive(t, inv.Counts["file:hub-data"])
+}
+
+// Retained state inside a mixed area is inventoried: losing gitsync's sync
+// state or a paused host session record blocks a transition, while the
+// clone and the replay caches beside them are not read.
+func TestMixedAreasKeepTheirState(t *testing.T) {
+	for _, p := range []string{"gitsync/state.json", "browser/sessions/run-1.json", "computer/sessions/run-1.json"} {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+			l, _ := build(t)
+			full := filepath.Join(l.DataDir, filepath.FromSlash(p))
+			require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o750))
+			require.NoError(t, os.WriteFile(full, []byte(`{"cursor":3}`), 0o600))
+			require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, "gitsync", "repo"), 0o750))
+			before := scan(t, l)
+			assert.Empty(t, continuity.Blocking(continuity.Validate(before, continuity.Policy{})))
+			require.NoError(t, os.Remove(full))
+			after := scan(t, l)
+			assert.Positive(t, codes(continuity.Compare(before, after, continuity.CompareOptions{}).Issues, continuity.SeverityBlock)["file_missing"])
+		})
+	}
+	t.Run("an unknown entry of a mixed area", func(t *testing.T) {
+		t.Parallel()
+		l, _ := build(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(l.DataDir, "browser", "profiles"), 0o750))
+		assert.Positive(t, codes(continuity.Validate(scan(t, l), continuity.Policy{}), continuity.SeverityBlock)["unclassified_area"])
+	})
 }

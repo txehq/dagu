@@ -83,14 +83,29 @@ var hubDataExcluded = map[string]string{
 	"auth":             "holds the encryption key; not read",
 	"tailscale":        "holds tailscale node keys; not read",
 	"license":          "holds license material; not read",
-	"gitsync":          "a clone of a remote whose git config can carry credentials; reproducible from the remote, not read",
 	"dag-run-work":     "per-run scratch working directories; operational, not retained",
 	"tools":            "downloaded tool binaries; reinstalled, not retained data",
 	"materializations": "derived caches; rebuilt",
 	"cache":            "derived caches (the DAG index); rebuilt",
-	"browser":          "browser host replay cache; rebuilt",
-	"computer":         "computer host replay cache; rebuilt",
-	"xlsx":             "workbook replay cache; rebuilt",
+}
+
+// Areas of the data directory classified entry by entry: they hold both
+// retained state and something that is rebuilt or holds credentials. An
+// entry not listed blocks as unclassified. A value is a file policy, or
+// "exclude: <reason>".
+var hubDataSubAreas = map[string]map[string]string{
+	// The sync state records each item's last synced hash and local
+	// modification; the clone's git config can carry remote credentials and
+	// the clone is reproducible from the remote.
+	"gitsync": {
+		"state.json": PolicyMutable,
+		"repo":       "exclude: a clone of a remote whose git config can carry credentials; reproducible from the remote, not read",
+	},
+	// Host session records are what a paused step resumes from; the replay
+	// cache is rebuilt.
+	"browser":  {"sessions": PolicyMutable, "cache": "exclude: browser host replay cache; rebuilt"},
+	"computer": {"sessions": PolicyMutable, "cache": "exclude: computer host replay cache; rebuilt"},
+	"xlsx":     {"sessions": PolicyMutable, "cache": "exclude: workbook replay cache; rebuilt"},
 }
 
 // Areas of a machine's TXE home.
@@ -200,8 +215,45 @@ func (s *scanner) hubData() error {
 			if err := s.files(name, hubDataAreas[name]); err != nil {
 				return err
 			}
+		case hubDataSubAreas[name] != nil:
+			if err := s.subAreas(name, hubDataSubAreas[name]); err != nil {
+				return err
+			}
 		default:
 			s.issue("unclassified_area", "", name, "%s/%s is not a known area of the data directory; classify it before a transition, it was not read", s.root.Label, name)
+		}
+	}
+	return nil
+}
+
+// subAreas scans an area of the data directory entry by entry.
+func (s *scanner) subAreas(area string, entries map[string]string) error {
+	if info, err := os.Lstat(filepath.Join(s.root.Path, area)); err != nil || !info.IsDir() {
+		if err != nil {
+			return err
+		}
+		s.issue("unclassified_area", "", area, "%s/%s is not a directory; it was not read", s.root.Label, area)
+		return nil
+	}
+	list, err := os.ReadDir(filepath.Join(s.root.Path, area))
+	if err != nil {
+		return err
+	}
+	for _, e := range list {
+		rel := area + "/" + e.Name()
+		if s.symlink(rel, e) {
+			continue
+		}
+		class, ok := entries[e.Name()]
+		switch {
+		case !ok:
+			s.issue("unclassified_area", "", rel, "%s/%s is not a known part of the data directory; classify it before a transition, it was not read", s.root.Label, rel)
+		case strings.HasPrefix(class, "exclude: "):
+			s.exclude(rel, strings.TrimPrefix(class, "exclude: "))
+		default:
+			if err := s.files(rel, class); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
