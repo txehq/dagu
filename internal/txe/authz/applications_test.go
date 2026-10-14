@@ -98,6 +98,14 @@ func TestEnrolmentApplications(t *testing.T) {
 	b := f.bind("bob", ownerB)
 	_, err = f.store.EnrolFromApplication(ctx, b, machineA1, authn.ClassWorker, "dagu-worker-a1", worker.Identity)
 	require.Equal(t, CodeNotFound, CodeOf(err))
+	absent, err := f.store.EnrolFromApplication(ctx, b, machineA1, authn.ClassWorker, "no-such-client", worker.Identity)
+	require.Nil(t, absent)
+	// Another owner learns nothing about the applications on file: a wrong
+	// identity, an absent application and (below) a stale one all give the
+	// same answer.
+	_, otherIdentity := f.store.EnrolFromApplication(ctx, b, machineA1, authn.ClassWorker, "dagu-worker-a1", authn.Identity{Issuer: issuer, Subject: "mallory"})
+	require.Equal(t, CodeNotFound, CodeOf(otherIdentity))
+	require.Equal(t, CodeOf(err), CodeOf(otherIdentity))
 	_, err = f.store.EnrolFromApplication(ctx, f.resolve(f.token(authn.ClassCLI, "alice", "dagu-cli", "s1")), machineA1, authn.ClassWorker, "dagu-worker-a1", worker.Identity)
 	require.Equal(t, CodeForbidden, CodeOf(err))
 
@@ -110,6 +118,8 @@ func TestEnrolmentApplications(t *testing.T) {
 	f.clock.Advance(6 * time.Minute)
 	_, err = f.store.EnrolFromApplication(ctx, a, machineA1, authn.ClassWorker, "dagu-worker-a1", worker.Identity)
 	require.Equal(t, CodeStale, CodeOf(err))
+	_, err = f.store.EnrolFromApplication(ctx, b, machineA1, authn.ClassWorker, "dagu-worker-a1", worker.Identity)
+	require.Equal(t, CodeNotFound, CodeOf(err), "another owner is not told the application is stale")
 	fresh := f.token(authn.ClassWorker, "alice", "dagu-worker-a1", "s1")
 	_, err = f.store.ApplyForEnrolment(ctx, fresh, machineA1)
 	require.NoError(t, err)

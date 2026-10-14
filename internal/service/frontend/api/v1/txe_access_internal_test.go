@@ -6,6 +6,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -235,4 +238,19 @@ func TestTxeAccessEnrolment(t *testing.T) {
 	scope, err = w.svc.Scope(worker2, txeauth.Classify(worker2))
 	require.NoError(t, err)
 	require.Equal(t, authz.ScopeUnbound, scope.Kind())
+}
+
+// An unreadable registry is an outage to the administrator listing a
+// machine's enrolments, never a missing machine.
+func TestTxeAccessEnrolmentListRegistryFailure(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX permissions and a non-root user")
+	}
+	w := newTwoOwners(t, "")
+	machines := filepath.Join(registry.Dir(w.dataDir), "machines")
+	require.NoError(t, os.Chmod(machines, 0))
+	t.Cleanup(func() { _ = os.Chmod(machines, 0o750) })
+	_, err := w.api.ListTxeEnrolments(w.admin, apigen.ListTxeEnrolmentsRequestObject{MachineId: w.machineA})
+	require.Equal(t, http.StatusServiceUnavailable, statusOf(err))
+	require.Equal(t, "authz_unavailable", detailOf(err))
 }

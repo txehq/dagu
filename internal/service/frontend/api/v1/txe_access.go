@@ -387,8 +387,13 @@ func (a *API) ListTxeEnrolments(ctx context.Context, req api.ListTxeEnrolmentsRe
 	owner := scope.OwnerID()
 	if scope.Kind() == authz.ScopePlatformAdmin {
 		o, err := a.txeAuth.Registry().MachineOwner(ctx, req.MachineId)
-		if err != nil {
+		if errors.Is(err, authz.ErrNotFound) {
 			return nil, txeAccessNotFound("machine " + req.MachineId)
+		}
+		if err != nil {
+			// A registry that cannot be read is an outage, not a missing
+			// machine.
+			return nil, errTxeAuthzUnavailable
 		}
 		owner = o
 	} else {

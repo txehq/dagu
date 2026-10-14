@@ -6,6 +6,7 @@ package authz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"time"
 
@@ -155,13 +156,26 @@ func (s *Store) EnrolFromApplication(ctx context.Context, by Scope, machineID st
 	if err := s.requirePerson(ctx, by); err != nil {
 		return nil, err
 	}
+	notFound := refuse(CodeNotFound, "machine %s has no %s application from client %s", machineID, class, clientID)
+	// Another owner's machine is answered before its applications are
+	// looked at, exactly as a machine with none: nothing about them is told.
+	owner, err := s.registry.MachineOwner(ctx, machineID)
+	if errors.Is(err, ErrNotFound) {
+		return nil, notFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if owner != by.ownerID {
+		return nil, notFound
+	}
 	var application EnrolmentApplication
 	_, found, err := s.read(ctx, applicationID(machineID, class, clientID), &application)
 	if err != nil {
 		return nil, err
 	}
 	if !found || application.MachineID != machineID || application.Class != class || application.ClientID != clientID {
-		return nil, refuse(CodeNotFound, "machine %s has no %s application from client %s", machineID, class, clientID)
+		return nil, notFound
 	}
 	if application.Issuer != seen.Issuer || application.Subject != seen.Subject {
 		return nil, &Error{Code: CodeConflict, Message: "the application on file is not the one you read; read it again", Current: &application}
