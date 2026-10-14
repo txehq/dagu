@@ -5,6 +5,7 @@ package transportauth_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -563,6 +564,7 @@ func TestNothingSecretIsPrinted(t *testing.T) {
 		Mode: "enforce", Verifier: f.verifier, Machines: f.store, HubKey: testHubKey,
 	})
 	require.NoError(t, err)
+	config := transportauth.ServerConfig{Mode: "enforce", Verifier: f.verifier, Machines: f.store, HubKey: testHubKey}
 	key := transportauth.StaticHubKey(testHubKey)
 	hubCredentials := transportauth.NewHubCredentials(testHubKey)
 	workerCredentials := transportauth.NewWorkerCredentials(source)
@@ -580,6 +582,7 @@ func TestNothingSecretIsPrinted(t *testing.T) {
 		"credential": credential, "*credential": &credential,
 		"source": source, "*source": *source,
 		"server": server, "*server": *server,
+		"config": config, "*config": &config,
 		"key": key, "*key": &key,
 		"hub credentials": hubCredentials, "*hub credentials": *hubCredentials,
 		"worker credentials": workerCredentials,
@@ -601,8 +604,73 @@ func TestNothingSecretIsPrinted(t *testing.T) {
 		}
 	}
 	for _, secret := range secrets {
-		for _, form := range forms(secret) {
+		for _, form := range append(forms(secret), base64.StdEncoding.EncodeToString([]byte(secret))[:12]) {
 			assert.NotContains(t, logs.String(), form)
 		}
 	}
+}
+
+func TestASaveRetryNeverOverwritesANewerRefreshToken(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	// unsavedSource rotates offline-1 to offline-2 while the directory is
+	// read-only, so the file keeps offline-1.
+	unsavedSource := func(t *testing.T) (*transportauth.RefreshingSource, *tokenEndpoint, *clock, string) {
+		c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+		endpoint := &tokenEndpoint{}
+		source, path := newSource(t, endpoint, c)
+		_, err := source.Token(context.Background())
+		require.NoError(t, err)
+		dir := filepath.Dir(path)
+		require.NoError(t, os.Chmod(dir, 0o500))
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-2" })
+		c.Advance(5 * time.Minute)
+		_, err = source.Token(context.Background())
+		require.NoError(t, err)
+		require.Error(t, source.Unsaved())
+		require.NoError(t, os.Chmod(dir, 0o700))
+		endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "" })
+		return source, endpoint, c, path
+	}
+	rewrite := func(t *testing.T, path, refresh string) {
+		credential, err := transportauth.ReadMachineCredential(path)
+		require.NoError(t, err)
+		credential.RefreshToken = refresh
+		require.NoError(t, transportauth.WriteMachineCredential(path, credential))
+	}
+
+	t.Run("another process rotated after this one", func(t *testing.T) {
+		source, endpoint, c, path := unsavedSource(t)
+		rewrite(t, path, "offline-3")
+		c.Advance(10 * time.Second)
+		_, err := source.Token(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, source.Unsaved())
+		saved, err := transportauth.ReadMachineCredential(path)
+		require.NoError(t, err)
+		assert.Equal(t, "offline-3", saved.RefreshToken, "the newer token is kept")
+
+		c.Advance(5 * time.Minute)
+		_, err = source.Token(context.Background())
+		require.NoError(t, err)
+		endpoint.mu.Lock()
+		assert.Equal(t, "offline-3", endpoint.seen[len(endpoint.seen)-1], "and presented next")
+		endpoint.mu.Unlock()
+	})
+
+	t.Run("the earlier write landed", func(t *testing.T) {
+		source, endpoint, c, path := unsavedSource(t)
+		rewrite(t, path, "offline-2")
+		calls := endpoint.callCount()
+		c.Advance(10 * time.Second)
+		_, err := source.Token(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, source.Unsaved())
+		assert.Equal(t, calls, endpoint.callCount())
+		saved, err := transportauth.ReadMachineCredential(path)
+		require.NoError(t, err)
+		assert.Equal(t, "offline-2", saved.RefreshToken)
+	})
 }

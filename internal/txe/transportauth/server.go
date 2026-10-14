@@ -28,6 +28,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -161,8 +162,8 @@ type ServerConfig struct {
 	// Machines finds the machine a credential is enrolled for.
 	Machines MachineResolver
 	// HubKey is the key the hub's own processes present. It must be at
-	// least MinHubKeyBytes long.
-	HubKey []byte
+	// least MinHubKeyBytes long. It is never printed or marshalled.
+	HubKey []byte `json:"-"`
 	// Resources authorizes machines on SurfaceScoped methods. Nil refuses
 	// them.
 	Resources ResourceAuthorizer
@@ -171,6 +172,17 @@ type ServerConfig struct {
 	Observe func(ctx context.Context, d Decision)
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
+}
+
+// Format prints the mode and nothing of the hub key, for every verb, for the
+// config and a pointer to it.
+func (c ServerConfig) Format(f fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(f, "transportauth.ServerConfig{mode %s}", c.Mode)
+}
+
+// LogValue keeps the hub key out of structured logs.
+func (c ServerConfig) LogValue() slog.Value {
+	return slog.StringValue(fmt.Sprintf("transportauth.ServerConfig{mode %s}", c.Mode))
 }
 
 // Server authenticates coordinator calls.

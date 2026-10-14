@@ -246,9 +246,11 @@ type sourceState struct {
 	access     string
 	expires    time.Time
 	revoked    bool
-	// unsaved is set while the credential file holds an older refresh token
-	// than this source; saveAfter is when saving is tried again.
+	// unsaved is set while the credential file may hold an older refresh
+	// token than this source: previous, the one this source rotated away
+	// from. saveAfter is when saving is tried again.
 	unsaved   error
+	previous  string
 	saveAfter time.Time
 }
 
@@ -344,14 +346,15 @@ func (s *RefreshingSource) Token(ctx context.Context) (string, error) {
 	}
 	defer func() { _ = s.fileLock.Unlock() }()
 
-	s.retrySave()
+	// The file is settled first: a rotation this source could not save, or
+	// one another process made, decides which refresh token is presented.
+	if err := s.reconcile(); err != nil {
+		return s.unexpiredOr(err)
+	}
 	// Another caller may have renewed while this one waited, or only a save
 	// was due.
 	if token, done, err := s.cached(); done {
 		return token, err
-	}
-	if err := s.adoptFile(); err != nil {
-		return s.unexpiredOr(err)
 	}
 	s.state.mu.Lock()
 	credential := s.state.credential
@@ -393,56 +396,67 @@ func (s *RefreshingSource) unexpiredOr(err error) (string, error) {
 	return "", err
 }
 
-// retrySave saves a rotated refresh token that could not be saved before.
-// The caller holds the file lock.
-func (s *RefreshingSource) retrySave() {
+// reconcile brings this source and the credential file into agreement. The
+// caller holds the renewal slot and the file lock; the file is read and
+// written without state.mu held.
+//
+//   - The file holds this source's refresh token: if it was recorded as
+//     unsaved, the rename landed, and only the directory sync is retried.
+//   - The file holds the refresh token this source rotated away from and
+//     could not save: the save is retried.
+//   - The file holds another refresh token of the same enrolment: another
+//     process rotated it, and this source adopts it. Nothing is written.
+//   - The file holds another enrolment: it is refused.
+func (s *RefreshingSource) reconcile() error {
+	st := s.state
+	st.mu.Lock()
+	held, previous, unsaved := st.credential, st.previous, st.unsaved != nil
+	st.mu.Unlock()
+
+	onDisk, readErr := ReadMachineCredential(s.path)
+	switch {
+	case readErr != nil && !unsaved:
+		return readErr
+	case readErr != nil:
+		// The file is gone or unusable and only this source holds the
+		// current refresh token: write it.
+		s.recordSave(WriteMachineCredential(s.path, held))
+	case !onDisk.sameEnrolment(held):
+		return errCredentialReplaced
+	case onDisk.RefreshToken == held.RefreshToken:
+		if unsaved {
+			s.recordSave(fileutil.SyncDir(filepath.Dir(s.path)))
+		}
+	case unsaved && onDisk.RefreshToken == previous:
+		s.recordSave(WriteMachineCredential(s.path, held))
+	default:
+		st.mu.Lock()
+		st.credential = onDisk
+		st.previous, st.unsaved, st.saveAfter = "", nil, time.Time{}
+		st.mu.Unlock()
+	}
+	return nil
+}
+
+// recordSave records the outcome of saving the held credential.
+func (s *RefreshingSource) recordSave(err error) {
 	st := s.state
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.unsaved != nil {
-		s.saveLocked()
-	}
-}
-
-// saveLocked writes the held credential. The caller holds the file lock and
-// state.mu.
-func (s *RefreshingSource) saveLocked() {
-	st := s.state
-	if err := WriteMachineCredential(s.path, st.credential); err != nil {
+	if err != nil {
 		st.unsaved = fmt.Errorf("transportauth: a renewed refresh token could not be saved: %w", err)
 		st.saveAfter = s.now().Add(saveRetryInterval)
 		return
 	}
-	st.unsaved, st.saveAfter = nil, time.Time{}
-}
-
-// adoptFile reads the credential file again, so that a refresh token another
-// process rotated is the one this source presents. The caller holds the file
-// lock.
-func (s *RefreshingSource) adoptFile() error {
-	onDisk, err := ReadMachineCredential(s.path)
-	if err != nil {
-		return err
-	}
-	st := s.state
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.unsaved != nil {
-		// This source holds a newer refresh token than the file.
-		return nil
-	}
-	if !onDisk.sameEnrolment(st.credential) {
-		return errCredentialReplaced
-	}
-	st.credential = onDisk
-	return nil
+	st.previous, st.unsaved, st.saveAfter = "", nil, time.Time{}
 }
 
 // install records the outcome of a renewal and decides what Token returns.
+// The caller holds the renewal slot and the file lock.
 func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err error) (string, error) {
 	st := s.state
+	var rotated *MachineCredential
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	if err == nil {
 		// The expiry is counted from before the request was sent, so it is
 		// never later than the provider's.
@@ -450,10 +464,22 @@ func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err erro
 		if answer.refresh != "" && answer.refresh != st.credential.RefreshToken {
 			// The provider may already have retired the old refresh token,
 			// so the new one is kept in memory even when it cannot be saved.
+			// previous is what the file holds until a save lands.
+			if st.unsaved == nil {
+				st.previous = st.credential.RefreshToken
+			}
 			st.credential.RefreshToken = answer.refresh
-			s.saveLocked()
+			next := st.credential
+			rotated = &next
 		}
 	}
+	st.mu.Unlock()
+	if rotated != nil {
+		s.recordSave(WriteMachineCredential(s.path, *rotated))
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	now := s.now()
 	switch {
 	case err == nil:
