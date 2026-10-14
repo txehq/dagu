@@ -103,6 +103,7 @@ const (
 	KindEvent     = "resource_event"
 	KindPackage   = "package"
 	KindEnrolment = "enrolment"
+	KindException = "exception"
 )
 
 // Inventory is everything retained at one point, with digests.
@@ -111,15 +112,18 @@ type Inventory struct {
 	Label     string    `json:"label,omitempty"`
 	ScannedAt time.Time `json:"scanned_at"`
 	// Tool is the build of the tool that scanned, when known.
-	Tool          string            `json:"tool,omitempty"`
-	ExpectedOwner string            `json:"expected_owner"`
-	Roots         []RootInfo        `json:"roots"`
-	Counts        map[string]int    `json:"counts"`
-	Records       []Record          `json:"records"`
-	Files         []File            `json:"files"`
-	Excluded      []Excluded        `json:"excluded,omitempty"`
-	Issues        []Issue           `json:"issues,omitempty"`
-	Machines      map[string]string `json:"machines,omitempty"` // machine home root label -> machine ID
+	Tool          string `json:"tool,omitempty"`
+	ExpectedOwner string `json:"expected_owner"`
+	// ModeBits says the scan recorded permission bits; on a system without
+	// them every file's Mode is unknown, not zero.
+	ModeBits bool              `json:"mode_bits,omitempty"`
+	Roots    []RootInfo        `json:"roots"`
+	Counts   map[string]int    `json:"counts"`
+	Records  []Record          `json:"records"`
+	Files    []File            `json:"files"`
+	Excluded []Excluded        `json:"excluded,omitempty"`
+	Issues   []Issue           `json:"issues,omitempty"`
+	Machines map[string]string `json:"machines,omitempty"` // machine home root label -> machine ID
 	// Digest is the SHA-256 of the canonical JSON of the inventory without
 	// this field.
 	Digest string `json:"digest"`

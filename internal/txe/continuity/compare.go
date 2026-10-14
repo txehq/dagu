@@ -48,11 +48,17 @@ func Compare(before, after *Inventory) *Report {
 
 	later := map[string]*Record{}
 	laterRegistry := map[string]*Record{}
+	// laterJobEntities are the entities each job defines later, live in its
+	// aggregate or archived in its history.
+	laterJobEntities := map[string]bool{}
 	for i := range after.Records {
 		r := &after.Records[i]
 		later[r.Store+"/"+r.ID] = r
 		if r.Store == "registry" {
 			laterRegistry[r.ID] = r
+			for _, e := range r.Defines {
+				laterJobEntities[r.Job+"|"+e.Kind+"|"+e.ID] = true
+			}
 		}
 	}
 	earlier := map[string]bool{}
@@ -86,6 +92,7 @@ func Compare(before, after *Inventory) *Report {
 		if b.Class == ClassJob {
 			compareJob(b, a, key, add)
 			compareChains(b, a, key, laterRegistry, add)
+			compareLive(b, a, key, laterJobEntities, add)
 		}
 	}
 	for i := range after.Records {
@@ -95,6 +102,8 @@ func Compare(before, after *Inventory) *Report {
 		}
 	}
 
+	// Modes are compared only when both scans had permission bits.
+	modes := before.ModeBits && after.ModeBits
 	laterFiles := map[string]File{}
 	for _, f := range after.Files {
 		laterFiles[f.Root+"/"+f.Path] = f
@@ -109,7 +118,7 @@ func Compare(before, after *Inventory) *Report {
 			continue
 		case !ok:
 			add("file_missing", "file", key, "the retained file is no longer present")
-		case a.SHA256 == b.SHA256 && a.Link == b.Link && (b.Policy != PolicyImmutable || a.Mode == b.Mode):
+		case a.SHA256 == b.SHA256 && a.Link == b.Link && (b.Policy != PolicyImmutable || !modes || a.Mode == b.Mode):
 		case b.Policy == PolicyImmutable:
 			rep.Changed = append(rep.Changed, key)
 			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
@@ -174,6 +183,32 @@ func compareChains(b, a *Record, key string, records map[string]*Record, add fun
 		}
 		if !found {
 			add("history_unreachable", ClassJob, key, "the job's "+kind+" history no longer reaches "+head+", which it had committed")
+		}
+	}
+}
+
+// compareLive checks that nothing the job held live was dropped. The
+// registry removes a proposal or an action from a job only by archiving it
+// into the job's history, and never removes an exception or a decision key,
+// so each must still be defined by the job later.
+func compareLive(b, a *Record, key string, entities map[string]bool, add func(code, class, id, detail string)) {
+	for _, e := range b.Defines {
+		switch e.Kind {
+		case KindProposal, KindAction, KindException:
+			if !entities[b.Job+"|"+e.Kind+"|"+e.ID] {
+				add("live_entry_lost", ClassJob, key, "the job's "+e.Kind+" "+e.ID+" is neither held nor archived any more")
+			}
+		}
+	}
+	keys := map[string]bool{}
+	for _, r := range a.Refs {
+		if strings.HasPrefix(r.Rel, "decision_key:") {
+			keys[r.Rel] = true
+		}
+	}
+	for _, r := range b.Refs {
+		if strings.HasPrefix(r.Rel, "decision_key:") && !keys[r.Rel] {
+			add("live_entry_lost", ClassJob, key, "the job's "+r.Rel+" is no longer held, so a replayed decision would not be recognized")
 		}
 	}
 }

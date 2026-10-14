@@ -107,6 +107,7 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 		ScannedAt:     now().UTC(),
 		Tool:          opts.Tool,
 		ExpectedOwner: opts.ExpectedOwner,
+		ModeBits:      hasModeBits,
 		Machines:      map[string]string{},
 	}
 	labels := map[string]bool{}

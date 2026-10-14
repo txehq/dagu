@@ -312,6 +312,13 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 		b.define(KindAction, id)
 		actionRefs(b, a)
 	}
+	for id, e := range j.Exceptions {
+		if e == nil {
+			b.block("corrupt_entry", "exception %s is null", id)
+			continue
+		}
+		b.define(KindException, id)
+	}
 	if c := j.Claim; c != nil {
 		b.ref("claim_machine", KindMachine, c.Reviewer.MachineID)
 		b.attr("claim", string(c.State)+":"+string(c.Kind))
@@ -559,7 +566,9 @@ func artifactRecord(jobID, runID, execution string, data []byte) (*Record, []Iss
 			f := ArtifactFact{Deliverable: a.Deliverable, Path: a.Path, Location: a.Location, Status: string(a.Status),
 				SHA256: a.SHA256, Bytes: a.Bytes, MachineID: a.MachineID}
 			if a.Location == registry.DeliveryHub && m.ArchiveDir != "" {
-				f.HubPath = path.Join(slashPath(m.ArchiveDir), registry.HubCopyPath(m.Execution, a.Path))
+				// Joined without cleaning, so a UNC prefix (//server/share)
+				// survives as it does in the mount it is matched against.
+				f.HubPath = strings.TrimSuffix(slashPath(m.ArchiveDir), "/") + "/" + registry.HubCopyPath(m.Execution, a.Path)
 			}
 			if a.Location == registry.DeliveryMachine {
 				f.MachinePath = path.Join("outputs", jobID, "runs", runID, "executions", produced, a.Path)

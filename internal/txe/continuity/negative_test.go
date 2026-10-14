@@ -246,33 +246,36 @@ func TestInventoryIsDeterministic(t *testing.T) {
 // A store written on Windows records archive paths with backslashes; they
 // are matched to the scanned root and the bytes are checked, not skipped.
 func TestWindowsArchivePathsAreChecked(t *testing.T) {
-	t.Parallel()
-	l, f := build(t)
-	const mount = `C:\dagu\data`
-	dir := filepath.Join(registry.Dir(l.DataDir), "artifacts")
-	var manifest string
-	require.NoError(t, filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			manifest = p
-		}
-		return err
-	}))
-	edit(t, manifest, func(m map[string]any) {
-		rel := strings.TrimPrefix(m["archive_dir"].(string), filepath.ToSlash(l.HubMount))
-		m["archive_dir"] = mount + strings.ReplaceAll(rel, "/", `\`)
-	})
-	rs := roots(l)
-	rs[0].Mount = mount
-	scanWith := func() map[string]int {
-		inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
-		require.NoError(t, err)
-		issues := continuity.Validate(inv, continuity.Policy{})
-		assert.Zero(t, codes(issues, continuity.SeverityWarn)["artifact_unverified"])
-		return codes(issues, continuity.SeverityBlock)
+	for name, mount := range map[string]string{"drive": `C:\dagu\data`, "unc": `\\fileserver\share\dagu\data`} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			l, f := build(t)
+			dir := filepath.Join(registry.Dir(l.DataDir), "artifacts")
+			var manifest string
+			require.NoError(t, filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					manifest = p
+				}
+				return err
+			}))
+			edit(t, manifest, func(m map[string]any) {
+				rel := strings.TrimPrefix(m["archive_dir"].(string), filepath.ToSlash(l.HubMount))
+				m["archive_dir"] = mount + strings.ReplaceAll(rel, "/", `\`)
+			})
+			rs := roots(l)
+			rs[0].Mount = mount
+			scanWith := func() map[string]int {
+				inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
+				require.NoError(t, err)
+				issues := continuity.Validate(inv, continuity.Policy{})
+				assert.Zero(t, codes(issues, continuity.SeverityWarn)["artifact_unverified"])
+				return codes(issues, continuity.SeverityBlock)
+			}
+			assert.Empty(t, scanWith())
+			require.NoError(t, os.Remove(filepath.Join(l.DataDir, filepath.FromSlash(f.HubArtifacts[0]))))
+			assert.Positive(t, scanWith()["artifact_missing"])
+		})
 	}
-	assert.Empty(t, scanWith())
-	require.NoError(t, os.Remove(filepath.Join(l.DataDir, filepath.FromSlash(f.HubArtifacts[0]))))
-	assert.Positive(t, scanWith()["artifact_missing"])
 }
 
 // Ownership is only ever an owner_id field. A person who signed in first
