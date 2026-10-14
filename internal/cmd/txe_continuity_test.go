@@ -57,7 +57,10 @@ func TestTXEContinuityCommands(t *testing.T) {
 		p := filepath.Join(dir, name)
 		out, err := runTXEContinuity(t, append([]string{"inventory", "--label", name, "--owner", fixture.StableOwner, "--out", p}, scans...)...)
 		require.NoError(t, err, out)
-		assert.Contains(t, out, "written to "+p)
+		// The printer escapes what it prints, so a Windows path is not
+		// shown verbatim; the file itself is the evidence.
+		assert.Contains(t, out, "written to")
+		assert.FileExists(t, p)
 		return p
 	}
 	first := inventory("before.json")
