@@ -86,6 +86,9 @@ type Step struct {
 	AfterRecord string `json:"after_record,omitempty"`
 	// Mode is an imported file's permission bits, where they are known.
 	Mode uint32 `json:"mode,omitempty"`
+	// Link is a retained symbolic link's target: the step recreates the
+	// link and never follows it.
+	Link string `json:"link,omitempty"`
 }
 
 // JournalEntry records one step's outcome.
@@ -138,7 +141,10 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 		return nil, errors.New("continuity: the inventory has no hub data root")
 	}
 	p := &Plan{Format: PlanFormatV1, Mode: mode, Source: inv.Digest}
-	for _, r := range inv.Records {
+	// projected is the inventory as the transition will leave it.
+	projected := *inv
+	projected.Records = append([]Record(nil), inv.Records...)
+	for i, r := range inv.Records {
 		if r.Store != "registry" && r.Store != "authz" {
 			continue
 		}
@@ -155,9 +161,12 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 		if err != nil {
 			return nil, fmt.Errorf("continuity: transform %s: %w", rel, err)
 		}
-		if err := checkTransformed(r, out); err != nil {
+		got, err := checkTransformed(r, out)
+		if err != nil {
 			return nil, err
 		}
+		got.Store, got.ID, got.SHA256, got.Raw = r.Store, r.ID, recordDigest(out), rawDigest(out)
+		projected.Records[i] = *got
 		step := Step{Path: rel, Store: r.Store, ID: r.ID, Before: before, After: rawDigest(out), AfterRecord: recordDigest(out)}
 		switch {
 		case mode == ModeImport:
@@ -174,11 +183,12 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 			if f.Root != hub {
 				continue
 			}
-			if f.Policy == PolicyOperational || f.Link != "" {
+			if f.Policy == PolicyOperational {
 				p.NotCopied = append(p.NotCopied, f.Path)
 				continue
 			}
-			p.Steps = append(p.Steps, Step{Path: f.Path, Before: f.SHA256, After: f.SHA256, Mode: f.Mode})
+			// A retained link is recreated as a link, never followed.
+			p.Steps = append(p.Steps, Step{Path: f.Path, Before: f.SHA256, After: f.SHA256, Mode: f.Mode, Link: f.Link})
 			p.Copies++
 		}
 		for _, e := range inv.Excluded {
@@ -188,6 +198,11 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 		}
 		sort.Strings(p.NotCopied)
 	}
+	// The transformed records must still hold together: owners, references
+	// and history as Validate checks them.
+	if blocking := Blocking(Validate(&projected, pol)); len(blocking) > 0 {
+		return nil, fmt.Errorf("%w: the transformed store would not validate: %d, first %s %s: %s", ErrBlocked, len(blocking), blocking[0].Code, blocking[0].ID, blocking[0].Detail)
+	}
 	sort.Slice(p.Steps, func(i, k int) bool { return p.Steps[i].Path < p.Steps[k].Path })
 	return p, nil
 }
@@ -195,19 +210,19 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 // checkTransformed refuses a transformed record that this package can no
 // longer read, or whose owner or class changed: a transition never
 // reassigns ownership.
-func checkTransformed(r Record, out []byte) error {
+func checkTransformed(r Record, out []byte) (*Record, error) {
 	classify := classifyRegistry
 	if r.Store == "authz" {
 		classify = classifyAuthz
 	}
 	got, issues := classify(r.ID, out)
 	if len(Blocking(issues)) > 0 {
-		return fmt.Errorf("%w: the transformed %s/%s does not validate: %s", ErrBlocked, r.Store, r.ID, Blocking(issues)[0].Detail)
+		return nil, fmt.Errorf("%w: the transformed %s/%s does not validate: %s", ErrBlocked, r.Store, r.ID, Blocking(issues)[0].Detail)
 	}
 	if got.Class != r.Class || got.Owner != r.Owner {
-		return fmt.Errorf("%w: the transform changes %s/%s from %s owned by %q to %s owned by %q", ErrBlocked, r.Store, r.ID, r.Class, r.Owner, got.Class, got.Owner)
+		return nil, fmt.Errorf("%w: the transform changes %s/%s from %s owned by %q to %s owned by %q", ErrBlocked, r.Store, r.ID, r.Class, r.Owner, got.Class, got.Owner)
 	}
-	return nil
+	return got, nil
 }
 
 // ApplyOptions configure Apply.
@@ -234,10 +249,13 @@ type ApplyResult struct {
 	AlreadyDone int
 }
 
-// stagingDir holds the transition's writes before each is installed. It is
-// at the target root, on the same file system, cleared when a run starts
-// and removed when it ends.
-const stagingDir = ".txe-transition-staging"
+// stagingPrefix names the directories a transition stages its writes in,
+// at the target root on the same file system. Each transition's is its own
+// (named from its plan and journal) and carries an owner marker, so a run
+// clears only what an earlier run of the same transition left.
+const stagingPrefix = ".txe-transition-staging"
+
+const ownerMarker = ".owner"
 
 // Apply carries out a plan. It can be run again after any interruption: a
 // step journaled done is checked and skipped, a step whose write happened
@@ -247,7 +265,12 @@ const stagingDir = ".txe-transition-staging"
 // Every read and write goes through an os.Root on the source and the
 // target, and a step whose path passes through a link is refused, so a
 // transition cannot write outside its target or read outside its source.
+// It runs on a Unix host, where the store lives: the durability it relies
+// on (synced directories) is not what Windows provides.
 func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, error) {
+	if !hasModeBits {
+		return nil, errors.New("continuity: a transition runs on the Unix host that holds the store, not on Windows")
+	}
 	if plan.Format != PlanFormatV1 {
 		return nil, fmt.Errorf("continuity: plan format %q is not %q", plan.Format, PlanFormatV1)
 	}
@@ -284,9 +307,13 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 		}
 		defer func() { _ = dst.Close() }()
 	}
-	// Writes interrupted inside the staging area are discarded: their step
-	// is not done and is written again.
-	if err := dst.RemoveAll(stagingDir); err != nil {
+	journalPath, err := filepath.Abs(opts.Journal)
+	if err != nil {
+		return nil, err
+	}
+	token := rawDigest([]byte(plan.Source + "\x00" + journalPath))[len("sha256:"):][:16]
+	staging := stagingPrefix + "-" + token
+	if err := resetStaging(dst, staging, token); err != nil {
 		return nil, err
 	}
 	journal, err := openJournal(opts.Journal)
@@ -300,7 +327,7 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		done, err := applyStep(i, s, plan, opts, src, dst, journal, now)
+		done, err := applyStep(i, s, plan, opts, src, dst, staging, journal, now)
 		if err != nil {
 			return res, err
 		}
@@ -310,14 +337,54 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 			res.Written++
 		}
 	}
-	if err := dst.RemoveAll(stagingDir); err != nil {
+	if err := dst.RemoveAll(staging); err != nil {
 		return res, err
 	}
 	return res, syncRootDir(dst, ".")
 }
 
+// resetStaging clears what an earlier run of this transition staged, and
+// refuses a staging directory it cannot show is this transition's.
+func resetStaging(root *os.Root, staging, token string) error {
+	info, err := root.Lstat(staging)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return err
+	case !info.IsDir() || info.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%w: %s is not this transition's staging directory", ErrConflict, staging)
+	default:
+		owner, err := root.ReadFile(staging + "/" + ownerMarker)
+		if err != nil || string(owner) != token {
+			return fmt.Errorf("%w: %s exists and was not made by this transition; it is left as it is", ErrConflict, staging)
+		}
+		if err := root.RemoveAll(staging); err != nil {
+			return err
+		}
+	}
+	if err := mkdirAllDurable(root, staging); err != nil {
+		return err
+	}
+	f, err := root.OpenFile(staging+"/"+ownerMarker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(token); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return syncRootDir(root, staging)
+}
+
 // applyStep carries out one step; done reports it was already applied.
-func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, j *journalFile, now func() time.Time) (bool, error) {
+func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, staging string, j *journalFile, now func() time.Time) (bool, error) {
 	inPlace := plan.Mode == ModeInPlace
 	record := func(outcome, detail string) error {
 		return j.append(JournalEntry{Path: s.Path, Before: s.Before, After: s.After, Outcome: outcome, Detail: detail, At: now().UTC()})
@@ -331,9 +398,32 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 	if err := noLinks(dst, s.Path); err != nil {
 		return false, conflict(err.Error())
 	}
+	if err := noLinks(src, s.Path); err != nil {
+		return false, conflict(err.Error())
+	}
+	if s.Link != "" {
+		return applyLink(i, s, opts, src, dst, j, record, conflict)
+	}
+	// An import's source must still be what the plan read, whatever the
+	// target holds; in place the source is the target and is checked below.
+	var data []byte
+	var mode fs.FileMode
+	if !inPlace {
+		var ok bool
+		var err error
+		if data, mode, ok, err = readNoFollow(src, s.Path); err != nil {
+			return false, conflict(err.Error())
+		}
+		if !ok {
+			return false, conflict("the source no longer has it")
+		}
+		if rawDigest(data) != s.Before {
+			return false, conflict("the source changed since the plan")
+		}
+	}
 	cur, curMode, present, err := readNoFollow(dst, s.Path)
 	if err != nil {
-		return false, err
+		return false, conflict(err.Error())
 	}
 	applied := present && rawDigest(cur) == s.After && modeMatches(curMode, s.Mode)
 	if after, ok := j.done[s.Path]; ok && after == s.After {
@@ -346,22 +436,14 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 		// Installed before an interruption that came before the journal.
 		return true, record(OutcomeDone, "found applied")
 	}
-	if err := noLinks(src, s.Path); err != nil {
-		return false, conflict(err.Error())
-	}
-	data, mode, ok, err := readNoFollow(src, s.Path)
-	if err != nil {
-		return false, err
-	}
 	switch {
-	case !ok:
-		return false, conflict("the source no longer has it")
-	case rawDigest(data) != s.Before:
-		return false, conflict("the source changed since the plan")
 	case inPlace && (!present || rawDigest(cur) != s.Before):
 		return false, conflict("the record holds something the plan did not read")
 	case !inPlace && present:
 		return false, conflict("the target holds something else")
+	}
+	if inPlace {
+		data, mode = cur, curMode
 	}
 	out := data
 	if s.Store != "" {
@@ -372,19 +454,14 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 			return false, conflict("the transform gives another result than it planned")
 		}
 	}
-	perm := fs.FileMode(0o600)
-	switch {
-	case inPlace:
-		perm = curMode.Perm()
-	case s.Mode != 0:
+	perm := mode.Perm()
+	if !inPlace && s.Mode != 0 {
 		perm = fs.FileMode(s.Mode)
-	case mode != 0:
-		perm = mode.Perm()
 	}
 	if err := interrupt(opts, i, "before_write"); err != nil {
 		return false, err
 	}
-	staged, err := stage(dst, out, perm)
+	staged, err := stage(dst, staging, out, perm)
 	if err != nil {
 		return false, err
 	}
@@ -403,11 +480,62 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 	return false, record(OutcomeDone, "")
 }
 
-func interrupt(opts ApplyOptions, step int, point string) error {
-	if opts.Interrupt == nil {
-		return nil
+// applyLink recreates a retained symbolic link in an import, as a link to
+// the same target, without following it on either side.
+func applyLink(i int, s Step, opts ApplyOptions, src, dst *os.Root, j *journalFile, record func(string, string) error, conflict func(string) error) (bool, error) {
+	readLink := func(root *os.Root) (string, bool, error) {
+		info, err := root.Lstat(s.Path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			return "", true, nil
+		}
+		target, err := root.Readlink(s.Path)
+		return target, true, err
 	}
-	return opts.Interrupt(step, point)
+	have, ok, err := readLink(src)
+	switch {
+	case err != nil:
+		return false, err
+	case !ok || have != s.Link:
+		return false, conflict("the source link changed since the plan")
+	}
+	cur, present, err := readLink(dst)
+	if err != nil {
+		return false, err
+	}
+	if present && cur == s.Link {
+		if _, done := j.done[s.Path]; done {
+			return true, nil
+		}
+		return true, record(OutcomeDone, "found applied")
+	}
+	if _, done := j.done[s.Path]; done {
+		return false, conflict("changed after it was applied")
+	}
+	if present {
+		return false, conflict("the target holds something else")
+	}
+	if err := interrupt(opts, i, "before_write"); err != nil {
+		return false, err
+	}
+	if err := mkdirAllDurable(dst, path.Dir(s.Path)); err != nil {
+		return false, err
+	}
+	if err := dst.Symlink(s.Link, s.Path); err != nil {
+		return false, err
+	}
+	if err := syncRootDir(dst, path.Dir(s.Path)); err != nil {
+		return false, err
+	}
+	if err := interrupt(opts, i, "after_write"); err != nil {
+		return false, err
+	}
+	return false, record(OutcomeDone, "")
 }
 
 // checkRelPath refuses a plan path that is not a clean, relative,
@@ -416,16 +544,17 @@ func checkRelPath(p string) error {
 	switch {
 	case p == "", p == ".", p == "..", strings.HasPrefix(p, "../"), path.IsAbs(p),
 		strings.ContainsAny(p, "\\:"), path.Clean(p) != p,
-		p == stagingDir, strings.HasPrefix(p, stagingDir+"/"):
+		strings.HasPrefix(p, stagingPrefix):
 		return fmt.Errorf("continuity: the plan names an unsafe path %q", p)
 	}
 	return nil
 }
 
 // checkRoots refuses a source and target that are not what the mode needs,
-// and a journal inside either. Directories are compared by file system
-// identity, through every existing ancestor, so an alias (a link, a
-// junction, another letter case) is the directory it names.
+// and a journal inside either or one that is a link. Containment is decided
+// on physical paths (every existing part resolved, links included) by file
+// system identity, so an alias of the source or of any directory in it (a
+// link, a junction, another letter case) counts as the source.
 func checkRoots(source, target, journal string, inPlace bool) error {
 	srcInfo, err := os.Stat(source)
 	if err != nil {
@@ -434,47 +563,90 @@ func checkRoots(source, target, journal string, inPlace bool) error {
 	if !srcInfo.IsDir() {
 		return fmt.Errorf("continuity: the source %s is not a directory", source)
 	}
+	tgtInfo, tgtErr := os.Stat(target)
 	if inPlace {
-		tgt, err := os.Stat(target)
-		if err != nil || !os.SameFile(srcInfo, tgt) {
+		if tgtErr != nil || !os.SameFile(srcInfo, tgtInfo) {
 			return fmt.Errorf("continuity: an in-place transition writes its own source; %s is not %s", target, source)
 		}
 	} else {
-		if within(target, srcInfo) {
+		in, err := within(target, srcInfo)
+		if err != nil || in {
 			return fmt.Errorf("continuity: the import target %s is the source or inside it", target)
 		}
-		if tgt, err := os.Stat(target); err == nil && within(source, tgt) {
-			return fmt.Errorf("continuity: the source %s is inside the import target", source)
+		if tgtErr == nil {
+			if in, err := within(source, tgtInfo); err != nil || in {
+				return fmt.Errorf("continuity: the source %s is inside the import target", source)
+			}
 		}
 	}
 	if journal == "" {
 		return errors.New("continuity: a journal path is required")
 	}
-	dir := filepath.Dir(journal)
-	if within(dir, srcInfo) {
+	if in, err := within(journal, srcInfo); err != nil || in {
 		return fmt.Errorf("continuity: the journal %s is inside the source", journal)
 	}
-	if tgt, err := os.Stat(target); err == nil && within(dir, tgt) {
-		return fmt.Errorf("continuity: the journal %s is inside the target", journal)
+	if tgtErr == nil {
+		if in, err := within(journal, tgtInfo); err != nil || in {
+			return fmt.Errorf("continuity: the journal %s is inside the target", journal)
+		}
+	}
+	// The journal file itself must be a plain file of its own: a link, or a
+	// second name of another file, could be a file of a store.
+	info, err := os.Lstat(journal)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return err
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("continuity: the journal %s is not a regular file", journal)
+	case linkCount(info) > 1:
+		return fmt.Errorf("continuity: the journal %s has other names (hard links); use a file of its own", journal)
 	}
 	return nil
 }
 
-// within reports whether p, or any existing ancestor of it, is dir.
-func within(p string, dir fs.FileInfo) bool {
+// within reports whether p, resolved to its physical path, is dir or lies
+// inside it. Every existing part of p is resolved, links included; the
+// parts that do not exist yet cannot be links.
+func within(p string, dir fs.FileInfo) (bool, error) {
+	physical, err := physicalPath(p)
+	if err != nil {
+		return false, err
+	}
+	for cur := physical; ; {
+		if info, err := os.Stat(cur); err == nil && os.SameFile(info, dir) {
+			return true, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return false, nil
+		}
+		cur = parent
+	}
+}
+
+// physicalPath resolves the longest existing prefix of p and appends the
+// rest.
+func physicalPath(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
-		return true
+		return "", err
 	}
-	for {
-		if info, err := os.Stat(abs); err == nil && os.SameFile(info, dir) {
-			return true
+	rest := ""
+	for cur := abs; ; {
+		if _, err := os.Lstat(cur); err == nil {
+			resolved, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(resolved, rest), nil
 		}
-		parent := filepath.Dir(abs)
-		if parent == abs {
-			return false
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
 		}
-		abs = parent
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
 	}
 }
 
@@ -541,15 +713,12 @@ func modeMatches(have fs.FileMode, want uint32) bool {
 }
 
 // stage writes data to a new file in the staging area and returns its name.
-func stage(root *os.Root, data []byte, perm fs.FileMode) (string, error) {
-	if err := mkdirAllDurable(root, stagingDir); err != nil {
-		return "", err
-	}
+func stage(root *os.Root, staging string, data []byte, perm fs.FileMode) (string, error) {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	name := stagingDir + "/" + hex.EncodeToString(b[:])
+	name := staging + "/" + hex.EncodeToString(b[:])
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
 		return "", err
@@ -741,11 +910,12 @@ func ReadJournal(path string) ([]JournalEntry, error) {
 }
 
 // VerifyTransition checks the store after a transition against the
-// inventory taken before it, with the strict freeze comparison. Only the
+// inventory taken before it, with the strict freeze comparison, and
+// validates the result. Only the
 // records the plan rewrote, and the journal records as done, may differ,
 // and each must now hold exactly what the plan computed. Everything else
 // must be as it was; nothing may be missing or added.
-func VerifyTransition(before, after *Inventory, plan *Plan, journal []JournalEntry) *Report {
+func VerifyTransition(before, after *Inventory, plan *Plan, journal []JournalEntry, pol Policy) *Report {
 	done := map[string]JournalEntry{}
 	for _, e := range journal {
 		if e.Outcome == OutcomeDone {
@@ -785,8 +955,8 @@ func VerifyTransition(before, after *Inventory, plan *Plan, journal []JournalEnt
 		}
 		// Every step's result must be the exact bytes the plan computed.
 		if s.Store == "" {
-			if f, ok := laterFiles[s.Path]; ok && f.SHA256 != s.After {
-				add("step_result_differs", s.Path, "the file holds "+f.SHA256+", not the "+s.After+" the plan copied")
+			if f, ok := laterFiles[s.Path]; ok && (f.SHA256 != s.After || f.Link != s.Link) {
+				add("step_result_differs", s.Path, "the file is not the one the plan copied")
 			}
 			continue
 		}
@@ -800,6 +970,15 @@ func VerifyTransition(before, after *Inventory, plan *Plan, journal []JournalEnt
 	}
 	rep := Compare(before, after, CompareOptions{Reconciled: reconciled})
 	rep.Issues = append(rep.Issues, issues...)
+	// The result must hold together on its own, too.
+	rep.Issues = append(rep.Issues, Blocking(Validate(after, pol))...)
 	sortIssues(rep.Issues)
 	return rep
+}
+
+func interrupt(opts ApplyOptions, step int, point string) error {
+	if opts.Interrupt == nil {
+		return nil
+	}
+	return opts.Interrupt(step, point)
 }

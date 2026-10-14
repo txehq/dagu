@@ -73,6 +73,7 @@ type rehearsal struct {
 
 func newRehearsal(t *testing.T, mode string, transform continuity.Transform) *rehearsal {
 	t.Helper()
+	skipApplyOnWindows(t)
 	l, _ := build(t)
 	before := scan(t, l)
 	plan, err := continuity.PlanTransition(before, l.DataDir, mode, transform, continuity.Policy{})
@@ -105,7 +106,7 @@ func (r *rehearsal) verify(t *testing.T) *continuity.Report {
 	t.Helper()
 	journal, err := continuity.ReadJournal(r.journal)
 	require.NoError(t, err)
-	return continuity.VerifyTransition(r.before, r.after(t), r.plan, journal)
+	return continuity.VerifyTransition(r.before, r.after(t), r.plan, journal, continuity.Policy{})
 }
 
 var errCrash = errors.New("crash")
@@ -149,7 +150,7 @@ func TestInPlaceTransition(t *testing.T) {
 	assert.Equal(t, 3, res.Written)
 	after := r.after(t)
 	assert.Empty(t, continuity.Blocking(continuity.Validate(after, continuity.Policy{})))
-	rep := continuity.VerifyTransition(r.before, after, r.plan, mustJournal(t, r.journal))
+	rep := continuity.VerifyTransition(r.before, after, r.plan, mustJournal(t, r.journal), continuity.Policy{})
 	assert.Empty(t, rep.Issues)
 	assert.Len(t, rep.Changed, 3)
 	assert.Empty(t, rep.Added, "nothing executed, nothing added")
@@ -296,6 +297,7 @@ func TestVerifyFindsAStepLostAfterTheJournal(t *testing.T) {
 // An import does not carry queued dispatch across: the queue is
 // operational, and copying it would run work in the new store.
 func TestImportLeavesTheQueue(t *testing.T) {
+	skipApplyOnWindows(t)
 	t.Parallel()
 	l, _ := build(t)
 	q := filepath.Join(l.DataDir, "queue", "item.json")
@@ -314,7 +316,7 @@ func TestImportLeavesTheQueue(t *testing.T) {
 	rs[0].Path = target
 	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
 	require.NoError(t, err)
-	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal)).Issues)
+	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal), continuity.Policy{}).Issues)
 }
 
 // A crash in the middle of appending to the journal leaves a torn line, or
@@ -364,7 +366,9 @@ func TestInterruptedStagingLeavesNothing(t *testing.T) {
 	require.ErrorIs(t, err, errCrash)
 	_, err = r.apply(context.Background(), continuity.Identity, nil)
 	require.NoError(t, err)
-	assert.NoDirExists(t, filepath.Join(r.target, ".txe-transition-staging"))
+	left, err := filepath.Glob(filepath.Join(r.target, ".txe-transition-staging*"))
+	require.NoError(t, err)
+	assert.Empty(t, left)
 	assert.Empty(t, r.verify(t).Issues)
 }
 
@@ -436,6 +440,7 @@ func TestMutatingTransformIsPlanned(t *testing.T) {
 
 // An import keeps each file's permission bits.
 func TestImportKeepsPermissions(t *testing.T) {
+	skipApplyOnWindows(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("no permission bits")
 	}
@@ -458,7 +463,7 @@ func TestImportKeepsPermissions(t *testing.T) {
 	rs[0].Path = target
 	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
 	require.NoError(t, err)
-	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal)).Issues)
+	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal), continuity.Policy{}).Issues)
 }
 
 // Verification holds each rewritten record to the exact bytes the plan
@@ -477,4 +482,125 @@ func TestVerifyChecksExactBytes(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(p, compact, 0o600))
 	assert.Positive(t, codes(r.verify(t).Issues, continuity.SeverityBlock)["step_result_differs"])
+}
+
+func skipApplyOnWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a transition runs on the Unix host that holds the store")
+	}
+}
+
+// An import target reached through an alias of a directory inside the
+// source, or a journal that is a link or a second name of a source file,
+// is refused before anything is written.
+func TestAliasesIntoTheSourceAreRefused(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	before := treeState(t, r.l.Root)
+	try := func(target, journal string) error {
+		_, err := continuity.Apply(context.Background(), r.plan, continuity.ApplyOptions{SourceData: r.l.DataDir, TargetData: target, Journal: journal})
+		return err
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	require.NoError(t, os.Symlink(filepath.Join(r.l.DataDir, "dag-runs"), alias))
+	assert.Error(t, try(filepath.Join(alias, "imported"), r.journal), "a target under an alias of a source subdirectory")
+	assert.Error(t, try(r.target, filepath.Join(alias, "journal.jsonl")), "a journal under an alias of a source subdirectory")
+
+	protected := filepath.Join(r.l.DataDir, "proc", "journal.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(protected), 0o750))
+	require.NoError(t, os.WriteFile(protected, nil, 0o600))
+	before = treeState(t, r.l.Root)
+	linked := filepath.Join(t.TempDir(), "journal.jsonl")
+	require.NoError(t, os.Symlink(protected, linked))
+	assert.Error(t, try(r.target, linked), "a journal that is a link to a source file")
+	hard := filepath.Join(t.TempDir(), "journal.jsonl")
+	require.NoError(t, os.Link(protected, hard))
+	assert.Error(t, try(r.target, hard), "a journal that is another name of a source file")
+	assert.Equal(t, before, treeState(t, r.l.Root), "nothing was written")
+}
+
+// A retained symbolic link is imported as the same link, never followed.
+func TestImportKeepsLinks(t *testing.T) {
+	skipApplyOnWindows(t)
+	t.Parallel()
+	l, _ := build(t)
+	link := filepath.Join(l.DataDir, "workspaces", "current")
+	require.NoError(t, os.MkdirAll(filepath.Dir(link), 0o750))
+	require.NoError(t, os.Symlink("../views/somewhere", link))
+	before := scan(t, l)
+	plan, err := continuity.PlanTransition(before, l.DataDir, continuity.ModeImport, continuity.Identity, continuity.Policy{})
+	require.NoError(t, err)
+	target := filepath.Join(t.TempDir(), "data")
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	_, err = continuity.Apply(context.Background(), plan, continuity.ApplyOptions{SourceData: l.DataDir, TargetData: target, Journal: journal})
+	require.NoError(t, err)
+	got, err := os.Readlink(filepath.Join(target, "workspaces", "current"))
+	require.NoError(t, err)
+	assert.Equal(t, "../views/somewhere", got)
+	rs := roots(l)
+	rs[0].Path = target
+	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
+	require.NoError(t, err)
+	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal), continuity.Policy{}).Issues)
+}
+
+// A transform whose result would not hold together, such as a decision
+// pointing at a proposal that does not exist, is refused at planning.
+func TestTransformBreakingRelationshipsIsRefused(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	breaking := func(store, id string, data []byte) ([]byte, error) {
+		if store == "registry" && strings.Contains(id, "/decisions/") {
+			var m map[string]any
+			if err := json.Unmarshal(data, &m); err != nil {
+				return nil, err
+			}
+			m["proposal_id"] = "prp_01M4ZZZZZZZZZZZZZZZZZZZZZZ"
+			return indent(m)
+		}
+		return data, nil
+	}
+	_, err := continuity.PlanTransition(scan(t, l), l.DataDir, continuity.ModeInPlace, breaking, continuity.Policy{})
+	require.ErrorIs(t, err, continuity.ErrBlocked)
+	assert.ErrorContains(t, err, "dangling_ref")
+}
+
+// Resuming an import checks the source of a step that is already in the
+// target: a source changed after it was copied stops the transition.
+func TestImportResumeRechecksTheSource(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	const k = 5
+	_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+		if i == k && p == "after_write" {
+			return errCrash
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, errCrash)
+	require.NoError(t, os.WriteFile(filepath.Join(r.l.DataDir, filepath.FromSlash(r.plan.Steps[k].Path)), []byte(`{"changed":true}`), 0o600))
+	_, err = r.apply(context.Background(), continuity.Identity, nil)
+	require.ErrorIs(t, err, continuity.ErrConflict)
+}
+
+// A staging directory whose owner marker is not this transition's is left
+// alone and stops the run.
+func TestForeignStagingIsLeftAlone(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+		if i == 2 && p == "staged" {
+			return errCrash
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, errCrash)
+	matches, err := filepath.Glob(filepath.Join(r.target, ".txe-transition-staging-*", ".owner"))
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	require.NoError(t, os.WriteFile(matches[0], []byte("someone-else"), 0o600))
+	_, err = r.apply(context.Background(), continuity.Identity, nil)
+	require.ErrorIs(t, err, continuity.ErrConflict)
+	assert.FileExists(t, matches[0], "the foreign staging directory is kept")
 }
