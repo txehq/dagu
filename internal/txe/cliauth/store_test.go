@@ -5,6 +5,7 @@ package cliauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -433,4 +434,115 @@ func TestNormalizeHub(t *testing.T) {
 		assert.Error(t, err, bad)
 	}
 	assert.False(t, strings.Contains(got, "?"))
+}
+
+func TestRefreshIDTokenAtAnotherIssuerEndsSignIn(t *testing.T) {
+	ctx := context.Background()
+	f := cliauthtest.New(t)
+	s := newTestStore(t)
+	_, err := s.Replace(ctx, entryFor(f, signIn(t, f)))
+	require.NoError(t, err)
+	// Still valid, so a renewal without a verdict would keep using it.
+	expire(t, s, 10*time.Second)
+	f.RefreshIDToken = true
+	f.IDIssuer = "https://other.example"
+	_, err = s.AccessToken(ctx, testHub, nil)
+	require.ErrorIs(t, err, ErrIdentityChanged)
+	_, err = s.Load(testHub)
+	assert.ErrorIs(t, err, ErrNotSignedIn)
+}
+
+func TestRefreshFailuresWithoutVerdictAreUnverifiable(t *testing.T) {
+	cases := map[string]func(t *testing.T, f *cliauthtest.Provider){
+		"not a bearer token": func(_ *testing.T, f *cliauthtest.Provider) {
+			f.RefreshHandler = func(w http.ResponseWriter) bool {
+				cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"access_token": "a", "token_type": "mac", "expires_in": 60})
+				return true
+			}
+		},
+		"discovery names another issuer": func(_ *testing.T, f *cliauthtest.Provider) {
+			f.IssuerOverride = f.Issuer() + "/"
+		},
+		"signing keys unreachable": func(t *testing.T, f *cliauthtest.Provider) {
+			ln, err := net.Listen("tcp4", "127.0.0.1:0")
+			require.NoError(t, err)
+			addr := ln.Addr().String()
+			require.NoError(t, ln.Close())
+			f.RefreshIDToken = true
+			f.JWKSURI = "http://" + addr + "/jwks"
+		},
+	}
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := cliauthtest.New(t)
+			tokens := signIn(t, f)
+			breakIt(t, f)
+			_, err := Refresh(context.Background(), providerOf(f), tokens.Identity, tokens.RefreshToken, nil)
+			var unverifiable *UnverifiableError
+			require.ErrorAs(t, err, &unverifiable)
+			var refused *RefusedError
+			assert.False(t, errors.As(err, &refused))
+			assert.NotErrorIs(t, err, ErrIdentityChanged)
+		})
+	}
+}
+
+func TestStoreRefusesEditedBinding(t *testing.T) {
+	ctx := context.Background()
+	f := cliauthtest.New(t)
+	for _, field := range []string{"issuer", "client_id", "subject", "hub"} {
+		t.Run(field, func(t *testing.T) {
+			s := newTestStore(t)
+			_, err := s.Replace(ctx, entryFor(f, signIn(t, f)))
+			require.NoError(t, err)
+			file, _, err := s.paths(testHub)
+			require.NoError(t, err)
+			data, err := os.ReadFile(file)
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(data, &raw))
+			raw[field] = "https://attacker.example"
+			if field == "hub" {
+				raw[field] = testHub + "/x"
+			}
+			edited, err := json.Marshal(raw)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(file, edited, 0o600))
+
+			before := f.Refreshes()
+			_, err = s.AccessToken(ctx, testHub, nil)
+			require.Error(t, err)
+			_, err = s.Renew(ctx, testHub, "stale", nil)
+			require.Error(t, err)
+			assert.Equal(t, before, f.Refreshes(), "an edited entry sends its refresh token nowhere")
+
+			// Signing in again replaces it.
+			_, err = s.Replace(ctx, entryFor(f, signIn(t, f)))
+			require.NoError(t, err)
+			_, err = s.Load(testHub)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestStoreRenewalHasDeadline(t *testing.T) {
+	ctx := context.Background()
+	f := cliauthtest.New(t)
+	s := newTestStore(t)
+	_, err := s.Replace(ctx, entryFor(f, signIn(t, f)))
+	require.NoError(t, err)
+	expire(t, s, -time.Second)
+	var deadline time.Time
+	var bounded bool
+	s.renew = func(ctx context.Context, _ Provider, _ Identity, _ string, _ *http.Client) (*Tokens, error) {
+		deadline, bounded = ctx.Deadline()
+		return nil, &UnverifiableError{Op: "renewal", Err: ctx.Err()}
+	}
+	start := time.Now()
+	_, err = s.AccessToken(ctx, testHub, nil)
+	var unverifiable *UnverifiableError
+	require.ErrorAs(t, err, &unverifiable)
+	require.True(t, bounded)
+	assert.WithinRange(t, deadline, start, time.Now().Add(renewTimeout))
+	assert.Less(t, renewTimeout, lockTimeout, "a waiting process outlasts a renewal")
 }

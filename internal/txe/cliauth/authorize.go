@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// DefaultAuthorizeTimeout bounds how long a sign-in waits for the browser.
+// DefaultAuthorizeTimeout bounds a whole sign-in, the browser included.
 const DefaultAuthorizeTimeout = 5 * time.Minute
 
 // Prompt values a sign-in may ask the provider for.
@@ -42,11 +42,12 @@ type AuthorizeOptions struct {
 	// Prompt is passed to the provider: "" (reuse its session), "login" or
 	// "select_account".
 	Prompt string
-	// Timeout bounds the wait for the browser. Zero means
-	// DefaultAuthorizeTimeout.
+	// Timeout bounds the whole sign-in, the wait for the browser included.
+	// Zero means DefaultAuthorizeTimeout.
 	Timeout time.Duration
 	// HTTP is used for every call to the provider. Nil means
-	// http.DefaultClient. Redirects are never followed.
+	// http.DefaultClient. Redirects are never followed, and each request and
+	// answer is bounded.
 	HTTP *http.Client
 }
 
@@ -64,6 +65,15 @@ func Authorize(ctx context.Context, p Provider, opts AuthorizeOptions) (*Tokens,
 	default:
 		return nil, fmt.Errorf("unknown prompt %q: use %q or %q", opts.Prompt, PromptLogin, PromptSelectAccount)
 	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DefaultAuthorizeTimeout
+	}
+	// The deadline covers the whole attempt: discovery, the browser, the
+	// exchange and the ID token's keys.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	client := providerClient(opts.HTTP)
 	e, err := discover(ctx, p, client)
 	if err != nil {
@@ -81,13 +91,6 @@ func Authorize(ctx context.Context, p Provider, opts AuthorizeOptions) (*Tokens,
 	if err != nil {
 		return nil, err
 	}
-
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = DefaultAuthorizeTimeout
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	cb, err := listenLoopback(state, p.Issuer)
 	if err != nil {
@@ -113,7 +116,7 @@ func Authorize(ctx context.Context, p Provider, opts AuthorizeOptions) (*Tokens,
 		_, _ = fmt.Fprintf(out, "Open this address in a browser on this machine to sign in:\n\n%s\n\n", authURL)
 	}
 
-	code, err := cb.wait(waitCtx)
+	code, err := cb.wait(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +148,7 @@ func Authorize(ctx context.Context, p Provider, opts AuthorizeOptions) (*Tokens,
 	if claims.identity.Issuer != p.Issuer {
 		return nil, ErrIdentityChanged
 	}
-	if err := checkAccessTokenIdentity(resp.AccessToken, claims.identity); err != nil {
+	if err := checkTokenIdentity(resp.AccessToken, claims.identity); err != nil {
 		return nil, err
 	}
 	return &Tokens{

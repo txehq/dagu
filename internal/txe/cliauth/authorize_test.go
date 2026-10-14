@@ -11,7 +11,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -217,4 +219,75 @@ func TestDiscoveryRequiresExactIssuer(t *testing.T) {
 	var unverifiable *UnverifiableError
 	assert.False(t, errors.As(err, &unverifiable), "a provider naming another issuer is not an outage: %v", err)
 	assert.Contains(t, err.Error(), "does not say it is that issuer")
+}
+
+func TestDiscoveryRequiresSecureSigningKeys(t *testing.T) {
+	f := cliauthtest.New(t)
+	f.JWKSURI = "http://keys.example/jwks"
+	_, err := authorize(t, f, AuthorizeOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "signing keys endpoint")
+	assert.Contains(t, err.Error(), "https")
+}
+
+func TestAuthorizeDeadlineCoversDiscovery(t *testing.T) {
+	release := make(chan struct{})
+	hung := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer hung.Close()
+	defer close(release)
+	start := time.Now()
+	_, err := Authorize(context.Background(), Provider{Issuer: hung.URL, ClientID: "c"}, AuthorizeOptions{
+		OpenBrowser: func(string) error { return nil },
+		Timeout:     300 * time.Millisecond,
+	})
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second)
+}
+
+func TestProviderClientIsBounded(t *testing.T) {
+	c := providerClient(nil)
+	assert.Equal(t, providerRequestTimeout, c.Timeout)
+	assert.Zero(t, http.DefaultClient.Timeout, "the shared client is not changed")
+	assert.Equal(t, time.Second, providerClient(&http.Client{Timeout: time.Second}).Timeout)
+
+	for _, n := range []int{0, maxProviderResponse} {
+		b := &limitedBody{body: io.NopCloser(bytes.NewReader(make([]byte, n))), left: maxProviderResponse}
+		got, err := io.ReadAll(b)
+		require.NoError(t, err)
+		assert.Len(t, got, n)
+	}
+	b := &limitedBody{body: io.NopCloser(bytes.NewReader(make([]byte, maxProviderResponse+1))), left: maxProviderResponse}
+	_, err := io.ReadAll(b)
+	assert.ErrorIs(t, err, errResponseTooLarge)
+}
+
+func TestProviderAnswersAreBounded(t *testing.T) {
+	chunk := bytes.Repeat([]byte("a"), 64<<10)
+	streamed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issuer":"`))
+		for range 2 * maxProviderResponse / len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer streamed.Close()
+	declared := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(2*maxProviderResponse))
+		_, _ = w.Write(chunk)
+	}))
+	defer declared.Close()
+	for _, issuer := range []string{streamed.URL, declared.URL} {
+		_, err := Refresh(context.Background(), Provider{Issuer: issuer, ClientID: "c"}, Identity{Issuer: issuer, Subject: "s"}, "rt", nil)
+		var unverifiable *UnverifiableError
+		require.ErrorAs(t, err, &unverifiable, issuer)
+		// go-oidc keeps only the text of the cause.
+		assert.Contains(t, err.Error(), errResponseTooLarge.Error(), issuer)
+	}
 }

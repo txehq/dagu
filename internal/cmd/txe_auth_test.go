@@ -194,3 +194,32 @@ func TestTXESignInDoesNotChangeOtherCommands(t *testing.T) {
 	require.NotNil(t, remote)
 	assert.Equal(t, "dagu_test_key", remote.apiKey)
 }
+
+// Each login flag defaults on its own: repeating the issuer and client id
+// keeps the scopes of the last sign-in.
+func TestTXELoginKeepsScopesWithExplicitProvider(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	withFakeBrowser(t, p)
+
+	f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID, "--scope", "offline_access")
+	assert.Equal(t, "openid offline_access", p.LastAuth().Get("scope"))
+	f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
+	assert.Equal(t, "openid offline_access", p.LastAuth().Get("scope"))
+
+	// An unreadable sign-in cannot supply the provider, and does not stop a
+	// login that gives it.
+	dir := filepath.Join(f.home, txeSignInDir)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, e.Name()), []byte("{"), 0o600))
+		}
+	}
+	_, err = f.run("login")
+	require.Error(t, err)
+	login := f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
+	assert.Equal(t, p.Subject, login["subject"])
+	assert.Equal(t, "openid", p.LastAuth().Get("scope"))
+}

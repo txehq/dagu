@@ -18,11 +18,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc"
 )
@@ -101,17 +103,82 @@ type endpoints struct {
 	revocation string
 }
 
+const (
+	// providerRequestTimeout bounds one request to the provider when the
+	// caller's client sets no limit of its own.
+	providerRequestTimeout = 30 * time.Second
+	// maxProviderResponse bounds every body read from the provider:
+	// discovery, keys, tokens and revocation.
+	maxProviderResponse = 1 << 20
+)
+
+// errResponseTooLarge reports a provider answer over maxProviderResponse.
+var errResponseTooLarge = errors.New("the identity provider's answer is too large")
+
 // providerClient returns an HTTP client that never follows a redirect: the
 // provider's endpoints answer directly, and a redirect could carry a request
-// with a code or token to another host.
+// with a code or token to another host. Each request is bounded in time, and
+// each answer in size, including the ones go-oidc reads itself.
 func providerClient(client *http.Client) *http.Client {
 	if client == nil {
 		client = http.DefaultClient
 	}
 	c := *client
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if c.Timeout <= 0 {
+		c.Timeout = providerRequestTimeout
+	}
+	base := c.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if _, ok := base.(limitedTransport); !ok {
+		c.Transport = limitedTransport{base: base}
+	}
 	return &c
 }
+
+// limitedTransport fails a response body once it passes maxProviderResponse.
+type limitedTransport struct {
+	base http.RoundTripper
+}
+
+func (t limitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.ContentLength > maxProviderResponse {
+		_ = resp.Body.Close()
+		return nil, errResponseTooLarge
+	}
+	resp.Body = &limitedBody{body: resp.Body, left: maxProviderResponse}
+	return resp, nil
+}
+
+type limitedBody struct {
+	body io.ReadCloser
+	left int64
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	if b.left < 0 {
+		return 0, errResponseTooLarge
+	}
+	// Read one byte past the limit, so that a body of exactly the limit
+	// still ends cleanly.
+	if int64(len(p)) > b.left+1 {
+		p = p[:b.left+1]
+	}
+	n, err := b.body.Read(p)
+	b.left -= int64(n)
+	if b.left < 0 {
+		return 0, errResponseTooLarge
+	}
+	return n, err
+}
+
+func (b *limitedBody) Close() error { return b.body.Close() }
 
 // discover reads the provider's metadata. The issuer it states must equal
 // p.Issuer exactly, and every endpoint must be acceptable the way the issuer
@@ -131,9 +198,18 @@ func discover(ctx context.Context, p Provider, client *http.Client) (*endpoints,
 	}
 	var meta struct {
 		Revocation string `json:"revocation_endpoint"`
+		JWKS       string `json:"jwks_uri"`
 	}
 	if err := provider.Claims(&meta); err != nil {
 		return nil, &UnverifiableError{Op: "discovery", Err: err}
+	}
+	// go-oidc fetches the signing keys from jwks_uri as given, so it is held
+	// to the issuer's rule like every other endpoint.
+	if meta.JWKS == "" {
+		return nil, errors.New("the provider names no signing keys (jwks_uri)")
+	}
+	if err := checkIssuer(meta.JWKS); err != nil {
+		return nil, fmt.Errorf("provider's signing keys endpoint: %w", err)
 	}
 	e := &endpoints{
 		provider:   provider,

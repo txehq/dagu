@@ -56,6 +56,8 @@ type Provider struct {
 	IDNonce         func(nonce string) string        // nonce put in the ID token
 	IDAudience      string                           // audience of the ID token
 	IDSubject       string                           // subject of the ID token, when not subject
+	IDIssuer        string                           // issuer of the ID token, when not the issuer
+	JWKSURI         string                           // jwks_uri stated in discovery, when not its own
 	AccessSubject   string                           // subject of access tokens, when not subject
 	SignWith        *rsa.PrivateKey                  // key that signs tokens, when not key
 	RefreshHandler  func(w http.ResponseWriter) bool // answers a refresh instead, when it returns true
@@ -120,6 +122,9 @@ func (f *Provider) discovery(w http.ResponseWriter, _ *http.Request) {
 		"token_endpoint":                        f.Issuer() + "/token",
 		"jwks_uri":                              f.Issuer() + "/jwks",
 		"id_token_signing_alg_values_supported": []string{"RS256"},
+	}
+	if f.JWKSURI != "" {
+		doc["jwks_uri"] = f.JWKSURI
 	}
 	if !f.NoRevocation {
 		doc["revocation_endpoint"] = f.Issuer() + "/revoke"
@@ -193,8 +198,12 @@ func (f *Provider) issue(w http.ResponseWriter, subject, nonce string, withID bo
 		if f.IDAudience != "" {
 			aud = f.IDAudience
 		}
+		idIss := f.Issuer()
+		if f.IDIssuer != "" {
+			idIss = f.IDIssuer
+		}
 		claims := jwt.MapClaims{
-			"iss": f.Issuer(), "sub": idSub, "aud": aud, "azp": f.ClientID,
+			"iss": idIss, "sub": idSub, "aud": aud, "azp": f.ClientID,
 			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 			"preferred_username": f.Username, "email": "alice@example.test",
 		}

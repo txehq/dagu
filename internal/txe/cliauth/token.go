@@ -158,11 +158,37 @@ func cleanCode(code string) string {
 // returns none, the access token's own issuer and subject, read without
 // verification, must not name anyone else. A renewal that names someone
 // else is refused and its tokens are dropped.
+//
+// The error is a *RefusedError, ErrIdentityChanged, ErrNotSignedIn when
+// there is no refresh token, or otherwise an *UnverifiableError.
 func Refresh(ctx context.Context, p Provider, want Identity, refreshToken string, client *http.Client) (*Tokens, error) {
 	if refreshToken == "" {
 		return nil, ErrNotSignedIn
 	}
-	client = providerClient(client)
+	tokens, err := refresh(ctx, p, want, refreshToken, providerClient(client))
+	if err != nil {
+		return nil, renewalVerdict(err)
+	}
+	return tokens, nil
+}
+
+// renewalVerdict keeps a refusal and a changed identity as they are. Every
+// other failure gave no verdict on the grant, so it is an
+// *UnverifiableError.
+func renewalVerdict(err error) error {
+	if _, ok := errors.AsType[*RefusedError](err); ok {
+		return err
+	}
+	if _, ok := errors.AsType[*UnverifiableError](err); ok {
+		return err
+	}
+	if errors.Is(err, ErrIdentityChanged) {
+		return err
+	}
+	return &UnverifiableError{Op: "renewal", Err: err}
+}
+
+func refresh(ctx context.Context, p Provider, want Identity, refreshToken string, client *http.Client) (*Tokens, error) {
 	e, err := discover(ctx, p, client)
 	if err != nil {
 		return nil, err
@@ -181,6 +207,11 @@ func Refresh(ctx context.Context, p Provider, want Identity, refreshToken string
 		tokens.RefreshToken = refreshToken
 	}
 	if resp.IDToken != "" {
+		// An ID token naming another issuer fails verification before its
+		// identity could be compared; read first, it is a changed identity.
+		if err := checkTokenIdentity(resp.IDToken, want); err != nil {
+			return nil, err
+		}
 		claims, err := verifyIDToken(ctx, e, p, client, resp.IDToken, "")
 		if err != nil {
 			return nil, err
@@ -190,7 +221,7 @@ func Refresh(ctx context.Context, p Provider, want Identity, refreshToken string
 		}
 		tokens.Username = claims.username
 	}
-	if err := checkAccessTokenIdentity(resp.AccessToken, want); err != nil {
+	if err := checkTokenIdentity(resp.AccessToken, want); err != nil {
 		return nil, err
 	}
 	tokens.Expiry = expiry(now, resp.ExpiresIn, resp.AccessToken)
@@ -201,11 +232,12 @@ func Refresh(ctx context.Context, p Provider, want Identity, refreshToken string
 // identity than the one it was for.
 var ErrIdentityChanged = errors.New("the identity provider returned tokens for another identity; they were discarded: run \"dagu txe login\"")
 
-// checkAccessTokenIdentity reads the access token's iss and sub without
-// verifying it (the hub verifies it) and refuses a token that names another
-// identity. A token that is not a readable JWT, or carries neither claim,
-// is accepted: the provider is not required to issue JWTs.
-func checkAccessTokenIdentity(token string, want Identity) error {
+// checkTokenIdentity reads a token's iss and sub without verifying it (the
+// hub verifies an access token; an ID token is verified after this) and
+// refuses a token that names another identity. A token that is not a
+// readable JWT, or carries neither claim, is accepted: the provider is not
+// required to issue JWT access tokens.
+func checkTokenIdentity(token string, want Identity) error {
 	claims, ok := unverifiedClaims(token)
 	if !ok {
 		return nil

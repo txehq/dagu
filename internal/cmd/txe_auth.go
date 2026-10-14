@@ -215,7 +215,9 @@ func runTXELogin(ctx *Context, _ []string) error {
 
 // txeLoginProvider takes the provider from the flags, or from the hub's
 // current sign-in when they are not given. A flag that differs from the
-// current sign-in is a deliberate change of provider.
+// current sign-in is a deliberate change of provider. Each flag defaults on
+// its own: the scopes are the current sign-in's whenever --scope is not
+// given and the issuer is the same.
 func txeLoginProvider(ctx *Context, store *cliauth.Store, hub string) (cliauth.Provider, error) {
 	issuer, err := ctx.StringParam("issuer")
 	if err != nil {
@@ -230,23 +232,33 @@ func txeLoginProvider(ctx *Context, store *cliauth.Store, hub string) (cliauth.P
 		return cliauth.Provider{}, err
 	}
 	p := cliauth.Provider{Issuer: issuer, ClientID: clientID, Scopes: scopes}
-	if issuer == "" || clientID == "" {
-		current, err := store.Load(hub)
-		if err != nil && !errors.Is(err, cliauth.ErrNotSignedIn) {
-			return cliauth.Provider{}, err
-		}
-		if current == nil {
+	needed := issuer == "" || clientID == ""
+	if !needed && ctx.Command.Flags().Changed("scope") {
+		return p, p.Validate()
+	}
+	current, err := store.Load(hub)
+	if err != nil && !errors.Is(err, cliauth.ErrNotSignedIn) && needed {
+		return cliauth.Provider{}, err
+	}
+	// An unreadable sign-in supplies nothing; signing in again with every
+	// value given is how one recovers from it.
+	if err != nil {
+		current = nil
+	}
+	if current == nil {
+		if needed {
 			return cliauth.Provider{}, errors.New("this hub has no sign-in yet: give --issuer and --client-id")
 		}
-		if issuer == "" {
-			p.Issuer = current.Provider.Issuer
-		}
-		if clientID == "" {
-			p.ClientID = current.Provider.ClientID
-		}
-		if !ctx.Command.Flags().Changed("scope") {
-			p.Scopes = current.Provider.Scopes
-		}
+		return p, p.Validate()
+	}
+	if issuer == "" {
+		p.Issuer = current.Provider.Issuer
+	}
+	if clientID == "" {
+		p.ClientID = current.Provider.ClientID
+	}
+	if !ctx.Command.Flags().Changed("scope") && p.Issuer == current.Provider.Issuer {
+		p.Scopes = current.Provider.Scopes
 	}
 	return p, p.Validate()
 }

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +39,10 @@ const (
 	storeFilePerm = 0o600
 	lockTimeout   = 30 * time.Second
 	lockRetry     = 50 * time.Millisecond
+	// renewTimeout bounds a renewal made under the lock. It is shorter than
+	// lockTimeout, so a process waiting for the lock outlasts a renewal
+	// that gets no answer.
+	renewTimeout = 20 * time.Second
 )
 
 // Entry is a hub's sign-in: one identity at one provider.
@@ -55,20 +60,38 @@ type Entry struct {
 	RenewedAt  time.Time
 }
 
-// storedEntry is an Entry as written: the tokens encrypted.
+// storedEntry is an Entry as written. Sealed holds the tokens, encrypted
+// together with what they are bound to.
 type storedEntry struct {
-	Schema          int       `json:"schema"`
-	Hub             string    `json:"hub"`
-	Issuer          string    `json:"issuer"`
-	ClientID        string    `json:"client_id"`
-	Scopes          []string  `json:"scopes,omitempty"`
-	Subject         string    `json:"subject"`
-	Username        string    `json:"username,omitempty"`
-	AccessTokenEnc  string    `json:"access_token_enc"`
-	RefreshTokenEnc string    `json:"refresh_token_enc"`
-	Expiry          time.Time `json:"expiry"`
-	SignedInAt      time.Time `json:"signed_in_at"`
-	RenewedAt       time.Time `json:"renewed_at,omitzero"`
+	Schema     int       `json:"schema"`
+	Hub        string    `json:"hub"`
+	Issuer     string    `json:"issuer"`
+	ClientID   string    `json:"client_id"`
+	Scopes     []string  `json:"scopes,omitempty"`
+	Subject    string    `json:"subject"`
+	Username   string    `json:"username,omitempty"`
+	Sealed     string    `json:"sealed"`
+	Expiry     time.Time `json:"expiry"`
+	SignedInAt time.Time `json:"signed_in_at"`
+	RenewedAt  time.Time `json:"renewed_at,omitzero"`
+}
+
+// sealedEntry is the plaintext of storedEntry.Sealed. The binding is sealed
+// with the tokens, so that editing the file's hub, issuer, client or subject
+// cannot send a refresh token to another provider: the entry stops reading.
+type sealedEntry struct {
+	Hub          string   `json:"hub"`
+	Issuer       string   `json:"issuer"`
+	ClientID     string   `json:"client_id"`
+	Scopes       []string `json:"scopes,omitempty"`
+	Subject      string   `json:"subject"`
+	AccessToken  string   `json:"access_token"`
+	RefreshToken string   `json:"refresh_token"`
+}
+
+func (b sealedEntry) binds(stored *storedEntry) bool {
+	return b.Hub == stored.Hub && b.Issuer == stored.Issuer && b.ClientID == stored.ClientID &&
+		b.Subject == stored.Subject && slices.Equal(b.Scopes, stored.Scopes)
 }
 
 // Store keeps one sign-in per hub in a directory only this user can read.
@@ -171,21 +194,24 @@ func (s *Store) read(file, hub string) (*Entry, error) {
 	if stored.Hub != want {
 		return nil, fmt.Errorf("sign-in %s is for %s, not %s", file, stored.Hub, want)
 	}
-	access, err := s.enc.Decrypt(stored.AccessTokenEnc)
+	plain, err := s.enc.Decrypt(stored.Sealed)
 	if err != nil {
 		return nil, fmt.Errorf("read sign-in %s: %w", file, err)
 	}
-	refresh, err := s.enc.Decrypt(stored.RefreshTokenEnc)
-	if err != nil {
+	var sealed sealedEntry
+	if err := json.Unmarshal([]byte(plain), &sealed); err != nil {
 		return nil, fmt.Errorf("read sign-in %s: %w", file, err)
+	}
+	if !sealed.binds(&stored) {
+		return nil, fmt.Errorf("sign-in %s was changed outside dagu: run \"dagu txe login\"", file)
 	}
 	return &Entry{
 		Hub:          stored.Hub,
 		Provider:     Provider{Issuer: stored.Issuer, ClientID: stored.ClientID, Scopes: stored.Scopes},
 		Identity:     Identity{Issuer: stored.Issuer, Subject: stored.Subject},
 		Username:     stored.Username,
-		AccessToken:  access,
-		RefreshToken: refresh,
+		AccessToken:  sealed.AccessToken,
+		RefreshToken: sealed.RefreshToken,
 		Expiry:       stored.Expiry,
 		SignedInAt:   stored.SignedInAt,
 		RenewedAt:    stored.RenewedAt,
@@ -199,27 +225,34 @@ func (s *Store) write(file string, e *Entry) error {
 	if e.Identity.Subject == "" || e.RefreshToken == "" || e.AccessToken == "" {
 		return errors.New("cliauth: an entry needs a subject and both tokens")
 	}
-	access, err := s.enc.Encrypt(e.AccessToken)
+	plain, err := json.Marshal(sealedEntry{ //nolint:gosec // the plaintext that is encrypted below; never written as it is
+		Hub:          e.Hub,
+		Issuer:       e.Provider.Issuer,
+		ClientID:     e.Provider.ClientID,
+		Scopes:       e.Provider.Scopes,
+		Subject:      e.Identity.Subject,
+		AccessToken:  e.AccessToken,
+		RefreshToken: e.RefreshToken,
+	})
 	if err != nil {
-		return fmt.Errorf("encrypt sign-in: %w", err)
+		return err
 	}
-	refresh, err := s.enc.Encrypt(e.RefreshToken)
+	sealed, err := s.enc.Encrypt(string(plain))
 	if err != nil {
 		return fmt.Errorf("encrypt sign-in: %w", err)
 	}
 	data, err := json.MarshalIndent(storedEntry{
-		Schema:          storeSchema,
-		Hub:             e.Hub,
-		Issuer:          e.Provider.Issuer,
-		ClientID:        e.Provider.ClientID,
-		Scopes:          e.Provider.Scopes,
-		Subject:         e.Identity.Subject,
-		Username:        e.Username,
-		AccessTokenEnc:  access,
-		RefreshTokenEnc: refresh,
-		Expiry:          e.Expiry.UTC(),
-		SignedInAt:      e.SignedInAt.UTC(),
-		RenewedAt:       e.RenewedAt.UTC(),
+		Schema:     storeSchema,
+		Hub:        e.Hub,
+		Issuer:     e.Provider.Issuer,
+		ClientID:   e.Provider.ClientID,
+		Scopes:     e.Provider.Scopes,
+		Subject:    e.Identity.Subject,
+		Username:   e.Username,
+		Sealed:     sealed,
+		Expiry:     e.Expiry.UTC(),
+		SignedInAt: e.SignedInAt.UTC(),
+		RenewedAt:  e.RenewedAt.UTC(),
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -352,7 +385,9 @@ func (s *Store) renewAfter(ctx context.Context, hub, stale string, client *http.
 			token = e.AccessToken
 			return nil
 		}
-		renewed, err := s.renew(ctx, e.Provider, e.Identity, e.RefreshToken, client)
+		renewCtx, cancel := context.WithTimeout(ctx, renewTimeout)
+		renewed, err := s.renew(renewCtx, e.Provider, e.Identity, e.RefreshToken, client)
+		cancel()
 		var refused *RefusedError
 		switch {
 		case err == nil:
