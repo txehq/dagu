@@ -49,6 +49,8 @@ type Layout struct {
 	DataDir     string
 	DAGsDir     string
 	MachineHome string
+	// LogsDir is the hub's run log directory.
+	LogsDir string
 	// HubMount is the data directory path as the fixture's hub saw it; a
 	// copy of DataDir is scanned with this as its mount.
 	HubMount string
@@ -103,9 +105,10 @@ func Build(ctx context.Context, root string) (*Layout, *Facts, error) {
 		DataDir:     filepath.Join(root, "hub", "data"),
 		DAGsDir:     filepath.Join(root, "hub", "dags"),
 		MachineHome: filepath.Join(root, "machine", "txe-dagu"),
+		LogsDir:     filepath.Join(root, "hub", "logs"),
 	}
 	l.HubMount = l.DataDir
-	for _, d := range []string{l.DataDir, l.DAGsDir, l.MachineHome} {
+	for _, d := range []string{l.DataDir, l.DAGsDir, l.MachineHome, l.LogsDir} {
 		if err := os.MkdirAll(d, 0o750); err != nil {
 			return nil, nil, err
 		}
@@ -870,6 +873,9 @@ func (b *builder) nativeRuns() error {
 			return err
 		}
 		if err := writeFile(filepath.Join(dir, "attempt_1", "run.stdout.log"), []byte("fixture output for "+name+"\n")); err != nil {
+			return err
+		}
+		if err := writeFile(filepath.Join(b.layout.LogsDir, jobID, "run-"+name+".log"), []byte("fixture log line for "+name+"\n")); err != nil {
 			return err
 		}
 	}

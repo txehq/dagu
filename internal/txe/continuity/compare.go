@@ -159,7 +159,7 @@ func CompareProgress(before, after *Inventory) *Report {
 		case b.Policy == PolicyImmutable:
 			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
 		case a.Size < b.Size && appendOnly[b.Root+"\x00"+b.Path]:
-			// Run status and logs only grow; a shorter one lost content.
+			// A log only grows; a shorter one lost content.
 			add("file_truncated", "file", key, fmt.Sprintf("the retained file shrank from %d to %d bytes", b.Size, a.Size))
 		}
 	}, func(File, string) {})
@@ -361,9 +361,9 @@ func compareIntents(b, a *Record, key string, add func(code, class, id, detail s
 	}
 }
 
-// appendOnlyFiles are the files that only ever grow: native run history in
-// a hub data directory's dag-runs and everything in a log root. A DAG,
-// view or workspace file may legitimately get shorter.
+// appendOnlyFiles are the files that only ever grow: those in a log root.
+// A run's status file is compacted to its latest status when the run ends,
+// and a DAG, view or workspace file may get shorter, so those are not.
 func appendOnlyFiles(inv *Inventory) map[string]bool {
 	areas := map[string]string{}
 	for _, r := range inv.Roots {
@@ -371,13 +371,8 @@ func appendOnlyFiles(inv *Inventory) map[string]bool {
 	}
 	out := map[string]bool{}
 	for _, f := range inv.Files {
-		switch areas[f.Root] {
-		case AreaLogs:
+		if areas[f.Root] == AreaLogs {
 			out[f.Root+"\x00"+f.Path] = true
-		case AreaHubData:
-			if strings.HasPrefix(f.Path, "dag-runs/") {
-				out[f.Root+"\x00"+f.Path] = true
-			}
 		}
 	}
 	return out

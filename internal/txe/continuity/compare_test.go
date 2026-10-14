@@ -204,8 +204,8 @@ func TestCompareBreaksAreBlocking(t *testing.T) {
 				m["revision"] = m["revision"].(float64) + 1
 			})
 		}, "live_entry_lost"},
-		{"a completed run's status and log emptied", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
-			require.NoError(t, filepath.WalkDir(filepath.Join(l.DataDir, "dag-runs"), func(p string, d fs.DirEntry, err error) error {
+		{"run logs emptied", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
+			require.NoError(t, filepath.WalkDir(l.LogsDir, func(p string, d fs.DirEntry, err error) error {
 				if err == nil && !d.IsDir() {
 					return os.WriteFile(p, nil, 0o600)
 				}
@@ -328,6 +328,26 @@ func TestProgressAcceptsAShorterDAG(t *testing.T) {
 	rep := continuity.CompareProgress(before, scan(t, l))
 	assert.Empty(t, rep.Issues)
 	assert.Contains(t, rep.Changed, "hub-dags/"+f.Jobs["health-check"]+".yaml")
+}
+
+// Dagu compacts a run's status file to its latest status when the run
+// ends, so a shorter status file is progress, not a loss; the freeze
+// comparison still blocks it.
+func TestProgressAcceptsStatusCompaction(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	before := scan(t, l)
+	var status string
+	require.NoError(t, filepath.WalkDir(filepath.Join(l.DataDir, "dag-runs"), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Name() == "status.jsonl" && status == "" {
+			status = p
+		}
+		return err
+	}))
+	require.NoError(t, os.WriteFile(status, []byte("{}\n"), 0o600))
+	after := scan(t, l)
+	assert.Empty(t, continuity.CompareProgress(before, after).Issues)
+	assert.Positive(t, compareCodes(continuity.Compare(before, after, continuity.CompareOptions{}))["file_changed"])
 }
 
 // Permission bits are compared only between scans that both had them.

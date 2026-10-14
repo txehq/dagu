@@ -188,6 +188,11 @@ func TestBreaksAreBlocking(t *testing.T) {
 			require.NoError(t, os.MkdirAll(filepath.Join(l.Root, "elsewhere"), 0o750))
 			require.NoError(t, os.Symlink(filepath.Join(l.Root, "elsewhere"), filepath.Join(l.DataDir, "views")))
 		}, "unsupported_file"},
+		{"a machine home without its identity", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			require.NoError(t, os.Remove(filepath.Join(l.MachineHome, "machine.json")))
+			require.NoError(t, fixture.Unseal(filepath.Join(l.MachineHome, "packages", f.Jobs["validation"])))
+			require.NoError(t, os.RemoveAll(filepath.Join(l.MachineHome, "packages", f.Jobs["validation"])))
+		}, "machine_identity_missing"},
 		{"the expected owner's record lost", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
 			require.NoError(t, os.Remove(regPath(l, "owners/"+fixture.StableOwner)))
 		}, "owner_missing"},
@@ -412,4 +417,24 @@ func skipWithoutSymlinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symbolic links needs a privilege on Windows")
 	}
+}
+
+// A worker finds packages only under its own home: a package that is only
+// on another scanned machine does not count for the job's machine.
+func TestPackageOnTheWrongMachine(t *testing.T) {
+	t.Parallel()
+	l, f := build(t)
+	other := filepath.Join(l.Root, "machine2", "txe-dagu")
+	require.NoError(t, os.MkdirAll(filepath.Join(other, "packages"), 0o750))
+	id, err := json.Marshal(map[string]any{"schema": 1, "machine_id": f.Machine2, "owner_id": fixture.StableOwner})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(other, "machine.json"), id, 0o600))
+	jobDir := filepath.Join(l.MachineHome, "packages", f.Jobs["validation"])
+	require.NoError(t, fixture.Unseal(jobDir))
+	require.NoError(t, os.Rename(jobDir, filepath.Join(other, "packages", f.Jobs["validation"])))
+	rs := append(roots(l), continuity.Root{Area: continuity.AreaMachineHome, Path: other, Label: "linux-home"})
+	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
+	require.NoError(t, err)
+	got := codes(continuity.Validate(inv, continuity.Policy{}), continuity.SeverityBlock)
+	assert.Positive(t, got["package_missing"], "%v", got)
 }

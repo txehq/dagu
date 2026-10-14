@@ -62,7 +62,7 @@ func build(t *testing.T) (*fixture.Layout, *fixture.Facts) {
 		return filepath.Join(root, rel)
 	}
 	l := &fixture.Layout{Root: root, DataDir: rebase(templateLayout.DataDir), DAGsDir: rebase(templateLayout.DAGsDir),
-		MachineHome: rebase(templateLayout.MachineHome), HubMount: templateLayout.HubMount}
+		MachineHome: rebase(templateLayout.MachineHome), LogsDir: rebase(templateLayout.LogsDir), HubMount: templateLayout.HubMount}
 	return l, templateFacts
 }
 
@@ -71,6 +71,7 @@ func roots(l *fixture.Layout) []continuity.Root {
 		{Area: continuity.AreaHubData, Path: l.DataDir, Label: "hub-data", Mount: l.HubMount},
 		{Area: continuity.AreaDAGs, Path: l.DAGsDir, Label: "hub-dags"},
 		{Area: continuity.AreaMachineHome, Path: l.MachineHome, Label: "laptop-home"},
+		{Area: continuity.AreaLogs, Path: l.LogsDir, Label: "hub-logs"},
 	}
 }
 

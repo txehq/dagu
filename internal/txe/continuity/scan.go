@@ -367,6 +367,9 @@ func (s *scanner) machineHome() error {
 			s.issue("unclassified_area", "", s.root.Label+"/"+name, "%s/%s is not a known part of a machine's TXE home; classify it before a transition, it was not read", s.root.Label, name)
 		}
 	}
+	if s.inv.Machines[s.root.Label] == "" {
+		s.issue("machine_identity_missing", ClassMachineIdentity, s.root.Label+"/machine.json", "%s has no readable machine identity, so its packages cannot be checked against the jobs it runs; a worker cannot use it", s.root.Label)
+	}
 	return nil
 }
 

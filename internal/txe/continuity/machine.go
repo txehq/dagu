@@ -152,7 +152,7 @@ func (s *scanner) pkg(jobID, dirName string) error {
 	}
 	if len(b.issues) == 0 {
 		// Only a package that verified counts as the version's package.
-		b.define(KindPackage, jobID+"|"+digest)
+		b.define(KindPackage, s.root.Label+"|"+jobID+"|"+digest)
 	}
 	rec, issues := b.done()
 	for i := range issues {

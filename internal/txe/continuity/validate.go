@@ -42,7 +42,7 @@ type validator struct {
 	records      map[string]*Record         // registry storage ID -> record
 	ownerOf      map[string]map[string]string
 	allowed      map[string]bool
-	verifiedPkgs map[string]bool // job|digest present in a scanned machine home
+	verifiedPkgs map[string]bool // home|job|digest verified in a scanned machine home
 }
 
 func (v *validator) add(sev, code string, r *Record, format string, args ...any) {
@@ -232,9 +232,9 @@ func (v *validator) packages() {
 	if len(v.inv.Machines) == 0 {
 		return
 	}
-	scanned := map[string]bool{}
-	for _, m := range v.inv.Machines {
-		scanned[m] = true
+	homes := map[string][]string{} // machine ID -> labels of its scanned homes
+	for label, m := range v.inv.Machines {
+		homes[m] = append(homes[m], label)
 	}
 	for i := range v.inv.Records {
 		r := &v.inv.Records[i]
@@ -242,14 +242,20 @@ func (v *validator) packages() {
 			continue
 		}
 		job := v.records["jobs/"+r.Job]
-		if job == nil || !scanned[job.Attrs["machine"]] {
+		if job == nil || len(homes[job.Attrs["machine"]]) == 0 {
 			continue
 		}
 		if job.Attrs["registration"] == "incomplete" && r.Attrs["version"] == job.Attrs["version"] {
 			// An incomplete registration has no package yet by definition.
 			continue
 		}
-		if !v.verifiedPkgs[r.Job+"|"+r.Attrs["package_digest"]] {
+		// The package must be on the machine that runs the job: a worker
+		// resolves packages only under its own home.
+		found := false
+		for _, label := range homes[job.Attrs["machine"]] {
+			found = found || v.verifiedPkgs[label+"|"+r.Job+"|"+r.Attrs["package_digest"]]
+		}
+		if !found {
 			v.add(SeverityBlock, "package_missing", r, "machine %s holds no verified package %s for version %s of job %s", job.Attrs["machine"], r.Attrs["package_digest"], r.Attrs["version"], r.Job)
 		}
 	}
