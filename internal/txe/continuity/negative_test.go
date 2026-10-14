@@ -429,12 +429,21 @@ func TestPackageOnTheWrongMachine(t *testing.T) {
 	id, err := json.Marshal(map[string]any{"schema": 1, "machine_id": f.Machine2, "owner_id": fixture.StableOwner})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(other, "machine.json"), id, 0o600))
-	jobDir := filepath.Join(l.MachineHome, "packages", f.Jobs["validation"])
-	require.NoError(t, fixture.Unseal(jobDir))
-	require.NoError(t, os.Rename(jobDir, filepath.Join(other, "packages", f.Jobs["validation"])))
+	// Moved sealed, as it is: only its place changes.
+	job := f.Jobs["validation"]
+	require.NoError(t, os.Rename(filepath.Join(l.MachineHome, "packages", job), filepath.Join(other, "packages", job)))
 	rs := append(roots(l), continuity.Root{Area: continuity.AreaMachineHome, Path: other, Label: "linux-home"})
 	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
 	require.NoError(t, err)
-	got := codes(continuity.Validate(inv, continuity.Policy{}), continuity.SeverityBlock)
-	assert.Positive(t, got["package_missing"], "%v", got)
+	var missing, corrupt []string
+	for _, i := range continuity.Validate(inv, continuity.Policy{}) {
+		switch {
+		case i.Code == "package_missing" && strings.Contains(i.ID, "registry/history/"+job+"/versions/"):
+			missing = append(missing, i.ID)
+		case i.Code == "package_corrupt" && strings.Contains(i.ID, job):
+			corrupt = append(corrupt, i.ID)
+		}
+	}
+	assert.NotEmpty(t, missing, "the validation job's version has no package on its own machine")
+	assert.Empty(t, corrupt, "the moved package itself verifies")
 }
