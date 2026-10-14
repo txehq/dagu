@@ -1,7 +1,13 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { SWRConfig } from 'swr';
 import { describe, expect, it, vi } from 'vitest';
@@ -149,6 +155,38 @@ describe('the job page and sharing', () => {
     expect(await screen.findByRole('status')).toHaveTextContent(
       'Shared with Bo.'
     );
+  });
+
+  it('shows a share that changed elsewhere while the panel is open', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const listShares = vi
+        .fn()
+        .mockResolvedValueOnce({
+          granted: [share('shr_1', JOB, TxeShareState.revoked)],
+          received: [],
+        })
+        .mockResolvedValue({ granted: [share('shr_1', JOB)], received: [] });
+      renderJob(OWNER, accessApi({ listShares }));
+
+      expect(await screen.findByTestId('txe-share')).toHaveTextContent(
+        'Revoked'
+      );
+      expect(
+        screen.queryByRole('button', { name: 'Revoke' })
+      ).not.toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(
+        await screen.findByRole('button', { name: 'Revoke' })
+      ).toBeInTheDocument();
+      expect(screen.getByTestId('txe-share')).not.toHaveTextContent('Revoked');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('says why a share was refused', async () => {

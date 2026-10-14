@@ -12,12 +12,16 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { RefreshButton } from '@/components/ui/refresh-button';
 import { RelativeTime } from '@/components/ui/relative-time';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
 
 import type { Share, SharePermission } from '../access';
 import { useTxeAccessApi } from '../hooks';
+
+// How often an open panel re-reads the shares, as often as the job page.
+const REFRESH_MS = 10_000;
 
 // The permissions an owner may share. administer is never shared.
 const SHAREABLE: SharePermission[] = [
@@ -129,8 +133,10 @@ function ShareRow({
 export function SharingPanel({ jobId }: { jobId: string }): React.ReactElement {
   const { ts } = useI18n();
   const access = useTxeAccessApi();
-  const { data, error, mutate } = useSWR(['txe', 'shares'], () =>
-    access.listShares()
+  const { data, error, mutate } = useSWR(
+    ['txe', 'shares'],
+    () => access.listShares(),
+    { refreshInterval: REFRESH_MS }
   );
   const [grantee, setGrantee] = React.useState('');
   const [permissions, setPermissions] = React.useState<SharePermission[]>([
@@ -175,9 +181,12 @@ export function SharingPanel({ jobId }: { jobId: string }): React.ReactElement {
 
   return (
     <section className="space-y-2" data-testid="txe-sharing">
-      <h2 className="text-sm font-semibold">
-        <I18nText text="Sharing" />
-      </h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">
+          <I18nText text="Sharing" />
+        </h2>
+        <RefreshButton onRefresh={reload} />
+      </div>
       <p className="text-xs text-muted-foreground">
         <I18nText text="Share this job with another owner by their exact owner id. Sharing never transfers ownership, and you can revoke it." />
       </p>
