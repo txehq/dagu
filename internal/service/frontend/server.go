@@ -72,6 +72,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/tunnel"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 	"github.com/dagucloud/dagu/v2/internal/upgrade"
 	workspacepkg "github.com/dagucloud/dagu/v2/internal/workspace"
 )
@@ -112,6 +113,7 @@ type Server struct {
 	sessionWatchClock    auth.SessionWatchClock // nil is the system clock; tests set another
 	trustedProxyCfg      *auth.TrustedProxyLoginConfig
 	authService          *authservice.Service
+	txeAuth              *txeauth.Service
 	auditService         *audit.Service
 	auditStore           io.Closer
 	eventService         *eventstore.Service
@@ -553,6 +555,7 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 		apiOpts = append(apiOpts, apiv1.WithViewStore(stores.View))
 	}
 
+	var txeAuth *txeauth.Service
 	if cfg.Paths.DataDir != "" && dr != nil {
 		runs := &runcontrol.Control{DAGs: dr, Runs: dagRunRepository, Manager: &drm, ExecMode: cfg.DefaultExecMode}
 		if cc != nil {
@@ -564,6 +567,15 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			return nil, fmt.Errorf("failed to create TXE registry: %w", err)
 		}
 		apiOpts = append(apiOpts, apiv1.WithTxeRegistry(txeRegistry))
+		txeAuth, err = txeauth.NewService(cfg.TXE, cfg.Paths.DataDir, txeRegistry)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set up TXE authorization: %w", err)
+		}
+		apiOpts = append(apiOpts, apiv1.WithTxeAuth(txeAuth))
+	} else if txeOwnersConfigured(cfg.TXE) {
+		// Owner authorization reads every owner from the registry. Without
+		// one it could only fail open or refuse everything.
+		return nil, fmt.Errorf("txe.authz and txe.authn need the TXE registry, which needs a data directory and a DAG store")
 	}
 
 	var notificationSvc *notificationservice.Service
@@ -599,6 +611,7 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 	// Note: SSO/OIDC gating is applied after opts are processed (see below)
 
 	srv := &Server{
+		txeAuth:              txeAuth,
 		config:               cfg,
 		builtinOIDCCfg:       builtinOIDCCfg,
 		trustedProxyCfg:      trustedProxyCfg,
@@ -945,6 +958,9 @@ func (srv *Server) Serve(ctx context.Context) error {
 	metrics.StartUptime(ctx)
 	logger.Info(ctx, "Server is starting", tag.Addr(addr))
 	srv.startPeriodicUpdateCheck(ctx)
+	if srv.txeAuth != nil {
+		go srv.txeAuth.Run(ctx)
+	}
 
 	go srv.startServer(ctx)
 	srv.setupGracefulShutdown(ctx)
@@ -1771,4 +1787,10 @@ func (srv *Server) setupGracefulShutdown(ctx context.Context) {
 	}
 	// Runner cleanup has its own DAG budget, independent of HTTP shutdown.
 	<-runsDone
+}
+
+// txeOwnersConfigured reports whether the configuration asks for TXE owner
+// authorization or provider tokens.
+func txeOwnersConfigured(c config.TXEConfig) bool {
+	return (c.Authz.Mode != "" && c.Authz.Mode != config.TXEAuthzModeOff) || c.Authn.Enabled()
 }

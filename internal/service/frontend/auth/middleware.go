@@ -6,6 +6,7 @@ package auth
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
+	"github.com/dagucloud/dagu/v2/internal/txe/authn"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 // rawRemoteAddrKey is the context key for the unmodified remote address.
@@ -49,6 +52,15 @@ type Options struct {
 	APIKeyValidator APIKeyValidator
 	// RequiredAPIKeySurface, when set, requires API keys to include this surface.
 	RequiredAPIKeySurface auth.APIKeySurface
+	// ProviderTokens, when set, accepts an identity provider access token as
+	// a bearer credential. Such a request carries no hub user, role or
+	// workspace access: only its verified principal.
+	ProviderTokens ProviderTokenVerifier
+	// ProviderTokenRoute says which requests may be made with a provider
+	// token. Any other request that carries one is refused with 403, so a
+	// route that has not been made owner-aware never sees such a caller.
+	// Nil admits none.
+	ProviderTokenRoute func(r *http.Request) bool
 	// OnDenied is called when the middleware rejects a request after auth evaluation.
 	OnDenied func(r *http.Request, reason string, apiKey *auth.APIKey)
 	// AuthRequired indicates whether authentication is required.
@@ -63,10 +75,21 @@ type Options struct {
 // has to know whether its callers were authenticated asks this, so that it
 // and the middleware cannot disagree.
 func (o Options) Authenticates() bool {
-	return o.BasicAuthEnabled || o.JWTValidator != nil || o.APIKeyValidator != nil
+	return o.BasicAuthEnabled || o.JWTValidator != nil || o.APIKeyValidator != nil || o.ProviderTokens != nil
+}
+
+// ProviderTokenVerifier verifies an identity provider access token.
+type ProviderTokenVerifier interface {
+	Verify(ctx context.Context, token string) (authn.Principal, error)
 }
 
 const (
+	// DenialReasonProviderTokenRoute is a provider token on a route that
+	// does not accept one.
+	DenialReasonProviderTokenRoute = "provider_token_route"
+	// DenialReasonProviderUnavailable is a provider token that could not be
+	// verified because the provider's keys could not be fetched.
+	DenialReasonProviderUnavailable = "provider_unavailable"
 	DenialReasonAPIKeySurfaceDenied = "api_key_surface_denied"
 	DenialReasonAuthFailed          = "auth_failed"
 	DenialReasonMissingCredentials  = "missing_credentials"
@@ -136,6 +159,7 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 
 	jwtEnabled := opts.JWTValidator != nil
 	apiKeyEnabled := opts.APIKeyValidator != nil
+	providerEnabled := opts.ProviderTokens != nil
 	anyAuthEnabled := opts.Authenticates()
 
 	return func(next http.Handler) http.Handler {
@@ -164,7 +188,7 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 
 			// Extract bearer token once for both JWT and API key checks
 			var bearerToken string
-			if jwtEnabled || apiKeyEnabled {
+			if jwtEnabled || apiKeyEnabled || providerEnabled {
 				bearerToken = extractBearerToken(r)
 			}
 			denialReason := DenialReasonMissingCredentials
@@ -212,6 +236,37 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 					return
 				}
 				// API key validation failed, continue to try other methods
+			}
+
+			// Try an identity provider access token if enabled. It is tried
+			// last among bearer credentials, so a hub token or an API key is
+			// never sent to it.
+			if providerEnabled && bearerToken != "" && !strings.HasPrefix(bearerToken, "dagu_") {
+				principal, err := opts.ProviderTokens.Verify(r.Context(), bearerToken)
+				switch {
+				case err == nil:
+					if opts.ProviderTokenRoute == nil || !opts.ProviderTokenRoute(r) {
+						callDenied(opts, r, DenialReasonProviderTokenRoute, nil)
+						writeProviderTokenRouteRefused(w)
+						return
+					}
+					next.ServeHTTP(w, r.WithContext(txeauth.WithToken(r.Context(), principal)))
+					return
+				case authn.ProviderUnavailable(err):
+					// The token was not judged. Answering 401 would tell the
+					// caller to sign in again for an outage of the provider.
+					callDenied(opts, r, DenialReasonProviderUnavailable, nil)
+					writeProviderUnavailable(w)
+					return
+				case providerMeantToken(err):
+					// A token the provider issued and this server refuses:
+					// expired, too long-lived, for another audience or
+					// client. The caller has to obtain a new one.
+					callDenied(opts, r, DenialReasonAuthFailed, nil)
+					requireBearerAuthInvalidToken(w, opts.Realm)
+					return
+				}
+				// Not a provider token at all; fall through.
 			}
 
 			// Try Basic Auth if enabled
@@ -289,6 +344,55 @@ func checkBasicAuth(user, pass string, validCreds map[string]string) bool {
 func requireBasicAuth(w http.ResponseWriter, realm string) {
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+// providerMeantToken reports whether a refused token was one the identity
+// provider issued: it is a signed token of the configured issuer, refused for
+// what it says. A token that is not one at all, or names another issuer, is
+// left to the other methods.
+func providerMeantToken(err error) bool {
+	switch authn.ReasonOf(err) {
+	case authn.ReasonMalformed, authn.ReasonIssuer, authn.ReasonAlgorithm, authn.ReasonUnknownKey:
+		return false
+	case authn.ReasonSignature, authn.ReasonTokenType, authn.ReasonAudience, authn.ReasonClient, authn.ReasonSubject,
+		authn.ReasonTimes, authn.ReasonLifetime, authn.ReasonNotYetValid, authn.ReasonExpired:
+		return true
+	case authn.ReasonKeysUnavailable:
+		// Handled before this is asked.
+		return false
+	default:
+		return false
+	}
+}
+
+// providerUnavailableRetryAfterSeconds is how soon a client is told to try
+// again when the provider's keys could not be fetched.
+const providerUnavailableRetryAfterSeconds = "30"
+
+func writeProviderUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", providerUnavailableRetryAfterSeconds)
+	writeJSONError(w, http.StatusServiceUnavailable, "service_unavailable", "provider_unavailable",
+		"The identity provider did not answer, so the token could not be verified. Try again shortly.")
+}
+
+func writeProviderTokenRouteRefused(w http.ResponseWriter) {
+	writeJSONError(w, http.StatusForbidden, "forbidden", "forbidden",
+		"This route does not accept an identity provider token.")
+}
+
+// requireBearerAuthInvalidToken sends a 401 that tells the caller its token
+// was refused and a new one is needed.
+func requireBearerAuthInvalidToken(w http.ResponseWriter, realm string) {
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s", error="invalid_token"`, realm))
+	writeJSONError(w, http.StatusUnauthorized, "unauthorized", "invalid_token", "The token was refused. Sign in again.")
+}
+
+// writeJSONError writes the API's error shape, with the reason in
+// details.code.
+func writeJSONError(w http.ResponseWriter, status int, code, detail, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"code": code, "message": message, "details": map[string]string{"code": detail}})
 }
 
 // requireBearerAuth sends a 401 response with Bearer auth challenge.

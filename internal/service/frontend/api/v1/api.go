@@ -50,6 +50,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/dagucloud/dagu/v2/internal/tunnel"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 	"github.com/dagucloud/dagu/v2/internal/view"
 	"github.com/dagucloud/dagu/v2/internal/wiki"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
@@ -100,6 +101,7 @@ type API struct {
 	profileStore         profilepkg.Store
 	viewStore            view.Store
 	txeRegistry          *registry.Store
+	txeAuth              *txeauth.Service
 	licenseManager       *license.Manager
 	apiKeyCreateMu       sync.Mutex
 	workspaceStore       workspace.Store
@@ -762,6 +764,10 @@ func (a *API) buildAuthOptions(mountedAPIPath string) (frontendauth.Options, err
 
 	if err := a.configureBuiltinAuth(authConfig, &authOptions); err != nil {
 		return frontendauth.Options{}, err
+	}
+	if authConfig.Mode == config.AuthModeBuiltin && a.txeAuth != nil && a.txeAuth.AcceptsTokens() {
+		authOptions.ProviderTokens = a.txeAuth
+		authOptions.ProviderTokenRoute = txeTokenRoute(mountedAPIPath)
 	}
 
 	return authOptions, nil

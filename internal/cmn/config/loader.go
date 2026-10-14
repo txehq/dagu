@@ -342,6 +342,11 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	if licenseErr != nil {
 		return nil, licenseErr
 	}
+	if l.requires(SectionServer) {
+		if err := l.loadTXEConfig(&cfg); err != nil {
+			return nil, err
+		}
+	}
 
 	l.loadCacheConfig(&cfg, def)
 	l.loadWebhooksConfig(&cfg, def)
@@ -2473,6 +2478,13 @@ var envBindings = []envBinding{
 	{key: "license.cloud_url", env: "LICENSE_CLOUD_URL"},
 	{key: licenseForkFeaturesKey, env: licenseForkFeaturesEnv},
 	{key: licenseForkMaxAPIKeysKey, env: licenseForkMaxAPIKeysEnv},
+
+	// TXE owner authorization
+	{key: txeAuthzModeKey, env: txeAuthzModeEnv},
+	{key: txeAuthnIssuerKey, env: txeAuthnIssuerEnv},
+	{key: txeAuthnAudienceKey, env: txeAuthnAudienceEnv},
+	{key: txeAuthnJWKSKey, env: txeAuthnJWKSEnv},
+	{key: txeAuthnLifetimeKey, env: txeAuthnLifetimeEnv},
 
 	// GitSync
 	{key: "git_sync.enabled", env: "GITSYNC_ENABLED"},

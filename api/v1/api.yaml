@@ -10531,6 +10531,39 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/identity:
+    get:
+      summary: "Who the hub takes the caller to be"
+      description: "Returns the caller's principal, whether it acts for an owner, and the authorization mode. Answers for every authenticated caller, including one that acts for nobody, and is the one route an identity provider access token is accepted on before owner-scoped routes are enabled. An unbound caller is an answer here, not an error. Email is never returned."
+      operationId: "getTxeIdentity"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Identity"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeIdentity"
+        "401":
+          description: "Not authenticated, or the token was refused (details.code invalid_token)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "The identity provider or the owner store could not be read (details.code provider_unavailable or authz_unavailable)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/installation:
     get:
       summary: "Get the TXE registry installation"
@@ -19726,6 +19759,101 @@ components:
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [owner_id, display_name]
+
+    TxeIdentity:
+      type: object
+      description: "Who the hub takes the caller to be (TXE-3415 contract 1)."
+      properties:
+        contract:
+          type: integer
+          description: "Version of the principal and API contract. 1."
+        authz_mode:
+          type: string
+          enum: ["off", "observe", "enforce"]
+          description: "How the hub treats credentials it accepted before owners were enforced. A person or an identity provider token is held to its owner in every mode."
+        principal:
+          $ref: "#/components/schemas/TxeIdentityPrincipal"
+        state:
+          type: string
+          enum: [unbound, pending, bound]
+          description: "bound: acts for an owner (or, for a machine, is enrolled). pending: a person whose binding request awaits approval. unbound: acts for nobody and sees nothing."
+        owners:
+          type: array
+          description: "The owners the caller acts for: none or one."
+          items:
+            $ref: "#/components/schemas/TxeIdentityOwner"
+        scope:
+          $ref: "#/components/schemas/TxeIdentityScope"
+        request:
+          $ref: "#/components/schemas/TxeIdentityRequest"
+        platform_admin:
+          type: boolean
+          description: "The installation's builtin administrator. It is not an owner and owns nothing."
+        is_person:
+          type: boolean
+          description: "Signed in through the browser with the identity provider: the only caller whose decision counts as a person's."
+      required: [contract, authz_mode, principal, state, owners, scope, platform_admin, is_person]
+
+    TxeIdentityPrincipal:
+      type: object
+      properties:
+        class:
+          type: string
+          enum: [person, cli, worker, reviewer, platform_admin, legacy]
+          description: "legacy is a credential the hub accepted before owners were enforced: an API key, a builtin user who is not the administrator, or a proxy user."
+        issuer:
+          type: string
+        subject:
+          type: string
+        client_id:
+          type: string
+          description: "The identity provider client a token was issued to."
+        shown:
+          $ref: "#/components/schemas/TxeIdentityShown"
+      required: [class, shown]
+
+    TxeIdentityShown:
+      type: object
+      description: "For a person to read. Never matched."
+      properties:
+        username:
+          type: string
+
+    TxeIdentityOwner:
+      type: object
+      properties:
+        owner_id:
+          type: string
+        display_name:
+          type: string
+      required: [owner_id, display_name]
+
+    TxeIdentityScope:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [unbound, owner, machine, platform_admin]
+        machine_id:
+          type: string
+        unbound_reason:
+          type: string
+          description: "Why the caller acts for nobody, e.g. unbound, not_enrolled, binding_revoked, enrolment_revoked, expired, class, legacy."
+      required: [kind]
+
+    TxeIdentityRequest:
+      type: object
+      description: "The person's binding request."
+      properties:
+        state:
+          type: string
+          enum: [pending, approved]
+        requested_at:
+          type: string
+          format: date-time
+        generation:
+          type: integer
+      required: [state, requested_at, generation]
 
     TxeInstallation:
       type: object

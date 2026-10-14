@@ -41,6 +41,7 @@ type Config struct {
 	GitSync         GitSyncConfig
 	Tunnel          TunnelConfig
 	License         LicenseConfig
+	TXE             TXEConfig
 	Notices         []string
 	Warnings        []string
 }
@@ -733,6 +734,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateLicense(); err != nil {
+		return err
+	}
+	if err := c.validateTXE(); err != nil {
 		return err
 	}
 	if err := c.validateProc(); err != nil {

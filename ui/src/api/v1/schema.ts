@@ -3821,6 +3821,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/txe/identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who the hub takes the caller to be
+         * @description Returns the caller's principal, whether it acts for an owner, and the authorization mode. Answers for every authenticated caller, including one that acts for nobody, and is the one route an identity provider access token is accepted on before owner-scoped routes are enabled. An unbound caller is an answer here, not an error. Email is never returned.
+         */
+        get: operations["getTxeIdentity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/txe/installation": {
         parameters: {
             query?: never;
@@ -8039,6 +8059,65 @@ export interface components {
             display_name: string;
             provenance?: string;
             actor?: components["schemas"]["TxeActor"];
+        };
+        /** @description Who the hub takes the caller to be (TXE-3415 contract 1). */
+        TxeIdentity: {
+            /** @description Version of the principal and API contract. 1. */
+            contract: number;
+            /**
+             * @description How the hub treats credentials it accepted before owners were enforced. A person or an identity provider token is held to its owner in every mode.
+             * @enum {string}
+             */
+            authz_mode: TxeIdentityAuthz_mode;
+            principal: components["schemas"]["TxeIdentityPrincipal"];
+            /**
+             * @description bound: acts for an owner (or, for a machine, is enrolled). pending: a person whose binding request awaits approval. unbound: acts for nobody and sees nothing.
+             * @enum {string}
+             */
+            state: TxeIdentityState;
+            /** @description The owners the caller acts for: none or one. */
+            owners: components["schemas"]["TxeIdentityOwner"][];
+            scope: components["schemas"]["TxeIdentityScope"];
+            request?: components["schemas"]["TxeIdentityRequest"];
+            /** @description The installation's builtin administrator. It is not an owner and owns nothing. */
+            platform_admin: boolean;
+            /** @description Signed in through the browser with the identity provider: the only caller whose decision counts as a person's. */
+            is_person: boolean;
+        };
+        TxeIdentityPrincipal: {
+            /**
+             * @description legacy is a credential the hub accepted before owners were enforced: an API key, a builtin user who is not the administrator, or a proxy user.
+             * @enum {string}
+             */
+            class: TxeIdentityPrincipalClass;
+            issuer?: string;
+            subject?: string;
+            /** @description The identity provider client a token was issued to. */
+            client_id?: string;
+            shown: components["schemas"]["TxeIdentityShown"];
+        };
+        /** @description For a person to read. Never matched. */
+        TxeIdentityShown: {
+            username?: string;
+        };
+        TxeIdentityOwner: {
+            owner_id: string;
+            display_name: string;
+        };
+        TxeIdentityScope: {
+            /** @enum {string} */
+            kind: TxeIdentityScopeKind;
+            machine_id?: string;
+            /** @description Why the caller acts for nobody, e.g. unbound, not_enrolled, binding_revoked, enrolment_revoked, expired, class, legacy. */
+            unbound_reason?: string;
+        };
+        /** @description The person's binding request. */
+        TxeIdentityRequest: {
+            /** @enum {string} */
+            state: TxeIdentityRequestState;
+            /** Format: date-time */
+            requested_at: string;
+            generation: number;
         };
         TxeInstallation: {
             schema: number;
@@ -21874,6 +21953,53 @@ export interface operations {
             };
         };
     };
+    getTxeIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Identity */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeIdentity"];
+                };
+            };
+            /** @description Not authenticated, or the token was refused (details.code invalid_token) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The identity provider or the owner store could not be read (details.code provider_unavailable or authz_unavailable) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getTxeInstallation: {
         parameters: {
             query?: never;
@@ -25094,6 +25220,34 @@ export enum TxeActorKind {
     reconciler = "reconciler",
     system = "system",
     cli = "cli"
+}
+export enum TxeIdentityAuthz_mode {
+    off = "off",
+    observe = "observe",
+    enforce = "enforce"
+}
+export enum TxeIdentityState {
+    unbound = "unbound",
+    pending = "pending",
+    bound = "bound"
+}
+export enum TxeIdentityPrincipalClass {
+    person = "person",
+    cli = "cli",
+    worker = "worker",
+    reviewer = "reviewer",
+    platform_admin = "platform_admin",
+    legacy = "legacy"
+}
+export enum TxeIdentityScopeKind {
+    unbound = "unbound",
+    owner = "owner",
+    machine = "machine",
+    platform_admin = "platform_admin"
+}
+export enum TxeIdentityRequestState {
+    pending = "pending",
+    approved = "approved"
 }
 export enum TxeTargetExistence_check {
     pre_run = "pre_run",

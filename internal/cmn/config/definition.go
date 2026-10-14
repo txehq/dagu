@@ -100,6 +100,7 @@ type Definition struct {
 	GitSync    *GitSyncDef    `mapstructure:"git_sync"`
 	Tunnel     *TunnelDef     `mapstructure:"tunnel"`
 	License    *LicenseDef    `mapstructure:"license"`
+	TXE        *TXEDef        `mapstructure:"txe"`
 }
 
 // OpenCodeDef configures the process-local managed OpenCode service.
@@ -578,4 +579,11 @@ type LicenseDef struct {
 type LicenseForkPolicyDef struct {
 	Features   any `mapstructure:"features"`
 	MaxAPIKeys any `mapstructure:"max_api_keys"`
+}
+
+// TXEDef configures TXE owner authorization. The loader reads its values
+// strictly from the raw configuration, so they are untyped here.
+type TXEDef struct {
+	Authz any `mapstructure:"authz"`
+	Authn any `mapstructure:"authn"`
 }
