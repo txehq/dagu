@@ -5,6 +5,8 @@ package transportauth_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -243,26 +245,38 @@ func TestHealthIsPublic(t *testing.T) {
 }
 
 func TestMethodsWithoutASurfaceAreClosed(t *testing.T) {
-	f := newFixture(t, fixtureOptions{})
-	server, err := transportauth.NewServer(transportauth.ServerConfig{
-		Mode: authz.ModeEnforce, Verifier: f.verifier, Machines: f.store, HubKey: testHubKey,
-	})
-	require.NoError(t, err)
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "TXE-Hub "+string(testHubKey)))
-	ran := false
-	handler := func(context.Context, any) (any, error) { ran = true; return nil, nil }
+	for _, mode := range []transportauth.Mode{authz.ModeEnforce, authz.ModeObserve} {
+		t.Run(string(mode), func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{})
+			var decisions []transportauth.Decision
+			server, err := transportauth.NewServer(transportauth.ServerConfig{
+				Mode: mode, Verifier: f.verifier, Machines: f.store, HubKey: testHubKey,
+				Observe: func(_ context.Context, d transportauth.Decision) { decisions = append(decisions, d) },
+			})
+			require.NoError(t, err)
+			hub := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "TXE-Hub "+string(testHubKey)))
+			ran := false
+			handler := func(context.Context, any) (any, error) { ran = true; return nil, nil }
+			unknown := &grpc.UnaryServerInfo{FullMethod: "/coordinator.v1.CoordinatorService/NotYetDecided"}
 
-	// A method the service gains later is closed, even to the hub, until
-	// someone gives it a surface.
-	_, err = server.UnaryInterceptor()(ctx, &coordinatorv1.PollRequest{},
-		&grpc.UnaryServerInfo{FullMethod: "/coordinator.v1.CoordinatorService/NotYetDecided"}, handler)
-	assert.Equal(t, codes.PermissionDenied, codeOf(t, err))
-	assert.False(t, ran)
+			// A method the service gains later is closed, even to the hub
+			// and even in observe mode, until someone gives it a surface.
+			for _, ctx := range []context.Context{hub, context.Background()} {
+				_, err = server.UnaryInterceptor()(ctx, &coordinatorv1.PollRequest{}, unknown, handler)
+				assert.Equal(t, codes.PermissionDenied, codeOf(t, err))
+				assert.False(t, ran)
+				require.NotEmpty(t, decisions)
+				last := decisions[len(decisions)-1]
+				assert.False(t, last.Allowed)
+				assert.Equal(t, transportauth.ReasonUnknownMethod, last.Reason)
+			}
 
-	_, err = server.UnaryInterceptor()(ctx, &coordinatorv1.DispatchRequest{},
-		&grpc.UnaryServerInfo{FullMethod: coordinatorv1.CoordinatorService_Dispatch_FullMethodName}, handler)
-	require.NoError(t, err)
-	assert.True(t, ran)
+			_, err = server.UnaryInterceptor()(hub, &coordinatorv1.DispatchRequest{},
+				&grpc.UnaryServerInfo{FullMethod: coordinatorv1.CoordinatorService_Dispatch_FullMethodName}, handler)
+			require.NoError(t, err)
+			assert.True(t, ran)
+		})
+	}
 }
 
 func TestEveryCoordinatorMethodHasASurface(t *testing.T) {
@@ -354,6 +368,70 @@ func TestStreamMessagesAreCheckedOneByOne(t *testing.T) {
 		assert.Equal(t, codes.Unauthenticated, codeOf(t, err))
 		assert.Equal(t, before+1, f.service.received())
 	})
+}
+
+func TestADownloadStopsWhenItsTokenExpiresOrItsEnrolmentIsRevoked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(f *fixture)
+	}{
+		{"expiry", func(f *fixture) { f.clock.Advance(5 * time.Minute) }},
+		{"revocation", func(f *fixture) {
+			f.revokeEnrolment(subjectA, machineA1)
+			f.clock.Advance(time.Second)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{resources: allowOnly{machine: machineA1}})
+			f.bindAndEnrol(subjectA, ownerA, clientA1Worker, machineA1)
+			f.service.setBundle(3, func(i int) {
+				if i == 1 {
+					tc.end(f)
+				}
+			})
+			stream, err := f.worker(f.token(subjectA, clientA1Worker)).GetWorkspaceBundle(context.Background(), &coordinatorv1.GetWorkspaceBundleRequest{})
+			require.NoError(t, err)
+			_, err = stream.Recv()
+			require.NoError(t, err, "the first chunk goes out while the credential stands")
+			_, err = stream.Recv()
+			assert.Equal(t, codes.Unauthenticated, codeOf(t, err), "no chunk goes out after it")
+		})
+	}
+
+	t.Run("the hub's download is not rechecked", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{})
+		f.service.setBundle(3, func(i int) {
+			if i == 1 {
+				f.clock.Advance(time.Hour)
+			}
+		})
+		stream, err := f.hub(testHubKey).GetWorkspaceBundle(context.Background(), &coordinatorv1.GetWorkspaceBundleRequest{})
+		require.NoError(t, err)
+		for range 3 {
+			_, err = stream.Recv()
+			require.NoError(t, err)
+		}
+	})
+}
+
+// refuseQuoting is an authorizer whose refusal quotes the request.
+type refuseQuoting struct{}
+
+func (refuseQuoting) AuthorizeResource(context.Context, authz.Machine, string, any) error {
+	return errors.New("bundle request-secret-value is not yours")
+}
+
+func TestAResourceRefusalReportsNoTextFromTheAuthorizer(t *testing.T) {
+	f := newFixture(t, fixtureOptions{resources: refuseQuoting{}})
+	f.bindAndEnrol(subjectA, ownerA, clientA1Worker, machineA1)
+	stream, err := f.worker(f.token(subjectA, clientA1Worker)).GetWorkspaceBundle(context.Background(), &coordinatorv1.GetWorkspaceBundleRequest{})
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	assert.Equal(t, codes.PermissionDenied, codeOf(t, err))
+	assert.NotContains(t, err.Error(), "request-secret-value")
+	d := f.lastDecision()
+	assert.Equal(t, transportauth.ReasonNoResourceCheck, d.Reason)
+	assert.NotContains(t, fmt.Sprintf("%+v", d), "request-secret-value")
 }
 
 type allowOnly struct{ machine string }

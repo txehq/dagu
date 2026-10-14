@@ -143,11 +143,12 @@ type Decision struct {
 	WouldDeny bool
 	Reason    Reason
 	// Detail is the verifier's or the store's reason, when there is one.
-	Detail    string
-	Kind      CallerKind
+	Detail string
+	Kind   CallerKind
+	// MachineID and OwnerID are the enrolment's, never the token's or the
+	// request's.
 	MachineID string
 	OwnerID   string
-	ClientID  string
 }
 
 // ServerConfig configures a Server.
@@ -181,6 +182,11 @@ type Server struct {
 	resources ResourceAuthorizer
 	observe   func(context.Context, Decision)
 	now       func() time.Time
+}
+
+// Format prints the mode and nothing of the hub key, for every verb.
+func (s Server) Format(f fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(f, "transportauth.Server{mode %s}", s.mode)
 }
 
 // NewServer validates cfg and returns a Server.
@@ -228,9 +234,9 @@ func (s *Server) UnaryInterceptor() grpc.UnaryServerInterceptor {
 }
 
 // StreamInterceptor authenticates a stream when it opens, and checks every
-// message a machine sends on it: the token must still be unexpired, the
-// enrolment must still stand, and the message's worker id must be the
-// machine's.
+// message on it. For each message a machine sends and each message sent to
+// it, the token must still be unexpired and the enrolment must still stand;
+// each message a machine sends must also name the machine's worker.
 func (s *Server) StreamInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		caller, err := s.admit(ss.Context(), info.FullMethod, nil)
@@ -261,10 +267,11 @@ func (s *Server) admit(ctx context.Context, method string, req any) (Caller, err
 	return s.settle(ctx, caller, err, decision)
 }
 
-// settle applies the mode to an evaluation and reports it.
+// settle applies the mode to an evaluation and reports it. A method with no
+// surface is refused in every mode.
 func (s *Server) settle(ctx context.Context, caller Caller, refusal error, decision Decision) (Caller, error) {
 	decision.Allowed = refusal == nil
-	if refusal != nil && s.mode == authz.ModeObserve {
+	if refusal != nil && s.mode == authz.ModeObserve && decision.Reason != ReasonUnknownMethod {
 		decision.Allowed, decision.WouldDeny = true, true
 		refusal = nil
 	}
@@ -334,7 +341,9 @@ func (s *Server) checkRequest(ctx context.Context, method string, surface Surfac
 			return status.Error(codes.PermissionDenied, "transportauth: this machine may not use this resource")
 		}
 		if err := s.resources.AuthorizeResource(ctx, machine, method, req); err != nil {
-			d.Reason, d.Detail = ReasonNoResourceCheck, err.Error()
+			// The authorizer's error is not reported: it may quote the
+			// request.
+			d.Reason = ReasonNoResourceCheck
 			return status.Error(codes.PermissionDenied, "transportauth: this machine may not use this resource")
 		}
 		return nil
@@ -361,7 +370,6 @@ func (s *Server) machine(ctx context.Context, token string, d *Decision) (Caller
 		d.Reason = ReasonTokenRefused
 		return Caller{}, status.Error(codes.Unauthenticated, "transportauth: the token is not accepted")
 	}
-	d.ClientID = principal.ClientID
 	if principal.Class != authn.ClassWorker {
 		d.Reason, d.Detail = ReasonNotMachine, string(principal.Class)
 		return Caller{}, status.Error(codes.PermissionDenied, "transportauth: only a worker's credential is accepted here")
@@ -482,16 +490,40 @@ func (c *checkedStream) RecvMsg(m any) error {
 		// machine, was decided when the stream opened.
 		return nil
 	}
-	decision := Decision{
-		Method: c.method, Mode: c.server.mode, Kind: CallerMachine,
-		MachineID: c.caller.Machine.MachineID, OwnerID: c.caller.Machine.OwnerID, ClientID: c.caller.Principal.ClientID,
+	decision := c.decision()
+	refusal := c.standing(&decision)
+	if refusal == nil {
+		surface, _ := SurfaceOf(c.method)
+		refusal = c.server.checkRequest(c.ctx, c.method, surface, c.caller.Machine, m, &decision)
 	}
-	refusal := c.check(m, &decision)
 	_, err := c.server.settle(c.ctx, c.caller, refusal, decision)
 	return err
 }
 
-func (c *checkedStream) check(m any, d *Decision) error {
+// SendMsg checks, before each message the coordinator sends a machine, that
+// the machine's token is unexpired and its enrolment still stands, so a
+// download stops when either ends.
+func (c *checkedStream) SendMsg(m any) error {
+	if c.caller.Kind == CallerMachine {
+		decision := c.decision()
+		refusal := c.standing(&decision)
+		if _, err := c.server.settle(c.ctx, c.caller, refusal, decision); err != nil {
+			return err
+		}
+	}
+	return c.ServerStream.SendMsg(m)
+}
+
+func (c *checkedStream) decision() Decision {
+	return Decision{
+		Method: c.method, Mode: c.server.mode, Kind: CallerMachine,
+		MachineID: c.caller.Machine.MachineID, OwnerID: c.caller.Machine.OwnerID,
+	}
+}
+
+// standing checks that the stream's token is unexpired and, at least once
+// per streamRecheckInterval, that its enrolment is unchanged.
+func (c *checkedStream) standing(d *Decision) error {
 	now := c.server.now()
 	if !now.Before(c.caller.Principal.Expires) {
 		d.Reason = ReasonExpired
@@ -513,6 +545,5 @@ func (c *checkedStream) check(m any, d *Decision) error {
 		c.resolvedAt = now
 		c.mu.Unlock()
 	}
-	surface, _ := SurfaceOf(c.method)
-	return c.server.checkRequest(c.ctx, c.method, surface, c.caller.Machine, m, d)
+	return nil
 }

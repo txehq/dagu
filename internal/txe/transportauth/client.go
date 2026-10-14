@@ -6,6 +6,9 @@ package transportauth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -30,11 +33,28 @@ type StaticHubKey []byte
 // Token implements TokenSource.
 func (k StaticHubKey) Token(context.Context) (string, error) { return string(k), nil }
 
+// String hides the key.
+func (k StaticHubKey) String() string { return "transportauth.StaticHubKey{redacted}" }
+
+// GoString hides the key.
+func (k StaticHubKey) GoString() string { return k.String() }
+
+// Format prints String for every verb, so no verb prints the key.
+func (k StaticHubKey) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, k.String()) }
+
+// LogValue keeps the key out of structured logs.
+func (k StaticHubKey) LogValue() slog.Value { return slog.StringValue(k.String()) }
+
 // PerRPC sends a TokenSource's credential on every call. It implements
 // credentials.PerRPCCredentials.
 type PerRPC struct {
 	source TokenSource
 	scheme string
+}
+
+// Format prints the scheme and nothing of the credential, for every verb.
+func (p PerRPC) Format(f fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(f, "transportauth.PerRPC{scheme %s}", p.scheme)
 }
 
 // NewWorkerCredentials sends a worker machine's provider access token.
@@ -64,6 +84,8 @@ func (p *PerRPC) GetRequestMetadata(ctx context.Context, uri ...string) (map[str
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	case errors.Is(err, ErrProviderUnavailable):
 		return nil, status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return nil, status.FromContextError(err).Err()
 	default:
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}

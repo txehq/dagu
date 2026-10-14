@@ -327,6 +327,16 @@ type recordingService struct {
 	mu      sync.Mutex
 	callers []transportauth.Caller
 	chunks  int
+	// bundleChunks is how many chunks GetWorkspaceBundle sends (one when
+	// zero); beforeChunk runs before each.
+	bundleChunks int
+	beforeChunk  func(i int)
+}
+
+func (s *recordingService) setBundle(chunks int, beforeChunk func(i int)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bundleChunks, s.beforeChunk = chunks, beforeChunk
 }
 
 func (s *recordingService) record(ctx context.Context) {
@@ -394,5 +404,16 @@ func (s *recordingService) StreamLogs(stream coordinatorv1.CoordinatorService_St
 
 func (s *recordingService) GetWorkspaceBundle(_ *coordinatorv1.GetWorkspaceBundleRequest, stream coordinatorv1.CoordinatorService_GetWorkspaceBundleServer) error {
 	s.record(stream.Context())
-	return stream.Send(&coordinatorv1.WorkspaceBundleChunk{})
+	s.mu.Lock()
+	chunks, beforeChunk := max(s.bundleChunks, 1), s.beforeChunk
+	s.mu.Unlock()
+	for i := range chunks {
+		if beforeChunk != nil {
+			beforeChunk(i)
+		}
+		if err := stream.Send(&coordinatorv1.WorkspaceBundleChunk{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

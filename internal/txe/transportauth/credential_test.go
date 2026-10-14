@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,11 +37,19 @@ type tokenEndpoint struct {
 	ctype    string
 	rotateTo string
 	issue    func() string
-	seen     []string
-	calls    int
+	// during runs while a request is being answered, before the answer.
+	during func()
+	seen   []string
+	calls  int
 }
 
 func (e *tokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	e.mu.Lock()
+	during := e.during
+	e.mu.Unlock()
+	if during != nil {
+		during()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls++
@@ -85,6 +95,9 @@ func (e *tokenEndpoint) callCount() int {
 
 func writeCredential(t *testing.T, dir, endpoint string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a machine credential is refused on Windows")
+	}
 	path := filepath.Join(dir, "machine-credential.json")
 	require.NoError(t, transportauth.WriteMachineCredential(path, transportauth.MachineCredential{
 		Schema:        transportauth.CredentialSchema,
@@ -261,6 +274,9 @@ func TestAnswersThatAreNotVerdictsAreOutages(t *testing.T) {
 		{"proxy page on 400", http.StatusBadRequest, "text/html", `<html>bad gateway</html>`},
 		{"json without error on 401", http.StatusUnauthorized, "application/json", `{"message":"no"}`},
 		{"empty error on 400", http.StatusBadRequest, "application/json", `{"error":""}`},
+		{"invalid request on 400", http.StatusBadRequest, "application/json", `{"error":"invalid_request"}`},
+		{"temporarily unavailable on 400", http.StatusBadRequest, "application/json", `{"error":"temporarily_unavailable"}`},
+		{"unauthorized client on 401", http.StatusUnauthorized, "application/json", `{"error":"unauthorized_client"}`},
 		{"redirect", http.StatusFound, "", ""},
 		{"ok without a token", http.StatusOK, "application/json", `{"token_type":"Bearer","expires_in":300}`},
 		{"ok with a long-lived token", http.StatusOK, "application/json", `{"access_token":"a","token_type":"Bearer","expires_in":3600}`},
@@ -310,7 +326,9 @@ func TestRotatedRefreshTokenIsSavedAndUsedNext(t *testing.T) {
 
 	entries, err := os.ReadDir(filepath.Dir(path))
 	require.NoError(t, err)
-	assert.Len(t, entries, 1, "no temporary file is left behind")
+	for _, entry := range entries {
+		assert.False(t, strings.HasPrefix(entry.Name(), "."+filepath.Base(path)), "no temporary file is left behind: %s", entry.Name())
+	}
 }
 
 func TestWorkerCredentialsReachTheCoordinatorOnEveryCall(t *testing.T) {
@@ -364,4 +382,227 @@ func TestProviderOutageReachesTheCallerAsUnavailable(t *testing.T) {
 	client := f.dial(grpc.WithPerRPCCredentials(transportauth.NewWorkerCredentials(source)))
 	_, err := client.Poll(context.Background(), poll(machineA1, machineA1))
 	assert.Equal(t, codes.Unavailable, codeOf(t, err))
+}
+
+func TestNoTokenIsHandedOutThatExpiredDuringItsRenewal(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{}
+	source, _ := newSource(t, endpoint, c)
+	ctx := context.Background()
+	_, err := source.Token(ctx)
+	require.NoError(t, err)
+
+	// The held token has 5 s left when renewal starts; the provider takes
+	// 10 s to fail.
+	c.Advance(4*time.Minute + 55*time.Second)
+	endpoint.set(func(e *tokenEndpoint) {
+		e.status, e.body = http.StatusServiceUnavailable, "down"
+		e.during = func() { c.Advance(10 * time.Second) }
+	})
+	_, err = source.Token(ctx)
+	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable)
+
+	// The provider answers, but only after the token it issues has expired.
+	endpoint.set(func(e *tokenEndpoint) {
+		e.status = 0
+		e.during = func() { c.Advance(5*time.Minute + time.Second) }
+	})
+	_, err = source.Token(ctx)
+	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable)
+}
+
+func TestAnUnsavedRotationIsReportedAndSavedLater(t *testing.T) {
+	if runtime.GOOS != "windows" && os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{}
+	source, path := newSource(t, endpoint, c)
+	ctx := context.Background()
+	_, err := source.Token(ctx)
+	require.NoError(t, err)
+	require.NoError(t, source.Unsaved())
+
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "offline-2" })
+	c.Advance(5 * time.Minute)
+	token, err := source.Token(ctx)
+	require.NoError(t, err, "the process keeps working on the new refresh token")
+	assert.NotEmpty(t, token)
+	require.Error(t, source.Unsaved())
+	saved, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	assert.Equal(t, "offline-1", saved.RefreshToken)
+
+	// The directory is writable again: the next call after the retry
+	// interval saves the new refresh token, without asking the provider.
+	require.NoError(t, os.Chmod(dir, 0o700))
+	endpoint.set(func(e *tokenEndpoint) { e.rotateTo = "" })
+	calls := endpoint.callCount()
+	c.Advance(10 * time.Second)
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	require.NoError(t, source.Unsaved())
+	assert.Equal(t, calls, endpoint.callCount())
+	saved, err = transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	assert.Equal(t, "offline-2", saved.RefreshToken)
+}
+
+func TestSourcesSharingACredentialFileUseTheLatestRefreshToken(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	var mu sync.Mutex
+	current, next := "offline-1", 1
+	reused := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Form.Get("refresh_token") != current {
+			// The provider retires a refresh token once it is used.
+			reused++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		next++
+		current = fmt.Sprintf("offline-%d", next)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": fmt.Sprintf("access-%d", next), "token_type": "Bearer", "expires_in": 300, "refresh_token": current,
+		})
+	}))
+	t.Cleanup(server.Close)
+	path := writeCredential(t, t.TempDir(), server.URL+"/token")
+	first, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+	require.NoError(t, err)
+	second, err := transportauth.NewRefreshingSource(path, transportauth.WithSourceClock(c.Now))
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	for range 3 {
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i, source := range []*transportauth.RefreshingSource{first, second} {
+			wg.Go(func() { _, errs[i] = source.Token(ctx) })
+		}
+		wg.Wait()
+		require.NoError(t, errs[0])
+		require.NoError(t, errs[1])
+		c.Advance(5 * time.Minute)
+	}
+	mu.Lock()
+	assert.Zero(t, reused, "no retired refresh token was presented")
+	mu.Unlock()
+	saved, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	assert.Equal(t, "offline-7", saved.RefreshToken)
+}
+
+func TestASourceRefusesACredentialFileReplacedUnderIt(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	endpoint := &tokenEndpoint{}
+	source, path := newSource(t, endpoint, c)
+	other, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	other.MachineID = machineA2
+	require.NoError(t, transportauth.WriteMachineCredential(path, other))
+
+	_, err = source.Token(context.Background())
+	require.ErrorContains(t, err, "different credential")
+	assert.Zero(t, endpoint.callCount())
+}
+
+func TestWaitingForARenewalEndsWithTheCallersContext(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	endpoint := &tokenEndpoint{during: func() { entered <- struct{}{}; <-release }}
+	source, _ := newSource(t, endpoint, c)
+
+	done := make(chan error, 1)
+	go func() { _, err := source.Token(context.Background()); done <- err }()
+	<-entered // the first renewal is waiting on the provider
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := source.Token(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), 5*time.Second)
+
+	close(release)
+	require.NoError(t, <-done)
+}
+
+func TestCredentialFilesAreRefusedOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows only")
+	}
+	path := filepath.Join(t.TempDir(), "machine-credential.json")
+	err := transportauth.WriteMachineCredential(path, transportauth.MachineCredential{
+		Schema: 1, Issuer: testIssuer, TokenEndpoint: "https://issuer.example/token", ClientID: clientA1Worker,
+		Class: authn.ClassWorker, MachineID: machineA1, RefreshToken: "r",
+	})
+	require.Error(t, err)
+	require.NoError(t, os.WriteFile(path, []byte("{}"), 0o600))
+	_, err = transportauth.ReadMachineCredential(path)
+	require.Error(t, err)
+}
+
+func TestNothingSecretIsPrinted(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	source, path := newSource(t, &tokenEndpoint{issue: func() string { return "access-secret" }}, c)
+	_, err := source.Token(context.Background())
+	require.NoError(t, err)
+	credential, err := transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+	f := newFixture(t, fixtureOptions{})
+	server, err := transportauth.NewServer(transportauth.ServerConfig{
+		Mode: "enforce", Verifier: f.verifier, Machines: f.store, HubKey: testHubKey,
+	})
+	require.NoError(t, err)
+	key := transportauth.StaticHubKey(testHubKey)
+	hubCredentials := transportauth.NewHubCredentials(testHubKey)
+	workerCredentials := transportauth.NewWorkerCredentials(source)
+
+	secrets := []string{"offline-1", "access-secret", string(testHubKey)}
+	// A secret printed as text, as hex, or as the decimal bytes of a slice.
+	forms := func(secret string) []string {
+		var digits []string
+		for _, b := range []byte(secret)[:4] {
+			digits = append(digits, strconv.Itoa(int(b)))
+		}
+		return []string{secret, fmt.Sprintf("%x", secret), strings.Join(digits, " ")}
+	}
+	values := map[string]any{
+		"credential": credential, "*credential": &credential,
+		"source": source, "*source": *source,
+		"server": server, "*server": *server,
+		"key": key, "*key": &key,
+		"hub credentials": hubCredentials, "*hub credentials": *hubCredentials,
+		"worker credentials": workerCredentials,
+	}
+	var logs strings.Builder
+	text := slog.New(slog.NewTextHandler(&logs, nil))
+	jsonLog := slog.New(slog.NewJSONHandler(&logs, nil))
+	for name, value := range values {
+		var out strings.Builder
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d"} {
+			out.WriteString(fmt.Sprintf(verb, value) + "\n")
+		}
+		text.Info("value", "v", value)
+		jsonLog.Info("value", "v", value)
+		for _, secret := range secrets {
+			for _, form := range forms(secret) {
+				assert.NotContains(t, out.String(), form, name)
+			}
+		}
+	}
+	for _, secret := range secrets {
+		for _, form := range forms(secret) {
+			assert.NotContains(t, logs.String(), form)
+		}
+	}
 }

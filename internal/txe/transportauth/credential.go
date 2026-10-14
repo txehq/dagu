@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -21,6 +22,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofrs/flock"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 )
 
@@ -36,6 +40,13 @@ const (
 	// lifetime cap is refused afterwards anyway.
 	maxExpiresInSeconds = 24 * 60 * 60
 	defaultHTTPTimeout  = 30 * time.Second
+
+	// saveRetryInterval is how often a source tries again to save a rotated
+	// refresh token that it could not save.
+	saveRetryInterval = 10 * time.Second
+	// fileLockRetryDelay is how often a renewal waiting for another process
+	// to finish its own renewal tries the lock again.
+	fileLockRetryDelay = 20 * time.Millisecond
 )
 
 var (
@@ -48,7 +59,18 @@ var (
 	// no verdict, and no unexpired access token is held. It is not a
 	// refusal; the caller retries later. Nothing is accepted meanwhile.
 	ErrProviderUnavailable = errors.New("transportauth: the identity provider did not answer and no unexpired token is held")
+
+	errNoOwnerOnlyFiles   = errors.New("transportauth: a machine credential cannot be kept on Windows: this package cannot check there that only its owner can read it")
+	errCredentialReplaced = errors.New("transportauth: the machine credential file now holds a different credential; restart the worker")
 )
+
+// revokingErrors are the OAuth error codes that are a verdict on the
+// machine's credential. Every other code says nothing about it.
+var revokingErrors = map[string]bool{
+	"invalid_grant":  true,
+	"not_allowed":    true,
+	"invalid_client": true,
+}
 
 // MachineCredential is what an enrolled machine holds: the offline refresh
 // token its owner obtained for it through the provider client that exists
@@ -76,6 +98,19 @@ func (c MachineCredential) String() string {
 // GoString is String, so %#v hides the refresh token as well.
 func (c MachineCredential) GoString() string { return c.String() }
 
+// Format prints String for every verb, so no verb prints the refresh token.
+func (c MachineCredential) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.String()) }
+
+// LogValue keeps the refresh token out of structured logs.
+func (c MachineCredential) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+// sameEnrolment reports whether two credentials are for the same machine,
+// client and provider, whatever their refresh tokens.
+func (c MachineCredential) sameEnrolment(other MachineCredential) bool {
+	c.RefreshToken, other.RefreshToken = "", ""
+	return c == other
+}
+
 // Validate checks that the credential is complete and usable by a worker.
 func (c MachineCredential) Validate() error {
 	if c.Schema != CredentialSchema {
@@ -102,8 +137,12 @@ func (c MachineCredential) Validate() error {
 }
 
 // ReadMachineCredential reads a credential file. The file must be a regular
-// file that only its owner can read or write.
+// file that only its owner can read or write. It is refused on Windows,
+// where that cannot be checked.
 func ReadMachineCredential(path string) (MachineCredential, error) {
+	if runtime.GOOS == "windows" {
+		return MachineCredential{}, errNoOwnerOnlyFiles
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return MachineCredential{}, fmt.Errorf("transportauth: read machine credential: %w", err)
@@ -111,7 +150,7 @@ func ReadMachineCredential(path string) (MachineCredential, error) {
 	if !info.Mode().IsRegular() {
 		return MachineCredential{}, errors.New("transportauth: the machine credential is not a regular file")
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	if info.Mode().Perm()&0o077 != 0 {
 		return MachineCredential{}, fmt.Errorf("transportauth: the machine credential file has mode %#o; it must be readable by its owner only (0600)", info.Mode().Perm())
 	}
 	raw, err := os.ReadFile(path) //nolint:gosec // the path is the operator's configured credential file
@@ -133,9 +172,13 @@ func ReadMachineCredential(path string) (MachineCredential, error) {
 	return credential, nil
 }
 
-// WriteMachineCredential replaces a credential file atomically, readable by
-// its owner only.
+// WriteMachineCredential replaces a credential file atomically and durably,
+// readable by its owner only. It is refused on Windows, where owner-only
+// access cannot be set by a file mode.
 func WriteMachineCredential(path string, credential MachineCredential) error {
+	if runtime.GOOS == "windows" {
+		return errNoOwnerOnlyFiles
+	}
 	if err := credential.Validate(); err != nil {
 		return err
 	}
@@ -155,7 +198,7 @@ func WriteMachineCredential(path string, credential MachineCredential) error {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
@@ -174,22 +217,39 @@ func WriteMachineCredential(path string, credential MachineCredential) error {
 		return fmt.Errorf("transportauth: write machine credential: %w", err)
 	}
 	committed = true
+	if err := fileutil.SyncDir(dir); err != nil {
+		return fmt.Errorf("transportauth: write machine credential: the directory could not be synced: %w", err)
+	}
 	return nil
 }
 
 // RefreshingSource gives a worker machine's access token, renewing it from
 // the machine's refresh token at the provider. It is safe for concurrent
-// use; one renewal runs at a time.
+// use. One renewal runs at a time in a process, and, through a lock file
+// beside the credential file, one at a time among the processes sharing
+// that file.
 type RefreshingSource struct {
-	path   string
-	client *http.Client
-	now    func() time.Time
+	path      string
+	machineID string
+	client    *http.Client
+	now       func() time.Time
+	fileLock  *flock.Flock
+	// renewing holds one token while a renewal runs in this process.
+	renewing chan struct{}
+	// state holds the secrets and the lock that guards them.
+	state *sourceState
+}
 
+type sourceState struct {
 	mu         sync.Mutex
 	credential MachineCredential
 	access     string
 	expires    time.Time
 	revoked    bool
+	// unsaved is set while the credential file holds an older refresh token
+	// than this source; saveAfter is when saving is tried again.
+	unsaved   error
+	saveAfter time.Time
 }
 
 // SourceOption configures a RefreshingSource.
@@ -222,10 +282,13 @@ func NewRefreshingSource(path string, opts ...SourceOption) (*RefreshingSource, 
 		return nil, err
 	}
 	s := &RefreshingSource{
-		path:       path,
-		client:     &http.Client{Timeout: defaultHTTPTimeout},
-		now:        time.Now,
-		credential: credential,
+		path:      path,
+		machineID: credential.MachineID,
+		client:    &http.Client{Timeout: defaultHTTPTimeout},
+		now:       time.Now,
+		fileLock:  flock.New(path + ".lock"),
+		renewing:  make(chan struct{}, 1),
+		state:     &sourceState{credential: credential},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -236,43 +299,189 @@ func NewRefreshingSource(path string, opts ...SourceOption) (*RefreshingSource, 
 	return s, nil
 }
 
+// Format prints the machine and nothing secret, for every verb, for the
+// source and a pointer to it.
+func (s RefreshingSource) Format(f fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(f, "transportauth.RefreshingSource{machine %s}", s.machineID)
+}
+
 // MachineID returns the machine the credential is for, as the enrolment
 // command recorded it. The hub decides the machine from the credential
 // itself; this is what the worker names itself with.
-func (s *RefreshingSource) MachineID() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.credential.MachineID
+func (s *RefreshingSource) MachineID() string { return s.machineID }
+
+// Unsaved returns why a rotated refresh token is held only in memory, or nil
+// when the credential file is current. While it is not nil, a restart loses
+// the machine's credential; the worker should report it.
+func (s *RefreshingSource) Unsaved() error {
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	return s.state.unsaved
 }
 
-// Token implements TokenSource.
+// Token implements TokenSource. It returns a token only while it is
+// unexpired, by the clock read when it returns.
 func (s *RefreshingSource) Token(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.revoked {
-		return "", ErrRevoked
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if token, done, err := s.cached(); done {
+		return token, err
+	}
+	select {
+	case s.renewing <- struct{}{}:
+	case <-ctx.Done():
+		return s.unexpiredOr(ctx.Err())
+	}
+	defer func() { <-s.renewing }()
+
+	locked, err := s.fileLock.TryLockContext(ctx, fileLockRetryDelay)
+	if err != nil || !locked {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return s.unexpiredOr(ctxErr)
+		}
+		return s.unexpiredOr(fmt.Errorf("transportauth: the machine credential cannot be locked for renewal: %w", err))
+	}
+	defer func() { _ = s.fileLock.Unlock() }()
+
+	s.retrySave()
+	// Another caller may have renewed while this one waited, or only a save
+	// was due.
+	if token, done, err := s.cached(); done {
+		return token, err
+	}
+	if err := s.adoptFile(); err != nil {
+		return s.unexpiredOr(err)
+	}
+	s.state.mu.Lock()
+	credential := s.state.credential
+	s.state.mu.Unlock()
+
+	startedAt := s.now()
+	answer, err := s.exchange(ctx, credential)
+	return s.install(startedAt, answer, err)
+}
+
+// cached returns the held token when no renewal is due. done is false when
+// the caller must renew, or retry a save.
+func (s *RefreshingSource) cached() (token string, done bool, err error) {
+	st := s.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.revoked {
+		return "", true, ErrRevoked
 	}
 	now := s.now()
-	if s.access != "" && now.Add(RenewBefore).Before(s.expires) {
-		return s.access, nil
+	if st.unsaved != nil && !now.Before(st.saveAfter) {
+		return "", false, nil
 	}
-	err := s.renew(ctx, now)
+	if st.access != "" && now.Add(RenewBefore).Before(st.expires) {
+		return st.access, true, nil
+	}
+	return "", false, nil
+}
+
+// unexpiredOr returns the held token while it is unexpired, and err
+// otherwise.
+func (s *RefreshingSource) unexpiredOr(err error) (string, error) {
+	st := s.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !st.revoked && st.access != "" && s.now().Before(st.expires) {
+		return st.access, nil
+	}
+	return "", err
+}
+
+// retrySave saves a rotated refresh token that could not be saved before.
+// The caller holds the file lock.
+func (s *RefreshingSource) retrySave() {
+	st := s.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.unsaved != nil {
+		s.saveLocked()
+	}
+}
+
+// saveLocked writes the held credential. The caller holds the file lock and
+// state.mu.
+func (s *RefreshingSource) saveLocked() {
+	st := s.state
+	if err := WriteMachineCredential(s.path, st.credential); err != nil {
+		st.unsaved = fmt.Errorf("transportauth: a renewed refresh token could not be saved: %w", err)
+		st.saveAfter = s.now().Add(saveRetryInterval)
+		return
+	}
+	st.unsaved, st.saveAfter = nil, time.Time{}
+}
+
+// adoptFile reads the credential file again, so that a refresh token another
+// process rotated is the one this source presents. The caller holds the file
+// lock.
+func (s *RefreshingSource) adoptFile() error {
+	onDisk, err := ReadMachineCredential(s.path)
+	if err != nil {
+		return err
+	}
+	st := s.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.unsaved != nil {
+		// This source holds a newer refresh token than the file.
+		return nil
+	}
+	if !onDisk.sameEnrolment(st.credential) {
+		return errCredentialReplaced
+	}
+	st.credential = onDisk
+	return nil
+}
+
+// install records the outcome of a renewal and decides what Token returns.
+func (s *RefreshingSource) install(startedAt time.Time, answer renewal, err error) (string, error) {
+	st := s.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err == nil {
+		// The expiry is counted from before the request was sent, so it is
+		// never later than the provider's.
+		st.access, st.expires = answer.access, startedAt.Add(answer.lifetime)
+		if answer.refresh != "" && answer.refresh != st.credential.RefreshToken {
+			// The provider may already have retired the old refresh token,
+			// so the new one is kept in memory even when it cannot be saved.
+			st.credential.RefreshToken = answer.refresh
+			s.saveLocked()
+		}
+	}
+	now := s.now()
 	switch {
 	case err == nil:
-		return s.access, nil
+		if now.Before(st.expires) {
+			return st.access, nil
+		}
+		st.access, st.expires = "", time.Time{}
+		return "", fmt.Errorf("%w: the renewed token expired before it could be used", ErrProviderUnavailable)
 	case errors.Is(err, ErrRevoked):
-		s.revoked = true
-		s.access, s.expires = "", time.Time{}
+		st.revoked = true
+		st.access, st.expires = "", time.Time{}
 		return "", err
 	default:
 		// The provider gave no verdict. A token that has not expired is
 		// still what the hub would accept; one that has is never used.
-		if s.access != "" && now.Before(s.expires) {
-			return s.access, nil
+		if st.access != "" && now.Before(st.expires) {
+			return st.access, nil
 		}
-		s.access, s.expires = "", time.Time{}
+		st.access, st.expires = "", time.Time{}
 		return "", err
 	}
+}
+
+// renewal is a token endpoint's usable answer.
+type renewal struct {
+	access   string
+	lifetime time.Duration
+	refresh  string
 }
 
 // tokenResponse is the provider's answer to a refresh.
@@ -284,75 +493,61 @@ type tokenResponse struct {
 	Error        *string         `json:"error"`
 }
 
-// renew asks the provider for a new access token. It is called with s.mu
-// held.
-func (s *RefreshingSource) renew(ctx context.Context, startedAt time.Time) error {
+// exchange asks the provider for a new access token.
+func (s *RefreshingSource) exchange(ctx context.Context, credential MachineCredential) (renewal, error) {
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
-		"client_id":     {s.credential.ClientID},
-		"refresh_token": {s.credential.RefreshToken},
+		"client_id":     {credential.ClientID},
+		"refresh_token": {credential.RefreshToken},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.credential.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, credential.TokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return fmt.Errorf("%w: %s", ErrProviderUnavailable, "the token request could not be built")
+		return renewal{}, fmt.Errorf("%w: the token request could not be built", ErrProviderUnavailable)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: the token endpoint could not be reached", ErrProviderUnavailable)
+		return renewal{}, fmt.Errorf("%w: the token endpoint could not be reached", ErrProviderUnavailable)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBytes+1))
 	if err != nil || len(body) > maxTokenResponseBytes {
-		return fmt.Errorf("%w: the token endpoint's answer could not be read", ErrProviderUnavailable)
+		return renewal{}, fmt.Errorf("%w: the token endpoint's answer could not be read", ErrProviderUnavailable)
 	}
 
 	var answer tokenResponse
 	isJSON := jsonContent(resp.Header.Get("Content-Type")) && json.Unmarshal(body, &answer) == nil
 
 	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
-		// A refusal is a verdict only when the provider says so in an
-		// OAuth error body. Anything else, a proxy's page included, says
-		// nothing about the credential.
-		if isJSON && answer.Error != nil && *answer.Error != "" {
-			return fmt.Errorf("%w (%s)", ErrRevoked, oauthErrorCode(*answer.Error))
+		// A refusal is a verdict only when the provider names one of the
+		// revoking codes in an OAuth error body. Anything else, a proxy's
+		// page or a transient OAuth error included, says nothing about the
+		// credential.
+		if isJSON && answer.Error != nil && revokingErrors[*answer.Error] {
+			return renewal{}, fmt.Errorf("%w (%s)", ErrRevoked, *answer.Error)
 		}
-		return fmt.Errorf("%w: HTTP %d without an OAuth error", ErrProviderUnavailable, resp.StatusCode)
+		if isJSON && answer.Error != nil && *answer.Error != "" {
+			return renewal{}, fmt.Errorf("%w: HTTP %d with OAuth error %s", ErrProviderUnavailable, resp.StatusCode, oauthErrorCode(*answer.Error))
+		}
+		return renewal{}, fmt.Errorf("%w: HTTP %d without an OAuth error", ErrProviderUnavailable, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: HTTP %d", ErrProviderUnavailable, resp.StatusCode)
+		return renewal{}, fmt.Errorf("%w: HTTP %d", ErrProviderUnavailable, resp.StatusCode)
 	}
 	if !isJSON || answer.AccessToken == "" || !strings.EqualFold(answer.TokenType, "Bearer") {
-		return fmt.Errorf("%w: the token endpoint's answer is not a bearer token", ErrProviderUnavailable)
+		return renewal{}, fmt.Errorf("%w: the token endpoint's answer is not a bearer token", ErrProviderUnavailable)
 	}
 	lifetime, ok := expiresIn(answer.ExpiresIn)
 	if !ok || lifetime <= 0 {
-		return fmt.Errorf("%w: the token endpoint's answer has no usable expiry", ErrProviderUnavailable)
+		return renewal{}, fmt.Errorf("%w: the token endpoint's answer has no usable expiry", ErrProviderUnavailable)
 	}
 	if lifetime > authn.MaxTokenLifetime {
 		// The hub refuses such a token; holding it would only fail later.
-		return fmt.Errorf("%w: the provider issued a token living longer than %s; the machine's client must be limited to it",
+		return renewal{}, fmt.Errorf("%w: the provider issued a token living longer than %s; the machine's client must be limited to it",
 			ErrProviderUnavailable, authn.MaxTokenLifetime)
 	}
-
-	if answer.RefreshToken != "" && answer.RefreshToken != s.credential.RefreshToken {
-		next := s.credential
-		next.RefreshToken = answer.RefreshToken
-		if err := WriteMachineCredential(s.path, next); err != nil {
-			// The provider may already have retired the old refresh token.
-			// Keep the new one in memory so this process keeps working,
-			// and report that the file is stale.
-			s.credential = next
-			s.access, s.expires = answer.AccessToken, startedAt.Add(lifetime)
-			return fmt.Errorf("transportauth: a renewed refresh token could not be saved: %w", err)
-		}
-		s.credential = next
-	}
-	// The expiry is counted from before the request was sent, so it is never
-	// later than the provider's.
-	s.access, s.expires = answer.AccessToken, startedAt.Add(lifetime)
-	return nil
+	return renewal{access: answer.AccessToken, lifetime: lifetime, refresh: answer.RefreshToken}, nil
 }
 
 func jsonContent(contentType string) bool {
