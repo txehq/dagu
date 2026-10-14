@@ -7,10 +7,10 @@ import { Button } from '@/components/ui/button';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
 
-import { shownName, type ShownIdentity } from './shown';
-
 type Props = {
-  shown?: ShownIdentity;
+  // username is the account's name as the hub's own user record holds it,
+  // shown as text. Nothing is matched or decided on it.
+  username?: string;
   // onRequestAccess records a request for the signed-in account. It runs only
   // when the person presses the button, never on display.
   onRequestAccess: () => void;
@@ -23,14 +23,14 @@ type Props = {
 // NoAccessYet is shown to a signed-in account that the hub has not given
 // access to anything: no jobs, no inbox, only a way to ask for access.
 export function NoAccessYet({
-  shown,
+  username,
   onRequestAccess,
   requesting = false,
   requestError,
   onSignOut,
 }: Props): React.ReactElement {
   const { t } = useI18n();
-  const who = shownName(shown);
+  const who = username?.trim() || undefined;
   return (
     <section className="space-y-3" data-testid="txe-no-access">
       <h1 className="text-lg font-semibold">

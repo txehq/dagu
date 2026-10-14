@@ -13,7 +13,6 @@ import { EmptyPrivateInbox } from '../components/identity/EmptyPrivateInbox';
 import { NoAccessYet } from '../components/identity/NoAccessYet';
 import { NotFoundOrNotShared } from '../components/identity/NotFoundOrNotShared';
 import { SharedWithYou } from '../components/identity/SharedWithYou';
-import { shownName } from '../components/identity/shown';
 
 function inLocale(locale: 'en' | 'zh-CN' | 'ja', ui: React.ReactElement) {
   localStorage.setItem('user_preferences', JSON.stringify({ locale }));
@@ -30,18 +29,6 @@ afterEach(() => {
   localStorage.clear();
 });
 
-describe('shownName', () => {
-  it('prefers the name, then the username, then the email', () => {
-    expect(shownName({ name: 'Ada', username: 'ada', email: 'a@x' })).toBe(
-      'Ada'
-    );
-    expect(shownName({ name: ' ', username: 'ada', email: 'a@x' })).toBe('ada');
-    expect(shownName({ email: 'a@x' })).toBe('a@x');
-    expect(shownName({})).toBeUndefined();
-    expect(shownName(undefined)).toBeUndefined();
-  });
-});
-
 describe('NoAccessYet', () => {
   it('asks for access only when the person presses the button', () => {
     const onRequestAccess = vi.fn();
@@ -49,7 +36,7 @@ describe('NoAccessYet', () => {
     inLocale(
       'en',
       <NoAccessYet
-        shown={{ username: 'ada' }}
+        username="ada"
         onRequestAccess={onRequestAccess}
         onSignOut={onSignOut}
       />
@@ -64,7 +51,7 @@ describe('NoAccessYet', () => {
     expect(onSignOut).toHaveBeenCalledTimes(1);
   });
 
-  it('says only that the account is signed in when the provider gave no name', () => {
+  it('says only that the account is signed in when it has no username', () => {
     inLocale(
       'en',
       <NoAccessYet onRequestAccess={vi.fn()} onSignOut={vi.fn()} />
@@ -90,11 +77,11 @@ describe('NoAccessYet', () => {
     );
   });
 
-  it('shows a provider name as text, not markup', () => {
+  it('shows a username as text, not markup', () => {
     const { container } = inLocale(
       'en',
       <NoAccessYet
-        shown={{ name: '<img src=x onerror=alert(1)>' }}
+        username="<img src=x onerror=alert(1)>"
         onRequestAccess={vi.fn()}
         onSignOut={vi.fn()}
       />
@@ -109,7 +96,7 @@ describe('NoAccessYet', () => {
     inLocale(
       'zh-CN',
       <NoAccessYet
-        shown={{ username: 'ada' }}
+        username="ada"
         onRequestAccess={vi.fn()}
         onSignOut={vi.fn()}
       />
