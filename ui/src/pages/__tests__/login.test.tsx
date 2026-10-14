@@ -4,7 +4,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ConfigContext, type Config } from '@/contexts/ConfigContext';
 import { UserPreferencesProvider } from '@/contexts/UserPreference';
@@ -169,5 +169,45 @@ describe('LoginPage', () => {
     renderLogin(makeConfig());
 
     expect(screen.queryByTestId('signout-unconfirmed')).not.toBeInTheDocument();
+  });
+});
+
+describe('LoginPage single sign-on', () => {
+  const original = window.location;
+  const assign = vi.fn();
+
+  beforeEach(() => {
+    assign.mockReset();
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...original, assign },
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: original,
+    });
+  });
+
+  it('starts the sign-in as before, and with prompt=login for another account', async () => {
+    const user = userEvent.setup();
+    renderLogin(makeConfig({ oidcEnabled: true, oidcButtonLabel: 'SSO' }));
+
+    await user.click(screen.getByRole('button', { name: 'SSO' }));
+    expect(assign).toHaveBeenLastCalledWith('/dagu/oidc-login');
+
+    await user.click(
+      screen.getByRole('button', { name: 'Use a different account' })
+    );
+    expect(assign).toHaveBeenLastCalledWith('/dagu/oidc-login?prompt=login');
+  });
+
+  it('offers no other account without single sign-on', () => {
+    renderLogin(makeConfig());
+    expect(
+      screen.queryByRole('button', { name: 'Use a different account' })
+    ).not.toBeInTheDocument();
   });
 });

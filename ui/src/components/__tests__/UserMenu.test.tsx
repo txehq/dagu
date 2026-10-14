@@ -1,10 +1,10 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { UserAuthProvider, UserRole } from '@/api/v1/schema';
 import { UserMenu } from '../UserMenu';
@@ -18,7 +18,11 @@ vi.mock('@/contexts/AuthContext', () => ({
 }));
 
 vi.mock('@/contexts/ConfigContext', () => ({
-  useConfig: () => ({ authMode: 'builtin' }),
+  useConfig: () => ({
+    authMode: 'builtin',
+    oidcEnabled: true,
+    basePath: '/dagu',
+  }),
 }));
 
 function LoginProbe() {
@@ -92,6 +96,67 @@ describe('UserMenu', () => {
       'Acting for Ada Lovelace'
     );
     expect(screen.queryByText(UserRole.viewer)).not.toBeInTheDocument();
+  });
+
+  it('offers Switch account only to an account from the identity provider', async () => {
+    const user = userEvent.setup();
+    renderMenu(UserAuthProvider.builtin);
+    await user.click(screen.getByRole('button', { name: 'test-user' }));
+    expect(
+      screen.queryByRole('menuitem', { name: 'Switch account' })
+    ).not.toBeInTheDocument();
+  });
+
+  describe('Switch account', () => {
+    const original = window.location;
+    const assign = vi.fn();
+
+    beforeEach(() => {
+      assign.mockReset();
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: { ...original, assign },
+      });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: original,
+      });
+    });
+
+    it('signs out, then asks the provider for a fresh sign-in', async () => {
+      const user = userEvent.setup();
+      const logout = vi.fn(() => Promise.resolve('ended'));
+      renderMenu(UserAuthProvider.oidc, logout);
+
+      await user.click(screen.getByRole('button', { name: 'test-user' }));
+      await user.click(
+        screen.getByRole('menuitem', { name: 'Switch account' })
+      );
+
+      await waitFor(() =>
+        expect(assign).toHaveBeenCalledWith('/dagu/oidc-login?prompt=login')
+      );
+      expect(logout).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops at the login page when the hub did not confirm the sign-out', async () => {
+      const user = userEvent.setup();
+      const logout = vi.fn(() => Promise.resolve('unconfirmed'));
+      renderMenu(UserAuthProvider.oidc, logout);
+
+      await user.click(screen.getByRole('button', { name: 'test-user' }));
+      await user.click(
+        screen.getByRole('menuitem', { name: 'Switch account' })
+      );
+
+      expect(await screen.findByTestId('login-page')).toHaveTextContent(
+        '?signout=unconfirmed'
+      );
+      expect(assign).not.toHaveBeenCalled();
+    });
   });
 
   it('does not offer password changes to proxy users', async () => {

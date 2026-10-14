@@ -14,6 +14,8 @@ import {
   CheckCircle,
   ShieldCheck,
 } from 'lucide-react';
+import { I18nText } from '@/i18n/I18nText';
+import { oidcLoginURL } from '@/lib/oidcLogin';
 import { useI18n } from '@/i18n/I18nProvider';
 
 export default function LoginPage() {
@@ -97,8 +99,8 @@ export default function LoginPage() {
     }
   };
 
-  const handleOIDCLogin = () => {
-    window.location.href = `${config.basePath}/oidc-login`;
+  const handleOIDCLogin = (prompt?: 'login') => {
+    window.location.assign(oidcLoginURL(config.basePath, prompt));
   };
 
   const externalLoginEnabled = config.oidcEnabled || config.proxyEnabled;
@@ -195,11 +197,20 @@ export default function LoginPage() {
                   type="button"
                   variant="outline"
                   className="w-full h-9"
-                  onClick={handleOIDCLogin}
+                  onClick={() => handleOIDCLogin()}
                 >
                   <KeyRound className="h-4 w-4" />
                   {config.oidcButtonLabel || t('auth.loginWithSso')}
                 </Button>
+              )}
+              {config.oidcEnabled && (
+                <button
+                  type="button"
+                  className="w-full text-xs text-muted-foreground hover:underline"
+                  onClick={() => handleOIDCLogin('login')}
+                >
+                  <I18nText text="Use a different account" />
+                </button>
               )}
 
               {config.proxyEnabled && (

@@ -11,10 +11,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { User, LogOut, Key } from 'lucide-react';
+import { User, LogOut, Key, Users } from 'lucide-react';
 import { ChangePasswordModal } from './ChangePasswordModal';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
+import { oidcLoginURL } from '@/lib/oidcLogin';
 
 type UserMenuProps = {
   isCollapsed?: boolean;
@@ -61,6 +62,25 @@ export function UserMenu({
     // the hub did not confirm that the session ended.
     navigate(result === 'unconfirmed' ? '/login?signout=unconfirmed' : '/login');
   };
+
+  // Switching account ends this hub session like Sign Out, then asks the
+  // provider for a fresh sign-in instead of reusing its session. When the
+  // hub could not confirm the sign-out, the login page says so and nothing
+  // more happens.
+  const handleSwitchAccount = async () => {
+    if (signingOut) {
+      return;
+    }
+    setSigningOut(true);
+    const result = await logout();
+    if (result === 'unconfirmed') {
+      navigate('/login?signout=unconfirmed');
+      return;
+    }
+    window.location.assign(oidcLoginURL(config.basePath, 'login'));
+  };
+  const canSwitchAccount =
+    config.oidcEnabled && user.authProvider === UserAuthProvider.oidc;
 
   return (
     <>
@@ -121,6 +141,15 @@ export function UserMenu({
               </DropdownMenuItem>
               <DropdownMenuSeparator />
             </>
+          )}
+          {canSwitchAccount && (
+            <DropdownMenuItem
+              onClick={() => void handleSwitchAccount()}
+              disabled={signingOut}
+            >
+              <Users className="h-4 w-4 mr-2" />
+              <I18nText text="Switch account" />
+            </DropdownMenuItem>
           )}
           <DropdownMenuItem
             onClick={() => void handleLogout()}
