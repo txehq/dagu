@@ -7,6 +7,7 @@ import useSWR from 'swr';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useClient } from '@/hooks/api';
 
+import { createTxeAccessApi, type TxeAccessApi } from './access';
 import { createTxeApi, type TxeApi } from './api';
 import { sameRetryStates } from './retry';
 import type { Decision, Proposal, TxeJob } from './types';
@@ -32,6 +33,21 @@ export function useTxeApi(): TxeApi {
   const client = useClient();
   return React.useMemo(
     () => injected ?? createTxeApi(client),
+    [injected, client]
+  );
+}
+
+export const TxeAccessApiContext = React.createContext<TxeAccessApi | null>(
+  null
+);
+
+// useTxeAccessApi returns the injected access API (tests) or one bound to the
+// configured server.
+export function useTxeAccessApi(): TxeAccessApi {
+  const injected = React.useContext(TxeAccessApiContext);
+  const client = useClient();
+  return React.useMemo(
+    () => injected ?? createTxeAccessApi(client),
     [injected, client]
   );
 }

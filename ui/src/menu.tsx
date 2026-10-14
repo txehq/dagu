@@ -671,7 +671,7 @@ export const mainListItems = React.forwardRef<
   const canViewEventLogs = useCanViewEventLogs();
   const canViewAuditLogs = useCanViewAuditLogs();
   const { preferences, updatePreference } = useUserPreferences();
-  const { t } = useI18n();
+  const { t, ts } = useI18n();
 
   const theme = preferences.theme || 'dark';
   const title = config.title || DEFAULT_TITLE;
@@ -1097,6 +1097,7 @@ export const mainListItems = React.forwardRef<
               basePath={[
                 '/users',
                 '/api-keys',
+                '/txe/access',
                 '/remote-nodes',
                 '/terminal',
                 '/license',
@@ -1112,7 +1113,7 @@ export const mainListItems = React.forwardRef<
                   groupKey="administration-access"
                   label={t('navigation.access')}
                   isOpen={isOpen}
-                  basePath={['/users', '/api-keys']}
+                  basePath={['/users', '/api-keys', '/txe/access']}
                   customColor={customColor}
                   persistExpanded={false}
                 >
@@ -1126,6 +1127,13 @@ export const mainListItems = React.forwardRef<
                   <NavItem
                     to="/api-keys"
                     text={t('navigation.apiKeys')}
+                    isOpen={isOpen}
+                    onClick={onNavItemClick}
+                    customColor={customColor}
+                  />
+                  <NavItem
+                    to="/txe/access"
+                    text={ts('Access requests')}
                     isOpen={isOpen}
                     onClick={onNavItemClick}
                     customColor={customColor}

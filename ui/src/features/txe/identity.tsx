@@ -16,6 +16,7 @@ import { useClient } from '@/hooks/api';
 import { sseManager } from '@/hooks/SSEManager';
 
 import { AccessRequestPending } from './components/identity/AccessRequestPending';
+import { useTxeAccessApi } from './hooks';
 import { NoAccessYet } from './components/identity/NoAccessYet';
 
 export type TxeIdentity = components['schemas']['TxeIdentity'];
@@ -40,12 +41,13 @@ export function useTxeIdentity(): {
   identity: TxeIdentity | undefined;
   isLoading: boolean;
   error: unknown;
+  reload: () => Promise<unknown>;
 } {
   const config = useConfig();
   const { isAuthenticated, token } = useAuth();
   const client = useClient();
   const enabled = config.authMode === 'builtin' && isAuthenticated;
-  const { data, error, isLoading } = useSWR<TxeIdentity>(
+  const { data, error, isLoading, mutate } = useSWR<TxeIdentity>(
     enabled ? ['txe', 'identity', token] : null,
     async () => {
       const res = await client.GET('/txe/identity');
@@ -63,7 +65,12 @@ export function useTxeIdentity(): {
           : 0,
     }
   );
-  return { identity: data, isLoading: enabled && isLoading, error };
+  return {
+    identity: data,
+    isLoading: enabled && isLoading,
+    error,
+    reload: mutate,
+  };
 }
 
 // TxePersonGate shows a person signed in through the identity provider only
@@ -78,8 +85,11 @@ export function TxePersonGate({
   children: React.ReactNode;
   personApp: React.ReactNode;
 }): React.ReactElement | null {
-  const { identity, isLoading } = useTxeIdentity();
+  const { identity, isLoading, reload } = useTxeIdentity();
   const { logout } = useAuth();
+  const access = useTxeAccessApi();
+  const [requesting, setRequesting] = React.useState(false);
+  const [requestError, setRequestError] = React.useState<string>();
   const navigate = useNavigate();
 
   // The hub refuses every event stream to a person. The refusal follows the
@@ -100,6 +110,20 @@ export function TxePersonGate({
     );
   }, [logout, navigate]);
 
+  // Asking for access happens only on the person's press, never on display.
+  const requestAccess = async () => {
+    setRequesting(true);
+    setRequestError(undefined);
+    try {
+      await access.requestAccess();
+      await reload();
+    } catch (err) {
+      setRequestError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRequesting(false);
+    }
+  };
+
   if (isLoading) {
     return null;
   }
@@ -119,6 +143,9 @@ export function TxePersonGate({
       ) : (
         <NoAccessYet
           username={identity.principal.shown.username}
+          onRequestAccess={() => void requestAccess()}
+          requesting={requesting}
+          requestError={requestError}
           onSignOut={() => void signOut()}
         />
       )}

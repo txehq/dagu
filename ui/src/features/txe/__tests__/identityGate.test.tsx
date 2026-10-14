@@ -1,7 +1,13 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { SWRConfig } from 'swr';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,13 +23,15 @@ import { sseManager } from '@/hooks/SSEManager';
 import TxeJobPage from '@/pages/txe/job';
 
 import { TxeApiError, type TxeApi } from '../api';
-import { TxeApiContext } from '../hooks';
+import type { TxeAccessApi } from '../access';
+import { TxeAccessApiContext, TxeApiContext } from '../hooks';
 import { TxePersonGate, type TxeIdentity } from '../identity';
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   authMode: { value: 'builtin' },
   token: { value: 'token-a' },
+  requestAccess: vi.fn(),
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -81,7 +89,13 @@ function gate() {
 function withCache(cache: Map<unknown, unknown>) {
   return (
     <SWRConfig value={{ provider: () => cache as never, dedupingInterval: 0 }}>
-      <MemoryRouter>{gate()}</MemoryRouter>
+      <TxeAccessApiContext.Provider
+        value={
+          { requestAccess: mocks.requestAccess } as unknown as TxeAccessApi
+        }
+      >
+        <MemoryRouter>{gate()}</MemoryRouter>
+      </TxeAccessApiContext.Provider>
     </SWRConfig>
   );
 }
@@ -95,6 +109,7 @@ describe('TxePersonGate', () => {
 
   beforeEach(() => {
     mocks.get.mockReset();
+    mocks.requestAccess.mockReset();
     setRefused = vi.spyOn(sseManager, 'setRefused');
   });
 
@@ -112,16 +127,54 @@ describe('TxePersonGate', () => {
     expect(await screen.findByTestId('txe-no-access')).toHaveTextContent(
       'You are signed in as ada'
     );
-    // Asking for access is not wired yet: the person is told whom to ask.
-    expect(
-      screen.queryByRole('button', { name: 'Request access' })
-    ).not.toBeInTheDocument();
-    expect(screen.getByTestId('txe-no-access')).toHaveTextContent(
-      'Ask the platform administrator to give your account access.'
-    );
+    // Nothing is asked for on display.
+    expect(mocks.requestAccess).not.toHaveBeenCalled();
     expect(screen.queryByTestId('dashboard')).not.toBeInTheDocument();
     expect(screen.queryByTestId('person-app')).not.toBeInTheDocument();
     expect(setRefused).toHaveBeenCalledWith(true);
+  });
+
+  it('asks for access when the person presses the button, then shows it pending', async () => {
+    answer(identity({}));
+    mocks.requestAccess.mockImplementationOnce(async () => {
+      answer(
+        identity({
+          state: TxeIdentityState.pending,
+          request: {
+            state: TxeIdentityRequestState.pending,
+            requested_at: '2026-10-14T12:00:00Z',
+            generation: 1,
+          },
+        })
+      );
+    });
+    renderGate();
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Request access' })
+    );
+
+    expect(await screen.findByTestId('txe-access-pending')).toBeInTheDocument();
+    expect(mocks.requestAccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('says why a request for access was not recorded', async () => {
+    answer(identity({}));
+    mocks.requestAccess.mockRejectedValueOnce(
+      new Error('provider_unavailable')
+    );
+    renderGate();
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Request access' })
+    );
+
+    expect(await screen.findByTestId('txe-no-access-error')).toHaveTextContent(
+      'The request was not recorded: provider_unavailable'
+    );
+    expect(
+      screen.getByRole('button', { name: 'Request access' })
+    ).toBeEnabled();
   });
 
   it('shows a person whose request awaits approval that it is pending', async () => {
