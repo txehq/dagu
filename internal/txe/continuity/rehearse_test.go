@@ -173,7 +173,7 @@ func TestInterruptedTransitionResumes(t *testing.T) {
 		require.Positive(t, steps)
 		stride := max(1, steps/7)
 		for step := 0; step < steps; step += stride {
-			for _, point := range []string{"before_write", "staged", "after_write"} {
+			for _, point := range []string{"before_write", "staged", "installed", "after_write"} {
 				t.Run(fmt.Sprintf("%s/%d/%s", mode, step, point), func(t *testing.T) {
 					t.Parallel()
 					r := newRehearsal(t, mode, lineage)

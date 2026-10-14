@@ -239,8 +239,10 @@ type ApplyOptions struct {
 	Journal   string
 	Transform Transform
 	// Interrupt, when set, is called at every point a crash could stop the
-	// transition ("before_write", "staged", "after_write"); an error stops
-	// Apply there as a crash would, with nothing after it done.
+	// transition: per step "before_write", "staged", "installed" and
+	// "after_write", and with step -1 "staging_init" and
+	// "staging_teardown". An error stops Apply there as a crash would,
+	// with nothing after it done.
 	Interrupt func(step int, point string) error
 	Now       func() time.Time
 }
@@ -548,7 +550,14 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 		return true, nil
 	}
 	if applied {
-		// Installed before an interruption that came before the journal.
+		// Installed before an interruption that came before the journal:
+		// it is made durable before it is journaled done.
+		if err := syncFile(dst, s.Path); err != nil {
+			return false, err
+		}
+		if err := syncChain(dst, path.Dir(s.Path)); err != nil {
+			return false, err
+		}
 		return true, record(OutcomeDone, "found applied")
 	}
 	switch {
@@ -583,7 +592,7 @@ func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, 
 	if err := interrupt(opts, i, "staged"); err != nil {
 		return false, err
 	}
-	if err := install(dst, staged, s.Path, inPlace); err != nil {
+	if err := install(dst, staged, s.Path, inPlace, func() error { return interrupt(opts, i, "installed") }); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return false, conflict("the target was created by someone else")
 		}
@@ -627,6 +636,9 @@ func applyLink(i int, s Step, opts ApplyOptions, src, dst *os.Root, j *journalFi
 		if _, done := j.done[s.Path]; done {
 			return true, nil
 		}
+		if err := syncChain(dst, path.Dir(s.Path)); err != nil {
+			return false, err
+		}
 		return true, record(OutcomeDone, "found applied")
 	}
 	if _, done := j.done[s.Path]; done {
@@ -644,7 +656,7 @@ func applyLink(i int, s Step, opts ApplyOptions, src, dst *os.Root, j *journalFi
 	if err := dst.Symlink(s.Link, s.Path); err != nil {
 		return false, err
 	}
-	if err := syncRootDir(dst, path.Dir(s.Path)); err != nil {
+	if err := syncChain(dst, path.Dir(s.Path)); err != nil {
 		return false, err
 	}
 	if err := interrupt(opts, i, "after_write"); err != nil {
@@ -880,7 +892,7 @@ func stage(root *os.Root, staging string, data []byte, perm fs.FileMode) (string
 
 // install moves a staged file to rel: replacing what is there in place,
 // never replacing anything in an import.
-func install(root *os.Root, staged, rel string, replace bool) error {
+func install(root *os.Root, staged, rel string, replace bool, installed func() error) error {
 	dir := path.Dir(rel)
 	if err := mkdirAllDurable(root, dir); err != nil {
 		return err
@@ -897,7 +909,34 @@ func install(root *os.Root, staged, rel string, replace bool) error {
 			return err
 		}
 	}
-	return syncRootDir(root, dir)
+	if err := installed(); err != nil {
+		return err
+	}
+	return syncChain(root, dir)
+}
+
+// syncChain makes durable the entries of dir and of every directory above
+// it up to the root: one of them may have been created by a run that
+// stopped before it synced its parent.
+func syncChain(root *os.Root, dir string) error {
+	for d := dir; ; d = path.Dir(d) {
+		if err := syncRootDir(root, d); err != nil {
+			return err
+		}
+		if d == "." {
+			return nil
+		}
+	}
+}
+
+// syncFile makes a file's contents durable.
+func syncFile(root *os.Root, rel string) error {
+	f, err := root.Open(rel)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return f.Sync()
 }
 
 // mkdirAllDurable creates dir under root, syncing each new directory into
