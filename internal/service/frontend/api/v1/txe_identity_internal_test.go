@@ -177,7 +177,7 @@ func TestTxeIdentityWithoutRegistry(t *testing.T) {
 	require.ErrorIs(t, err, errTxeRegistryUnavailable)
 }
 
-func TestTxeTokenRouteAdmitsOnlyTheListedRoutes(t *testing.T) {
+func TestTxeTokenRouteAdmitsOnlyTxeRoutes(t *testing.T) {
 	admit := txeTokenRoute("/api/v1")
 	for _, tc := range []struct {
 		method, target string
@@ -187,9 +187,13 @@ func TestTxeTokenRouteAdmitsOnlyTheListedRoutes(t *testing.T) {
 		{http.MethodGet, "/api/v1/txe/identity/", true},
 		{http.MethodGet, "/api/v1/txe/identity?remoteNode=local", true},
 		{http.MethodGet, "/api/v1/txe/identity?remoteNode=other", false},
-		{http.MethodPost, "/api/v1/txe/identity", false},
-		{http.MethodGet, "/api/v1/txe/jobs", false},
-		{http.MethodGet, "/api/v1/txe/identity/../jobs", false},
+		{http.MethodPost, "/api/v1/txe/jobs", true},
+		{http.MethodGet, "/api/v1/txe/jobs/job_x/reviews", true},
+		{http.MethodGet, "/api/v1/txe", true},
+		{http.MethodGet, "/api/v1/txex", false},
+		{http.MethodGet, "/api/v1/txe/../dags", false},
+		{http.MethodGet, "/api/v1/dags", false},
+		{http.MethodGet, "/api/v1/dag-runs", false},
 		{http.MethodGet, "/txe/identity", false},
 	} {
 		req := httptest.NewRequest(tc.method, tc.target, nil)

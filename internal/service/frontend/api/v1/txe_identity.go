@@ -5,8 +5,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"path"
+	"strings"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
@@ -34,29 +36,73 @@ var errTxeAuthzUnavailable = &Error{
 	Details:    map[string]any{"code": "authz_unavailable"},
 }
 
-// txeTokenRoutes are the routes an identity provider access token may call,
-// as a method and a path under the API base. Only a route that answers for
-// the caller's own owner, and no other, may be listed: every other route
-// refuses such a token before its handler runs.
-var txeTokenRoutes = []struct{ method, path string }{
-	{http.MethodGet, "txe/identity"},
-}
+// txeTokenRoutePrefix is where an identity provider access token may call:
+// every /txe route answers for the caller's owner and no other (TXE-3415
+// contract 1, section 3). Every other route refuses such a token before its
+// handler runs.
+const txeTokenRoutePrefix = "txe"
 
 // txeTokenRoute says whether a request may be made with a provider token. A
 // request for a remote node is never admitted: it would be forwarded with a
 // credential the node knows nothing of.
 func txeTokenRoute(mountedAPIPath string) func(r *http.Request) bool {
+	root := pathutil.NormalizePath(path.Join(mountedAPIPath, txeTokenRoutePrefix))
 	return func(r *http.Request) bool {
 		if node := r.URL.Query().Get("remoteNode"); node != "" && node != "local" {
 			return false
 		}
-		p := pathutil.NormalizePath(r.URL.Path)
-		for _, route := range txeTokenRoutes {
-			if r.Method == route.method && p == pathutil.NormalizePath(path.Join(mountedAPIPath, route.path)) {
-				return true
+		// Dot segments are resolved first, so a path cannot name /txe and
+		// reach another route.
+		p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
+		return p == root || strings.HasPrefix(p, root+"/")
+	}
+}
+
+// txePersonGate admits a person signed in through the identity provider only
+// to /txe, where every route is decided by the person's owner, and to the
+// read of its own session. A person never gets the Dagu role or workspace
+// access its account was provisioned with (TXE-3415 contract 1, section 1),
+// so every other route refuses it until that route is scoped by owner.
+func (a *API) txePersonGate(mountedAPIPath string) func(http.Handler) http.Handler {
+	onTxe := txeTokenRoute(mountedAPIPath)
+	me := pathutil.NormalizePath(path.Join(mountedAPIPath, "auth/me"))
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if a.txeAuth == nil || txeauth.Classify(r.Context()).Kind != txeauth.KindPerson {
+				next.ServeHTTP(w, r)
+				return
 			}
-		}
-		return false
+			p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
+			if onTxe(r) || (r.Method == http.MethodGet && p == me) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeTxePersonRefused(w)
+		})
+	}
+}
+
+// writeTxePersonRefused answers a person on a route that is not scoped by
+// owner yet.
+func writeTxePersonRefused(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{"code": string(api.ErrorCodeForbidden),
+		"message": "this route is not open to identity provider sign-ins yet", "details": map[string]string{"code": "forbidden"}})
+}
+
+// TxePersonRefused is the middleware for the server's other surfaces
+// (streams, MCP, terminal): it refuses a person signed in through the
+// identity provider, who may use none of them yet.
+func (a *API) TxePersonRefused() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if a.txeAuth != nil && txeauth.Classify(r.Context()).Kind == txeauth.KindPerson {
+				writeTxePersonRefused(w)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 
