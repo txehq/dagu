@@ -345,6 +345,7 @@ func (s *scanner) store(store, dir string, classify func(id string, data []byte)
 		if rec.SHA256 == "" {
 			rec.SHA256 = recordDigest(data)
 		}
+		rec.Raw = rawDigest(data)
 		for i := range issues {
 			if issues[i].ID == "" {
 				issues[i].ID = store + "/" + id

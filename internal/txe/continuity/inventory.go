@@ -148,6 +148,9 @@ type Record struct {
 	// ID is the storage ID: the path under the store without ".json".
 	ID     string `json:"id"`
 	SHA256 string `json:"sha256"`
+	// Raw is the SHA-256 of the record's exact bytes; SHA256 is of its
+	// canonical JSON.
+	Raw    string `json:"raw,omitempty"`
 	Schema int    `json:"schema,omitempty"`
 	// Owner is the owner_id the record states, if it states one.
 	Owner string `json:"owner,omitempty"`
