@@ -78,6 +78,8 @@ type runningTaskState struct {
 	// firstRefusedAt is when the owner first definitively refused this
 	// run's heartbeat since the last one it accepted, or zero.
 	firstRefusedAt time.Time
+	// refusalCancelled is set once the run is cancelled for refusal.
+	refusalCancelled bool
 }
 
 // TaskHandler defines the interface for executing tasks.
@@ -826,35 +828,36 @@ func (w *Worker) enforceRefusalDeadlines(ctx context.Context) {
 }
 
 // cancelExpiredRefusals cancels each run refused, with no accepted heartbeat
-// since, for RefusedCallsStopAfter less one heartbeat interval.
+// since, for RefusedCallsStopAfter less one heartbeat interval. The check and
+// the cancellation hold pollersMu together, so a heartbeat accepted in
+// between cannot be overridden by a stale decision.
 func (w *Worker) cancelExpiredRefusals(ctx context.Context) {
 	now := w.clock()
-	var refused []*coordinatorv1.CancelledRun
+	var cancelled []string
 	w.pollersMu.Lock()
 	for attemptKey, state := range w.runningTasks {
-		if state == nil || state.firstRefusedAt.IsZero() {
+		if state == nil || state.firstRefusedAt.IsZero() || state.refusalCancelled {
 			continue
 		}
 		if now.Sub(state.firstRefusedAt) < RefusedCallsStopAfter-runHeartbeatInterval {
 			continue
 		}
-		run := &coordinatorv1.CancelledRun{AttemptKey: attemptKey}
-		if state.task != nil && state.task.ExecutionMarker != "" {
-			run.SetExecutionMarker(state.task.ExecutionMarker)
+		cancelFunc, ok := w.cancelFuncs[attemptKey]
+		if !ok {
+			continue
 		}
-		refused = append(refused, run)
+		cancelFunc()
+		state.refusalCancelled = true
+		cancelled = append(cancelled, attemptKey)
 	}
 	w.pollersMu.Unlock()
 
-	for _, run := range refused {
-		logger.Warn(ctx, "Owner coordinator refused this worker for the whole bound; cancelling distributed run",
+	for _, attemptKey := range cancelled {
+		logger.Warn(ctx, "Owner coordinator refused this worker for the whole bound; cancelled distributed run",
 			tag.WorkerID(w.id),
-			tag.AttemptKey(run.AttemptKey),
+			tag.AttemptKey(attemptKey),
 			slog.Duration("stop-after", RefusedCallsStopAfter),
 		)
-	}
-	if len(refused) > 0 {
-		w.processCancellations(ctx, refused)
 	}
 }
 

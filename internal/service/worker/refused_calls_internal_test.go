@@ -21,13 +21,14 @@ import (
 )
 
 // runHeartbeatClient answers RunHeartbeatTo with whatever error the test
-// sets, nil meaning accepted. While block is set, a call waits for it to be
-// closed or for its context to end.
+// sets, nil meaning accepted. While block is set, a call signals entered and
+// waits for block to be closed or for its context to end.
 type runHeartbeatClient struct {
 	coordinator.Client
-	mu    sync.Mutex
-	err   error
-	block chan struct{}
+	mu      sync.Mutex
+	err     error
+	block   chan struct{}
+	entered chan struct{}
 }
 
 func (c *runHeartbeatClient) set(err error) {
@@ -41,6 +42,10 @@ func (c *runHeartbeatClient) RunHeartbeatTo(ctx context.Context, _ serviceregist
 	block, err := c.block, c.err
 	c.mu.Unlock()
 	if block != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
 		select {
 		case <-block:
 		case <-ctx.Done():
@@ -64,6 +69,9 @@ type refusalHarness struct {
 	now       time.Time
 	start     time.Time
 	cancelled time.Duration // elapsed when the task's context was cancelled, or -1
+	// refusedAtCancel is the task's firstRefusedAt at the instant it was
+	// cancelled, read while the canceller holds pollersMu.
+	refusedAtCancel time.Time
 }
 
 func (h *refusalHarness) clock() time.Time {
@@ -98,11 +106,13 @@ func newRefusalHarness(t *testing.T) *refusalHarness {
 		owner:                serviceregistry.HostInfo{ID: "coord-1", Host: "127.0.0.1", Port: 50055},
 		lastOwnerHeartbeatAt: h.start,
 	}
+	// Every canceller holds pollersMu when it calls this.
 	h.worker.cancelFuncs["attempt-1"] = func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.cancelled < 0 {
 			h.cancelled = h.now.Sub(h.start)
+			h.refusedAtCancel = h.worker.runningTasks["attempt-1"].firstRefusedAt
 		}
 	}
 	return h
@@ -217,6 +227,7 @@ func TestARefusedRunStopsWhileAHeartbeatCallIsBlocked(t *testing.T) {
 	// owner's slow call would; the deadline is checked on its own.
 	h.client.mu.Lock()
 	h.client.block = make(chan struct{})
+	h.client.entered = make(chan struct{}, 1)
 	h.client.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -229,6 +240,11 @@ func TestARefusedRunStopsWhileAHeartbeatCallIsBlocked(t *testing.T) {
 		cancel()
 		<-done
 	}()
+	select {
+	case <-h.client.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the heartbeat call never started")
+	}
 
 	for h.cancelledAt() < 0 && h.elapsed() <= 2*time.Minute {
 		h.advance(runHeartbeatInterval)
@@ -243,6 +259,47 @@ func TestARefusedRunStopsWhileAHeartbeatCallIsBlocked(t *testing.T) {
 	require.GreaterOrEqual(t, cancelled, time.Duration(0), "the step was never cancelled")
 	assert.LessOrEqual(t, cancelled, RefusedCallsStopAfter)
 	assert.GreaterOrEqual(t, cancelled, RefusedCallsStopAfter-runHeartbeatInterval)
+}
+
+func TestAHeartbeatAcceptedBeforeTheCancelKeepsTheRun(t *testing.T) {
+	// An expired refusal races an accepted heartbeat. Whichever takes
+	// pollersMu first wins: the run is cancelled only while its refusal is
+	// still recorded, never after the accepted heartbeat cleared it.
+	for range 50 {
+		h := newRefusalHarness(t)
+		h.worker.runningTasks["attempt-1"].firstRefusedAt = h.start
+		h.advance(RefusedCallsStopAfter)
+		task := h.worker.runningTasks["attempt-1"].task
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			h.worker.markOwnerHeartbeatSuccess([]*coordinatorv1.RunningTask{task}, h.clock())
+		})
+		wg.Go(func() {
+			h.worker.cancelExpiredRefusals(context.Background())
+		})
+		wg.Wait()
+
+		if h.cancelledAt() >= 0 {
+			h.mu.Lock()
+			refusedAt := h.refusedAtCancel
+			h.mu.Unlock()
+			require.False(t, refusedAt.IsZero(), "cancelled after an accepted heartbeat cleared the refusal")
+		}
+	}
+}
+
+func TestARunIsCancelledForRefusalOnce(t *testing.T) {
+	h := newRefusalHarness(t)
+	calls := 0
+	h.worker.cancelFuncs["attempt-1"] = func() { calls++ }
+	h.worker.runningTasks["attempt-1"].firstRefusedAt = h.start
+	h.advance(RefusedCallsStopAfter)
+	for range 5 {
+		h.worker.cancelExpiredRefusals(context.Background())
+		h.advance(runHeartbeatInterval)
+	}
+	assert.Equal(t, 1, calls)
 }
 
 func TestOutagesThenRefusalsStopByWhicheverRuleComesFirst(t *testing.T) {
