@@ -328,3 +328,33 @@ func TestOIDCCallbackChecksStateBeforePKCE(t *testing.T) {
 	assert.Contains(t, recorder.Header().Get("Location"), "state+mismatch")
 	assert.Empty(t, endpoint.requests())
 }
+
+// A sign-in may ask the provider to show its sign-in page, so a person can
+// switch accounts; only the prompts that do that are passed on.
+func TestOIDCLoginPassesOnlyAccountSwitchPrompts(t *testing.T) {
+	t.Parallel()
+	for _, prompt := range []string{"login", "select_account"} {
+		recorder := httptest.NewRecorder()
+		BuiltinOIDCLoginHandler(pkceTestConfig(nil, false)).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oidc-login?prompt="+prompt, nil))
+		require.Equal(t, http.StatusFound, recorder.Code)
+		location, err := url.Parse(recorder.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, "idp.example.com", location.Host)
+		assert.Equal(t, prompt, location.Query().Get("prompt"))
+	}
+
+	location, _ := signIn(t, pkceTestConfig(nil, false))
+	assert.False(t, location.Query().Has("prompt"), "no prompt unless asked")
+
+	for _, prompt := range []string{"none", "consent", "login consent"} {
+		recorder := httptest.NewRecorder()
+		BuiltinOIDCLoginHandler(pkceTestConfig(nil, false)).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oidc-login?prompt="+url.QueryEscape(prompt), nil))
+		require.Equal(t, http.StatusFound, recorder.Code)
+		location, err := url.Parse(recorder.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, "/login", location.Path, prompt)
+		assert.Equal(t, "unsupported sign-in prompt", location.Query().Get("error"), prompt)
+		state := cookieNamed(t, recorder, cookieState)
+		assert.True(t, state == nil || state.Value == "" || state.MaxAge < 0, "no sign-in state is left: %s", prompt)
+	}
+}

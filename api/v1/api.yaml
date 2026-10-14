@@ -10531,6 +10531,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /txe/auth/cli:
+    get:
+      summary: "How the command line signs in"
+      description: "Public and non-secret: what the command line needs to sign in with the identity provider, built only from the server's txe.authn configuration. use says which routes accept the resulting token: txe (the /txe routes) or all; any other value is to be read as identity (GET /txe/identity only). 404 when the server accepts no provider tokens, or names no single cli client."
+      operationId: "getTxeCliAuth"
+      security: []
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Sign-in parameters"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeCliAuth"
+        "404":
+          description: "Provider tokens are not accepted here"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /txe/identity:
     get:
       summary: "Who the hub takes the caller to be"
@@ -20403,6 +20431,25 @@ components:
         actor:
           $ref: "#/components/schemas/TxeActor"
       required: [owner_id, display_name]
+
+    TxeCliAuth:
+      type: object
+      properties:
+        contract:
+          type: integer
+          description: "Version of this shape. 1."
+        issuer:
+          type: string
+        client_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        use:
+          type: string
+          description: "Which routes accept a cli token: txe, all, or (read any other value as) identity."
+      required: [contract, issuer, client_id, scopes, use]
 
     TxeIdentity:
       type: object

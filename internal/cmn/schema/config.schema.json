@@ -294,7 +294,8 @@
                 }
               }
             },
-            "max_lifetime": {"type": "string", "description": "The longest token lifetime accepted, at most 5m."}
+            "max_lifetime": {"type": "string", "description": "The longest token lifetime accepted, at most 5m."},
+            "cli_client": {"type": "string", "description": "The cli client advertised to the command line by GET /txe/auth/cli. Optional when there is exactly one cli client."}
           }
         }
       }

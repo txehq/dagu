@@ -132,3 +132,21 @@ func TestTxeIdentityOverHTTP(t *testing.T) {
 	server.Client().Get("/api/v1/txe/identity").WithBearerToken(providerToken(t, time.Now(), 10*time.Minute)).
 		ExpectStatus(http.StatusUnauthorized).Send(t)
 }
+
+// The command line learns how to sign in without any credential, and only
+// from the server's configuration.
+func TestTxeCliAuthDiscovery(t *testing.T) {
+	t.Parallel()
+	server := setupProviderTokenServer(t)
+	var got api.TxeCliAuth
+	server.Client().Get("/api/v1/txe/auth/cli").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &got)
+	require.Equal(t, api.TxeCliAuth{Contract: 1, Issuer: providerIssuer, ClientId: providerCLI, Scopes: []string{"openid"}, Use: "txe"}, got)
+
+	// A hub that accepts no provider tokens says so.
+	plain := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
+		cfg.Server.Auth.Mode = config.AuthModeBuiltin
+		cfg.Server.Auth.Builtin.Token.Secret = "jwt-secret-key"
+		cfg.Server.Auth.Builtin.Token.TTL = 24 * time.Hour
+	}))
+	plain.Client().Get("/api/v1/txe/auth/cli").ExpectStatus(http.StatusNotFound).Send(t)
+}
