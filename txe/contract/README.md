@@ -76,8 +76,9 @@ changes its owner.
   not a limit Dagu sets. A value the DAG declares replaces the base configuration's
   `hist_retention_days` or `hist_retention_runs`. A run dispatched to a worker does not delete
   history, because the worker keeps no run store of its own. A job version registered before this
-  change declares nothing; the job's next version does. A run snapshot recorded before it keeps
-  the retention it was recorded with, and a local retry or restart of that run uses it.
+  change declares nothing, and a run snapshot keeps the retention it was recorded with. Neither
+  is pruned either: a run started with local storage skips automatic retention for every DAG whose
+  worker selector has `txe.machine` (`internal/persis/runstate.go`), whatever retention it carries.
 
 ## Registry (CC3)
 
