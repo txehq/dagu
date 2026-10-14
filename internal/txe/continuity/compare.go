@@ -48,19 +48,14 @@ func Compare(before, after *Inventory) *Report {
 
 	later := map[string]*Record{}
 	laterRegistry := map[string]*Record{}
-	// laterJobEntities are the entities each job defines later, live in its
-	// aggregate or archived in its history.
-	laterJobEntities := map[string]bool{}
 	for i := range after.Records {
 		r := &after.Records[i]
 		later[r.Store+"/"+r.ID] = r
 		if r.Store == "registry" {
 			laterRegistry[r.ID] = r
-			for _, e := range r.Defines {
-				laterJobEntities[r.Job+"|"+e.Kind+"|"+e.ID] = true
-			}
 		}
 	}
+	laterJobEntities := committedEntities(laterRegistry)
 	earlier := map[string]bool{}
 	for i := range before.Records {
 		b := &before.Records[i]
@@ -200,15 +195,52 @@ func compareLive(b, a *Record, key string, entities map[string]bool, add func(co
 			}
 		}
 	}
-	keys := map[string]bool{}
+	keys := map[string]string{}
 	for _, r := range a.Refs {
 		if strings.HasPrefix(r.Rel, "decision_key:") {
-			keys[r.Rel] = true
+			keys[r.Rel] = r.ID
 		}
 	}
 	for _, r := range b.Refs {
-		if strings.HasPrefix(r.Rel, "decision_key:") && !keys[r.Rel] {
+		if !strings.HasPrefix(r.Rel, "decision_key:") {
+			continue
+		}
+		switch got, ok := keys[r.Rel]; {
+		case !ok:
 			add("live_entry_lost", ClassJob, key, "the job's "+r.Rel+" is no longer held, so a replayed decision would not be recognized")
+		case got != r.ID:
+			add("live_entry_lost", ClassJob, key, "the job's "+r.Rel+" now names "+got+" instead of "+r.ID+", so a replay would resolve to another decision")
 		}
 	}
+}
+
+// committedEntities are the entities each job defines, live in its aggregate
+// or in history its chains reach, keyed "job|kind|id". A history record no
+// chain reaches is from a commit that did not happen and counts for nothing.
+func committedEntities(records map[string]*Record) map[string]bool {
+	out := map[string]bool{}
+	define := func(r *Record) {
+		for _, e := range r.Defines {
+			out[r.Job+"|"+e.Kind+"|"+e.ID] = true
+		}
+	}
+	for _, j := range records {
+		if j.Class != ClassJob {
+			continue
+		}
+		define(j)
+		for _, kind := range chainKinds {
+			seen := map[string]bool{}
+			for id := j.Attrs["chain_"+kind]; id != "" && !seen[id]; {
+				seen[id] = true
+				r := records[id]
+				if r == nil || r.Job != j.Job {
+					break
+				}
+				define(r)
+				id = r.Attrs["prev"]
+			}
+		}
+	}
+	return out
 }

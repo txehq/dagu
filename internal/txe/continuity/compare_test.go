@@ -150,6 +150,38 @@ func TestCompareBreaksAreBlocking(t *testing.T) {
 				m["revision"] = m["revision"].(float64) + 1
 			})
 		}, "live_entry_lost"},
+		{"a live proposal dropped behind an uncommitted archive copy", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			jobID := f.Jobs["data-collector"]
+			var open map[string]any
+			edit(t, regPath(l, "jobs/"+jobID), func(m map[string]any) {
+				props := m["proposals"].(map[string]any)
+				for id, p := range props {
+					if p.(map[string]any)["state"] == "open" {
+						open = p.(map[string]any)
+						delete(props, id)
+					}
+				}
+				m["revision"] = m["revision"].(float64) + 1
+			})
+			// The copy a lost compare-and-swap would leave: on disk, on no chain.
+			data, err := json.Marshal(open)
+			require.NoError(t, err)
+			p := regPath(l, "history/"+jobID+"/proposals/01M4ZZZZZZZZZZZZZZZZZZZZZZ")
+			require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+			require.NoError(t, os.WriteFile(p, data, 0o600))
+		}, "live_entry_lost"},
+		{"a decision key repointed at another decision", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) {
+			edit(t, regPath(l, "jobs/"+f.Jobs["health-check"]), func(m map[string]any) {
+				keys := m["decision_keys"].(map[string]any)
+				require.GreaterOrEqual(t, len(keys), 2)
+				var names []string
+				for k := range keys {
+					names = append(names, k)
+				}
+				keys[names[0]], keys[names[1]] = keys[names[1]], keys[names[0]]
+				m["revision"] = m["revision"].(float64) + 1
+			})
+		}, "live_entry_lost"},
 		{"the store reset to empty", func(t *testing.T, l *fixture.Layout, _ *fixture.Facts) {
 			require.NoError(t, os.RemoveAll(filepath.Join(l.DataDir, "txe")))
 		}, "record_missing"},
