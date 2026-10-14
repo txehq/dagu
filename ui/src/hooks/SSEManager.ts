@@ -289,10 +289,6 @@ export class SSEManager {
     apiURL: string,
     callbacks: SubscriberCallbacks
   ): () => void {
-    if (this.refused) {
-      callbacks.onStateChange(REFUSED_STATE);
-      return () => {};
-    }
     const key = buildConnectionKey(apiURL, remoteNode);
     const subscriberId = String(++subscriberIdCounter);
     const conn = this.getOrCreateConnection(key, apiURL, remoteNode);
@@ -447,7 +443,9 @@ export class SSEManager {
   }
 
   private connect(conn: ManagedConnection): void {
+    // The subscription is kept, so it connects once streams are allowed.
     if (this.refused) {
+      this.updateState(conn, REFUSED_STATE);
       return;
     }
     if (conn.topics.size === 0) {
@@ -835,18 +833,47 @@ export class SSEManager {
     }
   }
 
+  // closeStream ends a connection's stream but keeps its subscribers.
+  private closeStream(conn: ManagedConnection): void {
+    if (conn.eventSource) {
+      conn.eventSource.close();
+      conn.eventSource = null;
+    }
+    if (conn.retryTimeout) {
+      clearTimeout(conn.retryTimeout);
+      conn.retryTimeout = null;
+    }
+    if (conn.connectTimeout) {
+      clearTimeout(conn.connectTimeout);
+      conn.connectTimeout = null;
+    }
+    if (conn.mutationTimeout) {
+      clearTimeout(conn.mutationTimeout);
+      conn.mutationTimeout = null;
+    }
+    conn.sessionId = null;
+    conn.retryCount = 0;
+    conn.serverTopics.clear();
+    conn.pendingAdd.clear();
+    conn.pendingRemove.clear();
+  }
+
   // setRefused stops this browser opening any event stream while true, and
-  // closes the ones open. Subscribers fall back to polling.
+  // closes the ones open; subscribers fall back to polling. When streams are
+  // allowed again, every connection that still has subscribers reconnects.
   setRefused(refused: boolean): void {
     if (this.refused === refused) {
       return;
     }
     this.refused = refused;
-    if (refused) {
-      for (const conn of Array.from(this.connections.values())) {
+    for (const conn of Array.from(this.connections.values())) {
+      if (refused) {
+        this.closeStream(conn);
         this.updateState(conn, REFUSED_STATE);
+      } else {
+        this.updateState(conn, { shouldUseFallback: false, error: null });
+        this.ensureConnected(conn);
       }
-      this.disposeAll();
     }
   }
 }

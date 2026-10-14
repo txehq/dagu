@@ -38,16 +38,10 @@ export function useTxeIdentity(): {
     async () => {
       const res = await client.GET('/txe/identity');
       if (!res.data) {
-        // Not known to be a person: the dashboard is shown as before, with
-        // its streams, even after a person signed out in this browser.
-        sseManager.setRefused(false);
         throw new Error(
           res.error?.message ?? `Request failed (${res.response.status})`
         );
       }
-      // The hub refuses every event stream to a person. It is decided here,
-      // before any page that would open one is shown.
-      sseManager.setRefused(res.data.is_person);
       return res.data;
     },
     {
@@ -75,6 +69,17 @@ export function TxePersonGate({
   const { identity, isLoading } = useTxeIdentity();
   const { logout } = useAuth();
   const navigate = useNavigate();
+
+  // The hub refuses every event stream to a person. The refusal follows the
+  // identity of the current session only, so a late answer for an earlier
+  // session cannot set it, and a caller whose identity could not be read
+  // gets streams as before.
+  const isPerson = identity?.is_person === true;
+  React.useEffect(() => {
+    if (!isLoading) {
+      sseManager.setRefused(isPerson);
+    }
+  }, [isLoading, isPerson]);
 
   const signOut = React.useCallback(async () => {
     const result = await logout();

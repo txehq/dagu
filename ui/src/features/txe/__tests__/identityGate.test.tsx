@@ -1,7 +1,7 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { SWRConfig } from 'swr';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,12 +23,13 @@ import { TxePersonGate, type TxeIdentity } from '../identity';
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   authMode: { value: 'builtin' },
+  token: { value: 'token-a' },
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({
     isAuthenticated: true,
-    token: 'token-a',
+    token: mocks.token.value,
     logout: vi.fn(() => Promise.resolve('local')),
   }),
   useCanExecute: () => true,
@@ -65,16 +66,26 @@ function answer(body: TxeIdentity) {
   mocks.get.mockResolvedValue({ data: body, response: { status: 200 } });
 }
 
-function renderGate() {
-  return render(
-    <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
-      <MemoryRouter>
-        <TxePersonGate personApp={<p data-testid="person-app" />}>
-          <p data-testid="dashboard" />
-        </TxePersonGate>
-      </MemoryRouter>
+function gate() {
+  return (
+    <TxePersonGate personApp={<p data-testid="person-app" />}>
+      <p data-testid="dashboard" />
+    </TxePersonGate>
+  );
+}
+
+// withCache renders the gate on one SWR cache, which a rerender keeps, as a
+// browser keeps its cache from one session to the next.
+function withCache(cache: Map<unknown, unknown>) {
+  return (
+    <SWRConfig value={{ provider: () => cache as never, dedupingInterval: 0 }}>
+      <MemoryRouter>{gate()}</MemoryRouter>
     </SWRConfig>
   );
+}
+
+function renderGate(cache: Map<unknown, unknown> = new Map()) {
+  return render(withCache(cache));
 }
 
 describe('TxePersonGate', () => {
@@ -89,6 +100,7 @@ describe('TxePersonGate', () => {
     setRefused.mockRestore();
     sseManager.setRefused(false);
     mocks.authMode.value = 'builtin';
+    mocks.token.value = 'token-a';
   });
 
   it('shows a person who acts for nobody only that they have no access', async () => {
@@ -184,6 +196,51 @@ describe('TxePersonGate', () => {
 
     expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
     expect(setRefused).toHaveBeenLastCalledWith(false);
+  });
+
+  it('gives the dashboard with streams when the identity request fails', async () => {
+    mocks.get.mockRejectedValue(new TypeError('Failed to fetch'));
+    sseManager.setRefused(true);
+    renderGate();
+
+    expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
+    expect(setRefused).toHaveBeenLastCalledWith(false);
+  });
+
+  it('ignores a late answer for the session before', async () => {
+    let answerA: (value: unknown) => void = () => {};
+    mocks.get.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerA = resolve;
+        })
+    );
+    const cache = new Map();
+    const view = renderGate(cache);
+
+    // Session A (a person) is still being read when session B signs in.
+    mocks.token.value = 'token-b';
+    mocks.get.mockResolvedValueOnce({
+      data: identity({
+        principal: {
+          class: TxeIdentityPrincipalClass.legacy,
+          shown: { username: 'vera' },
+        },
+        scope: { kind: TxeIdentityScopeKind.unbound, unbound_reason: 'legacy' },
+        is_person: false,
+      }),
+      response: { status: 200 },
+    });
+    view.rerender(withCache(cache));
+    expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
+
+    await act(async () => {
+      answerA({ data: identity({}), response: { status: 200 } });
+    });
+
+    expect(screen.getByTestId('dashboard')).toBeInTheDocument();
+    expect(screen.queryByTestId('txe-no-access')).not.toBeInTheDocument();
+    expect(setRefused).not.toHaveBeenCalledWith(true);
   });
 
   it('does not ask the hub without builtin authentication', async () => {
