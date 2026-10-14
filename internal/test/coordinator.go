@@ -20,6 +20,7 @@ import (
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -36,6 +37,7 @@ type Coordinator struct {
 	running       bool
 	service       *coordinator.Service
 	handler       *coordinator.Handler
+	serverOptions []grpc.ServerOption
 }
 
 // SetupCoordinator creates and starts a test coordinator instance
@@ -94,6 +96,7 @@ func SetupCoordinator(t *testing.T, opts ...HelperOption) *Coordinator {
 	coord := &Coordinator{
 		Helper:        helper,
 		handlerConfig: cfg,
+		serverOptions: options.CoordinatorServerOptions,
 		host:          "127.0.0.1",
 		port:          port,
 		instanceID:    "test-coordinator",
@@ -111,7 +114,7 @@ func SetupCoordinator(t *testing.T, opts ...HelperOption) *Coordinator {
 func (c *Coordinator) start(t *testing.T, listener net.Listener) {
 	t.Helper()
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(c.serverOptions...)
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 
@@ -245,6 +248,15 @@ func (c *Coordinator) DispatchTask(t *testing.T, task *coordinatorv1.Task) error
 func (c *Coordinator) GetCoordinatorClient(t *testing.T) coordinator.Client {
 	t.Helper()
 	return coordinator.New(c.ServiceRegistry, CoordinatorClientConfig(c.Config.Paths.DataDir))
+}
+
+// GetCoordinatorClientWithCredentials returns a coordinator client that
+// presents creds on every call.
+func (c *Coordinator) GetCoordinatorClientWithCredentials(t *testing.T, creds credentials.PerRPCCredentials) coordinator.Client {
+	t.Helper()
+	cfg := CoordinatorClientConfig(c.Config.Paths.DataDir)
+	cfg.Credentials = creds
+	return coordinator.New(c.ServiceRegistry, cfg)
 }
 
 // CoordinatorClientConfig returns coordinator client settings backed by the test data directory.

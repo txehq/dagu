@@ -49,6 +49,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"gopkg.in/yaml.v3"
 )
 
@@ -87,6 +88,17 @@ type Options struct {
 	WithArtifactPersistence bool          // Enable artifact persistence to filesystem
 	StaleHeartbeatThreshold time.Duration // Override for handler's stale heartbeat threshold
 	StaleLeaseThreshold     time.Duration // Override for handler's stale lease threshold
+	// CoordinatorServerOptions are added to the test coordinator's gRPC
+	// server, such as authentication interceptors.
+	CoordinatorServerOptions []grpc.ServerOption
+}
+
+// WithCoordinatorServerOptions adds gRPC server options to a test
+// coordinator, such as authentication interceptors.
+func WithCoordinatorServerOptions(opts ...grpc.ServerOption) HelperOption {
+	return func(o *Options) {
+		o.CoordinatorServerOptions = append(o.CoordinatorServerOptions, opts...)
+	}
 }
 
 // WithCaptureLoggingOutput creates a logging capture option

@@ -27,6 +27,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/service/healthcheck"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Worker represents a worker instance that polls for tasks from the coordinator.
@@ -64,12 +66,18 @@ type Worker struct {
 	openCodeHost *opencodehost.Host
 
 	afterTaskAckHook func(context.Context, *coordinatorv1.Task) bool
+
+	// now is the clock the run heartbeat deadlines are measured with.
+	now func() time.Time
 }
 
 type runningTaskState struct {
 	task                 *coordinatorv1.RunningTask
 	owner                serviceregistry.HostInfo
 	lastOwnerHeartbeatAt time.Time
+	// firstRefusedAt is when the owner first definitively refused this
+	// run's heartbeat since the last one it accepted, or zero.
+	firstRefusedAt time.Time
 }
 
 // TaskHandler defines the interface for executing tasks.
@@ -82,6 +90,20 @@ var errTaskClaimRejectedBeforeExecution = errors.New("task claim rejected before
 const (
 	ownerRunHeartbeatCallTimeout = 10 * time.Second
 	ownerHeartbeatTimeout        = dagrun.DefaultStaleLeaseThreshold
+
+	// runHeartbeatInterval is how often running tasks are reported to their
+	// owner coordinator.
+	runHeartbeatInterval = 1 * time.Second
+
+	// RefusedCallsStopAfter bounds how long a run keeps executing locally
+	// once its owner coordinator definitively refuses this worker: its
+	// credential was refused, revoked or does not match the machine. The
+	// local step is cancelled on the first heartbeat tick at least
+	// RefusedCallsStopAfter minus one heartbeat interval after the first
+	// refusal, so no later than RefusedCallsStopAfter after it. A refusal
+	// is a verdict, unlike an unreachable coordinator or identity provider,
+	// which keeps the stale-lease rule (ownerHeartbeatTimeout).
+	RefusedCallsStopAfter = 60 * time.Second
 )
 
 // SetHandler sets a custom task executor for testing or custom execution logic
@@ -136,6 +158,7 @@ func NewWorker(
 		runSignals:     make(map[string]*runSignal),
 		healthServer:   healthcheck.NewServer("worker", healthPort),
 		openCodeHost:   opencodehost.New(context.Background(), openCodeConfig),
+		now:            time.Now,
 	}
 }
 
@@ -545,7 +568,7 @@ func (t *trackingHandler) Handle(ctx context.Context, task *coordinatorv1.Task) 
 	t.worker.runningTasks[attemptKey] = &runningTaskState{
 		task:                 runningTask,
 		owner:                owner,
-		lastOwnerHeartbeatAt: time.Now().UTC(),
+		lastOwnerHeartbeatAt: t.worker.clock(),
 	}
 	t.worker.pollerTasks[pollerID] = attemptKey
 	t.worker.cancelFuncs[attemptKey] = cancel
@@ -652,8 +675,7 @@ func (w *Worker) sendHeartbeats(ctx context.Context) {
 }
 
 func (w *Worker) sendRunHeartbeats(ctx context.Context) {
-	const interval = 1 * time.Second
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(runHeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -700,11 +722,14 @@ func (w *Worker) sendOwnerRunHeartbeats(ctx context.Context) {
 		cancel()
 
 		if err != nil {
+			if isDefinitiveRefusal(err) {
+				w.cancelTasksForRefusal(ctx, group.owner, group.tasks, err)
+			}
 			w.cancelTasksForOwnerTimeout(ctx, group.owner, group.tasks, lastSeen)
 			continue
 		}
 
-		w.markOwnerHeartbeatSuccess(group.tasks, time.Now().UTC())
+		w.markOwnerHeartbeatSuccess(group.tasks, w.clock())
 		if resp != nil && len(resp.CancelledRuns) > 0 {
 			w.processCancellations(ctx, resp.CancelledRuns)
 		}
@@ -721,12 +746,71 @@ func (w *Worker) markOwnerHeartbeatSuccess(tasks []*coordinatorv1.RunningTask, o
 		}
 		if state, ok := w.runningTasks[task.AttemptKey]; ok && state != nil {
 			state.lastOwnerHeartbeatAt = observedAt
+			state.firstRefusedAt = time.Time{}
 		}
 	}
 }
 
+// clock is the worker's current time, in UTC.
+func (w *Worker) clock() time.Time {
+	if w.now == nil {
+		return time.Now().UTC()
+	}
+	return w.now().UTC()
+}
+
+// isDefinitiveRefusal reports whether a coordinator call failed because the
+// coordinator, or this worker's own credential, refused it: the credential is
+// not accepted, was revoked by the identity provider, or does not match the
+// enrolled machine. An unreachable coordinator or identity provider
+// (Unavailable) and every other failure are not refusals.
+func isDefinitiveRefusal(err error) bool {
+	code := status.Code(err)
+	return code == codes.Unauthenticated || code == codes.PermissionDenied
+}
+
+// cancelTasksForRefusal records a definitive refusal of these runs'
+// heartbeat and cancels each run that has been refused, with no accepted
+// heartbeat since, for RefusedCallsStopAfter less one heartbeat interval.
+func (w *Worker) cancelTasksForRefusal(ctx context.Context, owner serviceregistry.HostInfo, tasks []*coordinatorv1.RunningTask, cause error) {
+	now := w.clock()
+	var refused []*coordinatorv1.CancelledRun
+	w.pollersMu.Lock()
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		state, ok := w.runningTasks[task.AttemptKey]
+		if !ok || state == nil {
+			continue
+		}
+		if state.firstRefusedAt.IsZero() {
+			state.firstRefusedAt = now
+		}
+		if now.Sub(state.firstRefusedAt) < RefusedCallsStopAfter-runHeartbeatInterval {
+			continue
+		}
+		refused = append(refused, &coordinatorv1.CancelledRun{AttemptKey: task.AttemptKey})
+	}
+	w.pollersMu.Unlock()
+
+	for _, run := range refused {
+		logger.Warn(ctx, "Owner coordinator refuses this worker; cancelling distributed run",
+			tag.WorkerID(w.id),
+			tag.AttemptKey(run.AttemptKey),
+			slog.String("owner-id", owner.ID),
+			tag.Host(owner.Host),
+			tag.Port(owner.Port),
+			tag.Error(cause),
+		)
+	}
+	if len(refused) > 0 {
+		w.processCancellations(ctx, refused)
+	}
+}
+
 func (w *Worker) cancelTasksForOwnerTimeout(ctx context.Context, owner serviceregistry.HostInfo, tasks []*coordinatorv1.RunningTask, lastSeen map[string]time.Time) {
-	now := time.Now().UTC()
+	now := w.clock()
 	var timedOut []*coordinatorv1.CancelledRun
 	for _, task := range tasks {
 		if task == nil {
