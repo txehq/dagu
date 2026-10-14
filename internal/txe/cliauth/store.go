@@ -148,13 +148,34 @@ func NormalizeHub(raw string) (string, error) {
 }
 
 func (s *Store) paths(hub string) (file, lock string, err error) {
+	return entryPaths(s.dir, hub)
+}
+
+func entryPaths(dir, hub string) (file, lock string, err error) {
 	hub, err = NormalizeHub(hub)
 	if err != nil {
 		return "", "", err
 	}
 	sum := sha256.Sum256([]byte(hub))
 	name := hex.EncodeToString(sum[:16])
-	return filepath.Join(s.dir, name+".json"), filepath.Join(s.dir, name+".lock"), nil
+	return filepath.Join(dir, name+".json"), filepath.Join(dir, name+".lock"), nil
+}
+
+// HasEntry reports whether dir holds a sign-in for hub. It creates nothing
+// and reads no key, so a machine that never signed in pays nothing for the
+// question.
+func HasEntry(dir, hub string) (bool, error) {
+	file, _, err := entryPaths(dir, hub)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Lstat(file); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // Load returns the hub's sign-in, or ErrNotSignedIn.

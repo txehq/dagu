@@ -395,3 +395,47 @@ func Revoke(ctx context.Context, p Provider, refreshToken string, client *http.C
 	}
 	return true, nil
 }
+
+// RefreshAt renews at a token endpoint the caller already holds, without
+// discovery, for a caller that keeps the endpoint with its credential (a
+// machine). The verdicts are Refresh's: *RefusedError, ErrIdentityChanged,
+// ErrNotSignedIn, or otherwise *UnverifiableError.
+//
+// An ID token in the answer is not verified against the issuer's keys here:
+// it came straight from the token endpoint. Its issuer and subject, and the
+// access token's, are read and must not name anyone but want.
+func RefreshAt(ctx context.Context, tokenURL string, p Provider, want Identity, refreshToken string, client *http.Client) (*Tokens, error) {
+	if refreshToken == "" {
+		return nil, ErrNotSignedIn
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if err := checkIssuer(tokenURL); err != nil {
+		return nil, fmt.Errorf("token endpoint: %w", err)
+	}
+	client = providerClient(client)
+	now := time.Now()
+	resp, err := postToken(ctx, client, tokenURL, "renewal", url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {p.ClientID},
+		"refresh_token": {refreshToken},
+	})
+	if err != nil {
+		return nil, renewalVerdict(err)
+	}
+	for _, token := range []string{resp.IDToken, resp.AccessToken} {
+		if token == "" {
+			continue
+		}
+		if err := checkTokenIdentity(token, want); err != nil {
+			return nil, err
+		}
+	}
+	tokens := &Tokens{Identity: want, AccessToken: resp.AccessToken, RefreshToken: resp.RefreshToken}
+	if tokens.RefreshToken == "" {
+		tokens.RefreshToken = refreshToken
+	}
+	tokens.Expiry = expiry(now, resp.ExpiresIn, resp.AccessToken)
+	return tokens, nil
+}

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,19 +17,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
 )
 
-// txeAuthFixture is a TXE home with a "txe" context for a hub that is never
-// contacted: signing in talks to the provider only.
+// txeAuthFixture is a TXE home with a "txe" context for an in-process hub.
+// No test reaches a real hub.
 type txeAuthFixture struct {
 	t        *testing.T
 	contexts string
 	data     string
 	home     string
+	hub      *cliauthtest.Hub
 }
-
-const txeAuthTestHub = "http://127.0.0.1:18080"
 
 func newTXEAuthFixture(t *testing.T) *txeAuthFixture {
 	t.Helper()
@@ -42,11 +43,12 @@ func newTXEAuthFixture(t *testing.T) *txeAuthFixture {
 		contexts: filepath.Join(base, "client", "contexts"),
 		data:     filepath.Join(base, "client", "data"),
 		home:     filepath.Join(base, "txe-home"),
+		hub:      cliauthtest.NewHub(t),
 	}
 	t.Setenv("TXE_DAGU_HOME", f.home)
 	store, err := newCLIContextStore(f.data, f.contexts)
 	require.NoError(t, err)
-	require.NoError(t, store.Create(context.Background(), &cliContext{Name: txeContextName, ServerURL: txeAuthTestHub, APIKey: "dagu_test_key"}))
+	require.NoError(t, store.Create(context.Background(), &cliContext{Name: txeContextName, ServerURL: f.hub.API(), APIKey: "dagu_test_key"}))
 	return f
 }
 
@@ -105,7 +107,7 @@ func TestTXELoginWhoamiLogout(t *testing.T) {
 	assert.Equal(t, p.Issuer(), login["issuer"])
 	assert.Equal(t, p.Subject, login["subject"])
 	assert.Equal(t, "alice", login["username"])
-	assert.Equal(t, txeAuthTestHub, login["hub"])
+	assert.Equal(t, f.hub.API(), login["hub"])
 	assert.NotContains(t, login, "replaced")
 
 	who := f.json("whoami")
@@ -172,14 +174,10 @@ func TestTXELoginRefusesBadInput(t *testing.T) {
 	assert.Error(t, err, "a failed sign-in stores nothing")
 }
 
-// Other txe commands still send the context's API key: the sign-in is not
-// wired to them yet.
-func TestTXESignInDoesNotChangeOtherCommands(t *testing.T) {
-	f := newTXEAuthFixture(t)
-	p := cliauthtest.New(t)
-	withFakeBrowser(t, p)
-	f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
-
+// txeProbeRemote runs a txe command that resolves the hub connection the
+// way every hub command does, and returns it.
+func (f *txeAuthFixture) txeProbeRemote() (*remoteClient, error) {
+	f.t.Helper()
 	var remote *remoteClient
 	root := txeAuthRoot()
 	family := TXE()
@@ -190,9 +188,133 @@ func TestTXESignInDoesNotChangeOtherCommands(t *testing.T) {
 	}))
 	root.AddCommand(family)
 	root.SetArgs([]string{"txe", "probe", "--dagu-home", filepath.Dir(f.contexts), "--contexts-dir", f.contexts, "--data-dir", f.data})
-	require.NoError(t, root.Execute())
-	require.NotNil(t, remote)
+	return remote, root.Execute()
+}
+
+// With no sign-in, a hub command sends the API key and asks the hub nothing
+// new: not even the discovery request.
+func TestTXEWithoutSignInNothingChanges(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+	remote, err := f.txeProbeRemote()
+	require.NoError(t, err)
 	assert.Equal(t, "dagu_test_key", remote.apiKey)
+	assert.Empty(t, f.hub.Requests())
+	_, err = os.Stat(filepath.Join(f.home, txeSignInDir))
+	assert.True(t, os.IsNotExist(err), "no sign-in store is created")
+}
+
+// Which credential a signed-in machine's hub commands carry follows what the
+// hub publishes, decided before any call.
+func TestTXESignedInCredentialFollowsTheHub(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	withFakeBrowser(t, p)
+	f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
+
+	t.Run("hub without CLI sign-in keeps the API key", func(t *testing.T) {
+		remote, err := f.txeProbeRemote()
+		require.NoError(t, err)
+		assert.Equal(t, "dagu_test_key", remote.apiKey)
+	})
+
+	t.Run("identity only keeps the API key for other calls", func(t *testing.T) {
+		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseIdentity)
+		remote, err := f.txeProbeRemote()
+		require.NoError(t, err)
+		assert.Equal(t, "dagu_test_key", remote.apiKey)
+	})
+
+	t.Run("all sends the sign-in and no API key", func(t *testing.T) {
+		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+		remote, err := f.txeProbeRemote()
+		require.NoError(t, err)
+		assert.Empty(t, remote.apiKey)
+		before := len(f.hub.Requests())
+		require.NoError(t, remote.do(context.Background(), http.MethodPost, "/txe/jobs", map[string]string{"request_id": "req_1"}, nil, nil))
+		reqs := f.hub.Requests()[before:]
+		require.Len(t, reqs, 1)
+		assert.True(t, strings.HasPrefix(reqs[0].Authorization, "Bearer ey"), reqs[0].Authorization)
+		assert.NotContains(t, reqs[0].Authorization, "dagu_")
+
+		// A refusal is renewed once and then reported; it never falls back
+		// to the API key.
+		f.hub.Decide = func(*http.Request, int) int { return http.StatusUnauthorized }
+		t.Cleanup(func() { f.hub.Decide = nil })
+		before = len(f.hub.Requests())
+		err = remote.do(context.Background(), http.MethodPost, "/txe/jobs", map[string]string{"request_id": "req_2"}, nil, nil)
+		require.ErrorIs(t, err, cliauth.ErrHubRefusedSignIn)
+		reqs = f.hub.Requests()[before:]
+		require.Len(t, reqs, 2)
+		for _, r := range reqs {
+			assert.NotContains(t, r.Authorization, "dagu_")
+		}
+		assert.Equal(t, reqs[0].Body, reqs[1].Body)
+	})
+
+	t.Run("a hub naming another provider is refused", func(t *testing.T) {
+		f.hub.Publish("https://other.example/realms/x", p.ClientID, cliauth.HubUseAll)
+		_, err := f.txeProbeRemote()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dagu txe login")
+	})
+
+	t.Run("a DAG step keeps the API key", func(t *testing.T) {
+		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+		t.Setenv("DAG_RUN_ID", "run-1")
+		t.Setenv("DAG_RUN_STEP_NAME", "publish")
+		before := len(f.hub.Requests())
+		remote, err := f.txeProbeRemote()
+		require.NoError(t, err)
+		assert.Equal(t, "dagu_test_key", remote.apiKey)
+		assert.Len(t, f.hub.Requests(), before, "a step asks the hub nothing new")
+	})
+}
+
+func TestTXELoginTakesTheHubsClient(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	withFakeBrowser(t, p)
+	f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseIdentity)
+
+	login := f.json("login")
+	assert.Equal(t, p.Issuer(), login["issuer"])
+	assert.Equal(t, p.ClientID, login["client_id"])
+
+	_, err := f.run("login", "--client-id", "another-client")
+	assert.ErrorContains(t, err, "the hub's CLI client is")
+	_, err = f.run("login", "--issuer", "https://other.example/realms/x")
+	assert.ErrorContains(t, err, "signs its CLI in at")
+
+	who := f.json("whoami")
+	identity, ok := who["hub_identity"].(map[string]any)
+	require.True(t, ok, who)
+	assert.Equal(t, "unbound", identity["state"])
+	principal := identity["principal"].(map[string]any)
+	assert.Equal(t, p.Subject, principal["subject"])
+	assert.Equal(t, "cli", principal["class"])
+	var asked bool
+	for _, r := range f.hub.Requests() {
+		if r.Path == "/api/v1/txe/identity" {
+			asked = true
+			assert.True(t, strings.HasPrefix(r.Authorization, "Bearer ey"), "whoami asks with the sign-in, never the API key")
+		}
+	}
+	assert.True(t, asked)
+}
+
+func TestTXEWhoamiWithoutHubSignIn(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	withFakeBrowser(t, p)
+	f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
+	who := f.json("whoami")
+	assert.NotContains(t, who, "hub_identity")
+	assert.Contains(t, who["hub_identity_error"], "does not accept CLI sign-in")
+	for _, r := range f.hub.Requests() {
+		assert.NotEqual(t, "/api/v1/txe/identity", r.Path, "the API key is never used to ask who the sign-in is")
+	}
 }
 
 // Each login flag defaults on its own: repeating the issuer and client id

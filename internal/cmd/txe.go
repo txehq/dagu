@@ -69,7 +69,10 @@ policy. The hub schedules it; this machine's worker runs it.
 
 These commands use the "txe" context in the TXE home's own context store
 (~/.local/share/txe-dagu/client) unless --context or --dagu-home says otherwise.
-DAGU_* environment variables are ignored: a job's steps inherit the worker's.`,
+DAGU_* environment variables are ignored: a job's steps inherit the worker's.
+
+Requests to the hub carry the context's API key, or this machine's sign-in
+("dagu txe login") when the hub asks for it.`,
 	}, nil, func(ctx *Context, _ []string) error {
 		return ctx.Command.Help()
 	})
@@ -213,9 +216,21 @@ func txeClient(ctx *Context) (*txeclient.Client, error) {
 	return txeclient.New(remote.baseURL, remote.apiKey, remote.client), nil
 }
 
-// txeRemote returns the hub connection: the command's remote context, or for
-// a command that also works without the hub, the "txe" context if it exists.
+// txeRemote returns the hub connection with the credential its calls carry:
+// the machine's sign-in when the hub asks for it (see txeHubAuth), otherwise
+// the context's API key.
 func txeRemote(ctx *Context) (*remoteClient, error) {
+	remote, err := txeRemoteContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return txeHubAuth(ctx, remote, false)
+}
+
+// txeRemoteContext returns the hub connection as the context describes it:
+// the command's remote context, or for a command that also works without
+// the hub, the "txe" context if it exists.
+func txeRemoteContext(ctx *Context) (*remoteClient, error) {
 	if ctx.IsRemote() {
 		return ctx.Remote, nil
 	}

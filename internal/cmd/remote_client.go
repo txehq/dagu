@@ -18,6 +18,7 @@ import (
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 )
 
 const defaultRemoteTimeout = 30 * time.Second
@@ -72,6 +73,15 @@ func newRemoteClient(ctx *cliContext) (*remoteClient, error) {
 			Transport: transport,
 		},
 	}, nil
+}
+
+// withSignIn returns a copy of c that sends the hub's sign-in from store
+// instead of the context's API key. The copy holds no API key, so nothing
+// falls back to it.
+func (c *remoteClient) withSignIn(store *cliauth.Store, hub string) *remoteClient {
+	httpClient := *c.client
+	httpClient.Transport = &cliauth.BearerTransport{Base: c.client.Transport, Store: store, Hub: hub}
+	return &remoteClient{baseURL: c.baseURL, client: &httpClient}
 }
 
 func (c *remoteClient) Test(ctx context.Context) error {
@@ -279,7 +289,9 @@ func (c *remoteClient) doWithQueryValues(ctx context.Context, method, path strin
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
