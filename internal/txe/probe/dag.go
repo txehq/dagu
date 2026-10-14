@@ -79,7 +79,7 @@ description: {{yaml .Description}}
 schedule: {{yaml .Schedule}}
 overlap_policy: skip
 max_active_runs: 1
-# Runs are kept with their logs: deleting them takes a person's decision.
+# Runs are kept with their logs for 100 years, not Dagu's 30-day default.
 hist_retention_days: {{.HistRetentionDays}}
 timeout_sec: {{.TimeoutSec}}
 worker_selector:

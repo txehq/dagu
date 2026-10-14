@@ -27,9 +27,10 @@ const (
 // HistRetentionDays is the run history every DAG TXE renders declares: 100
 // years. A DAG that declares none keeps Dagu's default of 30 days, or what a
 // base configuration sets, and a run started with local storage then removes
-// older runs with their logs and artifacts. TXE keeps them: deleting history
-// takes a person's decision, never a default. Dagu refuses a negative value
-// and reads 0 as its default, so no value turns the removal off.
+// older runs with their logs and artifacts. Dagu has no value that turns the
+// removal off: it refuses a negative one and reads 0 as its default. So TXE
+// declares a window longer than any run history it keeps, which postpones
+// the removal rather than disabling it.
 const HistRetentionDays = 36500
 
 // Overlap policies Dagu accepts.
