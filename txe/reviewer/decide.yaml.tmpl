@@ -10,6 +10,11 @@ description: Human decision for one TXE proposal on {{.MachineID}}
 # stated here so that the run never inherits a shorter one from a base
 # configuration. Waiting for the person holds no process and is not counted.
 timeout_sec: {{.DecideTimeoutSec}}
+# Runs are kept with their logs and artifacts. Without this the run
+# history would get Dagu's 30-day default, or a base configuration's, and
+# a run started with local storage would remove older runs. Dagu has no
+# value that turns the removal off; 100 years postpones it.
+hist_retention_days: {{.HistRetentionDays}}
 working_dir: {{yaml .StateDir}}
 worker_selector:
   txe.machine: {{yaml .MachineID}}

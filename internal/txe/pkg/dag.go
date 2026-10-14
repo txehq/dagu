@@ -24,6 +24,15 @@ const (
 	LabelPackage = "txe.package"
 )
 
+// HistRetentionDays is the run history every DAG TXE renders declares: 100
+// years. A DAG that declares none keeps Dagu's default of 30 days, or what a
+// base configuration sets, and a run started with local storage then removes
+// older runs with their logs and artifacts. Dagu has no value that turns the
+// removal off: it refuses a negative one and reads 0 as its default. So TXE
+// declares a window longer than any run history it keeps, which postpones
+// the removal rather than disabling it.
+const HistRetentionDays = 36500
+
 // Overlap policies Dagu accepts.
 const (
 	OverlapSkip   = "skip"
@@ -174,6 +183,7 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 		line("catchup_window: %s", quote(s.Schedule.CatchupWindow))
 	}
 	line("max_active_runs: 1")
+	line("hist_retention_days: %d", HistRetentionDays)
 	line("timeout_sec: %d", s.Schedule.TimeoutSec)
 	line("working_dir: %s", quote(s.WorkDir))
 	if s.Publish != nil && s.Publish.HubArtifacts {

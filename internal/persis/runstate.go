@@ -6,6 +6,7 @@ package persis
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
@@ -25,8 +26,48 @@ type runStateStore struct {
 	prepared   dagrun.Attempt
 }
 
+// TXE's names, spelled out here because persistence does not depend on TXE:
+// the worker selector label every DAG TXE renders carries
+// (txepkg.LabelMachine), the label naming a job's DAG (txepkg.LabelJob), and
+// the names of a machine's reviewer, decide and probe DAGs.
+const (
+	txeMachineLabel  = "txe.machine"
+	txeJobLabel      = "txe.job"
+	txeMachinePrefix = "mch_"
+)
+
+var txeMachineDAGPrefixes = []string{"txe-reviewer-", "txe-decide-", "txe-probe-"}
+
+// keepsHistory reports whether a DAG's run history is exempt from automatic
+// removal: a DAG TXE rendered, which is routed to a TXE machine and is either
+// a job's DAG, naming its job in a label, or one of that machine's own DAGs.
+// The DAGs TXE renders declare a 100-year retention, but a copy rendered
+// before they did, and every run snapshot recorded from one, still carries
+// Dagu's default. Another DAG that merely routes to a TXE machine keeps its
+// own retention.
+func keepsHistory(dag *ir.DAG) bool {
+	machine := dag.WorkerSelector[txeMachineLabel]
+	if !strings.HasPrefix(machine, txeMachinePrefix) {
+		return false
+	}
+	// Dagu lowercases label values when it loads them.
+	for _, job := range dag.Labels.Get(txeJobLabel) {
+		if strings.EqualFold(job, dag.Name) {
+			return true
+		}
+	}
+	suffix := strings.TrimPrefix(machine, txeMachinePrefix)
+	for _, prefix := range txeMachineDAGPrefixes {
+		if dag.Name == prefix+suffix {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *runStateStore) BeginAttempt(ctx context.Context, req runstate.BeginAttemptRequest) (runstate.Attempt, error) {
-	if req.DAG != nil && req.DAG.HistRetentionRuns == 0 {
+	prune := req.DAG != nil && !keepsHistory(req.DAG)
+	if prune && req.DAG.HistRetentionRuns == 0 {
 		if _, err := s.repository.RemoveOldDAGRuns(ctx, req.DAG.Name, req.DAG.HistRetentionDays, DAGRunRetentionOptions{}); err != nil {
 			logger.Error(ctx, "DAG runs data cleanup failed", tag.Error(err))
 		}
@@ -50,7 +91,7 @@ func (s *runStateStore) BeginAttempt(ctx context.Context, req runstate.BeginAtte
 		attempt = created
 	}
 
-	if req.DAG != nil && req.DAG.HistRetentionRuns > 0 {
+	if prune && req.DAG.HistRetentionRuns > 0 {
 		retentionRuns := req.DAG.HistRetentionRuns
 		if _, err := s.repository.RemoveOldDAGRuns(ctx, req.DAG.Name, 0, DAGRunRetentionOptions{
 			RetentionRuns: &retentionRuns,

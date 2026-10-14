@@ -60,6 +60,7 @@ schedule: "CRON_TZ=Australia/Perth */5 * * * *"
 overlap_policy: skip
 catchup_window: "1h"
 max_active_runs: 1
+hist_retention_days: 36500
 timeout_sec: 120
 working_dir: "/Users/x/.local/share/txe-dagu/packages/job_01K7A5ZQ8M3N4P5R6S7T8V9W0X/sha256-0123/files"
 env:

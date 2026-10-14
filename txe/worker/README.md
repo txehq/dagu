@@ -58,6 +58,9 @@ that check, and this worker runs it.
 ```
 
 Run it again after an upgrade. It rewrites the hub's copy only when the rendered DAG differs.
+Version 2 of that DAG declares `hist_retention_days: 36500`, so its runs are kept with their logs
+rather than getting Dagu's 30-day default; a hub copy at version 1 declares nothing until it is
+installed again.
 
 The installer manages that DAG: it restores its own rendered spec, so do not edit the hub's copy.
 

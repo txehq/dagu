@@ -214,6 +214,13 @@ files.
   read (`dagu txe update`). A job that declares no cadence at all is
   reviewed every hour. The reviewer's tick (`--schedule`) is only how
   often it looks for due jobs.
+- History: both DAGs declare `hist_retention_days: 36500`, as every DAG TXE
+  renders does (see the contract's job DAG). A review's packet and decision
+  are run artifacts, and a decision run holds the person's answer, so none
+  of them gets Dagu's 30-day default or a base configuration's. A copy
+  installed from an earlier render declares nothing until it is rendered
+  and installed again; a run started with local storage still does not
+  prune it, because it carries TXE's machine selector.
 - Concurrency: `max_active_runs: 1` and `overlap_policy: skip` on the tick,
   plus one fenced claim per job in the registry.
 - Duration: a run timeout, a shorter agent step timeout, and a per-action
