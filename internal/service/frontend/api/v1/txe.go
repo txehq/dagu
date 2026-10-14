@@ -589,6 +589,9 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 	if out == nil {
 		out = []api.TxeJob{}
 	}
+	for i := range out {
+		out[i].Access = a.txeJobAccess(ctx, out[i].JobId)
+	}
 	return api.ListTxeJobs200JSONResponse{Jobs: out}, err
 }
 
@@ -709,6 +712,7 @@ func (a *API) GetTxeJob(ctx context.Context, req api.GetTxeJobRequestObject) (ap
 		return nil, err
 	}
 	out, err := txeConvert[api.TxeJob](a.txePublicJob(ctx, s, job))
+	out.Access = a.txeJobAccess(ctx, req.JobId)
 	return api.GetTxeJob200JSONResponse(out), err
 }
 

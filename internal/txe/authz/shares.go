@@ -205,3 +205,26 @@ func (s *Store) activeShare(ctx context.Context, ownerID string, ref ResourceRef
 	}
 	return &share, nil
 }
+
+// ShareID is the opaque id a share is named by outside this package: the
+// granting owner, the resource and the grantee, which name its one record.
+func ShareID(share *Share) string {
+	return shareDigest(share.OwnerID, share.Resource, share.GranteeOwnerID)
+}
+
+// SharesReceived returns the shares granted to an owner, revoked ones
+// included.
+func (s *Store) SharesReceived(ctx context.Context, granteeOwnerID string) ([]*Share, error) {
+	var out []*Share
+	err := s.each(ctx, sharesPrefix, func(data []byte) error {
+		var share Share
+		if err := json.Unmarshal(data, &share); err != nil {
+			return err
+		}
+		if share.GranteeOwnerID == granteeOwnerID {
+			out = append(out, &share)
+		}
+		return nil
+	})
+	return out, err
+}
