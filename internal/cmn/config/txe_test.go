@@ -4,8 +4,12 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/spf13/viper"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +84,8 @@ func TestLoad_TXERefusals(t *testing.T) {
 		"ScalarTXE":        {"txe: enforce\n", "expected a map"},
 		"NullTXE":          {"txe: null\n", "is empty"},
 		"BareTXE":          {"auth:\n  mode: builtin\ntxe:\n", "is empty"},
+		"UpperNullTXE":     {"TXE: null\n", "is empty"},
+		"MixedBareTXE":     {"auth:\n  mode: builtin\nTxe:\n", "is empty"},
 		"ScalarAuthz":      {"txe:\n  authz: enforce\n", "must be a mapping"},
 		"ScalarAuthn":      {"txe:\n  authn: https://a.example/r\n", "must be a mapping"},
 		"EmptyModeString":  {"txe:\n  authz:\n    mode: \"\"\n", "is empty"},
@@ -162,4 +168,14 @@ func TestLoad_TXEEmptyEnvIsRefused(t *testing.T) {
 	err := loadWithErrorFromYAML(t, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "set but empty")
+}
+
+func TestLoad_TXENullInAdminYAMLIsRefused(t *testing.T) {
+	home := t.TempDir()
+	configFile := filepath.Join(home, "config.yaml")
+	require.NoError(t, os.WriteFile(configFile, []byte("auth:\n  mode: builtin\n"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(home, "admin.yaml"), []byte("Txe: ~\n"), 0600))
+	_, err := NewConfigLoader(viper.New(), WithAppHomeDir(home), WithService(ServiceServer)).Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is empty")
 }

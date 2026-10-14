@@ -98,6 +98,12 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 			return fmt.Errorf("%s is set but empty: unset it, or give it a value", name)
 		}
 	}
+	switch null, err := l.txeTopLevelNull(txeKey); {
+	case err != nil:
+		return err
+	case null:
+		return fmt.Errorf("%s is empty: remove it, or give it its settings", txeKey)
+	}
 	// A section is a mapping or absent. A scalar in its place is refused:
 	// read as an empty mapping it would switch everything off.
 	for _, section := range []struct {
@@ -197,9 +203,8 @@ func (l *ConfigLoader) txeWrittenEmpty(key string) bool {
 	}
 	i := strings.LastIndex(key, ".")
 	if i < 0 {
-		// The loader drops a top-level key written with no value, so the
-		// files themselves are asked.
-		return l.txeTopLevelNull(key)
+		// A top-level key is checked in the files, by txeTopLevelNull.
+		return false
 	}
 	parent, ok := l.v.Get(key[:i]).(map[string]any)
 	if !ok {
@@ -210,22 +215,27 @@ func (l *ConfigLoader) txeWrittenEmpty(key string) bool {
 }
 
 // txeTopLevelNull reports whether a configuration file read writes key at
-// its top level with no value.
-func (l *ConfigLoader) txeTopLevelNull(key string) bool {
+// its top level with no value. The loader drops such a key, so the files
+// themselves are asked, with keys compared as the loader compares them,
+// ignoring case. A file that can no longer be read or parsed is an error,
+// never taken for one without the key.
+func (l *ConfigLoader) txeTopLevelNull(key string) (bool, error) {
 	for _, file := range l.txeConfigFiles {
 		data, err := os.ReadFile(file) //nolint:gosec // the configuration file the loader already read
 		if err != nil {
-			continue
+			return false, fmt.Errorf("%s: read %s again: %w", key, file, err)
 		}
 		var top map[string]any
-		if yaml.Unmarshal(data, &top) != nil {
-			continue
+		if err := yaml.Unmarshal(data, &top); err != nil {
+			return false, fmt.Errorf("%s: parse %s again: %w", key, file, err)
 		}
-		if v, present := top[key]; present && v == nil {
-			return true
+		for k, v := range top {
+			if strings.EqualFold(k, key) && v == nil {
+				return true, nil
+			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 func onlyKeys(m map[string]any, section string, allowed ...string) error {
