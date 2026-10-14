@@ -42,6 +42,13 @@ func newHubFixture(t *testing.T) *hubFixture {
 	return f
 }
 
+// closeBody closes a response the test expected not to get.
+func closeBody(resp *http.Response) {
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+}
+
 func (f *hubFixture) post(t *testing.T, path, body string) (*http.Response, error) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, f.hub.API()+path, strings.NewReader(body))
@@ -91,7 +98,8 @@ func TestBearerTransportRenewsOnceOnInvalidToken(t *testing.T) {
 func TestBearerTransportGivesUpAfterOneRenewal(t *testing.T) {
 	f := newHubFixture(t)
 	f.hub.Decide = func(*http.Request, int) int { return http.StatusUnauthorized }
-	_, err := f.post(t, "/txe/jobs", `{}`)
+	resp, err := f.post(t, "/txe/jobs", `{}`)
+	closeBody(resp)
 	require.ErrorIs(t, err, ErrHubRefusedSignIn)
 	assert.Len(t, f.hub.Requests(), 2, "one attempt and one retry, no more")
 	assert.Equal(t, 1, f.provider.Refreshes(), "one renewal, no more")
@@ -135,7 +143,8 @@ func TestBearerTransportPlain401IsNotRenewed(t *testing.T) {
 func TestBearerTransportProviderUnavailableIsDistinct(t *testing.T) {
 	f := newHubFixture(t)
 	f.hub.Decide = func(*http.Request, int) int { return http.StatusServiceUnavailable }
-	_, err := f.post(t, "/txe/jobs", `{}`)
+	resp, err := f.post(t, "/txe/jobs", `{}`)
+	closeBody(resp)
 	var unavailable *HubProviderUnavailableError
 	require.ErrorAs(t, err, &unavailable)
 	assert.Equal(t, "5", unavailable.RetryAfter)
@@ -183,7 +192,8 @@ func TestBearerTransportDoesNotResendAnUnreadableBody(t *testing.T) {
 func TestBearerTransportRefusesAnotherHost(t *testing.T) {
 	f := newHubFixture(t)
 	other := cliauthtest.NewHub(t)
-	_, err := f.client.Get(other.API() + "/txe/jobs") //nolint:noctx // test
+	resp, err := f.client.Get(other.API() + "/txe/jobs") //nolint:noctx // test
+	closeBody(resp)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to send")
 	assert.Empty(t, other.Requests())
@@ -197,7 +207,8 @@ func TestBearerTransportRefusesAnotherHost(t *testing.T) {
 	_, err = f.store.Replace(context.Background(), e)
 	require.NoError(t, err)
 	client := &http.Client{Transport: &BearerTransport{Store: f.store, Hub: redirector.URL}}
-	_, err = client.Get(redirector.URL + "/x") //nolint:noctx // test
+	resp, err = client.Get(redirector.URL + "/x") //nolint:noctx // test
+	closeBody(resp)
 	require.Error(t, err)
 	assert.Empty(t, other.Requests())
 }
@@ -209,7 +220,8 @@ func TestBearerTransportRenewalRefusedEndsSignIn(t *testing.T) {
 		cliauthtest.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant"})
 		return true
 	}
-	_, err := f.post(t, "/txe/jobs", `{}`)
+	resp, err := f.post(t, "/txe/jobs", `{}`)
+	closeBody(resp)
 	var refused *RefusedError
 	require.ErrorAs(t, err, &refused)
 	assert.Contains(t, err.Error(), "dagu txe login")
@@ -221,7 +233,8 @@ func TestBearerTransportRenewalRefusedEndsSignIn(t *testing.T) {
 func TestBearerTransportNotSignedIn(t *testing.T) {
 	hub := cliauthtest.NewHub(t)
 	client := &http.Client{Transport: &BearerTransport{Store: newTestStore(t), Hub: hub.API()}}
-	_, err := client.Get(hub.API() + "/txe/jobs") //nolint:noctx // test
+	resp, err := client.Get(hub.API() + "/txe/jobs") //nolint:noctx // test
+	closeBody(resp)
 	require.ErrorIs(t, err, ErrNotSignedIn)
 	assert.Empty(t, hub.Requests())
 }
