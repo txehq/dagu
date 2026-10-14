@@ -73,6 +73,9 @@ type ConfigLoader struct {
 	trustedProxyWorkspaceMappings    map[string][]TrustedProxyWorkspaceGrant
 	trustedProxyWorkspaceMappingsSet bool
 	legacySuspendFlagsDir            string
+	// txeConfigFiles are the configuration files read, which the txe section
+	// is checked in for a key written with no value.
+	txeConfigFiles []string
 }
 
 // ConfigLoaderOption defines a functional option for configuring a ConfigLoader.
@@ -269,6 +272,7 @@ func (l *ConfigLoader) Load() (*Config, error) {
 	}
 	l.applyTrustedProxyMappings(&def)
 
+	l.txeConfigFiles = configFilesUsed
 	cfg, err := l.buildConfig(def)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build config: %w", err)
@@ -341,6 +345,11 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	}
 	if licenseErr != nil {
 		return nil, licenseErr
+	}
+	if l.requires(SectionServer) {
+		if err := l.loadTXEConfig(&cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	l.loadCacheConfig(&cfg, def)
@@ -2473,6 +2482,13 @@ var envBindings = []envBinding{
 	{key: "license.cloud_url", env: "LICENSE_CLOUD_URL"},
 	{key: licenseForkFeaturesKey, env: licenseForkFeaturesEnv},
 	{key: licenseForkMaxAPIKeysKey, env: licenseForkMaxAPIKeysEnv},
+
+	// TXE owner authorization
+	{key: txeAuthzModeKey, env: txeAuthzModeEnv},
+	{key: txeAuthnIssuerKey, env: txeAuthnIssuerEnv},
+	{key: txeAuthnAudienceKey, env: txeAuthnAudienceEnv},
+	{key: txeAuthnJWKSKey, env: txeAuthnJWKSEnv},
+	{key: txeAuthnLifetimeKey, env: txeAuthnLifetimeEnv},
 
 	// GitSync
 	{key: "git_sync.enabled", env: "GITSYNC_ENABLED"},

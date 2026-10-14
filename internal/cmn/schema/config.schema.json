@@ -251,9 +251,54 @@
     },
     "license": {
       "$ref": "#/definitions/LicenseDef"
+    },
+    "txe": {
+      "$ref": "#/definitions/TXEDef"
     }
   },
   "definitions": {
+    "TXEDef": {
+      "type": "object",
+      "description": "TXE owner authorization (TXE-3415). Both sections are off unless set, and either one needs auth.mode builtin.",
+      "additionalProperties": false,
+      "properties": {
+        "authz": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["off", "observe", "enforce"],
+              "description": "How credentials the hub accepted before owners were enforced are treated: off (today), observe (log what enforce would deny) or enforce. A person or an identity provider token is held to its owner in every mode."
+            }
+          }
+        },
+        "authn": {
+          "type": "object",
+          "description": "Identity provider access tokens accepted as bearer credentials. With no issuer, none are.",
+          "additionalProperties": false,
+          "properties": {
+            "issuer": {"type": "string", "description": "The token issuer, compared exactly."},
+            "audience": {"type": "string", "description": "An audience every accepted token must carry."},
+            "jwks_url": {"type": "string", "description": "Where the issuer publishes its signing keys: https, or http on a loopback address."},
+            "clients": {
+              "type": "array",
+              "description": "Accepted provider clients and the class each yields. A machine has one client per class.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "class"],
+                "properties": {
+                  "id": {"type": "string", "minLength": 1},
+                  "class": {"type": "string", "enum": ["cli", "worker", "reviewer"]}
+                }
+              }
+            },
+            "max_lifetime": {"type": "string", "description": "The longest token lifetime accepted, at most 5m."}
+          }
+        }
+      }
+    },
     "IPAccessDef": {
       "type": "object",
       "description": "Server-wide HTTP client IP filtering.",
