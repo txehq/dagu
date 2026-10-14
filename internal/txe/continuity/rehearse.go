@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -338,7 +339,7 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 			res.Written++
 		}
 	}
-	if err := dst.RemoveAll(staging); err != nil {
+	if err := teardown(dst, staging, token, opts); err != nil {
 		return res, err
 	}
 	return res, syncRootDir(dst, ".")
@@ -350,7 +351,11 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 // marker written and synced, and only then given its name, so a crash
 // while preparing it never leaves an unmarked staging directory behind.
 func resetStaging(root *os.Root, staging, token string, opts ApplyOptions) error {
-	if err := removeOwned(root, staging, token, false); err != nil {
+	// A teardown an earlier run did not finish.
+	if err := removeDone(root, staging+".done", token); err != nil {
+		return err
+	}
+	if err := teardown(root, staging, token, opts); err != nil {
 		return err
 	}
 	init := staging + ".init"
@@ -386,6 +391,74 @@ func resetStaging(root *os.Root, staging, token string, opts ApplyOptions) error
 		return err
 	}
 	if err := root.Rename(init, staging); err != nil {
+		return err
+	}
+	return syncRootDir(root, ".")
+}
+
+// teardown removes this transition's staging directory. It is first
+// renamed out of the published name, so a crash while its contents are
+// being removed never leaves an unmarked directory there; the renamed
+// remains are recognized and finished by the next run.
+func teardown(root *os.Root, staging, token string, opts ApplyOptions) error {
+	info, err := root.Lstat(staging)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	case !info.IsDir() || info.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%w: %s is not this transition's staging directory", ErrConflict, staging)
+	}
+	if owner, err := root.ReadFile(staging + "/" + ownerMarker); err != nil || string(owner) != token {
+		return fmt.Errorf("%w: %s exists and was not made by this transition; it is left as it is", ErrConflict, staging)
+	}
+	done := staging + ".done"
+	if err := root.Rename(staging, done); err != nil {
+		return err
+	}
+	if err := syncRootDir(root, "."); err != nil {
+		return err
+	}
+	if err := interrupt(opts, -1, "staging_teardown"); err != nil {
+		return err
+	}
+	return removeDone(root, done, token)
+}
+
+var stagedName = regexp.MustCompile(`^[0-9a-f]{24}$`)
+
+// removeDone finishes removing a staging directory that a teardown renamed.
+// What it may still hold is only what this transition puts in staging: its
+// owner marker (whole, or cut short) and staged files; anything else is a
+// conflict and is left as it is.
+func removeDone(root *os.Root, done, token string) error {
+	info, err := root.Lstat(done)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	case !info.IsDir() || info.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%w: %s is not this transition's staging directory", ErrConflict, done)
+	}
+	entries, err := fs.ReadDir(root.FS(), done)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		switch {
+		case e.Name() == ownerMarker && e.Type().IsRegular():
+			owner, err := root.ReadFile(done + "/" + ownerMarker)
+			if err != nil || !strings.HasPrefix(token, string(owner)) {
+				return fmt.Errorf("%w: %s holds another transition's marker; it is left as it is", ErrConflict, done)
+			}
+		case stagedName.MatchString(e.Name()) && e.Type().IsRegular():
+		default:
+			return fmt.Errorf("%w: %s holds %s, which this transition did not stage; it is left as it is", ErrConflict, done, e.Name())
+		}
+	}
+	if err := root.RemoveAll(done); err != nil {
 		return err
 	}
 	return syncRootDir(root, ".")

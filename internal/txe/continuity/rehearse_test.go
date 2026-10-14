@@ -636,3 +636,38 @@ func TestJournalInsideANewTargetIsRefused(t *testing.T) {
 	assert.ErrorContains(t, err, "inside the target")
 	assert.NoDirExists(t, r.target, "nothing was created")
 }
+
+// A crash while the staging directory is being removed, at the end of a
+// run, leaves nothing that stops the next run: the remains are renamed out
+// of the way first and recognized as this transition's.
+func TestInterruptedStagingTeardownResumes(t *testing.T) {
+	for name, damage := range map[string]func(t *testing.T, done string){
+		"after the rename": func(*testing.T, string) {},
+		"after the marker was removed": func(t *testing.T, done string) {
+			require.NoError(t, os.Remove(filepath.Join(done, ".owner")))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+			_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+				if p == "staging_teardown" {
+					return errCrash
+				}
+				return nil
+			})
+			require.ErrorIs(t, err, errCrash)
+			dones, err := filepath.Glob(filepath.Join(r.target, ".txe-transition-staging-*.done"))
+			require.NoError(t, err)
+			require.Len(t, dones, 1)
+			damage(t, dones[0])
+			again, err := r.apply(context.Background(), continuity.Identity, nil)
+			require.NoError(t, err)
+			assert.Zero(t, again.Written)
+			left, err := filepath.Glob(filepath.Join(r.target, ".txe-transition-staging*"))
+			require.NoError(t, err)
+			assert.Empty(t, left)
+			assert.Empty(t, r.verify(t).Issues)
+		})
+	}
+}
