@@ -290,6 +290,46 @@ func TestCompareAcceptsArchiving(t *testing.T) {
 	assert.Contains(t, rep.Changed, "registry/jobs/"+jobID)
 }
 
+// A transition never deletes retained data: naming a removed record or file
+// as reconciled does not excuse it.
+func TestCompareNeverReconcilesALoss(t *testing.T) {
+	t.Parallel()
+	l, f := build(t)
+	before := scan(t, l)
+	rec := "jobs/" + f.Jobs["validation"]
+	require.NoError(t, os.Remove(regPath(l, rec)))
+	var runFile string
+	require.NoError(t, filepath.WalkDir(filepath.Join(l.DataDir, "dag-runs"), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && runFile == "" {
+			runFile = p
+		}
+		return err
+	}))
+	require.NoError(t, os.Remove(runFile))
+	rel, err := filepath.Rel(l.DataDir, runFile)
+	require.NoError(t, err)
+	got := compareCodes(continuity.Compare(before, scan(t, l), continuity.CompareOptions{Reconciled: map[string]bool{
+		"registry/" + rec: true, "hub-data/" + filepath.ToSlash(rel): true,
+	}}))
+	assert.Positive(t, got["record_missing"])
+	assert.Positive(t, got["file_missing"])
+}
+
+// A DAG legitimately gets shorter with a new version; only run history and
+// logs are held to growing.
+func TestProgressAcceptsAShorterDAG(t *testing.T) {
+	t.Parallel()
+	l, f := build(t)
+	before := scan(t, l)
+	p := filepath.Join(l.DAGsDir, f.Jobs["health-check"]+".yaml")
+	data, err := os.ReadFile(p) //nolint:gosec // test fixture path
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p, data[:len(data)/2], 0o600))
+	rep := continuity.CompareProgress(before, scan(t, l))
+	assert.Empty(t, rep.Issues)
+	assert.Contains(t, rep.Changed, "hub-dags/"+f.Jobs["health-check"]+".yaml")
+}
+
 // Permission bits are compared only between scans that both had them.
 func TestCompareIgnoresUnknownModes(t *testing.T) {
 	t.Parallel()

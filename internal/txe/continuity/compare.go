@@ -26,8 +26,10 @@ type Report struct {
 // CompareOptions configure Compare.
 type CompareOptions struct {
 	// Reconciled are the records ("<store>/<id>") and files ("<root>/<path>")
-	// that may differ between the two inventories, because a recorded step
-	// changed them (a transition's journal). Nothing else may.
+	// that may be changed or added between the two inventories, because a
+	// recorded step changed them (a transition's journal). Nothing else
+	// may. A missing record or file is never reconciled: a transition does
+	// not delete retained data.
 	Reconciled map[string]bool
 }
 
@@ -100,6 +102,7 @@ func Compare(before, after *Inventory, opts CompareOptions) *Report {
 // proof for mutable state; Compare at the freeze point is.
 func CompareProgress(before, after *Inventory) *Report {
 	rep, add := newReport(before, after)
+	appendOnly := appendOnlyFiles(before)
 	later := map[string]*Record{}
 	laterRegistry := map[string]*Record{}
 	for i := range after.Records {
@@ -155,8 +158,8 @@ func CompareProgress(before, after *Inventory) *Report {
 		switch {
 		case b.Policy == PolicyImmutable:
 			add("immutable_changed", "file", key, fmt.Sprintf("an immutable file changed from %s mode %o to %s mode %o", b.SHA256, b.Mode, a.SHA256, a.Mode))
-		case a.Size < b.Size:
-			// Run status and logs only grow; a shorter file lost content.
+		case a.Size < b.Size && appendOnly[b.Root+"\x00"+b.Path]:
+			// Run status and logs only grow; a shorter one lost content.
 			add("file_truncated", "file", key, fmt.Sprintf("the retained file shrank from %d to %d bytes", b.Size, a.Size))
 		}
 	}, func(File, string) {})
@@ -356,4 +359,26 @@ func compareIntents(b, a *Record, key string, add func(code, class, id, detail s
 			add("live_entry_lost", ClassJob, key, "the job's "+r.Rel+" was dropped while its action "+r.ID+" is still "+st)
 		}
 	}
+}
+
+// appendOnlyFiles are the files that only ever grow: native run history in
+// a hub data directory's dag-runs and everything in a log root. A DAG,
+// view or workspace file may legitimately get shorter.
+func appendOnlyFiles(inv *Inventory) map[string]bool {
+	areas := map[string]string{}
+	for _, r := range inv.Roots {
+		areas[r.Label] = r.Area
+	}
+	out := map[string]bool{}
+	for _, f := range inv.Files {
+		switch areas[f.Root] {
+		case AreaLogs:
+			out[f.Root+"\x00"+f.Path] = true
+		case AreaHubData:
+			if strings.HasPrefix(f.Path, "dag-runs/") {
+				out[f.Root+"\x00"+f.Path] = true
+			}
+		}
+	}
+	return out
 }
