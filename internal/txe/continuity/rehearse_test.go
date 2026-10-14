@@ -459,6 +459,10 @@ func TestImportKeepsPermissions(t *testing.T) {
 	info, err := os.Stat(filepath.Join(target, "workspaces", "tool.sh"))
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+	// Not left in the transition's staging area either.
+	left, err := filepath.Glob(filepath.Join(target, ".txe-transition-staging*"))
+	require.NoError(t, err)
+	assert.Empty(t, left)
 	rs := roots(l)
 	rs[0].Path = target
 	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})

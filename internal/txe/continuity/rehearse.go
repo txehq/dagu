@@ -893,6 +893,12 @@ func stage(root *os.Root, staging string, data []byte, perm fs.FileMode) (string
 		_ = f.Close()
 		return "", err
 	}
+	// The process umask may have narrowed the mode at creation; it is set
+	// on the open file before the sync, so the sync covers it.
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return "", err
+	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return "", err
@@ -900,8 +906,7 @@ func stage(root *os.Root, staging string, data []byte, perm fs.FileMode) (string
 	if err := f.Close(); err != nil {
 		return "", err
 	}
-	// The process umask may have narrowed the mode at creation.
-	return name, root.Chmod(name, perm)
+	return name, nil
 }
 
 // install moves a staged file to rel: replacing what is there in place,
