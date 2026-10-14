@@ -18,13 +18,16 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 // WithTxeRegistry enables the /txe endpoints backed by the TXE job registry.
@@ -148,6 +151,9 @@ func txeActor(ctx context.Context, in *api.TxeActor) (registry.Actor, error) {
 // txeWrite prepares a write: it checks the caller may write and resolves the
 // registry and actor.
 func (a *API) txeWrite(ctx context.Context, in *api.TxeActor) (*registry.Store, registry.Actor, error) {
+	if a.txeOwnerOnly(ctx) {
+		return a.txeOwnerWrite(ctx, in)
+	}
 	if err := a.requireDeveloperOrAbove(ctx); err != nil {
 		return nil, registry.Actor{}, err
 	}
@@ -159,12 +165,53 @@ func (a *API) txeWrite(ctx context.Context, in *api.TxeActor) (*registry.Store, 
 	return s, actor, err
 }
 
+// txeOwnerWrite prepares a write by a caller held to its owner: it needs an
+// owner, not a role, and the owner decision is made against the record the
+// write names. A token is recorded as an agent and never as a person.
+func (a *API) txeOwnerWrite(ctx context.Context, in *api.TxeActor) (*registry.Store, registry.Actor, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, registry.Actor{}, err
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return nil, registry.Actor{}, err
+	}
+	if c.scope.Kind() == authz.ScopeUnbound {
+		return nil, registry.Actor{}, errTxeUnbound
+	}
+	actor, err := txeActor(ctx, in)
+	if err != nil {
+		return nil, registry.Actor{}, err
+	}
+	if c.caller.Kind == txeauth.KindToken {
+		actor = txeTokenActor(c.caller, c.scope, actor)
+	}
+	return s, actor, nil
+}
+
+// txeRequireDAGWrite is the server's switch for DAG changes. For a caller
+// held to its owner it is only the switch: the owner decision replaces the
+// role check.
+func (a *API) txeRequireDAGWrite(ctx context.Context) error {
+	if !a.txeOwnerOnly(ctx) {
+		return a.requireDAGWrite(ctx)
+	}
+	if !a.config.Server.Permissions[config.PermissionWriteDAGs] {
+		return errPermissionDenied
+	}
+	if a.dagWritesDisabled {
+		return errDAGWritesDisabled
+	}
+	return nil
+}
+
 // txeRequireSpecWrite applies the native DAG write authorization to a job's
 // DAG: the caller must be able to write DAGs in the workspace the new spec
 // names and, when the DAG already exists, in the workspace it is in now. A
 // spec that does not parse is left to the registry to refuse.
 func (a *API) txeRequireSpecWrite(ctx context.Context, jobID, spec string) error {
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.txeRequireDAGWrite(ctx); err != nil {
 		return err
 	}
 	return a.txeCheckWorkspaces(ctx, jobID, spec, false, a.requireDAGWriteForWorkspace)
@@ -177,6 +224,19 @@ func (a *API) txeRequireSpecWrite(ctx context.Context, jobID, spec string) error
 // is seen. It does not depend on DAG writes being enabled, so claims and
 // settlements keep working under a read-only Git sync.
 func (a *API) txeRequireJobWrite(ctx context.Context, tx *registry.JobTx) error {
+	return a.txeRequireJobChange(ctx, tx, authz.PermissionAuthor, txeNeed{})
+}
+
+// txeRequireJobChange checks, inside the job transaction, that the caller
+// may exercise permission on the job's owner's data, and, for a caller the
+// hub's roles still govern, that it may write the job's workspaces.
+func (a *API) txeRequireJobChange(ctx context.Context, tx *registry.JobTx, permission authz.Permission, need txeNeed) error {
+	if err := a.txeAuthorizeJob(ctx, tx.Job.JobID, permission, need); err != nil {
+		return err
+	}
+	if a.txeOwnerOnly(ctx) {
+		return nil
+	}
 	v, err := tx.CurrentVersion()
 	if err != nil {
 		return err
@@ -214,7 +274,9 @@ func (a *API) txeRequireWorkspaceWrite(ctx context.Context, workspaceName string
 // workspace of the job's saved DAG, if one exists. With strict, a spec that
 // does not load is an error rather than left to the registry.
 func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict bool, check func(context.Context, string) error) error {
-	if a.dagRepository == nil {
+	if a.dagRepository == nil || a.txeOwnerOnly(ctx) {
+		// A caller held to its owner is authorized by the owner decision;
+		// workspaces do not apply to it.
 		return nil
 	}
 	dag, err := a.dagRepository.LoadSpec(ctx, []byte(spec), jobID, persis.DAGLoadOptions{AllowBuildErrors: true})
@@ -242,7 +304,10 @@ func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict
 // txeJobVisible refuses, as not found, a job the caller cannot see: the
 // workspaces of its current version and of its saved DAG must be visible.
 func (a *API) txeJobVisible(ctx context.Context, s *registry.Store, job *registry.Job) error {
-	if a.authService == nil {
+	if err := a.txeAuthorizeJob(ctx, job.JobID, authz.PermissionView, txeNeed{}); err != nil {
+		return err
+	}
+	if a.authService == nil || a.txeOwnerOnly(ctx) {
 		return nil
 	}
 	v, err := s.GetVersion(ctx, job.JobID, job.Version)
@@ -329,13 +394,13 @@ func txeLimit(limit *api.TxeLimit) int {
 }
 
 // txeTx runs fn in a job transaction and returns the committed job.
-func (a *API) txeTx(ctx context.Context, jobID string, in *api.TxeActor, fn func(tx *registry.JobTx) error) (api.TxeJob, error) {
+func (a *API) txeTx(ctx context.Context, jobID string, in *api.TxeActor, permission authz.Permission, need txeNeed, fn func(tx *registry.JobTx) error) (api.TxeJob, error) {
 	s, actor, err := a.txeWrite(ctx, in)
 	if err != nil {
 		return api.TxeJob{}, err
 	}
 	job, err := s.WithJobTx(ctx, jobID, actor, func(tx *registry.JobTx) error {
-		if err := a.txeRequireJobWrite(ctx, tx); err != nil {
+		if err := a.txeRequireJobChange(ctx, tx, permission, need); err != nil {
 			return err
 		}
 		return fn(tx)
@@ -355,6 +420,19 @@ func (a *API) GetTxeInstallation(ctx context.Context, _ api.GetTxeInstallationRe
 	if err != nil {
 		return nil, txeError(err)
 	}
+	// Each caller sees its own owner; only the platform administrator sees
+	// every owner.
+	owners := inst.Owners[:0:0]
+	for _, o := range inst.Owners {
+		ok, err := a.txeOwnerVisible(ctx, o.OwnerID)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			owners = append(owners, o)
+		}
+	}
+	inst.Owners = owners
 	out, err := txeConvert[api.TxeInstallation](inst)
 	if out.Owners == nil {
 		out.Owners = []api.TxeOwner{}
@@ -371,6 +449,11 @@ func (a *API) CreateTxeOwner(ctx context.Context, req api.CreateTxeOwnerRequestO
 	if err != nil {
 		return nil, err
 	}
+	// An owner is made only by the platform administrator, before a person
+	// is bound to it. No sign-in or token ever makes one.
+	if err := a.txeAuthorizePlatform(ctx, authz.PermissionAdminister); err != nil {
+		return nil, err
+	}
 	o, err := s.CreateOwner(ctx, registry.Owner{OwnerID: body.OwnerId, DisplayName: body.DisplayName, Provenance: valueOf(body.Provenance)}, actor)
 	if err != nil {
 		return nil, txeError(err)
@@ -383,6 +466,12 @@ func (a *API) GetTxeOwner(ctx context.Context, req api.GetTxeOwnerRequestObject)
 	s, err := a.txeStore()
 	if err != nil {
 		return nil, err
+	}
+	switch ok, err := a.txeOwnerVisible(ctx, req.OwnerId); {
+	case err != nil:
+		return nil, err
+	case !ok:
+		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "owner " + req.OwnerId + " not found"})
 	}
 	o, err := s.GetOwner(ctx, req.OwnerId)
 	if err != nil {
@@ -401,6 +490,9 @@ func (a *API) EnsureTxeProject(ctx context.Context, req api.EnsureTxeProjectRequ
 	if err != nil {
 		return nil, err
 	}
+	if err := a.txeAuthorizeOwnData(ctx, body.OwnerId, authz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	p, err := s.EnsureProject(ctx, body.OwnerId, body.Key, valueOf(body.Name), actor)
 	if err != nil {
 		return nil, txeError(err)
@@ -413,6 +505,12 @@ func (a *API) GetTxeProject(ctx context.Context, req api.GetTxeProjectRequestObj
 	s, err := a.txeStore()
 	if err != nil {
 		return nil, err
+	}
+	switch ok, err := a.txeAuthorizeRecord(ctx, func(st *authz.Store) (authz.Resource, error) { return st.Project(ctx, req.ProjectId) }); {
+	case err != nil:
+		return nil, err
+	case !ok:
+		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "project " + req.ProjectId + " not found"})
 	}
 	p, err := s.GetProject(ctx, req.ProjectId)
 	if err != nil {
@@ -431,9 +529,12 @@ func (a *API) CreateTxeMachine(ctx context.Context, req api.CreateTxeMachineRequ
 	if err != nil {
 		return nil, err
 	}
+	if err := a.txeAuthorizeOwnData(ctx, body.OwnerId, authz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	m, err := s.CreateMachine(ctx, registry.Machine{MachineID: body.MachineId, OwnerID: body.OwnerId, DisplayName: body.DisplayName}, actor)
 	if err != nil {
-		return nil, txeError(err)
+		return nil, txeError(a.txeVisibleMachineRefusal(ctx, err))
 	}
 	out, err := txeConvert[api.TxeMachine](m)
 	return api.CreateTxeMachine201JSONResponse(out), err
@@ -443,6 +544,12 @@ func (a *API) GetTxeMachine(ctx context.Context, req api.GetTxeMachineRequestObj
 	s, err := a.txeStore()
 	if err != nil {
 		return nil, err
+	}
+	switch ok, err := a.txeAuthorizeRecord(ctx, func(st *authz.Store) (authz.Resource, error) { return st.Machine(ctx, req.MachineId) }); {
+	case err != nil:
+		return nil, err
+	case !ok:
+		return nil, txeError(&registry.Error{Code: registry.CodeNotFound, Message: "machine " + req.MachineId + " not found"})
 	}
 	m, err := s.GetMachine(ctx, req.MachineId)
 	if err != nil {
@@ -468,8 +575,14 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 	}
 	jobs := make([]*registry.Job, 0, len(all))
 	for _, job := range all {
-		if a.txeJobVisible(ctx, s, job) == nil {
+		switch err := a.txeJobVisible(ctx, s, job); {
+		case err == nil:
 			jobs = append(jobs, a.txePublicJob(ctx, s, job))
+		case errors.Is(err, errTxeAuthzUnavailable):
+			// An owner store that cannot be read is an outage, not a list
+			// with jobs missing. Any other refusal hides the job, as
+			// before.
+			return nil, err
 		}
 	}
 	out, err := txeConvert[[]api.TxeJob](jobs)
@@ -491,6 +604,11 @@ func (a *API) RegisterTxeJob(ctx context.Context, req api.RegisterTxeJobRequestO
 	v, err := txeConvert[registry.JobVersion](body.Version)
 	if err != nil {
 		return nil, ErrInvalidRequestBody
+	}
+	// A job is registered only under the caller's own owner; the registry
+	// then refuses a project or machine of any other.
+	if err := a.txeAuthorizeOwnData(ctx, body.OwnerId, authz.PermissionAuthor); err != nil {
+		return nil, err
 	}
 	if err := a.txeRequireSpecWrite(ctx, body.JobId, v.DAG.Spec); err != nil {
 		return nil, err
@@ -599,11 +717,14 @@ func (a *API) MarkTxeJobReady(ctx context.Context, req api.MarkTxeJobReadyReques
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWrite(ctx); err != nil {
+	if err := a.txeRequireDAGWrite(ctx); err != nil {
 		return nil, err
 	}
 	s, actor, err := a.txeWrite(ctx, body.Actor)
 	if err != nil {
+		return nil, err
+	}
+	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionAuthor, txeNeed{}); err != nil {
 		return nil, err
 	}
 	pkg, err := txeConvert[registry.PackageEvidence](body.Package)
@@ -653,6 +774,9 @@ func (a *API) UpdateTxeJobVersion(ctx context.Context, req api.UpdateTxeJobVersi
 	v, err := txeConvert[registry.JobVersion](body.Version)
 	if err != nil {
 		return nil, ErrInvalidRequestBody
+	}
+	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionAuthor, txeNeed{}); err != nil {
+		return nil, err
 	}
 	if err := a.txeRequireSpecWrite(ctx, req.JobId, v.DAG.Spec); err != nil {
 		return nil, err
@@ -764,7 +888,7 @@ func (a *API) ObserveTxeJob(ctx context.Context, req api.ObserveTxeJobRequestObj
 	}
 	o.ActionID, o.Attempt, o.ClaimID, o.Fence = valueOf(body.ActionId), valueOf(body.Attempt), valueOf(body.ClaimId), valueOf(body.Fence)
 	o.JobVersion = valueOf(body.JobVersion)
-	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.Observe(o) })
+	job, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeNeed{}, func(tx *registry.JobTx) error { return tx.Observe(o) })
 	return api.ObserveTxeJob200JSONResponse(job), err
 }
 
@@ -778,7 +902,7 @@ func (a *API) AcquireTxeClaim(ctx context.Context, req api.AcquireTxeClaimReques
 		return nil, ErrInvalidRequestBody
 	}
 	var claim *registry.Claim
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeClaimNeed(registry.ClaimKind(body.Kind)), func(tx *registry.JobTx) error {
 		var err error
 		claim, err = tx.AcquireClaim(registry.ClaimKind(body.Kind), reviewer, time.Duration(body.TtlSec)*time.Second)
 		return err
@@ -794,7 +918,15 @@ func (a *API) ReleaseTxeClaim(ctx context.Context, req api.ReleaseTxeClaimReques
 	if err != nil {
 		return nil, err
 	}
-	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error { return tx.ReleaseClaim(req.ClaimId, body.Fence) })
+	job, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeMachineNeed, func(tx *registry.JobTx) error {
+		// A review claim is released only by the reviewer it belongs to.
+		if c := tx.Job.Claim; c != nil && c.ClaimID == req.ClaimId && c.Kind == registry.ClaimReview {
+			if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionExecute, txeReviewerNeed); err != nil {
+				return err
+			}
+		}
+		return tx.ReleaseClaim(req.ClaimId, body.Fence)
+	})
 	return api.ReleaseTxeClaim200JSONResponse(job), err
 }
 
@@ -808,7 +940,7 @@ func (a *API) AdvanceTxeCheckpoint(ctx context.Context, req api.AdvanceTxeCheckp
 		return nil, ErrInvalidRequestBody
 	}
 	var next *registry.Checkpoint
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeReviewerNeed, func(tx *registry.JobTx) error {
 		var err error
 		next, err = tx.AdvanceCheckpoint(body.ClaimId, body.Fence, body.ExpectedVersion, cp)
 		return err
@@ -824,7 +956,7 @@ func (a *API) DeferTxeReview(ctx context.Context, req api.DeferTxeReviewRequestO
 	if err != nil {
 		return nil, err
 	}
-	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	job, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeReviewerNeed, func(tx *registry.JobTx) error {
 		return tx.DeferReview(body.ClaimId, body.Fence, body.NextReviewAt)
 	})
 	return api.DeferTxeReview200JSONResponse(job), err
@@ -874,7 +1006,7 @@ func (a *API) RecordTxeReview(ctx context.Context, req api.RecordTxeReviewReques
 	if err != nil {
 		return nil, ErrInvalidRequestBody
 	}
-	job, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	job, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeReviewerNeed, func(tx *registry.JobTx) error {
 		return tx.RecordReview(body.ClaimId, body.Fence, review)
 	})
 	return api.RecordTxeReview200JSONResponse(job), err
@@ -918,7 +1050,7 @@ func (a *API) CreateTxeProposal(ctx context.Context, req api.CreateTxeProposalRe
 		return nil, ErrInvalidRequestBody
 	}
 	var p *registry.Proposal
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeReviewerNeed, func(tx *registry.JobTx) error {
 		var err error
 		p, err = tx.PutProposal(body.ClaimId, body.Fence, in)
 		return err
@@ -995,7 +1127,7 @@ func (a *API) AuthorizeTxeEffect(ctx context.Context, req api.AuthorizeTxeEffect
 	}
 	var g *registry.Grant
 	staleRetry := false
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeMachineNeed, func(tx *registry.JobTx) error {
 		var err error
 		g, err = tx.Authorize(effect)
 		// Reached only once the caller may write the job: an approved
@@ -1007,7 +1139,7 @@ func (a *API) AuthorizeTxeEffect(ctx context.Context, req api.AuthorizeTxeEffect
 			// A decided retry whose run moved on can never be authorized: end
 			// such retries (the caller's write permission is checked again),
 			// so they leave the decision queue, and return the refusal.
-			if _, eerr := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+			if _, eerr := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeMachineNeed, func(tx *registry.JobTx) error {
 				_, err := tx.EndMovedOnRetries()
 				return err
 			}); eerr != nil {
@@ -1056,7 +1188,7 @@ func (a *API) SettleTxeAction(ctx context.Context, req api.SettleTxeActionReques
 	settlement := registry.Settlement{ActionID: req.ActionId, GrantID: body.GrantId, ClaimID: body.ClaimId, Fence: body.Fence,
 		State: registry.ActionState(body.State), Receipt: valueOf(body.Receipt), Outcome: body.Outcome}
 	var action *registry.Action
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeMachineNeed, func(tx *registry.JobTx) error {
 		var err error
 		action, err = tx.SettleAction(settlement)
 		return err
@@ -1200,7 +1332,7 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	}
 	// The event affects, and reports, only jobs the caller may write.
 	writable := func(ctx context.Context, job *registry.Job) bool {
-		return a.txeCheckVersion(ctx, s, job, job.Version, a.txeRequireWorkspaceWrite) == nil
+		return a.txeResourceEventApplies(ctx, s, job)
 	}
 	recorded, err := s.RecordResourceEvent(ctx, ev, actor, writable)
 	if err != nil {
@@ -1256,8 +1388,7 @@ func (a *API) txeShowResourceEvent(ctx context.Context, s *registry.Store, ev *r
 		}
 	}
 	ev.Failures = failures
-	user, ok := auth.UserFromContext(ctx)
-	return a.authService == nil || len(visible)+len(pending) > 0 || (ok && user.Username == ev.Reporter.ID)
+	return a.authService == nil || len(visible)+len(pending) > 0 || a.txeIsStandingReporter(ctx, ev)
 }
 
 func (a *API) ListTxeResourceEvents(ctx context.Context, req api.ListTxeResourceEventsRequestObject) (api.ListTxeResourceEventsResponseObject, error) {
@@ -1343,7 +1474,7 @@ func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxePro
 		return nil, err
 	}
 	var closure *registry.Closure
-	if _, err := a.txeTx(ctx, req.JobId, body.Actor, func(tx *registry.JobTx) error {
+	if _, err := a.txeTx(ctx, req.JobId, body.Actor, authz.PermissionExecute, txeMachineNeed, func(tx *registry.JobTx) error {
 		var err error
 		closure, err = tx.RecordClosure(ctx, s, req.ProposalId, registry.ClosureOutcome(body.Outcome), valueOf(body.Detail))
 		return err
@@ -1353,6 +1484,10 @@ func (a *API) RecordTxeProposalClosure(ctx context.Context, req api.RecordTxePro
 	out, err := txeConvert[api.TxeClosure](closure)
 	return api.RecordTxeProposalClosure200JSONResponse(out), err
 }
+
+// txeBeforeArtifactTx, when set by a test, runs between the first owner
+// decision on an artifact report and the job transaction that decides again.
+var txeBeforeArtifactTx func()
 
 func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArtifactsRequestObject) (api.RecordTxeRunArtifactsResponseObject, error) {
 	body, err := txeBody(req.Body)
@@ -1373,6 +1508,14 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	if err != nil {
 		return nil, err
 	}
+	// Publishing is running the job: the job's owner decides it, and the
+	// run's workspace below cannot stand in for that decision.
+	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionExecute, txeMachineNeed); err != nil {
+		return nil, err
+	}
+	if txeBeforeArtifactTx != nil {
+		txeBeforeArtifactTx()
+	}
 	var m *registry.ArtifactManifest
 	// A run publishes in the workspace it was saved in, which may not be the
 	// job's current one (the job may have moved while it ran): publishing
@@ -1380,7 +1523,14 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 	// write the job is refused with the job's own denial whenever the run
 	// does not authorize it, so nothing tells them which runs exist.
 	if _, err := s.WithJobTx(ctx, req.JobId, actor, func(tx *registry.JobTx) error {
-		jobErr := a.txeRequireJobWrite(ctx, tx)
+		jobErr := a.txeRequireJobChange(ctx, tx, authz.PermissionExecute, txeMachineNeed)
+		if jobErr != nil && a.txeOwnerOnly(ctx) {
+			// A caller held to its owner is authorized by the owner alone,
+			// decided again in this transaction; no run's workspace stands
+			// in for a refusal, a revocation since the first check or a
+			// store that cannot be read.
+			return jobErr
+		}
 		latest, status, err := a.txeLatestRunAttempt(ctx, req.JobId, req.RunId)
 		if err != nil {
 			if jobErr != nil {
@@ -1388,7 +1538,7 @@ func (a *API) RecordTxeRunArtifacts(ctx context.Context, req api.RecordTxeRunArt
 			}
 			return err
 		}
-		if err := a.txeRequireWorkspaceWrite(ctx, statusWorkspaceName(status)); err != nil {
+		if err := a.txeRequireRunWorkspaceWrite(ctx, statusWorkspaceName(status)); err != nil {
 			if jobErr != nil {
 				return jobErr
 			}
@@ -1536,7 +1686,7 @@ func (a *API) txeArtifactExecutionVisible(ctx context.Context, s *registry.Store
 	if saved == nil {
 		return false, nil
 	}
-	if err := a.requireDAGRunStatusVisible(ctx, saved); err != nil {
+	if err := a.txeRunStatusVisible(ctx, saved); err != nil {
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
 			return false, nil
@@ -1662,7 +1812,7 @@ func (a *API) txeRetainedVisible(ctx context.Context, run ir.DAGRunRef, executio
 	if err := json.Unmarshal(data, &status); err != nil {
 		return false, nil
 	}
-	if err := a.requireDAGRunStatusVisible(ctx, &status); err != nil {
+	if err := a.txeRunStatusVisible(ctx, &status); err != nil {
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
 			return false, nil
@@ -1729,7 +1879,7 @@ func (a *API) ListTxeRunAbandonments(ctx context.Context, req api.ListTxeRunAban
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
+	if err := a.txeRunStatusVisible(ctx, status); err != nil {
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
 			return nil, notFound

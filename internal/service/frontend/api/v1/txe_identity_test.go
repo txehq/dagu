@@ -112,11 +112,18 @@ func TestTxeIdentityOverHTTP(t *testing.T) {
 	require.Equal(t, api.TxeIdentityStateUnbound, got.State)
 	require.Empty(t, got.Owners)
 
-	// Every route that is not owner-aware yet refuses it, the native ones
-	// included, so it inherits no global access.
-	for _, path := range []string{"/api/v1/txe/jobs", "/api/v1/txe/installation", "/api/v1/dags", "/api/v1/dag-runs", "/api/v1/users"} {
+	// Every route outside /txe refuses it, the native ones included, so it
+	// inherits no global access.
+	for _, path := range []string{"/api/v1/dags", "/api/v1/dag-runs", "/api/v1/users", "/api/v1/queues", "/api/v1/workers"} {
 		server.Client().Get(path).WithBearerToken(tok).ExpectStatus(http.StatusForbidden).Send(t)
 	}
+	// On /txe it acts for nobody: it sees nothing and may change nothing.
+	var jobs api.ListTxeJobs200JSONResponse
+	server.Client().Get("/api/v1/txe/jobs").WithBearerToken(tok).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &jobs)
+	require.Empty(t, jobs.Jobs)
+	var inst api.TxeInstallation
+	server.Client().Get("/api/v1/txe/installation").WithBearerToken(tok).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &inst)
+	require.Empty(t, inst.Owners)
 
 	// No grace: a token past its expiry, or minted to live longer than five
 	// minutes, is refused as a token, not as a missing credential.

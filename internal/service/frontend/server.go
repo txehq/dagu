@@ -1313,6 +1313,14 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 	termHandler := terminal.NewHandler(srv.authService, srv.auditService, auditChecker, srv.terminalManager, shell)
 	termHandler.SetSessionWatch(srv.sessionWatch())
 	wsPath := path.Join(apiV1BasePath, "terminal/ws")
+	if srv.builtinOIDCCfg != nil {
+		// A person signed in through the identity provider gets no terminal,
+		// whatever role its account was given. The handler authenticates by
+		// itself, so the request is authenticated once more in front of it.
+		authOpts := srv.buildStreamAuthOptions("restricted")
+		r.With(terminalQueryTokenOnly, auth.Middleware(authOpts), srv.apiV1.TxePersonRefused()).Get(wsPath, termHandler.ServeHTTP)
+		return
+	}
 	r.Get(wsPath, termHandler.ServeHTTP)
 	logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
 }
@@ -1353,6 +1361,7 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(auth.QueryTokenMiddleware())
 		r.Use(auth.ClientIPMiddleware())
 		r.Use(auth.Middleware(authOpts))
+		r.Use(srv.apiV1.TxePersonRefused())
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 
 		// The stream stays open, so it is closed when its OIDC session ends.
@@ -1443,6 +1452,7 @@ func (srv *Server) setupMCPRoute(ctx context.Context, r *chi.Mux) {
 		r.Use(auth.QueryTokenMiddleware())
 		r.Use(auth.ClientIPMiddleware())
 		r.Use(auth.Middleware(authOpts))
+		r.Use(srv.apiV1.TxePersonRefused())
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 		// An MCP request may stay open as a stream, so it is closed when its
 		// OIDC session ends.
@@ -1793,4 +1803,19 @@ func (srv *Server) setupGracefulShutdown(ctx context.Context) {
 // authorization or provider tokens.
 func txeOwnersConfigured(c config.TXEConfig) bool {
 	return (c.Authz.Mode != "" && c.Authz.Mode != config.TXEAuthzModeOff) || c.Authn.Enabled()
+}
+
+// terminalQueryTokenOnly makes the terminal's own credential, its "token"
+// query parameter, the one authenticated in front of it. Any Authorization
+// header is dropped, so the identity checked here is the identity the
+// terminal handler then uses.
+func terminalQueryTokenOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.Header.Del("Authorization")
+		if token := r.URL.Query().Get("token"); token != "" {
+			r2.Header.Set("Authorization", "Bearer "+token)
+		}
+		next.ServeHTTP(w, r2)
+	})
 }

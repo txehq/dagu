@@ -18,6 +18,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/decision"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
@@ -42,6 +43,11 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 	// A job the caller cannot see is not found, not forbidden, so a decision
 	// attempt does not reveal that it exists.
 	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
+		return nil, err
+	}
+	// Deciding is the job owner's, before anything about the proposal or
+	// its task is looked at.
+	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionApprove, txeNeed{}); err != nil {
 		return nil, err
 	}
 	svc := a.txeDecisionService(store)
@@ -115,6 +121,9 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
 		return nil, err
 	}
+	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionApprove, txeNeed{}); err != nil {
+		return nil, err
+	}
 	// The person decides on the execution they reviewed, so the request must
 	// name it completely: a request without it would bind whatever execution
 	// is latest, one they may never have seen. An empty queued_at is a value
@@ -146,7 +155,7 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil && !found {
 		return nil, txeError(err)
 	}
-	if _, verr := a.authorizeHumanTaskMutation(ctx, req.JobId, req.RunId); verr != nil {
+	if _, verr := a.txeJobRunStatus(ctx, req.JobId, req.RunId); verr != nil {
 		return nil, verr
 	}
 	if found {
@@ -223,7 +232,7 @@ type txeRun struct {
 // It authorizes only reading the run: the caller's right to retry it was
 // checked before, by the replay lookup, and is checked again in the commit.
 func (a *API) txeRunFacts(ctx context.Context, jobID, runID string) (txeRun, error) {
-	status, err := a.authorizeHumanTaskMutation(ctx, jobID, runID)
+	status, err := a.txeJobRunStatus(ctx, jobID, runID)
 	if err != nil {
 		return txeRun{}, err
 	}
@@ -369,6 +378,18 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 			if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 				return err
 			}
+			// A decision is the job owner's to make, and only a person makes
+			// one; it is decided on the job as it is in this transaction.
+			if err := a.txeAuthorizeJob(ctx, tx.Job.JobID, authz.PermissionApprove, txeNeed{}); err != nil {
+				return err
+			}
+			if a.txeOwnerOnly(ctx) {
+				// For a caller held to its owner, approve covers every
+				// verdict, pausing and retiring included: a person the owner
+				// shares approve with may decide them without authoring the
+				// job. Workspaces do not apply to such a caller.
+				return nil
+			}
 			switch verdict {
 			case registry.VerdictPause, registry.VerdictRetire:
 				return a.txeRequireJobWrite(ctx, tx)
@@ -384,6 +405,12 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 		// The same checks as completing the task through the native
 		// human-task endpoint.
 		AuthorizeTask: func(ctx context.Context, dagName, dagRunID string) error {
+			if a.txeOwnerOnly(ctx) {
+				// The decision service has checked that the task belongs to
+				// the job, and the job's owner has decided approve; the run
+				// need only exist.
+				return a.txeMachineDAGRunExists(ctx, dagName, dagRunID)
+			}
 			status, err := a.authorizeHumanTaskMutation(ctx, dagName, dagRunID)
 			if err != nil {
 				return err
