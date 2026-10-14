@@ -20,15 +20,22 @@ import (
 
 func runTXEContinuity(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	out, _, err := runTXEContinuityStreams(t, args...)
+	return out, err
+}
+
+func runTXEContinuityStreams(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
 	keepDaguEnvironment(t)
 	t.Setenv("TXE_DAGU_HOME", t.TempDir())
 	root := &cobra.Command{Use: "dagu", SilenceErrors: true, SilenceUsage: true}
 	root.AddCommand(TXE())
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	root.SetOut(&out)
+	root.SetErr(&errOut)
 	root.SetArgs(append([]string{"txe", "continuity"}, args...))
 	err := root.Execute()
-	return out.String(), err
+	return out.String(), errOut.String(), err
 }
 
 // The freeze workflow from the command line: inventory, validate, take a
@@ -71,7 +78,21 @@ func TestTXEContinuityCommands(t *testing.T) {
 	var rep map[string]any
 	require.NoError(t, json.Unmarshal([]byte(out), &rep))
 
+	// The progress report names what was added and changed.
+	require.NoError(t, os.WriteFile(filepath.Join(l.DataDir, "dag-runs", "new-run.jsonl"), []byte("{}\n"), 0o600))
+	later := inventory("later.json")
+	out, err = runTXEContinuity(t, "compare", "--progress", first, later)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "added   hub-data/dag-runs/new-run.jsonl")
+
 	require.NoError(t, os.Remove(filepath.Join(registry.Dir(l.DataDir), "jobs", f.Jobs["validation"]+".json")))
+	// Written to standard output, the inventory stays decodable and its
+	// findings go to standard error.
+	stdout, stderr, err := runTXEContinuityStreams(t, append([]string{"inventory"}, scans...)...)
+	require.Error(t, err)
+	var inv map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &inv))
+	assert.Contains(t, stderr, "dangling_ref")
 	third := inventoryExpectingIssues(t, dir, scans)
 	out, err = runTXEContinuity(t, "compare", first, third)
 	require.Error(t, err)

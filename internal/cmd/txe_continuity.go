@@ -165,6 +165,13 @@ func runTXEContinuityInventory(ctx *Context, _ []string) error {
 	}
 	issues := continuity.Validate(inv, txeContinuityPolicy(ctx))
 	if out == "" {
+		// Standard output holds the inventory; the findings go to standard
+		// error.
+		p := &txePrinter{w: ctx.Command.ErrOrStderr()}
+		printTXEContinuityIssues(p, issues)
+		if p.err != nil {
+			return p.err
+		}
 		return txeContinuityFail(issues)
 	}
 	if err := txeOutput(ctx, map[string]any{"digest": inv.Digest, "counts": inv.Counts, "excluded": inv.Excluded, "issues": issues, "out": out},
@@ -225,6 +232,12 @@ func runTXEContinuityCompare(ctx *Context, args []string) error {
 		}
 		p.f("%s of %s and %s.\n", kind, rep.Before, rep.After)
 		p.f("%d added, %d changed.\n", len(rep.Added), len(rep.Changed))
+		for _, k := range rep.Added {
+			p.f("added   %s\n", k)
+		}
+		for _, k := range rep.Changed {
+			p.f("changed %s\n", k)
+		}
 		printTXEContinuityIssues(p, rep.Issues)
 	}); err != nil {
 		return err
