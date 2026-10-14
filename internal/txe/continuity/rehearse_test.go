@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,7 +172,7 @@ func TestInterruptedTransitionResumes(t *testing.T) {
 		require.Positive(t, steps)
 		stride := max(1, steps/7)
 		for step := 0; step < steps; step += stride {
-			for _, point := range []string{"before_write", "after_write"} {
+			for _, point := range []string{"before_write", "staged", "after_write"} {
 				t.Run(fmt.Sprintf("%s/%d/%s", mode, step, point), func(t *testing.T) {
 					t.Parallel()
 					r := newRehearsal(t, mode, lineage)
@@ -313,4 +315,166 @@ func TestImportLeavesTheQueue(t *testing.T) {
 	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
 	require.NoError(t, err)
 	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal)).Issues)
+}
+
+// A crash in the middle of appending to the journal leaves a torn line, or
+// a complete entry without its newline; a resumed run repairs it before it
+// appends, and the journal reads cleanly afterwards.
+func TestTornJournalIsRepaired(t *testing.T) {
+	for name, tear := range map[string]func([]byte) []byte{
+		"incomplete line": func(b []byte) []byte { return append(b, []byte(`{"seq":`)...) },
+		"missing newline": func(b []byte) []byte { return b[:len(b)-1] },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := newRehearsal(t, continuity.ModeInPlace, lineage)
+			_, err := r.apply(context.Background(), lineage, func(i int, p string) error {
+				if i == 1 && p == "before_write" {
+					return errCrash
+				}
+				return nil
+			})
+			require.ErrorIs(t, err, errCrash)
+			data, err := os.ReadFile(r.journal)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(r.journal, tear(data), 0o600))
+			_, err = r.apply(context.Background(), lineage, nil)
+			require.NoError(t, err)
+			j := mustJournal(t, r.journal)
+			assert.NotEmpty(t, j)
+			again, err := r.apply(context.Background(), lineage, nil)
+			require.NoError(t, err)
+			assert.Zero(t, again.Written)
+			assert.Empty(t, r.verify(t).Issues)
+		})
+	}
+}
+
+// A crash after a write was staged, before it was installed, leaves
+// nothing behind once the transition resumes.
+func TestInterruptedStagingLeavesNothing(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	_, err := r.apply(context.Background(), continuity.Identity, func(i int, p string) error {
+		if i == 3 && p == "staged" {
+			return errCrash
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, errCrash)
+	_, err = r.apply(context.Background(), continuity.Identity, nil)
+	require.NoError(t, err)
+	assert.NoDirExists(t, filepath.Join(r.target, ".txe-transition-staging"))
+	assert.Empty(t, r.verify(t).Issues)
+}
+
+// The roots must be what the mode needs, compared by identity: an import
+// target that is the source under another name, or inside it, and a
+// journal inside a data directory are refused before anything is written.
+func TestRootsAreChecked(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	before := treeState(t, r.l.Root)
+	try := func(target, journal string) error {
+		_, err := continuity.Apply(context.Background(), r.plan, continuity.ApplyOptions{SourceData: r.l.DataDir, TargetData: target, Journal: journal})
+		return err
+	}
+	assert.Error(t, try(filepath.Join(r.l.DataDir, "nested"), r.journal), "a target inside the source")
+	assert.Error(t, try(r.target, filepath.Join(r.l.DataDir, "journal.jsonl")), "a journal inside the source")
+	if runtime.GOOS != "windows" {
+		alias := filepath.Join(t.TempDir(), "alias")
+		require.NoError(t, os.Symlink(r.l.DataDir, alias))
+		assert.Error(t, try(alias, r.journal), "the source under another name")
+	}
+	assert.Equal(t, before, treeState(t, r.l.Root), "nothing was written")
+	_, err := continuity.Apply(context.Background(), &continuity.Plan{Format: continuity.PlanFormatV1, Mode: continuity.ModeImport,
+		Steps: []continuity.Step{{Path: "../outside", Before: "x", After: "x"}}}, continuity.ApplyOptions{SourceData: r.l.DataDir, TargetData: r.target, Journal: r.journal})
+	assert.ErrorContains(t, err, "unsafe path")
+}
+
+// A linked directory inside the target never leads a write outside it.
+func TestLinkedTargetDirectoryIsRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs a privilege on Windows")
+	}
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeImport, continuity.Identity)
+	outside := t.TempDir()
+	require.NoError(t, os.MkdirAll(r.target, 0o750))
+	require.NoError(t, os.Symlink(outside, filepath.Join(r.target, "artifacts")))
+	_, err := r.apply(context.Background(), continuity.Identity, nil)
+	require.ErrorIs(t, err, continuity.ErrConflict)
+	entries, err := os.ReadDir(outside)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "nothing was written through the link")
+}
+
+// A transform that edits the slice it is given still has its rewrite
+// planned and applied.
+func TestMutatingTransformIsPlanned(t *testing.T) {
+	t.Parallel()
+	mutating := func(store, id string, data []byte) ([]byte, error) {
+		if store == "registry" && strings.HasPrefix(id, "owners/") {
+			out, err := lineage(store, id, data)
+			if err != nil {
+				return nil, err
+			}
+			for i := range data {
+				data[i] = ' '
+			}
+			return out, nil
+		}
+		return data, nil
+	}
+	r := newRehearsal(t, continuity.ModeInPlace, mutating)
+	assert.Equal(t, 1, r.plan.Rewrites)
+	res, err := r.apply(context.Background(), mutating, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Written)
+	assert.Empty(t, r.verify(t).Issues)
+}
+
+// An import keeps each file's permission bits.
+func TestImportKeepsPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no permission bits")
+	}
+	t.Parallel()
+	l, _ := build(t)
+	script := filepath.Join(l.DataDir, "workspaces", "tool.sh")
+	require.NoError(t, os.MkdirAll(filepath.Dir(script), 0o750))
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755)) //nolint:gosec // an executable fixture file
+	before := scan(t, l)
+	plan, err := continuity.PlanTransition(before, l.DataDir, continuity.ModeImport, continuity.Identity, continuity.Policy{})
+	require.NoError(t, err)
+	target := filepath.Join(t.TempDir(), "data")
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	_, err = continuity.Apply(context.Background(), plan, continuity.ApplyOptions{SourceData: l.DataDir, TargetData: target, Journal: journal})
+	require.NoError(t, err)
+	info, err := os.Stat(filepath.Join(target, "workspaces", "tool.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+	rs := roots(l)
+	rs[0].Path = target
+	after, err := continuity.Scan(context.Background(), continuity.Options{Roots: rs, ExpectedOwner: fixture.StableOwner})
+	require.NoError(t, err)
+	assert.Empty(t, continuity.VerifyTransition(before, after, plan, mustJournal(t, journal)).Issues)
+}
+
+// Verification holds each rewritten record to the exact bytes the plan
+// computed, not merely to equivalent JSON.
+func TestVerifyChecksExactBytes(t *testing.T) {
+	t.Parallel()
+	r := newRehearsal(t, continuity.ModeInPlace, lineage)
+	_, err := r.apply(context.Background(), lineage, nil)
+	require.NoError(t, err)
+	p := filepath.Join(registry.Dir(r.l.DataDir), "owners", fixture.StableOwner+".json")
+	data, err := os.ReadFile(p) //nolint:gosec // test path
+	require.NoError(t, err)
+	var v any
+	require.NoError(t, json.Unmarshal(data, &v))
+	compact, err := json.Marshal(v)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p, compact, 0o600))
+	assert.Positive(t, codes(r.verify(t).Issues, continuity.SeverityBlock)["step_result_differs"])
 }

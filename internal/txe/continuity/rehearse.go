@@ -6,15 +6,19 @@ package continuity
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
@@ -80,6 +84,8 @@ type Step struct {
 	// AfterRecord is the canonical digest of a rewritten record, as an
 	// inventory records it.
 	AfterRecord string `json:"after_record,omitempty"`
+	// Mode is an imported file's permission bits, where they are known.
+	Mode uint32 `json:"mode,omitempty"`
 }
 
 // JournalEntry records one step's outcome.
@@ -144,14 +150,15 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 		if recordDigest(data) != r.SHA256 {
 			return nil, fmt.Errorf("%w: %s changed since the inventory", ErrConflict, rel)
 		}
-		out, err := transform(r.Store, r.ID, data)
+		before := rawDigest(data)
+		out, err := transform(r.Store, r.ID, bytes.Clone(data))
 		if err != nil {
 			return nil, fmt.Errorf("continuity: transform %s: %w", rel, err)
 		}
 		if err := checkTransformed(r, out); err != nil {
 			return nil, err
 		}
-		step := Step{Path: rel, Store: r.Store, ID: r.ID, Before: rawDigest(data), After: rawDigest(out), AfterRecord: recordDigest(out)}
+		step := Step{Path: rel, Store: r.Store, ID: r.ID, Before: before, After: rawDigest(out), AfterRecord: recordDigest(out)}
 		switch {
 		case mode == ModeImport:
 			p.Copies++
@@ -171,7 +178,7 @@ func PlanTransition(inv *Inventory, dataDir, mode string, transform Transform, p
 				p.NotCopied = append(p.NotCopied, f.Path)
 				continue
 			}
-			p.Steps = append(p.Steps, Step{Path: f.Path, Before: f.SHA256, After: f.SHA256})
+			p.Steps = append(p.Steps, Step{Path: f.Path, Before: f.SHA256, After: f.SHA256, Mode: f.Mode})
 			p.Copies++
 		}
 		for _, e := range inv.Excluded {
@@ -208,14 +215,15 @@ type ApplyOptions struct {
 	// SourceData is the hub data directory the plan was made from.
 	SourceData string
 	// TargetData is the directory written: SourceData itself in place, a
-	// new directory for an import.
+	// new directory, disjoint from the source, for an import.
 	TargetData string
-	// Journal is the journal file; an existing one is resumed.
+	// Journal is the journal file, outside both data directories; an
+	// existing one is resumed.
 	Journal   string
 	Transform Transform
 	// Interrupt, when set, is called at every point a crash could stop the
-	// transition ("before_write", "after_write"); an error stops Apply
-	// there as a crash would, with nothing after it done.
+	// transition ("before_write", "staged", "after_write"); an error stops
+	// Apply there as a crash would, with nothing after it done.
 	Interrupt func(step int, point string) error
 	Now       func() time.Time
 }
@@ -226,17 +234,22 @@ type ApplyResult struct {
 	AlreadyDone int
 }
 
+// stagingDir holds the transition's writes before each is installed. It is
+// at the target root, on the same file system, cleared when a run starts
+// and removed when it ends.
+const stagingDir = ".txe-transition-staging"
+
 // Apply carries out a plan. It can be run again after any interruption: a
 // step journaled done is checked and skipped, a step whose write happened
 // but was not journaled is recognized by its bytes, and anything else that
 // differs stops the transition with ErrConflict and is never overwritten.
+//
+// Every read and write goes through an os.Root on the source and the
+// target, and a step whose path passes through a link is refused, so a
+// transition cannot write outside its target or read outside its source.
 func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, error) {
 	if plan.Format != PlanFormatV1 {
 		return nil, fmt.Errorf("continuity: plan format %q is not %q", plan.Format, PlanFormatV1)
-	}
-	inPlace := plan.Mode == ModeInPlace
-	if inPlace != samePath(opts.SourceData, opts.TargetData) {
-		return nil, fmt.Errorf("continuity: an %s transition needs %s source and target", plan.Mode, map[bool]string{true: "the same", false: "different"}[inPlace])
 	}
 	if opts.Transform == nil {
 		opts.Transform = Identity
@@ -245,108 +258,149 @@ func Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*ApplyResult, er
 	if opts.Now != nil {
 		now = opts.Now
 	}
-	journal, err := ReadJournal(opts.Journal)
+	for _, s := range plan.Steps {
+		if err := checkRelPath(s.Path); err != nil {
+			return nil, err
+		}
+	}
+	inPlace := plan.Mode == ModeInPlace
+	if err := checkRoots(opts.SourceData, opts.TargetData, opts.Journal, inPlace); err != nil {
+		return nil, err
+	}
+	src, err := os.OpenRoot(opts.SourceData)
 	if err != nil {
 		return nil, err
 	}
-	done := map[string]string{}
-	for _, e := range journal {
-		if e.Outcome == OutcomeDone {
-			done[e.Path] = e.After
+	defer func() { _ = src.Close() }()
+	if !inPlace {
+		if err := mkdirDurable(opts.TargetData); err != nil {
+			return nil, err
 		}
 	}
-	j, err := os.OpenFile(opts.Journal, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // the operator's journal path
+	dst := src
+	if !inPlace {
+		if dst, err = os.OpenRoot(opts.TargetData); err != nil {
+			return nil, err
+		}
+		defer func() { _ = dst.Close() }()
+	}
+	// Writes interrupted inside the staging area are discarded: their step
+	// is not done and is written again.
+	if err := dst.RemoveAll(stagingDir); err != nil {
+		return nil, err
+	}
+	journal, err := openJournal(opts.Journal)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = j.Close() }()
-	seq := len(journal)
-	record := func(s Step, outcome, detail string) error {
-		seq++
-		b, err := json.Marshal(JournalEntry{Seq: seq, Path: s.Path, Before: s.Before, After: s.After, Outcome: outcome, Detail: detail, At: now().UTC()})
-		if err != nil {
-			return err
-		}
-		if _, err := j.Write(append(b, '\n')); err != nil {
-			return err
-		}
-		return j.Sync()
-	}
-	conflict := func(s Step, detail string) error {
-		if err := record(s, OutcomeConflict, detail); err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: %s: %s", ErrConflict, s.Path, detail)
-	}
+	defer func() { _ = journal.f.Close() }()
 
 	res := &ApplyResult{}
 	for i, s := range plan.Steps {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		target := filepath.Join(opts.TargetData, filepath.FromSlash(s.Path))
-		cur, curErr := os.ReadFile(target) //nolint:gosec // a path of the plan under the target
-		present := curErr == nil
-		if curErr != nil && !errors.Is(curErr, fs.ErrNotExist) {
-			return res, curErr
-		}
-		if after, ok := done[s.Path]; ok && after == s.After {
-			if !present || rawDigest(cur) != s.After {
-				return res, conflict(s, "changed after it was applied")
-			}
-			res.AlreadyDone++
-			continue
-		}
-		if present && rawDigest(cur) == s.After {
-			// Written before an interruption that came before the journal.
-			if err := record(s, OutcomeDone, "found applied"); err != nil {
-				return res, err
-			}
-			res.AlreadyDone++
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(opts.SourceData, filepath.FromSlash(s.Path))) //nolint:gosec // a path of the plan under the source
+		done, err := applyStep(i, s, plan, opts, src, dst, journal, now)
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return res, conflict(s, "the source no longer has it")
-			}
 			return res, err
 		}
-		if rawDigest(src) != s.Before {
-			return res, conflict(s, "the source changed since the plan")
+		if done {
+			res.AlreadyDone++
+		} else {
+			res.Written++
 		}
-		if inPlace || present {
-			if !inPlace || rawDigest(cur) != s.Before {
-				return res, conflict(s, "the target holds something else")
-			}
-		}
-		out := src
-		if s.Store != "" {
-			if out, err = opts.Transform(s.Store, s.ID, src); err != nil {
-				return res, fmt.Errorf("continuity: transform %s: %w", s.Path, err)
-			}
-			if rawDigest(out) != s.After {
-				return res, conflict(s, "the transform gives another result than it planned")
-			}
-		}
-		if err := interrupt(opts, i, "before_write"); err != nil {
-			return res, err
-		}
-		if err := write(target, out, inPlace); err != nil {
-			if errors.Is(err, fs.ErrExist) {
-				return res, conflict(s, "the target was created by someone else")
-			}
-			return res, err
-		}
-		if err := interrupt(opts, i, "after_write"); err != nil {
-			return res, err
-		}
-		if err := record(s, OutcomeDone, ""); err != nil {
-			return res, err
-		}
-		res.Written++
 	}
-	return res, nil
+	if err := dst.RemoveAll(stagingDir); err != nil {
+		return res, err
+	}
+	return res, syncRootDir(dst, ".")
+}
+
+// applyStep carries out one step; done reports it was already applied.
+func applyStep(i int, s Step, plan *Plan, opts ApplyOptions, src, dst *os.Root, j *journalFile, now func() time.Time) (bool, error) {
+	inPlace := plan.Mode == ModeInPlace
+	record := func(outcome, detail string) error {
+		return j.append(JournalEntry{Path: s.Path, Before: s.Before, After: s.After, Outcome: outcome, Detail: detail, At: now().UTC()})
+	}
+	conflict := func(detail string) error {
+		if err := record(OutcomeConflict, detail); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: %s: %s", ErrConflict, s.Path, detail)
+	}
+	if err := noLinks(dst, s.Path); err != nil {
+		return false, conflict(err.Error())
+	}
+	cur, curMode, present, err := readNoFollow(dst, s.Path)
+	if err != nil {
+		return false, err
+	}
+	applied := present && rawDigest(cur) == s.After && modeMatches(curMode, s.Mode)
+	if after, ok := j.done[s.Path]; ok && after == s.After {
+		if !applied {
+			return false, conflict("changed after it was applied")
+		}
+		return true, nil
+	}
+	if applied {
+		// Installed before an interruption that came before the journal.
+		return true, record(OutcomeDone, "found applied")
+	}
+	if err := noLinks(src, s.Path); err != nil {
+		return false, conflict(err.Error())
+	}
+	data, mode, ok, err := readNoFollow(src, s.Path)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case !ok:
+		return false, conflict("the source no longer has it")
+	case rawDigest(data) != s.Before:
+		return false, conflict("the source changed since the plan")
+	case inPlace && (!present || rawDigest(cur) != s.Before):
+		return false, conflict("the record holds something the plan did not read")
+	case !inPlace && present:
+		return false, conflict("the target holds something else")
+	}
+	out := data
+	if s.Store != "" {
+		if out, err = opts.Transform(s.Store, s.ID, bytes.Clone(data)); err != nil {
+			return false, fmt.Errorf("continuity: transform %s: %w", s.Path, err)
+		}
+		if rawDigest(out) != s.After {
+			return false, conflict("the transform gives another result than it planned")
+		}
+	}
+	perm := fs.FileMode(0o600)
+	switch {
+	case inPlace:
+		perm = curMode.Perm()
+	case s.Mode != 0:
+		perm = fs.FileMode(s.Mode)
+	case mode != 0:
+		perm = mode.Perm()
+	}
+	if err := interrupt(opts, i, "before_write"); err != nil {
+		return false, err
+	}
+	staged, err := stage(dst, out, perm)
+	if err != nil {
+		return false, err
+	}
+	if err := interrupt(opts, i, "staged"); err != nil {
+		return false, err
+	}
+	if err := install(dst, staged, s.Path, inPlace); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, conflict("the target was created by someone else")
+		}
+		return false, err
+	}
+	if err := interrupt(opts, i, "after_write"); err != nil {
+		return false, err
+	}
+	return false, record(OutcomeDone, "")
 }
 
 func interrupt(opts ApplyOptions, step int, point string) error {
@@ -356,22 +410,305 @@ func interrupt(opts ApplyOptions, step int, point string) error {
 	return opts.Interrupt(step, point)
 }
 
-// write replaces a record in place or creates a new file of an import,
-// atomically either way. An import never replaces a file.
-func write(target string, data []byte, replace bool) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+// checkRelPath refuses a plan path that is not a clean, relative,
+// slash-separated path inside its root.
+func checkRelPath(p string) error {
+	switch {
+	case p == "", p == ".", p == "..", strings.HasPrefix(p, "../"), path.IsAbs(p),
+		strings.ContainsAny(p, "\\:"), path.Clean(p) != p,
+		p == stagingDir, strings.HasPrefix(p, stagingDir+"/"):
+		return fmt.Errorf("continuity: the plan names an unsafe path %q", p)
+	}
+	return nil
+}
+
+// checkRoots refuses a source and target that are not what the mode needs,
+// and a journal inside either. Directories are compared by file system
+// identity, through every existing ancestor, so an alias (a link, a
+// junction, another letter case) is the directory it names.
+func checkRoots(source, target, journal string, inPlace bool) error {
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !srcInfo.IsDir() {
+		return fmt.Errorf("continuity: the source %s is not a directory", source)
+	}
+	if inPlace {
+		tgt, err := os.Stat(target)
+		if err != nil || !os.SameFile(srcInfo, tgt) {
+			return fmt.Errorf("continuity: an in-place transition writes its own source; %s is not %s", target, source)
+		}
+	} else {
+		if within(target, srcInfo) {
+			return fmt.Errorf("continuity: the import target %s is the source or inside it", target)
+		}
+		if tgt, err := os.Stat(target); err == nil && within(source, tgt) {
+			return fmt.Errorf("continuity: the source %s is inside the import target", source)
+		}
+	}
+	if journal == "" {
+		return errors.New("continuity: a journal path is required")
+	}
+	dir := filepath.Dir(journal)
+	if within(dir, srcInfo) {
+		return fmt.Errorf("continuity: the journal %s is inside the source", journal)
+	}
+	if tgt, err := os.Stat(target); err == nil && within(dir, tgt) {
+		return fmt.Errorf("continuity: the journal %s is inside the target", journal)
+	}
+	return nil
+}
+
+// within reports whether p, or any existing ancestor of it, is dir.
+func within(p string, dir fs.FileInfo) bool {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return true
+	}
+	for {
+		if info, err := os.Stat(abs); err == nil && os.SameFile(info, dir) {
+			return true
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return false
+		}
+		abs = parent
+	}
+}
+
+// mkdirDurable creates dir and any missing parents, syncing each new entry
+// into its parent so the tree survives a crash.
+func mkdirDurable(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err == nil {
+		return nil
+	}
+	if err := mkdirDurable(filepath.Dir(abs)); err != nil {
+		return err
+	}
+	if err := os.Mkdir(abs, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	return fileutil.SyncDir(filepath.Dir(abs))
+}
+
+// noLinks refuses a path whose existing parent directories under root are
+// not plain directories: a link there could lead the step elsewhere.
+func noLinks(root *os.Root, rel string) error {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		dir := strings.Join(parts[:i], "/")
+		info, err := root.Lstat(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%s is not a plain directory", dir)
+		}
+	}
+	return nil
+}
+
+// readNoFollow reads a regular file under root without following a link.
+func readNoFollow(root *os.Root, rel string) ([]byte, fs.FileMode, bool, error) {
+	info, err := root.Lstat(rel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, 0, false, fmt.Errorf("%w: %s is not a regular file", ErrConflict, rel)
+	}
+	data, err := root.ReadFile(rel)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return data, info.Mode(), true, nil
+}
+
+func modeMatches(have fs.FileMode, want uint32) bool {
+	return want == 0 || !hasModeBits || uint32(have.Perm()) == want
+}
+
+// stage writes data to a new file in the staging area and returns its name.
+func stage(root *os.Root, data []byte, perm fs.FileMode) (string, error) {
+	if err := mkdirAllDurable(root, stagingDir); err != nil {
+		return "", err
+	}
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	name := stagingDir + "/" + hex.EncodeToString(b[:])
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	// The process umask may have narrowed the mode at creation.
+	return name, root.Chmod(name, perm)
+}
+
+// install moves a staged file to rel: replacing what is there in place,
+// never replacing anything in an import.
+func install(root *os.Root, staged, rel string, replace bool) error {
+	dir := path.Dir(rel)
+	if err := mkdirAllDurable(root, dir); err != nil {
 		return err
 	}
 	if replace {
-		return fileutil.WriteFileAtomic(target, data, 0o600)
+		if err := root.Rename(staged, rel); err != nil {
+			return err
+		}
+	} else {
+		if err := root.Link(staged, rel); err != nil {
+			return err
+		}
+		if err := root.Remove(staged); err != nil {
+			return err
+		}
 	}
-	return fileutil.WriteFileAtomicExclusive(target, data, 0o600)
+	return syncRootDir(root, dir)
 }
 
-func samePath(a, b string) bool {
-	ca, errA := filepath.Abs(a)
-	cb, errB := filepath.Abs(b)
-	return errA == nil && errB == nil && filepath.Clean(ca) == filepath.Clean(cb)
+// mkdirAllDurable creates dir under root, syncing each new directory into
+// its parent.
+func mkdirAllDurable(root *os.Root, dir string) error {
+	if dir == "." {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	for i := 1; i <= len(parts); i++ {
+		p := strings.Join(parts[:i], "/")
+		info, err := root.Lstat(p)
+		switch {
+		case err == nil && info.IsDir() && info.Mode()&fs.ModeSymlink == 0:
+			continue
+		case err == nil:
+			return fmt.Errorf("%w: %s is not a plain directory", ErrConflict, p)
+		case !errors.Is(err, fs.ErrNotExist):
+			return err
+		}
+		if err := root.Mkdir(p, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if err := syncRootDir(root, path.Dir(p)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncRootDir makes a directory's entries durable where the platform needs
+// it (Windows renames are written through).
+func syncRootDir(root *os.Root, dir string) error {
+	if !hasModeBits {
+		return nil
+	}
+	f, err := root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return f.Sync()
+}
+
+// journalFile is an open journal being appended to.
+type journalFile struct {
+	f    *os.File
+	seq  int
+	done map[string]string
+}
+
+// openJournal opens a journal for appending, first repairing a tail torn by
+// a crash: an incomplete last line is cut off, a complete last entry gets
+// its newline. The repair is synced before anything is appended.
+func openJournal(p string) (*journalFile, error) {
+	data, err := os.ReadFile(p) //nolint:gosec // the operator's journal path
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // the operator's journal path
+	if err != nil {
+		return nil, err
+	}
+	if n := len(data); n > 0 && data[n-1] != '\n' {
+		cut := bytes.LastIndexByte(data, '\n') + 1
+		var e JournalEntry
+		if json.Unmarshal(data[cut:], &e) == nil {
+			_, err = f.WriteAt([]byte("\n"), int64(n))
+			data = append(data, '\n')
+		} else {
+			err = f.Truncate(int64(cut))
+			data = data[:cut]
+		}
+		if err == nil {
+			err = f.Sync()
+		}
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	j := &journalFile{f: f, done: map[string]string{}}
+	for n, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var e JournalEntry
+		if err := json.Unmarshal(line, &e); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("continuity: journal %s line %d: %w", p, n+1, err)
+		}
+		j.seq = max(j.seq, e.Seq)
+		if e.Outcome == OutcomeDone {
+			j.done[e.Path] = e.After
+		}
+	}
+	return j, nil
+}
+
+func (j *journalFile) append(e JournalEntry) error {
+	j.seq++
+	e.Seq = j.seq
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	if _, err := j.f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	if err := j.f.Sync(); err != nil {
+		return err
+	}
+	if e.Outcome == OutcomeDone {
+		j.done[e.Path] = e.After
+	}
+	return nil
 }
 
 // ReadJournal reads a journal. A missing journal is empty; a torn last
@@ -428,19 +765,37 @@ func VerifyTransition(before, after *Inventory, plan *Plan, journal []JournalEnt
 		r := &after.Records[i]
 		later[r.Store+"/"+r.ID] = r
 	}
+	hub := ""
+	for _, r := range after.Roots {
+		if r.Area == AreaHubData {
+			hub = r.Label
+		}
+	}
+	laterFiles := map[string]File{}
+	for _, f := range after.Files {
+		if f.Root == hub {
+			laterFiles[f.Path] = f
+		}
+	}
 	for _, s := range plan.Steps {
 		e, ok := done[s.Path]
 		if !ok || e.After != s.After {
 			add("step_not_applied", s.Path, "the plan's step is not journaled done")
 			continue
 		}
-		if s.Store == "" || s.Before == s.After {
+		// Every step's result must be the exact bytes the plan computed.
+		if s.Store == "" {
+			if f, ok := laterFiles[s.Path]; ok && f.SHA256 != s.After {
+				add("step_result_differs", s.Path, "the file holds "+f.SHA256+", not the "+s.After+" the plan copied")
+			}
 			continue
 		}
 		key := s.Store + "/" + s.ID
-		reconciled[key] = true
-		if r := later[key]; r != nil && r.SHA256 != s.AfterRecord {
-			add("step_result_differs", key, "the record holds "+r.SHA256+", not the "+s.AfterRecord+" the plan computed")
+		if r := later[key]; r != nil && r.Raw != s.After {
+			add("step_result_differs", key, "the record's bytes are "+r.Raw+", not the "+s.After+" the plan computed")
+		}
+		if s.Before != s.After {
+			reconciled[key] = true
 		}
 	}
 	rep := Compare(before, after, CompareOptions{Reconciled: reconciled})
