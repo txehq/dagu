@@ -1,0 +1,248 @@
+name: codex-review
+
+# Codex reviews each ready PR head and posts the review on the PR (TXE-4205). The session that
+# owns the PR triages it, as before; only the review moves from a local Codex task into CI.
+#
+#   ready_for_review, opened or reopened (not draft)   a pass of the head
+#   synchronize                                        the next pass, of the new head
+#   the label codex-review-again                       one more pass of the same head
+#
+# Each pass runs on a fresh Codex thread. The prompt carries the PR's earlier codex-review
+# reviews and the triage the authorized author posted after them, so a pass N checks the claimed
+# fixes against the diff as the rprf loop's continuation prompt does.
+#
+# THIS REPOSITORY IS PUBLIC (a fork of dagucloud/dagu). So:
+#   - pull_request_target runs MAIN's copy of this file and of .github/codex-review/, never the
+#     PR's. No job executes anything from the PR: the PR head and its merge base are checked out
+#     only for git to diff and for Codex to READ through .github/codex-review/lib/repo_read.py.
+#   - Only a PR from a branch of this repository, opened by, and acted on by, an account in
+#     .github/codex-review/authorized-actors.txt (main's copy) is reviewed. A fork's PR never is.
+#   - The runner is GitHub-hosted. The Tokun key is a secret of the codex-review environment,
+#     whose deployments are limited to main, and it is a key for this repository alone, with a
+#     spending cap (TXE-4204). txe's arc-review runner is not used: its runner group admits no
+#     public repository.
+#   - Codex runs under env -i with an allowlist, with no shell, in a read-only sandbox, and
+#     --ephemeral (.github/codex-review/codex-run.sh, ported from txe ops/review/codex-run.sh).
+#     A probe turn first proves that a turn with the review's flags runs no command.
+#   - The review job has read permissions only. Only the post job can write, and it writes one
+#     PR review, after checking the head has not moved and the text holds no key-shaped string.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+
+permissions: {}
+
+env:
+  REVIEW_MODEL: openai/gpt-6-astra
+  REVIEW_EFFORT: medium
+  CODEX_VERSION: 0.157.1
+
+jobs:
+  # Only an eligible event from authorized actors reaches the review job's concurrency group, so
+  # an unrelated label, or an event from anyone else, cannot cancel a review in progress.
+  gate:
+    if: >-
+      github.event.pull_request.state == 'open'
+        && !github.event.pull_request.draft
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && (github.event.action != 'labeled' || github.event.label.name == 'codex-review-again')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main's review scripts (never the PR's)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/codex-review
+      - name: Authorize the PR's author and this event's actors
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING: ${{ github.triggering_actor }}
+        run: bash trusted/.github/codex-review/authorize.sh trusted/.github/codex-review/authorized-actors.txt "$AUTHOR" "$SENDER" "$ACTOR" "$TRIGGERING"
+
+  review:
+    needs: gate
+    runs-on: ubuntu-24.04
+    environment: codex-review
+    # Per head: gates finish out of order, so a late gate for an older head must not cancel the
+    # newer head's review. A review of a head that is no longer the PR's skips at its live read.
+    concurrency:
+      group: codex-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: true
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head: ${{ steps.ctx.outputs.head }}
+      pass: ${{ steps.prompt.outputs.pass }}
+    steps:
+      - name: Mask the Tokun key, and refuse without one
+        env:
+          TOKUN_API_KEY: ${{ secrets.TOKUN_API_KEY }}
+          TOKUN_BASE_URL: ${{ vars.TOKUN_BASE_URL }}
+        run: |
+          if [ -z "${TOKUN_API_KEY:-}" ] || [ -z "${TOKUN_BASE_URL:-}" ]; then
+            echo "::error::the codex-review environment needs the secret TOKUN_API_KEY and the variable TOKUN_BASE_URL (TXE-4204); nothing is reviewed"
+            exit 1
+          fi
+          echo "::add-mask::$TOKUN_API_KEY"
+      - name: Refuse unless this is main's copy of the workflow
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::codex-review runs only as main's copy; GITHUB_REF is $GITHUB_REF"
+            exit 1
+          fi
+      - name: Set up Node (before any PR file is on disk)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install the Codex CLI
+        working-directory: ${{ runner.temp }}
+        run: npm install -g "@openai/codex@$CODEX_VERSION" && codex --version
+      - name: Check out main's review scripts (never the PR's)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/codex-review
+      - name: Authorize the PR's author and this event's actors
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING: ${{ github.triggering_actor }}
+        run: bash trusted/.github/codex-review/authorize.sh trusted/.github/codex-review/authorized-actors.txt "$AUTHOR" "$SENDER" "$ACTOR" "$TRIGGERING"
+      - name: Read the PR live and its merge base
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR" >"$RUNNER_TEMP/pr.json"
+          read -r state draft head base_ref < <(jq -r '[.state, .draft, .head.sha, .base.ref] | @tsv' "$RUNNER_TEMP/pr.json")
+          if [ "$state" != open ] || [ "$draft" != false ] || [ "$head" != "$EVENT_HEAD" ]; then
+            echo "::notice::PR #$PR is no longer open, ready and at $EVENT_HEAD; a newer event reviews it"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mb="$(gh api "repos/$REPO/compare/${base_ref}...${head}" --jq .merge_base_commit.sha)"
+          [[ "$head" =~ ^[0-9a-f]{40}$ && "$mb" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::head or merge base is not a sha"; exit 1; }
+          { echo "skip=false"; echo "head=$head"; echo "base=$mb"; echo "base_ref=$base_ref"; } >>"$GITHUB_OUTPUT"
+      - name: Check out the PR head, to read only
+        if: steps.ctx.outputs.skip == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.ctx.outputs.head }}
+          path: pr
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the merge base, to read only
+        if: steps.ctx.outputs.skip == 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.ctx.outputs.base }}
+          path: merge-base
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build the diff
+        if: steps.ctx.outputs.skip == 'false'
+        env:
+          HEAD_SHA: ${{ steps.ctx.outputs.head }}
+          BASE_SHA: ${{ steps.ctx.outputs.base }}
+        run: bash trusted/.github/codex-review/build-diff.sh pr merge-base "$BASE_SHA" "$HEAD_SHA" "$RUNNER_TEMP/diff.txt"
+      - name: Read the review history (earlier codex-review reviews and the author's triage)
+        if: steps.ctx.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" | jq -s 'add // []' >"$RUNNER_TEMP/reviews.json"
+          gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" | jq -s 'add // []' >"$RUNNER_TEMP/comments.json"
+      - name: Build the prompt
+        if: steps.ctx.outputs.skip == 'false'
+        id: prompt
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head }}
+          BASE_SHA: ${{ steps.ctx.outputs.base }}
+          BASE_REF: ${{ steps.ctx.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 -I trusted/.github/codex-review/build_prompt.py \
+            --pr "$PR" --head "$HEAD_SHA" --base "$BASE_SHA" --base-ref "$BASE_REF" \
+            --model "${REVIEW_MODEL#*/}" --effort "$REVIEW_EFFORT" \
+            --pr-json "$RUNNER_TEMP/pr.json" --diff "$RUNNER_TEMP/diff.txt" \
+            --reviews "$RUNNER_TEMP/reviews.json" --comments "$RUNNER_TEMP/comments.json" \
+            --actors trusted/.github/codex-review/authorized-actors.txt \
+            --out "$RUNNER_TEMP/prompt.txt" --meta "$RUNNER_TEMP/meta.json"
+          echo "pass=$(jq -r .pass "$RUNNER_TEMP/meta.json")" >>"$GITHUB_OUTPUT"
+          jq -n --arg model "$REVIEW_MODEL" --arg effort "$REVIEW_EFFORT" '{model: $model, effort: $effort}' >"$RUNNER_TEMP/context.json"
+      - name: Prove a turn with the review's flags runs no command
+        if: steps.ctx.outputs.skip == 'false'
+        env:
+          TOKUN_API_KEY: ${{ secrets.TOKUN_API_KEY }}
+          TOKUN_BASE_URL: ${{ vars.TOKUN_BASE_URL }}
+        run: bash trusted/.github/codex-review/codex-run.sh probe "$RUNNER_TEMP/context.json" pr merge-base
+      - name: Codex reviews the PR
+        if: steps.ctx.outputs.skip == 'false'
+        env:
+          TOKUN_API_KEY: ${{ secrets.TOKUN_API_KEY }}
+          TOKUN_BASE_URL: ${{ vars.TOKUN_BASE_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          bash trusted/.github/codex-review/codex-run.sh review "$RUNNER_TEMP/context.json" "$RUNNER_TEMP/prompt.txt" "$RUNNER_TEMP/out/review.md" pr merge-base
+          cp "$RUNNER_TEMP/meta.json" "$RUNNER_TEMP/out/meta.json"
+      - name: Upload the review
+        if: steps.ctx.outputs.skip == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-review
+          path: ${{ runner.temp }}/out/
+          retention-days: 7
+          if-no-files-found: error
+
+  post:
+    needs: review
+    if: needs.review.result == 'success' && needs.review.outputs.head != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check out main's review scripts (never the PR's)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/codex-review
+      - name: Download the review
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: codex-review
+          path: ${{ runner.temp }}/out
+      - name: Post the review on the head it reviewed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ needs.review.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash trusted/.github/codex-review/post-review.sh "$RUNNER_TEMP/out/review.md" "$RUNNER_TEMP/out/meta.json"

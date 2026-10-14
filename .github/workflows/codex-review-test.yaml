@@ -1,0 +1,46 @@
+name: codex-review-test
+
+# Tests for .github/codex-review (TXE-4205). Runs the PR's own copy with no secret and a read-only
+# token, so it is an ordinary pull_request workflow.
+
+on:
+  pull_request:
+    paths:
+      - '.github/codex-review/**'
+      - '.github/workflows/codex-review.yml'
+      - '.github/workflows/codex-review-test.yaml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/codex-review/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Shellcheck
+        run: shellcheck .github/codex-review/*.sh
+      - name: Unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -I .github/codex-review/test_codex_review.py -v
+      - name: The read-only repo tool refuses reads outside its trees
+        run: |
+          set -euo pipefail
+          r=.github/codex-review/lib/repo_read.py
+          mkdir -p "$RUNNER_TEMP/h/.git" "$RUNNER_TEMP/b"
+          echo 'package x' >"$RUNNER_TEMP/h/a.go"
+          python3 "$r" call --tree "head=$RUNNER_TEMP/h" --tree "base=$RUNNER_TEMP/b" read_file '{"path":"a.go"}' | grep -q 'package x'
+          for p in /proc/self/environ ../../../../etc/passwd .git/config; do
+            if python3 "$r" call --tree "head=$RUNNER_TEMP/h" --tree "base=$RUNNER_TEMP/b" read_file "{\"path\":\"$p\"}" >"$RUNNER_TEMP/o"; then
+              echo "::error::$p was read"; exit 1
+            fi
+            grep -q '^refused: ' "$RUNNER_TEMP/o"
+          done
