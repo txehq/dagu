@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DWYZG0E2K15G9FS7AMMJT8",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 2,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DWYZG0E2K15G9FS7AMMJT8/versions/01M1DWYZG0HFTMYNWV4PHSRHY0"
+  ],
+  "package_digest": "sha256:77060db0b69af0c470b6b639ee832658fc69df1e25846a48bbd0eb38376d54ed",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "target-control",
+    "dedupe_key": "e30b0f4c3549f444c24e2368a5594bdcbb4efdcc071aeb39abbcf54dfc9e5be9",
+    "request_id": "req-job_01M1DWYZG0E2K15G9FS7AMMJT8",
+    "request_hash": "sha256:336ca53ada057a06218abfd1e4ec31c56abdb59addd4744a91a8587ebd4c2641",
+    "package": {
+      "digest": "sha256:77060db0b69af0c470b6b639ee832658fc69df1e25846a48bbd0eb38376d54ed",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DWYZG0E2K15G9FS7AMMJT8/sha256-77060db0b69af0c470b6b639ee832658fc69df1e25846a48bbd0eb38376d54ed",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T07:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T07:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1DWYZG0E2K15G9FS7AMMJT8/events/01M1DWYZG09EHBFCTAQGWSNCTZ"
+  },
+  "created": {
+    "at": "2026-09-01T07:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T07:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

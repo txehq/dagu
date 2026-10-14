@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DF7H00YM3VM8SBSZ2ZMEQJ",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 2,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DF7H00YM3VM8SBSZ2ZMEQJ/versions/01M1DF7H00199JAJWR0E40S9YE"
+  ],
+  "package_digest": "sha256:4c37ebadc17a4d45b422391ee783e9b60eff9e71f5fe5d0801ca6a265b046874",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "collector-dup",
+    "dedupe_key": "c5fba7688b2564cd76a84b514e8ba35f8a24080c959846bf0c6f88d843153f64",
+    "request_id": "req-job_01M1DF7H00YM3VM8SBSZ2ZMEQJ",
+    "request_hash": "sha256:f3b656e0dd402a48575dc8a195450f62c8364d9a9cf9e83146b0de4e8f23cf36",
+    "package": {
+      "digest": "sha256:4c37ebadc17a4d45b422391ee783e9b60eff9e71f5fe5d0801ca6a265b046874",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DF7H00YM3VM8SBSZ2ZMEQJ/sha256-4c37ebadc17a4d45b422391ee783e9b60eff9e71f5fe5d0801ca6a265b046874",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T03:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T03:12:00Z"
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1DF7H00YM3VM8SBSZ2ZMEQJ/events/01M1DF7H0020QTV2MHBPN2QW0J"
+  },
+  "created": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

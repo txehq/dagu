@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "project_id": "prj_01M1D47Z00H01990MFGG4J36Z0",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "key": "github.com/fixture/app",
+  "name": "github.com/fixture/app",
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "event_id": "evt_01M1E3TPR0R0FYHXMWB075EWB1",
+  "job_id": "job_01M1E3TPR021KQAEDRYFBJ88CC",
+  "revision": 1,
+  "kind": "registered",
+  "to": "incomplete",
+  "detail": "job key artifact-producer",
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T09:12:00Z"
+}

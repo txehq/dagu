@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "key": {
+    "issuer": "https://idp.fixture.invalid/realms/fixture",
+    "client_id": "dagu-worker-fixture-laptop"
+  },
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "class": "worker",
+  "claimed_at": "2026-09-01T12:13:00Z"
+}

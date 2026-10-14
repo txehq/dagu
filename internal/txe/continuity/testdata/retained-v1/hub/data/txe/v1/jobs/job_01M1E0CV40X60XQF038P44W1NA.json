@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1E0CV40X60XQF038P44W1NA",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H01990MFGG4J36Z0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 6,
+  "version": 2,
+  "version_refs": [
+    "history/job_01M1E0CV40X60XQF038P44W1NA/versions/01M1E0CV40W33X3GN2Z21S4F0G",
+    "history/job_01M1E0CV40X60XQF038P44W1NA/versions/01M1E0CV40GPJ8F5G76CZ93VMA"
+  ],
+  "package_digest": "sha256:4f2b874890c7045ecf9bfd7df553d127e2db65b957ba222e6092cfd8d5e6f6ea",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "incomplete",
+    "job_key": "superseded",
+    "dedupe_key": "444bd9c51d51643ccd939e7eb50c847bde7bfdfe271f2fca928e7dbfc73377f0",
+    "request_id": "upd-job_01M1E0CV40X60XQF038P44W1NA",
+    "request_hash": "sha256:eb901e3252ae11964276afdc8e55862f551d85bbb5e1cc9307e1e1b6ceb54ebc",
+    "dag_verified": false
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "claim": {
+    "claim_id": "clm_01M1E0CV402CM9N6Y65JR4J618",
+    "kind": "review",
+    "reviewer": {
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "dag_run_id": "fixture-review-run"
+    },
+    "fence": 1,
+    "acquired_at": "2026-09-01T08:12:00Z",
+    "expires_at": "2026-09-01T09:12:00Z",
+    "state": "released"
+  },
+  "fence": 1,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1E0CV40X60XQF038P44W1NA/events/01M1E0CV4045T47ZEE3K1D859W",
+    "proposals": "history/job_01M1E0CV40X60XQF038P44W1NA/proposals/01M1E0CV40TCT1XDT1XM4KJ8GZ"
+  },
+  "created": {
+    "at": "2026-09-01T08:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T08:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

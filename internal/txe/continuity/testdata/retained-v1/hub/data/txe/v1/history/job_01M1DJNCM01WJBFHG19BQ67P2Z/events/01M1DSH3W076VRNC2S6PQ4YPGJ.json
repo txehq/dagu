@@ -1,0 +1,16 @@
+{
+  "event_id": "evt_01M1DSH3W0WYK5NRW68NKQNMPK",
+  "job_id": "job_01M1DJNCM01WJBFHG19BQ67P2Z",
+  "revision": 3,
+  "kind": "lifecycle",
+  "from": "active",
+  "to": "retired",
+  "reason": "expired",
+  "detail": "lifetime ended at 2026-09-01T05:12:00Z",
+  "actor": {
+    "kind": "reconciler",
+    "id": "registry"
+  },
+  "at": "2026-09-01T06:12:00Z",
+  "prev": "history/job_01M1DJNCM01WJBFHG19BQ67P2Z/events/01M1DJNCM0GQWDSYJ8FRED02RA"
+}

@@ -1,0 +1,19 @@
+{
+  "event_id": "evt_01M1E3TPR0M8SNRAN43WD07RSW",
+  "job_id": "job_01M1E3TPR021KQAEDRYFBJ88CC",
+  "revision": 2,
+  "kind": "ready",
+  "from": "incomplete",
+  "to": "ready",
+  "evidence": [
+    "sha256:c10c3d2647dd0d899cfcef1e48e9969fafdc73fbbd57147d2611a06a5840c23a",
+    "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8"
+  ],
+  "actor": {
+    "kind": "cli",
+    "id": "fixture-cli",
+    "session": "fixture-session"
+  },
+  "at": "2026-09-01T09:12:00Z",
+  "prev": "history/job_01M1E3TPR021KQAEDRYFBJ88CC/events/01M1E3TPR0J5PS3A409YJZ2TXA"
+}

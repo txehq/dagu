@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DBSNC04DCPCZREP598WP82",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 3,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DBSNC04DCPCZREP598WP82/versions/01M1DBSNC0D7C1PP3ZC2KG4CCX"
+  ],
+  "package_digest": "sha256:003cda47ea8cf632a7e809a1d7bf12fc16f7485549fc44c52df32a6f93566c0e",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "needs-human",
+    "dedupe_key": "ad12ff4e5744426fc22b89b31fa7a37a9050b9100c3279d30f80b3f8d9f4975a",
+    "request_id": "req-job_01M1DBSNC04DCPCZREP598WP82",
+    "request_hash": "sha256:c5e62255911a74c4322c6f3f508ebed22f7ab33a3e7f2d0fb2004aa8af24dc51",
+    "package": {
+      "digest": "sha256:003cda47ea8cf632a7e809a1d7bf12fc16f7485549fc44c52df32a6f93566c0e",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DBSNC04DCPCZREP598WP82/sha256-003cda47ea8cf632a7e809a1d7bf12fc16f7485549fc44c52df32a6f93566c0e",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T02:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T02:12:00Z"
+  },
+  "lifecycle": "needs_human",
+  "lifecycle_reason": "fixture question",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1DBSNC04DCPCZREP598WP82/events/01M1DBSNC0HVZMXN8P0XT4GE5W"
+  },
+  "created": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T02:12:00Z",
+    "by": {
+      "kind": "human",
+      "id": "fixture-person"
+    }
+  }
+}

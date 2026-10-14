@@ -1,0 +1,22 @@
+{
+  "event_id": "evt_01M1DBSNC0MYDXM2G12PXZ46YA",
+  "job_id": "job_01M1DBSNC0AQ4MGHH1S920MYGW",
+  "revision": 3,
+  "kind": "lifecycle",
+  "from": "active",
+  "to": "retired",
+  "reason": "manual",
+  "detail": "experiment over",
+  "affected": [
+    {
+      "run_id": "run-mr-1",
+      "disposition": "allowed_to_finish"
+    }
+  ],
+  "actor": {
+    "kind": "human",
+    "id": "fixture-person"
+  },
+  "at": "2026-09-01T02:12:00Z",
+  "prev": "history/job_01M1DBSNC0AQ4MGHH1S920MYGW/events/01M1DBSNC0WK923YDGP79GWYMN"
+}

@@ -1,0 +1,19 @@
+{
+  "review_id": "rev_2R3RSDNG6QJRXF9FK7MKWGB48W",
+  "job_version": 1,
+  "checkpoint_version": 0,
+  "claim_id": "clm_01M1D47Z00990C0GA6E9YXXW45",
+  "fence": 1,
+  "evidence_run_ids": [
+    "run-hc-1"
+  ],
+  "outcome": "act",
+  "reasoning": "fixture review",
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "reviewer",
+      "id": "fixture-reviewer"
+    }
+  }
+}

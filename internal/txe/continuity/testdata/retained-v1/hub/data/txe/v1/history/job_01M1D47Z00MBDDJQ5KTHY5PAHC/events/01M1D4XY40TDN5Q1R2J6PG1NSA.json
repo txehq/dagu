@@ -1,0 +1,15 @@
+{
+  "event_id": "evt_01M1D4XY40PXCV74DE95F7EFNH",
+  "job_id": "job_01M1D47Z00MBDDJQ5KTHY5PAHC",
+  "revision": 24,
+  "kind": "availability",
+  "from": "ready",
+  "to": "auth_required",
+  "detail": "fixture credential expired",
+  "actor": {
+    "kind": "reconciler",
+    "id": "fixture-reconciler"
+  },
+  "at": "2026-09-01T00:12:00Z",
+  "prev": "history/job_01M1D47Z00MBDDJQ5KTHY5PAHC/events/01M1D4XY40EVR4Q15VATX83VYZ"
+}

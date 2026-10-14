@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "display_name": "Connor Wang",
+  "provenance": "fixture: installer",
+  "created": {
+    "at": "2026-09-01T00:00:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

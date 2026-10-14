@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DF7H00H1A6YD0Z2D5YJ1XP",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 1,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DF7H00H1A6YD0Z2D5YJ1XP/versions/01M1DF7H00DQ0C34R197HENVQT"
+  ],
+  "package_digest": "sha256:9cb8c00f407179ec9cb6bd39645fd70beb7b5c3d976821d8696dd2d9e1d60a42",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "incomplete",
+    "job_key": "incomplete",
+    "dedupe_key": "85554bb9dd4b57d6e5c850e0840dbac644cd5568d0e20a2000468b3a01a7532a",
+    "request_id": "req-job_01M1DF7H00H1A6YD0Z2D5YJ1XP",
+    "request_hash": "sha256:3bdadb9954473131f21daad177adf675afd001f4f4c3440e897ee1ebd6744140",
+    "dag_verified": false
+  },
+  "lifecycle": "active",
+  "availability": {
+    "state": "ready"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "chains": {
+    "events": "history/job_01M1DF7H00H1A6YD0Z2D5YJ1XP/events/01M1DF7H00ZSG90KBDPM1VEDG7"
+  },
+  "created": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T03:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  }
+}

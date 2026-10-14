@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "job_id": "job_01M1DWYZG0GKXPJ16X5SXZQMMV",
+  "owner_id": "own_01M4GBBMJ7A2VKXJGAADCKV7RR",
+  "project_id": "prj_01M1D47Z00H7DCCZ7P6A3QR2T0",
+  "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+  "revision": 5,
+  "version": 1,
+  "version_refs": [
+    "history/job_01M1DWYZG0GKXPJ16X5SXZQMMV/versions/01M1DWYZG0S6G76ZZ5M1NEDGYS"
+  ],
+  "package_digest": "sha256:192aecb68bc715c9a8de7125ba8d7392d36bf057688147b47639226927d6d7fe",
+  "dag_spec_sha256": "sha256:e41cec5464af5d7fe600eaf85e9ed9bec828e6c90651456e0d77ff6862dc8ec8",
+  "registration": {
+    "state": "ready",
+    "job_key": "target-deleted",
+    "dedupe_key": "7c05ae98fa32f0368b84f13723f4a24d74c9c8a6402b0bd4a5a1474ba9cae4a1",
+    "request_id": "req-job_01M1DWYZG0GKXPJ16X5SXZQMMV",
+    "request_hash": "sha256:468eda85538ab914f04adab40a1f5c6217728ad27a2444aae0975ff4cd342a12",
+    "package": {
+      "digest": "sha256:192aecb68bc715c9a8de7125ba8d7392d36bf057688147b47639226927d6d7fe",
+      "path": "/var/folders/nm/495p7xtj6ms7cyddrxj2fp3c0000gn/T/continuity-fixture-109760593/root/machine/txe-dagu/packages/job_01M1DWYZG0GKXPJ16X5SXZQMMV/sha256-192aecb68bc715c9a8de7125ba8d7392d36bf057688147b47639226927d6d7fe",
+      "machine_id": "mch_01M1D47Z00W8FHFW6R1N1FS5WC",
+      "asserted_at": "2026-09-01T07:12:00Z",
+      "asserted_by": {
+        "kind": "cli",
+        "id": "fixture-cli",
+        "session": "fixture-session"
+      }
+    },
+    "dag_verified": true,
+    "ready_at": "2026-09-01T07:12:00Z"
+  },
+  "lifecycle": "retired",
+  "lifecycle_reason": "target_deleted",
+  "availability": {
+    "state": "ready"
+  },
+  "retirement": {
+    "reason": "target_deleted",
+    "detail": "target fixture.volume fixture-gone {uid=vol-gone} deleted",
+    "evidence": [
+      "resource_event:evt_01M1DWYZG0197PFFWWFJYFK6NQ",
+      "fixture: NotFound uid vol-gone"
+    ],
+    "actor": {
+      "kind": "reconciler",
+      "id": "fixture-reconciler"
+    },
+    "at": "2026-09-01T07:12:00Z",
+    "active_run_policy": "finish"
+  },
+  "fence": 0,
+  "checkpoint": {
+    "version": 0
+  },
+  "suspend_gen": 1,
+  "applied_resource_events": [
+    {
+      "key": "identity|sha256:4194260394aedf4d7e629e5d76504dbec9e33ddd39907685725754acde630953",
+      "event_id": "evt_01M1DWYZG0197PFFWWFJYFK6NQ",
+      "at": "2026-09-01T07:12:00Z",
+      "disposition": {
+        "job_id": "job_01M1DWYZG0GKXPJ16X5SXZQMMV",
+        "match": "identity",
+        "outcome": "retired",
+        "detail": "target fixture.volume fixture-gone {uid=vol-gone} deleted"
+      }
+    }
+  ],
+  "suspended_by_registry": true,
+  "chains": {
+    "events": "history/job_01M1DWYZG0GKXPJ16X5SXZQMMV/events/01M1DWYZG01NEZ8YF0BN6Q17S8"
+  },
+  "created": {
+    "at": "2026-09-01T07:12:00Z",
+    "by": {
+      "kind": "cli",
+      "id": "fixture-cli",
+      "session": "fixture-session"
+    }
+  },
+  "updated": {
+    "at": "2026-09-01T07:12:00Z",
+    "by": {
+      "kind": "reconciler",
+      "id": "registry"
+    }
+  }
+}
