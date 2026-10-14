@@ -2341,11 +2341,28 @@ const english = {
   "This job does not exist, or it has not been shared with you.": "This job does not exist, or it has not been shared with you.",
   "Shared with you by {owner}": "Shared with you by {owner}",
   // TXE identity wiring (TXE-4246).
-  "Ask the platform administrator to give your account access.": "Ask the platform administrator to give your account access.",
   "Not available yet": "Not available yet",
   "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.",
   "Go to the job inbox": "Go to the job inbox",
   "Acting for {owner}": "Acting for {owner}",
+  // TXE access requests (TXE-4254).
+  "Access requests": "Access requests",
+  "Account": "Account",
+  "Approve for": "Approve for",
+  "Bound": "Bound",
+  "Bound accounts": "Bound accounts",
+  "Choose an owner…": "Choose an owner…",
+  "Confirm revoke": "Confirm revoke",
+  "New owner name": "New owner name",
+  "New owner…": "New owner…",
+  "No account is bound to an owner yet.": "No account is bound to an owner yet.",
+  "Nobody is waiting for access.": "Nobody is waiting for access.",
+  "Owner": "Owner",
+  "Requested": "Requested",
+  "Revoked": "Revoked",
+  "State": "State",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "The request changed since this page read it ({reason}). The list has been read again; approve again.",
+  "Waiting for approval": "Waiting for approval",
 } as const;
 
 export type StaticMessage = keyof typeof english;
@@ -4629,11 +4646,28 @@ const chinese = {
   "This job does not exist, or it has not been shared with you.": "此作业不存在，或尚未共享给你。",
   "Shared with you by {owner}": "由 {owner} 共享给你",
   // TXE identity wiring (TXE-4246).
-  "Ask the platform administrator to give your account access.": "请平台管理员为你的账户授予访问权限。",
   "Not available yet": "暂不可用",
   "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "通过单点登录登录的账户暂时无法使用此页面。你的作业在作业收件箱中。",
   "Go to the job inbox": "前往作业收件箱",
   "Acting for {owner}": "代表 {owner}",
+  // TXE access requests (TXE-4254).
+  "Access requests": "访问请求",
+  "Account": "账户",
+  "Approve for": "批准给",
+  "Bound": "绑定时间",
+  "Bound accounts": "已绑定的账户",
+  "Choose an owner…": "选择所有者…",
+  "Confirm revoke": "确认撤销",
+  "New owner name": "新所有者名称",
+  "New owner…": "新建所有者…",
+  "No account is bound to an owner yet.": "尚无账户绑定到所有者。",
+  "Nobody is waiting for access.": "没有人在等待访问权限。",
+  "Owner": "所有者",
+  "Requested": "申请时间",
+  "Revoked": "已撤销",
+  "State": "状态",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "此页面读取后请求已更改（{reason}）。列表已重新读取，请再次批准。",
+  "Waiting for approval": "等待批准",
 } as const satisfies Record<StaticMessage, string>;
 
 const japanese = {
@@ -6998,11 +7032,28 @@ const japanese = {
   "This job does not exist, or it has not been shared with you.": "このジョブは存在しないか、あなたと共有されていません。",
   "Shared with you by {owner}": "{owner} から共有",
   // TXE identity wiring (TXE-4246).
-  "Ask the platform administrator to give your account access.": "プラットフォーム管理者に、あなたのアカウントへのアクセス権の付与を依頼してください。",
   "Not available yet": "まだ利用できません",
   "This page is not available yet to an account signed in through single sign-on. Your jobs are in the job inbox.": "シングルサインオンでサインインしたアカウントでは、このページはまだ利用できません。あなたのジョブはジョブ受信箱にあります。",
   "Go to the job inbox": "ジョブ受信箱へ移動",
   "Acting for {owner}": "{owner} として操作中",
+  // TXE access requests (TXE-4254).
+  "Access requests": "アクセスリクエスト",
+  "Account": "アカウント",
+  "Approve for": "承認先",
+  "Bound": "バインド日時",
+  "Bound accounts": "バインド済みのアカウント",
+  "Choose an owner…": "オーナーを選択…",
+  "Confirm revoke": "取り消しを確定",
+  "New owner name": "新しいオーナー名",
+  "New owner…": "新しいオーナー…",
+  "No account is bound to an owner yet.": "まだオーナーにバインドされたアカウントはありません。",
+  "Nobody is waiting for access.": "アクセスを待っている人はいません。",
+  "Owner": "オーナー",
+  "Requested": "リクエスト日時",
+  "Revoked": "取り消し済み",
+  "State": "状態",
+  "The request changed since this page read it ({reason}). The list has been read again; approve again.": "このページの読み込み後にリクエストが変更されました（{reason}）。一覧を読み込み直しました。もう一度承認してください。",
+  "Waiting for approval": "承認待ち",
 } as const satisfies Record<StaticMessage, string>;
 
 export const staticMessages = {
