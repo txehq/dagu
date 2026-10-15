@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -108,15 +109,93 @@ var hubDataSubAreas = map[string]map[string]string{
 	"xlsx":     {"sessions": PolicyMutable, "cache": "exclude: workbook replay cache; rebuilt"},
 }
 
-// Areas of a machine's TXE home.
-var machineHomeAreas = map[string]string{
-	"receipts": PolicyMutable,
-	"outputs":  PolicyImmutable,
+// Entry kinds a rule can require.
+const (
+	kindDir = iota + 1
+	kindFile
+	kindLink
+)
+
+// rule classifies an entry of a machine's TXE home, by exact name or by a
+// name pattern: as a file policy for everything under it, as an exclusion
+// that is never read, or as a directory whose entries are classified in
+// turn. An entry no rule matches blocks.
+type rule struct {
+	name    string
+	pattern *regexp.Regexp
+	// kind, when set, is the entry's required type.
+	kind int
+	// target is the required target of a link.
+	target  *regexp.Regexp
+	policy  string
+	exclude string
+	dir     []rule
 }
 
-var machineHomeExcluded = map[string]string{
-	"client": "the CLI's Dagu home holds its hub credential; not read",
-	"skill":  "unpacked skill revisions; reinstalled, not retained data",
+func (r *rule) matches(name string) bool {
+	if r.pattern != nil {
+		return r.pattern.MatchString(name)
+	}
+	return r.name == name
+}
+
+const (
+	machineIDPattern   = `mch_[0-9A-HJKMNP-TV-Z]{26}`
+	daguVersionPattern = `[0-9]+\.[0-9]+\.[0-9]+-txe\.[0-9]+`
+)
+
+// machineHomeRules is a machine's TXE home as the worker installer
+// (txe/worker/install.sh) and the CLI write it; machine.json and packages
+// are read separately.
+var machineHomeRules = []rule{
+	{name: "receipts", kind: kindDir, policy: PolicyMutable},
+	{name: "outputs", kind: kindDir, policy: PolicyImmutable},
+	{name: "client", kind: kindDir, exclude: "the CLI's Dagu home holds its hub credential; not read"},
+	{name: "skill", kind: kindDir, exclude: "unpacked skill revisions; reinstalled, not retained data"},
+	{name: "tunnel", kind: kindDir, exclude: "the tunnel's port-forward credential (a ServiceAccount kubeconfig and its expiry), renewed by tunnel-credential.sh; not read"},
+	// Every installed binary with its build record, and the link to the
+	// current one: rebuilt from a release tag, and an upgrade moves the
+	// link, so they are counted, not compared.
+	{name: "bin", kind: kindDir, dir: []rule{
+		{name: "dagu", kind: kindLink, target: regexp.MustCompile(`^dagu-` + daguVersionPattern + `$`), policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^dagu-` + daguVersionPattern + `$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^dagu-` + daguVersionPattern + `\.json$`), kind: kindFile, policy: PolicyOperational},
+	}},
+	// The launchd agents' output: diagnostics that grow while the agents
+	// run, not job data.
+	{name: "logs", kind: kindDir, dir: []rule{
+		{name: "tunnel.log", kind: kindFile, policy: PolicyOperational},
+		{name: "worker.log", kind: kindFile, policy: PolicyOperational},
+	}},
+	// The worker's DAGU_HOME. Its data directory holds only credentials so
+	// far; anything else it gains blocks until it is classified.
+	{name: "worker-home", kind: kindDir, dir: []rule{
+		{name: "data", kind: kindDir, dir: []rule{
+			{name: "auth", kind: kindDir, exclude: "the worker's encryption key; not read"},
+			{name: "contexts", kind: kindDir, exclude: "remote context credentials; not read"},
+		}},
+	}},
+	{name: "state", kind: kindDir, dir: []rule{
+		// dagu txe hub install's lock (internal/cmd/txe_hub.go).
+		{pattern: regexp.MustCompile(`^hub-install-` + machineIDPattern + `\.lock$`), kind: kindFile, policy: PolicyOperational},
+		// The resource probe's journal: reports the registry has not
+		// acknowledged yet (internal/txe/probe/journal.go).
+		{name: "probe", kind: kindDir, dir: []rule{
+			{pattern: regexp.MustCompile(`^journal-` + machineIDPattern + `\.json$`), kind: kindFile, policy: PolicyMutable},
+			{pattern: regexp.MustCompile(`^journal-` + machineIDPattern + `\.json\.lock$`), kind: kindFile, policy: PolicyOperational},
+			{pattern: regexp.MustCompile(`^\.journal-[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		}},
+		// The reviewer's --state-dir as the reviewer is installed here: each
+		// run's hand-off between its steps (internal/txe/review/steps.go).
+		{name: "review", kind: kindDir, dir: []rule{
+			{name: "reviews", kind: kindDir, dir: []rule{
+				{pattern: regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`), kind: kindDir, dir: []rule{
+					{name: "prepared.json", kind: kindFile, policy: PolicyMutable},
+					{name: "prepared.json.tmp", kind: kindFile, policy: PolicyOperational},
+				}},
+			}},
+		}},
+	}},
 }
 
 // Scan inventories the roots. It only reads; a root that cannot be read is
@@ -423,18 +502,70 @@ func (s *scanner) machineHome() error {
 			if err := s.packages(); err != nil {
 				return err
 			}
-		case machineHomeExcluded[name] != "":
-			s.exclude(name, machineHomeExcluded[name])
-		case machineHomeAreas[name] != "":
-			if err := s.files(name, machineHomeAreas[name]); err != nil {
+		default:
+			if err := s.entry(name, e, machineHomeRules); err != nil {
 				return err
 			}
-		default:
-			s.issue("unclassified_area", "", s.root.Label+"/"+name, "%s/%s is not a known part of a machine's TXE home; classify it before a transition, it was not read", s.root.Label, name)
 		}
 	}
 	if s.inv.Machines[s.root.Label] == "" {
 		s.issue("machine_identity_missing", ClassMachineIdentity, s.root.Label+"/machine.json", "%s has no readable machine identity, so its packages cannot be checked against the jobs it runs; a worker cannot use it", s.root.Label)
+	}
+	return nil
+}
+
+// entry classifies one entry of a machine's TXE home by the first rule
+// that matches it.
+func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
+	var r *rule
+	for i := range rules {
+		if rules[i].matches(e.Name()) {
+			r = &rules[i]
+			break
+		}
+	}
+	if r == nil {
+		s.issue("unclassified_area", "", s.root.Label+"/"+rel, "%s/%s is not a known part of a machine's TXE home; classify it before a transition, it was not read", s.root.Label, rel)
+		return nil
+	}
+	isLink := e.Type()&fs.ModeSymlink != 0
+	if r.kind != kindLink && s.symlink(rel, e) {
+		return nil
+	}
+	// The type comes from the directory entry, so an excluded entry is
+	// checked without being opened.
+	switch {
+	case r.kind == kindDir && !e.IsDir(),
+		r.kind == kindFile && !e.Type().IsRegular(),
+		r.kind == kindLink && !isLink:
+		s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is not the kind of entry its place in a machine's TXE home holds; it was not read", s.root.Label, rel)
+		return nil
+	}
+	if r.exclude != "" {
+		s.exclude(rel, r.exclude)
+		return nil
+	}
+	if r.target != nil {
+		target, err := os.Readlink(filepath.Join(s.root.Path, filepath.FromSlash(rel)))
+		if err != nil {
+			return err
+		}
+		if !r.target.MatchString(target) {
+			s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s links to %q, which is not where it may point", s.root.Label, rel, target)
+			return nil
+		}
+	}
+	if r.dir == nil {
+		return s.files(rel, r.policy)
+	}
+	list, err := os.ReadDir(filepath.Join(s.root.Path, filepath.FromSlash(rel)))
+	if err != nil {
+		return err
+	}
+	for _, c := range list {
+		if err := s.entry(rel+"/"+c.Name(), c, r.dir); err != nil {
+			return err
+		}
 	}
 	return nil
 }
