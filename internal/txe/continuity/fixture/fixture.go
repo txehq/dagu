@@ -28,9 +28,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dag"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
@@ -75,6 +77,10 @@ type Facts struct {
 	// Artifact bytes, by path relative to the root they are under.
 	HubArtifacts     []string
 	MachineArtifacts []string
+	// Preparations are the preparation journal's entries, relative to the
+	// data directory: one for an attempt created and never handed to a
+	// worker, one for a queued execution of a reused attempt.
+	Preparations []string
 }
 
 var (
@@ -201,7 +207,10 @@ func (b *builder) build() error {
 		}
 		b.advance(time.Hour)
 	}
-	return b.nativeRuns()
+	if err := b.nativeRuns(); err != nil {
+		return err
+	}
+	return b.preparations()
 }
 
 // machineIdentity writes machine.json as the worker installer does
@@ -918,6 +927,55 @@ func (b *builder) nativeRuns() error {
 		return err
 	}
 	return writeFile(filepath.Join(b.layout.MachineHome, "receipts", "journal.jsonl"), []byte(`{"request":"fixture"}`+"\n"))
+}
+
+// preparations leaves two entries in the attempt preparation journal, as a
+// coordinator that stopped between preparing an attempt and publishing it
+// does: one for an attempt created to be handed to a worker, and one for a
+// queued execution of a reused attempt. They are written by the run store
+// itself, so they are in its journal's names and form.
+func (b *builder) preparations() error {
+	ctx := b.ctx
+	store := dagrun.NewStore(filepath.Join(b.layout.DataDir, "dag-runs"))
+	created := &ir.DAG{Name: b.facts.Jobs["health-check"]}
+	if _, err := store.CreateAttempt(ctx, persis.DAGRunCreateAttemptRequest{
+		DAG: created, Timestamp: b.clock(), DAGRunID: "run-prepared", TrackPreparation: true,
+	}); err != nil {
+		return err
+	}
+	queued := &ir.DAG{Name: b.facts.Jobs["data-collector"]}
+	att, err := store.CreateAttempt(ctx, persis.DAGRunCreateAttemptRequest{DAG: queued, Timestamp: b.clock(), DAGRunID: "run-queued"})
+	if err != nil {
+		return err
+	}
+	queuedAt := b.clock().Format(time.RFC3339Nano)
+	status := ir.InitialStatus(queued)
+	status.DAGRunID, status.AttemptID = "run-queued", att.ID()
+	status.Status, status.QueuedAt = ir.Queued, queuedAt
+	if err := att.Open(ctx); err != nil {
+		return err
+	}
+	if err := att.Write(ctx, status); err != nil {
+		return err
+	}
+	if err := att.Close(ctx); err != nil {
+		return err
+	}
+	run := ir.NewDAGRunRef(queued.Name, "run-queued")
+	if _, err := store.BeginAttemptPreparation(ctx, run, run, att.ID(), queuedAt); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(filepath.Join(b.layout.DataDir, "dag-runs.preparations"))
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		b.facts.Preparations = append(b.facts.Preparations, "dag-runs.preparations/"+e.Name())
+	}
+	if len(b.facts.Preparations) != 2 {
+		return fmt.Errorf("fixture: the preparation journal holds %d entries, want 2", len(b.facts.Preparations))
+	}
+	return nil
 }
 
 func writeFile(p string, data []byte) error {

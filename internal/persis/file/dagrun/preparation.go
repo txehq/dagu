@@ -349,12 +349,20 @@ func (store *Store) EndAttemptPreparation(_ context.Context, preparation persis.
 // preparationPath names an entry by its root run, run and attempt, and for
 // one execution of a reused attempt by its queued-at marker too.
 func (store *Store) preparationPath(p persis.AttemptPreparation) string {
-	name := store.attemptPreparationName(p)
+	return filepath.Join(store.preparationDir, PreparationEntryName(p))
+}
+
+// PreparationEntryName is the file name the journal keeps p's entry under:
+// a digest of its root run, run and attempt, and for one execution of a
+// reused attempt a digest of its queued-at marker too. p.RootRun must be set;
+// a root run is its own root.
+func PreparationEntryName(p persis.AttemptPreparation) string {
+	name := attemptPreparationName(p)
 	if p.QueuedAt != "" {
 		marker := sha256.Sum256([]byte(p.QueuedAt))
 		name += "-" + hex.EncodeToString(marker[:16])
 	}
-	return filepath.Join(store.preparationDir, name+preparationExt)
+	return name + preparationExt
 }
 
 // executionPreparationPaths lists the entries of an attempt's executions by
@@ -368,7 +376,7 @@ func (store *Store) executionPreparationPaths(p persis.AttemptPreparation) ([]st
 	if err != nil {
 		return nil, err
 	}
-	prefix := store.attemptPreparationName(p) + "-"
+	prefix := attemptPreparationName(p) + "-"
 	var paths []string
 	for _, e := range entries {
 		if name := e.Name(); strings.HasPrefix(name, prefix) && strings.HasSuffix(name, preparationExt) {
@@ -378,7 +386,7 @@ func (store *Store) executionPreparationPaths(p persis.AttemptPreparation) ([]st
 	return paths, nil
 }
 
-func (store *Store) attemptPreparationName(p persis.AttemptPreparation) string {
+func attemptPreparationName(p persis.AttemptPreparation) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		p.RootRun.Name, p.RootRun.ID, p.Run.Name, p.Run.ID, p.AttemptID,
 	}, "\x00")))
@@ -390,6 +398,13 @@ func readPreparation(path string) (*persis.AttemptPreparation, error) {
 	if err != nil {
 		return nil, err
 	}
+	return DecodePreparation(data)
+}
+
+// DecodePreparation decodes a journal entry and checks it as the journal does
+// when it reads one. An entry is also stored under its own name
+// (PreparationEntryName), which the caller checks.
+func DecodePreparation(data []byte) (*persis.AttemptPreparation, error) {
 	var entry persis.AttemptPreparation
 	if err := json.Unmarshal(data, &entry); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)

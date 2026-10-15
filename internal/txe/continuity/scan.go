@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 )
 
 // recordLockDirectoryName is the file collection's per-record lock
@@ -147,6 +148,9 @@ type rule struct {
 	policy  string
 	exclude string
 	dir     []rule
+	// check, when set, reads a file the rule retains and refuses one its
+	// writer would not have written.
+	check func(name string, data []byte) error
 }
 
 func (r *rule) matches(name string) bool {
@@ -233,8 +237,9 @@ var machineHomeRules = []rule{
 // (Record.Store); a machine home stores its records under its root label.
 var hubStores = map[string]bool{"registry": true, "authz": true}
 
-// hubDataRules classify, entry by entry, areas of the data directory that
-// hold a credential beside names that must stay exact.
+// hubDataRules classify, entry by entry, areas of the data directory whose
+// names must stay exact: a credential beside other files, or entries only
+// their writer's names and contents may have.
 var hubDataRules = []rule{
 	// The coordinator's hub key at its default path, and the temporary file
 	// it is created through (internal/cmn/config defaultHubKeyFile,
@@ -243,6 +248,31 @@ var hubDataRules = []rule{
 		{name: "hub.key", kind: kindFile, exclude: "the coordinator's hub key; not read"},
 		{pattern: regexp.MustCompile(`^\.hub\.key\.[0-9]+$`), kind: kindFile, exclude: "a hub key being created; not read"},
 	}},
+	// The attempt preparation journal beside the run tree
+	// (internal/persis/file/dagrun/preparation.go): an entry for each
+	// attempt prepared for a worker and not yet handed to one, which the
+	// coordinator reads after a restart to abandon an attempt it never
+	// dispatched (internal/service/coordinator/abandoned_preparation.go).
+	// Entries are retained; the temporary file one is written through
+	// (fileutil.WriteFileAtomic) is not.
+	{name: "dag-runs.preparations", kind: kindDir, dir: []rule{
+		{pattern: regexp.MustCompile(`^[0-9a-f]{64}(-[0-9a-f]{32})?\.json$`), kind: kindFile, policy: PolicyMutable, check: preparationEntry},
+		{pattern: regexp.MustCompile(`^[0-9a-f]{64}(-[0-9a-f]{32})?\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+	}},
+}
+
+// preparationEntry accepts a preparation journal entry the journal reads:
+// one it decodes, stored under its own name (ListAttemptPreparations skips
+// any other, so its attempt would never be abandoned).
+func preparationEntry(name string, data []byte) error {
+	p, err := dagrun.DecodePreparation(data)
+	if err != nil {
+		return err
+	}
+	if want := dagrun.PreparationEntryName(*p); want != name {
+		return fmt.Errorf("its contents name the entry %s", want)
+	}
+	return nil
 }
 
 func ruleFor(rules []rule, name string) *rule {
@@ -649,6 +679,16 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 		}
 		if !r.target.MatchString(target) {
 			s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s links to %q, which is not where it may point", s.root.Label, rel, target)
+			return nil
+		}
+	}
+	if r.check != nil {
+		data, err := os.ReadFile(filepath.Join(s.root.Path, filepath.FromSlash(rel))) //nolint:gosec // a path under the scanned root
+		if err != nil {
+			return err
+		}
+		if err := r.check(e.Name(), data); err != nil {
+			s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is not what its place in %s holds (%v); it was not inventoried", s.root.Label, rel, s.place(), err)
 			return nil
 		}
 	}
