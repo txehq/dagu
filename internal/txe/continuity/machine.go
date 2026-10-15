@@ -10,10 +10,25 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
+
+// machineSchema is the only machine.json schema the installer has written.
+const machineSchema = 1
+
+// machineFile is machine.json as the worker installer writes it
+// (txe/worker/install.sh, schema 1): txepkg.Machine and the time the
+// identity was minted. The installer writes it once and never rewrites it.
+type machineFile struct {
+	Schema      int    `json:"schema"`
+	MachineID   string `json:"machine_id"`
+	OwnerID     string `json:"owner_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+}
 
 // machineIdentity reads the machine's machine.json. It names the machine
 // whose packages and outputs the home holds.
@@ -31,12 +46,21 @@ func (s *scanner) machineIdentity() error {
 		return err
 	}
 	b := newBuilder(ClassMachineIdentity)
-	var m txepkg.Machine
+	var m machineFile
 	if b.decode(data, &m) {
-		b.schema(m.Schema)
+		b.rec.Schema = m.Schema
+		if m.Schema != machineSchema {
+			b.block("unsupported_schema", "machine.json schema %d is not a supported schema version", m.Schema)
+		}
 		b.owner(m.OwnerID)
 		b.required("machine", KindMachine, m.MachineID)
 		checkID(b, registry.PrefixMachine, m.MachineID, "machine_id")
+		if m.CreatedAt != "" {
+			// Python's isoformat: RFC 3339, with or without fractional seconds.
+			if _, err := time.Parse(time.RFC3339Nano, m.CreatedAt); err != nil {
+				b.block("undecodable", "created_at %q is not an RFC 3339 timestamp", m.CreatedAt)
+			}
+		}
 		s.inv.Machines[s.root.Label] = m.MachineID
 	}
 	rec, issues := b.done()

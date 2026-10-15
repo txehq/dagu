@@ -179,6 +179,9 @@ func (b *builder) build() error {
 	if err := b.machineIdentity(); err != nil {
 		return err
 	}
+	if err := b.installed(); err != nil {
+		return err
+	}
 	steps := []func() error{
 		b.activeWithHistory,
 		b.uncertainEffect,
@@ -201,13 +204,45 @@ func (b *builder) build() error {
 	return b.nativeRuns()
 }
 
+// machineIdentity writes machine.json as the worker installer does
+// (txe/worker/install.sh).
 func (b *builder) machineIdentity() error {
-	m := txepkg.Machine{Schema: 1, MachineID: b.facts.Machine, OwnerID: StableOwner, DisplayName: "fixture-laptop"}
+	m := map[string]any{"schema": 1, "machine_id": b.facts.Machine, "owner_id": StableOwner, "display_name": "fixture-laptop",
+		"created_at": b.clock().Format("2006-01-02T15:04:05.000000-07:00")}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(b.layout.MachineHome, "machine.json"), data, 0o600)
+}
+
+// installed writes what the worker installer and the CLI keep in a machine
+// home besides its packages, outputs and receipts: binaries and their build
+// records, the agents' logs, the tunnel credential, the worker's Dagu home,
+// and the CLI's local state. The credentials are placeholders. The link to
+// the current binary is left out, so the committed snapshot holds no link;
+// the tests add it.
+func (b *builder) installed() error {
+	home, m := b.layout.MachineHome, b.facts.Machine
+	files := map[string]string{
+		"bin/dagu-2.18.2-txe.6":                    "fixture binary\n",
+		"bin/dagu-2.18.2-txe.6.json":               `{"tag":"txe-v2.18.2-6","version":"2.18.2-txe.6"}` + "\n",
+		"logs/tunnel.log":                          "Forwarding from 127.0.0.1:18080 -> 8080\n",
+		"logs/worker.log":                          "fixture worker log\n",
+		"tunnel/kubeconfig":                        "fixture-tunnel-credential-placeholder\n",
+		"tunnel/kubeconfig.expires":                "2026-12-01\n",
+		"worker-home/data/auth/encryption_key":     "fixture-worker-key-placeholder",
+		"state/hub-install-" + m + ".lock":         "",
+		"state/probe/journal-" + m + ".json":       `{"checked":{}}` + "\n",
+		"state/probe/journal-" + m + ".json.lock":  "",
+		"state/review/reviews/run-1/prepared.json": `{"job_id":"fixture"}` + "\n",
+	}
+	for rel, data := range files {
+		if err := writeFile(filepath.Join(home, filepath.FromSlash(rel)), []byte(data)); err != nil {
+			return err
+		}
+	}
+	return os.MkdirAll(filepath.Join(home, "worker-home", "data", "contexts"), 0o750)
 }
 
 // pkg builds and commits a package for job in the machine home through the
