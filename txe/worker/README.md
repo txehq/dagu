@@ -8,7 +8,7 @@ service. Two launchd agents keep it running whether or not a coding session is o
 | Agent | What it runs |
 |---|---|
 | `com.txe.dagu.tunnel` | `kubectl port-forward` from `127.0.0.1:18080` to the UI/API and from `127.0.0.1:50055` to the coordinator, using a credential that can only port-forward in `dagu` |
-| `com.txe.dagu.worker` | `dagu worker`. Its id is this machine's `mch_` id, its labels are `txe.machine` and `txe.owner`, and it reaches the coordinator at `127.0.0.1:50055` |
+| `com.txe.dagu.worker` | `dagu worker`. Its id is this machine's `mch_` id, its labels are `txe.machine` and `txe.owner`, and it reaches the coordinator at `127.0.0.1:50055`. Once the machine is enrolled, it presents the machine credential (see "Machine credential") |
 
 ## Layout
 
@@ -22,6 +22,7 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 | `outputs/` | job outputs and deliverables, `outputs/<job id>/` | kept |
 | `receipts/`, `client/`, `skill/` | registration receipts, the CLI's context store with its API key, the shared skill (all owned by the CLI, TXE-3408) | kept |
 | `tunnel/kubeconfig` | the tunnel's ServiceAccount token, mode 0600 | renewed by `tunnel-credential.sh` |
+| `worker-credential.json`, `worker-credential.json.lock` | the worker's machine credential, mode 0600, and the lock the worker holds while renewing it | written by `dagu txe enrol`; the worker rewrites it when the provider rotates the refresh token |
 | `worker-home/` | the worker's `DAGU_HOME` | kept |
 | `logs/` | agent logs | kept |
 
@@ -74,6 +75,37 @@ has no conditional write.
 
 Keep one owner for installs and updates of this machine's hub DAG. Nothing here prevents
 conflicting writes atomically.
+
+## Machine credential
+
+When the hub verifies its workers (`coordinator.auth`), the worker must present this machine's own
+credential. Enrolment happens after the first install, because `dagu txe enrol` reads `machine.json`:
+
+```sh
+dagu txe enrol --client-id <this machine's worker client> --wait 15m   # a person of the owner signs in;
+                                                                       # a person approves in the hub
+txe/worker/install.sh --tag <the installed tag>                        # the worker agent now passes it
+txe/worker/status.sh                                                   # shows the credential it passes
+```
+
+The install uses `--credential-file <absolute path>` if given, or else `worker-credential.json` in
+the TXE home, where enrol writes it, when that file exists. With neither, the worker agent is
+exactly that of an unenrolled machine.
+
+Before anything is written, the install checks the credential and refuses it, rather than
+installing without it, when:
+- it is not an absolute path to a regular file, or it is a symlink;
+- it is not owned by you, or not mode 0600 or tighter;
+- its directory is not yours alone, or not writable: the worker saves rotated tokens and its lock
+  file there;
+- it does not hold exactly the machine credential's fields, with class `worker`;
+- it is another machine's.
+
+The agent gets the file's path only, in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`. No token is in the plist,
+an argument or a log. The install never reads the token beyond checking that it is present.
+
+To stop presenting a credential, remove the file (or revoke the enrolment in the hub) and install
+again.
 
 ## Upgrade
 

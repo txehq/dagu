@@ -67,6 +67,20 @@ except OSError:
   esac
 }
 
+# worker_credential GIVEN PATH MACHINE_ID: print the machine credential file the
+# worker agent is to pass, or nothing. GIVEN is 1 when --credential-file named PATH;
+# otherwise enrol's default, TXE_DAGU_HOME/worker-credential.json, is used when it
+# exists (a dangling link included, so it is refused rather than ignored). A file
+# that is not a usable credential for MACHINE_ID fails with the reason on stderr.
+worker_credential() {
+  local given="$1" path="$2" machine_id="$3" default="$TXE_DAGU_HOME/worker-credential.json"
+  if [ "$given" != 1 ]; then
+    if [ -e "$default" ] || [ -L "$default" ]; then path="$default"; else return 0; fi
+  fi
+  python3 -I "$(dirname "${BASH_SOURCE[0]}")/agents.py" check-credential "$path" "$machine_id" >&2 || return 1
+  printf '%s\n' "$path"
+}
+
 # json_field FILE KEY: print one top-level string field of a JSON file.
 json_field() {
   python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
