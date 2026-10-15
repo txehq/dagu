@@ -47,6 +47,12 @@ var queuedCountScanCap = 500
 // Declared as a var for the same reason as queuedCountScanCap.
 var queuedCountRequestScanCap = 2000
 
+// queuedMembershipScanCap bounds how many queued entries one request may walk
+// to find whether a queue holds a run of an owner-held caller's, after the
+// count's budget is spent. The walk reads a status only for entries of the
+// caller's own DAGs. A var for the same reason as queuedCountScanCap.
+var queuedMembershipScanCap = 20000
+
 // scanBudget bounds the queued entries one request may scan in total, shared
 // across every queue that request counts.
 type scanBudget struct {
@@ -315,6 +321,9 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	// One budget shared by every queue counted in this request.
 	budget := newScanBudget(queuedCountRequestScanCap)
 	ownerOnly := a.txeNativeOwnerOnly(ctx)
+	// The entries an owner-held caller's membership checks may walk in this
+	// request, past the count's budget.
+	membership := newScanBudget(queuedMembershipScanCap)
 	// setQueuedCount records a queue's count. A queue already listed (from
 	// configuration, or for a running run the caller may see) always takes
 	// its count. A queue not yet listed is added when the scan shows it
@@ -327,7 +336,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			// budget) before any visible entry decides nothing by count:
 			// whether the queue holds a run of the caller's is then read
 			// from its entries' DAG names, whatever the queue is called.
-			if ownerOnly && count == 0 && (!capped || !a.txeQueueHoldsVisibleRun(ctx, name)) {
+			if ownerOnly && count == 0 && (!capped || !a.txeQueueHoldsVisibleRun(ctx, name, membership)) {
 				return
 			}
 			if !ownerOnly && count == 0 && !capped && !listEmpty {
@@ -480,12 +489,14 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 // When either bound is reached, counting stops and the returned bool reports
 // that the count is a lower bound.
 // txeQueueHoldsVisibleRun reports whether a queue holds a run that a
-// caller held to its owner may see. A queued run is a root run, decided by
-// its DAG's owner, and each entry names its DAG, so this reads no run
-// status: it walks the entries, decides each DAG name once, and stops at
-// the first the caller may see. A queue that cannot be read holds nothing
-// visible.
-func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string) bool {
+// caller held to its owner may see, for a queue whose count was cut short
+// before any visible entry. Each entry names its run's DAG, so most entries
+// are passed over by that name, decided once per name, without reading a
+// status. An entry whose DAG the caller may see is confirmed as the count
+// confirms it, by the run's own status, so the two never read a queue
+// differently. The walk spends the request's membership budget; a queue it
+// cannot finish holds nothing visible, so it is not named.
+func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string, budget *scanBudget) bool {
 	decided := map[string]bool{}
 	cursor := ""
 	for {
@@ -494,6 +505,10 @@ func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string) boo
 			return false
 		}
 		for _, item := range page.Items {
+			if budget.exhausted() {
+				return false
+			}
+			budget.consume()
 			ref, err := item.Data()
 			if err != nil || ref == nil {
 				continue
@@ -503,7 +518,10 @@ func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string) boo
 				visible = a.txeNativeVisible(ctx, ref.Name)
 				decided[ref.Name] = visible
 			}
-			if visible {
+			if !visible {
+				continue
+			}
+			if summary, err := a.fetchDAGRunSummary(ctx, *ref); err == nil && summary.Status != api.StatusRunning {
 				return true
 			}
 		}

@@ -334,4 +334,20 @@ func TestTxeCustomQueuesBeyondTheScanBudgetAreDecidedByTheirRuns(t *testing.T) {
 	require.NotContains(t, byName, "aa-first")
 	_, err = w.api.GetQueue(neutral(w.personA), apigen.GetQueueRequestObject{Name: "zz-other"})
 	require.Equal(t, http.StatusNotFound, statusOf(err))
+
+	// The walk that finds A's run is bounded too: with its budget spent, the
+	// queue is not named, rather than walked without limit. A still reaches
+	// it by name, with that request's own budget.
+	savedWalk := queuedMembershipScanCap
+	t.Cleanup(func() { queuedMembershipScanCap = savedWalk })
+	queuedMembershipScanCap = 0
+	resp, err = w.api.ListQueues(neutral(w.personA), apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
+		require.NotEqual(t, "zz-custom", q.Name)
+	}
+	queuedCountRequestScanCap = saved
+	got, err := w.api.GetQueue(neutral(w.personA), apigen.GetQueueRequestObject{Name: "zz-custom"})
+	require.NoError(t, err)
+	require.Equal(t, 1, apigen.Queue(got.(apigen.GetQueue200JSONResponse)).QueuedCount)
 }
