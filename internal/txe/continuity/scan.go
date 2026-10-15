@@ -274,8 +274,8 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.keptMissing()
 	}
+	keptMissing(inv, keep, keepSeen)
 	if err := inv.Seal(); err != nil {
 		return nil, err
 	}

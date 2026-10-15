@@ -223,3 +223,47 @@ func TestDecodeKeepIsStrict(t *testing.T) {
 		assert.Error(t, err, name)
 	}
 }
+
+// A change no file shows still reaches the freeze comparison: an empty
+// directory removed from a kept tree, or a directory's permission bits.
+func TestKeepCompareSeesDirectoryChanges(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	strayEntries(t, l)
+	m := strayManifest()
+	pin(t, m, scanKeep(t, l, m))
+	before := scanKeep(t, l, m)
+	require.Empty(t, continuity.Blocking(continuity.Validate(before, continuity.Policy{})))
+	require.Len(t, before.Kept, 6)
+
+	require.NoError(t, os.Remove(homePath(l, "logs/admin/events/quarantine")))
+	got := compareCodes(continuity.Compare(before, scanKeep(t, l, m), continuity.CompareOptions{}))
+	assert.Equal(t, map[string]int{"kept_changed": 1}, got)
+	require.NoError(t, os.MkdirAll(homePath(l, "logs/admin/events/quarantine"), 0o750))
+	assert.Empty(t, compareCodes(continuity.Compare(before, scanKeep(t, l, m), continuity.CompareOptions{})))
+
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(homePath(l, "dags"), 0o700))
+		after := scanKeep(t, l, m)
+		assert.Equal(t, map[string]int{"kept_changed": 1}, compareCodes(continuity.Compare(before, after, continuity.CompareOptions{})))
+		assert.Equal(t, map[string]int{"kept_changed": 1}, compareCodes(continuity.CompareProgress(before, after)))
+	}
+
+	// An inventory taken without the manifest no longer keeps the entries.
+	inv, err := continuity.Scan(context.Background(), continuity.Options{Roots: roots(l), ExpectedOwner: fixture.StableOwner,
+		Label: "test", Now: func() time.Time { return scanTime }})
+	require.NoError(t, err)
+	assert.Equal(t, 6, compareCodes(continuity.Compare(before, inv, continuity.CompareOptions{}))["kept_missing"])
+}
+
+// A manifest names exactly what one inventory keeps: an entry whose root
+// was not scanned blocks instead of disappearing.
+func TestKeepEntryOfAnUnscannedRootBlocks(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	strayEntries(t, l)
+	m := strayManifest()
+	m.Entries = append(m.Entries, continuity.KeepEntry{Root: "linux-home", Path: "base.yaml", Provenance: "fixture"})
+	got := codes(continuity.Validate(scanKeep(t, l, m), continuity.Policy{}), continuity.SeverityBlock)
+	assert.Equal(t, 1, got["kept_missing"], "%v", got)
+}

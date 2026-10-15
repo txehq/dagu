@@ -124,9 +124,21 @@ type Inventory struct {
 	Excluded []Excluded        `json:"excluded,omitempty"`
 	Issues   []Issue           `json:"issues,omitempty"`
 	Machines map[string]string `json:"machines,omitempty"` // machine home root label -> machine ID
+	// Kept are the entries a keep manifest kept, with the tree digest the
+	// scan found, so a comparison sees a change no file shows.
+	Kept []Kept `json:"kept,omitempty"`
 	// Digest is the SHA-256 of the canonical JSON of the inventory without
 	// this field.
 	Digest string `json:"digest"`
+}
+
+// Kept is an entry no TXE writer owns, kept exactly as it is.
+type Kept struct {
+	Root string `json:"root"`
+	Path string `json:"path"`
+	// Digest is the tree digest the scan found (see KeepEntry).
+	Digest     string `json:"digest"`
+	Provenance string `json:"provenance"`
 }
 
 // RootInfo is one scanned root.
@@ -284,6 +296,13 @@ func (inv *Inventory) Seal() error {
 		return a.Path < b.Path
 	})
 	sortIssues(inv.Issues)
+	sort.Slice(inv.Kept, func(i, k int) bool {
+		a, b := inv.Kept[i], inv.Kept[k]
+		if a.Root != b.Root {
+			return a.Root < b.Root
+		}
+		return a.Path < b.Path
+	})
 	inv.Counts = map[string]int{}
 	for _, r := range inv.Records {
 		inv.Counts[r.Class]++

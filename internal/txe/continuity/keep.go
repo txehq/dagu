@@ -113,6 +113,7 @@ func (s *scanner) kept(rel string) (bool, error) {
 	if err != nil {
 		return true, err
 	}
+	s.inv.Kept = append(s.inv.Kept, Kept{Root: s.root.Label, Path: rel, Digest: digest, Provenance: e.Provenance})
 	switch {
 	case refused != "":
 		s.issue("kept_credential", "", id, "%s is or holds %s, whose name is where credentials are kept; exclude it in the keep manifest, it was not read", id, path.Join(rel, refused))
@@ -166,7 +167,8 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 		case d.Type()&fs.ModeSymlink != 0:
 			kind = "l"
 		case !d.Type().IsRegular():
-			kind = "o"
+			// A device, socket or pipe: its exact type is pinned.
+			kind = "o:" + info.Mode().Type().String()
 		}
 		if r != "." && exclude[r] {
 			lines = append(lines, fmt.Sprintf("x\x00%s\x00%s", r, kind))
@@ -197,17 +199,17 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 			}
 			f.Link = target
 			lines = append(lines, fmt.Sprintf("l\x00%s\x00%s", r, target))
-		case "o":
-			// A device, socket or pipe is pinned by its name and type and
-			// never opened.
-			lines = append(lines, fmt.Sprintf("o\x00%s", r))
-			return nil
-		default:
+		case "f":
 			f.Size, f.SHA256, err = fileDigest(p)
 			if err != nil {
 				return err
 			}
 			lines = append(lines, fmt.Sprintf("f\x00%s\x00%o\x00%s", r, perm, f.SHA256))
+		default:
+			// A device, socket or pipe is pinned by its type and
+			// permission bits, and never opened.
+			lines = append(lines, fmt.Sprintf("%s\x00%s\x00%o", kind, r, perm))
+			return nil
 		}
 		s.inv.Files = append(s.inv.Files, f)
 		return nil
@@ -232,19 +234,20 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 	return "sha256:" + hex.EncodeToString(sum[:]), refused, nil
 }
 
-// keptMissing blocks for every kept entry of the root that the scan did not
-// find.
-func (s *scanner) keptMissing() {
-	prefix := s.root.Label + "/"
+// keptMissing blocks for every entry of the manifest that the scan did not
+// find, whichever root it names: a manifest names exactly what one
+// inventory keeps.
+func keptMissing(inv *Inventory, keep map[string]*KeepEntry, seen map[string]bool) {
 	var missing []string
-	for key := range s.keep {
-		if strings.HasPrefix(key, prefix) && !s.keepSeen[key] {
+	for key := range keep {
+		if !seen[key] {
 			missing = append(missing, key)
 		}
 	}
 	sort.Strings(missing)
 	for _, key := range missing {
-		s.issue("kept_missing", "", key, "%s is kept by the keep manifest but is not there, or is now classified", key)
+		inv.Issues = append(inv.Issues, Issue{Code: "kept_missing", Severity: SeverityBlock, ID: key,
+			Detail: fmt.Sprintf("%s is kept by the keep manifest but was not found: it is gone, now classified, or its root was not scanned", key)})
 	}
 }
 
