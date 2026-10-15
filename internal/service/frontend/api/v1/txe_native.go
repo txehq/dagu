@@ -184,15 +184,38 @@ func txeNothingFilter() *workspace.WorkspaceFilter {
 	return &workspace.WorkspaceFilter{Enabled: true, IncludeUnlabelled: false}
 }
 
+// txeNativeDAGName is the name a loaded DAG's owner is read from: its
+// definition's file stem, which is the registry's key for the DAGs it
+// writes. A DAG whose declared name differs from its stem, where either
+// names an owner's DAG, is an alias of that DAG and not it: it reports ""
+// (no owner), so no file can take an owner's DAG name, and no owner's file
+// can shed it.
+func txeNativeDAGName(dag *ir.DAG) string {
+	stem := dag.SuspendFlagName()
+	if dag.Name != "" && dag.Name != stem && (txeNativeOwnedName(stem) || txeNativeOwnedName(dag.Name)) {
+		return ""
+	}
+	return stem
+}
+
+// txeNativeOwnedName reports whether a DAG name is one an owner's DAG has.
+func txeNativeOwnedName(name string) bool {
+	if registry.IsJobDAG(name) {
+		return true
+	}
+	_, ok := txeauth.MachineOfDAG(name)
+	return ok
+}
+
 // requireDAGVisible applies the hub's workspace check, or for a caller held
 // to its owner the owner's decision, to seeing a DAG.
 func (a *API) requireDAGVisible(ctx context.Context, dag *ir.DAG) error {
-	return a.requireNamedDAGVisible(ctx, dag.Name, dagWorkspaceName(dag))
+	return a.requireNamedDAGVisible(ctx, txeNativeDAGName(dag), dagWorkspaceName(dag))
 }
 
 // requireDAGExecute is requireDAGVisible for running a DAG.
 func (a *API) requireDAGExecute(ctx context.Context, dag *ir.DAG) error {
-	return a.requireNamedDAGExecute(ctx, dag.Name, dagWorkspaceName(dag))
+	return a.requireNamedDAGExecute(ctx, txeNativeDAGName(dag), dagWorkspaceName(dag))
 }
 
 // requireNamedDAGVisible decides seeing the DAG dagName whose workspace, for

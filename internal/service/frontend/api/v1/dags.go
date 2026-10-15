@@ -1908,6 +1908,11 @@ func (a *API) UpdateDAGSuspensionState(ctx context.Context, request api.UpdateDA
 }
 
 func (a *API) SearchDAGs(ctx context.Context, request api.SearchDAGsRequestObject) (api.SearchDAGsResponseObject, error) {
+	if a.txeNativeOwnerOnly(ctx) {
+		// Search is not owner-scoped (TXE-4264): a caller held to its owner
+		// finds its jobs in /txe/jobs.
+		return nil, errTxeForbidden
+	}
 	ret, errs, err := a.dagRepository.Grep(ctx, request.Params.Q)
 	if err != nil {
 		return nil, fmt.Errorf("error searching DAGs: %w", err)

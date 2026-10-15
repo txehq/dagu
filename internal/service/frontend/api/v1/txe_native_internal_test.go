@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -209,4 +210,42 @@ func TestTxeNativeSubRunOfAnotherOwnersDAG(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGRunStatusVisible(neutral(w.personB), own)))
 	// A legacy key in mode off is decided by workspace alone, as before.
 	require.NoError(t, w.api.requireDAGRunStatusVisible(w.legacy, sub))
+}
+
+// Search is not owner-scoped, so it is closed to a caller held to its owner.
+func TestTxeNativeSearchIsClosedToOwnerHeldCallers(t *testing.T) {
+	w := newTwoOwners(t, "")
+	_, err := w.api.SearchDAGs(neutral(w.personA), apigen.SearchDAGsRequestObject{Params: apigen.SearchDAGsParams{Q: "echo"}})
+	require.Equal(t, http.StatusForbidden, statusOf(err))
+	_, err = w.api.SearchDAGs(neutral(w.cliA), apigen.SearchDAGsRequestObject{Params: apigen.SearchDAGsParams{Q: "echo"}})
+	require.Equal(t, http.StatusForbidden, statusOf(err))
+	_, err = w.api.SearchDAGs(w.legacy, apigen.SearchDAGsRequestObject{Params: apigen.SearchDAGsParams{Q: "echo"}})
+	require.NoError(t, err)
+}
+
+// A DAG's owner is read from its definition's file, so a file declaring an
+// owner's DAG name is not that DAG, and an owner's file declaring another
+// name is no one's.
+func TestTxeNativeAliasOfAnOwnersDAG(t *testing.T) {
+	w := newTwoOwners(t, "")
+	personA := neutral(w.personA)
+	reviewerDAG := "txe-reviewer-" + w.machineA[len("mch_"):]
+	at := func(file, declared string) *ir.DAG {
+		return &ir.DAG{Location: filepath.Join("/dags", file+".yaml"), Name: declared}
+	}
+
+	require.NoError(t, w.api.requireDAGVisible(personA, at(w.jobA, w.jobA)))
+	require.NoError(t, w.api.requireDAGVisible(personA, at(w.jobA, "")))
+	require.NoError(t, w.api.requireDAGVisible(personA, at(reviewerDAG, reviewerDAG)))
+	for _, alias := range []*ir.DAG{
+		at("monitor", w.jobA),
+		at("monitor", reviewerDAG),
+		at(w.jobA, "monitor"),
+		at(w.jobA, w.jobB),
+	} {
+		require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGVisible(personA, alias)), alias.Location)
+		require.Equal(t, http.StatusNotFound, statusOf(w.api.requireDAGExecute(personA, alias)), alias.Location)
+	}
+	// A legacy credential in mode off is decided by workspace alone.
+	require.NoError(t, w.api.requireDAGVisible(w.legacy, at("monitor", w.jobA)))
 }
