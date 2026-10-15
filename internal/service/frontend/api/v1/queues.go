@@ -323,7 +323,11 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	setQueuedCount := func(name string, count int, capped, listEmpty bool) {
 		queue, listed := queueMap[name]
 		if !listed {
-			if ownerOnly && count == 0 {
+			// A scan cut short (by the queue's cap or the request's
+			// budget) before any visible entry decides nothing by count:
+			// the queue, named for its DAG, is then the caller's to see
+			// exactly when that DAG is.
+			if ownerOnly && count == 0 && (!capped || !a.txeNativeVisible(ctx, name)) {
 				return
 			}
 			if !ownerOnly && count == 0 && !capped && !listEmpty {

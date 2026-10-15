@@ -113,9 +113,9 @@ func txeCanonicalPath(r *http.Request) bool {
 			}
 		}
 	}
-	for i, segment := range strings.Split(r.URL.Path, "/") {
-		last := i == strings.Count(r.URL.Path, "/")
-		if segment == "." || segment == ".." || (segment == "" && i != 0 && !last) {
+	segments := strings.Split(r.URL.Path, "/")
+	for i, segment := range segments {
+		if segment == "." || segment == ".." || (segment == "" && i != 0 && i != len(segments)-1) {
 			return false
 		}
 	}

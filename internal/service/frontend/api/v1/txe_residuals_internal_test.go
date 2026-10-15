@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
@@ -240,4 +241,57 @@ func TestTxeSharedQueueCountsOnlyTheCallersRuns(t *testing.T) {
 	require.NotContains(t, listed, w.jobB)
 	// The legacy view is unchanged: the real flag.
 	require.True(t, *shared(w.legacy).QueuedCountCapped)
+}
+
+// A queue reached after the request's scan budget is spent is decided by its
+// name, the DAG it is named for: the caller's own queue is still listed
+// (with its count a lower bound), another owner's still is not.
+func TestTxeQueuesBeyondTheScanBudgetAreDecidedByName(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	queued := func(dag, runID string) {
+		w.writeRun(&ir.DAG{Name: dag, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+			s.Status = ir.Queued
+		})
+	}
+	queued(w.jobA, "qa-1")
+	queued(w.jobB, "qb-1")
+	qs := store.NewQueueStore(file.NewCollection(t.TempDir()))
+	ctx := context.Background()
+	require.NoError(t, qs.Enqueue(ctx, w.jobA, queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobA, "qa-1")))
+	require.NoError(t, qs.Enqueue(ctx, w.jobB, queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobB, "qb-1")))
+	w.api.queueStore = qs
+	w.api.procRepository = nil
+	// Queues are scanned in name order. The caller is the owner of the job
+	// whose queue comes second; the budget is spent on the first.
+	first, second, caller := w.jobA, w.jobB, w.personB
+	if w.jobB < w.jobA {
+		first, second, caller = w.jobB, w.jobA, w.personA
+	}
+	saved := queuedCountRequestScanCap
+	t.Cleanup(func() { queuedCountRequestScanCap = saved })
+	queuedCountRequestScanCap = 1
+
+	resp, err := w.api.ListQueues(neutral(caller), apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	byName := map[string]apigen.Queue{}
+	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
+		byName[q.Name] = q
+	}
+	require.Contains(t, byName, second, "the caller's own queue, beyond the budget, is listed")
+	require.True(t, *byName[second].QueuedCountCapped)
+	require.NotContains(t, byName, first, "the other owner's queue is not named to the caller")
+}
+
+// The canonical-path check is linear in the path's length.
+func TestTxeCanonicalPathIsLinear(t *testing.T) {
+	long := "/api/v1/dags/" + strings.Repeat("a/", 200_000) + "a"
+	done := make(chan bool, 1)
+	go func() { done <- txeCanonicalPath(httptest.NewRequest(http.MethodGet, long, nil)) }()
+	select {
+	case ok := <-done:
+		require.True(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a long path took more than five seconds")
+	}
 }
