@@ -187,7 +187,13 @@ func (a *API) requireEditRetryPermissions(ctx context.Context, plan *editRetryPl
 	if err := a.requireDAGRunStatusExecute(ctx, plan.sourceStatus); err != nil {
 		return err
 	}
-	return a.requireDAGWriteForWorkspace(ctx, plan.targetWorkspace)
+	// An edited retry runs a definition that is not the stored one: it is
+	// decided as a write to the DAG it runs as.
+	names := []string{plan.sourceStatus.Name}
+	if plan.editedDAG != nil {
+		names = append(names, plan.editedDAG.Name)
+	}
+	return a.txeNativeWriteClosed(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, plan.targetWorkspace) }, names...)
 }
 
 func (a *API) requireEditRetryPrePlanPermissions(ctx context.Context, dagName string, dagRunID string, specContent string) error {

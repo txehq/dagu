@@ -157,7 +157,7 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 	}
 
 	var yamlSpec []byte
-	var workspaceName string
+	var workspaceName, declaredName string
 	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
 		dag, err := a.dagRepository.LoadSpec(ctx,
 			[]byte(*request.Body.Spec),
@@ -180,13 +180,15 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 			}
 		}
 		workspaceName = dagWorkspaceName(dag)
+		declaredName = dag.Name
 		yamlSpec = []byte(*request.Body.Spec)
 	} else {
 		yamlSpec = []byte(`steps:
   - run: echo hello
 `)
 	}
-	if err := a.requireDAGWriteForWorkspace(ctx, workspaceName); err != nil {
+	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, workspaceName) },
+		request.Body.Name, declaredName); err != nil {
 		return nil, err
 	}
 
@@ -219,7 +221,8 @@ func (a *API) DeleteDAG(ctx context.Context, request api.DeleteDAGRequestObject)
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(dag)) },
+		request.FileName, dag.Name); err != nil {
 		return nil, err
 	}
 	if err := a.dagRepository.Delete(ctx, request.FileName); err != nil {
@@ -337,7 +340,8 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(currentDAG)); err != nil {
+	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(currentDAG)) },
+		string(request.FileName), currentDAG.Name); err != nil {
 		return nil, err
 	}
 	nextDAG, err := a.dagRepository.LoadSpec(ctx,
@@ -349,7 +353,8 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 		return nil, err
 	}
 	if nextDAG != nil {
-		if err := a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(nextDAG)); err != nil {
+		if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(nextDAG)) },
+			nextDAG.Name); err != nil {
 			return nil, err
 		}
 	}
@@ -394,7 +399,10 @@ func (a *API) RenameDAG(ctx context.Context, request api.RenameDAGRequestObject)
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	// The source and the destination are both decided: renaming a file to
+	// an owner's DAG name is writing that DAG.
+	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, dagWorkspaceName(dag)) },
+		request.FileName, dag.Name, request.Body.NewFileName); err != nil {
 		return nil, err
 	}
 
