@@ -217,6 +217,16 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, calls(w.jobB)), "calling B's job")
 			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, calls(w.jobA)), "calling a job: the registry's")
 			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, stepTo(w.machineA)), "a step on A's own machine")
+			// The coordinator matches every label: a selector that names no
+			// machine reaches any machine with those labels, B's included.
+			byLabel := func(label string) string {
+				return "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: s\n    call: " + w.reviewerA +
+					"\n    worker_selector:\n      " + label + "\n"
+			}
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, byLabel("txe.owner: "+w.ownerB)), "a step selecting B's owner")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, byLabel("os: linux")), "a step selecting by platform")
+			docByLabel := "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: s\n    run: echo s\n---\nname: child\nworker_selector:\n  os: linux\nsteps:\n  - name: s\n    run: echo s\n"
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, docByLabel), "a local DAG selecting by platform")
 
 			// A spec that does not load cannot be verified.
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, "steps: [unclosed\n"))

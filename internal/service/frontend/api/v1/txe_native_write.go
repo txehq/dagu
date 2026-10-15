@@ -207,8 +207,12 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacemen
 	return out, nil
 }
 
-// txeSelectedMachine is the machine a worker selector sends work to, or "".
-// A computed selector cannot be verified.
+// txeSelectedMachine is the machine a worker selector sends work to, or ""
+// for none. The coordinator matches every label a selector names, and every
+// worker carries labels that are not its machine (os, arch, txe.owner), so a
+// selector that names labels but no machine can reach any machine that has
+// them: where it runs cannot be decided, and it is not verified. Neither is
+// a computed selector.
 func txeSelectedMachine(selector map[string]string) (string, error) {
 	machine := ""
 	for k, v := range selector {
@@ -219,14 +223,16 @@ func txeSelectedMachine(selector map[string]string) (string, error) {
 			machine = v
 		}
 	}
+	if len(selector) > 0 && machine == "" {
+		return "", errTxeSpecUnverified
+	}
 	return machine, nil
 }
 
-// txeMachineLabel is the worker label that pins a DAG to a machine.
 const txeMachineLabel = "txe.machine"
 
 var errTxeSpecUnverified = &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
-	Message: "the spec could not be verified: it does not load, or its worker selector is computed",
+	Message: "the spec could not be verified: it does not load, or a worker selector is computed or does not name the machine it runs on",
 	Details: map[string]any{"code": "spec_unverified"}}
 
 // txeNativeWriteUnverified decides a write whose spec could not be read for
