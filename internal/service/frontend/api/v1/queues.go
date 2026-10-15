@@ -325,9 +325,9 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 		if !listed {
 			// A scan cut short (by the queue's cap or the request's
 			// budget) before any visible entry decides nothing by count:
-			// the queue, named for its DAG, is then the caller's to see
-			// exactly when that DAG is.
-			if ownerOnly && count == 0 && (!capped || !a.txeNativeVisible(ctx, name)) {
+			// whether the queue holds a run of the caller's is then read
+			// from its entries' DAG names, whatever the queue is called.
+			if ownerOnly && count == 0 && (!capped || !a.txeQueueHoldsVisibleRun(ctx, name)) {
 				return
 			}
 			if !ownerOnly && count == 0 && !capped && !listEmpty {
@@ -479,6 +479,41 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 // both bounds the cost grows with queue depth and with the number of queues.
 // When either bound is reached, counting stops and the returned bool reports
 // that the count is a lower bound.
+// txeQueueHoldsVisibleRun reports whether a queue holds a run that a
+// caller held to its owner may see. A queued run is a root run, decided by
+// its DAG's owner, and each entry names its DAG, so this reads no run
+// status: it walks the entries, decides each DAG name once, and stops at
+// the first the caller may see. A queue that cannot be read holds nothing
+// visible.
+func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string) bool {
+	decided := map[string]bool{}
+	cursor := ""
+	for {
+		page, err := a.queueStore.ListCursor(ctx, queueName, cursor, queueCursorScanBatch)
+		if err != nil {
+			return false
+		}
+		for _, item := range page.Items {
+			ref, err := item.Data()
+			if err != nil || ref == nil {
+				continue
+			}
+			visible, seen := decided[ref.Name]
+			if !seen {
+				visible = a.txeNativeVisible(ctx, ref.Name)
+				decided[ref.Name] = visible
+			}
+			if visible {
+				return true
+			}
+		}
+		if !page.HasMore {
+			return false
+		}
+		cursor = page.NextCursor
+	}
+}
+
 func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, budget *scanBudget) (int, bool, error) {
 	if a.queueStore == nil {
 		return 0, false, nil

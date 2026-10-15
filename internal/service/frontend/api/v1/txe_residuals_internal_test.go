@@ -295,3 +295,43 @@ func TestTxeCanonicalPathIsLinear(t *testing.T) {
 		t.Fatal("a long path took more than five seconds")
 	}
 }
+
+// A queue may be named otherwise than its DAG (an enqueue's queue override).
+// Past the scan budget, it is decided by the runs it holds: listed when one
+// is the caller's, whatever it is called, and not named otherwise.
+func TestTxeCustomQueuesBeyondTheScanBudgetAreDecidedByTheirRuns(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	queued := func(dag, runID string) {
+		w.writeRun(&ir.DAG{Name: dag, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+			s.Status = ir.Queued
+		})
+	}
+	queued(w.jobB, "qb-1")
+	queued(w.jobA, "qa-1")
+	queued(w.jobB, "qb-2")
+	qs := store.NewQueueStore(file.NewCollection(t.TempDir()))
+	ctx := context.Background()
+	// Scanned in name order: the budget is spent on the first.
+	require.NoError(t, qs.Enqueue(ctx, "aa-first", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobB, "qb-1")))
+	require.NoError(t, qs.Enqueue(ctx, "zz-custom", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobA, "qa-1")))
+	require.NoError(t, qs.Enqueue(ctx, "zz-other", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobB, "qb-2")))
+	w.api.queueStore = qs
+	w.api.procRepository = nil
+	saved := queuedCountRequestScanCap
+	t.Cleanup(func() { queuedCountRequestScanCap = saved })
+	queuedCountRequestScanCap = 1
+
+	resp, err := w.api.ListQueues(neutral(w.personA), apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	byName := map[string]apigen.Queue{}
+	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
+		byName[q.Name] = q
+	}
+	require.Contains(t, byName, "zz-custom", "A's run in a custom queue beyond the budget is listed")
+	require.True(t, *byName["zz-custom"].QueuedCountCapped)
+	require.NotContains(t, byName, "zz-other", "a queue of B's runs only is not named to A")
+	require.NotContains(t, byName, "aa-first")
+	_, err = w.api.GetQueue(neutral(w.personA), apigen.GetQueueRequestObject{Name: "zz-other"})
+	require.Equal(t, http.StatusNotFound, statusOf(err))
+}
