@@ -18,6 +18,16 @@ if [ -L "$TXE_DAGU_HOME/bin/dagu" ]; then
   printf 'binary   %s\n' "$(readlink "$TXE_DAGU_HOME/bin/dagu")"
 fi
 
+credential="$(python3 -I "$here/agents.py" credential "$TXE_DAGU_AGENTS_DIR/$TXE_DAGU_WORKER_LABEL.plist")"
+if [ -n "$credential" ]; then
+  printf 'credential %s\n' "$credential"
+  if [ -f "$machine" ]; then
+    python3 -I "$here/agents.py" check-credential "$credential" "$(json_field "$machine" machine_id)" >/dev/null || rc=1
+  fi
+else
+  echo "credential (none: the worker presents no machine credential)"
+fi
+
 expires="$TXE_DAGU_HOME/tunnel/kubeconfig.expires"
 if [ -s "$expires" ]; then
   exp="$(cat "$expires")"

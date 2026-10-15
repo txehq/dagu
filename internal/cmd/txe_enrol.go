@@ -27,7 +27,7 @@ import (
 )
 
 var (
-	txeEnrolClientFlag = commandLineFlag{name: "client-id", required: true,
+	txeEnrolClientFlag = commandLineFlag{name: "client-id",
 		usage: "This machine's own worker client at the identity provider, as the hub's administrator created it"}
 	txeEnrolIssuerFlag = commandLineFlag{name: "issuer",
 		usage: "Identity provider issuer URL, exactly as the provider states it (default: the hub's)"}
@@ -56,7 +56,7 @@ func init() {
 }
 
 func txeEnrolCommand() *cobra.Command {
-	return NewCommand(&cobra.Command{
+	cmd := NewCommand(&cobra.Command{
 		Use:   "enrol",
 		Short: "Enrol this machine's worker with the hub through its owner's browser sign-in",
 		Long: `Give this machine's worker its own credential, then apply to the hub to enrol it.
@@ -74,7 +74,8 @@ application grants nothing: a person of the machine's owner approves it in the
 hub, naming the class, client, issuer and subject this command prints. An
 application is live only while its token is, so --wait keeps applying each
 minute until the hub reports the machine enrolled. --resume applies again with
-the credential already written, without signing in.
+the credential already written, without signing in. "dagu txe enrol check"
+only loads the credential file the way the worker does.
 
 A worker that is renewing holds the credential's lock; the credential is
 written only once the lock is free. Not on Windows, where the worker cannot
@@ -82,6 +83,38 @@ check that only its owner reads the file.`,
 		Args: cobra.NoArgs,
 	}, []commandLineFlag{txeEnrolClientFlag, txeEnrolIssuerFlag, txeEnrolFileFlag, txeEnrolWaitFlag, txeEnrolResumeFlag,
 		txeLoginPromptFlag, txeLoginNoBrowser, txeJSONFlag}, runTXEEnrol)
+	cmd.AddCommand(txeEnrolCheckCommand())
+	return cmd
+}
+
+func txeEnrolCheckCommand() *cobra.Command {
+	return NewCommand(&cobra.Command{
+		Use:   "check",
+		Short: "Check that the worker can load this machine's credential file",
+		Long: `Load the credential file exactly as the worker does (an owner-only regular file
+holding a machine credential with a usable token endpoint) and require it to be
+this machine's (machine.json). It signs in nowhere and contacts nothing. The
+worker installer runs it with the binary it built before it passes the file to
+the worker.`,
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{txeLocalAnnotation: "true"},
+	}, []commandLineFlag{txeEnrolFileFlag, txeJSONFlag}, runTXEEnrolCheck)
+}
+
+func runTXEEnrolCheck(ctx *Context, _ []string) error {
+	home, err := txepkg.DefaultHome()
+	if err != nil {
+		return err
+	}
+	machine, err := home.Machine()
+	if err != nil {
+		return err
+	}
+	path, err := txeEnrolPath(ctx, home)
+	if err != nil {
+		return err
+	}
+	return txeEnrolCheck(ctx, machine.MachineID, path)
 }
 
 // txeEnrolView is what enrol shows. It never holds a token.
@@ -117,9 +150,6 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 	if runtime.GOOS == "windows" {
 		return errors.New("a machine credential cannot be kept on Windows: the worker cannot check there that only its owner reads it")
 	}
-	if txeInDAGStep() {
-		return errors.New("enrolment needs a person at a browser; it never runs as a DAG step")
-	}
 	home, err := txepkg.DefaultHome()
 	if err != nil {
 		return err
@@ -128,15 +158,21 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 	if err != nil {
 		return err
 	}
-	remote, err := txeRemoteContext(ctx)
+	path, err := txeEnrolPath(ctx, home)
 	if err != nil {
 		return err
+	}
+	if txeInDAGStep() {
+		return errors.New("enrolment needs a person at a browser; it never runs as a DAG step")
 	}
 	clientID, err := ctx.StringParam("client-id")
 	if err != nil {
 		return err
 	}
-	path, err := txeEnrolPath(ctx, home)
+	if clientID == "" {
+		return errors.New("--client-id is required: this machine's own worker client at the identity provider")
+	}
+	remote, err := txeRemoteContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -240,6 +276,31 @@ func txeEnrolMachineKnown(ctx *Context, remote *remoteClient, machineID string) 
 		return fmt.Errorf("ask the hub about machine %s: %w", machineID, err)
 	}
 	return nil
+}
+
+// txeEnrolChecked is what --check shows. It never holds a token.
+type txeEnrolChecked struct {
+	CredentialFile string `json:"credential_file"`
+	MachineID      string `json:"machine_id"`
+	ClientID       string `json:"client_id"`
+	Issuer         string `json:"issuer"`
+}
+
+// txeEnrolCheck loads the credential exactly as the worker does
+// (transportauth.ReadMachineCredential: owner-only regular file, known
+// fields, a usable token endpoint) and requires it to be this machine's.
+func txeEnrolCheck(ctx *Context, machineID, path string) error {
+	credential, err := transportauth.ReadMachineCredential(path)
+	if err != nil {
+		return err
+	}
+	if credential.MachineID != machineID {
+		return fmt.Errorf("%s is for machine %s, but this machine is %s", path, credential.MachineID, machineID)
+	}
+	view := txeEnrolChecked{CredentialFile: path, MachineID: credential.MachineID, ClientID: credential.ClientID, Issuer: credential.Issuer}
+	return txeOutput(ctx, view, func(p *txePrinter) {
+		p.f("credential %s: the worker can load it (machine %s, client %s at %s)\n", path, view.MachineID, view.ClientID, view.Issuer)
+	})
 }
 
 // txeEnrolPath is the credential file: the flag, made absolute, or the TXE

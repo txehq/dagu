@@ -3,6 +3,7 @@
 #
 #   txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_...   # first install
 #   txe/worker/install.sh --tag txe-v2.18.3-1                       # upgrade
+#   txe/worker/install.sh --tag txe-v2.18.3-1 --credential-file /abs/worker-credential.json
 #
 # It builds the worker from the same fork tag as the cluster image, keeps every
 # earlier binary, and writes two launchd agents that run whether or not any coding
@@ -18,6 +19,16 @@
 # different --owner-id is refused, so a reinstall cannot change who owns this
 # machine's work. Packages, outputs and logs are never touched.
 #
+# Machine credential (TXE-4366). Once `dagu txe enrol` has written this machine's
+# worker credential, install again: the worker agent then presents it to the
+# coordinator. The credential is --credential-file, or else
+# $TXE_DAGU_HOME/worker-credential.json (where enrol writes it) when that file
+# exists; with neither, the agents are exactly those of an unenrolled machine. A
+# credential that is not this machine's, not owner-only or not a worker's is
+# refused before anything is written. The agent gets the file's path only, in
+# DAGU_WORKER_AUTH_CREDENTIAL_FILE; no token is ever in the plist, an argument or
+# a log.
+#
 # Upgrade while no job is running: restarting the worker ends its running tasks.
 set -euo pipefail
 
@@ -25,11 +36,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=txe/worker/lib.sh
 . "$here/lib.sh"
 
-tag="" owner_id=""
+tag="" owner_id="" credential="" credential_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:-}"; shift 2 ;;
     --owner-id) owner_id="${2:-}"; shift 2 ;;
+    --credential-file)
+      [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
+      credential="$2" credential_given=1; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -77,6 +91,11 @@ finally:
 PY
 fi
 
+# Machine credential: a first check now, before the build, so a refused one changes
+# nothing; the built binary checks it again below, as the worker will load it.
+credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
+  || die "not installing: fix the machine credential, or give --credential-file"
+
 # Binary: built from the tag, kept beside every earlier version.
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
 if [ ! -x "$bin" ]; then
@@ -97,6 +116,12 @@ json.dump({"tag": tag, "commit": commit, "version": version, "sha256": digest},
 PY
 fi
 DAGU_HOME="$TXE_DAGU_HOME/worker-home" "$bin" version 2>&1 | grep -q -- "$version" || die "$bin does not report version $version"
+# The worker built from this tag must load the credential, or the agents are not
+# replaced: a worker that cannot load it would only be restarted by launchd forever.
+if [ -n "$credential" ]; then
+  env "TXE_DAGU_HOME=$TXE_DAGU_HOME" "DAGU_HOME=$TXE_DAGU_HOME/worker-home" "$bin" txe enrol check --credential-file "$credential" \
+    || die "not installing: the worker built from $tag cannot load $credential (a tag before TXE-4366 has no 'txe enrol check')"
+fi
 ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
 link_dagu_on_path
@@ -105,41 +130,18 @@ kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
 [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
 
 # launchd agents. PATH is the installing shell's, so scheduled scripts find the same
-# tools; nothing else from the environment is copied, and no credential at all.
+# tools; nothing else from the environment is copied, and no credential: the worker
+# gets the machine credential's path, never its contents.
 mkdir -p "$TXE_DAGU_AGENTS_DIR"
-python3 -I - "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
+python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
-  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" <<'PY'
-import os, plistlib, sys
-(agents, home, kubectl, machine_id, owner_id, path, tunnel_label, worker_label,
- namespace, service, ui_port, coord_port) = sys.argv[1:]
-common = {"RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
-          "ProcessType": "Background"}
-tunnel = dict(common, Label=tunnel_label, ProgramArguments=[
-    kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
-    "port-forward", "--address", "127.0.0.1", service,
-    f"{ui_port}:8080", f"{coord_port}:{coord_port}"],
-    StandardOutPath=f"{home}/logs/tunnel.log", StandardErrorPath=f"{home}/logs/tunnel.log")
-worker = dict(common, Label=worker_label, ProgramArguments=[
-    f"{home}/bin/dagu", "worker",
-    "--worker.id", machine_id,
-    "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
-    "--worker.coordinators", f"127.0.0.1:{coord_port}"],
-    EnvironmentVariables={"DAGU_HOME": f"{home}/worker-home", "PATH": path},
-    WorkingDirectory=f"{home}/worker-home",
-    StandardOutPath=f"{home}/logs/worker.log", StandardErrorPath=f"{home}/logs/worker.log")
-for label, body in ((tunnel_label, tunnel), (worker_label, worker)):
-    target = os.path.join(agents, f"{label}.plist")
-    with open(target + ".tmp", "wb") as f:
-        plistlib.dump(body, f)
-    os.replace(target + ".tmp", target)
-PY
+  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential"
 
 for label in "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL"; do
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$TXE_DAGU_AGENTS_DIR/$label.plist"
 done
 
-printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n' \
-  "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME"
+printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
+  "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"
 "$here/status.sh"
