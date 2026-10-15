@@ -329,10 +329,43 @@ func (v *validator) packages() {
 		for _, label := range homes[job.Attrs["machine"]] {
 			found = found || v.verifiedPkgs[label+"|"+r.Job+"|"+r.Attrs["package_digest"]]
 		}
+		if winner, ok := undelivered(job); ok {
+			if !found {
+				v.add(SeverityWarn, "package_not_delivered", r, "machine %s holds no package %s for version %s of job %s, a duplicate registration of %s; the registry never takes package evidence for a duplicate, so its client never placed one, and it is reported, not required", job.Attrs["machine"], r.Attrs["package_digest"], r.Attrs["version"], r.Job, winner)
+			}
+			continue
+		}
 		if !found {
 			v.add(SeverityBlock, "package_missing", r, "machine %s holds no verified package %s for version %s of job %s", job.Attrs["machine"], r.Attrs["package_digest"], r.Attrs["version"], r.Job)
 		}
 	}
+}
+
+// undelivered reports whether no version of a job was ever delivered to its
+// machine, and the job it duplicates. The registry's dedupe record, written
+// once, names the one job that wins a job key; every other job registered
+// under the key is marked duplicate of it. MarkReady, the only writer of
+// package evidence, refuses a job that is not the winner and a duplicate,
+// and UpdateVersion refuses a duplicate, so a duplicate never carries
+// evidence and never runs. Its client is refused before it moves the staged
+// package to the path the version names, and keeps the staged copy, which is
+// retained as a file like any other. A duplicate that names no winner or
+// carries evidence is not what the registry writes, and its versions are
+// held as every job's are.
+func undelivered(job *Record) (string, bool) {
+	if job.Attrs["registration"] != "duplicate" {
+		return "", false
+	}
+	winner := ""
+	for _, ref := range job.Refs {
+		switch ref.Rel {
+		case "package_evidence_machine":
+			return "", false
+		case "duplicate_of":
+			winner = ref.ID
+		}
+	}
+	return winner, winner != ""
 }
 
 // dags checks each job's saved DAG against the digest the job records, when
