@@ -28,6 +28,11 @@ const REASON_LABELS: Record<InboxItem['reason'], string> = {
   'follow-up': 'Decision follow-up pending',
 };
 
+// dagPath is the native page of a job's DAG, which is named by the job id.
+export function dagPath(dagName: string): string {
+  return `/dags/${encodeURIComponent(dagName)}`;
+}
+
 export function dagRunPath(dagName: string, dagRunId: string): string {
   return `/dag-runs/${encodeURIComponent(dagName)}/${encodeURIComponent(dagRunId)}`;
 }

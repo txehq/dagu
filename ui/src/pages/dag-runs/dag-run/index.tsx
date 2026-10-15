@@ -9,6 +9,11 @@ import { DAGRunDetailsContent } from '../../../features/dag-runs/components/dag-
 import { DAGRunContext } from '../../../features/dag-runs/contexts/DAGRunContext';
 import { matchesRequestedDAGRunDetails } from '../../../features/dag-runs/hooks/dagRunDetailsRequest';
 import { useBoundedDAGRunDetails } from '../../../features/dag-runs/hooks/useBoundedDAGRunDetails';
+import { NotFoundOrNotShared } from '@/features/txe/components/identity/NotFoundOrNotShared';
+import {
+  isNotFoundAnswer,
+  usePersonScope,
+} from '@/features/txe/personScope';
 import { I18nText } from '@/i18n/I18nText';
 
 type ApiError = {
@@ -54,6 +59,7 @@ function ErrorDisplay({ error, name, dagRunId }: ErrorDisplayProps) {
 function DAGRunDetailsPage() {
   const { name, dagRunId = 'latest' } = useParams();
   const appBarContext = useContext(AppBarContext);
+  const personScope = usePersonScope();
 
   const searchParams = new URLSearchParams(window.location.search);
   const subDAGRunId = searchParams.get('subDAGRunId');
@@ -116,6 +122,13 @@ function DAGRunDetailsPage() {
   const displayName = getDisplayName();
 
   if (error && !dagRunDetails) {
+    if (personScope && isNotFoundAnswer(error)) {
+      return (
+        <div className="mx-auto max-w-lg p-8">
+          <NotFoundOrNotShared />
+        </div>
+      );
+    }
     return <ErrorDisplay error={error} name={name} dagRunId={dagRunId} />;
   }
 

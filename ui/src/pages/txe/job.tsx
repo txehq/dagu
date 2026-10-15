@@ -13,7 +13,7 @@ import { useCanExecute } from '@/contexts/AuthContext';
 import { I18nText } from '@/i18n/I18nText';
 
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
-import { dagRunPath } from '@/features/txe/components/InboxItemCard';
+import { dagPath, dagRunPath } from '@/features/txe/components/InboxItemCard';
 import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
 import { RunRetry } from '@/features/txe/components/RunRetry';
 import { NotFoundOrNotShared } from '@/features/txe/components/identity/NotFoundOrNotShared';
@@ -309,9 +309,14 @@ export default function TxeJobPage(): React.ReactElement {
       </dl>
 
       <section className="space-y-1">
-        <h2 className="text-sm font-semibold">
-          <I18nText text="Recent runs" />
-        </h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-sm font-semibold">
+            <I18nText text="Recent runs" />
+          </h2>
+          <Link className="text-xs hover:underline" to={dagPath(job.jobId)}>
+            <I18nText text="Open the DAG" />
+          </Link>
+        </div>
         <ul className="text-xs">
           {job.latestRuns.map((run) => (
             <li key={run.dagRunId}>

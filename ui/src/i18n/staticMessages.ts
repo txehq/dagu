@@ -2365,6 +2365,7 @@ const english = {
   "Waiting for approval": "Waiting for approval",
   // TXE switch account (TXE-4267).
   "Use a different account": "Use a different account",
+  "Open the DAG": "Open the DAG",
   "Switch account": "Switch account",
   // TXE sharing (TXE-4266).
   "Owner id": "Owner id",
@@ -4681,6 +4682,7 @@ const chinese = {
   "Waiting for approval": "等待批准",
   // TXE switch account (TXE-4267).
   "Use a different account": "使用其他账户",
+  "Open the DAG": "打开 DAG",
   "Switch account": "切换账户",
   // TXE sharing (TXE-4266).
   "Owner id": "所有者 ID",
@@ -7078,6 +7080,7 @@ const japanese = {
   "Waiting for approval": "承認待ち",
   // TXE switch account (TXE-4267).
   "Use a different account": "別のアカウントを使用",
+  "Open the DAG": "DAG を開く",
   "Switch account": "アカウントを切り替え",
   // TXE sharing (TXE-4266).
   "Owner id": "オーナー ID",

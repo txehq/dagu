@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { usePersonScope } from '@/features/txe/personScope';
 import { INCIDENTS_ENABLED } from '@/lib/fork';
 import LoadingIndicator from '@/components/ui/loading-indicator';
 import { Tabs } from '@/components/ui/tabs';
@@ -95,6 +96,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
   buildScopedUrl,
   fillHeight = false,
 }) => {
+  const personScope = usePersonScope();
   const baseUrl = isModal ? '#' : `/dags/${fileName}`;
   const scopedUrl = React.useCallback(
     (path: string) => (buildScopedUrl ? buildScopedUrl(path) : path),
@@ -200,7 +202,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Webhook"
                   value="webhook"
@@ -215,7 +217,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   isActive={activeTab === 'webhook'}
                   icon={Webhook}
                 /></I18nProps>
-              )}
+              ))}
 
               {isModal ? (
                 <I18nProps><ModalLinkTab
@@ -234,7 +236,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Notifications"
                   value="notifications"
@@ -249,7 +251,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   isActive={activeTab === 'notifications'}
                   icon={Bell}
                 /></I18nProps>
-              )}
+              ))}
 
               {INCIDENTS_ENABLED && (isModal ? (
                 <I18nProps><ModalLinkTab
@@ -381,7 +383,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Webhook"
                   value="webhook"
@@ -400,7 +402,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   className="flex-1 justify-center"
                   aria-label="Webhook"
                 /></I18nProps>
-              )}
+              ))}
 
               {isModal ? (
                 <I18nProps><ModalLinkTab
@@ -423,7 +425,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               )}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Notifications"
                   value="notifications"
@@ -442,7 +444,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   className="flex-1 justify-center"
                   aria-label="Notifications"
                 /></I18nProps>
-              )}
+              ))}
 
               {isModal ? (
                 <I18nProps><ModalLinkTab

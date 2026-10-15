@@ -6,6 +6,7 @@ import React from 'react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppBarContext } from '@/contexts/AppBarContext';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import { useQuery } from '@/hooks/api';
 import { WorkspaceKind } from '@/lib/workspace';
 import DAGDetails from '..';
@@ -77,17 +78,19 @@ function LocationProbe() {
   );
 }
 
-function renderPage(initialEntry = '/dags/release-notes') {
+function renderPage(initialEntry = '/dags/release-notes', personScope = false) {
   render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <AppBarContext.Provider value={appBarValue}>
-        <LocationProbe />
-        <Routes>
-          <Route path="/dags/:fileName" element={<DAGDetails />} />
-          <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
-        </Routes>
-      </AppBarContext.Provider>
-    </MemoryRouter>
+    <PersonScopeContext.Provider value={personScope}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <AppBarContext.Provider value={appBarValue}>
+          <LocationProbe />
+          <Routes>
+            <Route path="/dags/:fileName" element={<DAGDetails />} />
+            <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
+          </Routes>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
 }
 
@@ -154,5 +157,53 @@ describe('DAGDetails page', () => {
         '/dags/release-notes?dagRunId=run-1&dagRunName=release-notes'
       );
     });
+  });
+
+  // The hub refuses a person a DAG's webhook and notification settings, so a
+  // person is not offered those tabs; their URLs show the status tab.
+  it.each(['webhook', 'notifications'])(
+    'sends a person from the %s tab to the status tab',
+    async (tab) => {
+      renderPage(`/dags/release-notes/${tab}`, true);
+
+      expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+        'data-active-tab',
+        'status'
+      );
+      await waitFor(() => {
+        expect(screen.getByTestId('location')).toHaveTextContent(
+          /^\/dags\/release-notes$/
+        );
+      });
+    }
+  );
+
+  it('keeps the webhook tab outside a person dashboard', () => {
+    renderPage('/dags/release-notes/webhook');
+
+    expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+      'data-active-tab',
+      'webhook'
+    );
+  });
+
+  // The hub answers a person the same 404 for another owner's DAG as for
+  // one that does not exist.
+  it('tells a person only that the job is not found', () => {
+    useQueryMock.mockImplementation(
+      (path) =>
+        ({
+          data: undefined,
+          error:
+            path === '/dags/{fileName}'
+              ? { code: 'not_found', message: 'not found' }
+              : undefined,
+          mutate: vi.fn(),
+        }) as never
+    );
+    renderPage('/dags/job_other', true);
+
+    expect(screen.getByText('Job not found')).toBeInTheDocument();
+    expect(screen.queryByTestId('dag-details-content')).not.toBeInTheDocument();
   });
 });
