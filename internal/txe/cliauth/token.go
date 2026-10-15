@@ -36,10 +36,9 @@ type Identity struct {
 	Subject string `json:"subject"`
 }
 
-// RefusedError is the provider's verdict that a grant no longer works: a 400
-// or 401 from its token endpoint whose JSON body has an "error" member, such
-// as invalid_grant (user disabled or deleted, session or grant ended),
-// not_allowed or invalid_client. Signing in again is the only way on.
+// RefusedError is the provider's refusal at its token endpoint: a 400 or 401
+// whose JSON body has an "error" member. A renewal ends the sign-in only on
+// one of revokingCodes; signing in again is then the only way on.
 type RefusedError struct {
 	Status int
 	Code   string
@@ -55,13 +54,18 @@ func (e *RefusedError) Error() string {
 type UnverifiableError struct {
 	Op     string
 	Status int
-	Err    error
+	// Code is the OAuth error the provider named, when it named one that is
+	// no verdict on the grant.
+	Code string
+	Err  error
 }
 
 func (e *UnverifiableError) Error() string {
 	switch {
 	case e.Err != nil:
 		return fmt.Sprintf("the identity provider did not answer (%s): %v", e.Op, e.Err)
+	case e.Status != 0 && e.Code != "":
+		return fmt.Sprintf("the identity provider did not answer (%s): HTTP %d %s, which is no verdict on the sign-in", e.Op, e.Status, e.Code)
 	case e.Status != 0:
 		return fmt.Sprintf("the identity provider did not answer (%s): HTTP %d", e.Op, e.Status)
 	default:
@@ -172,12 +176,25 @@ func Refresh(ctx context.Context, p Provider, want Identity, refreshToken string
 	return tokens, nil
 }
 
-// renewalVerdict keeps a refusal and a changed identity as they are. Every
-// other failure gave no verdict on the grant, so it is an
-// *UnverifiableError.
+// revokingCodes are the OAuth errors that are a verdict on a refresh token:
+// the user was disabled or deleted, the grant or session ended, or the
+// client was disabled. They are the codes that revoke a machine credential
+// too (transportauth), so a person's sign-in and a machine's end alike.
+var revokingCodes = map[string]bool{
+	"invalid_grant":  true,
+	"not_allowed":    true,
+	"invalid_client": true,
+}
+
+// renewalVerdict keeps a refusal on one of revokingCodes and a changed
+// identity as they are. Every other failure, another OAuth error included,
+// gave no verdict on the grant, so it is an *UnverifiableError.
 func renewalVerdict(err error) error {
-	if _, ok := errors.AsType[*RefusedError](err); ok {
-		return err
+	if refused, ok := errors.AsType[*RefusedError](err); ok {
+		if revokingCodes[refused.Code] {
+			return err
+		}
+		return &UnverifiableError{Op: "renewal", Status: refused.Status, Code: refused.Code}
 	}
 	if _, ok := errors.AsType[*UnverifiableError](err); ok {
 		return err
