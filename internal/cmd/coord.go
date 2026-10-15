@@ -244,6 +244,9 @@ func newCoordinator(
 		QueueStore:                persistence.QueueStore,
 		EventService:              ctx.event,
 		EventSourceInstance:       ctx.EventSourceInstance,
+		// A machine worker is handed only tasks pinned to it when owner
+		// authorization is enforced, and observed in observe (TXE-4422).
+		MachinePinning: dispatch.MachinePinningFor(cfg.TXE.Authz.Mode),
 	})
 
 	// Create and return service with advertise address for service registry
