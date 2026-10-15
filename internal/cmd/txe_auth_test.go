@@ -6,6 +6,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -127,7 +128,7 @@ func TestTXELoginWhoamiLogout(t *testing.T) {
 	for _, e := range entries {
 		data, err := os.ReadFile(filepath.Join(f.home, txeSignInDir, e.Name()))
 		require.NoError(t, err)
-		assert.NotContains(t, string(data), "eyJ", e.Name())
+		assertNoPlainToken(t, e.Name(), data)
 	}
 
 	// Signing in again reuses the provider and keeps the same identity
@@ -374,4 +375,28 @@ func TestTXELoginKeepsScopesWithExplicitProvider(t *testing.T) {
 	login := f.json("login", "--issuer", p.Issuer(), "--client-id", p.ClientID)
 	assert.Equal(t, p.Subject, login["subject"])
 	assert.Equal(t, "openid", p.LastAuth().Get("scope"))
+}
+
+// assertNoPlainToken checks that a sign-in store file holds no token in the
+// clear. A JSON entry's "sealed" field is random base64 ciphertext, which may
+// contain any three-character string, "eyJ" included, by chance (TXE-4426): it
+// is checked to decode, and every other field is checked for token text.
+func assertNoPlainToken(t *testing.T, name string, data []byte) {
+	t.Helper()
+	var entry map[string]any
+	if json.Unmarshal(data, &entry) != nil {
+		// Not a JSON entry (a lock or key file): it holds no base64 text.
+		assert.NotContains(t, string(data), "eyJ", name)
+		return
+	}
+	// Every JSON file here is a sign-in entry, and an entry keeps its
+	// tokens only in "sealed".
+	sealed, ok := entry["sealed"].(string)
+	require.True(t, ok, "%s: an entry without a sealed string", name)
+	_, err := base64.StdEncoding.DecodeString(sealed)
+	assert.NoError(t, err, "%s: sealed is not base64", name)
+	delete(entry, "sealed")
+	rest, err := json.Marshal(entry)
+	require.NoError(t, err)
+	assert.NotContains(t, string(rest), "eyJ", name)
 }
