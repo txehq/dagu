@@ -152,11 +152,11 @@ func (a *API) txeOwnerVisibleDAGNames(ctx context.Context) (map[string]bool, err
 	}
 	jobs, err := s.ListJobs(ctx, registry.JobFilter{})
 	if err != nil {
-		return nil, txeError(err)
+		return nil, errTxeAuthzUnavailable
 	}
 	machines, err := s.ListMachines(ctx, "")
 	if err != nil {
-		return nil, txeError(err)
+		return nil, errTxeAuthzUnavailable
 	}
 	candidates := make([]string, 0, len(jobs)+3*len(machines))
 	for _, job := range jobs {

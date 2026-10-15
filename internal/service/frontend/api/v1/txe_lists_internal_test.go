@@ -5,6 +5,10 @@ package api
 
 import (
 	"context"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -12,6 +16,7 @@ import (
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
 // listWorld is two owners with a machine DAG of A's and an ownerless DAG on
@@ -165,4 +170,29 @@ func TestTxeWholeHubListsIgnoreADeclaredOwnerName(t *testing.T) {
 	require.NoError(t, w.api.dagRepository.Create(context.Background(), "masquerade", spec))
 	dags, _ := w.listedDAGs(t, neutral(w.personA), apigen.ListDAGsParams{})
 	require.NotContains(t, dags, "masquerade")
+}
+
+// A registry that cannot be enumerated is an outage to a caller held to its
+// owner, on every list, never a shorter or a misleading one.
+func TestTxeWholeHubListsRegistryFailure(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX permissions and a non-root user")
+	}
+	for _, dir := range []string{"jobs", "machines"} {
+		t.Run(dir, func(t *testing.T) {
+			w := newListWorld(t, "enforce")
+			w.addRun(w.jobA, "run-a", "production")
+			personA := neutral(w.personA)
+			path := filepath.Join(registry.Dir(w.dataDir), dir)
+			require.NoError(t, os.Chmod(path, 0))
+			t.Cleanup(func() { _ = os.Chmod(path, 0o750) })
+
+			_, err := w.api.ListDAGs(personA, apigen.ListDAGsRequestObject{})
+			require.Equal(t, http.StatusServiceUnavailable, statusOf(err), "GET /dags")
+			_, err = w.api.ListDAGRuns(personA, apigen.ListDAGRunsRequestObject{})
+			require.Equal(t, http.StatusServiceUnavailable, statusOf(err), "GET /dag-runs")
+			_, err = w.api.ListDAGRunsByName(personA, apigen.ListDAGRunsByNameRequestObject{Name: w.jobA})
+			require.Equal(t, http.StatusServiceUnavailable, statusOf(err), "GET /dag-runs/{name}")
+		})
+	}
 }
