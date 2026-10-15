@@ -443,9 +443,8 @@ func (s *scanner) store(store, dir string, classify func(id string, data []byte)
 		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
 			// The file collection's own lock directories, as it skips them.
-			if rel != "." && (d.Name() == recordLockDirectoryName || dirlock.IsLockDirectoryName(d.Name())) {
-				s.exclude(store+"/"+rel, "collection lock directory; operational")
-				return filepath.SkipDir
+			if rel != "." && lockDirectoryName(d.Name()) {
+				return s.lockDirectory(p, d.Name(), store+"/"+rel, "collection lock directory; operational")
 			}
 			return nil
 		}
@@ -502,9 +501,8 @@ func (s *scanner) files(rel, policy string) error {
 			// A process's lock directory (a file collection's record locks,
 			// or a directory lock such as the scheduler's) belongs to the
 			// process that holds it, and goes when it is released.
-			if p != base && (d.Name() == recordLockDirectoryName || dirlock.IsLockDirectoryName(d.Name())) {
-				s.exclude(filepath.ToSlash(r), "lock directory; operational")
-				return filepath.SkipDir
+			if p != base && lockDirectoryName(d.Name()) {
+				return s.lockDirectory(p, d.Name(), filepath.ToSlash(r), "lock directory; operational")
 			}
 			return nil
 		}
@@ -626,6 +624,69 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 		}
 	}
 	return nil
+}
+
+// lockDirectoryName reports whether name is reserved for a lock directory:
+// a file collection's record locks (internal/persis/file/collection.go,
+// recordLockDirectoryName) or a directory lock (internal/cmn/dirlock,
+// LockDirectoryName and its releasing form).
+func lockDirectoryName(name string) bool {
+	return name == recordLockDirectoryName || dirlock.IsLockDirectoryName(name)
+}
+
+var lockBucketPattern = regexp.MustCompile(`^[0-9a-f]{2}$`)
+
+// lockDirectory excludes a directory with a reserved lock name only when it
+// has exactly the shape the backend writes, so a reserved name cannot hide
+// retained data. A directory lock holds at most its owner file; record
+// locks are two-hex-digit buckets of directory locks. Only names and types
+// are listed, nothing is read. A directory of another shape blocks, unread.
+// It returns filepath.SkipDir either way.
+func (s *scanner) lockDirectory(p, name, rel, reason string) error {
+	ok, err := lockShape(p, name)
+	if err != nil {
+		return err
+	}
+	if ok {
+		s.exclude(rel, reason)
+	} else {
+		s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s has a lock directory's name but not its shape; it was not read", s.root.Label, rel)
+	}
+	return filepath.SkipDir
+}
+
+func lockShape(p, name string) (bool, error) {
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		return false, err
+	}
+	if name == recordLockDirectoryName {
+		for _, bucket := range entries {
+			if !bucket.IsDir() || !lockBucketPattern.MatchString(bucket.Name()) {
+				return false, nil
+			}
+			locks, err := os.ReadDir(filepath.Join(p, bucket.Name()))
+			if err != nil {
+				return false, err
+			}
+			for _, l := range locks {
+				if !l.IsDir() || !dirlock.IsLockDirectoryName(l.Name()) {
+					return false, nil
+				}
+				if ok, err := lockShape(filepath.Join(p, bucket.Name(), l.Name()), l.Name()); err != nil || !ok {
+					return false, err
+				}
+			}
+		}
+		return true, nil
+	}
+	for _, e := range entries {
+		// The lock's owner token (dirlock lockOwnerFileName).
+		if e.Name() != "owner" || !e.Type().IsRegular() {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func fileDigest(p string) (int64, string, error) {
