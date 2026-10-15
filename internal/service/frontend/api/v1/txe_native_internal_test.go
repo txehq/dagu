@@ -16,6 +16,7 @@ import (
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
@@ -402,4 +403,55 @@ func TestTxeNativeReferencedRootRunOfAnotherOwner(t *testing.T) {
 	resp, err = w.api.GetSubDAGRunSpec(w.legacy, apigen.GetSubDAGRunSpecRequestObject{Name: w.jobA, DagRunId: "run-2", SubDAGRunId: "queued-b"})
 	require.NoError(t, err)
 	require.IsType(t, &apigen.GetSubDAGRunSpec200JSONResponse{}, resp)
+}
+
+// A retry of a step in a child run reruns every run on its path, so each is
+// decided by its owners: a person may not rerun another owner's child
+// through its own job's run, and nothing is dispatched.
+func TestTxeNativeChildRetryIsDecidedOnItsWholePath(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.markReady(w.jobA, w.machineA)
+	w.addRun(w.jobA, "run-1", "production")
+	recorder := &retryCoordinatorRecorder{}
+	w.api.coordinatorCli = recorder
+	w.api.defaultExecMode = config.ExecutionModeDistributed
+
+	root := ir.NewDAGRunRef(w.jobA, "run-3")
+	call := func(name string) ir.Step { return ir.Step{Name: "call-" + name, SubDAG: &ir.SubDAG{Name: name}} }
+	// The run is of the job's current definition, which the registry admits.
+	jobSpec, err := w.api.dagRepository.GetSpec(context.Background(), w.jobA)
+	require.NoError(t, err)
+	w.writeRun(&ir.DAG{Name: w.jobA, YamlData: []byte(jobSpec)}, "run-3", persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+		s.Root, s.Status = root, ir.Failed
+		s.Nodes = []*ir.Node{
+			{Step: call(w.jobB), Status: ir.NodeFailed, SubRuns: []ir.SubDAGRun{{DAGRunID: "child-b", DAGName: w.jobB}}},
+			{Step: call("shared-helper"), Status: ir.NodeFailed, SubRuns: []ir.SubDAGRun{{DAGRunID: "child-h", DAGName: "shared-helper"}}},
+		}
+	})
+	child := func(name, runID string, parent ir.DAGRunRef, nodes []*ir.Node) {
+		w.writeRun(&ir.DAG{Name: name, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{RootDAGRun: root}, func(s *ir.DAGRunStatus) {
+			s.Root, s.Parent, s.Status, s.Nodes = root, parent, ir.Failed, nodes
+		})
+	}
+	// B's job called an ownerless helper in turn.
+	child(w.jobB, "child-b", root, []*ir.Node{
+		{Step: ir.Step{Name: "b"}, Status: ir.NodeFailed},
+		{Step: call("deep-helper"), Status: ir.NodeFailed, SubRuns: []ir.SubDAGRun{{DAGRunID: "grandchild", DAGName: "deep-helper"}}},
+	})
+	child("deep-helper", "grandchild", ir.NewDAGRunRef(w.jobB, "child-b"), []*ir.Node{{Step: ir.Step{Name: "deep"}, Status: ir.NodeFailed}})
+	child("shared-helper", "child-h", root, []*ir.Node{{Step: ir.Step{Name: "h"}, Status: ir.NodeFailed}})
+
+	retry := func(ctx context.Context, sub, step string) error {
+		_, err := w.api.RetryDAGRun(ctx, apigen.RetryDAGRunRequestObject{Name: w.jobA, DagRunId: "run-3",
+			Body: &apigen.RetryDAGRunJSONRequestBody{DagRunId: "run-3", SubDAGRunId: &sub, StepName: &step}})
+		return err
+	}
+	personA := neutral(w.personA)
+	require.Equal(t, http.StatusNotFound, statusOf(retry(personA, "child-b", "b")))
+	require.Equal(t, http.StatusNotFound, statusOf(retry(personA, "grandchild", "deep")), "a path through another owner's run")
+	require.Empty(t, recorder.dispatched)
+
+	// A's own path, through an ownerless helper, is A's to retry.
+	require.NoError(t, retry(personA, "child-h", "h"))
+	require.Len(t, recorder.dispatched, 1)
 }

@@ -3163,6 +3163,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		if err != nil {
 			return retryDAGRunResult{}, retryPathRequestError(err)
 		}
+		if err := a.txeRetryPathCheck(ctx, ir.NewDAGRunRef(dagName, sourceDagRunID), retryPath, targetStatus); err != nil {
+			return retryDAGRunResult{}, err
+		}
 		retryValidationStatus = targetStatus
 		auditStepName = retryPath.Step
 		stepName = retryPath.RootStep()

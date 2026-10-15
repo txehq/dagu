@@ -10,6 +10,7 @@ import (
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -269,6 +270,41 @@ func (a *API) txeRunOwnerCheck(ctx context.Context, status *ir.DAGRunStatus, per
 		return err
 	}
 	return a.txeSubRunCheck(ctx, root, status.Name, permission)
+}
+
+// txeRetryPathCheck decides a retry of a step in a child of the run root.
+// Such a retry reruns every run on its path, each child that called the
+// next down to the target, so each is decided by its owners for execute
+// before anything is dispatched. A caller not held to its owner, in mode
+// off, is not affected.
+func (a *API) txeRetryPathCheck(ctx context.Context, root ir.DAGRunRef, path dagrun.RetryPath, target *ir.DAGRunStatus) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return err
+	}
+	if c.mode == authz.ModeOff && !c.ownerOnly() {
+		return nil
+	}
+	if err := a.txeRunOwnerCheck(ctx, target, authz.PermissionExecute); err != nil {
+		return err
+	}
+	for _, hop := range path.Hops {
+		attempt, err := a.dagRunRepository.FindSubAttempt(ctx, root, hop.RunID)
+		if err != nil {
+			return errTxeAuthzUnavailable
+		}
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil || status == nil {
+			return errTxeAuthzUnavailable
+		}
+		if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionExecute); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // txeSubRunCheck decides a run of the DAG dagName under a run of root that
