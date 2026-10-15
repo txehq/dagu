@@ -11447,6 +11447,37 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   /txe/machines:
+    get:
+      summary: "List machines"
+      description: "The machines the caller may see, decided by owner view (TXE-3415 contract 1): a person or cli token bound to an owner sees that owner's machines; a machine's worker or reviewer token sees its own machine; an unbound caller sees none; the platform administrator sees all. pending_applications is set only for a caller who may approve the machine's enrolment applications."
+      operationId: "listTxeMachines"
+      tags:
+        - "txe"
+      responses:
+        "200":
+          description: "Machines"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxeMachineList"
+        "401":
+          description: "Not authenticated"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "The owner store could not be read"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       summary: "Create a machine"
       description: "Creates an execution machine record. The machine ID is minted by the worker installer."
@@ -20897,6 +20928,29 @@ components:
         created:
           $ref: "#/components/schemas/TxeStamp"
       required: [schema, machine_id, owner_id, display_name, created]
+
+    TxeMachineList:
+      type: object
+      properties:
+        machines:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxeMachineSummary"
+      required: [machines]
+
+    TxeMachineSummary:
+      type: object
+      properties:
+        machine_id:
+          type: string
+        owner_id:
+          type: string
+        display_name:
+          type: string
+        pending_applications:
+          type: integer
+          description: "Enrolment applications on file whose credential has not expired. Set only for a caller who may approve them (a person of the machine's owner)."
+      required: [machine_id, owner_id, display_name]
 
     TxeMachineCreateRequest:
       type: object
