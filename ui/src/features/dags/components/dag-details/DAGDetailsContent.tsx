@@ -219,7 +219,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               ))}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Settings"
                   value="settings"
@@ -234,7 +234,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   isActive={activeTab === 'settings'}
                   icon={SettingsIcon}
                 /></I18nProps>
-              )}
+              ))}
 
               {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
@@ -404,7 +404,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                 /></I18nProps>
               ))}
 
-              {isModal ? (
+              {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab
                   label="Settings"
                   value="settings"
@@ -423,7 +423,7 @@ const DAGDetailsContent: React.FC<DAGDetailsContentProps> = ({
                   className="flex-1 justify-center"
                   aria-label="Settings"
                 /></I18nProps>
-              )}
+              ))}
 
               {!personScope && (isModal ? (
                 <I18nProps><ModalLinkTab

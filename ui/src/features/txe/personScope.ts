@@ -15,10 +15,11 @@ export function usePersonScope(): boolean {
   return React.useContext(PersonScopeContext);
 }
 
-// The DAG page tabs a person is not offered: the hub refuses a person the
-// webhook and the notification settings of a DAG.
+// The DAG page tabs a person is not offered: the hub refuses a person a
+// DAG's webhook, its settings and its notification settings.
 export const PERSON_HIDDEN_DAG_TABS: ReadonlySet<string> = new Set([
   'webhook',
+  'settings',
   'notifications',
 ]);
 

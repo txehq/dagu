@@ -163,9 +163,10 @@ describe('DAGDetails page', () => {
     });
   });
 
-  // The hub refuses a person a DAG's webhook and notification settings, so a
-  // person is not offered those tabs; their URLs show the status tab.
-  it.each(['webhook', 'notifications'])(
+  // The hub refuses a person a DAG's webhook, settings and notification
+  // settings, so a person is not offered those tabs; their URLs show the
+  // status tab.
+  it.each(['webhook', 'settings', 'notifications'])(
     'sends a person from the %s tab to the status tab',
     async (tab) => {
       renderPage(`/dags/release-notes/${tab}`, true);

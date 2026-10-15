@@ -136,16 +136,17 @@ describe('DAGDetailsContent', () => {
     expect(screen.queryByText('Wiki')).not.toBeInTheDocument();
   });
 
-  // The hub refuses a person a DAG's webhook and notification settings.
+  // The hub refuses a person a DAG's webhook, settings and notification
+  // settings.
   it.each([true, false])(
-    'offers a person no Webhook or Notifications tab (modal %s)',
+    'offers a person no Webhook, Settings or Notifications tab (modal %s)',
     (isModal) => {
       renderContent('status', isModal, true);
 
       expect(screen.queryByText('Webhook')).not.toBeInTheDocument();
       expect(screen.queryByText('Notifications')).not.toBeInTheDocument();
+      expect(screen.queryByText('Settings')).not.toBeInTheDocument();
       expect(screen.getAllByText('Spec')).toHaveLength(2);
-      expect(screen.getAllByText('Settings')).toHaveLength(2);
       expect(screen.getAllByText('History')).toHaveLength(2);
     }
   );
