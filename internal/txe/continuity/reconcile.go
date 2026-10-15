@@ -45,6 +45,9 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 	owner := map[string]int{}
 	for i, p := range parts {
 		for _, r := range p.Roots {
+			if hubStores[r.Label] {
+				return nil, fmt.Errorf("%w: root label %q of %s names a hub store", ErrIncompatible, r.Label, p.Digest)
+			}
 			if _, ok := owner[r.Label]; ok {
 				return nil, fmt.Errorf("%w: root %q is in more than one part", ErrIncompatible, r.Label)
 			}
@@ -105,7 +108,7 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			// from the hub's data directory; a machine home's are stored
 			// under its root label. Nothing else is a record's store.
 			switch {
-			case r.Store == "registry" || r.Store == "authz":
+			case hubStores[r.Store]:
 				if !hasHub {
 					return nil, fmt.Errorf("%w: record %s/%s of %s is a hub record, but that inventory did not scan the hub's data directory", ErrIncompatible, r.Store, r.ID, p.Digest)
 				}

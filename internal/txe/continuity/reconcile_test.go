@@ -143,6 +143,9 @@ func TestReconcileRefusesWhatDoesNotBelongTogether(t *testing.T) {
 		"a record under the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
 			c.Records = append(c.Records, continuity.Record{Store: "laptop-home", ID: "machine.json.planted", Class: continuity.ClassMachineIdentity})
 		})},
+		"a machine home labelled as a hub store": {hub, reseal(machine, func(c *continuity.Inventory) {
+			c.Roots[0].Label = "authz"
+		})},
 		"a hub record planted in a machine's inventory": {hub, reseal(machine, func(c *continuity.Inventory) {
 			planted := hub.Records[0]
 			planted.ID += "-planted"
@@ -217,4 +220,17 @@ func TestJointCompareSeesBothSides(t *testing.T) {
 	}
 	assert.True(t, missing["hub-data"], "%v", missing)
 	assert.True(t, missing["laptop-home"], "%v", missing)
+}
+
+// A machine home's records are stored under its root label, so a label that
+// names a hub store is refused before anything is scanned.
+func TestRootLabelMayNotNameAHubStore(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	for _, label := range []string{"registry", "authz"} {
+		home := roots(l)[2]
+		home.Label = label
+		_, err := continuity.Scan(context.Background(), continuity.Options{Roots: []continuity.Root{home}, ExpectedOwner: fixture.StableOwner})
+		assert.ErrorContains(t, err, "names a hub store", label)
+	}
 }
