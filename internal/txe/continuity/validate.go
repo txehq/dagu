@@ -351,9 +351,11 @@ func (v *validator) packages() {
 // package to the path the version names, and keeps the staged copy, which is
 // retained as a file like any other. A duplicate that names no winner or
 // carries evidence is not what the registry writes, and its versions are
-// held as every job's are.
+// held as every job's are. Evidence is seen by its machine reference, and
+// in an inventory of this version also by its own attribute, so evidence
+// that names no machine is not taken for none.
 func undelivered(job *Record) (string, bool) {
-	if job.Attrs["registration"] != "duplicate" {
+	if job.Attrs["registration"] != "duplicate" || job.Attrs["package_evidence"] != "" {
 		return "", false
 	}
 	winner := ""

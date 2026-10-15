@@ -164,6 +164,14 @@ func TestDeliveredPackagesAreStillRequired(t *testing.T) {
 			})
 			return r.jobID
 		}},
+		{"a duplicate whose package evidence names no machine", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) string {
+			r := loseRace(t, l, f)
+			edit(t, regPath(l, "jobs/"+r.jobID), func(m map[string]any) {
+				m["registration"].(map[string]any)["package"] = map[string]any{"digest": r.digest, "path": "/elsewhere",
+					"asserted_at": "2026-10-12T09:35:05Z", "asserted_by": map[string]any{"kind": "cli", "id": "admin"}}
+			})
+			return r.jobID
+		}},
 		{"a duplicate that names no job it duplicates", func(t *testing.T, l *fixture.Layout, f *fixture.Facts) string {
 			r := loseRace(t, l, f)
 			edit(t, regPath(l, "jobs/"+r.jobID), func(m map[string]any) { delete(m["registration"].(map[string]any), "duplicate_of") })
