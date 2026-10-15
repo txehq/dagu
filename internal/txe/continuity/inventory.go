@@ -23,7 +23,6 @@ package continuity
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -127,6 +126,9 @@ type Inventory struct {
 	// Kept are the entries a keep manifest kept, with the tree digest the
 	// scan found, so a comparison sees a change no file shows.
 	Kept []Kept `json:"kept,omitempty"`
+	// Parts are the digests of the inventories a joint inventory was
+	// reconciled from (Reconcile); empty for a scanned one.
+	Parts []string `json:"parts,omitempty"`
 	// Digest is the SHA-256 of the canonical JSON of the inventory without
 	// this field.
 	Digest string `json:"digest"`
@@ -336,7 +338,7 @@ func (inv *Inventory) digest() (string, error) {
 // Decode reads an inventory and checks its format and digest.
 func Decode(data []byte) (*Inventory, error) {
 	var inv Inventory
-	if err := json.Unmarshal(data, &inv); err != nil {
+	if err := strict(data, &inv); err != nil {
 		return nil, fmt.Errorf("continuity: decode inventory: %w", err)
 	}
 	if inv.Format != FormatV1 {

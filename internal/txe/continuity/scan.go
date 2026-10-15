@@ -215,6 +215,10 @@ var machineHomeRules = []rule{
 	}},
 }
 
+// hubStores are the stores of the records read from a hub data directory
+// (Record.Store); a machine home stores its records under its root label.
+var hubStores = map[string]bool{"registry": true, "authz": true}
+
 // Scan inventories the roots. It only reads; a root that cannot be read is
 // an error, and anything it does not understand is a blocking issue.
 func Scan(ctx context.Context, opts Options) (*Inventory, error) {
@@ -246,6 +250,11 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 		}
 		if labels[r.Label] {
 			return nil, fmt.Errorf("continuity: root label %q is used twice", r.Label)
+		}
+		if hubStores[r.Label] {
+			// A machine home's records are stored under its label, so a
+			// label that names a hub store would mix them with the hub's.
+			return nil, fmt.Errorf("continuity: root label %q names a hub store; choose another", r.Label)
 		}
 		labels[r.Label] = true
 		info, err := os.Stat(r.Path)

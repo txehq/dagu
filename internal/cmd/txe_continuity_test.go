@@ -142,3 +142,43 @@ func TestTXEContinuityKeep(t *testing.T) {
 	assert.Contains(t, out, "kept_unpinned")
 	assert.NotContains(t, out, "unclassified_area")
 }
+
+// The freeze from the command line: the hub and the machine are
+// inventoried apart, reconciled into one joint inventory that validates,
+// and joint inventories compare.
+func TestTXEContinuityReconcile(t *testing.T) {
+	l, _, err := fixture.Build(t.Context(), filepath.Join(t.TempDir(), "root"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fixture.Unseal(l.Root) })
+	dir := t.TempDir()
+	hub := filepath.Join(dir, "hub.json")
+	out, err := runTXEContinuity(t, "inventory", "--label", "freeze", "--out", hub,
+		"--scan", "hub-data=hub-data="+l.DataDir+"="+l.HubMount, "--scan", "dags=hub-dags="+l.DAGsDir, "--scan", "logs=hub-logs="+l.LogsDir)
+	require.NoError(t, err, out)
+	laptop := filepath.Join(dir, "laptop.json")
+	out, err = runTXEContinuity(t, "inventory", "--label", "freeze", "--out", laptop, "--scan", "machine-home=laptop-home="+l.MachineHome)
+	require.NoError(t, err, out)
+
+	joint := filepath.Join(dir, "joint.json")
+	out, err = runTXEContinuity(t, "reconcile", hub, laptop, "--out", joint)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "of 2 parts written to")
+	assert.Contains(t, out, "0 blocking")
+	out, err = runTXEContinuity(t, "validate", joint)
+	require.NoError(t, err, out)
+	assert.NotContains(t, out, "not_checked")
+	out, err = runTXEContinuity(t, "compare", joint, joint)
+	require.NoError(t, err, out)
+
+	_, err = runTXEContinuity(t, "reconcile", hub, "--out", filepath.Join(dir, "one.json"))
+	require.Error(t, err)
+	_, err = runTXEContinuity(t, "reconcile", hub, hub, "--out", filepath.Join(dir, "twice.json"))
+	require.ErrorContains(t, err, "given twice")
+	assert.NoFileExists(t, filepath.Join(dir, "twice.json"))
+	data, err := os.ReadFile(laptop)
+	require.NoError(t, err)
+	altered := filepath.Join(dir, "altered.json")
+	require.NoError(t, os.WriteFile(altered, bytes.Replace(data, []byte(`"label": "freeze"`), []byte(`"label": "other"`), 1), 0o600))
+	_, err = runTXEContinuity(t, "reconcile", hub, altered, "--out", filepath.Join(dir, "altered-joint.json"))
+	require.ErrorContains(t, err, "digest")
+}
