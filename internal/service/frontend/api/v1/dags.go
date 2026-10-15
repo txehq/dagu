@@ -854,7 +854,7 @@ func (a *API) ListDAGs(ctx context.Context, request api.ListDAGsRequestObject) (
 	if err != nil {
 		return nil, err
 	}
-	resp, err := a.listDAGsData(ctx, persis.DAGListOptions{
+	opts := persis.DAGListOptions{
 		Paginator:       &pg,
 		Name:            valueOf(request.Params.Name),
 		Labels:          labels,
@@ -862,7 +862,13 @@ func (a *API) ListDAGs(ctx context.Context, request api.ListDAGsRequestObject) (
 		Sort:            sortField,
 		Order:           sortOrder,
 		WorkspaceFilter: workspaceFilter,
-	})
+	}
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scope.apply(&opts)
+	resp, err := a.listDAGsData(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -870,14 +876,21 @@ func (a *API) ListDAGs(ctx context.Context, request api.ListDAGsRequestObject) (
 }
 
 func (a *API) GetAllDAGLabels(ctx context.Context, request api.GetAllDAGLabelsRequestObject) (api.GetAllDAGLabelsResponseObject, error) {
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if filter, err := a.workspaceFilterForParams(ctx, request.Params.Workspace); err != nil {
 		return nil, err
-	} else if filter != nil {
+	} else if filter != nil || scope.dag != nil {
+		// Labels of the DAGs the caller lists, never of the others.
 		pg := pagination.NewPaginator(1, int(^uint(0)>>1))
-		result, errs, err := a.dagRepository.List(ctx, persis.DAGListOptions{
+		opts := persis.DAGListOptions{
 			Paginator:       &pg,
 			WorkspaceFilter: filter,
-		})
+		}
+		scope.apply(&opts)
+		result, errs, err := a.dagRepository.List(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("error getting labels: %w", err)
 		}
@@ -909,14 +922,21 @@ func (a *API) GetAllDAGLabels(ctx context.Context, request api.GetAllDAGLabelsRe
 }
 
 func (a *API) GetAllDAGTags(ctx context.Context, request api.GetAllDAGTagsRequestObject) (api.GetAllDAGTagsResponseObject, error) {
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if filter, err := a.workspaceFilterForParams(ctx, request.Params.Workspace); err != nil {
 		return nil, err
-	} else if filter != nil {
+	} else if filter != nil || scope.dag != nil {
+		// Labels of the DAGs the caller lists, never of the others.
 		pg := pagination.NewPaginator(1, int(^uint(0)>>1))
-		result, errs, err := a.dagRepository.List(ctx, persis.DAGListOptions{
+		opts := persis.DAGListOptions{
 			Paginator:       &pg,
 			WorkspaceFilter: filter,
-		})
+		}
+		scope.apply(&opts)
+		result, errs, err := a.dagRepository.List(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("error getting labels: %w", err)
 		}
@@ -2141,7 +2161,7 @@ func (a *API) buildDAGListOptions(ctx context.Context, queryString string) (pers
 	if err != nil {
 		return persis.DAGListOptions{}, err
 	}
-	return persis.DAGListOptions{
+	opts := persis.DAGListOptions{
 		Paginator:       &pg,
 		Name:            params.Get("name"),
 		Labels:          labels,
@@ -2149,7 +2169,13 @@ func (a *API) buildDAGListOptions(ctx context.Context, queryString string) (pers
 		Sort:            sortField,
 		Order:           sortOrder,
 		WorkspaceFilter: workspaceFilter,
-	}, nil
+	}
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return persis.DAGListOptions{}, err
+	}
+	scope.apply(&opts)
+	return opts, nil
 }
 
 func (a *API) listDAGsData(ctx context.Context, listOpts persis.DAGListOptions) (api.ListDAGs200JSONResponse, error) {

@@ -688,6 +688,11 @@ func (a *API) ListDAGRuns(ctx context.Context, request api.ListDAGRunsRequestObj
 		return nil, err
 	}
 	opts.query.WorkspaceFilter = workspaceFilter
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scope.applyRuns(&opts.query)
 	var dagName, dagRunID string
 	if request.Params.Name != nil {
 		dagName = *request.Params.Name
@@ -731,15 +736,12 @@ func (a *API) ListDAGRunsByName(ctx context.Context, request api.ListDAGRunsByNa
 	if err != nil {
 		return nil, err
 	}
-	if a.txeNativeOwnerOnly(ctx) {
-		// One DAG's runs: a caller held to its owner sees them all if the
-		// DAG's owner lets it, and none otherwise, whatever workspace it
-		// names.
-		if a.txeNativeVisible(ctx, request.Name) {
-			workspaceFilter = nil
-		}
-	}
 	opts.query.WorkspaceFilter = workspaceFilter
+	scope, err := a.txeOneDAGListScope(ctx, request.Name)
+	if err != nil {
+		return nil, err
+	}
+	scope.applyRuns(&opts.query)
 	var dagRunID string
 	if request.Params.DagRunId != nil {
 		dagRunID = *request.Params.DagRunId
@@ -5181,6 +5183,11 @@ func (a *API) dagRunListOptionsFromQueryString(ctx context.Context, queryString 
 		return dagRunListOptions{}, err
 	}
 	opts.query.WorkspaceFilter = workspaceFilter
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return dagRunListOptions{}, err
+	}
+	scope.applyRuns(&opts.query)
 
 	return opts, nil
 }

@@ -83,6 +83,10 @@ type DAGListOptions struct {
 	Time              *time.Time
 	NextRunProjection func(*ir.DAG, time.Time) time.Time
 	WorkspaceFilter   *workspace.WorkspaceFilter
+	// Include, when set, keeps only the items it accepts. It is applied with
+	// the other filters, before sorting and pagination, so pages and counts
+	// are of the items it keeps.
+	Include func(DAGListItem) bool
 }
 
 // DAGSearchOptions contains parameters for cursor-based DAG search.

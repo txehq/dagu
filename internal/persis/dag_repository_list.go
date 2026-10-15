@@ -58,6 +58,9 @@ func (r *DAGRepository) list(ctx context.Context, opts DAGListOptions, includeSe
 		if !containsAllLabels(item.Labels, labelFilters) || !opts.WorkspaceFilter.MatchesLabels(item.Labels) {
 			continue
 		}
+		if opts.Include != nil && !opts.Include(item) {
+			continue
+		}
 		items = append(items, item)
 	}
 
