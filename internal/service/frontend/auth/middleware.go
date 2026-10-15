@@ -247,9 +247,16 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 				principal, err := opts.ProviderTokens.Verify(r.Context(), bearerToken)
 				if err != nil {
 					// The refusal's category only: never the token, its
-					// claims or the identity it names.
-					logger.Debug(r.Context(), "Provider token refused", slog.String("reason", string(authn.ReasonOf(err))),
-						slog.Bool("issuer_named", authn.UnpublishedKeyOfIssuer(err)))
+					// claims or the identity it names. A key the issuer no
+					// longer publishes is told apart from one it never did
+					// (TXE-4347), for unknown_key only: it means nothing for
+					// any other reason.
+					reason := authn.ReasonOf(err)
+					attrs := []slog.Attr{slog.String("reason", string(reason))}
+					if reason == authn.ReasonUnknownKey {
+						attrs = append(attrs, slog.Bool("retired_key_of_issuer", authn.UnpublishedKeyOfIssuer(err)))
+					}
+					logger.Debug(r.Context(), "Provider token refused", attrs...)
 				}
 				switch {
 				case err == nil:
