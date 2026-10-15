@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 )
 
 // listWorld is two owners with a machine DAG of A's and an ownerless DAG on
@@ -132,4 +133,36 @@ func TestTxeWholeHubListsByOwner(t *testing.T) {
 			require.Subset(t, adminDAGs, []string{w.jobA, w.jobB, w.reviewerA, w.plain})
 		})
 	}
+}
+
+// A run is listed to a caller held to its owner as S4 decides reading it: by
+// its root's DAG, and by its own DAG too when that is another owner's.
+func TestTxeRunListedDecidesRootAndOwnDAG(t *testing.T) {
+	jobA, jobB := "job_01M4AAAAAAAAAAAAAAAAAAAAAA", "job_01M4BBBBBBBBBBBBBBBBBBBBBB"
+	listed := txeRunListed(map[string]bool{jobA: true})
+	run := func(root, name string) *ir.DAGRunStatus {
+		s := &ir.DAGRunStatus{Name: name}
+		if root != "" {
+			s.Root = ir.NewDAGRunRef(root, "r1")
+		}
+		return s
+	}
+	require.True(t, listed(run("", jobA)), "A's own root run")
+	require.True(t, listed(run(jobA, jobA)), "A's root run, root named")
+	require.True(t, listed(run(jobA, "local-child")), "an ownerless child of A's run")
+	require.False(t, listed(run(jobB, jobA)), "A's job called from B's run")
+	require.False(t, listed(run(jobA, jobB)), "B's job called from A's run")
+	require.False(t, listed(run("", jobB)), "B's run")
+	require.False(t, listed(run(jobA, "")), "a run that names no DAG")
+	require.False(t, listed(run("", "nightly-backup")), "an ownerless root")
+}
+
+// A DAG on file whose declared name is an owner's is not that owner's DAG:
+// the list does not show it as one.
+func TestTxeWholeHubListsIgnoreADeclaredOwnerName(t *testing.T) {
+	w := newListWorld(t, "enforce")
+	spec := []byte("name: " + w.jobA + "\nsteps:\n  - name: s\n    run: echo s\n")
+	require.NoError(t, w.api.dagRepository.Create(context.Background(), "masquerade", spec))
+	dags, _ := w.listedDAGs(t, neutral(w.personA), apigen.ListDAGsParams{})
+	require.NotContains(t, dags, "masquerade")
 }

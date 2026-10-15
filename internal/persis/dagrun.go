@@ -62,10 +62,10 @@ type DAGRunStatusQuery struct {
 	Cursor          string
 	Labels          []string
 	WorkspaceFilter *workspace.WorkspaceFilter
-	// IncludeName, when set, keeps only runs of the DAGs it accepts by name.
-	// It is applied while the store iterates, before the page is cut, so
-	// pages are of the runs it keeps.
-	IncludeName func(name string) bool
+	// Include, when set, keeps only the runs it accepts. It is applied while
+	// the store iterates, before the page is cut, so pages are of the runs it
+	// keeps.
+	Include func(*ir.DAGRunStatus) bool
 }
 
 // DAGRunStatusPage is one forward-only page of DAG-run statuses.
@@ -204,9 +204,9 @@ type DAGRunListOptions struct {
 	AllHistory bool
 	// Unbounded disables the repository's result limit.
 	Unbounded bool
-	// IncludeName, when set, keeps only runs of the DAGs it accepts by name,
-	// before pagination (DAGRunStatusQuery.IncludeName).
-	IncludeName func(name string) bool
+	// Include, when set, keeps only the runs it accepts, before pagination
+	// (DAGRunStatusQuery.Include).
+	Include func(*ir.DAGRunStatus) bool
 }
 
 // DAGRunCompareAndSwapOptions configures an atomic latest-attempt status update.

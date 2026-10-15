@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -31,7 +32,7 @@ type txeListScope struct {
 	// filter.
 	replaceWorkspace bool
 	dag              func(persis.DAGListItem) bool
-	run              func(name string) bool
+	run              func(*ir.DAGRunStatus) bool
 }
 
 // apply narrows a DAG list.
@@ -53,7 +54,7 @@ func (s txeListScope) applyRuns(query *persis.DAGRunListOptions) {
 	if s.replaceWorkspace {
 		query.WorkspaceFilter = nil
 	}
-	query.IncludeName = s.run
+	query.Include = s.run
 }
 
 // txeWholeHubListScope decides the caller's whole-hub lists.
@@ -74,11 +75,11 @@ func (a *API) txeWholeHubListScope(ctx context.Context) (txeListScope, error) {
 		return txeListScope{
 			replaceWorkspace: true,
 			dag:              func(item persis.DAGListItem) bool { return item.DAG != nil && names[txeNativeDAGName(item.DAG)] },
-			run:              func(name string) bool { return names[name] },
+			run:              txeRunListed(names),
 		}, nil
 	case c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin:
 		none := func(persis.DAGListItem) bool { return false }
-		return txeListScope{dag: none, run: func(string) bool { return false }}, nil
+		return txeListScope{dag: none, run: func(*ir.DAGRunStatus) bool { return false }}, nil
 	default:
 		return txeListScope{}, nil
 	}
@@ -101,13 +102,42 @@ func (a *API) txeOneDAGListScope(ctx context.Context, dagName string) (txeListSc
 	}
 	switch err := a.txeNativeCheck(ctx, dagName, authz.PermissionView, func() error { return nil }); {
 	case err == nil && c.ownerOnly():
-		return txeListScope{replaceWorkspace: true, run: func(string) bool { return true }}, nil
+		// Each run is still decided as S4 reads it: a run of this DAG may
+		// be a sub-run of another owner's.
+		names, err := a.txeOwnerVisibleDAGNames(ctx)
+		if err != nil {
+			return txeListScope{}, err
+		}
+		return txeListScope{replaceWorkspace: true, run: txeRunListed(names)}, nil
 	case err == nil:
 		return txeListScope{}, nil
 	case err == errTxeAuthzUnavailable:
 		return txeListScope{}, err
 	default:
-		return txeListScope{run: func(string) bool { return false }}, nil
+		return txeListScope{run: func(*ir.DAGRunStatus) bool { return false }}, nil
+	}
+}
+
+// txeRunListed decides a run for a caller held to its owner as S4 decides
+// reading it (requireRunStatus): by its root's DAG and, when the run is of
+// another DAG, by that DAG too unless no owner has it. names is every DAG
+// the caller may view.
+func txeRunListed(names map[string]bool) func(*ir.DAGRunStatus) bool {
+	return func(status *ir.DAGRunStatus) bool {
+		root := txeNativeOwnerDAG(status)
+		if !names[root] {
+			return false
+		}
+		switch {
+		case status.Name == root:
+			return true
+		case status.Name == "":
+			return false
+		case txeNativeOwnedName(status.Name):
+			return names[status.Name]
+		default:
+			return true
+		}
 	}
 }
 
