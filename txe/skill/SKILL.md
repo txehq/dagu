@@ -240,7 +240,7 @@ A hub that accepts sign-in identifies the developer by their account at its iden
 - **Ask the person first.** The sign-in needs a person at a browser on this machine. Never type or paste a password, a code or a token into the terminal; the command asks for none.
 - **Never run `login` from a job script.** A job step never uses a person's sign-in. It keeps the hub context's API key until machines hold their own credential.
 - **Signing in grants nothing by itself.** The hub's administrator binds an identity to an owner. `dagu txe whoami` shows who this machine is signed in as. When the hub accepts the sign-in, it also shows how the hub sees it: unbound, pending or bound, and to which owner.
-- **Other commands use the sign-in only when the hub asks for it.** Otherwise they keep the API key, and nothing changes for a machine that never signed in.
+- **Other commands use the sign-in only on the routes the hub takes it on**, which the hub names: every `/txe` route, and on some hubs also `/dags`, `/dag-runs` and `/queues`. Every other request keeps the API key, and nothing changes for a machine that never signed in.
 - **Two different failures:**
   - "run `dagu txe login`": the provider or the hub refused the sign-in. Ask the person to sign in again; do not retry the command in a loop.
   - "the identity provider did not answer": nothing was refused. Retry later, and do not sign in again or sign out because of it.

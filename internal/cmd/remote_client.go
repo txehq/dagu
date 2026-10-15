@@ -75,13 +75,14 @@ func newRemoteClient(ctx *cliContext) (*remoteClient, error) {
 	}, nil
 }
 
-// withSignIn returns a copy of c that sends the hub's sign-in from store
-// instead of the context's API key. The copy holds no API key, so nothing
-// falls back to it.
-func (c *remoteClient) withSignIn(store *cliauth.Store, hub string) *remoteClient {
+// withSignIn returns a copy of c that sends the hub's sign-in from store,
+// instead of the context's API key, to the routes use names. Every other
+// route keeps the API key. Which credential a route gets is fixed here; a
+// refused sign-in is never retried with the API key.
+func (c *remoteClient) withSignIn(store *cliauth.Store, hub, use string) *remoteClient {
 	httpClient := *c.client
-	httpClient.Transport = &cliauth.BearerTransport{Base: c.client.Transport, Store: store, Hub: hub}
-	return &remoteClient{baseURL: c.baseURL, client: &httpClient}
+	httpClient.Transport = &cliauth.BearerTransport{Base: c.client.Transport, Store: store, Hub: hub, Use: use}
+	return &remoteClient{baseURL: c.baseURL, apiKey: c.apiKey, client: &httpClient}
 }
 
 func (c *remoteClient) Test(ctx context.Context) error {

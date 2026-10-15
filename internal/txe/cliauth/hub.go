@@ -12,17 +12,31 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 )
 
-// What a hub asks the CLI to use its sign-in for.
+// Which of the hub's routes accept its CLI sign-in. Every other route keeps
+// the context's API key: the hub refuses a CLI token there before any
+// handler runs.
 const (
-	// HubUseIdentity: only GET /txe/identity accepts a CLI token; every
-	// other call keeps the context's API key.
+	// HubUseIdentity: only /txe/identity. A hub that names a use this CLI
+	// does not know is read as this one.
 	HubUseIdentity = "identity"
-	// HubUseAll: every call the CLI makes to the hub carries the sign-in.
+	// HubUseTxe: every /txe route.
+	HubUseTxe = "txe"
+	// HubUseAll: /txe, /dags, /dag-runs and /queues, each answered for the
+	// sign-in's owner.
 	HubUseAll = "all"
 )
+
+// hubTokenRoots are the API routes, below the API root, that each use admits
+// a CLI token on.
+var hubTokenRoots = map[string][]string{
+	HubUseIdentity: {HubIdentityPath},
+	HubUseTxe:      {"/txe"},
+	HubUseAll:      {"/txe", "/dags", "/dag-runs", "/queues"},
+}
 
 // HubCLIPath is the hub's nonsecret description of its CLI client, relative
 // to the API root.
@@ -93,8 +107,8 @@ func DiscoverHub(ctx context.Context, apiBase string, client *http.Client) (*Hub
 	if cfg.Contract != 1 {
 		return nil, fmt.Errorf("the hub's sign-in settings are contract %d; this CLI reads contract 1", cfg.Contract)
 	}
-	if cfg.Use != HubUseIdentity && cfg.Use != HubUseAll {
-		return nil, fmt.Errorf("the hub's sign-in settings name an unknown use %q", cfg.Use)
+	if _, ok := hubTokenRoots[cfg.Use]; !ok {
+		cfg.Use = HubUseIdentity
 	}
 	if err := cfg.Provider().Validate(); err != nil {
 		return nil, fmt.Errorf("the hub's sign-in settings: %w", err)
@@ -132,11 +146,12 @@ func (e *HubProviderUnavailableError) Error() string {
 	return msg
 }
 
-// BearerTransport sends a hub's requests with the hub's sign-in instead of
-// any credential the request carries.
+// BearerTransport sends a hub's requests to the routes Use names with the
+// hub's sign-in instead of any credential the request carries; every other
+// request goes out as it is, with the context's API key if it has one.
 //
-// It sends the bearer only to the hub's own scheme and host: a redirect
-// elsewhere is refused before anything is sent. When the hub answers 401
+// The bearer goes only to the hub's own scheme and host, on a route the hub
+// admits a token on: a redirect elsewhere carries no token. When the hub answers 401
 // with error="invalid_token", the token is renewed and the request sent once
 // more; the hub's authentication refuses before any handler runs, so the
 // first attempt did nothing. A request whose body cannot be read again is
@@ -148,6 +163,8 @@ type BearerTransport struct {
 	// Store holds the sign-in; Hub names it.
 	Store *Store
 	Hub   string
+	// Use is the hub's HubConfig.Use.
+	Use string
 	// Provider is used for renewals. Nil means http.DefaultClient.
 	Provider *http.Client
 }
@@ -161,11 +178,18 @@ func (t *BearerTransport) base() http.RoundTripper {
 
 // RoundTrip implements http.RoundTripper.
 func (t *BearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	onRoute, err := t.tokenRoute(req.URL)
+	if err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	if !onRoute {
+		return t.base().RoundTrip(req)
+	}
 	if req.Body != nil {
 		defer func() { _ = req.Body.Close() }()
-	}
-	if err := t.sameHub(req.URL); err != nil {
-		return nil, err
 	}
 	ctx := req.Context()
 	token, err := t.Store.AccessToken(ctx, t.Hub, t.Provider)
@@ -205,17 +229,35 @@ func (t *BearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.checkUnavailable(resp)
 }
 
-// sameHub refuses any URL outside the hub's scheme and host, so a redirect
-// cannot carry the token elsewhere.
-func (t *BearerTransport) sameHub(u *url.URL) error {
+// tokenRoute reports whether the hub admits its CLI token on u: the hub's
+// own scheme and host, and a route Use names. It resolves dot segments first
+// and leaves out a request for a remote node, as the hub does, so a path
+// cannot name an admitted route and reach another.
+func (t *BearerTransport) tokenRoute(u *url.URL) (bool, error) {
 	hub, err := url.Parse(t.Hub)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !strings.EqualFold(u.Scheme, hub.Scheme) || !strings.EqualFold(u.Host, hub.Host) {
-		return fmt.Errorf("refusing to send this hub's sign-in to %s://%s", u.Scheme, u.Host)
+		return false, nil
 	}
-	return nil
+	if node := u.Query().Get("remoteNode"); node != "" && node != "local" {
+		return false, nil
+	}
+	rel, ok := strings.CutPrefix(path.Clean("/"+u.Path), hub.Path)
+	if !ok {
+		return false, nil
+	}
+	roots, ok := hubTokenRoots[t.Use]
+	if !ok {
+		roots = hubTokenRoots[HubUseIdentity]
+	}
+	for _, root := range roots {
+		if rel == root || strings.HasPrefix(rel, root+"/") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (t *BearerTransport) send(req *http.Request, body io.ReadCloser, token string) (*http.Response, error) {

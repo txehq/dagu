@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -61,10 +62,11 @@ The provider and client come from the hub (GET /api/v1/txe/auth/cli). A hub
 that does not publish them needs --issuer and --client-id; a flag that
 disagrees with what the hub publishes is refused.
 
-Other txe commands carry the sign-in only when the hub asks for it. Otherwise,
-and always inside a DAG step, they keep the context's API key. When the hub
-refuses the sign-in, the token is renewed once and the request sent once more;
-a second refusal says to sign in again.`,
+Other txe commands carry the sign-in on the routes the hub takes it on (the
+same answer names them: every /txe route, or also /dags, /dag-runs and
+/queues). Every other route, and every request inside a DAG step, keeps the
+context's API key. When the hub refuses the sign-in, the token is renewed once
+and the request sent once more; a second refusal says to sign in again.`,
 		Args: cobra.NoArgs,
 	}, []commandLineFlag{txeLoginIssuerFlag, txeLoginClientFlag, txeLoginScopeFlag, txeLoginPromptFlag, txeLoginNoBrowser, txeJSONFlag}, runTXELogin)
 }
@@ -150,16 +152,18 @@ func txeInDAGStep() bool {
 //
 // With no sign-in for the hub on this machine, or inside a DAG step, nothing
 // changes: the context's API key, and no extra request. With a sign-in, the
-// hub is asked which calls take it (GET /txe/auth/cli):
+// hub is asked which routes take it (GET /txe/auth/cli):
 //   - the hub does not accept CLI sign-in: the API key;
 //   - the hub names another provider or client than the sign-in was made
 //     at: an error; the sign-in is never sent there;
-//   - "all": every call carries the sign-in and no API key;
-//   - "identity": only calls to GET /txe/identity (identity is true) do.
+//   - otherwise the routes its use names ("txe": every /txe route; "all":
+//     /txe, /dags, /dag-runs and /queues; "identity", or a use this CLI does
+//     not know: /txe/identity) carry the sign-in, and every other route the
+//     API key.
 //
 // The choice is made before any call and never changes on an error: a
 // refused sign-in is reported, not replaced by the API key.
-func txeHubAuth(ctx *Context, remote *remoteClient, identity bool) (*remoteClient, error) {
+func txeHubAuth(ctx *Context, remote *remoteClient) (*remoteClient, error) {
 	if txeInDAGStep() {
 		return remote, nil
 	}
@@ -196,10 +200,7 @@ func txeHubAuth(ctx *Context, remote *remoteClient, identity bool) (*remoteClien
 		return nil, fmt.Errorf("this machine signed in to the hub at %s as client %s, but the hub now names %s and client %s: run \"dagu txe login\"",
 			entry.Provider.Issuer, entry.Provider.ClientID, cfg.Issuer, cfg.ClientID)
 	}
-	if cfg.Use != cliauth.HubUseAll && !identity {
-		return remote, nil
-	}
-	return remote.withSignIn(store, hub), nil
+	return remote.withSignIn(store, hub, cfg.Use), nil
 }
 
 // txeSignInView is what login and whoami show. It never holds a token.
@@ -337,7 +338,7 @@ func runTXELogin(ctx *Context, _ []string) error {
 // txeLoginProvider decides the provider to sign in at.
 //
 // A hub that publishes its CLI client decides it: --issuer and --client-id
-// may only repeat it, and --scope replaces its scopes. A hub that does not
+// may only repeat it, and --scope adds to its scopes. A hub that does not
 // publish one (or cannot be asked, when both flags are given) takes the
 // flags, or the hub's current sign-in for any flag not given.
 func txeLoginProvider(ctx *Context, store *cliauth.Store, hub string, advertised *cliauth.HubConfig, discoverErr error) (cliauth.Provider, error) {
@@ -361,9 +362,7 @@ func txeLoginProvider(ctx *Context, store *cliauth.Store, hub string, advertised
 			return cliauth.Provider{}, fmt.Errorf("the hub's CLI client is %s, not %s", advertised.ClientID, clientID)
 		}
 		p := advertised.Provider()
-		if ctx.Command.Flags().Changed("scope") {
-			p.Scopes = scopes
-		}
+		p.Scopes = mergeScopes(p.Scopes, scopes)
 		return p, p.Validate()
 	}
 	p := cliauth.Provider{Issuer: issuer, ClientID: clientID, Scopes: scopes}
@@ -399,6 +398,17 @@ func txeLoginProvider(ctx *Context, store *cliauth.Store, hub string, advertised
 		p.Scopes = current.Provider.Scopes
 	}
 	return p, p.Validate()
+}
+
+// mergeScopes is base followed by each of extra that base lacks.
+func mergeScopes(base, extra []string) []string {
+	out := slices.Clone(base)
+	for _, s := range extra {
+		if !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // txeRevokeTimeout bounds a best-effort revocation.
@@ -501,7 +511,7 @@ var errHubIdentityNotAsked = errors.New("the hub does not accept CLI sign-in, so
 // txeAskHubIdentity asks the hub who this sign-in is, with the sign-in
 // itself. It never asks with the API key: that would describe the key.
 func txeAskHubIdentity(ctx *Context, remote *remoteClient) (*txeHubIdentity, error) {
-	authed, err := txeHubAuth(ctx, remote, true)
+	authed, err := txeHubAuth(ctx, remote)
 	if err != nil {
 		return nil, err
 	}

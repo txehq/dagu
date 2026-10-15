@@ -219,38 +219,60 @@ func TestTXESignedInCredentialFollowsTheHub(t *testing.T) {
 		assert.Equal(t, "dagu_test_key", remote.apiKey)
 	})
 
+	// authOf sends one request and returns the Authorization the hub got.
+	authOf := func(t *testing.T, remote *remoteClient, method, path string) string {
+		t.Helper()
+		before := len(f.hub.Requests())
+		require.NoError(t, remote.do(context.Background(), method, path, map[string]string{"request_id": "req_" + path}, nil, nil))
+		reqs := f.hub.Requests()[before:]
+		require.Len(t, reqs, 1)
+		return reqs[0].Authorization
+	}
+	const apiKey = "Bearer dagu_test_key"
+	isSignIn := func(t *testing.T, auth string) {
+		t.Helper()
+		assert.True(t, strings.HasPrefix(auth, "Bearer ey"), auth)
+		assert.NotContains(t, auth, "dagu_")
+	}
+
 	t.Run("identity only keeps the API key for other calls", func(t *testing.T) {
 		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseIdentity)
 		remote, err := f.txeProbeRemote()
 		require.NoError(t, err)
-		assert.Equal(t, "dagu_test_key", remote.apiKey)
+		assert.Equal(t, apiKey, authOf(t, remote, http.MethodPost, "/txe/jobs"))
+		isSignIn(t, authOf(t, remote, http.MethodGet, "/txe/identity"))
 	})
 
-	t.Run("all sends the sign-in and no API key", func(t *testing.T) {
-		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+	t.Run("txe sends the sign-in on /txe and the API key elsewhere", func(t *testing.T) {
+		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseTxe)
 		remote, err := f.txeProbeRemote()
 		require.NoError(t, err)
-		assert.Empty(t, remote.apiKey)
-		before := len(f.hub.Requests())
-		require.NoError(t, remote.do(context.Background(), http.MethodPost, "/txe/jobs", map[string]string{"request_id": "req_1"}, nil, nil))
-		reqs := f.hub.Requests()[before:]
-		require.Len(t, reqs, 1)
-		assert.True(t, strings.HasPrefix(reqs[0].Authorization, "Bearer ey"), reqs[0].Authorization)
-		assert.NotContains(t, reqs[0].Authorization, "dagu_")
+		isSignIn(t, authOf(t, remote, http.MethodPost, "/txe/jobs"))
+		assert.Equal(t, apiKey, authOf(t, remote, http.MethodGet, "/dags"))
 
 		// A refusal is renewed once and then reported; it never falls back
 		// to the API key.
 		f.hub.Decide = func(*http.Request, int) int { return http.StatusUnauthorized }
 		t.Cleanup(func() { f.hub.Decide = nil })
-		before = len(f.hub.Requests())
+		before := len(f.hub.Requests())
 		err = remote.do(context.Background(), http.MethodPost, "/txe/jobs", map[string]string{"request_id": "req_2"}, nil, nil)
 		require.ErrorIs(t, err, cliauth.ErrHubRefusedSignIn)
-		reqs = f.hub.Requests()[before:]
+		reqs := f.hub.Requests()[before:]
 		require.Len(t, reqs, 2)
 		for _, r := range reqs {
 			assert.NotContains(t, r.Authorization, "dagu_")
 		}
 		assert.Equal(t, reqs[0].Body, reqs[1].Body)
+	})
+
+	t.Run("all also sends it on the owner-scoped native routes", func(t *testing.T) {
+		f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+		remote, err := f.txeProbeRemote()
+		require.NoError(t, err)
+		isSignIn(t, authOf(t, remote, http.MethodPost, "/txe/jobs"))
+		isSignIn(t, authOf(t, remote, http.MethodGet, "/dags"))
+		isSignIn(t, authOf(t, remote, http.MethodGet, "/dag-runs"))
+		assert.Equal(t, apiKey, authOf(t, remote, http.MethodGet, "/workers"))
 	})
 
 	t.Run("a hub naming another provider is refused", func(t *testing.T) {
@@ -281,6 +303,11 @@ func TestTXELoginTakesTheHubsClient(t *testing.T) {
 	login := f.json("login")
 	assert.Equal(t, p.Issuer(), login["issuer"])
 	assert.Equal(t, p.ClientID, login["client_id"])
+
+	// --scope adds to the scopes the hub names; it never drops one.
+	f.hub.Advertise["scopes"] = []string{"openid", "dagu-hub"}
+	f.json("login", "--scope", "offline_access")
+	assert.Equal(t, "openid dagu-hub offline_access", p.LastAuth().Get("scope"))
 
 	_, err := f.run("login", "--client-id", "another-client")
 	assert.ErrorContains(t, err, "the hub's CLI client is")
