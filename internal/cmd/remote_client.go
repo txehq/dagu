@@ -27,6 +27,9 @@ type remoteClient struct {
 	baseURL string
 	apiKey  string
 	client  *http.Client
+	// signInUse is the hub's use for this machine's sign-in when the
+	// client sends it (withSignIn), and empty otherwise.
+	signInUse string
 }
 
 type remoteError struct {
@@ -82,7 +85,7 @@ func newRemoteClient(ctx *cliContext) (*remoteClient, error) {
 func (c *remoteClient) withSignIn(store *cliauth.Store, hub, use string) *remoteClient {
 	httpClient := *c.client
 	httpClient.Transport = &cliauth.BearerTransport{Base: c.client.Transport, Store: store, Hub: hub, Use: use}
-	return &remoteClient{baseURL: c.baseURL, apiKey: c.apiKey, client: &httpClient}
+	return &remoteClient{baseURL: c.baseURL, apiKey: c.apiKey, client: &httpClient, signInUse: use}
 }
 
 func (c *remoteClient) Test(ctx context.Context) error {

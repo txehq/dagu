@@ -87,7 +87,48 @@ value is passed so that disabling the profile's settings does not drop it.`,
 		Args:        cobra.NoArgs,
 		Annotations: map[string]string{txeLocalAnnotation: "true"},
 	}, []commandLineFlag{txeReviewMachineFlag, txeReviewStateFlag, txeReviewOutDirFlag, txeReviewScheduleFlag, txeReviewAgentDirFlag, txeReviewAgentModelFlag, txeReviewCommandFlag, txeReviewHomeFlag, txeJSONFlag}, runTXEReviewRender))
+	command.AddCommand(txeReviewInstallCommand())
 	return command
+}
+
+// txeReviewDAGConfig is the reviewer DAGs' configuration for machineID from
+// the render flags, as render and install read them.
+func txeReviewDAGConfig(ctx *Context, machineID string) (review.DAGConfig, error) {
+	cfg := review.DAGConfig{MachineID: machineID}
+	var err error
+	for flag, into := range map[string]*string{
+		txeReviewStateFlag.name:      &cfg.StateDir,
+		txeReviewScheduleFlag.name:   &cfg.Schedule,
+		txeReviewAgentDirFlag.name:   &cfg.AgentConfigDir,
+		txeReviewAgentModelFlag.name: &cfg.AgentModel,
+		txeReviewCommandFlag.name:    &cfg.ReviewCommand,
+	} {
+		if *into, err = ctx.StringParam(flag); err != nil {
+			return cfg, err
+		}
+	}
+	home, err := ctx.StringParam(txeReviewHomeFlag.name)
+	if err != nil {
+		return cfg, err
+	}
+	// A step on the worker inherits the worker's DAGU_HOME, which is not
+	// where the CLI keeps its hub context, so the steps are given the
+	// client directory explicitly instead of relying on the default.
+	txeHome, err := txepkg.DefaultHome()
+	if err != nil {
+		return cfg, err
+	}
+	if home != "" {
+		if !filepath.IsAbs(home) {
+			return cfg, fmt.Errorf("--%s must be an absolute path", txeReviewHomeFlag.name)
+		}
+		txeHome = txepkg.Home{Root: filepath.Clean(home)}
+	}
+	cfg.Env = map[string]string{txepkg.EnvHome: txeHome.Root, "DAGU_HOME": txeHome.ClientDir()}
+	if cfg.StateDir, err = filepath.Abs(cfg.StateDir); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // txeReviewTransport adapts the hub client to the reviewer's transport. The
@@ -271,43 +312,16 @@ func txeReviewExecuteExit(err error) error {
 }
 
 func runTXEReviewRender(ctx *Context, _ []string) error {
-	cfg := review.DAGConfig{}
-	var err error
-	for flag, into := range map[string]*string{
-		txeReviewMachineFlag.name:    &cfg.MachineID,
-		txeReviewStateFlag.name:      &cfg.StateDir,
-		txeReviewScheduleFlag.name:   &cfg.Schedule,
-		txeReviewAgentDirFlag.name:   &cfg.AgentConfigDir,
-		txeReviewAgentModelFlag.name: &cfg.AgentModel,
-		txeReviewCommandFlag.name:    &cfg.ReviewCommand,
-	} {
-		if *into, err = ctx.StringParam(flag); err != nil {
-			return err
-		}
+	machine, err := ctx.StringParam(txeReviewMachineFlag.name)
+	if err != nil {
+		return err
+	}
+	cfg, err := txeReviewDAGConfig(ctx, machine)
+	if err != nil {
+		return err
 	}
 	outDir, err := ctx.StringParam(txeReviewOutDirFlag.name)
 	if err != nil {
-		return err
-	}
-	home, err := ctx.StringParam(txeReviewHomeFlag.name)
-	if err != nil {
-		return err
-	}
-	// A step on the worker inherits the worker's DAGU_HOME, which is not
-	// where the CLI keeps its hub context, so the steps are given the
-	// client directory explicitly instead of relying on the default.
-	txeHome, err := txepkg.DefaultHome()
-	if err != nil {
-		return err
-	}
-	if home != "" {
-		if !filepath.IsAbs(home) {
-			return fmt.Errorf("--%s must be an absolute path", txeReviewHomeFlag.name)
-		}
-		txeHome = txepkg.Home{Root: filepath.Clean(home)}
-	}
-	cfg.Env = map[string]string{txepkg.EnvHome: txeHome.Root, "DAGU_HOME": txeHome.ClientDir()}
-	if cfg.StateDir, err = filepath.Abs(cfg.StateDir); err != nil {
 		return err
 	}
 	dags, err := review.RenderDAGs(cfg)

@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/probe"
@@ -82,7 +83,13 @@ type txeHubDAGs interface {
 	createDAG(ctx context.Context, name, spec string) error
 	updateDAGSpec(ctx context.Context, name, spec string) error
 	listWorkers(ctx context.Context) (workers []api.Worker, listErrors []string, err error)
+	// ownerSignedIn reports whether native DAG calls carry an owner's
+	// sign-in. The hub shows such a caller no worker list.
+	ownerSignedIn() bool
 }
+
+// ownerSignedIn implements txeHubDAGs.
+func (c *remoteClient) ownerSignedIn() bool { return c.signInUse == cliauth.HubUseAll }
 
 // txeHubMachines is the registry lookup the installer verifies the machine
 // with.
@@ -328,11 +335,21 @@ func txeHubRemoteStatus(err error) int {
 // txeHubMachineWorker names a healthy worker labelled for the machine, or
 // returns a warning when there is none or its health cannot be established.
 // A worker that sleeps, as a laptop does, is no reason to refuse: the DAG's
-// runs wait for it. Only a hub that refuses the request fails the install.
+// runs wait for it. Readiness never decides an install: a hub that does not
+// show this caller its workers leaves it unknown.
+//
+// An owner's sign-in is not sent to GET /workers, which lists every worker of
+// the hub and is closed to it; nor is the API key sent instead.
 func txeHubMachineWorker(ctx context.Context, hub txeHubDAGs, machineID string) (worker, warning string, err error) {
+	if hub.ownerSignedIn() {
+		return "", fmt.Sprintf("whether a worker for %s is connected is not shown to an owner's sign-in; installed is not runnable until that worker connects", machineID), nil
+	}
 	workers, listErrors, err := hub.listWorkers(ctx)
-	if txeHubRemoteStatus(err) == http.StatusServiceUnavailable {
+	switch txeHubRemoteStatus(err) {
+	case http.StatusServiceUnavailable:
 		return "", fmt.Sprintf("the hub's coordinator is unavailable, so whether a worker for %s is connected is unknown; runs wait for one", machineID), nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", fmt.Sprintf("the hub does not show this caller its workers, so whether a worker for %s is connected is unknown; runs wait for one", machineID), nil
 	}
 	if err != nil {
 		return "", "", fmt.Errorf("list the hub's workers: %w", err)
