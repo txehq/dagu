@@ -348,6 +348,16 @@ func TestLogPageLimits(t *testing.T) {
 				"/sub-dag-runs/child/steps/main/log",
 			} {
 				t.Run(path, func(t *testing.T) {
+					// The stream is optional: without it, stdout (TXE-4414).
+					t.Run("no stream", func(t *testing.T) {
+						resp := server.Client().Get(fmt.Sprintf(
+							"/api/v1/dag-runs/%s/%s%s?remoteNode=local&limit=5", dag.Name, root.ID, path,
+						)).ExpectStatus(http.StatusOK).Send(t)
+						var body api.GetDAGRunLog200JSONResponse
+						resp.Unmarshal(t, &body)
+						require.NotNil(t, body.LineCount)
+						require.Equal(t, 5, *body.LineCount)
+					})
 					for _, param := range []string{"head", "tail", "limit"} {
 						for _, count := range []int{-1, 0, 1, 10000, 10001, 100000} {
 							t.Run(fmt.Sprintf("%s=%d", param, count), func(t *testing.T) {
