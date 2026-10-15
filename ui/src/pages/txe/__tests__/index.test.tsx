@@ -8,7 +8,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { TxeApi } from '@/features/txe/api';
 import { fixtureJob, fixtureProposal } from '@/features/txe/fixtures';
-import { TxeApiContext } from '@/features/txe/hooks';
+import { TxeEnrolmentApiContext, TxeApiContext } from '@/features/txe/hooks';
+import type { TxeEnrolmentApi } from '@/features/txe/enrolment';
 import type { DecisionRequest, Proposal } from '@/features/txe/types';
 import TxeInboxPage from '..';
 
@@ -219,5 +220,54 @@ describe('TxeInboxPage for a shared job', () => {
     expect(
       screen.getByText('You do not have permission to decide this proposal.')
     ).toBeInTheDocument();
+  });
+});
+
+describe('TxeInboxPage and machine enrolment', () => {
+  function renderWithMachines(listMachines: TxeEnrolmentApi['listMachines']) {
+    const enrolment = { listMachines } as unknown as TxeEnrolmentApi;
+    return render(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <TxeApiContext.Provider value={fakeApi([]).api}>
+          <TxeEnrolmentApiContext.Provider value={enrolment}>
+            <MemoryRouter>
+              <TxeInboxPage />
+            </MemoryRouter>
+          </TxeEnrolmentApiContext.Provider>
+        </TxeApiContext.Provider>
+      </SWRConfig>
+    );
+  }
+
+  it('tells a person when machines of their owner wait for approval', async () => {
+    identity.value = {
+      principal: { class: 'person', shown: {} },
+      state: 'bound',
+      is_person: true,
+    };
+    try {
+      renderWithMachines(async () => [
+        {
+          machine_id: 'mch_1',
+          owner_id: 'own_A',
+          display_name: 'ada-laptop',
+          pending_applications: 1,
+        },
+      ]);
+      expect(
+        await screen.findByTestId('txe-pending-enrolments')
+      ).toHaveTextContent('A machine is waiting for enrolment approval.');
+    } finally {
+      identity.value = undefined;
+    }
+  });
+
+  it('does not ask for machines for any other caller', async () => {
+    const listMachines = vi.fn(async () => []);
+    renderWithMachines(listMachines);
+
+    expect(await screen.findByTestId('txe-inbox-empty')).toBeInTheDocument();
+    expect(listMachines).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
   });
 });

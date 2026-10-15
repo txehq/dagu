@@ -67,6 +67,7 @@ const DAGRunDetails = React.lazy(() => import('./pages/dag-runs/dag-run'));
 const TxeInboxPage = React.lazy(() => import('./pages/txe'));
 const TxeJobPage = React.lazy(() => import('./pages/txe/job'));
 const TxeMachinePage = React.lazy(() => import('./pages/txe/machine'));
+const TxeMachinesPage = React.lazy(() => import('./pages/txe/machines'));
 const TxeAccessPage = React.lazy(() => import('./pages/txe/access'));
 const DAGs = React.lazy(() => import('./pages/dags'));
 const DAGDetails = React.lazy(() => import('./pages/dags/dag'));
@@ -348,6 +349,7 @@ function PersonApp(): React.ReactElement {
             <Route path="/txe" element={<TxeInboxPage />} />
             <Route path="/txe/jobs" element={<Navigate to="/txe" replace />} />
             <Route path="/txe/jobs/:jobId" element={<TxeJobPage />} />
+            <Route path="/txe/machines" element={<TxeMachinesPage />} />
             <Route
               path="/txe/machines/:machineId"
               element={<TxeMachinePage />}
@@ -834,6 +836,10 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                       <Route
                                         path="/txe/jobs/:jobId"
                                         element={<TxeJobPage />}
+                                      />
+                                      <Route
+                                        path="/txe/machines"
+                                        element={<TxeMachinesPage />}
                                       />
                                       <Route
                                         path="/txe/machines/:machineId"
