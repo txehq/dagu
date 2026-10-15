@@ -164,3 +164,32 @@ func TestKeepCredentialIsNeverRead(t *testing.T) {
 	_, err := continuity.DecodeKeep([]byte(`{"format":"txe.continuity.keep/v1","entries":[{"root":"r","path":"p","provenance":"x","credential":true,"exclude":["a"]}]}`))
 	assert.Error(t, err, "a credential has nothing to exclude")
 }
+
+// Only a file can be kept as a credential: a directory or a link marked as
+// one would hide what it holds, so it blocks and nothing under it is read.
+func TestKeepCredentialMustBeAFile(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	writeSecret(t, homePath(l, "creds/worker.json"))
+	writeSecret(t, homePath(l, "packages/txe-smoke/v1/files/smoke.sh"))
+	m := &continuity.KeepManifest{Format: continuity.KeepFormatV1, Entries: []continuity.KeepEntry{
+		{Root: "laptop-home", Path: "creds", Credential: true, Provenance: "fixture"},
+		{Root: "laptop-home", Path: "packages/txe-smoke", Credential: true, Provenance: "fixture"},
+	}}
+	inv := scanKeep(t, l, m)
+	got := codes(continuity.Validate(inv, continuity.Policy{}), continuity.SeverityBlock)
+	assert.Equal(t, map[string]int{"kept_credential": 2}, got)
+	for _, f := range inv.Files {
+		assert.False(t, strings.HasPrefix(f.Path, "creds/") || strings.HasPrefix(f.Path, "packages/txe-smoke/"), f.Path)
+	}
+	if runtime.GOOS != "windows" {
+		l, _ := build(t)
+		writeSecret(t, filepath.Join(l.Root, "elsewhere.json"))
+		require.NoError(t, os.Symlink(filepath.Join(l.Root, "elsewhere.json"), homePath(l, "my-worker.json")))
+		m := &continuity.KeepManifest{Format: continuity.KeepFormatV1, Entries: []continuity.KeepEntry{
+			{Root: "laptop-home", Path: "my-worker.json", Credential: true, Provenance: "fixture"},
+		}}
+		got := codes(continuity.Validate(scanKeep(t, l, m), continuity.Policy{}), continuity.SeverityBlock)
+		assert.Positive(t, got["kept_credential"]+got["unsupported_file"], "%v", got)
+	}
+}

@@ -122,6 +122,10 @@ func (s *scanner) kept(rel string) (bool, error) {
 	var err error
 	if e.Credential {
 		digest, err = s.keepCredential(rel)
+		if errors.Is(err, errCredentialNotFile) {
+			s.issue("kept_credential", "", id, "%s is marked as a credential but is not a regular file; it was not read", id)
+			return true, nil
+		}
 	} else {
 		digest, refused, err = s.keepTree(rel, e)
 	}
@@ -255,12 +259,20 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 	return "sha256:" + hex.EncodeToString(sum[:]), refused, nil
 }
 
+var errCredentialNotFile = errors.New("a kept credential must be a regular file")
+
 // keepCredential pins a kept credential by its type and permission bits,
 // from its directory entry, without opening it or anything under it.
 func (s *scanner) keepCredential(rel string) (string, error) {
 	info, err := os.Lstat(filepath.Join(s.root.Path, filepath.FromSlash(rel)))
 	if err != nil {
 		return "", err
+	}
+	// A credential is a file: its readers (the machine credential, the hub
+	// key) accept nothing else, and a directory or link marked as one would
+	// hide what it holds.
+	if !info.Mode().IsRegular() {
+		return "", errCredentialNotFile
 	}
 	perm := uint32(0)
 	if hasModeBits {
