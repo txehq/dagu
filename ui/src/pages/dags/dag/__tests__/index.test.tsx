@@ -78,11 +78,15 @@ function LocationProbe() {
   );
 }
 
-function renderPage(initialEntry = '/dags/release-notes', personScope = false) {
+function renderPage(
+  initialEntry = '/dags/release-notes',
+  personScope = false,
+  appBar = appBarValue
+) {
   render(
     <PersonScopeContext.Provider value={personScope}>
       <MemoryRouter initialEntries={[initialEntry]}>
-        <AppBarContext.Provider value={appBarValue}>
+        <AppBarContext.Provider value={appBar}>
           <LocationProbe />
           <Routes>
             <Route path="/dags/:fileName" element={<DAGDetails />} />
@@ -206,4 +210,45 @@ describe('DAGDetails page', () => {
     expect(screen.getByText('Job not found')).toBeInTheDocument();
     expect(screen.queryByTestId('dag-details-content')).not.toBeInTheDocument();
   });
+
+  // A person's dashboard has no workspace selector, so the ordinary
+  // dashboard's saved selection must not hide a person's own DAG.
+  it.each([
+    [true, 'shows'],
+    [false, 'hides'],
+  ])(
+    'with a saved Default selection, person scope %s: %s a workspace DAG',
+    (personScope, verdict) => {
+      useQueryMock.mockImplementation(
+        (path) =>
+          ({
+            data:
+              path === '/dags/{fileName}'
+                ? {
+                    ...dagData,
+                    dag: { ...dagData.dag, labels: ['workspace=ops'] },
+                  }
+                : undefined,
+            mutate: vi.fn(),
+          }) as never
+      );
+      renderPage('/dags/release-notes', personScope, {
+        selectedRemoteNode: 'local',
+        workspaceSelection: { kind: WorkspaceKind.default },
+      } as never);
+
+      const notInWorkspace = screen.queryByText(
+        'This DAG is not in the selected workspace.'
+      );
+      if (verdict === 'shows') {
+        expect(screen.getByTestId('dag-details-content')).toBeInTheDocument();
+        expect(notInWorkspace).not.toBeInTheDocument();
+      } else {
+        expect(
+          screen.queryByTestId('dag-details-content')
+        ).not.toBeInTheDocument();
+        expect(notInWorkspace).toBeInTheDocument();
+      }
+    }
+  );
 });

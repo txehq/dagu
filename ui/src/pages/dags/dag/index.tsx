@@ -66,12 +66,18 @@ function DAGDetails() {
     searchParams.get('workspace') ?? ''
   );
   const appWorkspaceSelection = appBarContext.workspaceSelection;
+  const personScope = usePersonScope();
   const workspaceSelection = useMemo(() => {
     if (queryWorkspace) {
       return { kind: WorkspaceKind.workspace, workspace: queryWorkspace };
     }
+    // A person's dashboard has no workspace selector, so a selection saved
+    // in this browser by the ordinary dashboard must not hide their DAG.
+    if (personScope) {
+      return { kind: WorkspaceKind.all };
+    }
     return sanitizeWorkspaceSelection(appWorkspaceSelection);
-  }, [appWorkspaceSelection, queryWorkspace]);
+  }, [appWorkspaceSelection, personScope, queryWorkspace]);
   const scopedQuery = useMemo(
     () => ({
       remoteNode,
@@ -79,7 +85,6 @@ function DAGDetails() {
     [remoteNode]
   );
   const fileName = params.fileName || '';
-  const personScope = usePersonScope();
 
   const dagSSE = useDAGSSE(fileName, !!fileName, remoteNode);
 
