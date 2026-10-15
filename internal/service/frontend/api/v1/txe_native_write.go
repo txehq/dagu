@@ -20,17 +20,19 @@ import (
 // retry. Each is decided for every name it touches: the file's, and any name
 // the definition declares, so that no file takes an owner's DAG name.
 //
-//   - A job's DAG is the registry's: in observe and enforce no caller writes
-//     it natively, the platform administrator included.
-//   - A machine's DAG is written by whoever holds author on the machine, as
-//     the owner store decides it: a person or cli of the machine's owner.
+//   - A job's DAG is the registry's: nobody is permitted to write it
+//     natively, the platform administrator included.
+//   - A machine's DAG is permitted to whoever holds author on the machine,
+//     as the owner store decides it: a person or cli of the machine's owner.
 //     The platform administrator holds only view on an owner's resources.
 //   - Any other DAG is the platform's, as S4 decides it for reads.
 //
-// In off, legacy callers and the administrator are decided by the hub's own
-// check alone, as before; in observe a refusal is logged and the write
-// proceeds; in enforce it is refused. A caller held to its owner is always
-// decided by owner.
+// What happens to a write that is not permitted depends on who asks and the
+// mode. For legacy callers and the administrator: in off the hub's own check
+// alone decides, as before; in observe the write proceeds and is logged as
+// would-deny; in enforce it is refused. A caller held to its owner (a person
+// or a provider token) is decided by owner in every mode: refused whenever
+// not permitted.
 //
 // A machine's owner never changes (the registry does not re-point a machine
 // ID), and a create or a rename onto a name that exists fails in the DAG
