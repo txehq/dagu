@@ -343,7 +343,6 @@ func TestTxeNativeWorkspaceSelectionOpensNothing(t *testing.T) {
 	unbound := neutral(w.nobody)
 
 	for _, ws := range []string{"default", "production"} {
-		ws := ws
 		for _, ctx := range []context.Context{personA, cliA, unbound} {
 			dags, err := w.api.ListDAGs(ctx, apigen.ListDAGsRequestObject{Params: apigen.ListDAGsParams{Workspace: &ws}})
 			require.NoError(t, err, ws)
