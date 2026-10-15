@@ -18,7 +18,8 @@ import (
 // The rendered pair satisfies the hub's native-write placement rules for a
 // machine's own DAGs (TXE-4412, TXE-4417). Loaded as the hub loads a spec,
 // each is one document pinned by a literal worker_selector to its machine
-// alone, declares no name of its own and holds no local DAG.
+// alone, declares no name of its own, holds no local DAG, and has no step
+// with a selector of its own or a call to another DAG.
 func TestRenderedDAGsArePinnedToTheirMachine(t *testing.T) {
 	const machine = "mch_01JREV000000000000000000ZZ"
 	dags, err := review.RenderDAGs(review.DAGConfig{MachineID: machine, StateDir: "/var/txe/state", AgentModel: "claude-test"})
@@ -29,6 +30,13 @@ func TestRenderedDAGsArePinnedToTheirMachine(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, map[string]string{"txe.machine": machine}, dag.WorkerSelector)
 			assert.Empty(t, dag.LocalDAGs)
+			// A step's selector would have to name the same machine, and a
+			// call may name only this machine's DAGs: the pair has neither.
+			require.NotEmpty(t, dag.Steps)
+			for _, step := range dag.Steps {
+				assert.Empty(t, step.WorkerSelector, "step %s", step.Name)
+				assert.Nil(t, step.SubDAG, "step %s calls another DAG", step.Name)
+			}
 			for k, v := range dag.WorkerSelector {
 				assert.False(t, strings.ContainsAny(k+v, "$`"), "a literal selector")
 			}
