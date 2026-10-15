@@ -29,6 +29,28 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 	if len(parts) < 2 {
 		return nil, fmt.Errorf("%w: reconcile needs the hub's inventory and at least one machine's", ErrIncompatible)
 	}
+	given := map[string]bool{}
+	for i, p := range parts {
+		if p == nil {
+			return nil, fmt.Errorf("%w: part %d is missing", ErrIncompatible, i+1)
+		}
+		if given[p.Digest] {
+			return nil, fmt.Errorf("%w: %s is given twice", ErrIncompatible, p.Digest)
+		}
+		given[p.Digest] = true
+	}
+	// A root label names the part that scanned it, and only that part
+	// may hold records, files, kept entries, exclusions or a machine
+	// identity under it.
+	owner := map[string]int{}
+	for i, p := range parts {
+		for _, r := range p.Roots {
+			if _, ok := owner[r.Label]; ok {
+				return nil, fmt.Errorf("%w: root %q is in more than one part", ErrIncompatible, r.Label)
+			}
+			owner[r.Label] = i
+		}
+	}
 	first := parts[0]
 	joint := &Inventory{
 		Format:        FormatV1,
@@ -38,15 +60,16 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 		ModeBits:      first.ModeBits,
 		Machines:      map[string]string{},
 	}
-	roots := map[string]bool{}
 	records := map[string]bool{}
 	files := map[string]bool{}
 	kept := map[string]bool{}
-	parents := map[string]bool{}
 	hubs, homes := 0, 0
 	for i, p := range parts {
-		if p == nil {
-			return nil, fmt.Errorf("%w: part %d is missing", ErrIncompatible, i+1)
+		own := func(label, what string) error {
+			if j, ok := owner[label]; !ok || j != i {
+				return fmt.Errorf("%w: %s of %s names root %q, which that inventory did not scan", ErrIncompatible, what, p.Digest, label)
+			}
+			return nil
 		}
 		switch {
 		case p.Format != FormatV1:
@@ -59,19 +82,12 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			return nil, fmt.Errorf("%w: %s and %s differ in whether they recorded permission bits", ErrIncompatible, p.Digest, first.Digest)
 		case len(p.Parts) > 0:
 			return nil, fmt.Errorf("%w: %s is already a joint inventory; reconcile the inventories it was made from", ErrIncompatible, p.Digest)
-		case parents[p.Digest]:
-			return nil, fmt.Errorf("%w: %s is given twice", ErrIncompatible, p.Digest)
 		}
-		parents[p.Digest] = true
 		joint.Parts = append(joint.Parts, p.Digest)
 		if p.ScannedAt.After(joint.ScannedAt) {
 			joint.ScannedAt = p.ScannedAt
 		}
 		for _, r := range p.Roots {
-			if roots[r.Label] {
-				return nil, fmt.Errorf("%w: root %q is in more than one part", ErrIncompatible, r.Label)
-			}
-			roots[r.Label] = true
 			switch r.Area {
 			case AreaHubData:
 				hubs++
@@ -81,6 +97,12 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			joint.Roots = append(joint.Roots, r)
 		}
 		for _, r := range p.Records {
+			// A machine home's records are stored under its root label.
+			if _, isRoot := owner[r.Store]; isRoot {
+				if err := own(r.Store, "record "+r.Store+"/"+r.ID); err != nil {
+					return nil, err
+				}
+			}
 			key := r.Store + "/" + r.ID
 			if records[key] {
 				return nil, fmt.Errorf("%w: record %s is in more than one part", ErrIncompatible, key)
@@ -89,6 +111,9 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			joint.Records = append(joint.Records, r)
 		}
 		for _, f := range p.Files {
+			if err := own(f.Root, "file "+f.Path); err != nil {
+				return nil, err
+			}
 			key := f.Root + "/" + f.Path
 			if files[key] {
 				return nil, fmt.Errorf("%w: file %s is in more than one part", ErrIncompatible, key)
@@ -97,6 +122,9 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			joint.Files = append(joint.Files, f)
 		}
 		for _, k := range p.Kept {
+			if err := own(k.Root, "kept entry "+k.Path); err != nil {
+				return nil, err
+			}
 			key := k.Root + "/" + k.Path
 			if kept[key] {
 				return nil, fmt.Errorf("%w: kept entry %s is in more than one part", ErrIncompatible, key)
@@ -105,10 +133,18 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			joint.Kept = append(joint.Kept, k)
 		}
 		for label, machine := range p.Machines {
+			if err := own(label, "machine "+machine); err != nil {
+				return nil, err
+			}
 			if have, ok := joint.Machines[label]; ok && have != machine {
 				return nil, fmt.Errorf("%w: machine home %q names machines %s and %s", ErrIncompatible, label, have, machine)
 			}
 			joint.Machines[label] = machine
+		}
+		for _, e := range p.Excluded {
+			if err := own(e.Root, "exclusion "+e.Path); err != nil {
+				return nil, err
+			}
 		}
 		joint.Excluded = append(joint.Excluded, p.Excluded...)
 		joint.Issues = append(joint.Issues, p.Issues...)
@@ -118,19 +154,6 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 	}
 	if homes == 0 {
 		return nil, fmt.Errorf("%w: no part holds a machine home", ErrIncompatible)
-	}
-	// Every record and file belongs to a root of its own part: a root
-	// label used for records of another part would make a machine's
-	// packages or files look like someone else's.
-	for _, f := range joint.Files {
-		if !roots[f.Root] {
-			return nil, fmt.Errorf("%w: file %s/%s names a root no part scanned", ErrIncompatible, f.Root, f.Path)
-		}
-	}
-	for label := range joint.Machines {
-		if !roots[label] {
-			return nil, fmt.Errorf("%w: machine home %q is not a scanned root", ErrIncompatible, label)
-		}
 	}
 	sort.Strings(joint.Parts)
 	sort.Slice(joint.Roots, func(i, k int) bool { return joint.Roots[i].Label < joint.Roots[k].Label })

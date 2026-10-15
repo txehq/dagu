@@ -8,7 +8,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strconv"
@@ -40,7 +42,9 @@ func strict(data []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if dec.More() {
+	// Only the end of input may follow: More reports false before a
+	// closing bracket or brace as well.
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("trailing data after the record")
 	}
 	return nil

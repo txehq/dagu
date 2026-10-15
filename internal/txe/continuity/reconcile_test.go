@@ -137,6 +137,23 @@ func TestReconcileRefusesWhatDoesNotBelongTogether(t *testing.T) {
 		"a record in two parts": {hub, reseal(machine, func(c *continuity.Inventory) {
 			c.Records = append(c.Records, hub.Records[0])
 		})},
+		"a file under the other part's root": {hub, reseal(machine, func(c *continuity.Inventory) {
+			c.Files = append(c.Files, continuity.File{Root: "hub-data", Path: "dag-runs/planted", Policy: continuity.PolicyMutable})
+		})},
+		"a record under the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
+			c.Records = append(c.Records, continuity.Record{Store: "laptop-home", ID: "machine.json.planted", Class: continuity.ClassMachineIdentity})
+		})},
+		"a machine identity for the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
+			c.Machines = map[string]string{"laptop-home": "mch_01M4ZZZZZZZZZZZZZZZZZZZZZZ"}
+		})},
+		"a kept entry under the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
+			c.Kept = append(c.Kept, continuity.Kept{Root: "laptop-home", Path: "base.yaml", Digest: "sha256:" + strings.Repeat("a", 64), Provenance: "x"})
+		})},
+		"an exclusion under the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
+			c.Excluded = append(c.Excluded, continuity.Excluded{Root: "laptop-home", Path: "outputs", Reason: "x"})
+		})},
+		"a missing first part": {nil, hub, machine},
+		"a missing later part": {hub, nil, machine},
 		"a file under a root no part scanned": {hub, reseal(machine, func(c *continuity.Inventory) {
 			c.Files = append(c.Files, continuity.File{Root: "nowhere", Path: "x", Policy: continuity.PolicyMutable})
 		})},
@@ -161,10 +178,12 @@ func TestDecodeRefusesMalformedInventories(t *testing.T) {
 	_, err = continuity.Decode(data)
 	require.NoError(t, err)
 	for name, doc := range map[string]string{
-		"an altered record": strings.Replace(string(data), machine.Records[0].SHA256, "sha256:"+strings.Repeat("0", 64), 1),
-		"an unknown field":  strings.Replace(string(data), `"format":`, `"merged_by":"x","format":`, 1),
-		"trailing data":     string(data) + "{}",
-		"not JSON":          "{",
+		"an altered record":  strings.Replace(string(data), machine.Records[0].SHA256, "sha256:"+strings.Repeat("0", 64), 1),
+		"an unknown field":   strings.Replace(string(data), `"format":`, `"merged_by":"x","format":`, 1),
+		"trailing data":      string(data) + "{}",
+		"a trailing bracket": string(data) + "]",
+		"a trailing brace":   string(data) + "}garbage",
+		"not JSON":           "{",
 	} {
 		_, err := continuity.Decode([]byte(doc))
 		assert.Error(t, err, name)
