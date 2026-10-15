@@ -4,6 +4,7 @@
 #   txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_...   # first install
 #   txe/worker/install.sh --tag txe-v2.18.3-1                       # upgrade
 #   txe/worker/install.sh --tag txe-v2.18.3-1 --credential-file /abs/worker-credential.json
+#   txe/worker/install.sh --tag txe-v2.18.3-1 --no-credential   # roll back; keeps the file
 #
 # It builds the worker from the same fork tag as the cluster image, keeps every
 # earlier binary, and writes two launchd agents that run whether or not any coding
@@ -27,7 +28,9 @@
 # credential that is not this machine's, not owner-only or not a worker's is
 # refused before anything is written. The agent gets the file's path only, in
 # DAGU_WORKER_AUTH_CREDENTIAL_FILE; no token is ever in the plist, an argument or
-# a log.
+# a log. --no-credential (TXE-4418) writes the agent of an unenrolled machine and
+# leaves the credential file where it is, so the next install without it passes the
+# credential again. Revoking the enrolment in the hub changes nothing here.
 #
 # Upgrade while no job is running: restarting the worker ends its running tasks.
 set -euo pipefail
@@ -43,7 +46,11 @@ while [ $# -gt 0 ]; do
     --owner-id) owner_id="${2:-}"; shift 2 ;;
     --credential-file)
       [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
+      [ "$credential_given" != none ] || die "--credential-file and --no-credential cannot both be given"
       credential="$2" credential_given=1; shift 2 ;;
+    --no-credential)
+      [ "$credential_given" != 1 ] || die "--credential-file and --no-credential cannot both be given"
+      credential_given=none; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -144,4 +151,7 @@ done
 
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
   "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"
+if [ "$credential_given" = none ] && [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then
+  printf '  kept %s; install again without --no-credential to pass it\n' "$TXE_DAGU_HOME/worker-credential.json"
+fi
 "$here/status.sh"

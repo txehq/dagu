@@ -26,6 +26,10 @@ if [ -n "$credential" ]; then
   fi
 else
   echo "credential (none: the worker presents no machine credential)"
+  if [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then
+    printf '  %s exists but the agent does not pass it (installed with --no-credential, or before enrolment)\n' \
+      "$TXE_DAGU_HOME/worker-credential.json"
+  fi
 fi
 
 expires="$TXE_DAGU_HOME/tunnel/kubeconfig.expires"
