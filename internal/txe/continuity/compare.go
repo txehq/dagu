@@ -209,6 +209,8 @@ func compareKept(before, after *Inventory, add func(code, class, id, detail stri
 		switch {
 		case !ok:
 			add("kept_missing", "", key, "the entry kept as it was is no longer kept")
+		case a.Refused != "" || b.Refused != "":
+			add("kept_credential", "", key, "the kept entry holds a credential-named path the manifest does not exclude, which was not read")
 		case a.Digest != b.Digest:
 			add("kept_changed", "", key, fmt.Sprintf("the kept entry's tree changed from %s to %s", b.Digest, a.Digest))
 		}

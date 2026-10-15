@@ -113,7 +113,11 @@ func (s *scanner) kept(rel string) (bool, error) {
 	if err != nil {
 		return true, err
 	}
-	s.inv.Kept = append(s.inv.Kept, Kept{Root: s.root.Label, Path: rel, Digest: digest, Provenance: e.Provenance})
+	k := Kept{Root: s.root.Label, Path: rel, Digest: digest, Provenance: e.Provenance}
+	if refused != "" {
+		k.Refused = path.Join(rel, refused)
+	}
+	s.inv.Kept = append(s.inv.Kept, k)
 	switch {
 	case refused != "":
 		s.issue("kept_credential", "", id, "%s is or holds %s, whose name is where credentials are kept; exclude it in the keep manifest, it was not read", id, path.Join(rel, refused))
@@ -179,6 +183,8 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 			return nil
 		}
 		if keepCredentialNames[d.Name()] {
+			// Pinned by its name and type, never opened.
+			lines = append(lines, fmt.Sprintf("c\x00%s\x00%s", r, kind))
 			if refused == "" {
 				refused = r
 			}

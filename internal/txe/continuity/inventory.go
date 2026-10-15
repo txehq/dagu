@@ -139,6 +139,10 @@ type Kept struct {
 	// Digest is the tree digest the scan found (see KeepEntry).
 	Digest     string `json:"digest"`
 	Provenance string `json:"provenance"`
+	// Refused is a credential-named path in the entry that the manifest did
+	// not exclude. It was not read, so the entry is not evidence that the
+	// tree was kept.
+	Refused string `json:"refused,omitempty"`
 }
 
 // RootInfo is one scanned root.

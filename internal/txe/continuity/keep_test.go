@@ -267,3 +267,41 @@ func TestKeepEntryOfAnUnscannedRootBlocks(t *testing.T) {
 	got := codes(continuity.Validate(scanKeep(t, l, m), continuity.Policy{}), continuity.SeverityBlock)
 	assert.Equal(t, 1, got["kept_missing"], "%v", got)
 }
+
+// A credential-named path that appears in a kept tree is never opened, but
+// it changes the tree's digest, and an inventory that refused it is no
+// evidence the tree was kept.
+func TestKeepCompareSeesARefusedCredentialPath(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	strayEntries(t, l)
+	m := strayManifest()
+	pin(t, m, scanKeep(t, l, m))
+	before := scanKeep(t, l, m)
+	require.Empty(t, continuity.Blocking(continuity.Validate(before, continuity.Policy{})))
+
+	require.NoError(t, os.MkdirAll(homePath(l, "logs/admin/auth"), 0o750))
+	require.NoError(t, os.WriteFile(homePath(l, "logs/admin/auth/key"), []byte("fixture-key-placeholder"), 0o600))
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(homePath(l, "logs/admin/auth"), 0o000))
+		t.Cleanup(func() { _ = os.Chmod(homePath(l, "logs/admin/auth"), 0o750) }) //nolint:gosec // restore for cleanup
+	}
+	after := scanKeep(t, l, m)
+	got := codes(continuity.Validate(after, continuity.Policy{}), continuity.SeverityBlock)
+	assert.Equal(t, map[string]int{"kept_credential": 1}, got)
+	digests := map[string]string{}
+	for _, k := range before.Kept {
+		digests[k.Path] = k.Digest
+	}
+	for _, k := range after.Kept {
+		if k.Path == "logs/admin" {
+			assert.NotEqual(t, digests[k.Path], k.Digest, "the refused path is part of the tree")
+			assert.Equal(t, "logs/admin/auth", k.Refused)
+		}
+	}
+	assert.Equal(t, map[string]int{"kept_credential": 1}, compareCodes(continuity.Compare(before, after, continuity.CompareOptions{})))
+	assert.Equal(t, map[string]int{"kept_credential": 1}, compareCodes(continuity.CompareProgress(before, after)))
+	for _, f := range after.Files {
+		assert.NotContains(t, f.Path, "logs/admin/auth")
+	}
+}
