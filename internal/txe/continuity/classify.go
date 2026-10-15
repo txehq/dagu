@@ -277,7 +277,9 @@ func jobRecord(key string, data []byte) (*Record, []Issue) {
 		b.ref("duplicate_of", KindJob, j.Registration.DuplicateOf)
 	}
 	if pe := j.Registration.Package; pe != nil {
-		b.ref("package_evidence_machine", KindMachine, pe.MachineID)
+		// MarkReady takes evidence only for the job's own machine.
+		b.attr("package_evidence", "asserted")
+		b.required("package_evidence_machine", KindMachine, pe.MachineID)
 	}
 	if j.Lifecycle == registry.LifecycleRetired && j.Retirement == nil {
 		b.block("retirement_missing", "job is retired with no retirement record")
