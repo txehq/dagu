@@ -93,7 +93,11 @@ func (v *validator) define(kind, id string) {
 // from a display name, an email address or an identity binding.
 func (v *validator) owners() {
 	if !v.defined[KindOwner][v.inv.ExpectedOwner] {
-		v.add(SeverityBlock, "owner_missing", nil, "the expected owner %s has no owner record", v.inv.ExpectedOwner)
+		if v.registryScanned() {
+			v.add(SeverityBlock, "owner_missing", nil, "the expected owner %s has no owner record", v.inv.ExpectedOwner)
+		} else {
+			v.add(SeverityWarn, "not_checked", nil, "the expected owner's record is in the registry, which this inventory did not scan")
+		}
 	}
 	for i := range v.inv.Records {
 		r := &v.inv.Records[i]
@@ -112,6 +116,19 @@ func (v *validator) owners() {
 	}
 }
 
+// registryScanned reports whether the inventory holds a hub data
+// directory, and so the registry. A machine home is inventoried on its
+// machine, apart from the hub; what only the registry can answer is then
+// reported as not checked, while every owner it names is still checked.
+func (v *validator) registryScanned() bool {
+	for _, root := range v.inv.Roots {
+		if root.Area == AreaHubData {
+			return true
+		}
+	}
+	return false
+}
+
 // refs checks that every required reference resolves.
 func (v *validator) refs() {
 	for i := range v.inv.Records {
@@ -123,6 +140,11 @@ func (v *validator) refs() {
 			if ref.Optional {
 				// It may never have existed; one that did and is gone is
 				// found by Compare as a missing record.
+				continue
+			}
+			if ref.Kind != KindPackage && !v.registryScanned() {
+				// Only a machine home's packages are outside the registry.
+				v.add(SeverityWarn, "not_checked", r, "%s refers to %s %s, which is in the registry; this inventory did not scan it", ref.Rel, ref.Kind, ref.ID)
 				continue
 			}
 			v.add(SeverityBlock, "dangling_ref", r, "%s refers to %s %s, which is not present", ref.Rel, ref.Kind, ref.ID)
