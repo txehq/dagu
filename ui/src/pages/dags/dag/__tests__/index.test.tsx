@@ -6,6 +6,7 @@ import React from 'react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppBarContext } from '@/contexts/AppBarContext';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import { useQuery } from '@/hooks/api';
 import { WorkspaceKind } from '@/lib/workspace';
 import DAGDetails from '..';
@@ -77,17 +78,23 @@ function LocationProbe() {
   );
 }
 
-function renderPage(initialEntry = '/dags/release-notes') {
+function renderPage(
+  initialEntry = '/dags/release-notes',
+  personScope = false,
+  appBar = appBarValue
+) {
   render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <AppBarContext.Provider value={appBarValue}>
-        <LocationProbe />
-        <Routes>
-          <Route path="/dags/:fileName" element={<DAGDetails />} />
-          <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
-        </Routes>
-      </AppBarContext.Provider>
-    </MemoryRouter>
+    <PersonScopeContext.Provider value={personScope}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <AppBarContext.Provider value={appBar}>
+          <LocationProbe />
+          <Routes>
+            <Route path="/dags/:fileName" element={<DAGDetails />} />
+            <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
+          </Routes>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
 }
 
@@ -155,4 +162,94 @@ describe('DAGDetails page', () => {
       );
     });
   });
+
+  // The hub refuses a person a DAG's webhook, settings and notification
+  // settings, so a person is not offered those tabs; their URLs show the
+  // status tab.
+  it.each(['webhook', 'settings', 'notifications'])(
+    'sends a person from the %s tab to the status tab',
+    async (tab) => {
+      renderPage(`/dags/release-notes/${tab}`, true);
+
+      expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+        'data-active-tab',
+        'status'
+      );
+      await waitFor(() => {
+        expect(screen.getByTestId('location')).toHaveTextContent(
+          /^\/dags\/release-notes$/
+        );
+      });
+    }
+  );
+
+  it('keeps the webhook tab outside a person dashboard', () => {
+    renderPage('/dags/release-notes/webhook');
+
+    expect(screen.getByTestId('dag-details-content')).toHaveAttribute(
+      'data-active-tab',
+      'webhook'
+    );
+  });
+
+  // The hub answers a person the same 404 for another owner's DAG as for
+  // one that does not exist.
+  it('tells a person only that the job is not found', () => {
+    useQueryMock.mockImplementation(
+      (path) =>
+        ({
+          data: undefined,
+          error:
+            path === '/dags/{fileName}'
+              ? { code: 'not_found', message: 'not found' }
+              : undefined,
+          mutate: vi.fn(),
+        }) as never
+    );
+    renderPage('/dags/job_other', true);
+
+    expect(screen.getByText('Job not found')).toBeInTheDocument();
+    expect(screen.queryByTestId('dag-details-content')).not.toBeInTheDocument();
+  });
+
+  // A person's dashboard has no workspace selector, so the ordinary
+  // dashboard's saved selection must not hide a person's own DAG.
+  it.each([
+    [true, 'shows'],
+    [false, 'hides'],
+  ])(
+    'with a saved Default selection, person scope %s: %s a workspace DAG',
+    (personScope, verdict) => {
+      useQueryMock.mockImplementation(
+        (path) =>
+          ({
+            data:
+              path === '/dags/{fileName}'
+                ? {
+                    ...dagData,
+                    dag: { ...dagData.dag, labels: ['workspace=ops'] },
+                  }
+                : undefined,
+            mutate: vi.fn(),
+          }) as never
+      );
+      renderPage('/dags/release-notes', personScope, {
+        selectedRemoteNode: 'local',
+        workspaceSelection: { kind: WorkspaceKind.default },
+      } as never);
+
+      const notInWorkspace = screen.queryByText(
+        'This DAG is not in the selected workspace.'
+      );
+      if (verdict === 'shows') {
+        expect(screen.getByTestId('dag-details-content')).toBeInTheDocument();
+        expect(notInWorkspace).not.toBeInTheDocument();
+      } else {
+        expect(
+          screen.queryByTestId('dag-details-content')
+        ).not.toBeInTheDocument();
+        expect(notInWorkspace).toBeInTheDocument();
+      }
+    }
+  );
 });

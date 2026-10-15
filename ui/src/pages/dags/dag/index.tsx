@@ -30,6 +30,12 @@ import {
   WorkspaceKind,
   workspaceNameFromLabels,
 } from '../../../lib/workspace';
+import { NotFoundOrNotShared } from '@/features/txe/components/identity/NotFoundOrNotShared';
+import {
+  isNotFoundAnswer,
+  PERSON_HIDDEN_DAG_TABS,
+  usePersonScope,
+} from '@/features/txe/personScope';
 import { INCIDENTS_ENABLED } from '@/lib/fork';
 import { I18nText } from '@/i18n/I18nText';
 
@@ -60,12 +66,18 @@ function DAGDetails() {
     searchParams.get('workspace') ?? ''
   );
   const appWorkspaceSelection = appBarContext.workspaceSelection;
+  const personScope = usePersonScope();
   const workspaceSelection = useMemo(() => {
     if (queryWorkspace) {
       return { kind: WorkspaceKind.workspace, workspace: queryWorkspace };
     }
+    // A person's dashboard has no workspace selector, so a selection saved
+    // in this browser by the ordinary dashboard must not hide their DAG.
+    if (personScope) {
+      return { kind: WorkspaceKind.all };
+    }
     return sanitizeWorkspaceSelection(appWorkspaceSelection);
-  }, [appWorkspaceSelection, queryWorkspace]);
+  }, [appWorkspaceSelection, personScope, queryWorkspace]);
   const scopedQuery = useMemo(
     () => ({
       remoteNode,
@@ -80,7 +92,8 @@ function DAGDetails() {
   const tab =
     params.tab === 'docs'
       ? 'wiki'
-      : !INCIDENTS_ENABLED && params.tab === 'incidents'
+      : (!INCIDENTS_ENABLED && params.tab === 'incidents') ||
+          (personScope && PERSON_HIDDEN_DAG_TABS.has(params.tab ?? ''))
         ? 'status'
         : params.tab || 'status';
 
@@ -137,16 +150,25 @@ function DAGDetails() {
     }
     // The fork does not offer incidents; the DAG's status tab takes their
     // place, keeping whatever run the URL selected.
-    if (!INCIDENTS_ENABLED && params.tab === 'incidents' && fileName) {
+    // A person is not offered the tabs the hub refuses them either.
+    if (
+      fileName &&
+      ((!INCIDENTS_ENABLED && params.tab === 'incidents') ||
+        (personScope && PERSON_HIDDEN_DAG_TABS.has(params.tab ?? '')))
+    ) {
       const query = searchParams.toString();
       navigate(buildUrl(`/dags/${fileName}${query ? `?${query}` : ''}`), {
         replace: true,
       });
     }
-  }, [buildUrl, fileName, navigate, params.tab, searchParams]);
+  }, [buildUrl, fileName, navigate, params.tab, personScope, searchParams]);
 
   // Fetch DAG details — SWR is the single source of truth, refreshed by live invalidations
-  const { data: dagData, mutate: mutateDag } = useQuery(
+  const {
+    data: dagData,
+    error: dagError,
+    mutate: mutateDag,
+  } = useQuery(
     '/dags/{fileName}',
     {
       params: {
@@ -267,6 +289,14 @@ function DAGDetails() {
   useEffect(() => {
     setRootDAGRunData(displayDAGRun);
   }, [displayDAGRun]);
+
+  if (personScope && !dagData && isNotFoundAnswer(dagError)) {
+    return (
+      <div className="mx-auto max-w-lg p-8">
+        <NotFoundOrNotShared />
+      </div>
+    );
+  }
 
   return (
     <UnsavedChangesProvider>

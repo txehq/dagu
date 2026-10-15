@@ -5,6 +5,7 @@ import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import DAGDetailsContent from '../DAGDetailsContent';
 
 vi.mock('../..', () => ({
@@ -70,20 +71,26 @@ const currentDAGRun = {
   artifactsAvailable: true,
 } as never;
 
-function renderContent(activeTab = 'status', isModal = true) {
+function renderContent(
+  activeTab = 'status',
+  isModal = true,
+  personScope = false
+) {
   render(
-    <MemoryRouter>
-      <DAGDetailsContent
-        fileName="release-notes"
-        dag={dag}
-        currentDAGRun={currentDAGRun}
-        refreshFn={vi.fn()}
-        formatDuration={vi.fn()}
-        activeTab={activeTab}
-        isModal={isModal}
-        fillHeight
-      />
-    </MemoryRouter>
+    <PersonScopeContext.Provider value={personScope}>
+      <MemoryRouter>
+        <DAGDetailsContent
+          fileName="release-notes"
+          dag={dag}
+          currentDAGRun={currentDAGRun}
+          refreshFn={vi.fn()}
+          formatDuration={vi.fn()}
+          activeTab={activeTab}
+          isModal={isModal}
+          fillHeight
+        />
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
 }
 
@@ -128,4 +135,19 @@ describe('DAGDetailsContent', () => {
     renderContent('status', false);
     expect(screen.queryByText('Wiki')).not.toBeInTheDocument();
   });
+
+  // The hub refuses a person a DAG's webhook, settings and notification
+  // settings.
+  it.each([true, false])(
+    'offers a person no Webhook, Settings or Notifications tab (modal %s)',
+    (isModal) => {
+      renderContent('status', isModal, true);
+
+      expect(screen.queryByText('Webhook')).not.toBeInTheDocument();
+      expect(screen.queryByText('Notifications')).not.toBeInTheDocument();
+      expect(screen.queryByText('Settings')).not.toBeInTheDocument();
+      expect(screen.getAllByText('Spec')).toHaveLength(2);
+      expect(screen.getAllByText('History')).toHaveLength(2);
+    }
+  );
 });

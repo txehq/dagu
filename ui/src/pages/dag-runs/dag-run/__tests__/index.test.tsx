@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { useBoundedDAGRunDetails } from '@/features/dag-runs/hooks/useBoundedDAGRunDetails';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import DAGRunDetailsPage from '..';
 
 vi.mock('@/features/dag-runs/hooks/useBoundedDAGRunDetails', () => ({
@@ -27,24 +28,26 @@ const dagRunDetails = {
   artifactsAvailable: true,
 } as never;
 
-function renderPage() {
+function renderPage(personScope = false) {
   render(
-    <MemoryRouter initialEntries={['/dag-runs/release-notes/run-1']}>
-      <AppBarContext.Provider
-        value={
-          {
-            selectedRemoteNode: 'local',
-          } as never
-        }
-      >
-        <Routes>
-          <Route
-            path="/dag-runs/:name/:dagRunId"
-            element={<DAGRunDetailsPage />}
-          />
-        </Routes>
-      </AppBarContext.Provider>
-    </MemoryRouter>
+    <PersonScopeContext.Provider value={personScope}>
+      <MemoryRouter initialEntries={['/dag-runs/release-notes/run-1']}>
+        <AppBarContext.Provider
+          value={
+            {
+              selectedRemoteNode: 'local',
+            } as never
+          }
+        >
+          <Routes>
+            <Route
+              path="/dag-runs/:name/:dagRunId"
+              element={<DAGRunDetailsPage />}
+            />
+          </Routes>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
 }
 
@@ -65,5 +68,32 @@ describe('DAGRunDetailsPage', () => {
     expect(content).toHaveAttribute('data-fill-height', 'true');
     expect(content.parentElement).toHaveClass('h-full');
     expect(content.parentElement).toHaveClass('min-h-0');
+  });
+
+  // A person gets the hub's uniform 404 for a run of another owner's DAG
+  // too, so the page must not suggest the run once existed.
+  it('tells a person only that the job is not found', () => {
+    useBoundedDAGRunDetailsMock.mockReturnValue({
+      data: null,
+      error: { code: 'not_found', message: 'not found' },
+      refresh: vi.fn(),
+    } as never);
+    renderPage(true);
+
+    expect(screen.getByText('Job not found')).toBeInTheDocument();
+    expect(screen.queryByText('DAG Run Not Found')).not.toBeInTheDocument();
+    expect(screen.queryByText(/dequeued or removed/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the native not-found message outside a person dashboard', () => {
+    useBoundedDAGRunDetailsMock.mockReturnValue({
+      data: null,
+      error: { response: { status: 404 } },
+      refresh: vi.fn(),
+    } as never);
+    renderPage();
+
+    expect(screen.getByText('DAG Run Not Found')).toBeInTheDocument();
+    expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
   });
 });
