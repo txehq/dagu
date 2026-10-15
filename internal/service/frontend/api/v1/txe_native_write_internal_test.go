@@ -227,6 +227,12 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, byLabel("os: linux")), "a step selecting by platform")
 			docByLabel := "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: s\n    run: echo s\n---\nname: child\nworker_selector:\n  os: linux\nsteps:\n  - name: s\n    run: echo s\n"
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, docByLabel), "a local DAG selecting by platform")
+			// Selectors are read as the runtime reads them: a padded key is
+			// the machine key, and is not let through as no machine.
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, byLabel("\" txe.machine \": "+w.machineB)), "a padded step key")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, byLabel("txe.machine: \" "+w.machineB+"\"")), "a padded step value")
+			padded := "worker_selector:\n  txe.machine: " + w.machineA + "\n  \"txe.machine \": " + w.machineB + "\nsteps:\n  - name: s\n    run: echo s\n"
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, padded), "a document key that collapses on load")
 
 			// A spec that does not load cannot be verified.
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, "steps: [unclosed\n"))

@@ -9,8 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/parser"
+
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/yamlutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
@@ -159,6 +163,9 @@ type txePlacement struct {
 // machine it sends that to. A spec that does not load, or whose worker
 // selector or called DAG is computed, cannot be verified.
 func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacement, error) {
+	if err := txeSelectorsWritten(spec); err != nil {
+		return nil, err
+	}
 	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
 	if err != nil {
 		return nil, err
@@ -208,25 +215,90 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacemen
 }
 
 // txeSelectedMachine is the machine a worker selector sends work to, or ""
-// for none. The coordinator matches every label a selector names, and every
-// worker carries labels that are not its machine (os, arch, txe.owner), so a
-// selector that names labels but no machine can reach any machine that has
-// them: where it runs cannot be decided, and it is not verified. Neither is
-// a computed selector.
+// for none, read as the runtime reads it: keys and values trimmed, and an
+// empty or repeated key an error. The coordinator matches every label a
+// selector names, and every worker carries labels that are not its machine
+// (os, arch, txe.owner), so a selector that names labels but no machine can
+// reach any machine that has them: where it runs cannot be decided, and it
+// is not verified. Neither is a computed selector.
 func txeSelectedMachine(selector map[string]string) (string, error) {
+	seen := make(map[string]bool, len(selector))
 	machine := ""
 	for k, v := range selector {
 		if strings.ContainsAny(k+v, "$`") {
 			return "", errTxeSpecUnverified
 		}
-		if k == txeMachineLabel {
-			machine = v
+		key := strings.TrimSpace(k)
+		if key == "" || seen[key] {
+			return "", errTxeSpecUnverified
+		}
+		seen[key] = true
+		if key == txeMachineLabel {
+			machine = strings.TrimSpace(v)
 		}
 	}
 	if len(selector) > 0 && machine == "" {
 		return "", errTxeSpecUnverified
 	}
 	return machine, nil
+}
+
+// txeSelectorsWritten refuses a spec whose worker selectors, wherever they
+// are written, have a key or value with surrounding space. The loader trims
+// a DAG's selector as it builds it, so two keys that differ only in space
+// collapse into one, by map order; the runtime trims a step's. Written
+// already trimmed, a selector reads the same to this check, the loader and
+// the runtime.
+func txeSelectorsWritten(spec []byte) error {
+	file, err := parser.ParseBytes(yamlutil.ClearEmptyDocumentSeparators(spec), 0)
+	if err != nil || file == nil {
+		return errTxeSpecUnverified
+	}
+	for _, doc := range file.Docs {
+		if doc == nil || doc.Body == nil {
+			continue
+		}
+		raw, err := doc.MarshalYAML()
+		if err != nil {
+			return errTxeSpecUnverified
+		}
+		var tree any
+		if err := yaml.Unmarshal(raw, &tree); err != nil {
+			return errTxeSpecUnverified
+		}
+		if !txeSelectorsTrimmed(tree) {
+			return errTxeSpecUnverified
+		}
+	}
+	return nil
+}
+
+func txeSelectorsTrimmed(node any) bool {
+	switch n := node.(type) {
+	case map[string]any:
+		for k, v := range n {
+			if strings.EqualFold(strings.TrimSpace(k), "worker_selector") {
+				if selector, ok := v.(map[string]any); ok {
+					for key, value := range selector {
+						text, isText := value.(string)
+						if key != strings.TrimSpace(key) || (isText && text != strings.TrimSpace(text)) {
+							return false
+						}
+					}
+				}
+			}
+			if !txeSelectorsTrimmed(v) {
+				return false
+			}
+		}
+	case []any:
+		for _, v := range n {
+			if !txeSelectorsTrimmed(v) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 const txeMachineLabel = "txe.machine"
