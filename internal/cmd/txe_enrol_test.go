@@ -40,8 +40,9 @@ type txeEnrolFixture struct {
 	applied  []string // azp of each application's token
 	approved bool
 	// approveAfter approves the machine once this many applications arrived.
-	approveAfter int
-	applyStatus  int
+	approveAfter   int
+	applyStatus    int
+	machineUnknown bool
 }
 
 func newTXEEnrolFixture(t *testing.T) *txeEnrolFixture {
@@ -82,6 +83,13 @@ func (f *txeEnrolFixture) serve(w http.ResponseWriter, r *http.Request) bool {
 			"machine_id": txeEnrolTestMachine, "class": "worker", "issuer": claims.Iss, "subject": claims.Sub, "client_id": claims.Azp,
 			"received_at": time.Now().UTC(), "credential_expires": time.Unix(claims.Exp, 0).UTC(),
 		})
+		return true
+	case "/api/v1/txe/machines/" + txeEnrolTestMachine:
+		if f.machineUnknown {
+			cliauthtest.WriteJSON(w, http.StatusNotFound, map[string]any{"code": "not_found", "message": "not found"})
+		} else {
+			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"machine_id": txeEnrolTestMachine, "owner_id": txeEnrolTestOwner})
+		}
 		return true
 	case "/api/v1/txe/identity":
 		f.mu.Lock()
@@ -313,4 +321,32 @@ func TestTXEEnrolReportsAFailedRenewal(t *testing.T) {
 	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable, "failing through the last round")
 	assert.Greater(t, f.provider.Refreshes()-refreshes, 1, "retried while time was left")
 	assert.Len(t, f.applied, applied, "the hub was not asked")
+}
+
+// A signed-in CLI asks the hub about the machine before anyone signs in for
+// it; a machine the hub does not know for the owner stops there.
+func TestTXEEnrolChecksTheMachineFirst(t *testing.T) {
+	f := newTXEEnrolFixture(t)
+	cli := cliauthtest.New(t)
+	withFakeBrowser(t, cli)
+	f.hub.Publish(cli.Issuer(), cli.ClientID, cliauth.HubUseAll)
+	f.json("login")
+	withFakeBrowser(t, f.provider)
+
+	f.machineUnknown = true
+	_, err := f.run("enrol", "--client-id", txeEnrolTestClient, "--issuer", f.provider.Issuer())
+	require.ErrorContains(t, err, "the hub has no machine "+txeEnrolTestMachine)
+	assert.Empty(t, f.provider.LastAuth(), "no sign-in for the machine")
+	var asked bool
+	for _, r := range f.hub.Requests() {
+		if r.Path == "/api/v1/txe/machines/"+txeEnrolTestMachine {
+			asked = true
+			assert.True(t, strings.HasPrefix(r.Authorization, "Bearer ey"), "asked with the CLI's sign-in")
+		}
+	}
+	assert.True(t, asked)
+
+	f.machineUnknown = false
+	out := f.json("enrol", "--client-id", txeEnrolTestClient, "--issuer", f.provider.Issuer())
+	assert.Equal(t, "applied", out["state"])
 }

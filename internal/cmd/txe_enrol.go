@@ -159,6 +159,11 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		view.resume += " --credential-file " + txeShellQuote(path)
 	}
 	view.resume += " --resume --wait 15m"
+	if !resume {
+		if err := txeEnrolMachineKnown(ctx, remote, machine.MachineID); err != nil {
+			return err
+		}
+	}
 	var token string
 	if resume {
 		credential, err := transportauth.ReadMachineCredential(path)
@@ -209,6 +214,32 @@ func txeEnrolApproveURL(apiBase, machineID, clientID string) string {
 	base := strings.TrimSuffix(strings.TrimRight(apiBase, "/"), "/api/v1")
 	q := url.Values{"class": {string(authn.ClassWorker)}, "client_id": {clientID}}
 	return base + "/txe/machines/" + url.PathEscape(machineID) + "?" + q.Encode()
+}
+
+// txeEnrolMachineKnown asks the hub, before anyone signs in for the
+// machine, whether it knows this machine for the CLI's owner. Only a
+// signed-in CLI asks: the hub answers its sign-in by owner, and 404 is
+// another owner's machine or none. Without a sign-in nothing is asked.
+func txeEnrolMachineKnown(ctx *Context, remote *remoteClient, machineID string) error {
+	authed, err := txeHubAuth(ctx, remote)
+	if err != nil {
+		return err
+	}
+	if authed == remote {
+		return nil
+	}
+	var out struct {
+		MachineID string `json:"machine_id"`
+	}
+	err = authed.do(ctx, http.MethodGet, "/txe/machines/"+url.PathEscape(machineID), nil, &out, nil)
+	var rerr *remoteError
+	if errors.As(err, &rerr) && rerr.NotFound() {
+		return fmt.Errorf("the hub has no machine %s of this sign-in's owner: run the worker installer, or sign in as a person of its owner", machineID)
+	}
+	if err != nil {
+		return fmt.Errorf("ask the hub about machine %s: %w", machineID, err)
+	}
+	return nil
 }
 
 // txeEnrolPath is the credential file: the flag, made absolute, or the TXE
