@@ -255,6 +255,22 @@ func (a *API) requireRunStatus(ctx context.Context, status *ir.DAGRunStatus, per
 	return a.txeSubRunCheck(ctx, root, status.Name, permission)
 }
 
+// txeRunOwnerCheck adds the owner decisions on a run to whatever the hub's
+// own checks decided: the owner of its root's DAG, and of its own DAG when
+// that is another. A run a reference resolves to is decided by itself this
+// way, whatever run referred to it. A caller not held to its owner, in mode
+// off, is not affected.
+func (a *API) txeRunOwnerCheck(ctx context.Context, status *ir.DAGRunStatus, permission authz.Permission) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	root := txeNativeOwnerDAG(status)
+	if err := a.txeNativeCheck(ctx, root, permission, func() error { return nil }); err != nil {
+		return err
+	}
+	return a.txeSubRunCheck(ctx, root, status.Name, permission)
+}
+
 // txeSubRunCheck decides a run of the DAG dagName under a run of root that
 // the caller has already been let into: when dagName is another DAG with an
 // owner of its own, that owner decides too.

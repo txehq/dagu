@@ -276,6 +276,11 @@ func (a *API) workspaceFilterForContext(ctx context.Context) *workspace.Workspac
 }
 
 func (a *API) workspaceFilterForSelection(ctx context.Context, selection workspaceSelection) (*workspace.WorkspaceFilter, error) {
+	if a.txeNativeOwnerOnly(ctx) {
+		// Held to its owner, whatever workspace it names: a list shows only
+		// what a list filters by owner itself.
+		return txeNothingFilter(), nil
+	}
 	switch selection.mode {
 	case workspaceSelectionAll:
 		return a.workspaceFilterForContext(ctx), nil
@@ -311,6 +316,11 @@ func (a *API) workspaceFilterForParams(ctx context.Context, workspaceParam *api.
 func (a *API) effectiveRoleForWorkspace(ctx context.Context, workspaceName string) (auth.Role, bool, error) {
 	if a.authService == nil {
 		return auth.RoleAdmin, true, nil
+	}
+	if a.txeNativeOwnerOnly(ctx) {
+		// A caller held to its owner has no workspace, the unnamed default
+		// one included: only its owner's decisions let it in anywhere.
+		return auth.RoleNone, false, nil
 	}
 	user, ok := auth.UserFromContext(ctx)
 	if !ok {

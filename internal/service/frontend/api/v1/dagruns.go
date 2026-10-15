@@ -725,9 +725,10 @@ func (a *API) ListDAGRunsByName(ctx context.Context, request api.ListDAGRunsByNa
 	if err != nil {
 		return nil, err
 	}
-	if a.txeNativeOwnerOnly(ctx) && request.Params.Workspace == nil {
+	if a.txeNativeOwnerOnly(ctx) {
 		// One DAG's runs: a caller held to its owner sees them all if the
-		// DAG's owner lets it, and none otherwise.
+		// DAG's owner lets it, and none otherwise, whatever workspace it
+		// names.
 		if a.txeNativeVisible(ctx, request.Name) {
 			workspaceFilter = nil
 		}
@@ -2480,7 +2481,7 @@ func (a *API) GetSubDAGRunSpec(ctx context.Context, request api.GetSubDAGRunSpec
 				Message: fmt.Sprintf("sub dag-run ID %s not found for DAG %s", request.SubDAGRunId, request.Name),
 			}, nil
 		}
-		if err := a.txeSubRunCheck(ctx, txeNativeOwnerDAG(status), status.Name, authz.PermissionView); err != nil {
+		if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionView); err != nil {
 			return nil, err
 		}
 	}
@@ -3892,13 +3893,13 @@ func (a *API) GetSubDAGRuns(ctx context.Context, request api.GetSubDAGRunsReques
 		}
 
 		for _, subRun := range node.SubRuns {
-			if detail, err := a.getSubDAGRunDetail(ctx, txeNativeOwnerDAG(dagStatus), detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
+			if detail, err := a.getSubDAGRunDetail(ctx, detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
 				subRuns = append(subRuns, detail)
 			}
 		}
 
 		for _, subRun := range node.SubRunsRepeated {
-			if detail, err := a.getSubDAGRunDetail(ctx, txeNativeOwnerDAG(dagStatus), detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
+			if detail, err := a.getSubDAGRunDetail(ctx, detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
 				subRuns = append(subRuns, detail)
 			}
 		}
@@ -3910,16 +3911,16 @@ func (a *API) GetSubDAGRuns(ctx context.Context, request api.GetSubDAGRunsReques
 }
 
 // getSubDAGRunDetail fetches timing and status info for a single sub DAG run
-// getSubDAGRunDetail reads one sub-run of a run under root, which the caller
-// may see. The sub-run is decided by the run it resolves to, not by the name
-// its parent recorded: a sub-run whose own DAG has an owner the caller may
-// not see is an error.
-func (a *API) getSubDAGRunDetail(ctx context.Context, root string, parentRef ir.DAGRunRef, subRunID string, params string, dagName string) (api.SubDAGRunDetail, error) {
+// getSubDAGRunDetail reads one sub-run of a run the caller may see. The
+// sub-run is decided by the run it resolves to, not by the name its parent
+// recorded: one whose own root or own DAG has an owner the caller may not
+// see is an error.
+func (a *API) getSubDAGRunDetail(ctx context.Context, parentRef ir.DAGRunRef, subRunID string, params string, dagName string) (api.SubDAGRunDetail, error) {
 	status, err := a.getReferencedDAGRunStatus(ctx, parentRef, subRunID, dagName)
 	if err != nil {
 		return api.SubDAGRunDetail{}, err
 	}
-	if err := a.txeSubRunCheck(ctx, root, status.Name, authz.PermissionView); err != nil {
+	if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionView); err != nil {
 		return api.SubDAGRunDetail{}, err
 	}
 

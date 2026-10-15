@@ -331,3 +331,75 @@ func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
 	_, err := w.api.GetSubStepLogDataByRef(personA, root, "sub-b", "inner", StepLogReadOptions{})
 	require.Equal(t, http.StatusNotFound, statusOf(err))
 }
+
+// A caller held to its owner has no workspace, the default one included:
+// naming one opens no list and passes no workspace check.
+func TestTxeNativeWorkspaceSelectionOpensNothing(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "")
+	w.addRun(w.jobB, "run-b", "")
+	personA, personB, cliA := neutral(w.personA), neutral(w.personB), neutral(w.cliA)
+	unbound := neutral(w.nobody)
+
+	for _, ws := range []string{"default", "production"} {
+		ws := ws
+		for _, ctx := range []context.Context{personA, cliA, unbound} {
+			dags, err := w.api.ListDAGs(ctx, apigen.ListDAGsRequestObject{Params: apigen.ListDAGsParams{Workspace: &ws}})
+			require.NoError(t, err, ws)
+			require.Empty(t, dags.(*apigen.ListDAGs200JSONResponse).Dags, ws)
+			runs, err := w.api.ListDAGRuns(ctx, apigen.ListDAGRunsRequestObject{Params: apigen.ListDAGRunsParams{Workspace: &ws}})
+			require.NoError(t, err, ws)
+			require.Empty(t, runs.(apigen.ListDAGRuns200JSONResponse).DagRuns, ws)
+			labels, err := w.api.GetAllDAGLabels(ctx, apigen.GetAllDAGLabelsRequestObject{Params: apigen.GetAllDAGLabelsParams{Workspace: &ws}})
+			require.NoError(t, err, ws)
+			require.Empty(t, labels.(*apigen.GetAllDAGLabels200JSONResponse).Labels, ws)
+		}
+		// One DAG's runs are decided by its owner, whatever workspace is
+		// named.
+		byName := func(ctx context.Context, dag string) int {
+			resp, err := w.api.ListDAGRunsByName(ctx, apigen.ListDAGRunsByNameRequestObject{Name: dag, Params: apigen.ListDAGRunsByNameParams{Workspace: &ws}})
+			require.NoError(t, err, ws)
+			return len(resp.(apigen.ListDAGRunsByName200JSONResponse).DagRuns)
+		}
+		require.Equal(t, 1, byName(personA, w.jobA), ws)
+		require.Zero(t, byName(personA, w.jobB), ws)
+		require.Zero(t, byName(personB, w.jobA), ws)
+		require.Zero(t, byName(unbound, w.jobA), ws)
+	}
+	for _, ctx := range []context.Context{personA, cliA, unbound} {
+		require.Equal(t, http.StatusNotFound, statusOf(w.api.requireWorkspaceVisible(ctx, "")))
+	}
+	// A legacy credential still sees the default workspace.
+	require.NoError(t, w.api.requireWorkspaceVisible(w.legacy, ""))
+}
+
+// A reference to a run of another owner's DAG that was started as a root of
+// its own (dag.enqueue) is decided by that run itself, not by the run that
+// referred to it.
+func TestTxeNativeReferencedRootRunOfAnotherOwner(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	w.writeRun(&ir.DAG{Name: w.jobA, YamlData: []byte("steps: []\n")}, "run-2", persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+		s.Nodes = []*ir.Node{{Step: ir.Step{Name: "enqueue"}, SubRuns: []ir.SubDAGRun{{DAGRunID: "queued-b", DAGName: w.jobB}}}}
+	})
+	w.writeRun(&ir.DAG{Name: w.jobB, YamlData: []byte("steps:\n  - name: b\n    run: echo b\n")}, "queued-b", persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+		s.Root = ir.NewDAGRunRef(w.jobB, "queued-b")
+	})
+	personA := neutral(w.personA)
+
+	resp, err := w.api.GetSubDAGRunSpec(personA, apigen.GetSubDAGRunSpecRequestObject{Name: w.jobA, DagRunId: "run-2", SubDAGRunId: "queued-b"})
+	if err == nil {
+		_, ok := resp.(*apigen.GetSubDAGRunSpec200JSONResponse)
+		require.False(t, ok, "another owner's YAML was returned")
+	} else {
+		require.Equal(t, http.StatusNotFound, statusOf(err))
+	}
+	list, err := w.api.GetSubDAGRuns(personA, apigen.GetSubDAGRunsRequestObject{Name: w.jobA, DagRunId: "run-2"})
+	require.NoError(t, err)
+	require.Empty(t, list.(*apigen.GetSubDAGRuns200JSONResponse).SubRuns)
+
+	// The same reference, for a legacy key in mode off, reads as today.
+	resp, err = w.api.GetSubDAGRunSpec(w.legacy, apigen.GetSubDAGRunSpecRequestObject{Name: w.jobA, DagRunId: "run-2", SubDAGRunId: "queued-b"})
+	require.NoError(t, err)
+	require.IsType(t, &apigen.GetSubDAGRunSpec200JSONResponse{}, resp)
+}
