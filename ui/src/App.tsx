@@ -33,7 +33,7 @@ import {
 import Layout from './layouts/Layout';
 import { PersonLayout } from '@/features/txe/components/identity/PersonLayout';
 import { NotAvailableYet } from '@/features/txe/components/identity/NotAvailableYet';
-import { PersonScopeContext } from '@/features/txe/personScope';
+import { personAppBar, PersonScopeContext } from '@/features/txe/personScope';
 import fetchJson from './lib/fetchJson';
 import { fetchWithTimeout, shouldRetryQueryError } from './lib/requestTimeout';
 import { useClient } from './hooks/api';
@@ -336,28 +336,35 @@ function LazyRoutes({
 // refuses a person every other route, so those show a placeholder instead
 // of failing. Event streams stay refused, so the native pages poll.
 function PersonApp(): React.ReactElement {
+  const appBar = React.useContext(AppBarContext);
+  const scopedAppBar = React.useMemo(() => personAppBar(appBar), [appBar]);
   return (
     <PersonScopeContext.Provider value={true}>
-      <PersonLayout>
-        <LazyRoutes>
-          <Route path="/" element={<Navigate to="/txe" replace />} />
-          <Route path="/txe" element={<TxeInboxPage />} />
-          <Route path="/txe/jobs" element={<Navigate to="/txe" replace />} />
-          <Route path="/txe/jobs/:jobId" element={<TxeJobPage />} />
-          <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
-          <Route path="/dags/:fileName/" element={<DAGDetails />} />
-          <Route path="/dag-runs/:name/:dagRunId" element={<DAGRunDetails />} />
-          <Route path="/queues/:name" element={<QueueDetailsPage />} />
-          <Route
-            path="*"
-            element={
-              <div className="mx-auto max-w-lg p-8">
-                <NotAvailableYet />
-              </div>
-            }
-          />
-        </LazyRoutes>
-      </PersonLayout>
+      <AppBarContext.Provider value={scopedAppBar}>
+        <PersonLayout>
+          <LazyRoutes>
+            <Route path="/" element={<Navigate to="/txe" replace />} />
+            <Route path="/txe" element={<TxeInboxPage />} />
+            <Route path="/txe/jobs" element={<Navigate to="/txe" replace />} />
+            <Route path="/txe/jobs/:jobId" element={<TxeJobPage />} />
+            <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
+            <Route path="/dags/:fileName/" element={<DAGDetails />} />
+            <Route
+              path="/dag-runs/:name/:dagRunId"
+              element={<DAGRunDetails />}
+            />
+            <Route path="/queues/:name" element={<QueueDetailsPage />} />
+            <Route
+              path="*"
+              element={
+                <div className="mx-auto max-w-lg p-8">
+                  <NotAvailableYet />
+                </div>
+              }
+            />
+          </LazyRoutes>
+        </PersonLayout>
+      </AppBarContext.Provider>
     </PersonScopeContext.Provider>
   );
 }

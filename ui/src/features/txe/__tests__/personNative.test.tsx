@@ -7,13 +7,16 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { SWRConfig } from 'swr';
 import { describe, expect, it, vi } from 'vitest';
 
+import { AppBarContext } from '@/contexts/AppBarContext';
+import { useRemoteNode } from '@/contexts/RemoteNodeContext';
+import { WorkspaceKind } from '@/lib/workspace';
 import TxeJobPage from '@/pages/txe/job';
 
 import type { TxeAccessApi } from '../access';
 import type { TxeApi } from '../api';
 import { fixtureJob } from '../fixtures';
 import { TxeAccessApiContext, TxeApiContext } from '../hooks';
-import { isNotFoundAnswer } from '../personScope';
+import { isNotFoundAnswer, personAppBar } from '../personScope';
 
 vi.mock('@/contexts/AuthContext', () => ({
   useCanExecute: () => true,
@@ -66,5 +69,53 @@ describe('the job page', () => {
     expect(
       await screen.findByRole('link', { name: 'Open the DAG' })
     ).toHaveAttribute('href', '/dags/job_volume_monitor');
+  });
+});
+
+describe('personAppBar', () => {
+  // The ordinary dashboard saved a valid remote node and a workspace in this
+  // browser; a person's pages must still read the local hub's job.
+  const saved = {
+    title: '',
+    setTitle: () => {},
+    remoteNodes: ['local', 'edge'],
+    setRemoteNodes: () => {},
+    selectedRemoteNode: 'edge',
+    selectRemoteNode: () => {},
+    workspaceSelection: { kind: WorkspaceKind.default },
+  } as React.ContextType<typeof AppBarContext>;
+
+  function Probe() {
+    const appBar = React.useContext(AppBarContext);
+    return (
+      <span data-testid="probe">
+        {useRemoteNode()} {appBar.remoteNodes.join(',')}{' '}
+        {appBar.workspaceSelection?.kind}
+      </span>
+    );
+  }
+
+  it('scopes a person to the local hub and every workspace', () => {
+    render(
+      <AppBarContext.Provider value={saved}>
+        <AppBarContext.Provider value={personAppBar(saved)}>
+          <Probe />
+        </AppBarContext.Provider>
+      </AppBarContext.Provider>
+    );
+
+    expect(screen.getByTestId('probe')).toHaveTextContent(
+      `local local ${WorkspaceKind.all}`
+    );
+  });
+
+  it('leaves the ordinary dashboard on its saved node', () => {
+    render(
+      <AppBarContext.Provider value={saved}>
+        <Probe />
+      </AppBarContext.Provider>
+    );
+
+    expect(screen.getByTestId('probe')).toHaveTextContent('edge local,edge');
   });
 });
