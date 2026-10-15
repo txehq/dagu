@@ -95,8 +95,11 @@ func NewService(cfg config.TXEConfig, dataDir string, reg *registry.Store, opts 
 		Audience:    cfg.Authn.Audience,
 		Clients:     clients,
 		MaxLifetime: cfg.Authn.MaxLifetime,
-		Keys:        keys,
-		Now:         o.clock,
+		// Shared by the hub and the coordinator, which verify with this
+		// service.
+		IssuedAtSkew: cfg.Authn.IssuedAtSkew,
+		Keys:         keys,
+		Now:          o.clock,
 	})
 	if err != nil {
 		return nil, err

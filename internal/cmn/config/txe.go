@@ -41,6 +41,16 @@ type TXEAuthnConfig struct {
 	Clients []TXEAuthnClient
 	// MaxLifetime caps a token's lifetime. Zero is the verifier's cap.
 	MaxLifetime time.Duration
+	// IssuedAtSkew is how far in the future a token's "iat" and "nbf" may
+	// lie, to absorb a provider clock a little ahead of this one, which can
+	// make a token used at once name a second this clock has not reached.
+	// It never applies to "exp", and the lifetime cap is measured as
+	// before. Unset, it is TXEAuthnDefaultIssuedAtSkew; "0s" (parsed) turns
+	// it off.
+	IssuedAtSkew time.Duration
+	// issuedAtSkewGiven records that the setting was given, so that one
+	// without an issuer is refused whatever its value.
+	issuedAtSkewGiven bool
 	// CLIClient names the cli client the server advertises to the command
 	// line. Empty means the only cli client, if there is exactly one.
 	CLIClient string
@@ -90,6 +100,14 @@ const (
 	// txeAuthnMaxLifetime is the longest token lifetime that can be
 	// configured. The verifier refuses anything longer as well.
 	txeAuthnMaxLifetime = 5 * time.Minute
+
+	// TXEAuthnDefaultIssuedAtSkew is the issued-at tolerance when none is
+	// configured: a small, bounded operational tolerance for the provider's
+	// clock running ahead, not a measured requirement.
+	TXEAuthnDefaultIssuedAtSkew = 2 * time.Second
+	// txeAuthnMaxIssuedAtSkew is the largest tolerance that can be
+	// configured; it is the verifier's own bound.
+	txeAuthnMaxIssuedAtSkew = time.Minute
 )
 
 // txeAuthnClasses are the classes a provider token may yield. A person and
@@ -107,11 +125,13 @@ const (
 	txeAuthnCLIClientKey = "txe.authn.cli_client"
 	txeAuthnClientsKey   = "txe.authn.clients"
 	txeAuthnLifetimeKey  = "txe.authn.max_lifetime"
+	txeAuthnSkewKey      = "txe.authn.issued_at_skew"
 	txeAuthzModeEnv      = "TXE_AUTHZ_MODE"
 	txeAuthnIssuerEnv    = "TXE_AUTHN_ISSUER"
 	txeAuthnAudienceEnv  = "TXE_AUTHN_AUDIENCE"
 	txeAuthnJWKSEnv      = "TXE_AUTHN_JWKS_URL"
 	txeAuthnLifetimeEnv  = "TXE_AUTHN_MAX_LIFETIME"
+	txeAuthnSkewEnv      = "TXE_AUTHN_ISSUED_AT_SKEW"
 )
 
 // loadTXEConfig reads the txe section from the raw values, as the fork
@@ -119,7 +139,7 @@ const (
 // converted loosely, and a key that is not known is an error rather than
 // ignored.
 func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
-	for _, env := range []string{txeAuthzModeEnv, txeAuthnIssuerEnv, txeAuthnAudienceEnv, txeAuthnJWKSEnv, txeAuthnLifetimeEnv} {
+	for _, env := range []string{txeAuthzModeEnv, txeAuthnIssuerEnv, txeAuthnAudienceEnv, txeAuthnJWKSEnv, txeAuthnLifetimeEnv, txeAuthnSkewEnv} {
 		name := strings.ToUpper(AppSlug) + "_" + env
 		if value, set := os.LookupEnv(name); set && value == "" {
 			return fmt.Errorf("%s is set but empty: unset it, or give it a value", name)
@@ -139,7 +159,7 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 	}{
 		{txeKey, []string{"authz", "authn"}},
 		{txeAuthzKey, []string{"mode"}},
-		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime", "cli_client"}},
+		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime", "issued_at_skew", "cli_client"}},
 	} {
 		m, err := l.txeSection(section.key)
 		if err != nil {
@@ -182,6 +202,21 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 			return fmt.Errorf("%s: %w", txeAuthnLifetimeKey, perr)
 		}
 		cfg.TXE.Authn.MaxLifetime = d
+	}
+	skew, err := l.txeString(txeAuthnSkewKey)
+	if err != nil {
+		return err
+	}
+	switch {
+	case skew != "":
+		d, perr := time.ParseDuration(skew)
+		if perr != nil {
+			return fmt.Errorf("%s: %w", txeAuthnSkewKey, perr)
+		}
+		cfg.TXE.Authn.IssuedAtSkew = d
+		cfg.TXE.Authn.issuedAtSkewGiven = true
+	case cfg.TXE.Authn.Enabled():
+		cfg.TXE.Authn.IssuedAtSkew = TXEAuthnDefaultIssuedAtSkew
 	}
 	return nil
 }
@@ -341,7 +376,7 @@ func (c *Config) validateTXE() error {
 
 func (a TXEAuthnConfig) validate() error {
 	if !a.Enabled() {
-		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 || a.CLIClient != "" {
+		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 || a.IssuedAtSkew != 0 || a.issuedAtSkewGiven || a.CLIClient != "" {
 			return fmt.Errorf("%s: an issuer is required when any other value is set", txeAuthnKey)
 		}
 		return nil
@@ -377,6 +412,9 @@ func (a TXEAuthnConfig) validate() error {
 	}
 	if a.MaxLifetime < 0 || a.MaxLifetime > txeAuthnMaxLifetime {
 		return fmt.Errorf("%s must be between 0 and %s, got %s", txeAuthnLifetimeKey, txeAuthnMaxLifetime, a.MaxLifetime)
+	}
+	if a.IssuedAtSkew < 0 || a.IssuedAtSkew > txeAuthnMaxIssuedAtSkew {
+		return fmt.Errorf("%s must be between 0 and %s, got %s", txeAuthnSkewKey, txeAuthnMaxIssuedAtSkew, a.IssuedAtSkew)
 	}
 	return nil
 }

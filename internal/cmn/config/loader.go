@@ -2495,6 +2495,7 @@ var envBindings = []envBinding{
 	{key: txeAuthnAudienceKey, env: txeAuthnAudienceEnv},
 	{key: txeAuthnJWKSKey, env: txeAuthnJWKSEnv},
 	{key: txeAuthnLifetimeKey, env: txeAuthnLifetimeEnv},
+	{key: txeAuthnSkewKey, env: txeAuthnSkewEnv},
 
 	// GitSync
 	{key: "git_sync.enabled", env: "GITSYNC_ENABLED"},

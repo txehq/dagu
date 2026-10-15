@@ -295,6 +295,7 @@
               }
             },
             "max_lifetime": {"type": "string", "description": "The longest token lifetime accepted, at most 5m."},
+            "issued_at_skew": {"type": "string", "description": "How far in the future a token's iat and nbf may lie, to absorb a provider clock a little ahead; never applied to exp. Default 2s; 0s turns it off; at most 1m."},
             "cli_client": {"type": "string", "description": "The cli client advertised to the command line by GET /txe/auth/cli. Optional when there is exactly one cli client."}
           }
         }
