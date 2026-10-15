@@ -57,8 +57,10 @@ GET  /api/v1/dags/txe-reviewer-<machine>                                 # "susp
 ```
 
 Suspension is only the scheduler's flag. The spec, its schedule and the run history are kept, and a
-reinstall while suspended leaves it suspended. It stops new scheduled runs only. A run already queued
-or running carries on; stop or dequeue it on its own run's routes.
+reinstall while suspended leaves it suspended. A run already running carries on; stop it on its own
+run's route. Queued runs differ by what started them. One the schedule started (a scheduled, catch-up
+or retry run) is aborted and dequeued while the DAG is suspended, not held until it resumes. One
+started by hand, by a webhook or as a sub-DAG run is dispatched as usual.
 
 On a hub that enforces owners, the call is decided by the machine's owner, as running its DAGs is.
 A person or CLI sign-in of the owner may suspend and resume. Another owner's sign-in and a legacy API
