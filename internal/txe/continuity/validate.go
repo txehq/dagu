@@ -8,6 +8,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
 // Policy is what Validate holds an inventory to.
@@ -134,10 +136,14 @@ func (v *validator) refs() {
 	for i := range v.inv.Records {
 		r := &v.inv.Records[i]
 		for _, ref := range r.Refs {
+			optional := ref.Optional
+			if r.Class == ClassJob && ref.Rel == "checkpoint_review" && !v.checkpointReview(r, ref.ID) {
+				optional = true
+			}
 			if v.defined[ref.Kind][ref.ID] {
 				continue
 			}
-			if ref.Optional {
+			if optional {
 				// It may never have existed; one that did and is gone is
 				// found by Compare as a missing record.
 				continue
@@ -150,6 +156,52 @@ func (v *validator) refs() {
 			v.add(SeverityBlock, "dangling_ref", r, "%s refers to %s %s, which is not present", ref.Rel, ref.Kind, ref.ID)
 		}
 	}
+}
+
+// maxCheckpointEpisodes bounds the episodes checkpointReview enumerates.
+// A checkpoint further along than this is not judged, and its review is
+// required as it always was.
+const maxCheckpointEpisodes = 1 << 20
+
+// checkpointReview reports whether the review a job's checkpoint names
+// must be present, by the registry's contract. The registry records a
+// review of a job only under ReviewID(job, k) for an episode k it has
+// reached, and the reviewer records the review of episode v-1 before it
+// names it in checkpoint v. AdvanceCheckpoint stores whatever ID its caller
+// sends, so another client can leave a checkpoint naming a review the job
+// could not have recorded in any episode up to that checkpoint. Such an ID
+// is reported by name and not required to be present. Any ID the job could
+// have recorded stays required, and a checkpoint this cannot decide, with a
+// version the registry never writes, is held as it always was. A review
+// that is present is checked as every reference is, whatever it is named;
+// one that is lost later is a missing record to Compare, and a recorded
+// review of the job's own is also lost from its reviews chain.
+func (v *validator) checkpointReview(r *Record, id string) bool {
+	version, err := strconv.Atoi(r.Attrs["checkpoint"])
+	if err != nil || version < 1 || version > maxCheckpointEpisodes || r.Job == "" {
+		return true
+	}
+	ended, err := registry.ReviewID(r.Job, version-1)
+	if err != nil || id == ended {
+		return true
+	}
+	if registry.ValidateID(registry.PrefixReview, id) == nil {
+		for k := 0; k <= version; k++ {
+			if k == version-1 {
+				continue
+			}
+			other, err := registry.ReviewID(r.Job, k)
+			if err != nil {
+				return true
+			}
+			if id == other {
+				v.add(SeverityWarn, "checkpoint_review_noncanonical", r, "checkpoint %d names review %s of episode %d, not %s of the episode it ended; it is still required", version, id, k, ended)
+				return true
+			}
+		}
+	}
+	v.add(SeverityWarn, "checkpoint_review_unrecordable", r, "checkpoint %d names review %s, which this job could not have recorded in any episode up to its checkpoint (the episode it ended has %s); it is reported, not required", version, id, ended)
+	return false
 }
 
 // jobs checks that a job, its project and its machine have one owner, and
