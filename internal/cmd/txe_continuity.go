@@ -100,6 +100,26 @@ Example, at the freeze point, with the hub's PVC mounted at /data:
 	}, []commandLineFlag{txeContinuityScanFlag, txeContinuityOwnerFlag, txeContinuityOutFlag, txeContinuityLabelFlag,
 		txeContinuityAllowOwnerFlag, txeContinuityKeepFlag, txeJSONFlag}, runTXEContinuityInventory))
 	command.AddCommand(NewCommand(&cobra.Command{
+		Use:   "reconcile <inventory> <inventory>...",
+		Short: "Join inventories taken apart (the hub's, each machine's) into one and check it",
+		Long: `Join the inventory of the hub's data directory and those of the machine
+homes, taken apart, into one joint inventory, and validate it: owners,
+references and packages are checked across the hub and the machines, as in
+one scan. Inventories that do not belong together are refused (another
+owner, label or format, a root, record or file in two of them, no hub or no
+machine home, a malformed or altered inventory) and nothing is written.
+
+The joint inventory is written to --out, a new file; a blocking issue fails
+the command after it is written. Reconcile the inventories taken before a
+transition and those taken after, then compare the two joint inventories:
+
+  dagu txe continuity reconcile hub-before.json laptop-before.json --out joint-before.json
+  dagu txe continuity reconcile hub-after.json laptop-after.json --out joint-after.json
+  dagu txe continuity compare joint-before.json joint-after.json`,
+		Args:        cobra.MinimumNArgs(2),
+		Annotations: local,
+	}, []commandLineFlag{txeContinuityOutFlag, txeContinuityAllowOwnerFlag, txeJSONFlag}, runTXEContinuityReconcile))
+	command.AddCommand(NewCommand(&cobra.Command{
 		Use:         "validate <inventory>",
 		Short:       "Check one inventory: owners, references, history, packages and artifacts",
 		Args:        cobra.ExactArgs(1),
@@ -194,6 +214,44 @@ func runTXEContinuityInventory(ctx *Context, _ []string) error {
 		func(p *txePrinter) {
 			p.f("Inventory %s written to %s.\n", inv.Digest, out)
 			p.f("%d records, %d files, %d excluded areas.\n", len(inv.Records), len(inv.Files), len(inv.Excluded))
+			printTXEContinuityIssues(p, issues)
+		}); err != nil {
+		return err
+	}
+	return txeContinuityFail(issues)
+}
+
+func runTXEContinuityReconcile(ctx *Context, args []string) error {
+	out, _ := ctx.Command.Flags().GetString("out")
+	if out == "" {
+		return errors.New("name the joint inventory's file with --out")
+	}
+	parts := make([]*continuity.Inventory, 0, len(args))
+	for _, p := range args {
+		inv, err := readTXEContinuityInventory(p)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		parts = append(parts, inv)
+	}
+	joint, err := continuity.Reconcile(parts...)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(joint, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeNewFile(out, append(data, '\n')); err != nil {
+		return err
+	}
+	issues := continuity.Validate(joint, txeContinuityPolicy(ctx))
+	if err := txeOutput(ctx, map[string]any{"digest": joint.Digest, "parts": joint.Parts, "counts": joint.Counts, "issues": issues, "out": out},
+		func(p *txePrinter) {
+			p.f("Joint inventory %s of %d parts written to %s.\n", joint.Digest, len(joint.Parts), out)
+			for _, d := range joint.Parts {
+				p.f("part %s\n", d)
+			}
 			printTXEContinuityIssues(p, issues)
 		}); err != nil {
 		return err
