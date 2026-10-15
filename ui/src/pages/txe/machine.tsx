@@ -65,6 +65,22 @@ function Identity({
   );
 }
 
+// Identified is what an approval names: the application's key (class and
+// client) and the identity it was signed in with.
+type Identified = Pick<
+  EnrolmentApplication,
+  'class' | 'client_id' | 'issuer' | 'subject'
+>;
+
+function sameIdentity(a: Identified, b: Identified): boolean {
+  return (
+    a.class === b.class &&
+    a.client_id === b.client_id &&
+    a.issuer === b.issuer &&
+    a.subject === b.subject
+  );
+}
+
 function ApplicationRow({
   application,
   enrolledAs,
@@ -79,44 +95,61 @@ function ApplicationRow({
   onChanged: () => Promise<void>;
 }): React.ReactElement {
   const api = useTxeEnrolmentApi();
-  // readAs is the application as it was when the person opened the
-  // confirmation. The approval sends exactly that, never a later read: the
-  // list refreshes while the confirmation is open, and a machine may apply
-  // again in the meantime with another person's sign-in.
-  const [readAs, setReadAs] = React.useState<EnrolmentApplication>();
+  // readAs is the identity the person read when opening the confirmation.
+  // The list refreshes while it is open, and the machine may apply again: with
+  // the same identity that only renews the credential, but with another
+  // person's sign-in it is no longer the application being confirmed.
+  const [readAs, setReadAs] = React.useState<Identified>();
   const [busy, setBusy] = React.useState(false);
   const [outcome, setOutcome] = React.useState<
     | { kind: 'refused'; reason: string }
-    | { kind: 'conflict' }
+    | { kind: 'conflict'; reason: string }
     | { kind: 'changed' }
     | { kind: 'stale' }
   >();
-  const shown = readAs ?? application;
-  const expired = Date.parse(shown.credential_expires) <= Date.now();
-
-  // An application that now carries another identity is not the one being
-  // confirmed: close the confirmation instead of approving it.
+  // Re-render when the credential expires, so the row says so even when no
+  // refresh brings new data.
+  const [, setExpiryTick] = React.useState(0);
   React.useEffect(() => {
-    if (
-      readAs &&
-      !busy &&
-      (readAs.issuer !== application.issuer ||
-        readAs.subject !== application.subject)
-    ) {
+    const ms = Date.parse(application.credential_expires) - Date.now();
+    if (!(ms > 0)) return;
+    const timer = setTimeout(() => setExpiryTick((n) => n + 1), ms + 50);
+    return () => clearTimeout(timer);
+  }, [application.credential_expires]);
+  const expired = Date.parse(application.credential_expires) <= Date.now();
+  const changed = readAs !== undefined && !sameIdentity(readAs, application);
+
+  React.useEffect(() => {
+    if (!readAs || busy) return;
+    if (changed) {
       setReadAs(undefined);
       setOutcome({ kind: 'changed' });
+    } else if (expired) {
+      // An expired credential cannot be approved; the row says what to do.
+      setReadAs(undefined);
     }
-  }, [application, busy, readAs]);
+  }, [busy, changed, expired, readAs]);
 
-  const approve = async (read: EnrolmentApplication) => {
+  const approve = async () => {
+    // Send only the identity that was read; the current application carries
+    // it with its latest credential, or the confirmation is not approved.
+    if (!readAs || changed) {
+      setReadAs(undefined);
+      setOutcome({ kind: 'changed' });
+      return;
+    }
     setBusy(true);
     setOutcome(undefined);
     try {
-      await api.enrol(read);
+      await api.enrol(application);
       setReadAs(undefined);
     } catch (err) {
       setReadAs(undefined);
-      if (code(err) === 'conflict') setOutcome({ kind: 'conflict' });
+      // The hub answers conflict for an application that changed, for a
+      // class already enrolled with another credential, and for a client
+      // that belongs to another machine; its message says which.
+      if (code(err) === 'conflict')
+        setOutcome({ kind: 'conflict', reason: errorText(err) });
       else if (code(err) === 'credential_stale') setOutcome({ kind: 'stale' });
       else setOutcome({ kind: 'refused', reason: errorText(err) });
     } finally {
@@ -133,20 +166,20 @@ function ApplicationRow({
       data-testid="txe-enrolment-application"
     >
       <div className="flex flex-wrap items-center gap-2 text-sm">
-        <Badge variant="outline">{shown.class}</Badge>
+        <Badge variant="outline">{application.class}</Badge>
         <span className="text-xs text-muted-foreground">
           <I18nText text="Applied" />{' '}
-          <RelativeTime timestamp={shown.received_at} />
+          <RelativeTime timestamp={application.received_at} />
         </span>
         <span className="text-xs text-muted-foreground">
           <I18nText text="Credential expires" />{' '}
-          <RelativeTime timestamp={shown.credential_expires} />
+          <RelativeTime timestamp={application.credential_expires} />
         </span>
       </div>
       <Identity
-        issuer={shown.issuer}
-        subject={shown.subject}
-        clientId={shown.client_id}
+        issuer={application.issuer}
+        subject={application.subject}
+        clientId={application.client_id}
       />
       {enrolledAs && !readAs ? (
         <p className="text-xs text-muted-foreground">
@@ -168,11 +201,7 @@ function ApplicationRow({
             />
           </p>
           <div className="flex gap-2">
-            <Button
-              size="sm"
-              onClick={() => void approve(readAs)}
-              disabled={busy}
-            >
+            <Button size="sm" onClick={() => void approve()} disabled={busy}>
               <I18nText text="Confirm approval" />
             </Button>
             <Button
@@ -190,7 +219,12 @@ function ApplicationRow({
           size="sm"
           onClick={() => {
             setOutcome(undefined);
-            setReadAs(application);
+            setReadAs({
+              class: application.class,
+              client_id: application.client_id,
+              issuer: application.issuer,
+              subject: application.subject,
+            });
           }}
           disabled={busy}
         >
@@ -199,7 +233,10 @@ function ApplicationRow({
       )}
       {outcome?.kind === 'conflict' && (
         <p className="text-xs text-destructive" role="alert">
-          <I18nText text="Not approved: the application on file changed since you read it. It has been read again; check it before approving." />
+          <I18nText
+            text="Not approved: {reason}. The machine's applications and enrolments have been read again."
+            values={{ reason: outcome.reason }}
+          />
         </p>
       )}
       {outcome?.kind === 'changed' && (
@@ -238,6 +275,9 @@ function EnrolmentRow({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string>();
   const active = enrolment.state === TxeEnrolmentState.active;
+  // A pending enrolment is a reservation an interrupted approval left; it
+  // blocks another credential for the class until it is revoked too.
+  const revocable = enrolment.state !== TxeEnrolmentState.revoked;
 
   const revoke = async () => {
     setBusy(true);
@@ -272,7 +312,7 @@ function EnrolmentRow({
           />{' '}
           · <RelativeTime timestamp={enrolment.enrolled.at} />
         </span>
-        {active && !revoking && (
+        {revocable && !revoking && (
           <Button size="sm" variant="outline" onClick={() => setRevoking(true)}>
             <I18nText text="Revoke" />
           </Button>
@@ -283,7 +323,7 @@ function EnrolmentRow({
         subject={enrolment.subject}
         clientId={enrolment.client_id}
       />
-      {active && revoking && (
+      {revocable && revoking && (
         <div className="flex flex-wrap items-center gap-2">
           <Input
             aria-label={ts('Reason')}

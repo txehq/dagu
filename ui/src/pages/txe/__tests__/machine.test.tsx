@@ -143,10 +143,17 @@ describe('the machine enrolment page', () => {
     await waitFor(() => expect(api.listEnrolments).toHaveBeenCalledTimes(2));
   });
 
-  it('says the application changed, and reads it again, on a conflict', async () => {
+  // The hub answers conflict for three different things, and its message is
+  // the recovery: read again, revoke the class's enrolment first, or use a
+  // client of the machine's own.
+  it.each([
+    'the application on file is not the one you read; read it again',
+    'the machine is already enrolled for this class, or being enrolled, with another credential; revoke that enrolment first',
+    "this credential's client already belongs to another machine or class; it is not reassigned. Each machine and class needs a provider client of its own",
+  ])('shows the hub conflict as it says it: %s', async (message) => {
     const api = enrolmentApi({
       enrol: vi.fn(async () => {
-        throw new TxeRefusal(409, 'read it again', 'conflict');
+        throw new TxeRefusal(409, message, 'conflict');
       }),
     });
     renderPage(api);
@@ -155,9 +162,74 @@ describe('the machine enrolment page', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm approval' }));
 
     expect(
-      await screen.findByText(/the application on file changed/)
+      await screen.findByText(
+        `Not approved: ${message}. The machine's applications and enrolments have been read again.`
+      )
     ).toBeInTheDocument();
     await waitFor(() => expect(api.listApplications).toHaveBeenCalledTimes(2));
+  });
+
+  // The machine re-applies while it waits, renewing its credential under the
+  // same identity: an expiry while confirming must not block approval.
+  it('approves the renewed credential of the identity that was read', async () => {
+    const renewed = application({
+      received_at: new Date().toISOString(),
+      credential_expires: new Date(Date.now() + HOUR).toISOString(),
+    });
+    const listApplications = vi
+      .fn()
+      .mockResolvedValueOnce([
+        application({
+          credential_expires: new Date(Date.now() + 300).toISOString(),
+        }),
+      ])
+      .mockResolvedValue([renewed]);
+    const api = enrolmentApi({ listApplications });
+    renderPage(api);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
+    await waitFor(() => expect(listApplications).toHaveBeenCalledTimes(2));
+
+    const confirm = await screen
+      .findByRole('button', { name: 'Confirm approval' })
+      .catch(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+        return screen.getByRole('button', { name: 'Confirm approval' });
+      });
+    fireEvent.click(confirm);
+
+    await waitFor(() =>
+      expect(api.enrol).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subject: 'sub-ada',
+          credential_expires: renewed.credential_expires,
+        })
+      )
+    );
+  });
+
+  it('closes an open confirmation whose credential expired, and keeps it closable', async () => {
+    renderPage(
+      enrolmentApi({
+        listApplications: vi.fn(async () => [
+          application({
+            credential_expires: new Date(Date.now() + 300).toISOString(),
+          }),
+        ]),
+      })
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    // No refresh: the row notices the expiry by itself.
+
+    expect(
+      await screen.findByText(/This application's credential has expired/)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm approval' })
+    ).toBeNull();
   });
 
   // Seen on the live hub: a machine applied again with another person's
@@ -363,6 +435,47 @@ describe('the machine enrolment page', () => {
         'laptop retired'
       )
     );
+  });
+
+  // A pending enrolment is a reservation an interrupted approval left; it
+  // blocks another credential until it is revoked.
+  it('revokes a pending enrolment too', async () => {
+    const api = enrolmentApi({
+      listEnrolments: vi.fn(async () => [
+        enrolment({ state: TxeEnrolmentState.pending }),
+      ]),
+    });
+    renderPage(api);
+
+    const row = await screen.findByTestId('txe-enrolment');
+    fireEvent.click(within(row).getByRole('button', { name: 'Revoke' }));
+    fireEvent.change(within(row).getByLabelText('Reason'), {
+      target: { value: 'interrupted approval' },
+    });
+    fireEvent.click(
+      within(row).getByRole('button', { name: 'Confirm revoke' })
+    );
+
+    await waitFor(() =>
+      expect(api.revokeEnrolment).toHaveBeenCalledWith(
+        MACHINE,
+        'worker',
+        'interrupted approval'
+      )
+    );
+  });
+
+  it('offers no revoke for a revoked enrolment', async () => {
+    renderPage(
+      enrolmentApi({
+        listEnrolments: vi.fn(async () => [
+          enrolment({ state: TxeEnrolmentState.revoked }),
+        ]),
+      })
+    );
+
+    const row = await screen.findByTestId('txe-enrolment');
+    expect(within(row).queryByRole('button', { name: 'Revoke' })).toBeNull();
   });
 
   it('marks the application the link names', async () => {
