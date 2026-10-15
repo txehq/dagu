@@ -14,6 +14,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 func listedMachines(t *testing.T, w *twoOwners, ctx context.Context) map[string]apigen.TxeMachineSummary {
@@ -106,4 +107,43 @@ func TestTxeMachinesAreListedByOwner(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An application already approved is not pending: one whose credential is
+// the machine's active enrolment for its class. Another client's application
+// of the same class still is, and a revoked enrolment approves nothing.
+func TestTxeMachinesPendingExcludesEnrolledApplications(t *testing.T) {
+	w := newTwoOwners(t, "")
+	ctx := context.Background()
+	// A new machine of A's, not yet enrolled.
+	machine, err := registry.NewID(registry.PrefixMachine, time.Now())
+	require.NoError(t, err)
+	_, err = w.reg.CreateMachine(ctx, registry.Machine{MachineID: machine, OwnerID: w.ownerA, DisplayName: "new"},
+		registry.Actor{Kind: registry.ActorSystem, ID: "test"})
+	require.NoError(t, err)
+	apply := func(client string) authn.Identity {
+		id := authn.Identity{Issuer: ownersIssuer, Subject: "a"}
+		_, err := w.svc.Store().ApplyForEnrolment(ctx, authn.Principal{Identity: id, Class: authn.ClassWorker, ClientID: client,
+			Expires: time.Now().Add(time.Hour)}, machine)
+		require.NoError(t, err)
+		return id
+	}
+	pending := func() int {
+		return *listedMachines(t, w, w.personA)[machine].PendingApplications
+	}
+	seen := apply("dagu-worker-first")
+	require.Equal(t, 1, pending())
+
+	scope, err := w.svc.Scope(ctx, txeauth.Classify(w.personA))
+	require.NoError(t, err)
+	_, err = w.svc.Store().EnrolFromApplication(ctx, scope, machine, authn.ClassWorker, "dagu-worker-first", seen)
+	require.NoError(t, err)
+	require.Zero(t, pending(), "the approved application is not pending")
+
+	apply("dagu-worker-second")
+	require.Equal(t, 1, pending(), "another client's application of the same class still waits")
+
+	_, err = w.svc.Store().RevokeEnrolment(ctx, scope, machine, authn.ClassWorker, "lost")
+	require.NoError(t, err)
+	require.Equal(t, 2, pending(), "a revoked enrolment approves nothing")
 }
