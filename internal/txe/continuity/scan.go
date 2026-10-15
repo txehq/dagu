@@ -170,6 +170,20 @@ var machineHomeRules = []rule{
 	{name: "client", kind: kindDir, exclude: "the CLI's Dagu home holds its hub credential; not read"},
 	{name: "skill", kind: kindDir, exclude: "unpacked skill revisions; reinstalled, not retained data"},
 	{name: "tunnel", kind: kindDir, exclude: "the tunnel's port-forward credential (a ServiceAccount kubeconfig and its expiry), renewed by tunnel-credential.sh; not read"},
+	// The worker's machine credential at its default path, with its lock
+	// and the temporary file a rotation is saved through
+	// (internal/cmd/txe_enrol.go, internal/txe/transportauth/credential.go).
+	{name: "worker-credential.json", kind: kindFile, exclude: "the worker's machine credential (dagu txe enrol); not read"},
+	{name: "worker-credential.json.lock", kind: kindFile, exclude: "the machine credential's lock; not read"},
+	{pattern: regexp.MustCompile(`^\.worker-credential\.json\.[0-9]+$`), kind: kindFile, exclude: "a machine credential being saved; not read"},
+	// The CLI's sign-ins, one sealed entry per hub with its lock, and the
+	// temporary file an entry is written through (internal/txe/cliauth
+	// entryPaths, fileutil.WriteFileAtomic).
+	{name: "signin", kind: kindDir, dir: []rule{
+		{pattern: regexp.MustCompile(`^[0-9a-f]{32}\.json$`), kind: kindFile, exclude: "a sealed CLI sign-in; not read"},
+		{pattern: regexp.MustCompile(`^[0-9a-f]{32}\.lock$`), kind: kindFile, exclude: "a CLI sign-in's lock; not read"},
+		{pattern: regexp.MustCompile(`^[0-9a-f]{32}\.json\.tmp\.[0-9]+$`), kind: kindFile, exclude: "a CLI sign-in being saved; not read"},
+	}},
 	// Every installed binary with its build record, and the link to the
 	// current one: rebuilt from a release tag, and an upgrade moves the
 	// link, so they are counted, not compared.
@@ -218,6 +232,27 @@ var machineHomeRules = []rule{
 // hubStores are the stores of the records read from a hub data directory
 // (Record.Store); a machine home stores its records under its root label.
 var hubStores = map[string]bool{"registry": true, "authz": true}
+
+// hubDataRules classify, entry by entry, areas of the data directory that
+// hold a credential beside names that must stay exact.
+var hubDataRules = []rule{
+	// The coordinator's hub key at its default path, and the temporary file
+	// it is created through (internal/cmn/config defaultHubKeyFile,
+	// internal/txe/transportauth/hubkey.go).
+	{name: "coordinator", kind: kindDir, dir: []rule{
+		{name: "hub.key", kind: kindFile, exclude: "the coordinator's hub key; not read"},
+		{pattern: regexp.MustCompile(`^\.hub\.key\.[0-9]+$`), kind: kindFile, exclude: "a hub key being created; not read"},
+	}},
+}
+
+func ruleFor(rules []rule, name string) *rule {
+	for i := range rules {
+		if rules[i].matches(name) {
+			return &rules[i]
+		}
+	}
+	return nil
+}
 
 // Scan inventories the roots. It only reads; a root that cannot be read is
 // an error, and anything it does not understand is a blocking issue.
@@ -332,6 +367,10 @@ func (s *scanner) hubData() error {
 			}
 		case hubDataSubAreas[name] != nil:
 			if err := s.subAreas(name, hubDataSubAreas[name]); err != nil {
+				return err
+			}
+		case ruleFor(hubDataRules, name) != nil:
+			if err := s.entry(name, e, hubDataRules); err != nil {
 				return err
 			}
 		default:
@@ -567,21 +606,23 @@ func (s *scanner) machineHome() error {
 	return nil
 }
 
-// entry classifies one entry of a machine's TXE home by the first rule
-// that matches it.
-func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
-	var r *rule
-	for i := range rules {
-		if rules[i].matches(e.Name()) {
-			r = &rules[i]
-			break
-		}
+// place names the kind of root being scanned, for issue details.
+func (s *scanner) place() string {
+	if s.root.Area == AreaHubData {
+		return "the data directory"
 	}
+	return "a machine's TXE home"
+}
+
+// entry classifies one entry of a machine's TXE home, or of a rule-classified
+// area of the data directory, by the first rule that matches it.
+func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
+	r := ruleFor(rules, e.Name())
 	if r == nil {
 		if kept, err := s.kept(rel); err != nil || kept {
 			return err
 		}
-		s.issue("unclassified_area", "", s.root.Label+"/"+rel, "%s/%s is not a known part of a machine's TXE home; classify it before a transition, it was not read", s.root.Label, rel)
+		s.issue("unclassified_area", "", s.root.Label+"/"+rel, "%s/%s is not a known part of %s; classify it before a transition, it was not read", s.root.Label, rel, s.place())
 		return nil
 	}
 	isLink := e.Type()&fs.ModeSymlink != 0
@@ -594,7 +635,7 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 	case r.kind == kindDir && !e.IsDir(),
 		r.kind == kindFile && !e.Type().IsRegular(),
 		r.kind == kindLink && !isLink:
-		s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is not the kind of entry its place in a machine's TXE home holds; it was not read", s.root.Label, rel)
+		s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is not the kind of entry its place in %s holds; it was not read", s.root.Label, rel, s.place())
 		return nil
 	}
 	if r.exclude != "" {

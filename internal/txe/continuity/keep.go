@@ -44,6 +44,12 @@ type KeepEntry struct {
 	// Exclude names paths under the entry that are never opened, such as a
 	// key. Only their names and types are pinned.
 	Exclude []string `json:"exclude,omitempty"`
+	// Credential says the entry itself is a credential kept at a path no
+	// rule names, such as a worker credential file given to dagu txe enrol
+	// inside the TXE home. It is never opened: only its type and permission
+	// bits are pinned, so a rotation that rewrites it in place is not a
+	// change.
+	Credential bool `json:"credential,omitempty"`
 }
 
 var keepDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -80,6 +86,9 @@ func DecodeKeep(data []byte) (*KeepManifest, error) {
 			return nil, fmt.Errorf("keep manifest: entry %d (%s/%s): digest %q is not sha256:<64 hex>", i, e.Root, e.Path, e.Digest)
 		}
 		key := e.Root + "/" + e.Path
+		if e.Credential && len(e.Exclude) > 0 {
+			return nil, fmt.Errorf("keep manifest: %s is a credential, which is never read; it has nothing to exclude", key)
+		}
 		if seen[key] {
 			return nil, fmt.Errorf("keep manifest: %s is kept twice", key)
 		}
@@ -109,7 +118,13 @@ func (s *scanner) kept(rel string) (bool, error) {
 	}
 	s.keepSeen[s.root.Label+"/"+rel] = true
 	id := s.root.Label + "/" + rel
-	digest, refused, err := s.keepTree(rel, e)
+	var digest, refused string
+	var err error
+	if e.Credential {
+		digest, err = s.keepCredential(rel)
+	} else {
+		digest, refused, err = s.keepTree(rel, e)
+	}
 	if err != nil {
 		return true, err
 	}
@@ -238,6 +253,22 @@ func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, er
 	sort.Strings(lines)
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	return "sha256:" + hex.EncodeToString(sum[:]), refused, nil
+}
+
+// keepCredential pins a kept credential by its type and permission bits,
+// from its directory entry, without opening it or anything under it.
+func (s *scanner) keepCredential(rel string) (string, error) {
+	info, err := os.Lstat(filepath.Join(s.root.Path, filepath.FromSlash(rel)))
+	if err != nil {
+		return "", err
+	}
+	perm := uint32(0)
+	if hasModeBits {
+		perm = uint32(info.Mode().Perm())
+	}
+	s.exclude(rel, "a credential kept by the keep manifest; not read")
+	sum := sha256.Sum256([]byte(fmt.Sprintf("k\x00%s\x00%o", info.Mode().Type().String(), perm)))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // keptMissing blocks for every entry of the manifest that the scan did not
