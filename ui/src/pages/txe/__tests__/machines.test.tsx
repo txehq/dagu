@@ -245,6 +245,47 @@ describe('the machines page', () => {
     expect(screen.queryByText(/awaiting/)).toBeNull();
   });
 
+  // SWR keeps the previous counts when a refresh fails.
+  it('says only how many are on file when a refresh fails after a positive count', async () => {
+    const listApplications = vi
+      .fn()
+      .mockResolvedValueOnce([application()])
+      .mockRejectedValue(new TxeRefusal(503, 'unavailable', undefined));
+    const fake = api({ machines: [machine({ pending_applications: 1 })] });
+    fake.listApplications = listApplications;
+    renderAt(<TxeMachinesPage />, fake);
+
+    expect(await screen.findByText('1 awaiting approval')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
+
+    expect(
+      await screen.findByText('1 application on file')
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/awaiting/)).toBeNull();
+  });
+
+  // SWR's default comparison sees every two Maps as equal; counts must
+  // update when only the enrolments change.
+  it('updates the badge when an application is approved between reads', async () => {
+    const waiting = application();
+    const listEnrolments = vi
+      .fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([enrolmentOf(waiting)]);
+    const fake = api({
+      machines: [machine({ pending_applications: 1 })],
+      applications: { mch_ada_laptop: [waiting] },
+    });
+    fake.listEnrolments = listEnrolments;
+    renderAt(<TxeMachinesPage />, fake);
+
+    expect(await screen.findByText('1 awaiting approval')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /refresh/i }));
+
+    await waitFor(() => expect(listEnrolments).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/awaiting/)).toBeNull());
+  });
+
   it('opens the approval page of a machine', async () => {
     renderAt(<TxeMachinesPage />, api({ machines: [machine()] }));
 
@@ -425,6 +466,48 @@ describe('the pending enrolments notice', () => {
     await waitFor(() =>
       expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull()
     );
+  });
+
+  it('updates the notice when the enrolments change between reads', async () => {
+    const first = application();
+    // First read: approved. Second read: revoked, so it awaits approval again.
+    const listEnrolments = vi
+      .fn()
+      .mockResolvedValueOnce([enrolmentOf(first)])
+      .mockResolvedValue([enrolmentOf(first, TxeEnrolmentState.revoked)]);
+    const fake = api({
+      machines: [machine({ pending_applications: 1 })],
+      applications: { mch_ada_laptop: [first] },
+    });
+    fake.listEnrolments = listEnrolments;
+    function Revalidate() {
+      const { mutate } = useSWRConfig();
+      return (
+        <button
+          onClick={() =>
+            void mutate(['txe', 'awaiting-approval', 'mch_ada_laptop'])
+          }
+        >
+          revalidate
+        </button>
+      );
+    }
+    renderAt(
+      <>
+        <PendingEnrolmentsNotice />
+        <Revalidate />
+      </>,
+      fake
+    );
+
+    await waitFor(() => expect(listEnrolments).toHaveBeenCalledTimes(1));
+    await settle();
+    expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
+    fireEvent.click(screen.getByText('revalidate'));
+
+    expect(
+      await screen.findByTestId('txe-pending-enrolments')
+    ).toBeInTheDocument();
   });
 
   it('keeps a failed read out of the global error notices', async () => {

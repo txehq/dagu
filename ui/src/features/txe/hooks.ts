@@ -116,7 +116,9 @@ export function useAwaitingApproval(
           ] as const;
         })
       );
-      return new Map<string, number>(counts);
+      // A plain object, not a Map: SWR's default comparison sees every two
+      // Maps as equal and would keep the first counts on screen.
+      return Object.fromEntries(counts) as Record<string, number>;
     },
     {
       refreshInterval: MACHINES_REFRESH_MS,

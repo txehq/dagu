@@ -23,7 +23,9 @@ function MachineBadge({
   failed: boolean;
 }): React.ReactElement | null {
   if (onFile <= 0) return null;
-  if (failed && awaiting === undefined) {
+  // A failed read outranks counts cached from an earlier one: they may
+  // still claim an approval the hub has since made.
+  if (failed) {
     return (
       <Badge variant="outline" className="ml-auto">
         <I18nText
@@ -107,7 +109,7 @@ export default function TxeMachinesPage(): React.ReactElement {
                 </span>
                 <MachineBadge
                   onFile={m.pending_applications ?? 0}
-                  awaiting={awaiting.data?.get(m.machine_id)}
+                  awaiting={awaiting.data?.[m.machine_id]}
                   failed={Boolean(awaiting.error)}
                 />
               </Link>

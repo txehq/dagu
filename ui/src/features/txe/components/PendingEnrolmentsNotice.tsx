@@ -25,7 +25,7 @@ export function PendingEnrolmentsNotice(): React.ReactElement | null {
   const count =
     machines.error || awaiting.error || !awaiting.data
       ? 0
-      : [...awaiting.data.values()].reduce((sum, n) => sum + n, 0);
+      : Object.values(awaiting.data).reduce((sum, n) => sum + n, 0);
   if (count === 0) return null;
   return (
     <Alert data-testid="txe-pending-enrolments">
