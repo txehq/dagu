@@ -244,6 +244,7 @@ A hub that accepts sign-in identifies the developer by their account at its iden
 - **Two different failures:**
   - "run `dagu txe login`": the provider or the hub refused the sign-in. Ask the person to sign in again; do not retry the command in a loop.
   - "the identity provider did not answer": nothing was refused. Retry later, and do not sign in again or sign out because of it.
+- **Enrolling this machine's worker.** `dagu txe enrol --client-id <the machine's worker client>` is a second browser sign-in, by a person of the machine's owner, at the machine's own worker client. It writes the worker's credential and applies to the hub; a person of the owner then approves the application in the hub. Ask the person first, never run it from a job, and never copy the credential file anywhere.
 - **Changing accounts.** `dagu txe login --prompt select_account` changes the account; the previous account's sign-in is revoked and not kept. `dagu txe logout` ends this machine's sign-in.
 
 ## Reference

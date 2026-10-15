@@ -27,7 +27,10 @@ type Hub struct {
 	// Decide answers a request other than the CLI client: 0 or 200 serves
 	// it; 401 refuses the token (invalid_token); 403 forbids; 503 is
 	// provider_unavailable. Nil serves everything.
-	Decide   func(r *http.Request, call int) int
+	Decide func(r *http.Request, call int) int
+	// Handle, when set, may answer a request other than the CLI client
+	// itself, before Decide; it returns false to leave it to the hub.
+	Handle   func(w http.ResponseWriter, r *http.Request) bool
 	requests []Request
 }
 
@@ -70,8 +73,9 @@ func (h *Hub) serve(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.requests = append(h.requests, Request{Method: r.Method, Path: r.URL.Path, Authorization: r.Header.Get("Authorization"), Body: string(body)})
 	call := len(h.requests)
-	advertise, decide := h.Advertise, h.Decide
+	advertise, decide, handle := h.Advertise, h.Decide, h.Handle
 	h.mu.Unlock()
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
 
 	if r.URL.Path == "/api/v1/txe/auth/cli" {
 		if advertise == nil {
@@ -79,6 +83,9 @@ func (h *Hub) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		WriteJSON(w, http.StatusOK, advertise)
+		return
+	}
+	if handle != nil && handle(w, r) {
 		return
 	}
 	status := http.StatusOK
