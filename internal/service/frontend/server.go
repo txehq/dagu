@@ -1313,12 +1313,15 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 	termHandler := terminal.NewHandler(srv.authService, srv.auditService, auditChecker, srv.terminalManager, shell)
 	termHandler.SetSessionWatch(srv.sessionWatch())
 	wsPath := path.Join(apiV1BasePath, "terminal/ws")
-	if srv.builtinOIDCCfg != nil {
+	if srv.builtinOIDCCfg != nil || srv.apiV1.TxeOwnersEnabled() {
 		// A person signed in through the identity provider gets no terminal,
-		// whatever role its account was given. The handler authenticates by
-		// itself, so the request is authenticated once more in front of it.
+		// whatever role its account was given, and whether or not browser
+		// sign-in is still configured: a person's hub token outlives that
+		// configuration. The handler authenticates by itself, so the
+		// request is authenticated once more in front of it.
 		authOpts := srv.buildStreamAuthOptions("restricted")
 		r.With(terminalQueryTokenOnly, auth.Middleware(authOpts), srv.apiV1.TxePersonRefused()).Get(wsPath, termHandler.ServeHTTP)
+		logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
 		return
 	}
 	r.Get(wsPath, termHandler.ServeHTTP)

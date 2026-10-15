@@ -123,6 +123,11 @@ func writeTxePersonRefused(w http.ResponseWriter) {
 		"message": "this route is not open to identity provider sign-ins yet", "details": map[string]string{"code": "forbidden"}})
 }
 
+// TxeOwnersEnabled reports whether owner authorization is on, so that a
+// person signed in through the identity provider is told apart and held to
+// its owner.
+func (a *API) TxeOwnersEnabled() bool { return a != nil && a.txeAuth != nil }
+
 // TxePersonRefused is the middleware for the server's other surfaces
 // (streams, MCP, terminal): it refuses a person signed in through the
 // identity provider, who may use none of them yet.
