@@ -28,12 +28,38 @@ class Refused(Exception):
 
 
 def _loopback(host):
+    # As transportauth's isLoopback: "localhost" exactly, or a loopback IP.
     if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _endpoint_host(netloc):
+    """The host of an authority with no user info, brackets removed, case kept (as Go's Hostname)."""
+    if netloc.startswith("["):
+        end = netloc.find("]")
+        return netloc[1:end] if end > 0 else ""
+    return netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
+
+
+def _check_endpoint(path, raw):
+    # The worker loads the file with transportauth.MachineCredential.Validate: an absolute URL with
+    # a host, no user info and no fragment; https, or http to a loopback address.
+    try:
+        endpoint = urllib.parse.urlsplit(raw)
+        endpoint.port  # a malformed port raises
+    except ValueError:
+        raise Refused(f"{path}: token_endpoint is not an absolute URL")
+    if not endpoint.netloc or "@" in endpoint.netloc or endpoint.fragment or not endpoint.scheme:
+        raise Refused(f"{path}: token_endpoint is not an absolute URL")
+    host = _endpoint_host(endpoint.netloc)
+    if not host:
+        raise Refused(f"{path}: token_endpoint is not an absolute URL")
+    if endpoint.scheme != "https" and not (endpoint.scheme == "http" and _loopback(host)):
+        raise Refused(f"{path}: token_endpoint must use https, or http to a loopback address")
 
 
 def check_credential(path, machine_id):
@@ -71,8 +97,9 @@ def check_credential(path, machine_id):
     if set(data) != FIELDS:
         missing, extra = sorted(FIELDS - set(data)), sorted(set(data) - FIELDS)
         raise Refused(f"{path} does not hold exactly the machine credential fields (missing {missing}, unexpected {extra})")
-    if data["schema"] != 1 or isinstance(data["schema"], bool):
-        raise Refused(f"{path} has schema {data['schema']!r}, not 1")
+    # Go decodes schema into an int: 1.0 or "1" do not load.
+    if type(data["schema"]) is not int or data["schema"] != 1:
+        raise Refused(f"{path} has schema {data['schema']!r}, not the integer 1")
     for name in FIELDS - {"schema"}:
         value = data[name]
         if not isinstance(value, str) or not value.strip() or value != value.strip():
@@ -81,9 +108,7 @@ def check_credential(path, machine_id):
         raise Refused(f"{path} is a {data['class']!r} credential, not a worker's")
     if data["machine_id"] != machine_id:
         raise Refused(f"{path} is for machine {data['machine_id']}, but this machine is {machine_id}")
-    endpoint = urllib.parse.urlsplit(data["token_endpoint"])
-    if endpoint.scheme != "https" and not (endpoint.scheme == "http" and _loopback(endpoint.hostname or "")):
-        raise Refused(f"{path}: token_endpoint must use https, or http to a loopback address")
+    _check_endpoint(path, data["token_endpoint"])
     return data["machine_id"], data["client_id"]
 
 

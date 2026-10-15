@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
 const (
@@ -233,4 +235,54 @@ func TestWorkerCredentialChoice(t *testing.T) {
 	require.Error(t, err, "a bad default is refused, not skipped")
 	assert.Contains(t, stderr, "0600")
 	assert.False(t, strings.Contains(stderr, agentsSecret))
+}
+
+// The install's check never accepts a credential the worker's own loader
+// (transportauth) refuses: such a worker would fail at start and launchd
+// would restart it forever. Python may be stricter, never looser.
+func TestCheckCredentialAgreesWithTheWorker(t *testing.T) {
+	script := agentsScript(t)
+	cases := map[string]func(map[string]any){
+		"good":                func(map[string]any) {},
+		"loopback http":       func(c map[string]any) { c["token_endpoint"] = "http://127.0.0.1:8080/realms/r/token" },
+		"loopback v6":         func(c map[string]any) { c["token_endpoint"] = "http://[::1]:8080/token" },
+		"localhost":           func(c map[string]any) { c["token_endpoint"] = "http://localhost:8080/token" },
+		"LOCALHOST":           func(c map[string]any) { c["token_endpoint"] = "http://LOCALHOST:8080/token" },
+		"no host":             func(c map[string]any) { c["token_endpoint"] = "https:///token" },
+		"user info":           func(c map[string]any) { c["token_endpoint"] = "https://user:pass@idp.example/token" },
+		"fragment":            func(c map[string]any) { c["token_endpoint"] = "https://idp.example/token#f" },
+		"bad port":            func(c map[string]any) { c["token_endpoint"] = "https://idp.example:99999x/token" },
+		"relative":            func(c map[string]any) { c["token_endpoint"] = "/token" },
+		"plain http":          func(c map[string]any) { c["token_endpoint"] = "http://idp.example/token" },
+		"schema float":        func(c map[string]any) { c["schema"] = 1.0 },
+		"schema string":       func(c map[string]any) { c["schema"] = "1" },
+		"schema 2":            func(c map[string]any) { c["schema"] = 2 },
+		"class":               func(c map[string]any) { c["class"] = "reviewer" },
+		"spaced issuer":       func(c map[string]any) { c["issuer"] = " https://idp.example/realms/r" },
+		"numeric client":      func(c map[string]any) { c["client_id"] = 7 },
+		"extra field":         func(c map[string]any) { c["extra"] = "x" },
+		"missing field":       func(c map[string]any) { delete(c, "issuer") },
+		"empty refresh token": func(c map[string]any) { c["refresh_token"] = "" },
+	}
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := credentialFixture(t, edit)
+			if name == "schema float" {
+				// encoding/json writes 1.0 as 1; write the JSON text by hand.
+				raw, err := os.ReadFile(path)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(path, bytes.Replace(raw, []byte(`"schema":1`), []byte(`"schema":1.0`), 1), 0o600))
+			}
+			_, pyErr, err := python(t, script, "check-credential", path, agentsMachine)
+			pyAccepts := err == nil
+			_, goErr := transportauth.ReadMachineCredential(path)
+			if pyAccepts {
+				assert.NoError(t, goErr, "the install accepts what the worker refuses")
+			}
+			if goErr != nil {
+				assert.False(t, pyAccepts, "worker refuses (%v); install accepted", goErr)
+			}
+			assert.NotContains(t, pyErr, agentsSecret)
+		})
+	}
 }
