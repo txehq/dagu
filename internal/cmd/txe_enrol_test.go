@@ -280,6 +280,9 @@ func TestTXEEnrolCustomFileAndUnsavedRotation(t *testing.T) {
 	_, err = transportauth.ReadMachineCredential(path)
 	require.NoError(t, err)
 
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
 	require.NoError(t, os.Chmod(dir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	applied := len(f.applied)
