@@ -45,6 +45,37 @@ does not show an owner's sign-in its workers, so the output then says `runnable:
 Each rendered document is pinned to its own machine with a literal `worker_selector` and declares
 no name of its own, as the hub requires for a machine's DAGs.
 
+## Pausing and resuming the schedules
+
+To stop new reviews for a while (maintenance, a broken agent profile), suspend the pair and resume
+it afterwards, with the machine owner's sign-in as the bearer:
+
+```sh
+POST /api/v1/dags/txe-reviewer-<machine>/suspend   {"suspend": true}    # false resumes
+POST /api/v1/dags/txe-decide-<machine>/suspend     {"suspend": true}
+GET  /api/v1/dags/txe-reviewer-<machine>                                 # "suspended" reads it back
+```
+
+Suspension is only the scheduler's flag. The spec, its schedule and the run history are kept, and a
+reinstall while suspended leaves it suspended. A run already running carries on; stop it on its own
+run's route. Queued runs differ by what started them. One the schedule started (a scheduled, catch-up
+or retry run) is aborted and dequeued while the DAG is suspended, not held until it resumes. One
+started by hand, by a webhook or as a sub-DAG run is dispatched as usual.
+
+On a hub that enforces owners, the call is decided by the machine's owner, as running its DAGs is.
+A person or CLI sign-in of the owner may suspend and resume. Another owner's sign-in and a legacy API
+key get 404, and the platform administrator gets 403. On a hub that does not, the hub's own checks
+apply, as before. The hub's `run_dags` permission must be on, which is the default.
+
+**Placement under enforce.** Besides the install rules above, every non-empty `worker_selector`
+in a machine's DAG, on a document or a step, must name `txe.machine` of this machine, written
+without surrounding spaces. A step may call only this machine's own DAGs. The coordinator also hands
+a machine's worker only tasks pinned to that machine. Unpinned DAGs wait for a worker that is no
+machine's.
+
+Enforce is a source-level capability here: live `txe.authz.mode: enforce` activation has not been
+performed on any hub.
+
 ## What the agent can do
 
 Nothing but answer. It is launched with no tools, no MCP servers, no user or
