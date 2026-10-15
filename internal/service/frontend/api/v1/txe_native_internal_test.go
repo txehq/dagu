@@ -289,10 +289,16 @@ func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
 		s.Nodes = []*ir.Node{{Step: ir.Step{Name: "call"}, SubRuns: []ir.SubDAGRun{
 			{DAGRunID: "sub-b", DAGName: w.jobB},
 			{DAGRunID: "sub-h", DAGName: "shared-helper"},
+			// The parent's record names no DAG, or the wrong one: the run it
+			// resolves to decides.
+			{DAGRunID: "sub-x", DAGName: "shared-helper"},
+			{DAGRunID: "sub-y"},
 		}}}
 	})
 	child(w.jobB, "sub-b")
 	child("shared-helper", "sub-h")
+	child(w.jobB, "sub-x")
+	child(w.jobB, "sub-y")
 	personA := neutral(w.personA)
 
 	spec := func(ctx context.Context, sub string) error {
@@ -306,6 +312,7 @@ func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
 		return nil
 	}
 	require.Equal(t, http.StatusNotFound, statusOf(spec(personA, "sub-b")))
+	require.Equal(t, http.StatusNotFound, statusOf(spec(personA, "sub-x")))
 	require.NoError(t, spec(personA, "sub-h"))
 	require.NoError(t, spec(w.legacy, "sub-b"), "a legacy key in mode off reads as today")
 
@@ -319,7 +326,7 @@ func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
 		return ids
 	}
 	require.Equal(t, []string{"sub-h"}, listed(personA))
-	require.ElementsMatch(t, []string{"sub-b", "sub-h"}, listed(w.legacy))
+	require.ElementsMatch(t, []string{"sub-b", "sub-h", "sub-x", "sub-y"}, listed(w.legacy))
 
 	_, err := w.api.GetSubStepLogDataByRef(personA, root, "sub-b", "inner", StepLogReadOptions{})
 	require.Equal(t, http.StatusNotFound, statusOf(err))
