@@ -1,10 +1,16 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import React from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { SWRConfig } from 'swr';
+import { SWRConfig, useSWRConfig } from 'swr';
 import { describe, expect, it, vi } from 'vitest';
 
 import { PendingEnrolmentsNotice } from '@/features/txe/components/PendingEnrolmentsNotice';
@@ -34,9 +40,15 @@ function api(listMachines: TxeEnrolmentApi['listMachines']): TxeEnrolmentApi {
   return { listMachines } as unknown as TxeEnrolmentApi;
 }
 
-function renderAt(element: React.ReactElement, enrolment: TxeEnrolmentApi) {
+function renderAt(
+  element: React.ReactElement,
+  enrolment: TxeEnrolmentApi,
+  onError: (err: unknown) => void = () => undefined
+) {
   return render(
-    <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+    <SWRConfig
+      value={{ provider: () => new Map(), dedupingInterval: 0, onError }}
+    >
       <TxeEnrolmentApiContext.Provider value={enrolment}>
         <MemoryRouter initialEntries={['/start']}>
           <Routes>
@@ -197,4 +209,64 @@ describe('the pending enrolments notice', () => {
       expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
     }
   );
+
+  // SWR keeps the last good list when a refresh fails.
+  it('hides the notice when a refresh fails after a positive count', async () => {
+    const listMachines = vi
+      .fn()
+      .mockResolvedValueOnce([machine({ pending_applications: 1 })])
+      .mockRejectedValue(new TxeRefusal(503, 'unavailable', undefined));
+    function Revalidate() {
+      const { mutate } = useSWRConfig();
+      return (
+        <button onClick={() => void mutate(['txe', 'machines'])}>
+          revalidate
+        </button>
+      );
+    }
+    renderAt(
+      <>
+        <PendingEnrolmentsNotice />
+        <Revalidate />
+      </>,
+      api(listMachines)
+    );
+
+    expect(
+      await screen.findByTestId('txe-pending-enrolments')
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText('revalidate'));
+
+    await waitFor(() => expect(listMachines).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull()
+    );
+  });
+
+  it('keeps a failed read out of the global error notices', async () => {
+    const onError = vi.fn();
+    renderAt(
+      <PendingEnrolmentsNotice />,
+      api(async () => {
+        throw new TxeRefusal(503, 'unavailable', undefined);
+      }),
+      onError
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('still reports a failed read on the machines page', async () => {
+    const onError = vi.fn();
+    renderAt(
+      <TxeMachinesPage />,
+      api(async () => {
+        throw new TxeRefusal(503, 'unavailable', undefined);
+      }),
+      onError
+    );
+
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+  });
 });

@@ -12,10 +12,12 @@ import { pendingCount, useTxeMachines } from '../hooks';
 // PendingEnrolmentsNotice tells a person in the job inbox that machines of
 // their owner are waiting for enrolment approval, so the approval page is
 // found without the link `dagu txe enrol` printed. It shows nothing while
-// none waits, and leaves a failed read to the Machines page.
+// none waits, or when the last read failed: the Machines page reports that.
 export function PendingEnrolmentsNotice(): React.ReactElement | null {
-  const { data } = useTxeMachines();
-  const count = pendingCount(data);
+  const { data, error } = useTxeMachines({ quiet: true });
+  // SWR keeps the last good list when a refresh fails; a count it can no
+  // longer confirm is not shown.
+  const count = error ? 0 : pendingCount(data);
   if (count === 0) return null;
   return (
     <Alert data-testid="txe-pending-enrolments">

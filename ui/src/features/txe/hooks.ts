@@ -70,11 +70,14 @@ export function useTxeEnrolmentApi(): TxeEnrolmentApi {
 }
 
 // useTxeMachines lists the machines the hub lets the caller see, with the
-// pending enrolment applications counted for a person of their owner.
-export function useTxeMachines() {
+// pending enrolment applications counted for a person of their owner. A
+// quiet read keeps a failure to itself instead of the dashboard's global
+// error notice: its caller shows nothing rather than an error.
+export function useTxeMachines({ quiet = false }: { quiet?: boolean } = {}) {
   const api = useTxeEnrolmentApi();
   return useSWR(['txe', 'machines'], () => api.listMachines(), {
     refreshInterval: MACHINES_REFRESH_MS,
+    ...(quiet ? { onError: () => undefined } : {}),
   });
 }
 
