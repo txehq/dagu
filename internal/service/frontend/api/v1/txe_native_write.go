@@ -5,8 +5,14 @@ package api
 
 import (
 	"context"
+	"net/http"
+	"path/filepath"
+	"strings"
 
+	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
@@ -39,9 +45,16 @@ import (
 // store itself, so deciding by name before the write cannot be raced into
 // writing another owner's DAG.
 
-// txeNativeWrite decides a native write to the DAGs named names, after the
-// hub's own check legacy for the callers it governs.
-func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, names ...string) error {
+// txeNativeWrite decides a native write to the DAGs named names, whose
+// definition, when the write supplies one, is spec, after the hub's own check
+// legacy for the callers it governs.
+//
+// It decides what the DAG store and the spec loader will use, not the
+// request's strings: each name as the store resolves it (txeCanonicalDAGName),
+// every name the spec declares (the first document's and each local DAG's),
+// and every machine the spec runs on (worker_selector txe.machine). A
+// machine's own DAG runs only on that machine.
+func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []byte, names ...string) error {
 	if a.txeAuth == nil {
 		return legacy()
 	}
@@ -64,28 +77,162 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, names ...
 			return nil
 		}
 	}
-	seen := map[string]bool{}
+
+	files := map[string]bool{}
 	for _, name := range names {
-		if name == "" || seen[name] {
-			continue
+		if name != "" {
+			files[txeCanonicalDAGName(name)] = true
 		}
-		seen[name] = true
+	}
+	decide := map[string]bool{}
+	for name := range files {
+		decide[name] = true
+	}
+	var placements []txePlacement
+	if spec != nil {
+		declared, err := a.txeSpecPlacements(ctx, spec)
+		if err != nil {
+			if refused := a.txeNativeWriteUnverified(ctx, c, err); refused != nil {
+				return refused
+			}
+		}
+		for _, p := range declared {
+			// A DAG that declares no name takes the file's, decided above.
+			if strings.TrimSpace(p.name) != "" {
+				decide[txeCanonicalDAGName(p.name)] = true
+			}
+		}
+		placements = declared
+	}
+	for name := range decide {
 		if err := a.txeNativeWriteName(ctx, c, name); err != nil {
 			return err
 		}
 	}
+
+	// Where it runs. Every machine it is sent to needs author on that
+	// machine; a machine's own DAG is sent only to that machine.
+	targets := map[string]bool{}
+	for _, p := range placements {
+		if p.machine != "" {
+			targets[p.machine] = true
+		}
+	}
+	for machine := range targets {
+		if err := a.txeNativeWriteName(ctx, c, txeauth.MachineDAGs(machine)[0]); err != nil {
+			return err
+		}
+	}
+	if spec != nil {
+		for name := range files {
+			own, ok := txeauth.MachineOfDAG(name)
+			if !ok {
+				continue
+			}
+			for _, p := range placements {
+				if p.machine != own {
+					return a.txeNativeWriteMisplaced(ctx, c, name)
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// txePlacement is one DAG a spec defines: its declared name and the machine
+// its worker selector sends it to, if any.
+type txePlacement struct {
+	name, machine string
+}
+
+// txeSpecPlacements reads a spec as the loader reads it, with no name
+// imposed and nothing evaluated: every DAG it defines (the first document
+// and each local DAG), by its declared name and the machine it is sent to.
+// A spec that does not load, or whose worker selector is computed, cannot
+// be verified.
+func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacement, error) {
+	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if dag == nil {
+		return nil, errTxeSpecUnverified
+	}
+	dags := []*ir.DAG{dag}
+	for _, local := range dag.LocalDAGs {
+		dags = append(dags, local)
+	}
+	out := make([]txePlacement, 0, len(dags))
+	for _, d := range dags {
+		p := txePlacement{name: d.Name}
+		for k, v := range d.WorkerSelector {
+			if strings.ContainsAny(k+v, "$`") {
+				return nil, errTxeSpecUnverified
+			}
+			if k == txeMachineLabel {
+				p.machine = v
+			}
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// txeMachineLabel is the worker label that pins a DAG to a machine.
+const txeMachineLabel = "txe.machine"
+
+var errTxeSpecUnverified = &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
+	Message: "the spec could not be verified: it does not load, or its worker selector is computed",
+	Details: map[string]any{"code": "spec_unverified"}}
+
+// txeNativeWriteUnverified decides a write whose spec could not be read for
+// its names and placement: logged and let through in observe for a caller
+// the mode governs, refused otherwise.
+func (a *API) txeNativeWriteUnverified(ctx context.Context, c txeCall, cause error) error {
+	if c.mode == authz.ModeObserve && !c.ownerOnly() {
+		a.txeLogDecision(ctx, c, authz.PermissionAuthor, authz.Resource{}, authz.Decision{
+			Allowed: true, Mode: c.mode, Evaluated: true, WouldDeny: true, Reason: authz.ReasonInvalid})
+		return nil
+	}
+	if apiErr, ok := cause.(*Error); ok && apiErr == errTxeSpecUnverified {
+		return apiErr
+	}
+	return errTxeSpecUnverified
+}
+
+// txeNativeWriteMisplaced refuses a machine's DAG that would run elsewhere
+// than on its machine, as txeNativeWriteRefused refuses.
+func (a *API) txeNativeWriteMisplaced(ctx context.Context, c txeCall, name string) error {
+	return a.txeNativeWriteRefused(ctx, c, name)
+}
+
+// txeCanonicalDAGName is the DAG a name resolves to in the DAG store: its
+// base name, without a .yaml or .yml extension. An owner's DAG name is folded
+// to its canonical case, since a case-insensitive filesystem stores the
+// variants as one file: a near-collision of an owned name is that name.
+func txeCanonicalDAGName(name string) string {
+	base := filepath.Base(name)
+	if ext := filepath.Ext(base); strings.EqualFold(ext, ".yaml") || strings.EqualFold(ext, ".yml") {
+		base = strings.TrimSuffix(base, ext)
+	}
+	lower := strings.ToLower(base)
+	for _, prefix := range append([]string{string(registry.PrefixJob) + "_"}, txeauth.MachineDAGPrefixes()...) {
+		if strings.HasPrefix(lower, prefix) {
+			return prefix + strings.ToUpper(base[len(prefix):])
+		}
+	}
+	return base
 }
 
 // txeNativeWriteClosed is txeNativeWrite for a write that stays closed to a
 // caller held to its owner: an inline or edited run, or a DAG's settings.
 // Only creating, changing, renaming and deleting a machine's DAG are opened
 // to such a caller.
-func (a *API) txeNativeWriteClosed(ctx context.Context, legacy func() error, names ...string) error {
+func (a *API) txeNativeWriteClosed(ctx context.Context, legacy func() error, spec []byte, names ...string) error {
 	if a.txeNativeOwnerOnly(ctx) {
 		return errTxeForbidden
 	}
-	return a.txeNativeWrite(ctx, legacy, names...)
+	return a.txeNativeWrite(ctx, legacy, spec, names...)
 }
 
 // requireDAGWritesEnabled is the hub's own switch on DAG writes, apart from

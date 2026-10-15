@@ -151,7 +151,7 @@ func (a *API) ValidateDAGProfileUpdate(ctx context.Context, fileName, profileNam
 	}
 	// A DAG's settings change how it runs: they are decided as a write to
 	// it, after the hub's own role check.
-	if err := a.txeNativeWriteClosed(ctx, func() error { return a.requireManagerOrAbove(ctx) }, fileName); err != nil {
+	if err := a.txeNativeWriteClosed(ctx, func() error { return a.requireManagerOrAbove(ctx) }, nil, fileName); err != nil {
 		return "", err
 	}
 	if _, err := a.getDAGForSettings(ctx, fileName); err != nil {

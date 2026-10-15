@@ -247,7 +247,7 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 	// An inline spec runs a definition that is not stored: it is decided
 	// as a write to the DAG it runs as.
 	if err := a.txeNativeWriteClosed(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, runtimeWorkspaceName(dag, labels)) },
-		dag.Name); err != nil {
+		[]byte(request.Body.Spec), dag.Name); err != nil {
 		return nil, err
 	}
 
@@ -370,7 +370,7 @@ func (a *API) EnqueueDAGRunFromSpec(ctx context.Context, request api.EnqueueDAGR
 	// An inline spec runs a definition that is not stored: it is decided
 	// as a write to the DAG it runs as.
 	if err := a.txeNativeWriteClosed(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, runtimeWorkspaceName(dag, labels)) },
-		dag.Name); err != nil {
+		[]byte(request.Body.Spec), dag.Name); err != nil {
 		return nil, err
 	}
 

@@ -14,6 +14,9 @@ import (
 // machine's id without its prefix.
 var machineDAGPrefixes = []string{"txe-reviewer-", "txe-decide-", "txe-reconcile-"}
 
+// MachineDAGPrefixes returns the prefixes of per-machine DAG names.
+func MachineDAGPrefixes() []string { return append([]string(nil), machineDAGPrefixes...) }
+
 // MachineDAGs returns the names of a machine's per-machine DAGs.
 func MachineDAGs(machineID string) []string {
 	rest := strings.TrimPrefix(machineID, string(registry.PrefixMachine)+"_")

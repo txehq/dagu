@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -15,6 +16,11 @@ import (
 )
 
 const writeSpec = "steps:\n  - name: s\n    run: echo s\n"
+
+// pinned is writeSpec pinned to a machine, as a machine's own DAG must be.
+func pinned(machine string) string {
+	return "worker_selector:\n  txe.machine: " + machine + "\n" + writeSpec
+}
 
 // writeWorld is two owners with a machine DAG of A's and an ownerless DAG
 // on file, in one mode.
@@ -29,7 +35,7 @@ func newWriteWorld(t *testing.T, mode string) writeWorld {
 	ww := writeWorld{twoOwners: w, reviewerA: "txe-reviewer-" + w.machineA[len("mch_"):],
 		reviewerB: "txe-reviewer-" + w.machineB[len("mch_"):], plain: "nightly-backup"}
 	ctx := context.Background()
-	require.NoError(t, w.api.dagRepository.Create(ctx, ww.reviewerA, []byte(writeSpec)))
+	require.NoError(t, w.api.dagRepository.Create(ctx, ww.reviewerA, []byte(pinned(w.machineA))))
 	require.NoError(t, w.api.dagRepository.Create(ctx, ww.plain, []byte(writeSpec)))
 	w.api.authService = noWebhooks{}
 	return ww
@@ -42,7 +48,15 @@ type noWebhooks struct{ AuthService }
 func (noWebhooks) HasWebhookStore() bool { return false }
 
 func (w writeWorld) update(ctx context.Context, name string) int {
-	_, err := w.api.UpdateDAGSpec(ctx, apigen.UpdateDAGSpecRequestObject{FileName: name, Body: &apigen.UpdateDAGSpecJSONRequestBody{Spec: writeSpec}})
+	spec := writeSpec
+	if name == w.reviewerA {
+		spec = pinned(w.machineA)
+	}
+	return w.updateWith(ctx, name, spec)
+}
+
+func (w writeWorld) updateWith(ctx context.Context, name, spec string) int {
+	_, err := w.api.UpdateDAGSpec(ctx, apigen.UpdateDAGSpecRequestObject{FileName: name, Body: &apigen.UpdateDAGSpecJSONRequestBody{Spec: spec}})
 	return statusOf(err)
 }
 
@@ -84,7 +98,7 @@ func TestTxeNativeWritesOwnerHeldCallers(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, w.update(personA, w.plain), "the platform's")
 
 			// Create and rename are decided at both ends.
-			require.Equal(t, http.StatusNotFound, w.create(personA, w.reviewerB, writeSpec), "another owner's machine name")
+			require.Equal(t, http.StatusNotFound, w.create(personA, w.reviewerB, pinned(w.machineB)), "another owner's machine name")
 			require.Equal(t, http.StatusNotFound, w.create(personA, "anything", writeSpec), "an ownerless name")
 			require.Equal(t, http.StatusNotFound, w.rename(personA, w.reviewerA, "elsewhere"), "to an ownerless name")
 			require.Equal(t, http.StatusForbidden, w.rename(personA, w.reviewerA, w.jobA), "to a job's name")
@@ -147,4 +161,64 @@ func TestTxeInlineSpecRunsAreDecidedAsWrites(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, run(w.legacy, w.reviewerA))
 		}
 	}
+}
+
+// A write is decided on what the store and the loader will use: the name as
+// the store resolves it, every name the spec declares, and every machine it
+// runs on. A machine's own DAG runs only on that machine.
+func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
+	for _, mode := range []string{"", "enforce"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			w := newWriteWorld(t, mode)
+			personA := neutral(w.personA)
+
+			// The store resolves these to the job's and B's machine's files.
+			for _, name := range []string{w.jobA + ".yaml", w.jobA + ".yml", w.jobA + ".YAML", strings.ToLower(w.jobA), "JOB_" + w.jobA[len("job_"):]} {
+				require.Contains(t, []int{http.StatusForbidden, http.StatusNotFound}, w.create(personA, name, writeSpec), name)
+			}
+			// Refused, whether by the name check or by the owner decision.
+			require.NotEqual(t, wrote, w.create(personA, strings.ToUpper(w.reviewerB)+".yml", pinned(w.machineB)))
+			require.NotEqual(t, wrote, w.create(personA, w.reviewerB+".yml", pinned(w.machineB)))
+
+			// The first document's declared name is the stored DAG's name
+			// at load time: on A's own machine DAG, an otherwise permitted
+			// file, declaring B's job is refused.
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, "name: "+w.jobB+"\n"+pinned(w.machineA)))
+			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, "name: "+w.jobA+"\n"+pinned(w.machineA)))
+
+			// A local DAG named another owner's job is that job.
+			child := pinned(w.machineA) + "---\nname: " + w.jobB + "\n" + pinned(w.machineA)
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, child))
+
+			// Where it runs: unpinned, pinned elsewhere, or computed, a
+			// machine's DAG is refused; pinned to its machine it is written.
+			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, writeSpec), "unpinned")
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, pinned(w.machineB)), "on B's machine")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, "worker_selector:\n  txe.machine: ${M}\n"+writeSpec), "computed")
+			// A local DAG of no owner is not A's to declare.
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, pinned(w.machineA)+"---\nname: helper\n"+writeSpec), "a local DAG of no owner")
+			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, pinned(w.machineA)))
+
+			// A spec that does not load cannot be verified.
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, "steps: [unclosed\n"))
+
+			// Renaming a file to a machine's name moves its definition there:
+			// an unpinned one is refused.
+			require.Equal(t, http.StatusNotFound, w.rename(personA, w.reviewerA, w.reviewerB))
+		})
+	}
+	// An ownerless DAG sent to an owner's machine is that machine's to allow:
+	// in enforce, the administrator does not write one.
+	w := newWriteWorld(t, "enforce")
+	require.Equal(t, http.StatusForbidden, w.updateWith(w.admin, w.plain, pinned(w.machineA)))
+	// An ownerless file declaring a job's name is that job, which no one
+	// writes natively; nor does a create or rename reach one through a
+	// file name the store resolves to it.
+	require.Equal(t, http.StatusForbidden, w.updateWith(w.admin, w.plain, "name: "+w.jobA+"\n"+writeSpec))
+	require.Equal(t, http.StatusForbidden, w.create(w.admin, w.jobB+".yaml", writeSpec))
+	require.Equal(t, http.StatusForbidden, w.rename(w.admin, w.plain, w.jobB+".yml"))
+	require.Equal(t, wrote, w.updateWith(w.admin, w.plain, writeSpec))
+	// In off a legacy key writes as before, wherever it sends it.
+	off := newWriteWorld(t, "")
+	require.Equal(t, wrote, off.updateWith(off.legacy, off.plain, pinned(off.machineA)))
 }
