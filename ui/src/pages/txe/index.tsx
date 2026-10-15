@@ -12,6 +12,7 @@ import { I18nText } from '@/i18n/I18nText';
 import { DecisionPanel } from '@/features/txe/components/DecisionPanel';
 import { InboxItemCard } from '@/features/txe/components/InboxItemCard';
 import { DecisionAuthNotice } from '@/features/txe/components/DecisionAuthNotice';
+import { PendingEnrolmentsNotice } from '@/features/txe/components/PendingEnrolmentsNotice';
 import {
   useInboxData,
   usePersonDecisions,
@@ -64,6 +65,7 @@ export default function TxeInboxPage(): React.ReactElement {
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4">
       {!personDecisions && <DecisionAuthNotice />}
+      {isTxePerson(identity) && <PendingEnrolmentsNotice />}
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">
           <I18nText text="Job inbox" />

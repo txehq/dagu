@@ -14,6 +14,8 @@ import { sameRetryStates } from './retry';
 import type { Decision, Proposal, TxeJob } from './types';
 
 const REFRESH_MS = 10_000;
+// A machine re-applies at most once a minute while it waits for approval.
+const MACHINES_REFRESH_MS = 15_000;
 
 export const TxeApiContext = React.createContext<TxeApi | null>(null);
 
@@ -64,6 +66,29 @@ export function useTxeEnrolmentApi(): TxeEnrolmentApi {
   return React.useMemo(
     () => injected ?? createTxeEnrolmentApi(client),
     [injected, client]
+  );
+}
+
+// useTxeMachines lists the machines the hub lets the caller see, with the
+// pending enrolment applications counted for a person of their owner. A
+// quiet read keeps a failure to itself instead of the dashboard's global
+// error notice: its caller shows nothing rather than an error.
+export function useTxeMachines({ quiet = false }: { quiet?: boolean } = {}) {
+  const api = useTxeEnrolmentApi();
+  return useSWR(['txe', 'machines'], () => api.listMachines(), {
+    refreshInterval: MACHINES_REFRESH_MS,
+    ...(quiet ? { onError: () => undefined } : {}),
+  });
+}
+
+// pendingCount is how many applications wait on the machines that report a
+// count; a machine without one (the caller may not approve) adds nothing.
+export function pendingCount(
+  machines: { pending_applications?: number }[] | undefined
+): number {
+  return (machines ?? []).reduce(
+    (sum, m) => sum + Math.max(0, m.pending_applications ?? 0),
+    0
   );
 }
 

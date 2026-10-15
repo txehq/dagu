@@ -69,6 +69,7 @@ function enrolmentApi(
   overrides: Partial<TxeEnrolmentApi> = {}
 ): TxeEnrolmentApi {
   return {
+    listMachines: vi.fn(async () => []),
     getMachine: vi.fn(async () => ({
       schema: 1,
       machine_id: MACHINE,

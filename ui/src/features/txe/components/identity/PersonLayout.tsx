@@ -30,6 +30,9 @@ export function PersonLayout({
         <Link to="/txe" className="text-sm hover:underline">
           <I18nText text="Job inbox" />
         </Link>
+        <Link to="/txe/machines" className="text-sm hover:underline">
+          <I18nText text="Machines" />
+        </Link>
         <div className="ml-auto flex items-center gap-2">
           <LanguageSelector variant="sidebar" compact />
           <div className="w-40">

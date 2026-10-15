@@ -12,6 +12,7 @@ import type { Client } from 'openapi-fetch';
 import { TxeApiError } from './api';
 
 export type Machine = components['schemas']['TxeMachine'];
+export type MachineSummary = components['schemas']['TxeMachineSummary'];
 export type EnrolmentApplication =
   components['schemas']['TxeEnrolmentApplication'];
 export type Enrolment = components['schemas']['TxeEnrolment'];
@@ -47,6 +48,9 @@ function refusal(response: Response, error: unknown): TxeRefusal {
 // machine's owner approves one application and may revoke an enrolment.
 // The hub decides who may do each; this module only calls it.
 export interface TxeEnrolmentApi {
+  // listMachines returns the machines the hub lets the caller see. Only for
+  // a person of the machine's owner does it count pending applications.
+  listMachines(): Promise<MachineSummary[]>;
   getMachine(machineId: string): Promise<Machine>;
   listApplications(machineId: string): Promise<EnrolmentApplication[]>;
   // enrol approves the application with exactly the identity that was read
@@ -62,6 +66,11 @@ export interface TxeEnrolmentApi {
 
 export function createTxeEnrolmentApi(client: Client<paths>): TxeEnrolmentApi {
   return {
+    async listMachines() {
+      const res = await client.GET('/txe/machines');
+      if (!res.data) throw refusal(res.response, res.error);
+      return res.data.machines;
+    },
     async getMachine(machineId) {
       const res = await client.GET('/txe/machines/{machineId}', {
         params: { path: { machineId } },
