@@ -95,13 +95,23 @@ func txeTokenRoute(mountedAPIPath string) func(r *http.Request) bool {
 }
 
 // txeCanonicalPath reports whether a request's path reads the same to these
-// checks as to the router, which routes on the path as sent: no encoded
-// slash, dot or backslash, and no dot or empty segment. Any other path is
-// refused to a caller held to its owner, rather than decided on a reading the
-// router does not share.
+// checks as to the router and the handlers behind it. The router splits the
+// path as sent on "/" and resolves nothing; these checks split the decoded
+// path; the generated handlers decode each path parameter once more. All of
+// them agree, segment for segment, exactly when neither the path as sent nor
+// the decoded path carries an escaped "/" (which would join segments), "."
+// (which would make a dot segment only one of them sees), "\" or "%" (which a
+// further decoding would turn into any of those), and when the decoded path
+// has no dot or empty segment. Escapes are matched in either case. Any other
+// path is refused to a caller held to its owner, rather than decided on a
+// reading the router or a handler does not share.
 func txeCanonicalPath(r *http.Request) bool {
-	if raw := strings.ToLower(r.URL.RawPath); strings.Contains(raw, "%2f") || strings.Contains(raw, "%2e") || strings.Contains(raw, "%5c") {
-		return false
+	for _, form := range []string{strings.ToLower(r.URL.RawPath), strings.ToLower(r.URL.Path)} {
+		for _, escape := range []string{"%2f", "%2e", "%5c", "%25"} {
+			if strings.Contains(form, escape) {
+				return false
+			}
+		}
 	}
 	for i, segment := range strings.Split(r.URL.Path, "/") {
 		last := i == strings.Count(r.URL.Path, "/")

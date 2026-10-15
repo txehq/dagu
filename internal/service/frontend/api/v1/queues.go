@@ -315,6 +315,25 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	// One budget shared by every queue counted in this request.
 	budget := newScanBudget(queuedCountRequestScanCap)
 	ownerOnly := a.txeNativeOwnerOnly(ctx)
+	// setQueuedCount records a queue's count. A queue already listed (from
+	// configuration, or for a running run the caller may see) always takes
+	// its count. A queue not yet listed is added when the scan shows it
+	// holds something; to a caller held to its owner, only when it holds a
+	// run that caller may see, since a queue is named for its DAG.
+	setQueuedCount := func(name string, count int, capped, listEmpty bool) {
+		queue, listed := queueMap[name]
+		if !listed {
+			if ownerOnly && count == 0 {
+				return
+			}
+			if !ownerOnly && count == 0 && !capped && !listEmpty {
+				return
+			}
+			queue = getOrCreateQueue(queueMap, name, a.config)
+		}
+		queue.queuedCount = count
+		queue.queuedCountCapped = capped
+	}
 
 	if onlyQueue != "" {
 		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
@@ -326,14 +345,8 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			}
 		}
 		// A capped scan proves entries exist even when none seen so far were
-		// visible, so the queue must still surface rather than read as absent;
-		// except to a caller held to its owner, who learns nothing of a queue
-		// that holds none of its runs.
-		if count > 0 || (capped && !ownerOnly) {
-			queue := getOrCreateQueue(queueMap, onlyQueue, a.config)
-			queue.queuedCount = count
-			queue.queuedCountCapped = capped
-		}
+		// visible, so the queue must still surface rather than read as absent.
+		setQueuedCount(onlyQueue, count, capped, false)
 	} else {
 		queueNames, err := a.queueStore.QueueList(ctx)
 		if err != nil {
@@ -351,14 +364,20 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 					tag.Error(err))
 				continue
 			}
-			if ownerOnly && count == 0 {
-				// A queue is named for its DAG: one that holds none of
-				// this caller's runs is not named to it.
-				continue
+			setQueuedCount(queueName, count, capped, true)
+		}
+	}
+
+	if ownerOnly {
+		// Whether a scan of a shared queue was capped says how much of it
+		// is other owners'. To a caller held to its owner, a shared queue's
+		// count is always a lower bound: the flag is the same whatever the
+		// queue holds, and it keeps the queued items, which list only the
+		// caller's own runs, within reach.
+		for _, queue := range queueMap {
+			if queue.queueType == "global" {
+				queue.queuedCountCapped = true
 			}
-			queue := getOrCreateQueue(queueMap, queueName, a.config)
-			queue.queuedCount = count
-			queue.queuedCountCapped = capped
 		}
 	}
 

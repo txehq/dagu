@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
@@ -53,17 +54,34 @@ func routedThroughGate(t *testing.T, w *twoOwners, ctx context.Context, rawURL s
 // its owner, before any handler.
 func TestTxeGateRefusesPathsTheRouterReadsDifferently(t *testing.T) {
 	w := newTwoOwners(t, "")
+	// Browser sign-in only: no provider tokens are configured, and persons
+	// are held to the gate all the same.
+	require.Empty(t, w.api.config.TXE.Authn.Issuer)
 	w.addRun(w.jobA, "run-1", "production")
 	gateRefused := func(rec *httptest.ResponseRecorder) bool {
 		return rec.Code == http.StatusForbidden && strings.Contains(rec.Body.String(), "not open to identity provider sign-ins")
 	}
 	for _, raw := range []string{
+		// Encoded dots, in either case and mixed.
 		"/api/v1/users/%2E%2E/dags/" + w.jobA,
 		"/api/v1/workers/%2e%2e/dags/" + w.jobA,
-		"/api/v1/workers%2F..%2Fdags%2F" + w.jobA,
+		"/api/v1/workers/%2e%2E/dags/" + w.jobA,
 		"/api/v1/users/%2E%2E/txe/jobs",
 		"/api/v1/users/%2E%2E/auth/me",
+		// Encoded slashes, in either case.
+		"/api/v1/workers%2F..%2Fdags%2F" + w.jobA,
+		"/api/v1/workers%2f..%2fdags%2f" + w.jobA,
+		"/api/v1/dags/" + w.jobA + "%2fdag-runs",
+		// Double and triple encoding, which a handler's own decoding of a
+		// path parameter would turn into a slash or a dot.
+		"/api/v1/users/%252E%252E/dags/" + w.jobA,
+		"/api/v1/dags/x%252F..%252F" + w.jobA,
+		"/api/v1/dags/x%252f..%252f" + w.jobA,
+		"/api/v1/dags/" + w.jobA + "%25252E",
+		// Repeated slashes and dot segments as sent.
 		"/api/v1/dags//" + w.jobA,
+		"/api/v1//dags/" + w.jobA,
+		"/api/v1/dags///" + w.jobA,
 		"/api/v1/dags/./" + w.jobA,
 		"/api/v1/users/../dags/" + w.jobA,
 	} {
@@ -78,7 +96,8 @@ func TestTxeGateRefusesPathsTheRouterReadsDifferently(t *testing.T) {
 
 	// A provider token is admitted on exactly the same reading.
 	onRoute := txeTokenRoute("/api/v1")
-	for _, raw := range []string{"/api/v1/users/%2E%2E/dags/x", "/api/v1/users/%2E%2E/txe/jobs", "/api/v1/dags//x", "/api/v1/txe/../users"} {
+	for _, raw := range []string{"/api/v1/users/%2E%2E/dags/x", "/api/v1/users/%2e%2E/txe/jobs", "/api/v1/dags//x", "/api/v1/txe/../users",
+		"/api/v1/txe%2fjobs", "/api/v1/users/%252e%252e/txe/jobs", "/api/v1//txe/jobs"} {
 		require.False(t, onRoute(httptest.NewRequest(http.MethodGet, raw, nil)), raw)
 	}
 	for _, raw := range []string{"/api/v1/dags/x", "/api/v1/txe/jobs", "/api/v1/dag-runs/x/r/", "/api/v1/queues"} {
@@ -153,4 +172,72 @@ func TestTxeQueuesNameOnlyTheCallersQueues(t *testing.T) {
 	_, err = w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: w.jobB})
 	require.Equal(t, http.StatusNotFound, statusOf(err))
 	require.NotContains(t, names(personA), w.jobB)
+}
+
+// A shared queue from configuration is hub configuration, not an owner's: it
+// is listed to everyone. To a caller held to its owner its count is of that
+// caller's runs only, and it is always a lower bound, so a scan capped by
+// other owners' entries neither shows nor hides anything. The caller's own
+// entry stays within reach.
+func TestTxeSharedQueueCountsOnlyTheCallersRuns(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	w.api.config.Queues = config.Queues{Enabled: true, Config: []config.QueueConfig{{Name: "shared", MaxActiveRuns: 2}}}
+	queued := func(dag, runID string) {
+		w.writeRun(&ir.DAG{Name: dag, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+			s.Status = ir.Queued
+		})
+	}
+	queued(w.jobB, "qb-1")
+	queued(w.jobB, "qb-2")
+	queued(w.jobA, "qa-1")
+	qs := store.NewQueueStore(file.NewCollection(t.TempDir()))
+	ctx := context.Background()
+	// B's entries first, then A's.
+	for _, e := range []struct{ dag, run string }{{w.jobB, "qb-1"}, {w.jobB, "qb-2"}, {w.jobA, "qa-1"}} {
+		require.NoError(t, qs.Enqueue(ctx, "shared", queue.QueuePriorityLow, ir.NewDAGRunRef(e.dag, e.run)))
+	}
+	w.api.queueStore = qs
+	w.api.procRepository = nil
+
+	shared := func(c context.Context) apigen.Queue {
+		resp, err := w.api.GetQueue(c, apigen.GetQueueRequestObject{Name: "shared"})
+		require.NoError(t, err)
+		return apigen.Queue(resp.(apigen.GetQueue200JSONResponse))
+	}
+	personA, personB := neutral(w.personA), neutral(w.personB)
+	// Counted in full: A sees its one entry, B its two, and neither is told
+	// the scan was or was not capped.
+	for _, tc := range []struct {
+		ctx  context.Context
+		want int
+	}{{personA, 1}, {personB, 2}} {
+		q := shared(tc.ctx)
+		require.Equal(t, tc.want, q.QueuedCount)
+		require.NotNil(t, q.QueuedCountCapped)
+		require.True(t, *q.QueuedCountCapped)
+	}
+	require.Equal(t, 3, shared(w.legacy).QueuedCount)
+
+	// Capped before A's entry: A still gets the flag that keeps its items
+	// in reach, and nothing that tells it B has entries.
+	saved := queuedCountScanCap
+	t.Cleanup(func() { queuedCountScanCap = saved })
+	queuedCountScanCap = 1
+	q := shared(personA)
+	require.Zero(t, q.QueuedCount)
+	require.True(t, *q.QueuedCountCapped)
+	resp, err := w.api.ListQueues(personA, apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	var listed []string
+	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
+		listed = append(listed, q.Name)
+		if q.Name == "shared" {
+			require.True(t, *q.QueuedCountCapped)
+		}
+	}
+	require.Contains(t, listed, "shared")
+	require.NotContains(t, listed, w.jobB)
+	// The legacy view is unchanged: the real flag.
+	require.True(t, *shared(w.legacy).QueuedCountCapped)
 }
