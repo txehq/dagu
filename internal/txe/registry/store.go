@@ -230,6 +230,31 @@ func (s *Store) GetMachine(ctx context.Context, id string) (*Machine, error) {
 	return &m, nil
 }
 
+// ListMachines returns every machine, or those of one owner.
+func (s *Store) ListMachines(ctx context.Context, ownerID string) ([]*Machine, error) {
+	var out []*Machine
+	cursor := ""
+	for {
+		page, err := s.col.List(ctx, persis.ListQuery{Prefix: machinesPrefix, Cursor: cursor, Limit: 500})
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range page.Records {
+			var m Machine
+			if err := json.Unmarshal(rec.Data, &m); err != nil {
+				return nil, fmt.Errorf("registry: decode %s: %w", rec.ID, err)
+			}
+			if ownerID == "" || m.OwnerID == ownerID {
+				out = append(out, &m)
+			}
+		}
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
 // createIdentity inserts an identity record. Replaying an identical request
 // returns the stored record; a different record under the same ID is refused,
 // so an ID can never be re-pointed at another owner.

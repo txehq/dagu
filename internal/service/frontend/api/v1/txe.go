@@ -540,6 +540,59 @@ func (a *API) CreateTxeMachine(ctx context.Context, req api.CreateTxeMachineRequ
 	return api.CreateTxeMachine201JSONResponse(out), err
 }
 
+// ListTxeMachines lists the machines the caller may see, each decided by
+// owner view as GetTxeMachine decides one. A machine's own credential sees
+// that machine only. The count of pending enrolment applications is given
+// only to a person of the machine's owner, who may approve them.
+func (a *API) ListTxeMachines(ctx context.Context, _ api.ListTxeMachinesRequestObject) (api.ListTxeMachinesResponseObject, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
+	}
+	caller := txeauth.Classify(ctx)
+	scope, err := a.txeAuth.Scope(ctx, caller)
+	if err != nil {
+		return nil, errTxeAuthzUnavailable
+	}
+	all, err := s.ListMachines(ctx, "")
+	if err != nil {
+		return nil, txeError(err)
+	}
+	now := time.Now()
+	out := []api.TxeMachineSummary{}
+	for _, m := range all {
+		if own := scope.MachineID(); own != "" && m.MachineID != own {
+			continue
+		}
+		machineID := m.MachineID
+		switch ok, err := a.txeAuthorizeRecord(ctx, func(st *authz.Store) (authz.Resource, error) { return st.Machine(ctx, machineID) }); {
+		case err != nil:
+			return nil, err
+		case !ok:
+			continue
+		}
+		item := api.TxeMachineSummary{MachineId: m.MachineID, OwnerId: m.OwnerID, DisplayName: m.DisplayName}
+		switch approver, err := a.txeOwnsMachine(ctx, scope, m.MachineID, true); {
+		case err != nil:
+			return nil, err
+		case approver:
+			applications, err := a.txeAuth.Store().EnrolmentApplications(ctx, m.MachineID)
+			if err != nil {
+				return nil, txeAuthzError(err)
+			}
+			pending := 0
+			for _, application := range applications {
+				if !application.CredentialExpires.IsZero() && now.Before(application.CredentialExpires) {
+					pending++
+				}
+			}
+			item.PendingApplications = &pending
+		}
+		out = append(out, item)
+	}
+	return api.ListTxeMachines200JSONResponse{Machines: out}, nil
+}
+
 func (a *API) GetTxeMachine(ctx context.Context, req api.GetTxeMachineRequestObject) (api.GetTxeMachineResponseObject, error) {
 	s, err := a.txeStore()
 	if err != nil {

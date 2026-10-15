@@ -4166,7 +4166,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List machines
+         * @description The machines the caller may see, decided by owner view (TXE-3415 contract 1): a person or cli token bound to an owner sees that owner's machines; a machine's worker or reviewer token sees its own machine; an unbound caller sees none; the platform administrator sees all. pending_applications is set only for a caller who may approve the machine's enrolment applications.
+         */
+        get: operations["listTxeMachines"];
         put?: never;
         /**
          * Create a machine
@@ -8502,6 +8506,16 @@ export interface components {
             owner_id: string;
             display_name: string;
             created: components["schemas"]["TxeStamp"];
+        };
+        TxeMachineList: {
+            machines: components["schemas"]["TxeMachineSummary"][];
+        };
+        TxeMachineSummary: {
+            machine_id: string;
+            owner_id: string;
+            display_name: string;
+            /** @description Enrolment applications on file whose credential has not expired. Set only for a caller who may approve them (a person of the machine's owner). */
+            pending_applications?: number;
         };
         TxeMachineCreateRequest: {
             machine_id: string;
@@ -23588,6 +23602,53 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTxeMachines: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Machines */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeMachineList"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The owner store could not be read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
