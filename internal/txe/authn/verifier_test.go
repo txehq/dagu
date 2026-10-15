@@ -9,6 +9,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -616,4 +617,56 @@ func TestReasonOf(t *testing.T) {
 	assert.False(t, ProviderUnavailable(refuse(ReasonExpired, "")))
 	assert.False(t, ProviderUnavailable(refuse(ReasonUnknownKey, "")))
 	assert.True(t, ProviderUnavailable(refuse(ReasonKeysUnavailable, "")))
+}
+
+// A token on a key the configured issuer does not publish is refused as an
+// unknown key either way. It is marked as the issuer's only when its
+// unverified "iss" is the configured issuer, so a caller can renew it; a
+// token naming another issuer, or none, or one whose payload cannot be read,
+// is not marked.
+func TestVerifyMarksAnUnpublishedKeyOfTheIssuer(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	claims := accessClaims(f.clock.Now())
+	retired := testRSAKeys()[1]
+
+	marked := func(token string) bool {
+		t.Helper()
+		principal, err := f.verifier.Verify(context.Background(), token)
+		require.Error(t, err)
+		require.Equal(t, Principal{}, principal, "a refusal returns no principal")
+		assert.Equal(t, ReasonUnknownKey, ReasonOf(err))
+		assert.False(t, ProviderUnavailable(err))
+		assert.NotContains(t, err.Error(), token)
+		return UnpublishedKeyOfIssuer(err)
+	}
+
+	assert.True(t, marked(signRS256(t, retired, "retired", claims)), "the issuer's token on a retired key")
+	assert.True(t, marked(signRS256(t, f.key, "k9", claims)), "signed by a published key under an unknown name")
+	for name, iss := range map[string]any{
+		"AnotherIssuer":   "https://issuer.example/realms/other",
+		"IssuerOtherCase": strings.ToUpper(testIssuer),
+		"IssuerNotText":   7,
+		"NoIssuer":        nil,
+	} {
+		assert.False(t, marked(signRS256(t, retired, "retired", with(claims, map[string]any{"iss": iss}))), name)
+	}
+
+	// A payload that cannot be read is never marked.
+	header := strings.Split(signRS256(t, retired, "retired", claims), ".")
+	for name, payload := range map[string]string{
+		"NotBase64":  "!!!",
+		"NotJSON":    b64([]byte("not json")),
+		"TwoObjects": b64([]byte(`{"iss":"` + testIssuer + `"}{}`)),
+		"Array":      b64([]byte(`["` + testIssuer + `"]`)),
+	} {
+		assert.False(t, marked(header[0]+"."+payload+"."+header[2]), name)
+	}
+
+	// The mark belongs to unknown keys only: no other refusal carries it.
+	_, err := f.verifier.Verify(context.Background(), signRS256(t, retired, "k1", claims))
+	require.Equal(t, ReasonSignature, ReasonOf(err))
+	assert.False(t, UnpublishedKeyOfIssuer(err))
+	assert.False(t, UnpublishedKeyOfIssuer(errors.New("other")))
+	assert.False(t, UnpublishedKeyOfIssuer(nil))
 }
