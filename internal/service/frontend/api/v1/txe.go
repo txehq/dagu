@@ -560,6 +560,23 @@ func (a *API) ListTxeMachines(ctx context.Context, _ api.ListTxeMachinesRequestO
 	}
 	now := time.Now()
 	out := []api.TxeMachineSummary{}
+	// The owner's enrolments, by machine and class, read once when a count
+	// is first given: an application already enrolled is not pending.
+	var enrolled map[string]*authz.Enrolment
+	enrolledBy := func() (map[string]*authz.Enrolment, error) {
+		if enrolled != nil {
+			return enrolled, nil
+		}
+		all, err := a.txeAuth.Store().Enrolments(ctx, scope.OwnerID())
+		if err != nil {
+			return nil, err
+		}
+		enrolled = map[string]*authz.Enrolment{}
+		for _, e := range all {
+			enrolled[e.MachineID+"/"+string(e.Class)] = e
+		}
+		return enrolled, nil
+	}
 	for _, m := range all {
 		if own := scope.MachineID(); own != "" && m.MachineID != own {
 			continue
@@ -580,11 +597,23 @@ func (a *API) ListTxeMachines(ctx context.Context, _ api.ListTxeMachinesRequestO
 			if err != nil {
 				return nil, txeAuthzError(err)
 			}
+			enrolments, err := enrolledBy()
+			if err != nil {
+				return nil, txeAuthzError(err)
+			}
 			pending := 0
 			for _, application := range applications {
-				if !application.CredentialExpires.IsZero() && now.Before(application.CredentialExpires) {
-					pending++
+				if application.CredentialExpires.IsZero() || !now.Before(application.CredentialExpires) {
+					continue
 				}
+				// Approved: the machine's enrolment for the class is active
+				// and is this application's credential. A pending or
+				// revoked enrolment approves nothing.
+				if e := enrolments[application.MachineID+"/"+string(application.Class)]; e != nil && e.State == authz.StateActive &&
+					e.Key.Issuer == application.Issuer && e.Key.ClientID == application.ClientID && e.Subject == application.Subject {
+					continue
+				}
+				pending++
 			}
 			item.PendingApplications = &pending
 		}
