@@ -188,7 +188,10 @@ func (f *txeAuthFixture) txeProbeRemote() (*remoteClient, error) {
 	}))
 	root.AddCommand(family)
 	root.SetArgs([]string{"txe", "probe", "--dagu-home", filepath.Dir(f.contexts), "--contexts-dir", f.contexts, "--data-dir", f.data})
-	return remote, root.Execute()
+	// Execute runs before remote is read: the operands of one return are
+	// not evaluated in a specified order.
+	err := root.Execute()
+	return remote, err
 }
 
 // With no sign-in, a hub command sends the API key and asks the hub nothing
