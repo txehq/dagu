@@ -9,6 +9,7 @@ import { useClient } from '@/hooks/api';
 
 import { createTxeAccessApi, type TxeAccessApi } from './access';
 import { createTxeApi, type TxeApi } from './api';
+import { createTxeEnrolmentApi, type TxeEnrolmentApi } from './enrolment';
 import { sameRetryStates } from './retry';
 import type { Decision, Proposal, TxeJob } from './types';
 
@@ -48,6 +49,20 @@ export function useTxeAccessApi(): TxeAccessApi {
   const client = useClient();
   return React.useMemo(
     () => injected ?? createTxeAccessApi(client),
+    [injected, client]
+  );
+}
+
+export const TxeEnrolmentApiContext =
+  React.createContext<TxeEnrolmentApi | null>(null);
+
+// useTxeEnrolmentApi returns the injected enrolment API (tests) or one bound
+// to the configured server.
+export function useTxeEnrolmentApi(): TxeEnrolmentApi {
+  const injected = React.useContext(TxeEnrolmentApiContext);
+  const client = useClient();
+  return React.useMemo(
+    () => injected ?? createTxeEnrolmentApi(client),
     [injected, client]
   );
 }
