@@ -143,6 +143,14 @@ func TestReconcileRefusesWhatDoesNotBelongTogether(t *testing.T) {
 		"a record under the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
 			c.Records = append(c.Records, continuity.Record{Store: "laptop-home", ID: "machine.json.planted", Class: continuity.ClassMachineIdentity})
 		})},
+		"a hub record planted in a machine's inventory": {hub, reseal(machine, func(c *continuity.Inventory) {
+			planted := hub.Records[0]
+			planted.ID += "-planted"
+			c.Records = append(c.Records, planted)
+		})},
+		"a record of a store no part scanned": {hub, reseal(machine, func(c *continuity.Inventory) {
+			c.Records = append(c.Records, continuity.Record{Store: "elsewhere", ID: "x", Class: continuity.ClassMachineIdentity})
+		})},
 		"a machine identity for the other part's root": {machine, reseal(hub, func(c *continuity.Inventory) {
 			c.Machines = map[string]string{"laptop-home": "mch_01M4ZZZZZZZZZZZZZZZZZZZZZZ"}
 		})},

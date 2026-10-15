@@ -96,9 +96,20 @@ func Reconcile(parts ...*Inventory) (*Inventory, error) {
 			}
 			joint.Roots = append(joint.Roots, r)
 		}
+		hasHub := false
+		for _, r := range p.Roots {
+			hasHub = hasHub || r.Area == AreaHubData
+		}
 		for _, r := range p.Records {
-			// A machine home's records are stored under its root label.
-			if _, isRoot := owner[r.Store]; isRoot {
+			// The registry's and the authorization store's records come
+			// from the hub's data directory; a machine home's are stored
+			// under its root label. Nothing else is a record's store.
+			switch {
+			case r.Store == "registry" || r.Store == "authz":
+				if !hasHub {
+					return nil, fmt.Errorf("%w: record %s/%s of %s is a hub record, but that inventory did not scan the hub's data directory", ErrIncompatible, r.Store, r.ID, p.Digest)
+				}
+			default:
 				if err := own(r.Store, "record "+r.Store+"/"+r.ID); err != nil {
 					return nil, err
 				}
