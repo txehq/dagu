@@ -1,14 +1,21 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { components, paths } from '@/api/v1/schema';
+import {
+  TxeAccessResourceKind,
+  type components,
+  type paths,
+} from '@/api/v1/schema';
 import type { Client } from 'openapi-fetch';
 
 import { TxeApiError } from './api';
+import type { JobAccess } from './types';
 
 export type BindingRequest = components['schemas']['TxeBindingRequest'];
 export type Binding = components['schemas']['TxeBinding'];
 export type Owner = components['schemas']['TxeOwner'];
+export type Share = components['schemas']['TxeShare'];
+export type SharePermission = components['schemas']['TxeAccessPermission'];
 
 // The access routes the dashboard uses: a person asks to be bound, and the
 // platform administrator binds, creates owners and revokes. The hub decides
@@ -21,6 +28,14 @@ export interface TxeAccessApi {
   approve(ownerId: string, request: BindingRequest): Promise<Binding>;
   listBindings(ownerId: string): Promise<Binding[]>;
   revoke(ownerId: string, bindingId: string, reason: string): Promise<void>;
+  // Shares the caller's owner granted (and received).
+  listShares(): Promise<{ granted: Share[]; received: Share[] }>;
+  shareJob(
+    jobId: string,
+    granteeOwnerId: string,
+    permissions: SharePermission[]
+  ): Promise<Share>;
+  revokeShare(shareId: string, reason: string): Promise<void>;
 }
 
 type ErrorBody = { message?: string; details?: { code?: string } } | undefined;
@@ -33,6 +48,22 @@ function failure(response: Response, error: unknown): TxeApiError {
       body?.details?.code ??
       `Request failed (${response.status})`
   );
+}
+
+// mayDecide says whether to offer decision controls on a job. Where the hub
+// labels how the caller reaches it, as owner or through a share, the label's
+// approve permission decides. Otherwise (no label, or the platform
+// administrator) the hub role decides, as before. Display only: the hub
+// refuses a decision the caller may not make.
+export function mayDecide(
+  job: { access?: JobAccess } | undefined,
+  roleCanExecute: boolean
+): boolean {
+  const access = job?.access;
+  if (access && access.via !== 'platform_admin') {
+    return access.permissions.includes('approve');
+  }
+  return roleCanExecute;
 }
 
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -110,6 +141,29 @@ export function createTxeAccessApi(client: Client<paths>): TxeAccessApi {
         '/txe/owners/{ownerId}/bindings/{bindingId}/revoke',
         { params: { path: { ownerId, bindingId } }, body: { reason } }
       );
+      if (res.error) throw failure(res.response, res.error);
+    },
+    async listShares() {
+      const res = await client.GET('/txe/shares');
+      if (!res.data) throw failure(res.response, res.error);
+      return res.data;
+    },
+    async shareJob(jobId, granteeOwnerId, permissions) {
+      const res = await client.POST('/txe/shares', {
+        body: {
+          resource: { kind: TxeAccessResourceKind.job, id: jobId },
+          grantee_owner_id: granteeOwnerId,
+          permissions,
+        },
+      });
+      if (!res.data) throw failure(res.response, res.error);
+      return res.data;
+    },
+    async revokeShare(shareId, reason) {
+      const res = await client.POST('/txe/shares/{shareId}/revoke', {
+        params: { path: { shareId } },
+        body: { reason },
+      });
       if (res.error) throw failure(res.response, res.error);
     },
   };

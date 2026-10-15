@@ -19,6 +19,7 @@ import {
 } from '@/features/txe/hooks';
 import { EmptyPrivateInbox } from '@/features/txe/components/identity/EmptyPrivateInbox';
 import { isTxePerson, useTxeIdentity } from '@/features/txe/identity';
+import { mayDecide } from '@/features/txe/access';
 import { buildInbox } from '@/features/txe/inbox';
 
 const CLOCK_TICK_MS = 15_000;
@@ -28,8 +29,9 @@ const CLOCK_TICK_MS = 15_000;
 export default function TxeInboxPage(): React.ReactElement {
   const appBarContext = React.useContext(AppBarContext);
   const personDecisions = usePersonDecisions();
-  // A person may decide only where the hub can tell who they are.
-  const canDecide = useCanExecute() && personDecisions;
+  // A person may decide only where the hub can tell who they are, and only
+  // with approve on the job where the hub labels the caller's access.
+  const roleCanExecute = useCanExecute();
   const api = useTxeApi();
   const { data, error, isLoading, mutate } = useInboxData();
   const { identity } = useTxeIdentity();
@@ -113,7 +115,7 @@ export default function TxeInboxPage(): React.ReactElement {
           {item.proposal && (
             <DecisionPanel
               proposal={item.proposal}
-              canDecide={canDecide}
+              canDecide={personDecisions && mayDecide(item.job, roleCanExecute)}
               onSubmit={async (request) => {
                 const result = await api.decide(
                   item.job.jobId,

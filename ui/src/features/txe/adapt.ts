@@ -213,6 +213,18 @@ export function toJob(
       job.availability.observed_at ?? latestRuns[0]?.finishedAt,
     latestRuns,
     machineId: job.machine_id,
+    access: job.access
+      ? {
+          via: job.access.via,
+          sharedBy: job.access.shared_by
+            ? {
+                ownerId: job.access.shared_by.owner_id,
+                displayName: job.access.shared_by.display_name,
+              }
+            : undefined,
+          permissions: job.access.permissions,
+        }
+      : undefined,
     pendingFollowUps: Object.keys(job.native_resumes ?? {}),
     retirement: job.retirement
       ? {

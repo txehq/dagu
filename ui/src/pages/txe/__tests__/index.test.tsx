@@ -200,3 +200,24 @@ describe('TxeInboxPage for a person with no jobs', () => {
     expect(screen.queryByTestId('txe-inbox-first')).not.toBeInTheDocument();
   });
 });
+
+describe('TxeInboxPage for a shared job', () => {
+  it('says who shared it, and offers no decision without approve', async () => {
+    const { api } = fakeApi([fixtureProposal()]);
+    const shared = fixtureJob({
+      access: {
+        via: 'share',
+        sharedBy: { ownerId: 'own_A', displayName: 'Ada' },
+        permissions: ['view'],
+      },
+    });
+    renderPage({ ...api, listJobs: async () => [shared] });
+
+    expect(await screen.findByTestId('txe-shared-with-you')).toHaveTextContent(
+      'Shared with you by Ada'
+    );
+    expect(
+      screen.getByText('You do not have permission to decide this proposal.')
+    ).toBeInTheDocument();
+  });
+});
