@@ -140,6 +140,8 @@ func TestTXEEnrolWritesTheWorkerCredentialAndApplies(t *testing.T) {
 	assert.Equal(t, f.provider.Subject, application["subject"])
 	assert.Equal(t, txeEnrolTestClient, application["client_id"])
 	assert.NotContains(t, mustJSON(t, out), "refresh", "no token is shown")
+	hubBase := strings.TrimSuffix(f.hub.API(), "/api/v1")
+	assert.Equal(t, hubBase+"/txe/machines/"+txeEnrolTestMachine+"?class=worker&client_id="+txeEnrolTestClient, out["approve_url"])
 
 	assert.Equal(t, "openid offline_access", f.provider.LastAuth().Get("scope"))
 	assert.Equal(t, txeEnrolTestClient, f.provider.LastAuth().Get("client_id"))
@@ -274,6 +276,7 @@ func TestTXEEnrolCustomFileAndUnsavedRotation(t *testing.T) {
 	out, err := f.run("enrol", "--client-id", txeEnrolTestClient, "--credential-file", path)
 	require.NoError(t, err, out)
 	assert.Contains(t, out, "--credential-file '"+path+"' --resume --wait 15m")
+	assert.Contains(t, out, "Approve at "+strings.TrimSuffix(f.hub.API(), "/api/v1")+"/txe/machines/"+txeEnrolTestMachine+"?class=worker&client_id=")
 	_, err = transportauth.ReadMachineCredential(path)
 	require.NoError(t, err)
 

@@ -93,6 +93,9 @@ type txeEnrolView struct {
 	Subject        string               `json:"subject,omitempty"`
 	CredentialFile string               `json:"credential_file"`
 	Application    *txeEnrolApplication `json:"application,omitempty"`
+	// ApproveURL is the hub page where a person of the owner approves the
+	// application.
+	ApproveURL string `json:"approve_url,omitempty"`
 	// State is "applied" (awaiting a person's approval) or "enrolled".
 	State string `json:"state"`
 	// resume is the command that keeps the application live.
@@ -194,7 +197,18 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		}
 		view.Application, view.State = application, "applied"
 	}
+	if view.Application != nil {
+		view.ApproveURL = txeEnrolApproveURL(remote.baseURL, machine.MachineID, clientID)
+	}
 	return txeOutput(ctx, view, func(p *txePrinter) { printEnrol(p, view) })
+}
+
+// txeEnrolApproveURL is the hub page that lists the machine's applications,
+// with this one preselected: the hub's address without its API root.
+func txeEnrolApproveURL(apiBase, machineID, clientID string) string {
+	base := strings.TrimSuffix(strings.TrimRight(apiBase, "/"), "/api/v1")
+	q := url.Values{"class": {string(authn.ClassWorker)}, "client_id": {clientID}}
+	return base + "/txe/machines/" + url.PathEscape(machineID) + "?" + q.Encode()
 }
 
 // txeEnrolPath is the credential file: the flag, made absolute, or the TXE
@@ -489,6 +503,7 @@ func printEnrol(p *txePrinter, v txeEnrolView) {
 		p.f("Applied; the application is live until %s.\n", a.CredentialExpires.Format(time.RFC3339))
 		p.f("A person of owner %s approves it in the hub: class %s, client %s, issuer %s, subject %s.\n",
 			v.OwnerID, a.Class, a.ClientID, a.Issuer, a.Subject)
+		p.f("Approve at %s\n", v.ApproveURL)
 		p.f("Until then, keep it live with: %s\n", v.resume)
 	}
 	p.f("The worker reads it from worker.auth.credential_file: %s (or DAGU_WORKER_AUTH_CREDENTIAL_FILE).\n", v.CredentialFile)
