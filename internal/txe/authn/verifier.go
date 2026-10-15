@@ -85,6 +85,9 @@ type Error struct {
 	Reason Reason
 	detail string
 	cause  error
+	// issuerNamed marks a ReasonUnknownKey refusal of a token whose
+	// unverified "iss" is the configured issuer (UnpublishedKeyOfIssuer).
+	issuerNamed bool
 }
 
 func (e *Error) Error() string {
@@ -106,6 +109,17 @@ func ReasonOf(err error) Reason {
 		return e.Reason
 	}
 	return ""
+}
+
+// UnpublishedKeyOfIssuer reports whether err refuses a token that names the
+// configured issuer and a key the issuer does not publish, even after the
+// keys were fetched again: most likely a token the issuer signed with a key it
+// has since retired. The issuer is read from the token without any check, so
+// this only says which refusal it is, for a caller that may renew such a
+// token. It is never a reason to accept anything.
+func UnpublishedKeyOfIssuer(err error) bool {
+	e, ok := errors.AsType[*Error](err)
+	return ok && e.Reason == ReasonUnknownKey && e.issuerNamed
 }
 
 // ProviderUnavailable reports whether err means the token could not be judged
@@ -226,6 +240,9 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Principal, error) 
 	key, err := v.keys.Key(ctx, header.KeyID)
 	if err != nil {
 		if refused, ok := errors.AsType[*Error](err); ok {
+			if refused.Reason == ReasonUnknownKey && v.namesIssuer(header.payload) {
+				return Principal{}, &Error{Reason: ReasonUnknownKey, detail: refused.detail, issuerNamed: true}
+			}
 			return Principal{}, refused
 		}
 		return Principal{}, &Error{Reason: ReasonKeysUnavailable, detail: "the key source failed", cause: err}
@@ -253,6 +270,19 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Principal, error) 
 	}
 
 	return v.checkClaims(claims, v.now())
+}
+
+// namesIssuer reports whether a token's payload, read without any check of
+// its signature, names the configured issuer. It only sorts one refusal from
+// another (UnpublishedKeyOfIssuer). The issuer is not a secret: the hub
+// publishes it, so a refusal that differs by it tells a caller nothing new.
+func (v *Verifier) namesIssuer(payload string) bool {
+	claims, err := readClaims(payload)
+	if err != nil {
+		return false
+	}
+	issuer, ok := claims["iss"].(string)
+	return ok && issuer == v.issuer
 }
 
 type tokenHeader struct {

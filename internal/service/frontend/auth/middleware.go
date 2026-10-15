@@ -347,12 +347,15 @@ func requireBasicAuth(w http.ResponseWriter, realm string) {
 }
 
 // providerMeantToken reports whether a refused token was one the identity
-// provider issued: it is a signed token of the configured issuer, refused for
-// what it says. A token that is not one at all, or names another issuer, is
-// left to the other methods.
+// provider issued: a signed token of the configured issuer, refused for what
+// it says, or one naming the configured issuer on a key the issuer no longer
+// publishes, so that the caller renews it. A token that is not one at all, or
+// names another issuer, is left to the other methods.
 func providerMeantToken(err error) bool {
 	switch authn.ReasonOf(err) {
-	case authn.ReasonMalformed, authn.ReasonIssuer, authn.ReasonAlgorithm, authn.ReasonUnknownKey:
+	case authn.ReasonUnknownKey:
+		return authn.UnpublishedKeyOfIssuer(err)
+	case authn.ReasonMalformed, authn.ReasonIssuer, authn.ReasonAlgorithm:
 		return false
 	case authn.ReasonSignature, authn.ReasonTokenType, authn.ReasonAudience, authn.ReasonClient, authn.ReasonSubject,
 		authn.ReasonTimes, authn.ReasonLifetime, authn.ReasonNotYetValid, authn.ReasonExpired:
