@@ -389,11 +389,13 @@ func assertNoPlainToken(t *testing.T, name string, data []byte) {
 		assert.NotContains(t, string(data), "eyJ", name)
 		return
 	}
-	if sealed, ok := entry["sealed"].(string); ok {
-		_, err := base64.StdEncoding.DecodeString(sealed)
-		assert.NoError(t, err, "%s: sealed is not base64", name)
-		delete(entry, "sealed")
-	}
+	// Every JSON file here is a sign-in entry, and an entry keeps its
+	// tokens only in "sealed".
+	sealed, ok := entry["sealed"].(string)
+	require.True(t, ok, "%s: an entry without a sealed string", name)
+	_, err := base64.StdEncoding.DecodeString(sealed)
+	assert.NoError(t, err, "%s: sealed is not base64", name)
+	delete(entry, "sealed")
 	rest, err := json.Marshal(entry)
 	require.NoError(t, err)
 	assert.NotContains(t, string(rest), "eyJ", name)
