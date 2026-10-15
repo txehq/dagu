@@ -1,0 +1,265 @@
+// Copyright (C) 2026 TXE
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package continuity
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// KeepFormatV1 is the format of a keep manifest.
+const KeepFormatV1 = "txe.continuity.keep/v1"
+
+// KeepManifest names entries that no TXE writer owns but that are kept
+// exactly as they are: each one is attributed, and pinned by the digest of
+// its whole tree.
+type KeepManifest struct {
+	Format  string      `json:"format"`
+	Entries []KeepEntry `json:"entries"`
+}
+
+// KeepEntry is one kept entry. It applies only where the scan would
+// otherwise block because nothing classifies the entry: it never overrides
+// a classified or excluded area.
+type KeepEntry struct {
+	// Root is the label of the scanned root that holds the entry.
+	Root string `json:"root"`
+	// Path is the entry's slash-separated path under the root.
+	Path string `json:"path"`
+	// Digest pins the entry's tree (TreeDigest). An entry without one
+	// blocks and reports the digest it found, for review.
+	Digest string `json:"digest,omitempty"`
+	// Provenance says who wrote the entry, when and how.
+	Provenance string `json:"provenance"`
+	// Exclude names paths under the entry that are never opened, such as a
+	// key. Only their names and types are pinned.
+	Exclude []string `json:"exclude,omitempty"`
+}
+
+var keepDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// keepCredentialNames are names under which writers keep credentials. A
+// kept entry that holds one must exclude it.
+var keepCredentialNames = map[string]bool{
+	"auth": true, "users": true, "apikeys": true, "webhooks": true, "contexts": true, "remote-nodes": true,
+	"tailscale": true, "license": true, "secrets": true, "oidc_sessions": true, "client": true, "tunnel": true,
+	"encryption_key": true, "kubeconfig": true,
+}
+
+// DecodeKeep reads a keep manifest strictly.
+func DecodeKeep(data []byte) (*KeepManifest, error) {
+	var m KeepManifest
+	if err := strict(data, &m); err != nil {
+		return nil, fmt.Errorf("keep manifest: %w", err)
+	}
+	if m.Format != KeepFormatV1 {
+		return nil, fmt.Errorf("keep manifest: format %q is not %s", m.Format, KeepFormatV1)
+	}
+	seen := map[string]bool{}
+	for i, e := range m.Entries {
+		if e.Root == "" || strings.ContainsAny(e.Root, "/\\") {
+			return nil, fmt.Errorf("keep manifest: entry %d: root %q is not a root label", i, e.Root)
+		}
+		if !cleanRel(e.Path) {
+			return nil, fmt.Errorf("keep manifest: entry %d: path %q is not a clean relative path", i, e.Path)
+		}
+		if strings.TrimSpace(e.Provenance) == "" {
+			return nil, fmt.Errorf("keep manifest: entry %d (%s/%s) has no provenance", i, e.Root, e.Path)
+		}
+		if e.Digest != "" && !keepDigestPattern.MatchString(e.Digest) {
+			return nil, fmt.Errorf("keep manifest: entry %d (%s/%s): digest %q is not sha256:<64 hex>", i, e.Root, e.Path, e.Digest)
+		}
+		key := e.Root + "/" + e.Path
+		if seen[key] {
+			return nil, fmt.Errorf("keep manifest: %s is kept twice", key)
+		}
+		seen[key] = true
+		ex := map[string]bool{}
+		for _, x := range e.Exclude {
+			if !cleanRel(x) || ex[x] {
+				return nil, fmt.Errorf("keep manifest: %s: exclude %q is not a clean relative path, or is repeated", key, x)
+			}
+			ex[x] = true
+		}
+	}
+	return &m, nil
+}
+
+func cleanRel(p string) bool {
+	return p != "" && p != "." && !strings.Contains(p, "\\") && !path.IsAbs(p) && path.Clean(p) == p &&
+		p != ".." && !strings.HasPrefix(p, "../")
+}
+
+// kept takes over an entry the scan cannot classify, when the manifest
+// keeps it. It reports whether it did.
+func (s *scanner) kept(rel string) (bool, error) {
+	e := s.keep[s.root.Label+"/"+rel]
+	if e == nil {
+		return false, nil
+	}
+	s.keepSeen[s.root.Label+"/"+rel] = true
+	id := s.root.Label + "/" + rel
+	digest, refused, err := s.keepTree(rel, e)
+	if err != nil {
+		return true, err
+	}
+	switch {
+	case refused != "":
+		s.issue("kept_credential", "", id, "%s is or holds %s, whose name is where credentials are kept; exclude it in the keep manifest, it was not read", id, path.Join(rel, refused))
+	case e.Digest == "":
+		s.issue("kept_unpinned", "", id, "%s is kept but not pinned; its tree digest is %s, pin it after review", id, digest)
+	case e.Digest != digest:
+		s.issue("kept_changed", "", id, "%s is pinned at %s but its tree digest is now %s", id, e.Digest, digest)
+	default:
+		s.inv.Issues = append(s.inv.Issues, Issue{Code: "kept_unclassified", Severity: SeverityWarn, ID: id,
+			Detail: fmt.Sprintf("%s is no TXE writer's; kept exactly as it is (%s): %s", id, digest, e.Provenance)})
+	}
+	return true, nil
+}
+
+// keepTree inventories every file under a kept entry as immutable, without
+// following links or opening an excluded path, and returns the digest of
+// the tree: each path's type, permission bits, and its content digest or
+// link target. It refuses, without reading it, a credential-named path that
+// the entry does not exclude.
+func (s *scanner) keepTree(rel string, e *KeepEntry) (digest, refused string, err error) {
+	exclude := map[string]bool{}
+	for _, x := range e.Exclude {
+		exclude[x] = true
+	}
+	var lines []string
+	base := filepath.Join(s.root.Path, filepath.FromSlash(rel))
+	err = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+		r, err := filepath.Rel(base, p)
+		if err != nil {
+			return err
+		}
+		r = filepath.ToSlash(r)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		perm := uint32(0)
+		if hasModeBits {
+			perm = uint32(info.Mode().Perm())
+		}
+		kind := "f"
+		switch {
+		case d.IsDir():
+			kind = "d"
+		case d.Type()&fs.ModeSymlink != 0:
+			kind = "l"
+		case !d.Type().IsRegular():
+			kind = "o"
+		}
+		if r != "." && exclude[r] {
+			lines = append(lines, fmt.Sprintf("x\x00%s\x00%s", r, kind))
+			s.exclude(rel+"/"+r, "kept entry; excluded by the keep manifest and not read")
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if keepCredentialNames[d.Name()] {
+			if refused == "" {
+				refused = r
+			}
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		f := File{Root: s.root.Label, Path: path.Join(rel, r), Policy: PolicyImmutable, Mode: perm}
+		switch kind {
+		case "d":
+			lines = append(lines, fmt.Sprintf("d\x00%s\x00%o", r, perm))
+			return nil
+		case "l":
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			f.Link = target
+			lines = append(lines, fmt.Sprintf("l\x00%s\x00%s", r, target))
+		case "o":
+			// A device, socket or pipe is pinned by its name and type and
+			// never opened.
+			lines = append(lines, fmt.Sprintf("o\x00%s", r))
+			return nil
+		default:
+			f.Size, f.SHA256, err = fileDigest(p)
+			if err != nil {
+				return err
+			}
+			lines = append(lines, fmt.Sprintf("f\x00%s\x00%o\x00%s", r, perm, f.SHA256))
+		}
+		s.inv.Files = append(s.inv.Files, f)
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	for x := range exclude {
+		found := false
+		for _, l := range lines {
+			if strings.HasPrefix(l, "x\x00"+x+"\x00") {
+				found = true
+			}
+		}
+		if !found {
+			// A declared exclusion that is not there is part of the tree.
+			lines = append(lines, "x\x00"+x+"\x00absent")
+		}
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return "sha256:" + hex.EncodeToString(sum[:]), refused, nil
+}
+
+// keptMissing blocks for every kept entry of the root that the scan did not
+// find.
+func (s *scanner) keptMissing() {
+	prefix := s.root.Label + "/"
+	var missing []string
+	for key := range s.keep {
+		if strings.HasPrefix(key, prefix) && !s.keepSeen[key] {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	for _, key := range missing {
+		s.issue("kept_missing", "", key, "%s is kept by the keep manifest but is not there, or is now classified", key)
+	}
+}
+
+// keepIndex indexes a manifest's entries by root label and path.
+func keepIndex(m *KeepManifest) (map[string]*KeepEntry, error) {
+	out := map[string]*KeepEntry{}
+	if m == nil {
+		return out, nil
+	}
+	if m.Format != KeepFormatV1 {
+		return nil, errors.New("continuity: the keep manifest was not decoded with DecodeKeep")
+	}
+	for i := range m.Entries {
+		e := &m.Entries[i]
+		out[e.Root+"/"+e.Path] = e
+	}
+	return out, nil
+}
