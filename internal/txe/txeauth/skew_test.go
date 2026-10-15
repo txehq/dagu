@@ -13,11 +13,12 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 )
 
-// The cause of the refusals seen on the K3 and K4 rigs (TXE-4363). A
-// provider stamps iat in whole seconds by its own clock. When that clock is a
-// little ahead of the hub's, a token used at once is stamped a second the hub
-// has not reached yet. With every other claim valid, the hub refuses it as
-// not yet valid.
+// The mechanism suspected behind the refusals seen on the K3 and K4 rigs
+// (TXE-4363); this proves the mechanism, not that it was their cause, which
+// stays unconfirmed. When the provider's clock is a little ahead of the
+// hub's, a token used at once can be stamped with a second the hub has not
+// reached yet. With every other claim valid, the hub without a tolerance
+// refuses it as not yet valid.
 func TestAFreshTokenFromAProviderAheadIsRefusedWithoutIssuedAtTolerance(t *testing.T) {
 	w := newWorld(t)
 	keys := authn.StaticKeys{testKeyID: {Public: &testRSAKey().PublicKey, Algorithm: "RS256"}}

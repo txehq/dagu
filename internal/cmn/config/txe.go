@@ -42,11 +42,11 @@ type TXEAuthnConfig struct {
 	// MaxLifetime caps a token's lifetime. Zero is the verifier's cap.
 	MaxLifetime time.Duration
 	// IssuedAtSkew is how far in the future a token's "iat" and "nbf" may
-	// lie, to absorb a provider clock a little ahead of this one: a provider
-	// stamps iat in whole seconds, so a token used at once can name a second
-	// this clock has not reached. It never applies to "exp", and the
-	// lifetime cap is measured as before. Unset, it is
-	// TXEAuthnDefaultIssuedAtSkew; "0s" turns it off.
+	// lie, to absorb a provider clock a little ahead of this one, which can
+	// make a token used at once name a second this clock has not reached.
+	// It never applies to "exp", and the lifetime cap is measured as
+	// before. Unset, it is TXEAuthnDefaultIssuedAtSkew; "0s" (parsed) turns
+	// it off.
 	IssuedAtSkew time.Duration
 	// CLIClient names the cli client the server advertises to the command
 	// line. Empty means the only cli client, if there is exactly one.
@@ -99,8 +99,8 @@ const (
 	txeAuthnMaxLifetime = 5 * time.Minute
 
 	// TXEAuthnDefaultIssuedAtSkew is the issued-at tolerance when none is
-	// configured: a whole second of the provider's rounding and a second of
-	// drift.
+	// configured: a small, bounded operational tolerance for the provider's
+	// clock running ahead, not a measured requirement.
 	TXEAuthnDefaultIssuedAtSkew = 2 * time.Second
 	// txeAuthnMaxIssuedAtSkew is the largest tolerance that can be
 	// configured; it is the verifier's own bound.
