@@ -163,15 +163,13 @@ func TestTxeQueuesNameOnlyTheCallersQueues(t *testing.T) {
 	personA := neutral(w.personA)
 	require.Equal(t, []string{w.jobA}, names(personA))
 	require.ElementsMatch(t, []string{w.jobA, w.jobB}, names(w.legacy))
-	_, err := w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: w.jobB})
-	require.Equal(t, http.StatusNotFound, statusOf(err))
+	requireNothingTold(t, w, personA, w.jobB)
 
 	// A scan capped before reaching anything of A's.
 	saved := queuedCountScanCap
 	t.Cleanup(func() { queuedCountScanCap = saved })
 	queuedCountScanCap = 1
-	_, err = w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: w.jobB})
-	require.Equal(t, http.StatusNotFound, statusOf(err))
+	requireNothingTold(t, w, personA, w.jobB)
 	require.NotContains(t, names(personA), w.jobB)
 }
 
@@ -337,8 +335,7 @@ func TestTxeCustomQueuesAreTheCallersByItsDAGs(t *testing.T) {
 	got, err := w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: "zz-custom"})
 	require.NoError(t, err)
 	require.Equal(t, 1, apigen.Queue(got.(apigen.GetQueue200JSONResponse)).QueuedCount)
-	_, err = w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: "zz-other"})
-	require.Equal(t, http.StatusNotFound, statusOf(err))
+	requireNothingTold(t, w, personA, "zz-other")
 	// The legacy view is unchanged: every queue.
 	resp, err = w.api.ListQueues(w.legacy, apigen.ListQueuesRequestObject{})
 	require.NoError(t, err)
@@ -398,6 +395,26 @@ func TestTxeRunsQueuedElsewhereStayReachable(t *testing.T) {
 		require.NotEqual(t, "old-queue", q.Name, "not a queue A's DAGs name")
 	}
 
+	// The queue page opens: the caller's own count, a lower bound, so its
+	// items are within reach. Any other name is answered alike: nothing
+	// tells which queues exist or what they hold.
+	answer := func(name string) apigen.Queue {
+		got, err := w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: name})
+		require.NoError(t, err, name)
+		return apigen.Queue(got.(apigen.GetQueue200JSONResponse))
+	}
+	old := answer("old-queue")
+	require.Equal(t, 1, old.QueuedCount)
+	require.True(t, *old.QueuedCountCapped)
+	for _, name := range []string{"no-such-queue", w.jobB} {
+		q := answer(name)
+		require.Zero(t, q.QueuedCount, name)
+		require.True(t, *q.QueuedCountCapped, name)
+		require.Empty(t, q.Running, name)
+	}
+	_, err = w.api.GetQueue(w.legacy, apigen.GetQueueRequestObject{Name: "no-such-queue"})
+	require.Equal(t, http.StatusNotFound, statusOf(err), "the legacy answer is unchanged")
+
 	// The run page shows the run.
 	details, err := w.api.GetDAGRunDetails(personA, apigen.GetDAGRunDetailsRequestObject{Name: w.jobA, DagRunId: "qa-old"})
 	require.NoError(t, err)
@@ -409,7 +426,7 @@ func TestTxeRunsQueuedElsewhereStayReachable(t *testing.T) {
 	queueItemsScanCap = 1
 	var found []string
 	cursor := ""
-	for page := 0; page < 10; page++ {
+	for range 10 {
 		limit := 1
 		params := apigen.ListQueueItemsParams{Limit: &limit}
 		if cursor != "" {
@@ -427,4 +444,17 @@ func TestTxeRunsQueuedElsewhereStayReachable(t *testing.T) {
 		cursor = *out.NextCursor
 	}
 	require.Equal(t, []string{"qa-old"}, found, "only A's own entry, past B's")
+}
+
+// requireNothingTold asserts the answer a caller held to its owner gets for a
+// queue it may not see: its own count of zero, a lower bound, and no runs,
+// the same as for a queue that does not exist.
+func requireNothingTold(t *testing.T, w *twoOwners, ctx context.Context, name string) {
+	t.Helper()
+	resp, err := w.api.GetQueue(ctx, apigen.GetQueueRequestObject{Name: name})
+	require.NoError(t, err, name)
+	q := apigen.Queue(resp.(apigen.GetQueue200JSONResponse))
+	require.Zero(t, q.QueuedCount, name)
+	require.True(t, *q.QueuedCountCapped, name)
+	require.Empty(t, q.Running, name)
 }

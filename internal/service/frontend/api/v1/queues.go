@@ -348,9 +348,6 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	}
 
 	if onlyQueue != "" {
-		if !admitted(onlyQueue) {
-			return queueMap, nil
-		}
 		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
 		if err != nil {
 			return nil, &Error{
@@ -358,6 +355,17 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 				Message:    "Failed to get queue length",
 				HTTPStatus: 500,
 			}
+		}
+		if !admitted(onlyQueue) {
+			// A queue named directly that none of the caller's DAGs names
+			// now may still hold its runs, queued there earlier. It is
+			// answered the same whatever it holds, and whether or not it
+			// exists: the caller's own count, a lower bound, so the
+			// caller's items are within reach and nothing else is told.
+			queue := getOrCreateQueue(queueMap, onlyQueue, a.config)
+			queue.queuedCount = count
+			queue.queuedCountCapped = true
+			return queueMap, nil
 		}
 		// A capped scan proves entries exist even when none seen so far were
 		// visible, so the queue must still surface rather than read as absent.
