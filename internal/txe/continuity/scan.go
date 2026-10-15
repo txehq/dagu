@@ -66,11 +66,23 @@ var hubDataAreas = map[string]string{
 	"wiki":              PolicyMutable,
 	"docs":              PolicyMutable,
 	"workspace-bundles": PolicyMutable,
+	// Collections of the file backend (internal/persis/file/backend.go):
+	// per-DAG settings, the scheduler's watermarks and pause state, and
+	// profiles, whose values are plain and whose secrets are references.
+	"dag-settings": PolicyMutable,
+	"scheduler":    PolicyMutable,
+	"profiles":     PolicyMutable,
 	// Operational state that is rebuilt or consumed.
 	"queue":            PolicyOperational,
 	"proc":             PolicyOperational,
 	"service-registry": PolicyOperational,
 	"tunnel_url":       PolicyOperational,
+	// The upgrade check's cache; the distributed dispatch tasks, leases,
+	// active-run records and worker heartbeats; the agent-session cleanup
+	// queue.
+	"upgrade":                PolicyOperational,
+	"distributed":            PolicyOperational,
+	"agent-session-cleanups": PolicyOperational,
 }
 
 // Areas of the data directory that are never read.
@@ -83,6 +95,8 @@ var hubDataExcluded = map[string]string{
 	"auth":             "holds the encryption key; not read",
 	"tailscale":        "holds tailscale node keys; not read",
 	"license":          "holds license material; not read",
+	"secrets":          "the secret store; not read",
+	"oidc_sessions":    "OIDC session records with their tokens; not read",
 	"dag-run-work":     "per-run scratch working directories; operational, not retained",
 	"tools":            "downloaded tool binaries; reinstalled, not retained data",
 	"materializations": "derived caches; rebuilt",
