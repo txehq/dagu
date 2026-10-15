@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/auth"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 	"github.com/dagucloud/dagu/v2/internal/service/frontend/api/pathutil"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
@@ -243,6 +245,12 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 			// never sent to it.
 			if providerEnabled && bearerToken != "" && !strings.HasPrefix(bearerToken, "dagu_") {
 				principal, err := opts.ProviderTokens.Verify(r.Context(), bearerToken)
+				if err != nil {
+					// The refusal's category only: never the token, its
+					// claims or the identity it names.
+					logger.Debug(r.Context(), "Provider token refused", slog.String("reason", string(authn.ReasonOf(err))),
+						slog.Bool("issuer_named", authn.UnpublishedKeyOfIssuer(err)))
+				}
 				switch {
 				case err == nil:
 					if opts.ProviderTokenRoute == nil || !opts.ProviderTokenRoute(r) {

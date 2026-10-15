@@ -4,11 +4,14 @@
 package auth
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 )
 
@@ -129,5 +133,31 @@ func TestMiddleware_RetiredKeyLeavesHubCredentialsAlone(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, rec.Code, bearer)
 		require.False(t, s.called, bearer)
 		require.NotContains(t, rec.Header().Get("WWW-Authenticate"), "invalid_token", bearer)
+	}
+}
+
+// A refused provider token is logged at debug by its category only: never
+// the token, its claims or the identity it names.
+func TestMiddleware_ProviderRefusalIsLoggedByCategoryOnly(t *testing.T) {
+	opts, sign, claims := retiredKeySetup(t)
+	claims = withClaim(claims, "sub", "subject-that-must-not-be-logged")
+	var buf bytes.Buffer
+	ctx := logger.WithLogger(context.Background(), logger.NewLogger(logger.WithDebug(), logger.WithFormat("json"), logger.WithWriter(&buf)))
+
+	for _, token := range []string{sign("k2", claims), sign("k1", withClaim(claims, "exp", claims["iat"]))} {
+		buf.Reset()
+		h := Middleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("refused tokens reach no handler") }))
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/txe/identity", nil).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+token)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		out := buf.String()
+		require.Contains(t, out, "Provider token refused")
+		require.Contains(t, out, `"reason"`)
+		require.NotContains(t, out, token)
+		for part := range strings.SplitSeq(token, ".") {
+			require.NotContains(t, out, part)
+		}
+		require.NotContains(t, out, "subject-that-must-not-be-logged")
+		require.NotContains(t, out, retiredKeyIssuer)
 	}
 }
