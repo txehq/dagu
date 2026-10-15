@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -22,6 +23,10 @@ import (
 // renderer writes carries. A stored DAG without it is not the renderer's,
 // and the installer leaves it alone.
 const txeReviewRenderedMarker = "# Rendered by `dagu txe review render`; do not edit the installed copy."
+
+// txeReviewRenderedLine matches the marker as a whole line of its own, so the
+// same text inside a description or a script does not count.
+var txeReviewRenderedLine = regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(txeReviewRenderedMarker) + `\r?$`)
 
 var txeReviewInstallMachineFlag = commandLineFlag{name: "machine", usage: "Machine id to install for; must be this machine (default: this machine)"}
 
@@ -264,7 +269,7 @@ func txeReviewAssess(ctx context.Context, hub txeHubDAGs, name, spec string, exp
 		return txeHubCreated, nil
 	case current == spec:
 		return txeHubUnchanged, nil
-	case !strings.Contains(current, txeReviewRenderedMarker):
+	case !txeReviewRenderedLine.MatchString(current):
 		return "", fmt.Errorf("the hub's %s was not written by the reviewer renderer; it is left alone", name)
 	}
 	installed, err := txeReviewSettings(current)

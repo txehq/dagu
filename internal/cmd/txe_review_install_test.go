@@ -117,11 +117,22 @@ func TestTXEReviewInstallKeepsInstalledSettings(t *testing.T) {
 // A stored DAG the renderer did not write is left alone, and the other one
 // of the pair is not written either.
 func TestTXEReviewInstallLeavesForeignDAGs(t *testing.T) {
-	f := newReviewInstallFixture(t)
-	f.hub.specs[f.names.ReviewerName] = "steps:\n  - run: echo mine\n"
-	_, err := f.install(t, f.cfg, nil)
-	require.ErrorContains(t, err, "was not written by the reviewer renderer")
-	assert.Empty(t, f.hub.writesSoFar(), "the decision DAG was not written either")
+	foreign := map[string]string{
+		"no marker": "steps:\n  - run: echo mine\n",
+		// The marker's text as data, not as a line of its own.
+		"marker in a description": "description: \"" + txeReviewRenderedMarker + "\"\nsteps:\n  - run: echo mine\n",
+		"marker in a script":      "steps:\n  - run: |\n      echo '" + txeReviewRenderedMarker + "'\n",
+		"marker indented":         "steps:\n  - run: echo mine\n  " + txeReviewRenderedMarker + "\n",
+	}
+	for name, spec := range foreign {
+		t.Run(name, func(t *testing.T) {
+			f := newReviewInstallFixture(t)
+			f.hub.specs[f.names.ReviewerName] = spec
+			_, err := f.install(t, f.cfg, map[string]bool{"schedule": true, "agent-model": true, "state-dir": true, "agent-config-dir": true, "txe-home": true, "review-command": true})
+			require.ErrorContains(t, err, "was not written by the reviewer renderer")
+			assert.Empty(t, f.hub.writesSoFar(), "the decision DAG was not written either")
+		})
+	}
 }
 
 // When the second write fails, the first stays, the error says so, and the
