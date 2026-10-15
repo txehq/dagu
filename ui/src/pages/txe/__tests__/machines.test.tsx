@@ -13,19 +13,29 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { SWRConfig, useSWRConfig } from 'swr';
 import { describe, expect, it, vi } from 'vitest';
 
+import {
+  TxeEnrolmentApplicationClass,
+  TxeEnrolmentClass,
+  TxeEnrolmentState,
+} from '@/api/v1/schema';
 import { PendingEnrolmentsNotice } from '@/features/txe/components/PendingEnrolmentsNotice';
 import {
+  awaitingApproval,
   TxeRefusal,
+  type Enrolment,
+  type EnrolmentApplication,
   type MachineSummary,
   type TxeEnrolmentApi,
 } from '@/features/txe/enrolment';
-import { pendingCount, TxeEnrolmentApiContext } from '@/features/txe/hooks';
+import { TxeEnrolmentApiContext } from '@/features/txe/hooks';
 
 import TxeMachinesPage from '../machines';
 
 vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
+
+const HOUR = 3_600_000;
 
 function machine(overrides: Partial<MachineSummary> = {}): MachineSummary {
   return {
@@ -36,8 +46,72 @@ function machine(overrides: Partial<MachineSummary> = {}): MachineSummary {
   };
 }
 
-function api(listMachines: TxeEnrolmentApi['listMachines']): TxeEnrolmentApi {
-  return { listMachines } as unknown as TxeEnrolmentApi;
+function application(
+  overrides: Partial<EnrolmentApplication> = {}
+): EnrolmentApplication {
+  return {
+    machine_id: 'mch_ada_laptop',
+    class: TxeEnrolmentApplicationClass.worker,
+    issuer: 'https://idp.example/realms/r',
+    subject: 'sub-ada',
+    client_id: 'dagu-worker',
+    received_at: new Date().toISOString(),
+    credential_expires: new Date(Date.now() + HOUR).toISOString(),
+    ...overrides,
+  };
+}
+
+// The enrolment the hub makes from an application when it is approved.
+function enrolmentOf(
+  a: EnrolmentApplication,
+  state = TxeEnrolmentState.active
+): Enrolment {
+  return {
+    machine_id: a.machine_id,
+    class: TxeEnrolmentClass.worker,
+    owner_id: 'own_ada',
+    issuer: a.issuer,
+    subject: a.subject,
+    client_id: a.client_id,
+    generation: 1,
+    state,
+    enrolled: { at: new Date().toISOString() } as never,
+  };
+}
+
+type Fake = {
+  machines: MachineSummary[] | (() => Promise<MachineSummary[]>);
+  applications?: Record<string, EnrolmentApplication[]>;
+  enrolments?: Record<string, Enrolment[]>;
+  failDetails?: boolean;
+};
+
+type FakeApi = TxeEnrolmentApi & {
+  listApplications: ReturnType<typeof vi.fn>;
+  listEnrolments: ReturnType<typeof vi.fn>;
+};
+
+function api(fake: Fake): FakeApi {
+  const fail = async () => {
+    throw new TxeRefusal(503, 'unavailable', undefined);
+  };
+  return {
+    listMachines: vi.fn(
+      typeof fake.machines === 'function'
+        ? fake.machines
+        : async () => fake.machines as MachineSummary[]
+    ),
+    listApplications: vi.fn(
+      fake.failDetails
+        ? fail
+        : async (id: string) => fake.applications?.[id] ?? []
+    ),
+    listEnrolments: vi.fn(
+      fake.failDetails
+        ? fail
+        : async (id: string) => fake.enrolments?.[id] ?? []
+    ),
+  } as never;
 }
 
 function renderAt(
@@ -65,24 +139,38 @@ function renderAt(
   );
 }
 
-describe('pendingCount', () => {
-  it('adds only the counts the hub reported', () => {
-    expect(pendingCount(undefined)).toBe(0);
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+describe('awaitingApproval', () => {
+  it('leaves out an application already enrolled, and an expired one', () => {
+    const approved = application();
+    const waiting = application({ subject: 'sub-carl' });
+    const expired = application({
+      subject: 'sub-dan',
+      credential_expires: new Date(Date.now() - 1000).toISOString(),
+    });
+
     expect(
-      pendingCount([
-        machine({ pending_applications: 2 }),
-        machine({ pending_applications: 0 }),
-        machine(),
-      ])
-    ).toBe(2);
+      awaitingApproval([approved, waiting, expired], [enrolmentOf(approved)])
+    ).toEqual([waiting]);
+  });
+
+  it('still counts an application whose enrolment is only pending or was revoked', () => {
+    const a = application();
+
+    expect(
+      awaitingApproval([a], [enrolmentOf(a, TxeEnrolmentState.pending)])
+    ).toEqual([a]);
+    expect(
+      awaitingApproval([a], [enrolmentOf(a, TxeEnrolmentState.revoked)])
+    ).toEqual([a]);
   });
 });
 
 describe('the machines page', () => {
-  it('lists each machine the hub returns, with its pending applications', async () => {
-    renderAt(
-      <TxeMachinesPage />,
-      api(async () => [
+  it('says how many applications await approval on each machine', async () => {
+    const fake = api({
+      machines: [
         machine({ pending_applications: 1 }),
         machine({
           machine_id: 'mch_ada_desktop',
@@ -90,36 +178,75 @@ describe('the machines page', () => {
           pending_applications: 0,
         }),
         machine({ machine_id: 'mch_ada_ci', display_name: 'ada-ci' }),
-      ])
-    );
+      ],
+      applications: { mch_ada_laptop: [application()] },
+    });
+    renderAt(<TxeMachinesPage />, fake);
 
     const rows = await screen.findAllByTestId('txe-machine-row');
     expect(rows).toHaveLength(3);
-    expect(within(rows[0]!).getByText('ada-laptop')).toBeInTheDocument();
     expect(
-      within(rows[0]!).getByText('1 pending application')
+      await within(rows[0]!).findByText('1 awaiting approval')
     ).toBeInTheDocument();
-    // A count of 0, or no count at all, is not shown as waiting.
-    expect(within(rows[1]!).queryByText(/pending/)).toBeNull();
-    expect(within(rows[2]!).queryByText(/pending/)).toBeNull();
+    expect(within(rows[1]!).queryByText(/awaiting|on file/)).toBeNull();
+    expect(within(rows[2]!).queryByText(/awaiting|on file/)).toBeNull();
+    // Only the machine with a count is read further.
+    expect(fake.listApplications).toHaveBeenCalledTimes(1);
+    expect(fake.listApplications).toHaveBeenCalledWith('mch_ada_laptop');
   });
 
-  it('counts several pending applications', async () => {
+  // The hub keeps an approved application on file until its credential
+  // expires, and counts it in pending_applications meanwhile.
+  it('says nothing awaits approval when the application was already approved', async () => {
+    const approved = application();
+    const fake = api({
+      machines: [machine({ pending_applications: 1 })],
+      applications: { mch_ada_laptop: [approved] },
+      enrolments: { mch_ada_laptop: [enrolmentOf(approved)] },
+    });
+    renderAt(<TxeMachinesPage />, fake);
+
+    const row = await screen.findByTestId('txe-machine-row');
+    await waitFor(() => expect(fake.listEnrolments).toHaveBeenCalled());
+    await settle();
+    expect(within(row).queryByText(/awaiting|pending|on file/)).toBeNull();
+  });
+
+  it('counts several applications awaiting approval', async () => {
     renderAt(
       <TxeMachinesPage />,
-      api(async () => [machine({ pending_applications: 3 })])
+      api({
+        machines: [machine({ pending_applications: 3 })],
+        applications: {
+          mch_ada_laptop: [
+            application(),
+            application({ subject: 'sub-carl' }),
+            application({ client_id: 'dagu-reviewer' }),
+          ],
+        },
+      })
+    );
+
+    expect(await screen.findByText('3 awaiting approval')).toBeInTheDocument();
+  });
+
+  it('says only how many are on file when they cannot be read', async () => {
+    renderAt(
+      <TxeMachinesPage />,
+      api({
+        machines: [machine({ pending_applications: 2 })],
+        failDetails: true,
+      })
     );
 
     expect(
-      await screen.findByText('3 pending applications')
+      await screen.findByText('2 applications on file')
     ).toBeInTheDocument();
+    expect(screen.queryByText(/awaiting/)).toBeNull();
   });
 
   it('opens the approval page of a machine', async () => {
-    renderAt(
-      <TxeMachinesPage />,
-      api(async () => [machine()])
-    );
+    renderAt(<TxeMachinesPage />, api({ machines: [machine()] }));
 
     fireEvent.click(await screen.findByText('ada-laptop'));
 
@@ -127,27 +254,26 @@ describe('the machines page', () => {
   });
 
   // An unbound person, or one whose owner has no machines, gets none.
-  it('says how to enrol a machine when there is none', async () => {
-    renderAt(
-      <TxeMachinesPage />,
-      api(async () => [])
-    );
+  it('gives the order a machine is registered and enrolled in when there is none', async () => {
+    renderAt(<TxeMachinesPage />, api({ machines: [] }));
 
-    expect(await screen.findByTestId('txe-machines-empty')).toHaveTextContent(
-      'dagu txe enrol'
-    );
+    const empty = await screen.findByTestId('txe-machines-empty');
+    expect(empty).toHaveTextContent('the worker installer has registered it');
+    expect(empty).toHaveTextContent('dagu txe enrol --client-id');
     expect(screen.queryByTestId('txe-machine-row')).toBeNull();
   });
 
   it('says the machines could not be read, and lists none', async () => {
     renderAt(
       <TxeMachinesPage />,
-      api(async () => {
-        throw new TxeRefusal(
-          503,
-          'the owner store could not be read',
-          undefined
-        );
+      api({
+        machines: async () => {
+          throw new TxeRefusal(
+            503,
+            'the owner store could not be read',
+            undefined
+          );
+        },
       })
     );
 
@@ -159,63 +285,121 @@ describe('the machines page', () => {
     expect(screen.queryByTestId('txe-machine-row')).toBeNull();
     expect(screen.queryByTestId('txe-machines-empty')).toBeNull();
   });
+
+  it('still reports a failed read globally', async () => {
+    const onError = vi.fn();
+    renderAt(
+      <TxeMachinesPage />,
+      api({
+        machines: async () => {
+          throw new TxeRefusal(503, 'unavailable', undefined);
+        },
+      }),
+      onError
+    );
+
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+  });
 });
 
 describe('the pending enrolments notice', () => {
-  it('points to the machines when applications wait', async () => {
+  it('points to the machines when applications await approval', async () => {
     renderAt(
       <PendingEnrolmentsNotice />,
-      api(async () => [
-        machine({ pending_applications: 1 }),
-        machine({ machine_id: 'mch_2', pending_applications: 1 }),
-      ])
+      api({
+        machines: [
+          machine({ pending_applications: 1 }),
+          machine({ machine_id: 'mch_2', pending_applications: 1 }),
+        ],
+        applications: {
+          mch_ada_laptop: [application()],
+          mch_2: [application({ machine_id: 'mch_2' })],
+        },
+      })
     );
 
     const notice = await screen.findByTestId('txe-pending-enrolments');
     expect(notice).toHaveTextContent(
-      '2 machine applications are waiting for enrolment approval.'
+      '2 machine enrolment applications are awaiting your approval.'
     );
     fireEvent.click(within(notice).getByText('Review machines'));
     expect(await screen.findByText('machines page')).toBeInTheDocument();
   });
 
-  it('says one machine waits', async () => {
+  it('says one application awaits approval', async () => {
     renderAt(
       <PendingEnrolmentsNotice />,
-      api(async () => [machine({ pending_applications: 1 })])
+      api({
+        machines: [machine({ pending_applications: 1 })],
+        applications: { mch_ada_laptop: [application()] },
+      })
     );
 
     expect(
-      await screen.findByText('A machine is waiting for enrolment approval.')
+      await screen.findByText(
+        'A machine enrolment application is awaiting your approval.'
+      )
     ).toBeInTheDocument();
   });
 
-  it.each([
-    ['no machine', async () => []],
-    ['no count', async () => [machine()]],
-    ['a count of 0', async () => [machine({ pending_applications: 0 })]],
+  // The regression the TXE-4365 report found: an approved application the
+  // hub still counts must not tell the person an approval is waiting.
+  it('says nothing for an application already approved but not yet expired', async () => {
+    const approved = application();
+    const fake = api({
+      machines: [machine({ pending_applications: 1 })],
+      applications: { mch_ada_laptop: [approved] },
+      enrolments: { mch_ada_laptop: [enrolmentOf(approved)] },
+    });
+    renderAt(<PendingEnrolmentsNotice />, fake);
+
+    await waitFor(() => expect(fake.listEnrolments).toHaveBeenCalled());
+    await settle();
+    expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
+  });
+
+  it.each<[string, Fake]>([
+    ['no machine', { machines: [] }],
+    ['no count', { machines: [machine()] }],
+    ['a count of 0', { machines: [machine({ pending_applications: 0 })] }],
     [
-      'a failed read',
-      async () => {
-        throw new TxeRefusal(503, 'unavailable', undefined);
+      'a failed list',
+      {
+        machines: async () => {
+          throw new TxeRefusal(503, 'unavailable', undefined);
+        },
       },
     ],
-  ] as [string, TxeEnrolmentApi['listMachines']][])(
-    'shows nothing with %s',
-    async (_, listMachines) => {
-      renderAt(<PendingEnrolmentsNotice />, api(listMachines));
+    [
+      'failed application reads',
+      { machines: [machine({ pending_applications: 1 })], failDetails: true },
+    ],
+  ])('shows nothing with %s', async (_, fake) => {
+    renderAt(<PendingEnrolmentsNotice />, api(fake));
 
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
-    }
-  );
+    await settle();
+    expect(screen.queryByTestId('txe-pending-enrolments')).toBeNull();
+  });
 
-  // SWR keeps the last good list when a refresh fails.
+  it('asks nothing further for machines without a count', async () => {
+    const fake = api({ machines: [machine(), machine({ machine_id: 'm2' })] });
+    renderAt(<PendingEnrolmentsNotice />, fake);
+
+    await settle();
+    expect(fake.listApplications).not.toHaveBeenCalled();
+    expect(fake.listEnrolments).not.toHaveBeenCalled();
+  });
+
+  // SWR keeps the last good data when a refresh fails.
   it('hides the notice when a refresh fails after a positive count', async () => {
     const listMachines = vi
       .fn()
       .mockResolvedValueOnce([machine({ pending_applications: 1 })])
       .mockRejectedValue(new TxeRefusal(503, 'unavailable', undefined));
+    const fake = api({
+      machines: listMachines,
+      applications: { mch_ada_laptop: [application()] },
+    });
     function Revalidate() {
       const { mutate } = useSWRConfig();
       return (
@@ -229,7 +413,7 @@ describe('the pending enrolments notice', () => {
         <PendingEnrolmentsNotice />
         <Revalidate />
       </>,
-      api(listMachines)
+      fake
     );
 
     expect(
@@ -247,26 +431,14 @@ describe('the pending enrolments notice', () => {
     const onError = vi.fn();
     renderAt(
       <PendingEnrolmentsNotice />,
-      api(async () => {
-        throw new TxeRefusal(503, 'unavailable', undefined);
+      api({
+        machines: [machine({ pending_applications: 1 })],
+        failDetails: true,
       }),
       onError
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await settle();
     expect(onError).not.toHaveBeenCalled();
-  });
-
-  it('still reports a failed read on the machines page', async () => {
-    const onError = vi.fn();
-    renderAt(
-      <TxeMachinesPage />,
-      api(async () => {
-        throw new TxeRefusal(503, 'unavailable', undefined);
-      }),
-      onError
-    );
-
-    await waitFor(() => expect(onError).toHaveBeenCalled());
   });
 });

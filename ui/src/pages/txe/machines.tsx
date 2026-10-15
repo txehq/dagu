@@ -6,8 +6,49 @@ import { Link } from 'react-router-dom';
 
 import { Badge } from '@/components/ui/badge';
 import { RefreshButton } from '@/components/ui/refresh-button';
-import { useTxeMachines } from '@/features/txe/hooks';
+import { useAwaitingApproval, useTxeMachines } from '@/features/txe/hooks';
 import { I18nText } from '@/i18n/I18nText';
+
+// MachineBadge says how many applications await the person's approval. The
+// hub's count also includes an application it already approved, so the badge
+// waits for the applications and enrolments to be read; if that read fails,
+// it says only how many applications are on file.
+function MachineBadge({
+  onFile,
+  awaiting,
+  failed,
+}: {
+  onFile: number;
+  awaiting: number | undefined;
+  failed: boolean;
+}): React.ReactElement | null {
+  if (onFile <= 0) return null;
+  if (failed && awaiting === undefined) {
+    return (
+      <Badge variant="outline" className="ml-auto">
+        <I18nText
+          text={
+            onFile === 1
+              ? '1 application on file'
+              : '{count} applications on file'
+          }
+          values={{ count: String(onFile) }}
+        />
+      </Badge>
+    );
+  }
+  if (!awaiting) return null;
+  return (
+    <Badge variant="warning" className="ml-auto">
+      <I18nText
+        text={
+          awaiting === 1 ? '1 awaiting approval' : '{count} awaiting approval'
+        }
+        values={{ count: String(awaiting) }}
+      />
+    </Badge>
+  );
+}
 
 // TxeMachinesPage lists the machines the hub lets the caller see: for a
 // person, their owner's machines, with the enrolment applications waiting
@@ -15,6 +56,7 @@ import { I18nText } from '@/i18n/I18nText';
 // decides what is listed; an unbound caller gets none.
 export default function TxeMachinesPage(): React.ReactElement {
   const { data, error, isLoading, mutate } = useTxeMachines();
+  const awaiting = useAwaitingApproval(error ? undefined : data);
 
   return (
     <div className="mx-auto max-w-3xl space-y-4 p-4" data-testid="txe-machines">
@@ -24,7 +66,7 @@ export default function TxeMachinesPage(): React.ReactElement {
         </h1>
         <RefreshButton
           onRefresh={async () => {
-            await mutate();
+            await Promise.all([mutate(), awaiting.mutate()]);
           }}
         />
       </div>
@@ -48,7 +90,7 @@ export default function TxeMachinesPage(): React.ReactElement {
           className="text-sm text-muted-foreground"
           data-testid="txe-machines-empty"
         >
-          <I18nText text="No machines yet. Run `dagu txe enrol` on a machine to enrol it; its application then appears here." />
+          <I18nText text="No machines yet. A machine is listed once the worker installer has registered it for your owner. Then run `dagu txe enrol --client-id <its worker client>` on that machine, and its application appears here to approve." />
         </p>
       )}
       {data && data.length > 0 && (
@@ -63,18 +105,11 @@ export default function TxeMachinesPage(): React.ReactElement {
                 <span className="font-mono text-xs text-muted-foreground">
                   {m.machine_id}
                 </span>
-                {(m.pending_applications ?? 0) > 0 && (
-                  <Badge variant="warning" className="ml-auto">
-                    <I18nText
-                      text={
-                        m.pending_applications === 1
-                          ? '1 pending application'
-                          : '{count} pending applications'
-                      }
-                      values={{ count: String(m.pending_applications) }}
-                    />
-                  </Badge>
-                )}
+                <MachineBadge
+                  onFile={m.pending_applications ?? 0}
+                  awaiting={awaiting.data?.get(m.machine_id)}
+                  failed={Boolean(awaiting.error)}
+                />
               </Link>
             </li>
           ))}

@@ -9,7 +9,12 @@ import { useClient } from '@/hooks/api';
 
 import { createTxeAccessApi, type TxeAccessApi } from './access';
 import { createTxeApi, type TxeApi } from './api';
-import { createTxeEnrolmentApi, type TxeEnrolmentApi } from './enrolment';
+import {
+  awaitingApproval,
+  createTxeEnrolmentApi,
+  type MachineSummary,
+  type TxeEnrolmentApi,
+} from './enrolment';
 import { sameRetryStates } from './retry';
 import type { Decision, Proposal, TxeJob } from './types';
 
@@ -81,14 +86,42 @@ export function useTxeMachines({ quiet = false }: { quiet?: boolean } = {}) {
   });
 }
 
-// pendingCount is how many applications wait on the machines that report a
-// count; a machine without one (the caller may not approve) adds nothing.
-export function pendingCount(
-  machines: { pending_applications?: number }[] | undefined
-): number {
-  return (machines ?? []).reduce(
-    (sum, m) => sum + Math.max(0, m.pending_applications ?? 0),
-    0
+// useAwaitingApproval counts, per machine, the applications that really
+// await approval. The hub's pending_applications also counts an application
+// it already approved (it stays on file until its credential expires), so
+// for a machine with a count above 0 the applications and enrolments are
+// read, as the approval page reads them. Machines without a count, or with
+// 0, cost no request.
+export function useAwaitingApproval(
+  machines: MachineSummary[] | undefined,
+  { quiet = false }: { quiet?: boolean } = {}
+) {
+  const api = useTxeEnrolmentApi();
+  const ids = (machines ?? [])
+    .filter((m) => (m.pending_applications ?? 0) > 0)
+    .map((m) => m.machine_id)
+    .sort();
+  return useSWR(
+    ids.length > 0 ? ['txe', 'awaiting-approval', ids.join(',')] : null,
+    async () => {
+      const counts = await Promise.all(
+        ids.map(async (id) => {
+          const [applications, enrolments] = await Promise.all([
+            api.listApplications(id),
+            api.listEnrolments(id),
+          ]);
+          return [
+            id,
+            awaitingApproval(applications, enrolments).length,
+          ] as const;
+        })
+      );
+      return new Map<string, number>(counts);
+    },
+    {
+      refreshInterval: MACHINES_REFRESH_MS,
+      ...(quiet ? { onError: () => undefined } : {}),
+    }
   );
 }
 
