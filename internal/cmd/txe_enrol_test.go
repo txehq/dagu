@@ -375,7 +375,9 @@ func TestTXEEnrolCheck(t *testing.T) {
 		edit(c)
 		b, err := json.Marshal(c)
 		require.NoError(t, err)
-		path := filepath.Join(filepath.Dir(f.path()), "edited.json")
+		// Each subtest its own file: WriteFile keeps an existing file's mode,
+		// so a file another subtest loosened would decide this one.
+		path := filepath.Join(t.TempDir(), "edited.json")
 		require.NoError(t, os.WriteFile(path, b, 0o600))
 		return path
 	}
