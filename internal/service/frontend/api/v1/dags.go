@@ -1047,7 +1047,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 
@@ -1164,7 +1164,7 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 	timeout := request.Body.Timeout
@@ -1743,7 +1743,7 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}
 
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 	if nameOverride != "" {

@@ -314,6 +314,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 
 	// One budget shared by every queue counted in this request.
 	budget := newScanBudget(queuedCountRequestScanCap)
+	ownerOnly := a.txeNativeOwnerOnly(ctx)
 
 	if onlyQueue != "" {
 		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
@@ -325,8 +326,10 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			}
 		}
 		// A capped scan proves entries exist even when none seen so far were
-		// visible, so the queue must still surface rather than read as absent.
-		if count > 0 || capped {
+		// visible, so the queue must still surface rather than read as absent;
+		// except to a caller held to its owner, who learns nothing of a queue
+		// that holds none of its runs.
+		if count > 0 || (capped && !ownerOnly) {
 			queue := getOrCreateQueue(queueMap, onlyQueue, a.config)
 			queue.queuedCount = count
 			queue.queuedCountCapped = capped
@@ -346,6 +349,11 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 				logger.Warn(ctx, "Failed to get queue length",
 					tag.Queue(queueName),
 					tag.Error(err))
+				continue
+			}
+			if ownerOnly && count == 0 {
+				// A queue is named for its DAG: one that holds none of
+				// this caller's runs is not named to it.
 				continue
 			}
 			queue := getOrCreateQueue(queueMap, queueName, a.config)

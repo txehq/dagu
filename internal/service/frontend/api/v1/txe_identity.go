@@ -83,11 +83,33 @@ func txeTokenRoute(mountedAPIPath string) func(r *http.Request) bool {
 		if node := r.URL.Query().Get("remoteNode"); node != "" && node != "local" {
 			return false
 		}
-		// Dot segments are resolved first, so a path cannot name /txe and
-		// reach another route.
+		// The router routes on the path as sent. A path that only names
+		// /txe once decoded or cleaned is routed elsewhere, so it is not
+		// admitted at all.
+		if !txeCanonicalPath(r) {
+			return false
+		}
 		p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
 		return p == root || strings.HasPrefix(p, root+"/") || txeNativeRoute(pathutil.NormalizePath(mountedAPIPath), p)
 	}
+}
+
+// txeCanonicalPath reports whether a request's path reads the same to these
+// checks as to the router, which routes on the path as sent: no encoded
+// slash, dot or backslash, and no dot or empty segment. Any other path is
+// refused to a caller held to its owner, rather than decided on a reading the
+// router does not share.
+func txeCanonicalPath(r *http.Request) bool {
+	if raw := strings.ToLower(r.URL.RawPath); strings.Contains(raw, "%2f") || strings.Contains(raw, "%2e") || strings.Contains(raw, "%5c") {
+		return false
+	}
+	for i, segment := range strings.Split(r.URL.Path, "/") {
+		last := i == strings.Count(r.URL.Path, "/")
+		if segment == "." || segment == ".." || (segment == "" && i != 0 && !last) {
+			return false
+		}
+	}
+	return true
 }
 
 // txePersonGate admits a person signed in through the identity provider only
@@ -105,7 +127,7 @@ func (a *API) txePersonGate(mountedAPIPath string) func(http.Handler) http.Handl
 				return
 			}
 			p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
-			if onTxe(r) || (r.Method == http.MethodGet && p == me) {
+			if onTxe(r) || (r.Method == http.MethodGet && txeCanonicalPath(r) && p == me) {
 				next.ServeHTTP(w, r)
 				return
 			}

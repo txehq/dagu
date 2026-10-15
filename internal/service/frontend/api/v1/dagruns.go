@@ -3686,7 +3686,7 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 	if err != nil {
 		return rescheduleDAGRunResult{}, err
 	}
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return rescheduleDAGRunResult{}, err
 	}
 	currentFileParams := preservedSnapshotParams

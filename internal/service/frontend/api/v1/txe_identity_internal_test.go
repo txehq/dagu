@@ -191,7 +191,10 @@ func TestTxeTokenRouteAdmitsOnlyOwnerScopedRoutes(t *testing.T) {
 		{http.MethodGet, "/api/v1/txe/jobs/job_x/reviews", true},
 		{http.MethodGet, "/api/v1/txe", true},
 		{http.MethodGet, "/api/v1/txex", false},
-		{http.MethodGet, "/api/v1/txe/../dags", true},
+		// Not canonical: the router reads it otherwise (TXE-4352).
+		{http.MethodGet, "/api/v1/txe/../dags", false},
+		{http.MethodGet, "/api/v1/users/%2E%2E/txe/identity", false},
+		{http.MethodGet, "/api/v1/txe//identity", false},
 		{http.MethodGet, "/api/v1/dags", true},
 		{http.MethodGet, "/api/v1/dag-runs/job_x/run", true},
 		{http.MethodGet, "/api/v1/queues", true},

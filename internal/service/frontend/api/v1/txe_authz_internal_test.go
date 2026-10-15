@@ -423,10 +423,14 @@ func TestTxePersonGateKeepsPersonsToTheirOwnersRoutes(t *testing.T) {
 			require.True(t, reached, target)
 		}
 		// Since S4 the native DAG, run and queue routes answer by owner too.
-		for _, target := range []string{"/api/v1/dags", "/api/v1/dag-runs", "/api/v1/queues", "/api/v1/txe/../dags"} {
+		for _, target := range []string{"/api/v1/dags", "/api/v1/dag-runs", "/api/v1/queues"} {
 			require.Equal(t, http.StatusOK, serve(ctx, http.MethodGet, target), target)
 			require.True(t, reached, target)
 		}
+		// The router does not resolve dot segments, so a path with one is
+		// not read as the route it would name once cleaned: it is refused.
+		require.Equal(t, http.StatusForbidden, serve(ctx, http.MethodGet, "/api/v1/txe/../dags"))
+		require.False(t, reached)
 		for _, tc := range []struct{ method, target string }{
 			{http.MethodGet, "/api/v1/users"}, {http.MethodPost, "/api/v1/auth/change-password"}, {http.MethodGet, "/api/v1/workers"},
 			{http.MethodGet, "/api/v1/audit"}, {http.MethodGet, "/api/v1/dagsx"},
