@@ -47,6 +47,7 @@ import (
 	runtimeenvtransport "github.com/dagucloud/dagu/v2/internal/runtimeenv/transport"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	spectypes "github.com/dagucloud/dagu/v2/internal/spec/types"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/parser"
@@ -2470,6 +2471,20 @@ func (a *API) GetSubDAGRunSpec(ctx context.Context, request api.GetSubDAGRunSpec
 		return nil, err
 	}
 
+	// The sub-run's own DAG may have an owner other than the parent's.
+	if a.txeAuth != nil {
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil {
+			return &api.GetSubDAGRunSpec404JSONResponse{
+				Code:    api.ErrorCodeNotFound,
+				Message: fmt.Sprintf("sub dag-run ID %s not found for DAG %s", request.SubDAGRunId, request.Name),
+			}, nil
+		}
+		if err := a.txeSubRunCheck(ctx, txeNativeOwnerDAG(status), status.Name, authz.PermissionView); err != nil {
+			return nil, err
+		}
+	}
+
 	spec, err := a.getSpecFromAttempt(ctx, attempt)
 	if err != nil {
 		return &api.GetSubDAGRunSpec404JSONResponse{
@@ -3877,12 +3892,18 @@ func (a *API) GetSubDAGRuns(ctx context.Context, request api.GetSubDAGRunsReques
 		}
 
 		for _, subRun := range node.SubRuns {
+			if a.txeSubRunCheck(ctx, txeNativeOwnerDAG(dagStatus), subRun.DAGName, authz.PermissionView) != nil {
+				continue
+			}
 			if detail, err := a.getSubDAGRunDetail(ctx, detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
 				subRuns = append(subRuns, detail)
 			}
 		}
 
 		for _, subRun := range node.SubRunsRepeated {
+			if a.txeSubRunCheck(ctx, txeNativeOwnerDAG(dagStatus), subRun.DAGName, authz.PermissionView) != nil {
+				continue
+			}
 			if detail, err := a.getSubDAGRunDetail(ctx, detailParentRef, subRun.DAGRunID, subRun.Params, subRun.DAGName); err == nil {
 				subRuns = append(subRuns, detail)
 			}
@@ -4682,6 +4703,9 @@ func (a *API) GetSubStepLogDataByRef(ctx context.Context, root ir.DAGRunRef, sub
 		dagStatus, err := a.getReferencedDAGRunStatus(readCtx, root, subRunID, "")
 		if err != nil {
 			return StepLogResponse{}, fmt.Errorf("sub dag-run ID %s not found for DAG %s", subRunID, root.Name)
+		}
+		if err := a.requireDAGRunStatusVisible(readCtx, dagStatus); err != nil {
+			return StepLogResponse{}, err
 		}
 		return a.stepLogFromStatus(readCtx, dagStatus, stepName, opts)
 	})

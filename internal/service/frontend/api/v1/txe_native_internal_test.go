@@ -7,14 +7,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
@@ -248,4 +251,76 @@ func TestTxeNativeAliasOfAnOwnersDAG(t *testing.T) {
 	}
 	// A legacy credential in mode off is decided by workspace alone.
 	require.NoError(t, w.api.requireDAGVisible(w.legacy, at("monitor", w.jobA)))
+}
+
+// writeRun saves a finished run of d, edited by edit, in the fixture's run
+// store (which addRun creates).
+func (w *twoOwners) writeRun(d *ir.DAG, runID string, opts persis.DAGRunCreateAttemptOptions, edit func(*ir.DAGRunStatus)) {
+	w.t.Helper()
+	ctx := context.Background()
+	attempt, err := w.runs.CreateAttempt(ctx, d, time.Now(), runID, opts)
+	require.NoError(w.t, err)
+	status := ir.InitialStatus(d)
+	status.DAGRunID, status.AttemptID, status.Status = runID, attempt.ID(), ir.Succeeded
+	status.Labels = []string{"workspace=production"}
+	status.Log = filepath.Join(w.t.TempDir(), runID+".log")
+	require.NoError(w.t, os.WriteFile(status.Log, []byte("output of "+d.Name+"\n"), 0o600))
+	edit(&status)
+	require.NoError(w.t, attempt.Open(ctx))
+	require.NoError(w.t, attempt.Write(ctx, status))
+	require.NoError(w.t, attempt.Close(ctx))
+}
+
+// A sub-run of another owner's DAG, called from one's own job's run, is
+// not one's own on any sub-run route: its spec is not found, the sub-run
+// list leaves it out, and its step log is refused. A sub-run of a DAG with
+// no owner stays one's own.
+func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	root := ir.NewDAGRunRef(w.jobA, "run-2")
+	child := func(name, runID string) {
+		d := &ir.DAG{Name: name, YamlData: []byte("steps:\n  - name: inner\n    run: echo " + name + "\n")}
+		w.writeRun(d, runID, persis.DAGRunCreateAttemptOptions{RootDAGRun: root}, func(s *ir.DAGRunStatus) {
+			s.Root, s.Parent = root, root
+		})
+	}
+	w.writeRun(&ir.DAG{Name: w.jobA, YamlData: []byte("steps: []\n")}, "run-2", persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+		s.Nodes = []*ir.Node{{Step: ir.Step{Name: "call"}, SubRuns: []ir.SubDAGRun{
+			{DAGRunID: "sub-b", DAGName: w.jobB},
+			{DAGRunID: "sub-h", DAGName: "shared-helper"},
+		}}}
+	})
+	child(w.jobB, "sub-b")
+	child("shared-helper", "sub-h")
+	personA := neutral(w.personA)
+
+	spec := func(ctx context.Context, sub string) error {
+		resp, err := w.api.GetSubDAGRunSpec(ctx, apigen.GetSubDAGRunSpecRequestObject{Name: w.jobA, DagRunId: "run-2", SubDAGRunId: sub})
+		if err != nil {
+			return err
+		}
+		if _, ok := resp.(*apigen.GetSubDAGRunSpec200JSONResponse); !ok {
+			return &Error{HTTPStatus: http.StatusNotFound, Message: "no spec"}
+		}
+		return nil
+	}
+	require.Equal(t, http.StatusNotFound, statusOf(spec(personA, "sub-b")))
+	require.NoError(t, spec(personA, "sub-h"))
+	require.NoError(t, spec(w.legacy, "sub-b"), "a legacy key in mode off reads as today")
+
+	listed := func(ctx context.Context) []string {
+		resp, err := w.api.GetSubDAGRuns(ctx, apigen.GetSubDAGRunsRequestObject{Name: w.jobA, DagRunId: "run-2"})
+		require.NoError(t, err)
+		var ids []string
+		for _, s := range resp.(*apigen.GetSubDAGRuns200JSONResponse).SubRuns {
+			ids = append(ids, s.DagRunId)
+		}
+		return ids
+	}
+	require.Equal(t, []string{"sub-h"}, listed(personA))
+	require.ElementsMatch(t, []string{"sub-b", "sub-h"}, listed(w.legacy))
+
+	_, err := w.api.GetSubStepLogDataByRef(personA, root, "sub-b", "inner", StepLogReadOptions{})
+	require.Equal(t, http.StatusNotFound, statusOf(err))
 }

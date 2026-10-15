@@ -252,7 +252,14 @@ func (a *API) requireRunStatus(ctx context.Context, status *ir.DAGRunStatus, per
 	if err := check(ctx, root, statusWorkspaceName(status)); err != nil {
 		return err
 	}
-	if status.Name == root || a.txeAuth == nil {
+	return a.txeSubRunCheck(ctx, root, status.Name, permission)
+}
+
+// txeSubRunCheck decides a run of the DAG dagName under a run of root that
+// the caller has already been let into: when dagName is another DAG with an
+// owner of its own, that owner decides too.
+func (a *API) txeSubRunCheck(ctx context.Context, root, dagName string, permission authz.Permission) error {
+	if dagName == "" || dagName == root || a.txeAuth == nil {
 		return nil
 	}
 	c, err := a.txeResolve(ctx)
@@ -262,8 +269,8 @@ func (a *API) requireRunStatus(ctx context.Context, status *ir.DAGRunStatus, per
 	if c.mode == authz.ModeOff {
 		return nil
 	}
-	if _, owned, err := a.txeNativeResource(ctx, status.Name); err != nil || owned {
-		return a.txeNativeCheck(ctx, status.Name, permission, func() error { return nil })
+	if _, owned, err := a.txeNativeResource(ctx, dagName); err != nil || owned {
+		return a.txeNativeCheck(ctx, dagName, permission, func() error { return nil })
 	}
 	return nil
 }
