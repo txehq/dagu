@@ -47,6 +47,7 @@ import (
 	runtimeenvtransport "github.com/dagucloud/dagu/v2/internal/runtimeenv/transport"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	spectypes "github.com/dagucloud/dagu/v2/internal/spec/types"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/parser"
@@ -724,6 +725,14 @@ func (a *API) ListDAGRunsByName(ctx context.Context, request api.ListDAGRunsByNa
 	if err != nil {
 		return nil, err
 	}
+	if a.txeNativeOwnerOnly(ctx) {
+		// One DAG's runs: a caller held to its owner sees them all if the
+		// DAG's owner lets it, and none otherwise, whatever workspace it
+		// names.
+		if a.txeNativeVisible(ctx, request.Name) {
+			workspaceFilter = nil
+		}
+	}
 	opts.query.WorkspaceFilter = workspaceFilter
 	var dagRunID string
 	if request.Params.DagRunId != nil {
@@ -883,7 +892,7 @@ func (a *API) GetDAGRunLog(ctx context.Context, request api.GetDAGRunLogRequestO
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 
@@ -920,7 +929,7 @@ func (a *API) DownloadDAGRunLog(ctx context.Context, request api.DownloadDAGRunL
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 
@@ -953,7 +962,7 @@ func (a *API) GetDAGRunArtifacts(ctx context.Context, request api.GetDAGRunArtif
 		}
 		return nil, fmt.Errorf("get dag-run artifact status: %w", err)
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(status)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
 		return nil, err
 	}
 
@@ -984,7 +993,7 @@ func (a *API) GetDAGRunArtifactPreview(ctx context.Context, request api.GetDAGRu
 		}
 		return nil, fmt.Errorf("get dag-run artifact status: %w", err)
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(status)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
 		return nil, err
 	}
 
@@ -1013,7 +1022,7 @@ func (a *API) DownloadDAGRunArtifact(ctx context.Context, request api.DownloadDA
 		}
 		return nil, fmt.Errorf("get dag-run artifact status: %w", err)
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(status)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
 		return nil, err
 	}
 
@@ -1063,7 +1072,7 @@ func (a *API) GetDAGRunOutputs(ctx context.Context, request api.GetDAGRunOutputs
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+	if err := a.requireNamedDAGVisible(ctx, request.Name, workspaceName); err != nil {
 		return nil, err
 	}
 
@@ -1117,7 +1126,7 @@ func (a *API) GetDAGRunStepLog(ctx context.Context, request api.GetDAGRunStepLog
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 
@@ -2258,7 +2267,7 @@ func (a *API) loadRootDAGRunDetailsAttemptAndStatus(
 		if status == nil {
 			return nil, nil, fmt.Errorf("latest dag-run status is unavailable for DAG %s", dagName)
 		}
-		if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(status)); err != nil {
+		if err := a.requireDAGRunStatusVisible(ctx, status); err != nil {
 			return nil, nil, err
 		}
 
@@ -2284,7 +2293,7 @@ func (a *API) loadRootDAGRunDetailsAttemptAndStatus(
 	if err != nil {
 		return nil, nil, fmt.Errorf("dag-run ID %s not found for DAG %s", dagRunId, dagName)
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return nil, nil, err
 	}
 
@@ -2391,7 +2400,7 @@ func (a *API) GetDAGRunSpec(ctx context.Context, request api.GetDAGRunSpecReques
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+	if err := a.requireNamedDAGVisible(ctx, request.Name, workspaceName); err != nil {
 		return nil, err
 	}
 
@@ -2459,8 +2468,22 @@ func (a *API) GetSubDAGRunSpec(ctx context.Context, request api.GetSubDAGRunSpec
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+	if err := a.requireNamedDAGVisible(ctx, request.Name, workspaceName); err != nil {
 		return nil, err
+	}
+
+	// The sub-run's own DAG may have an owner other than the parent's.
+	if a.txeAuth != nil {
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil {
+			return &api.GetSubDAGRunSpec404JSONResponse{
+				Code:    api.ErrorCodeNotFound,
+				Message: fmt.Sprintf("sub dag-run ID %s not found for DAG %s", request.SubDAGRunId, request.Name),
+			}, nil
+		}
+		if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionView); err != nil {
+			return nil, err
+		}
 	}
 
 	spec, err := a.getSpecFromAttempt(ctx, attempt)
@@ -3072,7 +3095,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err != nil {
 		return retryDAGRunResult{}, err
 	}
-	if err := a.requireExecuteForWorkspace(ctx, workspaceName); err != nil {
+	if err := a.requireNamedDAGExecute(ctx, dagName, workspaceName); err != nil {
 		return retryDAGRunResult{}, err
 	}
 
@@ -3139,6 +3162,9 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		)
 		if err != nil {
 			return retryDAGRunResult{}, retryPathRequestError(err)
+		}
+		if err := a.txeRetryPathCheck(ctx, ir.NewDAGRunRef(dagName, sourceDagRunID), retryPath, targetStatus); err != nil {
+			return retryDAGRunResult{}, err
 		}
 		retryValidationStatus = targetStatus
 		auditStepName = retryPath.Step
@@ -3529,7 +3555,7 @@ func (a *API) DequeueDAGRun(ctx context.Context, request api.DequeueDAGRunReques
 	if err != nil {
 		return nil, mapAbortQueuedDAGRunAPIError(request.Name, request.DagRunId, err)
 	}
-	if err := a.requireExecuteForWorkspace(ctx, workspaceName); err != nil {
+	if err := a.requireNamedDAGExecute(ctx, request.Name, workspaceName); err != nil {
 		return nil, err
 	}
 	queueName, err := a.queueNameForDAGRun(ctx, dagRun)
@@ -3888,9 +3914,16 @@ func (a *API) GetSubDAGRuns(ctx context.Context, request api.GetSubDAGRunsReques
 }
 
 // getSubDAGRunDetail fetches timing and status info for a single sub DAG run
+// getSubDAGRunDetail reads one sub-run of a run the caller may see. The
+// sub-run is decided by the run it resolves to, not by the name its parent
+// recorded: one whose own root or own DAG has an owner the caller may not
+// see is an error.
 func (a *API) getSubDAGRunDetail(ctx context.Context, parentRef ir.DAGRunRef, subRunID string, params string, dagName string) (api.SubDAGRunDetail, error) {
 	status, err := a.getReferencedDAGRunStatus(ctx, parentRef, subRunID, dagName)
 	if err != nil {
+		return api.SubDAGRunDetail{}, err
+	}
+	if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionView); err != nil {
 		return api.SubDAGRunDetail{}, err
 	}
 
@@ -4558,7 +4591,7 @@ func (a *API) getDAGRunLogsData(ctx context.Context, identifier string) (DAGRunL
 	if err != nil {
 		return DAGRunLogsResponse{}, fmt.Errorf("dag-run ID %s not found for DAG %s", dagRunId, dagName)
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return DAGRunLogsResponse{}, err
 	}
 
@@ -4675,6 +4708,9 @@ func (a *API) GetSubStepLogDataByRef(ctx context.Context, root ir.DAGRunRef, sub
 		dagStatus, err := a.getReferencedDAGRunStatus(readCtx, root, subRunID, "")
 		if err != nil {
 			return StepLogResponse{}, fmt.Errorf("sub dag-run ID %s not found for DAG %s", subRunID, root.Name)
+		}
+		if err := a.requireDAGRunStatusVisible(readCtx, dagStatus); err != nil {
+			return StepLogResponse{}, err
 		}
 		return a.stepLogFromStatus(readCtx, dagStatus, stepName, opts)
 	})

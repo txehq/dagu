@@ -422,9 +422,14 @@ func TestTxePersonGateKeepsPersonsToTheirOwnersRoutes(t *testing.T) {
 			require.Equal(t, http.StatusOK, serve(ctx, http.MethodGet, target), target)
 			require.True(t, reached, target)
 		}
+		// Since S4 the native DAG, run and queue routes answer by owner too.
+		for _, target := range []string{"/api/v1/dags", "/api/v1/dag-runs", "/api/v1/queues", "/api/v1/txe/../dags"} {
+			require.Equal(t, http.StatusOK, serve(ctx, http.MethodGet, target), target)
+			require.True(t, reached, target)
+		}
 		for _, tc := range []struct{ method, target string }{
-			{http.MethodGet, "/api/v1/dags"}, {http.MethodGet, "/api/v1/dag-runs"}, {http.MethodGet, "/api/v1/users"},
-			{http.MethodPost, "/api/v1/auth/change-password"}, {http.MethodGet, "/api/v1/queues"}, {http.MethodGet, "/api/v1/txe/../dags"},
+			{http.MethodGet, "/api/v1/users"}, {http.MethodPost, "/api/v1/auth/change-password"}, {http.MethodGet, "/api/v1/workers"},
+			{http.MethodGet, "/api/v1/audit"}, {http.MethodGet, "/api/v1/dagsx"},
 		} {
 			require.Equal(t, http.StatusForbidden, serve(ctx, tc.method, tc.target), tc.target)
 			require.False(t, reached, tc.target)
@@ -608,6 +613,7 @@ func (w *twoOwners) addRun(jobID, runID, workspace string) string {
 		w.runs = persis.NewDAGRunRepository(filedagrun.NewStore(filepath.Join(dir, "runs")),
 			filedagrun.NewWorkDirStore(filepath.Join(dir, "work"), filepath.Join(dir, "runs")), persis.DAGRunRepositoryOptions{})
 		w.api.dagRunRepository = w.runs
+		w.api.dagRunMgr = rt.NewManager(w.runs, newTestProcRepository(filepath.Join(dir, "proc")), &config.Config{})
 	}
 	d := &ir.DAG{Name: jobID, YamlData: []byte("steps:\n  - name: run\n    run: /pkg/run.sh\n")}
 	attempt, err := w.runs.CreateAttempt(ctx, d, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
@@ -616,6 +622,8 @@ func (w *twoOwners) addRun(jobID, runID, workspace string) string {
 	status.DAGRunID, status.AttemptID, status.Status, status.QueuedAt = runID, attempt.ID(), ir.Failed, "q1"
 	status.StartedAt, status.FinishedAt = time.Now().Add(-time.Minute).Format(time.RFC3339), time.Now().Format(time.RFC3339)
 	status.Labels = []string{"workspace=" + workspace}
+	status.Log = filepath.Join(w.t.TempDir(), runID+".log")
+	require.NoError(w.t, os.WriteFile(status.Log, []byte("secret output of "+jobID+"\n"), 0o600))
 	require.NoError(w.t, attempt.Open(ctx))
 	require.NoError(w.t, attempt.Write(ctx, status))
 	require.NoError(w.t, attempt.Close(ctx))

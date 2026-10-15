@@ -44,8 +44,10 @@ var errTxeAuthzUnavailable = &Error{
 const txeTokenRoutePrefix = "txe"
 
 // txeTokenUse is what GET /txe/auth/cli tells the command line about where
-// its token is accepted. It follows txeTokenRoutePrefix: every /txe route.
-const txeTokenUse = "txe"
+// its token is accepted: every route that answers by owner (/txe and the
+// native DAG, run and queue routes, txeTokenRoute). Any other route refuses
+// it with 403 before its handler runs.
+const txeTokenUse = "all"
 
 // txeCLIScopes are the scopes the command line asks the provider for.
 var txeCLIScopes = []string{"openid"}
@@ -84,7 +86,7 @@ func txeTokenRoute(mountedAPIPath string) func(r *http.Request) bool {
 		// Dot segments are resolved first, so a path cannot name /txe and
 		// reach another route.
 		p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
-		return p == root || strings.HasPrefix(p, root+"/")
+		return p == root || strings.HasPrefix(p, root+"/") || txeNativeRoute(pathutil.NormalizePath(mountedAPIPath), p)
 	}
 }
 

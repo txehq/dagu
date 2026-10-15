@@ -155,7 +155,7 @@ func (a *API) fetchDAGRunSummary(ctx context.Context, dagRun ir.DAGRunRef) (api.
 	if err != nil {
 		return api.DAGRunSummary{}, err
 	}
-	if !a.canAccessWorkspace(ctx, statusWorkspaceName(runStatus)) {
+	if a.requireDAGRunStatusVisible(ctx, runStatus) != nil {
 		return api.DAGRunSummary{}, workspaceResourceNotFound()
 	}
 	return toDAGRunSummary(*runStatus), nil
@@ -292,7 +292,7 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			if err != nil {
 				continue
 			}
-			if !a.canAccessWorkspace(ctx, statusWorkspaceName(runStatus)) {
+			if a.requireDAGRunStatusVisible(ctx, runStatus) != nil {
 				continue
 			}
 			if queue == nil {
@@ -569,7 +569,7 @@ func (a *API) runningSummaryFromLease(ctx context.Context, lease dispatch.DAGRun
 	if status.AttemptID != lease.AttemptID {
 		return api.DAGRunSummary{}, false
 	}
-	if !a.canAccessWorkspace(ctx, statusWorkspaceName(status)) {
+	if a.requireDAGRunStatusVisible(ctx, status) != nil {
 		return api.DAGRunSummary{}, false
 	}
 	switch status.Status {

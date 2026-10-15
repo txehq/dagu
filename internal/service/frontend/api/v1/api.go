@@ -487,6 +487,7 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 		r.Use(stepLogDownloadFormAuth(mountedAPIPath))
 		r.Use(frontendauth.Middleware(authOptions))
 		r.Use(a.txePersonGate(mountedAPIPath))
+		r.Use(a.txeNeutralize)
 		r.Use(a.restAuditSubjectMiddleware())
 		r.Use(a.syncProxyAuthorization(mountedAPIPath))
 		r.Use(humanTaskInputMiddleware(mountedAPIPath))

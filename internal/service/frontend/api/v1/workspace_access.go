@@ -17,6 +17,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -246,6 +247,11 @@ func (a *API) workspaceFilterForContext(ctx context.Context) *workspace.Workspac
 	if a.authService == nil {
 		return nil
 	}
+	if a.txeNativeOwnerOnly(ctx) {
+		// Held to its owner: a list shows only what a list filters by
+		// owner itself.
+		return txeNothingFilter()
+	}
 	user, ok := auth.UserFromContext(ctx)
 	if !ok {
 		return &workspace.WorkspaceFilter{Enabled: true}
@@ -270,6 +276,11 @@ func (a *API) workspaceFilterForContext(ctx context.Context) *workspace.Workspac
 }
 
 func (a *API) workspaceFilterForSelection(ctx context.Context, selection workspaceSelection) (*workspace.WorkspaceFilter, error) {
+	if a.txeNativeOwnerOnly(ctx) {
+		// Held to its owner, whatever workspace it names: a list shows only
+		// what a list filters by owner itself.
+		return txeNothingFilter(), nil
+	}
 	switch selection.mode {
 	case workspaceSelectionAll:
 		return a.workspaceFilterForContext(ctx), nil
@@ -305,6 +316,11 @@ func (a *API) workspaceFilterForParams(ctx context.Context, workspaceParam *api.
 func (a *API) effectiveRoleForWorkspace(ctx context.Context, workspaceName string) (auth.Role, bool, error) {
 	if a.authService == nil {
 		return auth.RoleAdmin, true, nil
+	}
+	if a.txeNativeOwnerOnly(ctx) {
+		// A caller held to its owner has no workspace, the unnamed default
+		// one included: only its owner's decisions let it in anywhere.
+		return auth.RoleNone, false, nil
 	}
 	user, ok := auth.UserFromContext(ctx)
 	if !ok {
@@ -413,19 +429,19 @@ func (a *API) requireDAGRunVisible(ctx context.Context, dagRun ir.DAGRunRef) err
 	if err != nil {
 		return err
 	}
-	return a.requireWorkspaceVisible(ctx, workspaceName)
+	return a.requireNamedDAGVisible(ctx, dagRun.Name, workspaceName)
 }
 
 func (a *API) requireDAGRunStatusVisible(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil
 	}
-	return a.requireWorkspaceVisible(ctx, statusWorkspaceName(status))
+	return a.requireRunStatus(ctx, status, authz.PermissionView, a.requireNamedDAGVisible)
 }
 
 func (a *API) requireDAGRunStatusExecute(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil
 	}
-	return a.requireExecuteForWorkspace(ctx, statusWorkspaceName(status))
+	return a.requireRunStatus(ctx, status, authz.PermissionExecute, a.requireNamedDAGExecute)
 }

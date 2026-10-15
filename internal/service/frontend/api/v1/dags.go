@@ -84,6 +84,11 @@ func (a *API) checkSingletonQueued(ctx context.Context, dag *ir.DAG) error {
 
 // ValidateDAGSpec implements api.StrictServerInterface.
 func (a *API) ValidateDAGSpec(ctx context.Context, request api.ValidateDAGSpecRequestObject) (api.ValidateDAGSpecResponseObject, error) {
+	if a.txeNativeOwnerOnly(ctx) {
+		// Loading a spec reads the hub's base configuration; a caller held
+		// to its owner has no native DAG it may author.
+		return nil, errTxeForbidden
+	}
 	if request.Body == nil {
 		return nil, &Error{
 			HTTPStatus: http.StatusBadRequest,
@@ -276,7 +281,7 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 	} else {
 		errs = append(errs, extractBuildErrors(dag.BuildErrors)...)
 	}
-	if err := a.requireWorkspaceVisible(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGVisible(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -432,7 +437,7 @@ func (a *API) GetDAGDAGRunHistory(ctx context.Context, request api.GetDAGDAGRunH
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireWorkspaceVisible(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGVisible(ctx, dag); err != nil {
 		return nil, err
 	}
 	dagName := a.resolveDAGName(ctx, request.FileName)
@@ -496,7 +501,7 @@ func (a *API) getDAGDetailsData(ctx context.Context, fileName string) (api.GetDA
 	if err != nil {
 		return api.GetDAGDetails200JSONResponse{}, fmt.Errorf("failed to load DAG %s: %w", fileName, err)
 	}
-	if err := a.requireWorkspaceVisible(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGVisible(ctx, dag); err != nil {
 		return api.GetDAGDetails200JSONResponse{}, err
 	}
 
@@ -938,7 +943,7 @@ func (a *API) GetDAGDAGRunDetails(ctx context.Context, request api.GetDAGDAGRunD
 			}
 		}
 	}
-	if err := a.requireWorkspaceVisible(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGVisible(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -1011,7 +1016,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
@@ -1145,7 +1150,7 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
 		return nil, err
 	}
-	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
@@ -1714,7 +1719,7 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
@@ -1881,7 +1886,7 @@ func (a *API) UpdateDAGSuspensionState(ctx context.Context, request api.UpdateDA
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -1903,6 +1908,11 @@ func (a *API) UpdateDAGSuspensionState(ctx context.Context, request api.UpdateDA
 }
 
 func (a *API) SearchDAGs(ctx context.Context, request api.SearchDAGsRequestObject) (api.SearchDAGsResponseObject, error) {
+	if a.txeNativeOwnerOnly(ctx) {
+		// Search is not owner-scoped (TXE-4264): a caller held to its owner
+		// finds its jobs in /txe/jobs.
+		return nil, errTxeForbidden
+	}
 	ret, errs, err := a.dagRepository.Grep(ctx, request.Params.Q)
 	if err != nil {
 		return nil, fmt.Errorf("error searching DAGs: %w", err)
@@ -1910,7 +1920,7 @@ func (a *API) SearchDAGs(ctx context.Context, request api.SearchDAGsRequestObjec
 
 	var results []api.SearchResultItem
 	for _, item := range ret {
-		if !a.canAccessWorkspace(ctx, dagWorkspaceName(item.DAG)) {
+		if a.requireDAGVisible(ctx, item.DAG) != nil {
 			continue
 		}
 		var matches []api.SearchMatchItem
@@ -1949,7 +1959,7 @@ func (a *API) StopAllDAGRuns(ctx context.Context, request api.StopAllDAGRunsRequ
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
 	}
-	if err := a.requireExecuteForWorkspace(ctx, dagWorkspaceName(dag)); err != nil {
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
 
@@ -2024,7 +2034,7 @@ func (a *API) GetDAGHistoryData(ctx context.Context, fileName string) (any, erro
 		if err != nil {
 			return api.GetDAGDAGRunHistory200JSONResponse{}, err
 		}
-		if err := a.requireWorkspaceVisible(readCtx, dagWorkspaceName(dag)); err != nil {
+		if err := a.requireDAGVisible(readCtx, dag); err != nil {
 			return api.GetDAGDAGRunHistory200JSONResponse{}, err
 		}
 

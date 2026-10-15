@@ -8304,7 +8304,7 @@ export interface components {
             request?: components["schemas"]["TxeIdentityRequest"];
             /** @description The installation's builtin administrator. It is not an owner and owns nothing. */
             platform_admin: boolean;
-            /** @description Signed in through the browser with the identity provider: the only caller whose decision counts as a person's. */
+            /** @description A person signed in through the browser and bound to an owner: the only caller whose decisions count as a person's. False for a person who acts for nobody; use principal.class to tell a browser sign-in. */
             is_person: boolean;
         };
         TxeIdentityPrincipal: {
