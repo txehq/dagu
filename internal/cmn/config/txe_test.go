@@ -75,6 +75,12 @@ func TestLoad_TXEIssuedAtSkew(t *testing.T) {
 	require.Zero(t, loadFromYAML(t, txeAuthnYAML+"    issued_at_skew: 0s\n").TXE.Authn.IssuedAtSkew, "0s turns it off")
 	require.Equal(t, time.Minute, loadFromYAML(t, txeAuthnYAML+"    issued_at_skew: 1m\n").TXE.Authn.IssuedAtSkew)
 	require.Zero(t, loadFromYAML(t, "").TXE.Authn.IssuedAtSkew, "no tokens, no tolerance")
+	t.Run("ZeroFromEnvNoIssuer", func(t *testing.T) {
+		t.Setenv("DAGU_TXE_AUTHN_ISSUED_AT_SKEW", "0s")
+		err := loadWithErrorFromYAML(t, "auth:\n  mode: builtin\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "an issuer is required")
+	})
 	t.Run("FromEnv", func(t *testing.T) {
 		require.Equal(t, 3*time.Second, loadWithEnv(t, txeAuthnYAML, map[string]string{"DAGU_TXE_AUTHN_ISSUED_AT_SKEW": "3s"}).TXE.Authn.IssuedAtSkew)
 	})
@@ -84,6 +90,7 @@ func TestLoad_TXEIssuedAtSkew(t *testing.T) {
 		"Negative":     {txeAuthnYAML + "    issued_at_skew: -1s\n", "between 0 and 1m0s"},
 		"NotADuration": {txeAuthnYAML + "    issued_at_skew: soon\n", "txe.authn.issued_at_skew"},
 		"NoIssuer":     {"auth:\n  mode: builtin\ntxe:\n  authn:\n    issued_at_skew: 5s\n", "an issuer is required"},
+		"ZeroNoIssuer": {"auth:\n  mode: builtin\ntxe:\n  authn:\n    issued_at_skew: 0s\n", "an issuer is required"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := loadWithErrorFromYAML(t, tc.yaml)

@@ -48,6 +48,9 @@ type TXEAuthnConfig struct {
 	// before. Unset, it is TXEAuthnDefaultIssuedAtSkew; "0s" (parsed) turns
 	// it off.
 	IssuedAtSkew time.Duration
+	// issuedAtSkewGiven records that the setting was given, so that one
+	// without an issuer is refused whatever its value.
+	issuedAtSkewGiven bool
 	// CLIClient names the cli client the server advertises to the command
 	// line. Empty means the only cli client, if there is exactly one.
 	CLIClient string
@@ -211,6 +214,7 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 			return fmt.Errorf("%s: %w", txeAuthnSkewKey, perr)
 		}
 		cfg.TXE.Authn.IssuedAtSkew = d
+		cfg.TXE.Authn.issuedAtSkewGiven = true
 	case cfg.TXE.Authn.Enabled():
 		cfg.TXE.Authn.IssuedAtSkew = TXEAuthnDefaultIssuedAtSkew
 	}
@@ -372,7 +376,7 @@ func (c *Config) validateTXE() error {
 
 func (a TXEAuthnConfig) validate() error {
 	if !a.Enabled() {
-		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 || a.IssuedAtSkew != 0 || a.CLIClient != "" {
+		if a.Audience != "" || a.JWKSURL != "" || len(a.Clients) > 0 || a.MaxLifetime != 0 || a.IssuedAtSkew != 0 || a.issuedAtSkewGiven || a.CLIClient != "" {
 			return fmt.Errorf("%s: an issuer is required when any other value is set", txeAuthnKey)
 		}
 		return nil
