@@ -1739,6 +1739,12 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}
 
 	if request.Body.Queue != nil && *request.Body.Queue != "" {
+		// A caller held to its owner queues a run where its DAG names, so
+		// that its queues are those of the DAGs it may see.
+		if a.txeNativeOwnerOnly(ctx) && *request.Body.Queue != dag.ProcGroup() {
+			return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+				Message: "this run is queued only where its DAG names", Details: map[string]any{"code": "run_refused"}}
+		}
 		dag.Queue = *request.Body.Queue
 	}
 

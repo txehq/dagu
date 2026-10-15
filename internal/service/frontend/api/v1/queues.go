@@ -19,6 +19,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 const (
@@ -46,12 +48,6 @@ var queuedCountScanCap = 500
 //
 // Declared as a var for the same reason as queuedCountScanCap.
 var queuedCountRequestScanCap = 2000
-
-// queuedMembershipScanCap bounds how many queued entries one request may walk
-// to find whether a queue holds a run of an owner-held caller's, after the
-// count's budget is spent. The walk reads a status only for entries of the
-// caller's own DAGs. A var for the same reason as queuedCountScanCap.
-var queuedMembershipScanCap = 20000
 
 // scanBudget bounds the queued entries one request may scan in total, shared
 // across every queue that request counts.
@@ -321,34 +317,40 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	// One budget shared by every queue counted in this request.
 	budget := newScanBudget(queuedCountRequestScanCap)
 	ownerOnly := a.txeNativeOwnerOnly(ctx)
-	// The entries an owner-held caller's membership checks may walk in this
-	// request, past the count's budget.
-	membership := newScanBudget(queuedMembershipScanCap)
-	// setQueuedCount records a queue's count. A queue already listed (from
-	// configuration, or for a running run the caller may see) always takes
-	// its count. A queue not yet listed is added when the scan shows it
-	// holds something; to a caller held to its owner, only when it holds a
-	// run that caller may see, since a queue is named for its DAG.
-	setQueuedCount := func(name string, count int, capped, listEmpty bool) {
-		queue, listed := queueMap[name]
-		if !listed {
-			// A scan cut short (by the queue's cap or the request's
-			// budget) before any visible entry decides nothing by count:
-			// whether the queue holds a run of the caller's is then read
-			// from its entries' DAG names, whatever the queue is called.
-			if ownerOnly && count == 0 && (!capped || !a.txeQueueHoldsVisibleRun(ctx, name, membership)) {
-				return
-			}
-			if !ownerOnly && count == 0 && !capped && !listEmpty {
-				return
-			}
-			queue = getOrCreateQueue(queueMap, name, a.config)
+	// A caller held to its owner is counted only the queues it may see: the
+	// configured ones, those of its running runs (already listed), and those
+	// its own DAGs run in. No other queue is scanned or named, so another
+	// owner's backlog neither spends its budget nor hides its queues.
+	var own map[string]bool
+	if ownerOnly {
+		var err error
+		if own, err = a.txeOwnQueueNames(ctx); err != nil {
+			return nil, err
 		}
+	}
+	admitted := func(name string) bool {
+		if !ownerOnly {
+			return true
+		}
+		_, listed := queueMap[name]
+		return listed || own[name]
+	}
+	// setQueuedCount records a queue's count, listing the queue. To others
+	// than a caller held to its owner, a queue not yet listed is listed when
+	// the scan shows it holds something, as before.
+	setQueuedCount := func(name string, count int, capped, listEmpty bool) {
+		if _, listed := queueMap[name]; !listed && !ownerOnly && count == 0 && !capped && !listEmpty {
+			return
+		}
+		queue := getOrCreateQueue(queueMap, name, a.config)
 		queue.queuedCount = count
 		queue.queuedCountCapped = capped
 	}
 
 	if onlyQueue != "" {
+		if !admitted(onlyQueue) {
+			return queueMap, nil
+		}
 		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
 		if err != nil {
 			return nil, &Error{
@@ -370,6 +372,9 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			}
 		}
 		for _, queueName := range queueNames {
+			if !admitted(queueName) {
+				continue
+			}
 			count, capped, err := a.countVisibleQueuedItems(ctx, queueName, budget)
 			if err != nil {
 				logger.Warn(ctx, "Failed to get queue length",
@@ -488,48 +493,42 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 // both bounds the cost grows with queue depth and with the number of queues.
 // When either bound is reached, counting stops and the returned bool reports
 // that the count is a lower bound.
-// txeQueueHoldsVisibleRun reports whether a queue holds a run that a
-// caller held to its owner may see, for a queue whose count was cut short
-// before any visible entry. Each entry names its run's DAG, so most entries
-// are passed over by that name, decided once per name, without reading a
-// status. An entry whose DAG the caller may see is confirmed as the count
-// confirms it, by the run's own status, so the two never read a queue
-// differently. The walk spends the request's membership budget; a queue it
-// cannot finish holds nothing visible, so it is not named.
-func (a *API) txeQueueHoldsVisibleRun(ctx context.Context, queueName string, budget *scanBudget) bool {
-	decided := map[string]bool{}
-	cursor := ""
-	for {
-		page, err := a.queueStore.ListCursor(ctx, queueName, cursor, queueCursorScanBatch)
-		if err != nil {
-			return false
-		}
-		for _, item := range page.Items {
-			if budget.exhausted() {
-				return false
-			}
-			budget.consume()
-			ref, err := item.Data()
-			if err != nil || ref == nil {
-				continue
-			}
-			visible, seen := decided[ref.Name]
-			if !seen {
-				visible = a.txeNativeVisible(ctx, ref.Name)
-				decided[ref.Name] = visible
-			}
-			if !visible {
-				continue
-			}
-			if summary, err := a.fetchDAGRunSummary(ctx, *ref); err == nil && summary.Status != api.StatusRunning {
-				return true
-			}
-		}
-		if !page.HasMore {
-			return false
-		}
-		cursor = page.NextCursor
+// txeOwnQueueNames returns the queues the DAGs a caller held to its owner may
+// see run in: each job and per-machine DAG it may see, by the queue its
+// definition names (ProcGroup: its queue, else its name). It is read from
+// the caller's own DAGs, never from another owner's queue.
+func (a *API) txeOwnQueueNames(ctx context.Context) (map[string]bool, error) {
+	s, err := a.txeStore()
+	if err != nil {
+		return nil, err
 	}
+	var names []string
+	jobs, err := s.ListJobs(ctx, registry.JobFilter{})
+	if err != nil {
+		return nil, txeError(err)
+	}
+	for _, job := range jobs {
+		names = append(names, job.JobID)
+	}
+	machines, err := s.ListMachines(ctx, "")
+	if err != nil {
+		return nil, txeError(err)
+	}
+	for _, m := range machines {
+		names = append(names, txeauth.MachineDAGs(m.MachineID)...)
+	}
+	out := map[string]bool{}
+	for _, name := range names {
+		if !a.txeNativeVisible(ctx, name) {
+			continue
+		}
+		queue := name
+		if dag, err := a.dagRepository.GetMetadata(ctx, name); err == nil && dag != nil {
+			queue = dag.ProcGroup()
+		}
+		out[queue] = true
+	}
+	return out, nil
 }
 
 func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, budget *scanBudget) (int, bool, error) {

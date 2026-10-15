@@ -243,9 +243,9 @@ func TestTxeSharedQueueCountsOnlyTheCallersRuns(t *testing.T) {
 	require.True(t, *shared(w.legacy).QueuedCountCapped)
 }
 
-// A queue reached after the request's scan budget is spent is decided by its
-// name, the DAG it is named for: the caller's own queue is still listed
-// (with its count a lower bound), another owner's still is not.
+// Another owner's queues are not scanned for a caller held to its owner, so
+// they spend none of the request's budget: the caller's own queue is listed
+// and counted however much another owner has queued before it.
 func TestTxeQueuesBeyondTheScanBudgetAreDecidedByName(t *testing.T) {
 	w := newTwoOwners(t, "")
 	w.addRun(w.jobA, "run-1", "production")
@@ -278,8 +278,8 @@ func TestTxeQueuesBeyondTheScanBudgetAreDecidedByName(t *testing.T) {
 	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
 		byName[q.Name] = q
 	}
-	require.Contains(t, byName, second, "the caller's own queue, beyond the budget, is listed")
-	require.True(t, *byName[second].QueuedCountCapped)
+	require.Contains(t, byName, second, "the caller's own queue, after another owner's, is listed")
+	require.Equal(t, 1, byName[second].QueuedCount, "the other owner's queue is not scanned, so it spends none of the budget")
 	require.NotContains(t, byName, first, "the other owner's queue is not named to the caller")
 }
 
@@ -296,25 +296,26 @@ func TestTxeCanonicalPathIsLinear(t *testing.T) {
 	}
 }
 
-// A queue may be named otherwise than its DAG (an enqueue's queue override).
-// Past the scan budget, it is decided by the runs it holds: listed when one
-// is the caller's, whatever it is called, and not named otherwise.
-func TestTxeCustomQueuesBeyondTheScanBudgetAreDecidedByTheirRuns(t *testing.T) {
+// A DAG may name its own queue. A caller held to its owner sees the queues
+// its DAGs name, however they are called and whatever else is queued, and
+// never a queue that holds only another owner's runs.
+func TestTxeCustomQueuesAreTheCallersByItsDAGs(t *testing.T) {
 	w := newTwoOwners(t, "")
 	w.addRun(w.jobA, "run-1", "production")
-	queued := func(dag, runID string) {
+	ctx := context.Background()
+	reviewerA := "txe-reviewer-" + w.machineA[len("mch_"):]
+	require.NoError(t, w.api.dagRepository.Create(ctx, reviewerA, []byte("queue: zz-custom\nsteps:\n  - name: r\n    run: echo r\n")))
+	queued := func(dag, runID, queueName string) {
 		w.writeRun(&ir.DAG{Name: dag, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
-			s.Status = ir.Queued
+			s.Status, s.ProcGroup = ir.Queued, queueName
 		})
 	}
-	queued(w.jobB, "qb-1")
-	queued(w.jobA, "qa-1")
-	queued(w.jobB, "qb-2")
+	queued(w.jobB, "qb-1", "aa-first")
+	queued(reviewerA, "qr-1", "zz-custom")
+	queued(w.jobB, "qb-2", "zz-other")
 	qs := store.NewQueueStore(file.NewCollection(t.TempDir()))
-	ctx := context.Background()
-	// Scanned in name order: the budget is spent on the first.
 	require.NoError(t, qs.Enqueue(ctx, "aa-first", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobB, "qb-1")))
-	require.NoError(t, qs.Enqueue(ctx, "zz-custom", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobA, "qa-1")))
+	require.NoError(t, qs.Enqueue(ctx, "zz-custom", queue.QueuePriorityLow, ir.NewDAGRunRef(reviewerA, "qr-1")))
 	require.NoError(t, qs.Enqueue(ctx, "zz-other", queue.QueuePriorityLow, ir.NewDAGRunRef(w.jobB, "qb-2")))
 	w.api.queueStore = qs
 	w.api.procRepository = nil
@@ -322,32 +323,45 @@ func TestTxeCustomQueuesBeyondTheScanBudgetAreDecidedByTheirRuns(t *testing.T) {
 	t.Cleanup(func() { queuedCountRequestScanCap = saved })
 	queuedCountRequestScanCap = 1
 
-	resp, err := w.api.ListQueues(neutral(w.personA), apigen.ListQueuesRequestObject{})
+	personA := neutral(w.personA)
+	resp, err := w.api.ListQueues(personA, apigen.ListQueuesRequestObject{})
 	require.NoError(t, err)
 	byName := map[string]apigen.Queue{}
 	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
 		byName[q.Name] = q
 	}
-	require.Contains(t, byName, "zz-custom", "A's run in a custom queue beyond the budget is listed")
-	require.True(t, *byName["zz-custom"].QueuedCountCapped)
-	require.NotContains(t, byName, "zz-other", "a queue of B's runs only is not named to A")
+	require.Contains(t, byName, "zz-custom", "the queue A's DAG names is listed")
+	require.Equal(t, 1, byName["zz-custom"].QueuedCount)
+	require.NotContains(t, byName, "zz-other")
 	require.NotContains(t, byName, "aa-first")
-	_, err = w.api.GetQueue(neutral(w.personA), apigen.GetQueueRequestObject{Name: "zz-other"})
-	require.Equal(t, http.StatusNotFound, statusOf(err))
-
-	// The walk that finds A's run is bounded too: with its budget spent, the
-	// queue is not named, rather than walked without limit. A still reaches
-	// it by name, with that request's own budget.
-	savedWalk := queuedMembershipScanCap
-	t.Cleanup(func() { queuedMembershipScanCap = savedWalk })
-	queuedMembershipScanCap = 0
-	resp, err = w.api.ListQueues(neutral(w.personA), apigen.ListQueuesRequestObject{})
-	require.NoError(t, err)
-	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
-		require.NotEqual(t, "zz-custom", q.Name)
-	}
-	queuedCountRequestScanCap = saved
-	got, err := w.api.GetQueue(neutral(w.personA), apigen.GetQueueRequestObject{Name: "zz-custom"})
+	got, err := w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: "zz-custom"})
 	require.NoError(t, err)
 	require.Equal(t, 1, apigen.Queue(got.(apigen.GetQueue200JSONResponse)).QueuedCount)
+	_, err = w.api.GetQueue(personA, apigen.GetQueueRequestObject{Name: "zz-other"})
+	require.Equal(t, http.StatusNotFound, statusOf(err))
+	// The legacy view is unchanged: every queue.
+	resp, err = w.api.ListQueues(w.legacy, apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	require.Len(t, resp.(apigen.ListQueues200JSONResponse).Queues, 3)
+}
+
+// A caller held to its owner queues a run only where its DAG names; the
+// queue override stays with legacy callers.
+func TestTxeOwnerHeldEnqueueKeepsItsDAGsQueue(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.markReady(w.jobA, w.machineA)
+	w.addRun(w.jobA, "run-1", "production")
+	w.api.coordinatorCli = &retryCoordinatorRecorder{}
+	w.api.defaultExecMode = config.ExecutionModeDistributed
+	enqueue := func(ctx context.Context, q string) error {
+		_, err := w.api.EnqueueDAGDAGRun(ctx, apigen.EnqueueDAGDAGRunRequestObject{FileName: w.jobA,
+			Body: &apigen.EnqueueDAGDAGRunJSONRequestBody{Queue: &q}})
+		return err
+	}
+	err := enqueue(neutral(w.personA), "elsewhere")
+	require.Equal(t, http.StatusConflict, statusOf(err))
+	require.Contains(t, err.Error(), "queued only where its DAG names")
+	if err := enqueue(w.legacy, "elsewhere"); err != nil {
+		require.NotContains(t, err.Error(), "queued only where its DAG names")
+	}
 }
