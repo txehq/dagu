@@ -95,6 +95,8 @@ type txeEnrolView struct {
 	Application    *txeEnrolApplication `json:"application,omitempty"`
 	// State is "applied" (awaiting a person's approval) or "enrolled".
 	State string `json:"state"`
+	// resume is the command that keeps the application live.
+	resume string
 }
 
 // txeEnrolApplication is the part of the hub's TxeEnrolmentApplication
@@ -148,7 +150,12 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		return err
 	}
 
-	view := txeEnrolView{MachineID: machine.MachineID, OwnerID: machine.OwnerID, ClientID: clientID, CredentialFile: path}
+	view := txeEnrolView{MachineID: machine.MachineID, OwnerID: machine.OwnerID, ClientID: clientID, CredentialFile: path,
+		resume: "dagu txe enrol --client-id " + txeShellQuote(clientID)}
+	if path != filepath.Join(home.Root, txeEnrolCredentialFile) {
+		view.resume += " --credential-file " + txeShellQuote(path)
+	}
+	view.resume += " --resume --wait 15m"
 	var token string
 	if resume {
 		credential, err := transportauth.ReadMachineCredential(path)
@@ -397,29 +404,18 @@ func (h txeEnrolHub) await(ctx context.Context, path string, wait time.Duration,
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		token, err := source.Token(ctx)
-		switch {
-		case errors.Is(err, transportauth.ErrRevoked):
-			return fmt.Errorf("%w; run dagu txe enrol again without --resume", err)
-		case err != nil && time.Now().After(deadline):
-			return err
-		case err == nil:
-			done, err := h.enrolled(ctx, token)
-			if err != nil {
-				return err
-			}
-			if done {
-				view.State, view.Application = "enrolled", nil
-				return nil
-			}
-			application, err := h.apply(ctx, token)
-			if err != nil {
-				return err
-			}
-			view.Application, view.State, view.Subject = application, "applied", application.Subject
-		}
-		if !time.Now().Add(txeEnrolInterval).Before(deadline) {
+		err := h.round(ctx, source, path, view)
+		if errors.Is(err, errTxeEnrolled) {
 			return nil
+		}
+		var renewal *txeEnrolRenewalError
+		if err != nil && !errors.As(err, &renewal) {
+			return err
+		}
+		// A renewal the provider did not answer is retried while time is
+		// left; the last round's failure is the outcome.
+		if !time.Now().Add(txeEnrolInterval).Before(deadline) {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -427,6 +423,58 @@ func (h txeEnrolHub) await(ctx context.Context, path string, wait time.Duration,
 		case <-time.After(txeEnrolInterval):
 		}
 	}
+}
+
+// errTxeEnrolled ends a waiting enrolment: the hub reports it enrolled.
+var errTxeEnrolled = errors.New("enrolled")
+
+// txeEnrolRenewalError is a renewal the provider gave no verdict on; it may
+// be tried again.
+type txeEnrolRenewalError struct{ err error }
+
+func (e *txeEnrolRenewalError) Error() string { return e.err.Error() }
+func (e *txeEnrolRenewalError) Unwrap() error { return e.err }
+
+// round renews the worker's token, then asks the hub whether the machine is
+// enrolled and, if not, applies.
+func (h txeEnrolHub) round(ctx context.Context, source *transportauth.RefreshingSource, path string, view *txeEnrolView) error {
+	token, err := source.Token(ctx)
+	if errors.Is(err, transportauth.ErrRevoked) {
+		return fmt.Errorf("%w; run dagu txe enrol again without --resume", err)
+	}
+	if err != nil {
+		return &txeEnrolRenewalError{err: err}
+	}
+	// The provider may have retired the refresh token on file; one that
+	// lives only in this process is lost when it exits.
+	if unsaved := source.Unsaved(); unsaved != nil {
+		return fmt.Errorf("%w; %s no longer holds a usable credential: make its directory writable and run dagu txe enrol again without --resume",
+			unsaved, path)
+	}
+	done, err := h.enrolled(ctx, token)
+	if err != nil {
+		return err
+	}
+	if done {
+		view.State, view.Application = "enrolled", nil
+		return errTxeEnrolled
+	}
+	application, err := h.apply(ctx, token)
+	if err != nil {
+		return err
+	}
+	view.Application, view.State, view.Subject = application, "applied", application.Subject
+	return nil
+}
+
+// txeShellQuote quotes s for a POSIX shell when it needs it.
+func txeShellQuote(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("-_./:@", r)
+	}) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func printEnrol(p *txePrinter, v txeEnrolView) {
@@ -441,7 +489,7 @@ func printEnrol(p *txePrinter, v txeEnrolView) {
 		p.f("Applied; the application is live until %s.\n", a.CredentialExpires.Format(time.RFC3339))
 		p.f("A person of owner %s approves it in the hub: class %s, client %s, issuer %s, subject %s.\n",
 			v.OwnerID, a.Class, a.ClientID, a.Issuer, a.Subject)
-		p.f("Until then, keep it live with: dagu txe enrol --client-id %s --resume --wait 15m\n", v.ClientID)
+		p.f("Until then, keep it live with: %s\n", v.resume)
 	}
 	p.f("The worker reads it from worker.auth.credential_file: %s (or DAGU_WORKER_AUTH_CREDENTIAL_FILE).\n", v.CredentialFile)
 }

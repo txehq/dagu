@@ -263,3 +263,48 @@ func mustJSON(t *testing.T, v any) string {
 	require.NoError(t, err)
 	return string(b)
 }
+
+// A credential file elsewhere is named in the printed resume command, and a
+// rotated refresh token that cannot be saved there is an error, not a
+// success: the worker would read the retired one.
+func TestTXEEnrolCustomFileAndUnsavedRotation(t *testing.T) {
+	f := newTXEEnrolFixture(t)
+	dir := filepath.Join(filepath.Dir(f.home), "cred dir")
+	path := filepath.Join(dir, "worker.json")
+	out, err := f.run("enrol", "--client-id", txeEnrolTestClient, "--credential-file", path)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "--credential-file '"+path+"' --resume --wait 15m")
+	_, err = transportauth.ReadMachineCredential(path)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	applied := len(f.applied)
+	_, err = f.run("enrol", "--client-id", txeEnrolTestClient, "--credential-file", path, "--resume")
+	require.ErrorContains(t, err, "no longer holds a usable credential")
+	assert.Len(t, f.applied, applied, "nothing applied with a credential the worker cannot use")
+}
+
+// A renewal the provider does not answer is the outcome when no retry is
+// left, however short the wait.
+func TestTXEEnrolReportsAFailedRenewal(t *testing.T) {
+	f := newTXEEnrolFixture(t)
+	f.json("enrol", "--client-id", txeEnrolTestClient)
+	f.provider.RefreshHandler = func(w http.ResponseWriter) bool {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return true
+	}
+	applied := len(f.applied)
+
+	_, err := f.run("enrol", "--client-id", txeEnrolTestClient, "--resume", "--wait", "30s")
+	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable, "a wait shorter than one interval")
+
+	before := txeEnrolInterval
+	txeEnrolInterval = 20 * time.Millisecond
+	t.Cleanup(func() { txeEnrolInterval = before })
+	refreshes := f.provider.Refreshes()
+	_, err = f.run("enrol", "--client-id", txeEnrolTestClient, "--resume", "--wait", "200ms")
+	require.ErrorIs(t, err, transportauth.ErrProviderUnavailable, "failing through the last round")
+	assert.Greater(t, f.provider.Refreshes()-refreshes, 1, "retried while time was left")
+	assert.Len(t, f.applied, applied, "the hub was not asked")
+}
