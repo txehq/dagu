@@ -64,7 +64,7 @@ func TestTXEReviewCommandIsRegistered(t *testing.T) {
 	for _, sub := range txeReviewCommand().Commands() {
 		steps[sub.Name()] = true
 	}
-	assert.Equal(t, map[string]bool{"prepare": true, "apply": true, "execute": true, "render": true}, steps)
+	assert.Equal(t, map[string]bool{"prepare": true, "apply": true, "execute": true, "render": true, "install": true}, steps)
 }
 
 // What a job's commands may be is read from this machine's own record of the

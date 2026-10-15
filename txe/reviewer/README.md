@@ -13,6 +13,38 @@ and installed on the service:
 Dagu rejects DAG names of 40 characters or more. Read the names from a
 proposal's `native_task`; do not build them.
 
+## Installing the pair
+
+Install them from the machine itself:
+
+```sh
+dagu txe review install --state-dir <durable dir> --agent-config-dir <profile> --agent-model <model> [--schedule <cron>]
+```
+
+It takes `render`'s flags, renders the pair for this machine (machine.json) and creates or updates
+each DAG on the hub, the decision DAG first, then reads each write back. A DAG of that name that
+the renderer did not write is left alone. A repeated install with the same flags changes nothing.
+
+An update never resets a setting silently. When the installed reviewer's schedule, agent model,
+agent profile, state directory, TXE home or review command differs from what the install would
+render, it stops and names each one; give that flag with the installed value to keep it, or with a
+new one to change it.
+
+Both DAGs are checked before either is written. If the second write fails, the first stays, the
+output says so, and running the install again finishes it.
+
+**Credentials.** The install writes through this machine's hub connection. On a hub that enforces
+owners (`txe.authz.mode: enforce`), only a person or CLI sign-in of the machine's owner may write a
+machine's DAGs: sign in first with `dagu txe login`. The platform administrator cannot write them.
+Without a sign-in, the context's API key is used, as before, which a hub that does not enforce
+owners accepts. A refused sign-in is reported and never retried with the API key.
+
+**Installed is not runnable.** The DAGs run only when this machine's worker is connected. The hub
+does not show an owner's sign-in its workers, so the output then says `runnable: unknown`.
+
+Each rendered document is pinned to its own machine with a literal `worker_selector` and declares
+no name of its own, as the hub requires for a machine's DAGs.
+
 ## What the agent can do
 
 Nothing but answer. It is launched with no tools, no MCP servers, no user or

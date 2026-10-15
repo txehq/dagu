@@ -40,6 +40,8 @@ type fakeHub struct {
 	onCreate   func(h *fakeHub, name string) error // runs before a create, as another writer
 	afterWrite func(h *fakeHub, name string)       // runs after a write, as another writer
 	onListWork func()
+	owner      bool // native calls carry an owner's sign-in
+	putErrFor  map[string]error
 }
 
 func (h *fakeHub) getDAGSpec(_ context.Context, name string) (string, bool, error) {
@@ -77,6 +79,9 @@ func (h *fakeHub) updateDAGSpec(_ context.Context, name, spec string) error {
 	if h.putErr != nil {
 		return h.putErr
 	}
+	if err := h.putErrFor[name]; err != nil {
+		return err
+	}
 	h.writes = append(h.writes, "update "+name)
 	h.specs[name] = spec
 	if h.afterWrite != nil {
@@ -91,6 +96,8 @@ func (h *fakeHub) listWorkers(context.Context) ([]api.Worker, []string, error) {
 	}
 	return h.workers, h.listErrors, h.workersErr
 }
+
+func (h *fakeHub) ownerSignedIn() bool { return h.owner }
 
 func (h *fakeHub) writesSoFar() []string {
 	h.mu.Lock()
@@ -417,11 +424,35 @@ func TestTXEHubInstallWorkerHealthIsAdvisory(t *testing.T) {
 		require.Len(t, res.Warnings, 1)
 		assert.Contains(t, res.Warnings[0], "Coordinator service not configured")
 	})
-	t.Run("refused", func(t *testing.T) {
+	// Readiness never decides an install (TXE-4417): a hub that does not
+	// show this caller its workers leaves it unknown.
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run("refused "+http.StatusText(status), func(t *testing.T) {
+			f := newHubFixture(t)
+			f.hub.workersErr = &remoteError{StatusCode: status, Message: "refused"}
+			res, err := txeHubInstall(t.Context(), f.hub, f.machines, f.machine, f.cfg, f.opts)
+			require.NoError(t, err)
+			assert.Equal(t, txeHubCreated, res.Action)
+			assert.Empty(t, res.Worker)
+			require.Len(t, res.Warnings, 1)
+			assert.Contains(t, res.Warnings[0], "does not show this caller its workers")
+		})
+	}
+	t.Run("other failure", func(t *testing.T) {
 		f := newHubFixture(t)
-		f.hub.workersErr = &remoteError{StatusCode: http.StatusUnauthorized, Message: "unauthorized"}
+		f.hub.workersErr = &remoteError{StatusCode: http.StatusInternalServerError, Message: "boom"}
 		_, err := txeHubInstall(t.Context(), f.hub, f.machines, f.machine, f.cfg, f.opts)
-		require.ErrorContains(t, err, "unauthorized")
+		require.ErrorContains(t, err, "boom")
 		assert.Empty(t, f.hub.writesSoFar())
+	})
+	t.Run("owner sign-in asks nothing", func(t *testing.T) {
+		f := newHubFixture(t)
+		f.hub.owner = true
+		f.hub.onListWork = func() { t.Error("GET /workers was sent with an owner's sign-in") }
+		res, err := txeHubInstall(t.Context(), f.hub, f.machines, f.machine, f.cfg, f.opts)
+		require.NoError(t, err)
+		assert.Empty(t, res.Worker)
+		require.Len(t, res.Warnings, 1)
+		assert.Contains(t, res.Warnings[0], "not shown to an owner's sign-in")
 	})
 }
