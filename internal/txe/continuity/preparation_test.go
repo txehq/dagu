@@ -64,8 +64,14 @@ func TestPreparationJournalLossBlocks(t *testing.T) {
 	t.Parallel()
 	l, f := build(t)
 	journal := filepath.Join(l.DataDir, "dag-runs.preparations")
-	tmp := filepath.Join(journal, path.Base(f.Preparations[0])+".tmp.123456789")
-	require.NoError(t, os.WriteFile(tmp, []byte("{"), 0o600))
+	// An interrupted write leaves the temporary file fileutil.WriteFileAtomic
+	// makes, named by os.CreateTemp as it names it.
+	created, err := os.CreateTemp(journal, path.Base(f.Preparations[0])+".tmp.*")
+	require.NoError(t, err)
+	_, err = created.WriteString("{")
+	require.NoError(t, err)
+	require.NoError(t, created.Close())
+	tmp := created.Name()
 
 	before, err := continuity.Reconcile(hubAndMachine(t, l))
 	require.NoError(t, err)
