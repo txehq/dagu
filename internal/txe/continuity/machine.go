@@ -4,6 +4,7 @@
 package continuity
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -27,7 +28,9 @@ type machineFile struct {
 	MachineID   string `json:"machine_id"`
 	OwnerID     string `json:"owner_id"`
 	DisplayName string `json:"display_name,omitempty"`
-	CreatedAt   string `json:"created_at,omitempty"`
+	// CreatedAt is raw so that an explicit null or empty value is told
+	// apart from an omitted one.
+	CreatedAt json.RawMessage `json:"created_at,omitempty"`
 }
 
 // machineIdentity reads the machine's machine.json. It names the machine
@@ -55,10 +58,13 @@ func (s *scanner) machineIdentity() error {
 		b.owner(m.OwnerID)
 		b.required("machine", KindMachine, m.MachineID)
 		checkID(b, registry.PrefixMachine, m.MachineID, "machine_id")
-		if m.CreatedAt != "" {
+		if m.CreatedAt != nil {
 			// Python's isoformat: RFC 3339, with or without fractional seconds.
-			if _, err := time.Parse(time.RFC3339Nano, m.CreatedAt); err != nil {
-				b.block("undecodable", "created_at %q is not an RFC 3339 timestamp", m.CreatedAt)
+			var at string
+			if err := json.Unmarshal(m.CreatedAt, &at); err != nil || at == "" {
+				b.block("undecodable", "created_at %s is not an RFC 3339 timestamp", m.CreatedAt)
+			} else if _, err := time.Parse(time.RFC3339Nano, at); err != nil {
+				b.block("undecodable", "created_at %q is not an RFC 3339 timestamp", at)
 			}
 		}
 		s.inv.Machines[s.root.Label] = m.MachineID

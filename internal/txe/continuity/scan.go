@@ -150,9 +150,9 @@ const (
 var machineHomeRules = []rule{
 	{name: "receipts", kind: kindDir, policy: PolicyMutable},
 	{name: "outputs", kind: kindDir, policy: PolicyImmutable},
-	{name: "client", exclude: "the CLI's Dagu home holds its hub credential; not read"},
-	{name: "skill", exclude: "unpacked skill revisions; reinstalled, not retained data"},
-	{name: "tunnel", exclude: "the tunnel's port-forward credential (a ServiceAccount kubeconfig and its expiry), renewed by tunnel-credential.sh; not read"},
+	{name: "client", kind: kindDir, exclude: "the CLI's Dagu home holds its hub credential; not read"},
+	{name: "skill", kind: kindDir, exclude: "unpacked skill revisions; reinstalled, not retained data"},
+	{name: "tunnel", kind: kindDir, exclude: "the tunnel's port-forward credential (a ServiceAccount kubeconfig and its expiry), renewed by tunnel-credential.sh; not read"},
 	// Every installed binary with its build record, and the link to the
 	// current one: rebuilt from a release tag, and an upgrade moves the
 	// link, so they are counted, not compared.
@@ -171,8 +171,8 @@ var machineHomeRules = []rule{
 	// far; anything else it gains blocks until it is classified.
 	{name: "worker-home", kind: kindDir, dir: []rule{
 		{name: "data", kind: kindDir, dir: []rule{
-			{name: "auth", exclude: "the worker's encryption key; not read"},
-			{name: "contexts", exclude: "remote context credentials; not read"},
+			{name: "auth", kind: kindDir, exclude: "the worker's encryption key; not read"},
+			{name: "contexts", kind: kindDir, exclude: "remote context credentials; not read"},
 		}},
 	}},
 	{name: "state", kind: kindDir, dir: []rule{
@@ -532,15 +532,17 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 	if r.kind != kindLink && s.symlink(rel, e) {
 		return nil
 	}
-	if r.exclude != "" {
-		s.exclude(rel, r.exclude)
-		return nil
-	}
+	// The type comes from the directory entry, so an excluded entry is
+	// checked without being opened.
 	switch {
 	case r.kind == kindDir && !e.IsDir(),
 		r.kind == kindFile && !e.Type().IsRegular(),
 		r.kind == kindLink && !isLink:
 		s.issue("unsupported_file", "", s.root.Label+"/"+rel, "%s/%s is not the kind of entry its place in a machine's TXE home holds; it was not read", s.root.Label, rel)
+		return nil
+	}
+	if r.exclude != "" {
+		s.exclude(rel, r.exclude)
 		return nil
 	}
 	if r.target != nil {

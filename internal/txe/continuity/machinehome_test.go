@@ -122,6 +122,12 @@ func TestMachineHomeBreaksAreBlocking(t *testing.T) {
 			break_: editMachine(func(m map[string]any) { m["installed_by"] = "someone" }), want: "undecodable"},
 		{name: "machine.json whose created_at is not a timestamp",
 			break_: editMachine(func(m map[string]any) { m["created_at"] = "yesterday" }), want: "undecodable"},
+		{name: "machine.json whose created_at is empty",
+			break_: editMachine(func(m map[string]any) { m["created_at"] = "" }), want: "undecodable"},
+		{name: "machine.json whose created_at is null",
+			break_: editMachine(func(m map[string]any) { m["created_at"] = nil }), want: "undecodable"},
+		{name: "machine.json whose created_at is a number",
+			break_: editMachine(func(m map[string]any) { m["created_at"] = 1 }), want: "undecodable"},
 		{name: "machine.json of a later schema",
 			break_: editMachine(func(m map[string]any) { m["schema"] = 2 }), want: "unsupported_schema"},
 		{name: "a file in bin that is not an installed build", break_: write("bin/notes.txt", "x"), want: "unclassified_area"},
@@ -149,6 +155,21 @@ func TestMachineHomeBreaksAreBlocking(t *testing.T) {
 		// A Dagu run whose DAGU_HOME is the TXE home writes Dagu's
 		// first-run defaults there. No TXE writer does that, so each part
 		// blocks until someone decides what to do with it.
+		// An excluded credential area must still be a directory: its type
+		// is checked without opening it.
+		{name: "the tunnel credential replaced by a file", break_: func(t *testing.T, l *fixture.Layout) {
+			require.NoError(t, os.RemoveAll(homePath(l, "tunnel")))
+			write("tunnel", "x")(t, l)
+		}, want: "unsupported_file"},
+		{name: "the worker's key directory replaced by a file", break_: func(t *testing.T, l *fixture.Layout) {
+			require.NoError(t, os.RemoveAll(homePath(l, "worker-home/data/auth")))
+			write("worker-home/data/auth", "x")(t, l)
+		}, want: "unsupported_file"},
+		{name: "the worker's contexts replaced by a file", break_: func(t *testing.T, l *fixture.Layout) {
+			require.NoError(t, os.RemoveAll(homePath(l, "worker-home/data/contexts")))
+			write("worker-home/data/contexts", "x")(t, l)
+		}, want: "unsupported_file"},
+		{name: "the CLI's client directory replaced by a file", break_: write("client", "x"), want: "unsupported_file"},
 		{name: "Dagu's first-run defaults in the home", break_: func(t *testing.T, l *fixture.Layout) {
 			write("base.yaml", "# Base DAG Configuration\n")(t, l)
 			write(".base-config-created", "# Marker\n")(t, l)
