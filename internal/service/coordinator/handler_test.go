@@ -6511,3 +6511,65 @@ func TestHandler_GetOrOpenSubAttempt(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+// In enforce a machine worker is not a match for a task that is not pinned
+// to its machine, a sub-DAG's task included: such a task is answered as if
+// no worker matched, and a waiting poller of the machine is not handed it.
+// In off and observe the worker matches as before.
+func TestDispatchMachinePinning(t *testing.T) {
+	t.Parallel()
+
+	machineB := map[string]string{"txe.machine": "mch_B", "txe.owner": "own_B", "os": "darwin"}
+	tasks := map[string]*coordinatorv1.Task{
+		"unpinned":       {DagRunId: "r1", Target: "platform-dag"},
+		"platform label": {DagRunId: "r2", Target: "platform-dag", WorkerSelector: map[string]string{"os": "darwin"}},
+		"owner label":    {DagRunId: "r3", Target: "platform-dag", WorkerSelector: map[string]string{"txe.owner": "own_B"}},
+		"another machine": {DagRunId: "r4", Target: "job_A",
+			WorkerSelector: map[string]string{"txe.machine": "mch_A"}},
+		"sub-DAG, unpinned": {DagRunId: "r5", Target: "child", RootDagRunName: "job_A", RootDagRunId: "root",
+			ParentDagRunName: "job_A", ParentDagRunId: "root"},
+		"pinned": {DagRunId: "r6", Target: "txe-reviewer-B", WorkerSelector: map[string]string{"txe.machine": "mch_B"}},
+	}
+	for _, pinning := range []dispatch.MachinePinning{dispatch.MachinePinningOff, dispatch.MachinePinningObserve, dispatch.MachinePinningEnforce} {
+		for name, base := range tasks {
+			t.Run(fmt.Sprintf("%d/%s", pinning, name), func(t *testing.T) {
+				t.Parallel()
+				ctx := t.Context()
+				h := NewHandler(HandlerConfig{StaleHeartbeatThreshold: time.Hour, MachinePinning: pinning})
+				h.heartbeats["mch_B"] = &heartbeatInfo{
+					workerID: "mch_B", labels: machineB,
+					stats:           &coordinatorv1.WorkerStats{TotalPollers: 1, BusyPollers: 1},
+					lastHeartbeatAt: time.Now(),
+				}
+				task := &coordinatorv1.Task{
+					DagRunId: base.DagRunId, Target: base.Target, WorkerSelector: base.WorkerSelector,
+					RootDagRunName: base.RootDagRunName, RootDagRunId: base.RootDagRunId,
+					ParentDagRunName: base.ParentDagRunName, ParentDagRunId: base.ParentDagRunId,
+					Definition: "steps:\n  - name: test\n    command: echo hello\n",
+				}
+
+				want := errNoAvailableWorkers // B is a match, but busy
+				if name == "another machine" || (pinning == dispatch.MachinePinningEnforce && name != "pinned") {
+					want = errNoMatchingWorkers
+				}
+				_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: task})
+				require.Equal(t, dispatchErrorCode(want), status.Code(err))
+				require.Equal(t, want.Error(), status.Convert(err).Message())
+
+				// A waiting poller of B is handed the task only when B matches.
+				taskChan := make(chan *coordinatorv1.Task, 1)
+				h.mu.Lock()
+				h.waitingPollers["poller-b"] = &workerInfo{workerID: "mch_B", pollerID: "poller-b", taskChan: taskChan, labels: machineB}
+				h.mu.Unlock()
+				err = h.dispatchToWaitingPoller(ctx, task)
+				if want == errNoMatchingWorkers {
+					require.ErrorIs(t, err, errNoMatchingWorkers)
+					require.Empty(t, taskChan)
+				} else {
+					require.NoError(t, err)
+					require.Len(t, taskChan, 1)
+				}
+			})
+		}
+	}
+}

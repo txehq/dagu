@@ -2648,3 +2648,44 @@ func (c *transitioningListCollection) List(ctx context.Context, q persis.ListQue
 	}
 	return page, nil
 }
+
+// In enforce a machine worker claims only tasks pinned to its machine; an
+// unpinned task, one stored before pinning was enforced included, waits for
+// a worker that is no machine's. A claim found to match nothing under one
+// pinning is not remembered for another.
+func TestDispatchTaskStore_MachineWorkerClaimsOnlyPinnedTasksInEnforce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := store.NewDispatchTaskStore(testutil.NewMemoryBackend().Collection("dispatch_tasks"))
+	require.NoError(t, s.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID: "run-unpinned", Target: "platform-dag", AttemptID: "attempt-u", AttemptKey: "key-u",
+	}))
+	machineB := map[string]string{"txe.machine": "mch_B", "txe.owner": "own_B", "os": "darwin"}
+	claimAs := func(worker string, labels map[string]string, pinning dispatch.MachinePinning) *dispatch.ClaimedDispatchTask {
+		claimed, err := s.ClaimNext(ctx, dispatch.DispatchTaskClaim{
+			WorkerID: worker, PollerID: worker + "-poller", Labels: labels, MachinePinning: pinning,
+		})
+		require.NoError(t, err)
+		return claimed
+	}
+
+	assert.Nil(t, claimAs("mch_B", machineB, dispatch.MachinePinningEnforce), "an unpinned task on B's machine")
+	// The same claim under observe is not answered from enforce's no-match.
+	observed := claimAs("mch_B", machineB, dispatch.MachinePinningObserve)
+	require.NotNil(t, observed, "observe hands it out as before")
+	require.NoError(t, s.ReleaseClaim(ctx, observed.ClaimToken))
+
+	plain := claimAs("platform-worker", map[string]string{"os": "linux"}, dispatch.MachinePinningEnforce)
+	require.NotNil(t, plain, "a worker that is no machine's takes it")
+	assert.Equal(t, "run-unpinned", plain.Task.DAGRunID)
+
+	require.NoError(t, s.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID: "run-a", Target: "job_A", AttemptID: "attempt-a", AttemptKey: "key-a",
+		WorkerSelector: map[string]string{"txe.machine": "mch_A"},
+	}))
+	assert.Nil(t, claimAs("mch_B", machineB, dispatch.MachinePinningEnforce), "A's task on B's machine")
+	pinned := claimAs("mch_A", map[string]string{"txe.machine": "mch_A", "os": "darwin"}, dispatch.MachinePinningEnforce)
+	require.NotNil(t, pinned)
+	assert.Equal(t, "run-a", pinned.Task.DAGRunID)
+}

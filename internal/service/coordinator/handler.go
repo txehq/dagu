@@ -176,6 +176,7 @@ type Handler struct {
 	// Optional worker runtime services.
 	dagRunRepository          *persis.DAGRunRepository // For status persistence
 	runAdmitter               RunAdmitter
+	machinePinning            dispatch.MachinePinning
 	logDir                    string                             // For log storage
 	artifactDir               string                             // For artifact storage
 	stateStore                dagrun.StateStore                  // For persistent DAG state shared across DAG runs
@@ -218,6 +219,11 @@ type HandlerConfig struct {
 	// RunAdmitter, when set, re-checks TXE registered jobs before a worker
 	// may start a claimed run.
 	RunAdmitter RunAdmitter
+
+	// MachinePinning decides whether a TXE machine worker may be handed a
+	// task whose selector does not name its machine (dispatch.SelectorAdmits).
+	// Zero is off: every worker is matched as before.
+	MachinePinning dispatch.MachinePinning
 
 	// DAGRunRepository provides application access to persisted DAG-run statuses.
 	// Required for worker status reporting.
@@ -324,6 +330,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		owner:                     cfg.Owner,
 		dagRunRepository:          cfg.DAGRunRepository,
 		runAdmitter:               cfg.RunAdmitter,
+		machinePinning:            cfg.MachinePinning,
 		logDir:                    cfg.LogDir,
 		artifactDir:               cfg.ArtifactDir,
 		stateStore:                cfg.StateStore,
@@ -479,16 +486,18 @@ func (h *Handler) Poll(ctx context.Context, req *coordinatorv1.PollRequest) (*co
 		}
 		observedGeneration, _ := h.dispatchWakeSnapshot()
 		claimed, err := h.dispatchTaskStore.ClaimNext(ctx, dispatch.DispatchTaskClaim{
-			WorkerID:     req.WorkerId,
-			PollerID:     req.PollerId,
-			Labels:       req.Labels,
-			Owner:        h.owner,
-			ClaimTimeout: h.staleLeaseThreshold,
+			WorkerID:       req.WorkerId,
+			PollerID:       req.PollerId,
+			Labels:         req.Labels,
+			Owner:          h.owner,
+			ClaimTimeout:   h.staleLeaseThreshold,
+			MachinePinning: h.machinePinning,
 		})
 		if err != nil {
 			return nil, status.Error(codes.Internal, "failed to claim task: "+err.Error())
 		}
 		if claimed != nil && claimed.Task != nil {
+			h.observeMachinePin(ctx, req.Labels, claimed.Task.WorkerSelector, claimed.Task.Target, claimed.Task.DAGRunID)
 			claimed.Task.WorkerID = req.WorkerId
 			task, err := convert.DispatchTaskToProto(claimed.Task)
 			if err == nil {
@@ -585,7 +594,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 	if len(healthyWorkers) == 0 {
 		return nil, status.Error(codes.Unavailable, errNoAvailableWorkers.Error())
 	}
-	if !anyWorkerMatches(healthyWorkers, req.Task.WorkerSelector, req.Task.TargetWorkerId) {
+	if !anyWorkerMatches(healthyWorkers, req.Task.WorkerSelector, req.Task.TargetWorkerId, h.machinePinning) {
 		return nil, status.Error(codes.FailedPrecondition, errNoMatchingWorkers.Error())
 	}
 	if err := h.prepareDispatchTaskWorkspace(ctx, req.Task); err != nil {
@@ -1220,7 +1229,7 @@ func (h *Handler) ensureWaitingWorkerAvailability(ctx context.Context, selector 
 		if targetWorkerID != "" && worker.workerID != targetWorkerID {
 			continue
 		}
-		if !matchesSelector(worker.labels, selector) {
+		if !dispatch.SelectorAdmits(worker.labels, selector, h.machinePinning) {
 			continue
 		}
 		h.mu.Unlock()
@@ -1233,14 +1242,16 @@ func (h *Handler) ensureWaitingWorkerAvailability(ctx context.Context, selector 
 // Waiting pollers describe immediate capacity, not worker presence. Consult
 // fresh heartbeats before diagnosing a selector or target mismatch.
 func (h *Handler) waitingWorkerUnavailable(ctx context.Context, selector map[string]string, targetWorkerID string) error {
-	if len(selector) == 0 && targetWorkerID == "" {
+	// An empty selector matches every worker, unless machine workers take
+	// only tasks pinned to them.
+	if len(selector) == 0 && targetWorkerID == "" && h.machinePinning != dispatch.MachinePinningEnforce {
 		return errNoAvailableWorkers
 	}
 	healthyWorkers, err := h.listHealthyWorkers(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list workers: %w", err)
 	}
-	if anyWorkerMatches(healthyWorkers, selector, targetWorkerID) {
+	if anyWorkerMatches(healthyWorkers, selector, targetWorkerID, h.machinePinning) {
 		return errNoAvailableWorkers
 	}
 	return errNoMatchingWorkers
@@ -1254,10 +1265,11 @@ func (h *Handler) dispatchToWaitingPoller(ctx context.Context, task *coordinator
 		if task.TargetWorkerId != "" && worker.workerID != task.TargetWorkerId {
 			continue
 		}
-		if !matchesSelector(worker.labels, task.WorkerSelector) {
+		if !dispatch.SelectorAdmits(worker.labels, task.WorkerSelector, h.machinePinning) {
 			continue
 		}
 		matched = true
+		h.observeMachinePin(ctx, worker.labels, task.WorkerSelector, task.Target, task.DagRunId)
 		select {
 		case worker.taskChan <- task:
 			delete(h.waitingPollers, pollerID)
@@ -2013,9 +2025,9 @@ func (h *Handler) leaseRefreshWriteInterval() time.Duration {
 	return interval
 }
 
-func anyWorkerMatches(workers []dispatch.WorkerHeartbeatRecord, selector map[string]string, targetWorkerID string) bool {
+func anyWorkerMatches(workers []dispatch.WorkerHeartbeatRecord, selector map[string]string, targetWorkerID string, pinning dispatch.MachinePinning) bool {
 	for _, worker := range workers {
-		if dispatch.WorkerHeartbeatMatches(worker, selector, targetWorkerID) {
+		if dispatch.WorkerHeartbeatAdmits(worker, selector, targetWorkerID, pinning) {
 			return true
 		}
 	}
@@ -2023,15 +2035,21 @@ func anyWorkerMatches(workers []dispatch.WorkerHeartbeatRecord, selector map[str
 }
 
 func matchesSelector(workerLabels, selector map[string]string) bool {
-	if len(selector) == 0 {
-		return true
+	return dispatch.SelectorAdmits(workerLabels, selector, dispatch.MachinePinningOff)
+}
+
+// observeMachinePin logs, in observe, a task handed to a machine worker
+// whose selector does not name that machine: what enforce would refuse. It
+// names the machine, the target and the run, never the task's definition.
+func (h *Handler) observeMachinePin(ctx context.Context, workerLabels, selector map[string]string, target, runID string) {
+	if h.machinePinning != dispatch.MachinePinningObserve || !dispatch.MachinePinMissing(workerLabels, selector) {
+		return
 	}
-	for key, value := range selector {
-		if workerLabels[key] != value {
-			return false
-		}
-	}
-	return true
+	logger.Info(ctx, "txe.dispatch: would refuse a task not pinned to the machine",
+		slog.String("machine", workerLabels[dispatch.MachineLabel]),
+		tag.Target(target),
+		tag.RunID(runID),
+	)
 }
 
 func (h *Handler) collectAndRemoveStaleHeartbeats() []*heartbeatInfo {

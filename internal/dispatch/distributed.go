@@ -43,6 +43,9 @@ type DispatchTaskClaim struct {
 	Labels       map[string]string
 	Owner        CoordinatorEndpoint
 	ClaimTimeout time.Duration
+	// MachinePinning decides whether a machine worker may claim a task
+	// whose selector does not name its machine (SelectorAdmits).
+	MachinePinning MachinePinning
 }
 
 // ClaimedDispatchTask is a shared pending task that has been claimed by a
@@ -156,15 +159,16 @@ func WorkerHeartbeatFresh(record WorkerHeartbeatRecord, now time.Time, staleThre
 
 // WorkerHeartbeatMatches reports whether a worker satisfies the selector and target worker requirements.
 func WorkerHeartbeatMatches(record WorkerHeartbeatRecord, selector map[string]string, targetWorkerID string) bool {
+	return WorkerHeartbeatAdmits(record, selector, targetWorkerID, MachinePinningOff)
+}
+
+// WorkerHeartbeatAdmits is WorkerHeartbeatMatches with machine pinning
+// (SelectorAdmits).
+func WorkerHeartbeatAdmits(record WorkerHeartbeatRecord, selector map[string]string, targetWorkerID string, pinning MachinePinning) bool {
 	if targetWorkerID != "" && record.WorkerID != targetWorkerID {
 		return false
 	}
-	for key, value := range selector {
-		if record.Labels[key] != value {
-			return false
-		}
-	}
-	return true
+	return SelectorAdmits(record.Labels, selector, pinning)
 }
 
 // WorkerHeartbeatStore persists shared worker presence across coordinators.

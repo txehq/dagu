@@ -273,14 +273,14 @@ func (idx *dispatchTaskIndex) invalidateDerivedState() {
 	clear(idx.noMatch)
 }
 
-func (idx *dispatchTaskIndex) candidatePendingIDs(workerID string, workerLabels map[string]string) []string {
+func (idx *dispatchTaskIndex) candidatePendingIDs(workerID string, workerLabels map[string]string, pinning dispatch.MachinePinning) []string {
 	ids := make([]string, 0, len(idx.pendingIDs))
 	for _, id := range idx.pendingIDs {
 		entry, ok := idx.pending[id]
 		if !ok {
 			continue
 		}
-		if (entry.targetWorkerID == "" || entry.targetWorkerID == workerID) && matchesDispatchSelector(workerLabels, entry.workerSelector) {
+		if (entry.targetWorkerID == "" || entry.targetWorkerID == workerID) && dispatch.SelectorAdmits(workerLabels, entry.workerSelector, pinning) {
 			ids = append(ids, id)
 		}
 	}
@@ -306,22 +306,22 @@ func (idx *dispatchTaskIndex) hasExpired(now time.Time, ttl time.Duration) bool 
 	return false
 }
 
-func (idx *dispatchTaskIndex) rememberNoMatch(workerID string, labels map[string]string) {
+func (idx *dispatchTaskIndex) rememberNoMatch(workerID string, labels map[string]string, pinning dispatch.MachinePinning) {
 	if idx == nil {
 		return
 	}
-	key := workerID + "\x00" + dispatchClaimLabelsKey(labels)
+	key := dispatchNoMatchKey(workerID, labels, pinning)
 	if _, ok := idx.noMatch[key]; !ok && len(idx.noMatch) >= dispatchNoMatchCacheLimit {
 		clear(idx.noMatch)
 	}
 	idx.noMatch[key] = struct{}{}
 }
 
-func (idx *dispatchTaskIndex) hasNoMatch(workerID string, labels map[string]string) bool {
+func (idx *dispatchTaskIndex) hasNoMatch(workerID string, labels map[string]string, pinning dispatch.MachinePinning) bool {
 	if idx == nil {
 		return false
 	}
-	_, ok := idx.noMatch[workerID+"\x00"+dispatchClaimLabelsKey(labels)]
+	_, ok := idx.noMatch[dispatchNoMatchKey(workerID, labels, pinning)]
 	return ok
 }
 
@@ -592,12 +592,12 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 			return nil, false, err
 		}
 	}
-	if s.index.hasNoMatch(claim.WorkerID, claim.Labels) {
+	if s.index.hasNoMatch(claim.WorkerID, claim.Labels, claim.MachinePinning) {
 		return nil, false, nil
 	}
-	ids := s.index.candidatePendingIDs(claim.WorkerID, claim.Labels)
+	ids := s.index.candidatePendingIDs(claim.WorkerID, claim.Labels, claim.MachinePinning)
 	if len(ids) == 0 {
-		s.index.rememberNoMatch(claim.WorkerID, claim.Labels)
+		s.index.rememberNoMatch(claim.WorkerID, claim.Labels, claim.MachinePinning)
 		return nil, false, nil
 	}
 
@@ -635,7 +635,7 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 			s.index.addPending(rec, payload)
 			continue
 		}
-		if !matchesDispatchSelector(claim.Labels, payload.Task.WorkerSelector) {
+		if !dispatch.SelectorAdmits(claim.Labels, payload.Task.WorkerSelector, claim.MachinePinning) {
 			s.index.addPending(rec, payload)
 			continue
 		}
@@ -691,7 +691,7 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 		}
 		return claimed, stale, err
 	}
-	s.index.rememberNoMatch(claim.WorkerID, claim.Labels)
+	s.index.rememberNoMatch(claim.WorkerID, claim.Labels, claim.MachinePinning)
 	return nil, false, nil
 }
 
@@ -1358,14 +1358,8 @@ func clearDispatchTaskClaim(task *dispatch.DispatchTask) *dispatch.DispatchTask 
 	return task
 }
 
-func matchesDispatchSelector(workerLabels, selector map[string]string) bool {
-	if len(selector) == 0 {
-		return true
-	}
-	for key, value := range selector {
-		if workerLabels[key] != value {
-			return false
-		}
-	}
-	return true
+// dispatchNoMatchKey keys the claims known to match no pending task: the
+// same worker and labels may match differently under another pinning.
+func dispatchNoMatchKey(workerID string, labels map[string]string, pinning dispatch.MachinePinning) string {
+	return workerID + "\x00" + dispatchClaimLabelsKey(labels) + "\x00" + strconv.Itoa(int(pinning))
 }
