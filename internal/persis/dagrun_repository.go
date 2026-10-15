@@ -131,6 +131,7 @@ func (r *DAGRunRepository) statusQuery(options DAGRunListOptions) DAGRunStatusQu
 		Cursor:          options.Cursor,
 		Labels:          options.Labels,
 		WorkspaceFilter: options.WorkspaceFilter,
+		Include:         options.Include,
 	}
 	if !options.AllHistory && query.From.IsZero() && query.To.IsZero() {
 		query.From = NewUTC(r.startOfDay())

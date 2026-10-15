@@ -260,6 +260,9 @@ func (it *dagRunStatusIterator) loadDay(ctx context.Context, dayPath string) ([]
 		if it.opts.Name != "" && !containsFold(status.Name, it.opts.Name) {
 			continue
 		}
+		if it.opts.Include != nil && !it.opts.Include(status) {
+			continue
+		}
 
 		items = append(items, dagRunListItem{
 			Key: dagRunListKey{

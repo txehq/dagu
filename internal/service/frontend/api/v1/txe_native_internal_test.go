@@ -143,11 +143,16 @@ func TestTxeNativeDAGsAreOwnerScoped(t *testing.T) {
 	require.NoError(t, history(personA, w.jobA))
 	require.Equal(t, http.StatusNotFound, statusOf(history(personB, w.jobA)))
 
-	// The whole-hub DAG list shows such a caller nothing; its jobs are in
-	// /txe/jobs.
+	// The whole-hub DAG list shows such a caller what it may read: its
+	// owner's DAGs, never another owner's (TXE-4416).
 	resp, err := w.api.ListDAGs(personA, apigen.ListDAGsRequestObject{})
 	require.NoError(t, err)
-	require.Empty(t, resp.(*apigen.ListDAGs200JSONResponse).Dags)
+	var mine []string
+	for _, d := range resp.(*apigen.ListDAGs200JSONResponse).Dags {
+		mine = append(mine, d.FileName)
+	}
+	require.Contains(t, mine, w.jobA)
+	require.NotContains(t, mine, w.jobB)
 	resp, err = w.api.ListDAGs(w.legacy, apigen.ListDAGsRequestObject{})
 	require.NoError(t, err)
 	require.NotEmpty(t, resp.(*apigen.ListDAGs200JSONResponse).Dags, "a legacy key in mode off lists as today")
@@ -334,7 +339,9 @@ func TestTxeNativeSubRunRoutesOfAnotherOwnersDAG(t *testing.T) {
 }
 
 // A caller held to its owner has no workspace, the default one included:
-// naming one opens no list and passes no workspace check.
+// naming one opens nothing beyond its owner's (TXE-4416: the whole-hub lists
+// show it its owner's DAGs and runs, whatever workspace it names) and passes
+// no workspace check.
 func TestTxeNativeWorkspaceSelectionOpensNothing(t *testing.T) {
 	w := newTwoOwners(t, "")
 	w.addRun(w.jobA, "run-1", "")
@@ -343,16 +350,28 @@ func TestTxeNativeWorkspaceSelectionOpensNothing(t *testing.T) {
 	unbound := neutral(w.nobody)
 
 	for _, ws := range []string{"default", "production"} {
-		for _, ctx := range []context.Context{personA, cliA, unbound} {
+		for ctx, want := range map[context.Context]string{personA: w.jobA, cliA: w.jobA, personB: w.jobB, unbound: ""} {
 			dags, err := w.api.ListDAGs(ctx, apigen.ListDAGsRequestObject{Params: apigen.ListDAGsParams{Workspace: &ws}})
 			require.NoError(t, err, ws)
-			require.Empty(t, dags.(*apigen.ListDAGs200JSONResponse).Dags, ws)
 			runs, err := w.api.ListDAGRuns(ctx, apigen.ListDAGRunsRequestObject{Params: apigen.ListDAGRunsParams{Workspace: &ws}})
 			require.NoError(t, err, ws)
-			require.Empty(t, runs.(apigen.ListDAGRuns200JSONResponse).DagRuns, ws)
-			labels, err := w.api.GetAllDAGLabels(ctx, apigen.GetAllDAGLabelsRequestObject{Params: apigen.GetAllDAGLabelsParams{Workspace: &ws}})
-			require.NoError(t, err, ws)
-			require.Empty(t, labels.(*apigen.GetAllDAGLabels200JSONResponse).Labels, ws)
+			var dagNames, runNames []string
+			for _, d := range dags.(*apigen.ListDAGs200JSONResponse).Dags {
+				dagNames = append(dagNames, d.FileName)
+			}
+			for _, r := range runs.(apigen.ListDAGRuns200JSONResponse).DagRuns {
+				runNames = append(runNames, r.Name)
+			}
+			if want == "" {
+				require.Empty(t, dagNames, ws)
+				require.Empty(t, runNames, ws)
+				labels, err := w.api.GetAllDAGLabels(ctx, apigen.GetAllDAGLabelsRequestObject{Params: apigen.GetAllDAGLabelsParams{Workspace: &ws}})
+				require.NoError(t, err, ws)
+				require.Empty(t, labels.(*apigen.GetAllDAGLabels200JSONResponse).Labels, ws)
+				continue
+			}
+			require.Equal(t, []string{want}, dagNames, ws)
+			require.Equal(t, []string{want}, runNames, ws)
 		}
 		// One DAG's runs are decided by its owner, whatever workspace is
 		// named.
