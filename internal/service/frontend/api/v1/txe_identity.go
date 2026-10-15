@@ -83,11 +83,43 @@ func txeTokenRoute(mountedAPIPath string) func(r *http.Request) bool {
 		if node := r.URL.Query().Get("remoteNode"); node != "" && node != "local" {
 			return false
 		}
-		// Dot segments are resolved first, so a path cannot name /txe and
-		// reach another route.
+		// The router routes on the path as sent. A path that only names
+		// /txe once decoded or cleaned is routed elsewhere, so it is not
+		// admitted at all.
+		if !txeCanonicalPath(r) {
+			return false
+		}
 		p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
 		return p == root || strings.HasPrefix(p, root+"/") || txeNativeRoute(pathutil.NormalizePath(mountedAPIPath), p)
 	}
+}
+
+// txeCanonicalPath reports whether a request's path reads the same to these
+// checks as to the router and the handlers behind it. The router splits the
+// path as sent on "/" and resolves nothing; these checks split the decoded
+// path; the generated handlers decode each path parameter once more. All of
+// them agree, segment for segment, exactly when neither the path as sent nor
+// the decoded path carries an escaped "/" (which would join segments), "."
+// (which would make a dot segment only one of them sees), "\" or "%" (which a
+// further decoding would turn into any of those), and when the decoded path
+// has no dot or empty segment. Escapes are matched in either case. Any other
+// path is refused to a caller held to its owner, rather than decided on a
+// reading the router or a handler does not share.
+func txeCanonicalPath(r *http.Request) bool {
+	for _, form := range []string{strings.ToLower(r.URL.RawPath), strings.ToLower(r.URL.Path)} {
+		for _, escape := range []string{"%2f", "%2e", "%5c", "%25"} {
+			if strings.Contains(form, escape) {
+				return false
+			}
+		}
+	}
+	segments := strings.Split(r.URL.Path, "/")
+	for i, segment := range segments {
+		if segment == "." || segment == ".." || (segment == "" && i != 0 && i != len(segments)-1) {
+			return false
+		}
+	}
+	return true
 }
 
 // txePersonGate admits a person signed in through the identity provider only
@@ -105,7 +137,7 @@ func (a *API) txePersonGate(mountedAPIPath string) func(http.Handler) http.Handl
 				return
 			}
 			p := pathutil.NormalizePath(path.Clean("/" + r.URL.Path))
-			if onTxe(r) || (r.Method == http.MethodGet && p == me) {
+			if onTxe(r) || (r.Method == http.MethodGet && txeCanonicalPath(r) && p == me) {
 				next.ServeHTTP(w, r)
 				return
 			}

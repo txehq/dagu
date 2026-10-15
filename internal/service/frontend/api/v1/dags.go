@@ -1047,7 +1047,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 
@@ -1164,7 +1164,7 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	params := valueOf(request.Body.Params)
 	singleton := valueOf(request.Body.Singleton)
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 	timeout := request.Body.Timeout
@@ -1739,11 +1739,17 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}
 
 	if request.Body.Queue != nil && *request.Body.Queue != "" {
+		// A caller held to its owner queues a run where its DAG names, so
+		// that its queues are those of the DAGs it may see.
+		if a.txeNativeOwnerOnly(ctx) && *request.Body.Queue != dag.ProcGroup() {
+			return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+				Message: "this run is queued only where its DAG names", Details: map[string]any{"code": "run_refused"}}
+		}
 		dag.Queue = *request.Body.Queue
 	}
 
 	nameOverride := strings.TrimSpace(valueOf(request.Body.DagName))
-	if err := txeRefuseRunName(dag, nameOverride); err != nil {
+	if err := a.txeRefuseRunName(ctx, dag, nameOverride); err != nil {
 		return nil, err
 	}
 	if nameOverride != "" {

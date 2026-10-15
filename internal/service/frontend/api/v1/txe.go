@@ -1369,16 +1369,29 @@ func txeRunRefused(dagName string, adm registry.Admission) error {
 // txeRefuseRunName refuses running a registered job's DAG under another
 // name, and any DAG under a job's name: the run name is the identity the
 // scheduler and coordinator guard on.
-func txeRefuseRunName(dag *ir.DAG, name string) error {
+func (a *API) txeRefuseRunName(ctx context.Context, dag *ir.DAG, name string) error {
 	if name == "" || dag == nil {
 		return nil
 	}
-	if registry.IsJobDAG(dag.SuspendFlagName()) && name != dag.SuspendFlagName() {
+	own := dag.SuspendFlagName()
+	if registry.IsJobDAG(own) && name != own {
 		return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 			Message: "a registered job's DAG cannot run under another name",
 			Details: map[string]any{"code": "run_refused"}}
 	}
-	return txeRefuseInlineJobDAG(name)
+	if err := txeRefuseInlineJobDAG(name); err != nil {
+		return err
+	}
+	// A run belongs to the owner of the name it runs under: a machine's DAG
+	// does not run under another name, and no DAG runs under a machine's.
+	// A caller held to its owner runs a DAG only under its own name, so
+	// none of its runs lands where its owner does not reach.
+	if name != own && (txeNativeOwnedName(own) || txeNativeOwnedName(name) || a.txeNativeOwnerOnly(ctx)) {
+		return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+			Message: "this DAG cannot run under another name",
+			Details: map[string]any{"code": "run_refused"}}
+	}
+	return nil
 }
 
 // txeRefuseInlineJobDAG refuses an inline spec that names itself as a
