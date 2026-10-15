@@ -50,6 +50,9 @@ type Options struct {
 	Label         string
 	Tool          string
 	Now           func() time.Time
+	// Keep names entries that no writer owns but that are kept exactly as
+	// they are (DecodeKeep).
+	Keep *KeepManifest
 }
 
 // Hub data directory areas. Each top-level entry of the data directory is
@@ -231,6 +234,11 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 		ModeBits:      hasModeBits,
 		Machines:      map[string]string{},
 	}
+	keep, err := keepIndex(opts.Keep)
+	if err != nil {
+		return nil, err
+	}
+	keepSeen := map[string]bool{}
 	labels := map[string]bool{}
 	for _, r := range opts.Roots {
 		if r.Label == "" {
@@ -248,7 +256,7 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 			return nil, fmt.Errorf("continuity: root %s is not a directory", r.Label)
 		}
 		inv.Roots = append(inv.Roots, RootInfo{Area: r.Area, Label: r.Label, Path: r.Path, Mount: r.Mount})
-		s := &scanner{ctx: ctx, inv: inv, root: r}
+		s := &scanner{ctx: ctx, inv: inv, root: r, keep: keep, keepSeen: keepSeen}
 		switch r.Area {
 		case AreaHubData:
 			err = s.hubData()
@@ -267,6 +275,7 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 			return nil, err
 		}
 	}
+	keptMissing(inv, keep, keepSeen)
 	if err := inv.Seal(); err != nil {
 		return nil, err
 	}
@@ -277,6 +286,10 @@ type scanner struct {
 	ctx  context.Context
 	inv  *Inventory
 	root Root
+	// keep holds the keep manifest's entries by root label and path, and
+	// keepSeen those the scan found.
+	keep     map[string]*KeepEntry
+	keepSeen map[string]bool
 }
 
 func (s *scanner) issue(code, class, id, format string, args ...any) {
@@ -313,6 +326,12 @@ func (s *scanner) hubData() error {
 				return err
 			}
 		default:
+			if ok, err := s.kept(name); err != nil || ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			s.issue("unclassified_area", "", name, "%s/%s is not a known area of the data directory; classify it before a transition, it was not read", s.root.Label, name)
 		}
 	}
@@ -340,6 +359,12 @@ func (s *scanner) subAreas(area string, entries map[string]string) error {
 		class, ok := entries[e.Name()]
 		switch {
 		case !ok:
+			if kept, err := s.kept(rel); err != nil || kept {
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			s.issue("unclassified_area", "", rel, "%s/%s is not a known part of the data directory; classify it before a transition, it was not read", s.root.Label, rel)
 		case strings.HasPrefix(class, "exclude: "):
 			s.exclude(rel, strings.TrimPrefix(class, "exclude: "))
@@ -546,6 +571,9 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 		}
 	}
 	if r == nil {
+		if kept, err := s.kept(rel); err != nil || kept {
+			return err
+		}
 		s.issue("unclassified_area", "", s.root.Label+"/"+rel, "%s/%s is not a known part of a machine's TXE home; classify it before a transition, it was not read", s.root.Label, rel)
 		return nil
 	}

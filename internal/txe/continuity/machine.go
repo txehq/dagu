@@ -109,6 +109,12 @@ func (s *scanner) packages() error {
 			continue
 		}
 		if err := registry.ValidateID(registry.PrefixJob, name); err != nil {
+			if kept, err := s.kept("packages/" + name); err != nil || kept {
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			s.issue("unsupported_file", ClassPackage, s.root.Label+"/packages/"+name, "packages/%s is not named by a job ID", name)
 			continue
 		}

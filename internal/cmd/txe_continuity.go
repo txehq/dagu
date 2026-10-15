@@ -50,6 +50,11 @@ var (
 		usage:  "Report the changes made while the installation was in use, instead of the strict freeze comparison",
 		isBool: true,
 	}
+	txeContinuityKeepFlag = commandLineFlag{
+		name: "keep",
+		usage: "A keep manifest (" + continuity.KeepFormatV1 + ") naming entries no TXE writer owns that are kept exactly as they are, " +
+			"each attributed and pinned by its tree digest",
+	}
 	txeContinuityReconciledFlag = commandLineFlag{
 		name:  "reconciled",
 		usage: "A file listing, one per line, the records (<store>/<id>) and files (<root>/<path>) a recorded step changed or added",
@@ -93,7 +98,7 @@ Example, at the freeze point, with the hub's PVC mounted at /data:
 		Args:        cobra.NoArgs,
 		Annotations: local,
 	}, []commandLineFlag{txeContinuityScanFlag, txeContinuityOwnerFlag, txeContinuityOutFlag, txeContinuityLabelFlag,
-		txeContinuityAllowOwnerFlag, txeJSONFlag}, runTXEContinuityInventory))
+		txeContinuityAllowOwnerFlag, txeContinuityKeepFlag, txeJSONFlag}, runTXEContinuityInventory))
 	command.AddCommand(NewCommand(&cobra.Command{
 		Use:         "validate <inventory>",
 		Short:       "Check one inventory: owners, references, history, packages and artifacts",
@@ -147,7 +152,18 @@ func runTXEContinuityInventory(ctx *Context, _ []string) error {
 	owner, _ := flags.GetString("owner")
 	label, _ := flags.GetString("label")
 	out, _ := flags.GetString("out")
-	inv, err := continuity.Scan(ctx, continuity.Options{Roots: roots, ExpectedOwner: owner, Label: label, Tool: "dagu txe continuity"})
+	keepFile, _ := flags.GetString("keep")
+	var keep *continuity.KeepManifest
+	if keepFile != "" {
+		data, err := os.ReadFile(keepFile) //nolint:gosec // a manifest the operator names
+		if err != nil {
+			return err
+		}
+		if keep, err = continuity.DecodeKeep(data); err != nil {
+			return err
+		}
+	}
+	inv, err := continuity.Scan(ctx, continuity.Options{Roots: roots, ExpectedOwner: owner, Label: label, Tool: "dagu txe continuity", Keep: keep})
 	if err != nil {
 		return err
 	}

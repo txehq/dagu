@@ -120,3 +120,25 @@ func TestTXEContinuityScanValue(t *testing.T) {
 	_, err = runTXEContinuity(t, "inventory")
 	assert.ErrorContains(t, err, "--scan")
 }
+
+// --keep reads a strict keep manifest: a malformed one is refused before
+// anything is scanned, and an unpinned entry blocks with its digest.
+func TestTXEContinuityKeep(t *testing.T) {
+	l, _, err := fixture.Build(t.Context(), filepath.Join(t.TempDir(), "root"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fixture.Unseal(l.Root) })
+	require.NoError(t, os.WriteFile(filepath.Join(l.MachineHome, "base.yaml"), []byte("x\n"), 0o600))
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.json")
+	require.NoError(t, os.WriteFile(bad, []byte(`{"format":"txe.continuity.keep/v1","entries":[{"root":"laptop-home","path":"../x","provenance":"p"}]}`), 0o600))
+	scan := "machine-home=laptop-home=" + l.MachineHome
+	_, err = runTXEContinuity(t, "inventory", "--scan", scan, "--keep", bad)
+	assert.ErrorContains(t, err, "not a clean relative path")
+
+	keep := filepath.Join(dir, "keep.json")
+	require.NoError(t, os.WriteFile(keep, []byte(`{"format":"txe.continuity.keep/v1","entries":[{"root":"laptop-home","path":"base.yaml","provenance":"fixture"}]}`), 0o600))
+	out, err := runTXEContinuity(t, "inventory", "--scan", scan, "--keep", keep, "--out", filepath.Join(dir, "inv.json"))
+	require.Error(t, err)
+	assert.Contains(t, out, "kept_unpinned")
+	assert.NotContains(t, out, "unclassified_area")
+}

@@ -88,6 +88,7 @@ func Compare(before, after *Inventory, opts CompareOptions) *Report {
 			add("file_added", "file", key, "the file was added and no recorded step added it")
 		}
 	})
+	compareKept(before, after, add, true)
 	sortReport(rep)
 	return rep
 }
@@ -163,6 +164,7 @@ func CompareProgress(before, after *Inventory) *Report {
 			add("file_truncated", "file", key, fmt.Sprintf("the retained file shrank from %d to %d bytes", b.Size, a.Size))
 		}
 	}, func(File, string) {})
+	compareKept(before, after, add, false)
 	sortReport(rep)
 	return rep
 }
@@ -190,6 +192,39 @@ func newReport(before, after *Inventory) (*Report, func(code, class, id, detail 
 
 // compareFiles reports missing retained files, and hands each changed and
 // each added file that is not operational to changed and added.
+// compareKept checks the entries kept exactly as they are: each must still
+// be kept, with the same tree digest, which also covers what no file
+// shows (a directory, permission bits, an excluded path's type). The
+// strict comparison also refuses a newly kept entry.
+func compareKept(before, after *Inventory, add func(code, class, id, detail string), strict bool) {
+	later := map[string]Kept{}
+	for _, k := range after.Kept {
+		later[k.Root+"/"+k.Path] = k
+	}
+	earlier := map[string]bool{}
+	for _, b := range before.Kept {
+		key := b.Root + "/" + b.Path
+		earlier[key] = true
+		a, ok := later[key]
+		switch {
+		case !ok:
+			add("kept_missing", "", key, "the entry kept as it was is no longer kept")
+		case a.Refused != "" || b.Refused != "":
+			add("kept_credential", "", key, "the kept entry holds a credential-named path the manifest does not exclude, which was not read")
+		case a.Digest != b.Digest:
+			add("kept_changed", "", key, fmt.Sprintf("the kept entry's tree changed from %s to %s", b.Digest, a.Digest))
+		}
+	}
+	if !strict {
+		return
+	}
+	for _, a := range after.Kept {
+		if key := a.Root + "/" + a.Path; !earlier[key] {
+			add("kept_added", "", key, "the entry is kept now but was not before")
+		}
+	}
+}
+
 func compareFiles(before, after *Inventory, rep *Report, add func(code, class, id, detail string), changed func(b, a File, key string), added func(f File, key string)) {
 	// Modes are compared only when both scans had permission bits.
 	modes := before.ModeBits && after.ModeBits
