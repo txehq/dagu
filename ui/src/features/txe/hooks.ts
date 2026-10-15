@@ -104,21 +104,25 @@ export function useAwaitingApproval(
   return useSWR(
     ids.length > 0 ? ['txe', 'awaiting-approval', ids.join(',')] : null,
     async () => {
-      const counts = await Promise.all(
+      // Each machine on its own: one machine's failed read must not hide
+      // another's real count. null marks a machine whose reads failed.
+      const settled = await Promise.allSettled(
         ids.map(async (id) => {
           const [applications, enrolments] = await Promise.all([
             api.listApplications(id),
             api.listEnrolments(id),
           ]);
-          return [
-            id,
-            awaitingApproval(applications, enrolments).length,
-          ] as const;
+          return awaitingApproval(applications, enrolments).length;
         })
       );
       // A plain object, not a Map: SWR's default comparison sees every two
       // Maps as equal and would keep the first counts on screen.
-      return Object.fromEntries(counts) as Record<string, number>;
+      return Object.fromEntries(
+        ids.map((id, i) => {
+          const result = settled[i]!;
+          return [id, result.status === 'fulfilled' ? result.value : null];
+        })
+      ) as Record<string, number | null>;
     },
     {
       refreshInterval: MACHINES_REFRESH_MS,

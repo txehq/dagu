@@ -109,8 +109,11 @@ export default function TxeMachinesPage(): React.ReactElement {
                 </span>
                 <MachineBadge
                   onFile={m.pending_applications ?? 0}
-                  awaiting={awaiting.data?.[m.machine_id]}
-                  failed={Boolean(awaiting.error)}
+                  awaiting={awaiting.data?.[m.machine_id] ?? undefined}
+                  failed={
+                    Boolean(awaiting.error) ||
+                    awaiting.data?.[m.machine_id] === null
+                  }
                 />
               </Link>
             </li>

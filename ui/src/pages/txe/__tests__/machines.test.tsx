@@ -286,6 +286,37 @@ describe('the machines page', () => {
     await waitFor(() => expect(screen.queryByText(/awaiting/)).toBeNull());
   });
 
+  it('falls back only for the machine whose reads failed', async () => {
+    const fake = api({
+      machines: [
+        machine({ pending_applications: 1 }),
+        machine({
+          machine_id: 'mch_broken',
+          display_name: 'broken',
+          pending_applications: 2,
+        }),
+      ],
+      applications: { mch_ada_laptop: [application()] },
+    });
+    const ok = fake.listApplications.getMockImplementation() as (
+      id: string
+    ) => Promise<EnrolmentApplication[]>;
+    fake.listApplications.mockImplementation(async (id: string) => {
+      if (id === 'mch_broken') throw new TxeRefusal(503, 'x', undefined);
+      return ok(id);
+    });
+    renderAt(<TxeMachinesPage />, fake);
+
+    const rows = await screen.findAllByTestId('txe-machine-row');
+    expect(
+      await within(rows[0]!).findByText('1 awaiting approval')
+    ).toBeInTheDocument();
+    expect(
+      await within(rows[1]!).findByText('2 applications on file')
+    ).toBeInTheDocument();
+    expect(within(rows[1]!).queryByText(/awaiting/)).toBeNull();
+  });
+
   it('opens the approval page of a machine', async () => {
     renderAt(<TxeMachinesPage />, api({ machines: [machine()] }));
 
@@ -507,6 +538,30 @@ describe('the pending enrolments notice', () => {
 
     expect(
       await screen.findByTestId('txe-pending-enrolments')
+    ).toBeInTheDocument();
+  });
+
+  it("still counts the machines whose reads succeeded when another's fail", async () => {
+    const fake = api({
+      machines: [
+        machine({ pending_applications: 1 }),
+        machine({ machine_id: 'mch_broken', pending_applications: 1 }),
+      ],
+      applications: { mch_ada_laptop: [application()] },
+    });
+    const ok = fake.listEnrolments.getMockImplementation() as (
+      id: string
+    ) => Promise<Enrolment[]>;
+    fake.listEnrolments.mockImplementation(async (id: string) => {
+      if (id === 'mch_broken') throw new TxeRefusal(503, 'x', undefined);
+      return ok(id);
+    });
+    renderAt(<PendingEnrolmentsNotice />, fake);
+
+    expect(
+      await screen.findByText(
+        'A machine enrolment application is awaiting your approval.'
+      )
     ).toBeInTheDocument();
   });
 

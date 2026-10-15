@@ -21,11 +21,15 @@ export function PendingEnrolmentsNotice(): React.ReactElement | null {
     { quiet: true }
   );
   // SWR keeps the last good data when a refresh fails; a count it can no
-  // longer confirm is not shown.
+  // longer confirm is not shown. A machine whose own reads failed adds
+  // nothing; the others still count.
   const count =
     machines.error || awaiting.error || !awaiting.data
       ? 0
-      : Object.values(awaiting.data).reduce((sum, n) => sum + n, 0);
+      : Object.values(awaiting.data).reduce<number>(
+          (sum, n) => sum + (n ?? 0),
+          0
+        );
   if (count === 0) return null;
   return (
     <Alert data-testid="txe-pending-enrolments">
