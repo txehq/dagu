@@ -350,3 +350,58 @@ func TestTXEEnrolChecksTheMachineFirst(t *testing.T) {
 	out := f.json("enrol", "--client-id", txeEnrolTestClient, "--issuer", f.provider.Issuer())
 	assert.Equal(t, "applied", out["state"])
 }
+
+// enrol check loads the credential as the worker does and requires this
+// machine's; it signs in nowhere and asks nothing.
+func TestTXEEnrolCheck(t *testing.T) {
+	f := newTXEEnrolFixture(t)
+	f.json("enrol", "--client-id", txeEnrolTestClient)
+	requests, auths := len(f.hub.Requests()), f.provider.LastAuth()
+
+	out := f.json("enrol", "check")
+	assert.Equal(t, f.path(), out["credential_file"])
+	assert.Equal(t, txeEnrolTestMachine, out["machine_id"])
+	assert.Equal(t, txeEnrolTestClient, out["client_id"])
+	assert.NotContains(t, mustJSON(t, out), "refresh")
+	assert.Len(t, f.hub.Requests(), requests, "no hub request")
+	assert.Equal(t, auths, f.provider.LastAuth(), "no sign-in")
+
+	write := func(t *testing.T, edit func(map[string]any)) string {
+		t.Helper()
+		raw, err := os.ReadFile(f.path())
+		require.NoError(t, err)
+		var c map[string]any
+		require.NoError(t, json.Unmarshal(raw, &c))
+		edit(c)
+		b, err := json.Marshal(c)
+		require.NoError(t, err)
+		path := filepath.Join(filepath.Dir(f.path()), "edited.json")
+		require.NoError(t, os.WriteFile(path, b, 0o600))
+		return path
+	}
+	for name, tc := range map[string]struct {
+		path func(t *testing.T) string
+		why  string
+	}{
+		"bad escape": {func(t *testing.T) string {
+			return write(t, func(c map[string]any) { c["token_endpoint"] = "https://idp.example/token%ZZ" })
+		}, "token_endpoint"},
+		"other machine": {func(t *testing.T) string {
+			return write(t, func(c map[string]any) { c["machine_id"] = "mch_00000000000000000000000000" })
+		}, "is for machine"},
+		"group readable": {func(t *testing.T) string {
+			p := write(t, func(map[string]any) {})
+			require.NoError(t, os.Chmod(p, 0o640))
+			return p
+		}, "0600"},
+		"missing": {func(t *testing.T) string { return filepath.Join(t.TempDir(), "none.json") }, "no such file"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := f.run("enrol", "check", "--credential-file", tc.path(t))
+			require.ErrorContains(t, err, tc.why)
+		})
+	}
+
+	_, err := f.run("enrol")
+	assert.ErrorContains(t, err, "--client-id is required")
+}

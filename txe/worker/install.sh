@@ -91,7 +91,8 @@ finally:
 PY
 fi
 
-# Machine credential: checked now, before the build, so a refused one changes nothing.
+# Machine credential: a first check now, before the build, so a refused one changes
+# nothing; the built binary checks it again below, as the worker will load it.
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
 
@@ -115,6 +116,12 @@ json.dump({"tag": tag, "commit": commit, "version": version, "sha256": digest},
 PY
 fi
 DAGU_HOME="$TXE_DAGU_HOME/worker-home" "$bin" version 2>&1 | grep -q -- "$version" || die "$bin does not report version $version"
+# The worker built from this tag must load the credential, or the agents are not
+# replaced: a worker that cannot load it would only be restarted by launchd forever.
+if [ -n "$credential" ]; then
+  env "TXE_DAGU_HOME=$TXE_DAGU_HOME" "DAGU_HOME=$TXE_DAGU_HOME/worker-home" "$bin" txe enrol check --credential-file "$credential" \
+    || die "not installing: the worker built from $tag cannot load $credential (a tag before TXE-4366 has no 'txe enrol check')"
+fi
 ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
 link_dagu_on_path

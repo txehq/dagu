@@ -101,6 +101,10 @@ installing without it, when:
 - it does not hold exactly the machine credential's fields, with class `worker`;
 - it is another machine's.
 
+After building, the install also has the new binary load the credential exactly as the worker will
+(`dagu txe enrol check`), and stops if it cannot. A tag from before TXE-4366 has no such check,
+so an enrolled machine needs a tag that includes it.
+
 The agent gets the file's path only, in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`. No token is in the plist,
 an argument or a log. The install never reads the token beyond checking that it is present.
 

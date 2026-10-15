@@ -5,6 +5,8 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
   agents.py check-credential PATH MACHINE_ID
       Exit 0 and print the file's machine and client when PATH is a machine credential
       the worker can use for MACHINE_ID; otherwise print why to stderr and exit 1.
+      This is install.sh's early check, before the build; the built binary's
+      `dagu txe enrol check` (the worker's own loader) decides before any agent is written.
       Nothing secret is printed: the refresh token is only checked to be present.
 
   agents.py write AGENTS HOME KUBECTL MACHINE_ID OWNER_ID PATH TUNNEL_LABEL WORKER_LABEL
@@ -16,7 +18,7 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
   agents.py credential PLIST
       Print the credential file a worker agent passes, or nothing.
 """
-import ipaddress, json, os, plistlib, stat, sys, urllib.parse
+import ipaddress, json, os, plistlib, re, stat, sys, urllib.parse
 
 CREDENTIAL_ENV = "DAGU_WORKER_AUTH_CREDENTIAL_FILE"
 # transportauth.MachineCredential: the worker refuses any other field.
@@ -37,6 +39,9 @@ def _loopback(host):
         return False
 
 
+_BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
 def _endpoint_host(netloc):
     """The host of an authority with no user info, brackets removed, case kept (as Go's Hostname)."""
     if netloc.startswith("["):
@@ -54,6 +59,9 @@ def _check_endpoint(path, raw):
     except ValueError:
         raise Refused(f"{path}: token_endpoint is not an absolute URL")
     if not endpoint.netloc or "@" in endpoint.netloc or endpoint.fragment or not endpoint.scheme:
+        raise Refused(f"{path}: token_endpoint is not an absolute URL")
+    # Go's url.Parse refuses a malformed percent-escape in the host or the path.
+    if _BAD_ESCAPE.search(endpoint.netloc + endpoint.path):
         raise Refused(f"{path}: token_endpoint is not an absolute URL")
     host = _endpoint_host(endpoint.netloc)
     if not host:
