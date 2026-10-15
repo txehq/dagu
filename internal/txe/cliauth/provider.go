@@ -229,3 +229,22 @@ func discover(ctx context.Context, p Provider, client *http.Client) (*endpoints,
 	}
 	return e, nil
 }
+
+// Endpoints are a provider's endpoints, as its discovery document names
+// them and checked as the issuer is.
+type Endpoints struct {
+	Authorization string
+	Token         string
+	// Revocation is empty when the provider offers none.
+	Revocation string
+}
+
+// Discover reads the provider's endpoints. The provider must state p.Issuer
+// exactly. A provider that gives no answer is an *UnverifiableError.
+func Discover(ctx context.Context, p Provider, client *http.Client) (Endpoints, error) {
+	e, err := discover(ctx, p, providerClient(client))
+	if err != nil {
+		return Endpoints{}, err
+	}
+	return Endpoints{Authorization: e.authURL, Token: e.tokenURL, Revocation: e.revocation}, nil
+}

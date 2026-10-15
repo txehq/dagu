@@ -233,8 +233,22 @@ Say so in the registry, so dependent jobs are reviewed or retired instead of fai
 
 Check the result with `dagu txe inspect <job id>`: it shows the lifecycle and, for a retired job, the reason and time.
 
+## Signing in to the hub
+
+A hub that accepts sign-in identifies the developer by their account at its identity provider. `dagu txe login` opens the system browser on the provider's own page. The browser hands the result back to this machine, and the command keeps the sign-in for this hub only, readable only by this user. Every Claude Code or Codex session of this user on this machine then uses it, and it renews itself without asking while the provider allows it. A Codex thread still names its session with `--session` or `TXE_SESSION`.
+
+- **Ask the person first.** The sign-in needs a person at a browser on this machine. Never type or paste a password, a code or a token into the terminal; the command asks for none.
+- **Never run `login` from a job script.** A job step never uses a person's sign-in. It keeps the hub context's API key until machines hold their own credential.
+- **Signing in grants nothing by itself.** The hub's administrator binds an identity to an owner. `dagu txe whoami` shows who this machine is signed in as. When the hub accepts the sign-in, it also shows how the hub sees it: unbound, pending or bound, and to which owner.
+- **Other commands use the sign-in only on the routes the hub takes it on**, which the hub names: every `/txe` route, and on some hubs also `/dags`, `/dag-runs` and `/queues`. Every other request keeps the API key, and nothing changes for a machine that never signed in.
+- **Two different failures:**
+  - "run `dagu txe login`": the provider or the hub refused the sign-in. Ask the person to sign in again; do not retry the command in a loop.
+  - "the identity provider did not answer": nothing was refused. Retry later, and do not sign in again or sign out because of it.
+- **Changing accounts.** `dagu txe login --prompt select_account` changes the account; the previous account's sign-in is revoked and not kept. `dagu txe logout` ends this machine's sign-in.
+
 ## Reference
 
 - `dagu txe doctor`: checks this machine, the hub and unfinished registrations.
-- `dagu txe list`, `dagu txe inspect <job id>`: every session sees every job. The owner is the same whichever session created it; `created by` records the session.
+- `dagu txe list`, `dagu txe inspect <job id>`: every session of the same developer sees the same jobs. The owner is the same whichever session created it; `created by` records the session. A hub that enforces owners does not show you another developer's jobs unless they shared them.
+- `dagu txe login`, `dagu txe whoami`, `dagu txe logout`: this machine's sign-in to the hub. See "Signing in to the hub".
 - `examples/`: three job scripts with the behaviour a reviewer expects (structured output, state under `TXE_OUTPUT_DIR`, a completion signal).

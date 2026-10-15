@@ -18,6 +18,7 @@ import (
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 )
 
 const defaultRemoteTimeout = 30 * time.Second
@@ -72,6 +73,16 @@ func newRemoteClient(ctx *cliContext) (*remoteClient, error) {
 			Transport: transport,
 		},
 	}, nil
+}
+
+// withSignIn returns a copy of c that sends the hub's sign-in from store,
+// instead of the context's API key, to the routes use names. Every other
+// route keeps the API key. Which credential a route gets is fixed here; a
+// refused sign-in is never retried with the API key.
+func (c *remoteClient) withSignIn(store *cliauth.Store, hub, use string) *remoteClient {
+	httpClient := *c.client
+	httpClient.Transport = &cliauth.BearerTransport{Base: c.client.Transport, Store: store, Hub: hub, Use: use}
+	return &remoteClient{baseURL: c.baseURL, apiKey: c.apiKey, client: &httpClient}
 }
 
 func (c *remoteClient) Test(ctx context.Context) error {
@@ -279,7 +290,9 @@ func (c *remoteClient) doWithQueryValues(ctx context.Context, method, path strin
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
