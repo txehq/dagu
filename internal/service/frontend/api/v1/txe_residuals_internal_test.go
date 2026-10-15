@@ -365,3 +365,66 @@ func TestTxeOwnerHeldEnqueueKeepsItsDAGsQueue(t *testing.T) {
 		require.NotContains(t, err.Error(), "queued only where its DAG names")
 	}
 }
+
+// A run of the caller's queued where its DAG does not name now (under an
+// earlier queue override, or before its DAG's queue changed) is not
+// stranded: its run page shows it, and the queue's items, paged past every
+// other owner's entry, reach it. Only the queue list leaves such a queue
+// out, since it is not one the caller's DAGs name.
+func TestTxeRunsQueuedElsewhereStayReachable(t *testing.T) {
+	w := newTwoOwners(t, "")
+	w.addRun(w.jobA, "run-1", "production")
+	ctx := context.Background()
+	queued := func(dag, runID, queueName string) {
+		w.writeRun(&ir.DAG{Name: dag, YamlData: []byte("steps: []\n")}, runID, persis.DAGRunCreateAttemptOptions{}, func(s *ir.DAGRunStatus) {
+			s.Status, s.ProcGroup = ir.Queued, queueName
+		})
+	}
+	// Two of B's entries, then A's, in a queue A's job does not name.
+	queued(w.jobB, "qb-1", "old-queue")
+	queued(w.jobB, "qb-2", "old-queue")
+	queued(w.jobA, "qa-old", "old-queue")
+	qs := store.NewQueueStore(file.NewCollection(t.TempDir()))
+	for _, run := range []ir.DAGRunRef{ir.NewDAGRunRef(w.jobB, "qb-1"), ir.NewDAGRunRef(w.jobB, "qb-2"), ir.NewDAGRunRef(w.jobA, "qa-old")} {
+		require.NoError(t, qs.Enqueue(ctx, "old-queue", queue.QueuePriorityLow, run))
+	}
+	w.api.queueStore = qs
+	w.api.procRepository = nil
+	personA := neutral(w.personA)
+
+	resp, err := w.api.ListQueues(personA, apigen.ListQueuesRequestObject{})
+	require.NoError(t, err)
+	for _, q := range resp.(apigen.ListQueues200JSONResponse).Queues {
+		require.NotEqual(t, "old-queue", q.Name, "not a queue A's DAGs name")
+	}
+
+	// The run page shows the run.
+	details, err := w.api.GetDAGRunDetails(personA, apigen.GetDAGRunDetailsRequestObject{Name: w.jobA, DagRunId: "qa-old"})
+	require.NoError(t, err)
+	require.IsType(t, &apigen.GetDAGRunDetails200JSONResponse{}, details)
+
+	// The queue's items reach it, one entry scanned per page.
+	saved := queueItemsScanCap
+	t.Cleanup(func() { queueItemsScanCap = saved })
+	queueItemsScanCap = 1
+	var found []string
+	cursor := ""
+	for page := 0; page < 10; page++ {
+		limit := 1
+		params := apigen.ListQueueItemsParams{Limit: &limit}
+		if cursor != "" {
+			params.Cursor = &cursor
+		}
+		items, err := w.api.ListQueueItems(personA, apigen.ListQueueItemsRequestObject{Name: "old-queue", Params: params})
+		require.NoError(t, err)
+		out := items.(apigen.ListQueueItems200JSONResponse)
+		for _, item := range out.Items {
+			found = append(found, item.DagRunId)
+		}
+		if out.NextCursor == nil {
+			break
+		}
+		cursor = *out.NextCursor
+	}
+	require.Equal(t, []string{"qa-old"}, found, "only A's own entry, past B's")
+}
