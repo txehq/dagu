@@ -225,7 +225,22 @@ describe('TxeInboxPage for a shared job', () => {
 
 describe('TxeInboxPage and machine enrolment', () => {
   function renderWithMachines(listMachines: TxeEnrolmentApi['listMachines']) {
-    const enrolment = { listMachines } as unknown as TxeEnrolmentApi;
+    // The machine's one application is unexpired and not enrolled.
+    const enrolment = {
+      listMachines,
+      listApplications: async (machineId: string) => [
+        {
+          machine_id: machineId,
+          class: 'worker',
+          issuer: 'https://idp.example',
+          subject: 'sub-ada',
+          client_id: 'dagu-worker',
+          received_at: new Date().toISOString(),
+          credential_expires: new Date(Date.now() + 3_600_000).toISOString(),
+        },
+      ],
+      listEnrolments: async () => [],
+    } as unknown as TxeEnrolmentApi;
     return render(
       <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
         <TxeApiContext.Provider value={fakeApi([]).api}>
@@ -239,7 +254,7 @@ describe('TxeInboxPage and machine enrolment', () => {
     );
   }
 
-  it('tells a person when machines of their owner wait for approval', async () => {
+  it('tells a person when a machine of their owner awaits approval', async () => {
     identity.value = {
       principal: { class: 'person', shown: {} },
       state: 'bound',
@@ -256,7 +271,9 @@ describe('TxeInboxPage and machine enrolment', () => {
       ]);
       expect(
         await screen.findByTestId('txe-pending-enrolments')
-      ).toHaveTextContent('A machine is waiting for enrolment approval.');
+      ).toHaveTextContent(
+        'A machine enrolment application is awaiting your approval.'
+      );
     } finally {
       identity.value = undefined;
     }

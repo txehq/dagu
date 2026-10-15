@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input';
 import { RefreshButton } from '@/components/ui/refresh-button';
 import { RelativeTime } from '@/components/ui/relative-time';
 import {
+  activeEnrolmentOf,
   TxeRefusal,
   type Enrolment,
   type EnrolmentApplication,
@@ -474,14 +475,7 @@ export default function TxeMachinePage(): React.ReactElement {
               <ApplicationRow
                 key={`${a.class}|${a.client_id}`}
                 application={a}
-                enrolledAs={enrolments.data?.find(
-                  (e) =>
-                    e.state === TxeEnrolmentState.active &&
-                    String(e.class) === String(a.class) &&
-                    e.client_id === a.client_id &&
-                    e.issuer === a.issuer &&
-                    e.subject === a.subject
-                )}
+                enrolledAs={activeEnrolmentOf(a, enrolments.data ?? [])}
                 highlighted={
                   a.class === wantedClass && a.client_id === wantedClient
                 }

@@ -3,6 +3,7 @@
 
 import {
   ComponentsParametersTxeEnrolmentClass,
+  TxeEnrolmentState,
   TxeEnrolRequestClass,
   type components,
   type paths,
@@ -19,6 +20,37 @@ export type Enrolment = components['schemas']['TxeEnrolment'];
 // The generated client has one enum per place the class appears, with the
 // same members; they are mapped by name.
 export type EnrolmentClass = `${EnrolmentApplication['class']}`;
+
+// activeEnrolmentOf is the active enrolment made from exactly this
+// application, if any. The hub keeps an application on file after approving
+// it, so an application on file is not by itself waiting for approval.
+export function activeEnrolmentOf(
+  application: EnrolmentApplication,
+  enrolments: Enrolment[]
+): Enrolment | undefined {
+  return enrolments.find(
+    (e) =>
+      e.state === TxeEnrolmentState.active &&
+      String(e.class) === String(application.class) &&
+      e.client_id === application.client_id &&
+      e.issuer === application.issuer &&
+      e.subject === application.subject
+  );
+}
+
+// awaitingApproval is the applications a person could approve now: their
+// credential has not expired, and no active enrolment was made from them.
+export function awaitingApproval(
+  applications: EnrolmentApplication[],
+  enrolments: Enrolment[],
+  now: number = Date.now()
+): EnrolmentApplication[] {
+  return applications.filter(
+    (a) =>
+      Date.parse(a.credential_expires) > now &&
+      !activeEnrolmentOf(a, enrolments)
+  );
+}
 
 // TxeRefusal is a refused enrolment call, with the hub's reason code
 // (details.code: unbound, forbidden, not_found, conflict, credential_stale).
