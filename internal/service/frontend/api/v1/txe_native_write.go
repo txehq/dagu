@@ -130,7 +130,9 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 				continue
 			}
 			for _, p := range placements {
-				if p.machine != own {
+				// Every document is pinned to the machine; a step may leave
+				// its placement to its child, but may not send it elsewhere.
+				if (!p.step && p.machine != own) || (p.step && p.machine != "" && p.machine != own) {
 					return a.txeNativeWriteMisplaced(ctx, c, name)
 				}
 			}
@@ -139,17 +141,23 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 	return nil
 }
 
-// txePlacement is one DAG a spec defines: its declared name and the machine
-// its worker selector sends it to, if any.
+// txePlacement is one DAG a spec defines, or one step of it: the name it
+// declares or calls, and the machine it is sent to, if any.
 type txePlacement struct {
-	name, machine string
+	// name is a DAG the spec defines (its declared name) or a step calls.
+	name string
+	// machine is the txe.machine a document or a step selects, if any.
+	machine string
+	// step marks a step's placement or reference, not a document's.
+	step bool
 }
 
 // txeSpecPlacements reads a spec as the loader reads it, with no name
 // imposed and nothing evaluated: every DAG it defines (the first document
-// and each local DAG), by its declared name and the machine it is sent to.
-// A spec that does not load, or whose worker selector is computed, cannot
-// be verified.
+// and each local DAG), by its declared name and the machine it is sent to,
+// and every step of each, handlers included, by the DAG it calls and the
+// machine it sends that to. A spec that does not load, or whose worker
+// selector or called DAG is computed, cannot be verified.
 func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacement, error) {
 	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
 	if err != nil {
@@ -162,20 +170,56 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacemen
 	for _, local := range dag.LocalDAGs {
 		dags = append(dags, local)
 	}
-	out := make([]txePlacement, 0, len(dags))
+	var out []txePlacement
 	for _, d := range dags {
-		p := txePlacement{name: d.Name}
-		for k, v := range d.WorkerSelector {
-			if strings.ContainsAny(k+v, "$`") {
-				return nil, errTxeSpecUnverified
-			}
-			if k == txeMachineLabel {
-				p.machine = v
+		machine, err := txeSelectedMachine(d.WorkerSelector)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, txePlacement{name: d.Name, machine: machine})
+		steps := make([]*ir.Step, 0, len(d.Steps)+6)
+		for i := range d.Steps {
+			steps = append(steps, &d.Steps[i])
+		}
+		h := d.HandlerOn
+		for _, handler := range []*ir.Step{h.Init, h.Failure, h.Success, h.Abort, h.Exit, h.Wait} {
+			if handler != nil {
+				steps = append(steps, handler)
 			}
 		}
-		out = append(out, p)
+		for _, step := range steps {
+			machine, err := txeSelectedMachine(step.WorkerSelector)
+			if err != nil {
+				return nil, err
+			}
+			called := ""
+			if step.SubDAG != nil {
+				called = step.SubDAG.Name
+				if strings.ContainsAny(called, "$`") {
+					return nil, errTxeSpecUnverified
+				}
+			}
+			if machine != "" || called != "" {
+				out = append(out, txePlacement{name: called, machine: machine, step: true})
+			}
+		}
 	}
 	return out, nil
+}
+
+// txeSelectedMachine is the machine a worker selector sends work to, or "".
+// A computed selector cannot be verified.
+func txeSelectedMachine(selector map[string]string) (string, error) {
+	machine := ""
+	for k, v := range selector {
+		if strings.ContainsAny(k+v, "$`") {
+			return "", errTxeSpecUnverified
+		}
+		if k == txeMachineLabel {
+			machine = v
+		}
+	}
+	return machine, nil
 }
 
 // txeMachineLabel is the worker label that pins a DAG to a machine.

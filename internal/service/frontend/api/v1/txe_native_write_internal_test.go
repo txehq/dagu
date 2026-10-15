@@ -199,6 +199,25 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, pinned(w.machineA)+"---\nname: helper\n"+writeSpec), "a local DAG of no owner")
 			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, pinned(w.machineA)))
 
+			// Steps are placements too: a step may not send work, or call a
+			// DAG, where A may not write.
+			stepTo := func(machine string) string {
+				return "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: s\n    call: " + w.reviewerA +
+					"\n    worker_selector:\n      txe.machine: " + machine + "\n"
+			}
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, stepTo(w.machineB)), "a step on B's machine")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, stepTo("${M}")), "a step's computed machine")
+			handlerTo := pinned(w.machineA) + "handler_on:\n  failure:\n    call: " + w.reviewerA +
+				"\n    worker_selector:\n      txe.machine: " + w.machineB + "\n"
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, handlerTo), "a handler on B's machine")
+			calls := func(dag string) string {
+				return "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: s\n    call: " + dag + "\n"
+			}
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, calls(w.reviewerB)), "calling B's machine DAG")
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, calls(w.jobB)), "calling B's job")
+			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, calls(w.jobA)), "calling a job: the registry's")
+			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, stepTo(w.machineA)), "a step on A's own machine")
+
 			// A spec that does not load cannot be verified.
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, "steps: [unclosed\n"))
 
