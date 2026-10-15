@@ -108,8 +108,12 @@ so an enrolled machine needs a tag that includes it.
 The agent gets the file's path only, in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`. No token is in the plist,
 an argument or a log. The install never reads the token beyond checking that it is present.
 
-To stop presenting a credential, remove the file (or revoke the enrolment in the hub) and install
-again.
+To roll back to a worker that presents no credential, install again with `--no-credential`. It
+writes the worker agent of an unenrolled machine and keeps `worker-credential.json` where it is;
+the next install without `--no-credential` passes it again. Do not delete the credential to roll
+back: it cannot be recreated without enrolling again. Revoking the enrolment in the hub does not
+change what the agent passes either. The installer still finds the file, and the worker then
+presents a revoked credential and is refused; the coordinator decides that, not the install.
 
 ## Upgrade
 

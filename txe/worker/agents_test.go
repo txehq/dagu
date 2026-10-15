@@ -290,3 +290,68 @@ func TestCheckCredentialAgreesWithTheWorker(t *testing.T) {
 		})
 	}
 }
+
+// --no-credential (TXE-4418): the agent passes nothing, the credential file
+// is left exactly as it was, and the next install without the flag passes
+// it again.
+func TestNoCredentialRollbackKeepsTheFile(t *testing.T) {
+	agentsScript(t)
+	lib, err := filepath.Abs("lib.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	enrolled := credentialFixture(t, nil)
+	home := filepath.Dir(enrolled)
+	before, err := os.ReadFile(enrolled)
+	require.NoError(t, err)
+	info, err := os.Stat(enrolled)
+	require.NoError(t, err)
+
+	run := func(given string) (string, string, error) {
+		cmd := exec.Command(bash, "-c", `set -euo pipefail; . "$1"; worker_credential "$2" "" "$3"`, "bash", lib, given, agentsMachine)
+		cmd.Env = []string{"HOME=" + t.TempDir(), "TXE_DAGU_HOME=" + home, "PATH=/usr/bin:/bin"}
+		var out, errOut bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		err := cmd.Run()
+		return out.String(), errOut.String(), err
+	}
+	stdout, stderr, err := run("none")
+	require.NoError(t, err, stderr)
+	assert.Empty(t, stdout, "nothing is passed")
+	assert.Empty(t, stderr, "the file is not even checked")
+	after, err := os.ReadFile(enrolled)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	info2, err := os.Stat(enrolled)
+	require.NoError(t, err)
+	assert.Equal(t, info.Mode(), info2.Mode())
+	assert.Equal(t, info.ModTime(), info2.ModTime())
+
+	stdout, stderr, err = run("0")
+	require.NoError(t, err, stderr)
+	assert.Equal(t, enrolled+"\n", stdout, "the next plain install passes it again")
+}
+
+// install.sh refuses --no-credential with --credential-file, in either
+// order, before it does anything else.
+func TestInstallRefusesBothCredentialFlags(t *testing.T) {
+	agentsScript(t)
+	install, err := filepath.Abs("install.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	for _, args := range [][]string{
+		{"--no-credential", "--credential-file", "/x/worker-credential.json"},
+		{"--credential-file", "/x/worker-credential.json", "--no-credential"},
+	} {
+		home := t.TempDir()
+		cmd := exec.Command(bash, append([]string{install}, args...)...)
+		cmd.Env = []string{"HOME=" + home, "TXE_DAGU_HOME=" + filepath.Join(home, "txe"), "PATH=/usr/bin:/bin"}
+		var errOut bytes.Buffer
+		cmd.Stderr = &errOut
+		require.Error(t, cmd.Run(), args)
+		assert.Contains(t, errOut.String(), "--credential-file and --no-credential cannot both be given")
+		_, statErr := os.Stat(filepath.Join(home, "txe"))
+		assert.True(t, os.IsNotExist(statErr), "nothing was created")
+	}
+}
