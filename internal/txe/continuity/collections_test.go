@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
 	"github.com/dagucloud/dagu/v2/internal/txe/continuity"
@@ -112,4 +114,47 @@ func TestEveryBackendCollectionIsClassified(t *testing.T) {
 	} {
 		assert.Equal(t, want, policies[dir], dir)
 	}
+}
+
+// The scheduler holds a directory lock under its state directory while it
+// runs. The lock is the process's, not retained state: an inventory taken
+// while it is held excludes it, its release does not block the freeze
+// comparison, and an import leaves it behind.
+func TestHeldLocksAreNotRetained(t *testing.T) {
+	t.Parallel()
+	l, _ := build(t)
+	backend := persisfile.NewBackend(backendPaths(l.DataDir))
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, backend.Collection(persis.CollectionSchedulerState).Put(context.Background(),
+		&persis.Record{ID: "state", Data: []byte(`{"version":1}`), CreatedAt: at, UpdatedAt: at}))
+	lock := dirlock.New(filepath.Join(persisfile.SchedulerStateDir(backendPaths(l.DataDir)), "locks"), nil)
+	require.NoError(t, lock.TryLock())
+	before := scan(t, l)
+	require.NoError(t, lock.Unlock())
+	after := scan(t, l)
+
+	for _, f := range before.Files {
+		assert.False(t, strings.Contains(f.Path, dirlock.LockDirectoryName), f.Path)
+	}
+	excluded := map[string]bool{}
+	for _, e := range before.Excluded {
+		excluded[e.Root+"/"+e.Path] = true
+	}
+	assert.True(t, excluded["hub-data/scheduler/locks/"+dirlock.LockDirectoryName], "%v", before.Excluded)
+	rep := continuity.Compare(before, after, continuity.CompareOptions{})
+	assert.Empty(t, compareCodes(rep))
+	assert.Empty(t, continuity.Blocking(continuity.CompareProgress(before, after).Issues))
+
+	plan, err := continuity.PlanTransition(before, l.DataDir, continuity.ModeImport,
+		func(_, _ string, data []byte) ([]byte, error) { return data, nil }, continuity.Policy{})
+	require.NoError(t, err)
+	for _, step := range plan.Steps {
+		assert.False(t, strings.Contains(step.Path, dirlock.LockDirectoryName), step.Path)
+	}
+	assert.Contains(t, plan.NotCopied, "scheduler/locks/"+dirlock.LockDirectoryName)
+	var held bool
+	for _, step := range plan.Steps {
+		held = held || step.Path == "scheduler/state.json"
+	}
+	assert.True(t, held, "the scheduler's state is copied")
 }

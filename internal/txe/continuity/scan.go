@@ -381,12 +381,19 @@ func (s *scanner) files(rel, policy string) error {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		if d.IsDir() {
-			return nil
-		}
 		r, err := filepath.Rel(s.root.Path, p)
 		if err != nil {
 			return err
+		}
+		if d.IsDir() {
+			// A process's lock directory (a file collection's record locks,
+			// or a directory lock such as the scheduler's) belongs to the
+			// process that holds it, and goes when it is released.
+			if p != base && (d.Name() == recordLockDirectoryName || dirlock.IsLockDirectoryName(d.Name())) {
+				s.exclude(filepath.ToSlash(r), "lock directory; operational")
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		f := File{Root: s.root.Label, Path: filepath.ToSlash(r), Policy: policy}
 		if hasModeBits {
