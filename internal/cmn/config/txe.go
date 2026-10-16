@@ -353,6 +353,11 @@ func parseTXEPlatformAdmins(v any) ([]TXEPlatformAdmin, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s must be a list of {issuer, subject}, got %v", txeAuthzAdminsKey, v)
 	}
+	if len(items) == 0 {
+		// An empty list would remove every administrator silently; omit the
+		// setting instead.
+		return nil, fmt.Errorf("%s is empty: remove it, or list the administrators", txeAuthzAdminsKey)
+	}
 	admins := make([]TXEPlatformAdmin, 0, len(items))
 	for i, item := range items {
 		entry, ok := item.(map[string]any)

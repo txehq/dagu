@@ -268,6 +268,7 @@ func TestLoad_TXEPlatformAdminsRefusals(t *testing.T) {
 		want string
 	}{
 		"Empty":           {txeAdminsBase + "    platform_admins:\n", "is empty"},
+		"EmptyList":       {txeAdminsBase + "    platform_admins: []\n", "is empty"},
 		"NotAList":        {txeAdminsBase + "    platform_admins: " + iss + "\n", "must be a list"},
 		"NotAMapping":     {txeAdminsBase + "    platform_admins: [connor]\n", "must be {issuer, subject}"},
 		"UnknownKey":      {txeAdminsBase + "    platform_admins: [{issuer: " + iss + ", subject: s, email: c@example.com}]\n", `unknown key "email"`},
