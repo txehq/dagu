@@ -14,6 +14,7 @@ type Definition struct {
 	APIBasePath        string       `mapstructure:"api_base_path"`
 	APIBaseURL         string       `mapstructure:"api_base_url"` // Deprecated: use APIBasePath
 	Headless           *bool        `mapstructure:"headless"`
+	NoIndex            bool         `mapstructure:"noindex"`
 	CheckUpdates       *bool        `mapstructure:"check_updates"`
 	TLS                *TLSDef      `mapstructure:"tls"`
 	CORSAllowedOrigins []string     `mapstructure:"cors_allowed_origins"`

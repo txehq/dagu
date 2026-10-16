@@ -632,6 +632,7 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 		upgradeStore:         upgradeStore,
 		funcsConfig: funcsConfig{
 			NavbarColor:           cfg.UI.NavbarColor,
+			NoIndex:               cfg.Server.NoIndex,
 			NavbarTitle:           cfg.UI.NavbarTitle,
 			BasePath:              evaluatedBasePath,
 			APIBasePath:           cfg.Server.APIBasePath,
@@ -883,6 +884,10 @@ func (srv *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("configure IP access: %w", err)
 	}
 	r.Use(auth.PreserveRawRemoteAddr)
+	if srv.config.Server.NoIndex {
+		// First, so that every response carries it, refusals and errors too.
+		r.Use(noindexMiddleware)
+	}
 	r.Use(middleware.Compress(5))
 	if srv.config.Server.AccessLog != config.AccessLogNone {
 		logLevel := slog.LevelInfo
@@ -921,6 +926,10 @@ func (srv *Server) Serve(ctx context.Context) error {
 		setupPath:      path.Join(apiV1BasePath, "auth/setup"),
 	}.middleware)
 	r.Use(middleware.RedirectSlashes)
+
+	if srv.config.Server.NoIndex {
+		r.Get("/robots.txt", serveRobotsTxt)
+	}
 
 	if err := srv.setupRoutes(ctx, r); err != nil {
 		return err
