@@ -19,6 +19,19 @@ Every command here is written `dagu txe ...`. Run the `dagu` that the worker ins
 
 The TXE home is `~/.local/share/txe-dagu` unless `TXE_DAGU_HOME` names another directory, and then the binary is `$TXE_DAGU_HOME/bin/dagu`. That binary is the one this machine's jobs run. Nothing makes it the same build as the hub: `dagu txe doctor` prints both builds, and if they differ, tell the user before you register. It is not put on `PATH`: a bare `dagu` may be missing, or may be another build that has no `txe` command.
 
+## Signing in to the hub
+
+A machine that has never talked to the hub signs in once, through the browser. It needs no API key, and no token is ever copied:
+
+```sh
+dagu txe login --hub https://<the hub's address>
+```
+
+- `--hub` names the hub the first time. The command creates this machine's `txe` context with no API key, then opens the identity provider's sign-in page in this machine's browser.
+- Signing in grants nothing by itself. Login says whether the hub gives this identity access yet. If it does not, the person opens the hub in a browser, signs in with the same account, and asks for access; the hub's administrator approves it. `dagu txe whoami` shows the state at any time.
+- A machine that already has a `txe` context, such as one with a worker, keeps it: run `dagu txe login` with no `--hub`.
+- Without an API key, a command the hub does not take a sign-in on is refused by the hub. Registering and inspecting jobs are taken on a sign-in.
+
 ## Before you register
 
 1. **Check the machine.** Run `dagu txe doctor`. Fix what it reports before going further; each failed check names the action.
