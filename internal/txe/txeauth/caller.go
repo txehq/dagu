@@ -17,9 +17,11 @@ const (
 	// KindNone is a request nothing authenticated, on a server that does not
 	// require authentication.
 	KindNone Kind = "none"
-	// KindPlatformAdmin is the installation's builtin administrator, signed
-	// in with its password, or a basic-auth credential, which the server
-	// treats as an administrator.
+	// KindPlatformAdmin is the installation's administrator: the builtin
+	// administrator signed in with its password, a basic-auth credential,
+	// which the server treats as an administrator, or a person signed in
+	// through the identity provider whose exact issuer and subject the
+	// configuration names (txe.authz.platform_admins; WithPlatformAdminSession).
 	KindPlatformAdmin Kind = "platform_admin"
 	// KindPerson is someone signed in through the browser with the identity
 	// provider.
@@ -53,6 +55,18 @@ func (c Caller) New() bool {
 }
 
 type tokenKey struct{}
+
+// platformAdminKey marks a request whose hub user is a person the
+// configuration names as a platform administrator.
+type platformAdminKey struct{}
+
+// WithPlatformAdminSession marks ctx: its hub user, a person signed in through
+// the identity provider with the given identity, is named a platform
+// administrator by the configuration. Classify honours the mark only for that
+// same identity, and never for a provider token or an API key.
+func WithPlatformAdminSession(ctx context.Context, id authn.Identity) context.Context {
+	return context.WithValue(ctx, platformAdminKey{}, id)
+}
 
 // WithToken returns ctx carrying the principal of a verified provider access
 // token.
@@ -89,6 +103,10 @@ func Classify(ctx context.Context) Caller {
 			// An account that says it came from the provider and does not
 			// name the identity is nobody.
 			return Caller{Kind: KindLegacy, Username: user.Username}
+		}
+		id := authn.Identity{Issuer: user.OIDCIssuer, Subject: user.OIDCSubject}
+		if marked, ok := ctx.Value(platformAdminKey{}).(authn.Identity); ok && marked == id {
+			return Caller{Kind: KindPlatformAdmin, Username: user.Username}
 		}
 		return Caller{
 			Kind:     KindPerson,

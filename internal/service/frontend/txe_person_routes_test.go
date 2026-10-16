@@ -43,7 +43,7 @@ type personHub struct {
 // newPersonHub mounts the routes. browserOIDC says whether browser sign-in
 // is configured; persons are refused either way, since a hub token of a
 // person outlives a change of that configuration.
-func newPersonHub(t *testing.T, browserOIDC bool) *personHub {
+func newPersonHub(t *testing.T, browserOIDC bool, opts ...apiv1.APIOption) *personHub {
 	t.Helper()
 	ctx := testContext(t)
 	backend := testutil.NewMemoryBackend()
@@ -75,6 +75,9 @@ func newPersonHub(t *testing.T, browserOIDC bool) *personHub {
 	api := &apiv1.API{}
 	apiv1.WithTxeRegistry(reg)(api)
 	apiv1.WithTxeAuth(owners)(api)
+	for _, opt := range opts {
+		opt(api)
+	}
 
 	cfg := &config.Config{}
 	cfg.Server.Auth.Mode = config.AuthModeBuiltin
@@ -161,4 +164,25 @@ func TestTxePersonIsRefusedTheEventStreamAndMCP(t *testing.T) {
 		require.Equal(t, http.StatusOK, h.status(http.MethodGet, "/api/v1/events/stream", admin, "", nil))
 		require.Equal(t, http.StatusOK, h.status(http.MethodPost, "/mcp", admin, personMCPInitialize, mcpHeader()))
 	}
+}
+
+// A person txe.authz.platform_admins names follows the event stream as the
+// administrator, and is still refused MCP and the terminal like every other
+// identity provider sign-in. A person it does not name is refused all three.
+func TestTxePlatformAdminGetsTheEventStreamOnly(t *testing.T) {
+	h := newPersonHub(t, true, apiv1.WithTxePlatformAdmins([]config.TXEPlatformAdmin{
+		{Issuer: "https://issuer.example/realms/test", Subject: "subject-admin"},
+	}))
+
+	listed := h.token(h.adminP)
+	require.Equal(t, http.StatusOK, h.status(http.MethodGet, "/api/v1/events/stream", listed, "", nil))
+	require.Equal(t, http.StatusOK, h.status(http.MethodGet, "/api/v1/events/stream?token="+listed, "", "", nil))
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodPost, "/mcp", listed, personMCPInitialize, mcpHeader()))
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodGet, "/api/v1/terminal/ws?token="+listed, "", "", nil))
+
+	unlisted := h.token(h.person)
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodGet, "/api/v1/events/stream", unlisted, "", nil))
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodPost, "/api/v1/events/stream/topics", unlisted, `{}`, nil))
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodPost, "/mcp", unlisted, personMCPInitialize, mcpHeader()))
+	require.Equal(t, http.StatusForbidden, h.status(http.MethodGet, "/api/v1/terminal/ws?token="+unlisted, "", "", nil))
 }

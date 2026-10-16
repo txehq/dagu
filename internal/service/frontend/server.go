@@ -1392,6 +1392,9 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(auth.QueryTokenMiddleware())
 		r.Use(auth.ClientIPMiddleware())
 		r.Use(auth.Middleware(authOpts))
+		// A configured SSO administrator follows the UI's live updates. The
+		// terminal and MCP stay closed to every identity provider sign-in.
+		r.Use(srv.apiV1.TxePlatformAdminSession)
 		r.Use(srv.apiV1.TxePersonRefused())
 		r.Use(srv.injectDefaultStreamUserMiddleware())
 
