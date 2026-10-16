@@ -144,10 +144,26 @@ func TestTXELoginHubKeepsAnExistingContext(t *testing.T) {
 
 func TestTXELoginHubRefusesBadAddresses(t *testing.T) {
 	f := newFreshTXEFixture(t)
-	for _, bad := range []string{"dag.example.com", "ftp://dag.example.com", "https://user@dag.example.com", "https://dag.example.com/?x=1"} {
+	for _, bad := range []string{"dag.example.com", "ftp://dag.example.com", "https://user@dag.example.com", "https://dag.example.com/?x=1",
+		"http://dag.example.com", "http://10.0.0.5:8080"} {
 		_, err := f.run("login", "--hub", bad)
 		require.Error(t, err, bad)
 		assert.Contains(t, err.Error(), "--hub must be", bad)
+	}
+}
+
+func TestTXEHubAPIRoot(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://dag.example.com":          "https://dag.example.com/api/v1",
+		"https://dag.example.com/":         "https://dag.example.com/api/v1",
+		"https://dag.example.com/hub/api/": "https://dag.example.com/hub/api",
+		"http://127.0.0.1:18080":           "http://127.0.0.1:18080/api/v1",
+		"http://localhost:18080":           "http://localhost:18080/api/v1",
+		"http://[::1]:18080":               "http://[::1]:18080/api/v1",
+	} {
+		got, err := txeHubAPIRoot(in)
+		require.NoError(t, err, in)
+		assert.Equal(t, want, got, in)
 	}
 }
 

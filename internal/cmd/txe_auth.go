@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -425,13 +426,28 @@ func txeEnsureHubContext(ctx *Context) error {
 	})
 }
 
+// txeLoopbackHost reports whether host is this machine.
+func txeLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // txeHubAPIRoot is the API root a context names for --hub: the hub's address
 // with /api/v1 when it names no path, as a person writes it; a path given is
 // kept, for a hub whose API is mounted elsewhere.
 func txeHubAPIRoot(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("--hub must be the hub's http(s) address, such as https://dag.example.com, got %q", raw)
+		return "", fmt.Errorf("--hub must be the hub's https address, such as https://dag.example.com, got %q", raw)
+	}
+	// The sign-in and the hub's answer about who may sign in travel over
+	// this address, so it is https, except to this machine itself (a
+	// port-forward or a local hub).
+	if u.Scheme == "http" && !txeLoopbackHost(u.Hostname()) {
+		return "", fmt.Errorf("--hub must be the hub's https address: plain http is accepted only for this machine (127.0.0.1, ::1, localhost), got %q", raw)
 	}
 	if strings.Trim(u.Path, "/") == "" {
 		u.Path = "/api/v1"
