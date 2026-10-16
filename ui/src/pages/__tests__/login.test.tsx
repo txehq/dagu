@@ -211,3 +211,30 @@ describe('LoginPage single sign-on', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+describe('LoginPage when password sign-in is disabled', () => {
+  it('offers only single sign-on', () => {
+    renderLogin(
+      makeConfig({
+        passwordLoginDisabled: true,
+        oidcEnabled: true,
+        oidcButtonLabel: 'Login with SSO',
+      })
+    );
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(screen.getByTestId('password-login-disabled')).toHaveTextContent(
+      'Password sign-in is disabled on this hub.'
+    );
+    expect(
+      screen.getByRole('button', { name: 'Login with SSO' })
+    ).toBeInTheDocument();
+  });
+
+  it('offers the password form when it is not disabled', () => {
+    renderLogin(makeConfig({ oidcEnabled: true }));
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(
+      screen.queryByTestId('password-login-disabled')
+    ).not.toBeInTheDocument();
+  });
+});

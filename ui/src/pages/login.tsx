@@ -104,6 +104,8 @@ export default function LoginPage() {
   };
 
   const externalLoginEnabled = config.oidcEnabled || config.proxyEnabled;
+  // The server refuses password sign-in (auth.builtin.password_disabled).
+  const passwordLoginOffered = !config.passwordLoginDisabled;
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-muted/50">
@@ -141,56 +143,69 @@ export default function LoginPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="username" className="text-sm">
-                {t('auth.username')}
-              </Label>
-              <Input
-                id="username"
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-                autoComplete="username"
-                autoFocus
-                className="h-9"
-              />
-            </div>
+          {!passwordLoginOffered && (
+            <p
+              data-testid="password-login-disabled"
+              className="text-xs text-center text-muted-foreground"
+            >
+              <I18nText text="Password sign-in is disabled on this hub." />
+            </p>
+          )}
 
-            <div className="space-y-1.5">
-              <Label htmlFor="password" className="text-sm">
-                {t('auth.password')}
-              </Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                autoComplete="current-password"
-                className="h-9"
-              />
-            </div>
+          {passwordLoginOffered && (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="username" className="text-sm">
+                  {t('auth.username')}
+                </Label>
+                <Input
+                  id="username"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  required
+                  autoComplete="username"
+                  autoFocus
+                  className="h-9"
+                />
+              </div>
 
-            <Button type="submit" className="w-full h-9" disabled={isLoading}>
-              <LogIn className="h-4 w-4" />
-              {isLoading ? t('auth.signingIn') : t('auth.signIn')}
-            </Button>
-          </form>
+              <div className="space-y-1.5">
+                <Label htmlFor="password" className="text-sm">
+                  {t('auth.password')}
+                </Label>
+                <Input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  autoComplete="current-password"
+                  className="h-9"
+                />
+              </div>
+
+              <Button type="submit" className="w-full h-9" disabled={isLoading}>
+                <LogIn className="h-4 w-4" />
+                {isLoading ? t('auth.signingIn') : t('auth.signIn')}
+              </Button>
+            </form>
+          )}
 
           {externalLoginEnabled && (
             <>
-              <div className="relative">
-                <div className="absolute inset-0 flex items-center">
-                  <span className="w-full border-t" />
+              {passwordLoginOffered && (
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <span className="w-full border-t" />
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase">
+                    <span className="bg-background px-2 text-muted-foreground">
+                      {t('auth.or')}
+                    </span>
+                  </div>
                 </div>
-                <div className="relative flex justify-center text-xs uppercase">
-                  <span className="bg-background px-2 text-muted-foreground">
-                    {t('auth.or')}
-                  </span>
-                </div>
-              </div>
+              )}
 
               {config.oidcEnabled && (
                 <Button

@@ -755,6 +755,7 @@ func (a *API) buildAuthOptions(mountedAPIPath string) (frontendauth.Options, err
 		AuthRequired:          true,
 		RequiredAPIKeySurface: auth.APIKeySurfaceREST,
 		OnDenied:              a.logRESTAuthDenied,
+		PasswordDisabled:      authConfig.Builtin.PasswordDisabled,
 		PublicPaths:           publicPaths,
 		PublicPathPrefixes: []string{
 			pathutil.BuildPublicEndpointPath(mountedAPIPath, "webhooks") + "/",

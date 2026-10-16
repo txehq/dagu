@@ -2735,6 +2735,30 @@ func TestLoad_NoIndex(t *testing.T) {
 	})
 }
 
+func TestLoad_BuiltinPasswordDisabled(t *testing.T) {
+	t.Run("DefaultOff", func(t *testing.T) {
+		assert.False(t, loadFromYAML(t, "auth:\n  mode: builtin\n").Server.Auth.Builtin.PasswordDisabled)
+	})
+	t.Run("FromYAML", func(t *testing.T) {
+		cfg := loadFromYAML(t, "auth:\n  mode: builtin\n  builtin:\n    password_disabled: true\n")
+		assert.True(t, cfg.Server.Auth.Builtin.PasswordDisabled)
+	})
+	t.Run("FromEnv", func(t *testing.T) {
+		cfg := loadWithEnv(t, "auth:\n  mode: builtin\n", map[string]string{"DAGU_AUTH_BUILTIN_PASSWORD_DISABLED": "true"})
+		assert.True(t, cfg.Server.Auth.Builtin.PasswordDisabled)
+	})
+	t.Run("RefusedOutsideBuiltinMode", func(t *testing.T) {
+		err := loadWithErrorFromYAML(t, "auth:\n  mode: basic\n  basic:\n    username: u\n    password: p\n  builtin:\n    password_disabled: true\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "password_disabled needs auth.mode")
+	})
+	t.Run("RefusedWithAnInitialAdmin", func(t *testing.T) {
+		err := loadWithErrorFromYAML(t, "auth:\n  mode: builtin\n  builtin:\n    password_disabled: true\n    initial_admin:\n      username: admin\n      password: a-long-password-1\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "initial_admin could never sign in")
+	})
+}
+
 func TestLoad_OIDCPKCE(t *testing.T) {
 	t.Run("DefaultOff", func(t *testing.T) {
 		cfg := loadFromYAML(t, `
