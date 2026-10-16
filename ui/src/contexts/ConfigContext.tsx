@@ -54,6 +54,8 @@ export type Config = {
   // OIDC sessions are on: signing out must also end the hub session. Absent
   // means off, as on hubs without sessions.
   oidcSessionEnabled?: boolean;
+  // The server refuses password sign-in (auth.builtin.password_disabled).
+  passwordLoginDisabled?: boolean;
   proxyEnabled: boolean;
   proxyButtonLabel: string;
   terminalEnabled: boolean;

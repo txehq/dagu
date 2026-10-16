@@ -102,6 +102,9 @@ type API struct {
 	viewStore            view.Store
 	txeRegistry          *registry.Store
 	txeAuth              *txeauth.Service
+	// txePlatformAdmins are the people txe.authz.platform_admins names
+	// (TxePlatformAdminSession).
+	txePlatformAdmins    []config.TXEPlatformAdmin
 	licenseManager       *license.Manager
 	apiKeyCreateMu       sync.Mutex
 	workspaceStore       workspace.Store
@@ -429,6 +432,9 @@ func New(
 		leaseStaleThreshold: dagrun.DefaultStaleLeaseThreshold,
 	}
 
+	if cfg != nil {
+		a.txePlatformAdmins = cfg.TXE.Authz.PlatformAdmins
+	}
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -486,6 +492,7 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 		r.Use(frontendauth.LoginRateLimitMiddleware(loginPath))
 		r.Use(stepLogDownloadFormAuth(mountedAPIPath))
 		r.Use(frontendauth.Middleware(authOptions))
+		r.Use(a.TxePlatformAdminSession)
 		r.Use(a.txePersonGate(mountedAPIPath))
 		r.Use(a.txeNeutralize)
 		r.Use(a.restAuditSubjectMiddleware())
@@ -755,6 +762,7 @@ func (a *API) buildAuthOptions(mountedAPIPath string) (frontendauth.Options, err
 		AuthRequired:          true,
 		RequiredAPIKeySurface: auth.APIKeySurfaceREST,
 		OnDenied:              a.logRESTAuthDenied,
+		PasswordDisabled:      authConfig.Builtin.PasswordDisabled,
 		PublicPaths:           publicPaths,
 		PublicPathPrefixes: []string{
 			pathutil.BuildPublicEndpointPath(mountedAPIPath, "webhooks") + "/",

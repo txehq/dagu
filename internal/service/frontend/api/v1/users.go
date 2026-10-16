@@ -101,6 +101,10 @@ func (a *API) CreateUser(ctx context.Context, request api.CreateUserRequestObjec
 	if err := a.requireUserManagement(); err != nil {
 		return nil, err
 	}
+	if a.passwordDisabled() {
+		// Every user this route creates signs in with a password.
+		return api.CreateUser403JSONResponse{Code: api.ErrorCodeForbidden, Message: passwordDisabledMessage}, nil
+	}
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
@@ -380,6 +384,9 @@ func (a *API) DeleteUser(ctx context.Context, request api.DeleteUserRequestObjec
 func (a *API) ResetUserPassword(ctx context.Context, request api.ResetUserPasswordRequestObject) (api.ResetUserPasswordResponseObject, error) {
 	if err := a.requireUserManagement(); err != nil {
 		return nil, err
+	}
+	if a.passwordDisabled() {
+		return api.ResetUserPassword403JSONResponse{Code: api.ErrorCodeForbidden, Message: passwordDisabledMessage}, nil
 	}
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err

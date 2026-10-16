@@ -193,12 +193,17 @@ type Core struct {
 
 // Server contains the API server configuration.
 type Server struct {
-	Host              string
-	Port              int
-	PublicURL         string // Absolute external URL used in generated links
-	BasePath          string // URL path for reverse proxy subpath hosting
-	APIBasePath       string
-	Headless          bool
+	Host        string
+	Port        int
+	PublicURL   string // Absolute external URL used in generated links
+	BasePath    string // URL path for reverse proxy subpath hosting
+	APIBasePath string
+	Headless    bool
+	// NoIndex asks search engines not to index or follow the hub: every
+	// response carries X-Robots-Tag, the UI page a robots meta tag, and
+	// /robots.txt disallows everything. Compliant crawlers only; it is not
+	// access control. Default: false.
+	NoIndex           bool
 	CheckUpdates      bool
 	AccessLog         AccessLogMode // "all", "non-public", or "none" (default)
 	LatestStatusToday bool
@@ -309,6 +314,12 @@ type AuthBasic struct {
 type AuthBuiltin struct {
 	Token        TokenConfig
 	InitialAdmin InitialAdmin
+	// PasswordDisabled refuses password authentication everywhere: password
+	// sign-in, first-run setup, password changes and resets, password-user
+	// creation, a password user's token and basic auth, on every surface and
+	// through the port-forward too. Identity provider sign-in and API keys
+	// are unaffected. Default: false.
+	PasswordDisabled bool
 }
 
 const maxBuiltinAuthTokenTTL = 365 * 24 * time.Hour
@@ -959,6 +970,17 @@ func (c *Config) validateBasicAuth() error {
 
 // validateBuiltinAuth validates the builtin authentication configuration.
 func (c *Config) validateBuiltinAuth() error {
+	if c.Server.Auth.Builtin.PasswordDisabled {
+		// Basic auth is a password, and an initial administrator is one that
+		// could never sign in: either beside the switch means the operator
+		// expects a password to work.
+		if c.Server.Auth.Mode != AuthModeBuiltin {
+			return fmt.Errorf("auth.builtin.password_disabled needs auth.mode %q, not %q", AuthModeBuiltin, c.Server.Auth.Mode)
+		}
+		if c.Server.Auth.Builtin.InitialAdmin.Username != "" || c.Server.Auth.Builtin.InitialAdmin.Password != "" {
+			return fmt.Errorf("auth.builtin.password_disabled is set, so auth.builtin.initial_admin could never sign in: remove it")
+		}
+	}
 	if c.Server.Auth.Mode != AuthModeBuiltin {
 		return nil
 	}

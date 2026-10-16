@@ -5,6 +5,7 @@
     <meta charset="UTF-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    {{ if noindex }}<meta name="robots" content="noindex, nofollow, noarchive" />{{ end }}
     <link rel="icon" href="{{ basePath }}/assets/favicon.ico" />
     <title>{{ navbarTitle }}</title>
     <script>
@@ -25,6 +26,7 @@
           oidcEnabled: "{{ oidcEnabled }}" === "true",
           oidcButtonLabel: "{{ js oidcButtonLabel }}",
           oidcSessionEnabled: "{{ oidcSessionEnabled }}" === "true",
+          passwordLoginDisabled: "{{ passwordLoginDisabled }}" === "true",
           proxyEnabled: "{{ proxyEnabled }}" === "true",
           proxyButtonLabel: "{{ js proxyButtonLabel }}",
           terminalEnabled: "{{ terminalEnabled }}" === "true",

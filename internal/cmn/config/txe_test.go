@@ -202,3 +202,53 @@ func TestTXEAdvertisedCLIClient(t *testing.T) {
 	cfg := loadFromYAML(t, txeAuthnYAML+"    cli_client: dagu-cli\n")
 	assert.Equal(t, "dagu-cli", cfg.TXE.Authn.CLIClient)
 }
+
+const txeAdminsBase = `
+auth:
+  mode: builtin
+  oidc:
+    client_id: dagu-web
+    client_secret: s
+    client_url: https://dag.example
+    issuer: https://account.example/realms/master
+txe:
+  authz:
+    mode: observe
+`
+
+func TestLoad_TXEPlatformAdmins(t *testing.T) {
+	cfg := loadFromYAML(t, txeAdminsBase+`    platform_admins:
+      - {issuer: https://account.example/realms/master, subject: 84dbbe95-0000-4000-8000-000000000001}
+`)
+	assert.Equal(t, []TXEPlatformAdmin{{Issuer: "https://account.example/realms/master", Subject: "84dbbe95-0000-4000-8000-000000000001"}},
+		cfg.TXE.Authz.PlatformAdmins)
+
+	assert.Empty(t, loadFromYAML(t, txeAdminsBase).TXE.Authz.PlatformAdmins, "none unless listed")
+}
+
+func TestLoad_TXEPlatformAdminsRefusals(t *testing.T) {
+	const iss = "https://account.example/realms/master"
+	for name, tc := range map[string]struct {
+		yaml string
+		want string
+	}{
+		"Empty":           {txeAdminsBase + "    platform_admins:\n", "is empty"},
+		"EmptyList":       {txeAdminsBase + "    platform_admins: []\n", "is empty"},
+		"NotAList":        {txeAdminsBase + "    platform_admins: " + iss + "\n", "must be a list"},
+		"NotAMapping":     {txeAdminsBase + "    platform_admins: [connor]\n", "must be {issuer, subject}"},
+		"UnknownKey":      {txeAdminsBase + "    platform_admins: [{issuer: " + iss + ", subject: s, email: c@example.com}]\n", `unknown key "email"`},
+		"NoSubject":       {txeAdminsBase + "    platform_admins: [{issuer: " + iss + "}]\n", "issuer and subject are both required"},
+		"NoIssuer":        {txeAdminsBase + "    platform_admins: [{subject: s}]\n", "issuer and subject are both required"},
+		"SubjectNotAText": {txeAdminsBase + "    platform_admins: [{issuer: " + iss + ", subject: 12}]\n", "must be a string"},
+		"SpacedSubject":   {txeAdminsBase + "    platform_admins: [{issuer: " + iss + ", subject: ' s '}]\n", "leading or trailing space"},
+		"OtherIssuer":     {txeAdminsBase + "    platform_admins: [{issuer: https://other.example/realms/master, subject: s}]\n", "would match no one"},
+		"Twice":           {txeAdminsBase + "    platform_admins: [{issuer: " + iss + ", subject: s}, {issuer: " + iss + ", subject: s}]\n", "listed twice"},
+		"NoOIDC":          {"auth:\n  mode: builtin\ntxe:\n  authz:\n    platform_admins: [{issuer: " + iss + ", subject: s}]\n", "auth.oidc configured"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := loadWithErrorFromYAML(t, tc.yaml)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}

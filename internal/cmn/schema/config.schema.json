@@ -34,6 +34,10 @@
       "type": "boolean",
       "description": "Run in headless mode without the web UI."
     },
+    "noindex": {
+      "type": "boolean",
+      "description": "Ask search engines not to index the hub: X-Robots-Tag on every response, a robots meta tag on the UI page, and /robots.txt disallowing everything. Compliant crawlers only; not access control."
+    },
     "check_updates": {
       "type": "boolean",
       "description": "Enable automatic update checks for web UI notifications. Manual 'dagu upgrade' checks are unaffected.",
@@ -270,6 +274,20 @@
               "type": "string",
               "enum": ["off", "observe", "enforce"],
               "description": "How credentials the hub accepted before owners were enforced are treated: off (today), observe (log what enforce would deny) or enforce. A person or an identity provider token is held to its owner in every mode."
+            },
+            "platform_admins": {
+              "type": "array",
+              "minItems": 1,
+              "description": "People who, signed in through the browser with the identity provider, act as the installation's administrator. Matched on exact issuer and subject only; a provider token is never an administrator.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["issuer", "subject"],
+                "properties": {
+                  "issuer": {"type": "string", "minLength": 1, "description": "Must equal auth.oidc.issuer."},
+                  "subject": {"type": "string", "minLength": 1, "description": "The provider's stable subject (sub) of the person."}
+                }
+              }
             }
           }
         },
@@ -763,6 +781,10 @@
       "description": "Builtin authentication with RBAC configuration.",
       "additionalProperties": false,
       "properties": {
+        "password_disabled": {
+          "type": "boolean",
+          "description": "Refuse password authentication everywhere: password sign-in, first-run setup, password changes and resets, password-user creation, a password user's token and basic auth. Identity provider sign-in and API keys are unaffected."
+        },
         "token": {
           "$ref": "#/definitions/TokenConfigDef"
         }

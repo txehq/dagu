@@ -14,6 +14,7 @@ type Definition struct {
 	APIBasePath        string       `mapstructure:"api_base_path"`
 	APIBaseURL         string       `mapstructure:"api_base_url"` // Deprecated: use APIBasePath
 	Headless           *bool        `mapstructure:"headless"`
+	NoIndex            bool         `mapstructure:"noindex"`
 	CheckUpdates       *bool        `mapstructure:"check_updates"`
 	TLS                *TLSDef      `mapstructure:"tls"`
 	CORSAllowedOrigins []string     `mapstructure:"cors_allowed_origins"`
@@ -160,6 +161,8 @@ type AuthBasicDef struct {
 type AuthBuiltinDef struct {
 	Token        *TokenConfigDef  `mapstructure:"token"`
 	InitialAdmin *InitialAdminDef `mapstructure:"initial_admin"`
+	// PasswordDisabled refuses password authentication everywhere.
+	PasswordDisabled bool `mapstructure:"password_disabled"`
 }
 
 // TokenConfigDef configures JWT token settings.

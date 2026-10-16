@@ -123,6 +123,7 @@ type UpdateChecker interface {
 
 type funcsConfig struct {
 	NavbarColor           string
+	NoIndex               bool // the page carries a robots noindex meta tag
 	NavbarTitle           string
 	BasePath              string
 	APIBasePath           string
@@ -136,6 +137,9 @@ type funcsConfig struct {
 	OIDCEnabled           bool
 	OIDCButtonLabel       string
 	OIDCSessionEnabled    bool // sign-out also ends the hub session; see oidcSessionsEnabled
+	// PasswordLoginDisabled hides the password form: the server refuses
+	// password sign-in (auth.builtin.password_disabled).
+	PasswordLoginDisabled bool
 	ProxyEnabled          bool
 	ProxyButtonLabel      string
 	TerminalEnabled       bool
@@ -211,6 +215,8 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 		"permissionsWriteDags": func() string { return boolStr(cfg.Permissions[config.PermissionWriteDAGs]) },
 		"permissionsRunDags":   func() string { return boolStr(cfg.Permissions[config.PermissionRunDAGs]) },
 
+		"noindex": func() bool { return cfg.NoIndex },
+
 		// Feature toggle functions
 		"oidcEnabled": func() string {
 			if !cfg.OIDCEnabled {
@@ -221,7 +227,8 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 			}
 			return "true"
 		},
-		"oidcSessionEnabled": func() string { return boolStr(cfg.OIDCSessionEnabled) },
+		"oidcSessionEnabled":    func() string { return boolStr(cfg.OIDCSessionEnabled) },
+		"passwordLoginDisabled": func() string { return boolStr(cfg.PasswordLoginDisabled) },
 		"proxyEnabled": func() string {
 			if !cfg.ProxyEnabled {
 				return "false"
