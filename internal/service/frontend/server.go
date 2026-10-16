@@ -646,6 +646,7 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			OIDCEnabled:           oidcEnabled,
 			OIDCButtonLabel:       oidcButtonLabel,
 			OIDCSessionEnabled:    oidcSessionsEnabled(builtinOIDCCfg),
+			PasswordLoginDisabled: cfg.Server.Auth.Builtin.PasswordDisabled,
 			ProxyEnabled:          cfg.Server.Auth.Proxy.Enabled,
 			ProxyButtonLabel:      cfg.Server.Auth.Proxy.ButtonLabel,
 			TerminalEnabled:       cfg.Server.Terminal.Enabled && authSvc != nil,
@@ -1594,6 +1595,7 @@ func (srv *Server) buildStreamAuthOptions(realm string) auth.Options {
 		Realm:                 realm,
 		AuthRequired:          true,
 		RequiredAPIKeySurface: authmodel.APIKeySurfaceREST,
+		PasswordDisabled:      authCfg.Builtin.PasswordDisabled,
 	}
 
 	if authCfg.Mode == config.AuthModeBuiltin && srv.authService != nil {

@@ -161,6 +161,8 @@ type AuthBasicDef struct {
 type AuthBuiltinDef struct {
 	Token        *TokenConfigDef  `mapstructure:"token"`
 	InitialAdmin *InitialAdminDef `mapstructure:"initial_admin"`
+	// PasswordDisabled refuses password authentication everywhere.
+	PasswordDisabled bool `mapstructure:"password_disabled"`
 }
 
 // TokenConfigDef configures JWT token settings.

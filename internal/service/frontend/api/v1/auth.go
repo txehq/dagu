@@ -20,6 +20,14 @@ import (
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 )
 
+// passwordDisabledMessage tells a caller that this hub takes no password.
+const passwordDisabledMessage = "Password authentication is disabled on this hub; sign in with SSO"
+
+// passwordDisabled reports whether auth.builtin.password_disabled is set.
+func (a *API) passwordDisabled() bool {
+	return a.config != nil && a.config.Server.Auth.Builtin.PasswordDisabled
+}
+
 // Setup creates the initial admin user during first-run setup.
 // Returns 403 if users already exist.
 func (a *API) Setup(ctx context.Context, request api.SetupRequestObject) (api.SetupResponseObject, error) {
@@ -28,6 +36,10 @@ func (a *API) Setup(ctx context.Context, request api.SetupRequestObject) (api.Se
 			Code:    api.ErrorCodeForbidden,
 			Message: "Authentication is not enabled",
 		}, nil
+	}
+
+	if a.passwordDisabled() {
+		return api.Setup403JSONResponse{Code: api.ErrorCodeForbidden, Message: passwordDisabledMessage}, nil
 	}
 
 	if request.Body == nil {
@@ -112,6 +124,11 @@ func (a *API) Login(ctx context.Context, request api.LoginRequestObject) (api.Lo
 		}, nil
 	}
 
+	if a.passwordDisabled() {
+		// Refused before the password is judged.
+		return api.Login401JSONResponse{Code: api.ErrorCodeUnauthorized, Message: passwordDisabledMessage}, nil
+	}
+
 	if request.Body == nil {
 		return api.Login401JSONResponse{
 			Code:    api.ErrorCodeUnauthorized,
@@ -192,6 +209,9 @@ func (a *API) GetCurrentUser(ctx context.Context, _ api.GetCurrentUserRequestObj
 
 // ChangePassword allows the authenticated user to change their own password.
 func (a *API) ChangePassword(ctx context.Context, request api.ChangePasswordRequestObject) (api.ChangePasswordResponseObject, error) {
+	if a.passwordDisabled() {
+		return api.ChangePassword403JSONResponse{Code: api.ErrorCodeForbidden, Message: passwordDisabledMessage}, nil
+	}
 	if a.authService == nil {
 		return api.ChangePassword401JSONResponse{
 			Code:    api.ErrorCodeUnauthorized,

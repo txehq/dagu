@@ -1151,6 +1151,8 @@ func (l *ConfigLoader) loadBuiltinAuth(cfg *Config, auth *AuthDef) {
 		cfg.Server.Auth.Builtin.InitialAdmin.Username = auth.Builtin.InitialAdmin.Username
 		cfg.Server.Auth.Builtin.InitialAdmin.Password = auth.Builtin.InitialAdmin.Password
 	}
+
+	cfg.Server.Auth.Builtin.PasswordDisabled = auth.Builtin.PasswordDisabled
 }
 
 func (l *ConfigLoader) setAuthDefaults(cfg *Config) {
@@ -2397,6 +2399,7 @@ var envBindings = []envBinding{
 	{key: "auth.builtin.token.ttl", env: "AUTH_TOKEN_TTL"},
 	{key: "auth.builtin.initial_admin.username", env: "AUTH_BUILTIN_INITIAL_ADMIN_USERNAME"},
 	{key: "auth.builtin.initial_admin.password", env: "AUTH_BUILTIN_INITIAL_ADMIN_PASSWORD"},
+	{key: "auth.builtin.password_disabled", env: "AUTH_BUILTIN_PASSWORD_DISABLED"},
 
 	// TLS
 	{key: "tls.cert_file", env: "CERT_FILE"},
