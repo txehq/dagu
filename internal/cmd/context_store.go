@@ -40,6 +40,10 @@ type cliContext struct {
 	APIKey         string `json:"api_key,omitempty"`
 	SkipTLSVerify  bool   `json:"skip_tls_verify,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	// SignInOnly is a context with no API key: its requests carry this
+	// machine's sign-in ("dagu txe login") and nothing else, so routes the hub
+	// takes a sign-in on work and every other route is refused by the hub.
+	SignInOnly bool `json:"sign_in_only,omitempty"`
 }
 
 type storedContext struct {
@@ -49,12 +53,16 @@ type storedContext struct {
 	APIKeyEnc      string `json:"api_key_enc,omitempty"`
 	SkipTLSVerify  bool   `json:"skip_tls_verify,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	SignInOnly     bool   `json:"sign_in_only,omitempty"`
 }
 
 func (s storedContext) toContext(enc *crypto.Encryptor) (*cliContext, error) {
-	apiKey, err := enc.Decrypt(s.APIKeyEnc)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt api key: %w", err)
+	var apiKey string
+	if !s.SignInOnly {
+		var err error
+		if apiKey, err = enc.Decrypt(s.APIKeyEnc); err != nil {
+			return nil, fmt.Errorf("decrypt api key: %w", err)
+		}
 	}
 	return &cliContext{
 		Name:           s.Name,
@@ -63,13 +71,17 @@ func (s storedContext) toContext(enc *crypto.Encryptor) (*cliContext, error) {
 		APIKey:         apiKey,
 		SkipTLSVerify:  s.SkipTLSVerify,
 		TimeoutSeconds: s.TimeoutSeconds,
+		SignInOnly:     s.SignInOnly,
 	}, nil
 }
 
 func newStoredContext(ctx *cliContext, enc *crypto.Encryptor) (*storedContext, error) {
-	apiKeyEnc, err := enc.Encrypt(ctx.APIKey)
-	if err != nil {
-		return nil, fmt.Errorf("encrypt api key: %w", err)
+	var apiKeyEnc string
+	if !ctx.SignInOnly {
+		var err error
+		if apiKeyEnc, err = enc.Encrypt(ctx.APIKey); err != nil {
+			return nil, fmt.Errorf("encrypt api key: %w", err)
+		}
 	}
 	return &storedContext{
 		Name:           ctx.Name,
@@ -78,6 +90,7 @@ func newStoredContext(ctx *cliContext, enc *crypto.Encryptor) (*storedContext, e
 		APIKeyEnc:      apiKeyEnc,
 		SkipTLSVerify:  ctx.SkipTLSVerify,
 		TimeoutSeconds: ctx.TimeoutSeconds,
+		SignInOnly:     ctx.SignInOnly,
 	}, nil
 }
 
@@ -120,7 +133,10 @@ func (s *cliContextStore) ValidateContext(ctx *cliContext) error {
 	if err := validateStoredName(ctx.Name); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(ctx.APIKey, "dagu_") {
+	switch {
+	case ctx.SignInOnly && ctx.APIKey != "":
+		return errors.New("a sign-in-only context holds no api key")
+	case !ctx.SignInOnly && !strings.HasPrefix(ctx.APIKey, "dagu_"):
 		return errors.New("api key must use the dagu_ prefix")
 	}
 	u, err := url.Parse(ctx.ServerURL)
