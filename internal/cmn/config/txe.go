@@ -25,6 +25,19 @@ type TXEConfig struct {
 type TXEAuthzConfig struct {
 	// Mode is off, observe or enforce. Empty is off.
 	Mode string
+	// PlatformAdmins names the people who, signed in through the browser
+	// with the identity provider, act as the installation's administrator.
+	// Each is matched on its exact issuer and subject; no email, username or
+	// group claim is ever used. A provider token is never an administrator.
+	// Removing an entry takes effect on the next request after a restart.
+	PlatformAdmins []TXEPlatformAdmin
+}
+
+// TXEPlatformAdmin is one identity the configuration names a platform
+// administrator.
+type TXEPlatformAdmin struct {
+	Issuer  string
+	Subject string
 }
 
 // TXEAuthnConfig says which identity provider access tokens the server
@@ -118,6 +131,7 @@ const (
 	txeKey               = "txe"
 	txeAuthzKey          = "txe.authz"
 	txeAuthzModeKey      = "txe.authz.mode"
+	txeAuthzAdminsKey    = "txe.authz.platform_admins"
 	txeAuthnKey          = "txe.authn"
 	txeAuthnIssuerKey    = "txe.authn.issuer"
 	txeAuthnAudienceKey  = "txe.authn.audience"
@@ -158,7 +172,7 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 		allowed []string
 	}{
 		{txeKey, []string{"authz", "authn"}},
-		{txeAuthzKey, []string{"mode"}},
+		{txeAuthzKey, []string{"mode", "platform_admins"}},
 		{txeAuthnKey, []string{"issuer", "audience", "jwks_url", "clients", "max_lifetime", "issued_at_skew", "cli_client"}},
 	} {
 		m, err := l.txeSection(section.key)
@@ -172,6 +186,12 @@ func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 
 	var err error
 	if cfg.TXE.Authz.Mode, err = l.txeString(txeAuthzModeKey); err != nil {
+		return err
+	}
+	if l.txeWrittenEmpty(txeAuthzAdminsKey) {
+		return fmt.Errorf("%s is empty: remove it, or list the administrators", txeAuthzAdminsKey)
+	}
+	if cfg.TXE.Authz.PlatformAdmins, err = parseTXEPlatformAdmins(l.v.Get(txeAuthzAdminsKey)); err != nil {
 		return err
 	}
 	if cfg.TXE.Authn.Issuer, err = l.txeString(txeAuthnIssuerKey); err != nil {
@@ -325,6 +345,42 @@ func exactString(v any, key string) (string, error) {
 	}
 }
 
+func parseTXEPlatformAdmins(v any) ([]TXEPlatformAdmin, error) {
+	if v == nil {
+		return nil, nil
+	}
+	items, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a list of {issuer, subject}, got %v", txeAuthzAdminsKey, v)
+	}
+	if len(items) == 0 {
+		// An empty list would remove every administrator silently; omit the
+		// setting instead.
+		return nil, fmt.Errorf("%s is empty: remove it, or list the administrators", txeAuthzAdminsKey)
+	}
+	admins := make([]TXEPlatformAdmin, 0, len(items))
+	for i, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s[%d] must be {issuer, subject}, got %v", txeAuthzAdminsKey, i, item)
+		}
+		section := fmt.Sprintf("%s[%d]", txeAuthzAdminsKey, i)
+		if err := onlyKeys(entry, section, "issuer", "subject"); err != nil {
+			return nil, err
+		}
+		issuer, err := exactString(entry["issuer"], section+".issuer")
+		if err != nil {
+			return nil, err
+		}
+		subject, err := exactString(entry["subject"], section+".subject")
+		if err != nil {
+			return nil, err
+		}
+		admins = append(admins, TXEPlatformAdmin{Issuer: issuer, Subject: subject})
+	}
+	return admins, nil
+}
+
 func parseTXEAuthnClients(v any) ([]TXEAuthnClient, error) {
 	if v == nil {
 		return nil, nil
@@ -365,6 +421,9 @@ func (c *Config) validateTXE() error {
 		return fmt.Errorf("%s: unknown mode %q (off, observe or enforce)", txeAuthzModeKey, c.TXE.Authz.Mode)
 	}
 	if err := c.TXE.Authn.validate(); err != nil {
+		return err
+	}
+	if err := c.validateTXEPlatformAdmins(); err != nil {
 		return err
 	}
 	owners := c.TXE.Authz.Mode != "" && c.TXE.Authz.Mode != TXEAuthzModeOff
@@ -415,6 +474,36 @@ func (a TXEAuthnConfig) validate() error {
 	}
 	if a.IssuedAtSkew < 0 || a.IssuedAtSkew > txeAuthnMaxIssuedAtSkew {
 		return fmt.Errorf("%s must be between 0 and %s, got %s", txeAuthnSkewKey, txeAuthnMaxIssuedAtSkew, a.IssuedAtSkew)
+	}
+	return nil
+}
+
+// validateTXEPlatformAdmins refuses an administrator entry that is incomplete,
+// repeated, or could never match: the browser sign-in records the issuer of
+// auth.oidc, so an entry for any other issuer names nobody.
+func (c *Config) validateTXEPlatformAdmins() error {
+	admins := c.TXE.Authz.PlatformAdmins
+	if len(admins) == 0 {
+		return nil
+	}
+	if c.Server.Auth.Mode != AuthModeBuiltin || !c.Server.Auth.OIDC.IsConfigured() {
+		return fmt.Errorf("%s needs auth.mode %q with auth.oidc configured", txeAuthzAdminsKey, AuthModeBuiltin)
+	}
+	seen := make(map[TXEPlatformAdmin]bool, len(admins))
+	for i, a := range admins {
+		if a.Issuer == "" || a.Subject == "" {
+			return fmt.Errorf("%s[%d]: issuer and subject are both required", txeAuthzAdminsKey, i)
+		}
+		if a.Subject != strings.TrimSpace(a.Subject) {
+			return fmt.Errorf("%s[%d].subject has leading or trailing space", txeAuthzAdminsKey, i)
+		}
+		if a.Issuer != c.Server.Auth.OIDC.Issuer {
+			return fmt.Errorf("%s[%d].issuer %q is not auth.oidc.issuer %q, so it would match no one", txeAuthzAdminsKey, i, a.Issuer, c.Server.Auth.OIDC.Issuer)
+		}
+		if seen[a] {
+			return fmt.Errorf("%s[%d]: listed twice", txeAuthzAdminsKey, i)
+		}
+		seen[a] = true
 	}
 	return nil
 }
