@@ -2722,6 +2722,19 @@ signalHandling:
 	})
 }
 
+func TestLoad_NoIndex(t *testing.T) {
+	t.Run("DefaultOff", func(t *testing.T) {
+		assert.False(t, loadFromYAML(t, "port: 8080\n").Server.NoIndex)
+	})
+	t.Run("FromYAML", func(t *testing.T) {
+		assert.True(t, loadFromYAML(t, "noindex: true\n").Server.NoIndex)
+	})
+	t.Run("FromEnv", func(t *testing.T) {
+		cfg := loadWithEnv(t, "port: 8080\n", map[string]string{"DAGU_SERVER_NOINDEX": "true"})
+		assert.True(t, cfg.Server.NoIndex)
+	})
+}
+
 func TestLoad_OIDCPKCE(t *testing.T) {
 	t.Run("DefaultOff", func(t *testing.T) {
 		cfg := loadFromYAML(t, `

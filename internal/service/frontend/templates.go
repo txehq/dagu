@@ -123,6 +123,7 @@ type UpdateChecker interface {
 
 type funcsConfig struct {
 	NavbarColor           string
+	NoIndex               bool // the page carries a robots noindex meta tag
 	NavbarTitle           string
 	BasePath              string
 	APIBasePath           string
@@ -210,6 +211,8 @@ func defaultFunctions(cfg *funcsConfig) template.FuncMap {
 		// Permission functions
 		"permissionsWriteDags": func() string { return boolStr(cfg.Permissions[config.PermissionWriteDAGs]) },
 		"permissionsRunDags":   func() string { return boolStr(cfg.Permissions[config.PermissionRunDAGs]) },
+
+		"noindex": func() bool { return cfg.NoIndex },
 
 		// Feature toggle functions
 		"oidcEnabled": func() string {

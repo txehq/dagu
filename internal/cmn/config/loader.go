@@ -658,6 +658,7 @@ func (l *ConfigLoader) loadServerFlags(cfg *Config, def Definition) {
 	if def.Headless != nil {
 		cfg.Server.Headless = *def.Headless
 	}
+	cfg.Server.NoIndex = def.NoIndex
 	cfg.Server.AccessLog = AccessLogNone
 	if def.AccessLog != nil {
 		switch AccessLogMode(*def.AccessLog) {
@@ -2277,6 +2278,7 @@ var envBindings = []envBinding{
 	{key: "port", env: "PORT"},
 	{key: "debug", env: "DEBUG"},
 	{key: "headless", env: "HEADLESS"},
+	{key: "noindex", env: "SERVER_NOINDEX"},
 	{key: "check_updates", env: "CHECK_UPDATES"},
 	{key: "cors_allowed_origins", env: "CORS_ALLOWED_ORIGINS"},
 	{key: "ip_access.allowed_ips", env: "IP_ACCESS_ALLOWED_IPS", requires: SectionServer},

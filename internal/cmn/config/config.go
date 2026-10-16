@@ -193,12 +193,17 @@ type Core struct {
 
 // Server contains the API server configuration.
 type Server struct {
-	Host              string
-	Port              int
-	PublicURL         string // Absolute external URL used in generated links
-	BasePath          string // URL path for reverse proxy subpath hosting
-	APIBasePath       string
-	Headless          bool
+	Host        string
+	Port        int
+	PublicURL   string // Absolute external URL used in generated links
+	BasePath    string // URL path for reverse proxy subpath hosting
+	APIBasePath string
+	Headless    bool
+	// NoIndex asks search engines not to index or follow the hub: every
+	// response carries X-Robots-Tag, the UI page a robots meta tag, and
+	// /robots.txt disallows everything. Compliant crawlers only; it is not
+	// access control. Default: false.
+	NoIndex           bool
 	CheckUpdates      bool
 	AccessLog         AccessLogMode // "all", "non-public", or "none" (default)
 	LatestStatusToday bool
