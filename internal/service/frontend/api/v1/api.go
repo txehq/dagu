@@ -104,7 +104,7 @@ type API struct {
 	txeAuth              *txeauth.Service
 	// txePlatformAdmins are the people txe.authz.platform_admins names
 	// (TxePlatformAdminSession).
-	txePlatformAdmins []config.TXEPlatformAdmin
+	txePlatformAdmins    []config.TXEPlatformAdmin
 	licenseManager       *license.Manager
 	apiKeyCreateMu       sync.Mutex
 	workspaceStore       workspace.Store
