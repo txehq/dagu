@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -29,6 +31,7 @@ var (
 	txeLoginScopeFlag  = commandLineFlag{name: "scope", usage: "Extra scope to request besides openid; repeatable", isStringArray: true}
 	txeLoginPromptFlag = commandLineFlag{name: "prompt", usage: `Ask the provider to show its sign-in page ("login") or account chooser ("select_account") even when a browser session exists`}
 	txeLoginNoBrowser  = commandLineFlag{name: "no-browser", usage: "Print the sign-in address instead of opening the browser; it must still be opened on this machine", isBool: true}
+	txeLoginHubFlag    = commandLineFlag{name: "hub", usage: `The hub's address, such as https://dag.example.com: creates the "txe" context, signed in only and with no API key, when this machine has none`}
 )
 
 // txeSignInDir is where sign-ins are kept, in the TXE home.
@@ -66,9 +69,20 @@ Other txe commands carry the sign-in on the routes the hub takes it on (the
 same answer names them: every /txe route, or also /dags, /dag-runs and
 /queues). Every other route, and every request inside a DAG step, keeps the
 context's API key. When the hub refuses the sign-in, the token is renewed once
-and the request sent once more; a second refusal says to sign in again.`,
-		Args: cobra.NoArgs,
-	}, []commandLineFlag{txeLoginIssuerFlag, txeLoginClientFlag, txeLoginScopeFlag, txeLoginPromptFlag, txeLoginNoBrowser, txeJSONFlag}, runTXELogin)
+and the request sent once more; a second refusal says to sign in again.
+
+On a machine with no hub yet, --hub names it: the "txe" context is created with
+that address and no API key, so this machine's requests carry the sign-in alone.
+No API key is needed or asked for, and no token is ever copied:
+
+  dagu txe login --hub https://dag.example.com
+
+An existing "txe" context is kept as it is, API key and all; --hub must then
+name the same hub. After signing in, login asks the hub whether this identity
+has access yet and says what to do if it has not.`,
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{txeLocalAnnotation: "true"},
+	}, []commandLineFlag{txeLoginHubFlag, txeLoginIssuerFlag, txeLoginClientFlag, txeLoginScopeFlag, txeLoginPromptFlag, txeLoginNoBrowser, txeJSONFlag}, runTXELogin)
 }
 
 func txeLogoutCommand() *cobra.Command {
@@ -266,6 +280,9 @@ func printSignIn(p *txePrinter, v txeSignInView) {
 }
 
 func runTXELogin(ctx *Context, _ []string) error {
+	if err := txeEnsureHubContext(ctx); err != nil {
+		return err
+	}
 	remote, err := txeRemoteContext(ctx)
 	if err != nil {
 		return err
@@ -306,6 +323,10 @@ func runTXELogin(ctx *Context, _ []string) error {
 		return err
 	}
 	view := signInView(entry)
+	view.HubIdentity, err = txeAskHubIdentity(ctx, remote)
+	if err != nil {
+		view.HubError = err.Error()
+	}
 	var revokeErr error
 	// The previous sign-in of the same identity is only dropped: it may share
 	// the provider session the new one was issued from, which revoking would
@@ -332,7 +353,91 @@ func runTXELogin(ctx *Context, _ []string) error {
 			}
 		}
 		p.f("Signing in grants nothing by itself: access follows the hub's binding of this identity to an owner.\n")
+		printAccess(p, view, remote.baseURL)
 	})
+}
+
+// printAccess says whether the hub gives this sign-in access yet, and what to
+// do when it does not. A command line cannot ask for access itself: the
+// person asks once in the browser, and the hub's administrator approves.
+func printAccess(p *txePrinter, v txeSignInView, hub string) {
+	h := v.HubIdentity
+	switch {
+	case h == nil && v.HubError != "":
+		p.f("access: the hub could not be asked (%s)\n", v.HubError)
+	case h == nil:
+	case h.PlatformAdmin:
+		p.f("access: the hub's administrator\n")
+	case len(h.Owners) > 0:
+		p.f("access: owner %s\n", h.Owners[0].OwnerID)
+	case h.State == "pending":
+		p.f("access: requested, waiting for the hub's administrator to approve it\n")
+	default:
+		// The page is the hub's site, not its API root.
+		site := strings.TrimSuffix(strings.TrimRight(hub, "/"), "/api/v1")
+		p.f("access: none yet. Open %s in a browser, sign in with the same account, and ask for access; the hub's administrator approves it.\n", site)
+	}
+}
+
+// txeEnsureHubContext creates the "txe" context from --hub, signed in only and
+// with no API key, when this machine has none. An existing one is kept as it
+// is; --hub must then name the same hub.
+func txeEnsureHubContext(ctx *Context) error {
+	hubURL, err := ctx.StringParam("hub")
+	if err != nil {
+		return err
+	}
+	if hubURL == "" {
+		if !ctx.IsRemote() && ctx.ContextStore != nil {
+			if _, gerr := ctx.ContextStore.Get(ctx, txeContextName); gerr != nil {
+				return fmt.Errorf("this machine has no hub yet: run \"dagu txe login --hub https://<the hub's address>\"")
+			}
+		}
+		return nil
+	}
+	if ctx.IsRemote() {
+		return fmt.Errorf("--hub and --context name the hub twice: give one")
+	}
+	if ctx.ContextStore == nil {
+		return fmt.Errorf("this machine has no context store to keep the hub in")
+	}
+	apiRoot, err := txeHubAPIRoot(hubURL)
+	if err != nil {
+		return err
+	}
+	want, err := cliauth.NormalizeHub(apiRoot)
+	if err != nil {
+		return fmt.Errorf("--hub: %w", err)
+	}
+	existing, err := ctx.ContextStore.Get(ctx, txeContextName)
+	if err == nil {
+		have, herr := cliauth.NormalizeHub(existing.ServerURL)
+		if herr != nil || have != want {
+			return fmt.Errorf("this machine's %q context already names %s, not %s: remove it with \"dagu context remove %s\" to change hubs", txeContextName, existing.ServerURL, hubURL, txeContextName)
+		}
+		return nil
+	}
+	return ctx.ContextStore.Create(ctx, &cliContext{
+		Name:        txeContextName,
+		Description: "the TXE hub, signed in with dagu txe login",
+		ServerURL:   apiRoot,
+		SignInOnly:  true,
+	})
+}
+
+// txeHubAPIRoot is the API root a context names for --hub: the hub's address
+// with /api/v1 when it names no path, as a person writes it; a path given is
+// kept, for a hub whose API is mounted elsewhere.
+func txeHubAPIRoot(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("--hub must be the hub's http(s) address, such as https://dag.example.com, got %q", raw)
+	}
+	if strings.Trim(u.Path, "/") == "" {
+		u.Path = "/api/v1"
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String(), nil
 }
 
 // txeLoginProvider decides the provider to sign in at.
