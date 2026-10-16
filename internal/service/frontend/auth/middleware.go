@@ -63,6 +63,10 @@ type Options struct {
 	ProviderTokenRoute func(r *http.Request) bool
 	// OnDenied is called when the middleware rejects a request after auth evaluation.
 	OnDenied func(r *http.Request, reason string, apiKey *auth.APIKey)
+	// PasswordDisabled refuses every password credential: a token of a user
+	// who signs in with a password (a builtin account) and basic auth. API
+	// keys, identity provider sessions and provider tokens are unaffected.
+	PasswordDisabled bool
 	// AuthRequired indicates whether authentication is required.
 	// When false (e.g., auth mode "none"), credentials are validated if provided
 	// but unauthenticated requests are allowed through.
@@ -93,6 +97,9 @@ const (
 	DenialReasonAPIKeySurfaceDenied = "api_key_surface_denied"
 	DenialReasonAuthFailed          = "auth_failed"
 	DenialReasonMissingCredentials  = "missing_credentials"
+	// DenialReasonPasswordDisabled is a password credential, or a token of a
+	// password user, while PasswordDisabled is set.
+	DenialReasonPasswordDisabled = "password_disabled"
 )
 
 // QueryTokenMiddleware converts a "token" query parameter into an Authorization
@@ -200,6 +207,12 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 			if jwtEnabled && bearerToken != "" {
 				user, err := opts.JWTValidator.GetUserFromToken(r.Context(), bearerToken)
 				if err == nil {
+					if opts.PasswordDisabled && user.CanUsePassword() {
+						// A session from before the switch, or one minted
+						// any other way: it is a password session either way.
+						refusePasswordDisabled(w, r, opts)
+						return
+					}
 					ctx := auth.WithUser(r.Context(), user)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -269,6 +282,14 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 				// Not a provider token at all; fall through.
 			}
 
+			// Basic auth is a password; it is refused before it is judged.
+			if opts.PasswordDisabled {
+				if _, _, ok := r.BasicAuth(); ok {
+					refusePasswordDisabled(w, r, opts)
+					return
+				}
+			}
+
 			// Try Basic Auth if enabled
 			if opts.BasicAuthEnabled {
 				if user, pass, ok := r.BasicAuth(); ok {
@@ -309,6 +330,15 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 			requireBearerAuth(w, opts.Realm)
 		})
 	}
+}
+
+// refusePasswordDisabled answers a password credential while password
+// authentication is disabled: 403, so that a client does not take it for a
+// wrong password and retry.
+func refusePasswordDisabled(w http.ResponseWriter, r *http.Request, opts Options) {
+	callDenied(opts, r, DenialReasonPasswordDisabled, nil)
+	writeAuthError(w, http.StatusForbidden, "auth.password_disabled",
+		"Password authentication is disabled on this hub; sign in with SSO")
 }
 
 // sessionCheckRetryAfterSeconds is how soon a client is told to try again

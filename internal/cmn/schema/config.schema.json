@@ -767,6 +767,10 @@
       "description": "Builtin authentication with RBAC configuration.",
       "additionalProperties": false,
       "properties": {
+        "password_disabled": {
+          "type": "boolean",
+          "description": "Refuse password authentication everywhere: password sign-in, first-run setup, password changes and resets, password-user creation, a password user's token and basic auth. Identity provider sign-in and API keys are unaffected."
+        },
         "token": {
           "$ref": "#/definitions/TokenConfigDef"
         }

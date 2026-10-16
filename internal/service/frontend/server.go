@@ -437,6 +437,9 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 				Provision:      trustedProvisionSvc,
 				AuthService:    stores.AuthService,
 				InitialSetupComplete: func(ctx context.Context) (bool, error) {
+					if cfg.Server.Auth.Builtin.PasswordDisabled {
+						return noPasswordBootstrap(ctx)
+					}
 					count, err := stores.AuthService.CountUsers(ctx)
 					return count > 0, err
 				},
@@ -494,6 +497,12 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize builtin OIDC: %w", err)
+			}
+			if cfg.Server.Auth.Builtin.PasswordDisabled {
+				// No password administrator will ever be set up, so sign-in
+				// must not wait for one: an empty user store is ready for
+				// identity provider sign-in.
+				builtinOIDCCfg.InitialSetupComplete = noPasswordBootstrap
 			}
 			if oidcCfg.Session.Enabled() {
 				sessions, err := newOIDCSessions(cfg, oidcCfg.Session, builtinOIDCCfg, stores.OIDCSessions)
@@ -646,12 +655,13 @@ func NewServer(setup ServerConfig, opts ...ServerOption) (*Server, error) {
 			OIDCEnabled:           oidcEnabled,
 			OIDCButtonLabel:       oidcButtonLabel,
 			OIDCSessionEnabled:    oidcSessionsEnabled(builtinOIDCCfg),
+			PasswordLoginDisabled: cfg.Server.Auth.Builtin.PasswordDisabled,
 			ProxyEnabled:          cfg.Server.Auth.Proxy.Enabled,
 			ProxyButtonLabel:      cfg.Server.Auth.Proxy.ButtonLabel,
 			TerminalEnabled:       cfg.Server.Terminal.Enabled && authSvc != nil,
 			GitSyncEnabled:        cfg.GitSync.Enabled,
 			WorkspaceStore:        wsStore,
-			SetupRequiredChecker:  &setupChecker{authSvc: authSvc, fallback: setupRequired},
+			SetupRequiredChecker:  &setupChecker{authSvc: authSvc, fallback: setupRequired, passwordDisabled: cfg.Server.Auth.Builtin.PasswordDisabled},
 			UpdateChecker:         updateInfoChecker,
 		},
 	}
@@ -754,13 +764,20 @@ func (u *updateChecker) GetUpdateInfo() (bool, string) {
 // setupChecker implements SetupRequiredChecker by counting users via the auth service.
 // Once users exist, caches the result to avoid hitting the store on every page load.
 type setupChecker struct {
-	authSvc       *authservice.Service
-	fallback      bool
-	setupComplete atomic.Bool
+	authSvc  *authservice.Service
+	fallback bool
+	// passwordDisabled means there is no setup to do: first-run setup creates
+	// a password administrator, which auth.builtin.password_disabled refuses.
+	passwordDisabled bool
+	setupComplete    atomic.Bool
 }
 
+// noPasswordBootstrap reports builtin bootstrap complete: with password
+// authentication disabled there is none to wait for.
+func noPasswordBootstrap(context.Context) (bool, error) { return true, nil }
+
 func (s *setupChecker) IsSetupRequired(ctx context.Context) bool {
-	if s.setupComplete.Load() {
+	if s.passwordDisabled || s.setupComplete.Load() {
 		return false
 	}
 	if s.authSvc == nil {
@@ -1322,7 +1339,9 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 	termHandler := terminal.NewHandler(srv.authService, srv.auditService, auditChecker, srv.terminalManager, shell)
 	termHandler.SetSessionWatch(srv.sessionWatch())
 	wsPath := path.Join(apiV1BasePath, "terminal/ws")
-	if srv.builtinOIDCCfg != nil || srv.apiV1.TxeOwnersEnabled() {
+	if srv.builtinOIDCCfg != nil || srv.apiV1.TxeOwnersEnabled() || srv.config.Server.Auth.Builtin.PasswordDisabled {
+		// With password authentication disabled, the middleware's refusal of a
+		// password user's token has to stand in front of the handler too.
 		// A person signed in through the identity provider gets no terminal,
 		// whatever role its account was given, and whether or not browser
 		// sign-in is still configured: a person's hub token outlives that
@@ -1594,6 +1613,7 @@ func (srv *Server) buildStreamAuthOptions(realm string) auth.Options {
 		Realm:                 realm,
 		AuthRequired:          true,
 		RequiredAPIKeySurface: authmodel.APIKeySurfaceREST,
+		PasswordDisabled:      authCfg.Builtin.PasswordDisabled,
 	}
 
 	if authCfg.Mode == config.AuthModeBuiltin && srv.authService != nil {

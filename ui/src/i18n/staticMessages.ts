@@ -2365,6 +2365,8 @@ const english = {
   "Waiting for approval": "Waiting for approval",
   // TXE switch account (TXE-4267).
   "Use a different account": "Use a different account",
+  // TXE password sign-in disabled (TXE-4508).
+  "Password sign-in is disabled on this hub.": "Password sign-in is disabled on this hub.",
   "Open the DAG": "Open the DAG",
   "1 application on file": "1 application on file",
   "{count} applications on file": "{count} applications on file",
@@ -4715,6 +4717,8 @@ const chinese = {
   "Waiting for approval": "等待批准",
   // TXE switch account (TXE-4267).
   "Use a different account": "使用其他账户",
+  // TXE password sign-in disabled (TXE-4508).
+  "Password sign-in is disabled on this hub.": "此中心已禁用密码登录。",
   "Open the DAG": "打开 DAG",
   "1 application on file": "1 个已记录的申请",
   "{count} applications on file": "{count} 个已记录的申请",
@@ -7146,6 +7150,8 @@ const japanese = {
   "Waiting for approval": "承認待ち",
   // TXE switch account (TXE-4267).
   "Use a different account": "別のアカウントを使用",
+  // TXE password sign-in disabled (TXE-4508).
+  "Password sign-in is disabled on this hub.": "このハブではパスワードによるサインインは無効です。",
   "Open the DAG": "DAG を開く",
   "1 application on file": "記録済みの申請 1 件",
   "{count} applications on file": "記録済みの申請 {count} 件",
