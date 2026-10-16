@@ -32,15 +32,15 @@ func TestNoIndex_On(t *testing.T) {
 	t.Parallel()
 	server := setupBuiltinAuthServer(t, func(cfg *config.Config) { cfg.Server.NoIndex = true })
 
-	// Every kind of answer carries the header: the page, a static path's 404, a
-	// public API answer, a refusal for missing credentials, and a path that
-	// matches no API route.
+	// Every kind of answer carries the header: the page, a missing static
+	// file's 404, a public API answer, a refusal for missing credentials, and a
+	// path that matches no API route.
 	for path, status := range map[string]int{
-		"/":                     http.StatusOK,
-		"/assets/favicon.ico":   http.StatusNotFound, // a static path the test build lacks
-		"/api/v1/health":        http.StatusOK,
-		"/api/v1/dags":          http.StatusUnauthorized,
-		"/api/v1/no-such-route": http.StatusUnauthorized,
+		"/":                        http.StatusOK,
+		"/assets/no-such-asset.js": http.StatusNotFound,
+		"/api/v1/health":           http.StatusOK,
+		"/api/v1/dags":             http.StatusUnauthorized,
+		"/api/v1/no-such-route":    http.StatusUnauthorized,
 	} {
 		t.Run(path, func(t *testing.T) {
 			code, header, _ := rawGet(t, server, path)
