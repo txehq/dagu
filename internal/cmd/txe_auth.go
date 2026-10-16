@@ -443,10 +443,8 @@ func txeEnsureHubContext(ctx *Context) error {
 	if err == nil {
 		have, herr := cliauth.NormalizeHub(existing.ServerURL)
 		if herr != nil || have != want {
-			// dagu context reads the ordinary store unless told otherwise, so
-			// the command names the TXE home's store explicitly.
-			return fmt.Errorf("this machine's %q context already names %s, not %s: to change hubs, remove it with \"DAGU_CONTEXTS_DIR=%s DAGU_DATA_DIR=%s dagu context remove %s\" and sign in again",
-				txeContextName, existing.ServerURL, hubURL, ctx.Config.Paths.ContextsDir, ctx.Config.Paths.DataDir, txeContextName)
+			return fmt.Errorf("this machine's %q context already names %s, not %s: to change hubs, remove it with %s and sign in again",
+				txeContextName, existing.ServerURL, hubURL, txeContextRemoveHint(ctx.Config.Paths.ContextsDir, ctx.Config.Paths.DataDir))
 		}
 		return nil
 	}
@@ -456,6 +454,14 @@ func txeEnsureHubContext(ctx *Context) error {
 		ServerURL:   apiRoot,
 		SignInOnly:  true,
 	})
+}
+
+// txeContextRemoveHint is the command that removes the "txe" context from the
+// TXE home's store. dagu context reads the ordinary store unless told
+// otherwise, so the directories are named, each quoted for a POSIX shell.
+func txeContextRemoveHint(contextsDir, dataDir string) string {
+	return fmt.Sprintf("DAGU_CONTEXTS_DIR=%s DAGU_DATA_DIR=%s dagu context remove %s",
+		txeShellQuote(contextsDir), txeShellQuote(dataDir), txeContextName)
 }
 
 // txeLoopbackHost reports whether host is this machine.

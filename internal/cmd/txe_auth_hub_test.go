@@ -141,7 +141,8 @@ func TestTXELoginHubKeepsAnExistingContext(t *testing.T) {
 	_, err = f.run("login", "--hub", "https://other.example.com")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already names")
-	assert.Contains(t, err.Error(), "DAGU_CONTEXTS_DIR="+f.contexts, "the hint names the TXE home's store, not the ordinary one")
+	assert.Regexp(t, `remove it with DAGU_CONTEXTS_DIR=\S+ DAGU_DATA_DIR=\S+ dagu context remove txe`, err.Error(),
+		"the hint names the TXE home's store, not the ordinary one")
 	assert.Equal(t, "dagu_test_key", f.storedHub(t).APIKey)
 }
 
@@ -244,4 +245,11 @@ func TestContextUpdateKeepsASignInOnlyContext(t *testing.T) {
 	require.NoError(t, mergeContextUpdate(newCmd(map[string]string{"api-key": "dagu_new_key"}), current, keyed))
 	assert.False(t, keyed.SignInOnly)
 	require.NoError(t, store.Update(context.Background(), keyed))
+}
+
+func TestTXEContextRemoveHintQuotesThePaths(t *testing.T) {
+	assert.Equal(t, "DAGU_CONTEXTS_DIR=/home/a/client/contexts DAGU_DATA_DIR=/home/a/client/data dagu context remove txe",
+		txeContextRemoveHint("/home/a/client/contexts", "/home/a/client/data"))
+	assert.Equal(t, `DAGU_CONTEXTS_DIR='/tmp/txe client/contexts' DAGU_DATA_DIR='/tmp/o'\''brien/data' dagu context remove txe`,
+		txeContextRemoveHint("/tmp/txe client/contexts", "/tmp/o'brien/data"))
 }
