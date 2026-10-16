@@ -284,7 +284,7 @@ func runTXELogin(ctx *Context, _ []string) error {
 	if err := txeEnsureHubContext(ctx); err != nil {
 		return err
 	}
-	remote, err := txeRemoteContext(ctx)
+	remote, err := txeLoginRemote(ctx)
 	if err != nil {
 		return err
 	}
@@ -374,10 +374,39 @@ func printAccess(p *txePrinter, v txeSignInView, hub string) {
 	case h.State == "pending":
 		p.f("access: requested, waiting for the hub's administrator to approve it\n")
 	default:
-		// The page is the hub's site, not its API root.
+		// The page is the hub's site, not its API root. The hub does not tell
+		// a command line whether its person already asked in the browser, so
+		// both cases are said.
 		site := strings.TrimSuffix(strings.TrimRight(hub, "/"), "/api/v1")
-		p.f("access: none yet. Open %s in a browser, sign in with the same account, and ask for access; the hub's administrator approves it.\n", site)
+		p.f("access: none yet. If you have not asked, open %s in a browser, sign in with the same account, and ask for access. If you have, it is waiting for the hub's administrator to approve it.\n", site)
 	}
+}
+
+// txeContextExplicit reports whether --context was given on the command line,
+// as opposed to the store's current context, which login never follows: it
+// signs in to the same hub every other txe command defaults to.
+func txeContextExplicit(ctx *Context) bool {
+	f := ctx.Command.Flags().Lookup("context")
+	return f != nil && f.Changed
+}
+
+// txeLoginRemote is the hub login signs in to: the context --context names,
+// or else the "txe" context, whatever context is current in the store.
+func txeLoginRemote(ctx *Context) (*remoteClient, error) {
+	if txeContextExplicit(ctx) {
+		if !ctx.IsRemote() {
+			return nil, fmt.Errorf("--context names no remote hub")
+		}
+		return ctx.Remote, nil
+	}
+	if ctx.ContextStore == nil {
+		return nil, fmt.Errorf("this machine has no context store")
+	}
+	hub, err := ctx.ContextStore.Get(ctx, txeContextName)
+	if err != nil {
+		return nil, fmt.Errorf("no %q context in %s: %w", txeContextName, ctx.Config.Paths.ContextsDir, err)
+	}
+	return newRemoteClient(hub)
 }
 
 // txeEnsureHubContext creates the "txe" context from --hub, signed in only and
@@ -389,14 +418,14 @@ func txeEnsureHubContext(ctx *Context) error {
 		return err
 	}
 	if hubURL == "" {
-		if !ctx.IsRemote() && ctx.ContextStore != nil {
+		if !txeContextExplicit(ctx) && ctx.ContextStore != nil {
 			if _, gerr := ctx.ContextStore.Get(ctx, txeContextName); gerr != nil {
 				return fmt.Errorf("this machine has no hub yet: run \"dagu txe login --hub https://<the hub's address>\"")
 			}
 		}
 		return nil
 	}
-	if ctx.IsRemote() {
+	if txeContextExplicit(ctx) {
 		return fmt.Errorf("--hub and --context name the hub twice: give one")
 	}
 	if ctx.ContextStore == nil {
@@ -414,7 +443,10 @@ func txeEnsureHubContext(ctx *Context) error {
 	if err == nil {
 		have, herr := cliauth.NormalizeHub(existing.ServerURL)
 		if herr != nil || have != want {
-			return fmt.Errorf("this machine's %q context already names %s, not %s: remove it with \"dagu context remove %s\" to change hubs", txeContextName, existing.ServerURL, hubURL, txeContextName)
+			// dagu context reads the ordinary store unless told otherwise, so
+			// the command names the TXE home's store explicitly.
+			return fmt.Errorf("this machine's %q context already names %s, not %s: to change hubs, remove it with \"DAGU_CONTEXTS_DIR=%s DAGU_DATA_DIR=%s dagu context remove %s\" and sign in again",
+				txeContextName, existing.ServerURL, hubURL, ctx.Config.Paths.ContextsDir, ctx.Config.Paths.DataDir, txeContextName)
 		}
 		return nil
 	}

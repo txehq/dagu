@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -65,7 +66,8 @@ func TestTXELoginHubOnAFreshHome(t *testing.T) {
 	out, err := f.run("login", "--hub", f.hubAddress())
 	require.NoError(t, err, out)
 	assert.Contains(t, out, "Signed in.")
-	assert.Contains(t, out, "access: none yet. Open "+f.hubAddress()+" in a browser")
+	assert.Contains(t, out, "access: none yet. If you have not asked, open "+f.hubAddress()+" in a browser")
+	assert.Contains(t, out, "If you have, it is waiting for the hub's administrator")
 	assert.NotContains(t, out, "eyJ", "no token is printed")
 	assert.Equal(t, "S256", p.LastAuth().Get("code_challenge_method"))
 
@@ -139,6 +141,7 @@ func TestTXELoginHubKeepsAnExistingContext(t *testing.T) {
 	_, err = f.run("login", "--hub", "https://other.example.com")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already names")
+	assert.Contains(t, err.Error(), "DAGU_CONTEXTS_DIR="+f.contexts, "the hint names the TXE home's store, not the ordinary one")
 	assert.Equal(t, "dagu_test_key", f.storedHub(t).APIKey)
 }
 
@@ -182,4 +185,63 @@ func TestSignInOnlyContextValidation(t *testing.T) {
 		"holds no api key")
 	assert.ErrorContains(t, store.Create(ctx, &cliContext{Name: "neither", ServerURL: "https://dag.example.com/api/v1"}),
 		"dagu_ prefix", "an ordinary context still needs its key")
+}
+
+// Login signs in to the hub every other txe command defaults to, the "txe"
+// context, whatever context the store has as current; --hub works with
+// another context current, and only an explicit --context conflicts with it.
+func TestTXELoginIgnoresTheStoresCurrentContext(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	p := cliauthtest.New(t)
+	withFakeBrowser(t, p)
+	f.hub.Publish(p.Issuer(), p.ClientID, cliauth.HubUseAll)
+	other := cliauthtest.NewHub(t)
+
+	store, err := newCLIContextStore(f.data, f.contexts)
+	require.NoError(t, err)
+	require.NoError(t, store.Create(context.Background(), &cliContext{Name: "other", ServerURL: other.API(), APIKey: "dagu_other_key"}))
+	require.NoError(t, store.Use(context.Background(), "other"))
+
+	login := f.json("login")
+	assert.Equal(t, f.hub.API(), login["hub"], "login signs in to the txe hub, not the current context's")
+	for _, r := range other.Requests() {
+		t.Errorf("the current context's hub was contacted: %s %s", r.Method, r.Path)
+	}
+
+	_, err = f.run("login", "--hub", f.hub.API())
+	require.NoError(t, err, "--hub with another context current is no conflict")
+
+	_, err = f.run("login", "--hub", f.hub.API(), "--context", "other")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "name the hub twice")
+}
+
+func TestContextUpdateKeepsASignInOnlyContext(t *testing.T) {
+	newCmd := func(set map[string]string) *cobra.Command {
+		c := &cobra.Command{Use: "context"}
+		initFlags(c, contextManageFlags...)
+		for k, v := range set {
+			require.NoError(t, c.Flags().Set(k, v))
+		}
+		return c
+	}
+	current := &cliContext{Name: "txe", ServerURL: "https://dag.example.com/api/v1", SignInOnly: true}
+
+	// A new timeout keeps it sign-in only, with no key.
+	item := &cliContext{Name: "txe", TimeoutSeconds: 60}
+	require.NoError(t, mergeContextUpdate(newCmd(map[string]string{"timeout": "60"}), current, item))
+	assert.True(t, item.SignInOnly)
+	assert.Empty(t, item.APIKey)
+	assert.Equal(t, current.ServerURL, item.ServerURL)
+
+	store, err := newCLIContextStore(t.TempDir(), t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, store.Create(context.Background(), current))
+	require.NoError(t, store.Update(context.Background(), item), "the update validates")
+
+	// Given a key, it becomes an ordinary context.
+	keyed := &cliContext{Name: "txe", APIKey: "dagu_new_key"}
+	require.NoError(t, mergeContextUpdate(newCmd(map[string]string{"api-key": "dagu_new_key"}), current, keyed))
+	assert.False(t, keyed.SignInOnly)
+	require.NoError(t, store.Update(context.Background(), keyed))
 }

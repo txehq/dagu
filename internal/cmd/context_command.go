@@ -104,27 +104,38 @@ func contextUpdateCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if !ctx.Command.Flags().Changed("server") {
-			item.ServerURL = current.ServerURL
-		} else if item.ServerURL == "" {
-			return fmt.Errorf("--server cannot be empty")
-		}
-		if !ctx.Command.Flags().Changed("api-key") {
-			item.APIKey = current.APIKey
-		} else if item.APIKey == "" {
-			return fmt.Errorf("--api-key cannot be empty")
-		}
-		if !ctx.Command.Flags().Changed("description") {
-			item.Description = current.Description
-		}
-		if !ctx.Command.Flags().Changed("skip-tls-verify") {
-			item.SkipTLSVerify = current.SkipTLSVerify
-		}
-		if !ctx.Command.Flags().Changed("timeout") {
-			item.TimeoutSeconds = current.TimeoutSeconds
+		if err := mergeContextUpdate(ctx.Command, current, item); err != nil {
+			return err
 		}
 		return ctx.ContextStore.Update(ctx, item)
 	})
+}
+
+// mergeContextUpdate keeps each setting of current that the update command
+// was not given. A sign-in-only context stays one until it is given a key.
+func mergeContextUpdate(cmd *cobra.Command, current, item *cliContext) error {
+	if !cmd.Flags().Changed("server") {
+		item.ServerURL = current.ServerURL
+	} else if item.ServerURL == "" {
+		return fmt.Errorf("--server cannot be empty")
+	}
+	if !cmd.Flags().Changed("api-key") {
+		item.APIKey = current.APIKey
+		// A sign-in-only context stays one until it is given a key.
+		item.SignInOnly = current.SignInOnly
+	} else if item.APIKey == "" {
+		return fmt.Errorf("--api-key cannot be empty")
+	}
+	if !cmd.Flags().Changed("description") {
+		item.Description = current.Description
+	}
+	if !cmd.Flags().Changed("skip-tls-verify") {
+		item.SkipTLSVerify = current.SkipTLSVerify
+	}
+	if !cmd.Flags().Changed("timeout") {
+		item.TimeoutSeconds = current.TimeoutSeconds
+	}
+	return nil
 }
 
 func contextRemoveCommand() *cobra.Command {
