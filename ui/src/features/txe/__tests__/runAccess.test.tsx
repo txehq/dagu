@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   TxeAccessPermission,
   TxeIdentityAuthz_mode,
+  TxeIdentityPrincipalClass,
   TxeJobAccessVia,
 } from '@/api/v1/schema';
 
@@ -16,15 +17,19 @@ import { useJobRunAllowed } from '../runAccess';
 
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
 const mode = vi.hoisted(() => ({ current: 'enforce' as string | undefined }));
+const principal = vi.hoisted(() => ({ current: 'platform_admin' }));
 const GET = vi.fn();
 
 vi.mock('@/hooks/api', () => ({
   useClient: () => ({ GET }),
 }));
 
-vi.mock('../identity', () => ({
+vi.mock('../identity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../identity')>()),
   useTxeIdentity: () => ({
-    identity: mode.current ? { authz_mode: mode.current } : undefined,
+    identity: mode.current
+      ? { authz_mode: mode.current, principal: { class: principal.current } }
+      : undefined,
   }),
 }));
 
@@ -45,6 +50,7 @@ function answer(permissions: TxeAccessPermission[], via: TxeJobAccessVia) {
 beforeEach(() => {
   GET.mockReset();
   mode.current = TxeIdentityAuthz_mode.enforce;
+  principal.current = TxeIdentityPrincipalClass.platform_admin;
 });
 
 describe('useJobRunAllowed', () => {
@@ -75,13 +81,27 @@ describe('useJobRunAllowed', () => {
     await waitFor(() => expect(result.current).toBe(false));
   });
 
-  // In observe the hub lets the action through, though access is decided as
-  // enforce would; the page keeps its controls.
+  // The hub decides a person by owner in every mode: a view-only share is
+  // refused in off and observe too.
+  it.each([TxeIdentityAuthz_mode.observe, TxeIdentityAuthz_mode.off])(
+    'does not let a person with a view-only share run it in mode %s',
+    async (m) => {
+      mode.current = m;
+      principal.current = TxeIdentityPrincipalClass.person;
+      answer([TxeAccessPermission.view], TxeJobAccessVia.share);
+      const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
+
+      await waitFor(() => expect(result.current).toBe(false));
+    }
+  );
+
+  // Any other caller is held to the answer only in enforce: in observe the hub
+  // lets the action through, though access is decided as enforce would.
   it.each([
     TxeIdentityAuthz_mode.observe,
     TxeIdentityAuthz_mode.off,
     undefined,
-  ])('says nothing in authorization mode %s', async (m) => {
+  ])('says nothing to the platform administrator in mode %s', async (m) => {
     mode.current = m;
     answer([TxeAccessPermission.view], TxeJobAccessVia.share);
     const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
