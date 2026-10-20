@@ -30,9 +30,11 @@ const StepAuthSchema = 1
 const StepModeCredential = "credential"
 
 // StepAuth says, for each credential class ("worker", "reviewer"), how the
-// steps of that class reach the hub. A class it does not name has no
-// enrolled credential: its steps use the context's API key, as every step did
-// before machines were enrolled.
+// steps of that class reach the hub. A machine with no step-auth file at all
+// is not enrolled: its steps use the context's API key, as every step did
+// before machines were enrolled. Once the file names any class, a txe step of
+// a class it does not name is refused (TXE-4761): the machine is enrolled, and
+// that class has no credential of its own.
 //
 // It is written by "dagu txe enrol" once the hub reports the machine enrolled
 // for the class, and is never turned back by any command that runs on its
