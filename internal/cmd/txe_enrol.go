@@ -206,6 +206,9 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		if err != nil {
 			return err
 		}
+		if credential.Class != authn.ClassWorker {
+			return fmt.Errorf("%s holds a %s credential, not this machine's worker credential: enrol again without --resume", path, credential.Class)
+		}
 		if credential.MachineID != machine.MachineID || credential.ClientID != clientID {
 			return fmt.Errorf("%s is for machine %s and client %s, not machine %s and client %s: enrol again without --resume",
 				path, credential.MachineID, credential.ClientID, machine.MachineID, clientID)
@@ -293,6 +296,10 @@ func txeEnrolCheck(ctx *Context, machineID, path string) error {
 	credential, err := transportauth.ReadMachineCredential(path)
 	if err != nil {
 		return err
+	}
+	// The worker loads only a worker's credential (TXE-4733).
+	if credential.Class != authn.ClassWorker {
+		return fmt.Errorf("%s holds a %s credential; the worker loads only this machine's worker credential", path, credential.Class)
 	}
 	if credential.MachineID != machineID {
 		return fmt.Errorf("%s is for machine %s, but this machine is %s", path, credential.MachineID, machineID)
