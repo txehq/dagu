@@ -684,11 +684,12 @@ var terminalRunStatuses = map[api.StatusLabel]bool{
 const runPageLimit = 100
 
 // walkRuns visits every run the service lists for the job, newest created
-// first.
+// first. The listing starts at the epoch: without a range, the service lists
+// only runs since its local midnight.
 func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSummary) error) error {
 	page := ""
 	for {
-		q := url.Values{"limit": {strconv.Itoa(runPageLimit)}}
+		q := url.Values{"limit": {strconv.Itoa(runPageLimit)}, "fromDate": {"0"}}
 		if page != "" {
 			q.Set("cursor", page)
 		}
