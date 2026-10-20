@@ -9,10 +9,11 @@
 # come after it. This fork's main has no branch protection, so nothing else stops a merge with CI
 # failing or still running. This wrapper, read from origin/main and never from the PR:
 #   1. refuses a PR that is not open, is a draft, is not on main, or whose head is not <head-sha>;
-#   2. requires main's codex-review WORKFLOW RUN on that head (pull_request_target, created on every
+#   2. requires main's codex-review WORKFLOW RUN (.github/workflows/codex-review.yml) on that head (pull_request_target, created on every
 #      push, so its presence also shows the push's other runs were created) to be completed/success;
-#   3. requires every other workflow run, every check run and the combined commit status on that
-#      head to be finished and green: success, skipped or neutral; pending, missing reads, failure,
+#   3. requires every other workflow run (latest run per workflow file and event; run numbers count
+#      per workflow), every check run (latest per app, check suite and name) and the combined commit
+#      status on that head to be finished and green: success, skipped or neutral; pending, missing reads, failure,
 #      cancelled, timed out or action required refuse. Path-filtered workflows that did not match
 #      the PR have no run, and that is not a failure;
 #   4. re-runs main's codex-review-check.sh at that head, with no wait and never in fixture mode;
@@ -53,15 +54,17 @@ gh api "repos/$repo/commits/$want/status" --jq '[.state, .total_count] | @tsv' >
   || unread "the commit status of $want"
 jq -s -e 'all(.[]; type == "object")' "$tmp/runs.jsonl" "$tmp/checks.jsonl" >/dev/null 2>&1 \
   || unread "the CI payloads (not objects)"
-gate="$(jq -s -r '[.[] | select(.name == "codex-review" and .event == "pull_request_target")]
+# The gate is identified by its workflow FILE on main, not its display name, which another
+# workflow could share.
+gate="$(jq -s -r '[.[] | select(.path == ".github/workflows/codex-review.yml" and .event == "pull_request_target")]
   | max_by(.run_number) // empty | "\(.status) \(.conclusion)"' "$tmp/runs.jsonl")"
 [ "$gate" = "completed success" ] || refuse "main's codex-review run on $want is '${gate:-missing}', not completed success"
 bad="$(jq -s -r '
-  group_by(.name) | map(max_by(.run_number))[]
+  group_by([.workflow_id, .event]) | map(max_by(.run_number))[]
   | select(.status != "completed" or ((.conclusion // "") | IN("success","skipped","neutral") | not))
-  | "workflow \(.name): \(.status)/\(.conclusion // "none")"' "$tmp/runs.jsonl")
+  | "workflow \(.name) (\(.path)): \(.status)/\(.conclusion // "none")"' "$tmp/runs.jsonl")
 $(jq -s -r '
-  group_by(.name) | map(max_by(.started_at // ""))[]
+  group_by([.app.id, .check_suite.id, .name]) | map(max_by(.started_at // ""))[]
   | select(.status != "completed" or ((.conclusion // "") | IN("success","skipped","neutral") | not))
   | "check \(.name): \(.status)/\(.conclusion // "none")"' "$tmp/checks.jsonl")"
 bad="$(printf '%s\n' "$bad" | sed '/^$/d')"

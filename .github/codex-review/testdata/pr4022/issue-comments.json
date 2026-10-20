@@ -2,7 +2,7 @@
  {
   "id": 6239847177,
   "user": {
-   "login": "linear-code[bot]",
+   "login": "another-app[bot]",
    "id": 222613912,
    "type": "Bot"
   },
@@ -46,7 +46,7 @@
  {
   "id": 6239854495,
   "user": {
-   "login": "github-actions[bot]",
+   "login": "another-app[bot]",
    "id": 41898282,
    "type": "Bot"
   },
@@ -57,7 +57,7 @@
  {
   "id": 6239860911,
   "user": {
-   "login": "github-actions[bot]",
+   "login": "another-app[bot]",
    "id": 41898282,
    "type": "Bot"
   },
@@ -68,7 +68,7 @@
  {
   "id": 6239862287,
   "user": {
-   "login": "github-actions[bot]",
+   "login": "another-app[bot]",
    "id": 41898282,
    "type": "Bot"
   },
@@ -79,7 +79,7 @@
  {
   "id": 6239876186,
   "user": {
-   "login": "github-actions[bot]",
+   "login": "another-app[bot]",
    "id": 41898282,
    "type": "Bot"
   },
@@ -90,7 +90,7 @@
  {
   "id": 6239880337,
   "user": {
-   "login": "github-actions[bot]",
+   "login": "another-app[bot]",
    "id": 41898282,
    "type": "Bot"
   },

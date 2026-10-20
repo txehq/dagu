@@ -27,9 +27,9 @@ esac
 GH
 chmod +x "$TMP/bin/gh"
 PASS=0; FAIL=0
-GATE='{"name":"codex-review","event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}'
-CI='{"name":"CI","event":"pull_request","run_number":9,"status":"completed","conclusion":"success"}'
-CHK='{"name":"Go Linter (linux)","status":"completed","conclusion":"success","started_at":"2026-10-20T10:00:00Z"}'
+GATE='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}'
+CI='{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"completed","conclusion":"success"}'
+CHK='{"name":"Go Linter (linux)","app":{"id":15368},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-10-20T10:00:00Z"}'
 OK_CHECK='echo "PASS: main check"; exit 0'
 # run <name> <want exit> <want substring> <merged|not-merged> [VAR=value]... (defaults: all green)
 run() {
@@ -59,18 +59,28 @@ run fixture-env   1 "check does not pass"                 not-merged CODEX_REVIE
 # CI on the head
 run gate-missing  1 "codex-review run on $H is 'missing'" not-merged RUNS="$CI"
 run gate-running  1 "is 'in_progress null'"               not-merged \
-    RUNS='{"name":"codex-review","event":"pull_request_target","run_number":5,"status":"in_progress","conclusion":null}'
+    RUNS='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"in_progress","conclusion":null}'
 run gate-from-pr  1 "is 'missing'"                        not-merged \
-    RUNS='{"name":"codex-review","event":"pull_request","run_number":5,"status":"completed","conclusion":"success"}'
-run ci-failing    1 "workflow CI: completed/failure"      not-merged RUNS="$GATE
-"'{"name":"CI","event":"pull_request","run_number":9,"status":"completed","conclusion":"failure"}'
-run ci-pending    1 "workflow CI: queued/none"            not-merged RUNS="$GATE
-"'{"name":"CI","event":"pull_request","run_number":9,"status":"queued","conclusion":null}'
+    RUNS='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request","run_number":5,"status":"completed","conclusion":"success"}'
+# Another workflow file that calls itself codex-review is not the gate.
+run gate-by-name  1 "is 'missing'"                        not-merged \
+    RUNS='{"name":"codex-review","path":".github/workflows/other.yml","workflow_id":109,"event":"pull_request_target","run_number":50,"status":"completed","conclusion":"success"}'
+run ci-failing    1 "workflow CI (.github/workflows/ci.yaml): completed/failure" not-merged RUNS="$GATE
+"'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"completed","conclusion":"failure"}'
+run ci-pending    1 "workflow CI (.github/workflows/ci.yaml): queued/none" not-merged RUNS="$GATE
+"'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"queued","conclusion":null}'
 run ci-rerun-ok   0 merged                                merged RUNS="$GATE
-"'{"name":"CI","event":"pull_request","run_number":8,"status":"completed","conclusion":"failure"}
-{"name":"CI","event":"pull_request","run_number":9,"status":"completed","conclusion":"success"}'
+"'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":8,"status":"completed","conclusion":"failure"}
+{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"completed","conclusion":"success"}'
+# Two workflow files with one display name: a later green run of one never hides the other's failure.
+run same-name     1 "workflow CI (.github/workflows/ci-extra.yaml): completed/failure" not-merged RUNS="$GATE
+$CI
+"'{"name":"CI","path":".github/workflows/ci-extra.yaml","workflow_id":103,"event":"pull_request","run_number":3,"status":"completed","conclusion":"failure"}'
 run check-failing 1 "check Go Linter (linux): completed/failure" not-merged \
-    CHECKS='{"name":"Go Linter (linux)","status":"completed","conclusion":"failure","started_at":"2026-10-20T10:00:00Z"}'
+    CHECKS='{"name":"Go Linter (linux)","app":{"id":15368},"check_suite":{"id":7},"status":"completed","conclusion":"failure","started_at":"2026-10-20T10:00:00Z"}'
+# One check name in two suites: the later green one never hides the other's failure.
+run check-same-name 1 "check Go Linter (linux): completed/failure" not-merged CHECKS="$CHK
+"'{"name":"Go Linter (linux)","app":{"id":15368},"check_suite":{"id":8},"status":"completed","conclusion":"failure","started_at":"2026-10-20T09:00:00Z"}'
 run status-failed 1 "combined commit status of $H is failure" not-merged STATUS="failure	2"
 run status-none   0 merged                                merged STATUS="pending	0"
 # A read that fails, even with partial output, never merges

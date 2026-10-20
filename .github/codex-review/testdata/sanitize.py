@@ -5,8 +5,9 @@ public. So every object is rebuilt from an explicit allowlist of fields, and eve
 from values parsed out of it, never copied: the connector's state block (re-serialized from its
 known keys), its Code Review row (from its datetime and status), its receipt (from the reviewed
 commit), and each finding's badge (from its level). Paths become synthetic, people's logins
-a-person, branch names synthetic-branch, repository names synthetic/repo; state values and
-timestamps are kept only in their known shapes; bot logins are kept, the check reads them.
+a-person and other apps' logins another-app[bot] (only the connector's is kept, the check reads it),
+branch names synthetic-branch, repository names synthetic/repo; state values and
+timestamps are kept only in their known shapes; 
 
   python3 -I sanitize.py <file.json>...   # rewrites each file in place; idempotent
 """
@@ -73,7 +74,9 @@ def walk(v, key=None):
     if key == "body":
         return body(v)
     if key == "login":
-        return v if v.endswith("[bot]") else "a-person"
+        # Only the connector's login is read by the check; every other account, person or app, is
+        # replaced, so no private integration's name is published.
+        return v if v == "chatgpt-codex-connector[bot]" else ("another-app[bot]" if v.endswith("[bot]") else "a-person")
     if key in ("ref", "label"):
         return "synthetic-branch"
     if key == "path":

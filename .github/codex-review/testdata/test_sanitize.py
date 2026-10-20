@@ -40,6 +40,7 @@ class Sanitize(unittest.TestCase):
         self.assertNotIn("PRIVATE", text)
         self.assertNotIn("private", text)
         self.assertEqual(out["user"]["login"], "chatgpt-codex-connector[bot]")
+        self.assertEqual(sanitize.walk({"user": {"login": "private-integration[bot]"}})["user"]["login"], "another-app[bot]")
         self.assertTrue(out["path"].startswith("synthetic/"))
 
     def test_private_text_inside_kept_values_is_dropped(self):
