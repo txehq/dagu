@@ -287,11 +287,11 @@ func TestTXEStepClass(t *testing.T) {
 		require.NoError(t, root.Execute())
 		return callErr
 	}
-	// Enrolled for the worker class only: a reviewer step keeps the API key.
-	require.NoError(t, reviewerCall())
-	calls := f.jobCalls()
-	require.NotEmpty(t, calls)
-	assert.Equal(t, "Bearer dagu_test_key", calls[len(calls)-1].Authorization)
+	// Enrolled for the worker class only: a reviewer step does not fall back
+	// to the API key; it is told to enrol the reviewer class, and sends nothing.
+	beforeReviewer := len(f.jobCalls())
+	require.ErrorContains(t, reviewerCall(), "not the reviewer class this step needs: enrol it (dagu txe enrol --class reviewer)")
+	assert.Len(t, f.jobCalls(), beforeReviewer)
 
 	// Recorded as enrolled for the reviewer class with the worker's file: a
 	// reviewer step does not present a worker's credential; nothing is sent.
@@ -358,10 +358,12 @@ func TestTXEStepPresentsTheReviewerCredential(t *testing.T) {
 	require.Len(t, calls, 1)
 	assert.Equal(t, txeEnrolTestReviewerClient, enrolTestClaims(calls[0].Authorization).Azp)
 
-	// A job step on this machine is not enrolled for the worker class.
-	out2, err := f.inStep(t, "list")
-	require.NoError(t, err, out2)
-	assert.Contains(t, out2, "class=worker mode=api_key")
+	// A job step on this reviewer-only machine is refused, not run on the API
+	// key: the machine is enrolled, just not for the worker class.
+	beforeJob := len(f.jobCalls())
+	_, err = f.inStep(t, "list")
+	require.ErrorContains(t, err, "not the worker class this step needs: enrol it (dagu txe enrol --class worker)")
+	assert.Len(t, f.jobCalls(), beforeJob)
 }
 
 // A command other than txe, run by a step against a context, presents the

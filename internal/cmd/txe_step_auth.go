@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -77,8 +78,9 @@ func txeUnderReview(cmd *cobra.Command) bool {
 //     worker renews it, and only to that hub: a redirect is not followed;
 //   - a refusal is reported, never retried with the context's API key.
 //
-// Anything missing or mismatched fails before a call is made. A class the
-// machine is not enrolled for keeps the context's API key. A txe command
+// Anything missing or mismatched fails before a call is made. A machine with
+// no step-auth record keeps the context's API key for every step; one enrolled
+// for some class refuses a txe step of a class it is not enrolled for. A txe command
 // prints its class and mode on standard error in either case, for whoever
 // reads the run's log.
 //
@@ -111,6 +113,12 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	if !txeCommand && (!enrolled || hub != enrolledHub) {
 		return remote, nil
 	}
+	if !enrolled && len(auth.Classes) > 0 {
+		// The machine is enrolled for another class: a step of this one has
+		// no credential of its own, and the API key would hide that.
+		return nil, fmt.Errorf("this machine is enrolled for the %s class, not the %s class this step needs: enrol it (dagu txe enrol --class %s); nothing was sent",
+			txeEnrolledClasses(auth), class, class)
+	}
 	if !enrolled {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=api_key (this machine is not enrolled for the %s class)\n", class, class)
 		return remote, nil
@@ -123,6 +131,16 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=credential\n", class)
 	}
 	return stepRemote, nil
+}
+
+// txeEnrolledClasses names the classes a step-auth record enrols.
+func txeEnrolledClasses(auth txepkg.StepAuth) string {
+	classes := make([]string, 0, len(auth.Classes))
+	for class := range auth.Classes {
+		classes = append(classes, class)
+	}
+	slices.Sort(classes)
+	return strings.Join(classes, " and ")
 }
 
 // txeEnrolledRemote returns a copy of remote that presents this machine's
