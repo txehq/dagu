@@ -12,27 +12,57 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
-// txeStepClass is the credential class a step's command needs: a reviewer's
-// commands need the reviewer class, and every other step, a job's, the
-// worker class.
+// txeStepClass is the credential class a step needs: the reviewer class for
+// a "txe review" command run by this machine's reviewer or decide DAG, and
+// the worker class for every other step, a job's included. A job's own
+// command that runs "txe review" therefore presents the worker's credential,
+// which the hub refuses on the reviewer's routes.
+//
+// The DAG is named by the worker in the step's DAG_NAME. A job runs as the
+// same user as the reviewer and could set that variable, or read either
+// credential file, itself: the boundary between the two classes on one
+// machine is the hub's (which routes take which class), not this check.
 func txeStepClass(cmd *cobra.Command) authn.Class {
-	for current := cmd; current != nil; current = current.Parent() {
-		if current.Name() == "review" && current.Parent() != nil && current.Parent().Name() == "txe" {
-			return authn.ClassReviewer
-		}
+	if !txeUnderReview(cmd) {
+		return authn.ClassWorker
+	}
+	home, err := txepkg.DefaultHome()
+	if err != nil {
+		return authn.ClassWorker
+	}
+	machine, err := home.Machine()
+	if err != nil {
+		return authn.ClassWorker
+	}
+	switch os.Getenv(runenv.EnvKeyDAGName) {
+	case review.ReviewerDAGName(machine.MachineID), review.DecideDAGName(machine.MachineID):
+		return authn.ClassReviewer
 	}
 	return authn.ClassWorker
+}
+
+// txeUnderReview reports whether cmd is "txe review" or beneath it.
+func txeUnderReview(cmd *cobra.Command) bool {
+	for current := cmd; current != nil; current = current.Parent() {
+		if current.Name() == "review" && current.Parent() != nil && current.Parent().Name() == "txe" {
+			return true
+		}
+	}
+	return false
 }
 
 // txeStepRemote decides what a DAG step's calls to the hub carry.
@@ -89,9 +119,6 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 		return nil, fmt.Errorf("this machine's %s credential is enrolled with the hub at %s, but this step reaches %s: enrol with the store this machine's jobs use; nothing was sent",
 			class, entry.Hub, hub)
 	}
-	if class != authn.ClassWorker {
-		return nil, fmt.Errorf("this machine is enrolled for the %s class, but this build reads only worker credentials; nothing was sent", class)
-	}
 	machine, err := home.Machine()
 	if err != nil {
 		return nil, err
@@ -99,6 +126,9 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	credential, err := transportauth.ReadMachineCredential(entry.CredentialFile)
 	if err != nil {
 		return nil, fmt.Errorf("this machine is enrolled for the %s class, and its credential %s cannot be used (%w); nothing was sent", class, entry.CredentialFile, err)
+	}
+	if credential.Class != class {
+		return nil, fmt.Errorf("the %s step's credential %s is a %s credential; nothing was sent", class, entry.CredentialFile, credential.Class)
 	}
 	if credential.MachineID != machine.MachineID {
 		return nil, fmt.Errorf("the %s credential %s is for machine %s, but this machine is %s; nothing was sent", class, entry.CredentialFile, credential.MachineID, machine.MachineID)

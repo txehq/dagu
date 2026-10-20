@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gofrs/flock"
+
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
@@ -114,6 +116,16 @@ func (h Home) SetStepCredential(class, path, hub string) error {
 	if hub == "" {
 		return fmt.Errorf("the %s enrolment names no hub", class)
 	}
+	if err := os.MkdirAll(h.ClientDir(), 0o700); err != nil {
+		return err
+	}
+	// Two enrolments, of two classes, may finish at once: the file is read,
+	// changed and replaced under one lock, so neither drops the other's class.
+	lock := flock.New(filepath.Join(h.ClientDir(), StepAuthFile+".lock"))
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("lock the step-auth file: %w", err)
+	}
+	defer func() { _ = lock.Unlock() }()
 	auth, err := h.StepAuth()
 	if err != nil {
 		return err

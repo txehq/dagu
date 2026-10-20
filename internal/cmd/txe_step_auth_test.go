@@ -24,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
@@ -226,25 +227,46 @@ func TestTXEStepFailsClosedOnceEnrolled(t *testing.T) {
 // class only keeps the API key there, and one recorded as enrolled for the
 // reviewer class is refused until this build reads reviewer credentials.
 func TestTXEStepClass(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
 	root := txeAuthRoot()
 	txe := TXE()
 	root.AddCommand(txe)
-	for _, c := range txe.Commands() {
-		want := "worker"
-		if c.Name() == "review" {
-			want = "reviewer"
+	classes := func() map[string]string {
+		got := map[string]string{}
+		for _, c := range txe.Commands() {
+			got[c.Name()] = string(txeStepClass(c))
+			for _, leaf := range c.Commands() {
+				got[c.Name()+" "+leaf.Name()] = string(txeStepClass(leaf))
+			}
 		}
-		assert.Equal(t, want, string(txeStepClass(c)), c.Name())
-		for _, leaf := range c.Commands() {
-			assert.Equal(t, want, string(txeStepClass(leaf)), c.Name()+" "+leaf.Name())
+		return got
+	}
+	// In this machine's reviewer or decide DAG, txe review commands need the
+	// reviewer class, every other command the worker class.
+	for _, dag := range []string{review.ReviewerDAGName(txeEnrolTestMachine), review.DecideDAGName(txeEnrolTestMachine)} {
+		t.Setenv(runenv.EnvKeyDAGName, dag)
+		for name, class := range classes() {
+			want := "worker"
+			if name == "review" || strings.HasPrefix(name, "review ") {
+				want = "reviewer"
+			}
+			assert.Equal(t, want, class, dag+": "+name)
+		}
+	}
+	// In a job's DAG, or another machine's reviewer DAG, even txe review is
+	// worker class: a job's own command cannot present the reviewer's.
+	for _, dag := range []string{"job_01K7A5ZQ8M3N4P5R6S7T8V9W0J", review.ReviewerDAGName("mch_01K7A5ZQ8M3N4P5R6S7T8V9W0X")} {
+		t.Setenv(runenv.EnvKeyDAGName, dag)
+		for name, class := range classes() {
+			assert.Equal(t, "worker", class, dag+": "+name)
 		}
 	}
 
-	f := newStepAuthFixture(t)
-	f.enrolled(t)
 	reviewerCall := func() error {
 		t.Setenv(runenv.EnvKeyDAGRunID, "run-1")
 		t.Setenv(runenv.EnvKeyDAGRunStepName, "review")
+		t.Setenv(runenv.EnvKeyDAGName, review.ReviewerDAGName(txeEnrolTestMachine))
 		var callErr error
 		txe := TXE()
 		for _, c := range txe.Commands() {
@@ -271,11 +293,75 @@ func TestTXEStepClass(t *testing.T) {
 	require.NotEmpty(t, calls)
 	assert.Equal(t, "Bearer dagu_test_key", calls[len(calls)-1].Authorization)
 
-	// Recorded as enrolled for the reviewer class: refused, nothing sent.
+	// Recorded as enrolled for the reviewer class with the worker's file: a
+	// reviewer step does not present a worker's credential; nothing is sent.
 	require.NoError(t, txepkg.Home{Root: f.home}.SetStepCredential("reviewer", f.path(), f.hub.API()))
 	before := len(f.jobCalls())
-	require.ErrorContains(t, reviewerCall(), "enrolled for the reviewer class, but this build reads only worker credentials")
+	require.ErrorContains(t, reviewerCall(), "the reviewer step's credential")
 	assert.Len(t, f.jobCalls(), before)
+}
+
+const txeEnrolTestReviewerClient = "dagu-reviewer-mch_enroltest"
+
+// A machine enrolled for the reviewer class with its own reviewer client:
+// enrol writes the reviewer credential beside the worker's and records the
+// class; a reviewer step presents that credential, from the reviewer client,
+// and a job step keeps what the worker class says.
+func TestTXEStepPresentsTheReviewerCredential(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.provider.ClientID = txeEnrolTestReviewerClient
+	before := txeEnrolInterval
+	txeEnrolInterval = 20 * time.Millisecond
+	t.Cleanup(func() { txeEnrolInterval = before })
+	f.approveAfter = 1
+	out := f.json("enrol", "--class", "reviewer", "--client-id", txeEnrolTestReviewerClient, "--wait", "10s")
+	require.Equal(t, "enrolled", out["state"])
+	assert.Equal(t, "reviewer", out["class"])
+	reviewerFile := filepath.Join(f.home, txeEnrolReviewerCredentialFile)
+	assert.Equal(t, reviewerFile, out["credential_file"])
+	credential, err := transportauth.ReadMachineCredential(reviewerFile)
+	require.NoError(t, err)
+	assert.Equal(t, "reviewer", string(credential.Class))
+	assert.NoFileExists(t, f.path(), "the worker's credential is not written")
+	auth, err := txepkg.Home{Root: f.home}.StepAuth()
+	require.NoError(t, err)
+	entry, ok := auth.Enrolled("reviewer")
+	require.True(t, ok)
+	assert.Equal(t, reviewerFile, entry.CredentialFile)
+	_, ok = auth.Enrolled("worker")
+	assert.False(t, ok)
+
+	// A reviewer step presents the reviewer credential.
+	t.Setenv(runenv.EnvKeyDAGRunID, "run-1")
+	t.Setenv(runenv.EnvKeyDAGRunStepName, "review")
+	t.Setenv(runenv.EnvKeyDAGName, review.ReviewerDAGName(txeEnrolTestMachine))
+	var callErr error
+	txe := TXE()
+	for _, c := range txe.Commands() {
+		if c.Name() == "review" {
+			c.AddCommand(NewCommand(&cobra.Command{Use: "probe", Args: cobra.NoArgs}, nil, func(ctx *Context, _ []string) error {
+				client, err := txeClient(ctx)
+				if err == nil {
+					_, err = client.ListJobs(ctx, txeclient.JobFilter{})
+				}
+				callErr = err
+				return nil
+			}))
+		}
+	}
+	root := txeAuthRoot()
+	root.AddCommand(txe)
+	root.SetArgs([]string{"txe", "review", "probe", "--dagu-home", filepath.Dir(f.contexts), "--contexts-dir", f.contexts, "--data-dir", f.data})
+	require.NoError(t, root.Execute())
+	require.NoError(t, callErr)
+	calls := f.jobCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, txeEnrolTestReviewerClient, enrolTestClaims(calls[0].Authorization).Azp)
+
+	// A job step on this machine is not enrolled for the worker class.
+	out2, err := f.inStep(t, "list")
+	require.NoError(t, err, out2)
+	assert.Contains(t, out2, "class=worker mode=api_key")
 }
 
 // A command other than txe, run by a step against a context, presents the
@@ -403,4 +489,23 @@ func TestTXEStepChecksTheTokenItPresents(t *testing.T) {
 	require.ErrorContains(t, tr.checkToken("opaque-token"), "not a JWT")
 	tr.machineID = "mch_other"
 	require.ErrorContains(t, tr.checkToken(jwt(map[string]string{"iss": f.provider.Issuer(), "azp": txeEnrolTestClient})), "now names machine")
+}
+
+// The hub decides an application's class from the token's client. Enrolling
+// a client as the other class is refused, and nothing is recorded for steps.
+func TestTXEEnrolRefusesAClientOfAnotherClass(t *testing.T) {
+	for name, tc := range map[string]struct{ class, client string }{
+		"ReviewerWithAWorkerClient": {"reviewer", txeEnrolTestClient},
+		"WorkerWithAReviewerClient": {"worker", txeEnrolTestReviewerClient},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newStepAuthFixture(t)
+			f.provider.ClientID = tc.client
+			_, err := f.run("enrol", "--class", tc.class, "--client-id", tc.client)
+			require.ErrorContains(t, err, "not \""+tc.class+"\"")
+			auth, err := txepkg.Home{Root: f.home}.StepAuth()
+			require.NoError(t, err)
+			assert.Empty(t, auth.Classes)
+		})
+	}
 }
