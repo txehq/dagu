@@ -1,7 +1,7 @@
 name: codex-review-test
 
 # Tests for .github/codex-review (TXE-4719): the connector check over recorded payloads, and
-# shellcheck. The PR's own copy runs with no secret and a read-only token.
+# the merge wrapper, and shellcheck. The PR's own copy runs with no secret and a read-only token.
 
 on:
   pull_request:
@@ -29,3 +29,5 @@ jobs:
         run: shellcheck .github/codex-review/*.sh
       - name: The check over recorded connector payloads
         run: bash .github/codex-review/test-codex-review-check.sh
+      - name: The merge wrapper with a stand-in gh
+        run: bash .github/codex-review/test-merge.sh

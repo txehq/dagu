@@ -22,15 +22,18 @@ repository is public, so a PR from another repository fails unless a person adds
 3. Read every finding. Fix every P0 and P1 and push; a P2 or P3 never blocks.
 4. A push starts the next review. If none starts within a few minutes, comment `@codex review`.
    After a change of base, rebase onto it and force-push.
-5. Merge only when `codex-review` and CI are green, after running **main's** copy of the check
-   once more at the merge boundary (a pull_request run executes the PR's own copy):
+5. Merge only when `codex-review` and CI are green, through **main's** merge wrapper, which re-runs
+   main's copy of the check on the exact head and merges with `--match-head-commit` (a
+   pull_request run executes the PR's own copy, so the PR's result alone is not trusted):
 
    ```bash
    git fetch -q origin main
-   git show origin/main:.github/codex-review/codex-review-check.sh > "$TMPDIR/codex-review-check.sh"
-   GH_REPO=txehq/dagu PR_NUMBER=<n> CODEX_REVIEW_WAIT_SECONDS=0 bash "$TMPDIR/codex-review-check.sh" \
-     && gh pr merge <n> -R txehq/dagu --squash
+   git show origin/main:.github/codex-review/merge.sh | bash -s -- <n> <head sha>
    ```
+
+   Bootstrap: the PR that introduced this check (TXE-4719) could not be judged by a copy on main;
+   it was merged after an independent review of its source and a canary of the connector on its
+   own head.
 
 `review-override` is a person's decision: the check names who added it, and refuses one a bot
 added. Adding the label runs nothing by itself; re-run the check after it.
