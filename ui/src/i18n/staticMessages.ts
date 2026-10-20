@@ -2347,6 +2347,7 @@ const english = {
   "Acting for {owner}": "Acting for {owner}",
   // TXE access requests (TXE-4254).
   "Access requests": "Access requests",
+  "Waiting on the owner": "Waiting on the owner",
   "Account": "Account",
   "Approve for": "Approve for",
   "Bound": "Bound",
@@ -4699,6 +4700,7 @@ const chinese = {
   "Acting for {owner}": "代表 {owner}",
   // TXE access requests (TXE-4254).
   "Access requests": "访问请求",
+  "Waiting on the owner": "等待所有者",
   "Account": "账户",
   "Approve for": "批准给",
   "Bound": "绑定时间",
@@ -7132,6 +7134,7 @@ const japanese = {
   "Acting for {owner}": "{owner} として操作中",
   // TXE access requests (TXE-4254).
   "Access requests": "アクセスリクエスト",
+  "Waiting on the owner": "所有者の対応待ち",
   "Account": "アカウント",
   "Approve for": "承認先",
   "Bound": "バインド日時",

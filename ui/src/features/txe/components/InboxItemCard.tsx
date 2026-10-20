@@ -37,6 +37,23 @@ export function dagRunPath(dagName: string, dagRunId: string): string {
   return `/dag-runs/${encodeURIComponent(dagName)}/${encodeURIComponent(dagRunId)}`;
 }
 
+// waitingLabel says who the item waits on. A person's decision on a job shared
+// without approve is the owner's to make, as the hub's answer for the job says.
+function waitingLabel(item: InboxItem): { text: string; warning: boolean } {
+  const access = item.job.access;
+  if (
+    item.waitingOn === 'person' &&
+    access?.via === 'share' &&
+    !access.permissions.includes('approve')
+  ) {
+    return { text: 'Waiting on the owner', warning: false };
+  }
+  return {
+    text: WAITING_LABELS[item.waitingOn],
+    warning: item.waitingOn === 'person',
+  };
+}
+
 type Props = {
   item: InboxItem;
   children?: React.ReactNode;
@@ -48,6 +65,7 @@ type Props = {
 export function InboxItemCard({ item, children }: Props): React.ReactElement {
   const { job, proposal, failedRun } = item;
   const exceptions = item.exceptions ?? [];
+  const waiting = waitingLabel(item);
   const observedAt =
     proposal?.evidence.observedAt ??
     job.lastObservationAt ??
@@ -69,8 +87,8 @@ export function InboxItemCard({ item, children }: Props): React.ReactElement {
         <Badge variant="outline">
           <I18nText text={REASON_LABELS[item.reason]} />
         </Badge>
-        <Badge variant={item.waitingOn === 'person' ? 'warning' : 'secondary'}>
-          <I18nText text={WAITING_LABELS[item.waitingOn]} />
+        <Badge variant={waiting.warning ? 'warning' : 'secondary'}>
+          <I18nText text={waiting.text} />
         </Badge>
         {job.access?.via === 'share' && job.access.sharedBy && (
           <SharedWithYou
