@@ -10,23 +10,25 @@ name: codex-review
 # It replaces the Tokun-backed review workflow (TXE-4204), which stopped on 2026-10-20 when the
 # Tokun account ran out of balance (TXE-4714). Nothing here holds a secret.
 #
-# THIS REPOSITORY IS PUBLIC. A pull_request run executes the PR's OWN copy of this file and of the
-# script, with a read-only token. For a PR from a branch of this repository that copy is the one
-# under review; a PR from another repository could change it, so the script fails every such PR
-# unless a person adds `review-override`, and the merge re-runs main's copy of the script with
-# CODEX_REVIEW_WAIT_SECONDS=0 (.github/codex-review/README.md).
+# THIS REPOSITORY IS PUBLIC, so the gate runs MAIN's copy: pull_request_target executes this file
+# and the script as they are on main, never the PR's, so a PR (from a fork or not) cannot edit what
+# judges it. That is safe here because the job never checks out or runs anything from the PR: it
+# checks out main's .github/codex-review only and reads the PR through the API, with a read-only
+# token and no secret. A PR from another repository still fails unless a person adds
+# `review-override` (rule 0 in the script). The PR that introduces this file is judged by the
+# previous main's workflow, so it was merged on an independent review (README.md, bootstrap).
 #
-# TRIGGERS, as txe's: a push, a new PR and a draft marked ready make a connector review; a
-# submitted or dismissed review changes its findings; `edited` covers a change of base. Never
-# `labeled`: adding `review-override` runs nothing by itself, so re-run this check after adding it.
-# Every event polls (30 s, up to 15 min): a clean pass edits a comment and reacts, which fires no
-# event here. Drafts are skipped: the connector does not review a draft.
+# TRIGGERS. A push, a new or reopened PR and a draft marked ready make a connector review; `edited`
+# covers a change of base; `labeled`/`unlabeled` re-judge when `review-override` is added or
+# removed, so removing it revokes a pass. No pull_request_review trigger: that event runs the PR's
+# copy of the workflow. A connector review with findings lands while the push's run is polling
+# (30 s, up to 15 min), and a clean pass edits a comment and reacts, which fires no event. If a
+# review completes after the poll ended, re-run the check. Drafts are skipped: the connector does
+# not review a draft.
 
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, edited]
-  pull_request_review:
-    types: [submitted, dismissed]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled]
 
 concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
@@ -43,9 +45,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      # Main's scripts only (pull_request_target's default ref), never the PR's head or merge ref.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+          sparse-checkout: .github/codex-review
 
       - name: Test the check over recorded connector payloads
         run: bash .github/codex-review/test-codex-review-check.sh

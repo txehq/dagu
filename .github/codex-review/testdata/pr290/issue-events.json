@@ -4,9 +4,7 @@
   "actor": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "ready_for_review",
   "commit_id": null,
@@ -17,9 +15,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,

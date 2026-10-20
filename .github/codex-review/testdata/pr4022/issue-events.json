@@ -4,9 +4,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -17,9 +15,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -30,9 +26,7 @@
   "actor": {
    "login": "github-actions[bot]",
    "id": 41898282,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "event": "labeled",
   "commit_id": null,
@@ -40,17 +34,14 @@
   "label": {
    "name": "review-fix-v2",
    "color": "0e8a16"
-  },
-  "intent": null
+  }
  },
  {
   "id": 33537970823,
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "7f294a489f85b0b2fc672cf58bfd00f1a67d4957",
@@ -61,9 +52,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -74,9 +63,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "f40da6a530ea332f122506618bd284b15ba66ba6",
@@ -87,9 +74,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -100,9 +85,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "c725d70dea1fa801d915b811a23d72e511c05592",
@@ -113,9 +96,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -126,9 +107,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "34dcfbdd5f7f26d6caa6af1e7317fefba6483a90",
@@ -139,9 +118,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -152,9 +129,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "839c3bc973752c5ceb7c105daa707089cbc4e09d",
@@ -165,9 +140,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -178,9 +151,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "5b92902be3884d52b6393fbbb3b62ec0490d57b3",
@@ -191,9 +162,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -204,9 +173,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c",
@@ -217,9 +184,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -230,9 +195,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -243,9 +206,7 @@
   "actor": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "referenced",
   "commit_id": "83822e7ebb31ca9e2c81d3a13a53a8774d5250cf",
@@ -256,9 +217,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,
@@ -269,9 +228,7 @@
   "actor": {
    "login": "a-person",
    "id": 267193182,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "event": "mentioned",
   "commit_id": null,

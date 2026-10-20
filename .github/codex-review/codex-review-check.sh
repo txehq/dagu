@@ -125,10 +125,9 @@ read_state() {
         verdict 0 "PASS: $OVERRIDE_LABEL label added by ${who#*$'\t'} on $head — the connector review was not evaluated"
     fi
 
-    # ── 0. txehq/dagu is public: a PR from another repository runs ITS OWN copy of this
-    #    workflow and script (pull_request), so whatever it reports cannot be trusted, and only a
-    #    person's override (checked above, by the API) passes it. A head repository that is
-    #    missing or deleted is treated the same way (TXE-4719). ──
+    # ── 0. txehq/dagu is public: a PR from another repository is not merged on the connector's
+    #    review alone; only a person's override (checked above, by the API) passes it. A head
+    #    repository that is missing or deleted is treated the same way (TXE-4719). ──
     head_repo="$(printf '%s' "$pull" | jq -r 'if (.head | has("repo")) and .head.repo != null then (.head.repo.full_name // "") else "" end')"
     if [ "$head_repo" != "$repo" ]; then
         verdict 1 "FAIL: PR #$pr's head is in ${head_repo:-a missing or deleted repository}, not $repo; a PR from another repository runs its own copy of this check, so only a person's $OVERRIDE_LABEL passes it"

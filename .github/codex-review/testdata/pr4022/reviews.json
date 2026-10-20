@@ -4,13 +4,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `828845b6dc`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T19:48:48Z",
   "commit_id": "828845b6dc902132e783a2c0d318e9a992db86f5"
  },
@@ -19,13 +16,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T19:53:36Z",
   "commit_id": "7f294a489f85b0b2fc672cf58bfd00f1a67d4957"
  },
@@ -34,13 +28,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `7f294a489f`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T19:56:42Z",
   "commit_id": "7f294a489f85b0b2fc672cf58bfd00f1a67d4957"
  },
@@ -49,13 +40,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T19:58:32Z",
   "commit_id": "f40da6a530ea332f122506618bd284b15ba66ba6"
  },
@@ -64,13 +52,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `f40da6a530`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:01:22Z",
   "commit_id": "f40da6a530ea332f122506618bd284b15ba66ba6"
  },
@@ -79,13 +64,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:03:26Z",
   "commit_id": "f40da6a530ea332f122506618bd284b15ba66ba6"
  },
@@ -94,13 +76,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `c725d70dea`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:07:24Z",
   "commit_id": "c725d70dea1fa801d915b811a23d72e511c05592"
  },
@@ -109,13 +88,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:11:00Z",
   "commit_id": "34dcfbdd5f7f26d6caa6af1e7317fefba6483a90"
  },
@@ -124,13 +100,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `34dcfbdd5f`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:15:03Z",
   "commit_id": "34dcfbdd5f7f26d6caa6af1e7317fefba6483a90"
  },
@@ -139,13 +112,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:17:48Z",
   "commit_id": "839c3bc973752c5ceb7c105daa707089cbc4e09d"
  },
@@ -154,13 +124,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:17:50Z",
   "commit_id": "839c3bc973752c5ceb7c105daa707089cbc4e09d"
  },
@@ -169,13 +136,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:17:52Z",
   "commit_id": "839c3bc973752c5ceb7c105daa707089cbc4e09d"
  },
@@ -184,13 +148,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `839c3bc973`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:21:31Z",
   "commit_id": "839c3bc973752c5ceb7c105daa707089cbc4e09d"
  },
@@ -199,13 +160,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:25:02Z",
   "commit_id": "5b92902be3884d52b6393fbbb3b62ec0490d57b3"
  },
@@ -214,13 +172,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `5b92902be3`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:28:36Z",
   "commit_id": "5b92902be3884d52b6393fbbb3b62ec0490d57b3"
  },
@@ -229,13 +184,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:32:59Z",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c"
  },
@@ -244,13 +196,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:33:01Z",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c"
  },
@@ -259,13 +208,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:33:02Z",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c"
  },
@@ -274,13 +220,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `2fc3031c4f`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:37:24Z",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c"
  },
@@ -289,13 +232,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:46:36Z",
   "commit_id": "2fc3031c4f7b5ac75267c668946c07864ed6028c"
  },
@@ -304,13 +244,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `0fd56af346`",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:49:58Z",
   "commit_id": "0fd56af3462134bc79bb06bc9197816382c12e45"
  },
@@ -319,13 +256,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:51:26Z",
   "commit_id": "0fd56af3462134bc79bb06bc9197816382c12e45"
  },
@@ -334,13 +268,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T20:51:28Z",
   "commit_id": "0fd56af3462134bc79bb06bc9197816382c12e45"
  },
@@ -349,13 +280,10 @@
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "NONE",
   "submitted_at": "2026-10-17T20:51:36Z",
   "commit_id": "0fd56af3462134bc79bb06bc9197816382c12e45"
  },
@@ -364,13 +292,10 @@
   "user": {
    "login": "a-person",
    "id": 7822862,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "body": "Synthetic comment.",
   "state": "COMMENTED",
-  "author_association": "MEMBER",
   "submitted_at": "2026-10-17T21:05:39Z",
   "commit_id": "0fd56af3462134bc79bb06bc9197816382c12e45"
  }

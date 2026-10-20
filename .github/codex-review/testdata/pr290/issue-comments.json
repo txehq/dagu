@@ -4,181 +4,76 @@
   "user": {
    "login": "linear-code[bot]",
    "id": 222613912,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "created_at": "2026-10-16T09:37:30Z",
   "updated_at": "2026-10-16T09:37:31Z",
-  "body": "Synthetic comment.",
-  "author_association": "NONE",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  },
  {
   "id": 6212817829,
   "user": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "created_at": "2026-10-16T09:49:08Z",
   "updated_at": "2026-10-16T09:49:08Z",
-  "body": "Synthetic comment.",
-  "author_association": "MEMBER",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  },
  {
   "id": 6212993235,
   "user": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "created_at": "2026-10-16T09:59:21Z",
   "updated_at": "2026-10-16T09:59:21Z",
-  "body": "Synthetic comment.",
-  "author_association": "MEMBER",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  },
  {
   "id": 6215553282,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
    "id": 199175422,
-   "type": "Bot",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "Bot"
   },
   "created_at": "2026-10-16T12:31:20Z",
   "updated_at": "2026-10-16T17:12:44Z",
-  "body": "<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"c6f314a3806a7acbadf6b906b2b95c7afbcff82d\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-16T17:12:43.617739Z\">2026-10-16T17:12:43.617739Z</relative-time> | `c6f314a` | New commits |",
-  "author_association": "NONE",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"c6f314a3806a7acbadf6b906b2b95c7afbcff82d\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-16T17:12:43.617739Z\">2026-10-16T17:12:43.617739Z</relative-time> |"
  },
  {
   "id": 6219997521,
   "user": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "created_at": "2026-10-16T16:29:00Z",
   "updated_at": "2026-10-16T16:29:00Z",
-  "body": "Synthetic comment.",
-  "author_association": "MEMBER",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  },
  {
   "id": 6220275397,
   "user": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "created_at": "2026-10-16T16:44:27Z",
   "updated_at": "2026-10-16T16:44:27Z",
-  "body": "Synthetic comment.",
-  "author_association": "MEMBER",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  },
  {
   "id": 6220720540,
   "user": {
    "login": "a-person",
    "id": 44717411,
-   "type": "User",
-   "user_view_type": "public",
-   "site_admin": false
+   "type": "User"
   },
   "created_at": "2026-10-16T17:09:59Z",
   "updated_at": "2026-10-16T17:09:59Z",
-  "body": "Synthetic comment.",
-  "author_association": "MEMBER",
-  "reactions": {
-   "total_count": 0,
-   "+1": 0,
-   "-1": 0,
-   "laugh": 0,
-   "hooray": 0,
-   "confused": 0,
-   "heart": 0,
-   "rocket": 0,
-   "eyes": 0
-  },
-  "minimized": null
+  "body": "Synthetic comment."
  }
 ]

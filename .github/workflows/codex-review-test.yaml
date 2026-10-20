@@ -31,3 +31,5 @@ jobs:
         run: bash .github/codex-review/test-codex-review-check.sh
       - name: The merge wrapper with a stand-in gh
         run: bash .github/codex-review/test-merge.sh
+      - name: The fixture sanitizer keeps no private text
+        run: python3 -I .github/codex-review/testdata/test_sanitize.py

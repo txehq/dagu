@@ -9,6 +9,10 @@
 # from the PR, re-runs origin/main's copy of codex-review-check.sh (no wait) and then merges with
 # --match-head-commit, so GitHub refuses the merge if the head moved after the check.
 #
+# Residual window, stated rather than hidden: a connector review that lands on the SAME head in the
+# seconds between the check and the merge is not seen (the head pin cannot catch it); run this
+# right after the connector's state block is final, as txe's ops/merge-pr.sh does.
+#
 # Refuses (exit 1) when: the PR is not open, is a draft, or its head is not <head-sha>; its base is
 # not main; main's check does not pass on that head. Exit 2: usage or a read failure.
 set -euo pipefail

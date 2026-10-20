@@ -5,7 +5,8 @@ Every PR is reviewed by the Codex GitHub connector (GitHub App `chatgpt-codex-co
 turns its review into a merge decision. This replaced the Tokun-backed workflow (TXE-4204), which
 stopped on 2026-10-20 (TXE-4714). The rule is the same as txehq/txe's
 (`ops/ci/codex-review-check.sh`, `docs/workflow/review-loop.md` there), plus rule 0: this
-repository is public, so a PR from another repository fails unless a person adds `review-override`.
+repository is public, so the check runs main's copy (`pull_request_target`, which executes no PR
+code), and a PR from another repository fails unless a person adds `review-override`.
 
 ## The author's loop
 
@@ -23,8 +24,8 @@ repository is public, so a PR from another repository fails unless a person adds
 4. A push starts the next review. If none starts within a few minutes, comment `@codex review`.
    After a change of base, rebase onto it and force-push.
 5. Merge only when `codex-review` and CI are green, through **main's** merge wrapper, which re-runs
-   main's copy of the check on the exact head and merges with `--match-head-commit` (a
-   pull_request run executes the PR's own copy, so the PR's result alone is not trusted):
+   main's copy of the check on the exact head, with no wait, and merges with `--match-head-commit`,
+   so a head that moved after the check is refused:
 
    ```bash
    git fetch -q origin main
@@ -36,7 +37,7 @@ repository is public, so a PR from another repository fails unless a person adds
    own head.
 
 `review-override` is a person's decision: the check names who added it, and refuses one a bot
-added. Adding the label runs nothing by itself; re-run the check after it.
+added. Adding or removing the label re-runs the check, so removing it revokes the pass.
 
 ## Settings this depends on (not in this repository)
 
