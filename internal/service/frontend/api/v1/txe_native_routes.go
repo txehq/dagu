@@ -124,19 +124,51 @@ func (a *API) txeRunRoute(ctx context.Context, runName string, attempt dagrun.At
 	return nil
 }
 
-// txeRootRunRoute is txeRunRoute on a sub-run's root run, read from the
-// root's attempt. A root that cannot be found is not taken for no owner's
-// where owners are decided.
-func (a *API) txeRootRunRoute(ctx context.Context, root ir.DAGRunRef, permission authz.Permission) error {
+// txeRunPathMaxDepth bounds the walk from a sub-run up to its root.
+const txeRunPathMaxDepth = 64
+
+// txeSubRunPathRoute is txeRunRoute on every run above a sub-run: its root
+// run and each run between them, read from their attempts, so a sub-run is
+// governed by the owner of every DAG on its path. A run on the path that
+// cannot be read is not taken for no owner's where owners are decided.
+func (a *API) txeSubRunPathRoute(ctx context.Context, root ir.DAGRunRef, status *ir.DAGRunStatus, permission authz.Permission) error {
 	if a.txeAuth == nil {
 		return nil
 	}
-	attempt, err := a.dagRunRepository.FindAttempt(ctx, root)
-	if err != nil {
-		if a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce {
+	strict := a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce
+	unreadable := func() error {
+		if strict {
 			return errTxeAuthzUnavailable
 		}
-		attempt = nil
+		return nil
 	}
-	return a.txeRunRoute(ctx, root.Name, attempt, permission)
+	rootAttempt, err := a.dagRunRepository.FindAttempt(ctx, root)
+	if err != nil {
+		if strict {
+			return errTxeAuthzUnavailable
+		}
+		rootAttempt = nil
+	}
+	if err := a.txeRunRoute(ctx, root.Name, rootAttempt, permission); err != nil {
+		return err
+	}
+	parent := status.Parent
+	for depth := 0; !parent.Zero() && parent.ID != root.ID; depth++ {
+		if depth == txeRunPathMaxDepth {
+			return unreadable()
+		}
+		attempt, err := a.dagRunRepository.FindSubAttempt(ctx, root, parent.ID)
+		if err != nil {
+			return unreadable()
+		}
+		if err := a.txeRunRoute(ctx, parent.Name, attempt, permission); err != nil {
+			return err
+		}
+		next, err := attempt.ReadStatus(ctx)
+		if err != nil || next == nil {
+			return unreadable()
+		}
+		parent = next.Parent
+	}
+	return nil
 }

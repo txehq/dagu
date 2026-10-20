@@ -166,20 +166,37 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 		"a sub-run's agent session is its root owner's")
 	require.Equal(t, http.StatusForbidden, status(http.MethodPost, subRun+"/agent-session/restart", h.admin, map[string]any{}),
 		"so is restarting it")
+
+	// Deeper: a hub DAG's run calls the alias, which calls an ordinary
+	// DAG. The child's session is the owner's of the run between.
+	hubRoot := storeAliasRun(t, h.server, &ir.DAG{Name: "hub-root", YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")})
+	hubRef := ir.NewDAGRunRef("hub-root", hubRoot)
+	middle := storeSubRunOf(t, h.server, hubRef, hubRef, &ir.DAG{Name: "nightly-alias", SourceFile: sourceFile})
+	leaf := storeSubRunOf(t, h.server, hubRef, ir.NewDAGRunRef("nightly-alias", middle), &ir.DAG{Name: "plain-child"})
+	nested := "/api/v1/dag-runs/hub-root/" + hubRoot + "/sub-dag-runs/" + leaf + "/steps/s"
+	require.Equal(t, http.StatusForbidden, status(http.MethodPost, nested+"/agent-interactions/i1/respond", h.admin, map[string]any{"answer": "x"}),
+		"a sub-run within an owner's run is that owner's")
 }
 
 // storeSubRun stores a finished run of an ownerless DAG named name as a
 // sub-run of root, and returns its run id.
 func storeSubRun(t *testing.T, server test.Server, root ir.DAGRunRef, name string) string {
 	t.Helper()
+	return storeSubRunOf(t, server, root, root, &ir.DAG{Name: name})
+}
+
+// storeSubRunOf stores a finished run of dag under root, called by parent,
+// and returns its run id.
+func storeSubRunOf(t *testing.T, server test.Server, root, parent ir.DAGRunRef, dag *ir.DAG) string {
+	t.Helper()
 	ctx := context.Background()
-	dag := &ir.DAG{Name: name, YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")}
+	dag.YamlData = []byte("steps:\n  - name: s\n    run: echo s\n")
 	runID := fmt.Sprintf("sub-%d", time.Now().UnixNano())
 	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, time.Now(), runID, persis.DAGRunCreateAttemptOptions{RootDAGRun: root})
 	require.NoError(t, err)
 	st := ir.InitialStatus(dag)
 	st.DAGRunID, st.AttemptID, st.Status = runID, attempt.ID(), ir.Succeeded
-	st.Root, st.Parent = root, root
+	st.Root, st.Parent = root, parent
 	st.StartedAt, st.FinishedAt = time.Now().Add(-time.Minute).Format(time.RFC3339), time.Now().Format(time.RFC3339)
 	require.NoError(t, attempt.Open(ctx))
 	require.NoError(t, attempt.Write(ctx, st))

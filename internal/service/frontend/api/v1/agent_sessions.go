@@ -193,10 +193,11 @@ func (a *API) loadAgentStatus(ctx context.Context, root ir.DAGRunRef, subDAGRunI
 		return ir.DAGRunRef{}, nil, nil, err
 	}
 	if subDAGRunID != "" {
-		// A sub-run's session is also its root run's: the root's own DAG,
-		// read from the root's attempt, decides it as well, so a sub-run of
-		// an owner's DAG declared under another name is still the owner's.
-		if err := a.txeRootRunRoute(ctx, root, permission); err != nil {
+		// A sub-run's session is also that of every run above it: the DAG
+		// of its root and of each run between, read from their attempts,
+		// decides it as well, so a sub-run within an owner's DAG declared
+		// under another name is still the owner's.
+		if err := a.txeSubRunPathRoute(ctx, root, status, permission); err != nil {
 			return ir.DAGRunRef{}, nil, nil, err
 		}
 	}
