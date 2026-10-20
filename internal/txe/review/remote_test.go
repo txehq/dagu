@@ -480,11 +480,11 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 		return fmt.Sprintf(`{"dagRunId":%q,"attemptId":%q,"name":%q,"statusLabel":%q,"status":0,"startedAt":"2026-10-09T10:00:00Z","finishedAt":%q,"artifactsAvailable":false,"autoRetryCount":0}`, id, "a-"+id, job, status, finished)
 	}
 	stub := &stubTransport{t: t, replies: map[string]string{
-		"/dag-runs/" + job + "?limit=100": `{"dagRuns":[` +
+		"/dag-runs/" + job + "?fromDate=0&limit=100": `{"dagRuns":[` +
 			run("r3", "failed", "2026-10-09T10:03:00Z") + "," +
 			run("r-running", "running", "") + "," +
 			run("r1", "succeeded", "2026-10-09T10:01:00Z") + `],"nextCursor":"p2"}`,
-		"/dag-runs/" + job + "?cursor=p2&limit=100": `{"dagRuns":[` +
+		"/dag-runs/" + job + "?cursor=p2&fromDate=0&limit=100": `{"dagRuns":[` +
 			run("r2", "succeeded", "2026-10-09T10:02:00Z") + "," +
 			run("r-queued", "queued", "") + `]}`,
 		"/dag-runs/" + job + "/r2/outputs":                                 `{"metadata":{},"outputs":{"free_pct":"31"}}`,
@@ -563,7 +563,7 @@ func newRunList(t *testing.T) *runList {
 // set replaces the listed runs; each is "id attempt status finishedAt",
 // optionally followed by the time the attempt was queued.
 func (l *runList) set(runs ...string) {
-	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = l.page("", runs...)
+	l.stub.replies["/dag-runs/"+l.job+"?fromDate=0&limit=100"] = l.page("", runs...)
 }
 
 // page is one page of the run list as the service returns it.
@@ -715,7 +715,7 @@ func TestRemoteRunsAfterDoesNotDependOnEndTimesOrListingOrder(t *testing.T) {
 // listing returns it. The clocks here are normal.
 func TestRemoteRunsAfterDoesNotLoseARunCreatedBetweenPages(t *testing.T) {
 	l := newRunList(t)
-	first, p2 := "/dag-runs/"+l.job+"?limit=100", "/dag-runs/"+l.job+"?cursor=p2&limit=100"
+	first, p2 := "/dag-runs/"+l.job+"?fromDate=0&limit=100", "/dag-runs/"+l.job+"?cursor=p2&fromDate=0&limit=100"
 	y := "y y1 succeeded 2026-10-09T10:20:00Z"
 	// Page one is read before x exists; by page two, y has ended.
 	l.stub.seq = map[string][]string{first: {l.page("p2", "old o1 failed 2026-10-09T10:00:00Z")}}
@@ -792,7 +792,7 @@ func TestRemoteRunsAfterIsNeverBlockedByTheShapeOfTheHistory(t *testing.T) {
 // which would pass off every later retry of it as already reviewed.
 func TestRemoteRunsAfterFailsOnARunTheServiceDoesNotIdentify(t *testing.T) {
 	l := newRunList(t)
-	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[` +
+	l.stub.replies["/dag-runs/"+l.job+"?fromDate=0&limit=100"] = `{"dagRuns":[` +
 		`{"dagRunId":"r1","statusLabel":"failed","finishedAt":"2026-10-09T10:01:00Z"},` +
 		`{"dagRunId":"r2","attemptId":"b1","statusLabel":"succeeded","finishedAt":"2026-10-09T10:02:00Z"}]}`
 	runs, err := (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
@@ -801,7 +801,7 @@ func TestRemoteRunsAfterFailsOnARunTheServiceDoesNotIdentify(t *testing.T) {
 	assert.Empty(t, runs, "nothing is returned, so nothing can be covered")
 
 	// An unfinished run without one is not a result yet and is no failure.
-	l.stub.replies["/dag-runs/"+l.job+"?limit=100"] = `{"dagRuns":[{"dagRunId":"r1","statusLabel":"queued"}]}`
+	l.stub.replies["/dag-runs/"+l.job+"?fromDate=0&limit=100"] = `{"dagRuns":[{"dagRunId":"r1","statusLabel":"queued"}]}`
 	runs, err = (&review.Remote{Transport: l.stub}).RunsAfter(context.Background(), l.job, "")
 	require.NoError(t, err)
 	assert.Empty(t, runs)

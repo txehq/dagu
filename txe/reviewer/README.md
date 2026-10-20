@@ -486,6 +486,13 @@ files.
   result: a result is covered only once the review that was shown it has
   been persisted, and a crash, a failed read or a review that was never
   recorded covers nothing.
+- The reviewer reads the job's whole run history from the start. Asked for
+  no range, the service lists only runs since its local midnight, and a run
+  that ended before it would never be reviewed. The service's range is on
+  when a run was created, which a retry keeps, so no shorter range is safe:
+  the new execution of a run retried months after it was created is still
+  shown. The listing's cost grows with the job's history; what one review
+  is shown stays bounded by the packet.
 - So a retried run is shown again when its new execution ends, on either
   retry path; results with the same end time are separate results; a
   result reported late, a run created while the history was being listed
