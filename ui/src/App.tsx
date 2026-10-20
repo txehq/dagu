@@ -617,9 +617,9 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   React.useEffect(() => {
     return addAuthSessionListener((change) => {
       setAuthToken(change.token);
-      if (change.token === null) {
-        setPersonSignal(undefined);
-      }
+      // A new session, or none, may be someone else: the gate reads the
+      // identity again (it keys on the token) and publishes the signal anew.
+      setPersonSignal(undefined);
     });
   }, []);
 

@@ -12,6 +12,7 @@ import {
   resetPersonSignalForTest,
   setPersonSignal,
 } from '@/features/txe/personSignal';
+import { setAuthSession } from '@/lib/authSession';
 import { useLicense } from '@/hooks/useLicense';
 import userEvent from '@testing-library/user-event';
 
@@ -365,6 +366,27 @@ describe('App shell and the person signal', () => {
       expect.stringContaining('/remote-nodes'),
       expect.anything()
     );
+  });
+
+  // A new session may be a person even when the one before was not: nothing
+  // is asked until the gate has read the new session's identity.
+  it('forgets the signal when the session changes', async () => {
+    sessionStorage.setItem('dagu_txe_person', '0');
+    resetPersonSignalForTest();
+    renderAt('/home', builtin());
+    await waitFor(() =>
+      expect(clientGetMock).toHaveBeenCalledWith('/workspaces', {
+        params: { query: { remoteNode: 'local' } },
+      })
+    );
+    clientGetMock.mockClear();
+    vi.mocked(fetch).mockClear();
+    useQueryMock.mockClear();
+
+    act(() => setAuthSession('token-b'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sessionStorage.getItem('dagu_txe_person')).toBeNull();
+    expectNoAppReads();
   });
 
   // Only builtin authentication has persons: a flag left from such a session
