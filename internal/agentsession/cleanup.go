@@ -144,8 +144,15 @@ func (q *CleanupQueue) EnqueueDAGRunRemoval(ctx context.Context, root ir.DAGRunR
 	return nil
 }
 
-// Claim reserves the next eligible cleanup job for ownerWorkerID.
+// Claim reserves the next eligible cleanup job for ownerWorkerID: its own,
+// or, once a job has waited a day, any other host's.
 func (q *CleanupQueue) Claim(ctx context.Context, ownerWorkerID string, lease time.Duration) (*CleanupJob, error) {
+	return q.ClaimWithin(ctx, ownerWorkerID, lease, nil)
+}
+
+// ClaimWithin is Claim where a job of another host is taken over only when
+// mayTakeOver allows its owner. A nil mayTakeOver allows every owner.
+func (q *CleanupQueue) ClaimWithin(ctx context.Context, ownerWorkerID string, lease time.Duration, mayTakeOver func(resourceOwner string) bool) (*CleanupJob, error) {
 	if q == nil || q.col == nil {
 		return nil, persis.ErrNotFound
 	}
@@ -154,6 +161,9 @@ func (q *CleanupQueue) Claim(ctx context.Context, ownerWorkerID string, lease ti
 	err := q.visit(ctx, func(record *persis.Record, job CleanupJob) (bool, error) {
 		ownerMatches := sameCleanupOwner(job.Resource.OwnerWorkerID, ownerWorkerID)
 		if !ownerMatches && record.CreatedAt.Add(cleanupOwnerAffinityTTL).After(now) {
+			return false, nil
+		}
+		if !ownerMatches && mayTakeOver != nil && !mayTakeOver(job.Resource.OwnerWorkerID) {
 			return false, nil
 		}
 		if job.NextAttemptAt > now.UnixMilli() {

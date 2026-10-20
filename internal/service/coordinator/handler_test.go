@@ -6601,3 +6601,45 @@ func TestDispatchWithNoWorkerUnderPinningIsOneRefusal(t *testing.T) {
 		require.Equal(t, want.Error(), status.Convert(err).Message(), "pinning %d", pinning)
 	}
 }
+
+// With machines pinned, an agent session's cleanup, which names its provider,
+// session and directory on its host, is never handed to another machine,
+// however long it has waited; a worker of the same machine still takes it
+// over. Without pinning any host takes over a day-old job, as before.
+func TestHandlerAgentSessionCleanupStaysOnItsMachine(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		pinning  dispatch.MachinePinning
+		claimant string
+		found    bool
+	}{
+		"another machine, pinned":      {dispatch.MachinePinningEnforce, "mch_B@desk", false},
+		"a non-machine worker, pinned": {dispatch.MachinePinningEnforce, "worker-x", false},
+		"the same machine, pinned":     {dispatch.MachinePinningEnforce, "mch_A@other", true},
+		"another machine, unpinned":    {dispatch.MachinePinningOff, "mch_B@desk", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			backend := persistestutil.NewMemoryBackend()
+			col := backend.Collection("cleanups")
+			job := agentsession.CleanupJob{ID: "job-1", Root: ir.NewDAGRunRef("build", "run-removed"),
+				Resource: ir.AgentSessionResource{Provider: "opencode", SessionID: "session-1", Directory: "/home/a", OwnerWorkerID: "mch_A@laptop"}}
+			data, err := persis.Encode(job)
+			require.NoError(t, err)
+			aged := time.Now().Add(-25 * time.Hour)
+			require.NoError(t, col.Create(t.Context(), &persis.Record{ID: job.ID, Data: data, CreatedAt: aged, UpdatedAt: aged}))
+			handler := NewHandler(HandlerConfig{
+				DAGRunRepository:         newMockDAGRunStore().repository,
+				AgentSessionCleanupQueue: agentsession.NewCleanupQueue(col),
+				MachinePinning:           tc.pinning,
+			})
+			claimed, err := handler.ClaimAgentSessionCleanup(t.Context(), &coordinatorv1.ClaimAgentSessionCleanupRequest{WorkerId: tc.claimant})
+			require.NoError(t, err)
+			assert.Equal(t, tc.found, claimed.Found)
+			if !tc.found {
+				assert.Empty(t, claimed.Directory)
+				assert.Empty(t, claimed.SessionId)
+			}
+		})
+	}
+}

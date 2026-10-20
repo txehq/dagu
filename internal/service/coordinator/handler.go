@@ -1659,7 +1659,16 @@ func (h *Handler) ClaimAgentSessionCleanup(
 	if h.agentSessionCleanupQueue == nil || h.dagRunRepository == nil {
 		return nil, status.Error(codes.Unimplemented, "agent session cleanup is not configured")
 	}
-	job, err := h.agentSessionCleanupQueue.Claim(ctx, req.WorkerId, time.Minute)
+	// A cleanup job names the provider, the session and the directory of an
+	// agent session on its host. With machines pinned, another machine's is
+	// never handed over, however long it has waited: only a worker of the
+	// same machine, or with no machine for one that has none, takes it over.
+	var mayTakeOver func(string) bool
+	if h.machinePinning == dispatch.MachinePinningEnforce {
+		claimant := dispatch.WorkerMachine(req.WorkerId)
+		mayTakeOver = func(owner string) bool { return dispatch.WorkerMachine(owner) == claimant }
+	}
+	job, err := h.agentSessionCleanupQueue.ClaimWithin(ctx, req.WorkerId, time.Minute, mayTakeOver)
 	if errors.Is(err, persis.ErrNotFound) {
 		return &coordinatorv1.ClaimAgentSessionCleanupResponse{}, nil
 	}

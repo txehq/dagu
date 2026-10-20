@@ -163,3 +163,30 @@ func (s *cleanupDAGRunStore) FindAttempt(context.Context, ir.DAGRunRef) (dagrun.
 	}
 	return dagrun.NewNoopAttempt("attempt-1", nil), nil
 }
+
+// ClaimWithin takes over another host's day-old job only when mayTakeOver
+// allows its owner; its own job it claims as Claim does.
+func TestCleanupQueueTakesOverOnlyWhatItMay(t *testing.T) {
+	t.Parallel()
+
+	backend := persistestutil.NewMemoryBackend()
+	queue := NewCleanupQueue(backend.Collection("cleanups"))
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	queue.now = func() time.Time { return now }
+	root := ir.NewDAGRunRef("build", "run-1")
+	resource := ir.AgentSessionResource{Provider: "opencode", SessionID: "session-1", OwnerWorkerID: "worker-a"}
+	require.NoError(t, queue.EnqueueDAGRunRemoval(t.Context(), root, []ir.AgentSessionResource{resource}))
+	now = now.Add(cleanupOwnerAffinityTTL + time.Second)
+
+	refuse := func(string) bool { return false }
+	_, err := queue.ClaimWithin(t.Context(), "worker-b", time.Minute, refuse)
+	require.ErrorIs(t, err, persis.ErrNotFound, "not another's")
+	job, err := queue.ClaimWithin(t.Context(), "worker-a", time.Minute, refuse)
+	require.NoError(t, err, "its own")
+	require.NoError(t, queue.Release(t.Context(), "worker-a", job.ID, job.ClaimToken, "again"))
+	now = now.Add(time.Hour)
+	job, err = queue.ClaimWithin(t.Context(), "worker-b", time.Minute, func(owner string) bool { return owner == "worker-a" })
+	require.NoError(t, err, "another's it may take")
+	assert.Equal(t, "worker-b", job.ClaimedBy)
+}
+
