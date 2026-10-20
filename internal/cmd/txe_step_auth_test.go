@@ -24,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
@@ -226,25 +227,46 @@ func TestTXEStepFailsClosedOnceEnrolled(t *testing.T) {
 // class only keeps the API key there, and one recorded as enrolled for the
 // reviewer class is refused until this build reads reviewer credentials.
 func TestTXEStepClass(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
 	root := txeAuthRoot()
 	txe := TXE()
 	root.AddCommand(txe)
-	for _, c := range txe.Commands() {
-		want := "worker"
-		if c.Name() == "review" {
-			want = "reviewer"
+	classes := func() map[string]string {
+		got := map[string]string{}
+		for _, c := range txe.Commands() {
+			got[c.Name()] = string(txeStepClass(c))
+			for _, leaf := range c.Commands() {
+				got[c.Name()+" "+leaf.Name()] = string(txeStepClass(leaf))
+			}
 		}
-		assert.Equal(t, want, string(txeStepClass(c)), c.Name())
-		for _, leaf := range c.Commands() {
-			assert.Equal(t, want, string(txeStepClass(leaf)), c.Name()+" "+leaf.Name())
+		return got
+	}
+	// In this machine's reviewer or decide DAG, txe review commands need the
+	// reviewer class, every other command the worker class.
+	for _, dag := range []string{review.ReviewerDAGName(txeEnrolTestMachine), review.DecideDAGName(txeEnrolTestMachine)} {
+		t.Setenv(runenv.EnvKeyDAGName, dag)
+		for name, class := range classes() {
+			want := "worker"
+			if name == "review" || strings.HasPrefix(name, "review ") {
+				want = "reviewer"
+			}
+			assert.Equal(t, want, class, dag+": "+name)
+		}
+	}
+	// In a job's DAG, or another machine's reviewer DAG, even txe review is
+	// worker class: a job's own command cannot present the reviewer's.
+	for _, dag := range []string{"job_01K7A5ZQ8M3N4P5R6S7T8V9W0J", review.ReviewerDAGName("mch_01K7A5ZQ8M3N4P5R6S7T8V9W0X")} {
+		t.Setenv(runenv.EnvKeyDAGName, dag)
+		for name, class := range classes() {
+			assert.Equal(t, "worker", class, dag+": "+name)
 		}
 	}
 
-	f := newStepAuthFixture(t)
-	f.enrolled(t)
 	reviewerCall := func() error {
 		t.Setenv(runenv.EnvKeyDAGRunID, "run-1")
 		t.Setenv(runenv.EnvKeyDAGRunStepName, "review")
+		t.Setenv(runenv.EnvKeyDAGName, review.ReviewerDAGName(txeEnrolTestMachine))
 		var callErr error
 		txe := TXE()
 		for _, c := range txe.Commands() {
@@ -312,6 +334,7 @@ func TestTXEStepPresentsTheReviewerCredential(t *testing.T) {
 	// A reviewer step presents the reviewer credential.
 	t.Setenv(runenv.EnvKeyDAGRunID, "run-1")
 	t.Setenv(runenv.EnvKeyDAGRunStepName, "review")
+	t.Setenv(runenv.EnvKeyDAGName, review.ReviewerDAGName(txeEnrolTestMachine))
 	var callErr error
 	txe := TXE()
 	for _, c := range txe.Commands() {
