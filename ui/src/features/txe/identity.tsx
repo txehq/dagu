@@ -13,6 +13,7 @@ import {
 import { useAuth } from '@/contexts/AuthContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useClient } from '@/hooks/api';
+import { setPersonSignal } from './personSignal';
 import { sseManager } from '@/hooks/SSEManager';
 
 import { AccessRequestPending } from './components/identity/AccessRequestPending';
@@ -100,6 +101,7 @@ export function TxePersonGate({
   React.useEffect(() => {
     if (!isLoading) {
       sseManager.setRefused(isPerson);
+      setPersonSignal(isPerson);
     }
   }, [isLoading, isPerson]);
 

@@ -3,11 +3,12 @@
 
 import { render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Config } from '@/contexts/ConfigContext';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import App from '../App';
+import { resetPersonSignalForTest } from '@/features/txe/personSignal';
 import { useLicense } from '@/hooks/useLicense';
 import userEvent from '@testing-library/user-event';
 
@@ -292,6 +293,57 @@ describe('legacy Wiki routing', () => {
       expect(window.location.search).toBe('?workspace=ops');
       expect(window.location.hash).toBe('#rollback');
     });
+  });
+});
+
+// A person signed in through the identity provider, as TxePersonGate last
+// read it in this tab: the hub refuses a person these app-level reads.
+describe('App shell for a person', () => {
+  afterEach(() => {
+    sessionStorage.clear();
+    resetPersonSignalForTest();
+  });
+
+  it('asks for no workspaces, remote nodes or license status', async () => {
+    sessionStorage.setItem('dagu_txe_person', '1');
+    resetPersonSignalForTest();
+    renderAt('/home');
+
+    expect(await screen.findByRole('heading', { name: 'Home' })).toBeVisible();
+    expect(clientGetMock).not.toHaveBeenCalledWith(
+      '/workspaces',
+      expect.anything()
+    );
+    expect(fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining('/remote-nodes'),
+      expect.anything()
+    );
+    expect(useQueryMock).toHaveBeenCalledWith(
+      '/license/status',
+      null,
+      expect.anything()
+    );
+    expect(useQueryMock).not.toHaveBeenCalledWith(
+      '/license/status',
+      { params: { query: { remoteNode: 'local' } } },
+      expect.anything()
+    );
+  });
+
+  it('asks for them for every other caller', async () => {
+    resetPersonSignalForTest();
+    renderAt('/home');
+
+    expect(await screen.findByRole('heading', { name: 'Home' })).toBeVisible();
+    await waitFor(() =>
+      expect(clientGetMock).toHaveBeenCalledWith('/workspaces', {
+        params: { query: { remoteNode: 'local' } },
+      })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/remote-nodes'),
+      expect.anything()
+    );
   });
 });
 
