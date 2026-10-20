@@ -486,26 +486,13 @@ files.
   result: a result is covered only once the review that was shown it has
   been persisted, and a crash, a failed read or a review that was never
   recorded covers nothing.
-- The reviewer always asks the service for a range of the run history.
-  Asked for none, the service lists only runs since its local midnight, and
-  a run that ended before it would never be reviewed. The range starts at a
-  watermark the checkpoint's run cursor carries (`listed-from:` and a
-  time), or seven days ago if that is earlier. A checkpoint written before
-  the watermark existed reads the whole history.
-- The range is on when a run was created. The service does not report that,
-  and a retry keeps it, so the watermark moves only when nothing is left
-  behind. A review that covers every result it was shown, while no run is
-  unfinished, no result is beyond its packet and none changed while it was
-  read, moves the watermark to seven days before the earlier of the reviewer
-  machine's time and the latest time the service reported for any run it
-  listed. Those times can come from a worker's or the reviewer's clock, not
-  the hub's, which stamps when a run was created; clocks up to seven days
-  apart are allowed for. Any other review leaves the watermark where the
-  listing started. A review after a gap therefore reads the gap plus seven
-  days.
-- The bound hides one thing: the new execution of a run that a review had
-  covered and that is retried later, when the run was created before both
-  the watermark and seven days before the listing.
+- The reviewer reads the job's whole run history from the start. Asked for
+  no range, the service lists only runs since its local midnight, and a run
+  that ended before it would never be reviewed. The service's range is on
+  when a run was created, which a retry keeps, so no shorter range is safe:
+  the new execution of a run retried months after it was created is still
+  shown. The listing's cost grows with the job's history; what one review
+  is shown stays bounded by the packet.
 - So a retried run is shown again when its new execution ends, on either
   retry path; results with the same end time are separate results; a
   result reported late, a run created while the history was being listed

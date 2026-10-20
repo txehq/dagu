@@ -13,11 +13,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -568,32 +566,6 @@ func (l *runList) set(runs ...string) {
 	l.stub.replies["/dag-runs/"+l.job+"?fromDate=0&limit=100"] = l.page("", runs...)
 }
 
-// anyStart serves a run listing whatever start it asks for as the whole
-// history, and records the starts asked for.
-type anyStart struct {
-	next   review.Transport
-	starts []int64
-}
-
-func (a *anyStart) Do(ctx context.Context, method, path string, in, out any) error {
-	if base, query, ok := strings.Cut(path, "?"); ok {
-		q, err := url.ParseQuery(query)
-		if err != nil {
-			return err
-		}
-		if from := q.Get("fromDate"); from != "" {
-			n, err := strconv.ParseInt(from, 10, 64)
-			if err != nil {
-				return err
-			}
-			a.starts = append(a.starts, n)
-			q.Set("fromDate", "0")
-			path = base + "?" + q.Encode()
-		}
-	}
-	return a.next.Do(ctx, method, path, in, out)
-}
-
 // page is one page of the run list as the service returns it.
 func (l *runList) page(next string, runs ...string) string {
 	items := make([]string, 0, len(runs))
@@ -774,12 +746,7 @@ func TestRemoteRunsAfterNeverMixesTheEvidenceOfTwoExecutions(t *testing.T) {
 				`{"dagRunDetails":{"attemptId":"a1","queuedAt":"2026-10-09T09:59:00Z","statusLabel":"failed","nodes":[]}}`,
 				after,
 			}}
-			shown := l.uncovered()
-			assert.Equal(t, []string{"r2@b1"}, names(shown))
-			// r1 was left behind, so a review of r2 leaves the listing's start
-			// where it was.
-			assert.Equal(t, "listed-from:0001-01-01T00:00:00Z", shown[0].Cursor)
-			l.record(shown...)
+			assert.Equal(t, []string{"r2@b1"}, l.review())
 
 			l.set("r1 a1 failed 2026-10-09T10:01:00Z", "r2 b1 succeeded 2026-10-09T10:02:00Z")
 			assert.Equal(t, []string{"r1@a1"}, l.review(), "it is returned once its evidence can be read whole")
@@ -1538,9 +1505,8 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	l := newRunList(t)
 	l.job = f.jobID
 	l.set("run-1 a1 failed 2026-10-09T10:01:00Z")
-	listing := &anyStart{next: l.stub}
 	remote := &review.Remote{
-		Transport: splitTransport{runs: listing, rest: f.remote.Transport.(splitTransport).rest},
+		Transport: splitTransport{runs: l.stub, rest: f.remote.Transport.(splitTransport).rest},
 		MachineID: f.remote.MachineID, RunID: "tick-1", AgentClient: "fixture-agent 1.0",
 	}
 	reviewer := func(holder string) *review.Reviewer {
@@ -1576,24 +1542,12 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, runs)
 
-	// The review covered everything it was shown, so the checkpoint carries
-	// a watermark a week before the latest time the service reported, the
-	// run's end. That is earlier than the lookback, so the next listing
-	// starts there.
-	cp, err := remote.Checkpoint(ctx, f.jobID)
-	require.NoError(t, err)
-	watermark := time.Date(2026, 10, 2, 10, 1, 0, 0, time.UTC)
-	assert.Equal(t, "listed-from:"+watermark.Format(time.RFC3339), cp.RunCursor)
-	listing.starts = nil
-
 	// The run is retried on the queued path: same attempt id, later queue
 	// marker. It is another execution, in no review, and is shown again.
 	l.set("run-1 a1 failed 2026-10-09T10:01:00Z 2026-10-09T10:00:30Z")
 	again, err := reviewer("reviewer-c").Prepare(ctx, f.jobID)
 	require.NoError(t, err)
 	require.Equal(t, []string{"run-1"}, again.Packet.RunIDs())
-	require.NotEmpty(t, listing.starts)
-	assert.Equal(t, watermark.Unix(), listing.starts[0])
 	assert.Equal(t, "2026-10-09T10:00:30Z", again.Packet.NewRuns[0].QueuedAt)
 	_, err = reviewer("reviewer-c").Apply(ctx, again, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "again", EvidenceRunIDs: []string{"run-1"}})
 	require.NoError(t, err)
