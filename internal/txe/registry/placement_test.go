@@ -41,6 +41,16 @@ func TestJobSpecRunsOnlyOnItsMachine(t *testing.T) {
 			"steps:\n  - name: run\n    call: helper\n    worker_selector:\n      os: linux\n" + helper(f.machine),
 		"a selector is written with space": "worker_selector:\n  txe.machine: \" " + f.machine + "\"\n" +
 			"steps:\n  - name: run\n    run: /pkg/run.sh\n",
+		"a foreach body selects another machine": own + fmt.Sprintf(
+			"steps:\n  - name: loop\n    foreach:\n      items: [one]\n      steps:\n        - name: escape\n          call: helper\n          worker_selector:\n            txe.machine: %s\n", other) + helper(f.machine),
+		"a nested foreach body calls a DAG the spec does not define": own +
+			"steps:\n  - name: outer\n    foreach:\n      items: [one]\n      steps:\n        - name: inner\n          foreach:\n            items: [two]\n            steps:\n              - name: escape\n                call: somebody-elses-dag\n",
+		"a chat step's tool is a DAG the spec does not define": own +
+			"steps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [somebody-elses-dag]\n    messages:\n      - role: user\n        content: hi\n",
+		"the DAG's own llm tool is a DAG the spec does not define": own +
+			"llm:\n  provider: openai\n  model: gpt-4o\n  tools: [somebody-elses-dag]\nsteps:\n  - name: ask\n    type: chat\n    messages:\n      - role: user\n        content: hi\n",
+		"a step runs an action package": own +
+			"steps:\n  - name: act\n    action: someone/some-action@v1\n",
 	}
 	for name, spec := range refused {
 		t.Run(name, func(t *testing.T) {

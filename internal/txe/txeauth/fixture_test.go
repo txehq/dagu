@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/txe/placement"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -43,13 +44,17 @@ type memDAGs struct {
 	specs map[string][]byte
 }
 
-func (m *memDAGs) CheckSpec(_ context.Context, _ string, spec []byte) (registry.DAGFacts, error) {
+// CheckSpec reads the one document, of command steps, these tests register:
+// its machine is the only placement.
+func (m *memDAGs) CheckSpec(_ context.Context, name string, spec []byte) (registry.DAGFacts, error) {
 	for line := range strings.SplitSeq(string(spec), "\n") {
 		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "txe.machine:"); ok {
-			return registry.DAGFacts{WorkerSelector: map[string]string{"txe.machine": strings.TrimSpace(v)}}, nil
+			machine := strings.TrimSpace(v)
+			return registry.DAGFacts{WorkerSelector: map[string]string{"txe.machine": machine},
+				Placed: true, Placements: []placement.Placement{{Name: name, Machine: machine}}}, nil
 		}
 	}
-	return registry.DAGFacts{}, nil
+	return registry.DAGFacts{Placed: true, Placements: []placement.Placement{{Name: name}}}, nil
 }
 
 func (m *memDAGs) SpecSHA256(_ context.Context, name string) (string, error) {

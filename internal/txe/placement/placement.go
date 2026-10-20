@@ -39,9 +39,14 @@ type Placement struct {
 }
 
 // Of reports every DAG dag defines (itself and each local DAG), by its name
-// and the machine it is sent to, and every step of each, handlers included,
-// by the DAG it calls and the machine it sends that to. dag is the spec as
-// the loader built it; Written checks what the loader cannot show.
+// and the machine it is sent to, and every step of each, by the DAG it calls
+// and the machine it sends that to. Steps are read wherever they run:
+// handlers, and the body of a foreach, nested ones included. A DAG a chat
+// step may call as a tool, named by the step or by the DAG's own llm
+// settings, is a called DAG too. A step running an action package cannot be
+// verified: the package's DAG is fetched when it runs and goes where it says.
+// dag is the spec as the loader built it; Written checks what the loader
+// cannot show.
 func Of(dag *ir.DAG) ([]Placement, error) {
 	if dag == nil {
 		return nil, ErrUnverified
@@ -52,11 +57,19 @@ func Of(dag *ir.DAG) ([]Placement, error) {
 	}
 	var out []Placement
 	for _, d := range dags {
+		if d == nil {
+			return nil, ErrUnverified
+		}
 		machine, err := SelectedMachine(d.WorkerSelector)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, Placement{Name: d.Name, Machine: machine})
+		if d.LLM != nil {
+			if out, err = toolPlacements(out, d.LLM.Tools); err != nil {
+				return nil, err
+			}
+		}
 		steps := make([]*ir.Step, 0, len(d.Steps)+6)
 		for i := range d.Steps {
 			steps = append(steps, &d.Steps[i])
@@ -67,22 +80,63 @@ func Of(dag *ir.DAG) ([]Placement, error) {
 				steps = append(steps, handler)
 			}
 		}
-		for _, step := range steps {
-			machine, err := SelectedMachine(step.WorkerSelector)
-			if err != nil {
-				return nil, err
-			}
-			called := ""
-			if step.SubDAG != nil {
-				called = step.SubDAG.Name
-				if strings.ContainsAny(called, "$`") {
-					return nil, ErrUnverified
-				}
-			}
-			if machine != "" || called != "" {
-				out = append(out, Placement{Name: called, Machine: machine, Step: true})
+		if out, err = stepPlacements(out, steps); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// stepPlacements adds where each step, and each step of a foreach body,
+// sends its work.
+func stepPlacements(out []Placement, steps []*ir.Step) ([]Placement, error) {
+	for _, step := range steps {
+		if step == nil {
+			continue
+		}
+		if step.ExecutorConfig.Type == ir.ExecutorTypeAction {
+			return nil, ErrUnverified
+		}
+		machine, err := SelectedMachine(step.WorkerSelector)
+		if err != nil {
+			return nil, err
+		}
+		called := ""
+		if step.SubDAG != nil {
+			called = step.SubDAG.Name
+			if strings.ContainsAny(called, "$`") {
+				return nil, ErrUnverified
 			}
 		}
+		if machine != "" || called != "" {
+			out = append(out, Placement{Name: called, Machine: machine, Step: true})
+		}
+		if step.LLM != nil {
+			if out, err = toolPlacements(out, step.LLM.Tools); err != nil {
+				return nil, err
+			}
+		}
+		if step.Foreach != nil {
+			body := make([]*ir.Step, 0, len(step.Foreach.Steps))
+			for i := range step.Foreach.Steps {
+				body = append(body, &step.Foreach.Steps[i])
+			}
+			if out, err = stepPlacements(out, body); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// toolPlacements adds each DAG a chat step may call as a tool.
+func toolPlacements(out []Placement, tools []string) ([]Placement, error) {
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool)
+		if name == "" || strings.ContainsAny(name, "$`") {
+			return nil, ErrUnverified
+		}
+		out = append(out, Placement{Name: name, Step: true})
 	}
 	return out, nil
 }

@@ -217,6 +217,16 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, calls(w.jobB)), "calling B's job")
 			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, calls(w.jobA)), "calling a job: the registry's")
 			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, stepTo(w.machineA)), "a step on A's own machine")
+			// A foreach body's steps, a chat step's tool DAGs and an action
+			// package are placements too (TXE-4717).
+			onA := "worker_selector:\n  txe.machine: " + w.machineA + "\n"
+			loopTo := onA + "steps:\n  - name: loop\n    foreach:\n      items: [one]\n      steps:\n        - name: s\n          call: " +
+				w.reviewerA + "\n          worker_selector:\n            txe.machine: " + w.machineB + "\n"
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, loopTo), "a foreach body on B's machine")
+			toolOf := onA + "steps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [" +
+				w.reviewerB + "]\n    messages:\n      - role: user\n        content: hi\n"
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, toolOf), "a chat tool that is B's machine DAG")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, onA+"steps:\n  - name: act\n    action: someone/some-action@v1\n"), "an action package")
 			// The coordinator matches every label: a selector that names no
 			// machine reaches any machine with those labels, B's included.
 			byLabel := func(label string) string {

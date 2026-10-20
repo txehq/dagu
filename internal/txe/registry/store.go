@@ -56,8 +56,8 @@ func Dir(dataDir string) string {
 type DAGFacts struct {
 	WorkerSelector map[string]string
 	// Placed says the store read where the spec sends its work: Placements,
-	// or Unplaceable when that cannot be read. A store that does not read it
-	// leaves the top-level selector as the only placement checked.
+	// or Unplaceable when that cannot be read. A job is not registered on a
+	// store that does not read it.
 	Placed      bool
 	Placements  []placement.Placement
 	Unplaceable error

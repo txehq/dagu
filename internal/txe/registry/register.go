@@ -233,7 +233,7 @@ func (s *Store) checkDAG(ctx context.Context, jobID, machineID string, v *JobVer
 // admits a task to whatever machine its selector names.
 func checkPlacements(facts DAGFacts, machineID string) error {
 	if !facts.Placed {
-		return nil
+		return refuse(CodeNotReady, "the DAG store cannot tell where dag.spec runs")
 	}
 	if facts.Unplaceable != nil {
 		return refuse(CodeInvalid, "dag.spec does not say plainly where it runs: every worker_selector must name %s %s, written without surrounding space, and every called DAG must be named literally", machineLabel, machineID)
