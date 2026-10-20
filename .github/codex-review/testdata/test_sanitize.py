@@ -52,6 +52,13 @@ class Sanitize(unittest.TestCase):
         self.assertNotIn("private-repo", text)
         self.assertIn('"commit_sha":null', out["body"])
 
+    def test_short_private_values_are_dropped(self):
+        out = sanitize.walk({"body": '<!-- codex-review-state:v1 {"code_review":{"status":"acquisition_pending"}} -->',
+                             "head": {"repo": {"name": "private-project", "full_name": "txehq/private-project"}}})
+        text = json.dumps(out)
+        self.assertNotIn("acquisition", text)
+        self.assertNotIn("private-project", text)
+
 
 if __name__ == "__main__":
     unittest.main()

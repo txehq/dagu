@@ -18,6 +18,7 @@ FIELDS = {"id", "user", "login", "type", "body", "created_at", "updated_at", "su
           "original_position", "subject_type", "event", "actor", "label", "name", "color", "head",
           "sha", "repo", "full_name", "labels", "draft", "state", "number", "ref"}
 STATE_KEYS = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+STATUSES = {"completed", "in_progress", "queued", "pending", "running", "failed", "cancelled", "skipped"}
 paths = {}
 
 
@@ -27,7 +28,7 @@ def state_value(k, v):
         return v
     if k == "commit_sha" and isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v):
         return v
-    if k == "status" and isinstance(v, str) and re.fullmatch(r"[a-z_]{1,20}", v):
+    if k == "status" and v in STATUSES:
         return v
     return None
 
@@ -61,6 +62,8 @@ def body(text):
 
 
 def walk(v, key=None):
+    if isinstance(v, dict) and key == "repo":
+        return {"full_name": "synthetic/repo"}
     if isinstance(v, dict):
         return {k: walk(x, k) for k, x in v.items() if k in FIELDS}
     if isinstance(v, list):
