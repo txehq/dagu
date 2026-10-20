@@ -23,8 +23,8 @@ func (f *fixture) resolveAdmin(subject string) Scope {
 }
 
 // A platform administrator whose identity is bound is also its owner's
-// person: on that owner's records it may do what the person may, and the
-// administrator's own rights come on top. On another owner's records it
+// person for viewing, deciding and administering that owner's records, and
+// the administrator's own rights come on top. On another owner's records it
 // gains nothing beyond the administrator's view (TXE-4710).
 func TestBoundPlatformAdministratorIsItsOwnersPerson(t *testing.T) {
 	t.Parallel()
@@ -42,19 +42,24 @@ func TestBoundPlatformAdministratorIsItsOwnersPerson(t *testing.T) {
 	// The platform, as any administrator.
 	assert.True(t, f.enforce(admin, PermissionAdminister, Platform()).Allowed)
 
-	// Its own owner's job and machine, as the person.
-	for _, permission := range []Permission{PermissionView, PermissionAuthor, PermissionExecute, PermissionApprove, PermissionAdminister} {
-		decision := f.enforce(admin, permission, f.job(jobA1))
-		assert.True(t, decision.Allowed, permission)
-		assert.False(t, decision.BreakGlass, "%s: its own owner's data is not break-glass", permission)
-		assert.Equal(t, ReasonOwner, decision.Reason, permission)
-	}
+	// Its own owner's job and machine: it views, decides and administers as
+	// the person, not break-glass. It does not author or execute: those
+	// stay with the owner's own credentials.
 	machine, err := f.store.Machine(context.Background(), machineA1)
 	require.NoError(t, err)
-	assert.True(t, f.enforce(admin, PermissionAuthor, machine).Allowed)
 	own, err := OwnData(admin)
 	require.NoError(t, err)
-	assert.True(t, f.enforce(admin, PermissionAuthor, own).Allowed)
+	for _, res := range []Resource{f.job(jobA1), machine, own} {
+		for _, permission := range []Permission{PermissionView, PermissionApprove, PermissionAdminister} {
+			decision := f.enforce(admin, permission, res)
+			assert.True(t, decision.Allowed, "%s %s", permission, res.ID())
+			assert.False(t, decision.BreakGlass, "%s %s: its own owner's data is not break-glass", permission, res.ID())
+			assert.Equal(t, ReasonOwner, decision.Reason, permission)
+		}
+		for _, permission := range []Permission{PermissionAuthor, PermissionExecute} {
+			assert.False(t, f.enforce(admin, permission, res).Allowed, "%s %s", permission, res.ID())
+		}
+	}
 
 	// Another owner's: view as break-glass, and nothing else.
 	view := f.enforce(admin, PermissionView, f.job(jobB1))
@@ -130,4 +135,42 @@ func TestBoundPlatformAdministratorEnrolsItsOwnersMachine(t *testing.T) {
 	assert.Equal(t, ActorPerson, enrolment.Enrolled.By.Kind)
 	assert.Equal(t, "connor", enrolment.Enrolled.By.Subject)
 	assert.Equal(t, ScopeMachine, f.resolve(worker).Kind())
+}
+
+// A bound administrator is also its owner's person, so it may not approve a
+// binding of its own identity: it would make itself any owner's person. Its
+// request waits for another administrator.
+func TestPlatformAdministratorDoesNotBindItself(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	id := person("connor").Identity
+	_, err := f.store.RequestBinding(ctx, person("connor"), Shown{Username: "connor"})
+	require.NoError(t, err)
+
+	for _, owner := range []string{ownerA, ownerB} {
+		_, err = f.store.ApproveBinding(ctx, f.resolveAdmin("connor"), id, owner)
+		require.Error(t, err, owner)
+		assert.Equal(t, CodeForbidden, CodeOf(err), owner)
+	}
+	assert.Empty(t, f.resolveAdmin("connor").OwnerID(), "still bound to nobody")
+
+	// Another administrator approves it; then the bound administrator still
+	// may not move its own binding.
+	_, err = f.store.ApproveBinding(ctx, f.admin, id, ownerA)
+	require.NoError(t, err)
+	admin := f.resolveAdmin("connor")
+	require.Equal(t, ownerA, admin.OwnerID())
+	_, err = f.store.RevokeBinding(ctx, admin, id, "move")
+	require.NoError(t, err, "giving up its own binding is allowed")
+	_, err = f.store.RequestBinding(ctx, person("connor"), Shown{Username: "connor"})
+	require.NoError(t, err)
+	_, err = f.store.ApproveBinding(ctx, f.resolveAdmin("connor"), id, ownerB)
+	assert.Equal(t, CodeForbidden, CodeOf(err))
+
+	// It still approves anyone else's.
+	_, err = f.store.RequestBinding(ctx, person("bob"), Shown{Username: "bob"})
+	require.NoError(t, err)
+	_, err = f.store.ApproveBinding(ctx, f.resolveAdmin("connor"), person("bob").Identity, ownerB)
+	require.NoError(t, err)
 }

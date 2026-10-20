@@ -130,6 +130,12 @@ func (s *Store) approveBinding(ctx context.Context, by Scope, id authn.Identity,
 	if id.IsZero() || ownerID == "" {
 		return nil, refuse(CodeInvalid, "an issuer, a subject and an owner are required")
 	}
+	// A bound administrator is also that owner's person, so binding its own
+	// identity would make it any owner's person it chose. Another
+	// administrator must approve it.
+	if !by.signedIn.IsZero() && by.signedIn == id {
+		return nil, refuse(CodeForbidden, "an administrator does not approve a binding of its own identity")
+	}
 	exists, err := s.registry.OwnerExists(ctx, ownerID)
 	if err != nil {
 		return nil, err

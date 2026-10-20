@@ -24,7 +24,8 @@ const (
 	ScopeMachine ScopeKind = "machine"
 	// ScopePlatformAdmin is the installation's administrator. It owns
 	// nothing; an administrator signed in through the identity provider whose
-	// identity is bound is also that owner's person (OwnerPerson).
+	// identity is bound is also that owner's person for viewing, deciding
+	// and administering (OwnerPerson).
 	ScopePlatformAdmin ScopeKind = "platform_admin"
 )
 
@@ -42,8 +43,10 @@ type Scope struct {
 	// machineID and enrolmentGeneration are set for a machine.
 	machineID           string
 	enrolmentGeneration int
-	// admin is the platform administrator's account name.
-	admin string
+	// admin is the platform administrator's account name, and signedIn the
+	// identity it signed in with through the identity provider, if it did.
+	admin    string
+	signedIn authn.Identity
 	// reason says why a principal is unbound.
 	reason Reason
 }
@@ -116,6 +119,7 @@ func PlatformAdmin(name string) Scope {
 // the administrator only. An error means the store could not be read.
 func (s *Store) ResolvePlatformAdmin(ctx context.Context, name string, id authn.Identity) (Scope, error) {
 	scope := PlatformAdmin(name)
+	scope.signedIn = id
 	binding, _, err := s.activeBinding(ctx, id)
 	if err != nil {
 		return Scope{}, err

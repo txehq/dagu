@@ -14,6 +14,7 @@ import (
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/auth"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
@@ -37,8 +38,11 @@ func txeIdentityOf(t *testing.T, a *API, ctx context.Context) apigen.TxeIdentity
 
 // The listed administrator whose identity is bound to owner A approves A's
 // machine's enrolment and is told its pending applications, as A's person
-// is; it gets nothing of the kind for B's machine. Its own command line is
-// still only A's cli. In every mode (TXE-4710).
+// is; it gets nothing of the kind for B's machine. In enforce it decides A's
+// job, but it executes and authors nothing as the person: machine-only and
+// reviewer-only writes and the native writes closed to a person stay closed
+// to it. Its own command line is still only A's cli. In every mode
+// (TXE-4710).
 func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 	for _, mode := range []string{"", "enforce"} {
 		t.Run("mode="+mode, func(t *testing.T) {
@@ -90,6 +94,20 @@ func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, w.ownerA, resp.(apigen.EnrolTxeMachine200JSONResponse).OwnerId)
 
+			if mode == "enforce" {
+				// It decides A's job as A's person, and not B's.
+				require.NoError(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionApprove, txeNeed{}))
+				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobB, authz.PermissionApprove, txeNeed{}))
+				// It is no machine and no reviewer, and it does not execute
+				// or author as the person: the writes only A's machine makes,
+				// and the native writes closed to a person, stay closed.
+				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeReviewerNeed))
+				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeMachineNeed))
+				machineDAG := txeauth.MachineDAGs(w.machineA)[0]
+				require.Error(t, w.api.txeNativeWriteClosed(admin, func() error { return nil }, nil, machineDAG))
+				require.Error(t, w.api.txeNativeWrite(admin, func() error { return nil }, nil, machineDAG))
+			}
+
 			// The same identity's command line is A's cli, never the
 			// administrator.
 			cli := txeIdentityOf(t, w.api, w.cliA)
@@ -102,7 +120,8 @@ func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 }
 
 // A listed administrator bound to nobody is the administrator only: it may
-// ask to be bound, as a person may, and approves no enrolment meanwhile.
+// ask to be bound, as a person may, but not approve that request itself, and
+// approves no enrolment meanwhile.
 // The builtin administrator is unchanged.
 func TestTxeUnboundSSOAdministratorIsNoPerson(t *testing.T) {
 	w := newTwoOwners(t, "enforce")
@@ -119,6 +138,15 @@ func TestTxeUnboundSSOAdministratorIsNoPerson(t *testing.T) {
 	got = txeIdentityOf(t, w.api, admin)
 	require.Equal(t, apigen.TxeIdentityStatePending, got.State)
 	require.NotNil(t, got.Request)
+
+	// It may not approve its own request, to any owner: that would make it
+	// the owner's person of its choosing.
+	for _, owner := range []string{w.ownerA, w.ownerB} {
+		_, err = w.api.ApproveTxeBinding(admin, apigen.ApproveTxeBindingRequestObject{OwnerId: owner,
+			Body: &apigen.ApproveTxeBindingJSONRequestBody{Issuer: ownersIssuer, Subject: "z", RequestGeneration: got.Request.Generation}})
+		require.Equal(t, http.StatusForbidden, statusOf(err), owner)
+	}
+	require.Equal(t, apigen.TxeIdentityStatePending, txeIdentityOf(t, w.api, admin).State)
 
 	_, err = w.api.EnrolTxeMachine(admin, apigen.EnrolTxeMachineRequestObject{MachineId: w.machineA,
 		Body: &apigen.EnrolTxeMachineJSONRequestBody{Class: "worker", ClientId: "c", Issuer: ownersIssuer, Subject: "z"}})
