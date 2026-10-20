@@ -28,11 +28,15 @@ func TestTxeWebhookTriggerOfAnOwnersDAG(t *testing.T) {
 			machineDAG := &ir.DAG{Name: txeauth.MachineDAGs(w.machineA)[0]}
 			jobDAG := &ir.DAG{Name: w.jobA}
 			ownerless := &ir.DAG{Name: "nightly"}
+			// A machine's DAG file that declares an ordinary name is that
+			// machine's DAG all the same.
+			alias := &ir.DAG{Name: "nightly", Location: "/dags/" + txeauth.MachineDAGs(w.machineA)[0] + ".yaml"}
 
 			require.NoError(t, w.api.txeWebhookTrigger(ctx, ownerless), "an ownerless DAG")
 			if mode == "enforce" {
 				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, machineDAG)))
 				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, jobDAG)))
+				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, alias)), "an alias of A's machine DAG")
 				return
 			}
 			assert.NoError(t, w.api.txeWebhookTrigger(ctx, machineDAG))

@@ -187,6 +187,9 @@ func (a *API) loadAgentStatus(ctx context.Context, root ir.DAGRunRef, subDAGRunI
 	if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionExecute); err != nil {
 		return ir.DAGRunRef{}, nil, nil, err
 	}
+	if err := a.txeRunRoute(ctx, status.Name, attempt, authz.PermissionExecute); err != nil {
+		return ir.DAGRunRef{}, nil, nil, err
+	}
 	return mutationRef, status, attempt, nil
 }
 

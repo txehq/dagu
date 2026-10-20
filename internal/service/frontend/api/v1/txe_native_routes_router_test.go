@@ -110,4 +110,22 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 	require.True(t, refusedAsNotFound(http.MethodDelete, run, manager, nil), "legacy deletes no owner's run")
 	require.Equal(t, http.StatusForbidden, status(http.MethodDelete, run, h.admin, nil), "the administrator deletes no owner's run")
 	waitForStoredDAGRunStatus(t, h.server, decideA, started.DagRunId, time.Second, func(s *ir.DAGRunStatus) bool { return s.Status == ir.Succeeded })
+
+	// A machine's DAG file that declares an ordinary name stores its runs
+	// under that name; they are still the machine's owner's.
+	aliasFile := txeauth.MachineDAGs(h.machineA)[1]
+	h.server.CreateDAGFile(t, h.server.Config.Paths.DAGsDir, aliasFile, []byte("name: nightly-alias\nsteps:\n  - name: s\n    run: echo s\n"))
+	var aliased api.ExecuteDAG200JSONResponse
+	h.server.Client().Post("/api/v1/dags/"+aliasFile+"/start", api.ExecuteDAGJSONRequestBody{}).
+		WithBearerToken(h.admin).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &aliased)
+	require.NotEmpty(t, aliased.DagRunId)
+	{
+		waitForStoredDAGRunStatus(t, h.server, "nightly-alias", aliased.DagRunId, 10*time.Second, func(s *ir.DAGRunStatus) bool {
+			return s.Status == ir.Succeeded
+		})
+		aliasRun := "/api/v1/dag-runs/nightly-alias/" + aliased.DagRunId
+		require.Equal(t, http.StatusForbidden, status(http.MethodDelete, aliasRun, h.admin, nil), "an alias's run is the owner's")
+		require.Equal(t, http.StatusForbidden, status(http.MethodPost, aliasRun+"/steps/s/agent-interactions/i1/respond", h.admin, map[string]any{"answer": "x"}),
+			"so is its agent session")
+	}
 }

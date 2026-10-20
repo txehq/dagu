@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
@@ -41,7 +42,7 @@ func (a *API) txeWebhookTrigger(ctx context.Context, dag *ir.DAG) error {
 	if a.txeAuth == nil {
 		return nil
 	}
-	res, owned, err := a.txeNativeResource(ctx, dag.Name)
+	res, owned, err := a.txeNativeResource(ctx, txeOwnedIdentity(dag))
 	mode := a.txeAuth.Mode()
 	switch {
 	case err != nil && mode == authz.ModeEnforce:
@@ -62,4 +63,47 @@ func (a *API) txeWebhookVisible(ctx context.Context, dagName string) bool {
 		return true
 	}
 	return a.txeNativeVisible(ctx, txeCanonicalDAGName(dagName))
+}
+
+// txeOwnedIdentity is the name of the owner's DAG that dag is, for a
+// decision on it: its file's name when that is an owner's DAG name, or
+// else the name it declares when that is one, or else its file's name. A
+// file that declares another name than its own answers here to whichever
+// of the two an owner holds, so an alias of an owner's DAG is decided as
+// that DAG and never as one of no owner. A run is stored under the name
+// its DAG declares, so a run's DAG is read from its attempt.
+func txeOwnedIdentity(dag *ir.DAG) string {
+	stem := dag.SuspendFlagName()
+	switch {
+	case txeNativeOwnedName(stem):
+		return stem
+	case txeNativeOwnedName(dag.Name):
+		return dag.Name
+	default:
+		return stem
+	}
+}
+
+// txeRunRoute decides permission on a run's DAG after the route's own
+// check: on runName, the name the run is stored under, and on the DAG its
+// attempt ran as its owner holds it (txeOwnedIdentity), when the attempt
+// can be read. Both must allow.
+func (a *API) txeRunRoute(ctx context.Context, runName string, attempt dagrun.Attempt, permission authz.Permission) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	if err := a.txeDAGRoute(ctx, runName, permission); err != nil {
+		return err
+	}
+	if attempt == nil {
+		return nil
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil || dag == nil {
+		return nil
+	}
+	if identity := txeOwnedIdentity(dag); identity != txeCanonicalDAGName(runName) {
+		return a.txeDAGRoute(ctx, identity, permission)
+	}
+	return nil
 }
