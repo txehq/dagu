@@ -144,8 +144,9 @@ func TestRemoteRunsAfterReadsRunsFromBeforeMidnight(t *testing.T) {
 // The listing is bounded by the watermark the reviews' checkpoint carries.
 // A run created before the lookback and the watermark is not read; a run
 // from the day before is. A review that covers everything it was shown,
-// with nothing left behind, moves the watermark to an hour before its
-// listing began; only the last result returned carries that.
+// with nothing left behind, moves the watermark to an hour before the
+// latest time the service reported; only the last result returned carries
+// that.
 func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
 	h := newRunHistory(t)
 	now := time.Now()
@@ -160,7 +161,7 @@ func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
 	stay := watermark(time.Time{})
 	assert.Equal(t, stay, runs[0].Cursor, "a review that stops here leaves the start where it was")
 	assert.Equal(t, stay, runs[1].Cursor)
-	assert.WithinDuration(t, now.Add(-time.Hour), listedFrom(t, runs[2].Cursor), 5*time.Second)
+	assert.WithinDuration(t, now.Add(-time.Minute-time.Hour), listedFrom(t, runs[2].Cursor), 2*time.Second)
 
 	// A watermark from an hour ago: the lookback reaches back a week, so the
 	// month-old run is not read, and yesterday's is.
@@ -211,6 +212,18 @@ func TestRemoteRunsAfterHoldsTheWatermarkForWhatItLeavesBehind(t *testing.T) {
 	for _, run := range runs {
 		assert.Equal(t, from, run.Cursor, run.RunID)
 	}
+}
+
+// The watermark is taken from the service's clock. With this machine's
+// clock ahead of the service's, a watermark from it would be later than
+// runs the service creates right after the listing, and they would be
+// skipped once the lookback no longer reaches them.
+func TestRemoteRunsAfterTakesTheWatermarkFromTheServicesClock(t *testing.T) {
+	h := newRunHistory(t)
+	behind := time.Now().Add(-3 * time.Hour)
+	h.run("latest", behind)
+	_, next := h.runsAfter("")
+	assert.WithinDuration(t, behind.Add(-time.Hour), listedFrom(t, next), 2*time.Second)
 }
 
 // A run retried after a review covered it keeps the time it was created.

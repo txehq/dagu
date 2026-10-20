@@ -1577,13 +1577,13 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	assert.Empty(t, runs)
 
 	// The review covered everything it was shown, so the checkpoint carries
-	// a watermark an hour before its listing, and the next listing starts at
-	// the lookback, a week ago.
+	// a watermark an hour before the latest time the service reported, the
+	// run's end. That is earlier than the lookback, so the next listing
+	// starts there.
 	cp, err := remote.Checkpoint(ctx, f.jobID)
 	require.NoError(t, err)
-	at, err := time.Parse(time.RFC3339, strings.TrimPrefix(cp.RunCursor, "listed-from:"))
-	require.NoError(t, err, cp.RunCursor)
-	assert.WithinDuration(t, time.Now().Add(-time.Hour), at, time.Minute)
+	watermark := time.Date(2026, 10, 9, 9, 1, 0, 0, time.UTC)
+	assert.Equal(t, "listed-from:"+watermark.Format(time.RFC3339), cp.RunCursor)
 	listing.starts = nil
 
 	// The run is retried on the queued path: same attempt id, later queue
@@ -1593,7 +1593,7 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"run-1"}, again.Packet.RunIDs())
 	require.NotEmpty(t, listing.starts)
-	assert.InDelta(t, time.Now().Add(-7*24*time.Hour).Unix(), listing.starts[0], 60)
+	assert.Equal(t, watermark.Unix(), listing.starts[0])
 	assert.Equal(t, "2026-10-09T10:00:30Z", again.Packet.NewRuns[0].QueuedAt)
 	_, err = reviewer("reviewer-c").Apply(ctx, again, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "again", EvidenceRunIDs: []string{"run-1"}})
 	require.NoError(t, err)

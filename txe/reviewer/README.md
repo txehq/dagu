@@ -496,10 +496,13 @@ files.
   and a retry keeps it, so the watermark moves only when nothing is left
   behind. A review that covers every result it was shown, while no run is
   unfinished, no result is beyond its packet and none changed while it was
-  read, moves the watermark to an hour before its listing began. Any other
-  review leaves it where the listing started.
+  read, moves the watermark to an hour before the latest time the service
+  reported for any run it listed. That is the service's clock, not the
+  reviewer machine's, which may be ahead of it. Any other review leaves the
+  watermark where the listing started.
 - The bound hides one thing: the new execution of a run that a review had
-  covered and that is retried more than seven days after it was created.
+  covered and that is retried later, when the run was created before both
+  the watermark and seven days before the listing.
 - So a retried run is shown again when its new execution ends, on either
   retry path; results with the same end time are separate results; a
   result reported late, a run created while the history was being listed
