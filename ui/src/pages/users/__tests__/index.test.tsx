@@ -111,7 +111,8 @@ const appBarValue = {
 
 function renderPage(
   response: components['schemas']['UsersListResponse'],
-  config: Partial<Config> = {}
+  config: Partial<Config> = {},
+  remoteNode = 'local'
 ) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
@@ -122,7 +123,13 @@ function renderPage(
   render(
     <MemoryRouter>
       <ConfigContext.Provider value={makeConfig(config)}>
-        <AppBarContext.Provider value={appBarValue}>
+        <AppBarContext.Provider
+          value={{
+            ...appBarValue,
+            remoteNodes: ['local', remoteNode],
+            selectedRemoteNode: remoteNode,
+          }}
+        >
           <UsersPage />
         </AppBarContext.Provider>
       </ConfigContext.Provider>
@@ -175,6 +182,36 @@ describe('UsersPage', () => {
     expect(
       screen.getByText(/Password sign-in is disabled on this hub/)
     ).toBeVisible();
+  });
+
+  // The setting is this hub's; a remote node's users follow that node.
+  it('offers password actions on a remote node while this hub disables passwords', async () => {
+    const user = userEvent.setup();
+    renderPage(
+      {
+        users: [
+          makeUser({
+            id: 'local-user',
+            username: 'local-user',
+            authProvider: UserAuthProvider.builtin,
+          }),
+        ],
+        managedRoleProviders: [],
+        managedWorkspaceAccessProviders: [],
+      },
+      { passwordLoginDisabled: true },
+      'edge'
+    );
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Actions for local-user' })
+    );
+    expect(
+      screen.getByRole('menuitem', { name: 'Reset Password' })
+    ).toBeVisible();
+    expect(
+      screen.queryByText(/Password sign-in is disabled on this hub/)
+    ).not.toBeInTheDocument();
   });
 
   it('offers adding a user while password sign-in is enabled', async () => {

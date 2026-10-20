@@ -120,10 +120,13 @@ export default function UsersPage() {
   const { user: currentUser } = useAuth();
   const isAdmin = useIsAdmin();
   const hasRbac = useHasFeature('rbac');
-  // auth.builtin.password_disabled: the hub refuses every password
-  // account, password and reset, so none is offered.
-  const passwordDisabled = !!config.passwordLoginDisabled;
   const appBarContext = useContext(AppBarContext);
+  // auth.builtin.password_disabled: this hub refuses every password account,
+  // password and reset, so none is offered. It is this hub's setting; a
+  // selected remote node's users are managed by that node's own policy.
+  const passwordDisabled =
+    !!config.passwordLoginDisabled &&
+    (appBarContext.selectedRemoteNode || 'local') === 'local';
   const [users, setUsers] = useState<User[]>([]);
   const [managedRoleProviders, setManagedRoleProviders] = useState<
     UserAuthProvider[]
