@@ -167,7 +167,9 @@ func (a *API) SearchDAGFeed(ctx context.Context, request api.SearchDAGFeedReques
 		return nil, err
 	}
 	if a.txeHubHidden(ctx) {
-		workspaceFilter = txeNothingFilter()
+		// It reads no DAG, so it finds none, without searching any
+		// (TXE-4752).
+		return api.SearchDAGFeed200JSONResponse(toDAGSearchFeedResponse(&pagination.CursorResult[persis.DAGSearchResult]{})), nil
 	}
 
 	result, errs, err := a.dagRepository.SearchCursor(ctx, persis.DAGSearchOptions{

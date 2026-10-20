@@ -24,7 +24,9 @@ func (a *API) ListArtifacts(
 		return nil, err
 	}
 	if a.txeHubHidden(ctx) {
-		workspaceFilter = txeNothingFilter()
+		// It reads no DAG, so it lists no run's artifacts, without
+		// reading any (TXE-4752).
+		return api.ListArtifacts200JSONResponse{Items: []api.ArtifactListItem{}}, nil
 	}
 
 	query := persis.ArtifactQuery{WorkspaceFilter: workspaceFilter}
