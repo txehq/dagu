@@ -520,3 +520,23 @@ func txeAsAdministratorOnly(ctx context.Context) bool {
 	only, _ := ctx.Value(administratorOnlyKey{}).(bool)
 	return only
 }
+
+// txeAsPersonOn reports whether the caller acts on the native DAG dagName as
+// an owner's person without being held to its owner: a platform
+// administrator bound to an owner, under enforce, on an owner's DAG, which
+// it may act on only as that person. Whatever a person may not do there, it
+// may not either.
+func (a *API) txeAsPersonOn(ctx context.Context, dagName string) bool {
+	if a.txeAuth == nil || a.txeOwnerOnly(ctx) {
+		return false
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil || c.mode != authz.ModeEnforce {
+		return false
+	}
+	if _, bound := c.scope.OwnerPerson(); !bound {
+		return false
+	}
+	_, owned, err := a.txeNativeResource(ctx, txeCanonicalDAGName(dagName))
+	return err != nil || owned
+}

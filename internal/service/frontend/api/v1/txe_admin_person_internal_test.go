@@ -111,6 +111,15 @@ func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeReviewerNeed))
 				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeMachineNeed))
 				require.Error(t, w.api.txeNativeWriteClosed(admin, func() error { return nil }, nil, machineDAG))
+				// On an owner's DAG it names no profile and no other queue,
+				// as a person may not; on a hub DAG it is the administrator.
+				require.True(t, w.api.txeAsPersonOn(admin, machineDAG))
+				require.False(t, w.api.txeAsPersonOn(admin, "hub-dag"))
+				profile := apigen.RuntimeProfileOverride("ops")
+				_, err := w.api.runProfileForDAG(admin, machineDAG, "", &profile)
+				require.ErrorIs(t, err, errTxeRuntimeProfile)
+			} else {
+				require.False(t, w.api.txeAsPersonOn(admin, txeauth.MachineDAGs(w.machineA)[0]))
 			}
 
 			// The same identity's command line is A's cli, never the
