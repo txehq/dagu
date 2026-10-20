@@ -254,11 +254,65 @@ describe('TxeInboxPage and machine enrolment', () => {
     );
   }
 
+  const pending = async () => [
+    {
+      machine_id: 'mch_1',
+      owner_id: 'own_A',
+      display_name: 'ada-laptop',
+      pending_applications: 1,
+    },
+  ];
+
+  // An allowlisted SSO administrator bound to an owner approves that owner's
+  // machines as its person (TXE-4710); the builtin administrator acts for
+  // nobody.
+  it("tells a bound SSO administrator when their owner's machine awaits approval", async () => {
+    identity.value = {
+      principal: {
+        class: 'platform_admin',
+        issuer: 'https://idp.example',
+        subject: 'sub-root',
+        shown: {},
+      },
+      platform_admin: true,
+      state: 'bound',
+      is_person: true,
+      owners: [{ owner_id: 'own_A', display_name: 'Ada' }],
+    };
+    try {
+      renderWithMachines(pending);
+      expect(
+        await screen.findByTestId('txe-pending-enrolments')
+      ).toBeInTheDocument();
+    } finally {
+      identity.value = undefined;
+    }
+  });
+
+  it('asks the builtin administrator for no machines', async () => {
+    identity.value = {
+      principal: { class: 'platform_admin', shown: { username: 'admin' } },
+      platform_admin: true,
+      state: 'unbound',
+      is_person: false,
+      owners: [],
+    };
+    const listMachines = vi.fn(pending);
+    try {
+      renderWithMachines(listMachines);
+      expect(await screen.findByTestId('txe-inbox-empty')).toBeInTheDocument();
+      expect(listMachines).not.toHaveBeenCalled();
+    } finally {
+      identity.value = undefined;
+    }
+  });
+
   it('tells a person when a machine of their owner awaits approval', async () => {
     identity.value = {
       principal: { class: 'person', shown: {} },
       state: 'bound',
       is_person: true,
+      owners: [{ owner_id: 'own_A', display_name: 'Ada' }],
     };
     try {
       renderWithMachines(async () => [

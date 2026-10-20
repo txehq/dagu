@@ -19,7 +19,11 @@ import {
   useTxeApi,
 } from '@/features/txe/hooks';
 import { EmptyPrivateInbox } from '@/features/txe/components/identity/EmptyPrivateInbox';
-import { isTxePerson, useTxeIdentity } from '@/features/txe/identity';
+import {
+  actsForOwner,
+  isTxePerson,
+  useTxeIdentity,
+} from '@/features/txe/identity';
 import { mayDecide } from '@/features/txe/access';
 import { buildInbox } from '@/features/txe/inbox';
 
@@ -65,7 +69,7 @@ export default function TxeInboxPage(): React.ReactElement {
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-4">
       {!personDecisions && <DecisionAuthNotice />}
-      {isTxePerson(identity) && <PendingEnrolmentsNotice />}
+      {actsForOwner(identity) && <PendingEnrolmentsNotice />}
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">
           <I18nText text="Job inbox" />
