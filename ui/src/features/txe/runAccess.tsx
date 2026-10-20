@@ -51,7 +51,10 @@ export function useJobRunAllowed(
     // other TXE pages do.
     {
       onError: () => undefined,
-      shouldRetryOnError: false,
+      // A failed read keeps the last answer and is tried again, so polling
+      // goes on once the hub answers.
+      shouldRetryOnError: true,
+      errorRetryInterval: ACCESS_REFRESH_MS,
       refreshInterval: ACCESS_REFRESH_MS,
     }
   );

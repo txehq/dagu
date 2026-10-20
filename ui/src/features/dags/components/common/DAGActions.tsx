@@ -60,6 +60,9 @@ type Props = {
   refresh?: () => void;
   /** Display mode: 'compact' for icon-only, 'full' for text+icon buttons */
   displayMode?: 'compact' | 'full';
+  /** Whether to follow the hub's access answer for a job's DAG. Only a DAG's
+   * own page asks; a list row would ask once per row. */
+  checkJobAccess?: boolean;
 };
 
 /**
@@ -71,10 +74,11 @@ function DAGActions({
   dag,
   refresh,
   displayMode = 'compact',
+  checkJobAccess = false,
 }: Props) {
   const { ts } = useI18n();
   const dagContext = React.useContext(DAGContext);
-  const runAllowed = useJobRunAllowed(fileName);
+  const runAllowed = useJobRunAllowed(checkJobAccess ? fileName : undefined);
   const config = useConfig();
   const { hasUnsavedChanges } = useUnsavedChanges();
   const { showError } = useErrorModal();

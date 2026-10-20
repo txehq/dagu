@@ -68,10 +68,16 @@ function DAGRunActions({
 }: Props) {
   const { ts } = useI18n();
   const remoteNode = useRemoteNode();
-  // The hub decides a run's actions by its root's DAG.
-  const runAllowed = useJobRunAllowed(
-    (dagRun && 'rootDAGRunName' in dagRun && dagRun.rootDAGRunName) || name
-  );
+  // The hub decides a run's actions by its root's DAG and, for a sub-run of
+  // another job, by that job too: either refusing is a refusal.
+  const rootName =
+    (dagRun && 'rootDAGRunName' in dagRun && dagRun.rootDAGRunName) || name;
+  const rootAllowed = useJobRunAllowed(rootName);
+  const ownAllowed = useJobRunAllowed(name !== rootName ? name : undefined);
+  const runAllowed =
+    rootAllowed === false || ownAllowed === false
+      ? false
+      : (rootAllowed ?? ownAllowed);
   const config = useConfig();
   const { showError } = useErrorModal();
   const { showToast } = useSimpleToast();

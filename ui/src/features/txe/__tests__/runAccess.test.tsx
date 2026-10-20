@@ -163,6 +163,34 @@ describe('useJobRunAllowed', () => {
     }
   });
 
+  // A failed read is tried again, so a later grant or revoke still shows.
+  it('goes on reading after a failed read', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      principal.current = TxeIdentityPrincipalClass.person;
+      answer([TxeAccessPermission.view], TxeJobAccessVia.share);
+      const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
+      await waitFor(() => expect(result.current).toBe(false));
+
+      GET.mockResolvedValueOnce({ error: { message: 'unavailable' } });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ACCESS_REFRESH_MS + 100);
+      });
+      expect(result.current).toBe(false);
+
+      answer(
+        [TxeAccessPermission.view, TxeAccessPermission.execute],
+        TxeJobAccessVia.share
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3 * ACCESS_REFRESH_MS);
+      });
+      await waitFor(() => expect(result.current).toBe(true));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('says nothing when the job cannot be read', async () => {
     GET.mockResolvedValue({ error: { message: 'unavailable' } });
     const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });

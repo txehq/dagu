@@ -62,10 +62,14 @@ vi.mock('../../../../../hooks/api', () => ({
 
 const runAccess = vi.hoisted(() => ({
   allowed: undefined as boolean | undefined,
+  asked: [] as (string | undefined)[],
 }));
 
 vi.mock('@/features/txe/runAccess', () => ({
-  useJobRunAllowed: () => runAccess.allowed,
+  useJobRunAllowed: (name: string | undefined) => {
+    runAccess.asked.push(name);
+    return name ? runAccess.allowed : undefined;
+  },
   ViewOnly: () => <span>View only</span>,
 }));
 
@@ -95,6 +99,7 @@ function LocationProbe() {
 beforeEach(() => {
   vi.clearAllMocks();
   runAccess.allowed = undefined;
+  runAccess.asked = [];
   client.GET.mockResolvedValue({ data: { dag: { name: 'example' } } });
   client.POST.mockResolvedValue({ data: { dagRunId: 'created-run' } });
 });
@@ -169,6 +174,7 @@ describe('DAGActions', () => {
         fileName="job_01M4XEETKWKZX504BK65ADBVYB"
         dag={{ name: 'job_01M4XEETKWKZX504BK65ADBVYB' }}
         displayMode="full"
+        checkJobAccess
       />,
       { wrapper: MemoryRouter }
     );
@@ -177,6 +183,22 @@ describe('DAGActions', () => {
     expect(
       screen.queryByRole('button', { name: 'Start' })
     ).not.toBeInTheDocument();
+  });
+
+  // A list row does not ask: a page of job DAGs would ask once per row.
+  it('does not ask for the job access unless the page asks it to', () => {
+    runAccess.allowed = false;
+    render(
+      <DAGActions
+        fileName="job_01M4XEETKWKZX504BK65ADBVYB"
+        dag={{ name: 'job_01M4XEETKWKZX504BK65ADBVYB' }}
+        displayMode="full"
+      />,
+      { wrapper: MemoryRouter }
+    );
+
+    expect(runAccess.asked.every((name) => name === undefined)).toBe(true);
+    expect(screen.getByRole('button', { name: 'Start' })).toBeInTheDocument();
   });
 
   it('shows cancel for failed runs with pending auto retries', () => {
