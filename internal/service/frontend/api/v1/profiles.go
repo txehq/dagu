@@ -838,6 +838,12 @@ func (a *API) getRuntimeProfileForManage(ctx context.Context, name string) (*pro
 
 func (a *API) explicitRunProfile(ctx context.Context, raw *api.RuntimeProfileOverride) (string, bool, error) {
 	if raw != nil {
+		// Profiles belong to the whole hub, and a caller held to its owner
+		// cannot read them: naming one would hand its values to a run on
+		// the owner's machine. Naming none grants nothing.
+		if strings.TrimSpace(*raw) != "" && a.txeOwnerOnly(ctx) {
+			return "", true, errTxeRuntimeProfile
+		}
 		profileName, err := a.ensureRunnableRuntimeProfile(ctx, string(*raw))
 		return profileName, true, err
 	}
