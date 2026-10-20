@@ -1,4 +1,4 @@
-# Local Dagu worker (macOS)
+# Local Dagu worker (macOS; Linux in "Linux (systemd)")
 
 Runs Connor's jobs on his machine for the Dagu service in the TXE staging cluster
 (`capso-txe-development`, namespace `dagu`). The service schedules a job; this worker runs its
@@ -150,3 +150,34 @@ txe/worker/stop.sh
 ```
 
 This stops both agents. All data is kept.
+
+## Linux (systemd)
+
+`install-systemd.sh` is the Linux counterpart of `install.sh` (TXE-4715). It takes the same flags
+(`--tag`, `--owner-id`, `--credential-file`, `--no-credential`) and keeps the same TXE home,
+`machine.json` and machine-credential rules. Instead of launchd agents it writes two **systemd
+user** units into `~/.config/systemd/user` and starts them:
+
+| Unit | What it runs |
+|---|---|
+| `txe-dagu-tunnel.service` | the same `kubectl port-forward` as `com.txe.dagu.tunnel` |
+| `txe-dagu-worker.service` | the same `dagu worker` as `com.txe.dagu.worker`; once enrolled, it gets the credential file's path in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`, never its contents |
+
+```sh
+txe/worker/tunnel-credential.sh                                  # needs this machine's cluster access
+txe/worker/install-systemd.sh --tag txe-v2.18.2-<n> --owner-id own_...   # first install
+dagu txe enrol --client-id <this machine's worker client> --wait 15m    # then, as on macOS
+txe/worker/install-systemd.sh --tag txe-v2.18.2-<n>                      # the worker now passes it
+txe/worker/uninstall-systemd.sh            # stop and remove both units; the TXE home is kept
+txe/worker/uninstall-systemd.sh --purge    # and delete the TXE home (irreversible)
+```
+
+- **Tested on** Ubuntu 24.04 arm64, in an isolated OrbStack machine with no host file sharing
+  (2026-10-20). That run used a local hub in enforce mode: an enrolled worker ran its pinned DAG,
+  and uninstall removed the units and kept `machine.json` and the credential. Other distributions
+  with systemd user instances should work but are not claimed.
+- **Lingering:** user units stop at logout unless lingering is on (`loginctl enable-linger <user>`,
+  which may need an administrator). The install reports which.
+- **Logs:** `$TXE_DAGU_HOME/logs/{tunnel,worker}.log`. `StandardOutput=append:` takes the path
+  unquoted, so a TXE home whose path holds a space, `%` or `$` is refused.
+- Uninstalling does not revoke the machine's enrolment; revoke it in the hub.
