@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	api "github.com/dagucloud/dagu/v2/api/v1"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -141,6 +142,9 @@ type txeLocalState struct {
 	ReceiptHeld bool   `json:"receipt_held"`
 }
 
+// txeRunsLimit is the most runs the hub returns in one listing.
+const txeRunsLimit = 500
+
 func runTXEInspect(ctx *Context, args []string) error {
 	client, err := txeClient(ctx)
 	if err != nil {
@@ -155,22 +159,29 @@ func runTXEInspect(ctx *Context, args []string) error {
 		return err
 	}
 
-	// Runs are Dagu's own records of the DAG named after the job.
+	limit := 5
+	if raw, err := ctx.StringParam("runs"); err == nil {
+		if _, scanErr := fmt.Sscanf(raw, "%d", &limit); scanErr != nil || limit < 0 {
+			return fmt.Errorf("--runs must be a number, got %q", raw)
+		}
+	}
+
+	// Runs are Dagu's own records of the DAG named after the job. Asked for no
+	// start, the hub lists only runs since its local midnight, so the query
+	// starts at the epoch and asks for the newest runs inspect shows.
 	var runs []txeRun
 	remote, err := txeRemote(ctx)
 	if err != nil {
 		return err
 	}
-	summaries, err := remote.listDAGRuns(ctx, remoteHistoryQuery{Name: job.JobID})
-	if err != nil {
-		if remoteErr, ok := errors.AsType[*remoteError](err); !ok || !remoteErr.NotFound() {
-			return fmt.Errorf("list runs of %s: %w", job.JobID, err)
-		}
-	}
-	limit := 5
-	if raw, err := ctx.StringParam("runs"); err == nil {
-		if _, scanErr := fmt.Sscanf(raw, "%d", &limit); scanErr != nil || limit < 0 {
-			return fmt.Errorf("--runs must be a number, got %q", raw)
+	var summaries []api.DAGRunSummary
+	if limit > 0 {
+		from := int64(0)
+		summaries, err = remote.listDAGRuns(ctx, remoteHistoryQuery{Name: job.JobID, From: &from, Limit: min(limit, txeRunsLimit)})
+		if err != nil {
+			if remoteErr, ok := errors.AsType[*remoteError](err); !ok || !remoteErr.NotFound() {
+				return fmt.Errorf("list runs of %s: %w", job.JobID, err)
+			}
 		}
 	}
 	for i, s := range summaries {
