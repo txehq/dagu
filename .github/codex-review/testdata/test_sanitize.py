@@ -40,8 +40,19 @@ class Sanitize(unittest.TestCase):
         self.assertNotIn("PRIVATE", text)
         self.assertNotIn("private", text)
         self.assertEqual(out["user"]["login"], "chatgpt-codex-connector[bot]")
-        self.assertEqual(sanitize.walk({"user": {"login": "private-integration[bot]"}})["user"]["login"], "another-app[bot]")
         self.assertTrue(out["path"].startswith("synthetic/"))
+        self.assertEqual(sanitize.walk({"user": {"login": "private-integration[bot]"}})["user"]["login"], "another-app[bot]")
+
+    def test_account_ids_and_private_labels_are_dropped(self):
+        out = sanitize.walk({"id": 7, "user": {"login": "x", "id": 123456789, "type": "User"},
+                             "event": "labeled", "actor": {"login": "y", "id": 987654321, "type": "User"},
+                             "label": {"name": "customer-acme", "color": "b60205"},
+                             "labels": [{"name": "review-override"}, {"name": "secret-project"}]})
+        text = json.dumps(out)
+        for private in ("123456789", "987654321", "customer-acme", "secret-project"):
+            self.assertNotIn(private, text)
+        self.assertEqual(out["id"], 7)
+        self.assertEqual([l["name"] for l in out["labels"]], ["review-override", "synthetic-label"])
 
     def test_private_text_inside_kept_values_is_dropped(self):
         body = ('<!-- codex-review-state:v1 {"code_review":{"commit_sha":"' + SECRET + '","status":"' + SECRET

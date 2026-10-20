@@ -3,7 +3,6 @@
   "id": 33537606435,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -14,7 +13,6 @@
   "id": 33537614742,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -25,22 +23,19 @@
   "id": 33537643961,
   "actor": {
    "login": "another-app[bot]",
-   "id": 41898282,
    "type": "Bot"
   },
   "event": "labeled",
   "commit_id": null,
   "created_at": "2026-10-17T19:45:24Z",
   "label": {
-   "name": "review-fix-v2",
-   "color": "0e8a16"
+   "name": "synthetic-label"
   }
  },
  {
   "id": 33537970823,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -51,7 +46,6 @@
   "id": 33537982155,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -62,7 +56,6 @@
   "id": 33538173952,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -73,7 +66,6 @@
   "id": 33538182408,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -84,7 +76,6 @@
   "id": 33538375311,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -95,7 +86,6 @@
   "id": 33538378268,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -106,7 +96,6 @@
   "id": 33538687997,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -117,7 +106,6 @@
   "id": 33538698139,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -128,7 +116,6 @@
   "id": 33538947583,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -139,7 +126,6 @@
   "id": 33538961158,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -150,7 +136,6 @@
   "id": 33539230541,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -161,7 +146,6 @@
   "id": 33539239311,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -172,7 +156,6 @@
   "id": 33539522659,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -183,7 +166,6 @@
   "id": 33539541263,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -194,7 +176,6 @@
   "id": 33540074559,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -205,7 +186,6 @@
   "id": 33540817043,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "referenced",
@@ -216,7 +196,6 @@
   "id": 33540819676,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -227,7 +206,6 @@
   "id": 33540984678,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",

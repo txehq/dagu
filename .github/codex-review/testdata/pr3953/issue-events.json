@@ -3,7 +3,6 @@
   "id": 33531632590,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -14,7 +13,6 @@
   "id": 33531640674,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -25,7 +23,6 @@
   "id": 33531770133,
   "actor": {
    "login": "a-person",
-   "id": 267193182,
    "type": "User"
   },
   "event": "mentioned",
@@ -36,7 +33,6 @@
   "id": 33533347700,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "closed",
@@ -47,7 +43,6 @@
   "id": 33533350587,
   "actor": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "event": "head_ref_deleted",

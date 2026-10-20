@@ -3,7 +3,6 @@
   "id": 5545891883,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -15,7 +14,6 @@
   "id": 5546039867,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -27,7 +25,6 @@
   "id": 5550338861,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `1757a33d72`",
@@ -39,7 +36,6 @@
   "id": 5550655422,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `17299111c1`",
@@ -51,7 +47,6 @@
   "id": 5550906105,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `2bf1311d2b`",

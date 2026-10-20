@@ -3,7 +3,6 @@
   "id": 6212618667,
   "user": {
    "login": "another-app[bot]",
-   "id": 222613912,
    "type": "Bot"
   },
   "created_at": "2026-10-16T09:37:30Z",
@@ -14,7 +13,6 @@
   "id": 6212817829,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "created_at": "2026-10-16T09:49:08Z",
@@ -25,7 +23,6 @@
   "id": 6212993235,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "created_at": "2026-10-16T09:59:21Z",
@@ -36,7 +33,6 @@
   "id": 6215553282,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "created_at": "2026-10-16T12:31:20Z",
@@ -47,7 +43,6 @@
   "id": 6219997521,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "created_at": "2026-10-16T16:29:00Z",
@@ -58,7 +53,6 @@
   "id": 6220275397,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "created_at": "2026-10-16T16:44:27Z",
@@ -69,7 +63,6 @@
   "id": 6220720540,
   "user": {
    "login": "a-person",
-   "id": 44717411,
    "type": "User"
   },
   "created_at": "2026-10-16T17:09:59Z",

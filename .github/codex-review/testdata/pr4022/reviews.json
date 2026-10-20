@@ -3,7 +3,6 @@
   "id": 5559752220,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `828845b6dc`",
@@ -15,7 +14,6 @@
   "id": 5559771250,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -27,7 +25,6 @@
   "id": 5559782904,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `7f294a489f`",
@@ -39,7 +36,6 @@
   "id": 5559789062,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -51,7 +47,6 @@
   "id": 5559798186,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `f40da6a530`",
@@ -63,7 +58,6 @@
   "id": 5559806509,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -75,7 +69,6 @@
   "id": 5559830375,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `c725d70dea`",
@@ -87,7 +80,6 @@
   "id": 5559850214,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -99,7 +91,6 @@
   "id": 5559871697,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `34dcfbdd5f`",
@@ -111,7 +102,6 @@
   "id": 5559883765,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -123,7 +113,6 @@
   "id": 5559883917,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -135,7 +124,6 @@
   "id": 5559884069,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -147,7 +135,6 @@
   "id": 5559898693,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `839c3bc973`",
@@ -159,7 +146,6 @@
   "id": 5559914126,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -171,7 +157,6 @@
   "id": 5559925955,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `5b92902be3`",
@@ -183,7 +168,6 @@
   "id": 5559944060,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -195,7 +179,6 @@
   "id": 5559944252,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -207,7 +190,6 @@
   "id": 5559944420,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -219,7 +201,6 @@
   "id": 5559966765,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `2fc3031c4f`",
@@ -231,7 +212,6 @@
   "id": 5560006570,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -243,7 +223,6 @@
   "id": 5560024133,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `0fd56af346`",
@@ -255,7 +234,6 @@
   "id": 5560031291,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -267,7 +245,6 @@
   "id": 5560031450,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",
@@ -279,7 +256,6 @@
   "id": 5560032027,
   "user": {
    "login": "chatgpt-codex-connector[bot]",
-   "id": 199175422,
    "type": "Bot"
   },
   "body": "Synthetic comment.",
@@ -291,7 +267,6 @@
   "id": 5560092927,
   "user": {
    "login": "a-person",
-   "id": 7822862,
    "type": "User"
   },
   "body": "Synthetic comment.",

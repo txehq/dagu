@@ -65,6 +65,12 @@ def body(text):
 def walk(v, key=None):
     if isinstance(v, dict) and key == "repo":
         return {"full_name": "synthetic/repo"}
+    if isinstance(v, dict) and key in ("user", "actor"):
+        # An account: its login (rewritten below) and type only; never its numeric id.
+        return {k: walk(x, k) for k, x in v.items() if k in ("login", "type")}
+    if isinstance(v, dict) and key == "label":
+        # Only the override label's name is read by the check; other label names are private.
+        return {"name": v.get("name") if v.get("name") == "review-override" else "synthetic-label"}
     if isinstance(v, dict):
         return {k: walk(x, k) for k, x in v.items() if k in FIELDS}
     if isinstance(v, list):
@@ -83,7 +89,9 @@ def walk(v, key=None):
         return paths.setdefault(v, v if v.startswith("synthetic/") else f"synthetic/file{len(paths) + 1}.go")
     if key == "full_name":
         return "synthetic/repo"
-    if key in ("name", "state", "event", "type", "side", "subject_type", "color"):
+    if key == "name":
+        return v if v == "review-override" else "synthetic-label"
+    if key in ("state", "event", "type", "side", "subject_type", "color"):
         return v if len(v) <= 40 and "\n" not in v else "synthetic"
     return v
 
