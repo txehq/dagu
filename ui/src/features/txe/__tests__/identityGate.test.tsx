@@ -117,7 +117,7 @@ describe('TxePersonGate', () => {
   afterEach(() => {
     setRefused.mockRestore();
     sseManager.setRefused(false);
-    setPersonSignal(false);
+    setPersonSignal(undefined);
     mocks.authMode.value = 'builtin';
     mocks.token.value = 'token-a';
   });
@@ -244,7 +244,7 @@ describe('TxePersonGate', () => {
 
     expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
     expect(setRefused).toHaveBeenCalledWith(false);
-    expect(sessionStorage.getItem('dagu_txe_person')).toBeNull();
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe('0');
   });
 
   it('gives the dashboard as before when the identity cannot be read', async () => {

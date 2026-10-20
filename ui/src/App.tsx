@@ -413,9 +413,15 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   const canFetchAuthenticatedResources =
     config.authMode !== 'builtin' || authToken !== null;
   // The hub refuses a person workspaces, remote nodes and license status,
-  // and a person's dashboard pins all workspaces and the local hub.
+  // and a person's dashboard pins all workspaces and the local hub. Only
+  // builtin authentication has persons; a signed-in session there waits for
+  // the person gate, which shows nothing until it has read the identity.
   const person = usePersonSignal();
-  const canFetchAppResources = canFetchAuthenticatedResources && !person;
+  const awaitingIdentity =
+    config.authMode === 'builtin' && authToken !== null && person === undefined;
+  const canFetchAppResources =
+    canFetchAuthenticatedResources &&
+    (config.authMode !== 'builtin' || person === false);
   const handleSelectWorkspace = React.useCallback(
     (selection: WorkspaceSelection) => {
       const sanitized = sanitizeWorkspaceSelection(selection);
@@ -457,6 +463,9 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   );
 
   const fetchWorkspaces = React.useCallback(async () => {
+    if (awaitingIdentity) {
+      return;
+    }
     if (!canFetchAppResources) {
       setWorkspaceError(null);
       applyWorkspaces(initialWorkspacesRef.current ?? []);
@@ -493,7 +502,13 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
         setWorkspacesLoaded(true);
       }
     }
-  }, [applyWorkspaces, canFetchAppResources, client, selectedRemoteNode]);
+  }, [
+    applyWorkspaces,
+    awaitingIdentity,
+    canFetchAppResources,
+    client,
+    selectedRemoteNode,
+  ]);
 
   const handleCreateWorkspace = React.useCallback(
     async (name: string) => {
@@ -603,7 +618,7 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
     return addAuthSessionListener((change) => {
       setAuthToken(change.token);
       if (change.token === null) {
-        setPersonSignal(false);
+        setPersonSignal(undefined);
       }
     });
   }, []);

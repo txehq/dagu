@@ -11,15 +11,15 @@ import {
 } from '../personSignal';
 
 afterEach(() => {
-  setPersonSignal(false);
+  setPersonSignal(undefined);
   sessionStorage.clear();
   resetPersonSignalForTest();
 });
 
 describe('the person signal', () => {
-  it('tells the app shell when the caller is a person, and when not', () => {
+  it('is unknown until the gate has read the identity, then says which', () => {
     const { result } = renderHook(() => usePersonSignal());
-    expect(result.current).toBe(false);
+    expect(result.current).toBeUndefined();
 
     act(() => setPersonSignal(true));
     expect(result.current).toBe(true);
@@ -27,7 +27,16 @@ describe('the person signal', () => {
 
     act(() => setPersonSignal(false));
     expect(result.current).toBe(false);
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe('0');
+  });
+
+  it('is forgotten on sign-out', () => {
+    act(() => setPersonSignal(true));
+    act(() => setPersonSignal(undefined));
+
     expect(sessionStorage.getItem('dagu_txe_person')).toBeNull();
+    const { result } = renderHook(() => usePersonSignal());
+    expect(result.current).toBeUndefined();
   });
 
   // A reload of a person's tab must not ask before the identity is read.

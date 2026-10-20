@@ -1,14 +1,17 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Config } from '@/contexts/ConfigContext';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import App from '../App';
-import { resetPersonSignalForTest } from '@/features/txe/personSignal';
+import {
+  resetPersonSignalForTest,
+  setPersonSignal,
+} from '@/features/txe/personSignal';
 import { useLicense } from '@/hooks/useLicense';
 import userEvent from '@testing-library/user-event';
 
@@ -296,20 +299,29 @@ describe('legacy Wiki routing', () => {
   });
 });
 
-// A person signed in through the identity provider, as TxePersonGate last
-// read it in this tab: the hub refuses a person these app-level reads.
-describe('App shell for a person', () => {
+// The app shell asks the hub for workspaces, remote nodes and license status,
+// which the hub refuses a person. Under builtin authentication it asks only
+// once TxePersonGate has read that the signed-in caller is not a person.
+describe('App shell and the person signal', () => {
+  const builtin = () => makeConfig({ authMode: 'builtin' });
+
+  beforeEach(() => {
+    localStorage.setItem('dagu_auth_token', 'token-a');
+    // The identity is never answered here, so the gate leaves the signal as
+    // the test sets it.
+    clientGetMock.mockImplementation((path: string) =>
+      path === '/txe/identity'
+        ? new Promise(() => undefined)
+        : Promise.resolve({ data: { workspaces: [] } })
+    );
+  });
+
   afterEach(() => {
     sessionStorage.clear();
     resetPersonSignalForTest();
   });
 
-  it('asks for no workspaces, remote nodes or license status', async () => {
-    sessionStorage.setItem('dagu_txe_person', '1');
-    resetPersonSignalForTest();
-    renderAt('/home');
-
-    expect(await screen.findByRole('heading', { name: 'Home' })).toBeVisible();
+  function expectNoAppReads() {
     expect(clientGetMock).not.toHaveBeenCalledWith(
       '/workspaces',
       expect.anything()
@@ -318,23 +330,32 @@ describe('App shell for a person', () => {
       expect.stringContaining('/remote-nodes'),
       expect.anything()
     );
-    expect(useQueryMock).toHaveBeenCalledWith(
-      '/license/status',
-      null,
-      expect.anything()
-    );
     expect(useQueryMock).not.toHaveBeenCalledWith(
       '/license/status',
       { params: { query: { remoteNode: 'local' } } },
       expect.anything()
     );
+  }
+
+  it('asks for none of them for a person', async () => {
+    sessionStorage.setItem('dagu_txe_person', '1');
+    resetPersonSignalForTest();
+    renderAt('/home', builtin());
+
+    await new Promise((r) => setTimeout(r, 50));
+    expectNoAppReads();
   });
 
-  it('asks for them for every other caller', async () => {
+  // A cold sign-in in a fresh tab: nothing is asked before the gate has read
+  // the identity, then everything is for a caller who is not a person.
+  it('waits for the identity, then asks for them for anyone else', async () => {
     resetPersonSignalForTest();
-    renderAt('/home');
+    renderAt('/home', builtin());
 
-    expect(await screen.findByRole('heading', { name: 'Home' })).toBeVisible();
+    await new Promise((r) => setTimeout(r, 50));
+    expectNoAppReads();
+
+    act(() => setPersonSignal(false));
     await waitFor(() =>
       expect(clientGetMock).toHaveBeenCalledWith('/workspaces', {
         params: { query: { remoteNode: 'local' } },
@@ -343,6 +364,20 @@ describe('App shell for a person', () => {
     expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/remote-nodes'),
       expect.anything()
+    );
+  });
+
+  // Only builtin authentication has persons: a flag left from such a session
+  // does not hold back another mode.
+  it('ignores the signal without builtin authentication', async () => {
+    sessionStorage.setItem('dagu_txe_person', '1');
+    resetPersonSignalForTest();
+    renderAt('/home');
+
+    await waitFor(() =>
+      expect(clientGetMock).toHaveBeenCalledWith('/workspaces', {
+        params: { query: { remoteNode: 'local' } },
+      })
     );
   });
 });

@@ -5,31 +5,35 @@ import { useSyncExternalStore } from 'react';
 
 // The app shell sits above TxePersonGate and asks the hub for workspaces,
 // remote nodes and license status, which the hub refuses a person. The gate
-// publishes here whether the signed-in caller is a person, so the shell can
-// leave those requests out. It is kept for this tab across reloads, so a
-// person's page load does not ask before the identity has been read again,
-// and it is cleared on sign-out.
+// publishes here whether the signed-in caller is a person once it has read
+// the identity; until then the signal is unknown (undefined). It is kept for
+// this tab across reloads, so a person's page load does not ask before the
+// identity has been read again, and it is cleared on sign-out.
 const STORAGE_KEY = 'dagu_txe_person';
 
-function stored(): boolean {
+type Signal = boolean | undefined;
+
+function stored(): Signal {
   try {
-    return sessionStorage.getItem(STORAGE_KEY) === '1';
+    const value = sessionStorage.getItem(STORAGE_KEY);
+    return value === '1' ? true : value === '0' ? false : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
-let current = stored();
+let current: Signal = stored();
 const listeners = new Set<() => void>();
 
-export function setPersonSignal(person: boolean): void {
+// setPersonSignal records what the gate read; undefined forgets it.
+export function setPersonSignal(person: Signal): void {
   if (person === current) return;
   current = person;
   try {
-    if (person) {
-      sessionStorage.setItem(STORAGE_KEY, '1');
-    } else {
+    if (person === undefined) {
       sessionStorage.removeItem(STORAGE_KEY);
+    } else {
+      sessionStorage.setItem(STORAGE_KEY, person ? '1' : '0');
     }
   } catch {
     // Without storage the signal still holds for this page.
@@ -44,9 +48,10 @@ function subscribe(listener: () => void): () => void {
   };
 }
 
-// usePersonSignal is whether the signed-in caller is, as far as this tab last
-// read, a person signed in through the identity provider.
-export function usePersonSignal(): boolean {
+// usePersonSignal is whether the signed-in caller is, as this tab last read
+// it, a person signed in through the identity provider; undefined until the
+// gate has read the identity of this session.
+export function usePersonSignal(): Signal {
   return useSyncExternalStore(subscribe, () => current);
 }
 
