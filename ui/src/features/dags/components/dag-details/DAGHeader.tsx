@@ -292,6 +292,7 @@ const DAGHeader: React.FC<DAGHeaderProps> = ({
               fileName={fileName}
               refresh={refreshFn}
               displayMode="full"
+              checkJobAccess
             />
           </div>
         )}

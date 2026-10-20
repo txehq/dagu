@@ -34,6 +34,7 @@ import { getDAGRunTerminateActionDetails } from './terminateAction';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
 
 /**
  * Props for the DAGRunActions component
@@ -67,6 +68,16 @@ function DAGRunActions({
 }: Props) {
   const { ts } = useI18n();
   const remoteNode = useRemoteNode();
+  // The hub decides a run's actions by its root's DAG and, for a sub-run of
+  // another job, by that job too: either refusing is a refusal.
+  const rootName =
+    (dagRun && 'rootDAGRunName' in dagRun && dagRun.rootDAGRunName) || name;
+  const rootAllowed = useJobRunAllowed(rootName);
+  const ownAllowed = useJobRunAllowed(name !== rootName ? name : undefined);
+  const runAllowed =
+    rootAllowed === false || ownAllowed === false
+      ? false
+      : (rootAllowed ?? ownAllowed);
   const config = useConfig();
   const { showError } = useErrorModal();
   const { showToast } = useSimpleToast();
@@ -189,6 +200,10 @@ function DAGRunActions({
 
   if (!dagRun || !config.permissions.runDags) {
     return <></>;
+  }
+
+  if (runAllowed === false) {
+    return <ViewOnly />;
   }
 
   return (

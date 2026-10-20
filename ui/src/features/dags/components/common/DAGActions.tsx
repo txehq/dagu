@@ -40,6 +40,7 @@ import { pushRunProgress, StartDAGModal } from '../dag-execution';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
 
 /**
  * Props for the DAGActions component
@@ -59,6 +60,9 @@ type Props = {
   refresh?: () => void;
   /** Display mode: 'compact' for icon-only, 'full' for text+icon buttons */
   displayMode?: 'compact' | 'full';
+  /** Whether to follow the hub's access answer for a job's DAG. Only a DAG's
+   * own page asks; a list row would ask once per row. */
+  checkJobAccess?: boolean;
 };
 
 /**
@@ -70,9 +74,11 @@ function DAGActions({
   dag,
   refresh,
   displayMode = 'compact',
+  checkJobAccess = false,
 }: Props) {
   const { ts } = useI18n();
   const dagContext = React.useContext(DAGContext);
+  const runAllowed = useJobRunAllowed(checkJobAccess ? fileName : undefined);
   const config = useConfig();
   const { hasUnsavedChanges } = useUnsavedChanges();
   const { showError } = useErrorModal();
@@ -293,6 +299,10 @@ function DAGActions({
 
   if (!dag || !config.permissions.runDags) {
     return <></>;
+  }
+
+  if (runAllowed === false) {
+    return <ViewOnly />;
   }
 
   return (

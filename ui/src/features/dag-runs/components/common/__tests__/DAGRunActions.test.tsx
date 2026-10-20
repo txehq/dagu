@@ -11,6 +11,19 @@ import {
   isFailedAutoRetryPendingRun,
 } from '../terminateAction';
 
+const runAccess = vi.hoisted(() => ({
+  allowed: undefined as boolean | undefined,
+  byName: {} as Record<string, boolean>,
+}));
+
+vi.mock('@/features/txe/runAccess', () => ({
+  useJobRunAllowed: (name: string | undefined) =>
+    name && name in runAccess.byName
+      ? runAccess.byName[name]
+      : runAccess.allowed,
+  ViewOnly: () => <span>View only</span>,
+}));
+
 vi.mock('../../../../../contexts/ConfigContext', () => ({
   useConfig: () => ({
     permissions: {
@@ -115,6 +128,64 @@ describe('DAGRunActions', () => {
         autoRetryLimit: 0,
       })
     ).toBe('none');
+  });
+
+  it('offers no run control on a run of a job the caller may only view', () => {
+    runAccess.allowed = false;
+    render(
+      <DAGRunActions
+        dagRun={{
+          name: 'job_01M4XEETKWKZX504BK65ADBVYB',
+          dagRunId: 'run-1',
+          status: Status.Running,
+          statusLabel: StatusLabel.running,
+          artifactsAvailable: false,
+          autoRetryCount: 0,
+          autoRetryLimit: 0,
+          startedAt: '',
+          finishedAt: '',
+        }}
+        name="job_01M4XEETKWKZX504BK65ADBVYB"
+        displayMode="full"
+      />
+    );
+
+    expect(screen.getByText('View only')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Stop' })
+    ).not.toBeInTheDocument();
+    runAccess.allowed = undefined;
+  });
+
+  // The hub decides a sub-run by its root and by its own job.
+  it('offers no control on a sub-run of a job the caller may only view', () => {
+    runAccess.byName = {
+      job_ROOTXXXXXXXXXXXXXXXXXXXXXX: true,
+      job_CHILDXXXXXXXXXXXXXXXXXXXXX: false,
+    };
+    render(
+      <DAGRunActions
+        dagRun={{
+          name: 'job_CHILDXXXXXXXXXXXXXXXXXXXXX',
+          dagRunId: 'run-2',
+          rootDAGRunName: 'job_ROOTXXXXXXXXXXXXXXXXXXXXXX',
+          rootDAGRunId: 'run-1',
+          status: Status.Running,
+          statusLabel: StatusLabel.running,
+          artifactsAvailable: false,
+          autoRetryCount: 0,
+          autoRetryLimit: 0,
+          startedAt: '',
+          finishedAt: '',
+        }}
+        name="job_CHILDXXXXXXXXXXXXXXXXXXXXX"
+        displayMode="full"
+        isRootLevel={false}
+      />
+    );
+
+    expect(screen.getByText('View only')).toBeVisible();
+    runAccess.byName = {};
   });
 
   it('shows cancel for failed runs with pending auto retries', () => {
