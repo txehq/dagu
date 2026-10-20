@@ -378,11 +378,12 @@ func (r *Registrar) checkStepHub(ctx context.Context) error {
 // covers a request begun before steps were given the machine's store, and
 // one resumed from a session that reaches the hub another way.
 //
-// The DAG is read as YAML and its commands compared whole: the first command
-// of the run step must be this job's resource check with these store flags,
-// and every other "dagu txe" command must be one of the artifacts commands
-// with them. Text elsewhere in the DAG, such as the title, an environment
-// value or the job's own command, decides nothing.
+// The DAG is read as YAML and compared with the shape the renderer gives it:
+// a run step of this job's resource check, the artifacts begin command when
+// there are deliverables, the job's own command as the request saved it, and
+// the artifacts seal command; then, with deliverables, a publish step. Every
+// dagu command must carry this registrar's store flags. Text elsewhere in the
+// DAG, such as the title or an environment value, decides nothing.
 func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
 	var request struct {
 		Version JobVersion `json:"version"`
@@ -404,43 +405,43 @@ func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
 		return txepkg.ShellJoin(append(append([]string{cli.Dagu, "txe"}, words...), cli.StoreFlags...))
 	}
 	check := txe("resource", "check", "--job", entry.JobID, "--job-version", strconv.Itoa(entry.Version), "--machine", entry.MachineID)
-	allowed := map[string]bool{check: true, txe("artifacts", "begin"): true, txe("artifacts", "seal"): true, txe("artifacts", "publish"): true}
-	prefix := txepkg.ShellJoin([]string{cli.Dagu, "txe"}) + " "
+	job := request.Version.Package.Entrypoint
+	plain := []string{check, job}
+	delivering := []string{check, txe("artifacts", "begin"), job, txe("artifacts", "seal")}
+	publish := []string{txe("artifacts", "publish")}
 
-	refuse := fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
-		"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(cli.StoreFlags))
-	first := true
-	for _, step := range dag.Steps {
-		var commands []string
-		switch c := step.Command.(type) {
-		case string:
-			commands = []string{c}
-		case []any:
-			for _, item := range c {
-				line, ok := item.(string)
-				if !ok {
-					return refuse
-				}
-				commands = append(commands, line)
-			}
-		default:
-			return refuse
-		}
-		for _, line := range commands {
-			if first {
-				if step.Name != "run" || line != check {
-					return refuse
-				}
-				first = false
-				continue
-			}
-			if strings.HasPrefix(line, prefix) && !allowed[line] {
-				return refuse
-			}
-		}
+	matches := false
+	switch len(dag.Steps) {
+	case 1:
+		matches = dag.Steps[0].Name == "run" && slices.Equal(commandLines(dag.Steps[0].Command), plain)
+	case 2:
+		matches = dag.Steps[0].Name == "run" && slices.Equal(commandLines(dag.Steps[0].Command), delivering) &&
+			dag.Steps[1].Name == "publish" && slices.Equal(commandLines(dag.Steps[1].Command), publish)
 	}
-	if first {
-		return refuse
+	if !matches {
+		return fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
+			"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(cli.StoreFlags))
+	}
+	return nil
+}
+
+// commandLines returns a step's command as the list of lines it runs: one
+// line for a scalar, each item for a list of strings, and nil for anything
+// else.
+func commandLines(command any) []string {
+	switch c := command.(type) {
+	case string:
+		return []string{c}
+	case []any:
+		lines := make([]string, 0, len(c))
+		for _, item := range c {
+			line, ok := item.(string)
+			if !ok {
+				return nil
+			}
+			lines = append(lines, line)
+		}
+		return lines
 	}
 	return nil
 }

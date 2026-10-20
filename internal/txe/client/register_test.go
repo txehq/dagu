@@ -718,6 +718,39 @@ func TestRegisterChecksTheStepsOwnContext(t *testing.T) {
 		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
 	})
 
+	// A job whose own command is itself a dagu txe command, with
+	// deliverables, is an ordinary job: its interrupted registration is
+	// finished by a resume that gives the steps the same store.
+	t.Run("ADaguCommandAsTheJobsOwn", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, f.client()
+		_, dir := worktree(t, credentialFile(t))
+		specPath := filepath.Join(dir, "job.yaml")
+		text, err := os.ReadFile(specPath)
+		require.NoError(t, err)
+		edited := strings.Replace(string(text), "expected_outcome:\n", "expected_outcome:\n"+deliverablesYAML, 1)
+		edited = strings.Replace(edited, "entrypoint: [./collect.py]", "entrypoint: ["+filepath.Join(home.Root, "bin", "dagu")+", txe, inspect, job_x]", 1)
+		require.NoError(t, os.WriteFile(specPath, []byte(edited), 0o644)) //nolint:gosec // test file
+		spec, err := LoadJobSpec(specPath)
+		require.NoError(t, err)
+
+		f.mu.Lock()
+		f.failNextReady = true
+		f.mu.Unlock()
+		_, err = s.Register(ctx, spec)
+		var incomplete *ErrIncomplete
+		require.ErrorAs(t, err, &incomplete)
+		again := newSession(f, home, "cc3-s000003")
+		again.Hub, again.StepClient = steps, f.client()
+		out, err := again.Resume(ctx, incomplete.RequestID)
+		require.NoError(t, err)
+		assert.Contains(t, out.DAGSpec, "txe artifacts publish")
+		assert.Contains(t, out.DAGSpec, filepath.Join(home.Root, "bin", "dagu")+" txe inspect job_x")
+		assert.Equal(t, RegistrationReady, f.job(out.Receipt.JobID).Registration.State)
+	})
+
 	// A request begun before steps were given the machine's store names the
 	// session's own store in its DAG. Resuming it now would mark ready a job
 	// whose steps cannot run, so it is refused.
