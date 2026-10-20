@@ -14,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	openapiv1 "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -192,6 +194,20 @@ func TestConditionalRetryNeedsAFinishedExecution(t *testing.T) {
 func TestConditionalRetryUnknownDispatchOutcome(t *testing.T) {
 	f := newConditionalRetryFixture(t, false, false)
 	f.recorder.dispatchErr = errors.New("connection reset after the request was sent")
+	err := f.retry(f.attempt, "q1")
+	var apiErr *Error
+	require.True(t, errors.As(err, &apiErr), "%v", err)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.HTTPStatus)
+	assert.Equal(t, "dispatch_uncertain", apiErr.Details["code"])
+}
+
+// The coordinator may refuse for want of a worker after it has prepared the
+// attempt (an admitted dispatch), so that refusal does not prove nothing was
+// retried: a conditional retry stays uncertain rather than answering
+// no_eligible_worker (TXE-4712).
+func TestConditionalRetryRefusedForWantOfAWorkerStaysUncertain(t *testing.T) {
+	f := newConditionalRetryFixture(t, false, false)
+	f.recorder.dispatchErr = status.Error(codes.FailedPrecondition, dispatch.NoMatchingWorkersMessage)
 	err := f.retry(f.attempt, "q1")
 	var apiErr *Error
 	require.True(t, errors.As(err, &apiErr), "%v", err)

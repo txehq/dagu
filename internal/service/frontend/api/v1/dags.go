@@ -1602,6 +1602,9 @@ func (a *API) dispatchStartToCoordinator(ctx context.Context, dag *ir.DAG, opts 
 	)
 
 	if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
+		if refusal := a.dispatchRefusal(err, dag); refusal != nil {
+			return refusal
+		}
 		return fmt.Errorf("error dispatching to coordinator: %w", err)
 	}
 
@@ -1610,11 +1613,7 @@ func (a *API) dispatchStartToCoordinator(ctx context.Context, dag *ir.DAG, opts 
 		return dagStartWaitContextError(err)
 	}
 	if !statusChanged {
-		return &Error{
-			HTTPStatus: http.StatusInternalServerError,
-			Code:       api.ErrorCodeInternalError,
-			Message:    "DAG did not start after coordinator dispatch",
-		}
+		return errStartUnconfirmed(opts.dagRunID, timeout)
 	}
 
 	return nil

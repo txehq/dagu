@@ -5,6 +5,7 @@ package coordinator_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2639,4 +2640,51 @@ func startMockTLSServer(t *testing.T, service coordinatorv1.CoordinatorServiceSe
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	return startMockServerWithHealth(t, service, healthServer, grpc.Creds(creds))
+}
+
+// A refusal for want of a worker shows that nothing was dispatched only when
+// no earlier call of the same dispatch may have reached a coordinator. After
+// a call that failed some other way, which the coordinator may have taken,
+// the refusal is marked ErrDispatchOutcomeUnknown (TXE-4712).
+func TestClientDispatchRefusalAfterAnUncertainCall(t *testing.T) {
+	t.Parallel()
+	refusal := status.Error(codes.FailedPrecondition, dispatch.NoMatchingWorkersMessage)
+	for name, tc := range map[string]struct {
+		first   error
+		unknown bool
+	}{
+		"after a call that may have reached it": {status.Error(codes.DeadlineExceeded, "deadline exceeded"), true},
+		"after another refusal":                 {status.Error(codes.Unavailable, dispatch.NoAvailableWorkersMessage), false},
+		"on the first call":                     {nil, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			mockCoord := &mockCoordinatorService{
+				dispatchFunc: func(context.Context, *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
+					calls++
+					if calls == 1 && tc.first != nil {
+						return nil, tc.first
+					}
+					return nil, refusal
+				},
+			}
+			server, addr := startMockServer(t, mockCoord)
+			defer server.Stop()
+			host, port := parseHostPort(addr)
+			config := coordinator.DefaultConfig()
+			config.MaxRetries = 2
+			config.RetryInterval = time.Millisecond
+			config.RequestTimeout = time.Second
+			client := coordinator.New(&mockServiceMonitor{members: []serviceregistry.HostInfo{
+				{ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+			}}, config)
+
+			err := client.Dispatch(context.Background(), dispatch.DispatchRequest{
+				Task: &dispatch.DispatchTask{DAGRunID: "run-1", Target: "test-dag"}})
+			require.Error(t, err)
+			assert.True(t, dispatch.IsNoMatchingWorker(err), "the refusal is kept: %v", err)
+			assert.Equal(t, tc.unknown, errors.Is(err, coordinator.ErrDispatchOutcomeUnknown), "%v", err)
+		})
+	}
 }

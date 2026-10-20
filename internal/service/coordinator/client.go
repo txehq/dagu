@@ -241,6 +241,12 @@ func New(registry serviceregistry.ServiceRegistry, config *Config) Client {
 // been created and dispatched.
 var ErrDispatchUncertain = errors.New("the conditional retry was sent once and its outcome is unknown")
 
+// ErrDispatchOutcomeUnknown marks a coordinator's refusal for want of a
+// worker that came after an earlier call of the same dispatch failed in a
+// way that may have reached a coordinator: that call may have dispatched
+// the task, so the refusal does not show that nothing was.
+var ErrDispatchOutcomeUnknown = errors.New("an earlier dispatch call may have reached a coordinator")
+
 func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchRequest) error {
 	task := req.Task
 	if task == nil {
@@ -270,7 +276,10 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 
 	policy := backoff.WithJitter(basePolicy, backoff.FullJitter)
 
-	return backoff.Retry(ctx, func(ctx context.Context) error {
+	// mayHaveDispatched is set by a call that failed other than by a
+	// refusal for want of a worker: the coordinator may have taken it.
+	mayHaveDispatched := false
+	err = backoff.Retry(ctx, func(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -293,6 +302,9 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 
 			// Try to dispatch
 			resp, err := client.client.Dispatch(dispatchCtx, protoReq)
+			if err != nil && !dispatch.IsNoMatchingWorker(err) && !dispatch.IsNoAvailableWorker(err) {
+				mayHaveDispatched = true
+			}
 			if err != nil {
 				logger.Warn(ctx, "Failed to dispatch task to coordinator",
 					tag.RunID(task.DAGRunID),
@@ -347,6 +359,10 @@ func (cli *clientImpl) Dispatch(ctx context.Context, req dispatch.DispatchReques
 			return nil
 		})
 	}, policy, nil)
+	if err != nil && mayHaveDispatched && (dispatch.IsNoMatchingWorker(err) || dispatch.IsNoAvailableWorker(err)) {
+		return fmt.Errorf("%w: %w", ErrDispatchOutcomeUnknown, err)
+	}
+	return err
 }
 
 func (cli *clientImpl) prepareTaskWorkspace(ctx context.Context, task *dispatch.DispatchTask) error {

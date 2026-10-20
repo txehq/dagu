@@ -21,8 +21,6 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type queueDispatchDeps struct {
@@ -1503,27 +1501,20 @@ func queuedDispatchCondition(err error) []queuedConditionDef {
 	return workerDispatchUnavailableConditionDefs
 }
 
+// isNoMatchingWorker and isNoAvailableWorker read a dispatch failure for the
+// condition recorded on a queued run, so they also accept a message that
+// only mentions the refusal: a diagnosis, never proof that nothing was
+// dispatched (dispatch.IsNoMatchingWorker is that).
 func isNoMatchingWorker(err error) bool {
-	st, ok := status.FromError(err)
-	if ok && st.Code() == codes.FailedPrecondition && strings.Contains(st.Message(), "no workers match the required selector") {
-		return true
-	}
-	return strings.Contains(strings.ToLower(errorMessage(err)), "no workers match the required selector")
+	return dispatch.IsNoMatchingWorker(err) || mentions(err, dispatch.NoMatchingWorkersMessage)
 }
 
 func isNoAvailableWorker(err error) bool {
-	st, ok := status.FromError(err)
-	if ok && st.Code() == codes.Unavailable && strings.Contains(st.Message(), "no available workers") {
-		return true
-	}
-	return strings.Contains(strings.ToLower(errorMessage(err)), "no available workers")
+	return dispatch.IsNoAvailableWorker(err) || mentions(err, dispatch.NoAvailableWorkersMessage)
 }
 
-func errorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
+func mentions(err error, message string) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), message)
 }
 
 func (d *queueDispatcher) recordCapacityUnavailableConditions(

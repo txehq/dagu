@@ -3270,9 +3270,15 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 			}
 			if expect != nil {
 				// Only the coordinator's refusal proves nothing was retried.
+				// Not even its refusal for want of a worker does: on an
+				// admitted dispatch it prepares the attempt first and marks
+				// it failed after, so a conditional retry stays uncertain.
 				return retryDAGRunResult{}, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
 					Message: "the conditional retry was sent and its outcome is unknown: " + err.Error(),
 					Details: map[string]any{"code": "dispatch_uncertain"}}
+			}
+			if refusal := a.retryDispatchRefusal(err, dag, task); refusal != nil {
+				return retryDAGRunResult{}, refusal
 			}
 			return retryDAGRunResult{}, fmt.Errorf("error dispatching retry to coordinator: %w", err)
 		}
