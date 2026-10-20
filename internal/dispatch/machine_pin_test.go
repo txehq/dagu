@@ -60,3 +60,12 @@ func TestMachinePinningFor(t *testing.T) {
 	assert.Equal(t, dispatch.MachinePinningObserve, dispatch.MachinePinningFor(config.TXEAuthzModeObserve))
 	assert.Equal(t, dispatch.MachinePinningEnforce, dispatch.MachinePinningFor(config.TXEAuthzModeEnforce))
 }
+
+func TestWorkerMachine(t *testing.T) {
+	for id, want := range map[string]string{
+		"mch_A": "mch_A", "mch_A@laptop": "mch_A", "mch_A@host@42": "mch_A",
+		"worker-1": "", "local": "", "": "", "mch_": "", "mch_@x": "", "xmch_A": "",
+	} {
+		assert.Equal(t, want, dispatch.WorkerMachine(id), id)
+	}
+}

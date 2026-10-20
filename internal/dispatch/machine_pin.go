@@ -4,6 +4,8 @@
 package dispatch
 
 import (
+	"strings"
+
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
 
@@ -70,4 +72,17 @@ func MachinePinMissing(workerLabels, selector map[string]string) bool {
 		return false
 	}
 	return selector[MachineLabel] != machine
+}
+
+// WorkerMachine is the machine a TXE machine worker's ID names: the ID, or
+// its part before "@", when that is a machine ID. Any other worker names no
+// machine. An authenticating coordinator refuses a worker whose ID names
+// another machine than its credential's, so with machines pinned the ID is
+// the machine's.
+func WorkerMachine(workerID string) string {
+	machine, _, _ := strings.Cut(workerID, "@")
+	if !strings.HasPrefix(machine, "mch_") || len(machine) == len("mch_") {
+		return ""
+	}
+	return machine
 }

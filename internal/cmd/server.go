@@ -16,6 +16,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/opencodehost"
 	"github.com/dagucloud/dagu/v2/internal/service/frontend"
@@ -98,7 +99,7 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 	// Create a signal-aware context for services
 	serviceCtx := ctx.WithContext(ctx.withSignalPropagation(signalCtx))
 	openCodeHost := opencodehost.New(signalCtx, ctx.Config.OpenCode)
-	cleanupCancel, cleanupDone := startLocalAgentSessionCleanup(signalCtx, ctx.Persistence, openCodeHost)
+	cleanupCancel, cleanupDone := startLocalAgentSessionCleanup(signalCtx, ctx.Persistence, openCodeHost, localCleanupTakeover(ctx.Config.TXE.Authz.Mode))
 	startBrowserReaper(signalCtx, ctx.Config.Paths.DataDir, ctx.Persistence.DAGRunRepository)
 	var tunnelService *tunnel.Service
 	var resourceService *resource.Service
@@ -187,7 +188,18 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 	return nil
 }
 
-func startLocalAgentSessionCleanup(ctx context.Context, persistence Persistence, host *opencodehost.Host) (context.CancelFunc, <-chan struct{}) {
+// localCleanupTakeover is which other hosts' agent session cleanup the
+// hub's own host takes over. With machines pinned, only that of hosts that
+// are no machine: a machine's session lives on that machine, and deleting it
+// here would only mark it done.
+func localCleanupTakeover(authzMode string) func(resourceOwner string) bool {
+	if dispatch.MachinePinningFor(authzMode) != dispatch.MachinePinningEnforce {
+		return nil
+	}
+	return func(owner string) bool { return dispatch.WorkerMachine(owner) == "" }
+}
+
+func startLocalAgentSessionCleanup(ctx context.Context, persistence Persistence, host *opencodehost.Host, mayTakeOver func(string) bool) (context.CancelFunc, <-chan struct{}) {
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -202,7 +214,7 @@ func startLocalAgentSessionCleanup(ctx context.Context, persistence Persistence,
 					return err
 				}
 				return opencodehost.DeleteSession(cleanupCtx, hostConfig, resource.Directory, resource.SessionID)
-			})
+			}, mayTakeOver)
 	}()
 	return cancel, done
 }

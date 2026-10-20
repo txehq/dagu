@@ -38,6 +38,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
 	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -147,6 +148,9 @@ func (s *runLockSet) unlock(dagRunID string, entry *runLock) {
 }
 
 type Handler struct {
+	// callerFrom reads the caller the transport authenticated; nil is
+	// transportauth.CallerFrom. Tests replace it.
+	callerFrom func(context.Context) (transportauth.Caller, bool)
 	coordinatorv1.UnimplementedCoordinatorServiceServer
 
 	mu             sync.Mutex
@@ -1659,7 +1663,24 @@ func (h *Handler) ClaimAgentSessionCleanup(
 	if h.agentSessionCleanupQueue == nil || h.dagRunRepository == nil {
 		return nil, status.Error(codes.Unimplemented, "agent session cleanup is not configured")
 	}
-	job, err := h.agentSessionCleanupQueue.Claim(ctx, req.WorkerId, time.Minute)
+	// A cleanup job names the provider, the session and the directory of an
+	// agent session on its host. With machines pinned, another machine's is
+	// never handed over, however long it has waited: only a worker of the
+	// same machine, or with no machine for one that has none, takes it over.
+	//
+	// The claimant's machine is the authenticated caller's, never the
+	// request's: an enrolled machine claims as itself, and one of the hub's
+	// own processes as no machine. A worker id naming another machine, or a
+	// call nobody authenticated, is refused.
+	var mayTakeOver func(string) bool
+	if h.machinePinning == dispatch.MachinePinningEnforce {
+		claimant, err := h.authenticatedCleanupClaimant(ctx, req.WorkerId)
+		if err != nil {
+			return nil, err
+		}
+		mayTakeOver = func(owner string) bool { return dispatch.WorkerMachine(owner) == claimant }
+	}
+	job, err := h.agentSessionCleanupQueue.ClaimWithin(ctx, req.WorkerId, time.Minute, mayTakeOver)
 	if errors.Is(err, persis.ErrNotFound) {
 		return &coordinatorv1.ClaimAgentSessionCleanupResponse{}, nil
 	}
@@ -3956,4 +3977,24 @@ func finalizeNotStartedCancellation(ctx context.Context, attempt dagrun.Attempt)
 	}
 
 	return nil
+}
+
+// authenticatedCleanupClaimant is the machine a cleanup claim is made by,
+// from the caller the transport authenticated: an enrolled machine's own,
+// or "" for one of the hub's processes. The worker id must be of that
+// machine (or of none, for the hub).
+func (h *Handler) authenticatedCleanupClaimant(ctx context.Context, workerID string) (string, error) {
+	callerFrom := h.callerFrom
+	if callerFrom == nil {
+		callerFrom = transportauth.CallerFrom
+	}
+	caller, ok := callerFrom(ctx)
+	switch {
+	case ok && caller.Kind == transportauth.CallerMachine && transportauth.WorkerIDBelongsTo(workerID, caller.Machine.MachineID):
+		return caller.Machine.MachineID, nil
+	case ok && caller.Kind == transportauth.CallerHub && dispatch.WorkerMachine(workerID) == "":
+		return "", nil
+	default:
+		return "", status.Error(codes.PermissionDenied, "with machines pinned, agent session cleanup is claimed only by an authenticated worker of its machine")
+	}
 }

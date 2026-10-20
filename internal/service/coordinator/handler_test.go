@@ -28,6 +28,8 @@ import (
 	persistestutil "github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -6599,5 +6601,68 @@ func TestDispatchWithNoWorkerUnderPinningIsOneRefusal(t *testing.T) {
 		}})
 		require.Equal(t, dispatchErrorCode(want), status.Code(err), "pinning %d", pinning)
 		require.Equal(t, want.Error(), status.Convert(err).Message(), "pinning %d", pinning)
+	}
+}
+
+// With machines pinned, an agent session's cleanup, which names its provider,
+// session and directory on its host, is never handed to another machine,
+// however long it has waited; a worker of the same machine still takes it
+// over. The claimant's machine is the authenticated caller's: a worker id
+// naming another machine than the caller's, or a call nobody authenticated,
+// is refused. Without pinning any host takes over a day-old job, as before.
+func TestHandlerAgentSessionCleanupStaysOnItsMachine(t *testing.T) {
+	t.Parallel()
+	machine := func(id string) *transportauth.Caller {
+		return &transportauth.Caller{Kind: transportauth.CallerMachine, Machine: authz.Machine{MachineID: id}}
+	}
+	hub := &transportauth.Caller{Kind: transportauth.CallerHub}
+	for name, tc := range map[string]struct {
+		pinning  dispatch.MachinePinning
+		caller   *transportauth.Caller
+		claimant string
+		found    bool
+		refused  bool
+	}{
+		"another machine, pinned":          {pinning: dispatch.MachinePinningEnforce, caller: machine("mch_B"), claimant: "mch_B@desk"},
+		"a hub process, pinned":            {pinning: dispatch.MachinePinningEnforce, caller: hub, claimant: "worker-x"},
+		"the same machine, pinned":         {pinning: dispatch.MachinePinningEnforce, caller: machine("mch_A"), claimant: "mch_A@other", found: true},
+		"another machine naming A, pinned": {pinning: dispatch.MachinePinningEnforce, caller: machine("mch_B"), claimant: "mch_A@laptop", refused: true},
+		"a hub process naming A, pinned":   {pinning: dispatch.MachinePinningEnforce, caller: hub, claimant: "mch_A@laptop", refused: true},
+		"nobody authenticated, pinned":     {pinning: dispatch.MachinePinningEnforce, claimant: "mch_A@laptop", refused: true},
+		"another machine, unpinned":        {pinning: dispatch.MachinePinningOff, claimant: "mch_B@desk", found: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			backend := persistestutil.NewMemoryBackend()
+			col := backend.Collection("cleanups")
+			job := agentsession.CleanupJob{ID: "job-1", Root: ir.NewDAGRunRef("build", "run-removed"),
+				Resource: ir.AgentSessionResource{Provider: "opencode", SessionID: "session-1", Directory: "/home/a", OwnerWorkerID: "mch_A@laptop"}}
+			data, err := persis.Encode(job)
+			require.NoError(t, err)
+			aged := time.Now().Add(-25 * time.Hour)
+			require.NoError(t, col.Create(t.Context(), &persis.Record{ID: job.ID, Data: data, CreatedAt: aged, UpdatedAt: aged}))
+			handler := NewHandler(HandlerConfig{
+				DAGRunRepository:         newMockDAGRunStore().repository,
+				AgentSessionCleanupQueue: agentsession.NewCleanupQueue(col),
+				MachinePinning:           tc.pinning,
+			})
+			handler.callerFrom = func(context.Context) (transportauth.Caller, bool) {
+				if tc.caller == nil {
+					return transportauth.Caller{}, false
+				}
+				return *tc.caller, true
+			}
+			claimed, err := handler.ClaimAgentSessionCleanup(t.Context(), &coordinatorv1.ClaimAgentSessionCleanupRequest{WorkerId: tc.claimant})
+			if tc.refused {
+				require.Equal(t, codes.PermissionDenied, status.Code(err))
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.found, claimed.Found)
+			if !tc.found {
+				assert.Empty(t, claimed.Directory)
+				assert.Empty(t, claimed.SessionId)
+			}
+		})
 	}
 }
