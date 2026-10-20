@@ -607,6 +607,82 @@ func TestPublishStepUsesRegistrationContext(t *testing.T) {
 	assert.Contains(t, plan.DAGSpec, " --machine "+testMachine+" --dagu-home "+filepath.Join(stores, "other-hub")+" --config "+filepath.Join(stores, "hub.yaml")+" --context staging")
 }
 
+// A session that reaches the hub through another context than the job's
+// steps, such as a person's sign-in, registers a job only while the steps'
+// context reaches the same registry. Their store is what the DAG names; the
+// session's never is.
+func TestRegisterChecksTheStepsOwnContext(t *testing.T) {
+	ctx := context.Background()
+	stores := t.TempDir()
+	steps := HubContext{DaguHome: filepath.Join(stores, "machine"), Name: "txe",
+		ContextsDir: filepath.Join(stores, "machine", "data", "contexts"), DataDir: filepath.Join(stores, "machine", "data")}
+
+	t.Run("SameRegistry", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, f.client()
+		spec, _ := worktree(t, credentialFile(t))
+		out, err := s.Register(ctx, spec)
+		require.NoError(t, err)
+		assert.Equal(t, RegistrationReady, f.job(out.Receipt.JobID).Registration.State)
+		assert.Equal(t, 1, f.calls(http.MethodPost, "/txe/jobs/"+out.Receipt.JobID+"/ready"))
+		assert.Contains(t, out.DAGSpec, " --dagu-home "+steps.DaguHome+" --contexts-dir "+steps.ContextsDir+" --data-dir "+steps.DataDir+" --context txe")
+		// The steps' context is named by where it is: no key reaches the job,
+		// and its credential reference stays a path.
+		assert.NotContains(t, out.DAGSpec, "dagu_test_key")
+		assert.NotContains(t, out.DAGSpec, "txe-sentinel-credential")
+	})
+
+	t.Run("AnotherRegistry", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		other := newFakeRegistry(t)
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, other.client()
+		spec, _ := worktree(t, credentialFile(t))
+		_, err := s.Plan(ctx, spec)
+		require.ErrorContains(t, err, "cannot read machine "+testMachine)
+		_, err = s.Register(ctx, spec)
+		require.ErrorContains(t, err, "cannot read machine "+testMachine)
+		assert.Zero(t, f.jobCount(), "nothing was sent")
+	})
+
+	t.Run("AnotherOwner", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		other := newFakeRegistry(t)
+		other.machines[testMachine] = Machine{MachineID: testMachine, OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0B", DisplayName: "test-mac"}
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, other.client()
+		spec, _ := worktree(t, credentialFile(t))
+		_, err := s.Register(ctx, spec)
+		require.ErrorContains(t, err, "reach different registries")
+		assert.Zero(t, f.jobCount(), "nothing was sent")
+	})
+
+	// A second registry that happens to hold the same machine does not hold
+	// the job: the job is left unready, with nothing a worker would run.
+	t.Run("SameMachineAnotherRegistry", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		other := newFakeRegistry(t)
+		other.machines[testMachine] = f.machines[testMachine]
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, other.client()
+		spec, _ := worktree(t, credentialFile(t))
+		_, err := s.Register(ctx, spec)
+		var incomplete *ErrIncomplete
+		require.ErrorAs(t, err, &incomplete)
+		require.ErrorContains(t, err, "its steps would reach another hub")
+		jobs, err := s.Client.ListJobs(ctx, JobFilter{JobKey: "nightly-collector"})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
+		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
+	})
+}
+
 // An update names the version it changes. One made against an outdated
 // version is refused and leaves the job, its package and its receipts alone.
 func TestUpdate(t *testing.T) {
