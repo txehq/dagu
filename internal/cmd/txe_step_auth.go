@@ -89,9 +89,6 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 		return nil, fmt.Errorf("this machine's %s credential is enrolled with the hub at %s, but this step reaches %s: enrol with the store this machine's jobs use; nothing was sent",
 			class, entry.Hub, hub)
 	}
-	if class != authn.ClassWorker {
-		return nil, fmt.Errorf("this machine is enrolled for the %s class, but this build reads only worker credentials; nothing was sent", class)
-	}
 	machine, err := home.Machine()
 	if err != nil {
 		return nil, err
@@ -99,6 +96,9 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	credential, err := transportauth.ReadMachineCredential(entry.CredentialFile)
 	if err != nil {
 		return nil, fmt.Errorf("this machine is enrolled for the %s class, and its credential %s cannot be used (%w); nothing was sent", class, entry.CredentialFile, err)
+	}
+	if credential.Class != class {
+		return nil, fmt.Errorf("the %s step's credential %s is a %s credential; nothing was sent", class, entry.CredentialFile, credential.Class)
 	}
 	if credential.MachineID != machine.MachineID {
 		return nil, fmt.Errorf("the %s credential %s is for machine %s, but this machine is %s; nothing was sent", class, entry.CredentialFile, credential.MachineID, machine.MachineID)

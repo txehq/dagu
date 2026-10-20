@@ -96,7 +96,7 @@ func (f *txeEnrolFixture) serve(w http.ResponseWriter, r *http.Request) bool {
 		f.mu.Lock()
 		approved := f.approved
 		f.mu.Unlock()
-		if approved && claims.Azp == txeEnrolTestClient {
+		if approved && claims.Azp == f.provider.ClientID {
 			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"state": "bound", "scope": map[string]any{"kind": "owner", "machine_id": txeEnrolTestMachine}})
 		} else {
 			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"state": "unbound", "scope": map[string]any{"kind": "unbound", "unbound_reason": "not_enrolled"}})

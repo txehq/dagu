@@ -35,6 +35,8 @@ var (
 		usage: "Where the worker's credential is written (default: worker-credential.json in the TXE home)"}
 	txeEnrolWaitFlag = commandLineFlag{name: "wait", defaultValue: "0",
 		usage: `How long to keep the application live, re-applying each minute, until a person of the owner approves it (for example "15m"; 0 applies once)`}
+	txeEnrolClassFlag = commandLineFlag{name: "class", defaultValue: "worker",
+		usage: `The credential's class: "worker" for the worker and its jobs' steps, "reviewer" for the reviewer's steps`}
 	txeEnrolResumeFlag = commandLineFlag{name: "resume", isBool: true,
 		usage: "Apply again with the credential already written, without signing in"}
 )
@@ -42,6 +44,10 @@ var (
 // txeEnrolCredentialFile is the worker credential's default name in the TXE
 // home.
 const txeEnrolCredentialFile = "worker-credential.json" //nolint:gosec // a file name, not a credential
+
+// txeEnrolReviewerCredentialFile is the reviewer credential's default name in
+// the TXE home: its steps read it, never the worker.
+const txeEnrolReviewerCredentialFile = "reviewer-credential.json" //nolint:gosec // a file name, not a credential
 
 // txeEnrolLockWait bounds the wait for a worker that holds the credential's
 // lock: longer than one of its renewals takes.
@@ -81,7 +87,7 @@ A worker that is renewing holds the credential's lock; the credential is
 written only once the lock is free. Not on Windows, where the worker cannot
 check that only its owner reads the file.`,
 		Args: cobra.NoArgs,
-	}, []commandLineFlag{txeEnrolClientFlag, txeEnrolIssuerFlag, txeEnrolFileFlag, txeEnrolWaitFlag, txeEnrolResumeFlag,
+	}, []commandLineFlag{txeEnrolClientFlag, txeEnrolClassFlag, txeEnrolIssuerFlag, txeEnrolFileFlag, txeEnrolWaitFlag, txeEnrolResumeFlag,
 		txeLoginPromptFlag, txeLoginNoBrowser, txeJSONFlag}, runTXEEnrol)
 	cmd.AddCommand(txeEnrolCheckCommand())
 	return cmd
@@ -110,7 +116,7 @@ func runTXEEnrolCheck(ctx *Context, _ []string) error {
 	if err != nil {
 		return err
 	}
-	path, err := txeEnrolPath(ctx, home)
+	path, err := txeEnrolPath(ctx, home, authn.ClassWorker)
 	if err != nil {
 		return err
 	}
@@ -120,6 +126,7 @@ func runTXEEnrolCheck(ctx *Context, _ []string) error {
 // txeEnrolView is what enrol shows. It never holds a token.
 type txeEnrolView struct {
 	MachineID      string               `json:"machine_id"`
+	Class          authn.Class          `json:"class"`
 	OwnerID        string               `json:"owner_id"`
 	ClientID       string               `json:"client_id"`
 	Issuer         string               `json:"issuer"`
@@ -161,7 +168,15 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 	if err != nil {
 		return err
 	}
-	path, err := txeEnrolPath(ctx, home)
+	classText, err := ctx.StringParam("class")
+	if err != nil {
+		return err
+	}
+	class := authn.Class(classText)
+	if class != authn.ClassWorker && class != authn.ClassReviewer {
+		return fmt.Errorf("--class %q: give worker or reviewer", classText)
+	}
+	path, err := txeEnrolPath(ctx, home, class)
 	if err != nil {
 		return err
 	}
@@ -173,7 +188,7 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		return err
 	}
 	if clientID == "" {
-		return errors.New("--client-id is required: this machine's own worker client at the identity provider")
+		return fmt.Errorf("--client-id is required: this machine's own %s client at the identity provider", class)
 	}
 	remote, err := txeRemoteContext(ctx)
 	if err != nil {
@@ -192,9 +207,12 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		return err
 	}
 
-	view := txeEnrolView{MachineID: machine.MachineID, OwnerID: machine.OwnerID, ClientID: clientID, CredentialFile: path,
+	view := txeEnrolView{MachineID: machine.MachineID, Class: class, OwnerID: machine.OwnerID, ClientID: clientID, CredentialFile: path,
 		resume: "dagu txe enrol --client-id " + txeShellQuote(clientID)}
-	if path != filepath.Join(home.Root, txeEnrolCredentialFile) {
+	if class != authn.ClassWorker {
+		view.resume += " --class " + string(class)
+	}
+	if path != txeEnrolDefaultPath(home, class) {
 		view.resume += " --credential-file " + txeShellQuote(path)
 	}
 	view.resume += " --resume --wait 15m"
@@ -209,8 +227,8 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		if err != nil {
 			return err
 		}
-		if credential.Class != authn.ClassWorker {
-			return fmt.Errorf("%s holds a %s credential, not this machine's worker credential: enrol again without --resume", path, credential.Class)
+		if credential.Class != class {
+			return fmt.Errorf("%s holds a %s credential, not this machine's %s credential: enrol again without --resume", path, credential.Class, class)
 		}
 		if credential.MachineID != machine.MachineID || credential.ClientID != clientID {
 			return fmt.Errorf("%s is for machine %s and client %s, not machine %s and client %s: enrol again without --resume",
@@ -224,7 +242,7 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		}
 		view.Issuer = issuer
 		tokens, err := txeEnrolSignIn(ctx, cliauth.Provider{Issuer: issuer, ClientID: clientID, Scopes: []string{"offline_access"}},
-			machine.MachineID, path)
+			machine.MachineID, path, class)
 		if err != nil {
 			return err
 		}
@@ -245,7 +263,7 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		view.Application, view.State = application, "applied"
 	}
 	if view.Application != nil {
-		view.ApproveURL = txeEnrolApproveURL(remote.baseURL, machine.MachineID, clientID)
+		view.ApproveURL = txeEnrolApproveURL(remote.baseURL, machine.MachineID, clientID, class)
 	}
 	// Once the hub takes the credential as this machine, the machine's job
 	// steps present it from now on (txeStepRemote). Recorded only then: an
@@ -255,7 +273,7 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		if err != nil {
 			return err
 		}
-		if err := home.SetStepCredential(string(authn.ClassWorker), path, hub); err != nil {
+		if err := home.SetStepCredential(string(class), path, hub); err != nil {
 			return fmt.Errorf("the machine is enrolled, but its job steps could not be told to use the credential: %w", err)
 		}
 		view.StepAuth = txepkg.StepModeCredential
@@ -265,9 +283,9 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 
 // txeEnrolApproveURL is the hub page that lists the machine's applications,
 // with this one preselected: the hub's address without its API root.
-func txeEnrolApproveURL(apiBase, machineID, clientID string) string {
+func txeEnrolApproveURL(apiBase, machineID, clientID string, class authn.Class) string {
 	base := strings.TrimSuffix(strings.TrimRight(apiBase, "/"), "/api/v1")
-	q := url.Values{"class": {string(authn.ClassWorker)}, "client_id": {clientID}}
+	q := url.Values{"class": {string(class)}, "client_id": {clientID}}
 	return base + "/txe/machines/" + url.PathEscape(machineID) + "?" + q.Encode()
 }
 
@@ -328,15 +346,23 @@ func txeEnrolCheck(ctx *Context, machineID, path string) error {
 
 // txeEnrolPath is the credential file: the flag, made absolute, or the TXE
 // home's default.
-func txeEnrolPath(ctx *Context, home txepkg.Home) (string, error) {
+func txeEnrolPath(ctx *Context, home txepkg.Home, class authn.Class) (string, error) {
 	path, err := ctx.StringParam("credential-file")
 	if err != nil {
 		return "", err
 	}
-	if path == "" {
-		return filepath.Join(home.Root, txeEnrolCredentialFile), nil
+	if path != "" {
+		return filepath.Abs(path)
 	}
-	return filepath.Abs(path)
+	return txeEnrolDefaultPath(home, class), nil
+}
+
+// txeEnrolDefaultPath is the class's credential file in the TXE home.
+func txeEnrolDefaultPath(home txepkg.Home, class authn.Class) string {
+	if class == authn.ClassReviewer {
+		return filepath.Join(home.Root, txeEnrolReviewerCredentialFile)
+	}
+	return filepath.Join(home.Root, txeEnrolCredentialFile)
 }
 
 // txeEnrolIssuer is --issuer, or the issuer the hub names for its CLI.
@@ -361,7 +387,7 @@ func txeEnrolIssuer(ctx *Context, remote *remoteClient) (string, error) {
 // txeEnrolSignIn signs the owner's person in at the worker client and writes
 // the worker credential. A sign-in that cannot become the credential is
 // revoked at the provider.
-func txeEnrolSignIn(ctx *Context, p cliauth.Provider, machineID, path string) (*cliauth.Tokens, error) {
+func txeEnrolSignIn(ctx *Context, p cliauth.Provider, machineID, path string, class authn.Class) (*cliauth.Tokens, error) {
 	prompt, err := ctx.StringParam("prompt")
 	if err != nil {
 		return nil, err
@@ -399,7 +425,7 @@ func txeEnrolSignIn(ctx *Context, p cliauth.Provider, machineID, path string) (*
 	}
 	credential := transportauth.MachineCredential{
 		Schema: transportauth.CredentialSchema, Issuer: p.Issuer, TokenEndpoint: endpoints.Token,
-		ClientID: p.ClientID, Class: authn.ClassWorker, MachineID: machineID, RefreshToken: tokens.RefreshToken,
+		ClientID: p.ClientID, Class: class, MachineID: machineID, RefreshToken: tokens.RefreshToken,
 	}
 	if err := txeEnrolWrite(ctx, path, credential); err != nil {
 		return nil, err
@@ -612,9 +638,9 @@ func printEnrol(p *txePrinter, v txeEnrolView) {
 	p.f("credential: %s\n", v.CredentialFile)
 	switch {
 	case v.State == "enrolled":
-		p.f("Enrolled: the hub takes this machine's worker credential.\n")
+		p.f("Enrolled: the hub takes this machine's %s credential.\n", v.Class)
 		if v.StepAuth != "" {
-			p.f("Job steps on this machine now present it, and never the context's API key.\n")
+			p.f("This machine's %s steps now present it, and never the context's API key.\n", v.Class)
 		}
 	case v.Application != nil:
 		a := v.Application
