@@ -47,7 +47,7 @@ func (a *API) GetDAGSettings(ctx context.Context, request api.GetDAGSettingsRequ
 	if a.dagSettingsStore == nil {
 		return nil, dagSettingsStoreUnavailable()
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
 		return nil, err
 	}
 	if _, err := a.getDAGForSettings(ctx, request.FileName); err != nil {

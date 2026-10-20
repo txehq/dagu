@@ -67,7 +67,7 @@ func (a *API) GetDAGWebhook(ctx context.Context, request api.GetDAGWebhookReques
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionView); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionView); err != nil {
 		return nil, err
 	}
 
@@ -97,7 +97,7 @@ func (a *API) CreateDAGWebhook(ctx context.Context, request api.CreateDAGWebhook
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -151,7 +151,7 @@ func (a *API) DeleteDAGWebhook(ctx context.Context, request api.DeleteDAGWebhook
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -191,7 +191,7 @@ func (a *API) RegenerateDAGWebhookToken(ctx context.Context, request api.Regener
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -230,7 +230,7 @@ func (a *API) ToggleDAGWebhook(ctx context.Context, request api.ToggleDAGWebhook
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -272,7 +272,7 @@ func (a *API) ConfigureDAGWebhookProfileSelection(
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.requireAdmin(ctx); err != nil {
@@ -346,7 +346,7 @@ func (a *API) CreateDAGWebhookProfileToken(
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.requireAdmin(ctx); err != nil {
@@ -423,7 +423,7 @@ func (a *API) RevokeDAGWebhookProfileToken(
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.requireAdmin(ctx); err != nil {
@@ -491,7 +491,7 @@ func (a *API) EnableDAGWebhookHMAC(ctx context.Context, request api.EnableDAGWeb
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -549,7 +549,7 @@ func (a *API) ConfigureDAGWebhookHMAC(ctx context.Context, request api.Configure
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -604,7 +604,7 @@ func (a *API) RegenerateDAGWebhookHMACSecret(ctx context.Context, request api.Re
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -647,7 +647,7 @@ func (a *API) DisableDAGWebhookHMAC(ctx context.Context, request api.DisableDAGW
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 

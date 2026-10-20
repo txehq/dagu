@@ -94,6 +94,17 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 		require.False(t, ownerless == http.StatusForbidden || (ownerless == http.StatusNotFound && refused), "an ownerless DAG stays the administrator's: %s answered %d", what, ownerless)
 	}
 
+	// An ordinary file that declares an owner's DAG name is that owner's on
+	// these routes too.
+	h.server.CreateDAGFile(t, h.server.Config.Paths.DAGsDir, "declares-owned", []byte("name: "+owned+"\nsteps:\n  - name: s\n    run: echo s\n"))
+	for _, path := range []string{"/api/v1/dags/declares-owned/webhook", "/api/v1/dags/declares-owned/browser-cache"} {
+		method := http.MethodPost
+		if strings.HasSuffix(path, "browser-cache") {
+			method = http.MethodDelete
+		}
+		require.Equal(t, http.StatusForbidden, status(method, path, h.admin, map[string]any{}), "a file declaring an owner's DAG name: %s", path)
+	}
+
 	// The whole-hub webhook list shows a legacy credential no DAG's.
 	var listed api.ListWebhooks200JSONResponse
 	h.server.Client().Get("/api/v1/webhooks").WithBearerToken(manager).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &listed)

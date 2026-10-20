@@ -21,7 +21,7 @@ func (a *API) ClearDAGBrowserCache(ctx context.Context, request api.ClearDAGBrow
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	dag, err := a.dagRepository.GetMetadata(ctx, request.FileName)

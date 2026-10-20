@@ -259,7 +259,7 @@ func (a *API) GetDAGIncidents(ctx context.Context, request api.GetDAGIncidentsRe
 	if err := a.requireIncidentManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
 		return nil, err
 	}
 	if err := a.ensureDAGExists(ctx, string(request.FileName)); err != nil {
@@ -276,7 +276,7 @@ func (a *API) UpdateDAGIncidents(ctx context.Context, request api.UpdateDAGIncid
 	if err := a.requireIncidentManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -307,7 +307,7 @@ func (a *API) DeleteDAGIncidents(ctx context.Context, request api.DeleteDAGIncid
 	if err := a.requireIncidentManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.ensureDAGExists(ctx, string(request.FileName)); err != nil {

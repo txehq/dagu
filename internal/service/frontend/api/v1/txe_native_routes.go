@@ -5,11 +5,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
 
@@ -32,6 +34,35 @@ func (a *API) txeDAGRoute(ctx context.Context, fileName string, permission authz
 		return nil
 	}
 	return a.txeNativeCheck(ctx, txeCanonicalDAGName(fileName), permission, func() error { return nil })
+}
+
+// txeDAGFileRoute is txeDAGRoute for a route keyed by a DAG file: it
+// decides the file's name, and, when the file loads and declares the name
+// of an owner's DAG, that DAG as well (txeOwnedIdentity), so an ordinary
+// file declaring an owner's DAG name is decided as that owner's. A file that
+// does not exist is decided by its name alone; one that cannot be read is
+// not taken for no owner's where owners are decided.
+func (a *API) txeDAGFileRoute(ctx context.Context, fileName string, permission authz.Permission) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	if err := a.txeDAGRoute(ctx, fileName, permission); err != nil {
+		return err
+	}
+	dag, err := a.dagRepository.GetMetadata(ctx, fileName)
+	switch {
+	case errors.Is(err, persis.ErrDAGNotFound):
+		return nil
+	case err != nil || dag == nil:
+		if a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce {
+			return errTxeAuthzUnavailable
+		}
+		return nil
+	}
+	if identity := txeOwnedIdentity(dag); identity != txeCanonicalDAGName(fileName) {
+		return a.txeDAGRoute(ctx, identity, permission)
+	}
+	return nil
 }
 
 // txeWebhookTrigger decides a webhook trigger of dag. A webhook token is no

@@ -276,7 +276,7 @@ func (a *API) GetDAGNotifications(ctx context.Context, request api.GetDAGNotific
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
 		return nil, err
 	}
 
@@ -298,7 +298,7 @@ func (a *API) UpdateDAGNotifications(ctx context.Context, request api.UpdateDAGN
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -341,7 +341,7 @@ func (a *API) DeleteDAGNotifications(ctx context.Context, request api.DeleteDAGN
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.notificationService.DeleteByDAGName(ctx, request.FileName); err != nil {
@@ -364,7 +364,7 @@ func (a *API) TestDAGNotifications(ctx context.Context, request api.TestDAGNotif
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
-	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.ensureDAGExists(ctx, request.FileName); err != nil {
