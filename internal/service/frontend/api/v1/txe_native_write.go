@@ -137,7 +137,9 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 				if (!p.Step && p.Machine != own) || (p.Step && p.Machine != "" && p.Machine != own) {
 					return a.txeNativeWriteMisplaced(ctx, c, name)
 				}
-				if called, ok := txeauth.MachineOfDAG(p.Name); p.Step && ok && called != own {
+				// The name as the store resolves it: an extension, a path or
+				// another case names the same DAG.
+				if called, ok := txeauth.MachineOfDAG(txeCanonicalDAGName(p.Name)); p.Step && ok && called != own {
 					return a.txeNativeWriteMisplaced(ctx, c, name)
 				}
 			}

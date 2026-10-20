@@ -237,7 +237,13 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			_, err = w.reg.CreateMachine(context.Background(), registry.Machine{MachineID: second, OwnerID: w.ownerA, DisplayName: "desktop"},
 				registry.Actor{Kind: registry.ActorSystem, ID: "test"})
 			require.NoError(t, err)
-			require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, calls(txeauth.MachineDAGs(second)[0])), "calling A's other machine's DAG")
+			other := txeauth.MachineDAGs(second)[0]
+			for _, alias := range []string{other, other + ".yaml", other + ".yml", "./" + other, strings.ToLower(other)} {
+				require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, calls(alias)), "calling A's other machine's DAG as %q", alias)
+				toolTo := "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [" +
+					alias + "]\n    messages:\n      - role: user\n        content: hi\n"
+				require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, toolTo), "a tool that is A's other machine's DAG as %q", alias)
+			}
 			// The coordinator matches every label: a selector that names no
 			// machine reaches any machine with those labels, B's included.
 			byLabel := func(label string) string {
