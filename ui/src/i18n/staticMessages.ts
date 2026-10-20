@@ -2347,6 +2347,7 @@ const english = {
   "Acting for {owner}": "Acting for {owner}",
   // TXE access requests (TXE-4254).
   "Access requests": "Access requests",
+  "Waiting on the owner": "Waiting on the owner",
   "Account": "Account",
   "Approve for": "Approve for",
   "Bound": "Bound",
@@ -2371,7 +2372,6 @@ const english = {
   "1 application on file": "1 application on file",
   "{count} applications on file": "{count} applications on file",
   "Machines": "Machines",
-  "Waiting on the owner": "Waiting on the owner",
   "A machine enrolment application is awaiting your approval.": "A machine enrolment application is awaiting your approval.",
   "{count} machine enrolment applications are awaiting your approval.": "{count} machine enrolment applications are awaiting your approval.",
   "Review machines": "Review machines",
@@ -4700,6 +4700,7 @@ const chinese = {
   "Acting for {owner}": "代表 {owner}",
   // TXE access requests (TXE-4254).
   "Access requests": "访问请求",
+  "Waiting on the owner": "等待所有者",
   "Account": "账户",
   "Approve for": "批准给",
   "Bound": "绑定时间",
@@ -4724,7 +4725,6 @@ const chinese = {
   "1 application on file": "1 个已记录的申请",
   "{count} applications on file": "{count} 个已记录的申请",
   "Machines": "机器",
-  "Waiting on the owner": "等待所有者",
   "A machine enrolment application is awaiting your approval.": "有一个机器注册申请正在等待你的批准。",
   "{count} machine enrolment applications are awaiting your approval.": "{count} 个机器注册申请正在等待你的批准。",
   "Review machines": "查看机器",
@@ -7134,6 +7134,7 @@ const japanese = {
   "Acting for {owner}": "{owner} として操作中",
   // TXE access requests (TXE-4254).
   "Access requests": "アクセスリクエスト",
+  "Waiting on the owner": "所有者の対応待ち",
   "Account": "アカウント",
   "Approve for": "承認先",
   "Bound": "バインド日時",
@@ -7158,7 +7159,6 @@ const japanese = {
   "1 application on file": "記録済みの申請 1 件",
   "{count} applications on file": "記録済みの申請 {count} 件",
   "Machines": "マシン",
-  "Waiting on the owner": "所有者の対応待ち",
   "A machine enrolment application is awaiting your approval.": "1 件のマシン登録申請があなたの承認を待っています。",
   "{count} machine enrolment applications are awaiting your approval.": "{count} 件のマシン登録申請があなたの承認を待っています。",
   "Review machines": "マシンを確認",
