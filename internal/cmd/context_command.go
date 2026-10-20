@@ -173,7 +173,7 @@ func contextTestCommand() *cobra.Command {
 			fmt.Println("local context is always available")
 			return nil
 		}
-		remote, err := newRemoteClient(item)
+		remote, err := newCommandRemoteClient(ctx, ctx.Command, item)
 		if err != nil {
 			return err
 		}

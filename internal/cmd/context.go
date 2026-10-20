@@ -246,17 +246,9 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 	baseCtx := ctx
 	eventSourceInstance := eventstore.DefaultSourceInstance()
 	if scope == commandScopeContextAware && selectedContextName != localContextName {
-		remote, err := newRemoteClient(selectedContext)
+		remote, err := newCommandRemoteClient(ctx, cmd, selectedContext)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize remote context %q: %w", selectedContextName, err)
-		}
-		// A step on a machine enrolled with this context's hub presents the
-		// machine's credential, whatever the command; txe commands decide
-		// in txeHubAuth.
-		if txeInDAGStep() && !isTXECommand(cmd) {
-			if remote, err = txeStepRemote(ctx, cmd, remote); err != nil {
-				return nil, err
-			}
 		}
 		return &Context{
 			Context:             ctx,

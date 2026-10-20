@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -63,18 +64,24 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 		return nil, fmt.Errorf("this step cannot tell how this machine reaches the hub: %w", err)
 	}
 	entry, enrolled := auth.Enrolled(string(class))
-	hub, err := cliauth.NormalizeHub(remote.baseURL)
+	hub, err := txeHubKey(remote.baseURL)
 	if err != nil {
 		return nil, err
 	}
-	if !txeCommand && (!enrolled || hub != entry.Hub) {
+	enrolledHub := ""
+	if enrolled {
+		if enrolledHub, err = txeHubKey(entry.Hub); err != nil {
+			return nil, fmt.Errorf("this machine's %s enrolment names an invalid hub: %w", class, err)
+		}
+	}
+	if !txeCommand && (!enrolled || hub != enrolledHub) {
 		return remote, nil
 	}
 	if !enrolled {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=api_key (this machine is not enrolled for the %s class)\n", class, class)
 		return remote, nil
 	}
-	if hub != entry.Hub {
+	if hub != enrolledHub {
 		return nil, fmt.Errorf("this machine's %s credential is enrolled with the hub at %s, but this step reaches %s: enrol with the store this machine's jobs use; nothing was sent",
 			class, entry.Hub, hub)
 	}
@@ -164,4 +171,38 @@ func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		base = http.DefaultTransport
 	}
 	return base.RoundTrip(out)
+}
+
+// txeHubKey is a hub's API root as compared for a step's credential: the
+// normalized URL with a scheme's default port left out, so two spellings of
+// one destination compare equal.
+func txeHubKey(raw string) (string, error) {
+	normalized, err := cliauth.NormalizeHub(raw)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return "", err
+	}
+	if port := u.Port(); (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		host := u.Hostname()
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		u.Host = host
+	}
+	return u.String(), nil
+}
+
+// newCommandRemoteClient is newRemoteClient for a command's context. During
+// a DAG step, a command other than txe goes through txeStepRemote, so a
+// context for the hub the machine is enrolled with presents the machine's
+// credential; txe commands decide in txeHubAuth.
+func newCommandRemoteClient(ctx context.Context, cmd *cobra.Command, c *cliContext) (*remoteClient, error) {
+	remote, err := newRemoteClient(c)
+	if err != nil || !txeInDAGStep() || isTXECommand(cmd) {
+		return remote, err
+	}
+	return txeStepRemote(ctx, cmd, remote)
 }

@@ -298,3 +298,54 @@ func TestTXEStepRemoteForOtherCommands(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, elsewhere, got, "a context for another hub keeps its own key")
 }
+
+// Two spellings of one destination are one hub for a step's credential.
+func TestTXEHubKey(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"https://hub.example/api/v1", "https://hub.example:443/api/v1"},
+		{"https://Hub.Example/api/v1/", "https://hub.example/api/v1"},
+		{"http://127.0.0.1/api/v1", "http://127.0.0.1:80/api/v1"},
+		{"https://[::1]/api/v1", "https://[::1]:443/api/v1"},
+	} {
+		a, err := txeHubKey(pair[0])
+		require.NoError(t, err)
+		b, err := txeHubKey(pair[1])
+		require.NoError(t, err)
+		assert.Equal(t, a, b, pair)
+	}
+	for _, pair := range [][2]string{
+		{"http://hub.example/api/v1", "https://hub.example/api/v1"},
+		{"https://hub.example:8443/api/v1", "https://hub.example/api/v1"},
+	} {
+		a, _ := txeHubKey(pair[0])
+		b, _ := txeHubKey(pair[1])
+		assert.NotEqual(t, a, b, pair)
+	}
+}
+
+// "dagu context test" run by a step builds its own client for the context;
+// for the enrolled hub it carries the machine's token, not the stored key.
+func TestTXEStepContextTestPresentsTheMachineCredential(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
+	t.Setenv("DAGU_CONTEXTS_DIR", f.contexts)
+	t.Setenv("DAGU_DATA_DIR", f.data)
+	t.Setenv(runenv.EnvKeyDAGRunID, "run-1")
+	t.Setenv(runenv.EnvKeyDAGRunStepName, "check")
+	root := txeAuthRoot()
+	root.AddCommand(ContextCommand())
+	var out strings.Builder
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"context", "test", txeContextName, "--dagu-home", filepath.Dir(f.contexts)})
+	_ = root.Execute()
+	var me []cliauthtest.Request
+	for _, r := range f.hub.Requests() {
+		if r.Path == "/api/v1/auth/me" {
+			me = append(me, r)
+		}
+	}
+	require.Len(t, me, 1, out.String())
+	assert.True(t, strings.HasPrefix(me[0].Authorization, "Bearer ey"), "the machine's token")
+	assert.NotContains(t, me[0].Authorization, "dagu_test_key")
+}
