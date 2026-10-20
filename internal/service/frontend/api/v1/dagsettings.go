@@ -19,6 +19,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
 
 func dagSettingsStoreUnavailable() *Error {
@@ -45,6 +46,9 @@ type DAGProfileSelection struct {
 func (a *API) GetDAGSettings(ctx context.Context, request api.GetDAGSettingsRequestObject) (api.GetDAGSettingsResponseObject, error) {
 	if a.dagSettingsStore == nil {
 		return nil, dagSettingsStoreUnavailable()
+	}
+	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+		return nil, err
 	}
 	if _, err := a.getDAGForSettings(ctx, request.FileName); err != nil {
 		return nil, err

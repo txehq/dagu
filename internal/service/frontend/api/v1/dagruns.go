@@ -2212,6 +2212,9 @@ func (a *API) DeleteDAGRun(ctx context.Context, request api.DeleteDAGRunRequestO
 	if err := a.requireDAGWriteForWorkspace(ctx, workspaceName); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGRoute(ctx, request.Name, authz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	if err := a.dagRunRepository.RemoveDAGRun(ctx, ref, persis.DAGRunRemoveOptions{RejectActive: true}); err != nil {
 		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) || errors.Is(err, dagrun.ErrNoStatusData) {
 			return api.DeleteDAGRun404JSONResponse{

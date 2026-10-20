@@ -22,6 +22,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/humantask"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -71,6 +72,9 @@ func (a *API) RespondDAGRunStepAgentInteraction(ctx context.Context, request api
 	}
 	response, err := a.respondAgentInteraction(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), "", request.StepName, request.InteractionId, request.Body)
 	if err != nil {
+		if apiErr, ok := errors.AsType[*Error](err); ok {
+			return nil, apiErr
+		}
 		switch classifyAgentSessionAction(err) {
 		case agentSessionActionNotFound:
 			return &api.RespondDAGRunStepAgentInteraction404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
@@ -90,6 +94,9 @@ func (a *API) RespondSubDAGRunStepAgentInteraction(ctx context.Context, request 
 	}
 	response, err := a.respondAgentInteraction(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), request.SubDAGRunId, request.StepName, request.InteractionId, request.Body)
 	if err != nil {
+		if apiErr, ok := errors.AsType[*Error](err); ok {
+			return nil, apiErr
+		}
 		switch classifyAgentSessionAction(err) {
 		case agentSessionActionNotFound:
 			return &api.RespondSubDAGRunStepAgentInteraction404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
@@ -109,6 +116,9 @@ func (a *API) RestartDAGRunStepAgentSession(ctx context.Context, request api.Res
 	}
 	response, err := a.restartAgentSession(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), "", request.StepName)
 	if err != nil {
+		if apiErr, ok := errors.AsType[*Error](err); ok {
+			return nil, apiErr
+		}
 		switch classifyAgentSessionAction(err) {
 		case agentSessionActionNotFound:
 			return &api.RestartDAGRunStepAgentSession404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
@@ -128,6 +138,9 @@ func (a *API) RestartSubDAGRunStepAgentSession(ctx context.Context, request api.
 	}
 	response, err := a.restartAgentSession(ctx, ir.NewDAGRunRef(request.Name, request.DagRunId), request.SubDAGRunId, request.StepName)
 	if err != nil {
+		if apiErr, ok := errors.AsType[*Error](err); ok {
+			return nil, apiErr
+		}
 		switch classifyAgentSessionAction(err) {
 		case agentSessionActionNotFound:
 			return &api.RestartSubDAGRunStepAgentSession404JSONResponse{Code: api.ErrorCodeNotFound, Message: err.Error()}, nil
@@ -167,6 +180,11 @@ func (a *API) loadAgentStatus(ctx context.Context, root ir.DAGRunRef, subDAGRunI
 		return ir.DAGRunRef{}, nil, nil, err
 	}
 	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+		return ir.DAGRunRef{}, nil, nil, err
+	}
+	// Answering or restarting an agent session runs the step again: it is
+	// decided by the run's owners as executing it (TXE-4741).
+	if err := a.txeRunOwnerCheck(ctx, status, authz.PermissionExecute); err != nil {
 		return ir.DAGRunRef{}, nil, nil, err
 	}
 	return mutationRef, status, attempt, nil

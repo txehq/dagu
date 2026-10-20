@@ -17,6 +17,7 @@ import (
 	notificationmodel "github.com/dagucloud/dagu/v2/internal/notification"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	notificationservice "github.com/dagucloud/dagu/v2/internal/service/notification"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -275,6 +276,9 @@ func (a *API) GetDAGNotifications(ctx context.Context, request api.GetDAGNotific
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+		return nil, err
+	}
 
 	settings, err := a.notificationService.GetByDAGName(ctx, request.FileName)
 	if err != nil {
@@ -292,6 +296,9 @@ func (a *API) GetDAGNotifications(ctx context.Context, request api.GetDAGNotific
 
 func (a *API) UpdateDAGNotifications(ctx context.Context, request api.UpdateDAGNotificationsRequestObject) (api.UpdateDAGNotificationsResponseObject, error) {
 	if err := a.requireNotificationManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -334,6 +341,9 @@ func (a *API) DeleteDAGNotifications(ctx context.Context, request api.DeleteDAGN
 	if err := a.requireNotificationManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	if err := a.notificationService.DeleteByDAGName(ctx, request.FileName); err != nil {
 		if errors.Is(err, notificationmodel.ErrSettingsNotFound) {
 			return nil, &Error{
@@ -352,6 +362,9 @@ func (a *API) DeleteDAGNotifications(ctx context.Context, request api.DeleteDAGN
 
 func (a *API) TestDAGNotifications(ctx context.Context, request api.TestDAGNotificationsRequestObject) (api.TestDAGNotificationsResponseObject, error) {
 	if err := a.requireNotificationManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.ensureDAGExists(ctx, request.FileName); err != nil {
