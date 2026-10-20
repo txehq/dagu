@@ -189,4 +189,3 @@ func TestCleanupQueueTakesOverOnlyWhatItMay(t *testing.T) {
 	require.NoError(t, err, "another's it may take")
 	assert.Equal(t, "worker-b", job.ClaimedBy)
 }
-
