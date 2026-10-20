@@ -44,6 +44,12 @@ var (
 		Message:    "the owner of this record has not let you do this",
 		Details:    map[string]any{"code": "forbidden"},
 	}
+	errTxeRuntimeProfile = &Error{
+		HTTPStatus: http.StatusForbidden,
+		Code:       api.ErrorCodeForbidden,
+		Message:    "a runtime profile is the platform's to choose; start the run without one",
+		Details:    map[string]any{"code": "runtime_profile_not_permitted"},
+	}
 )
 
 // txeNeed says what a request needs beyond a permission.

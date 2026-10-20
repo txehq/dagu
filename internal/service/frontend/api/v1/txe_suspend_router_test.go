@@ -33,12 +33,18 @@ type suspendHub struct {
 
 func newSuspendHub(t *testing.T) suspendHub {
 	t.Helper()
+	return newOwnerHub(t, config.TXEAuthzModeEnforce)
+}
+
+// newOwnerHub is suspendHub's hub in the given authz mode.
+func newOwnerHub(t *testing.T, mode string) suspendHub {
+	t.Helper()
 	jwks := providerKeys(t)
 	server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Server.Auth.Mode = config.AuthModeBuiltin
 		cfg.Server.Auth.Builtin.Token.Secret = "jwt-secret-key"
 		cfg.Server.Auth.Builtin.Token.TTL = 24 * time.Hour
-		cfg.TXE.Authz.Mode = config.TXEAuthzModeEnforce
+		cfg.TXE.Authz.Mode = mode
 		cfg.TXE.Authn = config.TXEAuthnConfig{
 			Issuer: providerIssuer, Audience: providerAudience, JWKSURL: jwks + "/certs",
 			Clients: []config.TXEAuthnClient{{ID: providerCLI, Class: "cli"}},
