@@ -81,7 +81,7 @@ func (f *txeEnrolFixture) serve(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{
-			"machine_id": txeEnrolTestMachine, "class": "worker", "issuer": claims.Iss, "subject": claims.Sub, "client_id": claims.Azp,
+			"machine_id": txeEnrolTestMachine, "class": enrolTestClass(claims.Azp), "issuer": claims.Iss, "subject": claims.Sub, "client_id": claims.Azp,
 			"received_at": time.Now().UTC(), "credential_expires": time.Unix(claims.Exp, 0).UTC(),
 		})
 		return true
@@ -97,13 +97,24 @@ func (f *txeEnrolFixture) serve(w http.ResponseWriter, r *http.Request) bool {
 		approved := f.approved
 		f.mu.Unlock()
 		if approved && claims.Azp == f.provider.ClientID {
-			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"state": "bound", "scope": map[string]any{"kind": "owner", "machine_id": txeEnrolTestMachine}})
+			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"state": "bound", "principal": map[string]any{"class": enrolTestClass(claims.Azp)},
+				"scope": map[string]any{"kind": "owner", "machine_id": txeEnrolTestMachine}})
 		} else {
 			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"state": "unbound", "scope": map[string]any{"kind": "unbound", "unbound_reason": "not_enrolled"}})
 		}
 		return true
 	}
 	return false
+}
+
+// enrolTestClass is the class the test hub gives a client, as a hub's
+// txe.authn.clients list would: a client named dagu-reviewer-… is a
+// reviewer's, any other a worker's.
+func enrolTestClass(client string) string {
+	if strings.HasPrefix(client, "dagu-reviewer-") {
+		return "reviewer"
+	}
+	return "worker"
 }
 
 type enrolClaims struct {

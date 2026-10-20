@@ -250,7 +250,7 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 		token = tokens.AccessToken
 	}
 
-	hub := txeEnrolHub{base: remote.baseURL, client: txeEnrolClient(remote.client), machineID: machine.MachineID}
+	hub := txeEnrolHub{base: remote.baseURL, client: txeEnrolClient(remote.client), machineID: machine.MachineID, class: class}
 	if token == "" || wait > 0 {
 		if err := hub.await(ctx, path, wait, &view); err != nil {
 			return err
@@ -465,6 +465,9 @@ type txeEnrolHub struct {
 	base      string
 	client    *http.Client
 	machineID string
+	// class is the class being enrolled. The hub decides an application's
+	// class from the token's client; one it decides otherwise is refused.
+	class authn.Class
 }
 
 func (h txeEnrolHub) apply(ctx context.Context, token string) (*txeEnrolApplication, error) {
@@ -473,6 +476,10 @@ func (h txeEnrolHub) apply(ctx context.Context, token string) (*txeEnrolApplicat
 	if err := h.call(ctx, http.MethodPost, path, token, &out); err != nil {
 		return nil, fmt.Errorf("apply to enrol: %w", err)
 	}
+	if authn.Class(out.Class) != h.class {
+		return nil, fmt.Errorf("the hub takes client %s as a %q client, not %q: enrol it with --class %s, or use this machine's %s client",
+			out.ClientID, out.Class, h.class, out.Class, h.class)
+	}
 	return &out, nil
 }
 
@@ -480,7 +487,10 @@ func (h txeEnrolHub) apply(ctx context.Context, token string) (*txeEnrolApplicat
 // machine, enrolled.
 func (h txeEnrolHub) enrolled(ctx context.Context, token string) (bool, error) {
 	var out struct {
-		State string `json:"state"`
+		State     string `json:"state"`
+		Principal struct {
+			Class string `json:"class"`
+		} `json:"principal"`
 		Scope struct {
 			MachineID string `json:"machine_id"`
 		} `json:"scope"`
@@ -488,7 +498,16 @@ func (h txeEnrolHub) enrolled(ctx context.Context, token string) (bool, error) {
 	if err := h.call(ctx, http.MethodGet, cliauth.HubIdentityPath, token, &out); err != nil {
 		return false, fmt.Errorf("ask the hub whether the machine is enrolled: %w", err)
 	}
-	return out.State == "bound" && out.Scope.MachineID == h.machineID, nil
+	if out.State != "bound" || out.Scope.MachineID != h.machineID {
+		return false, nil
+	}
+	// Bound, but as another class: recording it under this one would make
+	// its steps present a token the hub refuses on their routes.
+	if authn.Class(out.Principal.Class) != h.class {
+		return false, fmt.Errorf("the hub takes this credential as this machine's %q credential, not %q: enrol with --class %s, or use this machine's %s client",
+			out.Principal.Class, h.class, out.Principal.Class, h.class)
+	}
+	return true, nil
 }
 
 func (h txeEnrolHub) call(ctx context.Context, method, path, token string, out any) error {

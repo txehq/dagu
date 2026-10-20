@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -94,4 +95,21 @@ func TestStepAuthRefusesALink(t *testing.T) {
 	require.NoError(t, os.Symlink(moved, real))
 	_, err := home.StepAuth()
 	require.Error(t, err)
+}
+
+// Enrolments of the two classes finishing at once both stay recorded.
+func TestStepAuthConcurrentClasses(t *testing.T) {
+	for range 20 {
+		home := Home{Root: t.TempDir()}
+		var wg sync.WaitGroup
+		for _, class := range []string{"worker", "reviewer"} {
+			wg.Go(func() {
+				assert.NoError(t, home.SetStepCredential(class, "/abs/"+class+".json", "http://h/api/v1"))
+			})
+		}
+		wg.Wait()
+		auth, err := home.StepAuth()
+		require.NoError(t, err)
+		assert.Len(t, auth.Classes, 2)
+	}
 }

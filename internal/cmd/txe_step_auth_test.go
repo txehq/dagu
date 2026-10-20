@@ -490,3 +490,22 @@ func TestTXEStepChecksTheTokenItPresents(t *testing.T) {
 	tr.machineID = "mch_other"
 	require.ErrorContains(t, tr.checkToken(jwt(map[string]string{"iss": f.provider.Issuer(), "azp": txeEnrolTestClient})), "now names machine")
 }
+
+// The hub decides an application's class from the token's client. Enrolling
+// a client as the other class is refused, and nothing is recorded for steps.
+func TestTXEEnrolRefusesAClientOfAnotherClass(t *testing.T) {
+	for name, tc := range map[string]struct{ class, client string }{
+		"ReviewerWithAWorkerClient": {"reviewer", txeEnrolTestClient},
+		"WorkerWithAReviewerClient": {"worker", txeEnrolTestReviewerClient},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newStepAuthFixture(t)
+			f.provider.ClientID = tc.client
+			_, err := f.run("enrol", "--class", tc.class, "--client-id", tc.client)
+			require.ErrorContains(t, err, "not \""+tc.class+"\"")
+			auth, err := txepkg.Home{Root: f.home}.StepAuth()
+			require.NoError(t, err)
+			assert.Empty(t, auth.Classes)
+		})
+	}
+}
