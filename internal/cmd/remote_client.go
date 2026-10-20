@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,8 @@ type remoteHistoryQuery struct {
 	Statuses []int
 	RunID    string
 	Labels   []string
+	// Limit is the most runs to return; zero leaves the hub's default.
+	Limit int
 }
 
 func newRemoteClient(ctx *cliContext) (*remoteClient, error) {
@@ -192,6 +195,9 @@ func (c *remoteClient) listDAGRuns(ctx context.Context, query remoteHistoryQuery
 	}
 	if len(query.Labels) > 0 {
 		params.Set("labels", strings.Join(query.Labels, ","))
+	}
+	if query.Limit > 0 {
+		params.Set("limit", strconv.Itoa(query.Limit))
 	}
 
 	var out struct {
