@@ -3277,7 +3277,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 					Message: "the conditional retry was sent and its outcome is unknown: " + err.Error(),
 					Details: map[string]any{"code": "dispatch_uncertain"}}
 			}
-			if refusal := a.dispatchRefusal(err, dag); refusal != nil {
+			if refusal := a.retryDispatchRefusal(err, dag, task); refusal != nil {
 				return retryDAGRunResult{}, refusal
 			}
 			return retryDAGRunResult{}, fmt.Errorf("error dispatching retry to coordinator: %w", err)

@@ -98,3 +98,15 @@ func TestSeededStartRefusedForWantOfAWorker(t *testing.T) {
 	err := a.dispatchSeededRun(context.Background(), dag, &ir.DAGRunStatus{Name: "nightly", DAGRunID: "r1"}, "")
 	requireAnswer(t, err, http.StatusConflict, "no_eligible_worker")
 }
+
+// A retry bound to the worker holding its agent session is refused as
+// waiting for that worker, not as a selector to change; one whose outcome
+// is unknown stays unclassified.
+func TestTargetedRetryRefusalNamesTheSessionWorker(t *testing.T) {
+	a := &API{config: &config.Config{}}
+	dag := &ir.DAG{Name: "agent"}
+	targeted := &dispatch.DispatchTask{TargetWorkerID: "worker-1"}
+	requireAnswer(t, a.retryDispatchRefusal(errRefusedNoMatch, dag, targeted), http.StatusServiceUnavailable, "session_worker_unavailable")
+	requireAnswer(t, a.retryDispatchRefusal(errRefusedNoMatch, dag, &dispatch.DispatchTask{}), http.StatusConflict, "no_eligible_worker")
+	assert.Nil(t, a.retryDispatchRefusal(fmt.Errorf("%w: %w", coordinator.ErrDispatchOutcomeUnknown, errRefusedNoMatch), dag, targeted))
+}

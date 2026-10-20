@@ -35,6 +35,10 @@ var (
 		Message: "this DAG names no machine, and where owners are enforced a machine's worker runs only DAGs pinned to " +
 			"it: pin the DAG with worker_selector txe.machine, or have a worker that is no machine's run it",
 		Details: map[string]any{"code": "dag_not_pinned"}}
+	errSessionWorkerUnavailable = &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
+		Message: "this retry resumes an agent session and must run on the worker that holds it, which is not connected; " +
+			"reconnect that worker, or start the session again",
+		Details: map[string]any{"code": "session_worker_unavailable"}}
 	errMachineWorkerUnavailable = &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
 		Message: "no worker of the machine this DAG is pinned to may run it now: check that the machine's worker is " +
 			"running and enrolled, and that it has every label the DAG's worker_selector names",
@@ -62,6 +66,18 @@ func (a *API) dispatchRefusal(err error, dag *ir.DAG) error {
 		return errNoEligibleWorker
 	}
 	return errNoWorkerAvailable
+}
+
+// retryDispatchRefusal is dispatchRefusal for a retry task. A retry that
+// resumes an agent session must run on the worker holding the session, so
+// when it is refused only that worker's return, not a selector change,
+// makes it runnable.
+func (a *API) retryDispatchRefusal(err error, dag *ir.DAG, task *dispatch.DispatchTask) error {
+	refusal := a.dispatchRefusal(err, dag)
+	if refusal != nil && task != nil && task.TargetWorkerID != "" {
+		return errSessionWorkerUnavailable
+	}
+	return refusal
 }
 
 // errStartUnconfirmed answers a run the coordinator accepted whose start
