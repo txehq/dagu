@@ -120,13 +120,16 @@ func (c MachineCredential) sameEnrolment(other MachineCredential) bool {
 	return c == other
 }
 
-// Validate checks that the credential is complete and usable by a worker.
+// Validate checks that the credential is complete and is a machine's: a
+// worker's, which the worker presents to the coordinator, or a reviewer's,
+// which the reviewer's steps present to the hub (TXE-4733). The coordinator
+// takes only a worker's.
 func (c MachineCredential) Validate() error {
 	if c.Schema != CredentialSchema {
 		return fmt.Errorf("transportauth: machine credential schema %d is not %d", c.Schema, CredentialSchema)
 	}
-	if c.Class != authn.ClassWorker {
-		return fmt.Errorf("transportauth: machine credential class %q is not %q", c.Class, authn.ClassWorker)
+	if !c.Class.Machine() {
+		return fmt.Errorf("transportauth: machine credential class %q is not %q or %q", c.Class, authn.ClassWorker, authn.ClassReviewer)
 	}
 	for name, value := range map[string]string{
 		"issuer": c.Issuer, "client_id": c.ClientID, "machine_id": c.MachineID, "refresh_token": c.RefreshToken,

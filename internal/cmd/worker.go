@@ -15,6 +15,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/worker"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	"github.com/spf13/cobra"
 )
@@ -174,6 +175,10 @@ func machineWorkerIdentity(credentialFile, configuredID, workerID string, labels
 	credential, err := transportauth.ReadMachineCredential(credentialFile)
 	if err != nil {
 		return "", nil, fmt.Errorf("worker.auth.credential_file: %w; enrol this machine again to replace it", err)
+	}
+	if credential.Class != authn.ClassWorker {
+		// The coordinator takes only a worker's credential.
+		return "", nil, fmt.Errorf("worker.auth.credential_file holds a %s credential, not the machine's worker credential", credential.Class)
 	}
 	machine := credential.MachineID
 	if configuredID == "" {

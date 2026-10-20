@@ -404,6 +404,16 @@ func TestWorkerIdentityMustNameTheEnrolledMachine(t *testing.T) {
 	_, _, err = machineWorkerIdentity(filepath.Join(t.TempDir(), "missing.json"), "", "h", nil)
 	require.ErrorContains(t, err, "enrol this machine again")
 
+	// A reviewer's credential is valid for its steps, not for the worker:
+	// the coordinator takes only a worker's (TXE-4733).
+	reviewer := filepath.Join(t.TempDir(), "reviewer.json")
+	require.NoError(t, transportauth.WriteMachineCredential(reviewer, transportauth.MachineCredential{
+		Schema: transportauth.CredentialSchema, Issuer: authTestIssuer, TokenEndpoint: "https://issuer.example/token",
+		ClientID: "dagu-reviewer-mch_A", Class: authn.ClassReviewer, MachineID: "mch_A", RefreshToken: "r",
+	}))
+	_, _, err = machineWorkerIdentity(reviewer, "", "h", nil)
+	require.ErrorContains(t, err, "not the machine's worker credential")
+
 	original := map[string]string{"os": "linux"}
 	_, _, err = machineWorkerIdentity(path, "", "h", original)
 	require.NoError(t, err)
