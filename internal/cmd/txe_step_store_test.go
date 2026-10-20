@@ -164,7 +164,7 @@ func TestTXEStepStoreRefusals(t *testing.T) {
 			setup: func(f *stepStoreFixture, t *testing.T) {
 				f.machineStore(t, &cliContext{Name: txeContextName, ServerURL: stepStoreTunnel, SignInOnly: true})
 			},
-			want: "holds no credential a job's steps can use",
+			want: "holds no API key, and this machine is not enrolled for the worker class",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
