@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
@@ -188,6 +189,14 @@ func TestTXEEnrolWritesTheWorkerCredentialAndApplies(t *testing.T) {
 
 	_, err = f.run("enrol", "--client-id", "another-client", "--resume")
 	assert.ErrorContains(t, err, "enrol again without --resume")
+
+	// A reviewer's credential in the file is not the worker's to resume with
+	// (TXE-4733).
+	asReviewer := rotated
+	asReviewer.Class = authn.ClassReviewer
+	require.NoError(t, transportauth.WriteMachineCredential(f.path(), asReviewer))
+	_, err = f.run("enrol", "--client-id", txeEnrolTestClient, "--resume")
+	assert.ErrorContains(t, err, "not this machine's worker credential")
 }
 
 func TestTXEEnrolWaitsForApproval(t *testing.T) {
@@ -397,6 +406,11 @@ func TestTXEEnrolCheck(t *testing.T) {
 			return p
 		}, "0600"},
 		"missing": {func(t *testing.T) string { return filepath.Join(t.TempDir(), "none.json") }, "no such file"},
+		// Valid for the reviewer's steps, but the worker loads only a
+		// worker's (TXE-4733).
+		"a reviewer's credential": {func(t *testing.T) string {
+			return write(t, func(c map[string]any) { c["class"] = "reviewer" })
+		}, "loads only this machine's worker credential"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := f.run("enrol", "check", "--credential-file", tc.path(t))

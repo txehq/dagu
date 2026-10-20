@@ -180,6 +180,11 @@ var machineHomeRules = []rule{
 	{name: "worker-credential.json", kind: kindFile, exclude: "the worker's machine credential (dagu txe enrol); not read"},
 	{name: "worker-credential.json.lock", kind: kindFile, exclude: "the machine credential's lock; not read"},
 	{pattern: regexp.MustCompile(`^\.worker-credential\.json\.[0-9]+$`), kind: kindFile, exclude: "a machine credential being saved; not read"},
+	// The reviewer's machine credential, written beside it by the same
+	// writer (dagu txe enrol --class reviewer; TXE-4733).
+	{name: "reviewer-credential.json", kind: kindFile, exclude: "the reviewer's machine credential (dagu txe enrol); not read"},
+	{name: "reviewer-credential.json.lock", kind: kindFile, exclude: "the reviewer credential's lock; not read"},
+	{pattern: regexp.MustCompile(`^\.reviewer-credential\.json\.[0-9]+$`), kind: kindFile, exclude: "a reviewer credential being saved; not read"},
 	// The CLI's sign-ins, one sealed entry per hub with its lock, and the
 	// temporary file an entry is written through (internal/txe/cliauth
 	// entryPaths, fileutil.WriteFileAtomic).

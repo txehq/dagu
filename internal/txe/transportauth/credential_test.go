@@ -155,8 +155,8 @@ func TestCredentialFileMustBeComplete(t *testing.T) {
 	require.NoError(t, valid.Validate())
 	for name, mutate := range map[string]func(*transportauth.MachineCredential){
 		"schema":             func(c *transportauth.MachineCredential) { c.Schema = 2 },
-		"reviewer class":     func(c *transportauth.MachineCredential) { c.Class = authn.ClassReviewer },
 		"cli class":          func(c *transportauth.MachineCredential) { c.Class = authn.ClassCLI },
+		"person class":       func(c *transportauth.MachineCredential) { c.Class = authn.ClassPerson },
 		"no machine":         func(c *transportauth.MachineCredential) { c.MachineID = "" },
 		"no refresh token":   func(c *transportauth.MachineCredential) { c.RefreshToken = "" },
 		"padded client":      func(c *transportauth.MachineCredential) { c.ClientID = " " + clientA1Worker },
@@ -173,6 +173,9 @@ func TestCredentialFileMustBeComplete(t *testing.T) {
 	c := valid
 	c.TokenEndpoint = "http://127.0.0.1:8080/token"
 	assert.NoError(t, c.Validate(), "plain http to a loopback provider")
+	c = valid
+	c.Class = authn.ClassReviewer
+	assert.NoError(t, c.Validate(), "a reviewer's credential, which its steps present to the hub")
 }
 
 func TestUnknownFieldsInTheCredentialFileAreRefused(t *testing.T) {

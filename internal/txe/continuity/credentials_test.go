@@ -40,6 +40,7 @@ func signedInAndEnrolled(t *testing.T, l *fixture.Layout) {
 	for _, rel := range []string{
 		"signin/" + signinEntry + ".json", "signin/" + signinEntry + ".lock", "signin/" + signinEntry + ".json.tmp.1234567",
 		"worker-credential.json", "worker-credential.json.lock", ".worker-credential.json.2345678",
+		"reviewer-credential.json", "reviewer-credential.json.lock", ".reviewer-credential.json.4567890",
 	} {
 		writeSecret(t, homePath(l, rel))
 	}
@@ -65,6 +66,8 @@ func TestCredentialsAreExcludedExactly(t *testing.T) {
 		"laptop-home/signin/" + signinEntry + ".json", "laptop-home/signin/" + signinEntry + ".lock",
 		"laptop-home/signin/" + signinEntry + ".json.tmp.1234567", "laptop-home/worker-credential.json",
 		"laptop-home/worker-credential.json.lock", "laptop-home/.worker-credential.json.2345678",
+		"laptop-home/reviewer-credential.json", "laptop-home/reviewer-credential.json.lock",
+		"laptop-home/.reviewer-credential.json.4567890",
 		"hub-data/coordinator/hub.key", "hub-data/coordinator/.hub.key.3456789",
 	} {
 		assert.True(t, excluded[p], p)
@@ -96,6 +99,8 @@ func TestCredentialAreasStayExact(t *testing.T) {
 		{name: "the machine credential as a directory", break_: dir("worker-credential.json"), want: "unsupported_file"},
 		{name: "a credential save not named by its writer", break_: file(".worker-credential.json.tmp"), want: "unclassified_area"},
 		{name: "another credential file beside it", break_: file("worker-credential.json.bak"), want: "unclassified_area"},
+		{name: "the reviewer credential as a directory", break_: dir("reviewer-credential.json"), want: "unsupported_file"},
+		{name: "a reviewer credential save not named by its writer", break_: file(".reviewer-credential.json.tmp"), want: "unclassified_area"},
 		{name: "the machine credential as a link", links: true, break_: func(t *testing.T, l *fixture.Layout) {
 			writeSecret(t, filepath.Join(l.Root, "elsewhere.json"))
 			require.NoError(t, os.Symlink(filepath.Join(l.Root, "elsewhere.json"), homePath(l, "worker-credential.json")))
