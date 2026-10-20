@@ -115,6 +115,30 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=api_key (this machine is not enrolled for the %s class)\n", class, class)
 		return remote, nil
 	}
+	stepRemote, err := txeEnrolledRemote(ctx, home, class, entry, remote)
+	if err != nil {
+		return nil, err
+	}
+	if txeCommand {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=credential\n", class)
+	}
+	return stepRemote, nil
+}
+
+// txeEnrolledRemote returns a copy of remote that presents this machine's
+// credential for class, after every check: the remote reaches the hub the
+// enrolment was made with; the credential loads as the worker loads it, is
+// of that class and this machine's, and is from the identity provider the
+// hub names. Anything else is an error, and nothing is sent.
+func txeEnrolledRemote(ctx context.Context, home txepkg.Home, class authn.Class, entry txepkg.StepAuthClass, remote *remoteClient) (*remoteClient, error) {
+	hub, err := txeHubKey(remote.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	enrolledHub, err := txeHubKey(entry.Hub)
+	if err != nil {
+		return nil, fmt.Errorf("this machine's %s enrolment names an invalid hub: %w", class, err)
+	}
 	if hub != enrolledHub {
 		return nil, fmt.Errorf("this machine's %s credential is enrolled with the hub at %s, but this step reaches %s: enrol with the store this machine's jobs use; nothing was sent",
 			class, entry.Hub, hub)
@@ -147,14 +171,7 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	if err != nil {
 		return nil, err
 	}
-	stepRemote, err := remote.withMachineCredential(source, credential)
-	if err != nil {
-		return nil, err
-	}
-	if txeCommand {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=credential\n", class)
-	}
-	return stepRemote, nil
+	return remote.withMachineCredential(source, credential)
 }
 
 // withMachineCredential returns a copy of c whose calls carry the machine's

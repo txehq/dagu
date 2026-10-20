@@ -509,3 +509,84 @@ func TestTXEEnrolRefusesAClientOfAnotherClass(t *testing.T) {
 		})
 	}
 }
+
+// A machine whose own store holds no API key registers with its enrolled
+// worker credential: the registrar reads the hub with that credential, as
+// the job's steps will (TXE-4760). Without a worker enrolment, with only a
+// reviewer one, or enrolled with another hub, it is refused. A store with
+// an API key keeps it.
+func TestTXEMachineStepClient(t *testing.T) {
+	ctx := context.Background()
+	signInOnly := func(f *stepAuthFixture) *cliContext {
+		return &cliContext{Name: txeContextName, ServerURL: f.hub.API(), SignInOnly: true}
+	}
+	machineCalls := func(f *stepAuthFixture) []cliauthtest.Request {
+		var out []cliauthtest.Request
+		for _, r := range f.hub.Requests() {
+			if r.Method == http.MethodGet && r.Path == "/api/v1/txe/machines/"+txeEnrolTestMachine {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	t.Run("EnrolledWorkerNoKey", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		home := txepkg.Home{Root: f.home}
+		client, err := txeMachineStepClient(ctx, home, signInOnly(f))
+		require.NoError(t, err)
+		before := len(machineCalls(f))
+		_, err = client.Machine(ctx, txeEnrolTestMachine)
+		require.NoError(t, err)
+		calls := machineCalls(f)
+		require.Len(t, calls, before+1)
+		last := calls[len(calls)-1]
+		assert.Equal(t, txeEnrolTestClient, enrolTestClaims(last.Authorization).Azp, "the worker's own token")
+		assert.NotContains(t, last.Authorization, "dagu_")
+	})
+
+	t.Run("NotEnrolled", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		_, err := txeMachineStepClient(ctx, txepkg.Home{Root: f.home}, signInOnly(f))
+		require.ErrorContains(t, err, "not enrolled for the worker class")
+	})
+
+	t.Run("ReviewerOnly", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.provider.ClientID = txeEnrolTestReviewerClient
+		before := txeEnrolInterval
+		txeEnrolInterval = 20 * time.Millisecond
+		t.Cleanup(func() { txeEnrolInterval = before })
+		f.approveAfter = 1
+		out := f.json("enrol", "--class", "reviewer", "--client-id", txeEnrolTestReviewerClient, "--wait", "10s")
+		require.Equal(t, "enrolled", out["state"])
+		_, err := txeMachineStepClient(ctx, txepkg.Home{Root: f.home}, signInOnly(f))
+		require.ErrorContains(t, err, "not enrolled for the worker class")
+	})
+
+	t.Run("EnrolledWithAnotherHub", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		other := signInOnly(f)
+		other.ServerURL = "https://other.invalid/api/v1"
+		_, err := txeMachineStepClient(ctx, txepkg.Home{Root: f.home}, other)
+		require.ErrorContains(t, err, "is enrolled with the hub at")
+	})
+
+	t.Run("CredentialGone", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		require.NoError(t, os.Rename(f.path(), f.path()+".moved"))
+		_, err := txeMachineStepClient(ctx, txepkg.Home{Root: f.home}, signInOnly(f))
+		require.ErrorContains(t, err, "nothing was sent")
+	})
+
+	t.Run("APIKeyStoreUnchanged", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		client, err := txeMachineStepClient(ctx, txepkg.Home{Root: f.home}, &cliContext{Name: txeContextName, ServerURL: f.hub.API(), APIKey: "dagu_test_key"})
+		require.NoError(t, err)
+		assert.Equal(t, "dagu_test_key", client.APIKey)
+	})
+}

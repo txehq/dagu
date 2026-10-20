@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -54,11 +55,41 @@ func txeStepStore(ctx *Context, home txepkg.Home, machine *txepkg.Machine) (txec
 	if err != nil {
 		return txeclient.HubContext{}, nil, err
 	}
-	remote, err := newRemoteClient(stepContext)
+	stepClient, err := txeMachineStepClient(ctx, home, stepContext)
 	if err != nil {
 		return txeclient.HubContext{}, nil, err
 	}
-	return steps, txeclient.New(remote.baseURL, remote.apiKey, remote.client), nil
+	return steps, stepClient, nil
+}
+
+// txeMachineStepClient reads the hub as this machine's job steps will: with
+// the machine store's API key, or, for a machine whose store holds none,
+// with the machine's enrolled worker credential (TXE-4707), which is then
+// what those steps present. A machine with neither has nothing its jobs
+// could run with, and is refused; so is a reviewer-only enrolment, which no
+// job step presents.
+func txeMachineStepClient(ctx context.Context, home txepkg.Home, stepContext *cliContext) (*txeclient.Client, error) {
+	remote, err := newRemoteClient(stepContext)
+	if err != nil {
+		return nil, err
+	}
+	if !stepContext.SignInOnly && stepContext.APIKey != "" {
+		return txeclient.New(remote.baseURL, remote.apiKey, remote.client), nil
+	}
+	auth, err := home.StepAuth()
+	if err != nil {
+		return nil, fmt.Errorf("this machine's own %q context holds no API key, and how its steps reach the hub cannot be read: %w", txeContextName, err)
+	}
+	entry, enrolled := auth.Enrolled(string(authn.ClassWorker))
+	if !enrolled {
+		return nil, fmt.Errorf("this machine's own %q context holds no API key, and this machine is not enrolled for the worker class, so a job's steps would have nothing to run with: enrol this machine's worker (dagu txe enrol) and register again",
+			txeContextName)
+	}
+	worker, err := txeEnrolledRemote(ctx, home, authn.ClassWorker, entry, remote)
+	if err != nil {
+		return nil, err
+	}
+	return txeclient.New(worker.baseURL, "", worker.client), nil
 }
 
 // txeOwnerIDs lists the owners a hub identity answer names.
@@ -80,7 +111,8 @@ func txeOwnerList(who *txeHubIdentity) string {
 
 // txeMachineStore opens this machine's own context store: the TXE home's
 // client store, resolved as a step resolves it when given only --dagu-home,
-// and its hub context, which must hold a credential a step can use.
+// and its hub context. Whether its steps have a credential to present is
+// txeMachineStepClient's to decide.
 func txeMachineStore(ctx context.Context, home txepkg.Home) (txeclient.HubContext, *cliContext, error) {
 	daguHome := home.ClientDir()
 	cfg, err := txeStoreConfig(daguHome)
@@ -98,9 +130,6 @@ func txeMachineStore(ctx context.Context, home txepkg.Home) (txeclient.HubContex
 	}
 	if err != nil {
 		return txeclient.HubContext{}, nil, fmt.Errorf("read the %q context in this machine's own store (%s): %w", txeContextName, cfg.Paths.ContextsDir, err)
-	}
-	if stored.SignInOnly || stored.APIKey == "" {
-		return txeclient.HubContext{}, nil, fmt.Errorf("this machine's own %q context (%s) holds no credential a job's steps can use, only a sign-in", txeContextName, cfg.Paths.ContextsDir)
 	}
 	return txeclient.HubContext{DaguHome: daguHome, Name: txeContextName, ContextsDir: cfg.Paths.ContextsDir, DataDir: cfg.Paths.DataDir}, stored, nil
 }
