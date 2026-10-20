@@ -16,6 +16,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/txe/placement"
 )
 
 // Record layout inside the registry collection. Nothing is ever deleted.
@@ -54,6 +55,12 @@ func Dir(dataDir string) string {
 // DAGFacts are the parts of a loaded DAG the registry checks.
 type DAGFacts struct {
 	WorkerSelector map[string]string
+	// Placed says the store read where the spec sends its work: Placements,
+	// or Unplaceable when that cannot be read. A store that does not read it
+	// leaves the top-level selector as the only placement checked.
+	Placed      bool
+	Placements  []placement.Placement
+	Unplaceable error
 }
 
 // DAGStore is the hub's DAG definition store. The registry is the only

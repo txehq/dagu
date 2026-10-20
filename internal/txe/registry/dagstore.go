@@ -10,6 +10,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/txe/placement"
 )
 
 // DAGRepository is the subset of the hub's DAG repository the registry uses.
@@ -34,7 +35,11 @@ func (d *repoDAGStore) CheckSpec(ctx context.Context, name string, spec []byte) 
 	if err != nil {
 		return DAGFacts{}, err
 	}
-	return DAGFacts{WorkerSelector: dag.WorkerSelector}, nil
+	facts := DAGFacts{WorkerSelector: dag.WorkerSelector, Placed: true}
+	if facts.Unplaceable = placement.Written(spec); facts.Unplaceable == nil {
+		facts.Placements, facts.Unplaceable = placement.Of(dag)
+	}
+	return facts, nil
 }
 
 func (d *repoDAGStore) SpecSHA256(ctx context.Context, name string) (string, error) {
