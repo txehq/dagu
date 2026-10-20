@@ -223,9 +223,9 @@ func TestTXEStepFailsClosedOnceEnrolled(t *testing.T) {
 	})
 }
 
-// A reviewer step needs the reviewer class: a machine enrolled for the worker
-// class only keeps the API key there, and one recorded as enrolled for the
-// reviewer class is refused until this build reads reviewer credentials.
+// A reviewer step needs the reviewer class: on a machine enrolled for the
+// worker class only it is refused with an enrol hint, never run on the API
+// key, and a worker credential recorded for the reviewer class is refused.
 func TestTXEStepClass(t *testing.T) {
 	f := newStepAuthFixture(t)
 	f.enrolled(t)

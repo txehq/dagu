@@ -159,7 +159,9 @@ func txeSignInStore(ctx *Context, remote *remoteClient) (*cliauth.Store, string,
 // txeInDAGStep reports whether this command runs as a step of a DAG run. A
 // step is unattended: it never uses a person's interactive sign-in. It
 // presents the machine's own credential when the machine is enrolled for the
-// step's class, and the context's API key otherwise (txeStepRemote).
+// step's class; on a machine enrolled for no class at all it uses the
+// context's API key; a txe step of a class an enrolled machine lacks is
+// refused (txeStepRemote).
 func txeInDAGStep() bool {
 	return os.Getenv(runenv.EnvKeyDAGRunID) != "" && os.Getenv(runenv.EnvKeyDAGRunStepName) != ""
 }
