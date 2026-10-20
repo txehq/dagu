@@ -41,5 +41,10 @@ run closed     1 "is closed"                    "closed	false	$H	main" "$ok_chec
 run other-base 1 "base is release"              "open	false	$H	release" "$ok_check" not-merged
 run check-fail 1 "does not pass"                "open	false	$H	main"  'echo "FAIL: P1"; exit 1' not-merged
 run no-check   2 "main has no codex-review-check.sh" "open	false	$H	main" '' not-merged
+# An inherited fixture directory never reaches main's check: here the check would pass only in fixture mode.
+export CODEX_REVIEW_FIXTURE_DIR="$TMP/fixtures"
+# shellcheck disable=SC2016  # the body is main's check, expanded when it runs
+run fixture-env 1 "does not pass" "open	false	$H	main" '[ -n "${CODEX_REVIEW_FIXTURE_DIR:-}" ] && exit 0; exit 1' not-merged
+unset CODEX_REVIEW_FIXTURE_DIR
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

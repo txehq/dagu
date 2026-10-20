@@ -5,7 +5,8 @@ public. So every object is rebuilt from an explicit allowlist of fields, and eve
 from values parsed out of it, never copied: the connector's state block (re-serialized from its
 known keys), its Code Review row (from its datetime and status), its receipt (from the reviewed
 commit), and each finding's badge (from its level). Paths become synthetic, people's logins
-a-person, branch names synthetic-branch; bot logins are kept, the check reads them.
+a-person, branch names synthetic-branch, repository names synthetic/repo; state values and
+timestamps are kept only in their known shapes; bot logins are kept, the check reads them.
 
   python3 -I sanitize.py <file.json>...   # rewrites each file in place; idempotent
 """
@@ -20,9 +21,20 @@ STATE_KEYS = {"commit_sha", "has_any_findings", "has_unresolved_findings", "stat
 paths = {}
 
 
+def state_value(k, v):
+    """A state value only in its known shape: a 40-hex SHA, a boolean, a short status word, or null."""
+    if v is None or isinstance(v, bool):
+        return v
+    if k == "commit_sha" and isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v):
+        return v
+    if k == "status" and isinstance(v, str) and re.fullmatch(r"[a-z_]{1,20}", v):
+        return v
+    return None
+
+
 def state_line(m):
     block = json.loads(m.group(1))
-    clean = {part: {k: v for k, v in (block.get(part) or {}).items() if k in STATE_KEYS}
+    clean = {part: {k: state_value(k, v) for k, v in (block.get(part) or {}).items() if k in STATE_KEYS}
              for part in ("code_review", "security_review") if part in block}
     return "<!-- codex-review-state:v1 " + json.dumps(clean, separators=(",", ":")) + " -->"
 
@@ -33,7 +45,7 @@ def body(text):
         if (m := re.search(r"<!-- codex-review-state:v1 (.*?) -->", line)):
             out.append(state_line(m))
         elif "**Code Review**" in line:
-            t = re.search(r'datetime="([^"]+)"', line)
+            t = re.search(r'datetime="([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]+)?Z)"', line)
             done = "Completed" in line
             out.append("| \U0001F4DD **Code Review** | " + ("✅ **Completed** " if done else "**Running** ")
                        + (f'<relative-time datetime="{t.group(1)}">{t.group(1)}</relative-time>' if t else "") + " |")
@@ -63,7 +75,9 @@ def walk(v, key=None):
         return "synthetic-branch"
     if key == "path":
         return paths.setdefault(v, v if v.startswith("synthetic/") else f"synthetic/file{len(paths) + 1}.go")
-    if key in ("name", "full_name", "state", "event", "type", "side", "subject_type", "color"):
+    if key == "full_name":
+        return "synthetic/repo"
+    if key in ("name", "state", "event", "type", "side", "subject_type", "color"):
         return v if len(v) <= 40 and "\n" not in v else "synthetic"
     return v
 

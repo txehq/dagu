@@ -29,6 +29,8 @@ name: codex-review
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled]
+    # The gate is main's copy only: on another base, github.sha would be that branch's scripts.
+    branches: [main]
 
 concurrency:
   group: codex-review-${{ github.event.pull_request.number }}

@@ -42,6 +42,16 @@ class Sanitize(unittest.TestCase):
         self.assertEqual(out["user"]["login"], "chatgpt-codex-connector[bot]")
         self.assertTrue(out["path"].startswith("synthetic/"))
 
+    def test_private_text_inside_kept_values_is_dropped(self):
+        body = ('<!-- codex-review-state:v1 {"code_review":{"commit_sha":"' + SECRET + '","status":"' + SECRET
+                + '","has_any_findings":"' + SECRET + '"}} -->\n'
+                + '| **Code Review** | Completed <relative-time datetime="' + SECRET + '">x</relative-time> |')
+        out = sanitize.walk({"body": body, "head": {"repo": {"full_name": "txehq/private-repo"}}})
+        text = json.dumps(out)
+        self.assertNotIn("PRIVATE", text)
+        self.assertNotIn("private-repo", text)
+        self.assertIn('"commit_sha":null', out["body"])
+
 
 if __name__ == "__main__":
     unittest.main()

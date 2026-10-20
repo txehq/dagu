@@ -34,7 +34,8 @@ read -r state draft head base < <(gh api "repos/$repo/pulls/$pr" --jq '[.state, 
 [ "$head" = "$want" ] || { echo "merge.sh: PR #$pr's head is $head, not $want" >&2; exit 1; }
 [ "$base" = main ] || { echo "merge.sh: PR #$pr's base is $base, not main" >&2; exit 1; }
 
-GH_REPO="$repo" PR_NUMBER="$pr" CODEX_REVIEW_WAIT_SECONDS=0 bash "$tmp/check.sh" \
+# Never fixture mode: an inherited CODEX_REVIEW_FIXTURE_DIR would judge local files and merge the live PR.
+env -u CODEX_REVIEW_FIXTURE_DIR GH_REPO="$repo" PR_NUMBER="$pr" CODEX_REVIEW_WAIT_SECONDS=0 bash "$tmp/check.sh" \
   || { echo "merge.sh: main's codex-review check does not pass on $want; not merging" >&2; exit 1; }
 
 gh pr merge "$pr" -R "$repo" --squash --match-head-commit "$want"
