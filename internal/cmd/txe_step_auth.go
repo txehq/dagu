@@ -136,8 +136,9 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 //   - only a token from the credential that was checked: its issuer, client
 //     and machine are compared with it each time one is presented.
 //
-// An error answer has the token, and any other bearer value in it, replaced,
-// so a hub that echoes a request's credential does not print it.
+// Any answer outside 2xx (an error, or a redirect, which is not followed) has
+// the token, and any other bearer value in it, replaced, so a hub that echoes
+// a request's credential does not print it.
 func (c *remoteClient) withMachineCredential(source *transportauth.RefreshingSource, credential transportauth.MachineCredential) (*remoteClient, error) {
 	base, err := url.Parse(c.baseURL)
 	if err != nil || base.Host == "" {
@@ -201,9 +202,10 @@ func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	out.Header.Set("Authorization", "Bearer "+token)
 	resp, err := base.RoundTrip(out)
-	if err != nil || resp.StatusCode < 400 {
+	if err != nil || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		return resp, err
 	}
+	// Every other answer, a redirect included, is shown as an error.
 	return txeRedactBearer(resp, token)
 }
 

@@ -353,28 +353,35 @@ func TestTXEStepContextTestSendsNoKeyToTheEnrolledHub(t *testing.T) {
 	assert.Empty(t, me[0].Authorization, "neither the key nor the machine's token")
 }
 
-// An error answer that echoes the request's credential has it replaced
-// before the step prints it.
+// An answer outside 2xx that echoes the request's credential, an error or a
+// redirect (which is not followed), has it replaced before the step prints it.
 func TestTXEStepRedactsAnEchoedBearer(t *testing.T) {
-	f := newStepAuthFixture(t)
-	f.enrolled(t)
-	enrol := f.hub.Handle
-	f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.URL.Path == "/api/v1/txe/jobs" {
-			cliauthtest.WriteJSON(w, http.StatusUnauthorized, map[string]any{"code": "unauthorized", "message": "refused " + r.Header.Get("Authorization")})
-			return true
-		}
-		return enrol(w, r)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			f := newStepAuthFixture(t)
+			f.enrolled(t)
+			enrol := f.hub.Handle
+			f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path == "/api/v1/txe/jobs" {
+					if status == http.StatusFound {
+						w.Header().Set("Location", "/elsewhere")
+					}
+					cliauthtest.WriteJSON(w, status, map[string]any{"code": "refused", "message": "refused " + r.Header.Get("Authorization")})
+					return true
+				}
+				return enrol(w, r)
+			}
+			out, err := f.inStep(t, "list")
+			require.Error(t, err)
+			calls := f.jobCalls()
+			require.Len(t, calls, 1)
+			token := strings.TrimPrefix(calls[0].Authorization, "Bearer ")
+			require.NotEmpty(t, token)
+			assert.NotContains(t, err.Error(), token)
+			assert.NotContains(t, out, token)
+			assert.Contains(t, err.Error(), "[redacted]")
+		})
 	}
-	out, err := f.inStep(t, "list")
-	require.Error(t, err)
-	calls := f.jobCalls()
-	require.Len(t, calls, 1)
-	token := strings.TrimPrefix(calls[0].Authorization, "Bearer ")
-	require.NotEmpty(t, token)
-	assert.NotContains(t, err.Error(), token)
-	assert.NotContains(t, out, token)
-	assert.Contains(t, err.Error(), "[redacted]")
 }
 
 // What is presented is checked against the credential that was checked:
