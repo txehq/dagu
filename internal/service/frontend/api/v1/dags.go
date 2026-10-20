@@ -1188,10 +1188,12 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 		}
 	}
 
-	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
+	// Decided before the definition's errors are reported: a caller that
+	// may not run the DAG learns neither them nor that it exists.
+	if err := a.requireDAGExecute(ctx, dag); err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGExecute(ctx, dag); err != nil {
+	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
 		return nil, err
 	}
 	if err := a.txeAdmitDAG(ctx, dag); err != nil {
