@@ -24,8 +24,7 @@ const (
 	ScopeMachine ScopeKind = "machine"
 	// ScopePlatformAdmin is the installation's administrator. It owns
 	// nothing; an administrator signed in through the identity provider whose
-	// identity is bound is also that owner's person for viewing, deciding
-	// and administering (OwnerPerson).
+	// identity is bound is also that owner's person (OwnerPerson).
 	ScopePlatformAdmin ScopeKind = "platform_admin"
 )
 
@@ -97,6 +96,16 @@ func (s Scope) OwnerPerson() (Scope, bool) {
 		return Scope{}, false
 	}
 	return Scope{kind: ScopeOwner, principal: s.principal, ownerID: s.ownerID, bindingGeneration: s.bindingGeneration}, true
+}
+
+// AdministratorOnly returns the scope without the person a bound
+// administrator also is: the administrator alone, for a decision a person
+// may not take whatever its owner's rights.
+func (s Scope) AdministratorOnly() Scope {
+	if s.Kind() != ScopePlatformAdmin {
+		return s
+	}
+	return Scope{kind: ScopePlatformAdmin, admin: s.admin, signedIn: s.signedIn}
 }
 
 func unbound(p authn.Principal, reason Reason) Scope {

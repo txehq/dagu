@@ -350,11 +350,14 @@ func txeCanonicalDAGName(name string) string {
 // caller held to its owner: an inline or edited run, or a DAG's settings.
 // Only creating, changing, renaming and deleting a machine's DAG are opened
 // to such a caller.
+//
+// A bound administrator is decided here as the administrator alone: what is
+// closed to a person stays closed to the person it also is.
 func (a *API) txeNativeWriteClosed(ctx context.Context, legacy func() error, spec []byte, names ...string) error {
 	if a.txeNativeOwnerOnly(ctx) {
 		return errTxeForbidden
 	}
-	return a.txeNativeWrite(ctx, legacy, spec, names...)
+	return a.txeNativeWrite(txeAdministratorOnly(ctx), legacy, spec, names...)
 }
 
 // requireDAGWritesEnabled is the hub's own switch on DAG writes, apart from

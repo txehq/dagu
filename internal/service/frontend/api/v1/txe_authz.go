@@ -96,6 +96,9 @@ func (a *API) txeResolve(ctx context.Context) (txeCall, error) {
 		return c, nil
 	}
 	scope, err := a.txeAuth.Scope(ctx, c.caller)
+	if err == nil && txeAsAdministratorOnly(ctx) {
+		scope = scope.AdministratorOnly()
+	}
 	if err != nil {
 		if c.mode == authz.ModeEnforce {
 			return c, errTxeAuthzUnavailable
@@ -195,7 +198,11 @@ func (a *API) txeAuthorizeJobFor(ctx context.Context, c txeCall, jobID string, p
 	if err != nil {
 		return err
 	}
-	if ok && c.ownerOnly() && need.machine && !txeMachineFits(c.scope, need) {
+	// A write only the job's machine makes takes that machine, whoever
+	// else may execute the job: a caller held to its owner, and under
+	// enforce a bound administrator acting as its owner's person.
+	if ok && need.machine && (c.ownerOnly() || (c.mode == authz.ModeEnforce && c.scope.Kind() == authz.ScopePlatformAdmin)) &&
+		!txeMachineFits(c.scope, need) {
 		ok = false
 		a.txeLogDecision(ctx, c, permission, res, authz.Decision{Mode: c.mode, Evaluated: true, Reason: authz.ReasonClass})
 	}
@@ -497,4 +504,19 @@ func (a *API) txeIsStandingReporter(ctx context.Context, ev *registry.ResourceEv
 		return false
 	}
 	return c.mode == authz.ModeOff || c.scope.Kind() != authz.ScopeUnbound
+}
+
+type administratorOnlyKey struct{}
+
+// txeAdministratorOnly marks ctx so that a platform administrator is
+// decided as the administrator alone, without the person it is bound as:
+// for what a person may not do whatever its owner's rights (see
+// txeNativeWriteClosed).
+func txeAdministratorOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, administratorOnlyKey{}, true)
+}
+
+func txeAsAdministratorOnly(ctx context.Context) bool {
+	only, _ := ctx.Value(administratorOnlyKey{}).(bool)
+	return only
 }

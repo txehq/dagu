@@ -137,14 +137,13 @@ func (s *Store) evaluate(ctx context.Context, scope Scope, permission Permission
 
 	switch scope.Kind() {
 	case ScopePlatformAdmin:
-		// A bound administrator is also its owner's person for what only a
-		// person does: it views, decides and administers as that person, on
-		// its owner's records and what is shared to that owner, and the
-		// administrator's own rights come on top. It does not author or
-		// execute as the person: the routes that take those from a person
-		// add limits a person is held to and the administrator is not, so
-		// the owner's own credentials do that work.
-		if person, ok := scope.OwnerPerson(); ok && resource.kind != KindPlatform && adminPersonPermissions[permission] {
+		// A bound administrator is also its owner's person: on its owner's
+		// records, and what is shared to that owner, it may do what that
+		// person may, and the administrator's own rights come on top. It
+		// gains nothing else on another owner's records. The routes that
+		// hold a person to more than the decision (writes only a machine
+		// makes, writes closed to a person) hold it to the same.
+		if person, ok := scope.OwnerPerson(); ok && resource.kind != KindPlatform {
 			v, err := s.evaluate(ctx, person, permission, resource)
 			if err != nil || v.allowed {
 				return v, err
@@ -197,12 +196,6 @@ func denyUnbound(scope Scope) (verdict, error) {
 		return deny(ReasonUnbound)
 	}
 	return deny(scope.reason)
-}
-
-// adminPersonPermissions are what a bound administrator holds as its owner's
-// person.
-var adminPersonPermissions = map[Permission]bool{
-	PermissionView: true, PermissionApprove: true, PermissionAdminister: true,
 }
 
 // evaluateAdmin is what the platform administrator may do. It administers the

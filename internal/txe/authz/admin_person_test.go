@@ -23,8 +23,8 @@ func (f *fixture) resolveAdmin(subject string) Scope {
 }
 
 // A platform administrator whose identity is bound is also its owner's
-// person for viewing, deciding and administering that owner's records, and
-// the administrator's own rights come on top. On another owner's records it
+// person: on that owner's records it may do what the person may, and the
+// administrator's own rights come on top. On another owner's records it
 // gains nothing beyond the administrator's view (TXE-4710).
 func TestBoundPlatformAdministratorIsItsOwnersPerson(t *testing.T) {
 	t.Parallel()
@@ -42,24 +42,24 @@ func TestBoundPlatformAdministratorIsItsOwnersPerson(t *testing.T) {
 	// The platform, as any administrator.
 	assert.True(t, f.enforce(admin, PermissionAdminister, Platform()).Allowed)
 
-	// Its own owner's job and machine: it views, decides and administers as
-	// the person, not break-glass. It does not author or execute: those
-	// stay with the owner's own credentials.
+	// Its own owner's job, machine and data: everything the person may, not
+	// break-glass.
 	machine, err := f.store.Machine(context.Background(), machineA1)
 	require.NoError(t, err)
 	own, err := OwnData(admin)
 	require.NoError(t, err)
 	for _, res := range []Resource{f.job(jobA1), machine, own} {
-		for _, permission := range []Permission{PermissionView, PermissionApprove, PermissionAdminister} {
+		for _, permission := range []Permission{PermissionView, PermissionAuthor, PermissionExecute, PermissionApprove, PermissionAdminister} {
 			decision := f.enforce(admin, permission, res)
 			assert.True(t, decision.Allowed, "%s %s", permission, res.ID())
 			assert.False(t, decision.BreakGlass, "%s %s: its own owner's data is not break-glass", permission, res.ID())
 			assert.Equal(t, ReasonOwner, decision.Reason, permission)
 		}
-		for _, permission := range []Permission{PermissionAuthor, PermissionExecute} {
-			assert.False(t, f.enforce(admin, permission, res).Allowed, "%s %s", permission, res.ID())
-		}
 	}
+	// Decided as the administrator alone, it is the administrator again.
+	alone := admin.AdministratorOnly()
+	assert.False(t, f.enforce(alone, PermissionAuthor, machine).Allowed)
+	assert.True(t, f.enforce(alone, PermissionView, machine).BreakGlass)
 
 	// Another owner's: view as break-glass, and nothing else.
 	view := f.enforce(admin, PermissionView, f.job(jobB1))

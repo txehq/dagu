@@ -39,11 +39,11 @@ func txeIdentityOf(t *testing.T, a *API, ctx context.Context) apigen.TxeIdentity
 
 // The listed administrator whose identity is bound to owner A approves A's
 // machine's enrolment and is told its pending applications, as A's person
-// is; it gets nothing of the kind for B's machine. In enforce it decides A's
-// job, but it executes and authors nothing as the person: machine-only and
-// reviewer-only writes and the native writes closed to a person stay closed
-// to it. Its own command line is still only A's cli. In every mode
-// (TXE-4710).
+// is; it gets nothing of the kind for B's machine. In enforce it decides,
+// runs and authors A's work as A's person and nothing of B's, while
+// machine-only and reviewer-only writes and the native writes closed to a
+// person stay closed to it. Its own command line is still only A's cli. In
+// every mode (TXE-4710).
 func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 	for _, mode := range []string{"", "enforce"} {
 		t.Run("mode="+mode, func(t *testing.T) {
@@ -96,17 +96,21 @@ func TestTxeBoundSSOAdministratorActsAsItsOwnersPerson(t *testing.T) {
 			require.Equal(t, w.ownerA, resp.(apigen.EnrolTxeMachine200JSONResponse).OwnerId)
 
 			if mode == "enforce" {
-				// It decides A's job as A's person, and not B's.
-				require.NoError(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionApprove, txeNeed{}))
-				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobB, authz.PermissionApprove, txeNeed{}))
-				// It is no machine and no reviewer, and it does not execute
-				// or author as the person: the writes only A's machine makes,
-				// and the native writes closed to a person, stay closed.
+				// It operates A's work as A's person: it decides, runs and
+				// authors A's job and machine DAGs, and none of B's.
+				for _, permission := range []authz.Permission{authz.PermissionApprove, authz.PermissionExecute, authz.PermissionAuthor} {
+					require.NoError(t, w.api.txeAuthorizeJob(admin, w.jobA, permission, txeNeed{}), permission)
+					require.Error(t, w.api.txeAuthorizeJob(admin, w.jobB, permission, txeNeed{}), permission)
+				}
+				machineDAG, machineB := txeauth.MachineDAGs(w.machineA)[0], txeauth.MachineDAGs(w.machineB)[0]
+				require.NoError(t, w.api.txeNativeWrite(admin, func() error { return nil }, nil, machineDAG), "it writes A's machine DAG")
+				require.Error(t, w.api.txeNativeWrite(admin, func() error { return nil }, nil, machineB), "not B's")
+				// It is no machine and no reviewer, and what is closed to a
+				// person stays closed to it: the writes only A's machine
+				// makes, and the native writes closed to a person.
 				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeReviewerNeed))
 				require.Error(t, w.api.txeAuthorizeJob(admin, w.jobA, authz.PermissionExecute, txeMachineNeed))
-				machineDAG := txeauth.MachineDAGs(w.machineA)[0]
 				require.Error(t, w.api.txeNativeWriteClosed(admin, func() error { return nil }, nil, machineDAG))
-				require.Error(t, w.api.txeNativeWrite(admin, func() error { return nil }, nil, machineDAG))
 			}
 
 			// The same identity's command line is A's cli, never the
