@@ -457,3 +457,41 @@ func TestInstallSafety(t *testing.T) {
 		assert.Contains(t, out, entry+" is not a link to")
 	})
 }
+
+// A profile with a name that is not a number (.claude-review) is a profile,
+// and links this script made follow ~/.coding_skills appearing and going away.
+func TestInstallProfilesAndMigration(t *testing.T) {
+	e := newDevEnv(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(e.home, ".claude-review"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(e.home, ".claude.json"), []byte("{}"), 0o600))
+	require.NoError(t, os.RemoveAll(e.canon))
+	bin := e.stub("dagu-11", "2.18.2-txe.11", "b")
+
+	out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", bin)
+	require.NoError(t, err, out)
+	current := filepath.Join(e.txeHome, "skill", "current")
+	review := filepath.Join(e.home, ".claude-review", "skills", "txe-dagu-jobs")
+	target, err := os.Readlink(review)
+	require.NoError(t, err)
+	assert.Equal(t, current, target, "with no ~/.coding_skills, profiles link to the unpacked skill")
+	assert.NoFileExists(t, filepath.Join(e.home, ".claude.json", "skills"))
+
+	// ~/.coding_skills appears: the script's own links move to it.
+	require.NoError(t, os.MkdirAll(e.canon, 0o755))
+	out, err = e.run("--tag", "txe-v2.18.2-11", "--binary", bin)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "(was "+current+")")
+	target, err = os.Readlink(review)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(e.canon, "txe-dagu-jobs"), target)
+
+	// It goes away again: they move back.
+	require.NoError(t, os.RemoveAll(e.canon))
+	out, err = e.run("--tag", "txe-v2.18.2-11", "--binary", bin)
+	require.NoError(t, err, out)
+	target, err = os.Readlink(review)
+	require.NoError(t, err)
+	assert.Equal(t, current, target)
+	out, err = e.run("--check")
+	require.NoError(t, err, out)
+}

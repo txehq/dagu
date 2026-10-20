@@ -28,11 +28,13 @@
 #      (dagu txe skill install), and every profile gets a link to it:
 #        ~/.coding_skills/txe-dagu-jobs   -> $TXE_DAGU_HOME/skill/current, when ~/.coding_skills exists
 #        <profile>/skills/txe-dagu-jobs   -> ~/.coding_skills/txe-dagu-jobs, or else skill/current
-#      for every ~/.claude*, ~/.codex* and $CODEX_HOME (a home that is a link
-#      is followed, and each real home is visited once), and ~/.agents/skills,
-#      which Codex also reads. An entry already there that is not exactly such
-#      a link (a real directory, or a link anywhere else, even to a matching
-#      revision) is someone's: it is reported and kept.
+#      for every ~/.claude* and ~/.codex* directory (.claude-review included)
+#      and $CODEX_HOME (a home that is a link is followed, and each real home
+#      is visited once), and ~/.agents/skills, which Codex also reads. A link
+#      this script made to its other target, before ~/.coding_skills appeared
+#      or after it went away, is moved to the current one. Any other entry (a
+#      real directory, or a link anywhere else, even to a matching revision)
+#      is someone's: it is reported and kept.
 #   5. It reads everything back: the wrapper is this script's and names the
 #      installed binary and the developer's store; dagu on PATH is the link to
 #      it; every location is exactly the managed link and resolves to this
@@ -193,7 +195,7 @@ EOF
 profiles() {
   local d real
   {
-    for d in "$HOME"/.claude "$HOME"/.claude[0-9]* "$HOME"/.codex "$HOME"/.codex[0-9]* ${CODEX_HOME:+"$CODEX_HOME"}; do
+    for d in "$HOME"/.claude* "$HOME"/.codex* ${CODEX_HOME:+"$CODEX_HOME"}; do
       [ -d "$d" ] || continue
       real="$(resolve "$d")"
       printf '%s\n' "$real/skills"
@@ -206,11 +208,23 @@ profiles() {
 
 # place_skill gives a skills directory its link to target, unless something
 # that is not exactly that link is already there.
-place_skill() {
-  local dir="$1" target="$2" entry="$1/$SKILL" made
+place_skill() { # place_skill <dir> <target> [<other target this script makes>...]
+  local dir="$1" target="$2" entry="$1/$SKILL" made current
+  shift 2
   if [ -L "$entry" ] && [ "$(readlink "$entry")" = "$target" ]; then
     say skill "$entry"
     return
+  fi
+  # A link this script made to its other target (~/.coding_skills appeared or
+  # went away since) is moved to the target it uses now.
+  if [ -L "$entry" ]; then
+    current="$(readlink "$entry")"
+    for managed in "$@"; do
+      if [ "$current" = "$managed" ] && swap_link "$target" "$entry" "$managed"; then
+        say skill "$entry -> $target (was $managed)"
+        return
+      fi
+    done
   fi
   if [ -e "$entry" ] || [ -L "$entry" ]; then
     say kept "$entry is not a link to $target; left as it is"
@@ -320,7 +334,7 @@ if [ "$check" = 0 ]; then
   fi
   if [ -d "$CODING_SKILLS" ]; then profile_target="$CODING_SKILLS/$SKILL"; else profile_target="$unpacked"; fi
   while IFS= read -r dir; do
-    place_skill "$dir" "$profile_target"
+    place_skill "$dir" "$profile_target" "$CODING_SKILLS/$SKILL" "$unpacked"
   done < <(profiles)
 fi
 
