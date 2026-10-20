@@ -1157,7 +1157,10 @@ func TestUnknownObservationChangesNothing(t *testing.T) {
 func TestIncompleteResourceEventsAreListed(t *testing.T) {
 	f := newFixture(t)
 	save := func(machine string, complete bool) string {
-		id := f.mint(PrefixEvent)
+		// Minted from the fixture's clock, which moves a second per event:
+		// ids minted in the same millisecond sort at random.
+		id, err := NewID(PrefixEvent, f.now)
+		require.NoError(t, err)
 		ev := ResourceEvent{Schema: SchemaVersion, EventID: id, Target: target("v-1"), Observation: ResourceUnreachable,
 			ObservedAt: f.now, Reporter: Actor{Kind: ActorReconciler, ID: "rec", MachineID: machine}, Complete: complete}
 		require.NoError(t, f.store.createJSON(f.ctx, resourceEventsPrefix+id, &ev))
