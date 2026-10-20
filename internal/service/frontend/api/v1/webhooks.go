@@ -714,18 +714,15 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 		}
 	}
 
-	// An owner's DAG is decided before the webhook is authenticated, so
-	// that no token of it is checked or marked used, and its answer is the
-	// same whatever the request presents (TXE-4762). A DAG that does not
-	// load is decided after authentication, as before.
-	ownerDecided := false
-	if a.txeAuth != nil {
-		if pre, loadErr := a.dagRepository.GetDetails(ctx, string(request.FileName), persis.DAGLoadOptions{}); loadErr == nil {
-			if err := a.txeWebhookTrigger(ctx, pre); err != nil {
-				return nil, err
-			}
-			ownerDecided = true
-		}
+	// Where owners are enforced, a webhook of a DAG named as an owner's is
+	// answered before it is authenticated, exactly as a webhook that does
+	// not exist is (an invalid token), so no token of it is checked or
+	// marked used and nothing tells whether that DAG exists (TXE-4762). It
+	// is decided by the name alone; an alias file is decided once loaded,
+	// after authentication, as before.
+	if a.txeAuth != nil && a.txeAuth.Mode() == txeauthz.ModeEnforce && txeNativeOwnedName(txeCanonicalDAGName(string(request.FileName))) {
+		logger.Warn(ctx, "Webhook: an owner's DAG has no webhook under owner enforcement", tag.Name(request.FileName))
+		return nil, errWebhookInvalidToken()
 	}
 
 	authz, err := a.authService.AuthorizeWebhookRequest(
@@ -741,11 +738,7 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 	if err != nil {
 		if errors.Is(err, authservice.ErrInvalidWebhookToken) {
 			logger.Warn(ctx, "Webhook: invalid token", tag.Name(request.FileName))
-			return nil, &Error{
-				HTTPStatus: http.StatusUnauthorized,
-				Code:       api.ErrorCodeUnauthorized,
-				Message:    "invalid webhook token",
-			}
+			return nil, errWebhookInvalidToken()
 		}
 		if errors.Is(err, authservice.ErrMissingWebhookHMACSignature) {
 			logger.Warn(ctx, "Webhook: missing HMAC signature", tag.Name(request.FileName))
@@ -793,10 +786,8 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 		}
 	}
 
-	if !ownerDecided {
-		if err := a.txeWebhookTrigger(ctx, dag); err != nil {
-			return nil, err
-		}
+	if err := a.txeWebhookTrigger(ctx, dag); err != nil {
+		return nil, err
 	}
 
 	profileName, err := a.webhookRunProfile(ctx, authz, request.FileName, dagWorkspaceName(dag), requestedProfile)
@@ -1157,4 +1148,14 @@ func buildWebhookRuntimeParams(payload, headers string, extras map[string]string
 	}
 
 	return strings.Join(parts, " ")
+}
+
+// errWebhookInvalidToken is the answer to a webhook request whose token is
+// not a webhook's of that DAG.
+func errWebhookInvalidToken() *Error {
+	return &Error{
+		HTTPStatus: http.StatusUnauthorized,
+		Code:       api.ErrorCodeUnauthorized,
+		Message:    "invalid webhook token",
+	}
 }
