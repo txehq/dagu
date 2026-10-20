@@ -19,9 +19,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
-	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 

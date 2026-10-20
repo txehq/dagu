@@ -14,8 +14,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/worker"
-	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	"github.com/spf13/cobra"
 )
