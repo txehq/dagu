@@ -53,7 +53,9 @@ const cappedZeroQueue: components['schemas']['Queue'] = {
   running: [],
 };
 
-function renderPage(queue: components['schemas']['Queue']): void {
+function renderPage(queue: components['schemas']['Queue']): {
+  rerender: () => void;
+} {
   useQueryMock.mockReturnValue({
     data: queue,
     error: null,
@@ -62,7 +64,9 @@ function renderPage(queue: components['schemas']['Queue']): void {
     mutate: vi.fn(),
   });
 
-  render(
+  // The tree is built afresh on each render, so a rerender reads the mocks
+  // again.
+  const tree = () => (
     <MemoryRouter initialEntries={[`/queues/${queue.name}`]}>
       <AppBarContext.Provider
         value={
@@ -78,6 +82,8 @@ function renderPage(queue: components['schemas']['Queue']): void {
       </AppBarContext.Provider>
     </MemoryRouter>
   );
+  const result = render(tree());
+  return { rerender: () => result.rerender(tree()) };
 }
 
 // A registered job's queue is named by its job id; its runs are dequeued only
@@ -120,6 +126,24 @@ describe('QueueDetailsPage for a job the caller may only view', () => {
       expect(
         screen.queryByRole('button', { name: 'Select all loaded' })
       ).toBeNull();
+    } finally {
+      runAccess.allowed = undefined;
+    }
+  });
+
+  it('closes an open confirmation when access is revoked', async () => {
+    runAccess.allowed = true;
+    try {
+      const view = renderPage(jobQueue);
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Select all loaded' })
+      );
+      fireEvent.click(screen.getByRole('button', { name: /Dequeue selected/ }));
+      expect(await screen.findByRole('dialog')).toBeInTheDocument();
+
+      runAccess.allowed = false;
+      view.rerender();
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     } finally {
       runAccess.allowed = undefined;
     }

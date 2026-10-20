@@ -214,6 +214,14 @@ function QueueDetailsPage() {
 
   const totalBatchCount = activeBatch?.snapshot.length ?? 0;
   const isDialogLocked = phase === 'running' || progress.isRefreshing;
+
+  // Access revoked while the confirmation is open: nothing snapshotted may
+  // still be submitted.
+  React.useEffect(() => {
+    if (!dequeueAllowed && phase === 'confirm') {
+      closeDialog();
+    }
+  }, [dequeueAllowed, phase, closeDialog]);
   const isProcessing = phase === 'running' || phase === 'complete';
   const utilization = queue?.maxConcurrency
     ? Math.round(((queue.runningCount || 0) / queue.maxConcurrency) * 100)
@@ -718,7 +726,7 @@ function QueueDetailsPage() {
                 <Button variant="outline" onClick={closeDialog}>
                   <I18nText text={'Cancel'} />
                 </Button>
-                <Button onClick={submitBatchDequeue}>
+                <Button onClick={submitBatchDequeue} disabled={!dequeueAllowed}>
                   {ts(
                     activeBatch.snapshot.length === 1
                       ? 'Dequeue {count} Run'
