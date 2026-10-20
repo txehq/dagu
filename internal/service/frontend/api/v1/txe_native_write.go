@@ -131,8 +131,13 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 			}
 			for _, p := range placements {
 				// Every document is pinned to the machine; a step may leave
-				// its placement to its child, but may not send it elsewhere.
+				// its placement to its child, but may not send it elsewhere,
+				// nor call another machine's DAG, which runs on that machine
+				// even when the same owner holds both.
 				if (!p.Step && p.Machine != own) || (p.Step && p.Machine != "" && p.Machine != own) {
+					return a.txeNativeWriteMisplaced(ctx, c, name)
+				}
+				if called, ok := txeauth.MachineOfDAG(p.Name); p.Step && ok && called != own {
 					return a.txeNativeWriteMisplaced(ctx, c, name)
 				}
 			}

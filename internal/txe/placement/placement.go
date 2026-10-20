@@ -36,6 +36,9 @@ type Placement struct {
 	Machine string
 	// Step marks a step's placement or reference, not a document's.
 	Step bool
+	// Document is, for a step, the name of the DAG the spec defines that the
+	// step belongs to.
+	Document string
 }
 
 // Of reports every DAG dag defines (itself and each local DAG), by its name
@@ -64,9 +67,15 @@ func Of(dag *ir.DAG) ([]Placement, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A base configuration's "worker_selector: local" survives a
+		// document's own selector: the DAG would run on the hub, not on the
+		// machine it names.
+		if d.ForceLocal && machine != "" {
+			return nil, ErrUnverified
+		}
 		out = append(out, Placement{Name: d.Name, Machine: machine})
 		if d.LLM != nil {
-			if out, err = toolPlacements(out, d.LLM.Tools); err != nil {
+			if out, err = toolPlacements(out, d.Name, d.LLM.Tools); err != nil {
 				return nil, err
 			}
 		}
@@ -80,16 +89,16 @@ func Of(dag *ir.DAG) ([]Placement, error) {
 				steps = append(steps, handler)
 			}
 		}
-		if out, err = stepPlacements(out, steps); err != nil {
+		if out, err = stepPlacements(out, d.Name, steps); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-// stepPlacements adds where each step, and each step of a foreach body,
-// sends its work.
-func stepPlacements(out []Placement, steps []*ir.Step) ([]Placement, error) {
+// stepPlacements adds where each step of document, and each step of a
+// foreach body, sends its work.
+func stepPlacements(out []Placement, document string, steps []*ir.Step) ([]Placement, error) {
 	for _, step := range steps {
 		if step == nil {
 			continue
@@ -104,15 +113,15 @@ func stepPlacements(out []Placement, steps []*ir.Step) ([]Placement, error) {
 		called := ""
 		if step.SubDAG != nil {
 			called = step.SubDAG.Name
-			if strings.ContainsAny(called, "$`") {
+			if !literalName(called) {
 				return nil, ErrUnverified
 			}
 		}
 		if machine != "" || called != "" {
-			out = append(out, Placement{Name: called, Machine: machine, Step: true})
+			out = append(out, Placement{Name: called, Machine: machine, Step: true, Document: document})
 		}
 		if step.LLM != nil {
-			if out, err = toolPlacements(out, step.LLM.Tools); err != nil {
+			if out, err = toolPlacements(out, document, step.LLM.Tools); err != nil {
 				return nil, err
 			}
 		}
@@ -121,7 +130,7 @@ func stepPlacements(out []Placement, steps []*ir.Step) ([]Placement, error) {
 			for i := range step.Foreach.Steps {
 				body = append(body, &step.Foreach.Steps[i])
 			}
-			if out, err = stepPlacements(out, body); err != nil {
+			if out, err = stepPlacements(out, document, body); err != nil {
 				return nil, err
 			}
 		}
@@ -129,16 +138,22 @@ func stepPlacements(out []Placement, steps []*ir.Step) ([]Placement, error) {
 	return out, nil
 }
 
-// toolPlacements adds each DAG a chat step may call as a tool.
-func toolPlacements(out []Placement, tools []string) ([]Placement, error) {
+// toolPlacements adds each DAG a chat step of document may call as a tool.
+func toolPlacements(out []Placement, document string, tools []string) ([]Placement, error) {
 	for _, tool := range tools {
-		name := strings.TrimSpace(tool)
-		if name == "" || strings.ContainsAny(name, "$`") {
+		if !literalName(tool) {
 			return nil, ErrUnverified
 		}
-		out = append(out, Placement{Name: name, Step: true})
+		out = append(out, Placement{Name: tool, Step: true, Document: document})
 	}
 	return out, nil
+}
+
+// literalName reports whether a called DAG's name is read the same by this
+// check and by the runtime, which looks it up exactly as written: not
+// empty, not computed, and with no surrounding space.
+func literalName(name string) bool {
+	return name != "" && name == strings.TrimSpace(name) && !strings.ContainsAny(name, "$`")
 }
 
 // SelectedMachine is the machine a worker selector sends work to, or "" for

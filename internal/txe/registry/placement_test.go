@@ -51,6 +51,16 @@ func TestJobSpecRunsOnlyOnItsMachine(t *testing.T) {
 			"llm:\n  provider: openai\n  model: gpt-4o\n  tools: [somebody-elses-dag]\nsteps:\n  - name: ask\n    type: chat\n    messages:\n      - role: user\n        content: hi\n",
 		"a step runs an action package": own +
 			"steps:\n  - name: act\n    action: someone/some-action@v1\n",
+		// A local DAG runs with its own document alone: whatever it calls,
+		// itself included, is looked up outside the spec.
+		"a local DAG calls itself": own + "steps:\n  - name: run\n    call: helper\n" +
+			"---\nname: helper\n" + own + "steps:\n  - name: again\n    call: helper\n",
+		"a local DAG calls another local DAG": own + "steps:\n  - name: run\n    call: helper\n" +
+			"---\nname: helper\n" + own + "steps:\n  - name: next\n    call: other\n" + helper(f.machine)[len("---\nname: helper"):len("---\nname: helper")] +
+			"---\nname: other\n" + own + "steps:\n  - name: o\n    run: echo o\n",
+		// The runtime looks a tool up exactly as written.
+		"a tool named with surrounding space": own +
+			"steps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [\" helper\"]\n    messages:\n      - role: user\n        content: hi\n" + helper(f.machine),
 	}
 	for name, spec := range refused {
 		t.Run(name, func(t *testing.T) {
@@ -65,6 +75,17 @@ func TestJobSpecRunsOnlyOnItsMachine(t *testing.T) {
 			assert.Equal(t, CodeNotFound, code(t, err), "nothing is stored")
 		})
 	}
+
+	// The job's own DAG calling itself runs what is stored under its name,
+	// outside the spec.
+	t.Run("the job's DAG calls itself", func(t *testing.T) {
+		jobID := f.mint(PrefixJob)
+		v := f.version(1)
+		v.DAG.Spec = own + "steps:\n  - name: again\n    call: " + jobID + "\n"
+		_, err := f.store.Register(f.ctx, RegisterInput{JobID: jobID, RequestID: "r-" + jobID, OwnerID: f.owner,
+			ProjectID: f.project, MachineID: f.machine, JobKey: "k-" + jobID, Version: v}, cli)
+		assert.Equal(t, CodeInvalid, code(t, err))
+	})
 
 	// A new version is held to the same rule, and the job keeps its version.
 	job := f.register("placement")

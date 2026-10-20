@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 const writeSpec = "steps:\n  - name: s\n    run: echo s\n"
@@ -227,6 +230,14 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 				w.reviewerB + "]\n    messages:\n      - role: user\n        content: hi\n"
 			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, toolOf), "a chat tool that is B's machine DAG")
 			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, onA+"steps:\n  - name: act\n    action: someone/some-action@v1\n"), "an action package")
+			// A machine's DAG may not call another machine's, which runs on
+			// that machine, even when A owns both.
+			second, err := registry.NewID(registry.PrefixMachine, time.Now())
+			require.NoError(t, err)
+			_, err = w.reg.CreateMachine(context.Background(), registry.Machine{MachineID: second, OwnerID: w.ownerA, DisplayName: "desktop"},
+				registry.Actor{Kind: registry.ActorSystem, ID: "test"})
+			require.NoError(t, err)
+			require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, calls(txeauth.MachineDAGs(second)[0])), "calling A's other machine's DAG")
 			// The coordinator matches every label: a selector that names no
 			// machine reaches any machine with those labels, B's included.
 			byLabel := func(label string) string {

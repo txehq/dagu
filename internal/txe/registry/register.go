@@ -226,11 +226,13 @@ func (s *Store) checkDAG(ctx context.Context, jobID, machineID string, v *JobVer
 
 // checkPlacements checks that everything a job's spec runs goes to the
 // job's machine, as native writes check a machine's DAG (TXE-4717): every
-// document (the job's DAG and each local DAG) names the machine, a step
-// that selects a machine names this one, and a step calls only the spec's
-// own DAGs. A step that calls a DAG kept elsewhere would run it where that
-// DAG says, which may be another owner's machine, and the dispatch pin
-// admits a task to whatever machine its selector names.
+// document (the job's DAG and each local DAG) names the machine, and a step
+// that selects a machine names this one. A step that calls a DAG kept
+// elsewhere would run it where that DAG says, which may be another owner's
+// machine, and the dispatch pin admits a task to whatever machine its
+// selector names. So only the job's own document calls DAGs, and only the
+// spec's other documents: a local DAG runs with its own document alone, so
+// any DAG it calls, itself included, is looked up outside the spec.
 func checkPlacements(facts DAGFacts, machineID string) error {
 	if !facts.Placed {
 		return refuse(CodeNotReady, "the DAG store cannot tell where dag.spec runs")
@@ -238,10 +240,16 @@ func checkPlacements(facts DAGFacts, machineID string) error {
 	if facts.Unplaceable != nil {
 		return refuse(CodeInvalid, "dag.spec does not say plainly where it runs: every worker_selector must name %s %s, written without surrounding space, and every called DAG must be named literally", machineLabel, machineID)
 	}
-	own := map[string]bool{}
+	root := ""
+	local := map[string]bool{}
 	for _, p := range facts.Placements {
-		if !p.Step {
-			own[p.Name] = true
+		if p.Step {
+			continue
+		}
+		if root == "" {
+			root = p.Name
+		} else {
+			local[p.Name] = true
 		}
 	}
 	for _, p := range facts.Placements {
@@ -250,8 +258,8 @@ func checkPlacements(facts DAGFacts, machineID string) error {
 			return refuse(CodeInvalid, "dag.spec DAG %q must have worker_selector %s %s", p.Name, machineLabel, machineID)
 		case p.Step && p.Machine != "" && p.Machine != machineID:
 			return refuse(CodeInvalid, "dag.spec sends a step to %s %s; a job runs only on its machine %s", machineLabel, p.Machine, machineID)
-		case p.Step && p.Name != "" && !own[p.Name]:
-			return refuse(CodeInvalid, "dag.spec calls DAG %q, which it does not define; a job's steps call only the spec's own DAGs", p.Name)
+		case p.Step && p.Name != "" && (p.Document != root || !local[p.Name]):
+			return refuse(CodeInvalid, "dag.spec calls DAG %q from %q; a job's own DAG calls only the spec's other DAGs, and they call none", p.Name, p.Document)
 		}
 	}
 	return nil
