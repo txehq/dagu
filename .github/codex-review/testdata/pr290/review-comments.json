@@ -1,0 +1,90 @@
+[
+ {
+  "pull_request_review_id": 5550338861,
+  "id": 4296627722,
+  "path": "synthetic/file1.go",
+  "commit_id": "c6f314a3806a7acbadf6b906b2b95c7afbcff82d",
+  "original_commit_id": "1757a33d727c07bbd12ab0eb1f22f4671a89f15b",
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**",
+  "created_at": "2026-10-16T15:59:58Z",
+  "updated_at": "2026-10-16T15:59:59Z",
+  "start_line": 517,
+  "original_start_line": 517,
+  "line": 519,
+  "original_line": 519,
+  "side": "RIGHT",
+  "original_position": 39,
+  "position": 39,
+  "subject_type": "line"
+ },
+ {
+  "pull_request_review_id": 5550655422,
+  "id": 4296859146,
+  "path": "synthetic/file2.go",
+  "commit_id": "17299111c10bb4db65f42755d2dac242bc1c9850",
+  "original_commit_id": "17299111c10bb4db65f42755d2dac242bc1c9850",
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**",
+  "created_at": "2026-10-16T16:25:17Z",
+  "updated_at": "2026-10-16T16:25:17Z",
+  "start_line": null,
+  "original_start_line": 232,
+  "line": null,
+  "original_line": 233,
+  "side": "RIGHT",
+  "original_position": 7,
+  "position": 1,
+  "subject_type": "line"
+ },
+ {
+  "pull_request_review_id": 5550906105,
+  "id": 4297056843,
+  "path": "synthetic/file2.go",
+  "commit_id": "2bf1311d2bb87741c536af0694229f85e885be44",
+  "original_commit_id": "2bf1311d2bb87741c536af0694229f85e885be44",
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**",
+  "created_at": "2026-10-16T16:47:47Z",
+  "updated_at": "2026-10-16T16:47:47Z",
+  "start_line": null,
+  "original_start_line": 232,
+  "line": null,
+  "original_line": 233,
+  "side": "RIGHT",
+  "original_position": 7,
+  "position": 1,
+  "subject_type": "line"
+ },
+ {
+  "pull_request_review_id": 5550906105,
+  "id": 4297056859,
+  "path": "synthetic/file1.go",
+  "commit_id": "c6f314a3806a7acbadf6b906b2b95c7afbcff82d",
+  "original_commit_id": "2bf1311d2bb87741c536af0694229f85e885be44",
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**",
+  "created_at": "2026-10-16T16:47:47Z",
+  "updated_at": "2026-10-16T16:47:47Z",
+  "start_line": 811,
+  "original_start_line": 811,
+  "line": 815,
+  "original_line": 815,
+  "side": "RIGHT",
+  "original_position": 195,
+  "position": 195,
+  "subject_type": "line"
+ }
+]

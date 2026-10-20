@@ -1,0 +1,57 @@
+[
+ {
+  "id": 5545891883,
+  "user": {
+   "login": "a-person",
+   "type": "User"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-16T09:42:57Z",
+  "commit_id": "bf26e9af093f94178ce806f568f65fa996823b5a"
+ },
+ {
+  "id": 5546039867,
+  "user": {
+   "login": "a-person",
+   "type": "User"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-16T09:53:49Z",
+  "commit_id": "8b8dfbe9c9544bc4de98e338096273d11e3c885a"
+ },
+ {
+  "id": 5550338861,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `1757a33d72`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-16T15:59:58Z",
+  "commit_id": "1757a33d727c07bbd12ab0eb1f22f4671a89f15b"
+ },
+ {
+  "id": 5550655422,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `17299111c1`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-16T16:25:17Z",
+  "commit_id": "17299111c10bb4db65f42755d2dac242bc1c9850"
+ },
+ {
+  "id": 5550906105,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `2bf1311d2b`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-16T16:47:47Z",
+  "commit_id": "2bf1311d2bb87741c536af0694229f85e885be44"
+ }
+]
