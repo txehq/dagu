@@ -20,6 +20,7 @@ import {
   TxeIdentityState,
 } from '@/api/v1/schema';
 import { sseManager } from '@/hooks/SSEManager';
+import { personSignalStorageValue, setPersonSignal } from '../personSignal';
 import TxeJobPage from '@/pages/txe/job';
 
 import { TxeApiError, type TxeApi } from '../api';
@@ -116,6 +117,7 @@ describe('TxePersonGate', () => {
   afterEach(() => {
     setRefused.mockRestore();
     sseManager.setRefused(false);
+    setPersonSignal(undefined);
     mocks.authMode.value = 'builtin';
     mocks.token.value = 'token-a';
   });
@@ -208,6 +210,10 @@ describe('TxePersonGate', () => {
     expect(await screen.findByTestId('person-app')).toBeInTheDocument();
     expect(screen.queryByTestId('dashboard')).not.toBeInTheDocument();
     expect(setRefused).toHaveBeenCalledWith(true);
+    // The app shell then leaves out what the hub refuses a person.
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe(
+      personSignalStorageValue(true)
+    );
   });
 
   it.each([
@@ -240,6 +246,9 @@ describe('TxePersonGate', () => {
 
     expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
     expect(setRefused).toHaveBeenCalledWith(false);
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe(
+      personSignalStorageValue(false)
+    );
   });
 
   it('gives the dashboard as before when the identity cannot be read', async () => {
@@ -252,6 +261,9 @@ describe('TxePersonGate', () => {
 
     expect(await screen.findByTestId('dashboard')).toBeInTheDocument();
     expect(setRefused).toHaveBeenLastCalledWith(false);
+    // A failed read is not kept: the next load reads the identity again
+    // before the app shell asks for anything a person is refused.
+    expect(sessionStorage.getItem('dagu_txe_person')).toBeNull();
   });
 
   it('gives the dashboard with streams when the identity request fails', async () => {

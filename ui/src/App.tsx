@@ -34,6 +34,7 @@ import Layout from './layouts/Layout';
 import { PersonLayout } from '@/features/txe/components/identity/PersonLayout';
 import { NotAvailableYet } from '@/features/txe/components/identity/NotAvailableYet';
 import { personAppBar, PersonScopeContext } from '@/features/txe/personScope';
+import { setPersonSignal, usePersonSignal } from '@/features/txe/personSignal';
 import fetchJson from './lib/fetchJson';
 import { fetchWithTimeout, shouldRetryQueryError } from './lib/requestTimeout';
 import { useClient } from './hooks/api';
@@ -411,6 +412,16 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   const selectedWorkspaceName = workspaceNameForSelection(workspaceSelection);
   const canFetchAuthenticatedResources =
     config.authMode !== 'builtin' || authToken !== null;
+  // The hub refuses a person workspaces, remote nodes and license status,
+  // and a person's dashboard pins all workspaces and the local hub. Only
+  // builtin authentication has persons; a signed-in session there waits for
+  // the person gate, which shows nothing until it has read the identity.
+  const person = usePersonSignal();
+  const awaitingIdentity =
+    config.authMode === 'builtin' && authToken !== null && person === undefined;
+  const canFetchAppResources =
+    canFetchAuthenticatedResources &&
+    (config.authMode !== 'builtin' || person === false);
   const handleSelectWorkspace = React.useCallback(
     (selection: WorkspaceSelection) => {
       const sanitized = sanitizeWorkspaceSelection(selection);
@@ -452,7 +463,10 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   );
 
   const fetchWorkspaces = React.useCallback(async () => {
-    if (!canFetchAuthenticatedResources) {
+    if (awaitingIdentity) {
+      return;
+    }
+    if (!canFetchAppResources) {
       setWorkspaceError(null);
       applyWorkspaces(initialWorkspacesRef.current ?? []);
       setWorkspacesLoaded(true);
@@ -490,7 +504,8 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
     }
   }, [
     applyWorkspaces,
-    canFetchAuthenticatedResources,
+    awaitingIdentity,
+    canFetchAppResources,
     client,
     selectedRemoteNode,
   ]);
@@ -567,7 +582,7 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
   // Fetch remote node names from the API on mount so the dropdown
   // includes store-sourced nodes (not just config-sourced ones from the template).
   React.useEffect(() => {
-    if (!canFetchAuthenticatedResources) {
+    if (!canFetchAppResources) {
       return;
     }
 
@@ -597,11 +612,14 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
       }
     };
     fetchRemoteNodeNames();
-  }, [canFetchAuthenticatedResources, config.apiURL]);
+  }, [canFetchAppResources, config.apiURL]);
 
   React.useEffect(() => {
     return addAuthSessionListener((change) => {
       setAuthToken(change.token);
+      // A new session, or none, may be someone else: the gate reads the
+      // identity again (it keys on the token) and publishes the signal anew.
+      setPersonSignal(undefined);
     });
   }, []);
 
@@ -672,7 +690,7 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
       >
         <ConfigContext.Provider value={config}>
           <LicenseProvider
-            enabled={canFetchAuthenticatedResources}
+            enabled={canFetchAppResources}
             remoteNode={selectedRemoteNode}
             initialLicense={initialConfig.license}
           >
