@@ -47,9 +47,9 @@ esac
 `
 
 type devEnv struct {
-	t                                 *testing.T
-	home, txeHome, cliRoot, linkDir   string
-	canon                             string
+	t                               *testing.T
+	home, txeHome, cliRoot, linkDir string
+	canon                           string
 }
 
 func newDevEnv(t *testing.T) *devEnv {
