@@ -5,6 +5,8 @@ package api
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -66,22 +68,23 @@ func (a *API) txeWebhookVisible(ctx context.Context, dagName string) bool {
 }
 
 // txeOwnedIdentity is the name of the owner's DAG that dag is, for a
-// decision on it: its file's name when that is an owner's DAG name, or
-// else the name it declares when that is one, or else its file's name. A
-// file that declares another name than its own answers here to whichever
-// of the two an owner holds, so an alias of an owner's DAG is decided as
-// that DAG and never as one of no owner. A run is stored under the name
-// its DAG declares, so a run's DAG is read from its attempt.
+// decision on it: the first of its file's name, the name of the file it
+// was loaded from (all a queued run's DAG keeps of its file, as enqueueing
+// clears its location) and the name it declares that is an owner's DAG
+// name, or else its file's name. A file that declares another name than
+// its own answers here to whichever an owner holds, so an alias of an
+// owner's DAG is decided as that DAG and never as one of no owner. A run
+// is stored under the name its DAG declares, so a run's DAG is read from
+// its attempt.
 func txeOwnedIdentity(dag *ir.DAG) string {
 	stem := dag.SuspendFlagName()
-	switch {
-	case txeNativeOwnedName(stem):
-		return stem
-	case txeNativeOwnedName(dag.Name):
-		return dag.Name
-	default:
-		return stem
+	source := strings.TrimSuffix(filepath.Base(dag.SourceFile), filepath.Ext(dag.SourceFile))
+	for _, name := range []string{stem, source, dag.Name} {
+		if name != "" && txeNativeOwnedName(name) {
+			return name
+		}
 	}
+	return stem
 }
 
 // txeRunRoute decides permission on a run's DAG after the route's own

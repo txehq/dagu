@@ -4,9 +4,14 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +19,9 @@ import (
 
 	"github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
@@ -132,4 +140,51 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 		require.Equal(t, http.StatusForbidden, status(http.MethodPost, aliasRun+"/steps/s/agent-interactions/i1/respond", h.admin, map[string]any{"answer": "x"}),
 			"so is its agent session")
 	}
+
+	// A queued run's DAG keeps its file only as SourceFile (enqueue clears
+	// Location); it is still the machine's owner's.
+	sourceFile := filepath.Join(h.server.Config.Paths.DAGsDir, aliasFile+".yaml")
+	queued := storeAliasRun(t, h.server, &ir.DAG{Name: "nightly-alias", SourceFile: sourceFile, YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")})
+	require.Equal(t, http.StatusForbidden, status(http.MethodDelete, "/api/v1/dag-runs/nightly-alias/"+queued, h.admin, nil),
+		"a queued alias's run is the owner's")
+
+	// A run whose DAG cannot be read is not taken for no owner's. Its
+	// workspace is read from its status, so only the owner check reads the
+	// DAG.
+	unread := storeAliasRun(t, h.server, &ir.DAG{Name: "nightly-alias", SourceFile: sourceFile,
+		Labels: ir.NewLabels([]string{"workspace=ops"}), YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")})
+	removeDAGSnapshot(t, h.server, unread)
+	require.Equal(t, http.StatusServiceUnavailable, status(http.MethodDelete, "/api/v1/dag-runs/nightly-alias/"+unread, h.admin, nil),
+		"a run whose DAG is unreadable")
+}
+
+// storeAliasRun stores a finished run of dag directly, as an attempt written
+// from a queued DAG is, and returns its run id.
+func storeAliasRun(t *testing.T, server test.Server, dag *ir.DAG) string {
+	t.Helper()
+	ctx := context.Background()
+	runID := fmt.Sprintf("alias-%d", time.Now().UnixNano())
+	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	st := ir.InitialStatus(dag)
+	st.DAGRunID, st.AttemptID, st.Status = runID, attempt.ID(), ir.Succeeded
+	st.StartedAt, st.FinishedAt = time.Now().Add(-time.Minute).Format(time.RFC3339), time.Now().Format(time.RFC3339)
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, st))
+	require.NoError(t, attempt.Close(ctx))
+	return runID
+}
+
+// removeDAGSnapshot deletes the DAG definition stored with the run runID.
+func removeDAGSnapshot(t *testing.T, server test.Server, runID string) {
+	t.Helper()
+	removed := 0
+	require.NoError(t, filepath.WalkDir(server.Config.Paths.DAGRunsDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == filedagrun.DAGDefinition && strings.Contains(path, runID) {
+			removed++
+			return os.Remove(path)
+		}
+		return err
+	}))
+	require.Equal(t, 1, removed)
 }
