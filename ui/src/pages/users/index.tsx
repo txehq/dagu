@@ -77,6 +77,32 @@ function AuthProviderBadge({
   );
 }
 
+// RoleCell shows a user's stored role. For the signed-in user it shows the
+// role the hub gave this sign-in when that differs, as it does for an SSO
+// administrator named in the configuration, whose stored role is unchanged.
+function RoleCell({
+  user,
+  effectiveRole,
+}: {
+  user: User;
+  effectiveRole?: string;
+}) {
+  const { ts } = useI18n();
+  const elevated = !!effectiveRole && effectiveRole !== user.role;
+  return (
+    <div className="flex flex-col items-start gap-0.5">
+      <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground capitalize">
+        {elevated ? effectiveRole : user.role}
+      </span>
+      {elevated && (
+        <span className="text-[10px] text-muted-foreground">
+          {ts('For this sign-in. Stored role: {role}', { role: user.role })}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function canUsePassword(user: User): boolean {
   return !user.authProvider || user.authProvider === UserAuthProvider.builtin;
 }
@@ -94,6 +120,9 @@ export default function UsersPage() {
   const { user: currentUser } = useAuth();
   const isAdmin = useIsAdmin();
   const hasRbac = useHasFeature('rbac');
+  // auth.builtin.password_disabled: the hub refuses every password
+  // account, password and reset, so none is offered.
+  const passwordDisabled = !!config.passwordLoginDisabled;
   const appBarContext = useContext(AppBarContext);
   const [users, setUsers] = useState<User[]>([]);
   const [managedRoleProviders, setManagedRoleProviders] = useState<
@@ -246,7 +275,7 @@ export default function UsersPage() {
             <I18nText text={'Manage user accounts and their roles'} />
           </p>
         </div>
-        {hasRbac && (
+        {hasRbac && !passwordDisabled && (
           <Button
             onClick={() => setShowCreateModal(true)}
             size="sm"
@@ -267,10 +296,18 @@ export default function UsersPage() {
       {!hasRbac && (
         <div className="space-y-2">
           <LicenseFeaturePrompt feature="rbac" />
-          <p className="text-xs text-muted-foreground">
-            <I18nText text="Password reset remains available to administrators." />
-          </p>
+          {!passwordDisabled && (
+            <p className="text-xs text-muted-foreground">
+              <I18nText text="Password reset remains available to administrators." />
+            </p>
+          )}
         </div>
+      )}
+
+      {passwordDisabled && (
+        <p className="text-xs text-muted-foreground">
+          <I18nText text="Password sign-in is disabled on this hub. People sign in through SSO, and no password can be set or reset here." />
+        </p>
       )}
 
       <div className="card-obsidian overflow-auto min-h-0">
@@ -334,9 +371,14 @@ export default function UsersPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground capitalize">
-                      {user.role}
-                    </span>
+                    <RoleCell
+                      user={user}
+                      effectiveRole={
+                        user.id === currentUser?.id
+                          ? currentUser?.role
+                          : undefined
+                      }
+                    />
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
                     <AuthProviderBadge
@@ -384,14 +426,16 @@ export default function UsersPage() {
                             <I18nText text={'Edit'} />
                           </DropdownMenuItem>
                         )}
-                        {isAdmin && canUsePassword(user) && (
-                          <DropdownMenuItem
-                            onClick={() => setResetPasswordUser(user)}
-                          >
-                            <Key className="h-4 w-4 mr-2" />
-                            <I18nText text={'Reset Password'} />
-                          </DropdownMenuItem>
-                        )}
+                        {isAdmin &&
+                          !passwordDisabled &&
+                          canUsePassword(user) && (
+                            <DropdownMenuItem
+                              onClick={() => setResetPasswordUser(user)}
+                            >
+                              <Key className="h-4 w-4 mr-2" />
+                              <I18nText text={'Reset Password'} />
+                            </DropdownMenuItem>
+                          )}
                         {hasRbac && isAdmin && user.id !== currentUser?.id && (
                           <DropdownMenuItem
                             onClick={() => handleToggleDisabled(user)}

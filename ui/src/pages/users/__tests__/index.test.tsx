@@ -12,16 +12,27 @@ import { ConfigContext, type Config } from '@/contexts/ConfigContext';
 import UsersPage from '..';
 import { UserFormModal } from '../UserFormModal';
 
+const authUser = vi.hoisted(() => ({
+  current: { id: 'admin' } as { id: string; role?: string },
+}));
+
 vi.mock('@/contexts/AuthContext', () => ({
   TOKEN_KEY: 'daguToken',
-  useAuth: () => ({ user: { id: 'admin' } }),
+  useAuth: () => ({ user: authUser.current }),
   useIsAdmin: () => true,
 }));
 
 type User = components['schemas']['User'];
 type UsersListResponse = components['schemas']['UsersListResponse'];
 
-function makeConfig(): Config {
+function makeConfig(overrides: Partial<Config> = {}): Config {
+  return {
+    ...baseConfig(),
+    ...overrides,
+  };
+}
+
+function baseConfig(): Config {
   return {
     apiURL: '/api/v1',
     basePath: '/',
@@ -98,7 +109,10 @@ const appBarValue = {
   workspaces: [{ id: 'payments', name: 'payments' }],
 };
 
-function renderPage(response: components['schemas']['UsersListResponse']) {
+function renderPage(
+  response: components['schemas']['UsersListResponse'],
+  config: Partial<Config> = {}
+) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
     json: async () => response,
@@ -107,7 +121,7 @@ function renderPage(response: components['schemas']['UsersListResponse']) {
 
   render(
     <MemoryRouter>
-      <ConfigContext.Provider value={makeConfig()}>
+      <ConfigContext.Provider value={makeConfig(config)}>
         <AppBarContext.Provider value={appBarValue}>
           <UsersPage />
         </AppBarContext.Provider>
@@ -127,6 +141,83 @@ describe('UsersPage', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     localStorage.clear();
+    authUser.current = { id: 'admin' };
+  });
+
+  // auth.builtin.password_disabled: the hub refuses password accounts,
+  // passwords and resets, so the page offers none of them.
+  it('offers no password action while password sign-in is disabled', async () => {
+    const user = userEvent.setup();
+    renderPage(
+      {
+        users: [
+          makeUser({
+            id: 'local-user',
+            username: 'local-user',
+            authProvider: UserAuthProvider.builtin,
+          }),
+        ],
+        managedRoleProviders: [],
+        managedWorkspaceAccessProviders: [],
+      },
+      { passwordLoginDisabled: true }
+    );
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Actions for local-user' })
+    );
+    expect(
+      screen.queryByRole('menuitem', { name: 'Reset Password' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Add User' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/Password sign-in is disabled on this hub/)
+    ).toBeVisible();
+  });
+
+  it('offers adding a user while password sign-in is enabled', async () => {
+    renderPage({
+      users: [makeUser()],
+      managedRoleProviders: [],
+      managedWorkspaceAccessProviders: [],
+    });
+
+    expect(
+      await screen.findByRole('button', { name: 'Add User' })
+    ).toBeVisible();
+    expect(
+      screen.queryByText(/Password sign-in is disabled on this hub/)
+    ).not.toBeInTheDocument();
+  });
+
+  // An SSO administrator named in txe.authz.platform_admins keeps its stored
+  // role; the hub makes it admin for each request only.
+  it("shows the signed-in user's role for this sign-in beside the stored one", async () => {
+    authUser.current = { id: 'oidc-user', role: UserRole.admin };
+    renderPage({
+      users: [makeUser()],
+      managedRoleProviders: [],
+      managedWorkspaceAccessProviders: [],
+    });
+
+    expect(await screen.findByText(UserRole.admin)).toBeVisible();
+    expect(
+      screen.getByText('For this sign-in. Stored role: viewer')
+    ).toBeVisible();
+  });
+
+  it('shows only the stored role when this sign-in has the same one', async () => {
+    authUser.current = { id: 'oidc-user', role: UserRole.viewer };
+    renderPage({
+      users: [makeUser()],
+      managedRoleProviders: [],
+      managedWorkspaceAccessProviders: [],
+    });
+
+    expect(await screen.findByText(UserRole.viewer)).toBeVisible();
+    expect(screen.queryByText(/For this sign-in/)).not.toBeInTheDocument();
   });
 
   it('marks OIDC users as managed when the selected node enables access sync', async () => {
