@@ -272,6 +272,10 @@ func TestWrapperFindsTheTXECommand(t *testing.T) {
 	assert.Equal(t, brackets("--session", "s1", "enrol"), e.wrapperArgs("txe", "--session", "s1", "enrol"))
 	// A job key or argument named enrol is not the enrol command.
 	assert.Equal(t, with("inspect", "enrol"), e.wrapperArgs("txe", "inspect", "enrol"))
+	// txe's boolean flags take no value, either way round.
+	assert.Equal(t, brackets("--quiet", "enrol", "--client-id", "w"), e.wrapperArgs("txe", "--quiet", "enrol", "--client-id", "w"))
+	assert.Equal(t, with("-q", "inspect", "enrol"), e.wrapperArgs("txe", "-q", "inspect", "enrol"))
+	assert.Equal(t, brackets("--cpu-profile", "enrol"), e.wrapperArgs("txe", "--cpu-profile", "enrol"))
 }
 
 // The review's cases: nothing at a temporary name is followed, the
