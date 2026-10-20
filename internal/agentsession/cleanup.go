@@ -52,18 +52,21 @@ func NewCleanupQueue(col persis.Collection) *CleanupQueue {
 // SessionDeleter removes one provider resource from its owning host.
 type SessionDeleter func(context.Context, ir.AgentSessionResource) error
 
-// RunCleanupLoop processes eligible jobs until ctx is cancelled.
+// RunCleanupLoop processes eligible jobs until ctx is cancelled. A job of
+// another host is taken over only when mayTakeOver allows its owner; nil
+// allows every owner.
 func RunCleanupLoop(
 	ctx context.Context,
 	ownerWorkerID string,
 	queue *CleanupQueue,
 	repository *persis.DAGRunRepository,
 	deleteSession SessionDeleter,
+	mayTakeOver func(resourceOwner string) bool,
 ) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
-		processed, err := ProcessNextCleanup(ctx, ownerWorkerID, queue, repository, deleteSession)
+		processed, err := ProcessNextCleanup(ctx, ownerWorkerID, queue, repository, deleteSession, mayTakeOver)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Warn(ctx, "Agent session cleanup failed", tag.Error(err), slog.String("worker-id", ownerWorkerID))
 		}
@@ -78,15 +81,17 @@ func RunCleanupLoop(
 	}
 }
 
-// ProcessNextCleanup processes one eligible job.
+// ProcessNextCleanup processes one eligible job, taking over another
+// host's only when mayTakeOver allows its owner (nil allows every owner).
 func ProcessNextCleanup(
 	ctx context.Context,
 	ownerWorkerID string,
 	queue *CleanupQueue,
 	repository *persis.DAGRunRepository,
 	deleteSession SessionDeleter,
+	mayTakeOver func(resourceOwner string) bool,
 ) (bool, error) {
-	job, err := queue.Claim(ctx, ownerWorkerID, time.Minute)
+	job, err := queue.ClaimWithin(ctx, ownerWorkerID, time.Minute, mayTakeOver)
 	if errors.Is(err, persis.ErrNotFound) {
 		return false, nil
 	}
