@@ -39,6 +39,17 @@ func TestStepAuth(t *testing.T) {
 	}
 
 	require.ErrorContains(t, home.SetStepCredential("worker", "relative.json", "http://h/api/v1"), "must be an absolute path")
+
+	// The directory is synced after the rename, and a failed sync is an
+	// error, not a silent success.
+	synced := ""
+	before := syncStepAuthDir
+	t.Cleanup(func() { syncStepAuthDir = before })
+	syncStepAuthDir = func(dir string) error { synced = dir; return nil }
+	require.NoError(t, home.SetStepCredential("worker", "/abs/w.json", "http://h/api/v1"))
+	assert.Equal(t, home.ClientDir(), synced)
+	syncStepAuthDir = func(string) error { return os.ErrPermission }
+	require.ErrorContains(t, home.SetStepCredential("worker", "/abs/w.json", "http://h/api/v1"), "could not be synced")
 	require.ErrorContains(t, home.SetStepCredential("Worker", "/abs", "http://h/api/v1"), "not a credential class")
 	require.ErrorContains(t, home.SetStepCredential("worker", "/abs", ""), "names no hub")
 }

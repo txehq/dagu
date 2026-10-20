@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
 // StepAuthFile names, in the machine's own context store (the TXE home's
@@ -152,5 +154,17 @@ func (h Home) SetStepCredential(class, path, hub string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(h.ClientDir(), StepAuthFile))
+	if err := os.Rename(tmp.Name(), filepath.Join(h.ClientDir(), StepAuthFile)); err != nil {
+		return err
+	}
+	// The rename is durable only once the directory is: a marker lost in a
+	// crash would read as "not enrolled", which keeps the API key.
+	if err := syncStepAuthDir(h.ClientDir()); err != nil {
+		return fmt.Errorf("the step-auth file was written but its directory could not be synced: %w", err)
+	}
+	return nil
 }
+
+// syncStepAuthDir makes a rename in the step-auth file's directory durable.
+// It is a variable so a test can see it called.
+var syncStepAuthDir = fileutil.SyncDir
