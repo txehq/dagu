@@ -301,6 +301,10 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 	if err != nil {
 		return nil, err
 	}
+	hub, stepClient, err := txeStepStore(ctx, home, machine)
+	if err != nil {
+		return nil, err
+	}
 	return &txeclient.Registrar{
 		Client:  client,
 		Home:    home,
@@ -310,8 +314,9 @@ func txeRegistrar(ctx *Context) (*txeclient.Registrar, error) {
 			Kind: txeclient.ActorKindCLI, ID: "cli", Session: session,
 			MachineID: machine.MachineID, Client: txeClientVersion(),
 		},
-		NewID: txeclient.NewID,
-		Hub:   txeHubContext(ctx),
+		NewID:      txeclient.NewID,
+		Hub:        hub,
+		StepClient: stepClient,
 	}, nil
 }
 

@@ -14,8 +14,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-yaml"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -99,6 +102,15 @@ type Registrar struct {
 	// publish step reaches the same hub. The zero value is the TXE home's own
 	// context store and its default context.
 	Hub HubContext
+	// StepClient is set when the job's steps reach the hub through another
+	// context than the session does: Hub names it, and StepClient reads the
+	// hub through it as a step would. A person's sign-in is one such session,
+	// since a step never presents it. Registration then goes ahead only while
+	// both reach the same registry: the steps' context must hold this
+	// machine for the same owner before anything is sent, and must read the
+	// job just registered, at its version and package, before it is marked
+	// ready. Nil means the steps use the session's own context.
+	StepClient *Client
 	// HasCommands reports whether the dagu binary at the given path has each
 	// of the "dagu txe" commands named. A job's DAG calls that binary on
 	// this machine, so a job is not registered while the binary lacks a
@@ -317,6 +329,9 @@ func (r *Registrar) checkMachine(ctx context.Context, spec *JobSpec) error {
 	if err := r.checkHub(); err != nil {
 		return err
 	}
+	if err := r.checkStepHub(ctx); err != nil {
+		return err
+	}
 	commands := [][]string{{"resource", "check"}}
 	if len(spec.ExpectedOutcome.Deliverables) > 0 {
 		commands = append(commands, []string{"artifacts", "begin"}, []string{"artifacts", "seal"}, []string{"artifacts", "publish"})
@@ -328,6 +343,123 @@ func (r *Registrar) checkMachine(ctx context.Context, spec *JobSpec) error {
 	dagu := r.cli().Dagu
 	if err := has(ctx, dagu, commands); err != nil {
 		return fmt.Errorf("the dagu this machine's jobs run (%s) cannot run this job's DAG: %w; install a dagu that has the command on this machine, then register again", dagu, err)
+	}
+	return nil
+}
+
+// checkStepHub refuses a registration whose steps would reach the hub through
+// a context that does not hold this machine, for the same owner, as the
+// session's does. Nothing has been sent yet.
+func (r *Registrar) checkStepHub(ctx context.Context) error {
+	if r.StepClient == nil {
+		return nil
+	}
+	machine, err := r.Home.Machine()
+	if err != nil {
+		return err
+	}
+	theirs, err := r.StepClient.Machine(ctx, machine.MachineID)
+	if err != nil {
+		return fmt.Errorf("the context this machine's jobs run with (%s) cannot read machine %s: %w", r.Hub.Name, machine.MachineID, err)
+	}
+	ours, err := r.Client.Machine(ctx, machine.MachineID)
+	if err != nil {
+		return fmt.Errorf("read machine %s through this session's hub: %w", machine.MachineID, err)
+	}
+	if *theirs != *ours || theirs.OwnerID != machine.OwnerID {
+		return fmt.Errorf("the context this machine's jobs run with (%s) and this session reach different registries: they hold machine %s for owner %s and %s, and this machine says %s",
+			r.Hub.Name, machine.MachineID, theirs.OwnerID, ours.OwnerID, machine.OwnerID)
+	}
+	return nil
+}
+
+// checkSavedSteps refuses a journal entry whose saved DAG runs the job's
+// steps with another context store than this registrar gives them. That
+// covers a request begun before steps were given the machine's store, and
+// one resumed from a session that reaches the hub another way.
+//
+// The DAG is read as YAML and compared with the shape the renderer gives it:
+// a run step of this job's resource check, the artifacts begin command when
+// there are deliverables, the job's own command as the request saved it, and
+// the artifacts seal command; then, with deliverables, a publish step. Every
+// dagu command must carry this registrar's store flags. Text elsewhere in the
+// DAG, such as the title or an environment value, decides nothing.
+func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
+	var request struct {
+		Version JobVersion `json:"version"`
+	}
+	if err := json.Unmarshal(entry.Request, &request); err != nil {
+		return fmt.Errorf("read the DAG saved with request %s: %w", entry.RequestID, err)
+	}
+	var dag struct {
+		Steps []struct {
+			Name    string `yaml:"name"`
+			Command any    `yaml:"command"`
+		} `yaml:"steps"`
+	}
+	if err := yaml.Unmarshal([]byte(request.Version.DAG.Spec), &dag); err != nil {
+		return fmt.Errorf("read the DAG saved with request %s: %w", entry.RequestID, err)
+	}
+	cli := r.cli()
+	txe := func(words ...string) string {
+		return txepkg.ShellJoin(append(append([]string{cli.Dagu, "txe"}, words...), cli.StoreFlags...))
+	}
+	check := txe("resource", "check", "--job", entry.JobID, "--job-version", strconv.Itoa(entry.Version), "--machine", entry.MachineID)
+	job := request.Version.Package.Entrypoint
+	plain := []string{check, job}
+	delivering := []string{check, txe("artifacts", "begin"), job, txe("artifacts", "seal")}
+	publish := []string{txe("artifacts", "publish")}
+
+	matches := false
+	switch len(dag.Steps) {
+	case 1:
+		matches = dag.Steps[0].Name == "run" && slices.Equal(commandLines(dag.Steps[0].Command), plain)
+	case 2:
+		matches = dag.Steps[0].Name == "run" && slices.Equal(commandLines(dag.Steps[0].Command), delivering) &&
+			dag.Steps[1].Name == "publish" && slices.Equal(commandLines(dag.Steps[1].Command), publish)
+	}
+	if !matches {
+		return fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
+			"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(cli.StoreFlags))
+	}
+	return nil
+}
+
+// commandLines returns a step's command as the list of lines it runs: one
+// line for a scalar, each item for a list of strings, and nil for anything
+// else.
+func commandLines(command any) []string {
+	switch c := command.(type) {
+	case string:
+		return []string{c}
+	case []any:
+		lines := make([]string, 0, len(c))
+		for _, item := range c {
+			line, ok := item.(string)
+			if !ok {
+				return nil
+			}
+			lines = append(lines, line)
+		}
+		return lines
+	}
+	return nil
+}
+
+// checkStepJob refuses to mark a job ready unless the steps' context reads
+// it as this session registered it: the same job, owner, machine, version and
+// package. A hub that merely holds the same machine is not enough.
+func (r *Registrar) checkStepJob(ctx context.Context, job *Job) error {
+	if r.StepClient == nil {
+		return nil
+	}
+	seen, err := r.StepClient.Job(ctx, job.JobID)
+	if err != nil {
+		return fmt.Errorf("the context this machine's jobs run with (%s) cannot read job %s, so its steps would reach another hub: %w", r.Hub.Name, job.JobID, err)
+	}
+	if seen.OwnerID != job.OwnerID || seen.MachineID != job.MachineID || seen.Version != job.Version || seen.PackageDigest != job.PackageDigest {
+		return fmt.Errorf("the context this machine's jobs run with (%s) reads job %s at version %d with package %s, not version %d with %s: its steps would reach another registry",
+			r.Hub.Name, job.JobID, seen.Version, seen.PackageDigest, job.Version, job.PackageDigest)
 	}
 	return nil
 }
@@ -634,6 +766,15 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 		return nil, fmt.Errorf("request %s was built on machine %s for owner %s; this is machine %s of owner %s, which cannot send or finish it",
 			entry.RequestID, entry.MachineID, entry.OwnerID, machine.MachineID, machine.OwnerID)
 	}
+	// A resumed request keeps the DAG it was built with. It is sent or
+	// finished only by a session whose job steps use the same context store,
+	// so that the checks below are made on the store its steps will read.
+	if err := r.checkSavedSteps(entry); err != nil {
+		return nil, err
+	}
+	if err := r.checkStepHub(ctx); err != nil {
+		return nil, err
+	}
 
 	// 1. The hub saves the job version and its DAG. Before this succeeds the
 	// package stays in the staging area: a refused request leaves no package
@@ -712,6 +853,9 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	if job.Version != entry.Version || job.PackageDigest != entry.PackageDigest {
 		return nil, incomplete(fmt.Errorf("job %s is at version %d with package %s; this request registered version %d with %s",
 			entry.JobID, job.Version, job.PackageDigest, entry.Version, entry.PackageDigest))
+	}
+	if err := r.checkStepJob(ctx, job); err != nil {
+		return nil, incomplete(err)
 	}
 	var size int64
 	for _, f := range pkg.Manifest.Files {
