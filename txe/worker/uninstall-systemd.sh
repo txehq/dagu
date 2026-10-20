@@ -23,12 +23,20 @@ case "${1:-}" in
 esac
 systemctl_bin="$(command -v systemctl)" || die "systemctl is not on PATH"
 
+# A unit that fails to stop is an error, not a warning: --purge must never delete the home of a
+# worker that is still running.
 for unit in txe-dagu-worker.service txe-dagu-tunnel.service; do
-  "$systemctl_bin" --user disable --now "$unit" >/dev/null 2>&1 || true
+  if [ -e "$TXE_DAGU_UNITS_DIR/$unit" ] || [ "$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)" = active ]; then
+    "$systemctl_bin" --user disable --now "$unit" >/dev/null || die "could not stop $unit; nothing was removed"
+  fi
+  state="$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)"
+  case "$state" in
+    active|activating|deactivating|reloading) die "$unit is still $state; nothing was removed" ;;
+  esac
   rm -f -- "$TXE_DAGU_UNITS_DIR/$unit"
   printf 'removed %s\n' "$unit"
 done
-"$systemctl_bin" --user daemon-reload
+"$systemctl_bin" --user daemon-reload || die "systemctl --user daemon-reload failed"
 
 if [ "$purge" = 1 ]; then
   case "$TXE_DAGU_HOME" in

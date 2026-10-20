@@ -19,19 +19,24 @@ import os, sys
 CREDENTIAL_ENV = "DAGU_WORKER_AUTH_CREDENTIAL_FILE"
 
 
-def _quote(word):
-    """One word for ExecStart= or Environment=, as systemd.syntax reads it: double-quoted, with
-    backslash and double quote escaped, % doubled (specifiers) and $ doubled (variable expansion)."""
+def _quote(word, exec_line):
+    """One word for ExecStart= (exec_line) or Environment=, as systemd.syntax and systemd.exec read
+    them: double-quoted, with backslash and double quote escaped and % doubled (specifiers are
+    expanded in both). $ is doubled only on ExecStart=, which expands variables; Environment= does
+    not, and keeps "$$" as two dollars (measured on Ubuntu 24.04's systemd 255)."""
     if any(c in word for c in "\n\r\0"):
         raise ValueError(f"a unit value cannot hold a line break or NUL: {word!r}")
-    return '"' + word.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+    word = word.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    if exec_line:
+        word = word.replace("$", "$$")
+    return '"' + word + '"'
 
 
 def _unit(description, argv, environment, log):
     lines = ["[Unit]", f"Description={description}", "After=network-online.target", "",
              "[Service]", "Type=simple"]
-    lines += [f"Environment={_quote(f'{k}={v}')}" for k, v in environment.items()]
-    lines += ["ExecStart=" + " ".join(_quote(a) for a in argv),
+    lines += [f"Environment={_quote(f'{k}={v}', False)}" for k, v in environment.items()]
+    lines += ["ExecStart=" + " ".join(_quote(a, True) for a in argv),
               # As launchd's KeepAlive with ThrottleInterval 5: always restarted, 5 s apart.
               "Restart=always", "RestartSec=5",
               f"StandardOutput=append:{log}", f"StandardError=append:{log}", "",
@@ -76,7 +81,7 @@ def unit_credential(unit_file):
     for line in lines:
         if line.startswith(prefix) and line.endswith('"'):
             raw = line[len(prefix):-1]
-            return raw.replace("$$", "$").replace("%%", "%").replace('\\"', '"').replace("\\\\", "\\")
+            return raw.replace("%%", "%").replace('\\"', '"').replace("\\\\", "\\")
     return None
 
 

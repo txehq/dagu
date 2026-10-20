@@ -79,7 +79,8 @@ func TestUnitsPassTheCredentialPathOnly(t *testing.T) {
 	require.NoError(t, err, stderr)
 	worker, err := os.ReadFile(filepath.Join(dir, "txe-dagu-worker.service"))
 	require.NoError(t, err)
-	escaped := strings.NewReplacer("%", "%%", "$", "$$").Replace(cred)
+	// Environment= expands specifiers but not variables: % is doubled, $ is kept as it is.
+	escaped := strings.ReplaceAll(cred, "%", "%%")
 	assert.Contains(t, string(worker), `Environment="DAGU_WORKER_AUTH_CREDENTIAL_FILE=`+escaped+`"`+"\n")
 	assert.NotContains(t, string(worker), agentsSecret, "the unit holds the path, never the token")
 	out, stderr, err := python(t, script, "credential", filepath.Join(dir, "txe-dagu-worker.service"))
@@ -152,4 +153,40 @@ func TestUninstallSystemdPurgeRefusesAHomeWithoutMachineJSON(t *testing.T) {
 	assert.Contains(t, errOut.String(), "it holds no machine.json")
 	_, statErr := os.Stat(filepath.Join(txe, "keep"))
 	assert.NoError(t, statErr, "nothing was deleted")
+}
+
+func TestUninstallSystemdStopsBeforeItRemovesOrPurges(t *testing.T) {
+	agentsScript(t)
+	script, err := filepath.Abs("uninstall-systemd.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	for _, c := range []struct{ name, systemctl, want string }{
+		// disable --now fails: a worker that could not be stopped keeps its unit and its home.
+		{"stop fails", "case \"$*\" in *disable*) exit 1;; *is-active*) echo active;; esac\nexit 0\n", "could not stop txe-dagu-worker.service"},
+		// disable --now succeeds but the unit is still running.
+		{"still active", "case \"$*\" in *is-active*) echo active;; esac\nexit 0\n", "txe-dagu-worker.service is still active"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			bin := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\n"+c.systemctl), 0o755))
+			home := t.TempDir()
+			units := filepath.Join(home, "units")
+			require.NoError(t, os.MkdirAll(units, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(units, "txe-dagu-worker.service"), []byte("[Service]\n"), 0o644))
+			txe := filepath.Join(home, "txe")
+			require.NoError(t, os.MkdirAll(txe, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(txe, "machine.json"), []byte("{}"), 0o600))
+			cmd := exec.Command(bash, script, "--purge")
+			cmd.Env = []string{"HOME=" + home, "TXE_DAGU_HOME=" + txe, "TXE_DAGU_UNITS_DIR=" + units, "PATH=" + bin + ":/usr/bin:/bin"}
+			var errOut bytes.Buffer
+			cmd.Stderr = &errOut
+			require.Error(t, cmd.Run())
+			assert.Contains(t, errOut.String(), c.want)
+			_, statErr := os.Stat(filepath.Join(units, "txe-dagu-worker.service"))
+			assert.NoError(t, statErr, "the unit was not removed")
+			_, statErr = os.Stat(filepath.Join(txe, "machine.json"))
+			assert.NoError(t, statErr, "the home was not purged")
+		})
+	}
 }
