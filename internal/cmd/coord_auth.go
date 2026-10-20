@@ -47,6 +47,13 @@ func coordinatorAuthOptions(ctx context.Context, cfg *config.Config, advertise s
 	if !cfg.Coordinator.Auth.Enabled() {
 		return nil, nil
 	}
+	if cfg.Coordinator.Auth.Mode == config.TXEAuthzModeEnforce && cfg.TXE.Authz.Mode != config.TXEAuthzModeEnforce {
+		// A staged rollout: workers are authenticated, but tasks are not yet
+		// pinned to their machines, so an enrolled machine may still be
+		// handed a task that names no machine.
+		logger.Warn(ctx, "coordinator.auth.mode is enforce but txe.authz.mode is not: tasks are not pinned to machines until it is",
+			slog.String("txe.authz.mode", cfg.TXE.Authz.Mode))
+	}
 	mode := authz.Mode(cfg.Coordinator.Auth.Mode)
 	tls := cfg.Core.Peer.CertFile != "" && cfg.Core.Peer.KeyFile != ""
 	if !tls && !transportauth.IsLoopbackHost(advertise) {

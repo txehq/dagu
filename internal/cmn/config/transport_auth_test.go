@@ -4,6 +4,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -108,4 +109,33 @@ func TestLoad_TransportAuthIsReadForTheServicesThatUseIt(t *testing.T) {
 	}
 	cfg := loadFromYAMLForService(t, ServiceWorker, yaml)
 	assert.Equal(t, credential, cfg.Worker.Auth.CredentialFile)
+}
+
+// A coordinator started on its own does not read the owner settings, so it
+// would neither pin tasks to machines nor be held to authenticate workers.
+// Owner authorization in observe or enforce, written in the file or the
+// environment, refuses to load for it; a config with owners off, or none,
+// loads as before, and the server and start-all read the settings
+// (TXE-4720).
+func TestLoad_ACoordinatorOnItsOwnRefusesOwners(t *testing.T) {
+	for _, mode := range []string{TXEAuthzModeObserve, TXEAuthzModeEnforce} {
+		file := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(file, []byte("txe:\n  authz:\n    mode: "+mode+"\n"), 0600))
+		err := testLoadWithError(t, WithConfigFile(file), WithService(ServiceCoordinator))
+		require.ErrorContains(t, err, "a coordinator started on its own", "file, %s", mode)
+
+		t.Run("env "+mode, func(t *testing.T) {
+			t.Setenv("DAGU_TXE_AUTHZ_MODE", mode)
+			err := testLoadWithError(t, WithService(ServiceCoordinator))
+			require.ErrorContains(t, err, "a coordinator started on its own")
+		})
+	}
+	for _, yaml := range []string{"", "txe:\n  authz:\n    mode: off\n"} {
+		cfg := loadFromYAMLForService(t, ServiceCoordinator, yaml+"coordinator:\n  auth:\n    mode: off\n")
+		assert.Empty(t, cfg.TXE.Authz.Mode, "a coordinator on its own still reads no owner settings")
+	}
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(file, []byte("auth:\n  mode: builtin\ntxe:\n  authz:\n    mode: enforce\n"), 0600))
+	cfg := testLoad(t, WithConfigFile(file))
+	assert.Equal(t, TXEAuthzModeEnforce, cfg.TXE.Authz.Mode, "start-all reads them")
 }
