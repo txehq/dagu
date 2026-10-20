@@ -241,8 +241,25 @@ describe('UsersPage', () => {
 
     expect(await screen.findByText(UserRole.admin)).toBeVisible();
     expect(
-      screen.getByText('For this sign-in. Stored role: viewer')
+      screen.getByText('· for this sign-in, stored: viewer')
     ).toBeVisible();
+  });
+
+  // A remote node's users are another store's; /auth/me is this hub's.
+  it("shows a remote node's user only their stored role", async () => {
+    authUser.current = { id: 'oidc-user', role: UserRole.admin };
+    renderPage(
+      {
+        users: [makeUser()],
+        managedRoleProviders: [],
+        managedWorkspaceAccessProviders: [],
+      },
+      {},
+      'edge'
+    );
+
+    expect(await screen.findByText(UserRole.viewer)).toBeVisible();
+    expect(screen.queryByText(/for this sign-in/)).not.toBeInTheDocument();
   });
 
   it('shows only the stored role when this sign-in has the same one', async () => {
@@ -254,7 +271,7 @@ describe('UsersPage', () => {
     });
 
     expect(await screen.findByText(UserRole.viewer)).toBeVisible();
-    expect(screen.queryByText(/For this sign-in/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/for this sign-in/)).not.toBeInTheDocument();
   });
 
   it('marks OIDC users as managed when the selected node enables access sync', async () => {

@@ -90,16 +90,16 @@ function RoleCell({
   const { ts } = useI18n();
   const elevated = !!effectiveRole && effectiveRole !== user.role;
   return (
-    <div className="flex flex-col items-start gap-0.5">
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
       <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground capitalize">
         {elevated ? effectiveRole : user.role}
       </span>
       {elevated && (
-        <span className="text-[10px] text-muted-foreground">
-          {ts('For this sign-in. Stored role: {role}', { role: user.role })}
+        <span className="text-xs text-muted-foreground">
+          · {ts('for this sign-in, stored: {role}', { role: user.role })}
         </span>
       )}
-    </div>
+    </span>
   );
 }
 
@@ -124,9 +124,8 @@ export default function UsersPage() {
   // auth.builtin.password_disabled: this hub refuses every password account,
   // password and reset, so none is offered. It is this hub's setting; a
   // selected remote node's users are managed by that node's own policy.
-  const passwordDisabled =
-    !!config.passwordLoginDisabled &&
-    (appBarContext.selectedRemoteNode || 'local') === 'local';
+  const isLocalNode = (appBarContext.selectedRemoteNode || 'local') === 'local';
+  const passwordDisabled = !!config.passwordLoginDisabled && isLocalNode;
   const [users, setUsers] = useState<User[]>([]);
   const [managedRoleProviders, setManagedRoleProviders] = useState<
     UserAuthProvider[]
@@ -377,7 +376,9 @@ export default function UsersPage() {
                     <RoleCell
                       user={user}
                       effectiveRole={
-                        user.id === currentUser?.id
+                        // /auth/me is this hub's: a remote node's users
+                        // live in another store.
+                        isLocalNode && user.id === currentUser?.id
                           ? currentUser?.role
                           : undefined
                       }
