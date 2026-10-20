@@ -36,7 +36,8 @@ var (
 			"it: pin the DAG with worker_selector txe.machine, or have a worker that is no machine's run it",
 		Details: map[string]any{"code": "dag_not_pinned"}}
 	errMachineWorkerUnavailable = &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
-		Message: "the worker of the machine this DAG is pinned to is not connected and enrolled; start it, then try again",
+		Message: "no worker of the machine this DAG is pinned to may run it now: check that the machine's worker is " +
+			"running and enrolled, and that it has every label the DAG's worker_selector names",
 		Details: map[string]any{"code": "machine_worker_unavailable"}}
 )
 

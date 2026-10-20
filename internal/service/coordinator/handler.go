@@ -592,6 +592,14 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		return nil, status.Error(codes.Internal, "failed to list workers: "+err.Error())
 	}
 	if len(healthyWorkers) == 0 {
+		if h.machinePinning == dispatch.MachinePinningEnforce {
+			// With machines pinned, "no worker at all" and "none of the
+			// connected ones may take it" are one answer: the difference
+			// is whether other owners' machines are connected, which the
+			// caller is not to learn, not even by how soon it is answered
+			// (the client retries the one and not the other).
+			return nil, status.Error(codes.FailedPrecondition, errNoMatchingWorkers.Error())
+		}
 		return nil, status.Error(codes.Unavailable, errNoAvailableWorkers.Error())
 	}
 	if !anyWorkerMatches(healthyWorkers, req.Task.WorkerSelector, req.Task.TargetWorkerId, h.machinePinning) {

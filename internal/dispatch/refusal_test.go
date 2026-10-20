@@ -37,6 +37,7 @@ func TestDispatchRefusals(t *testing.T) {
 		// mentions it.
 		"another code naming it":   status.Error(codes.Internal, NoMatchingWorkersMessage),
 		"a plain error naming it":  errors.New(NoAvailableWorkersMessage),
+		"the same code, more text": status.Error(codes.FailedPrecondition, "workspace of DAG \""+NoMatchingWorkersMessage+"\" is missing"),
 	} {
 		assert.False(t, IsNoMatchingWorker(err), name)
 		assert.False(t, IsNoAvailableWorker(err), name)

@@ -6573,3 +6573,31 @@ func TestDispatchMachinePinning(t *testing.T) {
 		}
 	}
 }
+
+// With machines pinned, a dispatch with no worker connected at all is
+// refused as one no connected worker may take: which one it is depends on
+// whether other owners' machines are connected, which the caller is not to
+// learn, and the client retries the one and not the other. Without pinning
+// the two stay apart (TXE-4712).
+func TestDispatchWithNoWorkerUnderPinningIsOneRefusal(t *testing.T) {
+	t.Parallel()
+	for pinning, want := range map[dispatch.MachinePinning]error{
+		dispatch.MachinePinningOff:     errNoAvailableWorkers,
+		dispatch.MachinePinningObserve: errNoAvailableWorkers,
+		dispatch.MachinePinningEnforce: errNoMatchingWorkers,
+	} {
+		dir := t.TempDir()
+		h := NewHandler(HandlerConfig{
+			DAGRunRepository:     newMockDAGRunStore().repository,
+			DispatchTaskStore:    newTestDispatchTaskStore(dir),
+			WorkerHeartbeatStore: newTestWorkerHeartbeatStore(dir),
+			MachinePinning:       pinning,
+		})
+		_, err := h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+			DagRunId: "r1", Target: "job_A", WorkerSelector: map[string]string{"txe.machine": "mch_A"},
+			Definition: "steps:\n  - name: test\n    command: echo hello\n",
+		}})
+		require.Equal(t, dispatchErrorCode(want), status.Code(err), "pinning %d", pinning)
+		require.Equal(t, want.Error(), status.Convert(err).Message(), "pinning %d", pinning)
+	}
+}

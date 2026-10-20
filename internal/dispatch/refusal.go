@@ -4,7 +4,7 @@
 package dispatch
 
 import (
-	"strings"
+	"errors"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,10 +34,15 @@ func IsNoAvailableWorker(err error) bool {
 	return isRefusal(err, codes.Unavailable, NoAvailableWorkersMessage)
 }
 
+// isRefusal reports whether err carries, as returned or wrapped, the gRPC
+// status the coordinator refuses with: its code and exactly its message. A
+// status of the same code whose message only contains the words is another
+// failure, and wrapping adds text only outside the status.
 func isRefusal(err error, code codes.Code, message string) bool {
-	if err == nil {
+	var carrier interface{ GRPCStatus() *status.Status }
+	if !errors.As(err, &carrier) {
 		return false
 	}
-	st, ok := status.FromError(err)
-	return ok && st.Code() == code && strings.Contains(st.Message(), message)
+	st := carrier.GRPCStatus()
+	return st != nil && st.Code() == code && st.Message() == message
 }
