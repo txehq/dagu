@@ -5,7 +5,9 @@ package api
 
 import (
 	"context"
+	"net/http"
 
+	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
@@ -175,4 +177,29 @@ func (a *API) txeOwnerVisibleDAGNames(ctx context.Context) (map[string]bool, err
 		}
 	}
 	return out, nil
+}
+
+// errTxeHubRecords refuses the hub's whole-hub records (TXE-4752).
+var errTxeHubRecords = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "under owner enforcement only the platform administrator reads the hub's records",
+	Details:    map[string]any{"code": "hub_records_not_permitted"},
+}
+
+// txeHubHidden reports whether the hub's whole-hub reads that are not
+// decided DAG by DAG are hidden from the caller (TXE-4752): DAG search, the
+// artifact list, event and audit logs, and workers. A caller held to its
+// owner reads only through its owner, and in enforce every caller but the
+// platform administrator reads no DAG, so these show them nothing of any
+// owner's. A failure to decide hides them.
+func (a *API) txeHubHidden(ctx context.Context) bool {
+	if a.txeAuth == nil {
+		return false
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return true
+	}
+	return c.ownerOnly() || (c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin)
 }

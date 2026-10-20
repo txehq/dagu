@@ -23,6 +23,11 @@ func (a *API) ListArtifacts(
 	if err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		// It reads no DAG, so it lists no run's artifacts, without
+		// reading any (TXE-4752).
+		return api.ListArtifacts200JSONResponse{Items: []api.ArtifactListItem{}}, nil
+	}
 
 	query := persis.ArtifactQuery{WorkspaceFilter: workspaceFilter}
 	if request.Params.Name != nil {

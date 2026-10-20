@@ -18,6 +18,9 @@ func (a *API) ListAuditLogs(ctx context.Context, request api.ListAuditLogsReques
 	if err := a.requireManagerOrAbove(ctx); err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		return nil, errTxeHubRecords
+	}
 
 	if err := a.requireLicensedAudit(); err != nil {
 		return nil, err

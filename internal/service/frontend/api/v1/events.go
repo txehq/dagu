@@ -19,6 +19,9 @@ func (a *API) ListEventLogs(ctx context.Context, request api.ListEventLogsReques
 	if err := a.requireManagerOrAbove(ctx); err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		return nil, errTxeHubRecords
+	}
 
 	if a.eventService == nil {
 		return nil, &Error{
