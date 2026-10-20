@@ -9,15 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/goccy/go-yaml"
-	"github.com/goccy/go-yaml/parser"
-
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
-	"github.com/dagucloud/dagu/v2/internal/cmn/yamlutil"
-	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
+	"github.com/dagucloud/dagu/v2/internal/txe/placement"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
@@ -92,7 +88,7 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 	for name := range files {
 		decide[name] = true
 	}
-	var placements []txePlacement
+	var placements []placement.Placement
 	if spec != nil {
 		declared, err := a.txeSpecPlacements(ctx, spec)
 		if err != nil {
@@ -102,8 +98,8 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 		}
 		for _, p := range declared {
 			// A DAG that declares no name takes the file's, decided above.
-			if strings.TrimSpace(p.name) != "" {
-				decide[txeCanonicalDAGName(p.name)] = true
+			if strings.TrimSpace(p.Name) != "" {
+				decide[txeCanonicalDAGName(p.Name)] = true
 			}
 		}
 		placements = declared
@@ -118,8 +114,8 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 	// machine; a machine's own DAG is sent only to that machine.
 	targets := map[string]bool{}
 	for _, p := range placements {
-		if p.machine != "" {
-			targets[p.machine] = true
+		if p.Machine != "" {
+			targets[p.Machine] = true
 		}
 	}
 	for machine := range targets {
@@ -135,8 +131,15 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 			}
 			for _, p := range placements {
 				// Every document is pinned to the machine; a step may leave
-				// its placement to its child, but may not send it elsewhere.
-				if (!p.step && p.machine != own) || (p.step && p.machine != "" && p.machine != own) {
+				// its placement to its child, but may not send it elsewhere,
+				// nor call another machine's DAG, which runs on that machine
+				// even when the same owner holds both.
+				if (!p.Step && p.Machine != own) || (p.Step && p.Machine != "" && p.Machine != own) {
+					return a.txeNativeWriteMisplaced(ctx, c, name)
+				}
+				// The name as the store resolves it: an extension, a path or
+				// another case names the same DAG.
+				if called, ok := txeauth.MachineOfDAG(txeCanonicalDAGName(p.Name)); p.Step && ok && called != own {
 					return a.txeNativeWriteMisplaced(ctx, c, name)
 				}
 			}
@@ -145,163 +148,26 @@ func (a *API) txeNativeWrite(ctx context.Context, legacy func() error, spec []by
 	return nil
 }
 
-// txePlacement is one DAG a spec defines, or one step of it: the name it
-// declares or calls, and the machine it is sent to, if any.
-type txePlacement struct {
-	// name is a DAG the spec defines (its declared name) or a step calls.
-	name string
-	// machine is the txe.machine a document or a step selects, if any.
-	machine string
-	// step marks a step's placement or reference, not a document's.
-	step bool
-}
-
 // txeSpecPlacements reads a spec as the loader reads it, with no name
 // imposed and nothing evaluated: every DAG it defines (the first document
 // and each local DAG), by its declared name and the machine it is sent to,
 // and every step of each, handlers included, by the DAG it calls and the
 // machine it sends that to. A spec that does not load, or whose worker
 // selector or called DAG is computed, cannot be verified.
-func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]txePlacement, error) {
-	if err := txeSelectorsWritten(spec); err != nil {
-		return nil, err
+func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]placement.Placement, error) {
+	if err := placement.Written(spec); err != nil {
+		return nil, errTxeSpecUnverified
 	}
 	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
 	if err != nil {
 		return nil, err
 	}
-	if dag == nil {
+	out, err := placement.Of(dag)
+	if err != nil {
 		return nil, errTxeSpecUnverified
-	}
-	dags := []*ir.DAG{dag}
-	for _, local := range dag.LocalDAGs {
-		dags = append(dags, local)
-	}
-	var out []txePlacement
-	for _, d := range dags {
-		machine, err := txeSelectedMachine(d.WorkerSelector)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, txePlacement{name: d.Name, machine: machine})
-		steps := make([]*ir.Step, 0, len(d.Steps)+6)
-		for i := range d.Steps {
-			steps = append(steps, &d.Steps[i])
-		}
-		h := d.HandlerOn
-		for _, handler := range []*ir.Step{h.Init, h.Failure, h.Success, h.Abort, h.Exit, h.Wait} {
-			if handler != nil {
-				steps = append(steps, handler)
-			}
-		}
-		for _, step := range steps {
-			machine, err := txeSelectedMachine(step.WorkerSelector)
-			if err != nil {
-				return nil, err
-			}
-			called := ""
-			if step.SubDAG != nil {
-				called = step.SubDAG.Name
-				if strings.ContainsAny(called, "$`") {
-					return nil, errTxeSpecUnverified
-				}
-			}
-			if machine != "" || called != "" {
-				out = append(out, txePlacement{name: called, machine: machine, step: true})
-			}
-		}
 	}
 	return out, nil
 }
-
-// txeSelectedMachine is the machine a worker selector sends work to, or ""
-// for none, read as the runtime reads it: keys and values trimmed, and an
-// empty or repeated key an error. The coordinator matches every label a
-// selector names, and every worker carries labels that are not its machine
-// (os, arch, txe.owner), so a selector that names labels but no machine can
-// reach any machine that has them: where it runs cannot be decided, and it
-// is not verified. Neither is a computed selector.
-func txeSelectedMachine(selector map[string]string) (string, error) {
-	seen := make(map[string]bool, len(selector))
-	machine := ""
-	for k, v := range selector {
-		if strings.ContainsAny(k+v, "$`") {
-			return "", errTxeSpecUnverified
-		}
-		key := strings.TrimSpace(k)
-		if key == "" || seen[key] {
-			return "", errTxeSpecUnverified
-		}
-		seen[key] = true
-		if key == txeMachineLabel {
-			machine = strings.TrimSpace(v)
-		}
-	}
-	if len(selector) > 0 && machine == "" {
-		return "", errTxeSpecUnverified
-	}
-	return machine, nil
-}
-
-// txeSelectorsWritten refuses a spec whose worker selectors, wherever they
-// are written, have a key or value with surrounding space. The loader trims
-// a DAG's selector as it builds it, so two keys that differ only in space
-// collapse into one, by map order; the runtime trims a step's. Written
-// already trimmed, a selector reads the same to this check, the loader and
-// the runtime.
-func txeSelectorsWritten(spec []byte) error {
-	file, err := parser.ParseBytes(yamlutil.ClearEmptyDocumentSeparators(spec), 0)
-	if err != nil || file == nil {
-		return errTxeSpecUnverified
-	}
-	for _, doc := range file.Docs {
-		if doc == nil || doc.Body == nil {
-			continue
-		}
-		raw, err := doc.MarshalYAML()
-		if err != nil {
-			return errTxeSpecUnverified
-		}
-		var tree any
-		if err := yaml.Unmarshal(raw, &tree); err != nil {
-			return errTxeSpecUnverified
-		}
-		if !txeSelectorsTrimmed(tree) {
-			return errTxeSpecUnverified
-		}
-	}
-	return nil
-}
-
-func txeSelectorsTrimmed(node any) bool {
-	switch n := node.(type) {
-	case map[string]any:
-		for k, v := range n {
-			if strings.EqualFold(strings.TrimSpace(k), "worker_selector") {
-				if selector, ok := v.(map[string]any); ok {
-					for key, value := range selector {
-						text, isText := value.(string)
-						if key != strings.TrimSpace(key) || (isText && text != strings.TrimSpace(text)) {
-							return false
-						}
-					}
-				}
-			}
-			if !txeSelectorsTrimmed(v) {
-				return false
-			}
-		}
-	case []any:
-		for _, v := range n {
-			if !txeSelectorsTrimmed(v) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-const txeMachineLabel = "txe.machine"
 
 var errTxeSpecUnverified = &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
 	Message: "the spec could not be verified: it does not load, or a worker selector is computed or does not name the machine it runs on",

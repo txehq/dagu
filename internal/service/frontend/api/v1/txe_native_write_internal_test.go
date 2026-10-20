@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 )
 
 const writeSpec = "steps:\n  - name: s\n    run: echo s\n"
@@ -217,6 +220,30 @@ func TestTxeNativeWritesDecideWhatTheStoreAndLoaderUse(t *testing.T) {
 			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, calls(w.jobB)), "calling B's job")
 			require.Equal(t, http.StatusForbidden, w.updateWith(personA, w.reviewerA, calls(w.jobA)), "calling a job: the registry's")
 			require.Equal(t, wrote, w.updateWith(personA, w.reviewerA, stepTo(w.machineA)), "a step on A's own machine")
+			// A foreach body's steps, a chat step's tool DAGs and an action
+			// package are placements too (TXE-4717).
+			onA := "worker_selector:\n  txe.machine: " + w.machineA + "\n"
+			loopTo := onA + "steps:\n  - name: loop\n    foreach:\n      items: [one]\n      steps:\n        - name: s\n          call: " +
+				w.reviewerA + "\n          worker_selector:\n            txe.machine: " + w.machineB + "\n"
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, loopTo), "a foreach body on B's machine")
+			toolOf := onA + "steps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [" +
+				w.reviewerB + "]\n    messages:\n      - role: user\n        content: hi\n"
+			require.Equal(t, http.StatusNotFound, w.updateWith(personA, w.reviewerA, toolOf), "a chat tool that is B's machine DAG")
+			require.Equal(t, http.StatusBadRequest, w.updateWith(personA, w.reviewerA, onA+"steps:\n  - name: act\n    action: someone/some-action@v1\n"), "an action package")
+			// A machine's DAG may not call another machine's, which runs on
+			// that machine, even when A owns both.
+			second, err := registry.NewID(registry.PrefixMachine, time.Now())
+			require.NoError(t, err)
+			_, err = w.reg.CreateMachine(context.Background(), registry.Machine{MachineID: second, OwnerID: w.ownerA, DisplayName: "desktop"},
+				registry.Actor{Kind: registry.ActorSystem, ID: "test"})
+			require.NoError(t, err)
+			other := txeauth.MachineDAGs(second)[0]
+			for _, alias := range []string{other, other + ".yaml", other + ".yml", "./" + other, strings.ToLower(other)} {
+				require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, calls(alias)), "calling A's other machine's DAG as %q", alias)
+				toolTo := "worker_selector:\n  txe.machine: " + w.machineA + "\nsteps:\n  - name: ask\n    type: chat\n    llm:\n      provider: openai\n      model: gpt-4o\n      tools: [" +
+					alias + "]\n    messages:\n      - role: user\n        content: hi\n"
+				require.NotEqual(t, wrote, w.updateWith(personA, w.reviewerA, toolTo), "a tool that is A's other machine's DAG as %q", alias)
+			}
 			// The coordinator matches every label: a selector that names no
 			// machine reaches any machine with those labels, B's included.
 			byLabel := func(label string) string {

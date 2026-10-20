@@ -209,6 +209,9 @@ func (s *Store) checkDAG(ctx context.Context, jobID, machineID string, v *JobVer
 	if facts.WorkerSelector[machineLabel] != machineID {
 		return refuse(CodeInvalid, "dag.spec worker_selector %s must be %s", machineLabel, machineID)
 	}
+	if err := checkPlacements(facts, machineID); err != nil {
+		return err
+	}
 	name, err := declaredName([]byte(v.DAG.Spec))
 	if err != nil {
 		return refuse(CodeInvalid, "dag.spec does not parse: %v", err)
@@ -217,6 +220,47 @@ func (s *Store) checkDAG(ctx context.Context, jobID, machineID string, v *JobVer
 		// Runs take the DAG's declared name; a job's runs must carry its ID,
 		// which is what admission, dispatch and run control key on.
 		return refuse(CodeInvalid, "dag.spec must not declare a name other than the job id %s", jobID)
+	}
+	return nil
+}
+
+// checkPlacements checks that everything a job's spec runs goes to the
+// job's machine, as native writes check a machine's DAG (TXE-4717): every
+// document (the job's DAG and each local DAG) names the machine, and a step
+// that selects a machine names this one. A step that calls a DAG kept
+// elsewhere would run it where that DAG says, which may be another owner's
+// machine, and the dispatch pin admits a task to whatever machine its
+// selector names. So only the job's own document calls DAGs, and only the
+// spec's other documents: a local DAG runs with its own document alone, so
+// any DAG it calls, itself included, is looked up outside the spec.
+func checkPlacements(facts DAGFacts, machineID string) error {
+	if !facts.Placed {
+		return refuse(CodeNotReady, "the DAG store cannot tell where dag.spec runs")
+	}
+	if facts.Unplaceable != nil {
+		return refuse(CodeInvalid, "dag.spec does not say plainly where it runs: every worker_selector must name %s %s, written without surrounding space, and every called DAG must be named literally", machineLabel, machineID)
+	}
+	root := ""
+	local := map[string]bool{}
+	for _, p := range facts.Placements {
+		if p.Step {
+			continue
+		}
+		if root == "" {
+			root = p.Name
+		} else {
+			local[p.Name] = true
+		}
+	}
+	for _, p := range facts.Placements {
+		switch {
+		case !p.Step && p.Machine != machineID:
+			return refuse(CodeInvalid, "dag.spec DAG %q must have worker_selector %s %s", p.Name, machineLabel, machineID)
+		case p.Step && p.Machine != "" && p.Machine != machineID:
+			return refuse(CodeInvalid, "dag.spec sends a step to %s %s; a job runs only on its machine %s", machineLabel, p.Machine, machineID)
+		case p.Step && p.Name != "" && (p.Document != root || !local[p.Name]):
+			return refuse(CodeInvalid, "dag.spec calls DAG %q from %q; a job's own DAG calls only the spec's other DAGs, and they call none", p.Name, p.Document)
+		}
 	}
 	return nil
 }
