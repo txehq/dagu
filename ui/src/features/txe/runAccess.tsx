@@ -40,7 +40,12 @@ export function useJobRunAllowed(
       const res = await client.GET('/txe/jobs/{jobId}', {
         params: { path: { jobId: jobId as string } },
       });
-      return res.data?.access ?? null;
+      // A failed read keeps the last answer (SWR keeps data on a throw), so a
+      // passing error never brings back controls the hub refused.
+      if (res.error || !res.data) {
+        throw new Error('job access could not be read');
+      }
+      return res.data.access ?? null;
     },
     // A share can change while the page is open: read it again, as the
     // other TXE pages do.

@@ -144,6 +144,25 @@ describe('useJobRunAllowed', () => {
     }
   });
 
+  it('keeps the last answer when a later read fails', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      principal.current = TxeIdentityPrincipalClass.person;
+      answer([TxeAccessPermission.view], TxeJobAccessVia.share);
+      const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
+      await waitFor(() => expect(result.current).toBe(false));
+
+      GET.mockResolvedValue({ error: { message: 'unavailable' } });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ACCESS_REFRESH_MS + 100);
+      });
+      expect(GET.mock.calls.length).toBeGreaterThan(1);
+      expect(result.current).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('says nothing when the job cannot be read', async () => {
     GET.mockResolvedValue({ error: { message: 'unavailable' } });
     const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
