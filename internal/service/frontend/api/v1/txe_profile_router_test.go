@@ -22,7 +22,7 @@ import (
 // run exists, in every mode. Asking for no profile, or naming none, is
 // allowed, and the administrator and legacy callers are unchanged (TXE-4704).
 func TestTxeOwnerCannotChooseRuntimeProfile(t *testing.T) {
-	for _, mode := range []string{config.TXEAuthzModeOff, config.TXEAuthzModeEnforce} {
+	for _, mode := range []string{config.TXEAuthzModeOff, config.TXEAuthzModeObserve, config.TXEAuthzModeEnforce} {
 		t.Run(mode, func(t *testing.T) {
 			h := newOwnerHub(t, mode)
 			h.server.Client().Post("/api/v1/profiles", api.CreateRuntimeProfileJSONRequestBody{Name: "shared"}).
@@ -55,11 +55,11 @@ func TestTxeOwnerCannotChooseRuntimeProfile(t *testing.T) {
 			h.server.Client().Post("/api/v1/dags/"+decideA+"/enqueue", api.EnqueueDAGDAGRunJSONRequestBody{DagRunId: str("empty-profile"), Profile: str("")}).
 				WithBearerToken(h.cliA).ExpectStatus(http.StatusOK).Send(t)
 
-			// The administrator, and in off a legacy caller, still name a
-			// profile on a DAG of no owner. In enforce a legacy caller sees
-			// no DAG at all.
+			// The administrator, and in off and observe a legacy caller,
+			// still name a profile on a DAG of no owner. In enforce a legacy
+			// caller sees no DAG at all.
 			callers := map[string]string{"admin": h.admin}
-			if mode == config.TXEAuthzModeOff {
+			if mode != config.TXEAuthzModeEnforce {
 				callers["legacy"] = h.legacy
 			}
 			for name, bearer := range callers {
