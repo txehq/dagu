@@ -39,7 +39,8 @@ const (
 type Caller struct {
 	Kind Kind
 	// Principal is the identity the provider vouched for. It is set for a
-	// person and a token, and is the zero value otherwise.
+	// person, a token and a platform administrator signed in through the
+	// identity provider, and is the zero value otherwise.
 	Principal authn.Principal
 	// Username is the hub account the request authenticated as, for a
 	// person, the platform administrator and a legacy caller. It is recorded
@@ -106,7 +107,10 @@ func Classify(ctx context.Context) Caller {
 		}
 		id := authn.Identity{Issuer: user.OIDCIssuer, Subject: user.OIDCSubject}
 		if marked, ok := ctx.Value(platformAdminKey{}).(authn.Identity); ok && marked == id {
-			return Caller{Kind: KindPlatformAdmin, Username: user.Username}
+			// The administrator keeps the identity it signed in with: if
+			// that identity is bound, it is also its owner's person.
+			return Caller{Kind: KindPlatformAdmin, Username: user.Username,
+				Principal: authn.Principal{Identity: id, Class: authn.ClassPerson}}
 		}
 		return Caller{
 			Kind:     KindPerson,

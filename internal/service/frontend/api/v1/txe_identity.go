@@ -213,8 +213,13 @@ func (a *API) GetTxeIdentity(ctx context.Context, _ api.GetTxeIdentityRequestObj
 		out.Owners = append(out.Owners, api.TxeIdentityOwner{OwnerId: owner, DisplayName: name})
 	}
 
-	// A person who acts for nobody may be waiting for approval.
-	if caller.Kind == txeauth.KindPerson && scope.Kind() == authz.ScopeUnbound {
+	// A person who acts for nobody may be waiting for approval, and so may a
+	// platform administrator who signed in through the identity provider.
+	waiting := caller.Kind == txeauth.KindPerson && scope.Kind() == authz.ScopeUnbound
+	if caller.Kind == txeauth.KindPlatformAdmin && caller.Principal.Issuer != "" && scope.OwnerID() == "" {
+		waiting = true
+	}
+	if waiting {
 		req, err := a.txeAuth.Store().PendingRequest(ctx, caller.Principal.Identity)
 		if err != nil {
 			return nil, errTxeAuthzUnavailable
@@ -239,6 +244,11 @@ func txeIdentityPrincipal(c txeauth.Caller) api.TxeIdentityPrincipal {
 	switch c.Kind {
 	case txeauth.KindPlatformAdmin:
 		out.Class = api.TxeIdentityPrincipalClassPlatformAdmin
+		if c.Principal.Issuer != "" {
+			// Named by the configuration by this exact identity.
+			out.Issuer = ptrOf(c.Principal.Issuer)
+			out.Subject = ptrOf(c.Principal.Subject)
+		}
 	case txeauth.KindPerson, txeauth.KindToken:
 		out.Class = api.TxeIdentityPrincipalClass(c.Principal.Class)
 		out.Issuer = ptrOf(c.Principal.Issuer)

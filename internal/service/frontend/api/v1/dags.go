@@ -1782,8 +1782,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 
 	if request.Body.Queue != nil && *request.Body.Queue != "" {
 		// A caller held to its owner queues a run where its DAG names, so
-		// that its queues are those of the DAGs it may see.
-		if a.txeNativeOwnerOnly(ctx) && *request.Body.Queue != dag.ProcGroup() {
+		// that its queues are those of the DAGs it may see; so does a bound
+		// administrator running an owner's DAG as that owner's person.
+		if *request.Body.Queue != dag.ProcGroup() && (a.txeNativeOwnerOnly(ctx) || a.txeAsPersonOn(ctx, request.FileName)) {
 			return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 				Message: "this run is queued only where its DAG names", Details: map[string]any{"code": "run_refused"}}
 		}

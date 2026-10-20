@@ -137,6 +137,18 @@ func (s *Store) evaluate(ctx context.Context, scope Scope, permission Permission
 
 	switch scope.Kind() {
 	case ScopePlatformAdmin:
+		// A bound administrator is also its owner's person: on its owner's
+		// records, and what is shared to that owner, it may do what that
+		// person may, and the administrator's own rights come on top. It
+		// gains nothing else on another owner's records. The routes that
+		// hold a person to more than the decision (writes only a machine
+		// makes, writes closed to a person) hold it to the same.
+		if person, ok := scope.OwnerPerson(); ok && resource.kind != KindPlatform {
+			v, err := s.evaluate(ctx, person, permission, resource)
+			if err != nil || v.allowed {
+				return v, err
+			}
+		}
 		return evaluateAdmin(permission, resource), nil
 
 	case ScopeOwner:
@@ -279,8 +291,12 @@ func (s *Store) machineStands(ctx context.Context, scope Scope) (Reason, error) 
 }
 
 // IsHuman reports whether a decision made by this scope counts as a person's
-// own. Only someone signed in through the browser does. A token of any class
-// is an agent, whoever it acts for, and so is the platform administrator.
+// own. Only someone signed in through the browser does, the platform
+// administrator only as the person it is bound as. A token of any class is an
+// agent, whoever it acts for.
 func IsHuman(scope Scope) bool {
+	if person, ok := scope.OwnerPerson(); ok {
+		scope = person
+	}
 	return scope.Kind() == ScopeOwner && scope.principal.Class == authn.ClassPerson
 }

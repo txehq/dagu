@@ -82,8 +82,10 @@ func (a *API) RequestTxeBinding(ctx context.Context, _ api.RequestTxeBindingRequ
 	if err != nil {
 		return nil, err
 	}
-	if caller.Kind != txeauth.KindPerson {
-		// The request is the proof that the subject signed in themselves.
+	if caller.Kind != txeauth.KindPerson && (caller.Kind != txeauth.KindPlatformAdmin || caller.Principal.Issuer == "") {
+		// The request is the proof that the subject signed in themselves: a
+		// person, or a platform administrator who signed in through the
+		// identity provider, never a token.
 		return nil, errTxeForbidden
 	}
 	request, err := a.txeAuth.Store().RequestBinding(ctx, caller.Principal, authz.Shown{Username: caller.Username})
@@ -194,6 +196,9 @@ func (a *API) ListTxeShares(ctx context.Context, _ api.ListTxeSharesRequestObjec
 		return nil, err
 	}
 	out := api.ListTxeShares200JSONResponse{Granted: []api.TxeShare{}, Received: []api.TxeShare{}}
+	if person, ok := scope.OwnerPerson(); ok {
+		scope = person
+	}
 	owner := scope.OwnerID()
 	if owner == "" || scope.Kind() != authz.ScopeOwner {
 		return out, nil
@@ -318,6 +323,9 @@ func (a *API) ApplyTxeEnrolment(ctx context.Context, req api.ApplyTxeEnrolmentRe
 // as a person when person is set. A machine that does not exist, or is
 // another owner's, is the same answer.
 func (a *API) txeOwnsMachine(ctx context.Context, scope authz.Scope, machineID string, person bool) (bool, error) {
+	if bound, ok := scope.OwnerPerson(); ok {
+		scope = bound
+	}
 	if scope.Kind() != authz.ScopeOwner || (person && !authz.IsHuman(scope)) {
 		return false, nil
 	}

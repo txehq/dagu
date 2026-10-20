@@ -44,6 +44,7 @@ type EnrolmentRequest struct {
 // that stops in between leaves a pending enrolment, which repeating the
 // request finishes and revoking clears.
 func (s *Store) Enrol(ctx context.Context, by Scope, request EnrolmentRequest) (*Enrolment, error) {
+	by = asPerson(by)
 	if err := s.requirePerson(ctx, by); err != nil {
 		return nil, err
 	}

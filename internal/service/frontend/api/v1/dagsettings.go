@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
@@ -225,6 +226,11 @@ func (a *API) defaultRunProfileError(err error) error {
 }
 
 func (a *API) runProfileForDAG(ctx context.Context, dagName string, workspaceName string, profile *api.RuntimeProfileOverride) (string, error) {
+	// A bound administrator runs an owner's DAG as that owner's person, and
+	// a person names no profile (TXE-4704); it is held to the same.
+	if profile != nil && strings.TrimSpace(*profile) != "" && a.txeAsPersonOn(ctx, dagName) {
+		return "", errTxeRuntimeProfile
+	}
 	profileName, explicit, err := a.explicitRunProfile(ctx, profile)
 	if err != nil || explicit {
 		return profileName, err
