@@ -3113,6 +3113,11 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err := a.requireNamedDAGExecute(ctx, dagName, workspaceName); err != nil {
 		return retryDAGRunResult{}, err
 	}
+	// The run is also its DAG's, as its owner holds it: a run of an alias
+	// of an owner's DAG is stored under a name no owner holds (TXE-4744).
+	if err := a.txeRunRoute(ctx, dagName, attempt, authz.PermissionExecute); err != nil {
+		return retryDAGRunResult{}, err
+	}
 
 	if retryDagRunID == "" || retryDagRunID == dagRunID {
 		retryDagRunID = sourceDagRunID
@@ -3578,6 +3583,14 @@ func (a *API) DequeueDAGRun(ctx context.Context, request api.DequeueDAGRunReques
 	}
 	if err := a.requireNamedDAGExecute(ctx, request.Name, workspaceName); err != nil {
 		return nil, err
+	}
+	if attempt, findErr := a.dagRunRepository.FindAttempt(ctx, dagRun); findErr == nil {
+		// Also its DAG's, as its owner holds it (TXE-4744).
+		if err := a.txeRunRoute(ctx, request.Name, attempt, authz.PermissionExecute); err != nil {
+			return nil, err
+		}
+	} else if a.txeAuth != nil && (a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce) {
+		return nil, errTxeAuthzUnavailable
 	}
 	queueName, err := a.queueNameForDAGRun(ctx, dagRun)
 	if err != nil {

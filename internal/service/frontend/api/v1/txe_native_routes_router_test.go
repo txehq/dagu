@@ -138,18 +138,23 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 	// under that name; they are still the machine's owner's.
 	aliasFile := txeauth.MachineDAGs(h.machineA)[1]
 	h.server.CreateDAGFile(t, h.server.Config.Paths.DAGsDir, aliasFile, []byte("name: nightly-alias\nsteps:\n  - name: s\n    run: echo s\n"))
-	var aliased api.ExecuteDAG200JSONResponse
-	h.server.Client().Post("/api/v1/dags/"+aliasFile+"/start", api.ExecuteDAGJSONRequestBody{}).
-		WithBearerToken(h.admin).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &aliased)
-	require.NotEmpty(t, aliased.DagRunId)
+	// The administrator does not start it (TXE-4744): its runs are stored
+	// directly here.
+	require.Equal(t, http.StatusForbidden, status(http.MethodPost, "/api/v1/dags/"+aliasFile+"/start", h.admin, map[string]any{}),
+		"the administrator starts no alias of an owner's DAG")
+	aliasLocation := filepath.Join(h.server.Config.Paths.DAGsDir, aliasFile+".yaml")
 	{
-		waitForStoredDAGRunStatus(t, h.server, "nightly-alias", aliased.DagRunId, 10*time.Second, func(s *ir.DAGRunStatus) bool {
-			return s.Status == ir.Succeeded
-		})
-		aliasRun := "/api/v1/dag-runs/nightly-alias/" + aliased.DagRunId
+		aliased := storeAliasRun(t, h.server, &ir.DAG{Name: "nightly-alias", Location: aliasLocation})
+		aliasRun := "/api/v1/dag-runs/nightly-alias/" + aliased
 		require.Equal(t, http.StatusForbidden, status(http.MethodDelete, aliasRun, h.admin, nil), "an alias's run is the owner's")
 		require.Equal(t, http.StatusForbidden, status(http.MethodPost, aliasRun+"/steps/s/agent-interactions/i1/respond", h.admin, map[string]any{"answer": "x"}),
 			"so is its agent session")
+		// The S4 run routes decide it by its DAG as well (TXE-4744).
+		require.Equal(t, http.StatusForbidden, status(http.MethodPost, aliasRun+"/retry", h.admin, map[string]any{"dagRunId": aliased}),
+			"the administrator retries no alias's run")
+		require.Equal(t, http.StatusForbidden, status(http.MethodPost, aliasRun+"/stop", h.admin, map[string]any{}),
+			"nor stops one")
+		require.True(t, refusedAsNotFound(http.MethodPost, aliasRun+"/stop", manager, map[string]any{}), "legacy")
 	}
 
 	// A queued run's DAG keeps its file only as SourceFile (enqueue clears
