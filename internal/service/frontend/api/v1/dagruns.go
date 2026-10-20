@@ -2212,7 +2212,10 @@ func (a *API) DeleteDAGRun(ctx context.Context, request api.DeleteDAGRunRequestO
 	if err := a.requireDAGWriteForWorkspace(ctx, workspaceName); err != nil {
 		return nil, err
 	}
-	attempt, _ := a.dagRunRepository.FindAttempt(ctx, ref)
+	attempt, findErr := a.dagRunRepository.FindAttempt(ctx, ref)
+	if findErr != nil && !isDAGRunLookupNotFound(findErr) {
+		return nil, fmt.Errorf("find DAG run before delete: %w", findErr)
+	}
 	if err := a.txeRunRoute(ctx, request.Name, attempt, authz.PermissionAuthor); err != nil {
 		return nil, err
 	}

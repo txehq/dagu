@@ -100,6 +100,12 @@ func (a *API) txeRunRoute(ctx context.Context, runName string, attempt dagrun.At
 	}
 	dag, err := attempt.ReadDAG(ctx)
 	if err != nil || dag == nil {
+		// The run exists, but which DAG it ran cannot be read: it cannot be
+		// shown to be no owner's, so where owners are decided it is not
+		// taken for one.
+		if a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce {
+			return errTxeAuthzUnavailable
+		}
 		return nil
 	}
 	if identity := txeOwnedIdentity(dag); identity != txeCanonicalDAGName(runName) {

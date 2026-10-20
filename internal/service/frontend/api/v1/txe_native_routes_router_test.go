@@ -106,6 +106,10 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 	run := "/api/v1/dag-runs/" + decideA + "/" + started.DagRunId
 	respond := run + "/steps/s/agent-interactions/i1/respond"
 	require.Equal(t, http.StatusForbidden, status(http.MethodPost, respond, h.admin, map[string]any{"answer": "x"}), "the administrator answers no owner's agent")
+	// Answering an agent's interaction is a person's answer, as a human task
+	// is: the owner's command line does not answer it.
+	require.Contains(t, []int{http.StatusForbidden, http.StatusNotFound}, status(http.MethodPost, respond, h.cliA, map[string]any{"answer": "x"}),
+		"the owner's cli answers no interaction")
 	require.True(t, refusedAsNotFound(http.MethodPost, respond, manager, map[string]any{"answer": "x"}), "legacy")
 	require.True(t, refusedAsNotFound(http.MethodDelete, run, manager, nil), "legacy deletes no owner's run")
 	require.Equal(t, http.StatusForbidden, status(http.MethodDelete, run, h.admin, nil), "the administrator deletes no owner's run")
