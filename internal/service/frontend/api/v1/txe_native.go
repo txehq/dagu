@@ -230,6 +230,12 @@ func (a *API) requireNamedDAGExecute(ctx context.Context, dagName, workspaceName
 	return a.txeNativeCheck(ctx, dagName, authz.PermissionExecute, func() error { return a.requireExecuteForWorkspace(ctx, workspaceName) })
 }
 
+// requireNamedDAGApprove is requireNamedDAGExecute for answering a human
+// gate: approve on an owner's DAG, after the hub's own execute check.
+func (a *API) requireNamedDAGApprove(ctx context.Context, dagName, workspaceName string) error {
+	return a.txeNativeCheck(ctx, dagName, authz.PermissionApprove, func() error { return a.requireExecuteForWorkspace(ctx, workspaceName) })
+}
+
 // txeNativeRoute says whether a request is on a native route that decides a
 // caller held to its owner by the owner of the DAG it touches.
 func txeNativeRoute(mountedAPIPath string, p string) bool {

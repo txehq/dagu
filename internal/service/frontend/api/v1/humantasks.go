@@ -90,10 +90,10 @@ func (a *API) CompleteHumanTask(
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, status); err != nil {
-		return nil, err
-	}
 	if request.Body == nil {
+		if err := a.requireDAGRunStatusApprove(ctx, status); err != nil {
+			return nil, err
+		}
 		return &api.CompleteHumanTask400JSONResponse{
 			Code:    api.ErrorCodeBadRequest,
 			Message: "human-task completion input must be a JSON object",
@@ -102,6 +102,9 @@ func (a *API) CompleteHumanTask(
 	input, ok := ctx.Value(humanTaskInputContextKey{}).(humantask.Input)
 	if !ok {
 		return nil, errors.New("validated human-task input is missing from the request context")
+	}
+	if err := a.requireHumanTaskCompletion(ctx, status, request.StepId, input); err != nil {
+		return nil, err
 	}
 
 	service := a.humanTaskService()
@@ -143,7 +146,7 @@ func (a *API) PushBackHumanTask(
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, status); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, status); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
