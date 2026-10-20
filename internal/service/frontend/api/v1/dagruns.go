@@ -3268,6 +3268,10 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 			if expect != nil && errors.Is(err, persis.ErrLatestExecutionChanged) {
 				return retryDAGRunResult{}, executionChangedError(expect, nil)
 			}
+			// A refusal for want of a worker proves nothing was retried.
+			if refusal := dispatchRefusal(err); refusal != nil {
+				return retryDAGRunResult{}, refusal
+			}
 			if expect != nil {
 				// Only the coordinator's refusal proves nothing was retried.
 				return retryDAGRunResult{}, &Error{HTTPStatus: http.StatusServiceUnavailable, Code: api.ErrorCodeInternalError,
@@ -4232,6 +4236,9 @@ func (a *API) resumeManagedAttempt(ctx context.Context, dag *ir.DAG, status *ir.
 		}
 		task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, runID, options...)
 		if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
+			if refusal := dispatchRefusal(err); refusal != nil {
+				return refusal
+			}
 			return fmt.Errorf("dispatch managed-agent resume: %w", err)
 		}
 		return nil

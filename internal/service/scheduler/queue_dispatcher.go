@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	osexec "os/exec"
-	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
@@ -21,8 +20,6 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type queueDispatchDeps struct {
@@ -1494,36 +1491,13 @@ func dispatchAdmissionWaitingCondition(decision *dispatch.DispatchAdmissionDecis
 }
 
 func queuedDispatchCondition(err error) []queuedConditionDef {
-	if isNoMatchingWorker(err) {
+	if dispatch.IsNoMatchingWorker(err) {
 		return noMatchingWorkerConditionDefs
 	}
-	if isNoAvailableWorker(err) {
+	if dispatch.IsNoAvailableWorker(err) {
 		return noAvailableWorkerConditionDefs
 	}
 	return workerDispatchUnavailableConditionDefs
-}
-
-func isNoMatchingWorker(err error) bool {
-	st, ok := status.FromError(err)
-	if ok && st.Code() == codes.FailedPrecondition && strings.Contains(st.Message(), "no workers match the required selector") {
-		return true
-	}
-	return strings.Contains(strings.ToLower(errorMessage(err)), "no workers match the required selector")
-}
-
-func isNoAvailableWorker(err error) bool {
-	st, ok := status.FromError(err)
-	if ok && st.Code() == codes.Unavailable && strings.Contains(st.Message(), "no available workers") {
-		return true
-	}
-	return strings.Contains(strings.ToLower(errorMessage(err)), "no available workers")
-}
-
-func errorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 func (d *queueDispatcher) recordCapacityUnavailableConditions(

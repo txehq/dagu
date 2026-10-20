@@ -89,8 +89,8 @@ const (
 )
 
 var (
-	errNoAvailableWorkers           = errors.New("no available workers")
-	errNoMatchingWorkers            = errors.New("no workers match the required selector")
+	errNoAvailableWorkers           = errors.New(dispatch.NoAvailableWorkersMessage)
+	errNoMatchingWorkers            = errors.New(dispatch.NoMatchingWorkersMessage)
 	errRunHeartbeatRepairSkipped    = errors.New("run heartbeat repair skipped")
 	errManualActionCheckpointChange = errors.New("completed manual action checkpoint changed")
 	errExecutionReplaced            = errors.New("attempt was re-queued for another execution")

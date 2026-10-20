@@ -23,12 +23,13 @@ import (
 var _ coordinator.Client = (*stubCoordinatorClient)(nil)
 
 type stubCoordinatorClient struct {
-	workers []*coordinatorv1.WorkerInfo
-	err     error
+	workers     []*coordinatorv1.WorkerInfo
+	err         error
+	dispatchErr error
 }
 
 func (s *stubCoordinatorClient) Dispatch(context.Context, dispatch.DispatchRequest) error {
-	return nil
+	return s.dispatchErr
 }
 
 func (s *stubCoordinatorClient) Cleanup(context.Context) error {
