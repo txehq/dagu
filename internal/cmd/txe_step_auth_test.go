@@ -5,6 +5,8 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth/cliauthtest"
 	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
+	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
 // stepAuthFixture is an enrolment fixture whose hub also lists jobs, the
@@ -323,9 +326,10 @@ func TestTXEHubKey(t *testing.T) {
 	}
 }
 
-// "dagu context test" run by a step builds its own client for the context;
-// for the enrolled hub it carries the machine's token, not the stored key.
-func TestTXEStepContextTestPresentsTheMachineCredential(t *testing.T) {
+// "dagu context test" run by a step builds its own client for the context.
+// For the enrolled hub it never carries the stored key, and its route
+// (/auth/me) is not one that takes a machine's token, so it carries nothing.
+func TestTXEStepContextTestSendsNoKeyToTheEnrolledHub(t *testing.T) {
 	f := newStepAuthFixture(t)
 	f.enrolled(t)
 	t.Setenv("DAGU_CONTEXTS_DIR", f.contexts)
@@ -346,6 +350,50 @@ func TestTXEStepContextTestPresentsTheMachineCredential(t *testing.T) {
 		}
 	}
 	require.Len(t, me, 1, out.String())
-	assert.True(t, strings.HasPrefix(me[0].Authorization, "Bearer ey"), "the machine's token")
-	assert.NotContains(t, me[0].Authorization, "dagu_test_key")
+	assert.Empty(t, me[0].Authorization, "neither the key nor the machine's token")
+}
+
+// An error answer that echoes the request's credential has it replaced
+// before the step prints it.
+func TestTXEStepRedactsAnEchoedBearer(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
+	enrol := f.hub.Handle
+	f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/api/v1/txe/jobs" {
+			cliauthtest.WriteJSON(w, http.StatusUnauthorized, map[string]any{"code": "unauthorized", "message": "refused " + r.Header.Get("Authorization")})
+			return true
+		}
+		return enrol(w, r)
+	}
+	out, err := f.inStep(t, "list")
+	require.Error(t, err)
+	calls := f.jobCalls()
+	require.Len(t, calls, 1)
+	token := strings.TrimPrefix(calls[0].Authorization, "Bearer ")
+	require.NotEmpty(t, token)
+	assert.NotContains(t, err.Error(), token)
+	assert.NotContains(t, out, token)
+	assert.Contains(t, err.Error(), "[redacted]")
+}
+
+// What is presented is checked against the credential that was checked:
+// another issuer, another client, or no JWT at all is not sent.
+func TestTXEStepChecksTheTokenItPresents(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
+	source, err := transportauth.NewRefreshingSource(f.path())
+	require.NoError(t, err)
+	tr := &txeMachineTransport{source: source, issuer: f.provider.Issuer(), clientID: txeEnrolTestClient, machineID: txeEnrolTestMachine}
+	jwt := func(claims map[string]string) string {
+		body, err := json.Marshal(claims)
+		require.NoError(t, err)
+		return "e30." + base64.RawURLEncoding.EncodeToString(body) + ".sig"
+	}
+	require.NoError(t, tr.checkToken(jwt(map[string]string{"iss": f.provider.Issuer(), "azp": txeEnrolTestClient})))
+	require.ErrorContains(t, tr.checkToken(jwt(map[string]string{"iss": "https://elsewhere.invalid", "azp": txeEnrolTestClient})), "nothing was sent")
+	require.ErrorContains(t, tr.checkToken(jwt(map[string]string{"iss": f.provider.Issuer(), "azp": "another-client"})), "nothing was sent")
+	require.ErrorContains(t, tr.checkToken("opaque-token"), "not a JWT")
+	tr.machineID = "mch_other"
+	require.ErrorContains(t, tr.checkToken(jwt(map[string]string{"iss": f.provider.Issuer(), "azp": txeEnrolTestClient})), "now names machine")
 }

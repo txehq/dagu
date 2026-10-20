@@ -5,10 +5,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -113,7 +117,7 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	if err != nil {
 		return nil, err
 	}
-	stepRemote, err := remote.withMachineCredential(source)
+	stepRemote, err := remote.withMachineCredential(source, credential)
 	if err != nil {
 		return nil, err
 	}
@@ -123,26 +127,45 @@ func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient
 	return stepRemote, nil
 }
 
-// withMachineCredential returns a copy of c whose every call carries the
-// machine's access token from source, never the context's API key, and only
-// to c's own scheme and host: redirects are returned, not followed.
-func (c *remoteClient) withMachineCredential(source *transportauth.RefreshingSource) (*remoteClient, error) {
+// withMachineCredential returns a copy of c whose calls carry the machine's
+// access token from source, never the context's API key, and only where the
+// hub takes a machine's token:
+//   - to c's own scheme and host; redirects are returned, not followed;
+//   - on the hub's /txe, /dags, /dag-runs and /queues routes; any other path
+//     is sent with no credential at all;
+//   - only a token from the credential that was checked: its issuer, client
+//     and machine are compared with it each time one is presented.
+//
+// An error answer has the token, and any other bearer value in it, replaced,
+// so a hub that echoes a request's credential does not print it.
+func (c *remoteClient) withMachineCredential(source *transportauth.RefreshingSource, credential transportauth.MachineCredential) (*remoteClient, error) {
 	base, err := url.Parse(c.baseURL)
 	if err != nil || base.Host == "" {
 		return nil, fmt.Errorf("the hub address %q is not an absolute URL", c.baseURL)
 	}
 	httpClient := *c.client
-	httpClient.Transport = &txeMachineTransport{base: c.client.Transport, source: source, scheme: base.Scheme, host: base.Host}
+	httpClient.Transport = &txeMachineTransport{
+		base: c.client.Transport, source: source, scheme: base.Scheme, host: base.Host,
+		root: strings.TrimRight(base.Path, "/"), issuer: credential.Issuer, clientID: credential.ClientID, machineID: credential.MachineID,
+	}
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &remoteClient{baseURL: c.baseURL, client: &httpClient}, nil
 }
 
+// txeMachineRoutes are the hub routes, under its API root, that take a
+// machine's token.
+var txeMachineRoutes = []string{"/txe", "/dags", "/dag-runs", "/queues"}
+
 // txeMachineTransport sets the machine's access token on each request to
-// the enrolled hub, and refuses any other destination.
+// the enrolled hub's machine routes, and refuses any other destination.
 type txeMachineTransport struct {
 	base         http.RoundTripper
 	source       *transportauth.RefreshingSource
 	scheme, host string
+	// root is the hub's API root path, such as /api/v1.
+	root string
+	// issuer, clientID and machineID are the checked credential's.
+	issuer, clientID, machineID string
 }
 
 func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -155,6 +178,15 @@ func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if req.URL.Scheme != t.scheme || req.URL.Host != t.host {
 		return fail(fmt.Errorf("refusing to send this machine's credential to %s://%s, which is not the hub", req.URL.Scheme, req.URL.Host))
 	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	out := req.Clone(req.Context())
+	out.Header.Del("Authorization")
+	if !t.machineRoute(req.URL.Path) {
+		return base.RoundTrip(out)
+	}
 	token, err := t.source.Token(req.Context())
 	if err != nil {
 		return fail(fmt.Errorf("renew this machine's access token: %w", err))
@@ -164,13 +196,92 @@ func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if unsaved := t.source.Unsaved(); unsaved != nil {
 		return fail(fmt.Errorf("this machine's renewed credential could not be saved, so the step stops: %w", unsaved))
 	}
-	out := req.Clone(req.Context())
-	out.Header.Set("Authorization", "Bearer "+token)
-	base := t.base
-	if base == nil {
-		base = http.DefaultTransport
+	if err := t.checkToken(token); err != nil {
+		return fail(err)
 	}
-	return base.RoundTrip(out)
+	out.Header.Set("Authorization", "Bearer "+token)
+	resp, err := base.RoundTrip(out)
+	if err != nil || resp.StatusCode < 400 {
+		return resp, err
+	}
+	return txeRedactBearer(resp, token)
+}
+
+// machineRoute reports whether path is one of the hub's machine routes.
+func (t *txeMachineTransport) machineRoute(path string) bool {
+	for _, route := range txeMachineRoutes {
+		prefix := t.root + route
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkToken compares the token about to be presented with the credential
+// that was checked: the file is read again for each renewal, and what it
+// holds then is what is sent.
+func (t *txeMachineTransport) checkToken(token string) error {
+	if machine := t.source.MachineID(); machine != t.machineID {
+		return fmt.Errorf("the machine credential now names machine %s, not %s; nothing was sent", machine, t.machineID)
+	}
+	claims, err := txeTokenClaims(token)
+	if err != nil {
+		return fmt.Errorf("this machine's access token cannot be read (%w); nothing was sent", err)
+	}
+	client := claims.Azp
+	if client == "" {
+		client = claims.ClientID
+	}
+	if claims.Iss != t.issuer || client != t.clientID {
+		return fmt.Errorf("this machine's access token is from %s for client %s, not %s for %s; nothing was sent", claims.Iss, client, t.issuer, t.clientID)
+	}
+	return nil
+}
+
+// txeTokenClaimSet is the part of an access token's claims checked before
+// it is sent.
+type txeTokenClaimSet struct {
+	Iss      string `json:"iss"`
+	Azp      string `json:"azp"`
+	ClientID string `json:"client_id"`
+}
+
+// txeTokenClaims reads, without verifying them, the claims of a JWT access
+// token: the hub verifies it; this only checks what is about to be sent.
+func txeTokenClaims(token string) (txeTokenClaimSet, error) {
+	var claims txeTokenClaimSet
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return claims, errors.New("it is not a JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims, errors.New("its payload is not base64url")
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return claims, errors.New("its payload is not JSON")
+	}
+	return claims, nil
+}
+
+// txeBearerPattern is a bearer value as an echoed header would show it.
+var txeBearerPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]+`)
+
+// txeRedactBearer replaces the token, and any bearer value, in an error
+// answer's body before anything reads it.
+func txeRedactBearer(resp *http.Response, token string) (*http.Response, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	text := strings.ReplaceAll(string(body), token, "[redacted]")
+	text = txeBearerPattern.ReplaceAllString(text, "Bearer [redacted]")
+	resp.Body = io.NopCloser(strings.NewReader(text))
+	resp.ContentLength = int64(len(text))
+	resp.Header.Del("Content-Length")
+	return resp, nil
 }
 
 // txeHubKey is a hub's API root as compared for a step's credential: the

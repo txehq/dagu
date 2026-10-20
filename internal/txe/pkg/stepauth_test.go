@@ -80,3 +80,18 @@ func TestStepAuthRefusesWhatItDidNotWrite(t *testing.T) {
 		})
 	}
 }
+
+// A step-auth file that is a link is refused, even to a valid file.
+func TestStepAuthRefusesALink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links are refused there by Lstat, tested by the reader itself")
+	}
+	home := Home{Root: t.TempDir()}
+	require.NoError(t, home.SetStepCredential("worker", "/abs/w.json", "http://h/api/v1"))
+	real := filepath.Join(home.ClientDir(), StepAuthFile)
+	moved := real + ".real"
+	require.NoError(t, os.Rename(real, moved))
+	require.NoError(t, os.Symlink(moved, real))
+	_, err := home.StepAuth()
+	require.Error(t, err)
+}

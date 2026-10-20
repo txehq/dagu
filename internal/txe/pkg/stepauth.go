@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
@@ -59,20 +59,15 @@ var stepAuthClasses = map[string]bool{"worker": true, "reviewer": true}
 // class. The file must be a regular file only its owner can read or write.
 func (h Home) StepAuth() (StepAuth, error) {
 	path := filepath.Join(h.ClientDir(), StepAuthFile)
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 		return StepAuth{Schema: StepAuthSchema}, nil
 	}
+	f, err := openStepAuth(path)
 	if err != nil {
 		return StepAuth{}, fmt.Errorf("read %s: %w", path, err)
 	}
-	if !info.Mode().IsRegular() {
-		return StepAuth{}, fmt.Errorf("%s is not a regular file", path)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return StepAuth{}, fmt.Errorf("%s has mode %#o; it must be readable by its owner only (0600)", path, info.Mode().Perm())
-	}
-	raw, err := os.ReadFile(path) //nolint:gosec // fixed file name under the TXE home
+	defer func() { _ = f.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(f, 1<<20))
 	if err != nil {
 		return StepAuth{}, fmt.Errorf("read %s: %w", path, err)
 	}
