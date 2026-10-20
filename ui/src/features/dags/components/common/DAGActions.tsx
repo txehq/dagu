@@ -40,6 +40,7 @@ import { pushRunProgress, StartDAGModal } from '../dag-execution';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
+import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
 
 /**
  * Props for the DAGActions component
@@ -73,6 +74,7 @@ function DAGActions({
 }: Props) {
   const { ts } = useI18n();
   const dagContext = React.useContext(DAGContext);
+  const runAllowed = useJobRunAllowed(fileName);
   const config = useConfig();
   const { hasUnsavedChanges } = useUnsavedChanges();
   const { showError } = useErrorModal();
@@ -293,6 +295,10 @@ function DAGActions({
 
   if (!dag || !config.permissions.runDags) {
     return <></>;
+  }
+
+  if (runAllowed === false) {
+    return <ViewOnly />;
   }
 
   return (

@@ -11,6 +11,15 @@ import {
   isFailedAutoRetryPendingRun,
 } from '../terminateAction';
 
+const runAccess = vi.hoisted(() => ({
+  allowed: undefined as boolean | undefined,
+}));
+
+vi.mock('@/features/txe/runAccess', () => ({
+  useJobRunAllowed: () => runAccess.allowed,
+  ViewOnly: () => <span>View only</span>,
+}));
+
 vi.mock('../../../../../contexts/ConfigContext', () => ({
   useConfig: () => ({
     permissions: {
@@ -115,6 +124,33 @@ describe('DAGRunActions', () => {
         autoRetryLimit: 0,
       })
     ).toBe('none');
+  });
+
+  it('offers no run control on a run of a job the caller may only view', () => {
+    runAccess.allowed = false;
+    render(
+      <DAGRunActions
+        dagRun={{
+          name: 'job_01M4XEETKWKZX504BK65ADBVYB',
+          dagRunId: 'run-1',
+          status: Status.Running,
+          statusLabel: StatusLabel.running,
+          artifactsAvailable: false,
+          autoRetryCount: 0,
+          autoRetryLimit: 0,
+          startedAt: '',
+          finishedAt: '',
+        }}
+        name="job_01M4XEETKWKZX504BK65ADBVYB"
+        displayMode="full"
+      />
+    );
+
+    expect(screen.getByText('View only')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Stop' })
+    ).not.toBeInTheDocument();
+    runAccess.allowed = undefined;
   });
 
   it('shows cancel for failed runs with pending auto retries', () => {

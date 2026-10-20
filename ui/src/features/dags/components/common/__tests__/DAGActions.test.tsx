@@ -60,6 +60,15 @@ vi.mock('../../../../../hooks/api', () => ({
   }),
 }));
 
+const runAccess = vi.hoisted(() => ({
+  allowed: undefined as boolean | undefined,
+}));
+
+vi.mock('@/features/txe/runAccess', () => ({
+  useJobRunAllowed: () => runAccess.allowed,
+  ViewOnly: () => <span>View only</span>,
+}));
+
 vi.mock('../../../../../contexts/AuthContext', () => ({
   useCanManageProfiles: () => false,
 }));
@@ -85,6 +94,7 @@ function LocationProbe() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  runAccess.allowed = undefined;
   client.GET.mockResolvedValue({ data: { dag: { name: 'example' } } });
   client.POST.mockResolvedValue({ data: { dagRunId: 'created-run' } });
 });
@@ -150,6 +160,25 @@ describe('DAGActions', () => {
     );
     expect(screen.getByLabelText('Location')).toHaveTextContent('/dags');
   });
+  // The hub's answer for the job grants no execute (a view-only share, or
+  // the platform administrator under enforce): no run control is offered.
+  it('offers no run control on a job the caller may only view', () => {
+    runAccess.allowed = false;
+    render(
+      <DAGActions
+        fileName="job_01M4XEETKWKZX504BK65ADBVYB"
+        dag={{ name: 'job_01M4XEETKWKZX504BK65ADBVYB' }}
+        displayMode="full"
+      />,
+      { wrapper: MemoryRouter }
+    );
+
+    expect(screen.getByText('View only')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Start' })
+    ).not.toBeInTheDocument();
+  });
+
   it('shows cancel for failed runs with pending auto retries', () => {
     render(
       <DAGActions
