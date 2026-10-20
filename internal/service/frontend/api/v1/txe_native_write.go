@@ -169,7 +169,6 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]placement.P
 	return out, nil
 }
 
-
 var errTxeSpecUnverified = &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
 	Message: "the spec could not be verified: it does not load, or a worker selector is computed or does not name the machine it runs on",
 	Details: map[string]any{"code": "spec_unverified"}}
