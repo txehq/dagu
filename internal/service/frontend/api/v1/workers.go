@@ -19,6 +19,9 @@ func (a *API) GetWorkers(ctx context.Context, _ api.GetWorkersRequestObject) (ap
 	if err := a.requireDeveloperOrAbove(ctx); err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		return nil, errTxeHubRecords
+	}
 	logger.Debug(ctx, "GetWorkers called")
 
 	errors := []string{}

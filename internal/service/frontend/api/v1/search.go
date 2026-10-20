@@ -166,6 +166,9 @@ func (a *API) SearchDAGFeed(ctx context.Context, request api.SearchDAGFeedReques
 	if err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		workspaceFilter = txeNothingFilter()
+	}
 
 	result, errs, err := a.dagRepository.SearchCursor(ctx, persis.DAGSearchOptions{
 		Cursor:          valueOf(request.Params.Cursor),
@@ -252,6 +255,10 @@ func (a *API) SearchDagMatches(ctx context.Context, request api.SearchDagMatches
 	workspaceFilter, err := a.workspaceFilterForParams(ctx, request.Params.Workspace)
 	if err != nil {
 		return nil, err
+	}
+	if a.txeHubHidden(ctx) {
+		// It reads no DAG, so it is told of none (TXE-4752).
+		return nil, &Error{Code: api.ErrorCodeNotFound, Message: "DAG not found", HTTPStatus: http.StatusNotFound}
 	}
 
 	result, err := a.dagRepository.SearchMatches(ctx, request.FileName, persis.DAGMatchSearchOptions{

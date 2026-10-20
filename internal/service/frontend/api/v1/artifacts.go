@@ -23,6 +23,9 @@ func (a *API) ListArtifacts(
 	if err != nil {
 		return nil, err
 	}
+	if a.txeHubHidden(ctx) {
+		workspaceFilter = txeNothingFilter()
+	}
 
 	query := persis.ArtifactQuery{WorkspaceFilter: workspaceFilter}
 	if request.Params.Name != nil {
