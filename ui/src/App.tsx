@@ -332,11 +332,18 @@ function LazyRoutes({
   );
 }
 
+// Native frames a native page in a person's dashboard with the padding the
+// ordinary layout gives it.
+function Native({ page }: { page: React.ReactNode }): React.ReactElement {
+  return <div className="w-full p-4 md:p-6">{page}</div>;
+}
+
 // PersonApp is the dashboard of a person signed in through the identity
-// provider and acting for an owner: the TXE pages, and the native pages of a
-// job the hub answers for that owner (its DAG, runs and queue). The hub
-// refuses a person every other route, so those show a placeholder instead
-// of failing. Event streams stay refused, so the native pages poll.
+// provider and acting for an owner: the TXE pages, and the native pages the
+// hub answers for that owner: the DAG, run and queue lists, which it filters
+// to what the person may read, and each of those DAGs, runs and queues. The
+// hub refuses a person every other route, so those show a placeholder
+// instead of failing. Event streams stay refused, so the native pages poll.
 function PersonApp(): React.ReactElement {
   const appBar = React.useContext(AppBarContext);
   const scopedAppBar = React.useMemo(() => personAppBar(appBar), [appBar]);
@@ -354,13 +361,25 @@ function PersonApp(): React.ReactElement {
               path="/txe/machines/:machineId"
               element={<TxeMachinePage />}
             />
-            <Route path="/dags/:fileName/:tab" element={<DAGDetails />} />
-            <Route path="/dags/:fileName/" element={<DAGDetails />} />
+            <Route path="/dags/" element={<Native page={<DAGs />} />} />
+            <Route
+              path="/dags/:fileName/:tab"
+              element={<Native page={<DAGDetails />} />}
+            />
+            <Route
+              path="/dags/:fileName/"
+              element={<Native page={<DAGDetails />} />}
+            />
+            <Route path="/dag-runs" element={<Native page={<DAGRuns />} />} />
             <Route
               path="/dag-runs/:name/:dagRunId"
-              element={<DAGRunDetails />}
+              element={<Native page={<DAGRunDetails />} />}
             />
-            <Route path="/queues/:name" element={<QueueDetailsPage />} />
+            <Route path="/queues" element={<Native page={<Queues />} />} />
+            <Route
+              path="/queues/:name"
+              element={<Native page={<QueueDetailsPage />} />}
+            />
             <Route
               path="*"
               element={

@@ -30,6 +30,15 @@ export function PersonLayout({
         <Link to="/txe" className="text-sm hover:underline">
           <I18nText text="Job inbox" />
         </Link>
+        <Link to="/dags" className="text-sm hover:underline">
+          <I18nText text="Workflows" />
+        </Link>
+        <Link to="/dag-runs" className="text-sm hover:underline">
+          <I18nText text="Executions" />
+        </Link>
+        <Link to="/queues" className="text-sm hover:underline">
+          <I18nText text="Queues" />
+        </Link>
         <Link to="/txe/machines" className="text-sm hover:underline">
           <I18nText text="Machines" />
         </Link>
