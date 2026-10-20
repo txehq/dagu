@@ -1,41 +1,77 @@
 #!/usr/bin/env bash
-# merge.sh — merge a txehq/dagu PR only after MAIN's copy of the codex-review check passes on the
-# exact head being merged (TXE-4719).
+# merge.sh — merge a txehq/dagu PR only when, on the exact head being merged, MAIN's codex-review
+# check passes now and every CI run on that head has finished green (TXE-4719).
 #
 #   git fetch -q origin main && git show origin/main:.github/codex-review/merge.sh | bash -s -- <pr> <head-sha>
 #
-# Why it exists: a pull_request run executes the PR's own copy of codex-review.yml and of the
-# check, so a PR can edit the check that judges it. This wrapper, read from origin/main and never
-# from the PR, re-runs origin/main's copy of codex-review-check.sh (no wait) and then merges with
-# --match-head-commit, so GitHub refuses the merge if the head moved after the check.
+# Why it exists. The codex-review workflow already runs main's copy (pull_request_target), but its
+# verdict is a result of the past: it polled up to 15 minutes, and a review, a label or a push can
+# come after it. This fork's main has no branch protection, so nothing else stops a merge with CI
+# failing or still running. This wrapper, read from origin/main and never from the PR:
+#   1. refuses a PR that is not open, is a draft, is not on main, or whose head is not <head-sha>;
+#   2. requires main's codex-review WORKFLOW RUN on that head (pull_request_target, created on every
+#      push, so its presence also shows the push's other runs were created) to be completed/success;
+#   3. requires every other workflow run, every check run and the combined commit status on that
+#      head to be finished and green: success, skipped or neutral; pending, missing reads, failure,
+#      cancelled, timed out or action required refuse. Path-filtered workflows that did not match
+#      the PR have no run, and that is not a failure;
+#   4. re-runs main's codex-review-check.sh at that head, with no wait and never in fixture mode;
+#   5. merges with --match-head-commit, so GitHub refuses the merge if the head moved after 1-4.
 #
-# Residual window, stated rather than hidden: a connector review that lands on the SAME head in the
-# seconds between the check and the merge is not seen (the head pin cannot catch it); run this
-# right after the connector's state block is final, as txe's ops/merge-pr.sh does.
+# Residual window, stated rather than hidden: a connector review or a run that changes on the SAME
+# head in the seconds between 4 and 5 is not seen; run this once the connector's state is final.
 #
-# Refuses (exit 1) when: the PR is not open, is a draft, or its head is not <head-sha>; its base is
-# not main; main's check does not pass on that head. Exit 2: usage or a read failure.
+# Exit 0 merged; 1 refused; 2 usage or a read failure (nothing merged).
 set -euo pipefail
 
 repo="${GH_REPO:-txehq/dagu}"
 pr="${1:-}"; want="${2:-}"
 [[ "$pr" =~ ^[0-9]+$ && "$want" =~ ^[0-9a-f]{40}$ ]] || { echo "usage: merge.sh <pr-number> <40-hex head sha>" >&2; exit 2; }
+refuse() { echo "merge.sh: $*; not merging" >&2; exit 1; }
+unread() { echo "merge.sh: could not read $*; not merging" >&2; exit 2; }
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # main's copy of the check, from the remote, never the working tree or the PR.
-gh api "repos/$repo/contents/.github/codex-review/codex-review-check.sh?ref=main" --jq .content \
-  | base64 -d >"$tmp/check.sh" || { echo "merge.sh: could not read main's codex-review-check.sh" >&2; exit 2; }
-[ -s "$tmp/check.sh" ] || { echo "merge.sh: main has no codex-review-check.sh" >&2; exit 2; }
+gh api "repos/$repo/contents/.github/codex-review/codex-review-check.sh?ref=main" --jq .content >"$tmp/check.b64" \
+  || unread "main's codex-review-check.sh"
+base64 -d <"$tmp/check.b64" >"$tmp/check.sh" || unread "main's codex-review-check.sh (not base64)"
+[ -s "$tmp/check.sh" ] || unread "main's codex-review-check.sh (empty: main has none)"
 
-read -r state draft head base < <(gh api "repos/$repo/pulls/$pr" --jq '[.state, .draft, .head.sha, .base.ref] | @tsv') \
-  || { echo "merge.sh: could not read PR #$pr" >&2; exit 2; }
-[ "$state" = open ] || { echo "merge.sh: PR #$pr is $state" >&2; exit 1; }
-[ "$draft" = false ] || { echo "merge.sh: PR #$pr is a draft" >&2; exit 1; }
-[ "$head" = "$want" ] || { echo "merge.sh: PR #$pr's head is $head, not $want" >&2; exit 1; }
-[ "$base" = main ] || { echo "merge.sh: PR #$pr's base is $base, not main" >&2; exit 1; }
+gh api "repos/$repo/pulls/$pr" --jq '[.state, .draft, .head.sha, .base.ref] | @tsv' >"$tmp/pull.tsv" || unread "PR #$pr"
+read -r state draft head base <"$tmp/pull.tsv" || unread "PR #$pr (no fields)"
+[ "$state" = open ] || refuse "PR #$pr is $state"
+[ "$draft" = false ] || refuse "PR #$pr is a draft"
+[ "$head" = "$want" ] || refuse "PR #$pr's head is $head, not $want"
+[ "$base" = main ] || refuse "PR #$pr's base is $base, not main"
+
+# ── CI on the exact head: workflow runs (latest attempt per workflow), check runs, statuses ──
+gh api --paginate "repos/$repo/actions/runs?head_sha=$want&per_page=100" --jq '.workflow_runs[]' >"$tmp/runs.jsonl" \
+  || unread "the workflow runs on $want"
+gh api --paginate "repos/$repo/commits/$want/check-runs?per_page=100" --jq '.check_runs[]' >"$tmp/checks.jsonl" \
+  || unread "the check runs on $want"
+gh api "repos/$repo/commits/$want/status" --jq '[.state, .total_count] | @tsv' >"$tmp/status.tsv" \
+  || unread "the commit status of $want"
+jq -s -e 'all(.[]; type == "object")' "$tmp/runs.jsonl" "$tmp/checks.jsonl" >/dev/null 2>&1 \
+  || unread "the CI payloads (not objects)"
+gate="$(jq -s -r '[.[] | select(.name == "codex-review" and .event == "pull_request_target")]
+  | max_by(.run_number) // empty | "\(.status) \(.conclusion)"' "$tmp/runs.jsonl")"
+[ "$gate" = "completed success" ] || refuse "main's codex-review run on $want is '${gate:-missing}', not completed success"
+bad="$(jq -s -r '
+  group_by(.name) | map(max_by(.run_number))[]
+  | select(.status != "completed" or ((.conclusion // "") | IN("success","skipped","neutral") | not))
+  | "workflow \(.name): \(.status)/\(.conclusion // "none")"' "$tmp/runs.jsonl")
+$(jq -s -r '
+  group_by(.name) | map(max_by(.started_at // ""))[]
+  | select(.status != "completed" or ((.conclusion // "") | IN("success","skipped","neutral") | not))
+  | "check \(.name): \(.status)/\(.conclusion // "none")"' "$tmp/checks.jsonl")"
+bad="$(printf '%s\n' "$bad" | sed '/^$/d')"
+[ -z "$bad" ] || refuse "CI on $want is not finished green:
+$bad"
+read -r cstate ccount <"$tmp/status.tsv" || unread "the commit status of $want (no fields)"
+[ "$ccount" = 0 ] || [ "$cstate" = success ] || refuse "the combined commit status of $want is $cstate"
 
 # Never fixture mode: an inherited CODEX_REVIEW_FIXTURE_DIR would judge local files and merge the live PR.
 env -u CODEX_REVIEW_FIXTURE_DIR GH_REPO="$repo" PR_NUMBER="$pr" CODEX_REVIEW_WAIT_SECONDS=0 bash "$tmp/check.sh" \
-  || { echo "merge.sh: main's codex-review check does not pass on $want; not merging" >&2; exit 1; }
+  || refuse "main's codex-review check does not pass on $want"
 
 gh pr merge "$pr" -R "$repo" --squash --match-head-commit "$want"

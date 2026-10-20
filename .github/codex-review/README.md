@@ -23,9 +23,11 @@ code), and a PR from another repository fails unless a person adds `review-overr
 3. Read every finding. Fix every P0 and P1 and push; a P2 or P3 never blocks.
 4. A push starts the next review. If none starts within a few minutes, comment `@codex review`.
    After a change of base, rebase onto it and force-push.
-5. Merge only when `codex-review` and CI are green, through **main's** merge wrapper, which re-runs
-   main's copy of the check on the exact head, with no wait, and merges with `--match-head-commit`,
-   so a head that moved after the check is refused:
+5. Merge only through **main's** merge wrapper. This fork's main has no branch protection, so the
+   wrapper is what enforces the gate at the merge boundary. On the exact head it requires main's
+   codex-review run completed/success, every other workflow run, check run and the combined status
+   finished green (pending or unreadable refuses), and main's check passing again with no wait; it
+   then merges with `--match-head-commit`:
 
    ```bash
    git fetch -q origin main

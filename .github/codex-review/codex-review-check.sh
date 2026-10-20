@@ -130,7 +130,7 @@ read_state() {
     #    repository that is missing or deleted is treated the same way (TXE-4719). ──
     head_repo="$(printf '%s' "$pull" | jq -r 'if (.head | has("repo")) and .head.repo != null then (.head.repo.full_name // "") else "" end')"
     if [ "$head_repo" != "$repo" ]; then
-        verdict 1 "FAIL: PR #$pr's head is in ${head_repo:-a missing or deleted repository}, not $repo; a PR from another repository runs its own copy of this check, so only a person's $OVERRIDE_LABEL passes it"
+        verdict 1 "FAIL: PR #$pr's head is in ${head_repo:-a missing or deleted repository}, not $repo; a PR from another repository is not merged on the connector's review alone, so only a person's $OVERRIDE_LABEL passes it"
     fi
 
     # ── 1. the connector's state block, on the head ──

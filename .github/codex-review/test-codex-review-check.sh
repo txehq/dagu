@@ -289,5 +289,37 @@ expect4022 receipt-earlier-pass 1 "no clean-pass receipt for it were found"
 txe4022 receipt-not-connector issue-comments 'map(if .id == 6241141339 then .user.login = "connorwang" | .user.type = "User" else . end)'
 expect4022 receipt-not-connector 1 "no clean-pass receipt for it were found"
 
+# 11. LIVE reads that fail (TXE-4719): no fixture directory, a stand-in gh that serves the recorded
+#     clean case, except that ONE read prints a partial page and exits 1, as a broken API page
+#     would. The clean case passes when every read works, so each refusal below is that read's.
+#     Every list read is `gh api --paginate | jq -s` under pipefail: a failed gh must never become
+#     an empty list, which for reviews would turn "no review on the head" into a pass.
+mkdir -p "$TMP/livebin" "$TMP/live" && cp "$BASE"/*.json "$TMP/live/" || exit 2
+with_head_repo "$TMP/live" txehq/sub2api
+cat >"$TMP/livebin/gh" <<'GH'
+#!/usr/bin/env bash
+path=""; for a in "$@"; do case "$a" in repos/*) path="${a%%\?*}" ;; esac; done
+case "$path" in
+  */pulls/290) f=pull ;; */issues/290/comments) f=issue-comments ;; */issues/290/events) f=issue-events ;;
+  */pulls/290/reviews) f=reviews ;; */pulls/290/comments) f=review-comments ;; *) echo "unexpected $*" >&2; exit 9 ;;
+esac
+if [ "$f" = "$LIVE_FAIL" ]; then printf '[]'; exit 1; fi  # a valid but partial page, then failure
+cat "$LIVE_DIR/$f.json"
+GH
+chmod +x "$TMP/livebin/gh"
+live() { # live <name> <failing read or ""> <want exit> <want substring>
+    local out rc
+    out="$(env -u CODEX_REVIEW_FIXTURE_DIR PATH="$TMP/livebin:$PATH" LIVE_DIR="$TMP/live" LIVE_FAIL="$2" \
+        GH_REPO=txehq/sub2api PR_NUMBER=290 GITHUB_STEP_SUMMARY=/dev/null bash "$CHECK" 2>&1)"; rc=$?
+    case "$rc:$out" in
+        "$3:"*"$4"*) PASS=$((PASS + 1)); printf '  ok   %s (exit %s)\n' "$1" "$rc" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: want exit %s and %s\n       got exit %s:\n%s\n' "$1" "$3" "$4" "$rc" "$(printf '%s' "$out" | sed 's/^/         /')" ;;
+    esac
+}
+live live-clean           ""               0 "PASS: the connector completed its review of $HEAD_RECORDED"
+live live-pull-unread     pull             2 "could not read PR #290"
+live live-comments-unread issue-comments   2 "could not read PR #290's comments"
+live live-reviews-unread  reviews          2 "could not read PR #290's reviews"
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
