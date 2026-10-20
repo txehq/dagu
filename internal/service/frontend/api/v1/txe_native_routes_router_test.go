@@ -156,6 +156,35 @@ func TestTxeNativeRoutesDecideAnOwnersDAGInEnforce(t *testing.T) {
 	removeDAGSnapshot(t, h.server, unread)
 	require.Equal(t, http.StatusServiceUnavailable, status(http.MethodDelete, "/api/v1/dag-runs/nightly-alias/"+unread, h.admin, nil),
 		"a run whose DAG is unreadable")
+
+	// An ordinary DAG run as a sub-run of the alias's run: its agent
+	// session is the root's owner's too.
+	rootID := storeAliasRun(t, h.server, &ir.DAG{Name: "nightly-alias", SourceFile: sourceFile, YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")})
+	childID := storeSubRun(t, h.server, ir.NewDAGRunRef("nightly-alias", rootID), "plain-child")
+	subRun := "/api/v1/dag-runs/nightly-alias/" + rootID + "/sub-dag-runs/" + childID + "/steps/s"
+	require.Equal(t, http.StatusForbidden, status(http.MethodPost, subRun+"/agent-interactions/i1/respond", h.admin, map[string]any{"answer": "x"}),
+		"a sub-run's agent session is its root owner's")
+	require.Equal(t, http.StatusForbidden, status(http.MethodPost, subRun+"/agent-session/restart", h.admin, map[string]any{}),
+		"so is restarting it")
+}
+
+// storeSubRun stores a finished run of an ownerless DAG named name as a
+// sub-run of root, and returns its run id.
+func storeSubRun(t *testing.T, server test.Server, root ir.DAGRunRef, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	dag := &ir.DAG{Name: name, YamlData: []byte("steps:\n  - name: s\n    run: echo s\n")}
+	runID := fmt.Sprintf("sub-%d", time.Now().UnixNano())
+	attempt, err := server.DAGRunRepository.CreateAttempt(ctx, dag, time.Now(), runID, persis.DAGRunCreateAttemptOptions{RootDAGRun: root})
+	require.NoError(t, err)
+	st := ir.InitialStatus(dag)
+	st.DAGRunID, st.AttemptID, st.Status = runID, attempt.ID(), ir.Succeeded
+	st.Root, st.Parent = root, root
+	st.StartedAt, st.FinishedAt = time.Now().Add(-time.Minute).Format(time.RFC3339), time.Now().Format(time.RFC3339)
+	require.NoError(t, attempt.Open(ctx))
+	require.NoError(t, attempt.Write(ctx, st))
+	require.NoError(t, attempt.Close(ctx))
+	return runID
 }
 
 // storeAliasRun stores a finished run of dag directly, as an attempt written

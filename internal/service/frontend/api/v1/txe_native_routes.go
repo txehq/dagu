@@ -123,3 +123,21 @@ func (a *API) txeRunRoute(ctx context.Context, runName string, attempt dagrun.At
 	}
 	return nil
 }
+
+// txeRootRunRoute is txeRunRoute on a sub-run's root run, read from the
+// root's attempt. A root that cannot be found is not taken for no owner's
+// where owners are decided.
+func (a *API) txeRootRunRoute(ctx context.Context, root ir.DAGRunRef, permission authz.Permission) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	attempt, err := a.dagRunRepository.FindAttempt(ctx, root)
+	if err != nil {
+		if a.txeOwnerOnly(ctx) || a.txeAuth.Mode() == authz.ModeEnforce {
+			return errTxeAuthzUnavailable
+		}
+		attempt = nil
+	}
+	return a.txeRunRoute(ctx, root.Name, attempt, permission)
+}
+
