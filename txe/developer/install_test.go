@@ -366,6 +366,35 @@ func TestInstallSafety(t *testing.T) {
 		assert.Contains(t, out, "missing or not this script's: "+wrapper)
 	})
 
+	t.Run("DataDirectoriesSharedElsewhere", func(t *testing.T) {
+		e := newDevEnv(t)
+		shared := filepath.Join(e.home, "mnt", "dagu-data")
+		require.NoError(t, os.MkdirAll(shared, 0o700))
+		require.NoError(t, os.MkdirAll(filepath.Join(e.txeHome, "client"), 0o700))
+		require.NoError(t, os.MkdirAll(filepath.Join(e.cliRoot, "client"), 0o700))
+		require.NoError(t, os.Symlink(shared, filepath.Join(e.txeHome, "client", "data")))
+		require.NoError(t, os.Symlink(shared, filepath.Join(e.cliRoot, "client", "data")))
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.Error(t, err)
+		assert.Contains(t, out, "must stay apart from the developer's")
+	})
+
+	// The wrapper's binary is the one installed for its tag, and says so: a
+	// binary of another release swapped in under the same name fails.
+	t.Run("ABinaryOfAnotherReleaseUnderTheTagsName", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		bin := filepath.Join(e.cliRoot, "bin", "dagu-2.18.2-txe.11")
+		other, err := os.ReadFile(e.stub("dagu-12", "2.18.2-txe.12", "b"))
+		require.NoError(t, err)
+		require.NoError(t, os.Remove(bin))
+		require.NoError(t, os.WriteFile(bin, other, 0o755)) //nolint:gosec // test stub
+		out, err = e.run("--check")
+		require.Error(t, err)
+		assert.Contains(t, out, "missing or not this script's")
+	})
+
 	t.Run("PathThroughALinkedDirectory", func(t *testing.T) {
 		e := newDevEnv(t)
 		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))

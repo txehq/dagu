@@ -91,7 +91,9 @@ except OSError as e:
 
 # swap_link points a link of ours at target: a link made under a fresh unique
 # name in the same directory, then renamed over it, only if the pathname is
-# still a link to one of the targets named.
+# still a link to one of the targets named. The check and the rename are two
+# steps: another program replacing that link in between would lose its file.
+# The lock serialises this script, not other programs.
 swap_link() { # swap_link <target> <link> <allowed-target>...
   python3 -I -c '
 import os, sys
@@ -235,7 +237,7 @@ if within "$cli_real" "$home_real" || within "$home_real" "$cli_real"; then
   die "$TXE_DAGU_CLI_ROOT and the TXE home $TXE_DAGU_HOME are the same place or inside each other; give the developer CLI a root of its own"
 fi
 for mine in "$TXE_DAGU_CLI_ROOT/bin" "$TXE_DAGU_CLI_ROOT/client" "$store"; do
-  for theirs in "$TXE_DAGU_HOME" "$TXE_DAGU_HOME/bin" "$TXE_DAGU_HOME/client"; do
+  for theirs in "$TXE_DAGU_HOME" "$TXE_DAGU_HOME/bin" "$TXE_DAGU_HOME/client" "$TXE_DAGU_HOME/client/data" "$TXE_DAGU_HOME/client/data/contexts"; do
     a="$(resolve "$mine")" b="$(resolve "$theirs")"
     if within "$a" "$b" || within "$b" "$a"; then
       die "$mine and $theirs are the same place or inside each other; the worker's binary and store must stay apart from the developer's"
@@ -337,8 +339,17 @@ for line in open(sys.argv[1]):
   wtag="${rest%%)*}"
   [[ "$wtag" =~ ^txe-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || wtag=""
 fi
-if [ -n "$installed" ] && [ -n "$wtag" ] && [ -x "$installed" ] && [ "$(wrapper_text "$wtag" "$installed")" = "$(cat "$wrapper")" ]; then
-  say wrapper "$wrapper -> $installed, store $store"
+# The binary must be the one this script installs for the wrapper's tag, and
+# say it is that version.
+want_bin="" want_version=""
+if [[ "$wtag" =~ ^txe-v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+  want_version="${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}"
+  want_bin="$TXE_DAGU_CLI_ROOT/bin/dagu-$want_version"
+fi
+if [ -n "$installed" ] && [ "$installed" = "$want_bin" ] && [ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] &&
+  [ "$("$installed" version 2>/dev/null | head -1)" = "$want_version" ] &&
+  [ "$(wrapper_text "$wtag" "$installed")" = "$(cat "$wrapper")" ]; then
+  say wrapper "$wrapper -> $installed ($want_version), store $store"
 else
   say wrapper "missing or not this script's: $wrapper"
   installed=""

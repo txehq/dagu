@@ -41,7 +41,7 @@ An upgrade moves `skill/current`, so every profile reads the new revision with n
 
 `--check` changes nothing outside a temporary directory it removes, and reads no context store: the skill status runs with a Dagu home and store of its own there. It checks three things:
 
-- the wrapper is byte for byte what this script writes for its tag and binary;
+- the wrapper is byte for byte what this script writes for its tag, and its binary is `dagu-<that tag's version>` and reports that version;
 - `dagu` on PATH is the link to the wrapper;
 - every location is exactly the managed link, and resolves to the binary's skill revision.
 
@@ -54,5 +54,5 @@ A build from a tag uses `-trimpath`, so rebuilding the same tag with the same to
 - It never reads, copies or writes a credential.
 - It never installs into the TXE home: a developer root that is, or leads into, the TXE home is refused.
 - It writes nothing through a fixed temporary name, or through a link at a destination. Every staged file is created for the run and renamed onto exactly its pathname. A versioned binary is published only where nothing exists yet.
-- It runs one install at a time, using a lock directory in the CLI root.
-- It refuses a developer bin or client directory that resolves to, or into, the worker's.
+- It runs one install at a time, using a lock directory in the CLI root. That lock serialises this script, not other programs: one that replaces `~/.local/bin/dagu` between this script's check and its swap would lose its file.
+- It refuses a developer bin, client or store directory that resolves to, or into, the worker's. That covers the TXE home, its `bin`, `client`, `client/data` and `client/data/contexts`.
