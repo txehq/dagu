@@ -26,6 +26,18 @@ Use a tag that has passed acceptance. `--binary` must report exactly the tag's v
 
 The developer's sign-in and the machine's store are kept apart. On a machine with a worker, the machine's `txe` context reaches the hub over the local tunnel with the machine's credential, and `dagu txe login --hub` would refuse to replace it. A job a signed-in developer registers still runs its steps with the machine's own store. Registration checks that store first: the sign-in must be bound to the machine's owner, and both stores must reach the same registry (TXE-4706).
 
+## Enrolling this machine's worker
+
+`dagu txe enrol` is the machine's, not the developer's. The wrapper leaves it on the machine's own store, the TXE home's `client`. The hub the enrolment records is therefore the one this machine's job steps reach. A step presents the machine credential only to that hub (TXE-4707), so an enrolment made through the developer's store would leave the steps refusing to run.
+
+Order on a machine with a worker:
+
+1. **Hub:** the hub's administrator lists the machine's worker client in `txe.authn.clients`.
+2. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub.
+3. **Upgrade the worker:** its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
+
+Until step 2 completes, the steps keep the context's API key, and say so.
+
 ## Skill links
 
 `dagu txe skill install` unpacks the binary's skill under the TXE home and points `skill/current` at it. Then:

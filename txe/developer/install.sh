@@ -17,7 +17,8 @@
 #      command, with or without --context before it, it names the developer's
 #      own context store, under $TXE_DAGU_CLI_ROOT/client/data, so
 #      `dagu txe login --hub` keeps the developer's sign-in there and never in
-#      the machine's own store, which belongs to this machine's worker. The TXE
+#      the machine's own store, which belongs to this machine's worker; only
+#      `dagu txe enrol`, which enrols the machine itself, keeps that store. The TXE
 #      home (machine identity, packages, receipts, skill) is the machine's and
 #      is shared.
 #   3. $TXE_DAGU_LINK_DIR/dagu (default ~/.local/bin/dagu) links to the wrapper.
@@ -157,7 +158,10 @@ finally:
 # It finds the subcommand the way dagu's command parser does: a long flag
 # without "=" takes the next argument as its value (but --help), and so does a
 # two-letter short flag (but -h). When that subcommand is txe, the developer's
-# store flags go right after it.
+# store flags go right after it, except for "txe enrol": enrolling gives this
+# machine's worker its credential, and the enrolment records the hub of the
+# store it ran with, which must be the machine's own (TXE-4734). Past txe,
+# txe's own boolean flags (--quiet, -q, --cpu-profile) take no value.
 wrapper_text() { # wrapper_text <tag> <binary>
   cat <<EOF
 #!/bin/sh
@@ -165,18 +169,28 @@ $MARKER ($1). dagu txe commands use the
 # developer's own context store; the machine's worker keeps its own.
 binary=$(shell_quote "$2")
 store=$(shell_quote "$store")
-n=0 at=0 skip=0
+n=0 at=0 skip=0 sub=
 for arg do
     n=\$((n + 1))
     if [ "\$skip" = 1 ]; then skip=0; continue; fi
+    # Past txe, its boolean flags take no value.
+    if [ "\$at" -gt 0 ]; then
+        case "\$arg" in --quiet|-q|--cpu-profile) continue ;; esac
+    fi
     case "\$arg" in
         --help|-h|--*=*) ;;
         --*) skip=1 ;;
         -?) skip=1 ;;
         -*) ;;
-        *) [ "\$arg" = txe ] && at=\$n; break ;;
+        *)
+            if [ "\$at" -gt 0 ]; then sub=\$arg; break; fi
+            [ "\$arg" = txe ] || break
+            at=\$n ;;
     esac
 done
+# Enrolment is the machine's: it keeps the machine's own store, the one this
+# machine's job steps reach the hub through.
+if [ "\$sub" = enrol ]; then at=0; fi
 if [ "\$at" -gt 0 ]; then
     i=0
     for arg do

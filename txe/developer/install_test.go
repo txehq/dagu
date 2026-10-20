@@ -265,6 +265,17 @@ func TestWrapperFindsTheTXECommand(t *testing.T) {
 	assert.Equal(t, with("register", "-f", "my job.yaml", "", "x"), e.wrapperArgs("txe", "register", "-f", "my job.yaml", "", "x"))
 	// "txe" as an argument of another command is not the txe command.
 	assert.Contains(t, e.wrapperArgs("start", "txe"), "(no txe call)")
+	// Enrolment is the machine's: it keeps the machine's own store, so the
+	// hub it records is the one this machine's job steps reach (TXE-4734).
+	assert.Equal(t, brackets("enrol", "--client-id", "w"), e.wrapperArgs("txe", "enrol", "--client-id", "w"))
+	assert.Equal(t, brackets("enrol", "check"), e.wrapperArgs("--context", "txe", "txe", "enrol", "check"))
+	assert.Equal(t, brackets("--session", "s1", "enrol"), e.wrapperArgs("txe", "--session", "s1", "enrol"))
+	// A job key or argument named enrol is not the enrol command.
+	assert.Equal(t, with("inspect", "enrol"), e.wrapperArgs("txe", "inspect", "enrol"))
+	// txe's boolean flags take no value, either way round.
+	assert.Equal(t, brackets("--quiet", "enrol", "--client-id", "w"), e.wrapperArgs("txe", "--quiet", "enrol", "--client-id", "w"))
+	assert.Equal(t, with("-q", "inspect", "enrol"), e.wrapperArgs("txe", "-q", "inspect", "enrol"))
+	assert.Equal(t, brackets("--cpu-profile", "enrol"), e.wrapperArgs("txe", "--cpu-profile", "enrol"))
 }
 
 // The review's cases: nothing at a temporary name is followed, the
