@@ -683,13 +683,55 @@ var terminalRunStatuses = map[api.StatusLabel]bool{
 
 const runPageLimit = 100
 
-// walkRuns visits every run the service lists for the job, newest created
-// first. The listing starts at the epoch: without a range, the service lists
-// only runs since its local midnight.
-func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSummary) error) error {
+// The run history a review lists is bounded by a watermark the checkpoint's
+// run cursor carries ("listed-from:" and a time): every finished run that no
+// review has covered, and every run not finished yet, was created after it.
+const (
+	listedFromPrefix = "listed-from:"
+	// runLookback is how far back every listing reaches whatever the
+	// watermark. A run retried after a review covered it keeps the time it
+	// was created, so its new execution is shown again only while that is
+	// within the lookback.
+	runLookback = 7 * 24 * time.Hour
+	// runSlack allows for a run created before the earliest time the service
+	// reports for it.
+	runSlack = time.Hour
+)
+
+// listingFrom is where a listing starts for a checkpoint's run cursor. A
+// cursor that carries no watermark, as one written before this bound
+// existed, gives the zero time: the whole history.
+func listingFrom(cursor string, now time.Time) time.Time {
+	raw, ok := strings.CutPrefix(cursor, listedFromPrefix)
+	if !ok {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return minTime(at, now.Add(-runLookback))
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// walkRuns visits every run the service lists for the job that was created
+// at or after from, newest created first; the zero time lists them all. The
+// range is always sent: without one, the service lists only runs since its
+// local midnight.
+func (r *Remote) walkRuns(ctx context.Context, jobID string, from time.Time, visit func(runSummary) error) error {
+	fromDate := "0"
+	if from.Unix() > 0 {
+		fromDate = strconv.FormatInt(from.Unix(), 10)
+	}
 	page := ""
 	for {
-		q := url.Values{"limit": {strconv.Itoa(runPageLimit)}, "fromDate": {"0"}}
+		q := url.Values{"limit": {strconv.Itoa(runPageLimit)}, "fromDate": {fromDate}}
 		if page != "" {
 			q.Set("cursor", page)
 		}
@@ -721,7 +763,7 @@ func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSumma
 // names it, so nothing is covered before the review that was shown it is
 // persisted, a crash or a failed read covers nothing, and no ordering of
 // end times, late report or number of unfinished runs can make a result
-// pass for covered. The cursor argument is not used.
+// pass for covered.
 //
 // The service shows one result per run: its latest execution. An execution
 // that was replaced by a retry between two reviews was never listed and is
@@ -732,10 +774,22 @@ func (r *Remote) walkRuns(ctx context.Context, jobID string, visit func(runSumma
 // taken for covered. A finished run the service gives no attempt id for
 // fails the listing with ErrUnidentifiedExecution.
 //
-// The cost is a read of the job's whole review and run history on every
-// review. That is the price of exactness without an index; making it
-// cheaper is capacity work and must not change what counts as covered.
-func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence, error) {
+// The cursor bounds only how much of the history is read, never what counts
+// as covered. Each listing starts at the earlier of the cursor's watermark
+// and runLookback ago; a cursor with no watermark reads the whole history.
+// Every result returned carries, as its cursor, a watermark before the
+// earliest time of every result still to be shown and every run not
+// finished, the returned ones included, so a review that covers them moves
+// the next listing's start forward and none of them falls outside it.
+// The one result the bound can hide is the new execution of a run that was
+// retried after a review covered it and was created more than runLookback
+// ago.
+//
+// The cost is a read of the job's whole review history, and of its run
+// history since the listing's start, on every review.
+func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvidence, error) {
+	now := time.Now()
+	from := listingFrom(cursor, now)
 	covered, err := r.coveredExecutions(ctx, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("read what earlier reviews covered: %w", err)
@@ -744,10 +798,23 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence,
 	// others are waiting. Only that many are kept while the history is read.
 	todo := uncovered{limit: maxPacketRuns + 1}
 	byKey := map[string]runSummary{}
-	err = r.walkRuns(ctx, jobID, func(run runSummary) error {
+	// earliest is the earliest time of a result still to be shown or a run
+	// not finished; unknown is set when one has no time at all.
+	earliest, unknown := now, false
+	note := func(run runSummary) {
+		at, ok := run.earliest()
+		switch {
+		case !ok:
+			unknown = true
+		case at.Before(earliest):
+			earliest = at
+		}
+	}
+	err = r.walkRuns(ctx, jobID, from, func(run runSummary) error {
 		if !terminalRunStatuses[run.StatusLabel] {
-			// Not a result yet. Nothing has to be remembered about it:
-			// when it ends, its execution is in no review and is returned.
+			// Not a result yet: when it ends, its execution is in no review
+			// and is returned, so the next listing must still reach it.
+			note(run)
 			return nil
 		}
 		if run.AttemptID == "" {
@@ -759,6 +826,7 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence,
 		if covered[point.key()] {
 			return nil
 		}
+		note(run)
 		todo.add(point)
 		byKey[point.key()] = run
 		if len(byKey) > 8*todo.limit {
@@ -777,6 +845,11 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence,
 	// pair one execution's status with another's output. A result whose run
 	// moved on meanwhile is not returned. It is in no review, so the next
 	// listing meets whatever the run's latest execution is by then.
+	watermark := earliest.Add(-runSlack)
+	if unknown {
+		watermark = from
+	}
+	next := listedFromPrefix + watermark.UTC().Format(time.RFC3339)
 	points := todo.settle()
 	out := make([]RunEvidence, 0, len(points))
 	for _, p := range points {
@@ -785,6 +858,7 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, _ string) ([]RunEvidence,
 			return nil, err
 		}
 		if same {
+			ev.Cursor = next
 			out = append(out, ev)
 		}
 	}
@@ -1879,6 +1953,17 @@ func (s runSummary) point() runPoint {
 		}
 	}
 	return p
+}
+
+// earliest is the earliest time the service reports for the run's latest
+// execution. ok is false when it reports none.
+func (s runSummary) earliest() (at time.Time, ok bool) {
+	for _, raw := range []string{s.QueuedAt, s.StartedAt, s.FinishedAt} {
+		if t, err := time.Parse(time.RFC3339, raw); err == nil && !t.IsZero() && (!ok || t.Before(at)) {
+			at, ok = t, true
+		}
+	}
+	return at, ok
 }
 
 func (s runSummary) state() RunState {

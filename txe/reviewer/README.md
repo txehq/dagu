@@ -486,9 +486,18 @@ files.
   result: a result is covered only once the review that was shown it has
   been persisted, and a crash, a failed read or a review that was never
   recorded covers nothing.
-- The reviewer reads the job's whole run history from the start. Asked for
-  no range, the service lists only runs since its local midnight, and a run
-  that ended before it would never be reviewed.
+- The reviewer always asks the service for a range of the run history.
+  Asked for none, the service lists only runs since its local midnight, and
+  a run that ended before it would never be reviewed. The range starts at a
+  watermark the checkpoint's run cursor carries (`listed-from:` and a
+  time), or seven days ago if that is earlier. The watermark is an hour
+  before the earliest result still to be shown and the earliest run not
+  finished, so covering a result can move it forward but never past one
+  that is still to be shown. A checkpoint written before the watermark
+  existed reads the whole history once.
+- The bound hides one thing: the new execution of a run retried after a
+  review covered it, when the run was created more than seven days ago. A
+  retry keeps the run's creation time, which is what the range is on.
 - So a retried run is shown again when its new execution ends, on either
   retry path; results with the same end time are separate results; a
   result reported late, a run created while the history was being listed

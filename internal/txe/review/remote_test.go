@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -551,6 +552,8 @@ type runList struct {
 	stub *stubTransport
 	// reviews are the covered_executions of each recorded review.
 	reviews [][]string
+	// froms are the listing starts served besides the whole history.
+	froms []string
 }
 
 func newRunList(t *testing.T) *runList {
@@ -563,7 +566,9 @@ func newRunList(t *testing.T) *runList {
 // set replaces the listed runs; each is "id attempt status finishedAt",
 // optionally followed by the time the attempt was queued.
 func (l *runList) set(runs ...string) {
-	l.stub.replies["/dag-runs/"+l.job+"?fromDate=0&limit=100"] = l.page("", runs...)
+	for _, from := range append([]string{"0"}, l.froms...) {
+		l.stub.replies["/dag-runs/"+l.job+"?fromDate="+from+"&limit=100"] = l.page("", runs...)
+	}
 }
 
 // page is one page of the run list as the service returns it.
@@ -1541,6 +1546,14 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	runs, err := remote.RunsAfter(ctx, f.jobID, "")
 	require.NoError(t, err)
 	assert.Empty(t, runs)
+
+	// The checkpoint carries the watermark: an hour before the result's
+	// earliest time. It is earlier than the lookback, so the next listing
+	// starts there.
+	cp, err := remote.Checkpoint(ctx, f.jobID)
+	require.NoError(t, err)
+	assert.Equal(t, "listed-from:2026-10-09T08:59:00Z", cp.RunCursor)
+	l.froms = []string{strconv.FormatInt(time.Date(2026, 10, 9, 8, 59, 0, 0, time.UTC).Unix(), 10)}
 
 	// The run is retried on the queued path: same attempt id, later queue
 	// marker. It is another execution, in no review, and is shown again.
