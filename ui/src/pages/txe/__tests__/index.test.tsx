@@ -220,6 +220,24 @@ describe('TxeInboxPage for a shared job', () => {
     expect(
       screen.getByText('You do not have permission to decide this proposal.')
     ).toBeInTheDocument();
+    // The decision is the owner's, so the card does not say it waits on you.
+    expect(screen.getByText('Waiting on the owner')).toBeInTheDocument();
+    expect(screen.queryByText('Waiting on you')).not.toBeInTheDocument();
+  });
+
+  it('waits on you when the share includes approve', async () => {
+    const { api } = fakeApi([fixtureProposal()]);
+    const shared = fixtureJob({
+      access: {
+        via: 'share',
+        sharedBy: { ownerId: 'own_A', displayName: 'Ada' },
+        permissions: ['view', 'approve'],
+      },
+    });
+    renderPage({ ...api, listJobs: async () => [shared] });
+
+    expect(await screen.findByText('Waiting on you')).toBeInTheDocument();
+    expect(screen.queryByText('Waiting on the owner')).not.toBeInTheDocument();
   });
 });
 
