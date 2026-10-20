@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/txe/review"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -247,6 +248,9 @@ func TestTXECommandFamily(t *testing.T) {
 		}
 	}
 	assert.Equal(t, commandScopeContextAware, scopeForCommand("txe"))
+	// Every txe command is a client of a remote hub: it serves nothing.
+	assert.Equal(t, config.ServiceHubClient, serviceForCommand("txe"))
+	assert.Equal(t, config.ServiceNone, serviceForCommand("start-all"))
 	// A command of another family that happens to be called txe deeper down
 	// is not affected.
 	other := &cobra.Command{Use: "txe"}

@@ -1891,6 +1891,18 @@ auth:
 	t.Run("AuthModeDefaultBuiltin", func(t *testing.T) {
 		cfg := loadFromYAML(t, "# empty")
 		require.Equal(t, AuthModeBuiltin, cfg.Server.Auth.Mode)
+		assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "No auth.mode configured")
+	})
+
+	// A hub client gets the same default, but serves nothing, so the advice
+	// to configure the local server's auth is a notice and not a warning.
+	t.Run("AuthModeDefaultHubClient", func(t *testing.T) {
+		configFile := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configFile, []byte("# empty\n"), 0600))
+		cfg := testLoad(t, WithConfigFile(configFile), WithService(ServiceHubClient))
+		require.Equal(t, AuthModeBuiltin, cfg.Server.Auth.Mode)
+		assert.NotContains(t, strings.Join(cfg.Warnings, "\n"), "auth.mode")
+		assert.Contains(t, strings.Join(cfg.Notices, "\n"), "No auth.mode configured")
 	})
 
 	t.Run("AuthModeInvalid", func(t *testing.T) {
