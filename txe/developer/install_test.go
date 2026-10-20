@@ -24,6 +24,7 @@ import (
 // "current" at it; status fails unless every location resolves to it.
 const stubDagu = `#!/bin/sh
 rev=rev-%s
+while [ $# -gt 0 ]; do case "$1" in --context) shift 2 ;; --context=*) shift ;; *) break ;; esac; done
 case "$1" in
 version) echo %s; exit 0 ;;
 txe) shift ;;
@@ -31,6 +32,8 @@ txe) shift ;;
 esac
 # The wrapper passes the developer store first; record what reached us.
 mkdir -p "$TXE_DAGU_HOME" && echo "$*" >> "$TXE_DAGU_HOME/stub-args"
+# Like dagu, any txe command opens the context store it is given, creating it.
+prev=""; for a in "$@"; do [ "$prev" = --contexts-dir ] && mkdir -p "$a"; prev=$a; done
 while [ $# -gt 0 ]; do case "$1" in --contexts-dir|--data-dir) shift 2 ;; *) break ;; esac; done
 case "$1 $2" in
 "skill install")
@@ -50,6 +53,7 @@ type devEnv struct {
 	t                               *testing.T
 	home, txeHome, cliRoot, linkDir string
 	canon                           string
+	env                             []string
 }
 
 func newDevEnv(t *testing.T) *devEnv {
@@ -84,7 +88,7 @@ func (e *devEnv) run(args ...string) (string, error) {
 	script, err := filepath.Abs("install.sh")
 	require.NoError(e.t, err)
 	cmd := exec.Command(bash, append([]string{script}, args...)...) //nolint:gosec // the script under test
-	cmd.Env = []string{"HOME=" + e.home, "PATH=" + e.linkDir + ":/usr/bin:/bin", "TXE_DAGU_HOME=" + e.txeHome}
+	cmd.Env = append([]string{"HOME=" + e.home, "PATH=" + e.linkDir + ":/usr/bin:/bin", "TXE_DAGU_HOME=" + e.txeHome}, e.env...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
@@ -115,7 +119,7 @@ func TestInstallLinksEveryProfileAndKeepsTheWorkers(t *testing.T) {
 	// The custom copy is not this binary's revision, so the readback fails,
 	// and it is kept as it was.
 	require.Error(t, err, out)
-	assert.Contains(t, out, custom+" is not a link to this skill; left as it is")
+	assert.Contains(t, out, custom+" is not a link to "+filepath.Join(e.canon, "txe-dagu-jobs")+"; left as it is")
 	assert.Contains(t, out, "STALE "+filepath.Join(e.home, ".codex3", "skills"))
 	assert.FileExists(t, filepath.Join(custom, "NOTES"))
 
@@ -142,10 +146,13 @@ func TestInstallLinksEveryProfileAndKeepsTheWorkers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(e.canon, "txe-dagu-jobs"), target)
 
-	// The wrapper gives txe commands the developer's store and nothing else.
+	// The skill command was given a store of its own, never the developer's
+	// or the machine's.
 	args, err := os.ReadFile(filepath.Join(e.txeHome, "stub-args"))
 	require.NoError(t, err)
-	assert.Contains(t, string(args), "--contexts-dir "+filepath.Join(e.cliRoot, "client", "data", "contexts")+" --data-dir "+filepath.Join(e.cliRoot, "client", "data")+" skill install")
+	assert.Contains(t, string(args), "skill install --contexts-dir ")
+	assert.NotContains(t, string(args), filepath.Join(e.cliRoot, "client"))
+	assert.NotContains(t, string(args), filepath.Join(e.txeHome, "client"))
 
 	// Once the custom copy is moved away, a second run completes, and
 	// --check agrees without changing anything.
@@ -179,7 +186,7 @@ func TestInstallRefusals(t *testing.T) {
 		require.NoError(t, err, out)
 		out, err = e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("other-11", "2.18.2-txe.11", "z"))
 		require.Error(t, err)
-		assert.Contains(t, out, "already exists and differs from this build")
+		assert.Contains(t, out, "already exists and is not this build")
 	})
 
 	// A dagu on PATH that is neither this install's link nor the worker's is
@@ -202,5 +209,138 @@ func TestInstallRefusals(t *testing.T) {
 		out, err := e.run("--tag", "v2.18.2", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
 		require.Error(t, err)
 		assert.Contains(t, out, "--tag must be txe-v<major>.<minor>.<patch>-<n>")
+	})
+}
+
+// wrapperArgs runs the installed wrapper and returns the arguments the stub
+// binary received.
+func (e *devEnv) wrapperArgs(args ...string) string {
+	e.t.Helper()
+	argsFile := filepath.Join(e.txeHome, "stub-args")
+	_ = os.Remove(argsFile)
+	cmd := exec.Command(filepath.Join(e.cliRoot, "bin", "dagu"), args...) //nolint:gosec // the wrapper under test
+	cmd.Env = []string{"HOME=" + e.home, "PATH=/usr/bin:/bin", "TXE_DAGU_HOME=" + e.txeHome}
+	out, _ := cmd.CombinedOutput()
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		return "(no txe call) " + string(out)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// The wrapper gives a dagu txe command the developer's store, also when
+// --context comes first, and leaves every other command as it is.
+func TestWrapperFindsTheTXECommand(t *testing.T) {
+	e := newDevEnv(t)
+	out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+	require.NoError(t, err, out)
+	store := filepath.Join(e.cliRoot, "client", "data")
+	flags := "--contexts-dir " + filepath.Join(store, "contexts") + " --data-dir " + store
+	assert.Equal(t, flags+" whoami --json", e.wrapperArgs("txe", "whoami", "--json"))
+	assert.Equal(t, flags+" whoami", e.wrapperArgs("--context", "txe", "txe", "whoami"))
+	assert.Equal(t, flags+" whoami", e.wrapperArgs("--context=txe", "txe", "whoami"))
+	// "txe" as an argument of another command is not the txe command.
+	assert.Contains(t, e.wrapperArgs("start", "txe"), "(no txe call)")
+}
+
+// The review's cases: nothing at a temporary name is followed, the
+// developer's root cannot be the worker's, --check writes nothing, a quote in
+// the root is kept, a home that is a link is followed, the wrapper is checked
+// and a link pinned to one revision is not the managed one.
+func TestInstallSafety(t *testing.T) {
+	t.Run("NoFixedTemporaryName", func(t *testing.T) {
+		e := newDevEnv(t)
+		victim := filepath.Join(e.home, "victim")
+		require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+		require.NoError(t, os.MkdirAll(filepath.Join(e.cliRoot, "bin"), 0o755))
+		require.NoError(t, os.MkdirAll(e.linkDir, 0o755))
+		for _, p := range []string{filepath.Join(e.cliRoot, "bin", "dagu.tmp"), filepath.Join(e.cliRoot, "bin", "dagu-2.18.2-txe.11.tmp"), filepath.Join(e.linkDir, "dagu.tmp")} {
+			require.NoError(t, os.Symlink(victim, p))
+		}
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		data, err := os.ReadFile(victim)
+		require.NoError(t, err)
+		assert.Equal(t, "keep", string(data))
+	})
+
+	t.Run("RootInsideTheTXEHome", func(t *testing.T) {
+		e := newDevEnv(t)
+		e.env = []string{"TXE_DAGU_CLI_ROOT=" + e.txeHome}
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.Error(t, err)
+		assert.Contains(t, out, "are the same place or inside each other")
+		assert.NoFileExists(t, filepath.Join(e.txeHome, "bin", "dagu"))
+	})
+
+	t.Run("ClientLinkedIntoTheTXEHome", func(t *testing.T) {
+		e := newDevEnv(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(e.txeHome, "client"), 0o700))
+		require.NoError(t, os.MkdirAll(e.cliRoot, 0o755))
+		require.NoError(t, os.Symlink(filepath.Join(e.txeHome, "client"), filepath.Join(e.cliRoot, "client")))
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.Error(t, err)
+		assert.Contains(t, out, "leads into the TXE home")
+	})
+
+	t.Run("CheckWritesNothing", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		require.NoError(t, os.RemoveAll(filepath.Join(e.cliRoot, "client")))
+		out, err = e.run("--check")
+		require.NoError(t, err, out)
+		assert.NoDirExists(t, filepath.Join(e.cliRoot, "client"))
+	})
+
+	t.Run("AQuoteInTheRoot", func(t *testing.T) {
+		e := newDevEnv(t)
+		e.cliRoot = filepath.Join(e.home, "Connor's Disk", "txe-dagu-cli")
+		e.env = []string{"TXE_DAGU_CLI_ROOT=" + e.cliRoot}
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		store := filepath.Join(e.cliRoot, "client", "data")
+		assert.Equal(t, "--contexts-dir "+filepath.Join(store, "contexts")+" --data-dir "+store+" whoami", e.wrapperArgs("txe", "whoami"))
+	})
+
+	t.Run("AHomeThatIsALink", func(t *testing.T) {
+		e := newDevEnv(t)
+		real := filepath.Join(e.home, "profiles", "claude-work")
+		require.NoError(t, os.MkdirAll(real, 0o755))
+		require.NoError(t, os.Symlink(real, filepath.Join(e.home, ".claude7")))
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		target, err := os.Readlink(filepath.Join(real, "skills", "txe-dagu-jobs"))
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(e.canon, "txe-dagu-jobs"), target)
+	})
+
+	t.Run("AWrapperThatIsNotTheScripts", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		wrapper := filepath.Join(e.cliRoot, "bin", "dagu")
+		require.NoError(t, os.Remove(wrapper))
+		data, err := os.ReadFile(filepath.Join(e.cliRoot, "bin", "dagu-2.18.2-txe.11"))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(wrapper, data, 0o755)) //nolint:gosec // test stub
+		out, err = e.run("--check")
+		require.Error(t, err)
+		assert.Contains(t, out, "missing or not this script's: "+wrapper)
+	})
+
+	t.Run("ALinkPinnedToOneRevision", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		entry := filepath.Join(e.home, ".codex", "skills", "txe-dagu-jobs")
+		require.NoError(t, os.Remove(entry))
+		require.NoError(t, os.Symlink(filepath.Join(e.txeHome, "skill", "rev-b"), entry))
+		out, err = e.run("--check")
+		require.Error(t, err)
+		assert.Contains(t, out, entry+" is not the link to "+filepath.Join(e.canon, "txe-dagu-jobs"))
+		out, err = e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.Error(t, err)
+		assert.Contains(t, out, entry+" is not a link to")
 	})
 }

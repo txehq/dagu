@@ -17,7 +17,7 @@ Use a tag that has passed acceptance. `--binary` must report exactly the tag's v
 | Path | What | Owner |
 |---|---|---|
 | `~/.local/share/txe-dagu-cli/bin/dagu-<version>` | the binary; earlier versions are kept | this script |
-| `~/.local/share/txe-dagu-cli/bin/dagu` | wrapper: `dagu txe ...` uses the developer's context store | this script |
+| `~/.local/share/txe-dagu-cli/bin/dagu` | wrapper: `dagu txe ...` and `dagu --context <name> txe ...` use the developer's context store | this script |
 | `~/.local/share/txe-dagu-cli/client/data` | the developer's context store: the `txe` context `dagu txe login --hub` creates, sign-in only, no API key | `dagu txe login` |
 | `~/.local/bin/dagu` | link to the wrapper | this script |
 | `~/.local/share/txe-dagu/` | the TXE home: machine identity, packages, receipts, sign-ins, the unpacked skill | the worker and the CLI |
@@ -32,13 +32,25 @@ The developer's sign-in and the machine's store are kept apart. On a machine wit
 
 - `~/.coding_skills/txe-dagu-jobs` links to `skill/current`, when `~/.coding_skills` exists.
 - Each `~/.claude*/skills`, `~/.codex*/skills` and `$CODEX_HOME/skills`, plus `~/.agents/skills` (which Codex also reads), gets `txe-dagu-jobs`. It links to `~/.coding_skills/txe-dagu-jobs`, or to `skill/current` when there is no `~/.coding_skills`.
-- A real directory, or a link that resolves elsewhere, is someone's own copy. It is reported and kept, and the readback fails until it is moved away.
-- A profile home that is itself a link to another home is covered by that home.
+- A real directory, or any link other than exactly that one, is someone's own copy. That includes a link pinned to one revision. It is reported and kept, and the readback fails until it is moved away.
+- A profile home that is a link is followed, and each real home is visited once.
 
 An upgrade moves `skill/current`, so every profile reads the new revision with no link changed.
+
+## Readback
+
+`--check` writes nothing, and reads no context store: the skill status runs against an empty store in a temporary directory. It checks three things:
+
+- the wrapper is this script's, and names an installed binary and the developer's store;
+- `dagu` on PATH is the link to the wrapper;
+- every location is exactly the managed link, and resolves to the binary's skill revision.
+
+A build from a tag uses `-trimpath`, so rebuilding the same tag with the same toolchain gives the same file.
 
 ## What it never does
 
 - It never changes the worker's binary, its launchd agents or its context store.
 - It never replaces a `~/.local/bin/dagu` it cannot name. It replaces only its own link, or the link the worker installer makes to `~/.local/share/txe-dagu/bin/dagu`.
 - It never reads, copies or writes a credential.
+- It never installs into the TXE home: a developer root that is, or leads into, the TXE home is refused.
+- It writes nothing through a fixed temporary name. Every staged file is created for the run and renamed into place.
