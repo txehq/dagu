@@ -99,6 +99,17 @@ func TestUnitsRefuseALogPathSystemdCannotTake(t *testing.T) {
 	assert.Contains(t, stderr, "units refused: the log path must have no space or special character")
 }
 
+func TestUnitsRefuseARelativeHome(t *testing.T) {
+	agentsScript(t)
+	script, err := filepath.Abs("units.py")
+	require.NoError(t, err)
+	_, stderr, err := python(t, script, "write", filepath.Join(t.TempDir(), "user"), "relative/txe", "/usr/bin/kubectl",
+		agentsMachine, agentsOwner, "/usr/bin:/bin", "txe-dagu-tunnel.service", "txe-dagu-worker.service",
+		"dagu", "svc/dagu", "18080", "50055", "")
+	require.Error(t, err)
+	assert.Contains(t, stderr, "the TXE home must be an absolute path")
+}
+
 func TestUnitsRefuseALineBreak(t *testing.T) {
 	agentsScript(t)
 	script, err := filepath.Abs("units.py")
@@ -229,14 +240,28 @@ func TestSystemdWaitActive(t *testing.T) {
 	require.NoError(t, err)
 	bash, err := exec.LookPath("bash")
 	require.NoError(t, err)
+	// The stand-in systemctl answers is-active with STATE and NRestarts from a counter file that
+	// CYCLE increments on every NRestarts read after the first, as a unit that keeps respawning.
 	for _, c := range []struct {
-		name, state string
-		ok          bool
-	}{{"active", "active", true}, {"cycling", "activating", false}, {"failed", "failed", false}, {"no answer", "", false}} {
+		name, state, cycle, want string
+		ok                       bool
+	}{
+		{"active", "active", "", "", true},
+		{"cycling-while-settling", "active", "yes", "restarted while settling", false},
+		{"activating", "activating", "", "is activating, not active", false},
+		{"failed", "failed", "", "is failed, not active", false},
+		{"no answer", "", "", "is unknown, not active", false},
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			bin := t.TempDir()
-			require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"),
-				[]byte("#!/bin/sh\necho '"+c.state+"'\n[ '"+c.state+"' = active ]\n"), 0o755))
+			n := filepath.Join(bin, "n")
+			require.NoError(t, os.WriteFile(n, []byte("0"), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"), []byte(`#!/bin/sh
+case "$*" in
+  *NRestarts*) v=$(cat "`+n+`"); [ "`+c.cycle+`" = yes ] && echo $((v + 1)) > "`+n+`"; echo "$v" ;;
+  *is-active*) echo '`+c.state+`'; [ '`+c.state+`' = active ] ;;
+esac
+`), 0o755))
 			cmd := exec.Command(bash, script, "txe-dagu-tunnel.service", "txe-dagu-worker.service")
 			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "TXE_DAGU_ACTIVE_WAIT=1", "TXE_DAGU_ACTIVE_SETTLE=0"}
 			var errOut bytes.Buffer
@@ -247,8 +272,7 @@ func TestSystemdWaitActive(t *testing.T) {
 				return
 			}
 			require.Error(t, err)
-			assert.Contains(t, errOut.String(), "txe-dagu-tunnel.service is ")
-			assert.Contains(t, errOut.String(), "not active")
+			assert.Contains(t, errOut.String(), c.want)
 		})
 	}
 }

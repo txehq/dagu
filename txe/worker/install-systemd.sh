@@ -31,6 +31,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=txe/worker/lib.sh
 . "$here/lib.sh"
 TXE_DAGU_UNITS_DIR="${TXE_DAGU_UNITS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+# Units need absolute paths (ExecStart, logs); a relative TXE home is made absolute here, as
+# lib.sh's link_dagu_on_path does for its link.
+case "$TXE_DAGU_HOME" in /*) ;; *) TXE_DAGU_HOME="$PWD/$TXE_DAGU_HOME" ;; esac
 TXE_DAGU_TUNNEL_UNIT="txe-dagu-tunnel.service"
 TXE_DAGU_WORKER_UNIT="txe-dagu-worker.service"
 

@@ -49,6 +49,9 @@ def _unit(description, argv, environment, log):
 
 def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, worker_unit,
                 namespace, service, ui_port, coord_port, credential_file):
+    for name, value in (("the TXE home", home), ("kubectl", kubectl)):
+        if not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path for a unit, got {value!r}")
     tunnel = _unit("TXE Dagu tunnel to the hub (kubectl port-forward, loopback only)", [
         kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
         "port-forward", "--address", "127.0.0.1", service,
