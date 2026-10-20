@@ -152,6 +152,23 @@ const (
 // license policy is read: a value that decides who is let in is never
 // converted loosely, and a key that is not known is an error rather than
 // ignored.
+// refuseOwnersWithoutServer refuses owner authorization to a coordinator
+// started on its own. It does not read the owner settings, which the server
+// reads, so it would neither pin tasks to machines nor be held to
+// authenticate workers (TXE-4720): owners are run with start-all, whose
+// coordinator reads them.
+func (l *ConfigLoader) refuseOwnersWithoutServer() error {
+	mode, err := l.txeString(txeAuthzModeKey)
+	if err != nil {
+		return err
+	}
+	if mode != "" && mode != TXEAuthzModeOff {
+		return fmt.Errorf("%s is %s, but a coordinator started on its own does not read the owner settings, "+
+			"so it would neither pin tasks to machines nor authenticate workers: start it with start-all", txeAuthzModeKey, mode)
+	}
+	return nil
+}
+
 func (l *ConfigLoader) loadTXEConfig(cfg *Config) error {
 	for _, env := range []string{txeAuthzModeEnv, txeAuthnIssuerEnv, txeAuthnAudienceEnv, txeAuthnJWKSEnv, txeAuthnLifetimeEnv, txeAuthnSkewEnv} {
 		name := strings.ToUpper(AppSlug) + "_" + env

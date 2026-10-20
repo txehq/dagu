@@ -21,7 +21,9 @@ import (
 
 // coordinatorAuthOptions returns the gRPC server options that make the
 // coordinator authenticate every caller, or none when coordinator.auth is off,
-// which leaves the coordinator exactly as it was.
+// which leaves the coordinator exactly as it was. Owner authorization in
+// enforce needs coordinator.auth in enforce too: the coordinator does not
+// start otherwise.
 //
 // A worker machine is verified with the server's provider token settings
 // (txe.authn) and found through its enrolment in the TXE owner store. The
@@ -33,8 +35,24 @@ import (
 // loopback address, so that address must be one; otherwise every
 // authenticated call would fail in the client, observe mode included.
 func coordinatorAuthOptions(ctx context.Context, cfg *config.Config, advertise string, opts ...txeauth.Option) ([]grpc.ServerOption, error) {
+	// Owner authorization in enforce hands each machine only its own tasks
+	// (TXE-4422), and only an authenticating coordinator knows which machine
+	// a worker is: without it, a process that claims a machine's label is
+	// handed that machine's tasks (TXE-4720).
+	if cfg.TXE.Authz.Mode == config.TXEAuthzModeEnforce && cfg.Coordinator.Auth.Mode != config.TXEAuthzModeEnforce {
+		return nil, fmt.Errorf("txe.authz.mode is enforce but coordinator.auth.mode is %q: a coordinator that does not authenticate "+
+			"workers would hand a machine's tasks to any worker naming that machine; set coordinator.auth.mode to enforce, "+
+			"or keep txe.authz.mode at observe until it is", cfg.Coordinator.Auth.Mode)
+	}
 	if !cfg.Coordinator.Auth.Enabled() {
 		return nil, nil
+	}
+	if cfg.Coordinator.Auth.Mode == config.TXEAuthzModeEnforce && cfg.TXE.Authz.Mode != config.TXEAuthzModeEnforce {
+		// A staged rollout: workers are authenticated, but tasks are not yet
+		// pinned to their machines, so an enrolled machine may still be
+		// handed a task that names no machine.
+		logger.Warn(ctx, "coordinator.auth.mode is enforce but txe.authz.mode is not: tasks are not pinned to machines until it is",
+			slog.String("txe.authz.mode", cfg.TXE.Authz.Mode))
 	}
 	mode := authz.Mode(cfg.Coordinator.Auth.Mode)
 	tls := cfg.Core.Peer.CertFile != "" && cfg.Core.Peer.KeyFile != ""

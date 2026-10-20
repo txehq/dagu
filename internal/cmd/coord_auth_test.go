@@ -268,6 +268,34 @@ func TestCoordinatorAuthOffInstallsNothingAndSendsNothing(t *testing.T) {
 	}
 }
 
+// Owner authorization in enforce pins each task to its machine, and only an
+// authenticating coordinator knows which machine a worker is: without it a
+// process claiming txe.machine=A1 would be handed A1's tasks. Such a
+// coordinator does not start; every other pair of modes starts as before
+// (TXE-4720).
+func TestEnforcedOwnersNeedAnEnforcingCoordinator(t *testing.T) {
+	for _, mode := range []string{"", config.TXEAuthzModeOff, config.TXEAuthzModeObserve} {
+		cfg := &config.Config{}
+		cfg.Paths.DataDir = t.TempDir()
+		cfg.TXE.Authz.Mode = config.TXEAuthzModeEnforce
+		cfg.Coordinator.Auth.Mode = mode
+		_, err := coordinatorAuthOptions(context.Background(), cfg, "127.0.0.1")
+		require.Error(t, err, "coordinator.auth %q", mode)
+		require.ErrorContains(t, err, "txe.authz.mode is enforce")
+		require.ErrorContains(t, err, "coordinator.auth.mode")
+	}
+	for _, authz := range []string{"", config.TXEAuthzModeOff, config.TXEAuthzModeObserve} {
+		for _, coord := range []string{"", config.TXEAuthzModeOff} {
+			cfg := &config.Config{}
+			cfg.Paths.DataDir = t.TempDir()
+			cfg.TXE.Authz.Mode = authz
+			cfg.Coordinator.Auth.Mode = coord
+			_, err := coordinatorAuthOptions(context.Background(), cfg, "127.0.0.1")
+			require.NoError(t, err, "authz %q, coordinator.auth %q", authz, coord)
+		}
+	}
+}
+
 func TestCoordinatorAuthNeedsProviderTokenSettings(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Paths.DataDir = t.TempDir()
