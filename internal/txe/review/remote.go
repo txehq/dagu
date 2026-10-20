@@ -689,12 +689,14 @@ const runPageLimit = 100
 const (
 	listedFromPrefix = "listed-from:"
 	// runLookback is how far back every listing reaches whatever the
-	// watermark. A run retried after a review covered it keeps the time it
+	// watermark, and how far a watermark that moves stays behind the times
+	// it moves by. A run retried after a review covered it keeps the time it
 	// was created, so its new execution is listed while that time is after
-	// the watermark or within the lookback of the listing.
+	// the watermark or within the lookback of the listing. The times a
+	// watermark moves by may come from a worker's clock or this machine's,
+	// not the service's, which stamps a run's creation: the lookback is the
+	// skew between them that is allowed.
 	runLookback = 7 * 24 * time.Hour
-	// runSlack allows for runs created while the listing was read.
-	runSlack = time.Hour
 )
 
 // listingFrom is where a listing starts for a checkpoint's run cursor. A
@@ -780,9 +782,11 @@ func (r *Remote) walkRuns(ctx context.Context, jobID string, from time.Time, vis
 // report, and a retry keeps. So a watermark moves forward only when nothing
 // is left behind: a review that covers every result returned, when no run is
 // unfinished, no result is beyond the packet and none moved on while it was
-// read, moves it to an hour before the latest time the service reported for
-// any run it listed: the service's clock, not this machine's, which may be
-// ahead. Otherwise it stays where this listing started. Each result returned
+// read, moves it to runLookback before the earlier of this machine's time
+// and the latest time the service reported for any run it listed. Those
+// times may be from clocks other than the one that stamps a run's creation,
+// and runLookback is the skew allowed. Otherwise it stays where this listing
+// started. Each result returned
 // carries, as its cursor, what the watermark is if the review covers it and
 // every result returned before it: only the last can move it. The one result
 // the bound can hide is the new execution of a run that a review had
@@ -806,8 +810,7 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 	todo := uncovered{limit: maxPacketRuns + 1}
 	byKey := map[string]runSummary{}
 	results := 0
-	// latest is the latest time the service reported for any run listed: a
-	// time its clock had passed when the listing was read.
+	// latest is the latest time the service reported for any run listed.
 	var latest time.Time
 	err = r.walkRuns(ctx, jobID, from, func(run runSummary) error {
 		for _, raw := range []string{run.FinishedAt, run.StartedAt, run.QueuedAt} {
@@ -868,7 +871,7 @@ func (r *Remote) RunsAfter(ctx context.Context, jobID, cursor string) ([]RunEvid
 		out[i].Cursor = stay
 	}
 	if n := len(out); n > 0 && !held && !latest.IsZero() {
-		out[n-1].Cursor = listedFromPrefix + minTime(latest, now).Add(-runSlack).UTC().Format(time.RFC3339)
+		out[n-1].Cursor = listedFromPrefix + minTime(latest, now).Add(-runLookback).UTC().Format(time.RFC3339)
 	}
 	return out, nil
 }

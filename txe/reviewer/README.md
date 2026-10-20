@@ -496,10 +496,13 @@ files.
   and a retry keeps it, so the watermark moves only when nothing is left
   behind. A review that covers every result it was shown, while no run is
   unfinished, no result is beyond its packet and none changed while it was
-  read, moves the watermark to an hour before the latest time the service
-  reported for any run it listed. That is the service's clock, not the
-  reviewer machine's, which may be ahead of it. Any other review leaves the
-  watermark where the listing started.
+  read, moves the watermark to seven days before the earlier of the reviewer
+  machine's time and the latest time the service reported for any run it
+  listed. Those times can come from a worker's or the reviewer's clock, not
+  the hub's, which stamps when a run was created; clocks up to seven days
+  apart are allowed for. Any other review leaves the watermark where the
+  listing started. A review after a gap therefore reads the gap plus seven
+  days.
 - The bound hides one thing: the new execution of a run that a review had
   covered and that is retried later, when the run was created before both
   the watermark and seven days before the listing.

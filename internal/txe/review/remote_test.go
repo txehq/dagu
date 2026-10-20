@@ -1577,12 +1577,12 @@ func TestRemoteCoverageIsReadBackFromTheRegistrysReviewRecords(t *testing.T) {
 	assert.Empty(t, runs)
 
 	// The review covered everything it was shown, so the checkpoint carries
-	// a watermark an hour before the latest time the service reported, the
+	// a watermark a week before the latest time the service reported, the
 	// run's end. That is earlier than the lookback, so the next listing
 	// starts there.
 	cp, err := remote.Checkpoint(ctx, f.jobID)
 	require.NoError(t, err)
-	watermark := time.Date(2026, 10, 9, 9, 1, 0, 0, time.UTC)
+	watermark := time.Date(2026, 10, 2, 10, 1, 0, 0, time.UTC)
 	assert.Equal(t, "listed-from:"+watermark.Format(time.RFC3339), cp.RunCursor)
 	listing.starts = nil
 

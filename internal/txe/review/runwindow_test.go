@@ -65,12 +65,18 @@ func (h *runHistory) retry(runID string, at time.Time, status ir.Status) {
 }
 
 func (h *runHistory) attempt(runID string, at time.Time, retry bool, status ir.Status) {
+	h.stamped(runID, at, at, retry, status)
+}
+
+// stamped records an execution created by the service at created whose
+// times, as another clock gave them, are stamped.
+func (h *runHistory) stamped(runID string, created, stamped time.Time, retry bool, status ir.Status) {
 	h.t.Helper()
 	ctx := context.Background()
-	attempt, err := h.repo.CreateAttempt(ctx, &ir.DAG{Name: h.job}, at, runID, persis.DAGRunCreateAttemptOptions{Retry: retry})
+	attempt, err := h.repo.CreateAttempt(ctx, &ir.DAG{Name: h.job}, created, runID, persis.DAGRunCreateAttemptOptions{Retry: retry})
 	require.NoError(h.t, err)
 	require.NoError(h.t, attempt.Open(ctx))
-	stamp, finished := at.Format(time.RFC3339), ""
+	stamp, finished := stamped.Format(time.RFC3339), ""
 	if status != ir.Running {
 		finished = stamp
 	}
@@ -144,7 +150,7 @@ func TestRemoteRunsAfterReadsRunsFromBeforeMidnight(t *testing.T) {
 // The listing is bounded by the watermark the reviews' checkpoint carries.
 // A run created before the lookback and the watermark is not read; a run
 // from the day before is. A review that covers everything it was shown,
-// with nothing left behind, moves the watermark to an hour before the
+// with nothing left behind, moves the watermark to the lookback before the
 // latest time the service reported; only the last result returned carries
 // that.
 func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
@@ -161,7 +167,7 @@ func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
 	stay := watermark(time.Time{})
 	assert.Equal(t, stay, runs[0].Cursor, "a review that stops here leaves the start where it was")
 	assert.Equal(t, stay, runs[1].Cursor)
-	assert.WithinDuration(t, now.Add(-time.Minute-time.Hour), listedFrom(t, runs[2].Cursor), 2*time.Second)
+	assert.WithinDuration(t, now.Add(-time.Minute-7*24*time.Hour), listedFrom(t, runs[2].Cursor), 2*time.Second)
 
 	// A watermark from an hour ago: the lookback reaches back a week, so the
 	// month-old run is not read, and yesterday's is.
@@ -214,16 +220,30 @@ func TestRemoteRunsAfterHoldsTheWatermarkForWhatItLeavesBehind(t *testing.T) {
 	}
 }
 
-// The watermark is taken from the service's clock. With this machine's
-// clock ahead of the service's, a watermark from it would be later than
-// runs the service creates right after the listing, and they would be
-// skipped once the lookback no longer reaches them.
-func TestRemoteRunsAfterTakesTheWatermarkFromTheServicesClock(t *testing.T) {
-	h := newRunHistory(t)
-	behind := time.Now().Add(-3 * time.Hour)
-	h.run("latest", behind)
-	_, next := h.runsAfter("")
-	assert.WithinDuration(t, behind.Add(-time.Hour), listedFrom(t, next), 2*time.Second)
+// The service stamps when a run is created; the times it reports for an
+// execution may come from a worker's clock, and this machine's may differ
+// from both. A watermark moved by them stays the lookback behind the
+// earlier of the latest reported time and this machine's, so a run the
+// service creates just after the listing is after it while the clocks are
+// less than the lookback apart.
+func TestRemoteRunsAfterKeepsTheWatermarkBehindSkewedClocks(t *testing.T) {
+	now := time.Now()
+	for name, run := range map[string]struct{ created, stamped time.Time }{
+		// The service's clock two hours behind the worker's and this one's.
+		"service behind": {now.Add(-2 * time.Hour), now},
+		// The worker's clock two hours ahead of everyone's.
+		"worker ahead": {now, now.Add(2 * time.Hour)},
+		// This machine's clock three hours ahead of the service and worker.
+		"reviewer ahead": {now.Add(-3 * time.Hour), now.Add(-3 * time.Hour)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newRunHistory(t)
+			h.stamped("latest", run.created, run.stamped, false, ir.Succeeded)
+			_, next := h.runsAfter("")
+			// A run the service creates right after the listing, by its clock.
+			assert.True(t, listedFrom(t, next).Before(run.created.Add(-6*24*time.Hour)), next)
+		})
+	}
 }
 
 // A run retried after a review covered it keeps the time it was created.
