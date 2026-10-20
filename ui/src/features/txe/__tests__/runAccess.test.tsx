@@ -191,6 +191,31 @@ describe('useJobRunAllowed', () => {
     }
   });
 
+  // A share revoked while the page is open: the hub then answers 404.
+  it('turns a revoked share into no run', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      principal.current = TxeIdentityPrincipalClass.person;
+      answer(
+        [TxeAccessPermission.view, TxeAccessPermission.execute],
+        TxeJobAccessVia.share
+      );
+      const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
+      await waitFor(() => expect(result.current).toBe(true));
+
+      GET.mockResolvedValue({
+        error: { code: 'not_found' },
+        response: { status: 404 },
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ACCESS_REFRESH_MS + 100);
+      });
+      await waitFor(() => expect(result.current).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('says nothing when the job cannot be read', async () => {
     GET.mockResolvedValue({ error: { message: 'unavailable' } });
     const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });

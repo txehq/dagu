@@ -42,6 +42,11 @@ export function useJobRunAllowed(
       });
       // A failed read keeps the last answer (SWR keeps data on a throw), so a
       // passing error never brings back controls the hub refused.
+      // The hub's 404 is definitive: the job is gone or no longer shared,
+      // so nothing may be run from it.
+      if (res.response?.status === 404) {
+        return { permissions: [] as string[] };
+      }
       if (res.error || !res.data) {
         throw new Error('job access could not be read');
       }
