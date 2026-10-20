@@ -216,7 +216,26 @@ func (a *API) requireDAGVisible(ctx context.Context, dag *ir.DAG) error {
 
 // requireDAGExecute is requireDAGVisible for running a DAG.
 func (a *API) requireDAGExecute(ctx context.Context, dag *ir.DAG) error {
-	return a.requireNamedDAGExecute(ctx, txeNativeDAGName(dag), dagWorkspaceName(dag))
+	if err := a.requireNamedDAGExecute(ctx, txeNativeDAGName(dag), dagWorkspaceName(dag)); err != nil {
+		return err
+	}
+	return a.txeAliasCheck(ctx, dag, authz.PermissionExecute)
+}
+
+// txeAliasCheck decides a loaded DAG that is an alias of an owner's DAG (a
+// file that declares another name than its own, where either is an owner's
+// DAG name; txeNativeDAGName reports it as no owner's) as that owner's DAG
+// as well (TXE-4744). Viewing is not decided again: whoever may view an
+// ownerless DAG may view an owner's, or is refused the alias already.
+func (a *API) txeAliasCheck(ctx context.Context, dag *ir.DAG, permission authz.Permission) error {
+	if a.txeAuth == nil || dag == nil || permission == authz.PermissionView {
+		return nil
+	}
+	identity := txeOwnedIdentity(dag)
+	if identity == txeNativeDAGName(dag) || !txeNativeOwnedName(identity) {
+		return nil
+	}
+	return a.txeDAGRoute(ctx, identity, permission)
 }
 
 // requireNamedDAGVisible decides seeing the DAG dagName whose workspace, for
@@ -259,7 +278,54 @@ func (a *API) requireRunStatus(ctx context.Context, status *ir.DAGRunStatus, per
 	if err := check(ctx, root, statusWorkspaceName(status)); err != nil {
 		return err
 	}
-	return a.txeSubRunCheck(ctx, root, status.Name, permission)
+	if err := a.txeSubRunCheck(ctx, root, status.Name, permission); err != nil {
+		return err
+	}
+	return a.txeRunIdentityCheck(ctx, status, permission)
+}
+
+// txeRunIdentityCheck decides a run by the DAGs its attempts ran, as their
+// owners hold them, where its stored names do not: a run is stored under
+// the name its DAG declares, so a run of an alias of an owner's DAG names no
+// owner (TXE-4744). The run's own attempt is read, and for a sub-run every
+// run on its path up to its root. Viewing is not decided again (see
+// txeAliasCheck). A run whose attempt cannot be read is not taken for no
+// owner's where owners are decided.
+func (a *API) txeRunIdentityCheck(ctx context.Context, status *ir.DAGRunStatus, permission authz.Permission) error {
+	if a.txeAuth == nil || status == nil || permission == authz.PermissionView || a.dagRunRepository == nil {
+		return nil
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return err
+	}
+	if c.mode == authz.ModeOff && !c.ownerOnly() {
+		return nil
+	}
+	strict := c.ownerOnly() || c.mode == authz.ModeEnforce
+	self := ir.NewDAGRunRef(status.Name, status.DAGRunID)
+	root := status.Root
+	if root.Zero() || root == self {
+		attempt, err := a.dagRunRepository.FindAttempt(ctx, self)
+		if err != nil {
+			if strict {
+				return errTxeAuthzUnavailable
+			}
+			return nil
+		}
+		return a.txeRunRoute(ctx, status.Name, attempt, permission)
+	}
+	if err := a.txeSubRunPathRoute(ctx, root, status, permission); err != nil {
+		return err
+	}
+	attempt, err := a.dagRunRepository.FindSubAttempt(ctx, root, status.DAGRunID)
+	if err != nil {
+		if strict {
+			return errTxeAuthzUnavailable
+		}
+		return nil
+	}
+	return a.txeRunRoute(ctx, status.Name, attempt, permission)
 }
 
 // txeRunOwnerCheck adds the owner decisions on a run to whatever the hub's
