@@ -47,6 +47,18 @@ export function isSSOAdministrator(identity: TxeIdentity | undefined): boolean {
   );
 }
 
+// identityRefreshInterval re-reads the identity of a caller waiting for a
+// binding, a person or an SSO administrator, so an approval shows without a
+// reload; anyone else is read once.
+export function identityRefreshInterval(
+  latest: TxeIdentity | undefined
+): number {
+  const waiting =
+    (isTxePerson(latest) || isSSOAdministrator(latest)) &&
+    latest?.state !== TxeIdentityState.bound;
+  return waiting ? WAITING_REFRESH_MS : 0;
+}
+
 // How often a person waiting for access asks again, so an approval shows
 // without a reload.
 const WAITING_REFRESH_MS = 30_000;
@@ -77,10 +89,7 @@ export function useTxeIdentity(): {
       return res.data;
     },
     {
-      refreshInterval: (latest) =>
-        isTxePerson(latest) && latest?.state !== TxeIdentityState.bound
-          ? WAITING_REFRESH_MS
-          : 0,
+      refreshInterval: identityRefreshInterval,
     }
   );
   return {

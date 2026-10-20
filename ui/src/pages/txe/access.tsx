@@ -20,6 +20,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { AppBarContext } from '@/contexts/AppBarContext';
+import { useConfig } from '@/contexts/ConfigContext';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
 
@@ -83,12 +84,16 @@ function RequestRow({
   request,
   owners,
   own,
+  known,
   onChanged,
 }: {
   request: BindingRequest;
   owners: Owner[];
   // own is the signed-in administrator's own request.
   own: boolean;
+  // known is whether the hub has said who the caller is: until then a row
+  // could be the caller's own, so nothing is approved from it.
+  known: boolean;
   // onChanged re-reads the page, after an approval or a conflict.
   onChanged: () => Promise<void>;
 }): React.ReactElement {
@@ -165,7 +170,7 @@ function RequestRow({
               className={selectClass}
               value={ownerId}
               onChange={(e) => setOwnerId(e.target.value)}
-              disabled={busy}
+              disabled={busy || !known}
             >
               <option value="">{ts('Choose an owner…')}</option>
               {owners.map((owner) => (
@@ -188,7 +193,7 @@ function RequestRow({
             <Button
               size="sm"
               onClick={() => void approve()}
-              disabled={!ready || busy}
+              disabled={!ready || busy || !known}
             >
               <I18nText text="Approve" />
             </Button>
@@ -315,7 +320,18 @@ type AccessData = {
 export default function TxeAccessPage(): React.ReactElement {
   const appBarContext = React.useContext(AppBarContext);
   const access = useTxeAccessApi();
-  const { identity, reload: reloadIdentity } = useTxeIdentity();
+  const config = useConfig();
+  const {
+    identity,
+    isLoading: identityLoading,
+    error: identityError,
+    reload: reloadIdentity,
+  } = useTxeIdentity();
+  // Without builtin authentication there is no SSO administrator and no own
+  // request. With it, rows wait for the identity.
+  const identityKnown =
+    config.authMode !== 'builtin' ||
+    (!identityLoading && identity !== undefined);
   const [requesting, setRequesting] = React.useState(false);
   const [requestError, setRequestError] = React.useState<string>();
   const { data, error, mutate } = useSWR<AccessData>(
@@ -381,6 +397,18 @@ export default function TxeAccessPage(): React.ReactElement {
           <I18nText text="Loading…" />
         </p>
       )}
+      {data && !identityKnown && data.requests.length > 0 && (
+        <p
+          className="text-xs text-muted-foreground"
+          data-testid="txe-access-identity-unknown"
+        >
+          {identityError ? (
+            <I18nText text="Approvals wait until the hub says who you are, and it could not be read. Refresh the page to try again." />
+          ) : (
+            <I18nText text="Reading who you are before approvals are offered…" />
+          )}
+        </p>
+      )}
       {data && mayRequestOwn && (
         <section className="space-y-2" data-testid="txe-access-request-own">
           <p className="text-sm text-muted-foreground">
@@ -436,6 +464,7 @@ export default function TxeAccessPage(): React.ReactElement {
                       request={request}
                       owners={data.owners}
                       own={isOwnRequest(identity, request)}
+                      known={identityKnown}
                       onChanged={reload}
                     />
                   ))}

@@ -11,7 +11,7 @@ import {
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SWRConfig } from 'swr';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   TxeAccessActorKind,
@@ -34,14 +34,38 @@ vi.mock('@/hooks/api', () => ({
 
 // The signed-in caller, as GET /txe/identity reads it; the builtin
 // administrator unless a test says otherwise.
+const builtinAdmin = {
+  principal: { class: 'platform_admin', shown: { username: 'admin' } },
+  platform_admin: true,
+  is_person: false,
+  state: 'unbound',
+  owners: [],
+};
 const identity = vi.hoisted(() => ({
   value: undefined as unknown,
+  isLoading: false,
+  error: undefined as unknown,
   reload: vi.fn(),
 }));
 vi.mock('@/features/txe/identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/features/txe/identity')>()),
-  useTxeIdentity: () => ({ identity: identity.value, reload: identity.reload }),
+  useTxeIdentity: () => ({
+    identity: identity.value,
+    isLoading: identity.isLoading,
+    error: identity.error,
+    reload: identity.reload,
+  }),
 }));
+
+vi.mock('@/contexts/ConfigContext', () => ({
+  useConfig: () => ({ authMode: 'builtin' }),
+}));
+
+beforeEach(() => {
+  identity.value = builtinAdmin;
+  identity.isLoading = false;
+  identity.error = undefined;
+});
 
 // sso is an allowlisted SSO administrator with the given identity.
 function sso(subject: string, extra: Record<string, unknown> = {}) {
@@ -272,8 +296,32 @@ describe('TxeAccessPage', () => {
 
 describe('TxeAccessPage for an SSO administrator', () => {
   afterEach(() => {
-    identity.value = undefined;
     identity.reload.mockReset();
+  });
+
+  // Until the hub says who the caller is, any row could be its own: nothing
+  // is approved, and no owner is created, from it.
+  it('offers no approval while the identity is being read', async () => {
+    identity.value = undefined;
+    identity.isLoading = true;
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByTestId('txe-access-identity-unknown')
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    expect(screen.getByLabelText('Owner')).toBeDisabled();
+  });
+
+  it('offers no approval when the identity could not be read', async () => {
+    identity.value = undefined;
+    identity.error = new Error('unavailable');
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByTestId('txe-access-identity-unknown')
+    ).toHaveTextContent('could not be read');
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
   });
 
   // The hub refuses an administrator's approval of its own request (403).

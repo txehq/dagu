@@ -25,7 +25,11 @@ import TxeJobPage from '@/pages/txe/job';
 import { TxeApiError, type TxeApi } from '../api';
 import type { TxeAccessApi } from '../access';
 import { TxeAccessApiContext, TxeApiContext } from '../hooks';
-import { TxePersonGate, type TxeIdentity } from '../identity';
+import {
+  identityRefreshInterval,
+  TxePersonGate,
+  type TxeIdentity,
+} from '../identity';
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -103,6 +107,66 @@ function withCache(cache: Map<unknown, unknown>) {
 function renderGate(cache: Map<unknown, unknown> = new Map()) {
   return render(withCache(cache));
 }
+
+describe('identityRefreshInterval', () => {
+  // A caller waiting for a binding is read again so an approval shows; an SSO
+  // administrator can be waiting too (TXE-4710).
+  it.each([
+    [
+      'an unbound person',
+      TxeIdentityPrincipalClass.person,
+      'https://idp.example',
+      TxeIdentityState.unbound,
+      true,
+    ],
+    [
+      'a pending person',
+      TxeIdentityPrincipalClass.person,
+      'https://idp.example',
+      TxeIdentityState.pending,
+      true,
+    ],
+    [
+      'a bound person',
+      TxeIdentityPrincipalClass.person,
+      'https://idp.example',
+      TxeIdentityState.bound,
+      false,
+    ],
+    [
+      'a pending SSO administrator',
+      TxeIdentityPrincipalClass.platform_admin,
+      'https://idp.example',
+      TxeIdentityState.pending,
+      true,
+    ],
+    [
+      'a bound SSO administrator',
+      TxeIdentityPrincipalClass.platform_admin,
+      'https://idp.example',
+      TxeIdentityState.bound,
+      false,
+    ],
+    [
+      'the builtin administrator',
+      TxeIdentityPrincipalClass.platform_admin,
+      undefined,
+      TxeIdentityState.unbound,
+      false,
+    ],
+  ])('%s', (_who, cls, issuer, state, again) => {
+    const body = identity({
+      principal: {
+        class: cls,
+        issuer,
+        subject: issuer ? 'sub' : undefined,
+        shown: {},
+      },
+      state,
+    });
+    expect(identityRefreshInterval(body) > 0).toBe(again);
+  });
+});
 
 describe('TxePersonGate', () => {
   let setRefused: ReturnType<typeof vi.spyOn>;
