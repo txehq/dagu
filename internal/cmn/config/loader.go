@@ -59,8 +59,8 @@ const (
 	ServiceAgent
 
 	// ServiceHubClient is a command that only talks to a remote hub, such as
-	// "dagu txe". It loads all configuration, like ServiceNone, but serves
-	// nothing, so advice about the local server's auth mode is a notice.
+	// "dagu txe". It loads all configuration, like ServiceNone, but does not
+	// run the Dagu server, so advice about the server's auth mode is a notice.
 	ServiceHubClient
 )
 
@@ -710,7 +710,7 @@ func (l *ConfigLoader) loadAuthMode(cfg *Config, def Definition) {
 	if def.Auth == nil || def.Auth.Mode == nil {
 		cfg.Server.Auth.Mode = AuthModeBuiltin
 		if l.service == ServiceHubClient {
-			l.notices = append(l.notices, "No auth.mode configured — defaulting to 'builtin'; this command serves nothing, so it does not apply.")
+			l.notices = append(l.notices, "No auth.mode configured — defaulting to 'builtin'; this command does not run the Dagu server, so it does not apply.")
 			return
 		}
 		l.warnings = append(l.warnings, "No auth.mode configured — defaulting to 'builtin'. "+
