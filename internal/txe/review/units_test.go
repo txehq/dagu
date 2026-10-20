@@ -509,6 +509,9 @@ func TestCommandEffectorDoesNotHandTheReviewersContextToTheJob(t *testing.T) {
 		action := review.Action{ID: "act_1", Name: "a", TargetID: "t1", Params: map[string]string{"depth": "3"}}
 		declared := shellAction("env > env.txt", review.IdempotencyNone)
 		declared.Reconcile = declared.Command
+		// What the command sees is under test, not its timeout: a loaded
+		// machine can take more than shellAction's second to start a shell.
+		declared.TimeoutSec = 30
 		res := run(e, job, declared, action)
 		require.Equal(t, review.EffectApplied, res.Status, res.Detail)
 		raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
