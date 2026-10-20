@@ -13,6 +13,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/audit"
 	incidentmodel "github.com/dagucloud/dagu/v2/internal/incident"
 	incidentservice "github.com/dagucloud/dagu/v2/internal/service/incident"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
 
 var errIncidentManagementNotAvailable = &Error{
@@ -258,6 +259,9 @@ func (a *API) GetDAGIncidents(ctx context.Context, request api.GetDAGIncidentsRe
 	if err := a.requireIncidentManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionView); err != nil {
+		return nil, err
+	}
 	if err := a.ensureDAGExists(ctx, string(request.FileName)); err != nil {
 		return nil, err
 	}
@@ -270,6 +274,9 @@ func (a *API) GetDAGIncidents(ctx context.Context, request api.GetDAGIncidentsRe
 
 func (a *API) UpdateDAGIncidents(ctx context.Context, request api.UpdateDAGIncidentsRequestObject) (api.UpdateDAGIncidentsResponseObject, error) {
 	if err := a.requireIncidentManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -298,6 +305,9 @@ func (a *API) UpdateDAGIncidents(ctx context.Context, request api.UpdateDAGIncid
 
 func (a *API) DeleteDAGIncidents(ctx context.Context, request api.DeleteDAGIncidentsRequestObject) (api.DeleteDAGIncidentsResponseObject, error) {
 	if err := a.requireIncidentManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.ensureDAGExists(ctx, string(request.FileName)); err != nil {

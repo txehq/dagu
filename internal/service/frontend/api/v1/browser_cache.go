@@ -14,10 +14,14 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/replaycache"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
 
 func (a *API) ClearDAGBrowserCache(ctx context.Context, request api.ClearDAGBrowserCacheRequestObject) (api.ClearDAGBrowserCacheResponseObject, error) {
 	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), authz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	dag, err := a.dagRepository.GetMetadata(ctx, request.FileName)

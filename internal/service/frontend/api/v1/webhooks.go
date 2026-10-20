@@ -24,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
+	txeauthz "github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/google/uuid"
 	openapitypes "github.com/oapi-codegen/runtime/types"
 )
@@ -51,6 +52,9 @@ func (a *API) ListWebhooks(ctx context.Context, _ api.ListWebhooksRequestObject)
 
 	response := make([]api.WebhookDetails, 0, len(webhooks))
 	for _, wh := range webhooks {
+		if !a.txeWebhookVisible(ctx, wh.DAGName) {
+			continue
+		}
 		response = append(response, toWebhookDetails(wh))
 	}
 
@@ -61,6 +65,9 @@ func (a *API) ListWebhooks(ctx context.Context, _ api.ListWebhooksRequestObject)
 // Requires developer role or above.
 func (a *API) GetDAGWebhook(ctx context.Context, request api.GetDAGWebhookRequestObject) (api.GetDAGWebhookResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionView); err != nil {
 		return nil, err
 	}
 
@@ -88,6 +95,9 @@ func (a *API) GetDAGWebhook(ctx context.Context, request api.GetDAGWebhookReques
 // Requires developer role or above.
 func (a *API) CreateDAGWebhook(ctx context.Context, request api.CreateDAGWebhookRequestObject) (api.CreateDAGWebhookResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -141,6 +151,9 @@ func (a *API) DeleteDAGWebhook(ctx context.Context, request api.DeleteDAGWebhook
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 
 	// Get webhook info before deletion for audit logging
 	targetWebhook, _ := a.authService.GetWebhookByDAGName(ctx, request.FileName)
@@ -178,6 +191,9 @@ func (a *API) RegenerateDAGWebhookToken(ctx context.Context, request api.Regener
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 
 	result, err := a.authService.RegenerateWebhookToken(ctx, request.FileName)
 	if err != nil {
@@ -212,6 +228,9 @@ func (a *API) RegenerateDAGWebhookToken(ctx context.Context, request api.Regener
 // Requires developer role or above.
 func (a *API) ToggleDAGWebhook(ctx context.Context, request api.ToggleDAGWebhookRequestObject) (api.ToggleDAGWebhookResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -251,6 +270,9 @@ func (a *API) ConfigureDAGWebhookProfileSelection(
 	request api.ConfigureDAGWebhookProfileSelectionRequestObject,
 ) (api.ConfigureDAGWebhookProfileSelectionResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.requireAdmin(ctx); err != nil {
@@ -322,6 +344,9 @@ func (a *API) CreateDAGWebhookProfileToken(
 	request api.CreateDAGWebhookProfileTokenRequestObject,
 ) (api.CreateDAGWebhookProfileTokenResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if err := a.requireAdmin(ctx); err != nil {
@@ -398,6 +423,9 @@ func (a *API) RevokeDAGWebhookProfileToken(
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
@@ -463,6 +491,9 @@ func (a *API) EnableDAGWebhookHMAC(ctx context.Context, request api.EnableDAGWeb
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	if request.Body == nil {
 		return api.EnableDAGWebhookHMACdefaultJSONResponse{
 			StatusCode: http.StatusBadRequest,
@@ -518,6 +549,9 @@ func (a *API) ConfigureDAGWebhookHMAC(ctx context.Context, request api.Configure
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	if request.Body == nil {
 		return api.ConfigureDAGWebhookHMACdefaultJSONResponse{
 			StatusCode: http.StatusBadRequest,
@@ -570,6 +604,9 @@ func (a *API) RegenerateDAGWebhookHMACSecret(ctx context.Context, request api.Re
 	if err := a.requireWebhookManagement(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 
 	result, err := a.authService.RegenerateWebhookHMACSecret(ctx, request.FileName)
 	if err != nil {
@@ -608,6 +645,9 @@ func (a *API) RegenerateDAGWebhookHMACSecret(ctx context.Context, request api.Re
 // Requires developer role or above.
 func (a *API) DisableDAGWebhookHMAC(ctx context.Context, request api.DisableDAGWebhookHMACRequestObject) (api.DisableDAGWebhookHMACResponseObject, error) {
 	if err := a.requireWebhookManagement(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 
@@ -737,6 +777,10 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 			Code:       api.ErrorCodeNotFound,
 			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
 		}
+	}
+
+	if err := a.txeWebhookTrigger(ctx, dag); err != nil {
+		return nil, err
 	}
 
 	profileName, err := a.webhookRunProfile(ctx, authz, request.FileName, dagWorkspaceName(dag), requestedProfile)
