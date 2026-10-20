@@ -3277,7 +3277,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 					Message: "the conditional retry was sent and its outcome is unknown: " + err.Error(),
 					Details: map[string]any{"code": "dispatch_uncertain"}}
 			}
-			if refusal := dispatchRefusal(err); refusal != nil {
+			if refusal := a.dispatchRefusal(err, dag); refusal != nil {
 				return retryDAGRunResult{}, refusal
 			}
 			return retryDAGRunResult{}, fmt.Errorf("error dispatching retry to coordinator: %w", err)
@@ -4238,9 +4238,6 @@ func (a *API) resumeManagedAttempt(ctx context.Context, dag *ir.DAG, status *ir.
 		}
 		task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, runID, options...)
 		if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
-			if refusal := dispatchRefusal(err); refusal != nil {
-				return refusal
-			}
 			return fmt.Errorf("dispatch managed-agent resume: %w", err)
 		}
 		return nil

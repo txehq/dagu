@@ -19,43 +19,82 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 )
 
-// A start the coordinator refuses for want of a worker is answered with what
-// the caller can do, by a stable code, and not as an internal error. The
-// answer names nothing beyond the request. Any other failure is reported as
-// before (TXE-4712).
-func TestStartRefusedForWantOfAWorker(t *testing.T) {
-	start := func(dispatchErr error) error {
-		a := &API{config: &config.Config{}, coordinatorCli: &stubCoordinatorClient{dispatchErr: dispatchErr}}
-		dag := &ir.DAG{Name: "job_A", WorkerSelector: map[string]string{dispatch.MachineLabel: "mch_A1"}}
-		return a.dispatchStartToCoordinator(context.Background(), dag, startDAGRunOptions{dagRunID: "r1"}, "", time.Second)
-	}
-	for name, tc := range map[string]struct {
-		err    error
-		status int
-		code   string
-	}{
-		"no worker may take it": {fmt.Errorf("all coordinators failed: %w",
-			status.Error(codes.FailedPrecondition, dispatch.NoMatchingWorkersMessage)), http.StatusConflict, "no_eligible_worker"},
-		"no worker at all": {status.Error(codes.Unavailable, dispatch.NoAvailableWorkersMessage), http.StatusServiceUnavailable, "no_worker_available"},
-	} {
-		err := start(tc.err)
-		var apiErr *Error
-		require.True(t, errors.As(err, &apiErr), name)
-		assert.Equal(t, tc.status, apiErr.HTTPStatus, name)
-		assert.Equal(t, tc.code, apiErr.Details["code"], name)
-		assert.NotContains(t, apiErr.Message, "mch_A1", "%s: the answer names no machine", name)
-	}
+var (
+	errRefusedNoMatch  = fmt.Errorf("all coordinators failed: %w", status.Error(codes.FailedPrecondition, dispatch.NoMatchingWorkersMessage))
+	errRefusedNoWorker = status.Error(codes.Unavailable, dispatch.NoAvailableWorkersMessage)
+)
 
-	// Anything else is not taken for a refusal.
-	err := start(status.Error(codes.Unavailable, "connection refused"))
-	require.Error(t, err)
+func startWith(a *API, dag *ir.DAG, dispatchErr error) error {
+	a.coordinatorCli = &stubCoordinatorClient{dispatchErr: dispatchErr}
+	return a.dispatchStartToCoordinator(context.Background(), dag, startDAGRunOptions{dagRunID: "r1"}, "", time.Second)
+}
+
+func requireAnswer(t *testing.T, err error, status int, code string, msgAndArgs ...any) {
+	t.Helper()
 	var apiErr *Error
-	assert.False(t, errors.As(err, &apiErr), "an unclassified failure stays the error it was")
+	require.True(t, errors.As(err, &apiErr), msgAndArgs...)
+	assert.Equal(t, status, apiErr.HTTPStatus, msgAndArgs...)
+	assert.Equal(t, code, apiErr.Details["code"], msgAndArgs...)
+}
 
-	notStarted := errDispatchNotStarted(30 * time.Second)
-	assert.Equal(t, http.StatusServiceUnavailable, notStarted.HTTPStatus)
-	assert.Equal(t, "dispatch_not_started", notStarted.Details["code"])
-	assert.Contains(t, notStarted.Message, "30s")
+// A start the coordinator refuses for want of a worker is answered with what
+// the caller can do, by a stable code, and not as an internal error. A
+// refusal that does not show nothing was dispatched, and any other failure,
+// are reported as before (TXE-4712).
+func TestStartRefusedForWantOfAWorker(t *testing.T) {
+	a := &API{config: &config.Config{}}
+	dag := &ir.DAG{Name: "nightly", WorkerSelector: map[string]string{"os": "linux"}}
+
+	requireAnswer(t, startWith(a, dag, errRefusedNoMatch), http.StatusConflict, "no_eligible_worker", "no worker may take it")
+	requireAnswer(t, startWith(a, dag, errRefusedNoWorker), http.StatusServiceUnavailable, "no_worker_available", "no worker at all")
+
+	for name, err := range map[string]error{
+		"a refusal after a call that may have dispatched": fmt.Errorf("%w: %w", coordinator.ErrDispatchOutcomeUnknown, errRefusedNoMatch),
+		"another failure":                        status.Error(codes.Unavailable, "connection refused"),
+		"a message that only mentions a refusal": errors.New(dispatch.NoMatchingWorkersMessage),
+	} {
+		err := startWith(a, dag, err)
+		require.Error(t, err, name)
+		var apiErr *Error
+		assert.False(t, errors.As(err, &apiErr), "%s stays the error it was", name)
+	}
+}
+
+// Where owners are enforced, the answer is drawn from the caller's DAG
+// alone: whether it is pinned to a machine. Which workers the coordinator
+// sees, other owners' machines among them, makes no difference to it.
+func TestStartRefusalUnderEnforceNamesOnlyTheCallersDAG(t *testing.T) {
+	w := newTwoOwners(t, "enforce")
+	pinned := &ir.DAG{Name: "pinned", WorkerSelector: map[string]string{dispatch.MachineLabel: w.machineA}}
+	unpinned := &ir.DAG{Name: "unpinned"}
+	for _, refusal := range []error{errRefusedNoMatch, errRefusedNoWorker} {
+		requireAnswer(t, startWith(w.api, pinned, refusal), http.StatusServiceUnavailable, "machine_worker_unavailable", refusal.Error())
+		requireAnswer(t, startWith(w.api, unpinned, refusal), http.StatusConflict, "dag_not_pinned", refusal.Error())
+	}
+	var apiErr *Error
+	require.True(t, errors.As(startWith(w.api, pinned, errRefusedNoMatch), &apiErr))
+	assert.NotContains(t, apiErr.Message, w.machineA, "the answer names no machine")
+}
+
+// A run the coordinator accepted but that was not seen to start is not said
+// to have failed: it may yet start, and its ID is given to read it by.
+func TestStartUnconfirmedNamesTheRun(t *testing.T) {
+	err := errStartUnconfirmed("r1", 30*time.Second)
+	assert.Equal(t, http.StatusGatewayTimeout, err.HTTPStatus)
+	assert.Equal(t, "start_unconfirmed", err.Details["code"])
+	assert.Equal(t, "r1", err.Details["dag_run_id"])
+	assert.Contains(t, err.Message, "30s")
+	assert.NotContains(t, err.Message, "has not run")
+}
+
+// A start of selected steps goes to the coordinator as a seeded run, and is
+// answered the same way.
+func TestSeededStartRefusedForWantOfAWorker(t *testing.T) {
+	a := &API{config: &config.Config{}, coordinatorCli: &stubCoordinatorClient{dispatchErr: errRefusedNoMatch}}
+	dag := &ir.DAG{Name: "nightly", WorkerSelector: map[string]string{"os": "linux"}}
+	err := a.dispatchSeededRun(context.Background(), dag, &ir.DAGRunStatus{Name: "nightly", DAGRunID: "r1"}, "")
+	requireAnswer(t, err, http.StatusConflict, "no_eligible_worker")
 }

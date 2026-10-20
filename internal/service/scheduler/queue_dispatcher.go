@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	osexec "os/exec"
+	"strings"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
@@ -1491,13 +1492,29 @@ func dispatchAdmissionWaitingCondition(decision *dispatch.DispatchAdmissionDecis
 }
 
 func queuedDispatchCondition(err error) []queuedConditionDef {
-	if dispatch.IsNoMatchingWorker(err) {
+	if isNoMatchingWorker(err) {
 		return noMatchingWorkerConditionDefs
 	}
-	if dispatch.IsNoAvailableWorker(err) {
+	if isNoAvailableWorker(err) {
 		return noAvailableWorkerConditionDefs
 	}
 	return workerDispatchUnavailableConditionDefs
+}
+
+// isNoMatchingWorker and isNoAvailableWorker read a dispatch failure for the
+// condition recorded on a queued run, so they also accept a message that
+// only mentions the refusal: a diagnosis, never proof that nothing was
+// dispatched (dispatch.IsNoMatchingWorker is that).
+func isNoMatchingWorker(err error) bool {
+	return dispatch.IsNoMatchingWorker(err) || mentions(err, dispatch.NoMatchingWorkersMessage)
+}
+
+func isNoAvailableWorker(err error) bool {
+	return dispatch.IsNoAvailableWorker(err) || mentions(err, dispatch.NoAvailableWorkersMessage)
+}
+
+func mentions(err error, message string) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), message)
 }
 
 func (d *queueDispatcher) recordCapacityUnavailableConditions(

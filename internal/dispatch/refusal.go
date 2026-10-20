@@ -22,13 +22,14 @@ const (
 )
 
 // IsNoMatchingWorker reports whether err is the coordinator's refusal of a
-// task no connected worker may take. Nothing was dispatched.
+// task no connected worker may take: its gRPC status, as returned or
+// wrapped, never a message that merely mentions it.
 func IsNoMatchingWorker(err error) bool {
 	return isRefusal(err, codes.FailedPrecondition, NoMatchingWorkersMessage)
 }
 
 // IsNoAvailableWorker reports whether err is the coordinator's refusal for
-// want of any healthy worker. Nothing was dispatched.
+// want of any healthy worker, by its gRPC status as IsNoMatchingWorker.
 func IsNoAvailableWorker(err error) bool {
 	return isRefusal(err, codes.Unavailable, NoAvailableWorkersMessage)
 }
@@ -37,8 +38,6 @@ func isRefusal(err error, code codes.Code, message string) bool {
 	if err == nil {
 		return false
 	}
-	if st, ok := status.FromError(err); ok && st.Code() == code && strings.Contains(st.Message(), message) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), message)
+	st, ok := status.FromError(err)
+	return ok && st.Code() == code && strings.Contains(st.Message(), message)
 }

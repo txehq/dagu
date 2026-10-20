@@ -142,6 +142,9 @@ func (a *API) dispatchSeededRun(ctx context.Context, dag *ir.DAG, status *ir.DAG
 		opts...,
 	)
 	if err := a.coordinatorCli.Dispatch(ctx, dispatch.DispatchRequest{Task: task}); err != nil {
+		if refusal := a.dispatchRefusal(err, dag); refusal != nil {
+			return refusal
+		}
 		return fmt.Errorf("error dispatching seeded run to coordinator: %w", err)
 	}
 	return nil

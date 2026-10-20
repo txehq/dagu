@@ -15,7 +15,7 @@ import (
 
 // The coordinator's two refusals for want of a worker are told apart from
 // each other and from every other failure, as the coordinator returns them
-// and as the client wraps them.
+// and as the client wraps them, by their gRPC status alone.
 func TestDispatchRefusals(t *testing.T) {
 	noMatch := status.Error(codes.FailedPrecondition, NoMatchingWorkersMessage)
 	noWorker := status.Error(codes.Unavailable, NoAvailableWorkersMessage)
@@ -33,6 +33,10 @@ func TestDispatchRefusals(t *testing.T) {
 		"another refusal":         status.Error(codes.FailedPrecondition, "distributed dispatch requires DAG run storage"),
 		"the coordinator is down": status.Error(codes.Unavailable, "connection refused"),
 		"a plain error":           errors.New("boom"),
+		// Only the coordinator's status is the refusal, not a message that
+		// mentions it.
+		"another code naming it":   status.Error(codes.Internal, NoMatchingWorkersMessage),
+		"a plain error naming it":  errors.New(NoAvailableWorkersMessage),
 	} {
 		assert.False(t, IsNoMatchingWorker(err), name)
 		assert.False(t, IsNoAvailableWorker(err), name)
