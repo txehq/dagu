@@ -286,5 +286,60 @@ class Workflow(unittest.TestCase):
         self.assertIn("${{ github.event.pull_request.head.sha }}", group)
         self.assertNotIn("secrets.", gate)
 
+class TurnError(unittest.TestCase):
+    """codex-run.sh's turn_error names Tokun's own 401/402/403 (TXE-4714, ported from txe TXE-4344)."""
+
+    KEY = "sk-test" + "k" * 40
+
+    def run_turn_error(self, events):
+        src = open(os.path.join(HERE, "codex-run.sh")).read()
+        start = src.index("turn_error() {\n  python3 - \"$1\" <<'PY'\n") + len("turn_error() {\n  python3 - \"$1\" <<'PY'\n")
+        body = src[start:src.index("\nPY\n}", start)]
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "events.jsonl")
+            if isinstance(events, str):
+                with open(events) as src_f, open(f, "w") as out:
+                    out.write(src_f.read())
+            else:
+                with open(f, "w") as out:
+                    out.write("".join(json.dumps(e) + "\n" for e in events))
+            r = subprocess.run([sys.executable, "-I", "-", f], input=body, capture_output=True, text=True,
+                               env={"TOKUN_API_KEY": self.KEY, "PATH": os.environ.get("PATH", "")})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def failed(self, msg):
+        return [{"type": "turn.started"}, {"type": "turn.failed", "error": {"message": msg}}]
+
+    def test_the_measured_402_names_the_balance_and_drops_the_url(self):
+        out = self.run_turn_error(os.path.join(HERE, "testdata", "codex-0.157.1-tokun-402.jsonl"))
+        self.assertEqual(out, "Tokun answered HTTP 402 Payment Required: insufficient balance; "
+                              "the Tokun account behind TOKUN_API_KEY cannot cover the request; top up its balance")
+        self.assertNotIn("url", out)
+
+    def test_only_tokuns_own_messages_get_a_hint(self):
+        self.assertTrue(self.run_turn_error(self.failed("unexpected status 401 Unauthorized: invalid credential, url: http://x/v1"))
+                        .endswith("; Tokun did not accept TOKUN_API_KEY"))
+        self.assertTrue(self.run_turn_error(self.failed("unexpected status 403 Forbidden: credential budget exceeded"))
+                        .endswith("; the Tokun credential's budget is spent"))
+        relayed = self.run_turn_error(self.failed("unexpected status 403 Forbidden: upstream says no"))
+        self.assertEqual(relayed, "Tokun answered HTTP 403 Forbidden: upstream says no")
+
+    def test_the_last_error_event_is_used_without_a_turn_failed(self):
+        self.assertEqual(self.run_turn_error([{"type": "error", "message": "stream disconnected"}]), "Codex: stream disconnected")
+
+    def test_a_turn_with_no_error_says_nothing(self):
+        self.assertEqual(self.run_turn_error([{"type": "turn.started"}, {"type": "turn.completed"}]), "")
+
+    def test_a_message_holding_a_key_is_withheld(self):
+        self.assertEqual(self.run_turn_error(self.failed("bad key " + self.KEY)), "an error that holds the Tokun key, not printed")
+        self.assertEqual(self.run_turn_error(self.failed("ghp_" + "a" * 36 + " leaked")), "an error that holds a key or token, not printed")
+
+    def test_the_refusals_carry_the_cause(self):
+        src = open(os.path.join(HERE, "codex-run.sh")).read()
+        self.assertIn('fail "env probe: Codex gave no reply${cause:+ ($cause)}, so the probe proves nothing"', src)
+        self.assertIn('fail "Codex produced no review${cause:+ ($cause)}"', src)
+
+
 if __name__ == "__main__":
     unittest.main()

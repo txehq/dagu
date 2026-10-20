@@ -30,7 +30,9 @@
 #     to the trees, self-tested before every turn; a call lost mid-review fails the pass.
 #   - Every turn is --ephemeral: no session or rollout is kept, and CODEX_HOME is a
 #     temporary directory removed on exit. Nothing of Codex's state outlives the step.
-#   - Only token usage and Codex's error lines (cut short) reach the log; never the prompt.
+#   - Only token usage, Codex's error lines (cut short) and why a failed turn failed (turn_error:
+#     Tokun's HTTP status, when it answered one; ported from txe TXE-4344 by TXE-4714) reach the
+#     log; never the prompt.
 #   - A turn that gives no review (the probe: no reply) is run once more, about 30 s later, from a
 #     fresh CODEX_HOME, inside the 25 minutes one turn had (TXE-3623). Nothing else is retried:
 #     every refusal above fails the first time. The retry logs one line, its cause only.
@@ -377,21 +379,76 @@ else:
     print(f"clean {reached}")
 PY
 }
+
+# turn_error FILE: why a turn failed, read from Codex's JSONL, or nothing. Codex reports an HTTP
+# error from Tokun only there, never on stderr (measured on codex-cli 0.157.1, txe TXE-4344). On
+# 2026-10-20 every run here failed with only "no reply" while Tokun answered the key 402,
+# insufficient balance (TXE-4714). The cause is the turn.failed message, else the last error event:
+# the URL dropped, cut to 200 characters, and not printed at all if it holds a secret.
+turn_error() {
+  python3 - "$1" <<'PY'
+import json, os, re, sys
+failed = last = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(ev, dict):
+        continue
+    if ev.get("type") == "turn.failed":
+        failed = str((ev.get("error") or {}).get("message") or "") or failed
+    elif ev.get("type") == "error":
+        last = str(ev.get("message") or "") or last
+msg = failed or last
+if not msg:
+    sys.exit(0)
+if os.environ["TOKUN_API_KEY"] in msg:
+    print("an error that holds the Tokun key, not printed")
+    sys.exit(0)
+if re.search(r"sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}", msg):
+    print("an error that holds a key or token, not printed")
+    sys.exit(0)
+msg = re.sub(r",? url: [^\s)]+", "", msg)
+msg = re.sub(r"[^\x20-\x7e]", "?", msg)[:200]
+# Tokun's own answers, by status AND message: its credential check and its reserve step. The status
+# alone is not enough: Tokun relays an upstream provider's 401 or 403 unchanged, and that is no
+# fault of TOKUN_API_KEY or its account.
+hints = {
+    ("401", "missing credential"): "Tokun did not accept TOKUN_API_KEY",
+    ("401", "invalid credential"): "Tokun did not accept TOKUN_API_KEY",
+    ("402", "insufficient balance"): "the Tokun account behind TOKUN_API_KEY cannot cover the request; top up its balance",
+    ("403", "credential budget exceeded"): "the Tokun credential's budget is spent",
+}
+m = re.match(r"unexpected status (\d{3})\b([^:]*)(?::\s*(.*))?$", msg)
+if m:
+    hint = hints.get((m.group(1), (m.group(3) or "").strip()))
+    print(f"Tokun answered HTTP {m.group(1)}{m.group(2)}" + (f": {m.group(3)}" if m.group(3) is not None else "")
+          + (f"; {hint}" if hint else ""))
+else:
+    print(f"Codex: {msg}")
+PY
+}
 probe_env() {
-  local verdict started
+  local verdict started cause
   started="$(date +%s)"
   verdict="$(probe_turn)"
   # Only a turn with no reply is retried. A reply that ran a command, leaked or escaped is a
   # refusal the first time.
-  if [ "$verdict" = silent ] && may_retry "$started" "the env probe" "no reply" "$work/probe.err"; then
-    verdict="$(probe_turn)"
+  if [ "$verdict" = silent ]; then
+    cause="$(turn_error "$work/probe.jsonl")"
+    if [ -n "$cause" ]; then echo "codex-run: the env probe's turn failed: $cause"; fi
+    if may_retry "$started" "the env probe" "no reply" "$work/probe.err"; then
+      verdict="$(probe_turn)"
+      cause="$(turn_error "$work/probe.jsonl")"
+    fi
   fi
   case "$verdict" in
     clean*) echo "codex-run: env probe: with the review's flags Codex ran no command, so nothing it runs can see the Tokun key; its reply and tool answers hold neither the key nor its name (repo calls answered: ${verdict#clean })" ;;
     ran) fail "env probe: Codex ran a command in a turn whose shell is disabled; a command it runs could see the Tokun key" ;;
     leak) fail "env probe: Codex's reply or a tool answer holds the Tokun key" ;;
     escaped) fail "env probe: the repo tool answered a read outside the checkouts" ;;
-    *) errors "$work/probe.err"; fail "env probe: Codex gave no reply, so the probe proves nothing" ;;
+    *) errors "$work/probe.err"; fail "env probe: Codex gave no reply${cause:+ ($cause)}, so the probe proves nothing" ;;
   esac
 }
 
@@ -427,8 +484,8 @@ if [ "$mode" = probe ]; then
   exit 0
 fi
 
-# review_turn: one review turn and its live environment check; its exit code is left in rc. No
-# file of an earlier attempt survives into it.
+# review_turn: one review turn and its live environment check; its exit code is left in rc, and why
+# it failed (turn_error), if it did, in cause. No file of an earlier attempt survives into it.
 review_turn() {
   : >"$work/last.txt"
   rm -f -- "$work/live" "$work/live.env"
@@ -445,6 +502,10 @@ review_turn() {
   echo "codex-run: the pass exited $rc"
   usage "$work/events.jsonl" || true
   errors "$work/codex.err"
+  # A turn that gave its review may have reconnected on the way; only a failed one has a cause.
+  cause=""
+  if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then cause="$(turn_error "$work/events.jsonl")"; fi
+  if [ -n "$cause" ]; then echo "codex-run: the review turn failed: $cause"; fi
 }
 # refuse_turn: the checks that refuse a turn whatever else happened to it. They run on a failed
 # turn before any retry, so a retry never replaces a turn that would have been refused
@@ -471,7 +532,7 @@ if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then
   [ "$rc" -eq 0 ] || why="exit $rc"
   if may_retry "$started" "the review turn" "$why"; then review_turn; fi
 fi
-if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then fail "Codex produced no review"; fi
+if [ "$rc" -ne 0 ] || [ ! -s "$work/last.txt" ]; then fail "Codex produced no review${cause:+ ($cause)}"; fi
 refuse_turn
 # A turn that read nothing is said, not refused (TXE-3493): it is the packet-only review that ran
 # before TXE-3469, and refusing it posted no review at all on four passes of other PRs.

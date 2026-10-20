@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"01a13e3c-acfd-7cb0-b3cc-dd62bb64fb8b"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses)"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses)"}
+{"type":"error","message":"Reconnecting... 3/5 (unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses)"}
+{"type":"error","message":"Reconnecting... 4/5 (unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses)"}
+{"type":"error","message":"Reconnecting... 5/5 (unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses)"}
+{"type":"error","message":"unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses"}
+{"type":"turn.failed","error":{"message":"unexpected status 402 Payment Required: insufficient balance, url: http://127.0.0.1:18402/v1/responses"}}
