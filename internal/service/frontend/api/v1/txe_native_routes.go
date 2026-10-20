@@ -77,14 +77,21 @@ func (a *API) txeWebhookVisible(ctx context.Context, dagName string) bool {
 // is stored under the name its DAG declares, so a run's DAG is read from
 // its attempt.
 func txeOwnedIdentity(dag *ir.DAG) string {
-	stem := dag.SuspendFlagName()
-	source := strings.TrimSuffix(filepath.Base(dag.SourceFile), filepath.Ext(dag.SourceFile))
-	for _, name := range []string{stem, source, dag.Name} {
+	stem := func(path string) string {
+		if path == "" {
+			return ""
+		}
+		return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
+	// The file's name only when it has a location: without one,
+	// SuspendFlagName falls back to the declared name, which must not come
+	// before the source file's.
+	for _, name := range []string{stem(dag.Location), stem(dag.SourceFile), dag.Name} {
 		if name != "" && txeNativeOwnedName(name) {
 			return name
 		}
 	}
-	return stem
+	return dag.SuspendFlagName()
 }
 
 // txeRunRoute decides permission on a run's DAG after the route's own

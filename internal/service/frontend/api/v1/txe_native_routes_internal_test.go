@@ -44,3 +44,25 @@ func TestTxeWebhookTriggerOfAnOwnersDAG(t *testing.T) {
 		})
 	}
 }
+
+// txeOwnedIdentity reads an owner's DAG from a DAG's file, then from the file
+// it was loaded from (all a queued run keeps), then from its declared name;
+// without a location, the declared name never comes before the source file.
+func TestTxeOwnedIdentity(t *testing.T) {
+	machineA := txeauth.MachineDAGs("mch_01M4AAAAAAAAAAAAAAAAAAAAAA")[0]
+	machineB := txeauth.MachineDAGs("mch_01M4BBBBBBBBBBBBBBBBBBBBBB")[0]
+	for name, tc := range map[string]struct {
+		dag  ir.DAG
+		want string
+	}{
+		"its file":                         {ir.DAG{Name: "nightly", Location: "/dags/" + machineA + ".yaml"}, machineA},
+		"its source file, queued":          {ir.DAG{Name: "nightly", SourceFile: "/dags/" + machineA + ".yaml"}, machineA},
+		"source file before declared name": {ir.DAG{Name: machineB, SourceFile: "/dags/" + machineA + ".yaml"}, machineA},
+		"its declared name":                {ir.DAG{Name: machineB, Location: "/dags/nightly.yaml"}, machineB},
+		"no owner's":                       {ir.DAG{Name: "nightly", Location: "/dags/backup.yaml"}, "backup"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.want, txeOwnedIdentity(&tc.dag))
+		})
+	}
+}
