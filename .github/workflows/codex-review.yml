@@ -4,8 +4,9 @@ name: codex-review
 # connector has completed a review of the PR's current head with no P0 or P1 finding, or a person
 # added the `review-override` label. The rule and its reasons are .github/codex-review/
 # codex-review-check.sh, ported from txehq/txe ops/ci/codex-review-check.sh (TXE-4664, TXE-4666);
-# this file only decides when it runs. The connector itself reviews each push: it is the GitHub
-# App chatgpt-codex-connector, with automatic review on every push for this repository.
+# this file only decides when it runs. The connector (GitHub App chatgpt-codex-connector, its
+# repository setting "All PRs") is expected to start a review on its own; when none starts within a
+# few minutes of a new head, the author comments `@codex review` once for that head (README.md).
 #
 # It replaces the Tokun-backed review workflow (TXE-4204), which stopped on 2026-10-20 when the
 # Tokun account ran out of balance (TXE-4714). Nothing here holds a secret.
