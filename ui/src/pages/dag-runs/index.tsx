@@ -25,6 +25,7 @@ import { useConfig } from '../../contexts/ConfigContext';
 import { useSearchState } from '../../contexts/SearchStateContext';
 import { useUserPreferences } from '../../contexts/UserPreference';
 import DAGRunBatchActions from '../../features/dag-runs/components/common/DAGRunBatchActions';
+import { usePersonScope } from '@/features/txe/personScope';
 import { DAGRunDetailsModal } from '../../features/dag-runs/components/dag-run-details';
 import DAGRunGroupedView from '../../features/dag-runs/components/dag-run-list/DAGRunGroupedView';
 import DAGRunTable from '../../features/dag-runs/components/dag-run-list/DAGRunTable';
@@ -206,7 +207,12 @@ function DAGRuns() {
     () => viewScopeForSelection(workspaceSelection),
     [workspaceSelection]
   );
-  const canManageRunViews = useCanWriteForWorkspace(runViewScope.workspace);
+  // A person's runs list is for reading and opening runs: the hub refuses a
+  // person saved views, bulk retry and delete, and retries of registered
+  // job runs, so none is offered.
+  const person = usePersonScope();
+  const canManageRunViews =
+    useCanWriteForWorkspace(runViewScope.workspace) && !person;
   const {
     views: sharedRunViews,
     isLoading: runViewsLoading,
@@ -514,7 +520,10 @@ function DAGRuns() {
           const date = dayjs(value);
           return {
             from: date.startOf('month').format('YYYY-MM-DDTHH:mm'),
-            to: date.startOf('month').add(1, 'month').format('YYYY-MM-DDTHH:mm'),
+            to: date
+              .startOf('month')
+              .add(1, 'month')
+              .format('YYYY-MM-DDTHH:mm'),
           };
         }
         case 'year': {
@@ -1621,14 +1630,16 @@ function DAGRuns() {
             )}
           </div>
         </div>
-        <DAGRunBatchActions
-          selectedRuns={selectedRuns}
-          loadedCount={dagRuns.length}
-          onSelectAllLoaded={selectAllLoaded}
-          onClearSelection={clearSelection}
-          onReplaceSelection={replaceSelection}
-          onActionComplete={refreshDagRuns}
-        />
+        {!person && (
+          <DAGRunBatchActions
+            selectedRuns={selectedRuns}
+            loadedCount={dagRuns.length}
+            onSelectAllLoaded={selectAllLoaded}
+            onClearSelection={clearSelection}
+            onReplaceSelection={replaceSelection}
+            onActionComplete={refreshDagRuns}
+          />
+        )}
         {viewMode === 'list' ? (
           <DAGRunTable
             dagRuns={dagRuns}
@@ -1637,7 +1648,7 @@ function DAGRuns() {
             onSelectDAGRun={selectDAGRun}
             onViewArtifacts={viewDAGRunArtifacts}
             selectedRunKeys={selectedKeys}
-            onToggleBulkSelect={toggleSelection}
+            onToggleBulkSelect={person ? undefined : toggleSelection}
           />
         ) : (
           <DAGRunGroupedView
@@ -1647,7 +1658,7 @@ function DAGRuns() {
             onSelectDAGRun={selectDAGRun}
             onViewArtifacts={viewDAGRunArtifacts}
             selectedRunKeys={selectedKeys}
-            onToggleBulkSelect={toggleSelection}
+            onToggleBulkSelect={person ? undefined : toggleSelection}
           />
         )}
         <div className="mt-3 flex flex-col items-center gap-2">

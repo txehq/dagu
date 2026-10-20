@@ -44,6 +44,7 @@ import {
 } from '../../lib/workspace';
 import LoadingIndicator from '@/components/ui/loading-indicator';
 import { useViews, type View, type ViewSpec } from '@/hooks/useViews';
+import { usePersonScope } from '@/features/txe/personScope';
 import { I18nText } from '@/i18n/I18nText';
 
 type DAGDefinitionsFilters = WorkflowFilterSet;
@@ -266,9 +267,11 @@ function DAGsContent() {
     () => viewScopeForSelection(workspaceSelection),
     [workspaceSelection]
   );
-  const canManageWorkflowViews = useCanWriteForWorkspace(
-    workflowViewScope.workspace
-  );
+  // The hub refuses a person saved views and DAG writes, so a person's
+  // workflow list offers neither.
+  const person = usePersonScope();
+  const canManageWorkflowViews =
+    useCanWriteForWorkspace(workflowViewScope.workspace) && !person;
   const {
     views: sharedWorkflowViews,
     isLoading: workflowViewsLoading,
