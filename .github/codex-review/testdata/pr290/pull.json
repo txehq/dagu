@@ -1,0 +1,9 @@
+{
+ "number": 290,
+ "state": "open",
+ "head": {
+  "sha": "c6f314a3806a7acbadf6b906b2b95c7afbcff82d",
+  "ref": "synthetic-branch"
+ },
+ "labels": []
+}

@@ -1,3 +1,0 @@
-# Accounts whose PRs codex-review reviews, and who may start a pass (push, label, ready).
-# Read from main's copy only. One GitHub login per line; # starts a comment.
-connorwang
