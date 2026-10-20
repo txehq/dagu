@@ -29,9 +29,14 @@ for unit in txe-dagu-worker.service txe-dagu-tunnel.service; do
   if [ -e "$TXE_DAGU_UNITS_DIR/$unit" ] || [ "$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)" = active ]; then
     "$systemctl_bin" --user disable --now "$unit" >/dev/null || die "could not stop $unit; nothing was removed"
   fi
+  # is-active exits non-zero for an inactive unit, so its exit code is not the answer; its word is.
+  # Only "inactive" or "failed" is safe; an empty or unknown answer (no user bus, a failed query)
+  # fails closed.
   state="$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)"
   case "$state" in
-    active|activating|deactivating|reloading) die "$unit is still $state; nothing was removed" ;;
+    inactive|failed) ;;
+    "") die "could not confirm that $unit is stopped (systemctl gave no state); nothing was removed" ;;
+    *) die "$unit is still $state; nothing was removed" ;;
   esac
   rm -f -- "$TXE_DAGU_UNITS_DIR/$unit"
   printf 'removed %s\n' "$unit"

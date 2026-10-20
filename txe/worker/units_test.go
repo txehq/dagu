@@ -140,7 +140,7 @@ func TestUninstallSystemdPurgeRefusesAHomeWithoutMachineJSON(t *testing.T) {
 	require.NoError(t, err)
 	bin := t.TempDir()
 	// A stand-in systemctl, so the test needs no systemd.
-	require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\ncase \"$*\" in *is-active*) echo inactive; exit 3;; esac\nexit 0\n"), 0o755))
 	home := t.TempDir()
 	txe := filepath.Join(home, "not-a-txe-home")
 	require.NoError(t, os.MkdirAll(txe, 0o700))
@@ -166,6 +166,8 @@ func TestUninstallSystemdStopsBeforeItRemovesOrPurges(t *testing.T) {
 		{"stop fails", "case \"$*\" in *disable*) exit 1;; *is-active*) echo active;; esac\nexit 0\n", "could not stop txe-dagu-worker.service"},
 		// disable --now succeeds but the unit is still running.
 		{"still active", "case \"$*\" in *is-active*) echo active;; esac\nexit 0\n", "txe-dagu-worker.service is still active"},
+		// The state query itself fails: nothing confirms the worker stopped.
+		{"no state", "case \"$*\" in *is-active*) exit 1;; esac\nexit 0\n", "could not confirm that txe-dagu-worker.service is stopped"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			bin := t.TempDir()
