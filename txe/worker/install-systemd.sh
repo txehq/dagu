@@ -136,6 +136,9 @@ for unit in "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT"; do
   "$systemctl_bin" --user enable "$unit" >/dev/null 2>&1 || die "systemctl --user enable $unit failed"
   "$systemctl_bin" --user restart "$unit" || die "systemctl --user restart $unit failed"
 done
+# A unit that exits right after starting (expired kubeconfig, port in use) is a failed install.
+"$here/systemd-wait-active.sh" "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" \
+  || die "installed, but a unit is not running; fix it and install again (the units stay installed)"
 
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
   "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"

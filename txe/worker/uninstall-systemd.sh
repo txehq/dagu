@@ -44,12 +44,18 @@ done
 "$systemctl_bin" --user daemon-reload || die "systemctl --user daemon-reload failed"
 
 if [ "$purge" = 1 ]; then
-  case "$TXE_DAGU_HOME" in
-    ""|/|"$HOME") die "refusing to purge TXE_DAGU_HOME=$TXE_DAGU_HOME" ;;
+  # Compare canonical paths: "$HOME/", "$HOME/." or a link to it must not pass as another
+  # directory. The home itself, any directory that contains it, and / are refused.
+  [ -n "$TXE_DAGU_HOME" ] && [ -d "$TXE_DAGU_HOME" ] || die "refusing to purge TXE_DAGU_HOME=$TXE_DAGU_HOME: not a directory"
+  real="$(cd -P -- "$TXE_DAGU_HOME" && pwd -P)" || die "cannot resolve $TXE_DAGU_HOME"
+  home_real="$(cd -P -- "$HOME" && pwd -P)" || die "cannot resolve HOME"
+  case "$home_real/" in
+    "$real"/*) die "refusing to purge $real: it is your home directory or contains it" ;;
   esac
-  [ -f "$TXE_DAGU_HOME/machine.json" ] || die "refusing to purge $TXE_DAGU_HOME: it holds no machine.json"
-  rm -rf -- "$TXE_DAGU_HOME"
-  printf 'purged %s\n' "$TXE_DAGU_HOME"
+  [ "$real" != / ] || die "refusing to purge /"
+  [ -f "$real/machine.json" ] || die "refusing to purge $real: it holds no machine.json"
+  rm -rf -- "$real"
+  printf 'purged %s\n' "$real"
 else
   printf 'kept %s\n' "$TXE_DAGU_HOME"
 fi

@@ -192,3 +192,63 @@ func TestUninstallSystemdStopsBeforeItRemovesOrPurges(t *testing.T) {
 		})
 	}
 }
+
+func TestUninstallSystemdPurgeRefusesTheHomeHoweverSpelled(t *testing.T) {
+	agentsScript(t)
+	script, err := filepath.Abs("uninstall-systemd.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"),
+		[]byte("#!/bin/sh\ncase \"$*\" in *is-active*) echo inactive; exit 3;; esac\nexit 0\n"), 0o755))
+	base := t.TempDir()
+	home := filepath.Join(base, "home", "dev")
+	require.NoError(t, os.MkdirAll(home, 0o700))
+	// machine.json in the home itself: an install that used the home as its TXE home.
+	require.NoError(t, os.WriteFile(filepath.Join(home, "machine.json"), []byte("{}"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(home), "machine.json"), []byte("{}"), 0o600))
+	link := filepath.Join(base, "link-to-home")
+	require.NoError(t, os.Symlink(home, link))
+	for _, txe := range []string{home + "/", home + "/.", link, filepath.Dir(home), "/"} {
+		cmd := exec.Command(bash, script, "--purge")
+		cmd.Env = []string{"HOME=" + home, "TXE_DAGU_HOME=" + txe, "TXE_DAGU_UNITS_DIR=" + filepath.Join(base, "units"),
+			"PATH=" + bin + ":/usr/bin:/bin"}
+		var errOut bytes.Buffer
+		cmd.Stderr = &errOut
+		require.Error(t, cmd.Run(), txe)
+		assert.Regexp(t, `refusing to purge`, errOut.String(), txe)
+		_, statErr := os.Stat(filepath.Join(home, "machine.json"))
+		require.NoError(t, statErr, "the home survived %q", txe)
+	}
+}
+
+func TestSystemdWaitActive(t *testing.T) {
+	agentsScript(t)
+	script, err := filepath.Abs("systemd-wait-active.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	for _, c := range []struct {
+		name, state string
+		ok          bool
+	}{{"active", "active", true}, {"cycling", "activating", false}, {"failed", "failed", false}, {"no answer", "", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			bin := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "systemctl"),
+				[]byte("#!/bin/sh\necho '"+c.state+"'\n[ '"+c.state+"' = active ]\n"), 0o755))
+			cmd := exec.Command(bash, script, "txe-dagu-tunnel.service", "txe-dagu-worker.service")
+			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "TXE_DAGU_ACTIVE_WAIT=1", "TXE_DAGU_ACTIVE_SETTLE=0"}
+			var errOut bytes.Buffer
+			cmd.Stderr = &errOut
+			err := cmd.Run()
+			if c.ok {
+				require.NoError(t, err, errOut.String())
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, errOut.String(), "txe-dagu-tunnel.service is ")
+			assert.Contains(t, errOut.String(), "not active")
+		})
+	}
+}
