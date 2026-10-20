@@ -98,12 +98,15 @@ export function TxePersonGate({
   // session cannot set it, and a caller whose identity could not be read
   // gets streams as before.
   const isPerson = isTxePerson(identity);
+  const answered = identity !== undefined;
   React.useEffect(() => {
     if (!isLoading) {
       sseManager.setRefused(isPerson);
-      setPersonSignal(isPerson);
+      // Only an identity the hub answered is kept for the next load: a failed
+      // read lets this page go on as before, and the next load asks again.
+      setPersonSignal(isPerson, { persist: answered });
     }
-  }, [isLoading, isPerson]);
+  }, [isLoading, isPerson, answered]);
 
   const signOut = React.useCallback(async () => {
     const result = await logout();

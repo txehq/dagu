@@ -8,6 +8,7 @@ import {
   resetPersonSignalForTest,
   setPersonSignal,
   usePersonSignal,
+  personSignalStorageValue,
 } from '../personSignal';
 
 afterEach(() => {
@@ -23,11 +24,15 @@ describe('the person signal', () => {
 
     act(() => setPersonSignal(true));
     expect(result.current).toBe(true);
-    expect(sessionStorage.getItem('dagu_txe_person')).toBe('1');
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe(
+      personSignalStorageValue(true)
+    );
 
     act(() => setPersonSignal(false));
     expect(result.current).toBe(false);
-    expect(sessionStorage.getItem('dagu_txe_person')).toBe('0');
+    expect(sessionStorage.getItem('dagu_txe_person')).toBe(
+      personSignalStorageValue(false)
+    );
   });
 
   it('is forgotten on sign-out', () => {
@@ -39,12 +44,35 @@ describe('the person signal', () => {
     expect(result.current).toBeUndefined();
   });
 
+  // Another tab may have signed someone else in: a stored signal holds only
+  // for the session it was read for.
+  it("is not trusted for another session's token", () => {
+    localStorage.setItem('dagu_auth_token', 'token-a');
+    sessionStorage.setItem('dagu_txe_person', personSignalStorageValue(false));
+    localStorage.setItem('dagu_auth_token', 'token-b');
+    resetPersonSignalForTest();
+
+    const { result } = renderHook(() => usePersonSignal());
+    expect(result.current).toBeUndefined();
+    localStorage.removeItem('dagu_auth_token');
+  });
+
+  it('can hold for this page only', () => {
+    act(() => setPersonSignal(false, { persist: false }));
+
+    const { result } = renderHook(() => usePersonSignal());
+    expect(result.current).toBe(false);
+    expect(sessionStorage.getItem('dagu_txe_person')).toBeNull();
+  });
+
   // A reload of a person's tab must not ask before the identity is read.
   it('holds across a reload of this tab', () => {
-    sessionStorage.setItem('dagu_txe_person', '1');
+    localStorage.setItem('dagu_auth_token', 'token-a');
+    sessionStorage.setItem('dagu_txe_person', personSignalStorageValue(true));
     resetPersonSignalForTest();
 
     const { result } = renderHook(() => usePersonSignal());
     expect(result.current).toBe(true);
+    localStorage.removeItem('dagu_auth_token');
   });
 });

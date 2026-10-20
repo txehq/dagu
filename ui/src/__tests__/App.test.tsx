@@ -11,6 +11,7 @@ import App from '../App';
 import {
   resetPersonSignalForTest,
   setPersonSignal,
+  personSignalStorageValue,
 } from '@/features/txe/personSignal';
 import { setAuthSession } from '@/lib/authSession';
 import { useLicense } from '@/hooks/useLicense';
@@ -339,7 +340,7 @@ describe('App shell and the person signal', () => {
   }
 
   it('asks for none of them for a person', async () => {
-    sessionStorage.setItem('dagu_txe_person', '1');
+    sessionStorage.setItem('dagu_txe_person', personSignalStorageValue(true));
     resetPersonSignalForTest();
     renderAt('/home', builtin());
 
@@ -371,7 +372,7 @@ describe('App shell and the person signal', () => {
   // A new session may be a person even when the one before was not: nothing
   // is asked until the gate has read the new session's identity.
   it('forgets the signal when the session changes', async () => {
-    sessionStorage.setItem('dagu_txe_person', '0');
+    sessionStorage.setItem('dagu_txe_person', personSignalStorageValue(false));
     resetPersonSignalForTest();
     renderAt('/home', builtin());
     await waitFor(() =>
@@ -392,7 +393,7 @@ describe('App shell and the person signal', () => {
   // Only builtin authentication has persons: a flag left from such a session
   // does not hold back another mode.
   it('ignores the signal without builtin authentication', async () => {
-    sessionStorage.setItem('dagu_txe_person', '1');
+    sessionStorage.setItem('dagu_txe_person', personSignalStorageValue(true));
     resetPersonSignalForTest();
     renderAt('/home');
 
