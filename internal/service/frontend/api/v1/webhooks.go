@@ -714,6 +714,20 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 		}
 	}
 
+	// An owner's DAG is decided before the webhook is authenticated, so
+	// that no token of it is checked or marked used, and its answer is the
+	// same whatever the request presents (TXE-4762). A DAG that does not
+	// load is decided after authentication, as before.
+	ownerDecided := false
+	if a.txeAuth != nil {
+		if pre, loadErr := a.dagRepository.GetDetails(ctx, string(request.FileName), persis.DAGLoadOptions{}); loadErr == nil {
+			if err := a.txeWebhookTrigger(ctx, pre); err != nil {
+				return nil, err
+			}
+			ownerDecided = true
+		}
+	}
+
 	authz, err := a.authService.AuthorizeWebhookRequest(
 		ctx,
 		authservice.AuthorizeWebhookRequestInput{
@@ -779,8 +793,10 @@ func (a *API) TriggerWebhook(ctx context.Context, request api.TriggerWebhookRequ
 		}
 	}
 
-	if err := a.txeWebhookTrigger(ctx, dag); err != nil {
-		return nil, err
+	if !ownerDecided {
+		if err := a.txeWebhookTrigger(ctx, dag); err != nil {
+			return nil, err
+		}
 	}
 
 	profileName, err := a.webhookRunProfile(ctx, authz, request.FileName, dagWorkspaceName(dag), requestedProfile)
