@@ -194,4 +194,3 @@ func TestTxeBoundSSOAdministratorDecidesAsItsOwnersPerson(t *testing.T) {
 	require.Error(t, asAdmin, "the person's path: the run must exist")
 	require.Equal(t, asPerson.Error(), asAdmin.Error())
 }
-
