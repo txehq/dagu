@@ -680,6 +680,74 @@ func TestRegisterChecksTheStepsOwnContext(t *testing.T) {
 		require.Len(t, jobs, 1)
 		assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
 		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
+
+		// A session with its own key for the session's registry cannot
+		// finish it: the saved DAG still runs its steps with the other store.
+		own := newSession(f, home, "cc3-s000003")
+		_, err = own.Resume(ctx, incomplete.RequestID)
+		require.ErrorContains(t, err, "was built to run its steps with another context store")
+		assert.Equal(t, RegistrationIncomplete, f.job(jobs[0].JobID).Registration.State)
+		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
+	})
+
+	// A request begun before steps were given the machine's store names the
+	// session's own store in its DAG. Resuming it now would mark ready a job
+	// whose steps cannot run, so it is refused.
+	t.Run("RequestBegunWithTheSessionsStore", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		before := newSession(f, home, "cc2-s000002")
+		before.Hub = HubContext{DaguHome: filepath.Join(stores, "developer"), Name: "txe"}
+		f.mu.Lock()
+		f.failNextReady = true
+		f.mu.Unlock()
+		spec, _ := worktree(t, credentialFile(t))
+		_, err := before.Register(ctx, spec)
+		var incomplete *ErrIncomplete
+		require.ErrorAs(t, err, &incomplete)
+
+		after := newSession(f, home, "cc2-s000002")
+		after.Hub, after.StepClient = steps, f.client()
+		_, err = after.Resume(ctx, incomplete.RequestID)
+		require.ErrorContains(t, err, "was built to run its steps with another context store")
+		require.ErrorContains(t, err, "register the job again")
+	})
+
+	// The same session's request, interrupted before ready, is finished by a
+	// resume that gives the steps the same store, after the same checks.
+	t.Run("ResumeWithTheSameSteps", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, f.client()
+		f.mu.Lock()
+		f.failNextReady = true
+		f.mu.Unlock()
+		spec, _ := worktree(t, credentialFile(t))
+		_, err := s.Register(ctx, spec)
+		var incomplete *ErrIncomplete
+		require.ErrorAs(t, err, &incomplete)
+
+		again := newSession(f, home, "cc3-s000003")
+		again.Hub, again.StepClient = steps, f.client()
+		out, err := again.Resume(ctx, incomplete.RequestID)
+		require.NoError(t, err)
+		assert.Equal(t, RegistrationReady, f.job(out.Receipt.JobID).Registration.State)
+
+		// A resume whose steps' context reaches another registry is refused
+		// before anything is sent.
+		other := newFakeRegistry(t)
+		f.mu.Lock()
+		f.failNextReady = true
+		f.mu.Unlock()
+		spec2, _ := worktree(t, credentialFile(t))
+		spec2.JobKey = "nightly-collector-2"
+		_, err = s.Register(ctx, spec2)
+		require.ErrorAs(t, err, &incomplete)
+		elsewhere := newSession(f, home, "cc3-s000003")
+		elsewhere.Hub, elsewhere.StepClient = steps, other.client()
+		_, err = elsewhere.Resume(ctx, incomplete.RequestID)
+		require.ErrorContains(t, err, "cannot read machine "+testMachine)
 	})
 }
 

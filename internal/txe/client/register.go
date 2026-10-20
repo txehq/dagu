@@ -370,6 +370,30 @@ func (r *Registrar) checkStepHub(ctx context.Context) error {
 	return nil
 }
 
+// checkSavedSteps refuses a journal entry whose saved DAG runs the job's
+// steps with another context store than this registrar gives them. That
+// covers a request begun before steps were given the machine's store, and
+// one resumed from a session that reaches the hub another way.
+func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
+	var request struct {
+		Version JobVersion `json:"version"`
+	}
+	if err := json.Unmarshal(entry.Request, &request); err != nil {
+		return fmt.Errorf("read the DAG saved with request %s: %w", entry.RequestID, err)
+	}
+	// Each step command is one JSON-quoted line in the DAG, and the resource
+	// check ends with the machine and then the store flags.
+	tail, err := json.Marshal(txepkg.ShellJoin(append([]string{"--machine", entry.MachineID}, r.cli().StoreFlags...)))
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(request.Version.DAG.Spec, " "+string(tail[1:])) {
+		return fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
+			"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(r.cli().StoreFlags))
+	}
+	return nil
+}
+
 // checkStepJob refuses to mark a job ready unless the steps' context reads
 // it as this session registered it: the same job, owner, machine, version and
 // package. A hub that merely holds the same machine is not enough.
@@ -689,6 +713,15 @@ func (r *Registrar) advance(ctx context.Context, entry *txepkg.Entry) (*Outcome,
 	if entry.MachineID != machine.MachineID || entry.OwnerID != machine.OwnerID {
 		return nil, fmt.Errorf("request %s was built on machine %s for owner %s; this is machine %s of owner %s, which cannot send or finish it",
 			entry.RequestID, entry.MachineID, entry.OwnerID, machine.MachineID, machine.OwnerID)
+	}
+	// A resumed request keeps the DAG it was built with. It is sent or
+	// finished only by a session whose job steps use the same context store,
+	// so that the checks below are made on the store its steps will read.
+	if err := r.checkSavedSteps(entry); err != nil {
+		return nil, err
+	}
+	if err := r.checkStepHub(ctx); err != nil {
+		return nil, err
 	}
 
 	// 1. The hub saves the job version and its DAG. Before this succeeds the
