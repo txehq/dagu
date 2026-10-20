@@ -131,6 +131,9 @@ type txeEnrolView struct {
 	ApproveURL string `json:"approve_url,omitempty"`
 	// State is "applied" (awaiting a person's approval) or "enrolled".
 	State string `json:"state"`
+	// StepAuth is "credential" once the machine's job steps present the
+	// credential.
+	StepAuth string `json:"step_auth,omitempty"`
 	// resume is the command that keeps the application live.
 	resume string
 }
@@ -243,6 +246,19 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 	}
 	if view.Application != nil {
 		view.ApproveURL = txeEnrolApproveURL(remote.baseURL, machine.MachineID, clientID)
+	}
+	// Once the hub takes the credential as this machine, the machine's job
+	// steps present it from now on (txeStepRemote). Recorded only then: an
+	// application alone changes nothing a step does.
+	if view.State == "enrolled" {
+		hub, err := cliauth.NormalizeHub(remote.baseURL)
+		if err != nil {
+			return err
+		}
+		if err := home.SetStepCredential(string(authn.ClassWorker), path, hub); err != nil {
+			return fmt.Errorf("the machine is enrolled, but its job steps could not be told to use the credential: %w", err)
+		}
+		view.StepAuth = txepkg.StepModeCredential
 	}
 	return txeOutput(ctx, view, func(p *txePrinter) { printEnrol(p, view) })
 }
@@ -597,6 +613,9 @@ func printEnrol(p *txePrinter, v txeEnrolView) {
 	switch {
 	case v.State == "enrolled":
 		p.f("Enrolled: the hub takes this machine's worker credential.\n")
+		if v.StepAuth != "" {
+			p.f("Job steps on this machine now present it, and never the context's API key.\n")
+		}
 	case v.Application != nil:
 		a := v.Application
 		p.f("Applied; the application is live until %s.\n", a.CredentialExpires.Format(time.RFC3339))

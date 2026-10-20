@@ -157,16 +157,18 @@ func txeSignInStore(ctx *Context, remote *remoteClient) (*cliauth.Store, string,
 }
 
 // txeInDAGStep reports whether this command runs as a step of a DAG run. A
-// step is unattended: it never uses a person's interactive sign-in, and
-// keeps the context's API key until machines hold their own credential.
+// step is unattended: it never uses a person's interactive sign-in. It
+// presents the machine's own credential when the machine is enrolled for the
+// step's class, and the context's API key otherwise (txeStepRemote).
 func txeInDAGStep() bool {
 	return os.Getenv(runenv.EnvKeyDAGRunID) != "" && os.Getenv(runenv.EnvKeyDAGRunStepName) != ""
 }
 
 // txeHubAuth decides what remote's calls carry.
 //
-// With no sign-in for the hub on this machine, or inside a DAG step, nothing
-// changes: the context's API key, and no extra request. With a sign-in, the
+// Inside a DAG step, txeStepRemote decides. With no sign-in for the hub on
+// this machine, nothing changes: the context's API key, and no extra
+// request. With a sign-in, the
 // hub is asked which routes take it (GET /txe/auth/cli):
 //   - the hub does not accept CLI sign-in: the API key;
 //   - the hub names another provider or client than the sign-in was made
@@ -180,7 +182,7 @@ func txeInDAGStep() bool {
 // refused sign-in is reported, not replaced by the API key.
 func txeHubAuth(ctx *Context, remote *remoteClient) (*remoteClient, error) {
 	if txeInDAGStep() {
-		return remote, nil
+		return txeStepRemote(ctx, ctx.Command, remote)
 	}
 	hub, err := cliauth.NormalizeHub(remote.baseURL)
 	if err != nil {

@@ -246,7 +246,7 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 	baseCtx := ctx
 	eventSourceInstance := eventstore.DefaultSourceInstance()
 	if scope == commandScopeContextAware && selectedContextName != localContextName {
-		remote, err := newRemoteClient(selectedContext)
+		remote, err := newCommandRemoteClient(ctx, cmd, selectedContext)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize remote context %q: %w", selectedContextName, err)
 		}
