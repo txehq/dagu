@@ -30,6 +30,36 @@ export function isTxePerson(identity: TxeIdentity | undefined): boolean {
   return identity?.principal.class === TxeIdentityPrincipalClass.person;
 }
 
+// actsForOwner reports a caller the hub treats as a person of an owner: a
+// person bound to it, or an allowlisted SSO administrator bound to it
+// (is_person with owners). It owns that owner's machines and decisions.
+export function actsForOwner(identity: TxeIdentity | undefined): boolean {
+  return identity?.is_person === true && (identity.owners?.length ?? 0) > 0;
+}
+
+// isSSOAdministrator reports the installation's administrator signed in
+// through the identity provider, named by issuer and subject: unlike the
+// builtin administrator it has a binding of its own.
+export function isSSOAdministrator(identity: TxeIdentity | undefined): boolean {
+  return (
+    identity?.principal.class === TxeIdentityPrincipalClass.platform_admin &&
+    !!identity.principal.issuer &&
+    !!identity.principal.subject
+  );
+}
+
+// identityRefreshInterval re-reads the identity of a caller waiting for a
+// binding, a person or an SSO administrator, so an approval shows without a
+// reload; anyone else is read once.
+export function identityRefreshInterval(
+  latest: TxeIdentity | undefined
+): number {
+  const waiting =
+    (isTxePerson(latest) || isSSOAdministrator(latest)) &&
+    latest?.state !== TxeIdentityState.bound;
+  return waiting ? WAITING_REFRESH_MS : 0;
+}
+
 // How often a person waiting for access asks again, so an approval shows
 // without a reload.
 const WAITING_REFRESH_MS = 30_000;
@@ -60,10 +90,7 @@ export function useTxeIdentity(): {
       return res.data;
     },
     {
-      refreshInterval: (latest) =>
-        isTxePerson(latest) && latest?.state !== TxeIdentityState.bound
-          ? WAITING_REFRESH_MS
-          : 0,
+      refreshInterval: identityRefreshInterval,
     }
   );
   return {

@@ -55,6 +55,7 @@ import { useUserPreferences } from './contexts/UserPreference';
 import { WorkspaceSelector } from './components/workspace/WorkspaceSelector';
 import { LanguageSelector } from './components/LanguageSelector';
 import { useI18n } from './i18n/I18nProvider';
+import { actsForOwner, useTxeIdentity } from '@/features/txe/identity';
 
 type NavItemProps = {
   to: string;
@@ -665,6 +666,8 @@ export const mainListItems = React.forwardRef<
       : roleAtLeast(user?.role ?? null, UserRole.developer);
   const canManageIncidents = INCIDENTS_ENABLED && canManageNotifications;
   const canAccessSystemStatus = useCanAccessSystemStatus();
+  // An SSO administrator bound to an owner has that owner's machines.
+  const ownerMachines = actsForOwner(useTxeIdentity().identity);
   const canAccessGitSync = useCanAccessGitSync();
   const canManageWebhooks = useCanManageWebhooks();
   const canManageProfiles = useCanManageProfiles();
@@ -951,6 +954,15 @@ export const mainListItems = React.forwardRef<
               onClick={onNavItemClick}
               customColor={customColor}
             />
+            {ownerMachines && (
+              <NavItem
+                to="/txe/machines"
+                text="Machines"
+                isOpen={isOpen}
+                onClick={onNavItemClick}
+                customColor={customColor}
+              />
+            )}
           </NavGroup>
 
           {(canAccessSystemStatus || canViewEventLogs || canViewAuditLogs) && (

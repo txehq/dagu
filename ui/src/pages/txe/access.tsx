@@ -20,12 +20,18 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { AppBarContext } from '@/contexts/AppBarContext';
+import { useConfig } from '@/contexts/ConfigContext';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
 
 import type { Binding, BindingRequest, Owner } from '@/features/txe/access';
 import { TxeApiError } from '@/features/txe/api';
 import { useTxeAccessApi } from '@/features/txe/hooks';
+import {
+  isSSOAdministrator,
+  useTxeIdentity,
+  type TxeIdentity,
+} from '@/features/txe/identity';
 
 // NEW_OWNER is the owner choice that creates an owner before binding.
 const NEW_OWNER = '__new__';
@@ -61,13 +67,33 @@ function Identity({
   );
 }
 
+// isOwnRequest is whether the request is the signed-in administrator's own,
+// which the hub lets only another administrator approve.
+function isOwnRequest(
+  identity: TxeIdentity | undefined,
+  request: BindingRequest
+): boolean {
+  return (
+    isSSOAdministrator(identity) &&
+    identity?.principal.issuer === request.issuer &&
+    identity?.principal.subject === request.subject
+  );
+}
+
 function RequestRow({
   request,
   owners,
+  own,
+  known,
   onChanged,
 }: {
   request: BindingRequest;
   owners: Owner[];
+  // own is the signed-in administrator's own request.
+  own: boolean;
+  // known is whether the hub has said who the caller is: until then a row
+  // could be the caller's own, so nothing is approved from it.
+  known: boolean;
   // onChanged re-reads the page, after an approval or a conflict.
   onChanged: () => Promise<void>;
 }): React.ReactElement {
@@ -130,40 +156,49 @@ function RequestRow({
         <RelativeTime timestamp={request.requested_at} />
       </TableCell>
       <TableCell>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label={ts('Owner')}
-            className={selectClass}
-            value={ownerId}
-            onChange={(e) => setOwnerId(e.target.value)}
-            disabled={busy}
+        {own ? (
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="txe-access-own-request"
           >
-            <option value="">{ts('Choose an owner…')}</option>
-            {owners.map((owner) => (
-              <option key={owner.owner_id} value={owner.owner_id}>
-                {owner.display_name} ({owner.owner_id})
-              </option>
-            ))}
-            <option value={NEW_OWNER}>{ts('New owner…')}</option>
-          </select>
-          {creating && (
-            <Input
-              aria-label={ts('New owner name')}
-              className="h-8 w-48 text-xs"
-              placeholder={ts('New owner name')}
-              value={newOwnerName}
-              onChange={(e) => setNewOwnerName(e.target.value)}
-              disabled={busy || created !== undefined}
-            />
-          )}
-          <Button
-            size="sm"
-            onClick={() => void approve()}
-            disabled={!ready || busy}
-          >
-            <I18nText text="Approve" />
-          </Button>
-        </div>
+            <I18nText text="This is your own request. Another platform administrator has to approve it." />
+          </p>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              aria-label={ts('Owner')}
+              className={selectClass}
+              value={ownerId}
+              onChange={(e) => setOwnerId(e.target.value)}
+              disabled={busy || !known}
+            >
+              <option value="">{ts('Choose an owner…')}</option>
+              {owners.map((owner) => (
+                <option key={owner.owner_id} value={owner.owner_id}>
+                  {owner.display_name} ({owner.owner_id})
+                </option>
+              ))}
+              <option value={NEW_OWNER}>{ts('New owner…')}</option>
+            </select>
+            {creating && (
+              <Input
+                aria-label={ts('New owner name')}
+                className="h-8 w-48 text-xs"
+                placeholder={ts('New owner name')}
+                value={newOwnerName}
+                onChange={(e) => setNewOwnerName(e.target.value)}
+                disabled={busy || created !== undefined}
+              />
+            )}
+            <Button
+              size="sm"
+              onClick={() => void approve()}
+              disabled={!ready || busy || !known}
+            >
+              <I18nText text="Approve" />
+            </Button>
+          </div>
+        )}
         {error && (
           <p className="mt-1 text-xs text-destructive" role="alert">
             {error}
@@ -285,6 +320,20 @@ type AccessData = {
 export default function TxeAccessPage(): React.ReactElement {
   const appBarContext = React.useContext(AppBarContext);
   const access = useTxeAccessApi();
+  const config = useConfig();
+  const {
+    identity,
+    isLoading: identityLoading,
+    error: identityError,
+    reload: reloadIdentity,
+  } = useTxeIdentity();
+  // Without builtin authentication there is no SSO administrator and no own
+  // request. With it, rows wait for the identity.
+  const identityKnown =
+    config.authMode !== 'builtin' ||
+    (!identityLoading && identity !== undefined);
+  const [requesting, setRequesting] = React.useState(false);
+  const [requestError, setRequestError] = React.useState<string>();
   const { data, error, mutate } = useSWR<AccessData>(
     ['txe', 'access'],
     async () => {
@@ -307,6 +356,26 @@ export default function TxeAccessPage(): React.ReactElement {
     appBarContext.setTitle('Access requests');
   }, [appBarContext]);
 
+  // An SSO administrator who acts for no owner may ask to be bound, as a
+  // person does; another administrator approves it.
+  const mayRequestOwn =
+    isSSOAdministrator(identity) &&
+    !identity?.is_person &&
+    !identity?.request &&
+    !data?.requests.some((r) => isOwnRequest(identity, r));
+  const requestOwn = async () => {
+    setRequesting(true);
+    setRequestError(undefined);
+    try {
+      await access.requestAccess();
+      await Promise.all([reload(), reloadIdentity()]);
+    } catch (err) {
+      setRequestError(errorText(err));
+    } finally {
+      setRequesting(false);
+    }
+  };
+
   const ownerName = (ownerId: string) =>
     data?.owners.find((o) => o.owner_id === ownerId)?.display_name ?? ownerId;
 
@@ -327,6 +396,38 @@ export default function TxeAccessPage(): React.ReactElement {
         <p className="text-sm text-muted-foreground">
           <I18nText text="Loading…" />
         </p>
+      )}
+      {data && !identityKnown && data.requests.length > 0 && (
+        <p
+          className="text-xs text-muted-foreground"
+          data-testid="txe-access-identity-unknown"
+        >
+          {identityError ? (
+            <I18nText text="Approvals wait until the hub says who you are, and it could not be read. Refresh the page to try again." />
+          ) : (
+            <I18nText text="Reading who you are before approvals are offered…" />
+          )}
+        </p>
+      )}
+      {data && mayRequestOwn && (
+        <section className="space-y-2" data-testid="txe-access-request-own">
+          <p className="text-sm text-muted-foreground">
+            <I18nText text="You administer this hub but act for no owner, so you have no machines or jobs of your own. Ask to be bound to an owner; another platform administrator approves it." />
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void requestOwn()}
+            disabled={requesting}
+          >
+            <I18nText text="Request access for yourself" />
+          </Button>
+          {requestError && (
+            <p className="text-xs text-destructive" role="alert">
+              {requestError}
+            </p>
+          )}
+        </section>
       )}
       {data && (
         <>
@@ -362,6 +463,8 @@ export default function TxeAccessPage(): React.ReactElement {
                       key={`${request.issuer}|${request.subject}`}
                       request={request}
                       owners={data.owners}
+                      own={isOwnRequest(identity, request)}
+                      known={identityKnown}
                       onChanged={reload}
                     />
                   ))}

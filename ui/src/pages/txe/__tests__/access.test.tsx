@@ -7,10 +7,11 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SWRConfig } from 'swr';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   TxeAccessActorKind,
@@ -30,6 +31,58 @@ import TxeAccessPage from '../access';
 vi.mock('@/hooks/api', () => ({
   useClient: () => ({}),
 }));
+
+// The signed-in caller, as GET /txe/identity reads it; the builtin
+// administrator unless a test says otherwise.
+const builtinAdmin = {
+  principal: { class: 'platform_admin', shown: { username: 'admin' } },
+  platform_admin: true,
+  is_person: false,
+  state: 'unbound',
+  owners: [],
+};
+const identity = vi.hoisted(() => ({
+  value: undefined as unknown,
+  isLoading: false,
+  error: undefined as unknown,
+  reload: vi.fn(),
+}));
+vi.mock('@/features/txe/identity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/features/txe/identity')>()),
+  useTxeIdentity: () => ({
+    identity: identity.value,
+    isLoading: identity.isLoading,
+    error: identity.error,
+    reload: identity.reload,
+  }),
+}));
+
+vi.mock('@/contexts/ConfigContext', () => ({
+  useConfig: () => ({ authMode: 'builtin' }),
+}));
+
+beforeEach(() => {
+  identity.value = builtinAdmin;
+  identity.isLoading = false;
+  identity.error = undefined;
+});
+
+// sso is an allowlisted SSO administrator with the given identity.
+function sso(subject: string, extra: Record<string, unknown> = {}) {
+  return {
+    principal: {
+      class: 'platform_admin',
+      issuer: 'https://idp.example',
+      subject,
+      shown: {},
+    },
+    platform_admin: true,
+    is_person: false,
+    state: 'unbound',
+    owners: [],
+    ...extra,
+  };
+}
 
 const stamp = {
   at: '2026-10-14T12:00:00Z',
@@ -238,5 +291,95 @@ describe('TxeAccessPage', () => {
       })
     );
     expect(await screen.findByText('forbidden')).toBeInTheDocument();
+  });
+});
+
+describe('TxeAccessPage for an SSO administrator', () => {
+  afterEach(() => {
+    identity.reload.mockReset();
+  });
+
+  // Until the hub says who the caller is, any row could be its own: nothing
+  // is approved, and no owner is created, from it.
+  it('offers no approval while the identity is being read', async () => {
+    identity.value = undefined;
+    identity.isLoading = true;
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByTestId('txe-access-identity-unknown')
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    expect(screen.getByLabelText('Owner')).toBeDisabled();
+  });
+
+  it('offers no approval when the identity could not be read', async () => {
+    identity.value = undefined;
+    identity.error = new Error('unavailable');
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByTestId('txe-access-identity-unknown')
+    ).toHaveTextContent('could not be read');
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+  });
+
+  // The hub refuses an administrator's approval of its own request (403).
+  it("offers no approval of the administrator's own request", async () => {
+    identity.value = sso('sub-ada', { state: 'pending' });
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByTestId('txe-access-own-request')
+    ).toHaveTextContent('Another platform administrator has to approve it.');
+    expect(
+      screen.queryByRole('button', { name: 'Approve' })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId('txe-access-request-own')).toBeNull();
+  });
+
+  it("approves another person's request as before", async () => {
+    identity.value = sso('sub-root', {
+      is_person: true,
+      state: 'bound',
+      owners: [{ owner_id: 'own_A', display_name: 'Team A' }],
+    });
+    renderPage(fakeAccess());
+
+    expect(
+      await screen.findByRole('button', { name: 'Approve' })
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('txe-access-own-request')).toBeNull();
+    expect(screen.queryByTestId('txe-access-request-own')).toBeNull();
+  });
+
+  it('asks for access for an administrator who acts for no owner, on its press only', async () => {
+    identity.value = sso('sub-root');
+    const api = fakeAccess({ listRequests: vi.fn(async () => []) });
+    renderPage(api);
+
+    const own = await screen.findByTestId('txe-access-request-own');
+    expect(api.requestAccess).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(own).getByRole('button', { name: 'Request access for yourself' })
+    );
+    await waitFor(() => expect(api.requestAccess).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(identity.reload).toHaveBeenCalled());
+  });
+
+  it('offers the builtin administrator no request of its own', async () => {
+    identity.value = {
+      principal: { class: 'platform_admin', shown: { username: 'admin' } },
+      platform_admin: true,
+      is_person: false,
+      state: 'unbound',
+      owners: [],
+    };
+    renderPage(fakeAccess({ listRequests: vi.fn(async () => []) }));
+
+    expect(
+      await screen.findByTestId('txe-access-no-requests')
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('txe-access-request-own')).toBeNull();
   });
 });

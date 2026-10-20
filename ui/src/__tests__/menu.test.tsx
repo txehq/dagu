@@ -51,6 +51,13 @@ vi.mock('@/hooks/useLicense', () => ({
   }),
 }));
 
+const txeIdentity = vi.hoisted(() => ({ value: undefined as unknown }));
+vi.mock('@/features/txe/identity', () => ({
+  useTxeIdentity: () => ({ identity: txeIdentity.value }),
+  actsForOwner: (identity?: { is_person?: boolean; owners?: unknown[] }) =>
+    identity?.is_person === true && (identity.owners?.length ?? 0) > 0,
+}));
+
 vi.mock('@/hooks/useViews', () => ({
   useViews: (type?: ViewSpecType) => useViewsMock(type),
 }));
@@ -350,6 +357,42 @@ describe('sidebar menu', () => {
     expect(
       screen.queryByRole('button', { name: 'Incidents' })
     ).not.toBeInTheDocument();
+  });
+
+  // An SSO administrator bound to an owner has that owner's machines
+  // (TXE-4710); other callers are not offered the page.
+  it.each([
+    [
+      'offers',
+      {
+        is_person: true,
+        owners: [{ owner_id: 'own_A', display_name: 'Ada' }],
+      },
+      1,
+    ],
+    ['does not offer', { is_person: false, owners: [] }, 0],
+    ['does not offer', undefined, 0],
+  ])('%s Machines for identity %j', (_verb, identity, count) => {
+    txeIdentity.value = identity;
+    try {
+      renderMenu('/txe');
+      const group = screen.getByRole('button', { name: 'Executions' });
+      if (group.getAttribute('aria-expanded') === 'false') {
+        fireEvent.click(group);
+      }
+      expect(screen.getByRole('link', { name: 'Job inbox' })).toBeVisible();
+      expect(screen.queryAllByRole('link', { name: 'Machines' })).toHaveLength(
+        count
+      );
+      if (count) {
+        expect(screen.getByRole('link', { name: 'Machines' })).toHaveAttribute(
+          'href',
+          '/txe/machines'
+        );
+      }
+    } finally {
+      txeIdentity.value = undefined;
+    }
   });
 
   it('expands the workflows section', () => {
