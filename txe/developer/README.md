@@ -17,7 +17,7 @@ Use a tag that has passed acceptance. `--binary` must report exactly the tag's v
 | Path | What | Owner |
 |---|---|---|
 | `~/.local/share/txe-dagu-cli/bin/dagu-<version>` | the binary; earlier versions are kept | this script |
-| `~/.local/share/txe-dagu-cli/bin/dagu` | wrapper: `dagu txe ...` and `dagu --context <name> txe ...` use the developer's context store | this script |
+| `~/.local/share/txe-dagu-cli/bin/dagu` | wrapper: a `dagu txe` command uses the developer's context store, whatever flags come before `txe` | this script |
 | `~/.local/share/txe-dagu-cli/client/data` | the developer's context store: the `txe` context `dagu txe login --hub` creates, sign-in only, no API key | `dagu txe login` |
 | `~/.local/bin/dagu` | link to the wrapper | this script |
 | `~/.local/share/txe-dagu/` | the TXE home: machine identity, packages, receipts, sign-ins, the unpacked skill | the worker and the CLI |
@@ -39,9 +39,9 @@ An upgrade moves `skill/current`, so every profile reads the new revision with n
 
 ## Readback
 
-`--check` writes nothing, and reads no context store: the skill status runs against an empty store in a temporary directory. It checks three things:
+`--check` changes nothing outside a temporary directory it removes, and reads no context store: the skill status runs with a Dagu home and store of its own there. It checks three things:
 
-- the wrapper is this script's, and names an installed binary and the developer's store;
+- the wrapper is byte for byte what this script writes for its tag and binary;
 - `dagu` on PATH is the link to the wrapper;
 - every location is exactly the managed link, and resolves to the binary's skill revision.
 
@@ -53,4 +53,6 @@ A build from a tag uses `-trimpath`, so rebuilding the same tag with the same to
 - It never replaces a `~/.local/bin/dagu` it cannot name. It replaces only its own link, or the link the worker installer makes to `~/.local/share/txe-dagu/bin/dagu`.
 - It never reads, copies or writes a credential.
 - It never installs into the TXE home: a developer root that is, or leads into, the TXE home is refused.
-- It writes nothing through a fixed temporary name. Every staged file is created for the run and renamed into place.
+- It writes nothing through a fixed temporary name, or through a link at a destination. Every staged file is created for the run and renamed onto exactly its pathname. A versioned binary is published only where nothing exists yet.
+- It runs one install at a time, using a lock directory in the CLI root.
+- It refuses a developer bin or client directory that resolves to, or into, the worker's.

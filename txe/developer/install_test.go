@@ -23,17 +23,25 @@ import (
 // for one skill revision: install unpacks it under the TXE home and points
 // "current" at it; status fails unless every location resolves to it.
 const stubDagu = `#!/bin/sh
-rev=rev-%s
-while [ $# -gt 0 ]; do case "$1" in --context) shift 2 ;; --context=*) shift ;; *) break ;; esac; done
+rev=rev-@REV@
+while [ $# -gt 0 ]; do case "$1" in --help|-h|--*=*) shift ;; --*|-?) shift 2 ;; *) break ;; esac; done
 case "$1" in
-version) echo %s; exit 0 ;;
+version) echo @VERSION@; exit 0 ;;
 txe) shift ;;
 *) exit 2 ;;
 esac
 # The wrapper passes the developer store first; record what reached us.
-mkdir -p "$TXE_DAGU_HOME" && echo "$*" >> "$TXE_DAGU_HOME/stub-args"
-# Like dagu, any txe command opens the context store it is given, creating it.
-prev=""; for a in "$@"; do [ "$prev" = --contexts-dir ] && mkdir -p "$a"; prev=$a; done
+mkdir -p "$TXE_DAGU_HOME" && { for a in "$@"; do printf '[%s]' "$a"; done; echo; } >> "$TXE_DAGU_HOME/stub-args"
+# Like dagu, any txe command opens the context store it is given, creating it,
+# and writes a base configuration into its Dagu home (the TXE home's client
+# when none is given).
+home="$TXE_DAGU_HOME/client"; prev=""
+for a in "$@"; do
+  [ "$prev" = --contexts-dir ] && mkdir -p "$a"
+  [ "$prev" = --dagu-home ] && home=$a
+  prev=$a
+done
+mkdir -p "$home" && touch "$home/base.yaml"
 while [ $# -gt 0 ]; do case "$1" in --contexts-dir|--data-dir) shift 2 ;; *) break ;; esac; done
 case "$1 $2" in
 "skill install")
@@ -77,7 +85,7 @@ func (e *devEnv) stub(name, version, rev string) string {
 	e.t.Helper()
 	p := filepath.Join(e.home, "builds", name)
 	require.NoError(e.t, os.MkdirAll(filepath.Dir(p), 0o755))
-	require.NoError(e.t, os.WriteFile(p, []byte(strings.ReplaceAll(strings.Replace(stubDagu, "%s", rev, 1), "%s", version)), 0o755)) //nolint:gosec // test stub
+	require.NoError(e.t, os.WriteFile(p, []byte(strings.NewReplacer("@REV@", rev, "@VERSION@", version).Replace(stubDagu)), 0o755)) //nolint:gosec // test stub
 	return p
 }
 
@@ -150,9 +158,10 @@ func TestInstallLinksEveryProfileAndKeepsTheWorkers(t *testing.T) {
 	// or the machine's.
 	args, err := os.ReadFile(filepath.Join(e.txeHome, "stub-args"))
 	require.NoError(t, err)
-	assert.Contains(t, string(args), "skill install --contexts-dir ")
+	assert.Contains(t, string(args), "[skill][install][--dagu-home]")
 	assert.NotContains(t, string(args), filepath.Join(e.cliRoot, "client"))
 	assert.NotContains(t, string(args), filepath.Join(e.txeHome, "client"))
+	assert.NoDirExists(t, filepath.Join(e.txeHome, "client"), "the skill commands wrote nothing into the machine's store home")
 
 	// Once the custom copy is moved away, a second run completes, and
 	// --check agrees without changing anything.
@@ -228,17 +237,32 @@ func (e *devEnv) wrapperArgs(args ...string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// The wrapper gives a dagu txe command the developer's store, also when
-// --context comes first, and leaves every other command as it is.
+// brackets renders arguments the way the stub records them.
+func brackets(args ...string) string {
+	var b strings.Builder
+	for _, a := range args {
+		b.WriteString("[" + a + "]")
+	}
+	return b.String()
+}
+
+// The wrapper gives a dagu txe command the developer's store, whatever flags
+// come before it, and leaves every other command and every argument as it is.
 func TestWrapperFindsTheTXECommand(t *testing.T) {
 	e := newDevEnv(t)
 	out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
 	require.NoError(t, err, out)
 	store := filepath.Join(e.cliRoot, "client", "data")
-	flags := "--contexts-dir " + filepath.Join(store, "contexts") + " --data-dir " + store
-	assert.Equal(t, flags+" whoami --json", e.wrapperArgs("txe", "whoami", "--json"))
-	assert.Equal(t, flags+" whoami", e.wrapperArgs("--context", "txe", "txe", "whoami"))
-	assert.Equal(t, flags+" whoami", e.wrapperArgs("--context=txe", "txe", "whoami"))
+	flags := []string{"--contexts-dir", filepath.Join(store, "contexts"), "--data-dir", store}
+	with := func(rest ...string) string { return brackets(append(append([]string{}, flags...), rest...)...) }
+	assert.Equal(t, with("whoami", "--json"), e.wrapperArgs("txe", "whoami", "--json"))
+	assert.Equal(t, with("whoami"), e.wrapperArgs("--context", "txe", "txe", "whoami"))
+	assert.Equal(t, with("whoami"), e.wrapperArgs("--context=txe", "txe", "whoami"))
+	// Any flag before the subcommand, as dagu's parser reads it.
+	assert.Equal(t, with("whoami"), e.wrapperArgs("--config", "/tmp/empty.yaml", "txe", "whoami"))
+	assert.Equal(t, with("whoami"), e.wrapperArgs("-c", "/tmp/empty.yaml", "txe", "whoami"))
+	// Spaces and empty arguments arrive as they were given.
+	assert.Equal(t, with("register", "-f", "my job.yaml", "", "x"), e.wrapperArgs("txe", "register", "-f", "my job.yaml", "", "x"))
 	// "txe" as an argument of another command is not the txe command.
 	assert.Contains(t, e.wrapperArgs("start", "txe"), "(no txe call)")
 }
@@ -280,7 +304,7 @@ func TestInstallSafety(t *testing.T) {
 		require.NoError(t, os.Symlink(filepath.Join(e.txeHome, "client"), filepath.Join(e.cliRoot, "client")))
 		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
 		require.Error(t, err)
-		assert.Contains(t, out, "leads into the TXE home")
+		assert.Contains(t, out, "the worker's binary and store must stay apart from the developer's")
 	})
 
 	t.Run("CheckWritesNothing", func(t *testing.T) {
@@ -291,6 +315,66 @@ func TestInstallSafety(t *testing.T) {
 		out, err = e.run("--check")
 		require.NoError(t, err, out)
 		assert.NoDirExists(t, filepath.Join(e.cliRoot, "client"))
+		assert.NoDirExists(t, filepath.Join(e.txeHome, "client"))
+	})
+
+	t.Run("BinDirectoriesSharedElsewhere", func(t *testing.T) {
+		e := newDevEnv(t)
+		shared := filepath.Join(e.home, "mnt", "dagu-bin")
+		require.NoError(t, os.MkdirAll(shared, 0o755))
+		require.NoError(t, os.MkdirAll(e.txeHome, 0o700))
+		require.NoError(t, os.MkdirAll(e.cliRoot, 0o755))
+		require.NoError(t, os.Symlink(shared, filepath.Join(e.txeHome, "bin")))
+		require.NoError(t, os.Symlink(shared, filepath.Join(e.cliRoot, "bin")))
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.Error(t, err)
+		assert.Contains(t, out, "must stay apart from the developer's")
+		entries, err := os.ReadDir(shared)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+	})
+
+	t.Run("AWrapperPathThatIsALinkToADirectory", func(t *testing.T) {
+		e := newDevEnv(t)
+		elsewhere := filepath.Join(e.home, "elsewhere")
+		require.NoError(t, os.MkdirAll(elsewhere, 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(e.cliRoot, "bin"), 0o755))
+		require.NoError(t, os.Symlink(elsewhere, filepath.Join(e.cliRoot, "bin", "dagu")))
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		entries, err := os.ReadDir(elsewhere)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "nothing was written through the link")
+		info, err := os.Lstat(filepath.Join(e.cliRoot, "bin", "dagu"))
+		require.NoError(t, err)
+		assert.True(t, info.Mode().IsRegular(), "the link itself was replaced by the wrapper")
+	})
+
+	t.Run("AWrapperWithAnotherBody", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		wrapper := filepath.Join(e.cliRoot, "bin", "dagu")
+		data, err := os.ReadFile(wrapper)
+		require.NoError(t, err)
+		// Same marker, binary and store lines; the dispatch removed.
+		body := strings.Replace(string(data), `--contexts-dir "$store/contexts" --data-dir "$store"`, "", 1)
+		require.NotEqual(t, string(data), body)
+		require.NoError(t, os.WriteFile(wrapper, []byte(body), 0o755)) //nolint:gosec // test stub
+		out, err = e.run("--check")
+		require.Error(t, err)
+		assert.Contains(t, out, "missing or not this script's: "+wrapper)
+	})
+
+	t.Run("PathThroughALinkedDirectory", func(t *testing.T) {
+		e := newDevEnv(t)
+		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+		require.NoError(t, err, out)
+		alias := filepath.Join(e.home, "bin")
+		require.NoError(t, os.Symlink(e.linkDir, alias))
+		e.env = []string{"PATH=" + alias + ":/usr/bin:/bin"}
+		out, err = e.run("--check")
+		require.NoError(t, err, out)
 	})
 
 	t.Run("AQuoteInTheRoot", func(t *testing.T) {
@@ -300,7 +384,7 @@ func TestInstallSafety(t *testing.T) {
 		out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
 		require.NoError(t, err, out)
 		store := filepath.Join(e.cliRoot, "client", "data")
-		assert.Equal(t, "--contexts-dir "+filepath.Join(store, "contexts")+" --data-dir "+store+" whoami", e.wrapperArgs("txe", "whoami"))
+		assert.Equal(t, brackets("--contexts-dir", filepath.Join(store, "contexts"), "--data-dir", store, "whoami"), e.wrapperArgs("txe", "whoami"))
 	})
 
 	t.Run("AHomeThatIsALink", func(t *testing.T) {

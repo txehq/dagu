@@ -38,8 +38,9 @@
 #      it; every location is exactly the managed link and resolves to this
 #      binary's skill revision. Anything else fails the run.
 #
-# --check does step 5 only. It writes nothing and reads no context store: the
-# skill status runs against an empty store in a temporary directory.
+# --check does step 5 only. It changes nothing outside a temporary directory it
+# removes, and reads no context store: the skill status runs with a Dagu home
+# and store of its own there.
 #
 # No credential is read, copied or written. Signing in is the developer's own
 # step afterwards: dagu txe login --hub https://<the hub's address>
@@ -88,12 +89,13 @@ except OSError as e:
     print("failed: %s" % e.strerror)' "$1" "$2"
 }
 
-# swap_link points an existing link of ours at target: a link made under a
-# fresh unique name in the same directory, then renamed over it.
-swap_link() {
+# swap_link points a link of ours at target: a link made under a fresh unique
+# name in the same directory, then renamed over it, only if the pathname is
+# still a link to one of the targets named.
+swap_link() { # swap_link <target> <link> <allowed-target>...
   python3 -I -c '
 import os, sys
-target, link = sys.argv[1], sys.argv[2]
+target, link, allowed = sys.argv[1], sys.argv[2], sys.argv[3:]
 d = os.path.dirname(link)
 for _ in range(100):
     tmp = os.path.join(d, ".%s.%s" % (os.path.basename(link), os.urandom(6).hex()))
@@ -102,18 +104,86 @@ for _ in range(100):
         break
     except FileExistsError:
         continue
-os.replace(tmp, link)' "$1" "$2"
+if not os.path.islink(link) or os.readlink(link) not in allowed:
+    os.unlink(tmp)
+    sys.exit("%s changed while installing; it is left as it is" % link)
+os.replace(tmp, link)' "$@"
 }
 
-# stage copies or writes into a new file created only for this run, beside
-# its destination, then renames it into place: nothing at a fixed temporary
-# name is ever followed or reused.
+# stage_file writes stdin into a new file created only for this run, beside
+# its destination, then renames it onto exactly that pathname: a link there is
+# replaced, never followed, and a directory there is refused.
 stage_file() { # stage_file <dest> <mode>; content on stdin
   local tmp
   tmp="$(mktemp "$(dirname "$1")/.$(basename "$1").XXXXXX")"
   cat > "$tmp"
   chmod "$2" "$tmp"
-  mv -f "$tmp" "$1"
+  python3 -I -c '
+import os, stat, sys
+tmp, dest = sys.argv[1], sys.argv[2]
+try:
+    if stat.S_ISDIR(os.lstat(dest).st_mode):
+        os.unlink(tmp)
+        sys.exit("%s is a directory" % dest)
+except FileNotFoundError:
+    pass
+os.replace(tmp, dest)' "$tmp" "$1" || die "could not write $1"
+}
+
+# publish_new puts a staged copy of a file at a pathname that must not exist
+# yet. The hard link fails if anything appeared there, so two installs never
+# overwrite each other's binary.
+publish_new() { # publish_new <src> <dest>
+  local tmp
+  tmp="$(mktemp "$(dirname "$2")/.$(basename "$2").XXXXXX")"
+  cat "$1" > "$tmp"
+  chmod 0755 "$tmp"
+  python3 -I -c '
+import os, sys
+tmp, dest = sys.argv[1], sys.argv[2]
+try:
+    os.link(tmp, dest)
+finally:
+    os.unlink(tmp)' "$tmp" "$2" || die "$2 appeared while installing; run the install again"
+}
+
+# wrapper_text is the wrapper for a tag and binary, exactly. The readback
+# compares the installed wrapper with it byte for byte.
+#
+# It finds the subcommand the way dagu's command parser does: a long flag
+# without "=" takes the next argument as its value (but --help), and so does a
+# two-letter short flag (but -h). When that subcommand is txe, the developer's
+# store flags go right after it.
+wrapper_text() { # wrapper_text <tag> <binary>
+  cat <<EOF
+#!/bin/sh
+$MARKER ($1). dagu txe commands use the
+# developer's own context store; the machine's worker keeps its own.
+binary=$(shell_quote "$2")
+store=$(shell_quote "$store")
+n=0 at=0 skip=0
+for arg do
+    n=\$((n + 1))
+    if [ "\$skip" = 1 ]; then skip=0; continue; fi
+    case "\$arg" in
+        --help|-h|--*=*) ;;
+        --*) skip=1 ;;
+        -?) skip=1 ;;
+        -*) ;;
+        *) [ "\$arg" = txe ] && at=\$n; break ;;
+    esac
+done
+if [ "\$at" -gt 0 ]; then
+    i=0
+    for arg do
+        shift
+        i=\$((i + 1))
+        set -- "\$@" "\$arg"
+        if [ "\$i" -eq "\$at" ]; then set -- "\$@" --contexts-dir "\$store/contexts" --data-dir "\$store"; fi
+    done
+fi
+exec "\$binary" "\$@"
+EOF
 }
 
 # The profile homes on this machine, each real home once, with the skills
@@ -164,9 +234,14 @@ home_real="$(resolve "$TXE_DAGU_HOME")"
 if within "$cli_real" "$home_real" || within "$home_real" "$cli_real"; then
   die "$TXE_DAGU_CLI_ROOT and the TXE home $TXE_DAGU_HOME are the same place or inside each other; give the developer CLI a root of its own"
 fi
-if within "$(resolve "$store")" "$home_real" || within "$(resolve "$TXE_DAGU_CLI_ROOT/bin")" "$home_real"; then
-  die "$TXE_DAGU_CLI_ROOT/client or bin leads into the TXE home $TXE_DAGU_HOME, whose store and binary are the worker's"
-fi
+for mine in "$TXE_DAGU_CLI_ROOT/bin" "$TXE_DAGU_CLI_ROOT/client" "$store"; do
+  for theirs in "$TXE_DAGU_HOME" "$TXE_DAGU_HOME/bin" "$TXE_DAGU_HOME/client"; do
+    a="$(resolve "$mine")" b="$(resolve "$theirs")"
+    if within "$a" "$b" || within "$b" "$a"; then
+      die "$mine and $theirs are the same place or inside each other; the worker's binary and store must stay apart from the developer's"
+    fi
+  done
+done
 
 tag="" binary="" check=0
 while [ $# -gt 0 ]; do
@@ -183,10 +258,15 @@ if [ "$check" = 0 ]; then
   version="${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}"
   bin="$TXE_DAGU_CLI_ROOT/bin/dagu-$version"
   umask 022
+  # One install at a time on this machine.
+  mkdir -p "$TXE_DAGU_CLI_ROOT"
+  lock="$TXE_DAGU_CLI_ROOT/.install.lock"
+  mkdir "$lock" 2>/dev/null || die "another install is running (or one was stopped: remove $lock)"
+  src=""
+  trap 'rm -rf "${src:-}"; rmdir "$lock"' EXIT
 
   # 1. The binary: an accepted build given with --binary, or built from the tag.
   src="$(mktemp -d)"
-  trap 'rm -rf "$src"' EXIT
   if [ -n "$binary" ]; then
     [ -f "$binary" ] && [ -x "$binary" ] || die "--binary $binary is not an executable file"
     built="$binary"
@@ -206,46 +286,20 @@ if [ "$check" = 0 ]; then
       die "$bin already exists and is not this build; move it away first"
     fi
   else
-    stage_file "$bin" 0755 < "$built"
+    publish_new "$built" "$bin"
   fi
   say binary "$bin (sha256 $(sum256 "$bin"))"
 
-  # 2. The wrapper, replaced as a whole. It finds the subcommand past the root
-  # flag --context and its value, and puts the store flags right after txe.
-  stage_file "$wrapper" 0755 <<EOF
-#!/bin/sh
-$MARKER ($tag). dagu txe commands use the
-# developer's own context store; the machine's worker keeps its own.
-binary=$(shell_quote "$bin")
-store=$(shell_quote "$store")
-n=0 at=0 skip=0
-for arg do
-    n=\$((n + 1))
-    if [ "\$skip" = 1 ]; then skip=0; continue; fi
-    case "\$arg" in
-        --context) skip=1 ;;
-        -*) ;;
-        *) [ "\$arg" = txe ] && at=\$n; break ;;
-    esac
-done
-if [ "\$at" -gt 0 ]; then
-    i=0
-    for arg do
-        shift
-        i=\$((i + 1))
-        set -- "\$@" "\$arg"
-        if [ "\$i" -eq "\$at" ]; then set -- "\$@" --contexts-dir "\$store/contexts" --data-dir "\$store"; fi
-    done
-fi
-exec "\$binary" "\$@"
-EOF
+  # 2. The wrapper, replaced as a whole.
+  wrapper_text "$tag" "$bin" | stage_file "$wrapper" 0755
   say wrapper "$wrapper"
 
   # 3. dagu on PATH.
   worker_link="$TXE_DAGU_HOME/bin/dagu"
   if [ -L "$link" ] && { [ "$(readlink "$link")" = "$wrapper" ] || [ "$(readlink "$link")" = "$worker_link" ]; }; then
-    swap_link "$wrapper" "$link"
-    say path "$link -> $wrapper"
+    if swap_link "$wrapper" "$link" "$wrapper" "$worker_link"; then
+      say path "$link -> $wrapper"
+    fi
   else
     mkdir -p "$TXE_DAGU_LINK_DIR"
     made="$(make_link "$wrapper" "$link")"
@@ -258,7 +312,7 @@ EOF
 
   # 4. The skill, then a link in every profile. The skill command needs no
   # context store, so it is given an empty one of its own.
-  "$bin" txe skill install --contexts-dir "$src/store/contexts" --data-dir "$src/store" >/dev/null
+  "$bin" txe skill install --dagu-home "$src/home" --contexts-dir "$src/home/contexts" --data-dir "$src/home/data" >/dev/null
   if [ -d "$CODING_SKILLS" ]; then
     place_skill "$CODING_SKILLS" "$unpacked"
   fi
@@ -270,26 +324,28 @@ fi
 
 # 5. Read back.
 failed=0
-installed=""
-if [ -f "$wrapper" ] && [ "$(sed -n 2p "$wrapper" | cut -c1-${#MARKER})" = "$MARKER" ]; then
+installed="" wtag=""
+if [ -f "$wrapper" ] && [ ! -L "$wrapper" ]; then
   installed="$(python3 -I -c '
 import shlex, sys
 for line in open(sys.argv[1]):
     if line.startswith("binary="):
         print(shlex.split(line[len("binary="):])[0])
-        break' "$wrapper")"
-  if ! grep -qxF "store=$(shell_quote "$store")" "$wrapper" || [ ! -x "$installed" ]; then
-    say wrapper "$wrapper does not name an installed binary and the developer's store $store"
-    failed=1
-  else
-    say wrapper "$wrapper -> $installed, store $store"
-  fi
+        break' "$wrapper" 2>/dev/null || true)"
+  line2="$(sed -n 2p "$wrapper")"
+  rest="${line2#"$MARKER ("}"
+  wtag="${rest%%)*}"
+  [[ "$wtag" =~ ^txe-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] || wtag=""
+fi
+if [ -n "$installed" ] && [ -n "$wtag" ] && [ -x "$installed" ] && [ "$(wrapper_text "$wtag" "$installed")" = "$(cat "$wrapper")" ]; then
+  say wrapper "$wrapper -> $installed, store $store"
 else
   say wrapper "missing or not this script's: $wrapper"
+  installed=""
   failed=1
 fi
 on_path="$(command -v dagu || true)"
-if [ -n "$on_path" ] && [ "$on_path" = "$link" ] && [ -L "$link" ] && [ "$(readlink "$link")" = "$wrapper" ]; then
+if [ -n "$on_path" ] && [ "$(resolve "$(dirname "$on_path")")" = "$(resolve "$TXE_DAGU_LINK_DIR")" ] && [ -L "$link" ] && [ "$(readlink "$link")" = "$wrapper" ]; then
   say path "dagu -> $wrapper, version $(dagu version 2>/dev/null | head -1)"
 else
   say path "dagu on PATH is ${on_path:-missing}, not $link -> $wrapper"
@@ -315,7 +371,7 @@ for i in "${!locations[@]}"; do
 done
 if [ -n "$installed" ] && [ -x "$installed" ]; then
   scratch="$(mktemp -d)"
-  if ! "$installed" txe skill status --contexts-dir "$scratch/contexts" --data-dir "$scratch" "${links[@]}"; then
+  if ! "$installed" txe skill status --dagu-home "$scratch" --contexts-dir "$scratch/contexts" --data-dir "$scratch/data" "${links[@]}"; then
     failed=1
   fi
   rm -rf "$scratch"
