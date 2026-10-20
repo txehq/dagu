@@ -48,6 +48,7 @@ import Ticker from '@/components/ui/ticker';
 import VisuallyHidden from '@/components/ui/visually-hidden';
 import { CreateDAGModal, DAGPagination } from '../common';
 import DAGActions from '../common/DAGActions';
+import { usePersonScope } from '@/features/txe/personScope';
 import LiveSwitch from '../common/LiveSwitch';
 
 declare const getConfig: () => Config;
@@ -191,6 +192,8 @@ function DAGCard({
   onDeleteDAG,
   className = '',
 }: DAGCardProps) {
+  // A person acts from a DAG's own page, which follows the hub's answer.
+  const readOnly = usePersonScope();
   const fileName = dag.fileName;
   const title = dag.dag.name;
   const status = dag.latestDAGRun?.status;
@@ -328,7 +331,7 @@ function DAGCard({
           className={`flex items-center gap-1 flex-shrink-0 min-w-0 ${!hasSchedule ? 'opacity-40 pointer-events-none' : ''}`}
           onClick={(e) => e.stopPropagation()}
         >
-          <LiveSwitch dag={dag} refresh={refreshFn} />
+          {!readOnly && <LiveSwitch dag={dag} refresh={refreshFn} />}
           <span className="text-xs text-muted-foreground truncate">
             {dag.suspended ? (
               <I18nText text={'Suspended'} />
@@ -343,13 +346,15 @@ function DAGCard({
           className="flex flex-shrink-0 items-center gap-1"
           onClick={(e) => e.stopPropagation()}
         >
-          <DAGActions
-            dag={dag.dag}
-            status={dag.latestDAGRun}
-            fileName={fileName}
-            label={false}
-            refresh={refreshFn}
-          />
+          {!readOnly && (
+            <DAGActions
+              dag={dag.dag}
+              status={dag.latestDAGRun}
+              fileName={fileName}
+              label={false}
+              refresh={refreshFn}
+            />
+          )}
           {canRenameDAGs && (
             <RenameDAGButton dag={dag} onRename={onRenameDAG} />
           )}
@@ -484,6 +489,9 @@ declare module '@tanstack/react-table' {
     onOpenRenameDAG?: (dag: components['schemas']['DAGFile']) => void;
     canDeleteDAGs?: boolean;
     onOpenDeleteDAG?: (dag: components['schemas']['DAGFile']) => void;
+    // readOnly leaves out the row's schedule switch and run actions: a
+    // person acts from a DAG's own page, which follows the hub's answer.
+    readOnly?: boolean;
   }
 }
 
@@ -865,7 +873,7 @@ const defaultColumns = [
       const hasSchedule = schedules.length > 0;
 
       // LiveSwitch component
-      const liveSwitch = (
+      const liveSwitch = table.options.meta?.readOnly ? null : (
         <div
           onClick={(e) => e.stopPropagation()}
           className={`flex-shrink-0 p-0.5 ${!hasSchedule ? 'opacity-40 pointer-events-none' : ''}`}
@@ -975,6 +983,9 @@ const defaultColumns = [
       // Use row and table
       const data = row.original!;
       if (data.kind === ItemKind.Group) {
+        return null;
+      }
+      if (table.options.meta?.readOnly) {
         return null;
       }
       // Assuming DAGActions is refactored or compatible
@@ -1216,6 +1227,7 @@ function DAGTable({
   selectedDAG = null,
   onSelectDAG,
 }: Props) {
+  const person = usePersonScope();
   const { ts } = useI18n();
   const navigate = useNavigate();
   const columns = useMemo(
@@ -1649,6 +1661,7 @@ function DAGTable({
       onOpenRenameDAG: openRenameDAG,
       canDeleteDAGs,
       onOpenDeleteDAG: openDeleteDAG,
+      readOnly: person,
     },
   });
 
