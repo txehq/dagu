@@ -156,13 +156,17 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 // Scope resolves a caller to what it may act as. The platform administrator
-// is its own scope. A person or a token is resolved through its binding or
+// is its own scope; one signed in through the identity provider whose
+// identity is bound is also its owner's person (authz.ResolvePlatformAdmin). A person or a token is resolved through its binding or
 // enrolment. A legacy caller, and a request nothing authenticated, act for
 // nobody. An error means the owner store could not be read.
 func (s *Service) Scope(ctx context.Context, c Caller) (authz.Scope, error) {
 	switch c.Kind {
 	case KindPlatformAdmin:
-		return authz.PlatformAdmin(c.Username), nil
+		if c.Principal.Issuer == "" {
+			return authz.PlatformAdmin(c.Username), nil
+		}
+		return s.store.ResolvePlatformAdmin(ctx, c.Username, c.Principal.Identity)
 	case KindPerson, KindToken:
 		return s.store.Resolve(ctx, c.Principal)
 	case KindLegacy, KindNone:

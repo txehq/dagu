@@ -28,6 +28,7 @@ type ShareGrant struct {
 // change nothing, so a share is widened only by revoking it and granting
 // anew.
 func (s *Store) GrantShare(ctx context.Context, by Scope, grant ShareGrant) (*Share, error) {
+	by = asPerson(by)
 	permissions, err := normalizePermissions(grant.Permissions)
 	if err != nil {
 		return nil, err
@@ -91,6 +92,7 @@ func (s *Store) GrantShare(ctx context.Context, by Scope, grant ShareGrant) (*Sh
 // RevokeShare ends a share. Revoking one that is already revoked returns it
 // unchanged.
 func (s *Store) RevokeShare(ctx context.Context, by Scope, resource ResourceRef, granteeOwnerID, reason string) (*Share, error) {
+	by = asPerson(by)
 	if reason == "" {
 		return nil, refuse(CodeInvalid, "a reason is required")
 	}
@@ -176,6 +178,7 @@ func (s *Store) administeredOwner(ctx context.Context, by Scope, ref ResourceRef
 // still stands. Only such a caller administers an owner's shares and
 // enrolments.
 func (s *Store) requirePerson(ctx context.Context, by Scope) error {
+	by = asPerson(by)
 	if by.Kind() != ScopeOwner || by.principal.Class != authn.ClassPerson {
 		return refuse(CodeForbidden, "only a person acting for the owner may do this")
 	}
@@ -190,6 +193,15 @@ func (s *Store) requirePerson(ctx context.Context, by Scope) error {
 		return refuse(CodeForbidden, "the caller's binding no longer stands")
 	}
 	return nil
+}
+
+// asPerson is the scope a person-only act is made and recorded as: for a
+// bound platform administrator, the person it is bound as.
+func asPerson(by Scope) Scope {
+	if person, ok := by.OwnerPerson(); ok {
+		return person
+	}
+	return by
 }
 
 // activeShare returns the share of a resource to a grantee if it is in force.

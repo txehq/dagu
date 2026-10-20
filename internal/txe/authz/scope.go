@@ -22,8 +22,9 @@ const (
 	ScopeOwner ScopeKind = "owner"
 	// ScopeMachine is an enrolled machine acting for its owner.
 	ScopeMachine ScopeKind = "machine"
-	// ScopePlatformAdmin is the installation's administrator. It is not an
-	// owner and owns nothing.
+	// ScopePlatformAdmin is the installation's administrator. It owns
+	// nothing; an administrator signed in through the identity provider whose
+	// identity is bound is also that owner's person (OwnerPerson).
 	ScopePlatformAdmin ScopeKind = "platform_admin"
 )
 
@@ -55,11 +56,12 @@ func (s Scope) Kind() ScopeKind {
 	return s.kind
 }
 
-// Principal returns the authenticated caller. It is the zero value for the
-// platform administrator.
+// Principal returns the authenticated caller. For the platform administrator
+// it is the person it also is, when it is bound, and otherwise the zero value.
 func (s Scope) Principal() authn.Principal { return s.principal }
 
-// OwnerID returns the owner the scope acts for, or "" when there is none.
+// OwnerID returns the owner the scope acts for, or "" when there is none. For
+// the platform administrator it is the owner it is bound to as a person.
 func (s Scope) OwnerID() string { return s.ownerID }
 
 // MachineID returns the machine a machine scope is, or "".
@@ -84,6 +86,16 @@ func (s Scope) actor() Actor {
 	return Actor{Kind: ActorPerson, Issuer: s.principal.Issuer, Subject: s.principal.Subject, OwnerID: s.ownerID}
 }
 
+// OwnerPerson returns the person a bound platform administrator also is:
+// the scope of its identity's binding, as a person signed in through the
+// browser would have it. It reports false for every other scope.
+func (s Scope) OwnerPerson() (Scope, bool) {
+	if s.Kind() != ScopePlatformAdmin || s.ownerID == "" {
+		return Scope{}, false
+	}
+	return Scope{kind: ScopeOwner, principal: s.principal, ownerID: s.ownerID, bindingGeneration: s.bindingGeneration}, true
+}
+
 func unbound(p authn.Principal, reason Reason) Scope {
 	return Scope{kind: ScopeUnbound, principal: p, reason: reason}
 }
@@ -94,6 +106,25 @@ func unbound(p authn.Principal, reason Reason) Scope {
 // administrator does and is never matched.
 func PlatformAdmin(name string) Scope {
 	return Scope{kind: ScopePlatformAdmin, admin: name}
+}
+
+// ResolvePlatformAdmin returns the scope of a platform administrator who
+// signed in through the identity provider as id: the administrator, and if
+// id is bound to an owner, that owner's person too (OwnerPerson). Nothing is
+// written; the binding is read again whenever the person's rights are used,
+// so revoking it ends them on the next request. An unbound administrator is
+// the administrator only. An error means the store could not be read.
+func (s *Store) ResolvePlatformAdmin(ctx context.Context, name string, id authn.Identity) (Scope, error) {
+	scope := PlatformAdmin(name)
+	binding, _, err := s.activeBinding(ctx, id)
+	if err != nil {
+		return Scope{}, err
+	}
+	if binding != nil {
+		scope.principal = authn.Principal{Identity: id, Class: authn.ClassPerson}
+		scope.ownerID, scope.bindingGeneration = binding.OwnerID, binding.Generation
+	}
+	return scope, nil
 }
 
 // Resolve finds what an authenticated principal may act as.
