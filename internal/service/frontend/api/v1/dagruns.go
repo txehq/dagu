@@ -1328,7 +1328,7 @@ func (a *API) ApproveDAGRunStep(ctx context.Context, request api.ApproveDAGRunSt
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.dagRunRepository.FindAttempt(ctx, ref)
@@ -1452,7 +1452,7 @@ func (a *API) ApproveSubDAGRunStep(ctx context.Context, request api.ApproveSubDA
 			Message: fmt.Sprintf("sub DAG-run ID %s not found", request.SubDAGRunId),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.getReferencedAttempt(ctx, rootRef, request.SubDAGRunId, dagStatus.Name)
@@ -1669,7 +1669,7 @@ func (a *API) RejectDAGRunStep(ctx context.Context, request api.RejectDAGRunStep
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.dagRunRepository.FindAttempt(ctx, ref)
@@ -1772,7 +1772,7 @@ func (a *API) RejectSubDAGRunStep(ctx context.Context, request api.RejectSubDAGR
 			Message: fmt.Sprintf("sub DAG-run ID %s not found", request.SubDAGRunId),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.getReferencedAttempt(ctx, rootRef, request.SubDAGRunId, dagStatus.Name)
@@ -1887,7 +1887,7 @@ func (a *API) PushBackDAGRunStep(ctx context.Context, request api.PushBackDAGRun
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", request.DagRunId, request.Name),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.dagRunRepository.FindAttempt(ctx, ref)
@@ -2023,7 +2023,7 @@ func (a *API) PushBackSubDAGRunStep(ctx context.Context, request api.PushBackSub
 			Message: fmt.Sprintf("sub DAG-run ID %s not found", request.SubDAGRunId),
 		}, nil
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, dagStatus); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, dagStatus); err != nil {
 		return nil, err
 	}
 	attempt, err := a.getReferencedAttempt(ctx, rootRef, request.SubDAGRunId, dagStatus.Name)

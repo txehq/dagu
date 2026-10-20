@@ -439,6 +439,19 @@ func (a *API) requireDAGRunStatusVisible(ctx context.Context, status *ir.DAGRunS
 	return a.requireRunStatus(ctx, status, authz.PermissionView, a.requireNamedDAGVisible)
 }
 
+// requireDAGRunStatusApprove decides answering a run's human gate: a
+// wait step's approve, reject or push-back, or a human task's completion
+// or push-back. On an owner's DAG that takes approve, which only a person
+// holds, so an owner's command line or its machine's credentials, which
+// may execute, do not answer its gates (TXE-4721). The hub's own check is
+// execute in the run's workspace, as before.
+func (a *API) requireDAGRunStatusApprove(ctx context.Context, status *ir.DAGRunStatus) error {
+	if status == nil {
+		return nil
+	}
+	return a.requireRunStatus(ctx, status, authz.PermissionApprove, a.requireNamedDAGApprove)
+}
+
 func (a *API) requireDAGRunStatusExecute(ctx context.Context, status *ir.DAGRunStatus) error {
 	if status == nil {
 		return nil

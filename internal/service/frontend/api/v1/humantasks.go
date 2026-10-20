@@ -90,7 +90,7 @@ func (a *API) CompleteHumanTask(
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, status); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, status); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -143,7 +143,7 @@ func (a *API) PushBackHumanTask(
 	if err != nil {
 		return nil, err
 	}
-	if err := a.requireDAGRunStatusExecute(ctx, status); err != nil {
+	if err := a.requireDAGRunStatusApprove(ctx, status); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
