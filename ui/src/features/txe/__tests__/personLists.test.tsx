@@ -1,7 +1,7 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, renderHook, screen } from '@testing-library/react';
+import { render, renderHook, screen, within } from '@testing-library/react';
 import React from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -61,6 +61,19 @@ describe("a person's DAG, run and queue lists", () => {
       'href',
       '/queues'
     );
+    // The links are one navigation, which scrolls on a narrow screen while
+    // the account controls stay in view.
+    const nav = screen.getByRole('navigation');
+    for (const name of [
+      'Job inbox',
+      'Workflows',
+      'Executions',
+      'Queues',
+      'Machines',
+    ]) {
+      expect(within(nav).getByRole('link', { name })).toBeInTheDocument();
+    }
+    expect(within(nav).queryByText('user menu')).toBeNull();
   });
 });
 
