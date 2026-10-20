@@ -41,6 +41,17 @@ import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
 
+// startUnconfirmedRunId is the run the hub handed over without seeing it
+// start (504 start_unconfirmed, TXE-4712), or undefined for any other answer.
+export function startUnconfirmedRunId(error: unknown): string | undefined {
+  const details = (error as { details?: Record<string, unknown> } | undefined)
+    ?.details;
+  const runId = details?.dag_run_id;
+  return details?.code === 'start_unconfirmed' && typeof runId === 'string'
+    ? runId
+    : undefined;
+}
+
 /**
  * Props for the DAGActions component
  */
@@ -907,6 +918,20 @@ function DAGActions({
                   },
                   body,
                 }));
+            // The hub handed the run over but did not see it start: it may
+            // still start, so the run is followed, never started again.
+            const unconfirmed = startUnconfirmedRunId(error);
+            if (unconfirmed) {
+              showRunProgress(unconfirmed);
+              showToast(
+                ts(
+                  'The start was not confirmed; follow run {id} rather than start it again.',
+                  { id: unconfirmed }
+                )
+              );
+              reloadData();
+              return;
+            }
             if (error) {
               throw new Error(
                 error.message || 'Failed to start DAG execution.'
