@@ -4,7 +4,9 @@
 package cmd
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,7 +89,7 @@ func TestTXEStepUsesTheAPIKeyUntilEnrolled(t *testing.T) {
 	f := newStepAuthFixture(t)
 	out, err := f.inStep(t, "list")
 	require.NoError(t, err, out)
-	assert.Contains(t, out, "this step uses the context's API key: this machine is not enrolled for the worker class")
+	assert.Contains(t, out, "txe: step class=worker mode=api_key (this machine is not enrolled for the worker class)")
 	calls := f.jobCalls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, "Bearer dagu_test_key", calls[0].Authorization)
@@ -104,13 +106,15 @@ func TestTXEStepPresentsTheMachineCredentialOnceEnrolled(t *testing.T) {
 	entry, ok := auth.Enrolled("worker")
 	require.True(t, ok)
 	assert.Equal(t, f.path(), entry.CredentialFile)
+	assert.Equal(t, f.hub.API(), entry.Hub)
 	info, err := os.Stat(filepath.Join(f.home, "client", txepkg.StepAuthFile))
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 
 	out, err := f.inStep(t, "list")
 	require.NoError(t, err, out)
-	assert.NotContains(t, out, "API key")
+	assert.Contains(t, out, "txe: step class=worker mode=credential")
+	assert.NotContains(t, out, "api_key")
 	calls := f.jobCalls()
 	require.Len(t, calls, 1)
 	assert.True(t, strings.HasPrefix(calls[0].Authorization, "Bearer ey"), "the machine's access token")
@@ -157,6 +161,49 @@ func TestTXEStepFailsClosedOnceEnrolled(t *testing.T) {
 		require.NoError(t, os.Chmod(filepath.Join(f.home, "client", txepkg.StepAuthFile), 0o644))
 		_, err := f.inStep(t, "list")
 		require.ErrorContains(t, err, "cannot tell how this machine reaches the hub")
+		assert.Empty(t, f.jobCalls())
+	})
+
+	t.Run("AnotherHub", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		require.NoError(t, txepkg.Home{Root: f.home}.SetStepCredential("worker", f.path(), "https://other.invalid/api/v1"))
+		_, err := f.inStep(t, "list")
+		require.ErrorContains(t, err, "is enrolled with the hub at https://other.invalid/api/v1, but this step reaches")
+		assert.Empty(t, f.jobCalls())
+	})
+
+	t.Run("ARedirectElsewhere", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		var leaked []string
+		elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			leaked = append(leaked, r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(elsewhere.Close)
+		enrol := f.hub.Handle
+		f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path == "/api/v1/txe/jobs" {
+				http.Redirect(w, r, elsewhere.URL+"/steal", http.StatusFound)
+				return true
+			}
+			return enrol(w, r)
+		}
+		_, err := f.inStep(t, "list")
+		require.Error(t, err)
+		assert.Empty(t, leaked, "the token was not sent to the redirect's target")
+	})
+
+	t.Run("RotationNotSaved", func(t *testing.T) {
+		f := newStepAuthFixture(t)
+		f.enrolled(t)
+		// The provider rotates the refresh token; the credential's directory
+		// no longer takes the new one.
+		require.NoError(t, os.Chmod(f.home, 0o500))
+		t.Cleanup(func() { _ = os.Chmod(f.home, 0o700) })
+		_, err := f.inStep(t, "list")
+		require.ErrorContains(t, err, "renewed credential could not be saved")
 		assert.Empty(t, f.jobCalls())
 	})
 
@@ -222,8 +269,32 @@ func TestTXEStepClass(t *testing.T) {
 	assert.Equal(t, "Bearer dagu_test_key", calls[len(calls)-1].Authorization)
 
 	// Recorded as enrolled for the reviewer class: refused, nothing sent.
-	require.NoError(t, txepkg.Home{Root: f.home}.SetStepCredential("reviewer", f.path()))
+	require.NoError(t, txepkg.Home{Root: f.home}.SetStepCredential("reviewer", f.path(), f.hub.API()))
 	before := len(f.jobCalls())
 	require.ErrorContains(t, reviewerCall(), "enrolled for the reviewer class, but this build reads only worker credentials")
 	assert.Len(t, f.jobCalls(), before)
+}
+
+// A command other than txe, run by a step against a context, presents the
+// machine's credential when that context reaches the enrolled hub, and keeps
+// its own key for any other hub.
+func TestTXEStepRemoteForOtherCommands(t *testing.T) {
+	f := newStepAuthFixture(t)
+	f.enrolled(t)
+	other := &cobra.Command{Use: "status"}
+	(&cobra.Command{Use: "dagu"}).AddCommand(other)
+	ctx := context.Background()
+
+	enrolledHub, err := newRemoteClient(&cliContext{Name: "txe", ServerURL: f.hub.API(), APIKey: "dagu_test_key"})
+	require.NoError(t, err)
+	got, err := txeStepRemote(ctx, other, enrolledHub)
+	require.NoError(t, err)
+	assert.Empty(t, got.apiKey, "the API key is not sent to the enrolled hub")
+	assert.IsType(t, &txeMachineTransport{}, got.client.Transport)
+
+	elsewhere, err := newRemoteClient(&cliContext{Name: "other", ServerURL: "https://other.invalid/api/v1", APIKey: "dagu_other_key"})
+	require.NoError(t, err)
+	got, err = txeStepRemote(ctx, other, elsewhere)
+	require.NoError(t, err)
+	assert.Same(t, elsewhere, got, "a context for another hub keeps its own key")
 }

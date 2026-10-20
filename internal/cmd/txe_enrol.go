@@ -248,7 +248,11 @@ func runTXEEnrol(ctx *Context, _ []string) error {
 	// steps present it from now on (txeStepRemote). Recorded only then: an
 	// application alone changes nothing a step does.
 	if view.State == "enrolled" {
-		if err := home.SetStepCredential(string(authn.ClassWorker), path); err != nil {
+		hub, err := cliauth.NormalizeHub(remote.baseURL)
+		if err != nil {
+			return err
+		}
+		if err := home.SetStepCredential(string(authn.ClassWorker), path, hub); err != nil {
 			return fmt.Errorf("the machine is enrolled, but its job steps could not be told to use the credential: %w", err)
 		}
 		view.StepAuth = txepkg.StepModeCredential

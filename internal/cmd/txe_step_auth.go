@@ -4,9 +4,11 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/spf13/cobra"
 
@@ -33,17 +35,25 @@ func txeStepClass(cmd *cobra.Command) authn.Class {
 // A step never presents a person's sign-in. When the machine is enrolled for
 // the step's class (StepAuth names the class), the step presents the class's
 // machine credential, and only it:
+//   - the step must reach the hub the enrolment was made with;
 //   - the credential file must load as the worker loads it, be this
 //     machine's, and be from the identity provider the hub names;
 //   - every call carries its access token, renewed from the file as the
-//     worker renews it;
+//     worker renews it, and only to that hub: a redirect is not followed;
 //   - a refusal is reported, never retried with the context's API key.
 //
 // Anything missing or mismatched fails before a call is made. A class the
-// machine is not enrolled for keeps the context's API key, and the step says
-// so on standard error.
-func txeStepRemote(ctx *Context, remote *remoteClient) (*remoteClient, error) {
-	class := txeStepClass(ctx.Command)
+// machine is not enrolled for keeps the context's API key. A txe command
+// prints its class and mode on standard error in either case, for whoever
+// reads the run's log.
+//
+// txe commands always come here (txeHubAuth). Any other command a step runs
+// against a context comes here too (NewContext), and is changed only when its
+// context reaches the hub the machine is enrolled with: a context for another
+// hub keeps its own key.
+func txeStepRemote(ctx context.Context, cmd *cobra.Command, remote *remoteClient) (*remoteClient, error) {
+	class := txeStepClass(cmd)
+	txeCommand := isTXECommand(cmd)
 	home, err := txepkg.DefaultHome()
 	if err != nil {
 		return nil, err
@@ -53,9 +63,20 @@ func txeStepRemote(ctx *Context, remote *remoteClient) (*remoteClient, error) {
 		return nil, fmt.Errorf("this step cannot tell how this machine reaches the hub: %w", err)
 	}
 	entry, enrolled := auth.Enrolled(string(class))
-	if !enrolled {
-		_, _ = fmt.Fprintf(ctx.Command.ErrOrStderr(), "txe: this step uses the context's API key: this machine is not enrolled for the %s class\n", class)
+	hub, err := cliauth.NormalizeHub(remote.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if !txeCommand && (!enrolled || hub != entry.Hub) {
 		return remote, nil
+	}
+	if !enrolled {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=api_key (this machine is not enrolled for the %s class)\n", class, class)
+		return remote, nil
+	}
+	if hub != entry.Hub {
+		return nil, fmt.Errorf("this machine's %s credential is enrolled with the hub at %s, but this step reaches %s: enrol with the store this machine's jobs use; nothing was sent",
+			class, entry.Hub, hub)
 	}
 	if class != authn.ClassWorker {
 		return nil, fmt.Errorf("this machine is enrolled for the %s class, but this build reads only worker credentials; nothing was sent", class)
@@ -85,30 +106,56 @@ func txeStepRemote(ctx *Context, remote *remoteClient) (*remoteClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return remote.withMachineCredential(source), nil
+	stepRemote, err := remote.withMachineCredential(source)
+	if err != nil {
+		return nil, err
+	}
+	if txeCommand {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "txe: step class=%s mode=credential\n", class)
+	}
+	return stepRemote, nil
 }
 
 // withMachineCredential returns a copy of c whose every call carries the
-// machine's access token from source, and never the context's API key.
-func (c *remoteClient) withMachineCredential(source transportauth.TokenSource) *remoteClient {
+// machine's access token from source, never the context's API key, and only
+// to c's own scheme and host: redirects are returned, not followed.
+func (c *remoteClient) withMachineCredential(source *transportauth.RefreshingSource) (*remoteClient, error) {
+	base, err := url.Parse(c.baseURL)
+	if err != nil || base.Host == "" {
+		return nil, fmt.Errorf("the hub address %q is not an absolute URL", c.baseURL)
+	}
 	httpClient := *c.client
-	httpClient.Transport = &txeMachineTransport{base: c.client.Transport, source: source}
-	return &remoteClient{baseURL: c.baseURL, client: &httpClient}
+	httpClient.Transport = &txeMachineTransport{base: c.client.Transport, source: source, scheme: base.Scheme, host: base.Host}
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &remoteClient{baseURL: c.baseURL, client: &httpClient}, nil
 }
 
-// txeMachineTransport sets the machine's access token on each request.
+// txeMachineTransport sets the machine's access token on each request to
+// the enrolled hub, and refuses any other destination.
 type txeMachineTransport struct {
-	base   http.RoundTripper
-	source transportauth.TokenSource
+	base         http.RoundTripper
+	source       *transportauth.RefreshingSource
+	scheme, host string
 }
 
 func (t *txeMachineTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	token, err := t.source.Token(req.Context())
-	if err != nil {
+	fail := func(err error) (*http.Response, error) {
 		if req.Body != nil {
 			_ = req.Body.Close()
 		}
-		return nil, fmt.Errorf("renew this machine's access token: %w", err)
+		return nil, err
+	}
+	if req.URL.Scheme != t.scheme || req.URL.Host != t.host {
+		return fail(fmt.Errorf("refusing to send this machine's credential to %s://%s, which is not the hub", req.URL.Scheme, req.URL.Host))
+	}
+	token, err := t.source.Token(req.Context())
+	if err != nil {
+		return fail(fmt.Errorf("renew this machine's access token: %w", err))
+	}
+	// A renewal may have rotated the refresh token. Unless the file holds
+	// the new one, the next step and the worker would present a retired one.
+	if unsaved := t.source.Unsaved(); unsaved != nil {
+		return fail(fmt.Errorf("this machine's renewed credential could not be saved, so the step stops: %w", unsaved))
 	}
 	out := req.Clone(req.Context())
 	out.Header.Set("Authorization", "Bearer "+token)

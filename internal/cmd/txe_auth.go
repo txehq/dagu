@@ -182,7 +182,7 @@ func txeInDAGStep() bool {
 // refused sign-in is reported, not replaced by the API key.
 func txeHubAuth(ctx *Context, remote *remoteClient) (*remoteClient, error) {
 	if txeInDAGStep() {
-		return txeStepRemote(ctx, remote)
+		return txeStepRemote(ctx, ctx.Command, remote)
 	}
 	hub, err := cliauth.NormalizeHub(remote.baseURL)
 	if err != nil {

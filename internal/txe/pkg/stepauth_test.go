@@ -22,13 +22,13 @@ func TestStepAuth(t *testing.T) {
 	_, ok := auth.Enrolled("worker")
 	assert.False(t, ok)
 
-	require.NoError(t, home.SetStepCredential("worker", "/abs/worker-credential.json"))
-	require.NoError(t, home.SetStepCredential("reviewer", "/abs/reviewer-credential.json"))
+	require.NoError(t, home.SetStepCredential("worker", "/abs/worker-credential.json", "http://127.0.0.1:18080/api/v1"))
+	require.NoError(t, home.SetStepCredential("reviewer", "/abs/reviewer-credential.json", "http://127.0.0.1:18080/api/v1"))
 	auth, err = home.StepAuth()
 	require.NoError(t, err)
 	worker, ok := auth.Enrolled("worker")
 	require.True(t, ok)
-	assert.Equal(t, StepAuthClass{Mode: StepModeCredential, CredentialFile: "/abs/worker-credential.json"}, worker)
+	assert.Equal(t, StepAuthClass{Mode: StepModeCredential, CredentialFile: "/abs/worker-credential.json", Hub: "http://127.0.0.1:18080/api/v1"}, worker)
 	_, ok = auth.Enrolled("reviewer")
 	assert.True(t, ok)
 	path := filepath.Join(home.ClientDir(), StepAuthFile)
@@ -38,18 +38,27 @@ func TestStepAuth(t *testing.T) {
 		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	}
 
-	require.ErrorContains(t, home.SetStepCredential("worker", "relative.json"), "must be an absolute path")
+	require.ErrorContains(t, home.SetStepCredential("worker", "relative.json", "http://h/api/v1"), "must be an absolute path")
+	require.ErrorContains(t, home.SetStepCredential("Worker", "/abs", "http://h/api/v1"), "not a credential class")
+	require.ErrorContains(t, home.SetStepCredential("worker", "/abs", ""), "names no hub")
 }
 
 // A file this build did not write is refused rather than read loosely: an
 // unknown field, another mode, a relative path or another schema.
 func TestStepAuthRefusesWhatItDidNotWrite(t *testing.T) {
 	for name, body := range map[string]string{
-		"UnknownField": `{"schema":1,"classes":{},"extra":true}`,
-		"AnotherMode":  `{"schema":1,"classes":{"worker":{"mode":"api_key","credential_file":"/abs"}}}`,
-		"RelativePath": `{"schema":1,"classes":{"worker":{"mode":"credential","credential_file":"rel"}}}`,
-		"Schema":       `{"schema":2,"classes":{}}`,
-		"Trailing":     `{"schema":1,"classes":{}} {}`,
+		"UnknownField": `{"schema":1,"classes":{"worker":{"mode":"credential","credential_file":"/abs","hub":"http://h/api/v1"}},"extra":true}`,
+		"AnotherMode":  `{"schema":1,"classes":{"worker":{"mode":"api_key","credential_file":"/abs","hub":"http://h/api/v1"}}}`,
+		"RelativePath": `{"schema":1,"classes":{"worker":{"mode":"credential","credential_file":"rel","hub":"http://h/api/v1"}}}`,
+		"NoHub":        `{"schema":1,"classes":{"worker":{"mode":"credential","credential_file":"/abs"}}}`,
+		"Schema":       `{"schema":2,"classes":{"worker":{"mode":"credential","credential_file":"/abs","hub":"http://h/api/v1"}}}`,
+		"Trailing":     `{"schema":1,"classes":{"worker":{"mode":"credential","credential_file":"/abs","hub":"http://h/api/v1"}}} {}`,
+		// Shapes that would otherwise read as "not enrolled" and fall back to
+		// the API key.
+		"NoClasses":    `{"schema":1}`,
+		"NullClasses":  `{"schema":1,"classes":null}`,
+		"EmptyClasses": `{"schema":1,"classes":{}}`,
+		"UnknownClass": `{"schema":1,"classes":{"Worker":{"mode":"credential","credential_file":"/abs","hub":"http://h/api/v1"}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			home := Home{Root: t.TempDir()}

@@ -39,12 +39,19 @@ type StepAuth struct {
 	Classes map[string]StepAuthClass `json:"classes"`
 }
 
-// StepAuthClass is one class's mode and, for a credential, its file.
+// StepAuthClass is one class's mode, its credential file and the hub the
+// machine is enrolled with for it.
 type StepAuthClass struct {
 	Mode string `json:"mode"`
 	// CredentialFile is the absolute path of the class's credential file.
 	CredentialFile string `json:"credential_file"`
+	// Hub is the hub's API root the enrolment was made with. The credential
+	// is presented there and nowhere else.
+	Hub string `json:"hub"`
 }
+
+// stepAuthClasses are the credential classes a step can need.
+var stepAuthClasses = map[string]bool{"worker": true, "reviewer": true}
 
 // StepAuth reads the step-auth file. A home without one has no enrolled
 // class. The file must be a regular file only its owner can read or write.
@@ -76,9 +83,17 @@ func (h Home) StepAuth() (StepAuth, error) {
 	if auth.Schema != StepAuthSchema {
 		return StepAuth{}, fmt.Errorf("%s has schema %d, not %d", path, auth.Schema, StepAuthSchema)
 	}
+	// The file exists only once a class was enrolled, so one that names no
+	// class, or a class no step needs, was not written by this program.
+	if len(auth.Classes) == 0 {
+		return StepAuth{}, fmt.Errorf("%s names no enrolled class", path)
+	}
 	for class, c := range auth.Classes {
-		if c.Mode != StepModeCredential || !filepath.IsAbs(c.CredentialFile) {
-			return StepAuth{}, fmt.Errorf("%s: class %q must have mode %q and an absolute credential_file", path, class, StepModeCredential)
+		if !stepAuthClasses[class] {
+			return StepAuth{}, fmt.Errorf("%s: %q is not a credential class", path, class)
+		}
+		if c.Mode != StepModeCredential || !filepath.IsAbs(c.CredentialFile) || c.Hub == "" {
+			return StepAuth{}, fmt.Errorf("%s: class %q must have mode %q, an absolute credential_file and a hub", path, class, StepModeCredential)
 		}
 	}
 	return auth, nil
@@ -91,10 +106,16 @@ func (a StepAuth) Enrolled(class string) (StepAuthClass, bool) {
 }
 
 // SetStepCredential records that the class's steps present the credential
-// at path, replacing the file atomically, readable by its owner only.
-func (h Home) SetStepCredential(class, path string) error {
+// at path to hub, replacing the file atomically, readable by its owner only.
+func (h Home) SetStepCredential(class, path, hub string) error {
+	if !stepAuthClasses[class] {
+		return fmt.Errorf("%q is not a credential class", class)
+	}
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("the %s credential file %q must be an absolute path", class, path)
+	}
+	if hub == "" {
+		return fmt.Errorf("the %s enrolment names no hub", class)
 	}
 	auth, err := h.StepAuth()
 	if err != nil {
@@ -103,7 +124,7 @@ func (h Home) SetStepCredential(class, path string) error {
 	if auth.Classes == nil {
 		auth.Classes = map[string]StepAuthClass{}
 	}
-	auth.Classes[class] = StepAuthClass{Mode: StepModeCredential, CredentialFile: path}
+	auth.Classes[class] = StepAuthClass{Mode: StepModeCredential, CredentialFile: path, Hub: hub}
 	data, err := json.MarshalIndent(auth, "", "  ")
 	if err != nil {
 		return err
