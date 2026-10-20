@@ -490,14 +490,16 @@ files.
   Asked for none, the service lists only runs since its local midnight, and
   a run that ended before it would never be reviewed. The range starts at a
   watermark the checkpoint's run cursor carries (`listed-from:` and a
-  time), or seven days ago if that is earlier. The watermark is an hour
-  before the earliest result still to be shown and the earliest run not
-  finished, so covering a result can move it forward but never past one
-  that is still to be shown. A checkpoint written before the watermark
-  existed reads the whole history once.
-- The bound hides one thing: the new execution of a run retried after a
-  review covered it, when the run was created more than seven days ago. A
-  retry keeps the run's creation time, which is what the range is on.
+  time), or seven days ago if that is earlier. A checkpoint written before
+  the watermark existed reads the whole history.
+- The range is on when a run was created. The service does not report that,
+  and a retry keeps it, so the watermark moves only when nothing is left
+  behind. A review that covers every result it was shown, while no run is
+  unfinished, no result is beyond its packet and none changed while it was
+  read, moves the watermark to an hour before its listing began. Any other
+  review leaves it where the listing started.
+- The bound hides one thing: the new execution of a run that a review had
+  covered and that is retried more than seven days after it was created.
 - So a retried run is shown again when its new execution ends, on either
   retry path; results with the same end time are separate results; a
   result reported late, a run created while the history was being listed

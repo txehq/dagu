@@ -56,23 +56,26 @@ func newRunHistory(t *testing.T) *runHistory {
 
 // run records a finished run created, queued and ended at at.
 func (h *runHistory) run(runID string, at time.Time) {
-	h.attempt(runID, at, false)
+	h.attempt(runID, at, false, ir.Succeeded)
 }
 
-// retry records a new execution of the run, queued and ended at at.
-func (h *runHistory) retry(runID string, at time.Time) {
-	h.attempt(runID, at, true)
+// retry records a new execution of the run, queued at at, in that status.
+func (h *runHistory) retry(runID string, at time.Time, status ir.Status) {
+	h.attempt(runID, at, true, status)
 }
 
-func (h *runHistory) attempt(runID string, at time.Time, retry bool) {
+func (h *runHistory) attempt(runID string, at time.Time, retry bool, status ir.Status) {
 	h.t.Helper()
 	ctx := context.Background()
 	attempt, err := h.repo.CreateAttempt(ctx, &ir.DAG{Name: h.job}, at, runID, persis.DAGRunCreateAttemptOptions{Retry: retry})
 	require.NoError(h.t, err)
 	require.NoError(h.t, attempt.Open(ctx))
-	stamp := at.Format(time.RFC3339)
+	stamp, finished := at.Format(time.RFC3339), ""
+	if status != ir.Running {
+		finished = stamp
+	}
 	require.NoError(h.t, attempt.Write(ctx, ir.DAGRunStatus{
-		Name: h.job, DAGRunID: runID, AttemptID: attempt.ID(), Status: ir.Succeeded, QueuedAt: stamp, FinishedAt: stamp,
+		Name: h.job, DAGRunID: runID, AttemptID: attempt.ID(), Status: status, QueuedAt: stamp, StartedAt: stamp, FinishedAt: finished,
 	}))
 	require.NoError(h.t, attempt.Close(ctx))
 	h.execs[runID] = review.ExecutionRef(attempt.ID(), stamp)
@@ -87,6 +90,8 @@ func (h *runHistory) cover(runIDs ...string) {
 	h.reviews.replies["/txe/jobs/"+h.job+"/reviews"] = `{"reviews":[{"detail":{"covered_executions":[` + strings.Join(keys, ",") + `]}}]}`
 }
 
+// runsAfter lists what the next review is shown, and the cursor the
+// checkpoint gets when that review covers all of it.
 func (h *runHistory) runsAfter(cursor string) (ids []string, next string) {
 	h.t.Helper()
 	runs, err := h.remote.RunsAfter(context.Background(), h.job, cursor)
@@ -96,6 +101,11 @@ func (h *runHistory) runsAfter(cursor string) (ids []string, next string) {
 		next = run.Cursor
 	}
 	return ids, next
+}
+
+// watermark is the cursor for a listing that starts at at.
+func watermark(at time.Time) string {
+	return "listed-from:" + at.UTC().Format(time.RFC3339)
 }
 
 func listedFrom(t *testing.T, cursor string) time.Time {
@@ -132,10 +142,10 @@ func TestRemoteRunsAfterReadsRunsFromBeforeMidnight(t *testing.T) {
 }
 
 // The listing is bounded by the watermark the reviews' checkpoint carries.
-// A run created before the watermark and before the lookback is not read; a
-// run from the day before is; and once a review has covered what it was
-// shown, the next watermark is later, though never past a result still to
-// be shown.
+// A run created before the lookback and the watermark is not read; a run
+// from the day before is. A review that covers everything it was shown,
+// with nothing left behind, moves the watermark to an hour before its
+// listing began; only the last result returned carries that.
 func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
 	h := newRunHistory(t)
 	now := time.Now()
@@ -143,29 +153,64 @@ func TestRemoteRunsAfterIsBoundedByTheCheckpointWatermark(t *testing.T) {
 	h.run("yesterday", now.Add(-26*time.Hour))
 	h.run("today", now.Add(-time.Minute))
 
-	// Without a watermark, the whole history.
-	ids, next := h.runsAfter("")
-	assert.Equal(t, []string{"month-old", "yesterday", "today"}, ids)
-	assert.WithinDuration(t, now.Add(-30*24*time.Hour-time.Hour), listedFrom(t, next), time.Second)
+	runs, err := h.remote.RunsAfter(context.Background(), h.job, "")
+	require.NoError(t, err)
+	require.Len(t, runs, 3)
+	assert.Equal(t, "month-old", runs[0].RunID)
+	stay := watermark(time.Time{})
+	assert.Equal(t, stay, runs[0].Cursor, "a review that stops here leaves the start where it was")
+	assert.Equal(t, stay, runs[1].Cursor)
+	assert.WithinDuration(t, now.Add(-time.Hour), listedFrom(t, runs[2].Cursor), 5*time.Second)
 
-	// A watermark from two days ago: the lookback reaches back a week, so
-	// the month-old run is not read, and yesterday's is.
-	recent := "listed-from:" + now.Add(-48*time.Hour).UTC().Format(time.RFC3339)
-	ids, next = h.runsAfter(recent)
+	// A watermark from an hour ago: the lookback reaches back a week, so the
+	// month-old run is not read, and yesterday's is.
+	recent := watermark(now.Add(-time.Hour))
+	ids, _ := h.runsAfter(recent)
 	assert.Equal(t, []string{"yesterday", "today"}, ids)
-	assert.WithinDuration(t, now.Add(-26*time.Hour-time.Hour), listedFrom(t, next), time.Second)
 
-	// Yesterday's run covered: the watermark moves to the earliest result
-	// still to be shown.
 	h.cover("month-old", "yesterday")
-	ids, next = h.runsAfter(recent)
+	ids, _ = h.runsAfter(recent)
 	assert.Equal(t, []string{"today"}, ids)
-	assert.WithinDuration(t, now.Add(-time.Minute-time.Hour), listedFrom(t, next), time.Second)
 
 	// A watermark from before the month-old run reads it again; covered, it
 	// is not shown.
-	ids, _ = h.runsAfter("listed-from:" + now.Add(-60*24*time.Hour).UTC().Format(time.RFC3339))
+	ids, _ = h.runsAfter(watermark(now.Add(-60 * 24 * time.Hour)))
 	assert.Equal(t, []string{"today"}, ids)
+}
+
+// A run created long ago that is retried and not finished yet, or a result
+// beyond the packet, holds the watermark where the listing started: the
+// service lists by when a run was created, and neither run says when that
+// was. Once the retry ends, its new execution is shown.
+func TestRemoteRunsAfterHoldsTheWatermarkForWhatItLeavesBehind(t *testing.T) {
+	h := newRunHistory(t)
+	now := time.Now()
+	h.run("old", now.Add(-30*24*time.Hour))
+	h.cover("old")
+	h.retry("old", now.Add(-2*time.Minute), ir.Running)
+	h.run("today", now.Add(-time.Minute))
+
+	ids, next := h.runsAfter("")
+	assert.Equal(t, []string{"today"}, ids)
+	assert.Equal(t, watermark(time.Time{}), next, "an unfinished run holds the start")
+
+	h.cover("old", "today")
+	h.retry("old", now, ir.Failed)
+	ids, _ = h.runsAfter(next)
+	assert.Equal(t, []string{"old"}, ids)
+
+	// More results than one packet: the review is shown the oldest, and the
+	// rest hold the start.
+	from := watermark(now.Add(-8 * 24 * time.Hour))
+	for i := range 60 {
+		h.run(fmt.Sprintf("backlog-%02d", i), now.Add(-7*time.Hour+time.Duration(i)*time.Minute))
+	}
+	runs, err := h.remote.RunsAfter(context.Background(), h.job, from)
+	require.NoError(t, err)
+	require.NotEmpty(t, runs)
+	for _, run := range runs {
+		assert.Equal(t, from, run.Cursor, run.RunID)
+	}
 }
 
 // A run retried after a review covered it keeps the time it was created.
@@ -176,8 +221,8 @@ func TestRemoteRunsAfterShowsARetryOfAnOlderCoveredRun(t *testing.T) {
 	now := time.Now()
 	h.run("failed", now.Add(-3*24*time.Hour))
 	h.cover("failed")
-	h.retry("failed", now.Add(-time.Minute))
+	h.retry("failed", now.Add(-time.Minute), ir.Succeeded)
 
-	ids, _ := h.runsAfter("listed-from:" + now.Add(-time.Hour).UTC().Format(time.RFC3339))
+	ids, _ := h.runsAfter(watermark(now.Add(-time.Hour)))
 	assert.Equal(t, []string{"failed"}, ids)
 }
