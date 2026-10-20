@@ -4,6 +4,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,4 +139,14 @@ func TestLoad_ACoordinatorOnItsOwnRefusesOwners(t *testing.T) {
 	require.NoError(t, os.WriteFile(file, []byte("auth:\n  mode: builtin\ntxe:\n  authz:\n    mode: enforce\n"), 0600))
 	cfg := testLoad(t, WithConfigFile(file))
 	assert.Equal(t, TXEAuthzModeEnforce, cfg.TXE.Authz.Mode, "start-all reads them")
+
+	// A worker and a scheduler start no coordinator: a shared config, or the
+	// environment, with owners on loads for them as before.
+	for _, service := range []Service{ServiceWorker, ServiceScheduler} {
+		require.NoError(t, testLoadWithError(t, WithConfigFile(file), WithService(service)), "file, service %v", service)
+		t.Run(fmt.Sprintf("env service %v", service), func(t *testing.T) {
+			t.Setenv("DAGU_TXE_AUTHZ_MODE", TXEAuthzModeEnforce)
+			require.NoError(t, testLoadWithError(t, WithService(service)))
+		})
+	}
 }

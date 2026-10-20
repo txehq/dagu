@@ -350,7 +350,7 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 		if err := l.loadTXEConfig(&cfg); err != nil {
 			return nil, err
 		}
-	} else if l.requires(SectionCoordinator) {
+	} else if l.service == ServiceCoordinator {
 		if err := l.refuseOwnersWithoutServer(); err != nil {
 			return nil, err
 		}
