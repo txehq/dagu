@@ -690,6 +690,34 @@ func TestRegisterChecksTheStepsOwnContext(t *testing.T) {
 		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
 	})
 
+	// Text elsewhere in the DAG that ends like the resource check, in the
+	// title or an environment value, does not stand for it: a session with its
+	// own key still cannot finish a job whose steps read another registry.
+	t.Run("DecoyTextInTheDAG", func(t *testing.T) {
+		f := newFakeRegistry(t)
+		home := machineHome(t, f)
+		other := newFakeRegistry(t)
+		other.machines[testMachine] = f.machines[testMachine]
+		own := newSession(f, home, "cc3-s000003")
+		decoy := txepkg.ShellJoin(append([]string{"--machine", testMachine}, own.cli().StoreFlags...))
+		s := newSession(f, home, "cc2-s000002")
+		s.Hub, s.StepClient = steps, other.client()
+		spec, _ := worktree(t, credentialFile(t))
+		spec.Title = "decoy " + decoy
+		spec.Env["DECOY"] = "x " + decoy
+		_, err := s.Register(ctx, spec)
+		var incomplete *ErrIncomplete
+		require.ErrorAs(t, err, &incomplete)
+
+		_, err = own.Resume(ctx, incomplete.RequestID)
+		require.ErrorContains(t, err, "was built to run its steps with another context store")
+		jobs, err := own.Client.ListJobs(ctx, JobFilter{JobKey: "nightly-collector"})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Equal(t, RegistrationIncomplete, jobs[0].Registration.State)
+		assert.Zero(t, f.calls(http.MethodPost, "/txe/jobs/"+jobs[0].JobID+"/ready"))
+	})
+
 	// A request begun before steps were given the machine's store names the
 	// session's own store in its DAG. Resuming it now would mark ready a job
 	// whose steps cannot run, so it is refused.

@@ -14,8 +14,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-yaml"
 
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
@@ -374,6 +377,12 @@ func (r *Registrar) checkStepHub(ctx context.Context) error {
 // steps with another context store than this registrar gives them. That
 // covers a request begun before steps were given the machine's store, and
 // one resumed from a session that reaches the hub another way.
+//
+// The DAG is read as YAML and its commands compared whole: the first command
+// of the run step must be this job's resource check with these store flags,
+// and every other "dagu txe" command must be one of the artifacts commands
+// with them. Text elsewhere in the DAG, such as the title, an environment
+// value or the job's own command, decides nothing.
 func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
 	var request struct {
 		Version JobVersion `json:"version"`
@@ -381,15 +390,57 @@ func (r *Registrar) checkSavedSteps(entry *txepkg.Entry) error {
 	if err := json.Unmarshal(entry.Request, &request); err != nil {
 		return fmt.Errorf("read the DAG saved with request %s: %w", entry.RequestID, err)
 	}
-	// Each step command is one JSON-quoted line in the DAG, and the resource
-	// check ends with the machine and then the store flags.
-	tail, err := json.Marshal(txepkg.ShellJoin(append([]string{"--machine", entry.MachineID}, r.cli().StoreFlags...)))
-	if err != nil {
-		return err
+	var dag struct {
+		Steps []struct {
+			Name    string `yaml:"name"`
+			Command any    `yaml:"command"`
+		} `yaml:"steps"`
 	}
-	if !strings.Contains(request.Version.DAG.Spec, " "+string(tail[1:])) {
-		return fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
-			"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(r.cli().StoreFlags))
+	if err := yaml.Unmarshal([]byte(request.Version.DAG.Spec), &dag); err != nil {
+		return fmt.Errorf("read the DAG saved with request %s: %w", entry.RequestID, err)
+	}
+	cli := r.cli()
+	txe := func(words ...string) string {
+		return txepkg.ShellJoin(append(append([]string{cli.Dagu, "txe"}, words...), cli.StoreFlags...))
+	}
+	check := txe("resource", "check", "--job", entry.JobID, "--job-version", strconv.Itoa(entry.Version), "--machine", entry.MachineID)
+	allowed := map[string]bool{check: true, txe("artifacts", "begin"): true, txe("artifacts", "seal"): true, txe("artifacts", "publish"): true}
+	prefix := txepkg.ShellJoin([]string{cli.Dagu, "txe"}) + " "
+
+	refuse := fmt.Errorf("request %s was built to run its steps with another context store than this session gives them (%s), so it cannot be sent or finished from here: "+
+		"finish it from a session that reaches the hub the same way, or register the job again", entry.RequestID, txepkg.ShellJoin(cli.StoreFlags))
+	first := true
+	for _, step := range dag.Steps {
+		var commands []string
+		switch c := step.Command.(type) {
+		case string:
+			commands = []string{c}
+		case []any:
+			for _, item := range c {
+				line, ok := item.(string)
+				if !ok {
+					return refuse
+				}
+				commands = append(commands, line)
+			}
+		default:
+			return refuse
+		}
+		for _, line := range commands {
+			if first {
+				if step.Name != "run" || line != check {
+					return refuse
+				}
+				first = false
+				continue
+			}
+			if strings.HasPrefix(line, prefix) && !allowed[line] {
+				return refuse
+			}
+		}
+	}
+	if first {
+		return refuse
 	}
 	return nil
 }
