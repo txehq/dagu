@@ -62,6 +62,11 @@ run gate-running  1 "is 'in_progress null'"               not-merged \
     RUNS='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"in_progress","conclusion":null}'
 run gate-from-pr  1 "is 'missing'"                        not-merged \
     RUNS='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request","run_number":5,"status":"completed","conclusion":"success"}'
+# The documented ref-qualified path form is the same gate.
+run gate-ref-path 0 merged                                merged RUNS="$CI
+"'{"name":"codex-review","path":".github/workflows/codex-review.yml@main","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}'
+run gate-ref-full 0 merged                                merged RUNS="$CI
+"'{"name":"codex-review","path":".github/workflows/codex-review.yml@refs/heads/main","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}'
 # Another workflow file that calls itself codex-review is not the gate.
 run gate-by-name  1 "is 'missing'"                        not-merged \
     RUNS='{"name":"codex-review","path":".github/workflows/other.yml","workflow_id":109,"event":"pull_request_target","run_number":50,"status":"completed","conclusion":"success"}'

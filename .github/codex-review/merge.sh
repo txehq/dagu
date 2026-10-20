@@ -56,7 +56,9 @@ jq -s -e 'all(.[]; type == "object")' "$tmp/runs.jsonl" "$tmp/checks.jsonl" >/de
   || unread "the CI payloads (not objects)"
 # The gate is identified by its workflow FILE on main, not its display name, which another
 # workflow could share.
-gate="$(jq -s -r '[.[] | select(.path == ".github/workflows/codex-review.yml" and .event == "pull_request_target")]
+# The API has returned the bare path here; GitHub also documents a ref-qualified one
+# (".github/workflows/codex-review.yml@main"), so any "@<ref>" suffix is ignored.
+gate="$(jq -s -r '[.[] | select(((.path // "") | sub("@.*$"; "")) == ".github/workflows/codex-review.yml" and .event == "pull_request_target")]
   | max_by(.run_number) // empty | "\(.status) \(.conclusion)"' "$tmp/runs.jsonl")"
 [ "$gate" = "completed success" ] || refuse "main's codex-review run on $want is '${gate:-missing}', not completed success"
 bad="$(jq -s -r '
