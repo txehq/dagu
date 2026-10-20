@@ -23,19 +23,31 @@ export function PersonLayout({
   const { identity } = useTxeIdentity();
   return (
     <div className="flex min-h-screen flex-col bg-background">
-      <header className="flex h-12 items-center gap-4 border-b border-sidebar-border bg-sidebar px-4 text-sidebar-foreground">
-        <span className="font-semibold tracking-tight">
+      <header className="flex h-12 items-center gap-3 overflow-hidden border-b border-sidebar-border bg-sidebar px-4 text-sidebar-foreground">
+        <span className="shrink-0 font-semibold tracking-tight">
           {config.title || 'Dagu'}
         </span>
-        <Link to="/txe" className="text-sm hover:underline">
-          <I18nText text="Job inbox" />
-        </Link>
-        <Link to="/txe/machines" className="text-sm hover:underline">
-          <I18nText text="Machines" />
-        </Link>
-        <div className="ml-auto flex items-center gap-2">
+        {/* On a narrow screen the links scroll, and the account stays. */}
+        <nav className="flex min-w-0 flex-1 items-center gap-4 overflow-x-auto whitespace-nowrap">
+          <Link to="/txe" className="text-sm hover:underline">
+            <I18nText text="Job inbox" />
+          </Link>
+          <Link to="/dags" className="text-sm hover:underline">
+            <I18nText text="Workflows" />
+          </Link>
+          <Link to="/dag-runs" className="text-sm hover:underline">
+            <I18nText text="Executions" />
+          </Link>
+          <Link to="/queues" className="text-sm hover:underline">
+            <I18nText text="Queues" />
+          </Link>
+          <Link to="/txe/machines" className="text-sm hover:underline">
+            <I18nText text="Machines" />
+          </Link>
+        </nav>
+        <div className="flex shrink-0 items-center gap-2">
           <LanguageSelector variant="sidebar" compact />
-          <div className="w-40">
+          <div className="w-28 sm:w-40">
             <UserMenu
               side="bottom"
               actingFor={identity?.owners[0]?.display_name}

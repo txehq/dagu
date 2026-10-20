@@ -18,6 +18,7 @@ import type { View } from '@/hooks/useViews';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { ConfigContext, type Config } from '@/contexts/ConfigContext';
 import { WorkspaceKind } from '@/lib/workspace';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import DAGRuns from '..';
 
 const {
@@ -110,7 +111,7 @@ vi.mock('@/features/dag-runs/hooks/useBulkDAGRunSelection', () => ({
 }));
 
 vi.mock('@/features/dag-runs/components/common/DAGRunBatchActions', () => ({
-  default: () => null,
+  default: () => <div data-testid="batch-actions" />,
 }));
 
 vi.mock('@/features/dag-runs/components/dag-run-details', () => ({
@@ -152,12 +153,13 @@ vi.mock(
 );
 
 const dagRunTableProps = vi.hoisted(() => ({
-  current: {} as { isLoading?: boolean },
+  current: {} as { isLoading?: boolean; onToggleBulkSelect?: unknown },
 }));
 
 vi.mock('@/features/dag-runs/components/dag-run-list/DAGRunTable', () => ({
   default: (props: {
     isLoading?: boolean;
+    onToggleBulkSelect?: unknown;
     onSelectDAGRun: (run: { name: string; dagRunId: string }) => void;
     onViewArtifacts: (run: { name: string; dagRunId: string }) => void;
   }) => {
@@ -262,34 +264,65 @@ function locationSearchParams(): URLSearchParams {
 function renderPage(
   setTitle = vi.fn(),
   initialEntry = '/dag-runs',
-  configOverrides: Partial<Config> = {}
+  configOverrides: Partial<Config> = {},
+  person = false
 ): void {
   render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <LocationProbe />
-      <ConfigContext.Provider
-        value={
-          {
-            ...config,
-            ...configOverrides,
-          } as Config
-        }
-      >
-        <AppBarContext.Provider
+    <PersonScopeContext.Provider value={person}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <LocationProbe />
+        <ConfigContext.Provider
           value={
             {
-              setTitle,
-              selectedRemoteNode: 'local',
-              workspaceSelection: { kind: WorkspaceKind.all },
-            } as never
+              ...config,
+              ...configOverrides,
+            } as Config
           }
         >
-          <DAGRuns />
-        </AppBarContext.Provider>
-      </ConfigContext.Provider>
-    </MemoryRouter>
+          <AppBarContext.Provider
+            value={
+              {
+                setTitle,
+                selectedRemoteNode: 'local',
+                workspaceSelection: { kind: WorkspaceKind.all },
+              } as never
+            }
+          >
+            <DAGRuns />
+          </AppBarContext.Provider>
+        </ConfigContext.Provider>
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
 }
+
+describe('DAGRuns page for a person', () => {
+  // The hub refuses a person bulk retry and delete, and retries of
+  // registered job runs: the list is for reading and opening runs.
+  it('offers no batch actions or bulk selection', () => {
+    renderPage(vi.fn(), '/dag-runs', {}, true);
+
+    expect(screen.queryByTestId('batch-actions')).toBeNull();
+    expect(dagRunTableProps.current.onToggleBulkSelect).toBeUndefined();
+  });
+
+  it('offers no saving of the filters as a view', async () => {
+    const user = userEvent.setup();
+    renderPage(vi.fn(), '/dag-runs', {}, true);
+
+    await user.click(screen.getByRole('button', { name: /^Run view:/ }));
+    expect(
+      screen.queryByRole('menuitem', { name: 'Save current filters as view…' })
+    ).toBeNull();
+  });
+
+  it('offers them on the ordinary dashboard', () => {
+    renderPage();
+
+    expect(screen.getByTestId('batch-actions')).toBeInTheDocument();
+    expect(dagRunTableProps.current.onToggleBulkSelect).toBeDefined();
+  });
+});
 
 describe('DAGRuns page', () => {
   it.each([

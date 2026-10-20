@@ -12,6 +12,7 @@ import React from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Status, ViewSortField, ViewSortOrder } from '@/api/v1/schema';
+import { PersonScopeContext } from '@/features/txe/personScope';
 import { PanelWidthContext } from '@/components/SplitLayout';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { WorkspaceKind } from '@/lib/workspace';
@@ -26,11 +27,11 @@ vi.mock('@/hooks/api', () => ({
 }));
 
 vi.mock('@/features/dags/components/common/DAGActions', () => ({
-  default: () => null,
+  default: () => <span data-testid="row-actions" />,
 }));
 
 vi.mock('@/features/dags/components/common/LiveSwitch', () => ({
-  default: () => null,
+  default: () => <span data-testid="row-live-switch" />,
 }));
 
 vi.mock('@/features/dags/components/common', () => ({
@@ -51,6 +52,7 @@ function renderTable(
     canRenameDAGs?: boolean;
     onDeleteDAGs?: React.ComponentProps<typeof DAGTable>['onDeleteDAGs'];
     onRenameDAG?: (fileName: string, newFileName: string) => Promise<void>;
+    person?: boolean;
   } = {}
 ) {
   const onShowAllWorkflows = vi.fn();
@@ -65,65 +67,67 @@ function renderTable(
   const onRenameDAG =
     options.onRenameDAG ?? vi.fn().mockResolvedValue(undefined);
   const result = render(
-    <MemoryRouter>
-      <AppBarContext.Provider
-        value={
-          {
-            selectedRemoteNode: 'local',
-            workspaceSelection: { kind: WorkspaceKind.all },
-          } as never
-        }
-      >
-        <PanelWidthContext.Provider value={options.panelWidth ?? null}>
-          <DAGTable
-            dags={
-              options.dags ?? [
-                {
-                  fileName: 'example.yaml',
-                  dag: {
-                    name: searchText || 'example',
-                  },
-                  latestDAGRun: {
-                    status: Status.Success,
-                    statusLabel: 'Success',
-                  },
-                  suspended: false,
-                  errors: [],
-                } as never,
-              ]
-            }
-            group=""
-            refreshFn={vi.fn()}
-            searchText={searchText}
-            handleSearchTextChange={vi.fn()}
-            searchLabels={[]}
-            handleSearchLabelsChange={vi.fn()}
-            activeOnly={options.activeOnly ?? false}
-            handleActiveOnlyChange={handleActiveOnlyChange}
-            sortField="name"
-            sortOrder="asc"
-            onSortChange={vi.fn()}
-            workflowViews={options.workflowViews ?? []}
-            activeWorkflowViewId={options.activeWorkflowViewId ?? null}
-            isAllWorkflowsView={options.isAllWorkflowsView ?? true}
-            isWorkflowViewEdited={false}
-            canManageWorkflowViews={true}
-            canDeleteDAGs={options.canDeleteDAGs ?? true}
-            canRenameDAGs={options.canRenameDAGs ?? true}
-            onSelectWorkflowView={vi.fn()}
-            onShowAllWorkflows={onShowAllWorkflows}
-            onResetWorkflowView={vi.fn()}
-            onSaveWorkflowView={vi.fn()}
-            onUpdateWorkflowView={vi.fn()}
-            onSetDefaultWorkflowView={vi.fn()}
-            onSetPinnedWorkflowView={vi.fn()}
-            onDeleteWorkflowView={vi.fn()}
-            onDeleteDAGs={onDeleteDAGs}
-            onRenameDAG={onRenameDAG}
-          />
-        </PanelWidthContext.Provider>
-      </AppBarContext.Provider>
-    </MemoryRouter>
+    <PersonScopeContext.Provider value={options.person ?? false}>
+      <MemoryRouter>
+        <AppBarContext.Provider
+          value={
+            {
+              selectedRemoteNode: 'local',
+              workspaceSelection: { kind: WorkspaceKind.all },
+            } as never
+          }
+        >
+          <PanelWidthContext.Provider value={options.panelWidth ?? null}>
+            <DAGTable
+              dags={
+                options.dags ?? [
+                  {
+                    fileName: 'example.yaml',
+                    dag: {
+                      name: searchText || 'example',
+                    },
+                    latestDAGRun: {
+                      status: Status.Success,
+                      statusLabel: 'Success',
+                    },
+                    suspended: false,
+                    errors: [],
+                  } as never,
+                ]
+              }
+              group=""
+              refreshFn={vi.fn()}
+              searchText={searchText}
+              handleSearchTextChange={vi.fn()}
+              searchLabels={[]}
+              handleSearchLabelsChange={vi.fn()}
+              activeOnly={options.activeOnly ?? false}
+              handleActiveOnlyChange={handleActiveOnlyChange}
+              sortField="name"
+              sortOrder="asc"
+              onSortChange={vi.fn()}
+              workflowViews={options.workflowViews ?? []}
+              activeWorkflowViewId={options.activeWorkflowViewId ?? null}
+              isAllWorkflowsView={options.isAllWorkflowsView ?? true}
+              isWorkflowViewEdited={false}
+              canManageWorkflowViews={true}
+              canDeleteDAGs={options.canDeleteDAGs ?? true}
+              canRenameDAGs={options.canRenameDAGs ?? true}
+              onSelectWorkflowView={vi.fn()}
+              onShowAllWorkflows={onShowAllWorkflows}
+              onResetWorkflowView={vi.fn()}
+              onSaveWorkflowView={vi.fn()}
+              onUpdateWorkflowView={vi.fn()}
+              onSetDefaultWorkflowView={vi.fn()}
+              onSetPinnedWorkflowView={vi.fn()}
+              onDeleteWorkflowView={vi.fn()}
+              onDeleteDAGs={onDeleteDAGs}
+              onRenameDAG={onRenameDAG}
+            />
+          </PanelWidthContext.Provider>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    </PersonScopeContext.Provider>
   );
   return {
     ...result,
@@ -204,6 +208,22 @@ describe('DAGTable', () => {
       'aria-checked',
       'true'
     );
+  });
+
+  // A person acts from a DAG's own page, which follows the hub's answer:
+  // a row offers no schedule switch or run actions.
+  it("offers a person's rows no switch or run actions", () => {
+    renderTable('', { person: true });
+
+    expect(screen.queryAllByTestId('row-actions')).toHaveLength(0);
+    expect(screen.queryAllByTestId('row-live-switch')).toHaveLength(0);
+  });
+
+  it('offers them on the ordinary dashboard', () => {
+    renderTable();
+
+    expect(screen.getAllByTestId('row-actions').length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId('row-live-switch').length).toBeGreaterThan(0);
   });
 
   it('hides workflow mutation controls without write permission', () => {

@@ -4,6 +4,7 @@
 import { useCallback, useContext, useMemo } from 'react';
 import { components, ViewSpecType } from '@/api/v1/schema';
 import { AppBarContext } from '@/contexts/AppBarContext';
+import { usePersonScope } from '@/features/txe/personScope';
 import { useClient, useQuery } from '@/hooks/api';
 
 export type View = components['schemas']['View'];
@@ -28,9 +29,12 @@ export function useViews(type: ViewSpecType = ViewSpecType.kanban) {
   const appBar = useContext(AppBarContext);
   const remoteNode = appBar.selectedRemoteNode || 'local';
 
-  const { data, error, isLoading, mutate } = useQuery('/views', {
-    params: { query: { remoteNode } },
-  });
+  // The hub refuses saved views to a person, so a person's pages ask for none.
+  const person = usePersonScope();
+  const { data, error, isLoading, mutate } = useQuery(
+    '/views',
+    person ? null : { params: { query: { remoteNode } } }
+  );
 
   const views = useMemo<View[]>(
     () => (data?.views ?? []).filter((view) => view.type === type),
