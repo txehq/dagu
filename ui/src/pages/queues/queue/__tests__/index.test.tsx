@@ -26,6 +26,23 @@ vi.mock('@/features/dag-runs/components/dag-run-details', () => ({
   DAGRunDetailsModal: () => null,
 }));
 
+vi.mock('@/contexts/ConfigContext', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/contexts/ConfigContext')>()),
+  useConfig: () => ({
+    tz: 'UTC',
+    tzOffsetInSec: 0,
+    permissions: { runDags: true, writeDags: true },
+  }),
+}));
+
+const runAccess = vi.hoisted(() => ({
+  allowed: undefined as boolean | undefined,
+}));
+vi.mock('@/features/txe/runAccess', () => ({
+  useJobRunAllowed: () => runAccess.allowed,
+  ViewOnly: () => <span>View only</span>,
+}));
+
 const cappedZeroQueue: components['schemas']['Queue'] = {
   name: 'running-heavy-q',
   type: QueueType.dag_based,
@@ -36,7 +53,9 @@ const cappedZeroQueue: components['schemas']['Queue'] = {
   running: [],
 };
 
-function renderPage(queue: components['schemas']['Queue']): void {
+function renderPage(queue: components['schemas']['Queue']): {
+  rerender: () => void;
+} {
   useQueryMock.mockReturnValue({
     data: queue,
     error: null,
@@ -45,7 +64,9 @@ function renderPage(queue: components['schemas']['Queue']): void {
     mutate: vi.fn(),
   });
 
-  render(
+  // The tree is built afresh on each render, so a rerender reads the mocks
+  // again.
+  const tree = () => (
     <MemoryRouter initialEntries={[`/queues/${queue.name}`]}>
       <AppBarContext.Provider
         value={
@@ -61,7 +82,87 @@ function renderPage(queue: components['schemas']['Queue']): void {
       </AppBarContext.Provider>
     </MemoryRouter>
   );
+  const result = render(tree());
+  return { rerender: () => result.rerender(tree()) };
 }
+
+// A registered job's queue is named by its job id; its runs are dequeued only
+// by a caller the hub lets run the job (TXE-4740).
+describe('QueueDetailsPage for a job the caller may only view', () => {
+  const jobQueue: components['schemas']['Queue'] = {
+    name: 'job_01M4XEETKWKZX504BK65ADBVYB',
+    type: QueueType.dag_based,
+    maxConcurrency: 1,
+    runningCount: 0,
+    queuedCount: 1,
+    queuedCountCapped: false,
+    running: [],
+  };
+  const item = {
+    name: 'job_01M4XEETKWKZX504BK65ADBVYB',
+    dagRunId: 'run-1',
+    status: 5,
+    statusLabel: 'queued',
+    queuedAt: '2026-10-21T00:00:00Z',
+    startedAt: '',
+    finishedAt: '',
+  };
+
+  beforeEach(() => {
+    getMock.mockReset();
+    useQueryMock.mockReset();
+    getMock.mockResolvedValue({ data: { items: [item] }, error: undefined });
+  });
+
+  it('offers no selection or dequeue', async () => {
+    runAccess.allowed = false;
+    try {
+      renderPage(jobQueue);
+
+      expect(await screen.findByText('View only')).toBeVisible();
+      expect(
+        screen.queryByRole('button', { name: /Dequeue selected/ })
+      ).toBeNull();
+      expect(
+        screen.queryByRole('button', { name: 'Select all loaded' })
+      ).toBeNull();
+    } finally {
+      runAccess.allowed = undefined;
+    }
+  });
+
+  it('closes an open confirmation when access is revoked', async () => {
+    runAccess.allowed = true;
+    try {
+      const view = renderPage(jobQueue);
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Select all loaded' })
+      );
+      fireEvent.click(screen.getByRole('button', { name: /Dequeue selected/ }));
+      expect(await screen.findByRole('dialog')).toBeInTheDocument();
+
+      runAccess.allowed = false;
+      view.rerender();
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    } finally {
+      runAccess.allowed = undefined;
+    }
+  });
+
+  it('offers dequeue to a caller the hub lets run the job', async () => {
+    runAccess.allowed = true;
+    try {
+      renderPage(jobQueue);
+
+      expect(
+        await screen.findByRole('button', { name: /Dequeue selected/ })
+      ).toBeInTheDocument();
+      expect(screen.queryByText('View only')).toBeNull();
+    } finally {
+      runAccess.allowed = undefined;
+    }
+  });
+});
 
 describe('QueueDetailsPage', () => {
   beforeEach(() => {
