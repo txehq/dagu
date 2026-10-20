@@ -10,6 +10,9 @@ import { useI18n } from '@/i18n/I18nProvider';
 
 import { isTxePerson, useTxeIdentity } from './identity';
 
+// How often the job's access is read again while a page is open.
+export const ACCESS_REFRESH_MS = 10_000;
+
 // A job's DAG is named by its job id.
 const JOB_DAG_NAME = /^job_[0-9A-Z]{26}$/;
 
@@ -39,7 +42,13 @@ export function useJobRunAllowed(
       });
       return res.data?.access ?? null;
     },
-    { onError: () => undefined, shouldRetryOnError: false }
+    // A share can change while the page is open: read it again, as the
+    // other TXE pages do.
+    {
+      onError: () => undefined,
+      shouldRetryOnError: false,
+      refreshInterval: ACCESS_REFRESH_MS,
+    }
   );
   if (!binding || !data) return undefined;
   return data.permissions.includes(TxeAccessPermission.execute);

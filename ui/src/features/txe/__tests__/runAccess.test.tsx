@@ -1,7 +1,7 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import React from 'react';
 import { SWRConfig } from 'swr';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,7 +13,7 @@ import {
   TxeJobAccessVia,
 } from '@/api/v1/schema';
 
-import { useJobRunAllowed } from '../runAccess';
+import { ACCESS_REFRESH_MS, useJobRunAllowed } from '../runAccess';
 
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
 const mode = vi.hoisted(() => ({ current: 'enforce' as string | undefined }));
@@ -119,6 +119,29 @@ describe('useJobRunAllowed', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(result.current).toBeUndefined();
     expect(GET).not.toHaveBeenCalled();
+  });
+
+  // An owner grants or revokes execute while the page stays open.
+  it('follows a change of the share while the page is open', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mode.current = TxeIdentityAuthz_mode.off;
+      principal.current = TxeIdentityPrincipalClass.person;
+      answer([TxeAccessPermission.view], TxeJobAccessVia.share);
+      const { result } = renderHook(() => useJobRunAllowed(JOB), { wrapper });
+      await waitFor(() => expect(result.current).toBe(false));
+
+      answer(
+        [TxeAccessPermission.view, TxeAccessPermission.execute],
+        TxeJobAccessVia.share
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ACCESS_REFRESH_MS + 100);
+      });
+      await waitFor(() => expect(result.current).toBe(true));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('says nothing when the job cannot be read', async () => {
