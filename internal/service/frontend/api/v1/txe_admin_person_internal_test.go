@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -160,3 +161,37 @@ func TestTxeUnboundSSOAdministratorIsNoPerson(t *testing.T) {
 	_, err = w.api.RequestTxeBinding(w.admin, apigen.RequestTxeBindingRequestObject{})
 	require.Equal(t, http.StatusForbidden, statusOf(err), "the builtin administrator has no identity to bind")
 }
+
+// Under enforce, a bound administrator decides its owner's proposals as the
+// owner's person does: pause and retire on approve alone, and a task-backed
+// proposal through the person's path to the decide run. On another owner's
+// job it decides nothing (TXE-4710).
+func TestTxeBoundSSOAdministratorDecidesAsItsOwnersPerson(t *testing.T) {
+	w := newTwoOwners(t, "enforce")
+	admin := ssoAdmin("a")
+	svc := w.api.txeDecisionService(w.reg)
+	errDone := errors.New("done")
+	decide := func(ctx context.Context, jobID string, verdict registry.Verdict) error {
+		var got error
+		_, err := w.reg.WithJobTx(ctx, jobID, registry.Actor{Kind: registry.ActorHuman, ID: "t"}, func(tx *registry.JobTx) error {
+			got = svc.AuthorizeDecision(ctx, tx, verdict)
+			return errDone
+		})
+		require.ErrorIs(t, err, errDone)
+		return got
+	}
+	for _, verdict := range []registry.Verdict{registry.VerdictApprove, registry.VerdictPause, registry.VerdictRetire} {
+		require.NoError(t, decide(w.personA, w.jobA, verdict), "A's person: %s", verdict)
+		require.NoError(t, decide(admin, w.jobA, verdict), "bound administrator: %s", verdict)
+		require.Error(t, decide(admin, w.jobB, verdict), "B's job: %s", verdict)
+	}
+
+	// A task-backed decision reaches the decide run by the person's path.
+	decideDAG := txeauth.MachineDAGs(w.machineA)[1]
+	asPerson := svc.AuthorizeTask(w.personA, decideDAG, "run-1")
+	asAdmin := svc.AuthorizeTask(admin, decideDAG, "run-1")
+	require.Error(t, asPerson, "the fixture has no runs")
+	require.Error(t, asAdmin, "the person's path: the run must exist")
+	require.Equal(t, asPerson.Error(), asAdmin.Error())
+}
+

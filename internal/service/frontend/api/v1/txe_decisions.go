@@ -389,7 +389,7 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 			if err := a.txeAuthorizeJob(ctx, tx.Job.JobID, authz.PermissionApprove, txeNeed{}); err != nil {
 				return err
 			}
-			if a.txeOwnerOnly(ctx) {
+			if a.txeDecidesAsPerson(ctx) {
 				// For a caller held to its owner, approve covers every
 				// verdict, pausing and retiring included: a person the owner
 				// shares approve with may decide them without authoring the
@@ -411,7 +411,7 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 		// The same checks as completing the task through the native
 		// human-task endpoint.
 		AuthorizeTask: func(ctx context.Context, dagName, dagRunID string) error {
-			if a.txeOwnerOnly(ctx) {
+			if a.txeDecidesAsPerson(ctx) {
 				// The decision service has checked that the task belongs to
 				// the job, and the job's owner has decided approve; the run
 				// need only exist.
@@ -424,4 +424,26 @@ func (a *API) txeDecisionService(store *registry.Store) *decision.Service {
 			return a.requireDAGRunStatusExecute(ctx, status)
 		},
 	}
+}
+
+// txeDecidesAsPerson reports whether a decision is the caller's as a person
+// held to its owner: a caller from the identity provider, or, under enforce,
+// a platform administrator bound to an owner. Under enforce the
+// administrator holds approve on an owner's job only as that person
+// (authz.Scope.OwnerPerson), so a decision that passed the approve check is
+// the person's, and is held to what the person's would be, not to the
+// administrator's author and execute.
+func (a *API) txeDecidesAsPerson(ctx context.Context) bool {
+	if a.txeOwnerOnly(ctx) {
+		return true
+	}
+	if a.txeAuth == nil || txeauth.Classify(ctx).Kind != txeauth.KindPlatformAdmin {
+		return false
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil || c.mode != authz.ModeEnforce {
+		return false
+	}
+	_, bound := c.scope.OwnerPerson()
+	return bound
 }
