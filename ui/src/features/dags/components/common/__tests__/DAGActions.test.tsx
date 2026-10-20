@@ -12,7 +12,7 @@ import React from 'react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Status, StatusLabel } from '@/api/v1/schema';
-import DAGActions from '../DAGActions';
+import DAGActions, { startUnconfirmedRunId } from '../DAGActions';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { DAGContext } from '@/features/dags/contexts/DAGContext';
 
@@ -274,6 +274,56 @@ describe('DAGActions', () => {
     expect(
       within(view.container).getByRole('button', { name: 'Retry' })
     ).toBeDisabled();
+  });
+
+  // TXE-4712: the hub handed the run over but did not see it start. The
+  // page follows that run instead of leaving a Start that would make another.
+  it('follows a run whose start the hub could not confirm', async () => {
+    client.POST.mockResolvedValue({
+      error: {
+        code: 'timeout',
+        message: 'not seen to start',
+        details: { code: 'start_unconfirmed', dag_run_id: 'run-9' },
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={['/dags']}>
+        <AppBarContext.Provider
+          value={{ selectedRemoteNode: 'local' } as never}
+        >
+          <DAGActions
+            fileName="example-file"
+            dag={{ name: 'example' }}
+            displayMode="full"
+          />
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Submit start' }));
+
+    await waitFor(() =>
+      expect(runProgress.pushRunProgress).toHaveBeenCalledWith({
+        dagName: 'example',
+        dagRunId: 'run-9',
+        remoteNode: 'local',
+      })
+    );
+  });
+
+  it('reads only start_unconfirmed with a run id as an unconfirmed start', () => {
+    expect(
+      startUnconfirmedRunId({
+        details: { code: 'start_unconfirmed', dag_run_id: 'run-9' },
+      })
+    ).toBe('run-9');
+    expect(
+      startUnconfirmedRunId({ details: { code: 'dag_not_pinned' } })
+    ).toBeUndefined();
+    expect(
+      startUnconfirmedRunId({ details: { code: 'start_unconfirmed' } })
+    ).toBeUndefined();
+    expect(startUnconfirmedRunId(undefined)).toBeUndefined();
   });
 
   it('disables retry when there is no DAG run id', () => {
