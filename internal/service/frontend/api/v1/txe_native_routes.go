@@ -140,4 +140,3 @@ func (a *API) txeRootRunRoute(ctx context.Context, root ir.DAGRunRef, permission
 	}
 	return a.txeRunRoute(ctx, root.Name, attempt, permission)
 }
-
