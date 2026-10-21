@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -591,4 +592,23 @@ func TestTXEMachineStepClient(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "dagu_test_key", client.APIKey)
 	})
+}
+
+// A reviewer enrolment's output says how its steps find the credential and
+// never tells the operator to give it to the worker, which refuses it; a
+// worker enrolment still names the worker's setting.
+func TestTXEEnrolOutputNamesWhatReadsTheCredential(t *testing.T) {
+	var reviewer, worker bytes.Buffer
+	printEnrol(&txePrinter{w: &reviewer}, txeEnrolView{Class: "reviewer", State: "enrolled", StepAuth: "credential", CredentialFile: "/home/r/reviewer-credential.json"})
+	printEnrol(&txePrinter{w: &worker}, txeEnrolView{Class: "worker", State: "enrolled", StepAuth: "credential", CredentialFile: "/home/r/worker-credential.json"})
+	assert.Contains(t, reviewer.String(), "reviewer steps read it through client/step-auth.json")
+	assert.NotContains(t, reviewer.String(), "worker.auth.credential_file")
+	assert.Contains(t, worker.String(), "worker.auth.credential_file: /home/r/worker-credential.json")
+
+	// Applied but not yet enrolled: nothing reads it yet, and the output
+	// says so.
+	var applied bytes.Buffer
+	printEnrol(&txePrinter{w: &applied}, txeEnrolView{Class: "reviewer", State: "applied", CredentialFile: "/home/r/reviewer-credential.json"})
+	assert.Contains(t, applied.String(), "Once the hub enrols it, this machine's reviewer steps read it")
+	assert.NotContains(t, applied.String(), "worker.auth.credential_file")
 }
