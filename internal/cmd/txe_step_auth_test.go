@@ -604,4 +604,11 @@ func TestTXEEnrolOutputNamesWhatReadsTheCredential(t *testing.T) {
 	assert.Contains(t, reviewer.String(), "reviewer steps read it through client/step-auth.json")
 	assert.NotContains(t, reviewer.String(), "worker.auth.credential_file")
 	assert.Contains(t, worker.String(), "worker.auth.credential_file: /home/r/worker-credential.json")
+
+	// Applied but not yet enrolled: nothing reads it yet, and the output
+	// says so.
+	var applied bytes.Buffer
+	printEnrol(&txePrinter{w: &applied}, txeEnrolView{Class: "reviewer", State: "applied", CredentialFile: "/home/r/reviewer-credential.json"})
+	assert.Contains(t, applied.String(), "Once the hub enrols it, this machine's reviewer steps read it")
+	assert.NotContains(t, applied.String(), "worker.auth.credential_file")
 }
