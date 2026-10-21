@@ -214,7 +214,9 @@ profiles() {
       real="$(resolve "$d")"
       printf '%s\n' "$real/skills"
     done
-    if [ -d "$HOME/.agents" ] || [ -d "$HOME/.codex" ] || command -v codex >/dev/null 2>&1; then
+    # Codex reads ~/.agents/skills too: include it wherever Codex is in use,
+    # a custom CODEX_HOME included.
+    if [ -d "$HOME/.agents" ] || [ -d "$HOME/.codex" ] || { [ -n "${CODEX_HOME:-}" ] && [ -d "$CODEX_HOME" ]; } || command -v codex >/dev/null 2>&1; then
       printf '%s\n' "$(resolve "$HOME/.agents")/skills"
     fi
   } | awk '!seen[$0]++'
