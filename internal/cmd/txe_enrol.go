@@ -669,5 +669,12 @@ func printEnrol(p *txePrinter, v txeEnrolView) {
 		p.f("Approve at %s\n", v.ApproveURL)
 		p.f("Until then, keep it live with: %s\n", v.resume)
 	}
+	// Only the worker class configures the worker; the worker refuses a
+	// reviewer's credential (TXE-4733), whose steps find it through the
+	// machine's step-auth record instead.
+	if v.Class == authn.ClassReviewer {
+		p.f("This machine's reviewer steps read it through client/step-auth.json; do not give it to the worker.\n")
+		return
+	}
 	p.f("The worker reads it from worker.auth.credential_file: %s (or DAGU_WORKER_AUTH_CREDENTIAL_FILE).\n", v.CredentialFile)
 }
