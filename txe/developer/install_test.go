@@ -506,3 +506,21 @@ func TestInstallProfilesAndMigration(t *testing.T) {
 	out, err = e.run("--check")
 	require.NoError(t, err, out)
 }
+
+// Codex reads ~/.agents/skills as well as its home's skills: a custom
+// CODEX_HOME, with no ~/.codex, ~/.agents or codex on PATH, still gets both.
+func TestInstallLinksAgentsForACustomCodexHome(t *testing.T) {
+	e := newDevEnv(t)
+	require.NoError(t, os.RemoveAll(filepath.Join(e.home, ".codex")))
+	require.NoError(t, os.RemoveAll(filepath.Join(e.home, ".codex3")))
+	custom := filepath.Join(e.home, "profiles", "codex-work")
+	require.NoError(t, os.MkdirAll(custom, 0o755))
+	e.env = []string{"CODEX_HOME=" + custom}
+	out, err := e.run("--tag", "txe-v2.18.2-11", "--binary", e.stub("dagu-11", "2.18.2-txe.11", "b"))
+	require.NoError(t, err, out)
+	for _, dir := range []string{filepath.Join(custom, "skills"), filepath.Join(e.home, ".agents", "skills")} {
+		target, err := os.Readlink(filepath.Join(dir, "txe-dagu-jobs"))
+		require.NoError(t, err, dir)
+		assert.Equal(t, filepath.Join(e.canon, "txe-dagu-jobs"), target, dir)
+	}
+}
