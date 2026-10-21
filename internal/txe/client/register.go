@@ -174,7 +174,7 @@ func (r *Registrar) resolve(ctx context.Context, spec *JobSpec, provenance txepk
 	known, err := r.Client.Machine(ctx, machine.MachineID)
 	if err != nil {
 		if IsCode(err, CodeNotFound) {
-			return nil, fmt.Errorf("the hub does not know this machine (%s); enrol the local worker first", machine.MachineID)
+			return nil, fmt.Errorf("the hub does not know this machine (%s); record it with \"dagu txe machine create\" first", machine.MachineID)
 		}
 		return nil, fmt.Errorf("look up this machine on the hub: %w", err)
 	}

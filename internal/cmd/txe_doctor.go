@@ -82,7 +82,7 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 	}
 
 	machine, err := home.Machine()
-	if add("machine identity", err, "", "run the worker installer on this machine") {
+	if add("machine identity", err, "", "run \"dagu txe machine create\" on this machine") {
 		checks[len(checks)-1].Detail = fmt.Sprintf("%s, owner %s", machine.MachineID, machine.OwnerID)
 	}
 

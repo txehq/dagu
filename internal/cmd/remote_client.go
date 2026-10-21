@@ -36,6 +36,9 @@ type remoteClient struct {
 type remoteError struct {
 	StatusCode int
 	Message    string
+	// Detail is the error's details.code, such as "unbound" or "duplicate",
+	// when the hub gives one.
+	Detail string
 }
 
 func (e *remoteError) Error() string {
@@ -328,7 +331,11 @@ func decodeRemoteError(resp *http.Response) error {
 	}
 	var apiErr api.Error
 	if err := json.Unmarshal(data, &apiErr); err == nil && apiErr.Message != "" {
-		return &remoteError{StatusCode: resp.StatusCode, Message: apiErr.Message}
+		out := &remoteError{StatusCode: resp.StatusCode, Message: apiErr.Message}
+		if apiErr.Details != nil {
+			out.Detail, _ = (*apiErr.Details)["code"].(string)
+		}
+		return out
 	}
 	return &remoteError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(data))}
 }
