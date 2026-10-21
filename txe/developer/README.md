@@ -3,15 +3,15 @@
 `install.sh` puts the TXE developer CLI on this machine's `PATH` as `dagu`. It also gives every Claude Code and Codex profile the `txe-dagu-jobs` skill that binary carries. It runs on macOS and Linux and needs no Kubernetes access and no API key.
 
 ```sh
-txe/developer/install.sh --tag txe-v2.18.2-12          # build the fork tag (needs git and go)
-txe/developer/install.sh --tag txe-v2.18.2-12 --binary /abs/dagu-2.18.2-txe.12   # install an accepted build of that tag
+txe/developer/install.sh --tag <accepted tag>          # build the fork tag, such as txe-v2.18.2-14 (needs git and go)
+txe/developer/install.sh --tag <accepted tag> --binary /abs/dagu-<its version>   # install an accepted build of that tag
 txe/developer/install.sh --check                       # read back; changes nothing
 dagu txe login --hub https://dag.txeinternal.com        # then sign in, in the browser
 dagu txe whoami                                         # bound, and to which owner
 dagu txe machine create                                 # once per machine: record it in the hub
 ```
 
-Use a tag that has passed acceptance. `--binary` must report exactly the tag's version (`dagu version`).
+Use a tag that has passed acceptance; ask the hub's operators which one is current. `dagu txe machine create` needs `txe-v2.18.2-14` or later. `--binary` must report exactly the tag's version (`dagu version`), such as `2.18.2-txe.14` for `txe-v2.18.2-14`.
 
 ## Where things go
 
