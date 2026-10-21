@@ -307,7 +307,7 @@ func txeEnrolMachineKnown(ctx *Context, remote *remoteClient, machineID string) 
 	err = authed.do(ctx, http.MethodGet, "/txe/machines/"+url.PathEscape(machineID), nil, &out, nil)
 	var rerr *remoteError
 	if errors.As(err, &rerr) && rerr.NotFound() {
-		return fmt.Errorf("the hub has no machine %s of this sign-in's owner: run the worker installer, or sign in as a person of its owner", machineID)
+		return fmt.Errorf("the hub has no machine %s of this sign-in's owner: record it with \"dagu txe machine create\", or sign in as a person of its owner", machineID)
 	}
 	if err != nil {
 		return fmt.Errorf("ask the hub about machine %s: %w", machineID, err)

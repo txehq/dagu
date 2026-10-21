@@ -283,7 +283,7 @@ func TestTXEEnrolNeedsTheMachine(t *testing.T) {
 	f := newTXEEnrolFixture(t)
 	require.NoError(t, os.Remove(filepath.Join(f.home, "machine.json")))
 	_, err := f.run("enrol", "--client-id", txeEnrolTestClient)
-	require.ErrorContains(t, err, "install the local worker first")
+	require.ErrorContains(t, err, "dagu txe machine create")
 	assert.Empty(t, f.provider.LastAuth(), "no sign-in")
 }
 

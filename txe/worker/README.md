@@ -16,7 +16,7 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 
 | Path | Contents | Lifetime |
 |---|---|---|
-| `machine.json` | `machine_id`, `owner_id`, display name | written once; a reinstall never changes it |
+| `machine.json` | `machine_id`, `owner_id`, display name | written once, by `dagu txe machine create` or the first install; nothing changes it after that |
 | `bin/dagu-<version>`, `bin/dagu` | every installed binary with its build record; `dagu` points at the current one | kept across upgrades |
 | `packages/` | job packages (written by the CLI, TXE-3408) | kept |
 | `outputs/` | job outputs and deliverables, `outputs/<job id>/` | kept |
@@ -38,7 +38,8 @@ txe/worker/status.sh
 ```
 
 The owner id is minted once for the installation (`txe/worker/mint-id.sh own`) and recorded with
-the service. Pass it only on the first install.
+the service. Pass it only on the first install. If `dagu txe machine create` has already run, it
+wrote `machine.json` and the installer takes the owner from there.
 
 The installer links `~/.local/bin/dagu` to `bin/dagu`, so shells and coding-agent sessions run
 this install as `dagu` (set `TXE_DAGU_LINK_DIR` for another directory). If a `dagu` the installer
@@ -50,7 +51,8 @@ A job script can read Linear through the Orca CLI without a Linear key. A job's 
 is different, and needs one. The skill sets out both: `txe/skill/SKILL.md`, "Linear: the target check
 and your script are two things".
 
-Once the hub knows the machine, install its periodic resource check on the hub. The hub schedules
+Once the hub knows the machine (`dagu txe machine create`, run by a signed-in person of the
+owner), install its periodic resource check on the hub. The hub schedules
 that check, and this worker runs it.
 
 ```sh
@@ -79,7 +81,8 @@ conflicting writes atomically.
 ## Machine credential
 
 When the hub verifies its workers (`coordinator.auth`), the worker must present this machine's own
-credential. Enrolment happens after the first install, because `dagu txe enrol` reads `machine.json`:
+credential. Enrolment happens after the first install, because `dagu txe enrol` reads `machine.json`,
+and after `dagu txe machine create`, because the hub must know the machine:
 
 ```sh
 dagu txe enrol --client-id <this machine's worker client> --wait 15m   # a person of the owner signs in;

@@ -7,7 +7,8 @@ txe/developer/install.sh --tag txe-v2.18.2-12          # build the fork tag (nee
 txe/developer/install.sh --tag txe-v2.18.2-12 --binary /abs/dagu-2.18.2-txe.12   # install an accepted build of that tag
 txe/developer/install.sh --check                       # read back; changes nothing
 dagu txe login --hub https://dag.txeinternal.com        # then sign in, in the browser
-dagu txe whoami
+dagu txe whoami                                         # bound, and to which owner
+dagu txe machine create                                 # once per machine: record it in the hub
 ```
 
 Use a tag that has passed acceptance. `--binary` must report exactly the tag's version (`dagu version`).
@@ -26,13 +27,29 @@ Use a tag that has passed acceptance. `--binary` must report exactly the tag's v
 
 The developer's sign-in and the machine's store are kept apart. On a machine with a worker, the machine's `txe` context reaches the hub over the local tunnel with the machine's credential, and `dagu txe login --hub` would refuse to replace it. A job a signed-in developer registers still runs its steps with the machine's own store. Registration checks that store first: the sign-in must be bound to the machine's owner, and both stores must reach the same registry (TXE-4706).
 
+## Recording this machine in the hub
+
+The hub has to know a machine before it can enrol the machine's worker or register a job from it. `dagu txe machine create` records it, once, with the developer's sign-in. It sends nothing else: no API key and no administrator step.
+
+- The owner is the sign-in's owner, as the hub reports it. `--owner-id` only checks that; the command stops if it names another owner.
+- The machine's identity is `machine.json` in the TXE home. If it exists, its machine id is used and the file is never changed, and if it belongs to another owner, the command stops. If it does not exist, the command mints the id and writes the file first, the way the worker installer does, so the worker installer later keeps it (`--display-name` names it, default this computer's name).
+- Running it again is safe: the hub returns the record it already has for the same machine and owner.
+- The hub, not this command, decides: it holds a person's or CLI sign-in to its own owner in every mode. The command checks first only so that it sends nothing the hub would refuse. A machine's worker or reviewer credential cannot create a machine.
+
+On a new machine the order is:
+
+1. `txe/developer/install.sh`, then `dagu txe login --hub <the hub's address>` as a person of the owner;
+2. `dagu txe machine create`, which mints the machine id and writes `machine.json`;
+3. the worker installer, which keeps that `machine.json`, so it needs no `--owner-id`;
+4. `dagu txe enrol` (below).
+
 ## Enrolling this machine's worker
 
 `dagu txe enrol` is the machine's, not the developer's. The wrapper leaves it on the machine's own store, the TXE home's `client`. The hub the enrolment records is therefore the one this machine's job steps reach. A step presents the machine credential only to that hub (TXE-4707), so an enrolment made through the developer's store would leave the steps refusing to run.
 
 Order on a machine with a worker:
 
-1. **Hub:** the hub's administrator lists the machine's worker client in `txe.authn.clients`.
+1. **Hub:** `dagu txe machine create` has recorded the machine, and the hub's administrator lists the machine's worker client in `txe.authn.clients`.
 2. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub.
 3. **Upgrade the worker:** its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
 
