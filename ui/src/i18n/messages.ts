@@ -87,6 +87,7 @@ export const messages = {
     'navigation.integrations': 'Integrations',
     'navigation.webhooks': 'Webhooks',
     'navigation.apiReference': 'API Reference',
+    'navigation.developerSetup': 'Developer setup',
     'navigation.profilesSecrets': 'Profiles & Secrets',
     'navigation.administration': 'Administration',
     'navigation.access': 'Access',
@@ -135,6 +136,113 @@ export const messages = {
       'Trigger workflows from external systems.',
     'integrations.apiReferenceDescription':
       'Explore authenticated REST API endpoints.',
+    'integrations.devSetup.title': 'Developer setup',
+    'integrations.devSetup.intro':
+      "Set up the TXE developer CLI and the txe-dagu-jobs skill on your own Mac or Linux machine, then check that each part works. This page cannot see your machine: every check runs there, and the command's output is the result.",
+    'integrations.devSetup.factNoWorker':
+      'The developer install puts dagu on your PATH and links the skill. It does not install a worker: jobs run on your machine only once a worker is installed and enrolled (step 7).',
+    'integrations.devSetup.factNoKeys':
+      'Signing in needs no kubeconfig, API key or copied credential: the CLI signs in through your browser with your own account.',
+    'integrations.devSetup.factSeparate':
+      "Your sign-in is kept in the developer CLI's own context store. A worker on the same machine keeps its own store and credential, and the developer install never changes them.",
+    'integrations.devSetup.browserIdentity':
+      "This browser's account acts for {owner}. That is this browser, not your machine: on your machine, dagu txe whoami must name the same owner.",
+    'integrations.devSetup.tagLabel': 'Accepted tag',
+    'integrations.devSetup.tagHelp':
+      "Ask your hub's operators which tag has passed acceptance. Every command in this guide needs {min} or later.",
+    'integrations.devSetup.tagInvalid':
+      'A tag looks like {min}. The commands show a placeholder until it does.',
+    'integrations.devSetup.tagTooOld':
+      '{tag} does not have dagu txe machine create. Use {min} or later.',
+    'integrations.devSetup.prereqTitle': 'Prerequisites',
+    'integrations.devSetup.prereqBody':
+      'git, go, python3 and bash. go downloads the toolchain the tag needs. The CLI is linked into ~/.local/bin, which must be on your PATH; open a new terminal after changing your shell profile.',
+    'integrations.devSetup.prereqExpected':
+      'one path for each tool. A tool that prints nothing is missing.',
+    'integrations.devSetup.installTitle':
+      'Build and install the CLI from the tag',
+    'integrations.devSetup.installBody':
+      'No release downloads are published. The installer clones the tag again, builds it with go, installs it under ~/.local/share/txe-dagu-cli, links dagu into ~/.local/bin, and links the skill into every Claude Code and Codex profile.',
+    'integrations.devSetup.installExpected':
+      'lines for the binary, the wrapper, the path and each skill link, then "ok. Sign in with: dagu txe login --hub …".',
+    'integrations.devSetup.checkTitle': 'Check the install',
+    'integrations.devSetup.checkBody':
+      'Run in the same directory. It reads everything back and changes nothing: the wrapper, dagu on your PATH, and the skill link in every profile.',
+    'integrations.devSetup.checkExpected':
+      '"ok." on the last line of the check, and dagu version prints {version}.',
+    'integrations.devSetup.loginTitle': 'Sign in through your browser',
+    'integrations.devSetup.loginBody':
+      "The address is this hub's, taken from this page. On a machine with no desktop browser, use the second command and open the address it prints in a browser on that same machine.",
+    'integrations.devSetup.loginNoBrowser': 'Sign in without opening a browser',
+    'integrations.devSetup.loginHttp':
+      "This page is served over plain http. The CLI signs in only over https, except to this machine itself, so use the hub's https address instead.",
+    'integrations.devSetup.loginExpected':
+      '"access: owner own_…" once an administrator has bound you to an owner. "access: none yet" or "requested" means that is still to happen; see step 5.',
+    'integrations.devSetup.whoamiTitle': 'Check who the hub says you are',
+    'integrations.devSetup.whoamiBound':
+      '"bound, owner own_…": you act for that owner. Continue.',
+    'integrations.devSetup.whoamiUnbound':
+      '"unbound": open this hub in a browser with the same account and request access. An administrator has to approve it; nothing on your machine can.',
+    'integrations.devSetup.whoamiPending':
+      '"pending": your request is waiting for an administrator.',
+    'integrations.devSetup.machineTitle': 'Record this machine in the hub',
+    'integrations.devSetup.machineBody':
+      'Once per machine, signed in as a person of its owner. It writes machine.json in the TXE home and records the machine in the hub; running it again is safe. A machine that already has a worker is already recorded: skip this step and step 7.',
+    'integrations.devSetup.machineExpected':
+      '"machine mch_… is recorded in the hub for owner own_…". The machine then appears under',
+    'integrations.devSetup.machinesLink': 'Machines',
+    'integrations.devSetup.workerTitle':
+      'Install and enrol a worker (needs an administrator)',
+    'integrations.devSetup.workerBody':
+      "Only needed to run jobs on this machine, and not self-service today. The worker installer (txe/worker/README.md in the checkout) needs the hub's tunnel credential, which an administrator provides, and enrolment needs an administrator to list this machine's worker client in the hub. Then run the command below and approve the application on this machine's page in the hub.",
+    'integrations.devSetup.workerExpected':
+      "the enrol command waits until you approve, then reports the enrolment. The machine's page shows it as active.",
+    'integrations.devSetup.skillTitle': 'Use the skill in Claude Code or Codex',
+    'integrations.devSetup.skillBody':
+      'The installer linked txe-dagu-jobs into every profile, and step 3 checked each link. Start a new session: one that was already open does not see the skill. Ask it to keep a check running after the session ends, and it follows the skill.',
+    'integrations.devSetup.skillExpected':
+      '"ok" next to skill/current, at the revision this binary carries.',
+    'integrations.devSetup.verifyTitle': 'Check that it works',
+    'integrations.devSetup.verifyIntro':
+      'Four stages, each checked on your machine, in order: a stage needs the ones before it. Registered and ready is not the same as ran; only a finished run proves the last stage.',
+    'integrations.devSetup.stageCliTitle': 'CLI and skill installed',
+    'integrations.devSetup.stageCliProof':
+      'The check in step 3 ends with "ok.".',
+    'integrations.devSetup.stageIdentityTitle': 'Identity bound',
+    'integrations.devSetup.stageIdentityProof':
+      'dagu txe whoami says "bound, owner own_…" (step 5).',
+    'integrations.devSetup.stageMachineTitle': 'Machine and worker ready',
+    'integrations.devSetup.stageMachineProof':
+      'Every line says ok, including "machine on hub", and the machine\'s page in the hub shows an active enrolment.',
+    'integrations.devSetup.stageJobTitle':
+      'Test job ran and its result reached the hub',
+    'integrations.devSetup.smokeIntro':
+      'A harmless job that prints one line and publishes it as result.json. It reads and changes nothing on your machine.',
+    'integrations.devSetup.smokeCreate': 'Create the test job',
+    'integrations.devSetup.smokeCreateExpected':
+      'a new directory under ~/txe-dev-setup-smoke holding job.yaml and run.sh, and the job key and expiry printed. The expiry is three hours from when you run it.',
+    'integrations.devSetup.smokeDryRun': 'Dry run',
+    'integrations.devSetup.smokeDryRunExpected':
+      '"The spec is complete. Nothing was registered."',
+    'integrations.devSetup.smokeRegister': 'Register',
+    'integrations.devSetup.smokeRegisterNote':
+      'This is the one step that changes the hub: it registers a real job that runs every 30 minutes on this machine. Run it only when you mean to.',
+    'integrations.devSetup.smokeRegisterExpected':
+      '"Registered job_… version 1. The hub has marked it ready." Use that job id below.',
+    'integrations.devSetup.smokeVerify': 'Check the package',
+    'integrations.devSetup.smokeVerifyExpected':
+      '"the package is intact and the hub has marked the job ready." The job has not run yet.',
+    'integrations.devSetup.smokeInspect': 'Wait for a run, then inspect',
+    'integrations.devSetup.smokeInspectExpected':
+      'after the next :00 or :30 UTC, "Recent runs" lists a run with status succeeded. To read the run and its result.json in the hub, open the job from the',
+    'integrations.devSetup.inboxLink': 'job inbox',
+    'integrations.devSetup.smokeExpiry':
+      'Three hours after you created it, inspect shows "Lifecycle: retired" and the hub runs it no more. There is nothing to clean up.',
+    'integrations.devSetup.copy': 'Copy: {label}',
+    'integrations.devSetup.copied': 'Copied',
+    'integrations.devSetup.copyFailed':
+      'Could not copy. Select the text and copy it.',
+    'integrations.devSetup.expected': 'Expected:',
     'theme.lightMode': 'Light Mode',
     'theme.darkMode': 'Dark Mode',
     'auth.signInToAccount': 'Sign in to your account',
@@ -252,6 +360,7 @@ export const messages = {
     'navigation.integrations': '集成',
     'navigation.webhooks': 'Webhook',
     'navigation.apiReference': 'API 参考文档',
+    'navigation.developerSetup': '开发者设置',
     'navigation.profilesSecrets': '配置与密钥',
     'navigation.administration': '系统管理',
     'navigation.access': '访问控制',
@@ -295,6 +404,108 @@ export const messages = {
     'integrations.webhooksDescription': '从外部系统触发工作流。',
     'integrations.apiReferenceDescription':
       '浏览需要身份认证的 REST API 端点。',
+    'integrations.devSetup.title': '开发者设置',
+    'integrations.devSetup.intro':
+      '在你自己的 Mac 或 Linux 机器上设置 TXE 开发者 CLI 和 txe-dagu-jobs 技能，然后检查每一部分是否正常。此页面看不到你的机器：每项检查都在你的机器上运行，命令的输出就是结果。',
+    'integrations.devSetup.factNoWorker':
+      '开发者安装会把 dagu 放到你的 PATH 中并链接技能。它不会安装 worker：只有在安装并注册 worker 之后（第 7 步），作业才会在你的机器上运行。',
+    'integrations.devSetup.factNoKeys':
+      '登录不需要 kubeconfig、API 密钥或复制任何凭据：CLI 通过浏览器用你自己的账户登录。',
+    'integrations.devSetup.factSeparate':
+      '你的登录保存在开发者 CLI 自己的上下文存储中。同一台机器上的 worker 有自己的存储和凭据，开发者安装永远不会改动它们。',
+    'integrations.devSetup.browserIdentity':
+      '此浏览器的账户代表 {owner}。这是指此浏览器，而不是你的机器：在你的机器上，dagu txe whoami 必须显示同一个所有者。',
+    'integrations.devSetup.tagLabel': '已验收的标签',
+    'integrations.devSetup.tagHelp':
+      '请向 hub 的运维人员确认哪个标签已通过验收。本指南中的每条命令都需要 {min} 或更高版本。',
+    'integrations.devSetup.tagInvalid':
+      '标签的格式类似 {min}。在格式正确之前，命令中显示占位符。',
+    'integrations.devSetup.tagTooOld':
+      '{tag} 没有 dagu txe machine create。请使用 {min} 或更高版本。',
+    'integrations.devSetup.prereqTitle': '前提条件',
+    'integrations.devSetup.prereqBody':
+      'git、go、python3 和 bash。go 会下载该标签所需的工具链。CLI 链接到 ~/.local/bin，该目录必须在你的 PATH 中；修改 shell 配置后请打开新的终端。',
+    'integrations.devSetup.prereqExpected':
+      '每个工具输出一个路径。没有输出的工具即为缺失。',
+    'integrations.devSetup.installTitle': '从标签构建并安装 CLI',
+    'integrations.devSetup.installBody':
+      '没有发布可下载的版本。安装程序会再次克隆该标签，用 go 构建，安装到 ~/.local/share/txe-dagu-cli，把 dagu 链接到 ~/.local/bin，并把技能链接到每个 Claude Code 和 Codex 配置中。',
+    'integrations.devSetup.installExpected':
+      '依次输出二进制文件、包装脚本、路径和每个技能链接，然后是 “ok. Sign in with: dagu txe login --hub …”。',
+    'integrations.devSetup.checkTitle': '检查安装',
+    'integrations.devSetup.checkBody':
+      '在同一目录中运行。它会读回所有内容且不做任何更改：包装脚本、PATH 中的 dagu，以及每个配置中的技能链接。',
+    'integrations.devSetup.checkExpected':
+      '检查的最后一行为 “ok.”，并且 dagu version 输出 {version}。',
+    'integrations.devSetup.loginTitle': '通过浏览器登录',
+    'integrations.devSetup.loginBody':
+      '地址是此 hub 的地址，取自本页面。在没有桌面浏览器的机器上，请使用第二条命令，并在同一台机器的浏览器中打开它输出的地址。',
+    'integrations.devSetup.loginNoBrowser': '不打开浏览器登录',
+    'integrations.devSetup.loginHttp':
+      '此页面通过普通 http 提供。除本机外，CLI 只通过 https 登录，因此请改用 hub 的 https 地址。',
+    'integrations.devSetup.loginExpected':
+      '管理员将你绑定到所有者后，显示 “access: owner own_…”。“access: none yet” 或 “requested” 表示尚未绑定；见第 5 步。',
+    'integrations.devSetup.whoamiTitle': '检查 hub 认为你是谁',
+    'integrations.devSetup.whoamiBound':
+      '“bound, owner own_…”：你代表该所有者。继续。',
+    'integrations.devSetup.whoamiUnbound':
+      '“unbound”：用同一账户在浏览器中打开此 hub 并申请访问权限。必须由管理员批准；你的机器无法完成这一步。',
+    'integrations.devSetup.whoamiPending':
+      '“pending”：你的申请正在等待管理员处理。',
+    'integrations.devSetup.machineTitle': '在 hub 中登记此机器',
+    'integrations.devSetup.machineBody':
+      '每台机器一次，以其所有者成员的身份登录后运行。它会在 TXE 主目录中写入 machine.json 并在 hub 中登记此机器；重复运行是安全的。已经有 worker 的机器已登记：跳过此步骤和第 7 步。',
+    'integrations.devSetup.machineExpected':
+      '“machine mch_… is recorded in the hub for owner own_…”。此后该机器会出现在',
+    'integrations.devSetup.machinesLink': '机器',
+    'integrations.devSetup.workerTitle': '安装并注册 worker（需要管理员）',
+    'integrations.devSetup.workerBody':
+      '仅在此机器上运行作业时需要，目前不能自助完成。worker 安装程序（见检出目录中的 txe/worker/README.md）需要管理员提供的 hub 隧道凭据，注册需要管理员在 hub 中列出此机器的 worker 客户端。然后运行下面的命令，并在 hub 中此机器的页面上批准申请。',
+    'integrations.devSetup.workerExpected':
+      '注册命令会等待你批准，然后报告注册结果。机器页面显示其为活动状态。',
+    'integrations.devSetup.skillTitle': '在 Claude Code 或 Codex 中使用技能',
+    'integrations.devSetup.skillBody':
+      '安装程序已将 txe-dagu-jobs 链接到每个配置中，第 3 步已检查每个链接。请启动新会话：已经打开的会话看不到该技能。让它在会话结束后继续运行检查，它就会按照该技能操作。',
+    'integrations.devSetup.skillExpected':
+      'skill/current 旁显示 “ok”，版本为此二进制文件携带的版本。',
+    'integrations.devSetup.verifyTitle': '检查是否正常',
+    'integrations.devSetup.verifyIntro':
+      '共四个阶段，均在你的机器上按顺序检查：每个阶段都依赖前面的阶段。已注册且就绪不等于已运行；只有完成的运行才能证明最后一个阶段。',
+    'integrations.devSetup.stageCliTitle': 'CLI 和技能已安装',
+    'integrations.devSetup.stageCliProof': '第 3 步的检查以 “ok.” 结束。',
+    'integrations.devSetup.stageIdentityTitle': '身份已绑定',
+    'integrations.devSetup.stageIdentityProof':
+      'dagu txe whoami 显示 “bound, owner own_…”（第 5 步）。',
+    'integrations.devSetup.stageMachineTitle': '机器和 worker 已就绪',
+    'integrations.devSetup.stageMachineProof':
+      '每一行都显示 ok，包括 “machine on hub”，并且 hub 中此机器的页面显示一个活动的注册。',
+    'integrations.devSetup.stageJobTitle': '测试作业已运行且结果已到达 hub',
+    'integrations.devSetup.smokeIntro':
+      '一个无害的作业：输出一行内容并将其作为 result.json 发布。它不会读取或更改你机器上的任何内容。',
+    'integrations.devSetup.smokeCreate': '创建测试作业',
+    'integrations.devSetup.smokeCreateExpected':
+      '~/txe-dev-setup-smoke 下出现一个包含 job.yaml 和 run.sh 的新目录，并输出作业键和过期时间。过期时间为运行该命令后的三小时。',
+    'integrations.devSetup.smokeDryRun': '试运行',
+    'integrations.devSetup.smokeDryRunExpected':
+      '“The spec is complete. Nothing was registered.”',
+    'integrations.devSetup.smokeRegister': '注册',
+    'integrations.devSetup.smokeRegisterNote':
+      '这是唯一会更改 hub 的步骤：它会注册一个真实的作业，每 30 分钟在此机器上运行一次。请仅在确定要这样做时运行。',
+    'integrations.devSetup.smokeRegisterExpected':
+      '“Registered job_… version 1. The hub has marked it ready.” 在下面的命令中使用该作业 ID。',
+    'integrations.devSetup.smokeVerify': '检查软件包',
+    'integrations.devSetup.smokeVerifyExpected':
+      '“the package is intact and the hub has marked the job ready.” 作业尚未运行。',
+    'integrations.devSetup.smokeInspect': '等待运行，然后查看',
+    'integrations.devSetup.smokeInspectExpected':
+      '在下一个 UTC :00 或 :30 之后，“Recent runs” 列出一次状态为 succeeded 的运行。要在 hub 中查看该运行及其 result.json，请从以下位置打开作业：',
+    'integrations.devSetup.inboxLink': '作业收件箱',
+    'integrations.devSetup.smokeExpiry':
+      '创建三小时后，inspect 显示 “Lifecycle: retired”，hub 不再运行它。无需清理。',
+    'integrations.devSetup.copy': '复制：{label}',
+    'integrations.devSetup.copied': '已复制',
+    'integrations.devSetup.copyFailed': '无法复制。请选中文本后手动复制。',
+    'integrations.devSetup.expected': '预期结果：',
     'theme.lightMode': '浅色模式',
     'theme.darkMode': '深色模式',
     'auth.signInToAccount': '登录你的账户',
@@ -414,6 +625,7 @@ export const messages = {
     'navigation.integrations': 'インテグレーション',
     'navigation.webhooks': 'Webhook',
     'navigation.apiReference': 'API リファレンス',
+    'navigation.developerSetup': '開発者セットアップ',
     'navigation.profilesSecrets': 'プロファイルとシークレット',
     'navigation.administration': '管理',
     'navigation.access': 'アクセス',
@@ -461,6 +673,114 @@ export const messages = {
       '外部システムからワークフローを起動します。',
     'integrations.apiReferenceDescription':
       '認証済み REST API エンドポイントを確認します。',
+    'integrations.devSetup.title': '開発者セットアップ',
+    'integrations.devSetup.intro':
+      'ご自身の Mac または Linux マシンに TXE 開発者 CLI と txe-dagu-jobs スキルをセットアップし、各部分が動作することを確認します。このページからはあなたのマシンは見えません。すべての確認はマシン上で実行し、コマンドの出力が結果です。',
+    'integrations.devSetup.factNoWorker':
+      '開発者インストールは dagu を PATH に置き、スキルをリンクします。ワーカーはインストールしません。ジョブがマシンで実行されるのは、ワーカーをインストールして登録した後です（手順 7）。',
+    'integrations.devSetup.factNoKeys':
+      'サインインに kubeconfig、API キー、コピーした認証情報は不要です。CLI はブラウザーでご自身のアカウントでサインインします。',
+    'integrations.devSetup.factSeparate':
+      'サインインは開発者 CLI 専用のコンテキストストアに保存されます。同じマシンのワーカーは独自のストアと認証情報を持ち、開発者インストールがそれらを変更することはありません。',
+    'integrations.devSetup.browserIdentity':
+      'このブラウザーのアカウントは {owner} として動作しています。これはこのブラウザーのことで、あなたのマシンではありません。マシン上で dagu txe whoami が同じオーナーを表示する必要があります。',
+    'integrations.devSetup.tagLabel': '承認済みタグ',
+    'integrations.devSetup.tagHelp':
+      'どのタグが承認済みか、ハブの運用担当者に確認してください。このガイドのすべてのコマンドには {min} 以降が必要です。',
+    'integrations.devSetup.tagInvalid':
+      'タグは {min} のような形式です。正しい形式になるまで、コマンドにはプレースホルダーが表示されます。',
+    'integrations.devSetup.tagTooOld':
+      '{tag} には dagu txe machine create がありません。{min} 以降を使用してください。',
+    'integrations.devSetup.prereqTitle': '前提条件',
+    'integrations.devSetup.prereqBody':
+      'git、go、python3、bash。go はタグに必要なツールチェーンをダウンロードします。CLI は ~/.local/bin にリンクされるため、このディレクトリが PATH に含まれている必要があります。シェルの設定を変更したら新しいターミナルを開いてください。',
+    'integrations.devSetup.prereqExpected':
+      'ツールごとにパスが 1 つ表示されます。何も表示されないツールは未インストールです。',
+    'integrations.devSetup.installTitle':
+      'タグから CLI をビルドしてインストール',
+    'integrations.devSetup.installBody':
+      'リリースのダウンロードは公開されていません。インストーラーはタグを再度クローンして go でビルドし、~/.local/share/txe-dagu-cli にインストールして dagu を ~/.local/bin にリンクし、スキルをすべての Claude Code と Codex のプロファイルにリンクします。',
+    'integrations.devSetup.installExpected':
+      'バイナリ、ラッパー、パス、各スキルリンクの行の後に「ok. Sign in with: dagu txe login --hub …」。',
+    'integrations.devSetup.checkTitle': 'インストールを確認',
+    'integrations.devSetup.checkBody':
+      '同じディレクトリで実行します。すべてを読み戻し、何も変更しません。ラッパー、PATH 上の dagu、各プロファイルのスキルリンクを確認します。',
+    'integrations.devSetup.checkExpected':
+      '確認の最終行が「ok.」で、dagu version が {version} を表示します。',
+    'integrations.devSetup.loginTitle': 'ブラウザーでサインイン',
+    'integrations.devSetup.loginBody':
+      'アドレスはこのページから取得したこのハブのものです。デスクトップブラウザーのないマシンでは 2 番目のコマンドを使い、表示されたアドレスを同じマシンのブラウザーで開いてください。',
+    'integrations.devSetup.loginNoBrowser': 'ブラウザーを開かずにサインイン',
+    'integrations.devSetup.loginHttp':
+      'このページは http で配信されています。CLI はこのマシン自身を除き https でのみサインインするため、ハブの https アドレスを使用してください。',
+    'integrations.devSetup.loginExpected':
+      '管理者がオーナーに紐付けると「access: owner own_…」。「access: none yet」または「requested」はまだ紐付けられていないことを示します。手順 5 を参照してください。',
+    'integrations.devSetup.whoamiTitle': 'ハブから見たあなたを確認',
+    'integrations.devSetup.whoamiBound':
+      '「bound, owner own_…」: そのオーナーとして動作します。続行してください。',
+    'integrations.devSetup.whoamiUnbound':
+      '「unbound」: 同じアカウントでブラウザーからこのハブを開き、アクセスをリクエストしてください。承認は管理者が行います。マシン側では何もできません。',
+    'integrations.devSetup.whoamiPending':
+      '「pending」: リクエストは管理者の承認待ちです。',
+    'integrations.devSetup.machineTitle': 'このマシンをハブに登録',
+    'integrations.devSetup.machineBody':
+      'マシンごとに 1 回、そのオーナーのメンバーとしてサインインして実行します。TXE ホームに machine.json を書き込み、マシンをハブに登録します。再実行しても安全です。すでにワーカーがあるマシンは登録済みなので、この手順と手順 7 は省略してください。',
+    'integrations.devSetup.machineExpected':
+      '「machine mch_… is recorded in the hub for owner own_…」。その後、マシンは次に表示されます:',
+    'integrations.devSetup.machinesLink': 'マシン',
+    'integrations.devSetup.workerTitle':
+      'ワーカーのインストールと登録（管理者が必要）',
+    'integrations.devSetup.workerBody':
+      'このマシンでジョブを実行する場合にのみ必要で、現在はセルフサービスではありません。ワーカーインストーラー（チェックアウト内の txe/worker/README.md）には管理者が提供するハブのトンネル認証情報が必要で、登録には管理者がこのマシンのワーカークライアントをハブに登録する必要があります。その後、下のコマンドを実行し、ハブのこのマシンのページで申請を承認してください。',
+    'integrations.devSetup.workerExpected':
+      '登録コマンドは承認されるまで待機し、その後登録結果を表示します。マシンのページにはアクティブと表示されます。',
+    'integrations.devSetup.skillTitle':
+      'Claude Code または Codex でスキルを使う',
+    'integrations.devSetup.skillBody':
+      'インストーラーは txe-dagu-jobs をすべてのプロファイルにリンクし、手順 3 で各リンクを確認しました。新しいセッションを開始してください。すでに開いているセッションからはスキルが見えません。セッション終了後もチェックを続けるよう依頼すると、スキルに従います。',
+    'integrations.devSetup.skillExpected':
+      'skill/current の横に「ok」と、このバイナリが持つリビジョンが表示されます。',
+    'integrations.devSetup.verifyTitle': '動作を確認',
+    'integrations.devSetup.verifyIntro':
+      '4 つの段階をマシン上で順に確認します。各段階はそれ以前の段階を前提とします。登録済みで準備完了であることは実行済みとは違います。最後の段階は完了した実行でのみ証明されます。',
+    'integrations.devSetup.stageCliTitle': 'CLI とスキルがインストール済み',
+    'integrations.devSetup.stageCliProof':
+      '手順 3 の確認が「ok.」で終わります。',
+    'integrations.devSetup.stageIdentityTitle': 'ID が紐付け済み',
+    'integrations.devSetup.stageIdentityProof':
+      'dagu txe whoami が「bound, owner own_…」と表示します（手順 5）。',
+    'integrations.devSetup.stageMachineTitle': 'マシンとワーカーが準備完了',
+    'integrations.devSetup.stageMachineProof':
+      '「machine on hub」を含むすべての行が ok で、ハブのマシンのページにアクティブな登録が表示されます。',
+    'integrations.devSetup.stageJobTitle':
+      'テストジョブが実行され、結果がハブに届いた',
+    'integrations.devSetup.smokeIntro':
+      '1 行を出力し、それを result.json として公開するだけの無害なジョブです。マシン上の何も読み取らず、変更もしません。',
+    'integrations.devSetup.smokeCreate': 'テストジョブを作成',
+    'integrations.devSetup.smokeCreateExpected':
+      '~/txe-dev-setup-smoke の下に job.yaml と run.sh を含む新しいディレクトリが作成され、ジョブキーと有効期限が表示されます。有効期限は実行時から 3 時間後です。',
+    'integrations.devSetup.smokeDryRun': 'ドライラン',
+    'integrations.devSetup.smokeDryRunExpected':
+      '「The spec is complete. Nothing was registered.」',
+    'integrations.devSetup.smokeRegister': '登録',
+    'integrations.devSetup.smokeRegisterNote':
+      'ハブを変更するのはこの手順だけです。このマシンで 30 分ごとに実行される実際のジョブを登録します。意図した場合にのみ実行してください。',
+    'integrations.devSetup.smokeRegisterExpected':
+      '「Registered job_… version 1. The hub has marked it ready.」以下ではそのジョブ ID を使います。',
+    'integrations.devSetup.smokeVerify': 'パッケージを確認',
+    'integrations.devSetup.smokeVerifyExpected':
+      '「the package is intact and the hub has marked the job ready.」ジョブはまだ実行されていません。',
+    'integrations.devSetup.smokeInspect': '実行を待ってから確認',
+    'integrations.devSetup.smokeInspectExpected':
+      '次の UTC :00 または :30 以降、「Recent runs」にステータス succeeded の実行が表示されます。ハブで実行と result.json を確認するには、次からジョブを開きます:',
+    'integrations.devSetup.inboxLink': 'ジョブ受信箱',
+    'integrations.devSetup.smokeExpiry':
+      '作成から 3 時間後、inspect に「Lifecycle: retired」と表示され、ハブはそれ以上実行しません。後片付けは不要です。',
+    'integrations.devSetup.copy': 'コピー: {label}',
+    'integrations.devSetup.copied': 'コピーしました',
+    'integrations.devSetup.copyFailed':
+      'コピーできませんでした。テキストを選択してコピーしてください。',
+    'integrations.devSetup.expected': '期待される結果:',
     'theme.lightMode': 'ライトモード',
     'theme.darkMode': 'ダークモード',
     'auth.signInToAccount': 'アカウントにログイン',

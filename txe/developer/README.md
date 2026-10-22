@@ -13,6 +13,36 @@ dagu txe machine create                                 # once per machine: reco
 
 Use a tag that has passed acceptance; ask the hub's operators which one is current. `dagu txe machine create` needs `txe-v2.18.2-14` or later. `--binary` must report exactly the tag's version (`dagu version`), such as `2.18.2-txe.14` for `txe-v2.18.2-14`.
 
+The fork publishes no release downloads, so on a new machine get the script from the tag and let it build that tag. It needs git, go, python3 and bash, and `~/.local/bin` on `PATH`:
+
+```sh
+git clone --depth 1 --branch <accepted tag> https://github.com/txehq/dagu.git txe-dagu-<accepted tag>
+cd txe-dagu-<accepted tag>
+txe/developer/install.sh --tag <accepted tag>
+```
+
+The hub's dashboard gives the same steps, with this hub's address filled in, under Integrations, "Developer setup". A person signed in through single sign-on finds them under "Developer setup" in their own dashboard. The page shows commands to copy and the output to expect; it runs nothing, and it cannot see the machine.
+
+## Checking that it works
+
+Four stages, each checked on the machine, in order:
+
+| Stage | Proof |
+|---|---|
+| CLI and skill installed | `install.sh --check` ends with `ok.` |
+| Identity bound | `dagu txe whoami` says `bound, owner own_…`; `unbound` or `pending` waits on an administrator |
+| Machine and worker ready | `dagu txe doctor` says ok on every line, `machine on hub` included, and the machine's page in the hub shows an active enrolment. The worker install and its enrolment need an administrator today: the tunnel credential, and the worker client listed in the hub |
+| A job ran and its result reached the hub | the smoke test below |
+
+`smoke/` is the smoke test. The page writes it into a new directory under `~/txe-dev-setup-smoke`. The shell that runs the page's command fills in `{{STAMP}}` and `{{EXPIRES_AT}}`: the job key, and a lifetime of three hours from then. Every run prints one line and publishes it as `result.json`; it reads and changes nothing else. Then:
+
+1. `dagu txe register -f job.yaml --session dev-setup-smoke --dry-run`: `The spec is complete. Nothing was registered.`
+2. `dagu txe register -f job.yaml --session dev-setup-smoke` registers a real job, which runs every 30 minutes on this machine: `Registered job_… version 1. The hub has marked it ready.`
+3. `dagu txe package verify <job id>`: the package is intact and the job is ready. It has not run yet.
+4. `dagu txe inspect <job id>` after the next `:00` or `:30` UTC: `Recent runs` lists a run with status `succeeded`, and the job's page in the hub shows the run and its `result.json`.
+
+When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and the hub runs it no more. `TestTXEDeveloperSmokeJob` registers these files with the built CLI against a hub with the real registry. The page's own tests check that it prints exactly these files.
+
 ## Where things go
 
 | Path | What | Owner |

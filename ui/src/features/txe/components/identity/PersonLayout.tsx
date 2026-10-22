@@ -7,6 +7,7 @@ import { Link } from 'react-router-dom';
 import { LanguageSelector } from '@/components/LanguageSelector';
 import { UserMenu } from '@/components/UserMenu';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useI18n } from '@/i18n/I18nProvider';
 import { I18nText } from '@/i18n/I18nText';
 
 import { useTxeIdentity } from '../../identity';
@@ -20,6 +21,7 @@ export function PersonLayout({
   children: React.ReactNode;
 }): React.ReactElement {
   const config = useConfig();
+  const { t } = useI18n();
   const { identity } = useTxeIdentity();
   return (
     <div className="flex min-h-screen flex-col bg-background">
@@ -43,6 +45,9 @@ export function PersonLayout({
           </Link>
           <Link to="/txe/machines" className="text-sm hover:underline">
             <I18nText text="Machines" />
+          </Link>
+          <Link to="/integrations" className="text-sm hover:underline">
+            {t('navigation.developerSetup')}
           </Link>
         </nav>
         <div className="flex shrink-0 items-center gap-2">
