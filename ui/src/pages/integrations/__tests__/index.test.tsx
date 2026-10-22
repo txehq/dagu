@@ -153,6 +153,20 @@ describe('DeveloperSetup', () => {
     );
   });
 
+  // --no-browser only skips opening a browser: the sign-in returns to a
+  // listener on that machine, reached from elsewhere only by forwarding its
+  // port.
+  it('explains signing in on a machine without a browser', () => {
+    renderPage();
+
+    expect(
+      screen.getByText(/--no-browser only stops the CLI opening a browser/)
+    ).toBeVisible();
+    expect(codeBlocks()).toContain(
+      'ssh -L <port>:127.0.0.1:<port> <you>@<that machine>'
+    );
+  });
+
   // Behind a base path the CLI must be given the API root, which it keeps.
   it('names the API root behind a base path', () => {
     mocks.apiURL.value = '/dagu/api/v1';

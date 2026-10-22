@@ -23,6 +23,8 @@ txe/developer/install.sh --tag <accepted tag>
 
 The hub's dashboard gives the same steps, with this hub's address filled in, under Integrations, "Developer setup". A person signed in through single sign-on finds them under "Developer setup" in their own dashboard. The page shows commands to copy and the output to expect; it runs nothing, and it cannot see the machine.
 
+Signing in ends at a one-time listener on `127.0.0.1` on the machine that runs `dagu txe login`, on a port it picks, and gives up after five minutes. `--no-browser` only stops the CLI from opening a browser: the address it prints must still be opened in a browser on that machine. On a remote machine over SSH, take the port from the `127.0.0.1` address in the printed `redirect_uri`, and forward that same port from your own computer in a second terminal (`ssh -L <port>:127.0.0.1:<port> <you>@<that machine>`). Then open the address in your own browser.
+
 ## Checking that it works
 
 Four stages, each checked on the machine, in order:
@@ -34,14 +36,14 @@ Four stages, each checked on the machine, in order:
 | Machine and worker ready | `dagu txe doctor` says ok on every line, `machine on hub` included, and the machine's page in the hub shows an active enrolment. The worker install and its enrolment need an administrator today: the tunnel credential, and the worker client listed in the hub |
 | A job ran and its result reached the hub | the smoke test below |
 
-`smoke/` is the smoke test. The page writes it into a new directory under `~/txe-dev-setup-smoke`. The shell that runs the page's command fills in `{{STAMP}}` and `{{EXPIRES_AT}}`: the job key, and a lifetime of three hours from then. Every run prints one line and publishes it as `result.json`; it reads and changes nothing else. Then:
+`smoke/` is the smoke test. The page writes it into a new directory under `~/txe-dev-setup-smoke`. The shell that runs the page's command fills in `{{STAMP}}` and `{{EXPIRES_AT}}`: the job key, and a lifetime of fifteen minutes from then. The job runs every minute. Each run prints one line and writes only its `result.json`, which is published to the hub; it calls no external service. Then:
 
 1. `dagu txe register -f job.yaml --session dev-setup-smoke --dry-run`: `The spec is complete. Nothing was registered.`
-2. `dagu txe register -f job.yaml --session dev-setup-smoke` registers a real job, which runs every 30 minutes on this machine: `Registered job_… version 1. The hub has marked it ready.`
+2. `dagu txe register -f job.yaml --session dev-setup-smoke` registers a real job, which runs every minute on this machine until it expires: `Registered job_… version 1. The hub has marked it ready.`
 3. `dagu txe package verify <job id>`: the package is intact and the job is ready. It has not run yet.
-4. `dagu txe inspect <job id>` after the next `:00` or `:30` UTC: `Recent runs` lists a run with status `succeeded`, and the job's page in the hub shows the run and its `result.json`.
+4. `dagu txe inspect <job id>` within a minute or two: `Recent runs` lists a run with status `succeeded`, and the job's page in the hub shows the run and its `result.json`.
 
-When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and the hub runs it no more. `TestTXEDeveloperSmokeJob` registers these files with the built CLI against a hub with the real registry. The page's own tests check that it prints exactly these files.
+When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and the hub runs it no more. Its runs stay readable. `TestTXEDeveloperSmokeJob` registers these files with the built CLI against a hub with the real registry. The page's own tests check that it prints exactly these files.
 
 ## Where things go
 

@@ -3,9 +3,9 @@ job_key: dev-setup-smoke-{{STAMP}}
 title: Developer setup smoke test
 purpose: >-
   Shows that this machine's worker runs a job the hub schedules and that the
-  result reaches the hub. It reads and changes nothing: each run prints one
-  line and publishes it as result.json. The job retires itself when its
-  lifetime ends.
+  result reaches the hub. It calls no external service: each run prints one
+  line and writes only its result.json, which is published to the hub. The
+  job retires itself when its lifetime ends.
 project:
   key: txe.local/dev-setup-smoke
   name: developer setup smoke test
@@ -17,7 +17,7 @@ targets:
     display_name: developer setup smoke test
     existence_check: event_only
 schedule:
-  cron: "*/30 * * * *"
+  cron: "* * * * *"
   timezone: UTC
   timeout_sec: 60
 package:

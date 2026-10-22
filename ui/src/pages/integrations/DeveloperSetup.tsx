@@ -231,6 +231,11 @@ export function DeveloperSetup(): React.ReactElement {
             command={cmd.loginNoBrowser}
             label={t('integrations.devSetup.loginNoBrowser')}
           />
+          <p>{t('integrations.devSetup.loginSshBody')}</p>
+          <CommandBlock
+            command={cmd.sshForward}
+            label={t('integrations.devSetup.loginSsh')}
+          />
           <Expected>{t('integrations.devSetup.loginExpected')}</Expected>
         </Step>
         <Step n={5} title={t('integrations.devSetup.whoamiTitle')}>

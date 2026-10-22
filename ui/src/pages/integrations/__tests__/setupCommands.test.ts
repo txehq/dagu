@@ -136,12 +136,18 @@ describe('the smoke test', () => {
     );
   });
 
+  // Setup feedback within a minute or two, bounded to fifteen minutes.
+  it('runs every minute and calls no external service', () => {
+    expect(SMOKE_JOB_TEMPLATE).toContain('  cron: "* * * * *"\n');
+    expect(SMOKE_SCRIPT).not.toMatch(/curl|wget|dagu |ssh /);
+  });
+
   it('has nothing an unquoted here-document would expand', () => {
     expect(SMOKE_JOB_TEMPLATE).not.toMatch(/[$`\\]/);
   });
 
   // The command runs as a person pastes it: the files it writes are the
-  // template with the shell's stamp and a lifetime three hours from now.
+  // template with the shell's stamp and a lifetime fifteen minutes from now.
   it.each(['bash', 'zsh'])('writes the files when run in %s', (shell) => {
     const which = spawnSync('sh', ['-c', `command -v ${shell}`]);
     if (which.status !== 0) return;
@@ -158,15 +164,16 @@ describe('the smoke test', () => {
     expect(out.status, out.stderr).toBe(0);
     const lines = out.stdout.trim().split('\n');
     const dir = lines[lines.length - 1] ?? '';
-    const m = /^job key dev-setup-smoke-(\d{12}), expires (\S+)$/.exec(
-      lines[0] ?? ''
-    );
+    const m =
+      /^job key dev-setup-smoke-(\d{14}-[0-9a-f]{6}), expires (\S+)$/.exec(
+        lines[0] ?? ''
+      );
     expect(m, out.stdout).not.toBeNull();
     const [, stamp = '', expires = ''] = m ?? [];
     expect(path.dirname(dir)).toBe(path.join(home, 'txe-dev-setup-smoke'));
     const lifetime = Date.parse(expires) - before;
-    expect(lifetime).toBeGreaterThan(3 * 3600_000 - 120_000);
-    expect(lifetime).toBeLessThanOrEqual(3 * 3600_000);
+    expect(lifetime).toBeGreaterThan(15 * 60_000 - 120_000);
+    expect(lifetime).toBeLessThanOrEqual(15 * 60_000);
     expect(readFileSync(path.join(dir, 'job.yaml'), 'utf8')).toBe(
       SMOKE_JOB_TEMPLATE.split('{{STAMP}}')
         .join(stamp)
@@ -177,6 +184,24 @@ describe('the smoke test', () => {
     expect(statSync(path.join(dir, 'run.sh')).mode & 0o777).toBe(0o755);
     // Nothing is written where the shell started.
     expect(readdirSync(cwd)).toEqual([]);
+  });
+
+  // Two people of one owner following the guide in the same minute register
+  // different job keys.
+  it('gives each run its own job key', () => {
+    const keys = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const home = mkdtempSync(path.join(tmpdir(), 'dev-setup-smoke-'));
+      dirs.push(home);
+      const out = spawnSync('sh', ['-c', smokeCommands().create], {
+        cwd: home,
+        env: { HOME: home, PATH: '/usr/bin:/bin' },
+        encoding: 'utf8',
+      });
+      expect(out.status, out.stderr).toBe(0);
+      keys.add(/job key (\S+),/.exec(out.stdout)?.[1] ?? '');
+    }
+    expect(keys.size).toBe(3);
   });
 
   // When the directory cannot be made, nothing is written elsewhere and the

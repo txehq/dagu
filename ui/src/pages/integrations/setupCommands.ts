@@ -104,6 +104,10 @@ export function setupCommands(tag: string, hub: string) {
     ].join('\n'),
     check: ['txe/developer/install.sh --check', 'dagu version'].join('\n'),
     login: `dagu txe login --hub ${shellQuote(hub)}`,
+    // The sign-in returns to a one-shot listener on 127.0.0.1 at the port in
+    // the printed address, so a browser elsewhere reaches it only through a
+    // forward of that same port.
+    sshForward: 'ssh -L <port>:127.0.0.1:<port> <you>@<that machine>',
     loginNoBrowser: `dagu txe login --hub ${shellQuote(hub)} --no-browser`,
     whoami: 'dagu txe whoami',
     machineCreate: 'dagu txe machine create',
@@ -115,7 +119,7 @@ export function setupCommands(tag: string, hub: string) {
 
 // The smoke test job (txe/developer/smoke). {{STAMP}} and {{EXPIRES_AT}} are
 // filled in by the shell when the person runs the command, so the lifetime
-// is three hours from then, never a date fixed when the page was loaded.
+// is fifteen minutes from then, never a date fixed when the page was loaded.
 // The template must stay free of $, ` and \, which an unquoted here-document
 // would expand.
 export const SMOKE_JOB_TEMPLATE = `schema: 1
@@ -123,9 +127,9 @@ job_key: dev-setup-smoke-{{STAMP}}
 title: Developer setup smoke test
 purpose: >-
   Shows that this machine's worker runs a job the hub schedules and that the
-  result reaches the hub. It reads and changes nothing: each run prints one
-  line and publishes it as result.json. The job retires itself when its
-  lifetime ends.
+  result reaches the hub. It calls no external service: each run prints one
+  line and writes only its result.json, which is published to the hub. The
+  job retires itself when its lifetime ends.
 project:
   key: txe.local/dev-setup-smoke
   name: developer setup smoke test
@@ -137,7 +141,7 @@ targets:
     display_name: developer setup smoke test
     existence_check: event_only
 schedule:
-  cron: "*/30 * * * *"
+  cron: "* * * * *"
   timezone: UTC
   timeout_sec: 60
 package:
@@ -182,8 +186,10 @@ export function smokeCommands() {
     .split('{{EXPIRES_AT}}')
     .join('${expires}');
   const create = [
-    'stamp="$(date -u +%Y%m%d%H%M)"',
-    'expires="$(date -u -v+3H +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d \'+3 hours\' +%Y-%m-%dT%H:%M:00Z)"',
+    // Seconds and random hex: two people of one owner in the same minute
+    // get different job keys.
+    'stamp="$(date -u +%Y%m%d%H%M%S)-$(od -An -N3 -tx1 /dev/urandom | tr -d \' \\n\')"',
+    'expires="$(date -u -v+15M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d \'+15 minutes\' +%Y-%m-%dT%H:%M:00Z)"',
     'smoke_dir="$HOME/txe-dev-setup-smoke/$stamp"',
     'mkdir -p "$smoke_dir"',
     'cat > "$smoke_dir/run.sh" <<\'EOF\'',

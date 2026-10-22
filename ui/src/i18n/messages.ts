@@ -172,8 +172,11 @@ export const messages = {
       '"ok." on the last line of the check, and dagu version prints {version}.',
     'integrations.devSetup.loginTitle': 'Sign in through your browser',
     'integrations.devSetup.loginBody':
-      "The address is this hub's, taken from this page. On a machine with no desktop browser, use the second command and open the address it prints in a browser on that same machine.",
+      "The address is this hub's, taken from this page. The sign-in comes back to a one-time listener on 127.0.0.1 on the machine where you run the command, at a port it picks, and gives up after five minutes. --no-browser only stops the CLI opening a browser: the address it prints must still be opened in a browser on that same machine.",
     'integrations.devSetup.loginNoBrowser': 'Sign in without opening a browser',
+    'integrations.devSetup.loginSsh': 'Forward the sign-in port over SSH',
+    'integrations.devSetup.loginSshBody':
+      'Signing in to a remote machine over SSH: run the --no-browser command there, take the port from the 127.0.0.1 address in the redirect_uri it prints, and forward that same port from your own computer in a second terminal. Then open the printed address in your own browser.',
     'integrations.devSetup.loginHttp':
       "This page is served over plain http. The CLI signs in only over https, except to this machine itself, so use the hub's https address instead.",
     'integrations.devSetup.loginExpected':
@@ -217,16 +220,16 @@ export const messages = {
     'integrations.devSetup.stageJobTitle':
       'Test job ran and its result reached the hub',
     'integrations.devSetup.smokeIntro':
-      'A harmless job that prints one line and publishes it as result.json. It reads and changes nothing on your machine.',
+      'A harmless job that prints one line and writes only its result.json, which is published to the hub. It calls no external service and changes nothing else on your machine.',
     'integrations.devSetup.smokeCreate': 'Create the test job',
     'integrations.devSetup.smokeCreateExpected':
-      'a new directory under ~/txe-dev-setup-smoke holding job.yaml and run.sh, and the job key and expiry printed. The expiry is three hours from when you run it.',
+      'a new directory under ~/txe-dev-setup-smoke holding job.yaml and run.sh, and the job key and expiry printed. The expiry is fifteen minutes from when you run it.',
     'integrations.devSetup.smokeDryRun': 'Dry run',
     'integrations.devSetup.smokeDryRunExpected':
       '"The spec is complete. Nothing was registered."',
     'integrations.devSetup.smokeRegister': 'Register',
     'integrations.devSetup.smokeRegisterNote':
-      'This is the one step that changes the hub: it registers a real job that runs every 30 minutes on this machine. Run it only when you mean to.',
+      'This is the one step that changes the hub: it registers a real job that runs every minute on this machine until it expires. Run it only when you mean to.',
     'integrations.devSetup.smokeRegisterExpected':
       '"Registered job_… version 1. The hub has marked it ready." Use that job id below.',
     'integrations.devSetup.smokeVerify': 'Check the package',
@@ -234,10 +237,10 @@ export const messages = {
       '"the package is intact and the hub has marked the job ready." The job has not run yet.',
     'integrations.devSetup.smokeInspect': 'Wait for a run, then inspect',
     'integrations.devSetup.smokeInspectExpected':
-      'after the next :00 or :30 UTC, "Recent runs" lists a run with status succeeded. To read the run and its result.json in the hub, open the job from the',
+      'within a minute or two, "Recent runs" lists a run with status succeeded. To read the run and its result.json in the hub, open the job from the',
     'integrations.devSetup.inboxLink': 'job inbox',
     'integrations.devSetup.smokeExpiry':
-      'Three hours after you created it, inspect shows "Lifecycle: retired" and the hub runs it no more. There is nothing to clean up.',
+      'Fifteen minutes after you created it, inspect shows "Lifecycle: retired" and the hub runs it no more. Its results stay readable; there is nothing to clean up.',
     'integrations.devSetup.copy': 'Copy: {label}',
     'integrations.devSetup.copied': 'Copied',
     'integrations.devSetup.copyFailed':
@@ -439,8 +442,11 @@ export const messages = {
       '检查的最后一行为 “ok.”，并且 dagu version 输出 {version}。',
     'integrations.devSetup.loginTitle': '通过浏览器登录',
     'integrations.devSetup.loginBody':
-      '地址是此 hub 的地址，取自本页面。在没有桌面浏览器的机器上，请使用第二条命令，并在同一台机器的浏览器中打开它输出的地址。',
+      '地址是此 hub 的地址，取自本页面。登录会回到你运行命令的那台机器上 127.0.0.1 的一次性监听端口（端口自动选择），五分钟后放弃。--no-browser 只是不让 CLI 打开浏览器：它输出的地址仍必须在同一台机器的浏览器中打开。',
     'integrations.devSetup.loginNoBrowser': '不打开浏览器登录',
+    'integrations.devSetup.loginSsh': '通过 SSH 转发登录端口',
+    'integrations.devSetup.loginSshBody':
+      '通过 SSH 登录远程机器时：在远程机器上运行 --no-browser 命令，从它输出的 redirect_uri 中的 127.0.0.1 地址取得端口号，并在你自己电脑的另一个终端中转发同一个端口。然后在你自己的浏览器中打开输出的地址。',
     'integrations.devSetup.loginHttp':
       '此页面通过普通 http 提供。除本机外，CLI 只通过 https 登录，因此请改用 hub 的 https 地址。',
     'integrations.devSetup.loginExpected':
@@ -481,16 +487,16 @@ export const messages = {
       '每一行都显示 ok，包括 “machine on hub”，并且 hub 中此机器的页面显示一个活动的注册。',
     'integrations.devSetup.stageJobTitle': '测试作业已运行且结果已到达 hub',
     'integrations.devSetup.smokeIntro':
-      '一个无害的作业：输出一行内容并将其作为 result.json 发布。它不会读取或更改你机器上的任何内容。',
+      '一个无害的作业：输出一行内容，只写入它的 result.json，并将其发布到 hub。它不调用任何外部服务，也不更改你机器上的其他任何内容。',
     'integrations.devSetup.smokeCreate': '创建测试作业',
     'integrations.devSetup.smokeCreateExpected':
-      '~/txe-dev-setup-smoke 下出现一个包含 job.yaml 和 run.sh 的新目录，并输出作业键和过期时间。过期时间为运行该命令后的三小时。',
+      '~/txe-dev-setup-smoke 下出现一个包含 job.yaml 和 run.sh 的新目录，并输出作业键和过期时间。过期时间为运行该命令后的十五分钟。',
     'integrations.devSetup.smokeDryRun': '试运行',
     'integrations.devSetup.smokeDryRunExpected':
       '“The spec is complete. Nothing was registered.”',
     'integrations.devSetup.smokeRegister': '注册',
     'integrations.devSetup.smokeRegisterNote':
-      '这是唯一会更改 hub 的步骤：它会注册一个真实的作业，每 30 分钟在此机器上运行一次。请仅在确定要这样做时运行。',
+      '这是唯一会更改 hub 的步骤：它会注册一个真实的作业，在过期之前每分钟在此机器上运行一次。请仅在确定要这样做时运行。',
     'integrations.devSetup.smokeRegisterExpected':
       '“Registered job_… version 1. The hub has marked it ready.” 在下面的命令中使用该作业 ID。',
     'integrations.devSetup.smokeVerify': '检查软件包',
@@ -498,10 +504,10 @@ export const messages = {
       '“the package is intact and the hub has marked the job ready.” 作业尚未运行。',
     'integrations.devSetup.smokeInspect': '等待运行，然后查看',
     'integrations.devSetup.smokeInspectExpected':
-      '在下一个 UTC :00 或 :30 之后，“Recent runs” 列出一次状态为 succeeded 的运行。要在 hub 中查看该运行及其 result.json，请从以下位置打开作业：',
+      '一两分钟内，“Recent runs” 列出一次状态为 succeeded 的运行。要在 hub 中查看该运行及其 result.json，请从以下位置打开作业：',
     'integrations.devSetup.inboxLink': '作业收件箱',
     'integrations.devSetup.smokeExpiry':
-      '创建三小时后，inspect 显示 “Lifecycle: retired”，hub 不再运行它。无需清理。',
+      '创建十五分钟后，inspect 显示 “Lifecycle: retired”，hub 不再运行它。其结果仍可查看；无需清理。',
     'integrations.devSetup.copy': '复制：{label}',
     'integrations.devSetup.copied': '已复制',
     'integrations.devSetup.copyFailed': '无法复制。请选中文本后手动复制。',
@@ -709,8 +715,11 @@ export const messages = {
       '確認の最終行が「ok.」で、dagu version が {version} を表示します。',
     'integrations.devSetup.loginTitle': 'ブラウザーでサインイン',
     'integrations.devSetup.loginBody':
-      'アドレスはこのページから取得したこのハブのものです。デスクトップブラウザーのないマシンでは 2 番目のコマンドを使い、表示されたアドレスを同じマシンのブラウザーで開いてください。',
+      'アドレスはこのページから取得したこのハブのものです。サインインは、コマンドを実行したマシンの 127.0.0.1 上で自動的に選ばれたポートの一回限りのリスナーに戻り、5 分で打ち切られます。--no-browser は CLI がブラウザーを開かないようにするだけで、表示されたアドレスは同じマシンのブラウザーで開く必要があります。',
     'integrations.devSetup.loginNoBrowser': 'ブラウザーを開かずにサインイン',
+    'integrations.devSetup.loginSsh': 'SSH でサインインのポートを転送',
+    'integrations.devSetup.loginSshBody':
+      'SSH 経由でリモートマシンにサインインする場合: リモートで --no-browser のコマンドを実行し、表示された redirect_uri 内の 127.0.0.1 アドレスからポート番号を取り、ご自身のコンピューターの別のターミナルで同じポートを転送します。その後、表示されたアドレスをご自身のブラウザーで開きます。',
     'integrations.devSetup.loginHttp':
       'このページは http で配信されています。CLI はこのマシン自身を除き https でのみサインインするため、ハブの https アドレスを使用してください。',
     'integrations.devSetup.loginExpected':
@@ -755,16 +764,16 @@ export const messages = {
     'integrations.devSetup.stageJobTitle':
       'テストジョブが実行され、結果がハブに届いた',
     'integrations.devSetup.smokeIntro':
-      '1 行を出力し、それを result.json として公開するだけの無害なジョブです。マシン上の何も読み取らず、変更もしません。',
+      '1 行を出力し、result.json だけを書き込んでハブに公開する無害なジョブです。外部サービスは呼び出さず、マシン上のほかのものは何も変更しません。',
     'integrations.devSetup.smokeCreate': 'テストジョブを作成',
     'integrations.devSetup.smokeCreateExpected':
-      '~/txe-dev-setup-smoke の下に job.yaml と run.sh を含む新しいディレクトリが作成され、ジョブキーと有効期限が表示されます。有効期限は実行時から 3 時間後です。',
+      '~/txe-dev-setup-smoke の下に job.yaml と run.sh を含む新しいディレクトリが作成され、ジョブキーと有効期限が表示されます。有効期限は実行時から 15 分後です。',
     'integrations.devSetup.smokeDryRun': 'ドライラン',
     'integrations.devSetup.smokeDryRunExpected':
       '「The spec is complete. Nothing was registered.」',
     'integrations.devSetup.smokeRegister': '登録',
     'integrations.devSetup.smokeRegisterNote':
-      'ハブを変更するのはこの手順だけです。このマシンで 30 分ごとに実行される実際のジョブを登録します。意図した場合にのみ実行してください。',
+      'ハブを変更するのはこの手順だけです。有効期限まで、このマシンで毎分実行される実際のジョブを登録します。意図した場合にのみ実行してください。',
     'integrations.devSetup.smokeRegisterExpected':
       '「Registered job_… version 1. The hub has marked it ready.」以下ではそのジョブ ID を使います。',
     'integrations.devSetup.smokeVerify': 'パッケージを確認',
@@ -772,10 +781,10 @@ export const messages = {
       '「the package is intact and the hub has marked the job ready.」ジョブはまだ実行されていません。',
     'integrations.devSetup.smokeInspect': '実行を待ってから確認',
     'integrations.devSetup.smokeInspectExpected':
-      '次の UTC :00 または :30 以降、「Recent runs」にステータス succeeded の実行が表示されます。ハブで実行と result.json を確認するには、次からジョブを開きます:',
+      '1〜2 分以内に「Recent runs」にステータス succeeded の実行が表示されます。ハブで実行と result.json を確認するには、次からジョブを開きます:',
     'integrations.devSetup.inboxLink': 'ジョブ受信箱',
     'integrations.devSetup.smokeExpiry':
-      '作成から 3 時間後、inspect に「Lifecycle: retired」と表示され、ハブはそれ以上実行しません。後片付けは不要です。',
+      '作成から 15 分後、inspect に「Lifecycle: retired」と表示され、ハブはそれ以上実行しません。結果は引き続き確認でき、後片付けは不要です。',
     'integrations.devSetup.copy': 'コピー: {label}',
     'integrations.devSetup.copied': 'コピーしました',
     'integrations.devSetup.copyFailed':

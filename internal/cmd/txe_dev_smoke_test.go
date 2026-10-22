@@ -46,8 +46,8 @@ func TestTXEDeveloperSmokeJob(t *testing.T) {
 
 	// The files as the page writes them: the stamp and the lifetime filled in.
 	now := time.Now().UTC()
-	stamp := now.Format("200601021504")
-	expires := now.Truncate(time.Minute).Add(3 * time.Hour).Format(time.RFC3339)
+	stamp := now.Format("20060102150405") + "-0a1b2c"
+	expires := now.Truncate(time.Minute).Add(15 * time.Minute).Format(time.RFC3339)
 	template, err := os.ReadFile(filepath.Join("..", "..", "txe", "developer", "smoke", "job.yaml"))
 	require.NoError(t, err)
 	script, err := os.ReadFile(filepath.Join("..", "..", "txe", "developer", "smoke", "run.sh"))
