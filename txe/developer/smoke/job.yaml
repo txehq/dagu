@@ -1,0 +1,40 @@
+schema: 1
+job_key: dev-setup-smoke-{{STAMP}}
+title: Developer setup smoke test
+purpose: >-
+  Shows that this machine's worker runs a job the hub schedules and that the
+  result reaches the hub. It calls no external service: each run prints one
+  line and writes only its result.json, which is published to the hub. The
+  job retires itself when its lifetime ends.
+project:
+  key: txe.local/dev-setup-smoke
+  name: developer setup smoke test
+targets:
+  - kind: example.smoke
+    environment: local
+    stable_id:
+      id: dev-setup-smoke-{{STAMP}}
+    display_name: developer setup smoke test
+    existence_check: event_only
+schedule:
+  cron: "* * * * *"
+  timezone: UTC
+  timeout_sec: 60
+package:
+  include: [run.sh]
+  entrypoint: [./run.sh]
+expected_outcome:
+  success_criteria:
+    - Each run exits 0, prints one line with ok true, and publishes result.json.
+  deliverables:
+    - name: result
+      path: result.json
+      delivery: hub
+      required: true
+lifetime:
+  expires_at: "{{EXPIRES_AT}}"
+review_policy:
+  cadence: "0 9 * * *"
+  brief: >-
+    A smoke test of one developer's setup. A failed run means this machine's
+    worker or its enrolment needs its owner; take no other action.

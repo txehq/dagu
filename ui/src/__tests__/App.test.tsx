@@ -405,6 +405,89 @@ describe('App shell and the person signal', () => {
   });
 });
 
+// A person signed in through single sign-on reaches the developer setup
+// guide from their own dashboard (TXE-4938); one still waiting for access
+// sees only the access screen, as before.
+describe('the developer setup guide for a person', () => {
+  const person = (state: 'bound' | 'pending') => ({
+    contract: 1,
+    authz_mode: 'enforce',
+    principal: {
+      class: 'person',
+      issuer: 'https://idp.example',
+      subject: 'sub-a',
+      shown: { username: 'ada' },
+    },
+    state,
+    owners:
+      state === 'bound' ? [{ owner_id: 'own_a', display_name: 'Ada' }] : [],
+    scope: state === 'bound' ? { kind: 'owner' } : { kind: 'unbound' },
+    platform_admin: false,
+    is_person: state === 'bound',
+    ...(state === 'pending'
+      ? {
+          request: {
+            state: 'pending',
+            requested_at: '2026-10-22T12:00:00Z',
+            generation: 1,
+          },
+        }
+      : {}),
+  });
+
+  // Each state signs in with its own token: the identity is cached per
+  // session.
+  function answer(state: 'bound' | 'pending') {
+    localStorage.setItem('dagu_auth_token', `token-${state}`);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        String(url).endsWith('/auth/me')
+          ? Response.json({ user: { id: 'u-ada', username: 'ada' } })
+          : Response.json({ remoteNodes: [] })
+      )
+    );
+    clientGetMock.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === '/txe/identity'
+          ? { data: person(state), response: { status: 200 } }
+          : { data: {}, response: { status: 200 } }
+      )
+    );
+  }
+
+  afterEach(() => {
+    sessionStorage.clear();
+    resetPersonSignalForTest();
+  });
+
+  it('gives a bound person the guide and a link to it', async () => {
+    answer('bound');
+    renderAt('/integrations', makeConfig({ authMode: 'builtin' }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Integrations' })
+    ).toBeVisible();
+    expect(
+      screen.getByRole('link', { name: 'Developer setup' })
+    ).toHaveAttribute('href', '/integrations');
+    expect(screen.queryByText('Not available yet')).not.toBeInTheDocument();
+  });
+
+  it('leaves a person waiting for access on the access screen', async () => {
+    answer('pending');
+    renderAt('/integrations', makeConfig({ authMode: 'builtin' }));
+
+    expect(await screen.findByTestId('txe-access-pending')).toBeVisible();
+    expect(
+      screen.queryByRole('heading', { name: 'Integrations' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('link', { name: 'Developer setup' })
+    ).not.toBeInTheDocument();
+  });
+});
+
 describe('App license routing', () => {
   it.each([
     { path: '/notifications', heading: 'Notifications' },

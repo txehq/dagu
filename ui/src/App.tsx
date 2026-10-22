@@ -381,6 +381,16 @@ function PersonApp(): React.ReactElement {
               path="/queues/:name"
               element={<Native page={<QueueDetailsPage />} />}
             />
+            {/* The developer setup guide only: it asks the hub nothing a
+                person is refused (TXE-4938). */}
+            <Route
+              path="/integrations"
+              element={
+                <div className="mx-auto max-w-4xl p-4">
+                  <IntegrationsPage />
+                </div>
+              }
+            />
             <Route
               path="*"
               element={
