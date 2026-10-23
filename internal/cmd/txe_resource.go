@@ -31,6 +31,11 @@ var (
 // txeResourceIDPattern is a registry id: a prefix and 26 Crockford digits.
 var txeResourceIDPattern = regexp.MustCompile(`^[a-z]{3}_[0-9A-HJKMNP-TV-Z]{26}$`)
 
+// txeLinearEndpoint is the Linear API the check asks. Only a test build
+// changes it, with -ldflags -X, to a stand-in for Linear on this machine; no
+// flag or environment variable can send a credential anywhere else.
+var txeLinearEndpoint = probe.LinearEndpoint
+
 func init() {
 	txeSubcommands = append(txeSubcommands, txeResourceCommand)
 }
@@ -160,7 +165,7 @@ func runTXEResourceCheck(ctx *Context, _ []string) error {
 	}
 	check := &probe.Check{
 		Registry:  probe.ClientRegistry{Client: client},
-		Probes:    probe.Probes{probe.Kubernetes{}, probe.Linear{}},
+		Probes:    probe.Probes{probe.Kubernetes{}, probe.Linear{Endpoint: txeLinearEndpoint}},
 		Journal:   journal,
 		MachineID: machineID,
 		Client:    txeClientVersion(),
