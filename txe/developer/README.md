@@ -43,7 +43,7 @@ Four stages, each checked on the machine, in order:
 3. `dagu txe package verify <job id>`: the package is intact and the job is ready. It has not run yet.
 4. `dagu txe inspect <job id>` within a minute or two: `Recent runs` lists a run with status `succeeded`, and the job's page in the hub shows the run and its `result.json`.
 
-When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and the hub runs it no more. Its runs stay readable. To end it sooner: `dagu txe retire <job id> --detail "smoke test done"`. `dagu txe complete` is for a job whose purpose is met. `TestTXEDeveloperSmokeJob` registers these files with the built CLI against a hub with the real registry. The page's own tests check that it prints exactly these files.
+When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and the hub runs it no more. Its runs stay readable. To end it sooner: `dagu txe retire <job id> --session dev-setup-smoke --detail "smoke test done"`. `dagu txe complete` is for a job whose purpose is met. `TestTXEDeveloperSmokeJob` registers these files with the built CLI against a hub with the real registry. The page's own tests check that it prints exactly these files.
 
 ## Where things go
 
