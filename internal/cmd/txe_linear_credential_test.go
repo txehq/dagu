@@ -49,7 +49,7 @@ credential_refs:
 expected_outcome:
   success_criteria: ["The run starts only when the Linear issue was seen."]
 lifetime:
-  expires_at: "2027-01-31T00:00:00Z"
+  open_ended: true
 review_policy:
   cadence: "0 9 * * *"
   brief: Nothing to act on.
