@@ -103,12 +103,13 @@ func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, ru
 		if err != nil {
 			return err
 		}
-		cli, err := txeMachineCLI(jobID, version.Package.Path)
+		cli, home, err := txeMachineCLI(jobID, version.Package.Path)
 		if err != nil {
 			return err
 		}
 		hub := slices.ContainsFunc(version.ExpectedOutcome.Deliverables, func(d registry.Deliverable) bool { return d.Delivery == registry.DeliveryHub })
-		if err := txeGeneratedPublishStep(ctx, dag, baseConfig, cli, hub); err != nil {
+		id := txepkg.GeneratedIdentity{JobID: jobID, Version: job.Version, Home: home}
+		if err := txeGeneratedPublishStep(ctx, dag, id, baseConfig, cli, hub); err != nil {
 			return err
 		}
 	}
@@ -168,10 +169,11 @@ func txeRepublishBinding(job *registry.Job, action *registry.Action, runID strin
 // bytes are checked as written (txepkg.CheckGeneratedPublish) and as Dagu's
 // own loader reads them with the base configuration the task carries, the
 // way the worker loads the task's definition, so that what is checked is
-// what runs. hub is whether the registered version has a hub deliverable,
+// what runs. id is the registered job, version and machine home it must
+// have been rendered for; hub is whether the registered version has a hub deliverable,
 // which the publish step needs the run's artifact directory for.
-func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, baseConfig, cli string, hub bool) error {
-	if err := txepkg.CheckGeneratedPublish(dag.YamlData); err != nil {
+func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, id txepkg.GeneratedIdentity, baseConfig, cli string, hub bool) error {
+	if err := txepkg.CheckGeneratedPublish(dag.YamlData, id); err != nil {
 		return txeRepublishRefusal("job %s's DAG is not the one the TXE renderer writes: %v", dag.Name, err)
 	}
 	if err := txeLoadedPublishStep(ctx, dag, baseConfig, cli, hub); err != nil {
@@ -182,29 +184,37 @@ func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, baseConfig, cli s
 
 // txeMachineCLI is the CLI the machine's worker installed, at bin/dagu of
 // its TXE home, the home the machine asserted the job's package under
-// (<home>/packages/<job>/<package>). The publish step must run that binary
-// and no other: a binary named only by the DAG could be anything. The path
-// is the machine's, written with its own separator, which need not be the
-// hub's: "/" for a POSIX path, "\" for a Windows drive or UNC path
-// (registry.MachineAbsPath), as the client joins both on the machine.
-func txeMachineCLI(jobID, packagePath string) (string, error) {
+// (<home>/packages/<job>/<package>), and that home. The publish step must
+// run that binary and no other: a binary named only by the DAG could be
+// anything. The path is the machine's, written with its own separator, which
+// need not be the hub's: "/" for a POSIX path, "\" for a Windows drive or
+// UNC path (registry.MachineAbsPath), as the client joins both on the
+// machine.
+func txeMachineCLI(jobID, packagePath string) (cli, home string, err error) {
 	refuse := txeRepublishRefusal("job %s's registered package path does not name the machine's TXE home", jobID)
 	if !registry.MachineAbsPath(packagePath) {
-		return "", refuse
+		return "", "", refuse
 	}
 	sep := "/"
 	if !strings.HasPrefix(packagePath, "/") {
 		sep = `\`
 	}
 	if !txeCleanMachinePath(packagePath, sep) {
-		return "", refuse
+		return "", "", refuse
 	}
 	marker := sep + "packages" + sep + jobID + sep
+	// A POSIX home may be "/" itself, which puts the marker first; a
+	// Windows home is at least a drive or a UNC share.
 	i := strings.LastIndex(packagePath, marker)
-	if i <= 0 || strings.Contains(packagePath[i+len(marker):], sep) {
-		return "", refuse
+	if i < 0 || (i == 0 && sep != "/") || strings.Contains(packagePath[i+len(marker):], sep) {
+		return "", "", refuse
 	}
-	return packagePath[:i] + sep + "bin" + sep + "dagu", nil
+	home = packagePath[:i]
+	cli = home + sep + "bin" + sep + "dagu"
+	if home == "" {
+		home = "/"
+	}
+	return cli, home, nil
 }
 
 // txeCleanMachinePath reports whether p, absolute on the machine, is written

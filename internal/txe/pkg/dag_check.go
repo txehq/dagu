@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/lexer"
 	"github.com/goccy/go-yaml/token"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 )
 
 // renderedTopLevel are the keys RenderDAG writes at the top of a job's DAG.
@@ -32,14 +35,25 @@ var (
 // renderedRunStep are the keys RenderDAG writes on the job's step.
 var renderedRunStep = []string{"name", "command", "retry_policy"}
 
+// GeneratedIdentity is what a job's DAG must have been rendered for: the
+// registered job and version, and the TXE home of the machine it was
+// registered from.
+type GeneratedIdentity struct {
+	JobID   string
+	Version int
+	Home    string
+}
+
 // CheckGeneratedPublish checks that spec, a job's DAG as stored, has exactly
 // the publish step RenderDAG writes for it: one document; nothing but the
-// keys RenderDAG writes; the job's step, then the publish step with only a
-// name and one command; and that command exactly the CLI's "txe artifacts
-// publish" with the same binary and store flags as the job step's resource
-// check, written as RenderDAG writes it. A republish (TXE-5067) runs that
-// step alone, so it may run only when the step can do nothing else.
-func CheckGeneratedPublish(spec []byte) error {
+// keys RenderDAG writes; the TXE variables first, as RenderDAG writes them
+// for id; the job's step, its resource check for id's job and version, then
+// the publish step with only a name and one command; and that command
+// exactly the CLI's "txe artifacts publish" with the same binary and store
+// flags as the job step's resource check, written as RenderDAG writes it. A
+// republish (TXE-5067) runs that step alone, with the TXE variables alone,
+// so it may run only when the step can do nothing else.
+func CheckGeneratedPublish(spec []byte, id GeneratedIdentity) error {
 	// The renderer writes plain mappings, lists and quoted scalars. A
 	// document marker, an anchor, an alias, a tag or a merge key is where one
 	// YAML reader and another can read the same bytes differently, so none
@@ -67,6 +81,9 @@ func CheckGeneratedPublish(spec []byte) error {
 		if m, ok := artifacts.(map[string]any); !ok || len(m) != 1 || m["enabled"] != true {
 			return errors.New("the DAG's artifacts setting is not the one the TXE renderer writes")
 		}
+	}
+	if err := checkTXEEnv(dag["env"], id); err != nil {
+		return err
 	}
 	if dag["type"] != "chain" {
 		return errors.New("the DAG is not the chain the TXE renderer writes")
@@ -100,6 +117,9 @@ func CheckGeneratedPublish(spec []byte) error {
 		argv[4] != "--job" || argv[6] != "--job-version" || argv[8] != "--machine" {
 		return fmt.Errorf("the %q step does not start with the CLI's resource check", RunStepName)
 	}
+	if argv[5] != id.JobID || argv[7] != strconv.Itoa(id.Version) {
+		return fmt.Errorf("the %q step's resource check is not for version %d of job %s", RunStepName, id.Version, id.JobID)
+	}
 	cli := CLI{Dagu: argv[0], StoreFlags: argv[10:]}
 
 	publish, ok := steps[1].(map[string]any)
@@ -117,6 +137,54 @@ func CheckGeneratedPublish(spec []byte) error {
 	}
 	if want := shellJoin(cli.command("artifacts", "publish")); command != want {
 		return fmt.Errorf("the %q step's command is not the CLI's artifacts publish the TXE renderer writes", PublishStepName)
+	}
+	return nil
+}
+
+// checkTXEEnv checks the DAG's variables: the TXE variables first, in the
+// order and with the values RenderDAG writes for id, and no other variable
+// named as one of them. The output directory is the machine's own, and the
+// run output directory is derived from it with the machine's separator.
+func checkTXEEnv(value any, id GeneratedIdentity) error {
+	entries, ok := value.([]any)
+	if !ok || len(entries) < len(runenv.TXEStepEnvNames) {
+		return errors.New("the DAG does not set the TXE variables the TXE renderer writes")
+	}
+	got := make([][2]string, len(entries))
+	for i, entry := range entries {
+		m, ok := entry.(map[string]any)
+		if !ok || len(m) != 1 {
+			return errors.New("the DAG's env is not the list of single variables the TXE renderer writes")
+		}
+		for name, v := range m {
+			text, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("the DAG's variable %s is not text", name)
+			}
+			got[i] = [2]string{name, text}
+		}
+	}
+	outputDir := got[2][1]
+	sep := "/"
+	if !strings.HasPrefix(outputDir, "/") {
+		sep = `\`
+	}
+	want := [][2]string{
+		{"TXE_JOB_ID", id.JobID},
+		{"TXE_JOB_VERSION", strconv.Itoa(id.Version)},
+		{"TXE_OUTPUT_DIR", outputDir},
+		{AttemptEnv, attemptRef},
+		{QueuedAtEnv, queuedAtRef},
+		{RunOutputEnv, strings.Join([]string{outputDir, "runs", "${DAG_RUN_ID}", "attempts", attemptRef}, sep)},
+		{EnvHome, id.Home},
+	}
+	if outputDir == "" || !slices.Equal(got[:len(want)], want) {
+		return fmt.Errorf("the DAG's TXE variables are not the ones the TXE renderer writes for version %d of job %s", id.Version, id.JobID)
+	}
+	for _, entry := range got[len(want):] {
+		if slices.Contains(runenv.TXEStepEnvNames, entry[0]) {
+			return fmt.Errorf("the DAG sets %s again", entry[0])
+		}
 	}
 	return nil
 }

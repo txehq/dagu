@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/build"
@@ -122,16 +123,22 @@ func (e Context) InheritedEnvs() []cmnvalue.EnvEntry {
 // Params are excluded because a child run owns its own: forwarding the parent's
 // would override the arguments the step passed to the child, and positional
 // params carry numeric names that are not valid environment variable names.
+// The retry provenance is excluded too: it describes this execution, not the
+// child's (retryProvenanceEnvs).
 func (e Context) PassableEnvs() []string {
 	if e.EnvScope == nil {
 		return nil
 	}
-	return e.EnvScope.ToSliceWithoutOriginOrSources(
+	envs := e.EnvScope.ToSliceWithoutOriginOrSources(
 		runtimeProfileOrigin,
 		cmnvalue.EnvSourceOS,
 		cmnvalue.EnvSourceSecret,
 		cmnvalue.EnvSourceParam,
 	)
+	return slices.DeleteFunc(envs, func(entry string) bool {
+		name, _, _ := strings.Cut(entry, "=")
+		return name == runenv.EnvKeyDAGRunRetryOf || name == runenv.EnvKeyDAGRunAcceptedFailedPrerequisites
+	})
 }
 
 // DAGLoader loads DAG definitions needed during execution.

@@ -448,6 +448,7 @@ func New(
 	}
 	if opts.AcceptFailedPrerequisites {
 		dag = republishScopedDAG(dag)
+		opts = republishScopedOptions(opts)
 	}
 
 	a := &Agent{
@@ -1722,6 +1723,18 @@ func republishScopedDAG(dag *ir.DAG) *ir.DAG {
 	scoped.ParamDefs = nil
 	scoped.ParamSchema = nil
 	return scoped
+}
+
+// republishScopedOptions are the options a republish runs with: no runtime
+// profile, selected or a workspace's defaults, is resolved, so none of its
+// variables or secrets reach the publish step, and no parent run's
+// variables are inherited (republishScopedDAG).
+func republishScopedOptions(opts Options) Options {
+	opts.ProfileName = ""
+	opts.ProfileStore = nil
+	opts.ProfileResolver = nil
+	opts.InheritedEnvs = nil
+	return opts
 }
 
 // retryOf is the execution this execution retries: as the worker derived it

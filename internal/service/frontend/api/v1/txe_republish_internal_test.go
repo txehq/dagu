@@ -185,7 +185,8 @@ func TestTxeGeneratedPublishStep(t *testing.T) {
 		return data
 	}
 	checkWith := func(data []byte, base string, hub bool) error {
-		return txeGeneratedPublishStep(ctx, &ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", YamlData: data}, base, cli, hub)
+		id := txepkg.GeneratedIdentity{JobID: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", Version: 1, Home: root}
+		return txeGeneratedPublishStep(ctx, &ir.DAG{Name: id.JobID, YamlData: data}, id, base, cli, hub)
 	}
 	check := func(data []byte) error { return checkWith(data, "", true) }
 
@@ -225,23 +226,24 @@ func TestTxeGeneratedPublishStep(t *testing.T) {
 // The publish step must run the CLI the machine installed in the TXE home it
 // registered the job's package under, whatever the hub's operating system.
 func TestTxeMachineCLI(t *testing.T) {
-	for path, want := range map[string]string{
-		"/Users/u/.local/share/txe-dagu/packages/job_1/sha256-0123": "/Users/u/.local/share/txe-dagu/bin/dagu",
-		`C:\Users\u\txe-dagu\packages\job_1\sha256-0123`:            `C:\Users\u\txe-dagu\bin\dagu`,
-		`C:\packages\job_1\sha256-0123`:                             `C:\bin\dagu`,
-		`\\srv\share\txe\packages\job_1\sha256-0123`:                `\\srv\share\txe\bin\dagu`,
+	for path, want := range map[string][2]string{
+		"/Users/u/.local/share/txe-dagu/packages/job_1/sha256-0123": {"/Users/u/.local/share/txe-dagu/bin/dagu", "/Users/u/.local/share/txe-dagu"},
+		"/packages/job_1/sha256-0123":                               {"/bin/dagu", "/"},
+		`C:\Users\u\txe-dagu\packages\job_1\sha256-0123`:            {`C:\Users\u\txe-dagu\bin\dagu`, `C:\Users\u\txe-dagu`},
+		`C:\packages\job_1\sha256-0123`:                             {`C:\bin\dagu`, `C:`},
+		`\\srv\share\txe\packages\job_1\sha256-0123`:                {`\\srv\share\txe\bin\dagu`, `\\srv\share\txe`},
 	} {
-		cli, err := txeMachineCLI("job_1", path)
+		cli, home, err := txeMachineCLI("job_1", path)
 		require.NoError(t, err, path)
-		assert.Equal(t, want, cli, path)
+		assert.Equal(t, want, [2]string{cli, home}, path)
 	}
 	for _, path := range []string{
-		"", "packages/job_1/sha256-0", "/x/packages/job_2/sha256-0", "/x/../y/packages/job_1/sha256-0", "/packages/job_1/s",
+		"", "packages/job_1/sha256-0", "/x/packages/job_2/sha256-0", "/x/../y/packages/job_1/sha256-0",
 		"/x//packages/job_1/s", "/x/./packages/job_1/s", "/x/packages/job_1/s/t", "/x/packages/job_1/",
 		`C:/x/packages/job_1/s`, `C:\x/packages\job_1\s`, `C:\x\.\packages\job_1\s`, `C:\x\\packages\job_1\s`,
 		`C:\x\..\packages\job_1\s`, `C:\x\packages\job_1\s\`, `x\packages\job_1\s`,
 	} {
-		_, err := txeMachineCLI("job_1", path)
+		_, _, err := txeMachineCLI("job_1", path)
 		assert.Error(t, err, path)
 	}
 }
