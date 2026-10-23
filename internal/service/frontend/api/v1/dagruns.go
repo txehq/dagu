@@ -3153,8 +3153,10 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		return retryDAGRunResult{}, err
 	}
 	// A registered job's retry made for an action is held to what the action
-	// approved: a republish of the sealed result, or a retry of the run.
-	if err := a.txeCheckRepublish(ctx, dag, retryDagRunID, expect, acceptFailedPrerequisites); err != nil {
+	// approved: a republish of the sealed result, or a retry of the run. A
+	// republish is dispatched with the base configuration it was checked with.
+	republishBase := executor.ResolveBaseConfig(dag.BaseConfigData, a.config.Paths.BaseConfig)
+	if err := a.txeCheckRepublish(ctx, dag, republishBase, retryDagRunID, expect, acceptFailedPrerequisites); err != nil {
 		return retryDAGRunResult{}, err
 	}
 	// A run executed locally runs a queued retry under a new attempt, which
@@ -3262,7 +3264,8 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 			if err := a.txeRepublishWorkerCheck(ctx, dag.WorkerSelector); err != nil {
 				return retryDAGRunResult{}, err
 			}
-			opts = append(opts, executor.WithAcceptFailedPrerequisites(true))
+			opts = append(opts, executor.WithAcceptFailedPrerequisites(true),
+				executor.WithBaseConfig(republishBase, dag.BaseConfigWorkspace))
 		}
 		if len(retryPath.Hops) > 0 {
 			opts = append(opts, executor.WithRetryPath(retryPath))

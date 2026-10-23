@@ -473,7 +473,7 @@ func NewContext(
 	// Seed the lowest-precedence layer from filtered BaseEnv so workflow step
 	// subprocesses stay isolated from arbitrary host env inherited by parent-
 	// spawned dagu start/retry/restart commands.
-	// Precedence (highest to lowest): secrets > managed run env >
+	// Precedence (highest to lowest): retry provenance > secrets > managed run env >
 	// execution env > DAG env > params > defaults > inherited parent env >
 	// BaseEnv.
 	scope := cmnvalue.NewEnvScope(nil, false)
@@ -501,6 +501,7 @@ func NewContext(
 	if len(secretEnvs) > 0 {
 		scope = scope.WithEntries(secretEnvs, cmnvalue.EnvSourceSecret)
 	}
+	scope = scope.WithEntries(retryProvenanceEnvs(options), cmnvalue.EnvSourceDAGEnv)
 
 	// Fields the caller cannot set through an option, because they are derived
 	// from the required arguments or from the environment layering above.

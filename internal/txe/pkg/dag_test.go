@@ -260,6 +260,8 @@ func TestRenderDAGRefusals(t *testing.T) {
 		{"ExpandedEnv", func(s *DAGSpec) { s.Env["WHERE"] = "${HOME}/x" }, "expands on the worker"},
 		{"ExpandedArgument", func(s *DAGSpec) { s.Entrypoint = []string{"./check.sh", "`id`"} }, "expands on the worker"},
 		{"ReservedEnv", func(s *DAGSpec) { s.Env["TXE_OUTPUT_DIR"] = "/elsewhere" }, "cannot be overridden"},
+		{"RetryProvenanceEnv", func(s *DAGSpec) { s.Env["DAG_RUN_ACCEPTED_FAILED_PREREQUISITES"] = "1" }, "cannot be overridden"},
+		{"RetryProvenanceCredential", func(s *DAGSpec) { s.CredentialRefs[0].Name = "DAG_RUN_RETRY_OF" }, "collides"},
 		{"CredentialShadowsEnv", func(s *DAGSpec) { s.Env["LINEAR_API_KEY"] = "x" }, "collides"},
 		{"CredentialKind", func(s *DAGSpec) { s.CredentialRefs[0].Kind = "literal" }, "kind must be"},
 		{"NoEntrypoint", func(s *DAGSpec) { s.Entrypoint = nil }, "entrypoint is required"},

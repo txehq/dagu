@@ -65,6 +65,9 @@ func TestCheckGeneratedPublishRefusesOtherDAGs(t *testing.T) {
 		"a third step":                         rendered + "  - name: after\n    command: touch /tmp/x\n",
 		"a second document":                    rendered + "---\nname: other\nsteps:\n  - name: x\n    command: touch /tmp/x\n",
 		"a run step that is not checked first": replace("txe resource check", "txe resource nocheck"),
+		"artifacts turned off":                 replace("artifacts:\n  enabled: true", "artifacts:\n  enabled: false"),
+		"artifacts moved":                      replace("artifacts:\n  enabled: true", "artifacts:\n  enabled: true\n  dir: /tmp/x"),
+		"artifacts not a mapping":              replace("artifacts:\n  enabled: true", "artifacts: true"),
 	} {
 		assert.Error(t, CheckGeneratedPublish([]byte(spec)), name)
 	}

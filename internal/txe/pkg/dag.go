@@ -285,10 +285,14 @@ func (s DAGSpec) overlap() string {
 	return s.Schedule.Overlap
 }
 
-// reservedEnv are set by the renderer and cannot be supplied by the job
-// (runenv.TXEStepEnvNames, which a republish keeps).
+// reservedEnv cannot be supplied by the job, as a variable or a credential:
+// the renderer sets runenv.TXEStepEnvNames, which a republish keeps, and the
+// agent sets the retry provenance the publish step reads.
 var reservedEnv = func() map[string]bool {
-	names := map[string]bool{}
+	names := map[string]bool{
+		runenv.EnvKeyDAGRunRetryOf:                     true,
+		runenv.EnvKeyDAGRunAcceptedFailedPrerequisites: true,
+	}
 	for _, name := range runenv.TXEStepEnvNames {
 		names[name] = true
 	}

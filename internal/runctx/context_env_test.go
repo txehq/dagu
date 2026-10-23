@@ -30,6 +30,8 @@ func TestNewContext_ManagedDAGRunEnvsAreProtectedAndAvailableToDAGEnv(t *testing
 		workDir:     filepath.Join(t.TempDir(), "work"),
 		artifactDir: filepath.Join(t.TempDir(), "artifacts"),
 	}
+	options.RetryOf = "test-dag:run-1:a1b2c3:"
+	options.AcceptFailedPrerequisites = true
 
 	expected := buildManagedDAGRunEnvs(ctx, dag, dagRunID, logFile, options)
 	require.NotEmpty(t, expected)
@@ -48,6 +50,8 @@ func TestNewContext_ManagedDAGRunEnvsAreProtectedAndAvailableToDAGEnv(t *testing
 	ctx = NewContext(ctx, dag, dagRunID, logFile,
 		WithWorkDir(options.workDir),
 		WithArtifactDir(options.artifactDir),
+		WithRetryOf(options.RetryOf),
+		WithAcceptFailedPrerequisites(true),
 		WithEnvVars(optionEnvs...),
 	)
 

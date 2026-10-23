@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"path/filepath"
+	"path"
 	"reflect"
 	"slices"
 	"strconv"
@@ -73,7 +73,8 @@ type txeRetryRunAction struct {
 // dagu.retry_run of this run's expected execution with step "publish", and
 // such an approval cannot be used for any other retry. It is called after
 // the job's admission (txeAdmitDAG), so dag is the job's current version.
-func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, runID string, expect *persis.ExpectedExecution, accept bool) error {
+// baseConfig is the base configuration the retry is dispatched with.
+func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, runID string, expect *persis.ExpectedExecution, accept bool) error {
 	jobID, err := txeJobIdentity(dag)
 	if err != nil {
 		return err
@@ -104,7 +105,8 @@ func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, runID string, 
 		if err != nil {
 			return err
 		}
-		if err := txeGeneratedPublishStep(ctx, dag, cli); err != nil {
+		hub := slices.ContainsFunc(version.ExpectedOutcome.Deliverables, func(d registry.Deliverable) bool { return d.Delivery == registry.DeliveryHub })
+		if err := txeGeneratedPublishStep(ctx, dag, baseConfig, cli, hub); err != nil {
 			return err
 		}
 	}
@@ -162,13 +164,15 @@ func txeRepublishBinding(job *registry.Job, action *registry.Action, runID strin
 // admission matched to the registered version), has exactly the publish
 // step the TXE renderer writes and nothing else that would run with it. The
 // bytes are checked as written (txepkg.CheckGeneratedPublish) and as Dagu's
-// own loader reads them, the way the worker loads the task's definition, so
-// that what is checked is what runs.
-func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, cli string) error {
+// own loader reads them with the base configuration the task carries, the
+// way the worker loads the task's definition, so that what is checked is
+// what runs. hub is whether the registered version has a hub deliverable,
+// which the publish step needs the run's artifact directory for.
+func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, baseConfig, cli string, hub bool) error {
 	if err := txepkg.CheckGeneratedPublish(dag.YamlData); err != nil {
 		return txeRepublishRefusal("job %s's DAG is not the one the TXE renderer writes: %v", dag.Name, err)
 	}
-	if err := txeLoadedPublishStep(ctx, dag, cli); err != nil {
+	if err := txeLoadedPublishStep(ctx, dag, baseConfig, cli, hub); err != nil {
 		return txeRepublishRefusal("job %s's DAG is not the one the TXE renderer writes: %v", dag.Name, err)
 	}
 	return nil
@@ -176,31 +180,86 @@ func txeGeneratedPublishStep(ctx context.Context, dag *ir.DAG, cli string) error
 
 // txeMachineCLI is the CLI the machine's worker installed, at bin/dagu of
 // its TXE home, the home the machine asserted the job's package under
-// (<home>/packages/<job>/...). The publish step must run that binary and no
-// other: a binary named only by the DAG could be anything.
+// (<home>/packages/<job>/<package>). The publish step must run that binary
+// and no other: a binary named only by the DAG could be anything. The path
+// is the machine's, written with its own separator, which need not be the
+// hub's: "/" for a POSIX path, "\" for a Windows drive or UNC path
+// (registry.MachineAbsPath), as the client joins both on the machine.
 func txeMachineCLI(jobID, packagePath string) (string, error) {
-	marker := "/packages/" + jobID + "/"
-	i := strings.Index(packagePath, marker)
-	if i <= 0 || !filepath.IsAbs(packagePath) || filepath.Clean(packagePath) != packagePath {
-		return "", txeRepublishRefusal("job %s's registered package path does not name the machine's TXE home", jobID)
+	refuse := txeRepublishRefusal("job %s's registered package path does not name the machine's TXE home", jobID)
+	if !registry.MachineAbsPath(packagePath) {
+		return "", refuse
 	}
-	return packagePath[:i] + "/bin/dagu", nil
+	sep := "/"
+	if !strings.HasPrefix(packagePath, "/") {
+		sep = `\`
+	}
+	if !txeCleanMachinePath(packagePath, sep) {
+		return "", refuse
+	}
+	marker := sep + "packages" + sep + jobID + sep
+	i := strings.LastIndex(packagePath, marker)
+	if i <= 0 || strings.Contains(packagePath[i+len(marker):], sep) {
+		return "", refuse
+	}
+	return packagePath[:i] + sep + "bin" + sep + "dagu", nil
+}
+
+// txeCleanMachinePath reports whether p, absolute on the machine, is written
+// as the machine's filepath.Join writes it: no empty or "." segment, and for
+// a Windows path no "/".
+func txeCleanMachinePath(p, sep string) bool {
+	if sep == "/" {
+		return path.Clean(p) == p
+	}
+	if strings.Contains(p, "/") {
+		return false
+	}
+	rest, unc := strings.CutPrefix(p, `\\`)
+	if !unc {
+		rest = p[len(`C:\`):]
+	}
+	for segment := range strings.SplitSeq(rest, sep) {
+		if segment == "" || segment == "." {
+			return false
+		}
+	}
+	return true
 }
 
 // txeLoadedPublishStep checks the DAG as the loader reads it: no handler or
 // precondition; the job's step then the publish step alone; the publish step
 // one command, the machine's CLI's artifacts publish with the resource
-// check's store flags, with nothing else that runs or changes how it runs.
-// The job's variables and secrets do not reach a republish at all: the
-// worker runs it with the TXE variables alone and resolves no secret
-// (agent republishScopedDAG), and only such a worker is given it.
-func txeLoadedPublishStep(ctx context.Context, dag *ir.DAG, cli string) error {
-	loaded, err := spec.LoadYAML(ctx, dag.YamlData, spec.WithName(dag.Name), spec.WithoutEval())
+// check's store flags, with nothing else that runs or changes how it runs;
+// the run's artifact directory on exactly when the job has a hub
+// deliverable. The base configuration may not change what runs either
+// (txeBaseConfigChanges). The job's variables and secrets do not reach a
+// republish at all: the worker runs it with the TXE variables alone and
+// resolves no secret (agent republishScopedDAG), and only such a worker is
+// given it.
+func txeLoadedPublishStep(ctx context.Context, dag *ir.DAG, baseConfig, cli string, hub bool) error {
+	load := func(opts ...spec.LoadOption) (*ir.DAG, error) {
+		return spec.LoadYAML(ctx, dag.YamlData, append([]spec.LoadOption{spec.WithName(dag.Name), spec.WithoutEval()}, opts...)...)
+	}
+	loaded, err := load()
 	if err != nil {
 		return fmt.Errorf("it does not load: %w", err)
 	}
+	if baseConfig != "" {
+		effective, err := load(spec.WithBaseConfigContent([]byte(baseConfig)))
+		if err != nil {
+			return fmt.Errorf("it does not load with the base configuration: %w", err)
+		}
+		if changed := txeBaseConfigChanges(loaded, effective); len(changed) > 0 {
+			return fmt.Errorf("the base configuration sets %s, which would run with the publish step", strings.Join(changed, ", "))
+		}
+		loaded = effective
+	}
 	if loaded.HandlerOn != (ir.HandlerOn{}) || len(loaded.Preconditions) > 0 {
 		return errors.New("it has a handler or a precondition")
+	}
+	if artifacts := loaded.Artifacts; (artifacts != nil && artifacts.Enabled) != hub || (artifacts != nil && artifacts.Dir != "") {
+		return errors.New("its artifact directory does not match the job's hub deliverables")
 	}
 	if len(loaded.Steps) != 2 || loaded.Steps[0].Name != txepkg.RunStepName || loaded.Steps[1].Name != txepkg.PublishStepName {
 		return errors.New("it does not have the job's step and the publish step alone")
@@ -227,6 +286,41 @@ func txeLoadedPublishStep(ctx context.Context, dag *ir.DAG, cli string) error {
 		return errors.New("the publish step does not follow the job's step alone")
 	}
 	return nil
+}
+
+// txeBaseIgnored are the DAG settings a base configuration may change for a
+// republish. A republish does not use them (its variables, dotenv files,
+// params and secrets are dropped by the worker, and the rest describe the
+// stored DAG), or they schedule, limit or describe the run and run nothing:
+// Dagu's default base configuration sets several. Every other setting, one
+// added later included, must be the DAG's own.
+var txeBaseIgnored = map[string]bool{
+	"Env": true, "Dotenv": true, "Params": true, "DefaultParams": true, "ParamsJSON": true, "ParamDefs": true,
+	"ParamSchema": true, "Secrets": true, "Consts": true, "EnvEvaluated": true, "RootEnvSpan": true,
+	"YamlData": true, "BaseConfigData": true, "BaseConfigWorkspace": true, "Location": true, "SourceFile": true,
+	"BuildErrors": true, "BuildWarnings": true,
+	"Type": true, "Schedule": true, "StopSchedule": true, "RestartSchedule": true, "SkipIfSuccessful": true,
+	"CatchupWindow": true, "OverlapPolicy": true, "MaxActiveRuns": true, "MaxActiveSteps": true, "Queue": true,
+	"HistRetentionDays": true, "HistRetentionRuns": true, "MaxCleanUpTime": true, "MaxOutputSize": true,
+	"LogOutput": true, "Labels": true, "Description": true, "Group": true,
+}
+
+// txeBaseConfigChanges names the settings of effective, the DAG loaded with
+// its base configuration, that differ from loaded, the DAG alone, other
+// than txeBaseIgnored.
+func txeBaseConfigChanges(loaded, effective *ir.DAG) []string {
+	var changed []string
+	own, based := reflect.ValueOf(loaded).Elem(), reflect.ValueOf(effective).Elem()
+	for i := range own.NumField() {
+		name := own.Type().Field(i).Name
+		if txeBaseIgnored[name] || !own.Type().Field(i).IsExported() {
+			continue
+		}
+		if !reflect.DeepEqual(own.Field(i).Interface(), based.Field(i).Interface()) {
+			changed = append(changed, name)
+		}
+	}
+	return changed
 }
 
 // txeRepublishWorkerCheck refuses a republish before it is dispatched when

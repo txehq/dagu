@@ -61,6 +61,13 @@ func CheckGeneratedPublish(spec []byte) error {
 			return fmt.Errorf("the DAG sets %q, which the TXE renderer does not write", key)
 		}
 	}
+	// RenderDAG writes "artifacts" only as "enabled: true", for a job with a
+	// hub deliverable; any other setting is not its.
+	if artifacts, set := dag["artifacts"]; set {
+		if m, ok := artifacts.(map[string]any); !ok || len(m) != 1 || m["enabled"] != true {
+			return errors.New("the DAG's artifacts setting is not the one the TXE renderer writes")
+		}
+	}
 	if dag["type"] != "chain" {
 		return errors.New("the DAG is not the chain the TXE renderer writes")
 	}

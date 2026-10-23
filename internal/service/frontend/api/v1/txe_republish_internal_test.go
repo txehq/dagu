@@ -9,6 +9,8 @@ import (
 	"errors"
 	"maps"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -151,22 +153,29 @@ func TestTxeRepublishBinding(t *testing.T) {
 
 // The job's DAG must be exactly what the TXE renderer writes, as written
 // (txepkg.CheckGeneratedPublish, tested there in full) and as the loader
-// reads it, and its publish step must run the machine's own CLI. The job's
-// variables and secrets are kept from a republish by the worker, not here.
+// reads it with the hub's base configuration, and its publish step must run
+// the machine's own CLI. The job's variables and secrets are kept from a
+// republish by the worker, not here.
 func TestTxeGeneratedPublishStep(t *testing.T) {
 	ctx := context.Background()
+	// RenderDAG renders on the machine, so its paths are this OS's.
+	root := "/h"
+	if runtime.GOOS == "windows" {
+		root = `C:\h`
+	}
+	cli := filepath.Join(root+" y", "bin", "dagu")
 	render := func(mutate func(*txepkg.DAGSpec)) []byte {
 		t.Helper()
 		spec := txepkg.DAGSpec{
 			Title: "t", JobID: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", OwnerID: "own_01K7A5ZQ8M3N4P5R6S7T8V9W0A",
 			ProjectID: "prj_01K7A5ZQ8M3N4P5R6S7T8V9W0B", MachineID: "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0C", Version: 1,
 			PackageDigest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-			WorkDir:       "/w", OutputDir: "/o", Entrypoint: []string{"./run.sh"},
+			WorkDir:       filepath.Join(root, "w"), OutputDir: filepath.Join(root, "o"), Entrypoint: []string{"./run.sh"},
 			Schedule:       txepkg.Schedule{Cron: "0 2 * * *", Timezone: "UTC", TimeoutSec: 60},
-			CLI:            txepkg.CLI{Dagu: "/h y/bin/dagu", HomeRoot: "/h", StoreFlags: []string{"--dagu-home", "/h/client"}},
+			CLI:            txepkg.CLI{Dagu: cli, HomeRoot: root, StoreFlags: []string{"--dagu-home", filepath.Join(root, "client")}},
 			Publish:        &txepkg.Publish{HubArtifacts: true},
 			Env:            map[string]string{"TARGET": "vol-1"},
-			CredentialRefs: []txepkg.CredentialRef{{Name: "LINEAR_API_KEY", Kind: txepkg.CredentialFile, Locator: "/k"}},
+			CredentialRefs: []txepkg.CredentialRef{{Name: "LINEAR_API_KEY", Kind: txepkg.CredentialFile, Locator: filepath.Join(root, "k")}},
 		}
 		if mutate != nil {
 			mutate(&spec)
@@ -175,33 +184,61 @@ func TestTxeGeneratedPublishStep(t *testing.T) {
 		require.NoError(t, err)
 		return data
 	}
-	check := func(data []byte) error {
-		return txeGeneratedPublishStep(ctx, &ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", YamlData: data}, "/h y/bin/dagu")
+	checkWith := func(data []byte, base string, hub bool) error {
+		return txeGeneratedPublishStep(ctx, &ir.DAG{Name: "job_01K7A5ZQ8M3N4P5R6S7T8V9W01", YamlData: data}, base, cli, hub)
 	}
+	check := func(data []byte) error { return checkWith(data, "", true) }
 
 	assert.NoError(t, check(render(nil)))
+	// What Dagu writes to base.yaml on first run, and base variables, which
+	// a republish does not get.
+	stock := "type: graph\noverlap_policy: skip\nlog_output: separate\nhist_retention_days: 30\nmax_clean_up_time_sec: 5\n" +
+		"max_active_steps: 10\nmax_output_size: 1048576\ncatchup_window: \"6h\"\nenv:\n  - BASE_ONLY: x\n"
+	assert.NoError(t, checkWith(render(nil), stock, true), "Dagu's default base configuration")
+	assert.NoError(t, checkWith(render(func(s *txepkg.DAGSpec) { s.Publish = &txepkg.Publish{} }), "", false), "a job with machine deliverables alone")
 
 	rendered := string(render(nil))
-	wrapped := strings.Replace(rendered, `command: "'/h y/bin/dagu' txe artifacts publish`, `command: "sh -c 'touch /tmp/x' ; '/h y/bin/dagu' txe artifacts publish`, 1)
+	quoted := strings.ReplaceAll("'"+cli+"'", `\`, `\\`) // as YAML's double quotes write it
+	wrapped := strings.Replace(rendered, `command: "`+quoted+` txe artifacts publish`, `command: "sh -c 'touch /tmp/x' ; `+quoted+` txe artifacts publish`, 1)
 	require.NotEqual(t, rendered, wrapped)
-	for name, data := range map[string][]byte{
-		"a shell wrapper":        []byte(wrapped),
-		"a binary the job names": []byte(strings.ReplaceAll(rendered, "'/h y/bin/dagu'", "./x")),
-		"another machine's CLI":  render(func(s *txepkg.DAGSpec) { s.CLI.Dagu = "/other/bin/dagu" }),
+	for name, err := range map[string]error{
+		"a shell wrapper":                 check([]byte(wrapped)),
+		"a binary the job names":          check([]byte(strings.ReplaceAll(rendered, quoted, "./x"))),
+		"another machine's CLI":           check(render(func(s *txepkg.DAGSpec) { s.CLI.Dagu = filepath.Join(root, "other", "bin", "dagu") })),
+		"a base handler":                  checkWith(render(nil), "handler_on:\n  exit:\n    command: touch /tmp/x\n", true),
+		"a base precondition":             checkWith(render(nil), "preconditions:\n  - condition: \"true\"\n", true),
+		"a base shell":                    checkWith(render(nil), "shell: /tmp/sh\n", true),
+		"a base container":                checkWith(render(nil), "container:\n  image: alpine\n", true),
+		"base step defaults":              checkWith(render(nil), "defaults:\n  continue_on:\n    failure: true\n", true),
+		"no artifact directory for hub":   checkWith(render(func(s *txepkg.DAGSpec) { s.Publish = &txepkg.Publish{} }), "", true),
+		"an artifact directory unasked":   checkWith(render(nil), "", false),
+		"a base artifact directory moved": checkWith(render(nil), "artifacts:\n  dir: /tmp/elsewhere\n", true),
+		"artifacts turned off in the DAG": check([]byte(strings.Replace(rendered, "  enabled: true", "  enabled: false", 1))),
 	} {
-		err := check(data)
 		require.Error(t, err, name)
 		assert.Equal(t, txeRepublishUnsupported, republishRefusalCode(t, err), name)
 	}
 }
 
 // The publish step must run the CLI the machine installed in the TXE home it
-// registered the job's package under.
+// registered the job's package under, whatever the hub's operating system.
 func TestTxeMachineCLI(t *testing.T) {
-	cli, err := txeMachineCLI("job_1", "/Users/u/.local/share/txe-dagu/packages/job_1/sha256-0123")
-	require.NoError(t, err)
-	assert.Equal(t, "/Users/u/.local/share/txe-dagu/bin/dagu", cli)
-	for _, path := range []string{"", "packages/job_1/sha256-0", "/x/packages/job_2/sha256-0", "/x/../y/packages/job_1/sha256-0", "/packages/job_1/s"} {
+	for path, want := range map[string]string{
+		"/Users/u/.local/share/txe-dagu/packages/job_1/sha256-0123": "/Users/u/.local/share/txe-dagu/bin/dagu",
+		`C:\Users\u\txe-dagu\packages\job_1\sha256-0123`:            `C:\Users\u\txe-dagu\bin\dagu`,
+		`C:\packages\job_1\sha256-0123`:                             `C:\bin\dagu`,
+		`\\srv\share\txe\packages\job_1\sha256-0123`:                `\\srv\share\txe\bin\dagu`,
+	} {
+		cli, err := txeMachineCLI("job_1", path)
+		require.NoError(t, err, path)
+		assert.Equal(t, want, cli, path)
+	}
+	for _, path := range []string{
+		"", "packages/job_1/sha256-0", "/x/packages/job_2/sha256-0", "/x/../y/packages/job_1/sha256-0", "/packages/job_1/s",
+		"/x//packages/job_1/s", "/x/./packages/job_1/s", "/x/packages/job_1/s/t", "/x/packages/job_1/",
+		`C:/x/packages/job_1/s`, `C:\x/packages\job_1\s`, `C:\x\.\packages\job_1\s`, `C:\x\\packages\job_1\s`,
+		`C:\x\..\packages\job_1\s`, `C:\x\packages\job_1\s\`, `x\packages\job_1\s`,
+	} {
 		_, err := txeMachineCLI("job_1", path)
 		assert.Error(t, err, path)
 	}

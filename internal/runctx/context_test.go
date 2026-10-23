@@ -94,6 +94,32 @@ func TestDAGContext_UserEnvsMap(t *testing.T) {
 	}
 }
 
+// The retry provenance is the coordinator's alone: a DAG variable, a param,
+// a secret or a runtime profile's secret of the same name cannot set it, on a
+// retry or on an execution that is not one.
+func TestNewContext_RetryProvenanceCannotBeSupplied(t *testing.T) {
+	t.Parallel()
+
+	spoof := []string{runenv.EnvKeyDAGRunRetryOf + "=spoofed", runenv.EnvKeyDAGRunAcceptedFailedPrerequisites + "=1"}
+	build := func(opts ...runctx.ContextOption) map[string]string {
+		dag := &ir.DAG{Name: "job", Env: spoof}
+		opts = append(opts,
+			runctx.WithParams(spoof),
+			runctx.WithSecrets(spoof),
+			runctx.WithRuntimeProfileValues(spoof, spoof, spoof, spoof),
+		)
+		return runctx.GetContext(runctx.NewContext(context.Background(), dag, "run-1", "test.log", opts...)).UserEnvsMap()
+	}
+
+	plain := build()
+	assert.Empty(t, plain[runenv.EnvKeyDAGRunRetryOf])
+	assert.Empty(t, plain[runenv.EnvKeyDAGRunAcceptedFailedPrerequisites])
+
+	retry := build(runctx.WithRetryOf("job:run-1:a1b2c3:"), runctx.WithAcceptFailedPrerequisites(true))
+	assert.Equal(t, "job:run-1:a1b2c3:", retry[runenv.EnvKeyDAGRunRetryOf])
+	assert.Equal(t, "1", retry[runenv.EnvKeyDAGRunAcceptedFailedPrerequisites])
+}
+
 func TestNewContext_DAGParamsJSON(t *testing.T) {
 	t.Parallel()
 
