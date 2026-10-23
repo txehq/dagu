@@ -247,29 +247,47 @@ func TestTxeMachineCLI(t *testing.T) {
 }
 
 // A republish is refused before it is dispatched when the job's machine has
-// connected workers and none advertises the capability: an older worker
-// would run the step retry without the option.
+// live workers and none advertises the capability: an older worker would
+// run the step retry without the option. A worker whose heartbeat is late
+// counts as neither capable nor live.
 func TestTxeRepublishWorkerCheck(t *testing.T) {
 	selector := map[string]string{dispatch.MachineLabel: "mch_1"}
 	capable := map[string]string{dispatch.MachineLabel: "mch_1", dispatch.AcceptFailedPrerequisitesLabel: dispatch.CapabilityLabelValue}
 	other := map[string]string{dispatch.MachineLabel: "mch_2", dispatch.AcceptFailedPrerequisitesLabel: dispatch.CapabilityLabelValue}
-	check := func(workers ...map[string]string) error {
+	type worker struct {
+		labels map[string]string
+		health coordinatorv1.WorkerHealthStatus
+	}
+	live := func(labels map[string]string) worker {
+		return worker{labels, coordinatorv1.WorkerHealthStatus_WORKER_HEALTH_STATUS_HEALTHY}
+	}
+	late := func(labels map[string]string) worker {
+		return worker{labels, coordinatorv1.WorkerHealthStatus_WORKER_HEALTH_STATUS_WARNING}
+	}
+	check := func(workers ...worker) error {
 		stub := &stubCoordinatorClient{}
-		for i, labels := range workers {
-			stub.workers = append(stub.workers, &coordinatorv1.WorkerInfo{WorkerId: string(rune('a' + i)), Labels: labels})
+		for i, w := range workers {
+			stub.workers = append(stub.workers, &coordinatorv1.WorkerInfo{WorkerId: string(rune('a' + i)), Labels: w.labels, HealthStatus: w.health})
 		}
 		return (&API{coordinatorCli: stub}).txeRepublishWorkerCheck(context.Background(), selector)
 	}
+	refused := func(err error, name string) {
+		t.Helper()
+		require.Error(t, err, name)
+		var apiErr *Error
+		require.True(t, errors.As(err, &apiErr), name)
+		assert.Equal(t, http.StatusConflict, apiErr.HTTPStatus, name)
+		assert.Equal(t, txeRepublishWorkerMissing, apiErr.Details["code"], name)
+	}
 
-	assert.NoError(t, check(capable))
-	assert.NoError(t, check(selector, capable), "one capable worker of the machine is enough")
+	assert.NoError(t, check(live(capable)))
+	assert.NoError(t, check(live(selector), live(capable)), "one capable worker of the machine is enough")
+	assert.NoError(t, check(late(selector), live(capable)), "a late older worker does not count")
 	assert.NoError(t, check(), "no workers: the coordinator's own refusal decides")
-	assert.NoError(t, check(other), "only another machine's workers: the coordinator's own refusal decides")
+	assert.NoError(t, check(live(other)), "only another machine's workers: the coordinator's own refusal decides")
+	assert.NoError(t, check(late(selector), late(capable)), "no live worker of the machine: the coordinator's own refusal decides")
 
-	err := check(selector)
-	require.Error(t, err)
-	var apiErr *Error
-	require.True(t, errors.As(err, &apiErr))
-	assert.Equal(t, http.StatusConflict, apiErr.HTTPStatus)
-	assert.Equal(t, txeRepublishWorkerMissing, apiErr.Details["code"])
+	refused(check(live(selector)), "an older worker alone")
+	refused(check(late(capable), live(selector)), "a capable worker that is late, beside a live older one")
+	refused(check(worker{capable, coordinatorv1.WorkerHealthStatus_WORKER_HEALTH_STATUS_UNHEALTHY}, live(selector)), "an unhealthy capable worker")
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 // A republish (TXE-5067) is a conditional step retry of a TXE job's publish
@@ -340,10 +341,11 @@ func txeStepEnv(env []string) []string {
 }
 
 // txeRepublishWorkerCheck refuses a republish before it is dispatched when
-// workers of the job's machine are connected and none of them can run it.
+// live workers of the job's machine are connected and none of them can run
+// it; a worker whose heartbeat is late counts as neither.
 // It runs before anything is queued or created, so its 409
 // worker_capability_missing has had no effect and a client may settle on it.
-// Without workers, or when they cannot be listed, the coordinator's own
+// Without live workers, or when they cannot be listed, the coordinator's own
 // refusal decides, as for any task. If the workers change after this check,
 // the coordinator still gives the task only to a worker whose labels match
 // its selector, which carries the capability label (executor.CreateTask);
@@ -362,7 +364,10 @@ func (a *API) txeRepublishWorkerCheck(ctx context.Context, selector map[string]s
 	maps.Copy(capable, selector)
 	machineWorkers := 0
 	for _, w := range workers {
-		if w == nil || !dispatch.SelectorAdmits(w.GetLabels(), selector, dispatch.MachinePinningOff) {
+		// A worker whose heartbeat is late may be gone: only a live one can
+		// take the task, so only a live one counts, capable or not.
+		if w == nil || w.GetHealthStatus() != coordinatorv1.WorkerHealthStatus_WORKER_HEALTH_STATUS_HEALTHY ||
+			!dispatch.SelectorAdmits(w.GetLabels(), selector, dispatch.MachinePinningOff) {
 			continue
 		}
 		machineWorkers++
