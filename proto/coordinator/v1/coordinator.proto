@@ -189,6 +189,10 @@ message Task {
   // coordinator records on the admitted execution the correlation it derives
   // from this, the run and previous_status's execution; workers ignore it.
   RetryRequestProto retry_request = 44;
+  // On a step retry, lets the selected step run although a direct
+  // prerequisite failed in an earlier execution. Only workers that advertise
+  // the accept-failed-prerequisites capability label are given such a task.
+  bool accept_failed_prerequisites = 45;
 }
 
 // RetryRequestProto names the action attempt a conditional retry was made

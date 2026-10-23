@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -198,6 +200,12 @@ type Agent struct {
 	includeDownstream bool
 	// bypassPreconditions skips step precondition evaluation for retried steps.
 	bypassPreconditions bool
+	// acceptFailedPrerequisites lets the retried step run although a direct
+	// prerequisite failed in an earlier execution.
+	acceptFailedPrerequisites bool
+	// givenRetryOf is the retried execution's reference the caller derived
+	// from the coordinator's task (Options.RetryOf).
+	givenRetryOf string
 
 	// retryPath identifies the persisted child invocation selected by a root retry.
 	retryPath dagrun.RetryPath
@@ -344,6 +352,13 @@ type Options struct {
 	// BypassPreconditions skips step precondition evaluation for the steps
 	// reset by a step retry.
 	BypassPreconditions bool
+	// AcceptFailedPrerequisites lets the step of a step retry run although a
+	// direct prerequisite failed in an earlier execution.
+	AcceptFailedPrerequisites bool
+	// RetryOf is the execution reference this execution retries, as the
+	// coordinator records it on the execution its conditional retry admitted
+	// (the worker derives it from the task the same way). Empty otherwise.
+	RetryOf string
 	// RetryPath identifies a persisted child DAG step retry.
 	RetryPath dagrun.RetryPath
 	// WorkerID is the identifier of the worker executing this DAG run.
@@ -431,56 +446,62 @@ func New(
 	if dagRepository != nil {
 		dagLoader = dagRepository
 	}
+	if opts.AcceptFailedPrerequisites {
+		dag = republishScopedDAG(dag)
+		opts = republishScopedOptions(opts)
+	}
 
 	a := &Agent{
-		cleanupDone:              make(chan struct{}),
-		rootDAGRun:               opts.RootDAGRun,
-		parentDAGRun:             opts.ParentDAGRun,
-		dagRunID:                 dagRunID,
-		dag:                      dag,
-		dry:                      opts.Dry,
-		noReuse:                  opts.NoReuse,
-		retryTarget:              opts.RetryTarget,
-		logDir:                   logDir,
-		logFile:                  logFile,
-		artifactDir:              opts.ArtifactDir,
-		artifactFinalizer:        opts.ArtifactFinalizer,
-		dagRunMgr:                drm,
-		dagLoader:                dagLoader,
-		runStateStore:            opts.RunStateStore,
-		stateStore:               opts.StateStore,
-		materializationStore:     opts.MaterializationStore,
-		secretStore:              opts.SecretStore,
-		secretReferenceResolver:  secretReferenceResolverForDAG(dag, opts),
-		profileStore:             opts.ProfileStore,
-		profileResolver:          opts.ProfileResolver,
-		registry:                 opts.ServiceRegistry,
-		extraEnvs:                append([]string{}, opts.ExtraEnvs...),
-		inheritedEnvs:            append([]cmnvalue.EnvEntry{}, opts.InheritedEnvs...),
-		workDir:                  opts.WorkDir,
-		workspaceSeed:            opts.WorkspaceSeed,
-		profileName:              opts.ProfileName,
-		definitionID:             opts.DAGDefinitionID,
-		stepRetry:                opts.StepRetry,
-		includeDownstream:        opts.IncludeDownstream,
-		bypassPreconditions:      opts.BypassPreconditions,
-		retryPath:                opts.RetryPath,
-		peerConfig:               opts.PeerConfig,
-		workerID:                 opts.WorkerID,
-		statusPusher:             opts.StatusPusher,
-		subWorkflowRunnerFactory: opts.SubWorkflowRunnerFactory,
-		logWriterFactory:         opts.LogWriterFactory,
-		queuedRun:                opts.QueuedRun,
-		attemptID:                opts.AttemptID,
-		triggerType:              opts.TriggerType,
-		triggerActor:             opts.TriggerActor,
-		parallelItem:             opts.ParallelItem,
-		defaultExecMode:          opts.DefaultExecMode,
-		scheduleTime:             opts.ScheduleTime,
-		dagRunLogDir:             opts.DAGRunLogDir,
-		dagRunArtifactDir:        opts.DAGRunArtifactDir,
-		socketServerFactory:      opts.SocketServerFactory,
-		remoteDAGLoader:          opts.RemoteDAGLoader,
+		cleanupDone:               make(chan struct{}),
+		rootDAGRun:                opts.RootDAGRun,
+		parentDAGRun:              opts.ParentDAGRun,
+		dagRunID:                  dagRunID,
+		dag:                       dag,
+		dry:                       opts.Dry,
+		noReuse:                   opts.NoReuse,
+		retryTarget:               opts.RetryTarget,
+		logDir:                    logDir,
+		logFile:                   logFile,
+		artifactDir:               opts.ArtifactDir,
+		artifactFinalizer:         opts.ArtifactFinalizer,
+		dagRunMgr:                 drm,
+		dagLoader:                 dagLoader,
+		runStateStore:             opts.RunStateStore,
+		stateStore:                opts.StateStore,
+		materializationStore:      opts.MaterializationStore,
+		secretStore:               opts.SecretStore,
+		secretReferenceResolver:   secretReferenceResolverForDAG(dag, opts),
+		profileStore:              opts.ProfileStore,
+		profileResolver:           opts.ProfileResolver,
+		registry:                  opts.ServiceRegistry,
+		extraEnvs:                 append([]string{}, opts.ExtraEnvs...),
+		inheritedEnvs:             append([]cmnvalue.EnvEntry{}, opts.InheritedEnvs...),
+		workDir:                   opts.WorkDir,
+		workspaceSeed:             opts.WorkspaceSeed,
+		profileName:               opts.ProfileName,
+		definitionID:              opts.DAGDefinitionID,
+		stepRetry:                 opts.StepRetry,
+		includeDownstream:         opts.IncludeDownstream,
+		bypassPreconditions:       opts.BypassPreconditions,
+		acceptFailedPrerequisites: opts.AcceptFailedPrerequisites,
+		givenRetryOf:              opts.RetryOf,
+		retryPath:                 opts.RetryPath,
+		peerConfig:                opts.PeerConfig,
+		workerID:                  opts.WorkerID,
+		statusPusher:              opts.StatusPusher,
+		subWorkflowRunnerFactory:  opts.SubWorkflowRunnerFactory,
+		logWriterFactory:          opts.LogWriterFactory,
+		queuedRun:                 opts.QueuedRun,
+		attemptID:                 opts.AttemptID,
+		triggerType:               opts.TriggerType,
+		triggerActor:              opts.TriggerActor,
+		parallelItem:              opts.ParallelItem,
+		defaultExecMode:           opts.DefaultExecMode,
+		scheduleTime:              opts.ScheduleTime,
+		dagRunLogDir:              opts.DAGRunLogDir,
+		dagRunArtifactDir:         opts.DAGRunArtifactDir,
+		socketServerFactory:       opts.SocketServerFactory,
+		remoteDAGLoader:           opts.RemoteDAGLoader,
 	}
 	if a.socketServerFactory == nil {
 		a.socketServerFactory = defaultSocketServerFactory
@@ -737,6 +758,8 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		runtime.WithRetryPath(a.retryPath),
 		runtime.WithIncludeDownstream(a.includeDownstream),
 		runtime.WithBypassPreconditions(a.bypassPreconditions),
+		runtime.WithAcceptFailedPrerequisites(a.acceptFailedPrerequisites),
+		runtime.WithRetryOf(a.retryOf()),
 		runtime.WithAttemptID(a.dagRunAttemptID),
 		runtime.WithWorkerID(a.workerID),
 		runtime.WithTriggerType(a.triggerType),
@@ -1672,6 +1695,62 @@ func (a *Agent) ownRetryRequest(source *ir.DAGRunStatus) *ir.RetryRequest {
 	return source.RetryRequest
 }
 
+// republishScopedDAG is the DAG a republish runs: the step retry that accepts
+// failed prerequisites runs the job's publish step alone, after a job that
+// already ran, so it gets none of the job's own settings. Of the DAG's
+// variables it keeps only the ones the TXE renderer writes for its commands
+// (runenv.TXEStepEnvNames); the job's other variables, its params and their
+// definitions, its dotenv files and its secrets are left out, and secrets are
+// not resolved at all.
+// The managed run variables are added as for any run.
+func republishScopedDAG(dag *ir.DAG) *ir.DAG {
+	if dag == nil {
+		return nil
+	}
+	scoped := dag.Clone()
+	scoped.Env = nil
+	for _, entry := range dag.Env {
+		name, _, _ := strings.Cut(entry, "=")
+		if slices.Contains(runenv.TXEStepEnvNames, name) {
+			scoped.Env = append(scoped.Env, entry)
+		}
+	}
+	scoped.Secrets = nil
+	scoped.Dotenv = nil
+	scoped.Params = nil
+	scoped.DefaultParams = ""
+	scoped.ParamsJSON = ""
+	scoped.ParamDefs = nil
+	scoped.ParamSchema = nil
+	return scoped
+}
+
+// republishScopedOptions are the options a republish runs with: no runtime
+// profile, selected or a workspace's defaults, is resolved, so none of its
+// variables or secrets reach the publish step, and no parent run's
+// variables are inherited (republishScopedDAG).
+func republishScopedOptions(opts Options) Options {
+	opts.ProfileName = ""
+	opts.ProfileStore = nil
+	opts.ProfileResolver = nil
+	opts.InheritedEnvs = nil
+	return opts
+}
+
+// retryOf is the execution this execution retries: as the worker derived it
+// from the coordinator's task, or from the retry request recorded on the
+// queued status that admitted it (ownRetryRequest). A step cannot set it,
+// and an execution without such a request has none.
+func (a *Agent) retryOf() string {
+	if a.givenRetryOf != "" {
+		return a.givenRetryOf
+	}
+	if request := a.ownRetryRequest(a.statusSourceTarget()); request != nil {
+		return request.RetryOf
+	}
+	return ""
+}
+
 // contextQueuedAt is the queue marker of this execution: the queuedAt every
 // status this agent reports carries, so a step and the stored status name the
 // same execution. It is passed as stored, never reformatted. A run that was
@@ -2393,6 +2472,8 @@ func (a *Agent) dryRun(ctx context.Context) error {
 		runtime.WithRetryPath(a.retryPath),
 		runtime.WithIncludeDownstream(a.includeDownstream),
 		runtime.WithBypassPreconditions(a.bypassPreconditions),
+		runtime.WithAcceptFailedPrerequisites(a.acceptFailedPrerequisites),
+		runtime.WithRetryOf(a.retryOf()),
 		runtime.WithAttemptID(a.dagRunAttemptID),
 		runtime.WithWorkerID(a.workerID),
 		runtime.WithTriggerType(a.triggerType),
@@ -2594,8 +2675,9 @@ func (a *Agent) setupStepRetryPlan(nodes []*runtime.Node) (*runtime.Plan, error)
 	// DAG that contains the selected step (empty remaining retry hops).
 	includeDownstream := a.includeDownstream && len(a.retryPath.Hops) == 0
 	plan, err := runtime.CreateStepRetryPlanWithOptions(a.dag, nodes, a.stepRetry, runtime.StepRetryPlanOptions{
-		IncludeDownstream:   includeDownstream,
-		BypassPreconditions: a.bypassPreconditions,
+		IncludeDownstream:         includeDownstream,
+		BypassPreconditions:       a.bypassPreconditions,
+		AcceptFailedPrerequisites: a.acceptFailedPrerequisites,
 	})
 	if err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/build"
@@ -25,11 +26,17 @@ const runtimeProfileOrigin = "runtime_profile"
 
 // Context contains the execution metadata for a dag-run.
 type Context struct {
-	DAGRunID             string
-	RootDAGRun           ir.DAGRunRef
-	RetryPath            dagrun.RetryPath
-	IncludeDownstream    bool
-	BypassPreconditions  bool
+	DAGRunID            string
+	RootDAGRun          ir.DAGRunRef
+	RetryPath           dagrun.RetryPath
+	IncludeDownstream   bool
+	BypassPreconditions bool
+	// AcceptFailedPrerequisites records a step retry allowed to treat the
+	// selected step's failed prerequisites as satisfied.
+	AcceptFailedPrerequisites bool
+	// RetryOf is the execution reference this execution retries, from the
+	// retry request the coordinator recorded on it; empty otherwise.
+	RetryOf              string
 	AttemptID            string
 	WorkerID             string
 	TriggerType          ir.TriggerType
@@ -116,16 +123,22 @@ func (e Context) InheritedEnvs() []cmnvalue.EnvEntry {
 // Params are excluded because a child run owns its own: forwarding the parent's
 // would override the arguments the step passed to the child, and positional
 // params carry numeric names that are not valid environment variable names.
+// The retry provenance is excluded too: it describes this execution, not the
+// child's (retryProvenanceEnvs).
 func (e Context) PassableEnvs() []string {
 	if e.EnvScope == nil {
 		return nil
 	}
-	return e.EnvScope.ToSliceWithoutOriginOrSources(
+	envs := e.EnvScope.ToSliceWithoutOriginOrSources(
 		runtimeProfileOrigin,
 		cmnvalue.EnvSourceOS,
 		cmnvalue.EnvSourceSecret,
 		cmnvalue.EnvSourceParam,
 	)
+	return slices.DeleteFunc(envs, func(entry string) bool {
+		name, _, _ := strings.Cut(entry, "=")
+		return name == runenv.EnvKeyDAGRunRetryOf || name == runenv.EnvKeyDAGRunAcceptedFailedPrerequisites
+	})
 }
 
 // DAGLoader loads DAG definitions needed during execution.
@@ -193,6 +206,22 @@ func WithIncludeDownstream(enabled bool) ContextOption {
 func WithBypassPreconditions(enabled bool) ContextOption {
 	return func(o *contextOptions) {
 		o.BypassPreconditions = enabled
+	}
+}
+
+// WithAcceptFailedPrerequisites records that the selected step of a step
+// retry may run although a prerequisite failed in an earlier execution.
+func WithAcceptFailedPrerequisites(enabled bool) ContextOption {
+	return func(o *contextOptions) {
+		o.AcceptFailedPrerequisites = enabled
+	}
+}
+
+// WithRetryOf records the execution reference this execution retries, as
+// the coordinator recorded it on the execution it admitted.
+func WithRetryOf(ref string) ContextOption {
+	return func(o *contextOptions) {
+		o.RetryOf = ref
 	}
 }
 
@@ -451,7 +480,7 @@ func NewContext(
 	// Seed the lowest-precedence layer from filtered BaseEnv so workflow step
 	// subprocesses stay isolated from arbitrary host env inherited by parent-
 	// spawned dagu start/retry/restart commands.
-	// Precedence (highest to lowest): secrets > managed run env >
+	// Precedence (highest to lowest): retry provenance > secrets > managed run env >
 	// execution env > DAG env > params > defaults > inherited parent env >
 	// BaseEnv.
 	scope := cmnvalue.NewEnvScope(nil, false)
@@ -479,6 +508,7 @@ func NewContext(
 	if len(secretEnvs) > 0 {
 		scope = scope.WithEntries(secretEnvs, cmnvalue.EnvSourceSecret)
 	}
+	scope = scope.WithEntries(retryProvenanceEnvs(options), cmnvalue.EnvSourceDAGEnv)
 
 	// Fields the caller cannot set through an option, because they are derived
 	// from the required arguments or from the environment layering above.

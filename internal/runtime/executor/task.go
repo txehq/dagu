@@ -5,6 +5,7 @@ package executor
 
 import (
 	"log/slog"
+	"maps"
 	"os"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
@@ -35,6 +36,18 @@ func CreateTask(
 
 	for _, opt := range opts {
 		opt(task)
+	}
+	// Only a worker that knows the option may take the task: one that does
+	// not would run the step retry without it. The capability is a label
+	// every such worker advertises, so the selector gates it on every path
+	// that matches workers, whatever order the options came in.
+	if task.AcceptFailedPrerequisites {
+		selector := maps.Clone(task.WorkerSelector)
+		if selector == nil {
+			selector = map[string]string{}
+		}
+		selector[dispatch.AcceptFailedPrerequisitesLabel] = dispatch.CapabilityLabelValue
+		task.WorkerSelector = selector
 	}
 
 	return task
@@ -126,6 +139,15 @@ func WithIncludeDownstream(enabled bool) TaskOption {
 func WithBypassPreconditions(enabled bool) TaskOption {
 	return func(task *dispatch.DispatchTask) {
 		task.BypassPreconditions = enabled
+	}
+}
+
+// WithAcceptFailedPrerequisites lets the selected step of a step retry run
+// although a direct prerequisite failed in an earlier execution. The task
+// is given only to a worker that advertises AcceptFailedPrerequisitesLabel.
+func WithAcceptFailedPrerequisites(enabled bool) TaskOption {
+	return func(task *dispatch.DispatchTask) {
+		task.AcceptFailedPrerequisites = enabled
 	}
 }
 

@@ -919,7 +919,7 @@ func TestMachineAbsPath(t *testing.T) {
 		"pkg": false, "./pkg": false, "~/pkg": false, `C:pkg`: false, "": false,
 		"/a/../b": false, `C:\a\..\b`: false, "/a/..": false,
 	} {
-		assert.Equal(t, want, machineAbsPath(p), p)
+		assert.Equal(t, want, MachineAbsPath(p), p)
 	}
 }
 

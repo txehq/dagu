@@ -12819,6 +12819,8 @@ export interface operations {
                     /** @description Optional, with expectedAttemptId. The queue marker (queuedAt) of the expected execution; empty for an execution that was never queued. */
                     expectedQueuedAt?: string;
                     retryRequest?: components["schemas"]["RetryRequestSpec"];
+                    /** @description Optional. When true, the selected step runs although a direct prerequisite of it failed in an earlier execution: the republish of a TXE job's sealed result, whose job step the hub recorded as failed (TXE-5067). Accepted only with stepName "publish" of a registered TXE job's DAG at its current version, expectedAttemptId and expectedQueuedAt, and a retryRequest naming that job's dagu.retry_run action whose params say step "publish" and name this run and expected execution; not with includeDownstream, bypassPreconditions or subDAGRunId. Otherwise 400 with details.code accept_failed_prerequisites_unsupported, and nothing is queued or created. The retry is given only to a worker that advertises the capability; with none, it is refused as for want of a matching worker. The job's step does not run again. */
+                    acceptFailedPrerequisites?: boolean;
                 };
             };
         };

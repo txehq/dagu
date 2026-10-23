@@ -34,6 +34,9 @@ type Plan struct {
 	nodeByName    map[string]*Node
 	inferredEdges map[[2]int]struct{}
 	stepRetry     *stepRetrySelection
+	// acceptFailedPrerequisites: this plan treats prerequisites marked
+	// FailureAcceptedByRetry as satisfied (StepRetryPlanOptions).
+	acceptFailedPrerequisites bool
 
 	// Adjacency lists (immutable after planning; exposed for unit tests)
 	DependencyMap map[int][]int // node ID -> list of dependency node IDs (upstream)
@@ -147,6 +150,21 @@ type StepRetryPlanOptions struct {
 	// BypassPreconditions marks reset nodes to skip step precondition
 	// evaluation when they execute.
 	BypassPreconditions bool
+	// AcceptFailedPrerequisites lets the selected step run although a direct
+	// prerequisite of it failed in an earlier execution: such a prerequisite
+	// is marked FailureAcceptedByRetry and counts as satisfied in this plan
+	// only. It does not combine with IncludeDownstream.
+	AcceptFailedPrerequisites bool
+}
+
+// ErrAcceptFailedPrerequisitesWithDownstream refuses a step retry that would
+// accept failed prerequisites for more than the selected step.
+var ErrAcceptFailedPrerequisitesWithDownstream = errors.New("accepting failed prerequisites applies to the selected step alone, not with its downstream steps")
+
+// acceptsFailure reports whether dep, a failed prerequisite, counts as
+// satisfied in this plan.
+func (p *Plan) acceptsFailure(dep *Node) bool {
+	return p.acceptFailedPrerequisites && dep.State().FailureAcceptedByRetry
 }
 
 // CreateStepRetryPlan creates a new execution plan for retrying a specific step.
@@ -192,6 +210,17 @@ func CreateStepRetryPlanWithOptions(dag *ir.DAG, nodes []*Node, stepName string,
 	resetStepRetryNode(targetNode, template, targetNode.State().Status == ir.NodeRetrying)
 	if opts.BypassPreconditions {
 		targetNode.SetBypassPreconditions(true)
+	}
+	if opts.AcceptFailedPrerequisites {
+		if opts.IncludeDownstream {
+			return nil, ErrAcceptFailedPrerequisitesWithDownstream
+		}
+		p.acceptFailedPrerequisites = true
+		for _, depID := range p.DependencyMap[targetNode.id] {
+			if dep := p.nodeByID[depID]; dep != nil && dep.State().Status == ir.NodeFailed {
+				dep.SetFailureAcceptedByRetry(true)
+			}
+		}
 	}
 
 	if opts.IncludeDownstream {

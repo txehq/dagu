@@ -6,6 +6,7 @@ package txepkg
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -284,10 +285,19 @@ func (s DAGSpec) overlap() string {
 	return s.Schedule.Overlap
 }
 
-// reservedEnv are set by the renderer and cannot be supplied by the job.
-var reservedEnv = map[string]bool{
-	"TXE_JOB_ID": true, "TXE_JOB_VERSION": true, "TXE_OUTPUT_DIR": true, RunOutputEnv: true, AttemptEnv: true, QueuedAtEnv: true, EnvHome: true,
-}
+// reservedEnv cannot be supplied by the job, as a variable or a credential:
+// the renderer sets runenv.TXEStepEnvNames, which a republish keeps, and the
+// agent sets the retry provenance the publish step reads.
+var reservedEnv = func() map[string]bool {
+	names := map[string]bool{
+		runenv.EnvKeyDAGRunRetryOf:                     true,
+		runenv.EnvKeyDAGRunAcceptedFailedPrerequisites: true,
+	}
+	for _, name := range runenv.TXEStepEnvNames {
+		names[name] = true
+	}
+	return names
+}()
 
 func (s DAGSpec) validate() error {
 	for _, id := range []string{s.JobID, s.OwnerID, s.ProjectID, s.MachineID} {

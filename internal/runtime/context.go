@@ -44,6 +44,11 @@ var (
 	// WithBypassPreconditions records that steps reset by a targeted step
 	// retry skip step precondition evaluation.
 	WithBypassPreconditions = runctx.WithBypassPreconditions
+	// WithAcceptFailedPrerequisites records a step retry allowed to treat the
+	// selected step's failed prerequisites as satisfied.
+	WithAcceptFailedPrerequisites = runctx.WithAcceptFailedPrerequisites
+	// WithRetryOf records the execution reference this execution retries.
+	WithRetryOf = runctx.WithRetryOf
 	// WithAttemptID sets the DAG-run attempt identifier.
 	WithAttemptID = runctx.WithAttemptID
 	// WithWorkerID sets the execution host identifier.

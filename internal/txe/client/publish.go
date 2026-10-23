@@ -54,6 +54,14 @@ type PublishInput struct {
 	// ArtifactDir is the run's native artifact directory. It is required
 	// only when a deliverable is declared for the hub.
 	ArtifactDir string
+	// Republish says the publish step runs in a step retry that accepted the
+	// job's failed step (DAG_RUN_ACCEPTED_FAILED_PREREQUISITES). Such an
+	// execution never runs the job, and publishes only the sealed result of
+	// RetryOf, the execution it retries.
+	Republish bool
+	// RetryOf is the execution reference the coordinator recorded as the one
+	// this execution retries (DAG_RUN_RETRY_OF); empty when none was.
+	RetryOf string
 }
 
 var runIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -103,6 +111,23 @@ func (p *Publisher) Publish(ctx context.Context, in PublishInput) (*ArtifactMani
 	// Only one that did not run the job takes the run's latest result.
 	seal := sealed.of(in.Execution)
 	switch {
+	case in.Republish && (seal != nil || sealed.began(in.Execution)):
+		// A republish accepts the job's failure instead of running it; an
+		// execution that ran the job is not one.
+		return nil, fmt.Errorf("run %s: execution %s ran the job, so it does not republish another's result: %w", in.RunID, in.Execution.Ref(), ErrNotRetriedSeal)
+	case in.Republish:
+		// Never the latest seal on trust: only the retried execution's, as
+		// RetriedSeal decides it for the reviewer too.
+		if in.RetryOf == "" {
+			return nil, fmt.Errorf("run %s: execution %s republishes without a retried execution recorded for it: %w", in.RunID, in.Execution.Ref(), ErrNotRetriedSeal)
+		}
+		retried, ok := sealed.byRef(in.RetryOf)
+		if !ok {
+			return nil, fmt.Errorf("run %s: execution %s republishes %s, which sealed nothing: %w", in.RunID, in.Execution.Ref(), in.RetryOf, ErrNotSealed)
+		}
+		if seal, err = retriedSeal(runRoot, sealed, in.RunID, retried); err != nil {
+			return nil, err
+		}
 	case seal != nil:
 	case sealed.began(in.Execution):
 		return nil, fmt.Errorf("run %s: execution %s ran the job and did not seal its outputs: %w", in.RunID, in.Execution.Ref(), ErrNotSealed)

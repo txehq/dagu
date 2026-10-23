@@ -92,29 +92,33 @@ type BuildExecution struct {
 
 // Node represents a DAG step with its execution state for persistence
 type Node struct {
-	Step                Step                 `json:"step,omitzero"`
-	PreconditionResults []ConditionResult    `json:"-"`
-	Stdout              string               `json:"stdout"` // standard output log file path
-	Stderr              string               `json:"stderr"` // standard error log file path
-	WorkingDir          string               `json:"workingDir,omitempty"`
-	StartedAt           string               `json:"startedAt"`
-	FinishedAt          string               `json:"finishedAt"`
-	Status              NodeStatus           `json:"status"`
-	RetriedAt           string               `json:"retriedAt,omitempty"`
-	RetryCount          int                  `json:"retryCount,omitempty"`
-	DoneCount           int                  `json:"doneCount,omitempty"`
-	Repeated            bool                 `json:"repeated,omitempty"` // indicates if the node has been repeated
-	SkippedByRetry      bool                 `json:"skippedByRetry,omitempty"`
-	Error               string               `json:"error,omitempty"`
-	StatusDetails       []NodeStatusDetail   `json:"statusDetails,omitempty"`
-	Build               *BuildExecution      `json:"build,omitempty"`
-	SubRuns             []SubDAGRun          `json:"children,omitempty"`
-	SubRunsRepeated     []SubDAGRun          `json:"childrenRepeated,omitempty"` // repeated sub DAG runs
-	OutputVariables     *collections.SyncMap `json:"outputVariables,omitempty"`
-	OutputValue         *string              `json:"outputValue,omitempty"`
-	OutputsValue        *string              `json:"outputsValue,omitempty"`
-	StepOutputsValue    *string              `json:"stepOutputsValue,omitempty"`
-	HumanTaskInput      json.RawMessage      `json:"humanTaskInput,omitempty"`
+	Step                Step              `json:"step,omitzero"`
+	PreconditionResults []ConditionResult `json:"-"`
+	Stdout              string            `json:"stdout"` // standard output log file path
+	Stderr              string            `json:"stderr"` // standard error log file path
+	WorkingDir          string            `json:"workingDir,omitempty"`
+	StartedAt           string            `json:"startedAt"`
+	FinishedAt          string            `json:"finishedAt"`
+	Status              NodeStatus        `json:"status"`
+	RetriedAt           string            `json:"retriedAt,omitempty"`
+	RetryCount          int               `json:"retryCount,omitempty"`
+	DoneCount           int               `json:"doneCount,omitempty"`
+	Repeated            bool              `json:"repeated,omitempty"` // indicates if the node has been repeated
+	SkippedByRetry      bool              `json:"skippedByRetry,omitempty"`
+	// FailureAcceptedByRetry records that this failed step was treated as
+	// satisfied by the step retry of the execution that wrote the status. It
+	// is a record of that execution only; no later plan reads it.
+	FailureAcceptedByRetry bool                 `json:"failureAcceptedByRetry,omitempty"`
+	Error                  string               `json:"error,omitempty"`
+	StatusDetails          []NodeStatusDetail   `json:"statusDetails,omitempty"`
+	Build                  *BuildExecution      `json:"build,omitempty"`
+	SubRuns                []SubDAGRun          `json:"children,omitempty"`
+	SubRunsRepeated        []SubDAGRun          `json:"childrenRepeated,omitempty"` // repeated sub DAG runs
+	OutputVariables        *collections.SyncMap `json:"outputVariables,omitempty"`
+	OutputValue            *string              `json:"outputValue,omitempty"`
+	OutputsValue           *string              `json:"outputsValue,omitempty"`
+	StepOutputsValue       *string              `json:"stepOutputsValue,omitempty"`
+	HumanTaskInput         json.RawMessage      `json:"humanTaskInput,omitempty"`
 	// AgentState stores the goal progress of an agent DAG's agent
 	// step, so a suspended run resumes with its task list intact.
 	AgentState json.RawMessage `json:"agentState,omitempty"`

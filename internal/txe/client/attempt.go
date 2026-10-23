@@ -169,6 +169,16 @@ func (s *seals) of(e Execution) *Seal {
 }
 
 // latest is the seal of the most recent execution that succeeded.
+// byRef returns the sealing execution named by its reference.
+func (s *seals) byRef(ref string) (Execution, bool) {
+	for _, seal := range s.Seals {
+		if seal.Execution.Ref() == ref {
+			return seal.Execution, true
+		}
+	}
+	return Execution{}, false
+}
+
 func (s *seals) latest() *Seal {
 	if len(s.Seals) == 0 {
 		return nil

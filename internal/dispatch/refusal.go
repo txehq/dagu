@@ -21,6 +21,18 @@ const (
 	NoAvailableWorkersMessage = "no available workers"
 )
 
+// Capability labels. A worker build that supports a task option advertises
+// its label with CapabilityLabelValue among its labels; a task that needs the
+// option carries the label in its selector, so a worker without it is never
+// given the task and the coordinator refuses it as NoMatchingWorkersMessage.
+const (
+	// AcceptFailedPrerequisitesLabel: the worker runs a step retry's
+	// AcceptFailedPrerequisites option (TXE-5067).
+	AcceptFailedPrerequisitesLabel = "dagu.capability.accept-failed-prerequisites"
+	// CapabilityLabelValue is the value of a capability label.
+	CapabilityLabelValue = "true"
+)
+
 // IsNoMatchingWorker reports whether err is the coordinator's refusal of a
 // task no connected worker may take: its gRPC status, as returned or
 // wrapped, never a message that merely mentions it.

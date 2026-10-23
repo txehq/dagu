@@ -5,6 +5,7 @@ package runctx
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
@@ -38,11 +39,28 @@ func buildManagedDAGRunEnvs(
 	if options.artifactDir != "" {
 		envs[runenv.EnvKeyDAGRunArtifactsDir] = options.artifactDir
 	}
+	maps.Copy(envs, retryProvenanceEnvs(options))
 	if dag.ParamsJSON != "" {
 		envs[runenv.EnvKeyDAGParamsJSON] = dag.ParamsJSON
 		envs[runenv.EnvKeyDAGParamsJSONCompat] = dag.ParamsJSON
 	}
 	return envs
+}
+
+// retryProvenanceEnvs are the execution's retry provenance, as the
+// coordinator recorded it. Unlike the other managed envs they are set, empty,
+// when there is none, and they are layered over secrets too: nothing the DAG,
+// its params, its secrets or a runtime profile name can stand in for them, or
+// make an ordinary execution look like a retry.
+func retryProvenanceEnvs(options *contextOptions) map[string]string {
+	accepted := ""
+	if options.AcceptFailedPrerequisites {
+		accepted = "1"
+	}
+	return map[string]string{
+		runenv.EnvKeyDAGRunRetryOf:                     options.RetryOf,
+		runenv.EnvKeyDAGRunAcceptedFailedPrerequisites: accepted,
+	}
 }
 
 // dagWikiDir returns the Wiki directory for the DAG, or an empty string

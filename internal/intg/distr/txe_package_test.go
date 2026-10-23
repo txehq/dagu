@@ -441,14 +441,15 @@ func txeStartPublishJob(t *testing.T, script string, env map[string]string, bind
 // the run is started.
 func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, start func(*testFixture), stores ...txePublishStore) *txePublishRun {
 	t.Helper()
-	run := txeNewPublishJob(t, script, env, bind, nil, stores...)
+	run := txeNewPublishJob(t, script, env, bind, nil, nil, stores...)
 	start(run.f)
 	return run
 }
 
 // txeNewPublishJob builds the job's fixture, with options added to the
-// defaults, and starts nothing.
-func txeNewPublishJob(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, options []fixtureOption, stores ...txePublishStore) *txePublishRun {
+// defaults and the job's spec changed by mutate (when given), and starts
+// nothing.
+func txeNewPublishJob(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, options []fixtureOption, mutate func(*txepkg.DAGSpec, txepkg.Home), stores ...txePublishStore) *txePublishRun {
 	t.Helper()
 	pkg := txeCommitPackage(t, map[string]string{"collect.sh": script}, []string{"collect.sh"}, []string{"./collect.sh"})
 
@@ -479,6 +480,9 @@ func txeNewPublishJob(t *testing.T, script string, env map[string]string, bind f
 		// Filled in below, once the fixture has built the binary.
 		CLI:     txepkg.CLI{Dagu: "/placeholder", HomeRoot: home.Root},
 		Publish: &txepkg.Publish{HubArtifacts: true},
+	}
+	if mutate != nil {
+		mutate(&spec, home)
 	}
 	rendered, err := txepkg.RenderDAG(spec)
 	require.NoError(t, err)

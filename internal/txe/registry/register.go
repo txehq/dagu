@@ -28,11 +28,11 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 var windowsAbsPath = regexp.MustCompile(`^([A-Za-z]:[\\/]|\\\\)`)
 
-// machineAbsPath reports whether p is absolute on the machine that runs the
+// MachineAbsPath reports whether p is absolute on the machine that runs the
 // job, which need not have the hub's operating system: a POSIX path, a
 // Windows drive path or a UNC path, with no ".." segment under either
 // separator.
-func machineAbsPath(p string) bool {
+func MachineAbsPath(p string) bool {
 	if !strings.HasPrefix(p, "/") && !windowsAbsPath.MatchString(p) {
 		return false
 	}
@@ -100,7 +100,7 @@ func normalizeVersion(jobID string, v *JobVersion) error {
 		return refuse(CodeInvalid, "purpose is required")
 	case !digestPattern.MatchString(v.Package.Digest):
 		return refuse(CodeInvalid, "package.digest must be sha256:<64 hex>")
-	case !machineAbsPath(v.Package.Path):
+	case !MachineAbsPath(v.Package.Path):
 		return refuse(CodeInvalid, "package.path must be absolute on the assigned machine")
 	case v.Package.Entrypoint == "":
 		return refuse(CodeInvalid, "package.entrypoint is required")
@@ -765,12 +765,13 @@ const (
 	// with step "publish" as a republish of the run's sealed result, held to
 	// that decision both ways, and gives it only to a worker that can run it
 	// (TXE-5067). A client sends such a retry only to a hub that names this.
-	// It is listed by Capabilities only once the hub implements it.
 	CapabilityRepublishSealed = "republish_sealed"
 )
 
 // Capabilities is what this registry enforces.
-func Capabilities() []string { return []string{CapabilityParamSchema} }
+func Capabilities() []string {
+	return []string{CapabilityParamSchema, CapabilityRepublishSealed}
+}
 
 // ApplyVersionDefaults returns v with exactly the defaults and derived
 // fields registration stores (see NormalizeVersion), and no validation: a

@@ -601,3 +601,24 @@ func TestTaskOption_Functions(t *testing.T) {
 	})
 
 }
+
+// A task that accepts failed prerequisites selects the capability label, so
+// only a worker that advertises it can be given the task, whatever order the
+// options come in (TXE-5067).
+func TestCreateTaskSelectsTheAcceptFailedPrerequisitesCapability(t *testing.T) {
+	machine := map[string]string{dispatch.MachineLabel: "mch_1"}
+	for name, opts := range map[string][]executor.TaskOption{
+		"selector first": {executor.WithWorkerSelector(machine), executor.WithAcceptFailedPrerequisites(true)},
+		"selector last":  {executor.WithAcceptFailedPrerequisites(true), executor.WithWorkerSelector(machine)},
+	} {
+		task := executor.CreateTask("job_1", "steps: []", dispatch.DispatchOperationRetry, "run-1", opts...)
+		require.True(t, task.AcceptFailedPrerequisites, name)
+		assert.Equal(t, map[string]string{dispatch.MachineLabel: "mch_1", dispatch.AcceptFailedPrerequisitesLabel: dispatch.CapabilityLabelValue}, task.WorkerSelector, name)
+		older := map[string]string{dispatch.MachineLabel: "mch_1", "os": "darwin"}
+		assert.False(t, dispatch.SelectorAdmits(older, task.WorkerSelector, dispatch.MachinePinningOff), "%s: a worker without the capability", name)
+		capable := map[string]string{dispatch.MachineLabel: "mch_1", "os": "darwin", dispatch.AcceptFailedPrerequisitesLabel: dispatch.CapabilityLabelValue}
+		assert.True(t, dispatch.SelectorAdmits(capable, task.WorkerSelector, dispatch.MachinePinningOff), name)
+	}
+	plain := executor.CreateTask("job_1", "steps: []", dispatch.DispatchOperationRetry, "run-1", executor.WithWorkerSelector(machine))
+	assert.Equal(t, machine, plain.WorkerSelector, "other tasks are unchanged")
+}

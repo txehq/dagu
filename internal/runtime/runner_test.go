@@ -26,6 +26,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/chat"
 	runtimeexec "github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/transform"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/google/uuid"
@@ -3815,6 +3816,75 @@ func TestRunner_StepRetryExecution(t *testing.T) {
 		result.assertNodeStatus(t, "E", ir.NodeAborted)
 		require.ErrorIs(t, result.Error, runtime.ErrUpstreamFailed)
 		assert.Contains(t, result.Error.Error(), "step E did not run")
+	})
+
+	// TXE-5067: a step retry that accepts failed prerequisites runs the
+	// selected step past a prerequisite that failed earlier, without running
+	// that prerequisite, and only for that plan.
+	t.Run("RetryAcceptingFailedPrerequisiteRunsOnlyTheSelectedStep", func(t *testing.T) {
+		r := setupRunner(t)
+		dag := &ir.DAG{
+			Steps: []ir.Step{
+				{Name: "run", Commands: []ir.CommandEntry{{Command: "false"}}},
+				{Name: "publish", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"publish"}}}, Depends: []string{"run"}},
+			},
+		}
+		nodes := func() []*runtime.Node {
+			return []*runtime.Node{
+				runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[0], State: runtime.NodeState{Status: ir.NodeFailed}}),
+				runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeAborted}}),
+			}
+		}
+		retryPlan, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes(), "publish", runtime.StepRetryPlanOptions{AcceptFailedPrerequisites: true})
+		require.NoError(t, err)
+
+		result := planHelper{testHelper: r, Plan: retryPlan}.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "run", ir.NodeFailed)
+		result.assertNodeStatus(t, "publish", ir.NodeSucceeded)
+		require.True(t, result.GetNodeByName("run").State().FailureAcceptedByRetry, "the acceptance is recorded")
+		assert.Equal(t, 0, result.GetNodeByName("run").State().DoneCount, "the failed step did not run again")
+
+		// The same failure without the option still blocks the step.
+		blocked, err := runtime.CreateStepRetryPlan(dag, nodes(), "publish")
+		require.NoError(t, err)
+		blockedResult := planHelper{testHelper: setupRunner(t), Plan: blocked}.assertRun(t, ir.Failed)
+		blockedResult.assertNodeStatus(t, "publish", ir.NodeAborted)
+	})
+
+	t.Run("AcceptingFailedPrerequisitesIsForTheSelectedStepAlone", func(t *testing.T) {
+		dag := &ir.DAG{
+			Steps: []ir.Step{
+				{Name: "run", Commands: []ir.CommandEntry{{Command: "true"}}},
+				{Name: "publish", Commands: []ir.CommandEntry{{Command: "true"}}, Depends: []string{"run"}},
+			},
+		}
+		nodes := []*runtime.Node{
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[0], State: runtime.NodeState{Status: ir.NodeFailed}}),
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeAborted}}),
+		}
+		_, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes, "publish", runtime.StepRetryPlanOptions{AcceptFailedPrerequisites: true, IncludeDownstream: true})
+		require.ErrorIs(t, err, runtime.ErrAcceptFailedPrerequisitesWithDownstream)
+	})
+
+	// An acceptance recorded in a stored status is not a standing approval:
+	// a later step retry without the option is blocked again.
+	t.Run("RecordedAcceptanceIsNotReadBack", func(t *testing.T) {
+		r := setupRunner(t)
+		dag := &ir.DAG{
+			Steps: []ir.Step{
+				{Name: "run", Commands: []ir.CommandEntry{{Command: "true"}}},
+				{Name: "publish", Commands: []ir.CommandEntry{{Command: "true"}}, Depends: []string{"run"}},
+			},
+		}
+		stored := ir.Node{Step: dag.Steps[0], Status: ir.NodeFailed, FailureAcceptedByRetry: true}
+		loaded := transform.ToNode(&stored)
+		require.False(t, loaded.State().FailureAcceptedByRetry, "loaded from a stored status")
+		nodes := []*runtime.Node{loaded,
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeSucceeded}})}
+		retryPlan, err := runtime.CreateStepRetryPlan(dag, nodes, "publish")
+		require.NoError(t, err)
+		result := planHelper{testHelper: r, Plan: retryPlan}.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "publish", ir.NodeAborted)
 	})
 
 	// An earlier failure on another branch does not block the retried step,
