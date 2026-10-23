@@ -133,6 +133,18 @@ func (c *Client) UpdateJobVersion(ctx context.Context, jobID string, req Version
 	return &out, nil
 }
 
+// ChangeLifecycle asks the registry to move a job through its lifecycle, such
+// as completing or retiring it. The registry decides whether the caller may
+// and whether the move is allowed from the job's state; it returns the job as
+// it now stands. Run history is never changed by it.
+func (c *Client) ChangeLifecycle(ctx context.Context, jobID string, req LifecycleRequest) (*Job, error) {
+	var out Job
+	if err := c.Do(ctx, http.MethodPost, "/txe/jobs/"+url.PathEscape(jobID)+"/lifecycle", nil, req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // MarkReady records that the package is in place on this machine and returns
 // the receipt. It is the only way a job becomes runnable.
 func (c *Client) MarkReady(ctx context.Context, jobID string, req ReadyRequest) (*Receipt, error) {

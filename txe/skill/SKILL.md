@@ -239,12 +239,20 @@ An update names the version it was made against. If another session has updated 
 
 Say so in the registry, so dependent jobs are reviewed or retired instead of failing forever. Record a deletion only when it is confirmed. An unreachable target, a denied permission or an expired login is not a deletion.
 
-`dagu txe` has no command that retires or pauses a job. What ends one:
+What ends a job:
 
-- **What the spec said at registration.** A job is not run after `lifetime.expires_at`. `retirement_rules` say what the registry does when a deletion or a replacement of the target is recorded: `on_target_deleted` and `on_replacement`, each `retire`, `review` (ask a person) or `keep`. Set these when you register, so the job ends without anyone having to remember it. `on_completion` is different: it is recorded for the reviewer and ends nothing by itself. A job that has met its goal is ended by a request to the hub.
-- **The hub.** A job is retired, paused, resumed or completed by a request to the hub: `POST /api/v1/txe/jobs/<job id>/lifecycle` with a body such as `{"op": "retire", "reason": "manual", "detail": "why"}`. It needs a login or API key for the hub, which this CLI does not hand out. If you have none, give the person who runs the hub the job id and the reason. A retired job can be brought back only by a person, so do not retire one to try something out.
+- **What the spec said at registration.** A job is not run after `lifetime.expires_at`. `retirement_rules` say what the registry does when a deletion or a replacement of the target is recorded: `on_target_deleted` and `on_replacement`, each `retire`, `review` (ask a person) or `keep`. Set these when you register, so the job ends without anyone having to remember it. `on_completion` is different: it is recorded for the reviewer and ends nothing by itself.
+- **The owner, with this CLI.** Both stop new and queued runs, close open proposals and keep every run, artifact and decision:
 
-Check the result with `dagu txe inspect <job id>`: it shows the lifecycle and, for a retired job, the reason and time.
+  ```sh
+  dagu txe complete <job id> --detail "<why its purpose is met>" --evidence <run id or link>
+  dagu txe retire <job id> --reason manual|replaced|target_deleted --detail "<why it is no longer wanted>"
+  ```
+
+  `--active-runs finish|cancel` says what happens to a run already going (default: the job's `retirement_rules`). Use `complete` for a fulfilled purpose and `retire` for one that is no longer wanted; `target_deleted` only for a confirmed deletion. The hub decides whether this sign-in or key may write the owner's jobs, and refuses otherwise. Ask the person before ending a job you did not register: only a person can bring a completed or retired job back, so never end one to try something out.
+- **Pausing or resuming** has no command here. It is a request to the hub, `POST /api/v1/txe/jobs/<job id>/lifecycle` with `{"op": "pause", "detail": "why"}`, by someone who may write the owner's jobs. If you cannot make it, give the person who runs the hub the job id and the reason.
+
+Check the result with `dagu txe inspect <job id>`: it shows the lifecycle and, for a completed or retired job, the reason and time.
 
 ## Signing in to the hub
 

@@ -460,6 +460,25 @@ type ReadyRequest struct {
 	Actor            Actor           `json:"actor"`
 }
 
+// Lifecycle operations a person or session asks for.
+const (
+	LifecycleComplete = "complete"
+	LifecycleRetire   = "retire"
+)
+
+// LifecycleRequest is a lifecycle change with why it was made.
+type LifecycleRequest struct {
+	Op string `json:"op"`
+	// Reason is required to retire: manual, replaced or target_deleted.
+	Reason   string   `json:"reason,omitempty"`
+	Detail   string   `json:"detail,omitempty"`
+	Evidence []string `json:"evidence,omitempty"`
+	// ActiveRunPolicy, finish or cancel, overrides the job's rule for a run
+	// already going.
+	ActiveRunPolicy string `json:"active_run_policy,omitempty"`
+	Actor           Actor  `json:"actor"`
+}
+
 // Registration states.
 const (
 	RegistrationIncomplete = "incomplete"
@@ -485,8 +504,12 @@ type Availability struct {
 
 // Retirement records why and when a job stopped.
 type Retirement struct {
-	Reason string    `json:"reason"`
-	At     time.Time `json:"at"`
+	Reason          string    `json:"reason"`
+	Detail          string    `json:"detail,omitempty"`
+	Evidence        []string  `json:"evidence,omitempty"`
+	Actor           Actor     `json:"actor"`
+	At              time.Time `json:"at"`
+	ActiveRunPolicy string    `json:"active_run_policy,omitempty"`
 }
 
 // Job is the part of a job's record the CLI reads. Raw holds the whole record
