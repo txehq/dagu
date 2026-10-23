@@ -761,6 +761,12 @@ const (
 	// at registration (refused when it cannot be enforced exactly) and the
 	// params of every action attempt are validated against it before a grant.
 	CapabilityParamSchema = "param_schema"
+	// CapabilityRepublishSealed: the hub carries out a dagu.retry_run decision
+	// with step "publish" as a republish of the run's sealed result, held to
+	// that decision both ways, and gives it only to a worker that can run it
+	// (TXE-5067). A client sends such a retry only to a hub that names this.
+	// It is listed by Capabilities only once the hub implements it.
+	CapabilityRepublishSealed = "republish_sealed"
 )
 
 // Capabilities is what this registry enforces.

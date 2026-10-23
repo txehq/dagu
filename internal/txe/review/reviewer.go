@@ -83,6 +83,10 @@ type Reviewer struct {
 	// Runs reads and retries the job's runs for the reserved retry action;
 	// nil disables it.
 	Runs RunRetrier
+	// Seals reads the results jobs sealed on this machine. With it, a
+	// retry of an execution whose sealed result was never published is
+	// proposed as a republish; nil proposes every retry as a re-run.
+	Seals SealReader
 	// RetryObserve is how long a dispatched retry is watched for its new
 	// attempt; retryObserveFor when zero.
 	RetryObserve time.Duration
@@ -1199,7 +1203,19 @@ func (r *Reviewer) applyAction(ctx context.Context, claim Claim, job Job, packet
 			RetryRunSpecParam: run.SpecSHA256, RetryRunPackageParam: job.PackageDigest,
 		}
 		requested.TargetID = ""
-		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? %s", runID, agentReason(requested.Reason)))
+		// An execution that sealed its result and failed before publishing
+		// it already had its effect. Running the job again would repeat that
+		// effect, so the owner is asked to publish the sealed result instead,
+		// and is never offered a re-run in its place.
+		switch sealed, unusable := r.republishable(ctx, job.ID, runID, run.Execution()); {
+		case sealed:
+			requested.Params[RetryRunStepParam] = RetryStepPublish
+			return propose(ProposalAction, fmt.Sprintf("Republish the sealed result of run %s (the job is not run again)? Execution %s sealed its result and failed before publishing it; only the publish step runs, for those bytes. %s",
+				runID, run.Execution().Ref(), agentReason(requested.Reason)))
+		case unusable != "":
+			return propose(ProposalQuestion, fmt.Sprintf("The reviewer suggests retrying run %s, which is not offered: %s. Running the job again could repeat its effect. %s", runID, unusable, agentReason(requested.Reason)))
+		}
+		return propose(ProposalAction, fmt.Sprintf("Retry run %s of this job? The job runs again. %s", runID, agentReason(requested.Reason)))
 	}
 	switch {
 	case !isDeclared:
@@ -1535,6 +1551,10 @@ type RetryRequest struct {
 	ActionID      string
 	ActionAttempt string
 	BindingDigest string
+	// Step is RetryStepPublish for a republish, which runs only the publish
+	// step for the retried execution's sealed result, and empty for a
+	// re-run of the run.
+	Step string
 }
 
 // RunState is what the service reports about one run of a job.
@@ -1575,6 +1595,48 @@ func retriedExecution(params map[string]string) (e Execution, complete bool) {
 	return e, e.known() && named
 }
 
+// SealReader reads the results jobs sealed on this machine.
+type SealReader interface {
+	// RetriedSeal returns nil when execution e of the run sealed the run's
+	// latest result and every sealed file still has the digest it was
+	// sealed with: the result a republish of e publishes. It returns
+	// ErrNotSealed when it did not, and any other error when that cannot
+	// be told.
+	RetriedSeal(jobID, runID string, e Execution) error
+}
+
+// ErrNotSealed is returned by SealReader when an execution has no intact
+// sealed result that is the run's latest.
+var ErrNotSealed = errors.New("txe review: the execution has no intact sealed result that is the run's latest")
+
+// republishable says how a retry of execution e of the run is offered.
+// sealed means e left the run's latest sealed result intact on this machine
+// and the service republishes: the retry is a republish. Otherwise a
+// non-empty unusable says why e's result, sealed or possibly sealed, cannot
+// be republished; such a run is not retried from here. Both are zero only
+// when e sealed nothing, or no seal reader is set: the retry re-runs the job.
+func (r *Reviewer) republishable(ctx context.Context, jobID, runID string, e Execution) (sealed bool, unusable string) {
+	if r.Seals == nil {
+		return false, ""
+	}
+	switch err := r.Seals.RetriedSeal(jobID, runID, e); {
+	case errors.Is(err, ErrNotSealed):
+		return false, ""
+	case err != nil:
+		return false, fmt.Sprintf("the result execution %s sealed cannot be republished (%v)", e.Ref(), err)
+	}
+	if r.Runs == nil {
+		return false, fmt.Sprintf("execution %s sealed its result, and this reviewer has no service to republish it through", e.Ref())
+	}
+	switch ok, err := r.Runs.Republishes(ctx); {
+	case err != nil:
+		return false, fmt.Sprintf("execution %s sealed its result, and whether the service can republish it could not be read (%v)", e.Ref(), err)
+	case !ok:
+		return false, fmt.Sprintf("execution %s sealed its result, and the service does not republish a sealed result (it does not list %s)", e.Ref(), CapabilityRepublishSealed)
+	}
+	return true, ""
+}
+
 // ErrRunNotRetryable is returned by RunRetrier.RetryRun when the service
 // definitely refused the retry and started nothing.
 var ErrRunNotRetryable = errors.New("txe review: the service refused to retry the run")
@@ -1606,6 +1668,10 @@ type RunRetrier interface {
 	// else, including that the service has no such record, is
 	// RecoveryUnknown.
 	Recover(ctx context.Context, jobID, runID string, expected Execution, request RetryRequest) RetryRecovery
+	// Republishes reports whether the service lists
+	// CapabilityRepublishSealed. A service that does not is never asked for
+	// a republish: it could run the step as a plain retry.
+	Republishes(ctx context.Context) (bool, error)
 }
 
 // RetryRecovery is what the service's record of a retry request says.
@@ -1680,9 +1746,24 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 	// registry's own terms. The registry settles the retry only with the
 	// execution the service recorded this request on, so a retry sent
 	// without them could run and never be recorded: it is not sent.
-	request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest}
+	request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest, Step: action.Params[RetryRunStepParam]}
 	if action.Attempt <= 0 || action.BindingDigest == "" {
 		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the registry's record of action " + action.ID + " gives no attempt number or binding digest to make the retry of run " + runID + " for"}
+	}
+	switch request.Step {
+	case "":
+	case RetryStepPublish:
+		// The decision was to publish what the execution sealed. If that
+		// result is no longer there, intact and the run's latest, there is
+		// nothing to publish, and the job is never run in its place.
+		if sealed, unusable := r.republishable(ctx, job.ID, runID, bound); !sealed {
+			if unusable == "" {
+				unusable = "this machine holds no sealed result of execution " + bound.Ref()
+			}
+			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision is to republish the sealed result of run " + runID + ", and " + unusable}
+		}
+	default:
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision names step " + request.Step + " of run " + runID + ", and only " + RetryStepPublish + " is ever retried alone"}
 	}
 	admitted, err := r.Runs.RetryRun(ctx, job.ID, runID, bound, request)
 	if err != nil {

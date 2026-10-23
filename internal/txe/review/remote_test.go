@@ -1674,6 +1674,56 @@ func TestRemoteRetryNamesTheExpectedExecution(t *testing.T) {
 	}
 }
 
+// A republish adds only the publish step and the option to take its failed
+// prerequisite as done; the service's refusal of that option is "nothing
+// started", and a code it uses for nothing else is not read as one under
+// another status.
+func TestRemoteRepublishNamesThePublishStep(t *testing.T) {
+	path := "/dag-runs/job_1/run-1/retry"
+	stub := &stubTransport{t: t, replies: map[string]string{path: `{}`}}
+	var sent map[string]any
+	runs := review.RemoteRuns(captureTransport{Transport: stub, path: path, into: &sent})
+	queued := review.Execution{AttemptID: "a1", QueuedAt: "2026-10-09T16:36:43.039647Z"}
+	request := review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d", Step: review.RetryStepPublish}
+
+	_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{
+		"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "2026-10-09T16:36:43.039647Z",
+		"retryRequest": map[string]any{"actionId": "act-1", "actionAttempt": "1", "bindingDigest": "sha256:d"},
+		"stepName":     "publish", "acceptFailedPrerequisites": true,
+	}, sent)
+
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadRequest, Code: "accept_failed_prerequisites_unsupported", Message: "not a TXE job's publish step"}}
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
+	require.ErrorIs(t, err, review.ErrRunNotRetryable)
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict, Code: "worker_capability_missing", Message: "no connected worker of the job's machine can republish"}}
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
+	require.ErrorIs(t, err, review.ErrRunNotRetryable)
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict, Code: "accept_failed_prerequisites_unsupported"}}
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, review.ErrRunNotRetryable, "the code means nothing started only with its own status")
+}
+
+// The service republishes only when its installation lists the capability.
+func TestRemoteRepublishesReadsTheInstallation(t *testing.T) {
+	stub := &stubTransport{t: t, replies: map[string]string{"/txe/installation": `{"schema":1,"capabilities":["param_schema"]}`}}
+	runs := review.RemoteRuns(stub)
+	ok, err := runs.Republishes(context.Background())
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	stub.replies["/txe/installation"] = `{"schema":1,"capabilities":["param_schema","republish_sealed"]}`
+	ok, err = runs.Republishes(context.Background())
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	stub.fail = map[string]*review.TransportError{"/txe/installation": {Status: http.StatusBadGateway}}
+	_, err = runs.Republishes(context.Background())
+	require.Error(t, err)
+}
+
 // Completing a human task: success, a run the service does not know, and a
 // conflict. The service answers 409 both when the task was already answered
 // and when it simply cannot be answered yet, so a conflict is "answered"
@@ -1971,6 +2021,61 @@ func TestRemoteRetryRunIsBoundAndRunsOnce(t *testing.T) {
 	after, err := f.remote.Proposal(ctx, f.jobID, retry.ID)
 	require.NoError(t, err)
 	assert.Equal(t, review.ProposalState(registry.ProposalExecuted), after.State)
+}
+
+// A republish the reviewer proposes is stored by the registry as a
+// dagu.retry_run with step "publish", bound into its binding digest; the
+// person's retry verdict makes it executable, and only the publish step is
+// sent.
+func TestRemoteRepublishIsBoundAndSendsOnlyThePublishStep(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	job := f.job()
+	f.remote.runs = []review.RunEvidence{{RunID: "run-1", Status: "failed", SpecSHA256: job.DAGSpecSHA256, AttemptID: "att-1"}}
+	service := f.service
+	service.fail("run-1", "att-1")
+	service.republishes = true
+	withSeal := func(holder string) *review.Reviewer {
+		r := f.retrying(holder, service)
+		r.Seals = seals{review.ExecutionRef("att-1", ""): nil}
+		return r
+	}
+	prepared, err := withSeal("reviewer-a").Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	_, err = withSeal("reviewer-a").Apply(ctx, prepared, review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "sealed, publish lost", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "lost publish"}},
+	})
+	require.NoError(t, err)
+
+	open, err := f.remote.OpenProposals(ctx, f.jobID)
+	require.NoError(t, err)
+	require.Len(t, open, 1)
+	republish := open[0]
+	assert.Equal(t, review.ProposalAction, republish.Kind)
+	assert.Equal(t, review.RetryStepPublish, republish.Params[review.RetryRunStepParam])
+	assert.Contains(t, republish.Question, "the job is not run again")
+	stored := f.job().Proposals[republish.ID]
+	require.NotNil(t, stored)
+	assert.JSONEq(t, `{"run_id":"run-1","attempt_id":"att-1","queued_at":"","run_spec_sha256":"`+job.DAGSpecSHA256+`","package_digest":"`+job.PackageDigest+`","step":"publish"}`,
+		string(stored.Action.Params), "the registry stores the step as part of what was decided")
+
+	decisionID, err := registry.NewID(registry.PrefixDecision, time.Now())
+	require.NoError(t, err)
+	_, err = f.store.WithJobTx(ctx, f.jobID, human, func(tx *registry.JobTx) error {
+		_, err := tx.AppendDecision(registry.Decision{
+			DecisionID: decisionID, ProposalID: republish.ID, ProposalRevision: 1, Verdict: registry.VerdictRetry,
+			BindingDigest: republish.BindingDigest, IdempotencyKey: "republish-run-1",
+		}, registry.ProposalDecided)
+		return err
+	})
+	require.NoError(t, err)
+
+	out, err := withSeal("executor").Execute(ctx, f.jobID, republish.ID, decisionID)
+	require.NoError(t, err)
+	require.Empty(t, out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, []string{review.RetryStepPublish}, service.steps, "only the publish step is retried")
 }
 
 // A retry a person requests directly is already decided and has no decision

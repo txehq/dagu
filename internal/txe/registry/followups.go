@@ -16,6 +16,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
 
 // Reserved action names. The registry gives them their meaning; a job's
@@ -57,7 +58,16 @@ type RetryRunParams struct {
 	QueuedAt      string `json:"queued_at"`
 	RunSpecSHA256 string `json:"run_spec_sha256"`
 	PackageDigest string `json:"package_digest"`
+	// Step, when set, is RetryStepPublish: the retry runs only the job's
+	// publish step, for the result the retried execution sealed, and never
+	// the job again. It is part of the action's binding, so a decision to
+	// re-run a run never authorizes a republish, nor the reverse.
+	Step string `json:"step,omitempty"`
 }
+
+// RetryStepPublish is the only step a dagu.retry_run may name: the TXE job's
+// publish step, retried for a sealed result whose publication was lost.
+const RetryStepPublish = txepkg.PublishStepName
 
 // UncertainEffectParams are the parameters of txe.uncertain_effect.
 // Attempt is the attempt whose outcome is unresolved: each escalation of an
@@ -188,6 +198,9 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		}
 		if rp.RunID == "" {
 			return refuse(CodeInvalid, "dagu.retry_run needs run_id")
+		}
+		if rp.Step != "" && rp.Step != RetryStepPublish {
+			return refuse(CodeInvalid, "dagu.retry_run retries the whole run or only its %q step, not %q", RetryStepPublish, rp.Step)
 		}
 		if err := tx.checkRunBinding(rp, true); err != nil {
 			return err
@@ -737,6 +750,11 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	}
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
+	}
+	if params.Step != "" {
+		// A republish is proposed by the reviewer, which can see the seal
+		// on the machine; a person's own retry re-runs the run.
+		return nil, nil, refuse(CodeInvalid, "a person's retry re-runs the whole run; it names no step")
 	}
 	if _, err := tx.EndMovedOnRetries(); err != nil {
 		return nil, nil, err

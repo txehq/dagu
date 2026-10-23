@@ -121,6 +121,15 @@ const (
 	// that execution is still the run's latest.
 	RetryRunAttemptParam = "attempt_id"
 	RetryRunQueuedParam  = "queued_at"
+	// RetryRunStepParam, set to RetryStepPublish, makes the retry a
+	// republish: only the job's publish step runs, for the result the failed
+	// execution sealed, and the job does not run again. The reviewer sets it,
+	// never the agent, and only when that seal is on this machine.
+	RetryRunStepParam = "step"
+	RetryStepPublish  = registry.RetryStepPublish
+	// CapabilityRepublishSealed is what the service's installation lists
+	// when it runs a retry of only the publish step for a sealed result.
+	CapabilityRepublishSealed = registry.CapabilityRepublishSealed
 	// UncertainEffectAction is the reserved action name of a proposal that
 	// asks the owner about an effect whose outcome is unknown. It is not
 	// executable.

@@ -72,6 +72,11 @@ var ErrNotSealed = errors.New("no execution of this run has sealed its outputs")
 // ErrChangedAfterSeal reports that a sealed file is not what was sealed.
 var ErrChangedAfterSeal = errors.New("a sealed file is not what was sealed")
 
+// ErrNotRetriedSeal refuses a republish whose retried execution is unknown,
+// or is not the execution whose sealed result is the run's latest: only
+// that result may be republished (TXE-5067).
+var ErrNotRetriedSeal = errors.New("the run's latest sealed result is not the retried execution's")
+
 // Execution names one execution of a run: the Dagu attempt, and the queue
 // marker the attempt was dispatched with. The marker is empty for a run that
 // was never queued; such a run is not executed twice under one attempt.
@@ -313,6 +318,60 @@ func (o Outputs) Sealed(jobID, runID string) (*Seal, error) {
 		return latest, nil
 	}
 	return nil, ErrNotSealed
+}
+
+// RetriedSeal returns the sealed result of execution e of a run when it may
+// be republished (TXE-5067): e sealed a result, that result is the run's
+// latest, and every file the seal recorded is still there with its recorded
+// digest. It reads and changes nothing else. It returns ErrNotSealed when e
+// sealed nothing, ErrNotRetriedSeal when the run's latest sealed result is
+// another execution's, and ErrChangedAfterSeal when a recorded file is gone
+// or differs. The reviewer proposes a republish, and the publish step
+// carries one out, only when this returns the seal.
+func (o Outputs) RetriedSeal(jobID, runID string, e Execution) (*Seal, error) {
+	if err := checkRun(jobID, runID, e); err != nil {
+		return nil, err
+	}
+	run, err := openRunDir(o.Home, jobID, runID)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("run %s: execution %s sealed nothing: %w", runID, e.Ref(), ErrNotSealed)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = run.Close() }()
+	sealed, err := readSeals(run, jobID, runID)
+	if err != nil {
+		return nil, err
+	}
+	return retriedSeal(run, sealed, runID, e)
+}
+
+// retriedSeal is RetriedSeal over a run directory already opened and read.
+func retriedSeal(run *os.Root, sealed *seals, runID string, e Execution) (*Seal, error) {
+	own := sealed.of(e)
+	if own == nil {
+		return nil, fmt.Errorf("run %s: execution %s sealed nothing: %w", runID, e.Ref(), ErrNotSealed)
+	}
+	if latest := sealed.latest(); latest.Execution != e {
+		return nil, fmt.Errorf("run %s: the latest sealed result is execution %s's, not %s's: %w", runID, latest.Execution.Ref(), e.Ref(), ErrNotRetriedSeal)
+	}
+	dir, err := openPath(run, executionsDir+"/"+own.Ref)
+	if err != nil {
+		return nil, fmt.Errorf("run %s: the sealed outputs of execution %s: %w (%w)", runID, e.Ref(), ErrChangedAfterSeal, err)
+	}
+	defer func() { _ = dir.Close() }()
+	current, err := sealedFiles(dir)
+	if err != nil {
+		return nil, fmt.Errorf("run %s: the sealed outputs of execution %s: %w (%w)", runID, e.Ref(), ErrChangedAfterSeal, err)
+	}
+	for _, want := range own.Files {
+		i := slices.IndexFunc(current, func(f SealedFile) bool { return f.Path == want.Path })
+		if i < 0 || current[i] != want {
+			return nil, fmt.Errorf("run %s: %s of execution %s: %w", runID, want.Path, e.Ref(), ErrChangedAfterSeal)
+		}
+	}
+	return own, nil
 }
 
 // sealedFiles lists every regular file beneath dir with its digest. A link

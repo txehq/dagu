@@ -938,3 +938,62 @@ func TestSkillExamplesAreValid(t *testing.T) {
 		})
 	}
 }
+
+// RetriedSeal is the one check the reviewer and the publish step share: the
+// execution's sealed result, only while it is the run's latest and intact.
+func TestRetriedSeal(t *testing.T) {
+	outputs := func(run publishRun) Outputs { return Outputs{Home: run.publisher.Home} }
+
+	t.Run("Intact", func(t *testing.T) {
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		sealedDir := run.seal(t)
+		require.NoError(t, os.WriteFile(filepath.Join(sealedDir, "late.txt"), []byte("added afterwards"), 0o600))
+
+		seal, err := outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
+		require.NoError(t, err, "a file added afterwards is not part of the result, and changes nothing")
+		assert.Equal(t, testExecution, seal.Execution)
+	})
+	t.Run("SealedNothing", func(t *testing.T) {
+		run := publishFixture(t)
+		_, err := outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
+		require.ErrorIs(t, err, ErrNotSealed)
+	})
+	t.Run("NoRunDirectory", func(t *testing.T) {
+		run := publishFixture(t)
+		_, err := outputs(run).RetriedSeal(run.in.JobID, "run-0002", testExecution)
+		require.ErrorIs(t, err, ErrNotSealed)
+	})
+	t.Run("AnotherSealIsLater", func(t *testing.T) {
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		run.seal(t)
+		later := Execution{AttemptID: "0c0c0c", QueuedAt: ""}
+		dir, err := outputs(run).Begin(run.in.JobID, run.in.RunID, later)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "snapshot.json"), []byte(`{"files":3}`), 0o600))
+		_, err = outputs(run).Seal(run.in.JobID, run.in.RunID, later)
+		require.NoError(t, err)
+
+		_, err = outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
+		require.ErrorIs(t, err, ErrNotRetriedSeal)
+	})
+	t.Run("FileChanged", func(t *testing.T) {
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		sealedDir := run.seal(t)
+		require.NoError(t, os.WriteFile(filepath.Join(sealedDir, "snapshot.json"), []byte(`{"files":7}`), 0o600))
+
+		_, err := outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
+		require.ErrorIs(t, err, ErrChangedAfterSeal)
+	})
+	t.Run("FileGone", func(t *testing.T) {
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		sealedDir := run.seal(t)
+		require.NoError(t, os.Remove(filepath.Join(sealedDir, "snapshot.json")))
+
+		_, err := outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
+		require.ErrorIs(t, err, ErrChangedAfterSeal)
+	})
+}

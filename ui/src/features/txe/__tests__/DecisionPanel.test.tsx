@@ -186,10 +186,38 @@ describe('DecisionPanel', () => {
       />
     );
     expect(
-      screen.getByRole('button', { name: 'Retry this run' })
+      screen.getByRole('button', {
+        name: 'Retry this run (the job runs again)',
+      })
     ).toBeInTheDocument();
     expect(
       screen.queryByTestId('txe-uncertain-effect')
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <DecisionPanel
+        proposal={fixtureProposal({
+          proposalId: 'prp_republish',
+          action: {
+            name: 'dagu.retry_run',
+            target: { kind: 'dagu.run', stableId: 'run-0003' },
+            params: { run_id: 'run-0003', step: 'publish' },
+          },
+          allowedVerdicts: ['retry', 'reject'],
+        })}
+        canDecide
+        onSubmit={vi.fn()}
+        onStale={vi.fn()}
+        now={now}
+      />
+    );
+    expect(
+      screen.getByRole('button', {
+        name: 'Republish sealed result (job not run again)',
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /runs again/ })
     ).not.toBeInTheDocument();
 
     rerender(

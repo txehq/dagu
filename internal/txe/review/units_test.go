@@ -1310,6 +1310,117 @@ func TestRetryRunIsProposedAndRunsOnceOnTheOwnersRetry(t *testing.T) {
 	assert.NotEmpty(t, out.Skipped)
 }
 
+// An execution that sealed its result and failed before publishing it is
+// proposed as a republish: the owner's retry then runs only the publish
+// step for that result, and the job is not run again. Only an execution
+// that sealed nothing is offered a re-run, and the owner is told the job
+// runs again; a seal that cannot be republished is a question, never a
+// re-run in its place.
+func TestRetryOfASealedExecutionIsARepublish(t *testing.T) {
+	sealedRef := review.ExecutionRef("att-1", "")
+	for name, c := range map[string]struct {
+		seals       seals
+		republishes bool
+		readErr     error
+		kind        review.ProposalKind
+		step        string
+		says        string
+	}{
+		"sealed and intact":          {seals: seals{sealedRef: nil}, republishes: true, kind: review.ProposalAction, step: review.RetryStepPublish, says: "Republish the sealed result of run run-1 (the job is not run again)"},
+		"sealed nothing":             {seals: seals{}, republishes: true, kind: review.ProposalAction, says: "The job runs again"},
+		"sealed, changed since":      {seals: seals{sealedRef: errors.New("output.json changed after it was sealed")}, republishes: true, kind: review.ProposalQuestion, says: "changed after it was sealed"},
+		"sealed, service cannot":     {seals: seals{sealedRef: nil}, kind: review.ProposalQuestion, says: review.CapabilityRepublishSealed},
+		"sealed, service unreadable": {seals: seals{sealedRef: nil}, republishes: true, readErr: errors.New("hub unreachable"), kind: review.ProposalQuestion, says: "hub unreachable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addRun("run-1", "failed")
+			service := newRuns()
+			service.fail("run-1", "att-1")
+			service.republishes, service.republishErr = c.republishes, c.readErr
+			r := f.reviewer("reviewer-a")
+			r.Runs, r.Seals = service, c.seals
+			_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+				Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+				Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "lost publish"}},
+			})
+			require.NoError(t, err)
+			proposals := f.state().Proposals[jobID]
+			require.Len(t, proposals, 1)
+			assert.Equal(t, c.kind, proposals[0].Kind)
+			assert.Contains(t, proposals[0].Question, c.says)
+			if c.kind == review.ProposalAction {
+				assert.Equal(t, c.step, proposals[0].Params[review.RetryRunStepParam])
+			}
+			assert.Empty(t, service.retried, "nothing runs before the owner decides")
+		})
+	}
+}
+
+// The owner's retry of a republish sends only the publish step, after
+// checking again that the sealed result is still there and the service
+// still republishes; when either changed, nothing is sent and the job is
+// never re-run in its place.
+func TestRepublishIsCheckedAgainBeforeItIsSent(t *testing.T) {
+	sealedRef := review.ExecutionRef("att-1", "")
+	for name, c := range map[string]struct {
+		change func(*runs, seals)
+		sent   bool
+		detail string
+	}{
+		"unchanged":                 {change: func(*runs, seals) {}, sent: true},
+		"the seal changed":          {change: func(_ *runs, s seals) { s[sealedRef] = errors.New("output.json changed after it was sealed") }, detail: "changed after it was sealed"},
+		"the seal is gone":          {change: func(_ *runs, s seals) { delete(s, sealedRef) }, detail: "holds no sealed result"},
+		"the service stopped":       {change: func(r *runs, _ seals) { r.republishes = false }, detail: review.CapabilityRepublishSealed},
+		"the service is unreadable": {change: func(r *runs, _ seals) { r.republishErr = errors.New("hub unreachable") }, detail: "hub unreachable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addRun("run-1", "failed")
+			service := newRuns()
+			service.fail("run-1", "att-1")
+			service.republishes = true
+			sealed := seals{sealedRef: nil}
+			withRetry := func(holder string) *review.Reviewer {
+				r := f.reviewer(holder)
+				r.Runs, r.Seals, r.RetryObserve = service, sealed, 20*time.Millisecond
+				return r
+			}
+			_, err := withRetry("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+				Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+				Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "lost publish"}},
+			})
+			require.NoError(t, err)
+			proposal := f.state().Proposals[jobID][0]
+			require.Equal(t, review.RetryStepPublish, proposal.Params[review.RetryRunStepParam])
+			decided, err := f.registry.Decide(jobID, proposal.ID, review.VerdictRetry, "", "connor")
+			require.NoError(t, err)
+
+			c.change(service, sealed)
+			out, err := withRetry("executor").Execute(context.Background(), jobID, proposal.ID, decided.ID)
+			require.NoError(t, err)
+			if c.sent {
+				assert.Equal(t, review.ActionSucceeded, out.Action.State)
+				assert.Equal(t, []string{review.RetryStepPublish}, service.steps, "only the publish step is retried")
+				return
+			}
+			assert.Equal(t, review.ActionFailed, out.Action.State, "nothing was sent")
+			assert.Contains(t, out.Action.Detail, "not dispatched")
+			assert.Contains(t, out.Action.Detail, c.detail)
+			assert.Empty(t, service.requested, "the service was never asked")
+		})
+	}
+}
+
+// A re-run sends no step: the job runs again, as the owner was told.
+func TestRetryOfAnUnsealedExecutionSendsNoStep(t *testing.T) {
+	f := newRetryFixture(t)
+	out := f.execute("executor")
+	assert.Equal(t, review.ActionSucceeded, out.Action.State)
+	assert.Equal(t, []string{""}, f.runs.steps)
+	assert.Contains(t, f.proposal.Question, "The job runs again")
+}
+
 // A decision is about one failed attempt. When the run has moved on since,
 // by any other retry, nothing is dispatched on its strength.
 func TestRetryRunIsNotDispatchedForAnAttemptThatIsNoLongerLatest(t *testing.T) {

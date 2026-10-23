@@ -1983,6 +1983,17 @@ func (r remoteRuns) Recover(ctx context.Context, jobID, runID string, expected E
 	return RetryRecovery{}
 }
 
+// Republishes implements RunRetrier from the registry's installation.
+func (r remoteRuns) Republishes(ctx context.Context) (bool, error) {
+	var installation struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := r.t.Do(ctx, http.MethodGet, "/txe/installation", nil, &installation); err != nil {
+		return false, err
+	}
+	return slices.Contains(installation.Capabilities, CapabilityRepublishSealed), nil
+}
+
 // RetryRun implements RunRetrier. The request names the execution the retry
 // is for, and the service admits it only while that is the run's latest
 // execution and has finished, checking it together with the admission.
@@ -1990,8 +2001,10 @@ func (r remoteRuns) Recover(ctx context.Context, jobID, runID string, expected E
 // "Nothing was started" is claimed only for the refusals the service itself
 // documents as made before anything is queued or created: 409 with
 // details.code execution_changed (another execution is the latest, or the
-// expected one has not finished) and 409 with conditional_retry_unsupported
-// (the retry would run in a local process). Every other failure is returned
+// expected one has not finished), 409 with conditional_retry_unsupported
+// (the retry would run in a local process), and, for a republish, 400 with
+// accept_failed_prerequisites_unsupported and 409 with
+// worker_capability_missing. Every other failure is returned
 // as it is and leaves the outcome unknown: 503 dispatch_uncertain, where
 // the service says itself that the retry may have been dispatched, any
 // other status, and a failure of the transport. An unknown outcome is
@@ -2013,9 +2026,14 @@ func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected 
 		"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt,
 		"retryRequest": map[string]string{"actionId": request.ActionID, "actionAttempt": request.ActionAttempt, "bindingDigest": request.BindingDigest},
 	}
+	if request.Step != "" {
+		// A republish: the service runs only this step, with its failed
+		// prerequisite, the job step, taken as done.
+		body["stepName"], body["acceptFailedPrerequisites"] = request.Step, true
+	}
 	var answer json.RawMessage
 	err = r.t.Do(ctx, http.MethodPost, path, body, &answer)
-	if te, ok := errors.AsType[*TransportError](err); ok && te.Status == http.StatusConflict && retryRefusedBeforeEffect[te.Code] {
+	if te, ok := errors.AsType[*TransportError](err); ok && refusedBeforeEffect(te) {
 		return Execution{}, fmt.Errorf("%w: %d %s %s", ErrRunNotRetryable, te.Status, te.Code, te.Message)
 	}
 	if err != nil {
@@ -2049,9 +2067,20 @@ func admittedExecution(answer json.RawMessage, requestID string) Execution {
 	return admitted
 }
 
-// retryRefusedBeforeEffect are the service's codes for a conditional retry
-// it refused before queueing or creating anything.
-var retryRefusedBeforeEffect = map[string]bool{
-	"execution_changed":             true,
-	"conditional_retry_unsupported": true,
+func refusedBeforeEffect(te *TransportError) bool {
+	status, ok := retryRefusedBeforeEffect[te.Code]
+	return ok && te.Status == status
+}
+
+// retryRefusedBeforeEffect are the service's codes, with their statuses,
+// for a conditional retry it refused before queueing or creating anything.
+var retryRefusedBeforeEffect = map[string]int{
+	"execution_changed":             http.StatusConflict,
+	"conditional_retry_unsupported": http.StatusConflict,
+	// The republish option was refused: not a TXE job's run, not its
+	// publish step alone, or without the expected execution and request.
+	"accept_failed_prerequisites_unsupported": http.StatusBadRequest,
+	// No connected worker of the job's machine can run a republish; the
+	// service checks that before it creates or dispatches the retry.
+	"worker_capability_missing": http.StatusConflict,
 }

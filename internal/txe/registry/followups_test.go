@@ -1362,3 +1362,48 @@ func TestFailedRetryNamesItsOwnExecution(t *testing.T) {
 		})
 	}
 }
+
+// A retry may name only the publish step, the step is part of the binding,
+// so a decision to re-run never authorizes a republish, and only the
+// reviewer, which sees the machine's seal, proposes one.
+func TestRetryStepIsBound(t *testing.T) {
+	r := newRetryFixture(t)
+	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+	c := acquire(t, r.f, r.job.JobID, ClaimReview, time.Hour)
+	id, err := RetryProposalID("run-1", ExecutionRef("a1", ""), r.job.Version)
+	require.NoError(t, err)
+	put := func(params RetryRunParams) (*Proposal, error) {
+		raw, err := json.Marshal(params)
+		require.NoError(t, err)
+		var p *Proposal
+		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
+			var err error
+			p, err = tx.PutProposal(c.ClaimID, c.Fence, Proposal{ProposalID: id, Action: ActionSpec{Name: ActionRetryRun, Params: raw}})
+			return err
+		})
+		return p, err
+	}
+
+	other := r.params("run-1", "a1")
+	other.Step = "run"
+	_, err = put(other)
+	assert.Equal(t, CodeInvalid, code(t, err), "only the publish step may be named")
+
+	republish := r.params("run-1", "a1")
+	republish.Step = RetryStepPublish
+	p, err := put(republish)
+	require.NoError(t, err)
+	whole, err := BindingDigest(r.job, ActionSpec{Name: ActionRetryRun, Params: mustJSON(t, r.params("run-1", "a1"))})
+	require.NoError(t, err)
+	assert.NotEqual(t, whole, p.BindingDigest, "a republish is not bound like a re-run")
+
+	_, _, err = r.propose(republish, "key-1")
+	assert.Equal(t, CodeInvalid, code(t, err), "a person's retry names no step")
+}
+
+func mustJSON(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
