@@ -1698,8 +1698,9 @@ func (a *Agent) ownRetryRequest(source *ir.DAGRunStatus) *ir.RetryRequest {
 // failed prerequisites runs the job's publish step alone, after a job that
 // already ran, so it gets none of the job's own settings. Of the DAG's
 // variables it keeps only the ones the TXE renderer writes for its commands
-// (runenv.TXEStepEnvNames); the job's other variables, its params, its dotenv
-// files and its secrets are left out, and secrets are not resolved at all.
+// (runenv.TXEStepEnvNames); the job's other variables, its params and their
+// definitions, its dotenv files and its secrets are left out, and secrets are
+// not resolved at all.
 // The managed run variables are added as for any run.
 func republishScopedDAG(dag *ir.DAG) *ir.DAG {
 	if dag == nil {
@@ -1717,6 +1718,9 @@ func republishScopedDAG(dag *ir.DAG) *ir.DAG {
 	scoped.Dotenv = nil
 	scoped.Params = nil
 	scoped.DefaultParams = ""
+	scoped.ParamsJSON = ""
+	scoped.ParamDefs = nil
+	scoped.ParamSchema = nil
 	return scoped
 }
 

@@ -213,6 +213,8 @@ func TestTxeGeneratedPublishStep(t *testing.T) {
 		"no artifact directory for hub":   checkWith(render(func(s *txepkg.DAGSpec) { s.Publish = &txepkg.Publish{} }), "", true),
 		"an artifact directory unasked":   checkWith(render(nil), "", false),
 		"a base artifact directory moved": checkWith(render(nil), "artifacts:\n  dir: /tmp/elsewhere\n", true),
+		"base params":                     checkWith(render(nil), "params:\n  - BASH_ENV: /tmp/x\n", true),
+		"a base TXE variable":             checkWith(render(nil), "env:\n  - TXE_DAGU_HOME: /tmp/elsewhere\n", true),
 		"artifacts turned off in the DAG": check([]byte(strings.Replace(rendered, "  enabled: true", "  enabled: false", 1))),
 	} {
 		require.Error(t, err, name)

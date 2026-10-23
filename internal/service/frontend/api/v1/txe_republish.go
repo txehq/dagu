@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -289,14 +290,14 @@ func txeLoadedPublishStep(ctx context.Context, dag *ir.DAG, baseConfig, cli stri
 }
 
 // txeBaseIgnored are the DAG settings a base configuration may change for a
-// republish. A republish does not use them (its variables, dotenv files,
-// params and secrets are dropped by the worker, and the rest describe the
-// stored DAG), or they schedule, limit or describe the run and run nothing:
-// Dagu's default base configuration sets several. Every other setting, one
-// added later included, must be the DAG's own.
+// republish. A republish does not use them (its dotenv files and secrets are
+// dropped by the worker, and the rest describe the stored DAG), or they
+// schedule, limit or describe the run and run nothing: Dagu's default base
+// configuration sets several. Its variables are compared apart
+// (txeStepEnv). Every other setting, params and one added later included,
+// must be the DAG's own.
 var txeBaseIgnored = map[string]bool{
-	"Env": true, "Dotenv": true, "Params": true, "DefaultParams": true, "ParamsJSON": true, "ParamDefs": true,
-	"ParamSchema": true, "Secrets": true, "Consts": true, "EnvEvaluated": true, "RootEnvSpan": true,
+	"Dotenv": true, "Secrets": true, "EnvEvaluated": true, "RootEnvSpan": true,
 	"YamlData": true, "BaseConfigData": true, "BaseConfigWorkspace": true, "Location": true, "SourceFile": true,
 	"BuildErrors": true, "BuildWarnings": true,
 	"Type": true, "Schedule": true, "StopSchedule": true, "RestartSchedule": true, "SkipIfSuccessful": true,
@@ -307,20 +308,35 @@ var txeBaseIgnored = map[string]bool{
 
 // txeBaseConfigChanges names the settings of effective, the DAG loaded with
 // its base configuration, that differ from loaded, the DAG alone, other
-// than txeBaseIgnored.
+// than txeBaseIgnored. Of the variables, only those a republish keeps
+// (runenv.TXEStepEnvNames) must be the DAG's own: the worker drops the rest.
 func txeBaseConfigChanges(loaded, effective *ir.DAG) []string {
 	var changed []string
 	own, based := reflect.ValueOf(loaded).Elem(), reflect.ValueOf(effective).Elem()
 	for i := range own.NumField() {
-		name := own.Type().Field(i).Name
-		if txeBaseIgnored[name] || !own.Type().Field(i).IsExported() {
-			continue
-		}
-		if !reflect.DeepEqual(own.Field(i).Interface(), based.Field(i).Interface()) {
-			changed = append(changed, name)
+		field := own.Type().Field(i)
+		switch {
+		case txeBaseIgnored[field.Name] || !field.IsExported():
+		case field.Name == "Env":
+			if !slices.Equal(txeStepEnv(loaded.Env), txeStepEnv(effective.Env)) {
+				changed = append(changed, "Env ("+strings.Join(runenv.TXEStepEnvNames, ", ")+")")
+			}
+		case !reflect.DeepEqual(own.Field(i).Interface(), based.Field(i).Interface()):
+			changed = append(changed, field.Name)
 		}
 	}
 	return changed
+}
+
+// txeStepEnv are the entries of env a republish keeps.
+func txeStepEnv(env []string) []string {
+	var kept []string
+	for _, entry := range env {
+		if name, _, _ := strings.Cut(entry, "="); slices.Contains(runenv.TXEStepEnvNames, name) {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
 }
 
 // txeRepublishWorkerCheck refuses a republish before it is dispatched when
