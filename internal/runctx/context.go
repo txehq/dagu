@@ -25,11 +25,17 @@ const runtimeProfileOrigin = "runtime_profile"
 
 // Context contains the execution metadata for a dag-run.
 type Context struct {
-	DAGRunID             string
-	RootDAGRun           ir.DAGRunRef
-	RetryPath            dagrun.RetryPath
-	IncludeDownstream    bool
-	BypassPreconditions  bool
+	DAGRunID            string
+	RootDAGRun          ir.DAGRunRef
+	RetryPath           dagrun.RetryPath
+	IncludeDownstream   bool
+	BypassPreconditions bool
+	// AcceptFailedPrerequisites records a step retry allowed to treat the
+	// selected step's failed prerequisites as satisfied.
+	AcceptFailedPrerequisites bool
+	// RetryOf is the execution reference this execution retries, from the
+	// retry request the coordinator recorded on it; empty otherwise.
+	RetryOf              string
 	AttemptID            string
 	WorkerID             string
 	TriggerType          ir.TriggerType
@@ -193,6 +199,22 @@ func WithIncludeDownstream(enabled bool) ContextOption {
 func WithBypassPreconditions(enabled bool) ContextOption {
 	return func(o *contextOptions) {
 		o.BypassPreconditions = enabled
+	}
+}
+
+// WithAcceptFailedPrerequisites records that the selected step of a step
+// retry may run although a prerequisite failed in an earlier execution.
+func WithAcceptFailedPrerequisites(enabled bool) ContextOption {
+	return func(o *contextOptions) {
+		o.AcceptFailedPrerequisites = enabled
+	}
+}
+
+// WithRetryOf records the execution reference this execution retries, as
+// the coordinator recorded it on the execution it admitted.
+func WithRetryOf(ref string) ContextOption {
+	return func(o *contextOptions) {
+		o.RetryOf = ref
 	}
 }
 

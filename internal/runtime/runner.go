@@ -1385,6 +1385,11 @@ func isReady(ctx context.Context, plan *Plan, node *Node) bool {
 			continue
 
 		case ir.NodeFailed:
+			if plan.acceptsFailure(dep) {
+				logger.Debug(ctx, "Dependency failed earlier; this step retry accepts it",
+					tag.Step(node.Name()), tag.Dependency(dep.Name()))
+				continue
+			}
 			if dep.ShouldContinue(ctx) {
 				logger.Debug(ctx, "Dependency failed but allowed to continue",
 					tag.Step(node.Name()), tag.Dependency(dep.Name()))

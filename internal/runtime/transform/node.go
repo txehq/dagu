@@ -108,6 +108,7 @@ func newNode(node runtime.NodeData) *ir.Node {
 		DoneCount:              node.State.DoneCount,
 		Repeated:               node.State.Repeated,
 		SkippedByRetry:         node.State.SkippedByRetry,
+		FailureAcceptedByRetry: node.State.FailureAcceptedByRetry,
 		Error:                  errText,
 		StatusDetails:          append([]ir.NodeStatusDetail(nil), node.State.StatusDetails...),
 		Build:                  node.State.Build,

@@ -560,9 +560,13 @@ type Task struct {
 	// On a conditional retry, the action attempt it was made for. The
 	// coordinator records on the admitted execution the correlation it derives
 	// from this, the run and previous_status's execution; workers ignore it.
-	RetryRequest  *RetryRequestProto `protobuf:"bytes,44,opt,name=retry_request,json=retryRequest,proto3" json:"retry_request,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RetryRequest *RetryRequestProto `protobuf:"bytes,44,opt,name=retry_request,json=retryRequest,proto3" json:"retry_request,omitempty"`
+	// On a step retry, lets the selected step run although a direct
+	// prerequisite failed in an earlier execution. Only workers that advertise
+	// the accept-failed-prerequisites capability label are given such a task.
+	AcceptFailedPrerequisites bool `protobuf:"varint,45,opt,name=accept_failed_prerequisites,json=acceptFailedPrerequisites,proto3" json:"accept_failed_prerequisites,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *Task) Reset() {
@@ -891,6 +895,13 @@ func (x *Task) GetRetryRequest() *RetryRequestProto {
 	return nil
 }
 
+func (x *Task) GetAcceptFailedPrerequisites() bool {
+	if x != nil {
+		return x.AcceptFailedPrerequisites
+	}
+	return false
+}
+
 func (x *Task) SetOperation(v Operation) {
 	x.Operation = v
 }
@@ -1063,6 +1074,10 @@ func (x *Task) SetRetryRequest(v *RetryRequestProto) {
 	x.RetryRequest = v
 }
 
+func (x *Task) SetAcceptFailedPrerequisites(v bool) {
+	x.AcceptFailedPrerequisites = v
+}
+
 func (x *Task) HasPreviousStatus() bool {
 	if x == nil {
 		return false
@@ -1176,6 +1191,10 @@ type Task_builder struct {
 	// coordinator records on the admitted execution the correlation it derives
 	// from this, the run and previous_status's execution; workers ignore it.
 	RetryRequest *RetryRequestProto
+	// On a step retry, lets the selected step run although a direct
+	// prerequisite failed in an earlier execution. Only workers that advertise
+	// the accept-failed-prerequisites capability label are given such a task.
+	AcceptFailedPrerequisites bool
 }
 
 func (b0 Task_builder) Build() *Task {
@@ -1225,6 +1244,7 @@ func (b0 Task_builder) Build() *Task {
 	x.ExecutionMarker = b.ExecutionMarker
 	x.RequireLatestIsPrevious = b.RequireLatestIsPrevious
 	x.RetryRequest = b.RetryRequest
+	x.AcceptFailedPrerequisites = b.AcceptFailedPrerequisites
 	return m0
 }
 
@@ -6312,7 +6332,7 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x10DispatchResponse\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12\x1b\n" +
-	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\xc7\x0f\n" +
+	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\x87\x10\n" +
 	"\x04Task\x127\n" +
 	"\toperation\x18\x06 \x01(\x0e2\x19.coordinator.v1.OperationR\toperation\x12)\n" +
 	"\x11root_dag_run_name\x18\x01 \x01(\tR\x0erootDagRunName\x12%\n" +
@@ -6368,7 +6388,8 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"passedEnvs\x12)\n" +
 	"\x10execution_marker\x18* \x01(\tR\x0fexecutionMarker\x12;\n" +
 	"\x1arequire_latest_is_previous\x18+ \x01(\bR\x17requireLatestIsPrevious\x12F\n" +
-	"\rretry_request\x18, \x01(\v2!.coordinator.v1.RetryRequestProtoR\fretryRequest\x1aA\n" +
+	"\rretry_request\x18, \x01(\v2!.coordinator.v1.RetryRequestProtoR\fretryRequest\x12>\n" +
+	"\x1baccept_failed_prerequisites\x18- \x01(\bR\x19acceptFailedPrerequisites\x1aA\n" +
 	"\x13WorkerSelectorEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x18\n" +

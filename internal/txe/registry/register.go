@@ -765,12 +765,13 @@ const (
 	// with step "publish" as a republish of the run's sealed result, held to
 	// that decision both ways, and gives it only to a worker that can run it
 	// (TXE-5067). A client sends such a retry only to a hub that names this.
-	// It is listed by Capabilities only once the hub implements it.
 	CapabilityRepublishSealed = "republish_sealed"
 )
 
 // Capabilities is what this registry enforces.
-func Capabilities() []string { return []string{CapabilityParamSchema} }
+func Capabilities() []string {
+	return []string{CapabilityParamSchema, CapabilityRepublishSealed}
+}
 
 // ApplyVersionDefaults returns v with exactly the defaults and derived
 // fields registration stores (see NormalizeVersion), and no validation: a

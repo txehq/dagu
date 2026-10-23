@@ -38,6 +38,14 @@ func buildManagedDAGRunEnvs(
 	if options.artifactDir != "" {
 		envs[runenv.EnvKeyDAGRunArtifactsDir] = options.artifactDir
 	}
+	// Generated here so that nothing the DAG or its params set can stand in
+	// for them: managed envs take precedence over both.
+	if options.RetryOf != "" {
+		envs[runenv.EnvKeyDAGRunRetryOf] = options.RetryOf
+	}
+	if options.AcceptFailedPrerequisites {
+		envs[runenv.EnvKeyDAGRunAcceptedFailedPrerequisites] = "1"
+	}
 	if dag.ParamsJSON != "" {
 		envs[runenv.EnvKeyDAGParamsJSON] = dag.ParamsJSON
 		envs[runenv.EnvKeyDAGParamsJSONCompat] = dag.ParamsJSON

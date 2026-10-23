@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -404,6 +405,26 @@ func TestWorkerRejectsConflictingPlatformLabels(t *testing.T) {
 
 	err := w.Start(ctx)
 	require.ErrorContains(t, err, `worker label "os" conflicts with built-in platform value`)
+}
+
+// The capability label is built in: a worker of this build advertises it,
+// and configuration cannot say otherwise (TXE-5067).
+func TestWorkerRejectsConflictingCapabilityLabel(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := worker.NewWorker(
+		"conflicting-capability",
+		1,
+		newMockCoordinatorCli(),
+		map[string]string{dispatch.AcceptFailedPrerequisitesLabel: "false"},
+		&config.Config{},
+	)
+	w.SetHandler(&mockHandler{})
+
+	err := w.Start(ctx)
+	require.ErrorContains(t, err, `worker label "`+dispatch.AcceptFailedPrerequisitesLabel+`" conflicts`)
 }
 
 func TestWorkerHeartbeat(t *testing.T) {

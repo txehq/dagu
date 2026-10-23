@@ -77,7 +77,10 @@ type DispatchTask struct {
 	ExternalStepRetry   bool
 	IncludeDownstream   bool
 	BypassPreconditions bool
-	RetryPath           string
+	// AcceptFailedPrerequisites lets the selected step of a step retry run
+	// although a direct prerequisite failed in an earlier execution.
+	AcceptFailedPrerequisites bool
+	RetryPath                 string
 	// RequireLatestIsPrevious makes a retry conditional: the coordinator
 	// creates its attempt only if the run's latest execution is
 	// PreviousStatus's (AttemptID, QueuedAt) and has finished.

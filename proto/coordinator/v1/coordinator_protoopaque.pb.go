@@ -524,6 +524,7 @@ type Task struct {
 	xxx_hidden_ExecutionMarker            string                 `protobuf:"bytes,42,opt,name=execution_marker,json=executionMarker,proto3"`
 	xxx_hidden_RequireLatestIsPrevious    bool                   `protobuf:"varint,43,opt,name=require_latest_is_previous,json=requireLatestIsPrevious,proto3"`
 	xxx_hidden_RetryRequest               *RetryRequestProto     `protobuf:"bytes,44,opt,name=retry_request,json=retryRequest,proto3"`
+	xxx_hidden_AcceptFailedPrerequisites  bool                   `protobuf:"varint,45,opt,name=accept_failed_prerequisites,json=acceptFailedPrerequisites,proto3"`
 	XXX_raceDetectHookData                protoimpl.RaceDetectHookData
 	XXX_presence                          [2]uint32
 	unknownFields                         protoimpl.UnknownFields
@@ -859,6 +860,13 @@ func (x *Task) GetRetryRequest() *RetryRequestProto {
 	return nil
 }
 
+func (x *Task) GetAcceptFailedPrerequisites() bool {
+	if x != nil {
+		return x.xxx_hidden_AcceptFailedPrerequisites
+	}
+	return false
+}
+
 func (x *Task) SetOperation(v Operation) {
 	x.xxx_hidden_Operation = v
 }
@@ -1009,7 +1017,7 @@ func (x *Task) SetIncludeDownstream(v bool) {
 
 func (x *Task) SetBaseConfigWorkspace(v string) {
 	x.xxx_hidden_BaseConfigWorkspace = &v
-	protoimpl.X.SetPresent(&(x.XXX_presence[1]), 37, 43)
+	protoimpl.X.SetPresent(&(x.XXX_presence[1]), 37, 44)
 }
 
 func (x *Task) SetBypassPreconditions(v bool) {
@@ -1030,6 +1038,10 @@ func (x *Task) SetRequireLatestIsPrevious(v bool) {
 
 func (x *Task) SetRetryRequest(v *RetryRequestProto) {
 	x.xxx_hidden_RetryRequest = v
+}
+
+func (x *Task) SetAcceptFailedPrerequisites(v bool) {
+	x.xxx_hidden_AcceptFailedPrerequisites = v
 }
 
 func (x *Task) HasPreviousStatus() bool {
@@ -1146,6 +1158,10 @@ type Task_builder struct {
 	// coordinator records on the admitted execution the correlation it derives
 	// from this, the run and previous_status's execution; workers ignore it.
 	RetryRequest *RetryRequestProto
+	// On a step retry, lets the selected step run although a direct
+	// prerequisite failed in an earlier execution. Only workers that advertise
+	// the accept-failed-prerequisites capability label are given such a task.
+	AcceptFailedPrerequisites bool
 }
 
 func (b0 Task_builder) Build() *Task {
@@ -1190,7 +1206,7 @@ func (b0 Task_builder) Build() *Task {
 	x.xxx_hidden_TargetWorkerId = b.TargetWorkerId
 	x.xxx_hidden_IncludeDownstream = b.IncludeDownstream
 	if b.BaseConfigWorkspace != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[1]), 37, 43)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[1]), 37, 44)
 		x.xxx_hidden_BaseConfigWorkspace = b.BaseConfigWorkspace
 	}
 	x.xxx_hidden_BypassPreconditions = b.BypassPreconditions
@@ -1198,6 +1214,7 @@ func (b0 Task_builder) Build() *Task {
 	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
 	x.xxx_hidden_RequireLatestIsPrevious = b.RequireLatestIsPrevious
 	x.xxx_hidden_RetryRequest = b.RetryRequest
+	x.xxx_hidden_AcceptFailedPrerequisites = b.AcceptFailedPrerequisites
 	return m0
 }
 
@@ -6297,7 +6314,7 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x10DispatchResponse\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\x01 \x01(\tR\tattemptId\x12\x1b\n" +
-	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\xc7\x0f\n" +
+	"\tqueued_at\x18\x02 \x01(\tR\bqueuedAt\"\x87\x10\n" +
 	"\x04Task\x127\n" +
 	"\toperation\x18\x06 \x01(\x0e2\x19.coordinator.v1.OperationR\toperation\x12)\n" +
 	"\x11root_dag_run_name\x18\x01 \x01(\tR\x0erootDagRunName\x12%\n" +
@@ -6353,7 +6370,8 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"passedEnvs\x12)\n" +
 	"\x10execution_marker\x18* \x01(\tR\x0fexecutionMarker\x12;\n" +
 	"\x1arequire_latest_is_previous\x18+ \x01(\bR\x17requireLatestIsPrevious\x12F\n" +
-	"\rretry_request\x18, \x01(\v2!.coordinator.v1.RetryRequestProtoR\fretryRequest\x1aA\n" +
+	"\rretry_request\x18, \x01(\v2!.coordinator.v1.RetryRequestProtoR\fretryRequest\x12>\n" +
+	"\x1baccept_failed_prerequisites\x18- \x01(\bR\x19acceptFailedPrerequisites\x1aA\n" +
 	"\x13WorkerSelectorEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x18\n" +

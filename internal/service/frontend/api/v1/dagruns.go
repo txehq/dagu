@@ -2992,6 +2992,7 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 	subDAGRunID := ""
 	includeDownstream := false
 	bypassPreconditions := false
+	acceptFailedPrerequisites := false
 	if request.Body != nil {
 		if request.Body.DagRunId != "" && request.DagRunId != "" && request.Body.DagRunId != request.DagRunId {
 			return nil, &Error{
@@ -3007,6 +3008,7 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 		subDAGRunID = valueOf(request.Body.SubDAGRunId)
 		includeDownstream = valueOf(request.Body.IncludeDownstream)
 		bypassPreconditions = valueOf(request.Body.BypassPreconditions)
+		acceptFailedPrerequisites = valueOf(request.Body.AcceptFailedPrerequisites)
 	}
 	if subDAGRunID != "" && stepName == "" {
 		return nil, &Error{
@@ -3033,7 +3035,12 @@ func (a *API) RetryDAGRun(ctx context.Context, request api.RetryDAGRunRequestObj
 	if err != nil {
 		return nil, err
 	}
-	result, err := a.retryDAGRun(ctx, request.Name, request.DagRunId, retryDagRunID, stepName, subDAGRunID, includeDownstream, bypassPreconditions, expect)
+	if acceptFailedPrerequisites {
+		if err := txeRepublishShape(stepName, subDAGRunID, includeDownstream, bypassPreconditions, expect); err != nil {
+			return nil, err
+		}
+	}
+	result, err := a.retryDAGRun(ctx, request.Name, request.DagRunId, retryDagRunID, stepName, subDAGRunID, includeDownstream, bypassPreconditions, acceptFailedPrerequisites, expect)
 	if err != nil {
 		return nil, err
 	}
@@ -3097,7 +3104,7 @@ func (a *API) resolveAttemptForDAGRun(
 	return attempt, status.DAGRunID, nil
 }
 
-func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID, stepName, subDAGRunID string, includeDownstream, bypassPreconditions bool, expect *persis.ExpectedExecution) (retryDAGRunResult, error) {
+func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID, stepName, subDAGRunID string, includeDownstream, bypassPreconditions, acceptFailedPrerequisites bool, expect *persis.ExpectedExecution) (retryDAGRunResult, error) {
 	if retryDagRunID == "" {
 		retryDagRunID = dagRunID
 	}
@@ -3143,6 +3150,11 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	// A conditional retry needs the expected execution to be the latest and
 	// finished; the admission below checks it again atomically.
 	if err := bindRetryRequest(expect, dag.Name, retryDagRunID); err != nil {
+		return retryDAGRunResult{}, err
+	}
+	// A registered job's retry made for an action is held to what the action
+	// approved: a republish of the sealed result, or a retry of the run.
+	if err := a.txeCheckRepublish(ctx, dag, retryDagRunID, expect, acceptFailedPrerequisites); err != nil {
 		return retryDAGRunResult{}, err
 	}
 	// A run executed locally runs a queued retry under a new attempt, which
@@ -3245,6 +3257,12 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		}
 		if bypassPreconditions {
 			opts = append(opts, executor.WithBypassPreconditions(true))
+		}
+		if acceptFailedPrerequisites {
+			if err := a.txeRepublishWorkerCheck(ctx, dag.WorkerSelector); err != nil {
+				return retryDAGRunResult{}, err
+			}
+			opts = append(opts, executor.WithAcceptFailedPrerequisites(true))
 		}
 		if len(retryPath.Hops) > 0 {
 			opts = append(opts, executor.WithRetryPath(retryPath))

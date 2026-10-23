@@ -17,6 +17,16 @@ const (
 	// EnvKeyDAGRunLogFile holds the path to the main log file for the DAG run.
 	EnvKeyDAGRunLogFile = "DAG_RUN_LOG_FILE"
 
+	// EnvKeyDAGRunRetryOf holds the execution reference this execution retries,
+	// as the coordinator recorded it on the execution a conditional retry
+	// admitted. It is set only for such an execution.
+	EnvKeyDAGRunRetryOf = "DAG_RUN_RETRY_OF"
+
+	// EnvKeyDAGRunAcceptedFailedPrerequisites is "1" in an execution of a
+	// step retry that was allowed to treat the step's failed prerequisites
+	// as satisfied. It is set only for such an execution.
+	EnvKeyDAGRunAcceptedFailedPrerequisites = "DAG_RUN_ACCEPTED_FAILED_PREREQUISITES"
+
 	// EnvKeyDAGRunStepName holds the name of the currently executing step.
 	EnvKeyDAGRunStepName = "DAG_RUN_STEP_NAME"
 
@@ -154,4 +164,14 @@ func IsNonTransferableRunEnvKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// TXEStepEnvNames are the variables the TXE renderer writes into a job's DAG
+// for its own commands: the job, its version and output directories, the
+// executing attempt and queue marker, and the TXE home. A job cannot set
+// them, and a republish's publish step gets these and no other job variable
+// (TXE-5067).
+var TXEStepEnvNames = []string{
+	"TXE_JOB_ID", "TXE_JOB_VERSION", "TXE_OUTPUT_DIR", "TXE_RUN_OUTPUT_DIR",
+	"TXE_ATTEMPT_ID", "TXE_QUEUED_AT", "TXE_DAGU_HOME",
 }

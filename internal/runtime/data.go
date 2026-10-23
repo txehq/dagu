@@ -62,6 +62,12 @@ type NodeState struct {
 	// execution during a retry. Edit-and-retry uses this to preserve outputs;
 	// include-downstream step retry uses it for preserved skipped join prerequisites.
 	SkippedByRetry bool
+	// FailureAcceptedByRetry marks a failed prerequisite that the step retry
+	// running now may treat as satisfied (StepRetryPlanOptions
+	// AcceptFailedPrerequisites). It is recorded for the execution that did
+	// so and never read back from a stored status: a later plan sets it only
+	// for itself.
+	FailureAcceptedByRetry bool
 	// Error is the error that the executor encountered.
 	Error error
 	// PreconditionResults records the latest precondition evaluation.
@@ -766,6 +772,13 @@ func (d *Data) SetSkippedByRetry(skipped bool) {
 	defer d.mu.Unlock()
 
 	d.inner.State.SkippedByRetry = skipped
+}
+
+func (d *Data) SetFailureAcceptedByRetry(accepted bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.inner.State.FailureAcceptedByRetry = accepted
 }
 
 func (d *Data) IsRepeated() bool {

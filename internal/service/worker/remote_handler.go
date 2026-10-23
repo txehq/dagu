@@ -203,12 +203,13 @@ func (h *remoteTaskHandler) handleRetry(ctx context.Context, task *coordinatorv1
 		owner:       owner,
 		profileName: profileName,
 		retry: &retryConfig{
-			target:              status,
-			stepName:            task.Step,
-			includeDownstream:   task.IncludeDownstream,
-			bypassPreconditions: task.BypassPreconditions,
-			triggerType:         queue.PreservedQueueTriggerType(status),
-			retryPath:           retryPath,
+			target:                    status,
+			stepName:                  task.Step,
+			includeDownstream:         task.IncludeDownstream,
+			bypassPreconditions:       task.BypassPreconditions,
+			acceptFailedPrerequisites: task.AcceptFailedPrerequisites,
+			triggerType:               queue.PreservedQueueTriggerType(status),
+			retryPath:                 retryPath,
 		},
 	}
 	logger.Info(ctx, "Using previous status from task for retry",
@@ -233,6 +234,28 @@ func (h *remoteTaskHandler) handleRetry(ctx context.Context, task *coordinatorv1
 		h.reportTaskInitFailure(ctx, run, initErr.err)
 	}
 	return err
+}
+
+// taskRetryOf is the execution a conditional retry made for an action
+// attempt retries, derived from the task exactly as the coordinator derives
+// the retry request it records on the admitted execution: the coordinator
+// admitted the task only because previous_status was then the run's latest
+// finished execution. Any other task retries no recorded execution.
+func taskRetryOf(task *coordinatorv1.Task) string {
+	spec := task.GetRetryRequest()
+	if spec == nil || !task.GetRequireLatestIsPrevious() || task.GetOperation() != coordinatorv1.Operation_OPERATION_RETRY {
+		return ""
+	}
+	prev, err := convert.ProtoToDAGRunStatus(task.PreviousStatus)
+	if err != nil || prev == nil || prev.AttemptID == "" {
+		return ""
+	}
+	request, err := ir.NewRetryRequest(ir.NewDAGRunRef(task.GetTarget(), task.GetDagRunId()), prev.AttemptID, prev.QueuedAt,
+		spec.GetActionId(), spec.GetActionAttempt(), spec.GetBindingDigest())
+	if err != nil {
+		return ""
+	}
+	return request.RetryOf
 }
 
 func retryTaskProfileName(status *ir.DAGRunStatus) string {
@@ -353,8 +376,11 @@ type retryConfig struct {
 	stepName            string
 	includeDownstream   bool
 	bypassPreconditions bool
-	triggerType         ir.TriggerType
-	retryPath           dagrun.RetryPath
+	// acceptFailedPrerequisites lets the retried step run although a direct
+	// prerequisite failed in an earlier execution.
+	acceptFailedPrerequisites bool
+	triggerType               ir.TriggerType
+	retryPath                 dagrun.RetryPath
 }
 
 type runHandlers struct {
@@ -812,6 +838,8 @@ func (h *remoteTaskHandler) executeDAGRun(
 		opts.StepRetry = run.retry.stepName
 		opts.IncludeDownstream = run.retry.includeDownstream
 		opts.BypassPreconditions = run.retry.bypassPreconditions
+		opts.AcceptFailedPrerequisites = run.retry.acceptFailedPrerequisites
+		opts.RetryOf = taskRetryOf(run.task)
 		opts.TriggerType = run.retry.triggerType
 		opts.RetryPath = run.retry.retryPath
 	}

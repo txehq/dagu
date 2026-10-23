@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"log/slog"
 	"maps"
 	"math"
@@ -298,6 +299,9 @@ func workerLabels(configured map[string]string) (map[string]string, error) {
 	}{
 		{key: "os", value: runtime.GOOS},
 		{key: "arch", value: runtime.GOARCH},
+		// This build runs a step retry's AcceptFailedPrerequisites option;
+		// a task that needs it selects this label (dispatch package).
+		{key: dispatch.AcceptFailedPrerequisitesLabel, value: dispatch.CapabilityLabelValue},
 	} {
 		if configuredValue, ok := labels[platform.key]; ok && configuredValue != platform.value {
 			return nil, fmt.Errorf(

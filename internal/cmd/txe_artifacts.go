@@ -6,6 +6,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"os"
 	"strconv"
 
@@ -201,6 +202,10 @@ func runTXEArtifactsPublish(ctx *Context, _ []string) error {
 		return err
 	}
 	in.Execution.QueuedAt = queuedAt
+	// Set by the agent from what the coordinator recorded, over anything the
+	// job's own settings name (managed run env).
+	in.Republish = os.Getenv(runenv.EnvKeyDAGRunAcceptedFailedPrerequisites) == "1"
+	in.RetryOf = os.Getenv(runenv.EnvKeyDAGRunRetryOf)
 	number, err := strconv.Atoi(version)
 	if err != nil || number < 1 {
 		return fmt.Errorf("job version %q is not a positive number", version)
