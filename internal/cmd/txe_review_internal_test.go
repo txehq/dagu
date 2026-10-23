@@ -166,7 +166,13 @@ func TestTXEReviewSealsAreThePublishCheck(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"}))
-	require.ErrorIs(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0b0b0b"}), review.ErrNotSealed)
+	publishOnly := seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0b0b0b"})
+	require.ErrorIs(t, publishOnly, txeclient.ErrNotRetriedSeal, "an execution that ran no job, as a failed republish, leaves the seal in force")
+	require.NotErrorIs(t, publishOnly, review.ErrNotSealed)
+	unsealed := txeclient.Execution{AttemptID: "0c0c0c"}
+	_, err = outputs.Begin(jobID, runID, unsealed)
+	require.NoError(t, err)
+	require.ErrorIs(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0c0c0c"}), review.ErrNotSealed, "it ran the job and sealed nothing")
 	require.ErrorIs(t, seals.RetriedSeal(jobID, "run-0002", review.Execution{AttemptID: "0a0a0a"}), review.ErrNotSealed)
 
 	seal, err := outputs.Sealed(jobID, runID)

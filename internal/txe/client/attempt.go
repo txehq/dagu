@@ -324,8 +324,10 @@ func (o Outputs) Sealed(jobID, runID string) (*Seal, error) {
 // be republished (TXE-5067): e sealed a result, that result is the run's
 // latest, and every file the seal recorded is still there with its recorded
 // digest. It reads and changes nothing else. It returns ErrNotSealed when e
-// sealed nothing, ErrNotRetriedSeal when the run's latest sealed result is
-// another execution's, and ErrChangedAfterSeal when a recorded file is gone
+// ran the job and sealed nothing, or no execution of the run sealed;
+// ErrNotRetriedSeal when the run's latest sealed result is another
+// execution's, including when e only ran the publish step; and
+// ErrChangedAfterSeal when a recorded file is gone
 // or differs. The reviewer proposes a republish, and the publish step
 // carries one out, only when this returns the seal.
 func (o Outputs) RetriedSeal(jobID, runID string, e Execution) (*Seal, error) {
@@ -350,6 +352,12 @@ func (o Outputs) RetriedSeal(jobID, runID string, e Execution) (*Seal, error) {
 // retriedSeal is RetriedSeal over a run directory already opened and read.
 func retriedSeal(run *os.Root, sealed *seals, runID string, e Execution) (*Seal, error) {
 	own := sealed.of(e)
+	if latest := sealed.latest(); own == nil && latest != nil && !sealed.began(e) {
+		// e only ran the publish step, as a failed republish does: the
+		// result it was to publish is still sealed, so e is no execution
+		// that sealed nothing, whose retry would run the job again.
+		return nil, fmt.Errorf("run %s: execution %s did not run the job, and the latest sealed result is execution %s's: %w", runID, e.Ref(), latest.Execution.Ref(), ErrNotRetriedSeal)
+	}
 	if own == nil {
 		return nil, fmt.Errorf("run %s: execution %s sealed nothing: %w", runID, e.Ref(), ErrNotSealed)
 	}

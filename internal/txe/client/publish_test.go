@@ -978,6 +978,27 @@ func TestRetriedSeal(t *testing.T) {
 		_, err = outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, testExecution)
 		require.ErrorIs(t, err, ErrNotRetriedSeal)
 	})
+	t.Run("PublishOnlyExecution", func(t *testing.T) {
+		// A republish that failed ran no job: the result it was to publish
+		// is still the run's, and its execution is not one that sealed
+		// nothing, which would be re-run.
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		run.seal(t)
+		_, err := outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, Execution{AttemptID: "0d0d0d", QueuedAt: ""})
+		require.ErrorIs(t, err, ErrNotRetriedSeal)
+		require.NotErrorIs(t, err, ErrNotSealed)
+	})
+	t.Run("RanTheJobWithoutSealing", func(t *testing.T) {
+		run := publishFixture(t)
+		run.write(t, "snapshot.json", `{"files":2}`)
+		run.seal(t)
+		later := Execution{AttemptID: "0c0c0c", QueuedAt: ""}
+		_, err := outputs(run).Begin(run.in.JobID, run.in.RunID, later)
+		require.NoError(t, err)
+		_, err = outputs(run).RetriedSeal(run.in.JobID, run.in.RunID, later)
+		require.ErrorIs(t, err, ErrNotSealed)
+	})
 	t.Run("FileChanged", func(t *testing.T) {
 		run := publishFixture(t)
 		run.write(t, "snapshot.json", `{"files":2}`)
