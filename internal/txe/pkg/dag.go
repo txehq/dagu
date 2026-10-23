@@ -33,6 +33,13 @@ const (
 // the removal rather than disabling it.
 const HistRetentionDays = 36500
 
+// The steps of a job's DAG: the job's own step, and the publish step that
+// records its deliverables after it.
+const (
+	RunStepName     = "run"
+	PublishStepName = "publish"
+)
+
 // Overlap policies Dagu accepts.
 const (
 	OverlapSkip   = "skip"
@@ -234,7 +241,7 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 	// that is what the publish step reads. Nothing is sealed unless the
 	// job's command succeeded.
 	line("steps:")
-	line("  - name: run")
+	line("  - name: %s", RunStepName)
 	line("    command:")
 	line("      - %s", quote(shellJoin(s.CLI.command("resource", "check",
 		"--job", s.JobID, "--job-version", fmt.Sprint(s.Version), "--machine", s.MachineID))))
@@ -251,7 +258,7 @@ func RenderDAG(s DAGSpec) ([]byte, error) {
 		line("      interval_sec: %d", s.Schedule.RetryIntervalSec)
 	}
 	if s.Publish != nil {
-		line("  - name: publish")
+		line("  - name: %s", PublishStepName)
 		line("    command: %s", quote(shellJoin(s.CLI.command("artifacts", "publish"))))
 	}
 	return []byte(b.String()), nil

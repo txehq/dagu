@@ -42,13 +42,23 @@ const RESPONSE_LABELS: Record<Verdict, string> = {
 export const ACTION_RETRY_RUN = 'dagu.retry_run';
 export const ACTION_UNCERTAIN_EFFECT = 'txe.uncertain_effect';
 
-// verdictLabel names what a verdict does for this proposal. Retry means two
-// different things, and the person must see which one they are choosing.
-export function verdictLabel(verdict: Verdict, action: string): string {
-  if (verdict === 'retry' && action === ACTION_RETRY_RUN) {
-    return 'Retry this run';
+// RETRY_STEP_PUBLISH is the step of a run retry that republishes the result
+// the failed execution sealed, without running the job again.
+export const RETRY_STEP_PUBLISH = 'publish';
+
+// verdictLabel names what a verdict does for this proposal. Retry means
+// different things, and the person must see which one they are choosing:
+// a run retry either runs the job again or only republishes a sealed result.
+export function verdictLabel(
+  verdict: Verdict,
+  action: { name: string; params?: Record<string, unknown> }
+): string {
+  if (verdict === 'retry' && action.name === ACTION_RETRY_RUN) {
+    return action.params?.step === RETRY_STEP_PUBLISH
+      ? 'Republish sealed result (job not run again)'
+      : 'Retry this run (the job runs again)';
   }
-  if (verdict === 'retry' && action === ACTION_UNCERTAIN_EFFECT) {
+  if (verdict === 'retry' && action.name === ACTION_UNCERTAIN_EFFECT) {
     return 'Confirm it did not take effect and allow one retry';
   }
   return RESPONSE_LABELS[verdict];
@@ -175,7 +185,7 @@ export function DecisionPanel({
             onClick={() => choose(option)}
             aria-pressed={verdict === option}
           >
-            <I18nText text={verdictLabel(option, proposal.action.name)} />
+            <I18nText text={verdictLabel(option, proposal.action)} />
           </Button>
         ))}
       </div>

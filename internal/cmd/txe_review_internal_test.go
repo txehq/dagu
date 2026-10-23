@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -147,4 +148,42 @@ func TestTXEReviewLocalVersionReadsTheRegistrationRecord(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "requests", "req_1.json"), other, 0o600))
 	_, err = local(jobID, 2)
 	require.Error(t, err)
+}
+
+// The reviewer's seal reader is the publish step's check: an intact seal is
+// republishable, an execution that sealed nothing is review.ErrNotSealed,
+// and a seal changed since is an error of its own, never "sealed nothing".
+func TestTXEReviewSealsAreThePublishCheck(t *testing.T) {
+	home := txepkg.Home{Root: t.TempDir()}
+	outputs := txeclient.Outputs{Home: home}
+	seals := txeReviewSeals{outputs}
+	const jobID, runID = "job_01HZX0000000000000000000AA", "run-0001"
+	sealed := txeclient.Execution{AttemptID: "0a0a0a"}
+	dir, err := outputs.Begin(jobID, runID, sealed)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "out.json"), []byte(`{"n":1}`), 0o600))
+	_, err = outputs.Seal(jobID, runID, sealed)
+	require.NoError(t, err)
+
+	require.NoError(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"}))
+	publishOnly := seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0b0b0b"})
+	require.ErrorIs(t, publishOnly, txeclient.ErrNotRetriedSeal, "an execution that ran no job, as a failed republish, leaves the seal in force")
+	require.NotErrorIs(t, publishOnly, review.ErrNotSealed)
+	unsealed := txeclient.Execution{AttemptID: "0c0c0c"}
+	_, err = outputs.Begin(jobID, runID, unsealed)
+	require.NoError(t, err)
+	require.ErrorIs(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0c0c0c"}), review.ErrNotSealed, "it ran the job and sealed nothing")
+	require.ErrorIs(t, seals.RetriedSeal(jobID, "run-0002", review.Execution{AttemptID: "0a0a0a"}), review.ErrNotSealed)
+
+	seal, err := outputs.Sealed(jobID, runID)
+	require.NoError(t, err)
+	require.NoError(t, filepath.WalkDir(home.Root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "out.json" && strings.Contains(path, seal.Ref) {
+			return os.WriteFile(path, []byte(`{"n":2}`), 0o600)
+		}
+		return err
+	}))
+	err = seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"})
+	require.ErrorIs(t, err, txeclient.ErrChangedAfterSeal)
+	require.NotErrorIs(t, err, review.ErrNotSealed)
 }

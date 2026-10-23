@@ -166,6 +166,12 @@ type runs struct {
 	recordsGone bool
 	// recovered counts the requests for a retry request's record.
 	recovered int
+	// republishes is what the service says about republishing a sealed
+	// result, and republishErr fails that read; steps records the step every
+	// retry request named.
+	republishes  bool
+	republishErr error
+	steps        []string
 	// recorded is the retry request the service recorded on each execution
 	// it admitted, by the request's id.
 	recorded map[string]recordedRetry
@@ -253,6 +259,7 @@ func (r *runs) RetryRun(_ context.Context, jobID, runID string, expected review.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.requested = append(r.requested, expected)
+	r.steps = append(r.steps, request.Step)
 	if now := r.state[runID].Execution(); now != expected {
 		return review.Execution{}, fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
 	}
@@ -285,6 +292,25 @@ func (r *runs) RetryRun(_ context.Context, jobID, runID string, expected review.
 		return review.Execution{}, r.loseAnswer
 	}
 	return admitted, nil
+}
+
+func (r *runs) Republishes(context.Context) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.republishes, r.republishErr
+}
+
+// seals is the machine's record of sealed results, by execution reference:
+// nil is an intact seal that is the run's latest, and an execution not
+// listed sealed nothing.
+type seals map[string]error
+
+func (s seals) RetriedSeal(_, _ string, e review.Execution) error {
+	err, ok := s[e.Ref()]
+	if !ok {
+		return review.ErrNotSealed
+	}
+	return err
 }
 
 // Recover is the service's record of a retry request, by the id it derives

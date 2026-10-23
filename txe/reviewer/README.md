@@ -323,6 +323,18 @@ files.
   before. A retry the reviewer proposes runs from its decision run once the
   owner answers `retry`; one the owner requests directly is already decided
   and is run by the next tick. Either way it is sent at most once.
+  A retry re-runs the job, so the reviewer reads the machine's seals first.
+  If the failed execution sealed its result, and that seal is the run's
+  latest and its files still have their sealed digests, the proposal is a
+  republish (`step: publish`). The owner's `retry` then runs only the
+  publish step, for those bytes (`stepName: publish`,
+  `acceptFailedPrerequisites`), and the job is not run again. This is sent
+  only to a service whose installation lists `republish_sealed`, and only
+  after the seal and the capability are checked again; otherwise nothing is
+  sent. A seal that cannot be republished, because it changed, cannot be
+  read, or the service lacks the capability, is put to the owner as a
+  question. It is never offered as a re-run. A person's own retry from the
+  dashboard always re-runs the job.
   The request also says which attempt of which action it is made for
   (`retryRequest`: the registry's action id, the attempt number, the
   action's binding digest, all taken from the registry's record). The

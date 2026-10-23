@@ -245,11 +245,25 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 			Effector:    &review.CommandEffector{ReadCredentialFile: probe.ReadCredentialFile},
 			Opener:      &review.RunOpener{Enqueue: review.RemoteEnqueue(transport), Complete: review.RemoteComplete(transport)},
 			Runs:        review.RemoteRuns(transport),
+			Seals:       txeReviewSeals{txeclient.Outputs{Home: txeHome}},
 			Holder:      machine + "/" + runID,
 			AgentClient: agentClient,
 			DecideDAG:   review.DecideDAGName(machine),
 		},
 	}, nil
+}
+
+// txeReviewSeals reads this machine's sealed results through the check the
+// publish step applies to a republish, so the reviewer proposes one only
+// when that step would publish it.
+type txeReviewSeals struct{ outputs txeclient.Outputs }
+
+func (s txeReviewSeals) RetriedSeal(jobID, runID string, e review.Execution) error {
+	_, err := s.outputs.RetriedSeal(jobID, runID, txeclient.Execution{AttemptID: e.AttemptID, QueuedAt: e.QueuedAt})
+	if errors.Is(err, txeclient.ErrNotSealed) {
+		return fmt.Errorf("%w: %w", review.ErrNotSealed, err)
+	}
+	return err
 }
 
 func runTXEReviewPrepare(ctx *Context, _ []string) error {
