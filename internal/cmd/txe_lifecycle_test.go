@@ -37,7 +37,7 @@ package:
 expected_outcome:
   success_criteria: ["The read-back says the purge happened."]
 lifetime:
-  expires_at: "2027-01-31T00:00:00Z"
+  open_ended: true
 review_policy:
   cadence: "0 9 * * *"
   brief: Nothing to act on.

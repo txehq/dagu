@@ -225,7 +225,7 @@ expected_outcome:
   deliverables:
     - {name: snapshot, path: snapshot.json, delivery: hub, required: true}
 lifetime:
-  expires_at: "2027-01-31T00:00:00Z"
+  open_ended: true
 review_policy:
   cadence: "0 9 * * *"
   brief: Check that last night's snapshot exists.
