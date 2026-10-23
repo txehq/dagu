@@ -3756,6 +3756,88 @@ func TestRunner_StepRetryExecution(t *testing.T) {
 		retryResult.assertNodeStatus(t, "D", ir.NodeSkipped)
 		retryResult.assertNodeStatus(t, "E", ir.NodeSucceeded)
 	})
+
+	// A retried step whose prerequisite failed in an earlier execution does
+	// not run, and the execution is not a success (TXE-5043): before, the
+	// runner recorded no error and reported succeeded.
+	t.Run("RetryOfStepBlockedByFailedPrerequisiteFails", func(t *testing.T) {
+		for _, downstream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("includeDownstream=%v", downstream), func(t *testing.T) {
+				r := setupRunner(t)
+				dag := &ir.DAG{
+					Steps: []ir.Step{
+						{Name: "run", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"run"}}}},
+						{Name: "publish", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"publish"}}}, Depends: []string{"run"}},
+						{Name: "after", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"after"}}}, Depends: []string{"publish"}},
+					},
+				}
+				nodes := []*runtime.Node{
+					runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[0], State: runtime.NodeState{Status: ir.NodeFailed}}),
+					runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeAborted}}),
+					runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[2], State: runtime.NodeState{Status: ir.NodeAborted}}),
+				}
+				retryPlan, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes, "publish", runtime.StepRetryPlanOptions{IncludeDownstream: downstream})
+				require.NoError(t, err)
+
+				result := planHelper{testHelper: r, Plan: retryPlan}.assertRun(t, ir.Failed)
+				result.assertNodeStatus(t, "run", ir.NodeFailed)
+				result.assertNodeStatus(t, "publish", ir.NodeAborted)
+				result.assertNodeStatus(t, "after", ir.NodeAborted)
+				require.ErrorIs(t, result.Error, runtime.ErrUpstreamFailed)
+				assert.Contains(t, result.Error.Error(), "step publish did not run")
+			})
+		}
+	})
+
+	// A join retried downstream of a reset branch, whose other prerequisite
+	// failed earlier, is found blocked only once the reset branch finishes:
+	// the execution is still not a success.
+	t.Run("RetryWithDownstreamJoinBlockedAfterResetBranchFinishes", func(t *testing.T) {
+		r := setupRunner(t)
+		dag := &ir.DAG{
+			Steps: []ir.Step{
+				{Name: "A", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"A"}}}},
+				{Name: "B", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"B"}}}},
+				{Name: "E", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"E"}}}, Depends: []string{"B", "A"}},
+			},
+		}
+		nodes := []*runtime.Node{
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[0], State: runtime.NodeState{Status: ir.NodeFailed}}),
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeSucceeded}}),
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[2], State: runtime.NodeState{Status: ir.NodeAborted}}),
+		}
+		retryPlan, err := runtime.CreateStepRetryPlanWithOptions(dag, nodes, "B", runtime.StepRetryPlanOptions{IncludeDownstream: true})
+		require.NoError(t, err)
+
+		result := planHelper{testHelper: r, Plan: retryPlan}.assertRun(t, ir.Failed)
+		result.assertNodeStatus(t, "A", ir.NodeFailed)
+		result.assertNodeStatus(t, "B", ir.NodeSucceeded)
+		result.assertNodeStatus(t, "E", ir.NodeAborted)
+		require.ErrorIs(t, result.Error, runtime.ErrUpstreamFailed)
+		assert.Contains(t, result.Error.Error(), "step E did not run")
+	})
+
+	// An earlier failure on another branch does not block the retried step,
+	// and the execution keeps the status it had before TXE-5043.
+	t.Run("RetryOfIndependentStepBesideEarlierFailureSucceeds", func(t *testing.T) {
+		r := setupRunner(t)
+		dag := &ir.DAG{
+			Steps: []ir.Step{
+				{Name: "A", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"A"}}}},
+				{Name: "B", Commands: []ir.CommandEntry{{Command: "echo", Args: []string{"B"}}}},
+			},
+		}
+		nodes := []*runtime.Node{
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[0], State: runtime.NodeState{Status: ir.NodeFailed}}),
+			runtime.NodeWithData(runtime.NodeData{Step: dag.Steps[1], State: runtime.NodeState{Status: ir.NodeFailed}}),
+		}
+		retryPlan, err := runtime.CreateStepRetryPlan(dag, nodes, "B")
+		require.NoError(t, err)
+
+		result := planHelper{testHelper: r, Plan: retryPlan}.assertRun(t, ir.Succeeded)
+		result.assertNodeStatus(t, "A", ir.NodeFailed)
+		result.assertNodeStatus(t, "B", ir.NodeSucceeded)
+	})
 }
 
 // TestRunner_StepIDAccess tests that step ID variables are expanded correctly

@@ -359,9 +359,22 @@ func (r *Runner) runGraphLoop(ctx context.Context, plan *Plan, nodes []*Node, pr
 
 	// Find initial ready nodes
 	for _, node := range nodes {
-		if node.State().Status == ir.NodeNotStarted && isReady(ctx, plan, node) {
+		if node.State().Status != ir.NodeNotStarted {
+			continue
+		}
+		if isReady(ctx, plan, node) {
 			logger.Debug(ctx, "Initial node ready", tag.Step(node.Name()))
 			readyCh <- node
+			continue
+		}
+		// A prerequisite that has already failed before anything ran here
+		// was carried over from an earlier execution, as in a step retry.
+		// The step it blocks did not run, so this execution must not end
+		// as a success; nothing else in it would record the failure. The
+		// same holds for a step found blocked later, once its other
+		// prerequisites finished (below).
+		if errors.Is(node.Error(), ErrUpstreamFailed) {
+			r.recordBlockedStep(node)
 		}
 	}
 
@@ -528,6 +541,9 @@ func (r *Runner) processCompletedNode(ctx context.Context, plan *Plan, node *Nod
 				} else if child.State().Status != ir.NodeNotStarted {
 					// Child was marked as Aborted/Skipped/Failed by isReady
 					// Add to queue to propagate to its children
+					if errors.Is(child.Error(), ErrUpstreamFailed) {
+						r.recordBlockedStep(child)
+					}
 					queue = append(queue, child)
 				}
 			}
@@ -778,6 +794,19 @@ func (r *Runner) setLastError(err error) {
 	defer r.mu.Unlock()
 
 	r.lastError = err
+}
+
+// recordBlockedStep records, unless an error is already recorded, that node
+// did not run because a prerequisite had failed. In an ordinary run the
+// prerequisite's own failure is already recorded, so this changes nothing;
+// it matters when the failure was carried over from an earlier execution.
+func (r *Runner) recordBlockedStep(node *Node) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.lastError == nil {
+		r.lastError = fmt.Errorf("step %s did not run: %w", node.Name(), ErrUpstreamFailed)
+	}
 }
 
 func (r *Runner) setPreconditionResults(results []ir.ConditionResult) {

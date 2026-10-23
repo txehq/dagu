@@ -441,6 +441,15 @@ func txeStartPublishJob(t *testing.T, script string, env map[string]string, bind
 // the run is started.
 func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, start func(*testFixture), stores ...txePublishStore) *txePublishRun {
 	t.Helper()
+	run := txeNewPublishJob(t, script, env, bind, nil, stores...)
+	start(run.f)
+	return run
+}
+
+// txeNewPublishJob builds the job's fixture, with options added to the
+// defaults, and starts nothing.
+func txeNewPublishJob(t *testing.T, script string, env map[string]string, bind func(home txepkg.Home, workerHome string) []string, options []fixtureOption, stores ...txePublishStore) *txePublishRun {
+	t.Helper()
 	pkg := txeCommitPackage(t, map[string]string{"collect.sh": script}, []string{"collect.sh"}, []string{"./collect.sh"})
 
 	// The TXE home of the worker's machine: identity, outputs, and the
@@ -474,10 +483,10 @@ func txeStartPublishJobWith(t *testing.T, script string, env map[string]string, 
 	rendered, err := txepkg.RenderDAG(spec)
 	require.NoError(t, err)
 
-	f := newTestFixture(t, string(rendered),
+	f := newTestFixture(t, string(rendered), append([]fixtureOption{
 		withLabels(map[string]string{"txe.machine": txeTestMachine}),
 		withLogPersistence(), withArtifactPersistence(), withIsolatedWorker(),
-	)
+	}, options...)...)
 	t.Cleanup(f.cleanup)
 
 	// The steps run the dagu binary built from this tree, whose path is
@@ -517,10 +526,7 @@ exec %q "$@"
 	out, err := add.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	run := &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome, checkLog: checkLog, checkExit: checkExit}
-
-	start(f)
-	return run
+	return &txePublishRun{f: f, home: home, registry: registry, workerHome: workerHome, checkLog: checkLog, checkExit: checkExit}
 }
 
 // outputDir is where the results of the execution a status describes are
