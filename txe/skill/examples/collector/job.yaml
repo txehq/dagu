@@ -11,8 +11,11 @@ project:
 targets:
   - kind: example.directory
     environment: local
+    # Nothing assigns this directory an id and the job only reads it, so it is
+    # named by its path ("A stable id for something with no UID" in SKILL.md).
+    # A directory recreated at the same path is the same target to the registry.
     stable_id:
-      id: example-exports-0001
+      path: /var/tmp/txe-example-exports
     display_name: exports
 schedule:
   cron: "0 2 * * *"

@@ -6,6 +6,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -199,24 +200,9 @@ func runTXEInspect(ctx *Context, args []string) error {
 		p.f("Owner:         %s\nProject:       %s\nMachine:       %s\n", job.OwnerID, job.ProjectID, job.MachineID)
 		p.f("Created by:    %s on %s\nLast changed:  %s on %s\n",
 			txeActorName(job.Created.By), job.Created.At.Format("2006-01-02 15:04Z07:00"), txeActorName(job.Updated.By), job.Updated.At.Format("2006-01-02 15:04Z07:00"))
-		p.f("\nLifecycle:     %s", job.Lifecycle)
-		if job.LifecycleReason != "" {
-			p.f(" (%s)", job.LifecycleReason)
-		}
-		p.f("\nRegistration:  %s\nAvailability:  %s", job.Registration.State, job.Availability.State)
-		if job.Availability.Detail != "" {
-			p.f(" (%s)", job.Availability.Detail)
-		}
-		p.f("\n")
-		if job.Retirement != nil {
-			p.f("Retired:       %s at %s\n", job.Retirement.Reason, job.Retirement.At.Format("2006-01-02 15:04Z07:00"))
-		}
-		if job.ExpiresAt != nil {
-			p.f("Expires:       %s\n", job.ExpiresAt.Format("2006-01-02 15:04Z07:00"))
-		}
-		p.f("Waiting on a person: %d proposal(s), %d exception(s)\n", len(job.Proposals), len(job.Exceptions))
+		txePrintJobState(p, job)
 
-		p.f("\nSchedule:      %s (%s), timeout %ds, missed runs: %s\n",
+		p.f("\nSchedule:     %s (%s), timeout %ds, missed runs: %s\n",
 			version.Schedule.Cron, version.Schedule.Timezone, version.Schedule.TimeoutSec, version.Schedule.MissedRun)
 		for _, t := range version.Targets {
 			p.f("Target:        %s %s %v\n", t.Kind, t.DisplayName, t.StableID)
@@ -242,6 +228,43 @@ func runTXEInspect(ctx *Context, args []string) error {
 			p.f("  %s  %-10s started %s  finished %s\n", r.RunID, r.Status, r.StartedAt, r.FinishedAt)
 		}
 	})
+}
+
+// txeRequestIDPattern is the shape of the request ids the CLI mints.
+var txeRequestIDPattern = regexp.MustCompile(`^req_[0-9A-HJKMNP-TV-Z]{26}$`)
+
+// txePrintJobState prints whether the job can run and what is still open on it.
+// Availability is the machine's, target's and credentials' condition and says
+// nothing about registration, so a job whose registration is not ready gets a
+// line of its own: the hub runs none of its ticks until it is.
+func txePrintJobState(p *txePrinter, job *txeclient.Job) {
+	p.f("\nLifecycle:     %s", job.Lifecycle)
+	if job.LifecycleReason != "" {
+		p.f(" (%s)", job.LifecycleReason)
+	}
+	p.f("\nRegistration:  %s\nAvailability:  %s", job.Registration.State, job.Availability.State)
+	if job.Availability.Detail != "" {
+		p.f(" (%s)", job.Availability.Detail)
+	}
+	p.f("\n")
+	if job.Registration.State != txeclient.RegistrationReady {
+		// The command is printed to be pasted into a shell, so it names the
+		// request only when the record's id has the shape the CLI mints.
+		if txeRequestIDPattern.MatchString(job.Registration.RequestID) {
+			p.f("Not runnable:  registration %s; finish it on machine %s with: dagu txe resume %s\n",
+				job.Registration.State, job.MachineID, job.Registration.RequestID)
+		} else {
+			p.f("Not runnable:  registration %s\n", job.Registration.State)
+		}
+	}
+	if job.Retirement != nil {
+		p.f("Retired:       %s at %s\n", job.Retirement.Reason, job.Retirement.At.Format("2006-01-02 15:04Z07:00"))
+	}
+	if job.ExpiresAt != nil {
+		p.f("Expires:       %s\n", job.ExpiresAt.Format("2006-01-02 15:04Z07:00"))
+	}
+	proposals, exceptions := job.Open()
+	p.f("Open:          %d proposal(s) waiting for a decision, %d unresolved exception(s)\n", proposals, exceptions)
 }
 
 // txeLocalPackage checks whether this machine holds the job's current package

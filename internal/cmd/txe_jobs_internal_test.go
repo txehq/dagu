@@ -79,3 +79,69 @@ func TestTXEInspectListsRunsFromBeforeMidnight(t *testing.T) {
 	f.json("inspect", job, "--runs", "0")
 	assert.Len(t, queries, 2)
 }
+
+// The registry keeps decided and finished proposals and resolved exceptions in
+// the job record. Inspect counts only what is still open, and says a job whose
+// registration is not ready cannot run, whatever its availability.
+func TestTXEInspectCountsOnlyWhatIsOpen(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	const job = "job_01K7A5ZQ8M3N4P5R6S7T8V9W0J"
+	record := map[string]any{
+		"job_id": job, "version": 2, "machine_id": "mch_01K7A5ZQ8M3N4P5R6S7T8V9W0K",
+		"registration": map[string]any{"state": "ready", "job_key": "k"},
+		"availability": map[string]any{"state": "ready"},
+		"proposals": map[string]any{
+			"prp_open":     map[string]any{"state": "open"},
+			"prp_snoozed":  map[string]any{"state": "snoozed"},
+			"prp_decided":  map[string]any{"state": "decided"},
+			"prp_executed": map[string]any{"state": "executed"},
+			"prp_rejected": map[string]any{"state": "rejected"},
+			"prp_super":    map[string]any{"state": "superseded"},
+			"prp_closed":   map[string]any{"state": "closed"},
+			"prp_unknown":  map[string]any{"state": "some-later-state"},
+		},
+		"exceptions": map[string]any{
+			"exc_resolved": map[string]any{"kind": "target_auth_denied", "resolved_at": "2026-10-12T09:30:12Z"},
+			"exc_open":     map[string]any{"kind": "machine_unavailable"},
+		},
+	}
+	f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
+		switch r.URL.Path {
+		case "/api/v1/txe/jobs/" + job:
+			cliauthtest.WriteJSON(w, http.StatusOK, record)
+		case "/api/v1/txe/jobs/" + job + "/versions/2":
+			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"title": "a job"})
+		default:
+			return false
+		}
+		return true
+	}
+
+	out, err := f.run("inspect", job, "--runs", "0")
+	require.NoError(t, err)
+	assert.Contains(t, out, "Open:          3 proposal(s) waiting for a decision, 1 unresolved exception(s)\n")
+	assert.NotContains(t, out, "Not runnable")
+
+	// Only a resolved exception, as on job_01M4QP81VY08CJY8Q120WVKCEY: nothing is open.
+	record["proposals"] = nil
+	record["exceptions"] = map[string]any{"exc_resolved": map[string]any{"kind": "target_auth_denied", "resolved_at": "2026-10-12T09:30:12Z"}}
+	out, err = f.run("inspect", job, "--runs", "0")
+	require.NoError(t, err)
+	assert.Contains(t, out, "Open:          0 proposal(s) waiting for a decision, 0 unresolved exception(s)\n")
+
+	// Version 2 saved and not ready: the hub runs none of its ticks.
+	record["registration"] = map[string]any{"state": "incomplete", "job_key": "k", "request_id": "req_01M4QQYWB60735V0287GA71339"}
+	out, err = f.run("inspect", job, "--runs", "0")
+	require.NoError(t, err)
+	assert.Contains(t, out, "Registration:  incomplete\nAvailability:  ready\n"+
+		"Not runnable:  registration incomplete; finish it on machine mch_01K7A5ZQ8M3N4P5R6S7T8V9W0K with: dagu txe resume req_01M4QQYWB60735V0287GA71339\n")
+
+	// No request id, or one the CLI did not mint: no command to paste.
+	for _, requestID := range []string{"", "req_x; rm -rf ~", "$(touch /tmp/x)", "req_01M4QQYWB60735V0287GA7133 x"} {
+		record["registration"] = map[string]any{"state": "incomplete", "job_key": "k", "request_id": requestID}
+		out, err = f.run("inspect", job, "--runs", "0")
+		require.NoError(t, err)
+		assert.Contains(t, out, "Not runnable:  registration incomplete\n", requestID)
+		assert.NotContains(t, out, "dagu txe resume", requestID)
+	}
+}

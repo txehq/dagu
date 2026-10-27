@@ -46,8 +46,11 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 
 | Field | What to write |
 |---|---|
+| `schema` | `1`, the version of this file format. Registration refuses any other value. |
 | `job_key` | A stable lowercase name for this job within its project, such as `hub-volume-health`. Registering the same key twice is refused. |
 | `title`, `purpose` | What the job is for, written for someone who never saw this conversation. |
+| `project` | `key` and optionally `name`: the project the job belongs to, within which `job_key` is unique. Optional when the files are in a git repository with an `origin` remote: the job then belongs to that repository, keyed like `github.com/acme/ops`. Required otherwise; registration refuses the spec without it. A `key` you give replaces the repository's. |
+| `chat_ref` | Optional. A pointer to the conversation that created the job. The job must make sense without it. |
 | `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). See "Targets" below. |
 | `schedule` | `cron` (five fields), `timezone`, `timeout_sec`. Optional: `overlap`, `retry` with `retry_interval_sec`, `catchup_window`. |
 | `package` | `include`: the files and directories the job needs, relative to the spec. `entrypoint`: the command. Uncommitted files are packaged as they are. |
@@ -123,6 +126,16 @@ credential_refs:
 The three names are fixed: they are what the probe looks up. A reference's name is also the variable your script receives, holding the file's content for a `file` reference. So `TXE_KUBECONFIG` holds the kubeconfig's text, not a path: if your script runs `kubectl`, point it at the file with a setting of your own under `env`, such as `KUBECONFIG: /Users/you/.kube/config`.
 
 A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
+
+### A stable id for something with no UID
+
+The registry knows a target by its `kind` and `stable_id` together. A recorded event about the target, a deletion for example, reaches the job only through that exact pair. A resource recorded as present under the same `kind`, `environment` and `display_name` but another `stable_id` is a replacement. `dagu txe list --target` searches these values. Choose the id in this order:
+
+1. **The id the system that holds the resource assigns**, if it has one: a Kubernetes UID, a Linear issue UUID, a cloud resource id, a database row's key. Copy it; do not derive it.
+2. **An id written into the resource, when you may write to it.** Make one id, write it into the resource (the first line of a file, a marker file in a directory, a field in a record), and put the same value in `stable_id`. The script then checks it on every run: a missing or different id means the resource was replaced, not just changed. `examples/healthcheck` does this with `TARGET_ID`.
+3. **The name it is reached by, when you can do neither.** For a file or directory, its absolute path, with the machine in `environment`. For a URL, the URL. Use a key that says what it is (`path:`, `url:`), not `uid:` or `id:`, so no reader takes it for an assigned identity. Say in `purpose` that a replacement at the same path or URL looks to the registry like the same target. Only the script can notice it, for example by comparing a digest it keeps under `TXE_OUTPUT_DIR`.
+
+Do not make up a label (`exports-0001`) that exists only in the spec. It is not a property of the resource. No other session would choose the same one, and no recorded event would carry it. So it never matches anything and protects against nothing. If none of the three fits, say so to the user instead of inventing one.
 
 ### Linear: the target check and your script are two things
 
