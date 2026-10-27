@@ -537,6 +537,37 @@ type Job struct {
 	Raw json.RawMessage `json:"-"`
 }
 
+// Open counts what the job record still holds open: proposals waiting for a
+// decision (open or snoozed) and exceptions not yet resolved. The record keeps
+// decided and finished proposals and resolved exceptions as history. An entry
+// that cannot be read, or in a state this build does not know, is counted as
+// open, so a record of another shape does not hide one.
+func (j *Job) Open() (proposals, exceptions int) {
+	for _, raw := range j.Proposals {
+		var p struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal(raw, &p) != nil {
+			proposals++
+			continue
+		}
+		switch p.State {
+		case "decided", "executed", "rejected", "superseded", "closed":
+		default:
+			proposals++
+		}
+	}
+	for _, raw := range j.Exceptions {
+		var e struct {
+			ResolvedAt *time.Time `json:"resolved_at"`
+		}
+		if json.Unmarshal(raw, &e) != nil || e.ResolvedAt == nil {
+			exceptions++
+		}
+	}
+	return proposals, exceptions
+}
+
 // UnmarshalJSON keeps the whole record beside the fields the CLI reads.
 func (j *Job) UnmarshalJSON(data []byte) error {
 	type plain Job

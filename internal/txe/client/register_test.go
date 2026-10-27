@@ -485,7 +485,8 @@ func TestResumeRecoversReceiptAfterJobMovedOn(t *testing.T) {
 
 // Version 1 never became ready: the ready call failed, and another session
 // moved the job on. The history has nothing for version 1, so no receipt is
-// written, and the request says so once instead of failing every resume.
+// written, and every resume of the request answers that it was superseded,
+// with the same fields, without asking the hub again.
 func TestResumeAfterJobMovedOnBeforeReady(t *testing.T) {
 	o := overtakenFixture(t, func(f *fakeRegistry) { f.failNextReady = true })
 	f, cc1, requestID, jobID := o.f, o.cc1, o.requestID, o.jobID
@@ -499,9 +500,30 @@ func TestResumeAfterJobMovedOnBeforeReady(t *testing.T) {
 	assert.Equal(t, txepkg.StepSuperseded, pendingSteps(t, cc1.Journal)[requestID])
 	_, err = cc1.Journal.Receipt(jobID, 1)
 	require.ErrorIs(t, err, fs.ErrNotExist)
+	f.mu.Lock()
+	calls := len(f.requests)
+	f.mu.Unlock()
 	_, err = cc1.Resume(context.Background(), requestID)
-	require.ErrorContains(t, err, "cannot be resumed")
-	require.ErrorContains(t, err, "no record that version 1 was ever marked ready")
+	var again *ErrSuperseded
+	require.ErrorAs(t, err, &again)
+	assert.Equal(t, *superseded, *again)
+	assert.Equal(t, err.Error(), superseded.Error())
+	f.mu.Lock()
+	assert.Len(t, f.requests, calls, "a request already closed as superseded asks the hub nothing")
+	f.mu.Unlock()
+
+	// A request closed by a build that did not record the job's version
+	// answers the same way, without naming a version it does not know.
+	entry, err := cc1.Journal.Get(requestID)
+	require.NoError(t, err)
+	entry.SupersededBy = 0
+	require.NoError(t, cc1.Journal.Save(entry))
+	_, err = cc1.Resume(context.Background(), requestID)
+	var older *ErrSuperseded
+	require.ErrorAs(t, err, &older)
+	assert.Equal(t, ErrSuperseded{RequestID: requestID, JobID: jobID, Version: 1}, *older)
+	assert.EqualError(t, err, "request "+requestID+" registered version 1 of "+jobID+
+		", but the job has moved on to a later version; nothing is left to resume and no receipt exists for version 1")
 
 	// Version 2 is untouched.
 	assert.Equal(t, 2, f.job(jobID).Version)

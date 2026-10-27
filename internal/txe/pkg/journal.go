@@ -69,10 +69,13 @@ type Entry struct {
 	Session       string          `json:"session,omitempty"`
 	Request       json.RawMessage `json:"request"`
 	// Response is the service's last answer, kept verbatim.
-	Response  json.RawMessage `json:"response,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	StartedAt time.Time       `json:"started_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	Response json.RawMessage `json:"response,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	// SupersededBy is the job's version when the request was closed as
+	// superseded, so every later resume answers as the first one did.
+	SupersededBy int       `json:"superseded_by,omitempty"`
+	StartedAt    time.Time `json:"started_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Receipt is the durable proof that a job version is fully registered: the

@@ -12,6 +12,8 @@ project:
 targets:
   - kind: example.file
     environment: local
+    # The id is written into the file (its first line) and the script checks
+    # it on every run, so a file replaced at the same path is noticed.
     stable_id:
       id: example-target-0001
     display_name: example target

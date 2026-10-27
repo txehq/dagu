@@ -12,8 +12,9 @@ project:
 targets:
   - kind: example.integration
     environment: local
+    # Named by the path the probe reads; nothing assigns it an id.
     stable_id:
-      id: example-integration-0001
+      path: /var/tmp/txe-example-probe
     display_name: example integration
 schedule:
   cron: "*/10 * * * *"

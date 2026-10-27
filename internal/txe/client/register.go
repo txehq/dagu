@@ -73,15 +73,22 @@ func (e *ErrIncomplete) Error() string {
 func (e *ErrIncomplete) Unwrap() error { return e.Cause }
 
 // ErrSuperseded reports a request whose job version was replaced by a later
-// one before its receipt was written. The job itself is unaffected.
+// one before its receipt was written. The job itself is unaffected. A resume
+// of a request already closed this way answers with it again.
 type ErrSuperseded struct {
 	RequestID string
 	JobID     string
 	Version   int
-	Current   int
+	// Current is the job's version when the request was closed; 0 for a
+	// request closed by a build that did not record it.
+	Current int
 }
 
 func (e *ErrSuperseded) Error() string {
+	if e.Current == 0 {
+		return fmt.Sprintf("request %s registered version %d of %s, but the job has moved on to a later version; nothing is left to resume and no receipt exists for version %d",
+			e.RequestID, e.Version, e.JobID, e.Version)
+	}
 	return fmt.Sprintf("request %s registered version %d of %s, but the job is now at version %d; nothing is left to resume and no receipt exists for version %d",
 		e.RequestID, e.Version, e.JobID, e.Current, e.Version)
 }
@@ -738,7 +745,7 @@ func (r *Registrar) Resume(ctx context.Context, requestID string) (*Outcome, err
 	case txepkg.StepRejected:
 		return nil, fmt.Errorf("request %s was refused by the hub and cannot be resumed: %s", requestID, entry.Error)
 	case txepkg.StepSuperseded:
-		return nil, fmt.Errorf("request %s cannot be resumed: %s", requestID, entry.Error)
+		return nil, &ErrSuperseded{RequestID: entry.RequestID, JobID: entry.JobID, Version: entry.Version, Current: entry.SupersededBy}
 	case txepkg.StepStaged, txepkg.StepRegistered, txepkg.StepCommitted:
 	}
 	return r.advance(ctx, entry)
@@ -945,7 +952,7 @@ func (r *Registrar) overtaken(ctx context.Context, entry *txepkg.Entry, job *Job
 		return outcome(entry, local, pkg), nil
 	}
 
-	entry.Step = txepkg.StepSuperseded
+	entry.Step, entry.SupersededBy = txepkg.StepSuperseded, job.Version
 	entry.Error = fmt.Sprintf("job %s moved on to version %d, and its history has no record that version %d was ever marked ready; the package stays in place and no receipt is written for that version",
 		entry.JobID, job.Version, entry.Version)
 	if err := r.Journal.Save(entry); err != nil {
