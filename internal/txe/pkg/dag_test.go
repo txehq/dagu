@@ -5,6 +5,7 @@ package txepkg
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,6 +214,28 @@ func TestRenderDAGPublishStep(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "artifacts:")
 
+}
+
+// A job's timeout_sec is one bound on the whole run: the resource check,
+// begin, the job's command and seal in the first step, and the publish
+// step. No step has a timeout of its own, so a slow check or publish spends
+// the job's time, and a run whose command succeeded can still fail on it.
+// The skill says so ("Write the job spec").
+func TestRenderDAGTimeoutBoundsTheWholeRun(t *testing.T) {
+	s := testDAGSpec()
+	s.Publish = &Publish{HubArtifacts: true}
+	data, err := RenderDAG(s)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(data), "timeout_sec:"), "timeout_sec is rendered once, for the run")
+
+	dag, err := spec.LoadYAML(context.Background(), data, spec.WithName(s.JobID), spec.WithoutEval())
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(s.Schedule.TimeoutSec)*time.Second, dag.Timeout)
+	require.Len(t, dag.Steps, 2)
+	require.Len(t, dag.Steps[0].Commands, 4, "the check, begin, the job's command and seal share the first step")
+	for _, step := range dag.Steps {
+		assert.Zero(t, step.Timeout, "step %s has a bound of its own", step.Name)
+	}
 }
 
 // Every job's DAG calls dagu before the job runs, so every job needs the

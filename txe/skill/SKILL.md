@@ -52,7 +52,7 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 | `project` | `key` and optionally `name`: the project the job belongs to, within which `job_key` is unique. Optional when the files are in a git repository with an `origin` remote: the job then belongs to that repository, keyed like `github.com/acme/ops`. Required otherwise; registration refuses the spec without it. A `key` you give replaces the repository's. |
 | `chat_ref` | Optional. A pointer to the conversation that created the job. The job must make sense without it. |
 | `targets` | The resource the job watches or acts on: `kind`, and a `stable_id` that survives a rename or a recreation (a UID, not a name). See "Targets" below. |
-| `schedule` | `cron` (five fields), `timezone`, `timeout_sec`. Optional: `overlap`, `retry` with `retry_interval_sec`, `catchup_window`. |
+| `schedule` | `cron` (five fields), `timezone`, `timeout_sec`. Optional: `overlap`, `retry` with `retry_interval_sec`, `catchup_window`. `timeout_sec` bounds the whole run, not only your command; see "How long a run may take" below. |
 | `package` | `include`: the files and directories the job needs, relative to the spec. `entrypoint`: the command. Uncommitted files are packaged as they are. |
 | `env` | Optional. Literal, non-secret settings for the script. |
 | `credential_refs` | Optional. See "Credentials" below. |
@@ -62,6 +62,14 @@ Put a `job.yaml` beside the script. Start from one of the examples in `examples/
 | `retirement_rules` | Optional. What the registry does when the target is deleted or replaced. See "When the work is over, or the target changes". |
 
 Review cadence is separate from the schedule. A check can run every five minutes and be reviewed once a day.
+
+### How long a run may take
+
+`timeout_sec` is one bound on the whole run, not on your command alone. The same time covers the target check before your command, setting up its output directory, sealing its results after it, and publishing the deliverables. No step has a bound of its own.
+
+When the time runs out, the run fails, even if your command had already succeeded. If the results were already sealed, they stay sealed on this machine but are not published for that run. A reviewer then sees a failed run.
+
+So do not size `timeout_sec` to your command alone. Allow at least a minute more than its longest expected run: a check reaches the cluster or Linear, and a publish uploads to the hub. Allow more if the deliverables are large.
 
 ### Bound what a reviewer may pass to an action
 
