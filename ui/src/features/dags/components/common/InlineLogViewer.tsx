@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { useEffect, useRef } from 'react';
 import { useRemoteNode } from '@/contexts/RemoteNodeContext';
 import { useQuery } from '@/hooks/api';
 import { whenEnabled } from '@/hooks/queryUtils';
@@ -8,8 +9,16 @@ import { AnsiLine } from '@/lib/ansi';
 import { components, Stream } from '../../../../api/v1/schema';
 import { I18nText } from '@/i18n/I18nText';
 
+// How often a step's log is fetched again while the step can still write to it.
+const LIVE_LOG_REFRESH_MS = 2000;
+
 /**
  * Simple inline log viewer - no controls, just logs
+ *
+ * The log is fetched again every two seconds only while `live` is set: while
+ * the step is running or retrying. A finished, failed or waiting step's log is
+ * fetched once, plus once more when the step stops, so its last lines are
+ * shown; a page left open on a finished run does not keep asking for it.
  */
 export function InlineLogViewer({
   dagName,
@@ -17,14 +26,17 @@ export function InlineLogViewer({
   stepName,
   stream,
   dagRun,
+  live,
 }: {
   dagName: string;
   dagRunId: string;
   stepName: string;
   stream: components['schemas']['Stream'];
   dagRun?: components['schemas']['DAGRunDetails'];
+  live: boolean;
 }) {
   const remoteNode = useRemoteNode();
+  const refreshInterval = live ? LIVE_LOG_REFRESH_MS : 0;
 
   // Determine if this is a sub DAG run - check both rootDAGRunId AND rootDAGRunName
   const isSubDAGRun =
@@ -52,7 +64,7 @@ export function InlineLogViewer({
       },
     }),
     {
-      refreshInterval: 2000,
+      refreshInterval,
       revalidateOnFocus: false,
     }
   );
@@ -75,13 +87,23 @@ export function InlineLogViewer({
       },
     }),
     {
-      refreshInterval: 2000,
+      refreshInterval,
       revalidateOnFocus: false,
     }
   );
 
   // Use the appropriate query based on whether this is a sub-DAG-run
-  const { data, isLoading } = isSubDAGRun ? subDAGQuery : dagRunQuery;
+  const { data, isLoading, mutate } = isSubDAGRun ? subDAGQuery : dagRunQuery;
+
+  // When the step stops, fetch once more: the last poll may predate its last
+  // lines.
+  const wasLive = useRef(live);
+  useEffect(() => {
+    if (wasLive.current && !live) {
+      void mutate();
+    }
+    wasLive.current = live;
+  }, [live, mutate]);
 
   // Process log content
   const content = data?.content || '';

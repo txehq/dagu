@@ -1046,3 +1046,118 @@ describe('NodeStatusTableRow', () => {
     }
   );
 });
+
+// TXE-4049: a decide run whose human task succeeded and whose execute step
+// then failed. The status table opens the failed step's stderr by itself; its
+// log must be fetched, but not asked for again every two seconds while the
+// page stays open on the finished run.
+describe('NodeStatusTableRow inline log of a failed step', () => {
+  type LogCall = { init: unknown; options?: { refreshInterval?: number } };
+  let logCalls: LogCall[];
+
+  beforeEach(() => {
+    // A running row animates and asks for the reduced-motion preference.
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+    logCalls = [];
+    mockedUseQuery.mockImplementation(((
+      path: unknown,
+      init: unknown,
+      options?: { refreshInterval?: number }
+    ) => {
+      if (path === stepLogPath) {
+        logCalls.push({ init, options });
+      }
+      return {
+        data:
+          path === stepLogPath && init
+            ? {
+                content:
+                  'txe review execute: job job_01 is claimed by another holder\n',
+                totalLines: 1,
+                lineCount: 1,
+              }
+            : undefined,
+        isLoading: false,
+        error: undefined,
+        isValidating: false,
+        mutate: vi.fn(),
+      };
+    }) as unknown as Parameters<typeof mockedUseQuery.mockImplementation>[0]);
+  });
+
+  const failedRun = {
+    ...dagRun,
+    name: 'txe-decide-01M9R1G0000000000000000000',
+    dagRunId: 'txe-rigfailed0000000000000000001',
+    status: Status.Failed,
+    statusLabel: StatusLabel.failed,
+  } as components['schemas']['DAGRunDetails'];
+
+  const executeNode = (status: NodeStatus) =>
+    ({
+      step: { name: 'execute', depends: ['decide'] },
+      status,
+      statusLabel:
+        status === NodeStatus.Failed
+          ? NodeStatusLabel.failed
+          : NodeStatusLabel.running,
+      stdout: '/logs/execute.stdout.log',
+      stderr: '/logs/execute.stderr.log',
+      startedAt: '',
+      finishedAt: '',
+      retryCount: 5,
+      doneCount: 0,
+      error: 'exit status 1',
+    }) as components['schemas']['Node'];
+
+  const renderRow = (node: components['schemas']['Node']) =>
+    render(
+      <MemoryRouter>
+        <AppBarContext.Provider value={appBarValue}>
+          <ToastProvider>
+            <table>
+              <tbody>
+                <NodeStatusTableRow
+                  rownum={2}
+                  node={node}
+                  name="txe-decide-01M9R1G0000000000000000000.yaml"
+                  dagRun={failedRun}
+                  view="desktop"
+                  defaultLogExpanded
+                />
+              </tbody>
+            </table>
+          </ToastProvider>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    );
+
+  it('shows the failed step stderr without polling it', () => {
+    renderRow(executeNode(NodeStatus.Failed));
+
+    expect(
+      screen.getByText(/is claimed by another holder/)
+    ).toBeInTheDocument();
+    const fetched = logCalls.filter((c) => c.init);
+    expect(fetched.length).toBeGreaterThan(0);
+    for (const call of fetched) {
+      expect(call.options?.refreshInterval).toBe(0);
+    }
+  });
+
+  it('polls the log of a step that is still running', () => {
+    renderRow(executeNode(NodeStatus.Running));
+    const fetched = logCalls.filter((c) => c.init);
+    expect(fetched[fetched.length - 1]?.options?.refreshInterval).toBe(2000);
+  });
+});
