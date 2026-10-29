@@ -182,7 +182,9 @@ class Log:
         self.rotate_failed_at = None  # monotonic time of the latest failed rotation
         self.rotate_failing_since = None
         self.jobs = queue.Queue(maxsize=max(backups, 1))
-        self.compressor = threading.Thread(target=self._compress_loop, name="compress", daemon=False)
+        # A daemon thread: the process must be able to exit however it ends; finish() waits for
+        # the compression in progress, with a bound, on every normal path.
+        self.compressor = threading.Thread(target=self._compress_loop, name="compress", daemon=True)
         self.stats = {"rotations": 0, "write_retries": 0}
 
     # ── start ──────────────────────────────────────────────────────────────────
@@ -326,7 +328,8 @@ class Log:
             self._check_degraded(next_write)
             return
         started = time.monotonic()
-        try:
+        previous_bytes = self.size  # read before the file is exposed under its rotated name: the
+        try:                        # compressor's sweep may compress and remove it at once
             self._close_quietly()
             rotated = self._move_no_clobber(self.path, lambda stamp: f"{self.base}.{stamp}", variants=(".gz", ".gz.tmp"))
             self._open()
@@ -348,7 +351,7 @@ class Log:
         self.stats["rotations"] += 1
         took_ms = int((time.monotonic() - started) * 1000)
         self.write(marker("rotated " + self.base, previous=os.path.basename(rotated),
-                          previous_bytes=os.path.getsize(rotated), took_ms=took_ms).encode(), line_start=False)
+                          previous_bytes=previous_bytes, took_ms=took_ms).encode(), line_start=False)
         self._enqueue(rotated)
 
     def _check_degraded(self, next_write):
@@ -433,9 +436,15 @@ class Log:
             except OSError as e:
                 self.diag.say("prune", f"could not delete {n}: {e.__class__.__name__}: {e}")
 
-    def finish(self):
-        self.jobs.put(None)
-        self.compressor.join()
+    def finish(self, timeout=120.0):
+        """End the compressor after the job in progress and the final sweep (bounded)."""
+        if self.compressor.is_alive():
+            self.jobs.put(None)
+            self.compressor.join(timeout)
+            if self.compressor.is_alive():
+                self.diag.say("compress", f"compression did not finish within {timeout:g}s at exit; a rotated file may "
+                                          f"stay uncompressed or a .gz.tmp may be left (reconciled at the next start)",
+                              always=True)
         self._close_quietly()
 
 
@@ -548,7 +557,13 @@ def main(argv):
 
     # Same process group as this process, launchd's group for the agent: launchd kills what is
     # left of it when this process exits (see the header), so no new group and no killpg.
-    child = subprocess.Popen(a.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        child = subprocess.Popen(a.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:
+        diag.say("start", f"cannot start the worker ({e.__class__.__name__}: {e}); exiting 127 so launchd retries",
+                 always=True)
+        log.finish()
+        return 127
     forwarded = {}
 
     def forward(signum, _frame):
@@ -584,6 +599,12 @@ def main(argv):
         stop_child(child, a.kill_timeout, diag)
         log.finish()
         return EXIT_IOERR
+    except Exception as e:  # anything unforeseen: never leave the agent alive but not draining
+        diag.say("crash", f"unexpected {e.__class__.__name__}: {e}; stopping the worker and exiting {EXIT_IOERR}",
+                 always=True)
+        stop_child(child, a.kill_timeout, diag)
+        log.finish()
+        raise
     code = child.wait()
     log.finish()
     if code < 0:

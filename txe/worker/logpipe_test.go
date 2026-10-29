@@ -703,6 +703,48 @@ print("earlier rotation untouched", gzip.open(earlier, "rb").read() == b"EARLIER
 	assert.Contains(t, stdout, "earlier rotation untouched True")
 }
 
+// A worker that cannot be started (no such executable) ends the wrapper at once with 127 and a
+// diagnostic, so launchd's KeepAlive retries once the executable is repaired; the compressor
+// thread must not keep the process alive.
+func TestLogpipeExitsWhenTheWorkerCannotStart(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 100000, 2, 4096, nil, filepath.Join(dir, "no-such-worker"))
+	start := time.Now()
+	assert.Equal(t, 127, r.exitCode(t))
+	assert.Less(t, time.Since(start), 10*time.Second, "no thread keeps the wrapper alive")
+	assert.Contains(t, r.diag(t), "cannot start the worker")
+}
+
+// The rotation marker's size is taken before the file is exposed under its rotated name, so a
+// compressor sweep that compresses and removes it at once cannot fault the drain.
+func TestLogpipeRotationSurvivesTheSweepTakingTheFileAtOnce(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+real_move = logpipe.Log._move_no_clobber
+def move_then_vanish(self, src, name_for, variants=()):
+    dst = real_move(self, src, name_for, variants)
+    if not dst.endswith(".log"):      # a rotation, not the legacy archive: the sweep already took it
+        os.remove(dst)
+    return dst
+logpipe.Log._move_no_clobber = move_then_vanish
+log = new_log(path, max_bytes=20000, backups=3)
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(2000))
+run_drain(log, payload)
+log.finish()
+print("rotations", log.stats["rotations"])
+text = open(path, "rb").read()
+print("marker has size", b'msg="txe-logpipe: rotated worker.log" previous=' in text and b"previous_bytes=" in text)
+print("last line kept", text.endswith(b"line 01999 some worker output text\n"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "rotations 4", "70 KB of lines over a 20 KB target: every rotation completed although its file vanished at once")
+	assert.Contains(t, stdout, "marker has size True")
+	assert.Contains(t, stdout, "last line kept True")
+}
+
 // If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
 // does that when the agent's main process dies); the worker's next write hits the closed
 // pipe, so a writing worker ends on its own and nothing hangs. A silent worker would be ended
