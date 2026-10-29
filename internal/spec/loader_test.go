@@ -3540,3 +3540,28 @@ func TestMetadataBaseValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRejectsTimezoneOnlySchedule(t *testing.T) {
+	t.Parallel()
+
+	// A DAG file whose schedule is only a zone prefix must fail to load
+	// with a validation error, not a panic (TXE-4024): this is the path a
+	// file in the DAG directory takes at startup and when it is watched.
+	for _, schedule := range []string{"TZ=UTC", "CRON_TZ=UTC", "TZ=UTC   "} {
+		t.Run(schedule, func(t *testing.T) {
+			t.Parallel()
+
+			content := "schedule: \"" + schedule + "\"\nsteps:\n  - id: a\n    run: echo hi\n"
+			tmpFile := createTempYAMLFile(t, content)
+			require.NotPanics(t, func() {
+				_, err := spec.Load(context.Background(), tmpFile)
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "invalid cron expression")
+			})
+
+			_, err := spec.LoadYAML(context.Background(), []byte(content))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "invalid cron expression")
+		})
+	}
+}

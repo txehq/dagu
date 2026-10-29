@@ -2188,3 +2188,51 @@ steps:
 	require.NotNil(t, notice.Class)
 	require.Equal(t, api.ValueReferenceNoticeClassRuntimeOnly, *notice.Class)
 }
+
+func TestDAGSpecTimezoneOnlyScheduleIsRefused(t *testing.T) {
+	server := test.SetupServer(t)
+
+	// A schedule that is only a zone prefix used to panic in the cron parser;
+	// the router's recoverer turned that into a 500 with nothing persisted
+	// (TXE-4024). Every supported submission path now refuses it as a
+	// validation error, and a spec saved before it is kept.
+	const steps = "steps:\n  - id: a\n    run: echo hi\n"
+	for _, schedule := range []string{"TZ=UTC", "CRON_TZ=UTC", "TZ=UTC   "} {
+		t.Run(schedule, func(t *testing.T) {
+			name := "tz_only_" + strings.NewReplacer("=", "_", "/", "_", " ", "_").Replace(schedule)
+			bad := "schedule: \"" + schedule + "\"\n" + steps
+
+			response := server.Client().Post("/api/v1/dags/validate", api.ValidateDAGSpecJSONRequestBody{
+				Name: &name, Spec: bad,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var validation api.ValidateDAGSpec200JSONResponse
+			response.Unmarshal(t, &validation)
+			require.False(t, validation.Valid)
+			require.NotEmpty(t, validation.Errors)
+			require.Contains(t, strings.Join(validation.Errors, "\n"), "invalid cron expression")
+
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &bad,
+			}).ExpectStatus(http.StatusBadRequest).Send(t)
+			server.Client().Get("/api/v1/dags/" + name).ExpectStatus(http.StatusNotFound).Send(t)
+
+			good := "schedule: \"0 1 * * *\"\n" + steps
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &good,
+			}).ExpectStatus(http.StatusCreated).Send(t)
+			// The update path refuses it like any other invalid cron (today a
+			// 500 from the raw load error, not a 400; that mapping is a
+			// separate gap) and keeps the saved spec. The server keeps
+			// answering, which the next read shows.
+			resp := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: bad,
+			}).Send(t)
+			require.GreaterOrEqual(t, resp.Response.StatusCode(), http.StatusBadRequest)
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var saved api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &saved)
+			require.Contains(t, saved.Spec, "0 1 * * *")
+			require.NotContains(t, saved.Spec, schedule)
+		})
+	}
+}

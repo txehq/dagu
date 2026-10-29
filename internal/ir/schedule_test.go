@@ -144,3 +144,50 @@ func TestCronDescriptorRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestCronTimezonePrefixWithoutExpressionRejected(t *testing.T) {
+	t.Parallel()
+
+	// A schedule that is only a zone prefix used to reach robfig/cron, whose
+	// parser slices the zone up to the first space and panics with
+	// "slice bounds out of range [:-1]" when there is none (TXE-4024). It is
+	// a validation error now, whatever the zone and whatever whitespace
+	// surrounds it.
+	cases := []string{
+		"TZ=UTC",
+		"CRON_TZ=UTC",
+		"TZ=UTC   ",
+		"  CRON_TZ=Asia/Tokyo \t",
+		"\tTZ=Not/AZone\n",
+		"TZ=",
+		"CRON_TZ=",
+	}
+	for _, tc := range cases {
+		t.Run(tc, func(t *testing.T) {
+			t.Parallel()
+
+			require.NotPanics(t, func() {
+				_, err := NewCronSchedule(tc)
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "invalid cron expression")
+				require.Contains(t, err.Error(), "timezone prefix")
+			})
+			// The same expression through the schedule value parser, which is
+			// what a DAG spec's schedule field reaches.
+			_, err := ParseScheduleValue(tc, ScheduleParseOptions{})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "timezone prefix")
+		})
+	}
+
+	// A zone prefix followed by an expression is still accepted unchanged.
+	for _, ok := range []string{"TZ=UTC 0 1 * * *", "CRON_TZ=Asia/Tokyo @daily", " TZ=UTC  */5 * * * * "} {
+		t.Run(ok, func(t *testing.T) {
+			t.Parallel()
+
+			s, err := NewCronSchedule(ok)
+			require.NoError(t, err)
+			require.True(t, s.IsCron())
+		})
+	}
+}

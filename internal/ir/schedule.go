@@ -283,6 +283,9 @@ func parseCronExpression(expr string) (cron.Schedule, string, error) {
 	if normalized == "" {
 		return nil, "", fmt.Errorf("cron expression must not be empty")
 	}
+	if isTimezonePrefixOnly(normalized) {
+		return nil, "", fmt.Errorf("invalid cron expression %q: a timezone prefix must be followed by a cron expression", normalized)
+	}
 
 	// "@every <duration>" has no calendar-time equivalent, so it keeps its
 	// descriptor form, with the shortest duration, as the canonical expression.
@@ -319,6 +322,17 @@ func parseCronExpression(expr string) (cron.Schedule, string, error) {
 		return nil, "", fmt.Errorf("invalid cron expression %q: %w", normalized, err)
 	}
 	return parsed, normalized, nil
+}
+
+// isTimezonePrefixOnly reports whether a whitespace-normalized expression is
+// nothing but a "TZ=" or "CRON_TZ=" field. robfig/cron slices the zone up to
+// the first space, so such an expression panics in its parser instead of
+// failing validation; it is refused here first.
+func isTimezonePrefixOnly(expr string) bool {
+	if !strings.HasPrefix(expr, "TZ=") && !strings.HasPrefix(expr, "CRON_TZ=") {
+		return false
+	}
+	return !strings.Contains(expr, " ")
 }
 
 // splitTimezonePrefix separates a leading "TZ=" or "CRON_TZ=" field from the
