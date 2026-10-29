@@ -16,9 +16,9 @@ Every --interval seconds after --grace it checks two things:
   new streams    GET /api/v1/health on the UI port answers 200, and the coordinator port
                  answers an HTTP/2 client preface with a SETTINGS frame. Each opens a new
                  local connection, so each needs a new stream through the forward.
-  the worker     the worker's existing coordinator connection, read from its own log: the
-                 heartbeat it sends every second logs "Heartbeat send failed" on each failure
-                 (internal/service/worker/worker.go) and nothing on success.
+  the worker     the worker's existing coordinator connection, read from its own log (text or
+                 JSON format): the heartbeat it sends every second logs "Heartbeat send failed"
+                 on each failure (internal/service/worker/worker.go) and nothing on success.
 
 New streams count as failing only when both probes fail: one that works shows the forward's
 connection is alive. It replaces the forward only when new streams and the worker are both
@@ -40,6 +40,7 @@ import argparse, datetime, json, os, re, signal, socket, subprocess, sys, time, 
 EXIT_REPLACED = 75
 PREFIX = "tunnel-supervise:"
 # The worker's own message (internal/service/worker/worker.go); txe/worker's tests pin it.
+HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"
 HEARTBEAT_FAILED = 'msg="Heartbeat send failed'
 _TIME = re.compile(r'^time=(\S+)')
 # HTTP/2 client connection preface and an empty SETTINGS frame (RFC 9113 3.4, 6.5).
@@ -95,13 +96,24 @@ def worker_unhealthy_since(path, now_wall, gap):
         return None
     times = []
     for line in text.splitlines():
-        if HEARTBEAT_FAILED not in line:
-            continue
-        m = _TIME.match(line)
-        if not m:
-            continue
+        # The worker's text format (the default) or its JSON format (log_format: json).
+        if line.startswith("{"):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("msg") != HEARTBEAT_MSG or not isinstance(rec.get("time"), str):
+                continue
+            stamp = rec["time"]
+        else:
+            if HEARTBEAT_FAILED not in line:
+                continue
+            m = _TIME.match(line)
+            if not m:
+                continue
+            stamp = m.group(1)
         try:
-            t = datetime.datetime.fromisoformat(m.group(1))
+            t = datetime.datetime.fromisoformat(stamp)
         except ValueError:
             continue
         if t.tzinfo is None:
