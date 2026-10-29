@@ -2220,19 +2220,71 @@ func TestDAGSpecTimezoneOnlyScheduleIsRefused(t *testing.T) {
 			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
 				Name: name, Spec: &good,
 			}).ExpectStatus(http.StatusCreated).Send(t)
-			// The update path refuses it like any other invalid cron (today a
-			// 500 from the raw load error, not a 400; that mapping is a
-			// separate gap) and keeps the saved spec. The server keeps
-			// answering, which the next read shows.
-			resp := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+			// The update path refuses it like any other invalid definition:
+			// 200 with the errors, nothing saved (TXE-5404; it was a 500).
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
 				Spec: bad,
-			}).Send(t)
-			require.GreaterOrEqual(t, resp.Response.StatusCode(), http.StatusBadRequest)
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var update api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &update)
+			require.Len(t, update.Errors, 1)
+			require.Contains(t, update.Errors[0], "invalid cron expression")
 			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
 			var saved api.GetDAGSpec200JSONResponse
 			response.Unmarshal(t, &saved)
 			require.Contains(t, saved.Spec, "0 1 * * *")
 			require.NotContains(t, saved.Spec, schedule)
+		})
+	}
+}
+
+func TestDAGSpecUpdateWithInvalidScheduleKeepsTheSavedSpec(t *testing.T) {
+	server := test.SetupServer(t)
+
+	// A schedule that does not parse is refused by PUT /dags/{name}/spec the
+	// way the endpoint refuses any other invalid definition: 200 with the
+	// errors and nothing written. Before TXE-5404 the file loader's raw
+	// decode error made it a 500 internal_error.
+	const steps = "steps:\n  - id: a\n    run: echo hi\n"
+	for _, tc := range []struct{ name, schedule, want string }{
+		{"malformed", `"1"`, `schedule: invalid cron expression "1": expected exactly 5 fields, found 1: [1]`},
+		{"timezone_only", `"TZ=UTC"`, `schedule: invalid cron expression "TZ=UTC": a timezone prefix must be followed by a cron expression`},
+		{"one_of_a_list", `["0 1 * * *", "61 * * * *"]`, `schedule[1]: invalid cron expression "61 * * * *": end of range (61) above maximum (59): 61`},
+		{"start_of_a_map", "\n  start: \"nope\"", `schedule.start: invalid cron expression "nope": expected exactly 5 fields, found 1: [nope]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "bad_schedule_" + tc.name
+			saved := "schedule: \"0 1 * * *\"\n" + steps
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &saved,
+			}).ExpectStatus(http.StatusCreated).Send(t)
+
+			response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: "schedule: " + tc.schedule + "\n" + steps,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var update api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &update)
+			require.Equal(t, []string{"failed to process document 0: decoding failed due to the following error(s):\n\n" +
+				"'schedule' failed to unmarshal from YAML: " + tc.want}, update.Errors)
+
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var kept api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &kept)
+			require.Equal(t, saved, kept.Spec)
+			server.Client().Get("/api/v1/dags/" + name).ExpectStatus(http.StatusOK).Send(t)
+
+			// A valid update of the same DAG is saved, with no errors.
+			next := "schedule: \"0 2 * * *\"\n" + steps
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: next,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			update = api.UpdateDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &update)
+			require.Empty(t, update.Errors)
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			kept = api.GetDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &kept)
+			require.Equal(t, next, kept.Spec)
 		})
 	}
 }

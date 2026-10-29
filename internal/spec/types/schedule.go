@@ -32,8 +32,16 @@ type ScheduleValue struct {
 	restarts []ir.Schedule // Restart schedules
 }
 
-// UnmarshalYAML implements BytesUnmarshaler for goccy/go-yaml.
+// UnmarshalYAML implements BytesUnmarshaler for goccy/go-yaml. Every error is
+// an *ir.ScheduleError: the value as written is not a schedule.
 func (s *ScheduleValue) UnmarshalYAML(data []byte) error {
+	if err := s.unmarshalYAML(data); err != nil {
+		return &ir.ScheduleError{Err: err}
+	}
+	return nil
+}
+
+func (s *ScheduleValue) unmarshalYAML(data []byte) error {
 	s.isSet = true
 
 	var raw any
