@@ -701,7 +701,8 @@ func TestTxeOwnersSharedApproverMayPauseAndRetire(t *testing.T) {
 
 // A lost registration race stays listed, directly after the job holding its
 // key, and names that job only to a caller who can see it: B, who was shared
-// the duplicate but not A's job, sees the duplicate without duplicate_of.
+// the duplicate but not A's job, sees the duplicate without duplicate_of and
+// where its own age puts it, so its place says nothing about A's job.
 func TestTxeOwnersDuplicateIsListedAfterItsJobAndNamesItOnlyToThoseWhoSeeIt(t *testing.T) {
 	w := newTwoOwners(t, "")
 	ctx := context.Background()
@@ -733,7 +734,7 @@ func TestTxeOwnersDuplicateIsListedAfterItsJobAndNamesItOnlyToThoseWhoSeeIt(t *t
 	require.Equal(t, "duplicate "+w.jobA, duplicateOf(w.personA)[dup])
 	require.Equal(t, "duplicate "+w.jobA, duplicateOf(w.admin)[dup])
 
-	require.Equal(t, []string{dup, w.jobB}, w.listJobs(w.personB))
+	require.Equal(t, []string{w.jobB, dup}, w.listJobs(w.personB))
 	require.Equal(t, "duplicate ", duplicateOf(w.personB)[dup], "B cannot see the job holding the key")
 	got, err := w.api.GetTxeJob(w.personB, apigen.GetTxeJobRequestObject{JobId: dup})
 	require.NoError(t, err)

@@ -254,10 +254,11 @@ func TestRegisterConcurrentDuplicates(t *testing.T) {
 		}
 	}
 
-	// Looked up by key, the job holding it comes first, whichever registered
-	// first; every loser follows, named as its duplicate.
-	jobs, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
+	// Looked up by key and put winner first, the job holding it comes first,
+	// whichever registered first; every loser follows, named as its duplicate.
+	listed, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
 	require.NoError(t, err)
+	jobs := WinnersFirst(listed)
 	require.Len(t, jobs, n, "duplicates are retained, not deleted")
 	assert.Equal(t, winner, jobs[0].JobID)
 	assert.NotEqual(t, RegistrationDuplicate, jobs[0].Registration.State)
@@ -267,7 +268,7 @@ func TestRegisterConcurrentDuplicates(t *testing.T) {
 	}
 	reread, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
 	require.NoError(t, err)
-	assert.Equal(t, jobs, reread, "the order is the same on every read")
+	assert.Equal(t, jobs, WinnersFirst(reread), "the order is the same on every read")
 
 	// Replay of the same request is idempotent; a different request reusing
 	// the job ID is refused.
@@ -987,7 +988,7 @@ func TestWinnersFirst(t *testing.T) {
 		}
 		return out
 	}
-	got := winnersFirst([]*Job{
+	got := WinnersFirst([]*Job{
 		job("a-dup1", "duplicate", "c-win"),
 		job("b-other", "ready", ""),
 		job("c-win", "ready", ""),
@@ -998,5 +999,5 @@ func TestWinnersFirst(t *testing.T) {
 		job("h-named", "ready", "c-win"),
 	})
 	assert.Equal(t, []string{"b-other", "c-win", "a-dup1", "e-dup2", "d-other", "f-orphan", "g-hidden", "h-named"}, ids(got))
-	assert.Empty(t, winnersFirst(nil))
+	assert.Empty(t, WinnersFirst(nil))
 }

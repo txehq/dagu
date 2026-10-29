@@ -336,9 +336,9 @@ func (f JobFilter) match(j *Job) bool {
 	return true
 }
 
-// ListJobs returns committed job aggregates matching f, oldest first, except
-// that a duplicate registration is listed directly after the job holding its
-// key when that job is listed too (see winnersFirst).
+// ListJobs returns committed job aggregates matching f, oldest first. A
+// listing shown to a caller orders what that caller may see with
+// WinnersFirst.
 func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, error) {
 	var out []*Job
 	cursor := ""
@@ -357,18 +357,22 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, error) {
 			}
 		}
 		if page.NextCursor == "" {
-			return winnersFirst(out), nil
+			return out, nil
 		}
 		cursor = page.NextCursor
 	}
 }
 
-// winnersFirst moves each duplicate registration to directly after the job
+// WinnersFirst moves each duplicate registration to directly after the job
 // its duplicate_of names, when that job is in jobs, so a caller looking a job
 // up by key meets the job holding the key first. Duplicates of one job keep
 // their order, and every other job keeps its place relative to the rest. A
 // duplicate whose job is not in jobs stays where it is.
-func winnersFirst(jobs []*Job) []*Job {
+//
+// Apply it only to the jobs a caller may see: ordered with a job the caller
+// cannot see, a duplicate would move to that job's place and so tell the
+// caller where it stands.
+func WinnersFirst(jobs []*Job) []*Job {
 	at := make(map[string]int, len(jobs))
 	for i, j := range jobs {
 		at[j.JobID] = i
