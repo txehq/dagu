@@ -7,7 +7,10 @@ known keys), its Code Review row (from its datetime and status), its receipt (fr
 commit), and each finding's badge (from its level). Paths become synthetic, people's logins
 a-person and other apps' logins another-app[bot] (only the connector's is kept, the check reads it),
 branch names synthetic-branch, repository names synthetic/repo; state values and
-timestamps are kept only in their known shapes; 
+timestamps are kept only in their known shapes. GraphQL reviewThreads pages (TXE-4791) keep their
+structure, an account's __typename and login (the connector's GraphQL login, which has no [bot]
+suffix, is kept; another Bot's becomes another-app), page cursors become synthetic-cursor-<n> and
+error messages synthetic error.
 
   python3 -I sanitize.py <file.json>...   # rewrites each file in place; idempotent
 """
@@ -17,10 +20,16 @@ FIELDS = {"id", "user", "login", "type", "body", "created_at", "updated_at", "su
           "commit_id", "original_commit_id", "pull_request_review_id", "in_reply_to_id", "path",
           "line", "original_line", "start_line", "original_start_line", "side", "position",
           "original_position", "subject_type", "event", "actor", "label", "name", "color", "head",
-          "sha", "repo", "full_name", "labels", "draft", "state", "number", "ref"}
+          "sha", "repo", "full_name", "labels", "draft", "state", "number", "ref",
+          # GraphQL reviewThreads (TXE-4791)
+          "data", "repository", "pullRequest", "reviewThreads", "pageInfo", "hasNextPage", "endCursor",
+          "nodes", "isResolved", "isOutdated", "originalLine", "resolvedBy", "comments", "databaseId",
+          "author", "__typename", "errors", "message"}
+CONNECTOR = {"chatgpt-codex-connector[bot]", "chatgpt-codex-connector"}
 STATE_KEYS = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
 STATUSES = {"completed", "in_progress", "queued", "pending", "running", "failed", "cancelled", "skipped"}
 paths = {}
+cursors = {}
 
 
 def state_value(k, v):
@@ -65,20 +74,43 @@ def body(text):
 def walk(v, key=None):
     if isinstance(v, dict) and key == "repo":
         return {"full_name": "synthetic/repo"}
-    if isinstance(v, dict) and key in ("user", "actor"):
-        # An account: its login (rewritten below) and type only; never its numeric id.
-        return {k: walk(x, k) for k, x in v.items() if k in ("login", "type")}
+    if isinstance(v, dict) and key in ("user", "actor", "author", "resolvedBy"):
+        # An account: its login and type only; never its numeric id. GraphQL names a Bot's login
+        # without the [bot] suffix, so the type decides whether it is an app's or a person's.
+        bot = v.get("type") == "Bot" or v.get("__typename") == "Bot"
+        out = {}
+        for k, x in v.items():
+            if k in ("type", "__typename") and isinstance(x, str) and len(x) <= 40:
+                out[k] = x
+            elif k == "login":
+                if not isinstance(x, str):
+                    out[k] = None
+                elif x in CONNECTOR:
+                    out[k] = x
+                elif x.endswith("[bot]"):
+                    out[k] = "another-app[bot]"
+                else:
+                    out[k] = "another-app" if bot else "a-person"
+        return out
     if isinstance(v, dict) and key == "label":
         # Only the override label's name is read by the check; other label names are private.
         return {"name": v.get("name") if v.get("name") == "review-override" else "synthetic-label"}
     if isinstance(v, dict):
-        return {k: walk(x, k) for k, x in v.items() if k in FIELDS}
+        # A numeric REST id only: a GraphQL node id (a string) is not read and not kept.
+        return {k: walk(x, k) for k, x in v.items() if k in FIELDS and (k != "id" or isinstance(x, int))}
     if isinstance(v, list):
         return [walk(x) for x in v]
     if not isinstance(v, str):
         return v
     if key == "body":
         return body(v)
+    if key == "endCursor":
+        # Distinct cursors stay distinct: the check refuses pages whose cursors repeat.
+        if re.fullmatch(r"synthetic-cursor-[0-9]+", v):
+            return v
+        return cursors.setdefault(v, f"synthetic-cursor-{len(cursors) + 1}")
+    if key == "message":
+        return "synthetic error"
     if key == "login":
         # Only the connector's login is read by the check; every other account, person or app, is
         # replaced, so no private integration's name is published.

@@ -20,7 +20,14 @@ code), and a PR from another repository fails unless a person adds `review-overr
    ```
 
    It is done when `commit_sha` is your head and `status` is `completed`, usually 2 to 8 minutes.
-3. Read every finding. Fix every P0 and P1 and push; a P2 or P3 never blocks.
+3. Read every finding. Fix every P0 and P1 and push; a P2 or P3 never blocks. When the connector
+   completes a re-review of your head with `has_any_findings: true` but posts neither a review of
+   the head nor a receipt naming it (dagu PRs 175 and 185), the check decides on its live threads
+   (TXE-4791): it passes when no thread it opened carries a P0 or P1 badge without being outdated,
+   or a person (resolvedBy typed User, not a `[bot]` login) resolved each one. Answer such a thread
+   with evidence, have a person resolve it, then re-run the check: resolving a thread fires no
+   event this workflow runs on. A thread read that is incomplete or unreadable is a failed read,
+   never a pass.
 4. Each new head needs a review of that head. If the connector has not started one (no 👀 on the PR,
    no "Running" row in its summary) within a few minutes, comment `@codex review` **once** for that
    head. Never comment it again on the same head to get a different answer. After a change of base,
@@ -56,4 +63,4 @@ manual comment in step 4 is the working path until an automatic start is observe
 not depend on how a review started: it requires a completed review of the current head either way.
 
 `test-codex-review-check.sh` runs the check over recorded connector payloads (`testdata/`, from
-txehq/sub2api and txehq/txe PRs); `codex-review-test.yaml` runs it with shellcheck.
+txehq/sub2api, txehq/txe and txehq/dagu PRs, reduced by `testdata/sanitize.py`); `codex-review-test.yaml` runs it with shellcheck.

@@ -1,0 +1,38 @@
+[
+ {
+  "data": {
+   "repository": {
+    "pullRequest": {
+     "reviewThreads": {
+      "pageInfo": {
+       "hasNextPage": false,
+       "endCursor": "synthetic-cursor-1"
+      },
+      "nodes": [
+       {
+        "isResolved": false,
+        "isOutdated": false,
+        "line": 4,
+        "originalLine": 4,
+        "resolvedBy": null,
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4387074421,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P1 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       }
+      ]
+     }
+    }
+   }
+  }
+ }
+]
