@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -458,6 +459,9 @@ type mockAttempt struct {
 	writeStepMessagesError error                      // injected error for WriteStepMessages
 	requireOpenForRead     bool
 	isOpen                 bool
+	outputs                *ir.DAGRunOutputs // what WriteOutputs last stored
+	outputsWrites          int               // calls of WriteOutputs with outputs to store
+	writeOutputsError      error             // injected error for WriteOutputs
 	mu                     sync.Mutex
 }
 
@@ -548,11 +552,26 @@ func (m *mockAttempt) IsAborting(_ context.Context) (bool, error) {
 }
 func (m *mockAttempt) Hide(_ context.Context) error { return nil }
 func (m *mockAttempt) Hidden() bool                 { return false }
-func (m *mockAttempt) WriteOutputs(_ context.Context, _ *ir.DAGRunOutputs) error {
+func (m *mockAttempt) WriteOutputs(_ context.Context, outputs *ir.DAGRunOutputs) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// As the file store: nothing is written for a run that published nothing.
+	if outputs == nil || len(outputs.Outputs) == 0 {
+		return nil
+	}
+	if m.writeOutputsError != nil {
+		return m.writeOutputsError
+	}
+	m.outputsWrites++
+	stored := *outputs
+	stored.Outputs = maps.Clone(outputs.Outputs)
+	m.outputs = &stored
 	return nil
 }
 func (m *mockAttempt) ReadOutputs(_ context.Context) (*ir.DAGRunOutputs, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.outputs, nil
 }
 func (m *mockAttempt) WriteStepMessages(_ context.Context, stepName string, messages []ir.LLMMessage) error {
 	m.mu.Lock()
