@@ -27,7 +27,9 @@ code), and a PR from another repository fails unless a person adds `review-overr
    or a person (resolvedBy typed User, not a `[bot]` login) resolved each one. Answer such a thread
    with evidence, have a person resolve it, then re-run the check: resolving a thread fires no
    event this workflow runs on. A thread read that is incomplete or unreadable is a failed read,
-   never a pass.
+   never a pass, and the threads are read only 120 s after the Code Review row's completion time
+   (a conservative visibility delay, not a consistency guarantee; the merge wrapper re-reads
+   everything at the exact head).
 4. Each new head needs a review of that head. If the connector has not started one (no 👀 on the PR,
    no "Running" row in its summary) within a few minutes, comment `@codex review` **once** for that
    head. Never comment it again on the same head to get a different answer. After a change of base,

@@ -51,7 +51,13 @@
 #      databaseId, a string body and an author typed and named (non-empty strings both); or a
 #      resolvedBy that is neither null nor typed and named the same way. (A thread whose first comment's author is a deleted
 #      account, null in GraphQL, is therefore unreadable too: the receipt or a person's
-#      review-override is the way past it.) Measured on txehq/dagu PRs 185
+#      review-override is the way past it.) And the threads are read only once the Code Review
+#      row of the state block (at the exact head) says the review completed at least
+#      SETTLE_S (120) s ago: a conservative visibility delay for a review object and its threads
+#      to show, not proof that GitHub is consistent; main failed closed here before. A row with
+#      no readable time, or one later than now, fails. Inside the poll the check sleeps out the
+#      rest and runs again from the start; without enough of the wait left it fails, and a re-run
+#      decides. Measured on txehq/dagu PRs 185
 #      (b0eb595ab, every live thread a P2: failed until a manual `@codex review` posted a receipt)
 #      and 175 (0503dc32f, one open live P1, which this rule still blocks). has_any_findings null
 #      or malformed is NOT decided here: it fails as below (txe's TXE-5123 receipt-only rule for
@@ -102,6 +108,8 @@ RECEIPT_MARKER="<!-- codex-review-receipt:v1 -->"
 # against 17:23:35.8Z; PR 4022: 21:09:56Z against 21:09:57.6Z); a pass takes minutes, so 120 s
 # cannot reach a receipt of the previous pass.
 RECEIPT_WINDOW_S=120
+# The live-thread decision waits this long after the Code Review row's completion (TXE-4791).
+SETTLE_S=120
 # Every review thread of the PR with its first comment: what rule 3's live-thread read needs.
 # shellcheck disable=SC2016  # GraphQL variables, not shell ones
 THREADS_QUERY='query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -150,7 +158,24 @@ fetch() {
 # with has_any_findings true and posted neither a review of the head nor a receipt naming it: the
 # verdict on its live P0/P1 threads at the head. Never returns.
 decide_on_live_threads() {
-    local pages bad live named blocking
+    local pages bad live named blocking now completed age left
+    # ── settle: the exact head's review completed SETTLE_S ago, by its Code Review row ──
+    # CODEX_REVIEW_NOW (epoch seconds) is the test suite's clock, like CODEX_REVIEW_FIXTURE_DIR.
+    now="${CODEX_REVIEW_NOW:-$(date +%s)}"
+    case "$now" in ''|*[!0-9]*) echo "CODEX_REVIEW_NOW is whole epoch seconds" >&2; exit 2 ;; esac
+    completed="$(jq -nr --arg r "$REVIEWED" '$r | fromdateiso8601' 2>/dev/null)" || completed=""
+    case "$completed" in ''|*[!0-9]*) verdict 1 "FAIL: the connector's state block reports findings on $head with no review of it and no receipt for it, and its Code Review row carries no readable completion time, so its live threads are not decided on — comment @codex review once (a clean pass posts a receipt), then re-run this check; or a person decides on $OVERRIDE_LABEL" ;; esac
+    age=$((now - completed))
+    [ "$age" -ge 0 ] || verdict 1 "FAIL: the connector's Code Review row dates its review of $head $REVIEWED, after now, so its live threads are not decided on — re-run this check"
+    if [ "$age" -lt "$SETTLE_S" ]; then
+        left=$((wait_s - ($(date +%s) - start)))
+        if [ "$left" -ge $((SETTLE_S - age)) ]; then
+            say "waiting $((SETTLE_S - age)) s: the connector's review of $head completed $age s ago, and its live threads are read $SETTLE_S s after"
+            sleep $((SETTLE_S - age))
+            CODEX_REVIEW_WAIT_SECONDS=$((left - (SETTLE_S - age))) exec bash "$0"
+        fi
+        verdict 1 "FAIL: the connector's review of $head completed $age s ago, and with no review of it and no receipt for it its live threads are read only $SETTLE_S s after completion — re-run this check"
+    fi
     if [ -n "${CODEX_REVIEW_FIXTURE_DIR:-}" ]; then
         pages="$(cat "$CODEX_REVIEW_FIXTURE_DIR/review-threads.json")" || die_read "PR #$pr's review threads"
     else

@@ -374,12 +374,14 @@ dagu() { # dagu <pr> <case> [<file> <jq program>]... — that dagu recording, wi
         shift 2
     done
 }
-expect_dagu() { # expect_dagu <pr> <case> <exit code> <substring>
-    local n="$1" out rc
-    shift
-    : >"$TMP/$1.summary"
-    out="$(env CODEX_REVIEW_FIXTURE_DIR="$TMP/$1" GH_REPO=txehq/dagu PR_NUMBER="$n" \
-        GITHUB_STEP_SUMMARY="$TMP/$1.summary" bash "$CHECK" 2>&1)"; rc=$?
+expect_dagu() { # expect_dagu <pr> <case> <exit code> <substring> [VAR=value]...
+    local n="$1" c="$2" want_rc="$3" want="$4" out rc
+    shift 4
+    : >"$TMP/$c.summary"
+    out="$(env CODEX_REVIEW_FIXTURE_DIR="$TMP/$c" GH_REPO=txehq/dagu PR_NUMBER="$n" \
+        GITHUB_STEP_SUMMARY="$TMP/$c.summary" "$@" bash "$CHECK" 2>&1)"; rc=$?
+    printf '%s' "$out" >"$TMP/$c.out"
+    set -- "$c" "$want_rc" "$want"
     case "$rc:$out" in
         "$2:"*"$3"*) PASS=$((PASS + 1)); printf '  ok   %s (exit %s)\n' "$1" "$rc" ;;
         *) FAIL=$((FAIL + 1)); printf '  FAIL %s: want exit %s and %s\n       got exit %s:\n%s\n' "$1" "$2" "$3" "$rc" "$(printf '%s' "$out" | sed 's/^/         /')" ;;
@@ -531,6 +533,71 @@ done
 # The same for a thread that is not the P1's: PR 185's outdated P2 4414469953 with its author gone.
 gap185 unreadable-other-thread review-threads "$THREADS.nodes |= map(if .comments.nodes[0].databaseId == 4414469953 then .comments.nodes[0].author = null else . end)"
 expect_dagu 185 unreadable-other-thread 2 "$UNREADABLE"
+
+# 12n. the settle (TXE-4791): the live threads are read only 120 s after the exact head's Code
+#      Review row says the review completed (PR 185's row: 2026-10-29T16:37:34.592315Z, read to the
+#      second). CODEX_REVIEW_NOW is the check's clock; with no wait left, an unsettled review fails.
+DONE_185="$(jq -nr '"2026-10-29T16:37:34Z" | fromdateiso8601')"
+expect_settle() { # expect_settle <case> <now> <exit code> <substring> — the check at that clock
+    local out rc
+    out="$(env CODEX_REVIEW_FIXTURE_DIR="$TMP/$1" GH_REPO=txehq/dagu PR_NUMBER=185 CODEX_REVIEW_NOW="$2" \
+        GITHUB_STEP_SUMMARY=/dev/null bash "$CHECK" 2>&1)"; rc=$?
+    case "$rc:$out" in
+        "$3:"*"$4"*) PASS=$((PASS + 1)); printf '  ok   %s at +%s s (exit %s)\n' "$1" "$(($2 - DONE_185))" "$rc" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s at %s: want exit %s and %s\n       got exit %s:\n%s\n' "$1" "$2" "$3" "$4" "$rc" "$(printf '%s' "$out" | sed 's/^/         /')" ;;
+    esac
+}
+gap185 settle
+expect_settle settle $((DONE_185 + 119)) 1 "completed 119 s ago, and with no review of it and no receipt for it its live threads are read only 120 s after completion"
+expect_settle settle $((DONE_185 + 120)) 0 "the connector's live findings at $HEAD_185 are none or P2/P3"
+expect_settle settle $((DONE_185 - 1)) 1 "dates its review of $HEAD_185 2026-10-29T16:37:34Z, after now"
+# the settle gates only this path: the recorded receipt (12b's PR 185, has_any_findings false)
+# and an explicit review are decided at once, even 1 s after completion.
+dagu 185 settle-not-this-path
+expect_settle settle-not-this-path $((DONE_185 + 1)) 0 "with no review object on it, so no findings"
+dagu 185 settle-receipt-path issue-comments "$GAP185_STATE" review-threads "$GAP185_THREADS"
+expect_settle settle-receipt-path $((DONE_185 + 1)) 0 "its receipt 6502587805 at 2026-10-29T16:37:33Z says no major issues there"
+dagu 185 settle-review-path issue-comments "$GAP185_STATE" reviews "map(if .id == 5701090922 then .commit_id = \"$HEAD_185\" else . end)" \
+    review-comments 'map(if .pull_request_review_id == 5701090922 then .body |= sub("P2 Badge"; "P1 Badge") else . end)'
+expect_settle settle-review-path $((DONE_185 + 1)) 1 "has P0/P1 findings"
+# no readable completion time on the row: never decided on threads.
+gap185 settle-no-time issue-comments '.[] |= (.body |= gsub("datetime=\"[^\"]*\""; ""))'
+expect_settle settle-no-time $((DONE_185 + 600)) 1 "its Code Review row carries no readable completion time"
+gap185 settle-bad-time issue-comments '.[] |= (.body |= gsub("datetime=\"[^\"]*\""; "datetime=\"2026-13-99T99:99:99Z\""))'
+# (an impossible date in the row's shape already fails the receipt read, exit 2: never a pass)
+expect_settle settle-bad-time $((DONE_185 + 600)) 2 "could not read the connector's receipt comments"
+gap185 settle-garbled-time issue-comments '.[] |= (.body |= gsub("datetime=\"[^\"]*\""; "datetime=\"yesterday\""))'
+expect_settle settle-garbled-time $((DONE_185 + 600)) 1 "its Code Review row carries no readable completion time"
+# a settled review of another head: the exact-head rule fails it before any thread is read.
+gap185 settle-head-mismatch pull ".head.sha = \"$HEAD_UNREVIEWED\""
+expect_settle settle-head-mismatch $((DONE_185 + 600)) 1 "is of $HEAD_185, not the current head $HEAD_UNREVIEWED"
+# a P1 that appears while the check waits out the settle: inside the poll, the review completed
+# 115 s ago (by the real clock), so the check sleeps about 5 s and runs again from the start; the
+# connector's P1 thread lands 1 s in, and the run fails naming it. Without it the same run passes.
+settle_live() { # settle_live <case> — PR 185's gap shape, its review dated 115 s ago
+    local t
+    t="$(jq -nr "now - 115 | floor | todateiso8601")"
+    gap185 "$1" issue-comments ".[] |= (.body |= gsub(\"datetime=\\\"[^\\\"]*\\\"\"; \"datetime=\\\"$t\\\"\"))"
+}
+settle_live settle-p1-appears
+jq "$THREADS.nodes |= map(if .comments.nodes[0].databaseId == 4414876959 then .comments.nodes[0].body |= sub(\"P2 Badge\"; \"P1 Badge\") else . end)" \
+    "$TMP/settle-p1-appears/review-threads.json" >"$TMP/settle-p1-appears.later.json" || exit 2
+( sleep 1; mv "$TMP/settle-p1-appears.later.json" "$TMP/settle-p1-appears/review-threads.json" ) &
+expect_dagu 185 settle-p1-appears 1 "not resolved by a user: thread 4414876959 at synthetic/file1.go:424 (unresolved)" \
+    CODEX_REVIEW_WAIT_SECONDS=30 CODEX_REVIEW_POLL_SECONDS=1
+wait
+if grep -qE "^waiting [0-9]+ s: the connector's review of $HEAD_185 completed 11[0-9] s ago" "$TMP/settle-p1-appears.out"; then
+    PASS=$((PASS + 1)); printf '  ok   settle-p1-appears waited out the settle before reading the threads\n'
+else
+    FAIL=$((FAIL + 1)); printf '  FAIL settle-p1-appears: no settle wait in its output\n'
+fi
+settle_live settle-waits-then-passes
+expect_dagu 185 settle-waits-then-passes 0 "the connector's live findings at $HEAD_185 are none or P2/P3" \
+    CODEX_REVIEW_WAIT_SECONDS=30 CODEX_REVIEW_POLL_SECONDS=1
+# with less of the wait left than the settle needs, it fails rather than reading early.
+settle_live settle-no-budget
+expect_dagu 185 settle-no-budget 1 "s ago, and with no review of it and no receipt for it its live threads are read only 120 s after completion" \
+    CODEX_REVIEW_WAIT_SECONDS=2 CODEX_REVIEW_POLL_SECONDS=1
 
 # 13. The live GraphQL read (TXE-4791): no fixture directory, a stand-in gh that serves PR 175's
 #     REST reads and prints its GraphQL pages the way `gh api graphql --paginate` does, one JSON
