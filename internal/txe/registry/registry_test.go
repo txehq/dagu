@@ -247,18 +247,31 @@ func TestRegisterConcurrentDuplicates(t *testing.T) {
 	}
 	assert.Equal(t, 1, winners)
 
-	jobs, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
-	require.NoError(t, err)
-	assert.Len(t, jobs, n, "duplicates are retained, not deleted")
-
-	// Replay of the same request is idempotent; a different request reusing
-	// the job ID is refused.
 	winner := ""
 	for i, err := range errs {
 		if err == nil {
 			winner = ids[i]
 		}
 	}
+
+	// Looked up by key and put winner first, the job holding it comes first,
+	// whichever registered first; every loser follows, named as its duplicate.
+	listed, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
+	require.NoError(t, err)
+	jobs := WinnersFirst(listed)
+	require.Len(t, jobs, n, "duplicates are retained, not deleted")
+	assert.Equal(t, winner, jobs[0].JobID)
+	assert.NotEqual(t, RegistrationDuplicate, jobs[0].Registration.State)
+	for _, job := range jobs[1:] {
+		assert.Equal(t, RegistrationDuplicate, job.Registration.State)
+		assert.Equal(t, winner, job.Registration.DuplicateOf)
+	}
+	reread, err := f.store.ListJobs(f.ctx, JobFilter{JobKey: "collect:daily"})
+	require.NoError(t, err)
+	assert.Equal(t, jobs, WinnersFirst(reread), "the order is the same on every read")
+
+	// Replay of the same request is idempotent; a different request reusing
+	// the job ID is refused.
 	again, err := f.store.Register(f.ctx, RegisterInput{JobID: winner, RequestID: "r", OwnerID: f.owner, ProjectID: f.project, MachineID: f.machine, JobKey: "collect:daily", Version: f.version(1)}, cli)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), again.Revision)
@@ -957,4 +970,34 @@ func TestClaimsAreBoundToTheJobsMachine(t *testing.T) {
 	require.NoError(t, err)
 	_, err = f.tx(job.JobID, agent, func(tx *JobTx) error { return tx.CheckClaim(c.ClaimID, c.Fence) })
 	assert.Equal(t, CodeNotPermitted, code(t, err))
+}
+
+// A duplicate is listed directly after the job holding its key, which keeps
+// its own place; every other job keeps its order. A duplicate whose job is
+// not in the list stays where it was.
+func TestWinnersFirst(t *testing.T) {
+	job := func(id, state, of string) *Job {
+		j := &Job{JobID: id}
+		j.Registration.State, j.Registration.DuplicateOf = RegistrationState(state), of
+		return j
+	}
+	ids := func(jobs []*Job) []string {
+		out := make([]string, len(jobs))
+		for i, j := range jobs {
+			out[i] = j.JobID
+		}
+		return out
+	}
+	got := WinnersFirst([]*Job{
+		job("a-dup1", "duplicate", "c-win"),
+		job("b-other", "ready", ""),
+		job("c-win", "ready", ""),
+		job("d-other", "incomplete", ""),
+		job("e-dup2", "duplicate", "c-win"),
+		job("f-orphan", "duplicate", "z-not-listed"),
+		job("g-hidden", "duplicate", ""),
+		job("h-named", "ready", "c-win"),
+	})
+	assert.Equal(t, []string{"b-other", "c-win", "a-dup1", "e-dup2", "d-other", "f-orphan", "g-hidden", "h-named"}, ids(got))
+	assert.Empty(t, WinnersFirst(nil))
 }

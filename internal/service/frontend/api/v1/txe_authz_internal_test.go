@@ -698,3 +698,51 @@ func TestTxeOwnersSharedApproverMayPauseAndRetire(t *testing.T) {
 	// A CLI token of the same owner holds no approve, shared or not.
 	require.Equal(t, http.StatusForbidden, statusOf(decide(w.cliA, registry.VerdictPause)))
 }
+
+// A lost registration race stays listed, directly after the job holding its
+// key, and names that job only to a caller who can see it: B, who was shared
+// the duplicate but not A's job, sees the duplicate without duplicate_of and
+// where its own age puts it, so its place says nothing about A's job.
+func TestTxeOwnersDuplicateIsListedAfterItsJobAndNamesItOnlyToThoseWhoSeeIt(t *testing.T) {
+	w := newTwoOwners(t, "")
+	ctx := context.Background()
+	dup, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	_, err = w.reg.Register(ctx, registry.RegisterInput{JobID: dup, RequestID: "r-dup", OwnerID: w.ownerA, ProjectID: w.projectA,
+		MachineID: w.machineA, JobKey: "k", Version: ownersVersion(w.machineA, 2)}, registry.Actor{Kind: registry.ActorSystem, ID: "test"})
+	require.Equal(t, registry.CodeDuplicate, registry.ErrorCode(err))
+	scopeA, err := w.svc.Scope(w.personA, txeauth.Classify(w.personA))
+	require.NoError(t, err)
+	_, err = w.svc.Store().GrantShare(ctx, scopeA, authz.ShareGrant{
+		Resource: authz.ResourceRef{Kind: authz.KindJob, ID: dup}, GranteeOwnerID: w.ownerB,
+		Permissions: []authz.Permission{authz.PermissionView}})
+	require.NoError(t, err)
+
+	duplicateOf := func(caller context.Context) map[string]string {
+		resp, err := w.api.ListTxeJobs(caller, apigen.ListTxeJobsRequestObject{})
+		require.NoError(t, err)
+		out := map[string]string{}
+		for _, j := range resp.(apigen.ListTxeJobs200JSONResponse).Jobs {
+			out[j.JobId] = string(j.Registration.State) + " " + valueOf(j.Registration.DuplicateOf)
+		}
+		return out
+	}
+
+	// Registered after B's job, the duplicate is listed right after A's.
+	require.Equal(t, []string{w.jobA, dup, w.jobB}, w.listJobs(w.admin))
+	require.Equal(t, []string{w.jobA, dup}, w.listJobs(w.personA))
+	require.Equal(t, "duplicate "+w.jobA, duplicateOf(w.personA)[dup])
+	require.Equal(t, "duplicate "+w.jobA, duplicateOf(w.admin)[dup])
+
+	require.Equal(t, []string{w.jobB, dup}, w.listJobs(w.personB))
+	require.Equal(t, "duplicate ", duplicateOf(w.personB)[dup], "B cannot see the job holding the key")
+	got, err := w.api.GetTxeJob(w.personB, apigen.GetTxeJobRequestObject{JobId: dup})
+	require.NoError(t, err)
+	require.Empty(t, valueOf(got.(apigen.GetTxeJob200JSONResponse).Registration.DuplicateOf))
+
+	// Nothing is deleted: the record is still there, as it was.
+	stored, err := w.reg.GetJob(ctx, dup)
+	require.NoError(t, err)
+	require.Equal(t, registry.RegistrationDuplicate, stored.Registration.State)
+	require.Equal(t, w.jobA, stored.Registration.DuplicateOf)
+}

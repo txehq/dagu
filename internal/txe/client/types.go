@@ -483,13 +483,19 @@ type LifecycleRequest struct {
 const (
 	RegistrationIncomplete = "incomplete"
 	RegistrationReady      = "ready"
+	// RegistrationDuplicate is a registration that lost the race for its job
+	// key. It is kept as a record and never runs.
+	RegistrationDuplicate = "duplicate"
 )
 
 // Registration is how far a job's registration has got.
 type Registration struct {
-	State       string           `json:"state"`
-	JobKey      string           `json:"job_key"`
-	RequestID   string           `json:"request_id,omitempty"`
+	State     string `json:"state"`
+	JobKey    string `json:"job_key"`
+	RequestID string `json:"request_id,omitempty"`
+	// DuplicateOf names the job holding the key of a duplicate registration.
+	// The hub leaves it empty for a caller who cannot see that job.
+	DuplicateOf string           `json:"duplicate_of,omitempty"`
 	Package     *PackageEvidence `json:"package,omitempty"`
 	DAGVerified bool             `json:"dag_verified"`
 	ReadyAt     *time.Time       `json:"ready_at,omitempty"`

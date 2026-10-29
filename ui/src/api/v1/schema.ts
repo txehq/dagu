@@ -4214,7 +4214,7 @@ export interface paths {
         };
         /**
          * List jobs
-         * @description Lists job aggregates matching the filters, oldest first.
+         * @description Lists job aggregates matching the filters, oldest first, except that a duplicate registration (registration.state duplicate) is listed directly after the job holding its key when that job is listed too. Duplicates are kept as records and listed; registration.duplicate_of names the job holding the key only to a caller who can see that job.
          */
         get: operations["listTxeJobs"];
         put?: never;
@@ -8732,6 +8732,7 @@ export interface components {
             dedupe_key: string;
             request_id?: string;
             request_hash?: string;
+            /** @description For a duplicate registration, the job holding its key. Empty for a caller who cannot see that job. */
             duplicate_of?: string;
             package?: components["schemas"]["TxePackageEvidence"];
             dag_verified: boolean;

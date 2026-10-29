@@ -667,7 +667,9 @@ func (a *API) ListTxeJobs(ctx context.Context, req api.ListTxeJobsRequestObject)
 			return nil, err
 		}
 	}
-	out, err := txeConvert[[]api.TxeJob](jobs)
+	// Ordered after the jobs the caller cannot see are left out, so where a
+	// duplicate stands says nothing about a job the caller cannot see.
+	out, err := txeConvert[[]api.TxeJob](registry.WinnersFirst(jobs))
 	if out == nil {
 		out = []api.TxeJob{}
 	}

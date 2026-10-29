@@ -39,6 +39,7 @@ dagu txe login --hub https://<the hub's address>
    - `dagu txe list --target <part of the resource's id or name>`
    - `dagu txe list --job-key <the key you would use>`
    - If one matches, run `dagu txe inspect <job id>` and read its purpose. Update that job instead of registering a second one.
+   - A row whose registration reads `duplicate` (or `duplicate of <job id>`) lost a race to register the same key. It is kept as a record, never runs and is never reviewed. Use the job holding the key, which `list` shows directly above it when you can see that job, not the duplicate.
 
 ## Write the job spec
 
@@ -230,7 +231,7 @@ Registration prints a receipt only when the hub has marked the job ready. Until 
 |---|---|---|
 | Receipt | The job is registered and its package is in place. | Continue to "Before removing the worktree". |
 | The spec is incomplete | Listed fields are missing. | Fill them in. Do not guess a target or a purpose; ask the user. |
-| Duplicate | The job key is already registered. | `inspect` the job named in the message and update it. |
+| Duplicate | The job key is already registered. | `inspect` the job named in the message and update it. The losing registration stays listed as `duplicate of <job id>`; leave it. |
 | Incomplete, with a request id | The run was interrupted. No receipt exists. | `dagu txe resume <request id>`. This cannot create a second job. |
 | Superseded | Another session saved a later version before this one was marked ready. No receipt exists for this version; the job is unaffected. | Nothing to resume. Inspect the job and merge your change into its current version if it is still needed. |
 

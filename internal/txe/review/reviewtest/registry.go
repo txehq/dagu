@@ -200,7 +200,7 @@ func (r *Registry) DueJobs(_ context.Context, machineID string, now time.Time) (
 	var due []string
 	err := r.Update(func(s *State) error {
 		for id, job := range s.Jobs {
-			if job.MachineID != machineID || !job.Lifecycle.Reviewable() {
+			if job.MachineID != machineID || !job.Lifecycle.Reviewable() || job.Registration == review.RegistrationDuplicate {
 				continue
 			}
 			if cp := s.Checkpoints[id]; cp.NextReviewAt.After(now) {

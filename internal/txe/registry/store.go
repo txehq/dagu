@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -335,7 +336,9 @@ func (f JobFilter) match(j *Job) bool {
 	return true
 }
 
-// ListJobs returns committed job aggregates matching f, oldest first.
+// ListJobs returns committed job aggregates matching f, oldest first. A
+// listing shown to a caller orders what that caller may see with
+// WinnersFirst.
 func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, error) {
 	var out []*Job
 	cursor := ""
@@ -358,6 +361,42 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, error) {
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// WinnersFirst moves each duplicate registration to directly after the job
+// its duplicate_of names, when that job is in jobs, so a caller looking a job
+// up by key meets the job holding the key first. Duplicates of one job keep
+// their order, and every other job keeps its place relative to the rest. A
+// duplicate whose job is not in jobs stays where it is.
+//
+// Apply it only to the jobs a caller may see: ordered with a job the caller
+// cannot see, a duplicate would move to that job's place and so tell the
+// caller where it stands.
+func WinnersFirst(jobs []*Job) []*Job {
+	at := make(map[string]int, len(jobs))
+	for i, j := range jobs {
+		at[j.JobID] = i
+	}
+	type place struct{ group, rank, index int }
+	places := make(map[*Job]place, len(jobs))
+	for i, j := range jobs {
+		p := place{group: i, index: i}
+		if winner, ok := at[j.Registration.DuplicateOf]; ok && j.Registration.State == RegistrationDuplicate && winner != i {
+			p.group, p.rank = winner, 1
+		}
+		places[j] = p
+	}
+	sort.SliceStable(jobs, func(a, b int) bool {
+		pa, pb := places[jobs[a]], places[jobs[b]]
+		if pa.group != pb.group {
+			return pa.group < pb.group
+		}
+		if pa.rank != pb.rank {
+			return pa.rank < pb.rank
+		}
+		return pa.index < pb.index
+	})
+	return jobs
 }
 
 // GetVersion returns an immutable job version.
