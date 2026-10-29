@@ -123,7 +123,12 @@ func txeInspectCommand() *cobra.Command {
 		Long: `Show everything needed to understand a job without the conversation that
 created it: purpose, targets, schedule, expected outcome, lifetime and review
 policy; lifecycle, availability and anything waiting on a person; recent runs;
-and whether this machine holds the package and receipt.`,
+and whether this machine holds the package and receipt.
+
+It also names each of the job's package directories on this machine that no
+version of the job was ever marked ready with, such as the package of a
+version another session replaced before it became ready. They are kept as a
+record and nothing removes them.`,
 		Args: cobra.ExactArgs(1),
 	}, []commandLineFlag{txeRunsFlag, txeJSONFlag}, runTXEInspect)
 }
@@ -141,6 +146,34 @@ type txeLocalState struct {
 	PackageDir  string `json:"package_dir,omitempty"`
 	Problem     string `json:"problem,omitempty"`
 	ReceiptHeld bool   `json:"receipt_held"`
+	// NeverReady lists the job's package directories on this machine that no
+	// version of the job was ever marked ready with. They are kept as a record
+	// and nothing removes them.
+	NeverReady []txeNeverReady `json:"never_ready,omitempty"`
+	// NeverReadyUnknown says why the directories could not be checked.
+	NeverReadyUnknown string `json:"never_ready_unknown,omitempty"`
+}
+
+// txeNeverReady is a directory this machine holds for a job that, by the
+// registry's history, no version of the job was ever marked ready with.
+type txeNeverReady struct {
+	Dir string `json:"dir"`
+	// Digest is empty for an entry that is not a package directory.
+	Digest string `json:"digest,omitempty"`
+	// Current is set for the package of the job's current version, which a
+	// registration that is not finished yet will use.
+	Current bool `json:"current,omitempty"`
+	// Requests are the unfinished or superseded requests in this machine's
+	// journal that registered the package. A rejected request is left out:
+	// its package never left the staging area.
+	Requests []txeNeverReadyRequest `json:"requests,omitempty"`
+}
+
+type txeNeverReadyRequest struct {
+	RequestID    string      `json:"request_id"`
+	Version      int         `json:"version"`
+	Step         txepkg.Step `json:"step"`
+	SupersededBy int         `json:"superseded_by,omitempty"`
 }
 
 // txeRunsLimit is the most runs the hub returns in one listing.
@@ -193,6 +226,7 @@ func runTXEInspect(ctx *Context, args []string) error {
 	}
 
 	local := txeLocalPackage(job)
+	local.NeverReady, local.NeverReadyUnknown = txeNeverReadyPackages(ctx, client, job)
 	return txeOutput(ctx, map[string]any{"job": job.Raw, "version": version, "runs": runs, "local": local}, func(p *txePrinter) {
 		p.f("%s  %s\n\n", job.JobID, version.Title)
 		p.f("Purpose:       %s\n", version.Purpose)
@@ -219,6 +253,7 @@ func runTXEInspect(ctx *Context, args []string) error {
 		default:
 			p.f("On this machine: not usable: %s\n", local.Problem)
 		}
+		txePrintNeverReady(p, job, local)
 
 		p.f("\nRecent runs:\n")
 		if len(runs) == 0 {
@@ -286,6 +321,98 @@ func txeLocalPackage(job *txeclient.Job) txeLocalState {
 	}
 	state.Held, state.PackageDir = true, pkg.Dir
 	return state
+}
+
+// txeNeverReadyPackages reads which of the job's package directories on this
+// machine no version of the job was ever marked ready with. The registry
+// writes a ready event, naming the package digest, each time a version is
+// marked ready, and never changes or removes one, so a digest no ready event
+// names was never run as the job. It reads only, and asks the hub nothing when
+// this machine holds no directory for the job. The second result says why the
+// answer is unknown.
+func txeNeverReadyPackages(ctx *Context, client *txeclient.Client, job *txeclient.Job) ([]txeNeverReady, string) {
+	home, err := txepkg.DefaultHome()
+	if err != nil {
+		return nil, err.Error()
+	}
+	held, err := txepkg.NewStore(home).Held(job.JobID)
+	if err != nil {
+		return nil, fmt.Sprintf("list the job's package directories: %v", err)
+	}
+	if len(held) == 0 {
+		return nil, ""
+	}
+	events, err := client.JobEvents(ctx, job.JobID)
+	if err != nil {
+		return nil, fmt.Sprintf("the history of %s, needed to tell which of the %d entries of its package directory were used, could not be read: %v", job.JobID, len(held), err)
+	}
+	// The journal only adds which request left a directory; doctor reports
+	// a journal that cannot be read.
+	entries, _ := txepkg.NewJournal(home).Pending()
+	return txeNeverReadyOf(job, held, events, entries), ""
+}
+
+// txeNeverReadyOf picks out the held entries no ready event names.
+func txeNeverReadyOf(job *txeclient.Job, held []txepkg.HeldPackage, events []txeclient.Event, entries []txepkg.Entry) []txeNeverReady {
+	ready := map[string]bool{}
+	for _, e := range events {
+		if e.Kind == txeclient.EventReady {
+			for _, evidence := range e.Evidence {
+				ready[evidence] = true
+			}
+		}
+	}
+	var never []txeNeverReady
+	for _, h := range held {
+		if h.Digest != "" && ready[h.Digest] {
+			continue
+		}
+		n := txeNeverReady{Dir: h.Dir, Digest: h.Digest, Current: h.Digest != "" && h.Digest == job.PackageDigest}
+		for _, e := range entries {
+			if h.Digest != "" && e.JobID == job.JobID && e.PackageDigest == h.Digest && e.Step != txepkg.StepRejected {
+				n.Requests = append(n.Requests, txeNeverReadyRequest{RequestID: e.RequestID, Version: e.Version, Step: e.Step, SupersededBy: e.SupersededBy})
+			}
+		}
+		never = append(never, n)
+	}
+	return never
+}
+
+// txePrintNeverReady prints the package directories no ready version used.
+func txePrintNeverReady(p *txePrinter, job *txeclient.Job, local txeLocalState) {
+	if local.NeverReadyUnknown != "" {
+		p.f("Never ready:   unknown: %s\n", local.NeverReadyUnknown)
+		return
+	}
+	if len(local.NeverReady) == 0 {
+		return
+	}
+	what := "1 package directory"
+	if n := len(local.NeverReady); n != 1 {
+		what = fmt.Sprintf("%d package directories", n)
+	}
+	p.f("Never ready:   %s on this machine that no version of this job was ever marked ready with;\n", what)
+	p.f("               kept as a record, and nothing removes them\n")
+	for _, n := range local.NeverReady {
+		p.f("  %s\n", n.Dir)
+		switch {
+		case n.Digest == "":
+			p.f("      not a package directory\n")
+		case n.Current && job.Registration.State != txeclient.RegistrationReady:
+			p.f("      the current version's package; registration is %s, and finishing it uses this package\n", job.Registration.State)
+		case n.Current:
+			p.f("      the current version's package, though the job's history records no version marked ready with it\n")
+		default:
+			p.f("      the job does not use it\n")
+		}
+		for _, r := range n.Requests {
+			p.f("      version %d, request %s, %s", r.Version, r.RequestID, r.Step)
+			if r.SupersededBy > 0 {
+				p.f(" by version %d", r.SupersededBy)
+			}
+			p.f("\n")
+		}
+	}
 }
 
 // txeActorName names who made a change: the coding session when there was

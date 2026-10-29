@@ -100,7 +100,10 @@ The update names the version it was made against. If another session has
 updated the job since, it is refused and nothing changes: inspect the job,
 merge the difference into the spec and try again against the new version.
 
-Earlier versions' packages and receipts are kept.`,
+Earlier versions' packages and receipts are kept. So is the package of a
+version that was superseded before it was marked ready: nothing removes a
+package automatically, and "dagu txe inspect" lists the ones no ready version
+used.`,
 		Args: cobra.ExactArgs(1),
 	}, []commandLineFlag{txeSpecFlag, txeExpectedVersionFlag, txeSessionFlag, txeJSONFlag}, runTXEUpdate)
 }
@@ -141,7 +144,11 @@ func txeResumeCommand() *cobra.Command {
 
 The saved request is sent again exactly as it was, which the hub recognises,
 so resuming never creates a second job. Any session on this machine can resume
-a request; "dagu txe doctor" lists the unfinished ones.`,
+a request; "dagu txe doctor" lists the unfinished ones.
+
+A request whose version another session replaced before it was marked ready
+is closed as superseded, with no receipt. Its package stays on this machine as
+a record and is never removed automatically.`,
 		Args: cobra.ExactArgs(1),
 	}, []commandLineFlag{txeSessionFlag, txeJSONFlag}, func(ctx *Context, args []string) error {
 		registrar, err := txeRegistrar(ctx)
