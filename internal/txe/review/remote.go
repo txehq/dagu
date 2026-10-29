@@ -561,7 +561,11 @@ func (r *Remote) DueJobs(ctx context.Context, machineID string, now time.Time) (
 	})
 	ids := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		if Lifecycle(job.Lifecycle).Reviewable() {
+		// A duplicate registration lost the race for its key and never
+		// becomes ready: it is left out rather than skipped on every tick.
+		// Any other registration that is not ready is still listed, so the
+		// tick keeps saying, every time, why such a job is not reviewed.
+		if Lifecycle(job.Lifecycle).Reviewable() && Registration(job.Registration.State) != RegistrationDuplicate {
 			ids = append(ids, job.JobId)
 		}
 	}

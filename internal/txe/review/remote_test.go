@@ -3266,3 +3266,56 @@ func TestRemoteAJobWhoseRegistrationIsNotReadyIsSkippedNotFailed(t *testing.T) {
 	assert.Empty(t, prepared.Skipped)
 	assert.Equal(t, second, prepared.Claim.JobID)
 }
+
+// A registration that lost the race for its key is kept as a record and is
+// never listed as due, so a tick does not pick it up and skip it again on
+// every run. An interrupted registration is still listed, so the tick keeps
+// saying why it is not reviewed. The lifecycle rule is unchanged: a retired
+// job is not due either.
+func TestRemoteDueJobsLeavesOutDuplicates(t *testing.T) {
+	f := newRemoteFixture(t)
+	ctx := context.Background()
+	first := f.job()
+	actor := &apigen.TxeActor{Kind: apigen.TxeActorKindCli, Id: "cc3-test"}
+	register := func(key, requestID string) (string, error) {
+		id, err := registry.NewID(registry.PrefixJob, time.Now())
+		require.NoError(t, err)
+		spec := fmt.Sprintf("worker_selector:\n  txe.machine: %s\nsteps:\n  - name: run\n    run: /pkg/other.sh\n", first.MachineID)
+		return id, f.remote.Transport.Do(ctx, http.MethodPost, "/txe/jobs", apigen.TxeRegisterRequest{
+			JobId: id, RequestId: requestID, OwnerId: first.OwnerID, ProjectId: first.ProjectID, MachineId: first.MachineID, JobKey: key,
+			Version: apigen.TxeJobVersionInput{
+				Title: "Another monitor", Purpose: "Registered while the job holding its key exists.",
+				Package:      apigen.TxePackage{Digest: fmt.Sprintf("sha256:%064x", 9), Path: t.TempDir(), Entrypoint: "other.sh"},
+				Dag:          apigen.TxeDAGRef{Spec: spec},
+				ReviewPolicy: &apigen.TxeReviewPolicy{Brief: new("Check usage."), Cadence: new("1h")},
+			},
+			Actor: actor,
+		}, nil)
+	}
+	duplicate, err := register(first.Registration.JobKey, "r-dup")
+	require.Error(t, err, "the key is already registered")
+	incomplete, err := register("volume:vol-3", "r-new")
+	require.NoError(t, err)
+	stored, err := f.store.GetJob(ctx, duplicate)
+	require.NoError(t, err, "the duplicate is kept")
+	require.Equal(t, registry.RegistrationDuplicate, stored.Registration.State)
+	require.Equal(t, registry.LifecycleActive, stored.Lifecycle)
+
+	due, err := f.remote.DueJobs(ctx, first.MachineID, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{first.JobID, incomplete}, due)
+
+	// Asked directly, the reviewer still skips it without an error.
+	prepared, err := f.reviewer("tick-1").Prepare(ctx, duplicate)
+	require.NoError(t, err)
+	assert.Equal(t, review.SkipNotRegistered, prepared.Skipped)
+	assert.Equal(t, "registration is duplicate", prepared.SkipDetail)
+
+	_, err = f.store.WithJobTx(ctx, first.JobID, human, func(tx *registry.JobTx) error {
+		return tx.Transition(registry.Transition{Op: registry.OpRetire, Reason: registry.RetireManual})
+	})
+	require.NoError(t, err)
+	due, err = f.remote.DueJobs(ctx, first.MachineID, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, []string{incomplete}, due)
+}

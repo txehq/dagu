@@ -289,3 +289,52 @@ func TestTXEInspectNamesPackagesNoReadyVersionUsed(t *testing.T) {
 	assert.Contains(t, out, "Never ready:   unknown: the history of "+job+", needed to tell which of the 4 entries of its package directory were used, could not be read: ")
 	assert.NotContains(t, out, v4Shown)
 }
+
+// A listing by key marks a duplicate registration as such, naming the job
+// holding the key when the hub named it, and keeps the hub's order, which
+// lists that job first. inspect says the same.
+func TestTXEListMarksDuplicates(t *testing.T) {
+	f := newTXEAuthFixture(t)
+	const winner, loser, hidden = "job_01K7A5ZQ8M3N4P5R6S7T8V9W0A", "job_01K7A5ZQ8M3N4P5R6S7T8V9W0B", "job_01K7A5ZQ8M3N4P5R6S7T8V9W0C"
+	jobs := []any{
+		map[string]any{"job_id": winner, "version": 1, "lifecycle": "active", "registration": map[string]any{"state": "ready", "job_key": "collect:daily"}},
+		map[string]any{"job_id": loser, "version": 1, "lifecycle": "active", "registration": map[string]any{"state": "duplicate", "job_key": "collect:daily", "duplicate_of": winner}},
+		// The hub names the winner only to a caller who can see it.
+		map[string]any{"job_id": hidden, "version": 1, "lifecycle": "active", "registration": map[string]any{"state": "duplicate", "job_key": "collect:daily"}},
+	}
+	f.hub.Handle = func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.URL.Path == "/api/v1/txe/jobs":
+			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+		case r.URL.Path == "/api/v1/txe/jobs/"+loser:
+			cliauthtest.WriteJSON(w, http.StatusOK, jobs[1])
+		case strings.HasSuffix(r.URL.Path, "/versions/1"):
+			cliauthtest.WriteJSON(w, http.StatusOK, map[string]any{"title": "a job"})
+		default:
+			return false
+		}
+		return true
+	}
+
+	out, err := f.run("list", "--job-key", "collect:daily")
+	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	require.Len(t, lines, 4, out)
+	assert.Contains(t, lines[1], winner)
+	assert.Contains(t, lines[1], " ready ")
+	assert.Contains(t, lines[2], loser)
+	assert.Contains(t, lines[2], "duplicate of "+winner)
+	assert.Contains(t, lines[3], hidden)
+	assert.Contains(t, lines[3], " duplicate ")
+	assert.NotContains(t, lines[3], "duplicate of")
+
+	answer := f.json("list", "--job-key", "collect:daily")
+	rows := answer["jobs"].([]any)
+	require.Len(t, rows, 3)
+	assert.Equal(t, winner, rows[1].(map[string]any)["registration"].(map[string]any)["duplicate_of"])
+	assert.NotContains(t, rows[2].(map[string]any)["registration"], "duplicate_of")
+
+	out, err = f.run("inspect", loser, "--runs", "0")
+	require.NoError(t, err)
+	assert.Contains(t, out, "Registration:  duplicate of "+winner+"\n")
+}

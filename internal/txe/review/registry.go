@@ -134,7 +134,8 @@ type ProbeEvidence struct {
 type Registry interface {
 	// DueJobs lists jobs on the machine whose next review time has passed,
 	// longest overdue first, so a job with a short cadence cannot keep a
-	// longer-waiting one from ever being reviewed.
+	// longer-waiting one from ever being reviewed. A duplicate registration
+	// is never listed; another registration that is not ready is.
 	DueJobs(ctx context.Context, machineID string, now time.Time) ([]string, error)
 	Job(ctx context.Context, jobID string) (Job, error)
 	Checkpoint(ctx context.Context, jobID string) (Checkpoint, error)

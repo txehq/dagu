@@ -94,7 +94,7 @@ func runTXEList(ctx *Context, _ []string) error {
 		table.f("JOB\tKEY\tVERSION\tLIFECYCLE\tREGISTRATION\tCREATED BY\tTITLE\n")
 		for _, r := range rows {
 			table.f("%s\t%s\t%d\t%s\t%s\t%s\t%s\n", r.JobID, r.Registration.JobKey, r.Version,
-				r.Lifecycle, r.Registration.State, txeActorName(r.Created.By), r.Title)
+				r.Lifecycle, txeRegistrationText(r.Registration), txeActorName(r.Created.By), r.Title)
 		}
 		if table.err == nil {
 			table.err = tw.Flush()
@@ -277,7 +277,7 @@ func txePrintJobState(p *txePrinter, job *txeclient.Job) {
 	if job.LifecycleReason != "" {
 		p.f(" (%s)", job.LifecycleReason)
 	}
-	p.f("\nRegistration:  %s\nAvailability:  %s", job.Registration.State, job.Availability.State)
+	p.f("\nRegistration:  %s\nAvailability:  %s", txeRegistrationText(job.Registration), job.Availability.State)
 	if job.Availability.Detail != "" {
 		p.f(" (%s)", job.Availability.Detail)
 	}
@@ -413,6 +413,17 @@ func txePrintNeverReady(p *txePrinter, job *txeclient.Job, local txeLocalState) 
 			p.f("\n")
 		}
 	}
+}
+
+// txeRegistrationText is a job's registration state as listings print it. A
+// duplicate names the job holding its key when the hub named it, so a
+// listing by key says which row to use; the hub names it only to a caller
+// who can see that job.
+func txeRegistrationText(r txeclient.Registration) string {
+	if r.State == txeclient.RegistrationDuplicate && r.DuplicateOf != "" {
+		return "duplicate of " + r.DuplicateOf
+	}
+	return r.State
 }
 
 // txeActorName names who made a change: the coding session when there was
