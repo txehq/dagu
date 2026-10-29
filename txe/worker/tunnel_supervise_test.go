@@ -330,7 +330,7 @@ func TestTunnelSuperviseReadsTheWorkersHeartbeatFailures(t *testing.T) {
 	lines := []string{
 		fail("2026-10-29T15:10:00.000+08:00"), // an earlier, separate run of failures
 		`time=2026-10-29T15:15:00.000+08:00 level=INFO msg="Task execution completed successfully"`,
-		fail("2026-10-29T15:16:04.291+08:00"),
+		fail("2026-10-29T07:16:04.291Z"), // UTC as Go writes it
 		// the worker's JSON log format (log_format: json)
 		`{"time":"2026-10-29T15:16:27.000+08:00","level":"WARN","msg":"Heartbeat send failed; will retry with backoff","worker-id":"mch_x"}`,
 		`{"time":"2026-10-29T15:16:40.000+08:00","level":"WARN","msg":"Heartbeat send failed (another message)"}`,

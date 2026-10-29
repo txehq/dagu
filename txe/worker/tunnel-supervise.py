@@ -112,6 +112,8 @@ def worker_unhealthy_since(path, now_wall, gap):
             if not m:
                 continue
             stamp = m.group(1)
+        if stamp.endswith("Z"):                 # Go writes UTC as Z; fromisoformat accepts it only from 3.11
+            stamp = stamp[:-1] + "+00:00"
         try:
             t = datetime.datetime.fromisoformat(stamp)
         except ValueError:
