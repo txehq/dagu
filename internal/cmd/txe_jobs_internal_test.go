@@ -246,12 +246,14 @@ func TestTXEInspectNamesPackagesNoReadyVersionUsed(t *testing.T) {
 		Step: txepkg.StepSuperseded, PackageDigest: v4, SupersededBy: 5})
 	require.NoError(t, err)
 	v4Dir := filepath.Join(jobDir, "sha256-"+strings.Repeat("4", 64))
+	// Text output escapes what it prints, a Windows path's backslashes included.
+	v4Shown := txeclient.CleanText(v4Dir, false)
 
 	out, err = f.run("inspect", job, "--runs", "0")
 	require.NoError(t, err)
 	assert.Contains(t, out, "Never ready:   1 package directory on this machine that no version of this job was ever marked ready with;\n"+
 		"               kept as a record, and nothing removes them\n"+
-		"  "+v4Dir+"\n"+
+		"  "+v4Shown+"\n"+
 		"      the job does not use it\n"+
 		"      version 4, request req_01M4QZS6Z1HXHJFE9D82QHR2E3, superseded by version 5\n")
 	assert.NotContains(t, out, strings.Repeat("3", 64), "version 3 was ready once: its package is not listed")
@@ -285,5 +287,5 @@ func TestTXEInspectNamesPackagesNoReadyVersionUsed(t *testing.T) {
 	out, err = f.run("inspect", job, "--runs", "0")
 	require.NoError(t, err)
 	assert.Contains(t, out, "Never ready:   unknown: the history of "+job+", needed to tell which of the 4 entries of its package directory were used, could not be read: ")
-	assert.NotContains(t, out, v4Dir)
+	assert.NotContains(t, out, v4Shown)
 }
