@@ -144,11 +144,14 @@ Upgrade while no job is running, because restarting the worker ends its running 
   Pod replacement or a lost connection. kubectl can also keep running while every new stream
   through it fails ("error creating error stream ... Timeout occurred" in `tunnel.log`); launchd
   sees nothing wrong then (TXE-5369). The supervisor checks every 30 seconds that a new stream
-  works (the health endpoint, or the coordinator's HTTP/2 reply) and reads the worker's
-  `Heartbeat send failed` lines in `worker.log`. When no new stream has worked and the worker's
-  heartbeats have failed for 90 seconds (doubled for each replacement in the last hour, at most 10
-  minutes), it ends kubectl and launchd starts a fresh one. It never replaces a forward while a new
-  stream works or while the worker's heartbeats succeed, and does nothing if it cannot read
+  works (the health endpoint, or the coordinator's HTTP/2 reply) and reads `worker.log`: the
+  heartbeat's `Heartbeat send failed` lines, and the coordinator client's `CoordinatorCli
+  connection recovered` line, which it logs on the first successful call after any failure
+  (successes are otherwise silent). When no new stream has worked, and the worker has logged
+  heartbeat failures with no recovery or `Starting worker` line in between, for 90 seconds
+  (doubled for each replacement in the last hour, at most 10 minutes), it ends kubectl and launchd
+  starts a fresh one. It never replaces a forward while a new stream works, or within 90 seconds of
+  any successful call of the worker to its coordinator, and does nothing if it cannot read
   `worker.log`. A hub that stops answering entirely for over 90 seconds also meets the condition:
   the forward is then replaced once, and launchd waits up to 5 seconds (its `ThrottleInterval`)
   before the new one starts. `status.sh` prints the supervisor's latest line.

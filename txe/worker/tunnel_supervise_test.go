@@ -31,7 +31,12 @@ import (
 //	              create a stream; the worker's existing connection is healthy (no log lines)
 //	dead-all      the same, and the worker logs a heartbeat failure every 0.2 s
 //	http-dead     health is closed, the coordinator still answers; the worker logs failures
+//	flapping      new connections fail as in dead-streams; the worker's heartbeats fail and
+//	              succeed in turn (a failure line, then the client's recovery line, every 0.2 s)
 //	exit:N        exit with code N
+//
+// The worker log lines are SIMULATED: they copy the worker's message text and format, but no
+// real worker writes them here.
 //
 // It records each signal it gets in its signal file, ends on SIGTERM unless the file "stubborn"
 // exists beside the mode file, and writes its pid to the pid file.
@@ -72,10 +77,12 @@ while True:
     m = mode()
     if m.startswith("exit:"):
         sys.exit(int(m[5:]))
-    if m in ("dead-all", "http-dead"):
+    if m in ("dead-all", "http-dead", "flapping"):
         with open(worker_log, "a") as f:
             t = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="milliseconds")
             f.write(f'time={t} level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x err="context deadline exceeded"\n')
+            if m == "flapping":
+                f.write(f'time={t} level=INFO msg="CoordinatorCli connection recovered" previous-consecutive-failures=1\n')
     time.sleep(0.2)
 `
 
@@ -235,6 +242,16 @@ func TestTunnelSuperviseKeepsAForwardTheWorkerStillUses(t *testing.T) {
 	assert.NotContains(t, s.stderr.String(), "replacing")
 }
 
+// New streams fail, and the worker's heartbeats fail often but keep succeeding in between (its
+// client logs a recovery after each): the existing connection still works at times, so the
+// failures are not uninterrupted and the forward is left alone (root's review of e0e1d0ddf).
+func TestTunnelSuperviseKeepsAForwardWhileTheWorkerSometimesSucceeds(t *testing.T) {
+	s := startSupervised(t, "flapping")
+	s.stillRunning(t, 4*time.Second)
+	assert.Contains(t, s.stderr.String(), "new streams through the forward are failing")
+	assert.NotContains(t, s.stderr.String(), "replacing")
+}
+
 // Health fails but the coordinator still answers a new connection, while the worker's
 // heartbeats fail (a stall of the hub's API, not of the forward): a new stream works, so the
 // forward's connection is alive and replacing it cannot help. It is left alone.
@@ -318,54 +335,117 @@ print(json.dumps(out))
 	assert.Equal(t, []bool{false, true}, got["cap"])
 }
 
-// The worker's heartbeat failures are read from its log: the current run of failures with no
-// gap over the limit, and only when the latest is recent. Anything unreadable is no signal.
+// The worker's episode of failed coordinator calls is read from its log: the heartbeat failures
+// since its client last logged a recovery (or the worker last started), only while the latest is
+// recent. Successes are silent, so a short gap between failure lines is not continuity: one
+// recovery line in between ends the episode. Anything unreadable is no signal. Lines are
+// SIMULATED in the worker's text and JSON formats.
 func TestTunnelSuperviseReadsTheWorkersHeartbeatFailures(t *testing.T) {
 	script := supervisorScript(t)
 	dir := t.TempDir()
-	log := filepath.Join(dir, "worker.log")
 	fail := func(ts string) string {
 		return `time=` + ts + ` level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x err="context deadline exceeded"`
 	}
-	lines := []string{
-		fail("2026-10-29T15:10:00.000+08:00"), // an earlier, separate run of failures
-		`time=2026-10-29T15:15:00.000+08:00 level=INFO msg="Task execution completed successfully"`,
-		fail("2026-10-29T07:16:04.291Z"), // UTC as Go writes it
-		// the worker's JSON log format (log_format: json)
-		`{"time":"2026-10-29T15:16:27.000+08:00","level":"WARN","msg":"Heartbeat send failed; will retry with backoff","worker-id":"mch_x"}`,
-		`{"time":"2026-10-29T15:16:40.000+08:00","level":"WARN","msg":"Heartbeat send failed (another message)"}`,
-		fail("2026-10-29T07:16:40"), // no offset: cannot be placed, ignored
-		fail("2026-10-29T15:16:50.000+08:00"),
+	recovered := func(ts string) string {
+		return `time=` + ts + ` level=INFO msg="CoordinatorCli connection recovered" previous-consecutive-failures=2`
 	}
-	require.NoError(t, os.WriteFile(log, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+	write := func(name string, lines ...string) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+		return path
+	}
+	logs := map[string]string{
+		// uninterrupted: the episode starts at the first failure after the recovery
+		"steady": write("steady.log",
+			fail("2026-10-29T15:10:00.000+08:00"),
+			recovered("2026-10-29T15:12:00.000+08:00"),
+			`time=2026-10-29T15:15:00.000+08:00 level=INFO msg="Task execution completed successfully"`,
+			fail("2026-10-29T07:16:04.291Z"), // UTC as Go writes it
+			// the worker's JSON log format (log_format: json)
+			`{"time":"2026-10-29T15:16:27.000+08:00","level":"WARN","msg":"Heartbeat send failed; will retry with backoff","worker-id":"mch_x"}`,
+			`{"time":"2026-10-29T15:16:40.000+08:00","level":"WARN","msg":"Heartbeat send failed (another message)"}`,
+			fail("2026-10-29T07:16:40"), // no offset: cannot be placed, ignored
+			fail("2026-10-29T15:16:50.000+08:00")),
+		// failures every 30 s, each followed by a recovery within a second: never uninterrupted
+		"flapping": write("flapping.log",
+			fail("2026-10-29T15:15:00.000+08:00"), recovered("2026-10-29T15:15:01.000+08:00"),
+			fail("2026-10-29T15:15:30.000+08:00"), recovered("2026-10-29T15:15:31.000+08:00"),
+			fail("2026-10-29T15:16:00.000+08:00"), recovered("2026-10-29T15:16:01.000+08:00"),
+			fail("2026-10-29T15:16:30.000+08:00"), recovered("2026-10-29T15:16:31.000+08:00"),
+			fail("2026-10-29T15:16:50.000+08:00")),
+		// the same in the JSON format
+		"flapping_json": write("flapping.json.log",
+			`{"time":"2026-10-29T07:15:00Z","level":"WARN","msg":"Heartbeat send failed; will retry with backoff"}`,
+			`{"time":"2026-10-29T07:16:31Z","level":"INFO","msg":"CoordinatorCli connection recovered","previous-consecutive-failures":3}`,
+			`{"time":"2026-10-29T07:16:50Z","level":"WARN","msg":"Heartbeat send failed; will retry with backoff"}`),
+		// a worker restart in between: its new client starts clean, so the episode restarts
+		"restarted": write("restarted.log",
+			fail("2026-10-29T15:15:00.000+08:00"),
+			`time=2026-10-29T15:16:10.000+08:00 level=INFO msg="Starting worker" worker-id=mch_x max-concurrency=100`,
+			fail("2026-10-29T15:16:20.000+08:00"),
+			fail("2026-10-29T15:16:50.000+08:00")),
+		// a silent stretch longer than the gap: not shown to be one episode
+		"gap": write("gap.log",
+			fail("2026-10-29T15:14:00.000+08:00"),
+			fail("2026-10-29T15:16:20.000+08:00"),
+			fail("2026-10-29T15:16:50.000+08:00")),
+	}
 	program := `
 import datetime, importlib.util, json, sys
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
 at = lambda s: datetime.datetime.fromisoformat(s).timestamp()
-def since(now):
-    v = ts.worker_unhealthy_since(sys.argv[2], at(now), 45)
+def since(path, now):
+    v = ts.worker_unhealthy_since(path, at(now), 45)
     return None if v is None else datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
-print(json.dumps({"now": since("2026-10-29T07:17:00+00:00"), "stale": since("2026-10-29T07:18:00+00:00"),
-                  "missing": ts.worker_unhealthy_since(sys.argv[2] + ".absent", at("2026-10-29T07:17:00+00:00"), 45)}))
+logs = json.loads(sys.argv[2])
+out = {k: since(p, "2026-10-29T07:17:00+00:00") for k, p in logs.items()}
+out["stale"] = since(logs["steady"], "2026-10-29T07:18:00+00:00")
+out["missing"] = since(logs["steady"] + ".absent", "2026-10-29T07:17:00+00:00")
+print(json.dumps(out))
 `
-	stdout, stderr, err := python(t, "-c", program, script, log)
+	arg, err := json.Marshal(logs)
+	require.NoError(t, err)
+	stdout, stderr, err := python(t, "-c", program, script, string(arg))
 	require.NoError(t, err, stderr)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
-	assert.Equal(t, "2026-10-29T07:16:04.291000+00:00", got["now"])
+	assert.Equal(t, "2026-10-29T07:16:04.291000+00:00", got["steady"])
+	assert.Equal(t, "2026-10-29T07:16:50+00:00", got["flapping"], "only the failure after the last recovery counts")
+	assert.Equal(t, "2026-10-29T07:16:50+00:00", got["flapping_json"])
+	assert.Equal(t, "2026-10-29T07:16:20+00:00", got["restarted"])
+	assert.Equal(t, "2026-10-29T07:16:20+00:00", got["gap"])
 	assert.Nil(t, got["stale"])
 	assert.Nil(t, got["missing"])
 }
 
-// The supervisor looks for the worker's own heartbeat failure message; if the worker's wording
-// changes, this fails instead of the supervisor silently seeing no failures.
-func TestTunnelSuperviseMatchesTheWorkersMessage(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("..", "..", "internal", "service", "worker", "worker.go"))
-	require.NoError(t, err)
-	assert.Contains(t, string(src), `logger.Warn(ctx, "Heartbeat send failed; will retry with backoff",`)
+// The supervisor reads three of the worker's own log messages. Each is pinned to the code that
+// emits it, together with what the supervisor relies on: every heartbeat goes through attemptCall,
+// which records each failure, and recordSuccess logs the recovery on the first success after a
+// recorded failure. If any of this changes, this fails instead of the supervisor misreading.
+func TestTunnelSuperviseMatchesTheWorkersMessages(t *testing.T) {
+	read := func(parts ...string) string {
+		b, err := os.ReadFile(filepath.Join(append([]string{"..", ".."}, parts...)...))
+		require.NoError(t, err)
+		return string(b)
+	}
+	worker := read("internal", "service", "worker", "worker.go")
+	client := read("internal", "service", "coordinator", "client.go")
+	assert.Contains(t, worker, `logger.Warn(ctx, "Heartbeat send failed; will retry with backoff",`)
+	assert.Contains(t, worker, `logger.Info(ctx, "Starting worker",`)
+	assert.Contains(t, client, `logger.Info(ctx, "CoordinatorCli connection recovered",`)
+	assert.Contains(t, client, `if !cli.state.IsConnected && cli.state.ConsecutiveFails > 0 {`)
+	hb := client[strings.Index(client, "func (cli *clientImpl) Heartbeat("):]
+	hb = hb[:strings.Index(hb, "\nfunc ")]
+	assert.Contains(t, hb, "cli.attemptCall(", "the heartbeat must go through attemptCall")
+	attempt := client[strings.Index(client, "func (cli *clientImpl) attemptCall("):]
+	attempt = attempt[:strings.Index(attempt, "\nfunc ")]
+	assert.Equal(t, 3, strings.Count(attempt, "cli.recordFailure(err)"), "every failed attempt is recorded")
+	assert.Contains(t, attempt, "cli.recordSuccess(ctx)")
 	sup, err := os.ReadFile(supervisorScript(t))
 	require.NoError(t, err)
-	assert.Contains(t, string(sup), `HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"`)
-	assert.Contains(t, string(sup), `HEARTBEAT_FAILED = 'msg="Heartbeat send failed'`)
+	for _, want := range []string{`HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"`,
+		`RECOVERED_MSG = "CoordinatorCli connection recovered"`, `STARTED_MSG = "Starting worker"`} {
+		assert.Contains(t, string(sup), want)
+	}
 }

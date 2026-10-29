@@ -16,16 +16,20 @@ Every --interval seconds after --grace it checks two things:
   new streams    GET /api/v1/health on the UI port answers 200, and the coordinator port
                  answers an HTTP/2 client preface with a SETTINGS frame. Each opens a new
                  local connection, so each needs a new stream through the forward.
-  the worker     the worker's existing coordinator connection, read from its own log (text or
-                 JSON format): the heartbeat it sends every second logs "Heartbeat send failed"
-                 on each failure (internal/service/worker/worker.go) and nothing on success.
+  the worker     whether ANY call of the worker to its coordinator has succeeded, read from the
+                 worker's own log (text or JSON format). Its heartbeat, sent every second over
+                 its existing connection, logs "Heartbeat send failed" on each failure; its
+                 coordinator client logs "CoordinatorCli connection recovered" on the first
+                 success after any failure. Successes are otherwise silent, so the gap between
+                 failure lines proves nothing: only the absence of a recovery (or worker start)
+                 line since the first failure shows the failures were uninterrupted.
 
 New streams count as failing only when both probes fail: one that works shows the forward's
 connection is alive. It replaces the forward only when new streams and the worker are both
 unhealthy for the required time, measured from the first failed round: every round has failed
 both probes since then (monotonic clock),
-and the worker has logged heartbeat failures with no gap over --worker-gap seconds for that
-long, the last one within --worker-gap. New streams failing while the worker's heartbeats
+and the worker has logged heartbeat failures with no recovery or start line in between (and no
+gap over --worker-gap seconds) for that long, the last one within --worker-gap. New streams failing while the worker's heartbeats
 succeed (the existing stream still works) never restarts it. Neither does a worker log that is
 missing or unreadable: the forward is then left as launchd would leave it. The required time is
 --unhealthy-after, doubled for each replacement in the last hour (at most --max-unhealthy-after).
@@ -39,10 +43,13 @@ import argparse, datetime, json, os, re, signal, socket, subprocess, sys, time, 
 
 EXIT_REPLACED = 75
 PREFIX = "tunnel-supervise:"
-# The worker's own message (internal/service/worker/worker.go); txe/worker's tests pin it.
+# The worker's own messages; txe/worker's tests pin each one to its source:
+# internal/service/worker/worker.go (heartbeat failure, start) and
+# internal/service/coordinator/client.go (the first success after a failure).
 HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"
-HEARTBEAT_FAILED = 'msg="Heartbeat send failed'
-_TIME = re.compile(r'^time=(\S+)')
+RECOVERED_MSG = "CoordinatorCli connection recovered"
+STARTED_MSG = "Starting worker"
+_TEXT = re.compile(r'^time=(\S+) level=\S+ msg="((?:[^"\\]|\\.)*)"')
 # HTTP/2 client connection preface and an empty SETTINGS frame (RFC 9113 3.4, 6.5).
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 H2_SETTINGS = 0x4
@@ -84,9 +91,43 @@ def probe_h2(port, timeout):
         return False
 
 
+def _record(line):
+    """(message, unix time) of one worker log line in its text or JSON format, or None."""
+    if line.startswith("{"):                    # log_format: json
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(rec, dict) or not isinstance(rec.get("msg"), str) or not isinstance(rec.get("time"), str):
+            return None
+        msg, stamp = rec["msg"], rec["time"]
+    else:                                       # the default text format: time=... level=... msg="..."
+        m = _TEXT.match(line)
+        if not m:
+            return None
+        stamp, msg = m.group(1), m.group(2)
+    if msg not in (HEARTBEAT_MSG, RECOVERED_MSG, STARTED_MSG):
+        return None
+    if stamp.endswith("Z"):                     # Go writes UTC as Z; fromisoformat accepts it only from 3.11
+        stamp = stamp[:-1] + "+00:00"
+    try:
+        t = datetime.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        return None                             # a naive time cannot be placed: not evidence
+    return msg, t.timestamp()
+
+
 def worker_unhealthy_since(path, now_wall, gap):
-    """The wall time the worker's current run of heartbeat failures began, or None when the worker
-    is not failing now (no failure within `gap` seconds) or its log cannot be read."""
+    """The wall time from which no call of the worker to its coordinator has succeeded, or None.
+
+    The worker's coordinator client logs RECOVERED_MSG on the first successful call after any
+    recorded failure (internal/service/coordinator/client.go recordSuccess), and every heartbeat
+    goes through it. So the current episode starts at the first heartbeat failure after the latest
+    recovery or worker start; a single success anywhere in between ends the episode. A failure
+    gap over `gap` seconds, or no failure within `gap` of now, is also no evidence (the worker may
+    have stopped, or stopped failing without a recorded failure). An unreadable log is None."""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -94,41 +135,21 @@ def worker_unhealthy_since(path, now_wall, gap):
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    times = []
+    failures = []
     for line in text.splitlines():
-        # The worker's text format (the default) or its JSON format (log_format: json).
-        if line.startswith("{"):
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict) or rec.get("msg") != HEARTBEAT_MSG or not isinstance(rec.get("time"), str):
-                continue
-            stamp = rec["time"]
-        else:
-            if HEARTBEAT_FAILED not in line:
-                continue
-            m = _TIME.match(line)
-            if not m:
-                continue
-            stamp = m.group(1)
-        if stamp.endswith("Z"):                 # Go writes UTC as Z; fromisoformat accepts it only from 3.11
-            stamp = stamp[:-1] + "+00:00"
-        try:
-            t = datetime.datetime.fromisoformat(stamp)
-        except ValueError:
+        rec = _record(line)
+        if rec is None:
             continue
-        if t.tzinfo is None:
-            continue                            # a naive time cannot be placed: not evidence
-        times.append(t.timestamp())
-    if not times or now_wall - times[-1] > gap:
+        msg, t = rec
+        if msg == HEARTBEAT_MSG:
+            if failures and t - failures[-1] > gap:
+                failures = []                   # a silent stretch: not shown to be one episode
+            failures.append(t)
+        else:
+            failures = []                       # a success, or a new worker process
+    if not failures or now_wall - failures[-1] > gap:
         return None
-    start = times[-1]
-    for t in reversed(times[:-1]):
-        if start - t > gap:
-            break
-        start = t
-    return start
+    return failures[0]
 
 
 class Verdict:
