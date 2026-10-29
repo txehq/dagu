@@ -926,11 +926,34 @@ func (r *Reviewer) escalate(ctx context.Context, claim Claim, job Job, action Ac
 // the stored proposal when one with this id already exists, so its locator
 // is checked first: the reviewer enqueues, with its own credential, only the
 // run it derives for this proposal, never a run a stored record names.
+//
+// It then reads the proposal back (TXE-4052). A job update can supersede the
+// proposal just before its run is opened, and another tick's CloseSuperseded
+// may already have looked for the run, found none and recorded that as final;
+// nothing else would close the run then. So the reviewer closes the run it has
+// just opened itself, as CloseSuperseded would. A supersession after this
+// read is caught by the next tick's CloseSuperseded, which then finds the run.
 func (r *Reviewer) openDecision(ctx context.Context, proposal Proposal) error {
 	if proposal.NativeTask != r.taskLocator(proposal.ID) {
 		return fmt.Errorf("proposal %s is stored with a task locator that is not its decision run", proposal.ID)
 	}
-	return r.Opener.OpenDecision(ctx, proposal)
+	if err := r.Opener.OpenDecision(ctx, proposal); err != nil {
+		return err
+	}
+	current, err := r.Registry.Proposal(ctx, proposal.JobID, proposal.ID)
+	if err != nil {
+		return fmt.Errorf("read proposal %s back after opening its decision run: %w", proposal.ID, err)
+	}
+	if current.State != ProposalSuperseded {
+		return nil
+	}
+	// closeOne completes a task only when the stored locator is this
+	// proposal's own run, and records any other as refused, untouched.
+	closure := r.closeOne(ctx, current)
+	if _, err := r.Registry.RecordClosure(ctx, closure); err != nil {
+		return fmt.Errorf("record closure of proposal %s: %w", proposal.ID, err)
+	}
+	return nil
 }
 
 func (r *Reviewer) taskLocator(proposalID string) TaskLocator {

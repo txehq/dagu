@@ -99,15 +99,22 @@ type opener struct {
 	closed map[string]int
 	// close decides what closing a proposal's run finds; closed when nil.
 	close func(p review.Proposal) (review.ClosureOutcome, error)
+	// onOpen, when set, runs once the run is open and before OpenDecision
+	// returns: what happens there happens between opening and the read-back.
+	onOpen func(p review.Proposal)
 }
 
 func (o *opener) OpenDecision(_ context.Context, p review.Proposal) error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.opened == nil {
 		o.opened = map[string]int{}
 	}
 	o.opened[p.NativeTask.RunID]++
+	hook := o.onOpen
+	o.mu.Unlock()
+	if hook != nil {
+		hook(p)
+	}
 	return nil
 }
 
@@ -1574,6 +1581,132 @@ func TestClosureRecordsWhatItActuallyFound(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out.Skipped, "superseded")
 	assert.Equal(t, 0, f.effects.count("expand_volume"))
+}
+
+// changeJob moves the job to a new version, which supersedes its open
+// proposals, as a job update between two of the reviewer's calls would.
+func (f *fixture) changeJob(version int) {
+	f.t.Helper()
+	changed := fixtureJob()
+	changed.Version = version
+	changed.PackageDigest = fmt.Sprintf("sha256:v%d", version)
+	require.NoError(f.t, f.registry.PutJob(changed))
+}
+
+// TXE-4052: the job is updated while the reviewer opens a proposal's decision
+// run, so the proposal is superseded before the reviewer reads it back. The
+// reviewer closes the run it has just opened itself, records that as a system
+// closure, and no later tick closes it again.
+func TestDecisionRunOpenedOnASupersededProposalIsClosedByItsReviewer(t *testing.T) {
+	f := newFixture(t)
+	f.opener.onOpen = func(review.Proposal) { f.changeJob(2) }
+
+	// The job update ends the reviewer's claim, so the rest of its review is
+	// abandoned (TXE-4034); whatever Apply returns, the run must not be left
+	// waiting.
+	_, _ = f.reviewer("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"),
+		review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "100"})}})
+
+	s := f.state()
+	require.Len(t, s.Proposals[jobID], 1)
+	p := s.Proposals[jobID][0]
+	require.Equal(t, review.ProposalSuperseded, p.State)
+	assert.Equal(t, 1, f.opener.opened[p.NativeTask.RunID])
+	assert.Equal(t, 1, f.opener.closed[p.NativeTask.RunID], "the run opened on a superseded proposal is closed")
+	require.Len(t, s.Closures[p.ID], 1)
+	assert.Equal(t, review.ClosureClosed, s.Closures[p.ID][0].Outcome)
+	assert.Equal(t, "reviewer-a", s.Closures[p.ID][0].By)
+	assert.Contains(t, s.Closures[p.ID][0].Reason, "superseded")
+	assert.Empty(t, s.Decisions[jobID], "a system closure is not a decision by anyone")
+
+	// The sweeper has nothing left to do, and closes nothing twice.
+	done, err := f.reviewer("sweeper").CloseSuperseded(context.Background(), fixtureJob().MachineID)
+	require.NoError(t, err)
+	assert.Empty(t, done)
+	assert.Equal(t, 1, f.opener.closed[p.NativeTask.RunID])
+}
+
+// TXE-4052, the case as filed: the proposal is superseded and another tick's
+// CloseSuperseded runs before the run exists. It finds no run and records
+// run_missing, which is final. The run the reviewer then opens is still closed,
+// by the reviewer's read-back.
+func TestDecisionRunOpenedAfterTheSweeperFoundNoneIsStillClosed(t *testing.T) {
+	f := newFixture(t)
+	notYetOpen := map[string]bool{}
+	f.opener.close = func(p review.Proposal) (review.ClosureOutcome, error) {
+		if notYetOpen[p.ID] {
+			return review.ClosureMissing, nil
+		}
+		return review.ClosureClosed, nil
+	}
+	ctx := context.Background()
+	machine := fixtureJob().MachineID
+	f.opener.onOpen = func(p review.Proposal) {
+		// Ordered as the race: the update and the sweep land first, then the
+		// run is open when the reviewer reads back.
+		f.changeJob(2)
+		notYetOpen[p.ID] = true
+		done, err := f.reviewer("sweeper").CloseSuperseded(ctx, machine)
+		require.NoError(t, err)
+		require.Len(t, done, 1)
+		require.Equal(t, review.ClosureMissing, done[0].Outcome)
+		notYetOpen[p.ID] = false
+	}
+	_, _ = f.reviewer("reviewer-a").Apply(ctx, f.prepare("reviewer-a"),
+		review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "100"})}})
+
+	p := f.state().Proposals[jobID][0]
+	assert.Equal(t, 2, f.opener.closed[p.NativeTask.RunID], "the sweeper's look found nothing; the reviewer's close found the run")
+	closures := f.state().Closures[p.ID]
+	require.Len(t, closures, 2)
+	assert.Equal(t, review.ClosureMissing, closures[0].Outcome)
+	assert.Equal(t, "sweeper", closures[0].By)
+	assert.Equal(t, review.ClosureClosed, closures[1].Outcome)
+	assert.Equal(t, "reviewer-a", closures[1].By)
+}
+
+// The read-back leaves an open proposal's run waiting, as before. When the
+// job changes only after the read-back, the next tick's CloseSuperseded is the
+// backstop that closes the run, exactly once.
+func TestDecisionRunSupersededAfterTheReadBackIsClosedByTheNextTick(t *testing.T) {
+	f := newFixture(t)
+	f.apply("reviewer-a", f.prepare("reviewer-a"),
+		review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "100"})}})
+	p := f.state().Proposals[jobID][0]
+	require.Equal(t, review.ProposalOpen, p.State)
+	assert.Equal(t, 1, f.opener.opened[p.NativeTask.RunID])
+	assert.Zero(t, f.opener.closed[p.NativeTask.RunID], "an open proposal's run keeps waiting for its answer")
+	assert.Empty(t, f.state().Closures[p.ID])
+
+	f.changeJob(2)
+	done, err := f.reviewer("sweeper").CloseSuperseded(context.Background(), fixtureJob().MachineID)
+	require.NoError(t, err)
+	require.Len(t, done, 1)
+	assert.Equal(t, review.ClosureClosed, done[0].Outcome)
+	assert.Equal(t, 1, f.opener.closed[p.NativeTask.RunID])
+}
+
+// When the proposal read back is superseded but its stored locator is not the
+// run the reviewer derives for it, nothing is completed with the reviewer's
+// credential: the closure is recorded as refused, as CloseSuperseded does.
+func TestDecisionReadBackRefusesAForeignLocator(t *testing.T) {
+	f := newFixture(t)
+	foreign := review.TaskLocator{DAG: "production-release", RunID: "release-42", StepID: "approve"}
+	f.opener.onOpen = func(review.Proposal) {
+		f.changeJob(2)
+		require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+			s.Proposals[jobID][0].NativeTask = foreign
+			return nil
+		}))
+	}
+	_, _ = f.reviewer("reviewer-a").Apply(context.Background(), f.prepare("reviewer-a"),
+		review.AgentDecision{Outcome: review.OutcomeAct, Reasoning: "Grow it.", Actions: []review.AgentAction{act("expand_volume", map[string]string{"size_gb": "100"})}})
+
+	p := f.state().Proposals[jobID][0]
+	assert.Zero(t, f.opener.closed["release-42"], "a foreign task was completed with the reviewer's credential")
+	assert.Empty(t, f.opener.closed, "nothing is closed on a mismatched locator")
+	require.Len(t, f.state().Closures[p.ID], 1)
+	assert.Equal(t, review.ClosureRefused, f.state().Closures[p.ID][0].Outcome)
 }
 
 // Security finding: the registry returns the stored proposal when its id
