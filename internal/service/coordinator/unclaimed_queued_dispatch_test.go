@@ -478,3 +478,173 @@ func TestAQueueItemPublishedAfterThePassReadIsNotMissed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, records, 1)
 }
+
+// enqueue puts the run in the queue its status names, as the scheduler holds
+// a queued run until a dispatch of it is published, and returns that queue.
+func (f *strandedFixture) enqueue(t *testing.T) string {
+	t.Helper()
+	found, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	st, err := found.ReadStatus(t.Context())
+	require.NoError(t, err)
+	require.NotEmpty(t, st.ProcGroup)
+	require.NoError(t, f.h.queueStore.Enqueue(t.Context(), st.ProcGroup, queue.QueuePriorityLow, f.ref))
+	return st.ProcGroup
+}
+
+// dequeue takes the run out of name, as the scheduler does once a dispatch of
+// it is published.
+func (f *strandedFixture) dequeue(t *testing.T, name string) {
+	t.Helper()
+	items, err := f.h.queueStore.List(t.Context(), name)
+	require.NoError(t, err)
+	for _, item := range items {
+		if ref, err := item.Data(); err == nil && *ref == f.ref {
+			_, err = f.h.queueStore.DeleteByItemIDs(t.Context(), name, []string{item.ID()})
+			require.NoError(t, err)
+		}
+	}
+}
+
+// The queue keeps a run whose dispatch fails and dispatches it again, here for
+// well past the age at which a journal entry is judged. Its execution is never
+// failed meanwhile, and the entry keeps the age of the first dispatch: the
+// queue's hold, not a refreshed age, is what protects it. The last dispatch is
+// published and the queue lets the run go. While its task can still be claimed,
+// or a lease names the execution, it is left. Once the task expired unclaimed
+// and nothing names it, the next pass fails it, however many dispatches came
+// before, and a dispatch of it after that is refused, so nothing revives it.
+func TestRepeatedFailedQueuedDispatchesFailTheExecutionOnlyAfterTheLastExpires(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	dispatches := &scriptedEnqueueStore{
+		DispatchTaskStore: store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "distributed")),
+			store.WithDispatchReservationTTL(shortReservation)),
+		fail: map[int]bool{0: true, 1: true, 2: true},
+	}
+	f := newStrandedFixture(t, dispatches)
+	const marker = "2026-10-30T09:00:00+08:00"
+	queued := f.writeQueued(t, "", marker)
+	queueName := f.enqueue(t)
+	req := f.queuedDispatch(t)
+
+	preparedAt := ""
+	for i, age := range []time.Duration{11 * time.Minute, 45 * time.Minute, 3 * time.Hour} {
+		_, err := f.h.Dispatch(t.Context(), req)
+		require.Error(t, err, "dispatch %d fails to publish", i)
+		f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(age))
+		entries := f.preparationEntries(t)
+		require.Len(t, entries, 1, "after dispatch %d", i)
+		if preparedAt == "" {
+			preparedAt = entries[0].PreparedAt
+		}
+		assert.Equal(t, preparedAt, entries[0].PreparedAt, "the entry keeps the age of the first dispatch")
+		assert.Empty(t, f.records(t), "the queue still holds the run after dispatch %d", i)
+	}
+
+	_, err := f.h.Dispatch(t.Context(), req)
+	require.NoError(t, err, "the fourth dispatch is published")
+	f.dequeue(t, queueName)
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Empty(t, f.records(t), "its task can still be claimed")
+
+	now := time.Now().UTC().UnixMilli()
+	require.NoError(t, f.leases.Upsert(t.Context(), dispatch.DAGRunLease{
+		AttemptKey: f.attemptKey(queued), DAGRun: f.ref, Root: f.ref, AttemptID: queued,
+		WorkerID: "worker-1", ClaimedAt: now, LastHeartbeatAt: now,
+	}))
+	time.Sleep(3 * shortReservation)
+	_, err = f.dispatches.HasOutstandingAttempt(t.Context(), f.attemptKey(queued), 0)
+	require.NoError(t, err)
+	time.Sleep(3 * shortReservation)
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	assert.Empty(t, f.records(t), "a lease names the execution")
+
+	require.NoError(t, f.leases.Delete(t.Context(), f.attemptKey(queued)))
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
+	require.NoError(t, err)
+	require.NotNil(t, record, "the last dispatch expired unclaimed and nothing names the execution")
+	assert.Empty(t, f.preparationEntries(t))
+	found, err := f.repository.FindAttempt(t.Context(), f.ref)
+	require.NoError(t, err)
+	st, err := found.ReadStatus(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, ir.Failed, st.Status)
+
+	_, err = f.h.Dispatch(t.Context(), req)
+	require.Error(t, err, "the failed execution is not dispatched again")
+	assert.Empty(t, f.preparationEntries(t), "nor journaled again")
+}
+
+// failingQueueStore cannot list its queues.
+type failingQueueStore struct{ queue.QueueStore }
+
+func (failingQueueStore) QueueList(context.Context) ([]string, error) {
+	return nil, errors.New("queue index unreadable")
+}
+
+// A queue that cannot be read is unknown, never empty: the execution is left.
+func TestReconcileLeavesAQueuedExecutionWhenTheQueuesCannotBeRead(t *testing.T) {
+	t.Parallel()
+	f := newStrandedFixture(t, nil)
+	f.h.queueStore = failingQueueStore{QueueStore: f.h.queueStore}
+	run := f.writeQueuedRun(t, "unreadable-queue-run", "2026-10-30T09:10:00+08:00", strandedDAG)
+
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(24*time.Hour))
+
+	assert.Len(t, f.preparationEntries(t), 1)
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+// A coordinator without a queue store cannot tell whether a queue still holds
+// a run. It journals no queued execution, so it never fails one on the age of
+// an entry. An entry an earlier configuration left is left unjudged however
+// old, ended once its execution settles, and judged as usual by a coordinator
+// that has a queue store.
+func TestWithoutAQueueStoreAQueuedExecutionIsNeitherJournaledNorFailed(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newStrandedFixture(t, nil)
+	queues := f.h.queueStore
+	f.h.queueStore = nil
+	f.writeQueued(t, "", "2026-10-30T09:20:00+08:00")
+	for range 2 {
+		_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+		require.NoError(t, err)
+	}
+	assert.Empty(t, f.preparationEntries(t), "a queued execution is not journaled")
+
+	legacy := f.writeQueuedRun(t, "legacy-run", "2026-10-30T09:21:00+08:00", strandedDAG)
+	settled := f.writeQueuedRun(t, "settled-run", "2026-10-30T09:22:00+08:00", strandedDAG)
+	for _, age := range []time.Duration{time.Hour, 30 * 24 * time.Hour} {
+		f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(age))
+		assert.Len(t, f.preparationEntries(t), 2, "left unjudged at age %s", age)
+	}
+	for _, run := range []ir.DAGRunRef{legacy, settled} {
+		records, err := f.repository.ListAttemptAbandonments(t.Context(), run, ir.DAGRunRef{})
+		require.NoError(t, err)
+		assert.Empty(t, records)
+	}
+
+	// The settled run's execution is handed to a worker.
+	attempt, err := f.repository.FindAttempt(t.Context(), settled)
+	require.NoError(t, err)
+	st, err := attempt.ReadStatus(t.Context())
+	require.NoError(t, err)
+	st.Status, st.WorkerID = ir.Running, "worker-1"
+	require.NoError(t, attempt.Open(t.Context()))
+	require.NoError(t, attempt.Write(t.Context(), *st))
+	require.NoError(t, attempt.Close(t.Context()))
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+	entries := f.preparationEntries(t)
+	require.Len(t, entries, 1, "the settled entry is ended")
+	assert.Equal(t, legacy, entries[0].Run)
+
+	f.h.queueStore = queues
+	f.h.reconcileAbandonedPreparations(t.Context(), time.Now().Add(time.Hour))
+	records, err := f.repository.ListAttemptAbandonments(t.Context(), legacy, ir.DAGRunRef{})
+	require.NoError(t, err)
+	assert.Len(t, records, 1, "with a queue store that does not hold the run, it is failed")
+	assert.Empty(t, f.preparationEntries(t))
+}

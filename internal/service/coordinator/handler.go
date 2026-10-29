@@ -166,6 +166,12 @@ type Handler struct {
 	// once rather than on every pass.
 	inFlightPreparationsMu sync.Mutex
 	inFlightPreparations   map[string]struct{}
+	// queueUnknownPreparations names, likewise, the entries of queued
+	// executions the last pass left because there is no queue store.
+	queueUnknownPreparations map[string]struct{}
+	// unjournaledQueuedWarning says once that queued executions are published
+	// unjournaled because there is no queue store.
+	unjournaledQueuedWarning sync.Once
 
 	// queueStore lets reconciliation see that a queued execution is still
 	// owned by its queue; see HandlerConfig.QueueStore.
@@ -283,7 +289,9 @@ type HandlerConfig struct {
 
 	// QueueStore is read by reconciliation: a queued execution whose run is
 	// still in its queue is not failed as undispatched, since the queue will
-	// dispatch it again. Optional - when nil, that check is skipped.
+	// dispatch it again. Optional, but without it a queued execution is
+	// neither journaled nor ever failed as undispatched: whether a queue
+	// still holds it cannot be known.
 	QueueStore queue.QueueStore
 
 	// StaleHeartbeatThreshold is the duration after which a worker's heartbeat
@@ -1047,8 +1055,20 @@ func (h *Handler) createAttemptForTask(ctx context.Context, task *coordinatorv1.
 // a writer that sets none) names no execution to journal or abandon. It is
 // published unjournaled, as before journaling existed, and reconciliation
 // never fails it: refusing it would discard its queue item and strand the run.
+//
+// So is every queued execution when this coordinator has no queue store: it
+// could never read whether a queue still holds the run, and failing the
+// execution on the entry's age alone could fail one the queue is still
+// dispatching. The coordinator says so once.
 func (h *Handler) beginQueuedExecutionPreparation(ctx context.Context, run ir.DAGRunRef, task *coordinatorv1.Task) error {
 	if !h.canAbandonPreparations() || task.ExecutionMarker == "" {
+		return nil
+	}
+	if h.queueStore == nil {
+		h.unjournaledQueuedWarning.Do(func() {
+			logger.Warn(ctx, "Queued executions are dispatched without a preparation journal entry: this coordinator has no queue store, "+
+				"so one whose task expires unclaimed is not failed and stays queued")
+		})
 		return nil
 	}
 	_, err := h.dagRunRepository.BeginAttemptPreparation(ctx, run, run, task.AttemptId, task.ExecutionMarker)
