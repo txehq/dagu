@@ -12,7 +12,9 @@
 #
 #   com.txe.dagu.tunnel  kubectl port-forward 127.0.0.1:18080 (UI/API) and
 #                        127.0.0.1:50055 (coordinator) to svc/dagu, using the
-#                        port-forward-only kubeconfig from tunnel-credential.sh
+#                        port-forward-only kubeconfig from tunnel-credential.sh,
+#                        under tunnel-supervise.py, which replaces a forward whose
+#                        connection is dead (TXE-5398)
 #   com.txe.dagu.worker  dagu worker, id = this machine's mch_ id, labels
 #                        txe.machine and txe.owner, coordinator 127.0.0.1:50055
 #
@@ -136,13 +138,20 @@ link_dagu_on_path
 kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
 [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
 
+# The tunnel supervisor (TXE-5398) runs from TXE_DAGU_HOME, never from a worktree, with
+# the interpreter python3 resolves to now: a version manager's shim needs an environment
+# the agent does not have.
+python_bin="$(python3 -I -c 'import sys; print(sys.executable)')" || die "python3 is not on PATH"
+install -m 0644 "$here/tunnel-supervise.py" "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py.next"
+mv -f "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py.next" "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py"
+
 # launchd agents. PATH is the installing shell's, so scheduled scripts find the same
 # tools; nothing else from the environment is copied, and no credential: the worker
 # gets the machine credential's path, never its contents.
 mkdir -p "$TXE_DAGU_AGENTS_DIR"
 python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
-  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential"
+  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin"
 
 for label in "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL"; do
   # Waits for launchd to finish removing the old agent before loading the new one

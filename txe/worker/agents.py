@@ -10,10 +10,12 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
       Nothing secret is printed: the refresh token is only checked to be present.
 
   agents.py write AGENTS HOME KUBECTL MACHINE_ID OWNER_ID PATH TUNNEL_LABEL WORKER_LABEL
-                  NAMESPACE SERVICE UI_PORT COORD_PORT CREDENTIAL_FILE
+                  NAMESPACE SERVICE UI_PORT COORD_PORT CREDENTIAL_FILE PYTHON
       Write the tunnel and worker agents. CREDENTIAL_FILE, when not empty, is passed to
       the worker as DAGU_WORKER_AUTH_CREDENTIAL_FILE: the path only, never the contents.
       With an empty CREDENTIAL_FILE the agents are exactly those of an install without one.
+      The tunnel agent runs HOME/tunnel/tunnel-supervise.py with PYTHON, and kubectl under it
+      (TXE-5398); install.sh puts the script there.
 
   agents.py credential PLIST
       Print the credential file a worker agent passes, or nothing.
@@ -121,10 +123,16 @@ def check_credential(path, machine_id):
 
 
 def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label, worker_label,
-                 namespace, service, ui_port, coord_port, credential_file):
+                 namespace, service, ui_port, coord_port, credential_file, python):
     common = {"RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
               "ProcessType": "Background"}
+    # launchd restarts the tunnel only when it exits, and a port-forward whose connection is
+    # dead can keep running, so the supervisor ends it when its streams and the worker's
+    # heartbeats have both failed long enough (TXE-5398).
     tunnel = dict(common, Label=tunnel_label, ProgramArguments=[
+        python, "-I", f"{home}/tunnel/tunnel-supervise.py",
+        "--ui-port", ui_port, "--coord-port", coord_port,
+        "--worker-log", f"{home}/logs/worker.log", "--state", f"{home}/tunnel/supervise-state.json", "--",
         kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
         "port-forward", "--address", "127.0.0.1", service,
         f"{ui_port}:8080", f"{coord_port}:{coord_port}"],
@@ -156,7 +164,7 @@ def main(argv):
             return 1
         print(f"credential {argv[1]} (machine {machine}, client {client})")
         return 0
-    if len(argv) == 14 and argv[0] == "write":
+    if len(argv) == 15 and argv[0] == "write":
         write_agents(*argv[1:])
         return 0
     if len(argv) == 2 and argv[0] == "credential":

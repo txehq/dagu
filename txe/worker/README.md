@@ -7,7 +7,7 @@ service. Two launchd agents keep it running whether or not a coding session is o
 
 | Agent | What it runs |
 |---|---|
-| `com.txe.dagu.tunnel` | `kubectl port-forward` from `127.0.0.1:18080` to the UI/API and from `127.0.0.1:50055` to the coordinator, using a credential that can only port-forward in `dagu` |
+| `com.txe.dagu.tunnel` | `kubectl port-forward` from `127.0.0.1:18080` to the UI/API and from `127.0.0.1:50055` to the coordinator, using a credential that can only port-forward in `dagu`. It runs under `tunnel/tunnel-supervise.py`, which replaces a forward whose connection is dead (see "Tunnel drop") |
 | `com.txe.dagu.worker` | `dagu worker`. Its id is this machine's `mch_` id, its labels are `txe.machine` and `txe.owner`, and it reaches the coordinator at `127.0.0.1:50055`. Once the machine is enrolled, it presents the machine credential (see "Machine credential") |
 
 ## Layout
@@ -22,6 +22,7 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 | `outputs/` | job outputs and deliverables, `outputs/<job id>/` | kept |
 | `receipts/`, `client/`, `skill/` | registration receipts, the CLI's context store with its API key, the shared skill (all owned by the CLI, TXE-3408) | kept |
 | `tunnel/kubeconfig` | the tunnel's ServiceAccount token, mode 0600 | renewed by `tunnel-credential.sh` |
+| `tunnel/tunnel-supervise.py`, `tunnel/supervise-state.json` | the tunnel supervisor, and the times it replaced the forward in the last hour | the script is replaced by each install |
 | `worker-credential.json`, `worker-credential.json.lock` | the worker's machine credential, mode 0600, and the lock the worker holds while renewing it | written by `dagu txe enrol`; the worker rewrites it when the provider rotates the refresh token |
 | `worker-home/` | the worker's `DAGU_HOME` | kept |
 | `logs/` | agent logs | kept |
@@ -139,7 +140,21 @@ Upgrade while no job is running, because restarting the worker ends its running 
   reason "not dispatched". Nothing ran, so start it again. There is no guarantee that queued work
   survives hours offline.
 - **Tunnel drop.** If the tunnel is down for more than 90 seconds, the worker cancels any task it
-  is running. launchd restarts the tunnel within seconds after a Pod replacement or network change.
+  is running. launchd restarts the tunnel within seconds when kubectl exits, as it does after a
+  Pod replacement or a lost connection. kubectl can also keep running while every new stream
+  through it fails ("error creating error stream ... Timeout occurred" in `tunnel.log`); launchd
+  sees nothing wrong then (TXE-5369). The supervisor checks every 30 seconds that a new stream
+  works (the health endpoint, or the coordinator's HTTP/2 reply) and reads `worker.log`: the
+  heartbeat's `Heartbeat send failed` lines, and the coordinator client's `CoordinatorCli
+  connection recovered` line, which it logs on the first successful call after any failure
+  (successes are otherwise silent). When no new stream has worked, and the worker has logged
+  heartbeat failures with no recovery or `Starting worker` line in between, for 90 seconds
+  (doubled for each replacement in the last hour, at most 10 minutes), it ends kubectl and launchd
+  starts a fresh one. It never replaces a forward while a new stream works, or within 90 seconds of
+  any successful call of the worker to its coordinator, and does nothing if it cannot read
+  `worker.log`. A hub that stops answering entirely for over 90 seconds also meets the condition:
+  the forward is then replaced once, and launchd waits up to 5 seconds (its `ThrottleInterval`)
+  before the new one starts. `status.sh` prints the supervisor's latest line.
 - **Credential expiry.** The tunnel credential expires (`status.sh` shows when). Rerun
   `tunnel-credential.sh` before then.
 - **Spot node replacement.** The service Pod is rescheduled against the same volume. Runs wait
@@ -163,7 +178,7 @@ user** units into `~/.config/systemd/user` and starts them:
 
 | Unit | What it runs |
 |---|---|
-| `txe-dagu-tunnel.service` | the same `kubectl port-forward` as `com.txe.dagu.tunnel` |
+| `txe-dagu-tunnel.service` | the same `kubectl port-forward` as `com.txe.dagu.tunnel`, without its supervisor: systemd restarts it only when kubectl exits |
 | `txe-dagu-worker.service` | the same `dagu worker` as `com.txe.dagu.worker`; once enrolled, it gets the credential file's path in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`, never its contents |
 
 ```sh
