@@ -15,8 +15,10 @@ import (
 
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	filedagrun "github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -262,4 +264,79 @@ func TestRefusedClaimAbortsItsExecutionOnTheFileStore(t *testing.T) {
 	assert.Contains(t, st.Error, "retired")
 	_, err = f.dispatches.GetClaim(t.Context(), claimed.ClaimToken)
 	assert.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the refused claim is removed")
+}
+
+// A refused claim whose run has an attempt handle cached by this coordinator
+// closes that handle before the execution is aborted, under the same locks:
+// the cache no longer holds it, nothing can be appended through it, and the
+// aborted status is what the run keeps once every handle is closed. A status
+// reporter that opens the run again while the claim is refused gets a fresh
+// handle, and closing that one keeps the aborted status too.
+func TestRefusedClaimClosesTheCachedAttempt(t *testing.T) {
+	t.Parallel()
+	jobID, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	f := newStrandedFixture(t, nil)
+	f.h.runAdmitter = &fakeRunAdmitter{adm: registry.Admission{JobID: jobID, Code: registry.AdmitRetired, Reason: "job retired"}}
+	current := f.writeAttempt(t, true, ir.NotStarted, "")
+	ctx := t.Context()
+
+	openCached := func() dagrun.Attempt {
+		held := f.h.runLocks.lock(strandedRun)
+		defer f.h.runLocks.unlock(strandedRun, held)
+		attempt, err := f.h.getOrOpenRootLocked(ctx, strandedDAG, strandedRun)
+		require.NoError(t, err)
+		return attempt
+	}
+	cached := openCached()
+	require.Equal(t, current, cached.ID())
+
+	require.NoError(t, f.dispatches.Enqueue(ctx, &dispatch.DispatchTask{
+		Target: strandedDAG, DefinitionID: jobID, DAGRunID: strandedRun, AttemptID: current, AttemptKey: f.attemptKey(current),
+		Owner: dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+	}))
+	claimed, err := f.dispatches.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p", ClaimTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	// Status reporters keep reopening the run while the claim is refused.
+	stop := make(chan struct{})
+	var reporters sync.WaitGroup
+	for range 4 {
+		reporters.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = openCached()
+				}
+			}
+		})
+	}
+	resp, err := f.h.AckTaskClaim(ctx, &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(current),
+	})
+	close(stop)
+	reporters.Wait()
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+
+	// The handle cached before the refusal is closed and no longer cached.
+	f.h.attemptsMu.RLock()
+	again, stillCached := f.h.openAttempts[strandedRun]
+	f.h.attemptsMu.RUnlock()
+	assert.False(t, stillCached && again == cached, "the refused run's earlier handle is still cached")
+	require.ErrorIs(t, cached.Write(ctx, ir.DAGRunStatus{Name: strandedDAG, DAGRunID: strandedRun, AttemptID: current, Status: ir.NotStarted}),
+		filedagrun.ErrStatusFileNotOpen, "the earlier handle still accepts writes")
+
+	// Closing every handle, as a coordinator shutdown does, keeps the abort.
+	f.h.Close(ctx)
+	attempt, err := f.repository.FindAttempt(ctx, f.ref)
+	require.NoError(t, err)
+	require.Equal(t, current, attempt.ID())
+	st, err := attempt.ReadStatusUncached(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Aborted, st.Status)
+	assert.Contains(t, st.Error, "retired")
 }

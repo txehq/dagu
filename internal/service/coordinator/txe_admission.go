@@ -82,7 +82,8 @@ func (h *Handler) refuseUnadmittedClaim(ctx context.Context, claimToken string, 
 // the abandonment fence see one state. An abandoned execution is left alone:
 // its stale claim is only removed. So is any other execution the run's
 // latest visible attempt now holds: another attempt, or the same attempt
-// queued again under a new queued-at marker (the rule leases follow).
+// queued again under a new queued-at marker (the rule leases follow). Before
+// aborting, it closes the handle this coordinator cached for the execution.
 func (h *Handler) abortQueuedAttempt(ctx context.Context, task *dispatch.DispatchTask, executionMarker, reason string) error {
 	if h.dagRunRepository == nil {
 		return nil
@@ -124,6 +125,10 @@ func (h *Handler) abortQueuedAttempt(ctx context.Context, task *dispatch.Dispatc
 	if status.Status == ir.Queued && status.QueuedAt != executionMarker {
 		return nil
 	}
+	// A handle this coordinator cached for the execution is closed first, as
+	// an abandonment does, so nothing is appended through it after the abort.
+	// A later status report opens the run again.
+	h.closeCachedAttemptForRun(ctx, ctx, task.DAGRunID, task.AttemptID)
 	// The store re-checks the attempt, its status and the marker in the same
 	// write, so an execution that changed after the read is never aborted.
 	aborted, swapped, err := h.dagRunRepository.CompareAndSwapLatestAttemptStatus(ctx, run, task.AttemptID, status.Status,
