@@ -16,8 +16,11 @@ const (
 	// checked for this long, such as one that left the membership. Its next
 	// failure, if any, is logged as the first of a new episode.
 	healthEpisodeExpiry = 10 * time.Minute
-	// healthEpisodesMax bounds the episodes kept at once; the least recently
-	// failing one is forgotten to make room.
+	// healthEpisodesMax bounds the memory the episodes take: the least
+	// recently failing one is forgotten to make room. A forgotten episode's
+	// suppression is reset, so its coordinator's next failure is logged as a
+	// new first failure. It bounds memory, not the overall log rate: with more
+	// coordinators failing at once than this, the lines are not bounded.
 	healthEpisodesMax = 64
 )
 
