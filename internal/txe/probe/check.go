@@ -114,7 +114,7 @@ func (c *Check) report(ctx context.Context, jobID string, requested Target, ev E
 		return nil, err
 	}
 	ev.EventID = id
-	p := pendingReport{JobID: jobID, Key: TargetKey(requested), Event: ev}
+	p := pendingReport{JobID: jobID, Key: progressKey(jobID, requested), Event: ev}
 	if err := c.Journal.hold(ctx, p); err != nil {
 		return nil, err
 	}
@@ -366,14 +366,19 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		}
 		for _, ev := range events {
 			key := TargetKey(ev.Target)
+			// An event made for a job of this machine is observed again for
+			// that job, whatever other jobs naming the target are observed.
+			if cand, ok := byJob[ev.ReporterJobID+"\x00"+key]; ok && ev.ReporterJobID != "" {
+				if !seen[ev.ReporterJobID+"\x00"+key] {
+					seen[ev.ReporterJobID+"\x00"+key], seen[key] = true, true
+					cands = append(cands, cand)
+				}
+				continue
+			}
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-			if cand, ok := byJob[ev.ReporterJobID+"\x00"+key]; ok && ev.ReporterJobID != "" {
-				cands = append(cands, cand)
-				continue
-			}
 			if cand, ok := byKey[key]; ok {
 				cands = append(cands, cand)
 				continue
@@ -396,7 +401,7 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		return res, ExitUnobserved, err
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
-		return checked[TargetKey(cands[i].target)].Before(checked[TargetKey(cands[j].target)])
+		return checked[progressKey(cands[i].jobID, cands[i].target)].Before(checked[progressKey(cands[j].jobID, cands[j].target)])
 	})
 	for i, cand := range cands {
 		if deadline.Sub(c.now()) < TargetTimeout {

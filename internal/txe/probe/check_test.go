@@ -415,7 +415,7 @@ func TestReplacementProgressIsRecordedForTheRequestedTarget(t *testing.T) {
 	}
 	j, _ := OpenJournal(f.path)
 	checked, _ := j.lastChecked(context.Background())
-	if checked[TargetKey(toTarget(cm("u-2", "two", CheckReconcile)))].IsZero() {
+	if checked[progressKey(jobA, toTarget(cm("u-2", "two", CheckReconcile)))].IsZero() {
 		t.Fatal("the requested target was not recorded as checked")
 	}
 }
@@ -563,5 +563,71 @@ func TestReportsNameTheJobWhoseCredentialWasUsed(t *testing.T) {
 		if strings.Contains(string(sent), secret) || strings.Contains(f.out.String(), secret) {
 			t.Fatalf("%q reached a report or an output line", secret)
 		}
+	}
+}
+
+// sharedOnTwoJobs gives job A and job B, both of this machine, the same
+// target, checked as check is for each.
+func (f *fixture) sharedOnTwoJobs(checkA, checkB string) Target {
+	shared := cm("shared", "shared", checkA)
+	f.reg.versions[jobA][2].Targets = []txeclient.Target{shared}
+	f.reg.jobs[jobB] = &txeclient.Job{JobID: jobB, MachineID: mch, Version: 1, Lifecycle: "active", Registration: txeclient.Registration{State: "ready"}}
+	f.reg.versions[jobB] = map[int]*txeclient.JobVersion{1: {Version: 1, Targets: []txeclient.Target{cm("shared", "shared", checkB)}}}
+	return toTarget(shared)
+}
+
+// When the deadline leaves time for one observation a run, the jobs sharing
+// a target take turns: observing it for one job does not count as observing
+// it for the other, whose own credential has not been tried.
+func TestPeriodicTakesTurnsBetweenJobsSharingATarget(t *testing.T) {
+	f := newFixture(t)
+	f.sharedOnTwoJobs(CheckReconcile, CheckReconcile)
+	f.probe.cost["shared"] = 2 * time.Second
+	var order []string
+	for range 4 {
+		f.reg.recorded = nil
+		if _, _, err := f.check.Periodic(context.Background(), f.now.Add(TargetTimeout+time.Second), noCreds); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.reg.recorded) != 1 {
+			t.Fatalf("observed %d times, want once a run", len(f.reg.recorded))
+		}
+		order = append(order, f.reg.recorded[0].ReporterJobID)
+	}
+	if order[0] == order[1] || order[1] == order[2] || order[2] == order[3] {
+		t.Fatalf("observations went to %v, want the jobs in turn", order)
+	}
+}
+
+// An incomplete event made for a job is observed again for that job, even
+// when another job of the machine already reconciles the same target, and
+// incomplete events of two jobs about one target are both observed.
+func TestPeriodicObservesIncompleteEventsForTheirOwnJob(t *testing.T) {
+	f := newFixture(t)
+	shared := f.sharedOnTwoJobs(CheckReconcile, CheckPreRun)
+	f.reg.incomplete = []RecordedEvent{{EventID: "evt_b", Target: shared, Observation: AuthDenied, ReporterJobID: jobB}}
+	if _, _, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), noCreds); err != nil {
+		t.Fatal(err)
+	}
+	jobs := map[string]bool{}
+	for _, ev := range f.reg.recorded {
+		jobs[ev.ReporterJobID] = true
+	}
+	if !jobs[jobA] || !jobs[jobB] || len(f.reg.recorded) != 2 {
+		t.Fatalf("reports %+v, want one for A's reconcile target and one for B's incomplete event", f.reg.recorded)
+	}
+
+	// Neither job reconciles it: both jobs' incomplete events are observed.
+	g := newFixture(t)
+	shared = g.sharedOnTwoJobs(CheckPreRun, CheckPreRun)
+	g.reg.incomplete = []RecordedEvent{
+		{EventID: "evt_a", Target: shared, Observation: Unreachable, ReporterJobID: jobA},
+		{EventID: "evt_b", Target: shared, Observation: AuthDenied, ReporterJobID: jobB},
+	}
+	if _, _, err := g.check.Periodic(context.Background(), g.now.Add(time.Hour), noCreds); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.reg.recorded) != 2 || g.reg.recorded[0].ReporterJobID == g.reg.recorded[1].ReporterJobID {
+		t.Fatalf("reports %+v, want one for each job", g.reg.recorded)
 	}
 }

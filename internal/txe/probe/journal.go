@@ -34,7 +34,8 @@ type Journal struct {
 type pendingReport struct {
 	// JobID is the job a pre-run report was made for; empty for periodic.
 	JobID string `json:"job_id,omitempty"`
-	// Key is the requested target's key, for scheduling.
+	// Key is the job and requested target the report was made for
+	// (progressKey), for scheduling.
 	Key   string `json:"key"`
 	Event Event  `json:"event"`
 }
@@ -160,7 +161,9 @@ func (j *Journal) pending(ctx context.Context, jobID string) ([]pendingReport, e
 	return out, err
 }
 
-// lastChecked returns when each requested target was last observed.
+// lastChecked returns when each job's requested target was last observed,
+// by progressKey. An entry an earlier build kept by target alone matches no
+// job, so that job's target counts as never observed and goes first.
 func (j *Journal) lastChecked(ctx context.Context) (map[string]time.Time, error) {
 	var out map[string]time.Time
 	err := j.locked(ctx, func() error {
@@ -169,6 +172,13 @@ func (j *Journal) lastChecked(ctx context.Context) (map[string]time.Time, error)
 		return err
 	})
 	return out, err
+}
+
+// progressKey identifies one job's observation of a target: each job's
+// target is observed with that job's own credentials, so checking it for one
+// job says nothing about another.
+func progressKey(jobID string, t Target) string {
+	return jobID + "\x00" + TargetKey(t)
 }
 
 // TargetKey identifies a target by kind and stable identity, the way the
