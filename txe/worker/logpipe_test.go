@@ -790,6 +790,48 @@ print("stale tmp reclaimed", not os.path.exists(stale + ".tmp"))
 	assert.Contains(t, stdout, "stale tmp reclaimed True")
 }
 
+// Retention holds however far compression falls behind: with the first compression stuck,
+// rotations keep coming and the rotating thread prunes, so at most --backups rotated files
+// plus the one in compression exist; the stuck one is not deleted from under the compressor,
+// and once it finishes, a result whose source was pruned meanwhile is discarded.
+func TestLogpipeRetentionDoesNotWaitForTheCompressor(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile, threading, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+release = threading.Event()
+real_compress = logpipe.Log._compress
+calls = []
+def slow_compress(self, rotated):
+    calls.append(rotated)
+    if len(calls) == 1:
+        release.wait(20)   # the first compression is stuck for the whole run
+    return real_compress(self, rotated)
+logpipe.Log._compress = slow_compress
+log = new_log(path, max_bytes=20000, backups=3)
+counts = []
+real_prune = logpipe.Log._prune
+def counting_prune(self):
+    real_prune(self)
+    counts.append(len(self._managed_names()))
+logpipe.Log._prune = counting_prune
+run_drain(log, b"".join(b"line %05d some worker output text\n" % i for i in range(20000)))  # about 35 rotations
+worst = max(counts)
+print("max managed files seen", worst, "within bound", worst <= 3 + 1)
+release.set()
+log.finish()
+names = log._managed_names()
+print("final", len(names), "all compressed", all(n.endswith(".gz") for n in names))
+print("no tmp", not any(n.endswith(".gz.tmp") for n in os.listdir(d)))
+print("last line kept", open(path, "rb").read().endswith(b"line 19999 some worker output text\n"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "within bound True")
+	assert.Contains(t, stdout, "final 3 all compressed True")
+	assert.Contains(t, stdout, "no tmp True")
+	assert.Contains(t, stdout, "last line kept True")
+}
+
 // If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
 // does that when the agent's main process dies); the worker's next write hits the closed
 // pipe, so a writing worker ends on its own and nothing hangs. A silent worker would be ended

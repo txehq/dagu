@@ -27,7 +27,9 @@ without one.
 Rotated files are gzipped by one background thread with a queue of at most --backups entries,
 so the drain only waits for the rename and reopen; a rotated file the queue cannot take is
 compressed by the thread's next sweep instead. The newest --backups rotated files are kept,
-compressed or not yet, and the oldest beyond that are deleted. That deletion is the only pruning, and it never touches a file this
+compressed or not yet, and the oldest beyond that are deleted, at every rotation as well as
+after every compression, so retention holds however far compression falls behind; the one
+file being compressed is never deleted from under it, so at most --backups plus one exist. That deletion is the only pruning, and it never touches a file this
 process did not rotate. A LOG that exists at start and was not written by this process (no
 marker as its first line) is the pre-activation log: it is moved to
 <stem>.legacy-<utc stamp><suffix> next to LOG, outside the pruned set, and never deleted here.
@@ -183,6 +185,8 @@ class Log:
         self.rotate_failing_since = None
         self.jobs = queue.Queue(maxsize=max(backups, 1))
         self.stopping = threading.Event()  # set by finish(): the compressor ends after its current job
+        self.names_lock = threading.Lock()  # held while listing and deleting rotated names, and while
+        self._compressing = ""              # a compression result is published; names the source in compression
         # A daemon thread: the process must be able to exit however it ends; finish() waits for
         # the compression in progress, with a bound, on every normal path.
         self.compressor = threading.Thread(target=self._compress_loop, name="compress", daemon=True)
@@ -265,7 +269,7 @@ class Log:
             stem = n[:-len(".gz.tmp")]
             if not self.managed.match(stem):
                 continue
-            if stem + ".gz.tmp" == os.path.basename(getattr(self, "_compressing", "")):
+            if stem == os.path.basename(self._compressing):
                 continue  # the compression in progress owns it
             if stem in names or stem + ".gz" in names:
                 try:
@@ -366,6 +370,7 @@ class Log:
         self.write(marker("rotated " + self.base, previous=os.path.basename(rotated),
                           previous_bytes=previous_bytes, took_ms=took_ms).encode(), line_start=False)
         self._enqueue(rotated)
+        self._prune()  # retention does not wait for the compressor
 
     def _check_degraded(self, next_write):
         if self.size + next_write > DEGRADED_FACTOR * self.max_bytes:
@@ -426,11 +431,12 @@ class Log:
                 return
 
     def _compress(self, rotated):
-        if not os.path.exists(rotated):
-            return  # pruned, or compressed by the sweep already
         started = time.monotonic()
         tmp = rotated + ".gz.tmp"
-        self._compressing = tmp
+        with self.names_lock:
+            if not os.path.exists(rotated):
+                return
+            self._compressing = rotated
         try:
             with open(rotated, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
                 while True:
@@ -438,10 +444,17 @@ class Log:
                     if not chunk:
                         break
                     dst.write(chunk)
-            os.replace(tmp, rotated + ".gz")
-            os.remove(rotated)
-            self.diag.say("compressed", f"compressed {os.path.basename(rotated)} in "
-                                        f"{int((time.monotonic() - started) * 1000)} ms")
+            with self.names_lock:
+                if os.path.exists(rotated):     # still retained: publish the result
+                    os.replace(tmp, rotated + ".gz")
+                    os.remove(rotated)
+                    published = True
+                else:                           # pruned meanwhile: the result is not wanted
+                    os.remove(tmp)
+                    published = False
+            if published:
+                self.diag.say("compressed", f"compressed {os.path.basename(rotated)} in "
+                                            f"{int((time.monotonic() - started) * 1000)} ms")
         except OSError as e:
             self.diag.say("compress", f"could not compress {os.path.basename(rotated)} "
                                       f"({e.__class__.__name__}: {e}); it is kept uncompressed")
@@ -450,19 +463,26 @@ class Log:
             except OSError:
                 pass
         finally:
-            self._compressing = ""
+            with self.names_lock:
+                self._compressing = ""
 
     def _prune(self):
         """Keep the newest `backups` rotated files, compressed or not; delete the rest, and
         reclaim a stale .gz.tmp whose source or result exists (one whose removal failed at
         the time), so nothing outside the retained set accumulates while this process lives."""
-        names = self._managed_names()
-        for n in names[:-self.backups]:
-            try:
-                os.remove(os.path.join(self.dir, n))
-            except OSError as e:
-                self.diag.say("prune", f"could not delete {n}: {e.__class__.__name__}: {e}")
-        self._reclaim_temporaries(report=False)
+        with self.names_lock:
+            names = self._managed_names()
+            keep = os.path.basename(self._compressing)
+            for n in names[:-self.backups]:
+                if n == keep:
+                    continue  # being compressed: its result is published, or not, under this lock
+                try:
+                    os.remove(os.path.join(self.dir, n))
+                except FileNotFoundError:
+                    pass  # the other thread pruned it
+                except OSError as e:
+                    self.diag.say("prune", f"could not delete {n}: {e.__class__.__name__}: {e}")
+            self._reclaim_temporaries(report=False)
 
     def finish(self, timeout=120.0):
         """End the compressor after the job in progress and the final sweep, within timeout:
