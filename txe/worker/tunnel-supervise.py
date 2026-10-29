@@ -120,37 +120,84 @@ def _record(line):
     return msg, t.timestamp()
 
 
-def worker_unhealthy_since(path, now_wall, gap):
-    """The wall time from which no call of the worker to its coordinator has succeeded, or None.
+class WorkerLog:
+    """Follows the worker's log across rounds and keeps its current failure episode.
 
+    The episode is the time from which no call of the worker to its coordinator has succeeded.
     The worker's coordinator client logs RECOVERED_MSG on the first successful call after any
     recorded failure (internal/service/coordinator/client.go recordSuccess), and every heartbeat
-    goes through it. So the current episode starts at the first heartbeat failure after the latest
-    recovery or worker start; a single success anywhere in between ends the episode. A failure
-    gap over `gap` seconds, or no failure within `gap` of now, is also no evidence (the worker may
-    have stopped, or stopped failing without a recorded failure). An unreadable log is None."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - LOG_TAIL_BYTES))
-            text = f.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    failures = []
-    for line in text.splitlines():
-        rec = _record(line)
+    goes through it. So the episode starts at the first heartbeat failure after the latest
+    recovery or worker start; a single success anywhere in between ends it. A failure gap over
+    `gap` seconds also ends it (not shown to be one episode), and no failure within `gap` of now
+    is no evidence (the worker may have stopped).
+
+    Each poll reads only what was appended since the last one, all of it, so an episode is kept
+    however much else the worker logs (its pollers' health-check warnings, for one). The first
+    poll reads the last LOG_TAIL_BYTES only. A file replaced (another inode) or shortened
+    (truncated) starts over from its beginning with no episode: that can only delay a
+    replacement, never cause one. An unreadable log is no evidence."""
+
+    def __init__(self, path, gap):
+        self.path, self.gap = path, gap
+        self.ident = None                       # (device, inode) of the file being followed
+        self.offset = 0
+        self.partial = b""                      # an unfinished last line, kept for the next read
+        self.start = self.last = None           # the episode's first and latest failure (unix time)
+
+    def _reset(self):
+        self.partial, self.start, self.last = b"", None, None
+
+    def _line(self, raw):
+        rec = _record(raw.decode("utf-8", "replace"))
         if rec is None:
-            continue
+            return
         msg, t = rec
-        if msg == HEARTBEAT_MSG:
-            if failures and t - failures[-1] > gap:
-                failures = []                   # a silent stretch: not shown to be one episode
-            failures.append(t)
+        if msg != HEARTBEAT_MSG:
+            self.start = self.last = None       # a success, or a new worker process
+        elif self.last is not None and t - self.last <= self.gap:
+            self.last = t
         else:
-            failures = []                       # a success, or a new worker process
-    if not failures or now_wall - failures[-1] > gap:
-        return None
-    return failures[0]
+            self.start = self.last = t          # a first failure, or one after a silent stretch
+
+    def poll(self, now_wall):
+        """Read what is new and return the episode's start, or None."""
+        try:
+            with open(self.path, "rb") as f:
+                st = os.fstat(f.fileno())
+                ident = (st.st_dev, st.st_ino)
+                if self.ident is None:
+                    self.offset = max(0, st.st_size - LOG_TAIL_BYTES)
+                    first = self.offset > 0     # the first line of a tail read is likely cut
+                elif ident != self.ident or st.st_size < self.offset:
+                    self._reset()
+                    self.offset, first = 0, False
+                else:
+                    first = False
+                self.ident = ident
+                f.seek(self.offset)
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.offset += len(chunk)
+                    lines = (self.partial + chunk).split(b"\n")
+                    self.partial = lines.pop()
+                    if first:
+                        lines, first = lines[1:], False
+                    for raw in lines:
+                        self._line(raw)
+        except OSError:
+            self.ident = None
+            self._reset()
+            return None
+        if self.start is None or now_wall - self.last > self.gap:
+            return None
+        return self.start
+
+
+def worker_unhealthy_since(path, now_wall, gap):
+    """One read of the worker's log: the start of its current failure episode, or None."""
+    return WorkerLog(path, gap).poll(now_wall)
 
 
 class Verdict:
@@ -245,6 +292,7 @@ def main(argv):
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, forward)
     verdict = Verdict(a.unhealthy_after, a.max_unhealthy_after, load_restarts(a.state, time.time()))
+    worker = WorkerLog(a.worker_log, a.worker_gap)
     next_round = time.monotonic() + a.grace
     try:
         while True:
@@ -263,8 +311,8 @@ def main(argv):
             streams_ok = probe_http(a.ui_port, a.probe_timeout) or probe_h2(a.coord_port, a.probe_timeout)
             now_wall = time.time()
             was_dead = verdict.dead_since is not None
-            reason = verdict.observe(time.monotonic(), now_wall, streams_ok,
-                                     None if streams_ok else worker_unhealthy_since(a.worker_log, now_wall, a.worker_gap))
+            worker_since = worker.poll(now_wall)    # every round, so nothing appended is skipped
+            reason = verdict.observe(time.monotonic(), now_wall, streams_ok, None if streams_ok else worker_since)
             if not streams_ok and not was_dead:
                 say("new streams through the forward are failing; watching the worker's heartbeats")
             elif streams_ok and was_dead:

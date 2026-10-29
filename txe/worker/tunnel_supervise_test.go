@@ -445,6 +445,82 @@ print(json.dumps(out))
 	assert.Nil(t, got["missing"])
 }
 
+// The supervisor follows the worker's log across rounds (TXE-5398 review of 3a3c24570): an episode
+// is kept however much else is logged between rounds, a replaced or truncated file starts over
+// with no episode, and a line cut across two reads is read whole. Lines are SIMULATED.
+func TestTunnelSuperviseFollowsTheWorkersLog(t *testing.T) {
+	script := supervisorScript(t)
+	program := `
+import importlib.util, json, os, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
+d = sys.argv[2]; T0 = 1793250000.0
+def stamp(t): return __import__("datetime").datetime.fromtimestamp(t, __import__("datetime").timezone.utc).isoformat(timespec="milliseconds")
+fail = lambda t: f'time={stamp(t)} level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x\n'
+noise = lambda t: f'time={stamp(t)} level=WARN msg="Failed to check coordinator health" coordinator-id=coord-0 err="health check failed"\n'
+out = {}
+
+# 1. 600 s of uninterrupted failures, every 10 s, with about 300 KiB of other warnings between rounds.
+p = os.path.join(d, "busy.log"); open(p, "w").close(); log = ts.WorkerLog(p, 45); seen = []
+log.poll(T0 - 30)   # the supervisor's first round, before the outage: from here on every read is incremental
+for i in range(61):
+    t = T0 + 10 * i
+    with open(p, "a") as f:
+        f.write(fail(t))
+        if i % 3 == 0:
+            f.write(noise(t) * 2000)
+    if i % 3 == 0:
+        seen.append(log.poll(t + 1))
+out["busy_start"] = seen[-1] - T0
+out["busy_size"] = os.path.getsize(p)
+v = ts.worker_unhealthy_since(p, T0 + 601, 45)   # a single tail read sees only the end, or no failure at all
+out["one_shot_start"] = None if v is None else v - T0
+
+# 2. The file is replaced (rotation by rename): the episode starts over in the new file.
+p = os.path.join(d, "rot.log"); log = ts.WorkerLog(p, 45)
+with open(p, "w") as f: f.write(fail(T0) + fail(T0 + 10))
+out["rot_before"] = log.poll(T0 + 11) - T0
+os.rename(p, p + ".1")
+with open(p, "w") as f: f.write(fail(T0 + 30))
+out["rot_after"] = log.poll(T0 + 31) - T0
+
+# 3. The file is truncated in place: the same.
+p = os.path.join(d, "trunc.log"); log = ts.WorkerLog(p, 45)
+with open(p, "w") as f: f.write(fail(T0) + fail(T0 + 10) + fail(T0 + 20))
+log.poll(T0 + 21)
+with open(p, "w") as f: f.write(fail(T0 + 40))
+out["trunc_after"] = log.poll(T0 + 41) - T0
+
+# 4. A line cut across two reads is read once, whole.
+p = os.path.join(d, "cut.log"); log = ts.WorkerLog(p, 45)
+line = fail(T0)
+with open(p, "w") as f: f.write(line[:30])
+out["cut_first"] = log.poll(T0 + 1)
+with open(p, "a") as f: f.write(line[30:])
+out["cut_second"] = log.poll(T0 + 1) - T0
+
+# 5. The log disappears: no evidence, and following starts again when it is back.
+p = os.path.join(d, "gone.log"); log = ts.WorkerLog(p, 45)
+with open(p, "w") as f: f.write(fail(T0))
+log.poll(T0 + 1); os.unlink(p)
+out["gone"] = log.poll(T0 + 2)
+print(json.dumps(out))
+`
+	stdout, stderr, err := python(t, "-c", program, script, t.TempDir())
+	require.NoError(t, err, stderr)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	assert.Greater(t, got["busy_size"], float64(4*256*1024), "the log grew well past one tail read")
+	assert.Equal(t, 0.0, got["busy_start"], "the episode keeps its start across all of it")
+	assert.NotEqual(t, 0.0, got["one_shot_start"], "a single tail read would have lost the start")
+	assert.Equal(t, 0.0, got["rot_before"])
+	assert.Equal(t, 30.0, got["rot_after"])
+	assert.Equal(t, 40.0, got["trunc_after"])
+	assert.Nil(t, got["cut_first"])
+	assert.Equal(t, 0.0, got["cut_second"])
+	assert.Nil(t, got["gone"])
+}
+
 // The supervisor reads three of the worker's own log messages. Each is pinned to the code that
 // emits it, together with what the supervisor relies on: every heartbeat goes through attemptCall,
 // which records each failure, and recordSuccess logs the recovery on the first success after a
