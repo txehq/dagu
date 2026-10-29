@@ -28,6 +28,46 @@ TXE_DAGU_WORKER_LABEL="com.txe.dagu.worker"
 
 die() { printf 'txe-dagu: %s\n' "$*" >&2; exit 1; }
 
+# launchd_reload LABEL PLIST: replace a launchd agent with PLIST's definition
+# (TXE-4185). `launchctl bootout` returns before launchd has finished removing the
+# service, and a `bootstrap` inside that window fails with "5: Input/output error";
+# the plain bootout/bootstrap pair therefore left an agent unloaded on the -6 cutover.
+# Here the service is booted out, then `launchctl print` is polled, at most
+# TXE_DAGU_LAUNCHD_WAIT_TRIES times TXE_DAGU_LAUNCHD_POLL_SECONDS apart (20 s), until
+# launchd no longer finds it (exit 113); only then is it bootstrapped, with at most
+# TXE_DAGU_LAUNCHD_BOOTSTRAP_TRIES attempts on exit 5. A service that was not loaded
+# (bootout exit 3, "No such process") is bootstrapped at once. Every other launchctl
+# failure, including a domain launchd cannot act on (print exit 125), ends the install
+# with the label and launchd's own message, so an agent is never left silently
+# unloaded; nothing here restarts a service beyond the one bootstrap.
+launchd_reload() {
+  local label="$1" plist="$2" domain out rc i
+  domain="gui/$(id -u)"
+  local tries="${TXE_DAGU_LAUNCHD_WAIT_TRIES:-40}" poll="${TXE_DAGU_LAUNCHD_POLL_SECONDS:-0.5}"
+  local boots="${TXE_DAGU_LAUNCHD_BOOTSTRAP_TRIES:-3}"
+  if out="$(launchctl bootout "$domain/$label" 2>&1)"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0 | 3) ;; # 0: launchd has begun removing it; 3: it was not loaded
+    *) die "$label: launchctl bootout failed ($rc): $out" ;;
+  esac
+  rc=0
+  for ((i = 0; i < tries; i++)); do
+    if out="$(launchctl print "$domain/$label" 2>&1)"; then rc=0; else rc=$?; fi
+    case "$rc" in
+      113) break ;;       # launchd no longer finds the service
+      0) sleep "$poll" ;; # still being removed
+      *) die "$label: launchctl print failed ($rc): $out" ;;
+    esac
+  done
+  [ "$rc" = 113 ] || die "$label: still loaded after $tries checks ($poll s apart) following bootout, so it was not bootstrapped; see 'launchctl print $domain/$label', then run the install again"
+  for ((i = 1; i <= boots; i++)); do
+    if out="$(launchctl bootstrap "$domain" "$plist" 2>&1)"; then return 0; else rc=$?; fi
+    [ "$rc" = 5 ] || die "$label: launchctl bootstrap failed ($rc): $out"
+    if [ "$i" -lt "$boots" ]; then sleep "$poll"; fi
+  done
+  die "$label: launchctl bootstrap failed with 5 (Input/output error) $boots times; the agent is not loaded; run the install again"
+}
+
 # link_dagu_on_path: make `dagu` resolve to this install by linking
 # TXE_DAGU_LINK_DIR/dagu to TXE_DAGU_HOME/bin/dagu, the link install.sh moves to
 # each new version. A `dagu` already there that is not that link was put there by
