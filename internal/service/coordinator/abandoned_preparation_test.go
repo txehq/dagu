@@ -17,6 +17,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/testutil"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
@@ -56,7 +58,9 @@ func newStrandedFixture(t *testing.T, dispatches dispatch.DispatchTaskStore) *st
 			DAGRunLeaseStore:          leases,
 			ActiveDistributedRunStore: newTestActiveDistributedRunStore(filepath.Join(dir, "distributed")),
 			WorkerHeartbeatStore:      heartbeats,
-			Owner:                     dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
+			// As in coord and start-all, which always have one.
+			QueueStore: store.NewQueueStore(file.NewCollection(filepath.Join(dir, "queue"))),
+			Owner:      dispatch.CoordinatorEndpoint{ID: "coord-a", Host: "127.0.0.1", Port: 50055},
 		}),
 		repository: repository,
 		dispatches: dispatches,

@@ -92,6 +92,9 @@ func SetupCoordinator(t *testing.T, opts ...HelperOption) *Coordinator {
 	cfg.WorkerHeartbeatStore = helper.WorkerHeartbeatStore
 	cfg.DAGRunLeaseStore = helper.DAGRunLeaseStore
 	cfg.ActiveDistributedRunStore = helper.ActiveDistributedRunStore
+	// The queues the scheduler dispatches from, as coord and start-all pass
+	// them: reconciliation journals and judges queued executions only with it.
+	cfg.QueueStore = helper.QueueStore
 
 	coord := &Coordinator{
 		Helper:        helper,

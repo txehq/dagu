@@ -55,6 +55,14 @@ var errDispatchInFlight = errors.New("dispatch may be in flight")
 // prove absence of dispatch at all, as without a dispatch or lease store.
 var errAbandonmentUnavailable = errors.New("abandonment requires dispatch and lease stores")
 
+// errQueueUnknown means a queued execution is judged by a coordinator that has
+// no queue store: whether a queue still holds its run, and will dispatch it
+// again, cannot be read, so it is unknown and the execution is never failed.
+// Without a queue store the coordinator also journals no queued execution
+// (see beginQueuedExecutionPreparation), so only an entry an earlier
+// configuration left behind meets this; it is ended once it settles.
+var errQueueUnknown = fmt.Errorf("%w: this coordinator has no queue store, so whether a queue still holds the run is unknown", errEvidenceUnknown)
+
 // neverDispatchedEvidence establishes, for one attempt, that nothing was ever
 // handed to a worker. Any lookup that fails is unknown, never absent.
 //
@@ -156,7 +164,14 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	if err != nil {
 		return nil, err
 	}
-	if queuedAt != "" && queued != nil {
+	// A queued execution is failed only when a queue read shows that no
+	// queue holds its run, and the queues have not changed since. Its age
+	// alone never fails it: the queue keeps a run whose dispatch failed and
+	// dispatches it again.
+	if queuedAt != "" {
+		if queued == nil {
+			return nil, errQueueUnknown
+		}
 		if err := queued.refuse(run); err != nil {
 			return nil, err
 		}
@@ -210,7 +225,8 @@ type queueSnapshot struct {
 }
 
 // readQueueSnapshot reads every queue, or returns nil when this coordinator
-// has no queue store, which skips the check.
+// has no queue store; a queued execution is then never failed
+// (errQueueUnknown).
 func (h *Handler) readQueueSnapshot(ctx context.Context) *queueSnapshot {
 	if h.queueStore == nil {
 		return nil
@@ -326,6 +342,7 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 		return
 	}
 	inFlight := make(map[string]struct{})
+	queueUnknown := make(map[string]struct{})
 	var queued *queueSnapshot
 	queuedRead := false
 	for _, p := range preparations {
@@ -353,6 +370,14 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 				logger.Info(ctx, "Left a prepared attempt that may be with a worker until it settles",
 					tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID), tag.Error(err))
 			}
+		case errors.Is(err, errQueueUnknown):
+			// Left until it settles; say so once, not on every pass.
+			key := preparationKey(p)
+			queueUnknown[key] = struct{}{}
+			if !h.wasQueueUnknown(key) {
+				logger.Warn(ctx, "Left a queued execution unjudged: without a queue store this coordinator cannot tell whether a queue still holds it",
+					tag.RunID(p.Run.ID), tag.AttemptID(p.AttemptID))
+			}
 		case errors.Is(err, persis.ErrAttemptNotAbandonable), errors.Is(err, dagrun.ErrDAGRunIDNotFound):
 			// Ended only once nothing of it is left to judge, decided under
 			// the lock abandonments take: while the latest attempt is another
@@ -370,6 +395,7 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 	}
 	h.inFlightPreparationsMu.Lock()
 	h.inFlightPreparations = inFlight
+	h.queueUnknownPreparations = queueUnknown
 	h.inFlightPreparationsMu.Unlock()
 }
 
@@ -390,6 +416,15 @@ func (h *Handler) wasInFlight(key string) bool {
 	h.inFlightPreparationsMu.Lock()
 	defer h.inFlightPreparationsMu.Unlock()
 	_, ok := h.inFlightPreparations[key]
+	return ok
+}
+
+// wasQueueUnknown reports whether the previous reconciliation pass left the
+// entry because this coordinator has no queue store.
+func (h *Handler) wasQueueUnknown(key string) bool {
+	h.inFlightPreparationsMu.Lock()
+	defer h.inFlightPreparationsMu.Unlock()
+	_, ok := h.queueUnknownPreparations[key]
 	return ok
 }
 
