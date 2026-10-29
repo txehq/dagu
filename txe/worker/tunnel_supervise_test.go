@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -86,10 +87,28 @@ while True:
     time.sleep(0.2)
 `
 
+// syncBuffer is the supervisor's output, read by the test while the process still writes it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 type supervised struct {
 	dir, modeFile, sigFile, pidFile, state string
 	cmd                                    *exec.Cmd
-	stderr                                 *bytes.Buffer
+	stderr                                 *syncBuffer
 	done                                   chan error
 }
 
@@ -134,7 +153,7 @@ func startSupervised(t *testing.T, mode string, extra ...string) *supervised {
 	args = append(args, extra...)
 	args = append(args, "--", py, "-I", fake, s.modeFile, s.sigFile, s.pidFile, workerLog, fmt.Sprint(ui), fmt.Sprint(coord))
 	s.cmd = exec.Command(py, args...)
-	s.stderr = &bytes.Buffer{}
+	s.stderr = &syncBuffer{}
 	s.cmd.Stdout, s.cmd.Stderr = s.stderr, s.stderr
 	s.cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	require.NoError(t, s.cmd.Start())
