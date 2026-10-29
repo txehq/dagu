@@ -120,7 +120,7 @@ jobs:
             esac
 
             case "${file}" in
-              ui/*|.github/workflows/ci.yaml)
+              ui/*)
                 e2e_changed=true
                 ;;
             esac
