@@ -73,8 +73,10 @@ func (e *ErrIncomplete) Error() string {
 func (e *ErrIncomplete) Unwrap() error { return e.Cause }
 
 // ErrSuperseded reports a request whose job version was replaced by a later
-// one before its receipt was written. The job itself is unaffected. A resume
-// of a request already closed this way answers with it again.
+// one before its receipt was written. The job itself is unaffected. The
+// version's package is kept on this machine as a record and is never removed
+// automatically. A resume of a request already closed this way answers with
+// it again.
 type ErrSuperseded struct {
 	RequestID string
 	JobID     string
@@ -86,11 +88,17 @@ type ErrSuperseded struct {
 
 func (e *ErrSuperseded) Error() string {
 	if e.Current == 0 {
-		return fmt.Sprintf("request %s registered version %d of %s, but the job has moved on to a later version; nothing is left to resume and no receipt exists for version %d",
-			e.RequestID, e.Version, e.JobID, e.Version)
+		return fmt.Sprintf("request %s registered version %d of %s, but the job has moved on to a later version; nothing is left to resume and no receipt exists for version %d. %s",
+			e.RequestID, e.Version, e.JobID, e.Version, supersededPackage(e.JobID))
 	}
-	return fmt.Sprintf("request %s registered version %d of %s, but the job is now at version %d; nothing is left to resume and no receipt exists for version %d",
-		e.RequestID, e.Version, e.JobID, e.Current, e.Version)
+	return fmt.Sprintf("request %s registered version %d of %s, but the job is now at version %d; nothing is left to resume and no receipt exists for version %d. %s",
+		e.RequestID, e.Version, e.JobID, e.Current, e.Version, supersededPackage(e.JobID))
+}
+
+// supersededPackage says what becomes of a superseded version's package.
+func supersededPackage(jobID string) string {
+	return "Its package stays on this machine as a record and is never removed automatically; dagu txe inspect " + jobID +
+		" lists it as never ready unless a version that was marked ready has the same package"
 }
 
 // Registrar registers and updates jobs from this machine. Each step is saved
@@ -953,7 +961,7 @@ func (r *Registrar) overtaken(ctx context.Context, entry *txepkg.Entry, job *Job
 	}
 
 	entry.Step, entry.SupersededBy = txepkg.StepSuperseded, job.Version
-	entry.Error = fmt.Sprintf("job %s moved on to version %d, and its history has no record that version %d was ever marked ready; the package stays in place and no receipt is written for that version",
+	entry.Error = fmt.Sprintf("job %s moved on to version %d, and its history has no record that version %d was ever marked ready; the package stays in place as a record, is never removed automatically, and no receipt is written for that version",
 		entry.JobID, job.Version, entry.Version)
 	if err := r.Journal.Save(entry); err != nil {
 		return nil, err

@@ -374,6 +374,40 @@ func (s *Store) Verify(jobID, digest string) (*Package, error) {
 	return &Package{JobID: jobID, Digest: digest, Dir: dir, Manifest: *manifest}, nil
 }
 
+// HeldPackage is one entry of a job's directory in the store.
+type HeldPackage struct {
+	Dir string
+	// Digest is the package digest a directory's name stands for. It is empty
+	// for an entry that is not a directory or whose name is not a digest's.
+	Digest string
+}
+
+// Held lists every entry of jobID's directory, sorted by name, whether or not
+// it holds an intact package. It reads only. A job with no directory on this
+// machine holds nothing.
+func (s *Store) Held(jobID string) ([]HeldPackage, error) {
+	if !namePattern.MatchString(jobID) {
+		return nil, fmt.Errorf("invalid job id %q", jobID)
+	}
+	dir := filepath.Join(s.Root, jobID)
+	found, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	held := make([]HeldPackage, 0, len(found))
+	for _, f := range found {
+		h := HeldPackage{Dir: filepath.Join(dir, f.Name())}
+		if digest := strings.Replace(f.Name(), "-", ":", 1); f.IsDir() && digestPattern.MatchString(digest) {
+			h.Digest = digest
+		}
+		held = append(held, h)
+	}
+	return held, nil
+}
+
 // PackageDir returns where the package for jobID and digest is, or would be.
 func (s *Store) PackageDir(jobID, digest string) (string, error) {
 	return s.packageDir(jobID, digest)

@@ -856,3 +856,38 @@ func TestInvalidNames(t *testing.T) {
 	_, err = store.PackageDir(testJob, "sha256:short")
 	require.ErrorContains(t, err, "invalid package digest")
 }
+
+// Held names every entry of a job's directory, so a caller can account for
+// each one. Only a directory whose name is a package digest's is taken for a
+// package; anything else is listed without a digest.
+func TestHeld(t *testing.T) {
+	store := newStore(t)
+	held, err := store.Held(testJob)
+	require.NoError(t, err)
+	assert.Empty(t, held, "a job with no directory holds nothing")
+
+	_, opts := collectorSource(t)
+	staged, err := store.Stage("req-1", opts)
+	require.NoError(t, err)
+	pkg, err := store.Commit(staged, testJob)
+	require.NoError(t, err)
+
+	jobDir := filepath.Dir(pkg.Dir)
+	require.NoError(t, os.Chmod(jobDir, 0o700)) //nolint:gosec // test adds stray entries
+	digestName := "sha256-" + strings.Repeat("0", 64)
+	require.NoError(t, os.WriteFile(filepath.Join(jobDir, digestName), nil, 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(jobDir, "leftover"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(jobDir, "sha256-short"), 0o700))
+
+	held, err = store.Held(testJob)
+	require.NoError(t, err)
+	assert.Equal(t, []HeldPackage{
+		{Dir: filepath.Join(jobDir, "leftover")},
+		{Dir: filepath.Join(jobDir, digestName)}, // a file, not a package directory
+		{Dir: pkg.Dir, Digest: pkg.Digest},
+		{Dir: filepath.Join(jobDir, "sha256-short")},
+	}, held)
+
+	_, err = store.Held("../escape")
+	require.ErrorContains(t, err, "invalid job id")
+}

@@ -232,6 +232,7 @@ Registration prints a receipt only when the hub has marked the job ready. Until 
 | The spec is incomplete | Listed fields are missing. | Fill them in. Do not guess a target or a purpose; ask the user. |
 | Duplicate | The job key is already registered. | `inspect` the job named in the message and update it. |
 | Incomplete, with a request id | The run was interrupted. No receipt exists. | `dagu txe resume <request id>`. This cannot create a second job. |
+| Superseded | Another session saved a later version before this one was marked ready. No receipt exists for this version; the job is unaffected. | Nothing to resume. Inspect the job and merge your change into its current version if it is still needed. |
 
 Add `--json` to any command for structured output.
 
@@ -255,6 +256,8 @@ dagu txe update <job id> -f job.yaml --expected-version <n>
 ```
 
 An update names the version it was made against. If another session has updated the job since, it is refused and nothing changes: inspect the job again, merge the difference into the spec, and update against the new version. Earlier versions' packages and receipts are kept.
+
+A version's package is never removed automatically, including the package of a version that was superseded before it was marked ready. The job runs only its current version's package; the others stay on the machine as a record of what was registered. `dagu txe inspect <job id>` lists, under "Never ready", each of the job's package directories on this machine that no version was ever marked ready with. Do not delete one unless the user asks.
 
 ## When the work is over, or the target changes
 

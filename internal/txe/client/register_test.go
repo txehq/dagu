@@ -500,6 +500,12 @@ func TestResumeAfterJobMovedOnBeforeReady(t *testing.T) {
 	assert.Equal(t, txepkg.StepSuperseded, pendingSteps(t, cc1.Journal)[requestID])
 	_, err = cc1.Journal.Receipt(jobID, 1)
 	require.ErrorIs(t, err, fs.ErrNotExist)
+	// The version's package is kept in place, intact, as a record.
+	closed, err := cc1.Journal.Get(requestID)
+	require.NoError(t, err)
+	assert.Contains(t, closed.Error, "the package stays in place as a record, is never removed automatically")
+	_, err = cc1.Store.Verify(jobID, closed.PackageDigest)
+	require.NoError(t, err)
 	f.mu.Lock()
 	calls := len(f.requests)
 	f.mu.Unlock()
@@ -523,7 +529,9 @@ func TestResumeAfterJobMovedOnBeforeReady(t *testing.T) {
 	require.ErrorAs(t, err, &older)
 	assert.Equal(t, ErrSuperseded{RequestID: requestID, JobID: jobID, Version: 1}, *older)
 	assert.EqualError(t, err, "request "+requestID+" registered version 1 of "+jobID+
-		", but the job has moved on to a later version; nothing is left to resume and no receipt exists for version 1")
+		", but the job has moved on to a later version; nothing is left to resume and no receipt exists for version 1. "+
+		"Its package stays on this machine as a record and is never removed automatically; dagu txe inspect "+jobID+
+		" lists it as never ready unless a version that was marked ready has the same package")
 
 	// Version 2 is untouched.
 	assert.Equal(t, 2, f.job(jobID).Version)
