@@ -136,6 +136,8 @@ The three names are fixed: they are what the probe looks up. A reference's name 
 
 A check that cannot see the target (expired login, unreachable cluster, timeout) stops the run and is recorded as such. It is never recorded as a deletion.
 
+What a check sees with a job's credential belongs to that job: a refused login, an unreachable or timed-out target, or the target being present again, changes only the availability of the job whose credential was used. Another job naming the same target keeps its own state, set by its own checks, even when its credential reference has the same name: a name is not the same credential. A deletion, an absence or a replacement is a fact about the target and applies to every job naming it.
+
 ### A stable id for something with no UID
 
 The registry knows a target by its `kind` and `stable_id` together. A recorded event about the target, a deletion for example, reaches the job only through that exact pair. A resource recorded as present under the same `kind`, `environment` and `display_name` but another `stable_id` is a replacement. `dagu txe list --target` searches these values. Choose the id in this order:

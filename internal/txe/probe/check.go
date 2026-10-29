@@ -90,14 +90,16 @@ func (c *Check) actor() *txeclient.Actor {
 	return &txeclient.Actor{Kind: ActorKindReconciler, ID: "txe-probe", MachineID: c.MachineID, Client: c.Client}
 }
 
-// event turns one observation into the report the registry receives. A
-// replacement is reported as the new identity being present; the old
-// identity is not also reported absent, so the registry applies the job's
-// replacement rule and not its deletion rule.
-func (c *Check) event(t Target, r Result) Event {
+// event turns one observation, made with the credentials of version of
+// jobID, into the report the registry receives. A replacement is reported as
+// the new identity being present; the old identity is not also reported
+// absent, so the registry applies the job's replacement rule and not its
+// deletion rule.
+func (c *Check) event(jobID string, version int, t Target, r Result) Event {
 	evidence := append(append([]string{}, r.Evidence...), c.Evidence...)
 	ev := Event{Target: t, Observation: r.Outcome, Authoritative: r.Outcome == Absent && r.Authoritative,
-		Detail: r.Detail, Evidence: evidence, ObservedAt: c.now().UTC(), Actor: c.actor()}
+		Detail: r.Detail, Evidence: evidence, ObservedAt: c.now().UTC(), Actor: c.actor(),
+		ReporterJobID: jobID, ReporterJobVersion: version}
 	if r.Observed != nil {
 		ev.Target = *r.Observed
 	}
@@ -155,11 +157,11 @@ func (c *Check) replay(ctx context.Context, jobID string) (int, error) {
 	return failed, nil
 }
 
-func (c *Check) observe(ctx context.Context, jobID string, t Target, creds Credentials) (Line, Result) {
+func (c *Check) observe(ctx context.Context, jobID string, version int, t Target, creds Credentials) (Line, Result) {
 	r := c.Probes.Probe(ctx, t, creds)
 	line := Line{JobID: jobID, Target: t, Observation: r.Outcome, Authoritative: r.Outcome == Absent && r.Authoritative,
 		Replacement: r.Observed, Detail: r.Detail}
-	ev := c.event(t, r)
+	ev := c.event(jobID, version, t, r)
 	rec, err := c.report(ctx, jobID, t, ev)
 	if err != nil {
 		line.ReportError = err.Error()
@@ -246,7 +248,7 @@ func (c *Check) PreRun(ctx context.Context, jobID string, version int, creds Cre
 		if t.ExistenceCheck != CheckPreRun {
 			continue
 		}
-		line, r := c.observe(ctx, jobID, toTarget(t), creds)
+		line, r := c.observe(ctx, jobID, version, toTarget(t), creds)
 		switch {
 		case !line.Reported:
 			worse(ExitUnobserved)
@@ -282,12 +284,13 @@ func rank(code int) int {
 	return 3
 }
 
-// candidate is one target a periodic check may observe, with the job whose
-// credentials it is observed with.
+// candidate is one target a periodic check may observe, with the job, at its
+// current version, whose credentials it is observed with.
 type candidate struct {
-	jobID  string
-	target Target
-	creds  Credentials
+	jobID   string
+	version int
+	target  Target
+	creds   Credentials
 }
 
 // PeriodicResult summarises one periodic run.
@@ -300,7 +303,9 @@ type PeriodicResult struct {
 
 // Periodic resends every unacknowledged report, then observes the
 // reconcile targets of the machine's jobs and the targets of the incomplete
-// events this machine reported, until the deadline. Targets it has waited
+// events this machine reported, until the deadline. A target several jobs
+// name is observed once for each of them, with each job's own credentials:
+// what one job's credential or route sees says nothing about another's. Targets it has waited
 // longest to see go first, so a run cut short by slow targets resumes with
 // the rest next time. An incomplete event whose target no job of the
 // machine names, by identity or as a replacement of a target's name, cannot
@@ -325,8 +330,8 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 	var cands []candidate
 	// byKey and byName find, for an incomplete event's target, a job of this
 	// machine that names it, or names its place (a replacement), for its
-	// credentials.
-	byKey, byName := map[string]candidate{}, map[string]candidate{}
+	// credentials; byJob finds the job an event was reported for.
+	byKey, byName, byJob := map[string]candidate{}, map[string]candidate{}, map[string]candidate{}
 	for _, job := range jobs {
 		if terminal(job.Lifecycle) || job.MachineID != c.MachineID {
 			continue
@@ -338,16 +343,17 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 		creds := credsFor(job.JobID, job.Version)
 		for _, t := range v.Targets {
 			pt := toTarget(t)
-			cand := candidate{jobID: job.JobID, target: pt, creds: creds}
+			cand := candidate{jobID: job.JobID, version: job.Version, target: pt, creds: creds}
 			key := TargetKey(pt)
 			if _, ok := byKey[key]; !ok {
 				byKey[key] = cand
 			}
+			byJob[job.JobID+"\x00"+key] = cand
 			if _, ok := byName[nameKey(pt)]; !ok && pt.DisplayName != "" {
 				byName[nameKey(pt)] = cand
 			}
-			if t.ExistenceCheck == CheckReconcile && !seen[key] {
-				seen[key] = true
+			if t.ExistenceCheck == CheckReconcile && !seen[job.JobID+"\x00"+key] {
+				seen[job.JobID+"\x00"+key], seen[key] = true, true
 				cands = append(cands, cand)
 			}
 		}
@@ -364,12 +370,16 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 				continue
 			}
 			seen[key] = true
+			if cand, ok := byJob[ev.ReporterJobID+"\x00"+key]; ok && ev.ReporterJobID != "" {
+				cands = append(cands, cand)
+				continue
+			}
 			if cand, ok := byKey[key]; ok {
 				cands = append(cands, cand)
 				continue
 			}
 			if cand, ok := byName[nameKey(ev.Target)]; ok && ev.Target.DisplayName != "" {
-				cands = append(cands, candidate{jobID: cand.jobID, target: ev.Target, creds: cand.creds})
+				cands = append(cands, candidate{jobID: cand.jobID, version: cand.version, target: ev.Target, creds: cand.creds})
 				continue
 			}
 			res.Unfinished++
@@ -396,7 +406,7 @@ func (c *Check) Periodic(ctx context.Context, deadline time.Time, credsFor func(
 			}
 			break
 		}
-		line, _ := c.observe(ctx, cand.jobID, cand.target, cand.creds)
+		line, _ := c.observe(ctx, cand.jobID, cand.version, cand.target, cand.creds)
 		if line.Reported {
 			res.Observed++
 		} else {

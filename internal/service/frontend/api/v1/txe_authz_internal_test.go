@@ -746,3 +746,96 @@ func TestTxeOwnersDuplicateIsListedAfterItsJobAndNamesItOnlyToThoseWhoSeeIt(t *t
 	require.Equal(t, registry.RegistrationDuplicate, stored.Registration.State)
 	require.Equal(t, w.jobA, stored.Registration.DuplicateOf)
 }
+
+// A report names the job whose credential made the observation, and the hub
+// checks it rather than trusting it: the caller must be allowed to write the
+// job, and a machine reports only for its own jobs. A report naming any other
+// job is refused and changes nothing. A denied credential then changes only
+// the reporting job; every other dependent the caller may write is left
+// unchanged. The reply and a later read name the reporting job only to a
+// caller who can see it.
+func TestTxeOwnersReporterJobIsCheckedAndShownOnlyToThoseWhoSeeIt(t *testing.T) {
+	w := newTwoOwners(t, "")
+	ctx := context.Background()
+	system := registry.Actor{Kind: registry.ActorSystem, ID: "test"}
+	shared := registry.Target{Kind: "kubernetes.configmap", StableID: map[string]string{"cluster_uid": "c-1", "uid": "shared-cm"}}
+	register := func(owner, project, machine string) string {
+		id, err := registry.NewID(registry.PrefixJob, time.Now())
+		require.NoError(t, err)
+		v := ownersVersion(machine, 3)
+		v.Targets = []registry.Target{shared}
+		_, err = w.reg.Register(ctx, registry.RegisterInput{JobID: id, RequestID: "r-" + id, OwnerID: owner, ProjectID: project,
+			MachineID: machine, JobKey: "cm-" + id, Version: v}, system)
+		require.NoError(t, err)
+		return id
+	}
+	machineA2, err := registry.NewID(registry.PrefixMachine, time.Now())
+	require.NoError(t, err)
+	_, err = w.reg.CreateMachine(ctx, registry.Machine{MachineID: machineA2, OwnerID: w.ownerA, DisplayName: "desktop"}, system)
+	require.NoError(t, err)
+	jobA, jobA2, jobB := register(w.ownerA, w.projectA, w.machineA), register(w.ownerA, w.projectA, machineA2), register(w.ownerB, w.projectB, w.machineB)
+	require.NoError(t, w.reg.RebuildResourceIndex(ctx))
+	target, err := txeConvert[apigen.TxeTarget](shared)
+	require.NoError(t, err)
+	report := func(caller context.Context, reporter string) (apigen.TxeResourceEvent, error) {
+		version := 1
+		resp, err := w.api.RecordTxeResourceEvent(caller, apigen.RecordTxeResourceEventRequestObject{Body: &apigen.RecordTxeResourceEventJSONRequestBody{
+			Target: target, Observation: apigen.TxeResourceObservation("auth_denied"), Detail: new("401 Unauthorized"),
+			ReporterJobId: &reporter, ReporterJobVersion: &version}})
+		if err != nil {
+			return apigen.TxeResourceEvent{}, err
+		}
+		return apigen.TxeResourceEvent(resp.(apigen.RecordTxeResourceEvent200JSONResponse)), nil
+	}
+	availability := func(jobID string) registry.AvailabilityState {
+		job, err := w.reg.GetJob(ctx, jobID)
+		require.NoError(t, err)
+		return job.Availability.State
+	}
+
+	// Refused: another owner's job, another machine's job, a job that does not exist.
+	_, err = report(w.cliB, jobA)
+	require.Equal(t, http.StatusNotFound, statusOf(err), "B cannot report for A's job")
+	_, err = report(w.workerA, jobA2)
+	require.Contains(t, []int{http.StatusForbidden, http.StatusNotFound}, statusOf(err), "machine A cannot report for a job of machine A2")
+	missing, err := registry.NewID(registry.PrefixJob, time.Now())
+	require.NoError(t, err)
+	_, err = report(w.workerA, missing)
+	require.Equal(t, http.StatusNotFound, statusOf(err))
+	for _, id := range []string{jobA, jobA2, jobB} {
+		require.Equal(t, registry.AvailabilityReady, availability(id), "a refused report changes nothing")
+	}
+
+	// Machine A reports its own job's denied credential: only that job changes.
+	ev, err := report(w.workerA, jobA)
+	require.NoError(t, err)
+	require.Equal(t, registry.AvailabilityAuthRequired, availability(jobA))
+	require.Equal(t, registry.AvailabilityReady, availability(jobA2), "A2 uses its own credential")
+	require.Equal(t, registry.AvailabilityReady, availability(jobB), "another owner's job is untouched")
+	for _, d := range ev.Dispositions {
+		require.NotEqual(t, jobB, d.JobId, "no other owner's job is reported to A's machine")
+	}
+
+	// An operator who may write every job reports A's job; B reads the event
+	// through its own unchanged job and is not told whose report it was.
+	ev, err = report(w.legacy, jobA)
+	require.NoError(t, err)
+	outcomes := map[string]string{}
+	for _, d := range ev.Dispositions {
+		outcomes[d.JobId] = string(d.Outcome)
+	}
+	require.Equal(t, "unchanged", outcomes[jobB])
+	require.Equal(t, "unchanged", outcomes[jobA2])
+	require.Equal(t, registry.AvailabilityReady, availability(jobB))
+	got, err := w.api.GetTxeResourceEvent(w.personB, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
+	require.NoError(t, err)
+	shown := got.(apigen.GetTxeResourceEvent200JSONResponse)
+	require.Nil(t, shown.ReporterJobId, "A's job is not named to B")
+	require.Nil(t, shown.ReporterJobVersion)
+	for _, d := range shown.Dispositions {
+		require.Equal(t, jobB, d.JobId)
+	}
+	got, err = w.api.GetTxeResourceEvent(w.personA, apigen.GetTxeResourceEventRequestObject{EventId: ev.EventId})
+	require.NoError(t, err)
+	require.Equal(t, jobA, valueOf(got.(apigen.GetTxeResourceEvent200JSONResponse).ReporterJobId))
+}

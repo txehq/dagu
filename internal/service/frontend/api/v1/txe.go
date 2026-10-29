@@ -1431,6 +1431,12 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	if body.ObservedAt != nil {
 		ev.ObservedAt = *body.ObservedAt
 	}
+	if body.ReporterJobId != nil {
+		ev.ReporterJobID, ev.ReporterJobVersion = *body.ReporterJobId, valueOf(body.ReporterJobVersion)
+		if err := a.txeAuthorizeReporterJob(ctx, s, ev.ReporterJobID); err != nil {
+			return nil, err
+		}
+	}
 	// The event affects, and reports, only jobs the caller may write.
 	writable := func(ctx context.Context, job *registry.Job) bool {
 		return a.txeResourceEventApplies(ctx, s, job)
@@ -1447,6 +1453,30 @@ func (a *API) RecordTxeResourceEvent(ctx context.Context, req api.RecordTxeResou
 	a.txeShowResourceEvent(ctx, s, shown)
 	out, err := txeConvert[api.TxeResourceEvent](shown)
 	return api.RecordTxeResourceEvent200JSONResponse(out), err
+}
+
+// txeAuthorizeReporterJob checks that the caller may report observations made
+// with jobID's credentials: it may write the job, as it must every job the
+// event changes, and a machine reports only for a job assigned to it. A job
+// the caller cannot write reads as not found. A report it may not make is
+// refused, never applied to every dependent instead.
+func (a *API) txeAuthorizeReporterJob(ctx context.Context, s *registry.Store, jobID string) error {
+	job, err := s.GetJob(ctx, jobID)
+	if registry.ErrorCode(err) == registry.CodeNotFound {
+		return txeJobNotFound(jobID)
+	}
+	if err != nil {
+		return txeError(err)
+	}
+	if !a.txeResourceEventApplies(ctx, s, job) {
+		return txeJobNotFound(jobID)
+	}
+	if c, err := a.txeResolve(ctx); err == nil && c.scope.Kind() == authz.ScopeMachine && job.MachineID != c.scope.MachineID() {
+		return &Error{HTTPStatus: http.StatusForbidden, Code: api.ErrorCodeForbidden,
+			Message: "a machine reports observations only for its own jobs",
+			Details: map[string]any{"code": "not_permitted"}}
+	}
+	return nil
 }
 
 // cloneResourceEvent copies ev, with its own lists, so a reply can be
@@ -1489,6 +1519,9 @@ func (a *API) txeShowResourceEvent(ctx context.Context, s *registry.Store, ev *r
 		}
 	}
 	ev.Failures = failures
+	if ev.ReporterJobID != "" && !canSee(ev.ReporterJobID) {
+		ev.ReporterJobID, ev.ReporterJobVersion = "", 0
+	}
 	return a.authService == nil || len(visible)+len(pending) > 0 || a.txeIsStandingReporter(ctx, ev)
 }
 

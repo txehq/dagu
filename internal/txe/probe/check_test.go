@@ -484,3 +484,84 @@ func TestEnvCredentials(t *testing.T) {
 }
 
 func noCreds(string, int) Credentials { return credMap{} }
+
+// byCredential answers as the target would for the credential it is handed:
+// one value is refused, any other accepted. It records which job's value it
+// saw, by value, so a test can tell the jobs apart without credentials ever
+// leaving the machine.
+type byCredential struct {
+	refused string
+	seen    []string
+}
+
+func (b *byCredential) Supports(kind string) bool { return kind == kindCM }
+func (b *byCredential) Probe(_ context.Context, _ Target, creds Credentials) Result {
+	c, _ := creds.Lookup(KubernetesCredential)
+	b.seen = append(b.seen, c.Value)
+	if c.Value == b.refused {
+		return Result{Outcome: AuthDenied, Detail: "401 Unauthorized"}
+	}
+	return Result{Outcome: Present}
+}
+
+// Two jobs of the machine name one reconcile target, each with its own
+// credential. The periodic check observes it once for each job, with that
+// job's credential, and every report names the job it was made for, at its
+// current version, so the registry applies a refused credential to that job
+// only. A pre-run report names its job and the version the run was rendered
+// for. No credential value or locator reaches a report or an output line.
+func TestReportsNameTheJobWhoseCredentialWasUsed(t *testing.T) {
+	f := newFixture(t)
+	shared := cm("shared", "shared", CheckReconcile)
+	f.reg.versions[jobA][2].Targets = []txeclient.Target{cm("u-1", "one", CheckPreRun), shared}
+	f.reg.jobs[jobB] = &txeclient.Job{JobID: jobB, MachineID: mch, Version: 4, Lifecycle: "active", Registration: txeclient.Registration{State: "ready"}}
+	f.reg.versions[jobB] = map[int]*txeclient.JobVersion{4: {Version: 4, Targets: []txeclient.Target{shared}}}
+	const expired, valid = "synthetic-expired-token", "synthetic-valid-token"
+	const locator = "/synthetic/creds/kubeconfig-a"
+	probe := &byCredential{refused: expired}
+	f.check.Probes = Probes{probe}
+	creds := func(jobID string, _ int) Credentials {
+		if jobID == jobA {
+			return credMap{KubernetesCredential: {Path: locator, Value: expired}}
+		}
+		return credMap{KubernetesCredential: {Value: valid}}
+	}
+
+	_, code, err := f.check.Periodic(context.Background(), f.now.Add(time.Hour), creds)
+	if err != nil || code != ExitOK {
+		t.Fatalf("exit = %d, %v", code, err)
+	}
+	got := map[string]Event{}
+	for _, ev := range f.reg.recorded {
+		if ev.Target.StableID[KeyUID] == "shared" {
+			got[ev.ReporterJobID] = ev
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("reports for the shared target = %+v, want one per job", f.reg.recorded)
+	}
+	if ev := got[jobA]; ev.Observation != AuthDenied || ev.ReporterJobVersion != 2 {
+		t.Fatalf("job A's report = %+v", ev)
+	}
+	if ev := got[jobB]; ev.Observation != Present || ev.ReporterJobVersion != 4 {
+		t.Fatalf("job B's report = %+v", ev)
+	}
+
+	f.reg.recorded = nil
+	if code := f.preRun(t, 2); code != ExitOK {
+		t.Fatalf("pre-run exit = %d", code)
+	}
+	if len(f.reg.recorded) != 1 || f.reg.recorded[0].ReporterJobID != jobA || f.reg.recorded[0].ReporterJobVersion != 2 {
+		t.Fatalf("pre-run reports = %+v", f.reg.recorded)
+	}
+
+	sent, err := json.Marshal(append(f.reg.recorded, got[jobA], got[jobB]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{expired, valid, locator} {
+		if strings.Contains(string(sent), secret) || strings.Contains(f.out.String(), secret) {
+			t.Fatalf("%q reached a report or an output line", secret)
+		}
+	}
+}
