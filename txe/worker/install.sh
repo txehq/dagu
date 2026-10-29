@@ -145,8 +145,9 @@ python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kub
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential"
 
 for label in "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL"; do
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$TXE_DAGU_AGENTS_DIR/$label.plist"
+  # Waits for launchd to finish removing the old agent before loading the new one
+  # (TXE-4185); fails naming the label rather than leaving it unloaded.
+  launchd_reload "$label" "$TXE_DAGU_AGENTS_DIR/$label.plist"
 done
 
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
