@@ -15,7 +15,8 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
       the worker as DAGU_WORKER_AUTH_CREDENTIAL_FILE: the path only, never the contents.
       With an empty CREDENTIAL_FILE the agents are exactly those of an install without one.
       The tunnel agent runs HOME/tunnel/tunnel-supervise.py with PYTHON, and kubectl under it
-      (TXE-5398); install.sh puts the script there.
+      (TXE-5398); the worker agent runs HOME/bin/logpipe.py with PYTHON, and the worker under
+      it, so logs/worker.log stays bounded (TXE-4724); install.sh puts both scripts there.
 
   agents.py credential PLIST
       Print the credential file a worker agent passes, or nothing.
@@ -130,24 +131,31 @@ def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label
     # dead can keep running, so the supervisor ends it when its streams and the worker's
     # heartbeats have both failed long enough (TXE-5398).
     tunnel = dict(common, Label=tunnel_label, ProgramArguments=[
+        python, "-I", f"{home}/bin/logpipe.py",
+        "--path", f"{home}/logs/tunnel.log", "--max-bytes", "8388608", "--backups", "5", "--",
         python, "-I", f"{home}/tunnel/tunnel-supervise.py",
         "--ui-port", ui_port, "--coord-port", coord_port,
         "--worker-log", f"{home}/logs/worker.log", "--state", f"{home}/tunnel/supervise-state.json", "--",
         kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
         "port-forward", "--address", "127.0.0.1", service,
         f"{ui_port}:8080", f"{coord_port}:{coord_port}"],
-        StandardOutPath=f"{home}/logs/tunnel.log", StandardErrorPath=f"{home}/logs/tunnel.log")
+        StandardOutPath=f"{home}/logs/tunnel.launchd.log", StandardErrorPath=f"{home}/logs/tunnel.launchd.log")
     environment = {"DAGU_HOME": f"{home}/worker-home", "PATH": path}
     if credential_file:
         environment[CREDENTIAL_ENV] = credential_file
+    # The worker's output goes through logpipe.py, which owns logs/worker.log and keeps it
+    # bounded (TXE-4724); launchd's own file for this agent holds only the wrapper's
+    # diagnostics, so no second descriptor on worker.log can defeat the bound.
     worker = dict(common, Label=worker_label, ProgramArguments=[
+        python, "-I", f"{home}/bin/logpipe.py",
+        "--path", f"{home}/logs/worker.log", "--max-bytes", "67108864", "--backups", "10", "--",
         f"{home}/bin/dagu", "worker",
         "--worker.id", machine_id,
         "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
         "--worker.coordinators", f"127.0.0.1:{coord_port}"],
         EnvironmentVariables=environment,
         WorkingDirectory=f"{home}/worker-home",
-        StandardOutPath=f"{home}/logs/worker.log", StandardErrorPath=f"{home}/logs/worker.log")
+        StandardOutPath=f"{home}/logs/worker.launchd.log", StandardErrorPath=f"{home}/logs/worker.launchd.log")
     for label, body in ((tunnel_label, tunnel), (worker_label, worker)):
         target = os.path.join(agents, f"{label}.plist")
         with open(target + ".tmp", "wb") as f:

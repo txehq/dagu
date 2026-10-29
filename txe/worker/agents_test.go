@@ -74,9 +74,15 @@ func TestAgentsWithoutACredential(t *testing.T) {
 	dir, worker := agentsOut(t, "")
 	home := filepath.Join(filepath.Dir(dir), "txe dagu")
 	assert.Equal(t, map[string]any{"DAGU_HOME": home + "/worker-home", "PATH": "/usr/bin:/bin"}, worker["EnvironmentVariables"])
-	assert.Equal(t, []any{home + "/bin/dagu", "worker", "--worker.id", agentsMachine,
+	// The worker runs under logpipe.py, which owns logs/worker.log (TXE-4724); launchd's own
+	// file for the agent is separate so it cannot hold a second descriptor on worker.log.
+	assert.Equal(t, []any{"/opt/py thon/bin/python3", "-I", home + "/bin/logpipe.py",
+		"--path", home + "/logs/worker.log", "--max-bytes", "67108864", "--backups", "10", "--",
+		home + "/bin/dagu", "worker", "--worker.id", agentsMachine,
 		"--worker.labels", "txe.machine=" + agentsMachine + ",txe.owner=" + agentsOwner,
 		"--worker.coordinators", "127.0.0.1:50055"}, worker["ProgramArguments"])
+	assert.Equal(t, home+"/logs/worker.launchd.log", worker["StandardOutPath"])
+	assert.Equal(t, home+"/logs/worker.launchd.log", worker["StandardErrorPath"])
 	stdout, _, err := python(t, agentsScript(t), "credential", filepath.Join(dir, "com.txe.dagu.worker.plist"))
 	require.NoError(t, err)
 	assert.Empty(t, stdout)
@@ -86,7 +92,9 @@ func TestAgentsWithoutACredential(t *testing.T) {
 	var tunnel map[string]any
 	require.NoError(t, json.Unmarshal([]byte(dump), &tunnel))
 	// The supervisor runs kubectl's unchanged command after "--" (TXE-5398).
-	assert.Equal(t, []any{"/opt/py thon/bin/python3", "-I", home + "/tunnel/tunnel-supervise.py",
+	assert.Equal(t, []any{"/opt/py thon/bin/python3", "-I", home + "/bin/logpipe.py",
+		"--path", home + "/logs/tunnel.log", "--max-bytes", "8388608", "--backups", "5", "--",
+		"/opt/py thon/bin/python3", "-I", home + "/tunnel/tunnel-supervise.py",
 		"--ui-port", "18080", "--coord-port", "50055",
 		"--worker-log", home + "/logs/worker.log", "--state", home + "/tunnel/supervise-state.json", "--",
 		"/opt/kube ctl/kubectl", "--kubeconfig", home + "/tunnel/kubeconfig", "-n", "dagu",

@@ -144,6 +144,9 @@ kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
 python_bin="$(python3 -I -c 'import sys; print(sys.executable)')" || die "python3 is not on PATH"
 install -m 0644 "$here/tunnel-supervise.py" "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py.next"
 mv -f "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py.next" "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py"
+# The worker's log wrapper (TXE-4724), beside the worker binaries it runs.
+install -m 0644 "$here/logpipe.py" "$TXE_DAGU_HOME/bin/logpipe.py.next"
+mv -f "$TXE_DAGU_HOME/bin/logpipe.py.next" "$TXE_DAGU_HOME/bin/logpipe.py"
 
 # launchd agents. PATH is the installing shell's, so scheduled scripts find the same
 # tools; nothing else from the environment is copied, and no credential: the worker
