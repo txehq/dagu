@@ -745,6 +745,51 @@ print("last line kept", text.endswith(b"line 01999 some worker output text\n"))
 	assert.Contains(t, stdout, "last line kept True")
 }
 
+// finish() ends the compressor within its timeout even when the job queue is full and the
+// compression in progress is stuck: the stop flag ends the loop, the sentinel is optional.
+func TestLogpipeFinishIsBoundedWithAFullQueueAndAStuckCompression(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile, threading, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path, max_bytes=20000, backups=1)   # queue of one
+release = threading.Event()
+def stuck_compress(self, rotated):
+    release.wait(10)   # a compression that does not return while the wrapper wants to exit
+logpipe.Log._compress = stuck_compress
+log._enqueue(os.path.join(d, "worker.log.20200101T000000000001Z"))   # taken by the loop at once
+time.sleep(0.2)
+log._enqueue(os.path.join(d, "worker.log.20200101T000000000002Z"))   # fills the queue
+print("queue full", log.jobs.full())
+t0 = time.monotonic(); log.finish(timeout=0.3); dt = time.monotonic() - t0
+print("finish returned in %.2fs bounded %s" % (dt, dt < 2.0))
+release.set()
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "queue full True")
+	assert.Contains(t, stdout, "bounded True")
+	assert.Contains(t, stderr, "compression did not finish within 0.3s at exit")
+}
+
+// A stale .gz.tmp beside its source is reclaimed during the process's life, at the next
+// prune, not only at start.
+func TestLogpipeReclaimsStaleTemporariesWhenPruning(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path, max_bytes=20000, backups=3)
+stale = os.path.join(d, "worker.log.20200101T000000000000Z.gz")
+open(stale, "wb").write(b"not really gzip")
+open(stale + ".tmp", "wb").write(b"partial")
+run_drain(log, b"".join(b"line %05d some worker output text\n" % i for i in range(1000)))  # one rotation, one prune
+log.finish()
+print("stale tmp reclaimed", not os.path.exists(stale + ".tmp"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "stale tmp reclaimed True")
+}
+
 // If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
 // does that when the agent's main process dies); the worker's next write hits the closed
 // pipe, so a writing worker ends on its own and nothing hangs. A silent worker would be ended

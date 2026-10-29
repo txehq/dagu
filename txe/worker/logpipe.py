@@ -182,6 +182,7 @@ class Log:
         self.rotate_failed_at = None  # monotonic time of the latest failed rotation
         self.rotate_failing_since = None
         self.jobs = queue.Queue(maxsize=max(backups, 1))
+        self.stopping = threading.Event()  # set by finish(): the compressor ends after its current job
         # A daemon thread: the process must be able to exit however it ends; finish() waits for
         # the compression in progress, with a bound, on every normal path.
         self.compressor = threading.Thread(target=self._compress_loop, name="compress", daemon=True)
@@ -249,19 +250,31 @@ class Log:
                                 break
             except OSError as e:
                 self.diag.say("reconcile", f"could not check {self.base}'s links: {e.__class__.__name__}: {e}", always=True)
+        self._reclaim_temporaries(report=True)
+
+    def _reclaim_temporaries(self, report):
+        """Remove a <rotated>.gz.tmp whose source or result exists; keep one that is the only
+        copy (reported at start only), never counted as a backup."""
+        try:
+            names = set(os.listdir(self.dir))
+        except OSError:
+            return
         for n in sorted(names):
             if not n.endswith(".gz.tmp"):
                 continue
             stem = n[:-len(".gz.tmp")]
             if not self.managed.match(stem):
                 continue
+            if stem + ".gz.tmp" == os.path.basename(getattr(self, "_compressing", "")):
+                continue  # the compression in progress owns it
             if stem in names or stem + ".gz" in names:
                 try:
                     os.remove(os.path.join(self.dir, n))
-                    self.diag.say("reconcile", f"removed {n}, left by an interrupted compression; its source is intact", always=True)
+                    if report:
+                        self.diag.say("reconcile", f"removed {n}, left by an interrupted compression; its source is intact", always=True)
                 except OSError as e:
-                    self.diag.say("reconcile", f"could not remove {n}: {e.__class__.__name__}: {e}", always=True)
-            else:
+                    self.diag.say("reconcile", f"could not remove {n}: {e.__class__.__name__}: {e}", always=report)
+            elif report:
                 self.diag.say("reconcile", f"{n} is the only copy of {stem} left by an interrupted compression; kept, "
                                            f"not counted as a backup; it may be incomplete", always=True)
 
@@ -391,13 +404,22 @@ class Log:
     def _compress_loop(self):
         """Compress each rotated file as it is queued; after each, and at the end, prune, then
         compress any rotated file still uncompressed (one the queue could not take, or one left
-        by an earlier process), newest last, so at most `backups` files are ever worked on."""
+        by an earlier process), newest last, so at most `backups` files are ever worked on.
+        Ends after the job in progress once finish() has asked, whether or not the sentinel
+        could be queued."""
         while True:
-            rotated = self.jobs.get()
+            try:
+                rotated = self.jobs.get(timeout=0.5)
+            except queue.Empty:
+                if not self.stopping.is_set():
+                    continue
+                rotated = None
             if rotated is not None:
                 self._compress(rotated)
             self._prune()
             for name in self._managed_names():
+                if self.stopping.is_set() and rotated is not None:
+                    break  # asked to stop: the final sweep runs once, on the sentinel turn
                 if not name.endswith(".gz"):
                     self._compress(os.path.join(self.dir, name))
             if rotated is None:
@@ -407,8 +429,9 @@ class Log:
         if not os.path.exists(rotated):
             return  # pruned, or compressed by the sweep already
         started = time.monotonic()
+        tmp = rotated + ".gz.tmp"
+        self._compressing = tmp
         try:
-            tmp = rotated + ".gz.tmp"
             with open(rotated, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
                 while True:
                     chunk = src.read(1 << 20)
@@ -423,23 +446,33 @@ class Log:
             self.diag.say("compress", f"could not compress {os.path.basename(rotated)} "
                                       f"({e.__class__.__name__}: {e}); it is kept uncompressed")
             try:
-                os.remove(rotated + ".gz.tmp")  # only this attempt's own temporary file
+                os.remove(tmp)  # only this attempt's own temporary file
             except OSError:
                 pass
+        finally:
+            self._compressing = ""
 
     def _prune(self):
-        """Keep the newest `backups` rotated files, compressed or not; delete the rest."""
+        """Keep the newest `backups` rotated files, compressed or not; delete the rest, and
+        reclaim a stale .gz.tmp whose source or result exists (one whose removal failed at
+        the time), so nothing outside the retained set accumulates while this process lives."""
         names = self._managed_names()
         for n in names[:-self.backups]:
             try:
                 os.remove(os.path.join(self.dir, n))
             except OSError as e:
                 self.diag.say("prune", f"could not delete {n}: {e.__class__.__name__}: {e}")
+        self._reclaim_temporaries(report=False)
 
     def finish(self, timeout=120.0):
-        """End the compressor after the job in progress and the final sweep (bounded)."""
+        """End the compressor after the job in progress and the final sweep, within timeout:
+        the stop flag is what ends the loop; the sentinel is queued only if there is room."""
         if self.compressor.is_alive():
-            self.jobs.put(None)
+            self.stopping.set()
+            try:
+                self.jobs.put_nowait(None)
+            except queue.Full:
+                pass  # the loop sees the flag at its next turn
             self.compressor.join(timeout)
             if self.compressor.is_alive():
                 self.diag.say("compress", f"compression did not finish within {timeout:g}s at exit; a rotated file may "
