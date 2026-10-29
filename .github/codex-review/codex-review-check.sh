@@ -28,6 +28,40 @@
 #      of the same SHA). A clean re-review after a fix loop keeps has_any_findings true while
 #      earlier findings' threads stay open (measured on PR 4022 at 83822e7eb, TXE-4666), so
 #      the receipt is what a clean pass reads then;
+#      — OR, with neither a review of the head nor a receipt naming it, the connector's LIVE
+#      findings at the head (TXE-4791, the port of txehq/txe TXE-4786 and TXE-4920) are none or
+#      P2/P3, or each live P0/P1 thread was resolved by a user. A live P0/P1 is a review thread
+#      whose first comment is the connector's (GraphQL author typed Bot, login
+#      chatgpt-codex-connector) and carries `P0 Badge` or `P1 Badge`, and which is not outdated,
+#      whatever commit it was posted on: GitHub keeps a thread no push has outdated on the current
+#      head, and the commit it reports is not read, so a late repositioning cannot hide one. A
+#      connector thread with a P2 or P3 badge, or with no badge, never blocks (txe's rule); a
+#      thread a person or another app opened is not a connector finding, whatever badge or login
+#      it shows. A thread counts as resolved by a user only when its resolvedBy is typed User and
+#      its login does not end in `[bot]`: resolved by a Bot, by an actor of another or no type,
+#      by a `[bot]` login or by no named user (resolvedBy is typed User in GitHub's schema, so a
+#      thread an App resolves comes back null) blocks. The resolving login is printed like the
+#      override label's actor: a named decision, not authentication. Every page of one paginated
+#      GraphQL read of the PR's reviewThreads is checked, and what cannot be read is a read that
+#      failed (exit 2), never "no findings": a page with errors, or without its threads or a
+#      boolean pageInfo.hasNextPage; pages whose hasNextPage is not true on every page but the last
+#      and false on the last; an empty page among several; a cursor of a non-last page missing or
+#      repeated; a page whose errors are not absent, null or empty, whatever their message says; a
+#      thread without boolean isResolved and isOutdated, without a first comment with a numeric
+#      databaseId, a string body and an author typed and named (non-empty strings both); or a
+#      resolvedBy that is neither null nor typed and named the same way. (A thread whose first comment's author is a deleted
+#      account, null in GraphQL, is therefore unreadable too: the receipt or a person's
+#      review-override is the way past it.) And the threads are read only once the Code Review
+#      row of the state block (at the exact head) says the review completed at least
+#      SETTLE_S (120) s ago: a conservative visibility delay for a review object and its threads
+#      to show, not proof that GitHub is consistent; main failed closed here before. A row with
+#      no readable time, or one later than now, fails. Inside the poll the check sleeps out the
+#      rest and runs again from the start; without enough of the wait left it fails, and a re-run
+#      decides. Measured on txehq/dagu PRs 185
+#      (b0eb595ab, every live thread a P2: failed until a manual `@codex review` posted a receipt)
+#      and 175 (0503dc32f, one open live P1, which this rule still blocks). has_any_findings null
+#      or malformed is NOT decided here: it fails as below (txe's TXE-5123 receipt-only rule for
+#      null is not ported);
 #   4. and the review saw the PR's current base (TXE-4666, the connector's P1s on PR 4022). A
 #      retarget, or a force-push of a stacked PR's base (`base_ref_changed`,
 #      `base_ref_force_pushed` issue events), changes the diff without moving the head. The
@@ -65,6 +99,7 @@
 set -uo pipefail
 
 CONNECTOR_LOGIN="chatgpt-codex-connector[bot]"
+CONNECTOR_GRAPHQL_LOGIN="chatgpt-codex-connector"   # GraphQL names a Bot without the [bot] suffix
 OVERRIDE_LABEL="review-override"
 STATE_MARKER="<!-- codex-review-state:v1 "
 BLOCKING_BADGES='P0 Badge|P1 Badge'
@@ -73,6 +108,24 @@ RECEIPT_MARKER="<!-- codex-review-receipt:v1 -->"
 # against 17:23:35.8Z; PR 4022: 21:09:56Z against 21:09:57.6Z); a pass takes minutes, so 120 s
 # cannot reach a receipt of the previous pass.
 RECEIPT_WINDOW_S=120
+# The live-thread decision waits this long after the Code Review row's completion (TXE-4791).
+SETTLE_S=120
+# Every review thread of the PR with its first comment: what rule 3's live-thread read needs.
+# shellcheck disable=SC2016  # GraphQL variables, not shell ones
+THREADS_QUERY='query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved isOutdated line originalLine
+          resolvedBy { __typename login }
+          comments(first: 1) { nodes { databaseId author { __typename login } path body } }
+        }
+      }
+    }
+  }
+}'
 
 repo="${GH_REPO:?GH_REPO (owner/name) is required}"
 pr="${PR_NUMBER:?PR_NUMBER is required}"
@@ -99,6 +152,91 @@ fetch() {
     else
         gh api "$2"
     fi
+}
+
+# decide_on_live_threads — the end of rule 3 when the connector completed its review of the head
+# with has_any_findings true and posted neither a review of the head nor a receipt naming it: the
+# verdict on its live P0/P1 threads at the head. Never returns.
+decide_on_live_threads() {
+    local pages bad live named blocking now completed age left
+    # ── settle: the exact head's review completed SETTLE_S ago, by its Code Review row ──
+    # CODEX_REVIEW_NOW (epoch seconds) is the test suite's clock, like CODEX_REVIEW_FIXTURE_DIR.
+    now="${CODEX_REVIEW_NOW:-$(date +%s)}"
+    case "$now" in ''|*[!0-9]*) echo "CODEX_REVIEW_NOW is whole epoch seconds" >&2; exit 2 ;; esac
+    completed="$(jq -nr --arg r "$REVIEWED" '$r | fromdateiso8601' 2>/dev/null)" || completed=""
+    case "$completed" in ''|*[!0-9]*) verdict 1 "FAIL: the connector's state block reports findings on $head with no review of it and no receipt for it, and its Code Review row carries no readable completion time, so its live threads are not decided on — comment @codex review once (a clean pass posts a receipt), then re-run this check; or a person decides on $OVERRIDE_LABEL" ;; esac
+    age=$((now - completed))
+    [ "$age" -ge 0 ] || verdict 1 "FAIL: the connector's Code Review row dates its review of $head $REVIEWED, after now, so its live threads are not decided on — re-run this check"
+    if [ "$age" -lt "$SETTLE_S" ]; then
+        left=$((wait_s - ($(date +%s) - start)))
+        if [ "$left" -ge $((SETTLE_S - age)) ]; then
+            say "waiting $((SETTLE_S - age)) s: the connector's review of $head completed $age s ago, and its live threads are read $SETTLE_S s after"
+            sleep $((SETTLE_S - age))
+            CODEX_REVIEW_WAIT_SECONDS=$((left - (SETTLE_S - age))) exec bash "$0"
+        fi
+        verdict 1 "FAIL: the connector's review of $head completed $age s ago, and with no review of it and no receipt for it its live threads are read only $SETTLE_S s after completion — re-run this check"
+    fi
+    if [ -n "${CODEX_REVIEW_FIXTURE_DIR:-}" ]; then
+        pages="$(cat "$CODEX_REVIEW_FIXTURE_DIR/review-threads.json")" || die_read "PR #$pr's review threads"
+    else
+        pages="$(gh api graphql --paginate -F owner="${repo%%/*}" -F name="${repo#*/}" -F pr="$pr" \
+            -f query="$THREADS_QUERY" | jq -s .)" || die_read "PR #$pr's review threads (the GraphQL error is above)"
+    fi
+    # Any error fails the read, whatever its text: errors absent, null or [] on every page, or no verdict.
+    bad="$(printf '%s' "$pages" | jq -r '[ .[]?
+        | if type != "object" then "a page that is not an object"
+          elif .errors == null then empty
+          elif (.errors | type) != "array" then "errors that are not a list"
+          else .errors[] | if type == "object" and (.message | type) == "string" and .message != ""
+                           then .message else "an error without a message" end end ] | join("; ")')" \
+        || die_read "PR #$pr's review threads (not JSON)"
+    [ -z "$bad" ] || die_read "PR #$pr's review threads (GraphQL: $bad)"
+    # One row per live P0/P1 of the connector at the head: ok|block, comment id, path:line, who, first line.
+    live="$(printf '%s' "$pages" | jq -er --arg bot "$CONNECTOR_GRAPHQL_LOGIN" --arg b "$BLOCKING_BADGES" '
+        def named(a): (a.__typename | type) == "string" and a.__typename != ""
+                      and (a.login | type) == "string" and a.login != "";
+        if type != "array" or length == 0 then error("no pages") else . end
+        | [ .[] | .data.repository.pullRequest.reviewThreads
+                | if type != "object" or (.pageInfo.hasNextPage | type) != "boolean" or (.nodes | type) != "array"
+                  then error("a page without its threads or its pageInfo") else . end ] as $p
+        | ($p | length) as $n
+        | if [ $p[] | .pageInfo.hasNextPage ] != [ range(0; $n) | . < $n - 1 ]
+          then error("pages that do not end where pageInfo says") else . end
+        | if $n > 1 and any($p[]; (.nodes | length) == 0) then error("an empty page among several") else . end
+        | [ $p[:-1][] | .pageInfo.endCursor ] as $cur
+        | if any($cur[]; type != "string" or . == "") or ($cur | unique | length) != ($cur | length)
+          then error("a page cursor missing or repeated") else . end
+        | [ $p[] | .nodes[] ]
+        | map(if (.isResolved | type) == "boolean" and (.isOutdated | type) == "boolean"
+                 and (.comments.nodes[0] | (.databaseId | type) == "number" and (.body | type) == "string"
+                      and (.author | type) == "object" and named(.author))
+                 and (.resolvedBy == null or ((.resolvedBy | type) == "object" and named(.resolvedBy)))
+              then . else error("a thread whose resolution, first comment, author or resolver cannot be read") end)
+        | map(.comments.nodes[0] as $c
+              | select($c.author.login == $bot and $c.author.__typename == "Bot"
+                       and .isOutdated == false and (($c.body // "") | test($b)))
+              | (.resolvedBy.login // "") as $who
+              | (.resolvedBy.__typename // "") as $kind
+              | [ (if .isResolved and $who != "" and $kind == "User" and ($who | endswith("[bot]") | not)
+                    then "ok" else "block" end),
+                  ($c.databaseId | tostring), "\($c.path):\(.line // .originalLine // "?")",
+                  (if (.isResolved | not) then "unresolved"
+                   elif $who == "" then "resolved by no named user"
+                   elif $kind == "Bot" or ($who | endswith("[bot]")) then "resolved by a bot, \($who)"
+                   elif $kind != "User" then "resolved by \($who), not a User: \($kind)"
+                   else "resolved by \($who)" end),
+                  ($c.body | split("\n") | first) ] | @tsv)
+        | join("\n")')" || die_read "PR #$pr's review threads (not what GraphQL returns for reviewThreads)"
+    if [ -z "$live" ]; then
+        verdict 0 "PASS: the connector completed its review of $head with no review object or receipt on it, and the connector's live findings at $head are none or P2/P3; has_any_findings carries over from earlier passes"
+    fi
+    printf '%s\n' "$live" | awk -F'\t' '{ printf "  thread %s %s, %s: %s\n", $2, $3, $4, $5 }'
+    named="$(printf '%s\n' "$live" | awk -F'\t' '{ printf "%sthread %s at %s %s", (NR > 1 ? "; " : ""), $2, $3, $4 }')"
+    blocking="$(printf '%s\n' "$live" | awk -F'\t' '$1 == "block" { printf "%sthread %s at %s (%s)", (n++ ? "; " : ""), $2, $3, $4 }')"
+    if [ -z "$blocking" ]; then
+        verdict 0 "PASS: the connector completed its review of $head with no review object or receipt on it, and every live P0/P1 thread of the connector there was resolved by a user: $named"
+    fi
+    verdict 1 "FAIL: the connector's state block reports findings on $head with no review of it and no receipt for it, and its live P0/P1 findings there are not resolved by a user: $blocking — fix them and push; or reply in the thread with evidence and have a person resolve it, then re-run this check; or comment @codex review once, then re-run this check"
 }
 
 # read_state — set head, and NOT_YET to why the connector has not finished on it ("" once it
@@ -236,8 +374,8 @@ if [ "$ids" = "[]" ]; then
                           | select((if $d < 0 then -$d else $d end) <= $w)
                           | "\($c.id) at \($c.created_at)" ] | last // ""')" || die_read "the connector's receipt comments"
             fi
-            [ -n "$receipt" ] || verdict 1 "FAIL: the connector's state block reports findings on $head but no connector review of $head and no clean-pass receipt for it were found — re-run this check"
-            verdict 0 "PASS: the connector completed its review of $head with no review object on it, and its receipt $receipt says no major issues there (has_any_findings stays true from earlier passes)" ;;
+            [ -z "$receipt" ] || verdict 0 "PASS: the connector completed its review of $head with no review object on it, and its receipt $receipt says no major issues there (has_any_findings stays true from earlier passes)"
+            decide_on_live_threads ;;
         *) verdict 1 "FAIL: the connector's state block gives has_any_findings as $(printf '%s' "$STATE" | jq -c '.code_review.has_any_findings') on $head, not false, and no connector review of $head was found — re-run this check" ;;
     esac
     verdict 0 "PASS: the connector completed its review of $head with no review object on it, so no findings"

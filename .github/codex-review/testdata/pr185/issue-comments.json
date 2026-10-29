@@ -1,0 +1,42 @@
+[
+ {
+  "id": 6501167759,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "created_at": "2026-10-29T15:37:42Z",
+  "updated_at": "2026-10-29T16:39:48Z",
+  "body": "<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"b0eb595abb11f889c19bb30f7f9a16bdd856cc14\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":\"b0eb595abb11f889c19bb30f7f9a16bdd856cc14\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"completed\"}} -->\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-29T16:37:34.592315Z\">2026-10-29T16:37:34.592315Z</relative-time> |"
+ },
+ {
+  "id": 6502549989,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "created_at": "2026-10-29T16:35:53Z",
+  "updated_at": "2026-10-29T16:35:53Z",
+  "body": "Synthetic comment."
+ },
+ {
+  "id": 6502587805,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "created_at": "2026-10-29T16:37:33Z",
+  "updated_at": "2026-10-29T16:37:33Z",
+  "body": "<!-- codex-review-receipt:v1 -->\nCodex Review: Didn't find any major issues.\n**Reviewed commit:** `b0eb595abb`"
+ },
+ {
+  "id": 6502636882,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "created_at": "2026-10-29T16:39:46Z",
+  "updated_at": "2026-10-29T16:39:46Z",
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `b0eb595abb`"
+ }
+]

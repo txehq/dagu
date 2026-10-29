@@ -1,0 +1,32 @@
+[
+ {
+  "id": 34350073096,
+  "actor": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "event": "mentioned",
+  "commit_id": null,
+  "created_at": "2026-10-27T09:31:17Z"
+ },
+ {
+  "id": 34350073301,
+  "actor": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "event": "subscribed",
+  "commit_id": null,
+  "created_at": "2026-10-27T09:31:17Z"
+ },
+ {
+  "id": 34350271951,
+  "actor": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "event": "head_ref_force_pushed",
+  "commit_id": "0503dc32f85d8fd7444a3b7b21e981840e9f26de",
+  "created_at": "2026-10-27T09:33:43Z"
+ }
+]

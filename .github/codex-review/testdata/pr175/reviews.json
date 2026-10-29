@@ -1,0 +1,24 @@
+[
+ {
+  "id": 5664915503,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `6f2a4ff973`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-27T09:32:37Z",
+  "commit_id": "6f2a4ff97389a1eacd86bf7f347f920983bad1b5"
+ },
+ {
+  "id": 5664930840,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-27T09:33:57Z",
+  "commit_id": "0503dc32f85d8fd7444a3b7b21e981840e9f26de"
+ }
+]

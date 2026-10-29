@@ -24,8 +24,10 @@ name: codex-review
 # removed, so removing it revokes a pass. No pull_request_review trigger: that event runs the PR's
 # copy of the workflow. A connector review with findings lands while the push's run is polling
 # (30 s, up to 15 min), and a clean pass edits a comment and reacts, which fires no event. If a
-# review completes after the poll ended, re-run the check. Drafts are skipped: the connector does
-# not review a draft.
+# review completes after the poll ended, re-run the check. Nor is `pull_request_review_thread`:
+# when the connector posted neither a review of the head nor a receipt, a person resolving its live
+# P0/P1 thread (TXE-4791) runs nothing either; re-run then too. Drafts are skipped: the connector
+# does not review a draft.
 
 on:
   pull_request_target:

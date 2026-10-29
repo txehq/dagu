@@ -1,0 +1,156 @@
+[
+ {
+  "data": {
+   "repository": {
+    "pullRequest": {
+     "reviewThreads": {
+      "pageInfo": {
+       "hasNextPage": false,
+       "endCursor": "synthetic-cursor-1"
+      },
+      "nodes": [
+       {
+        "isResolved": true,
+        "isOutdated": true,
+        "line": null,
+        "originalLine": 484,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414469953,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       },
+       {
+        "isResolved": true,
+        "isOutdated": true,
+        "line": null,
+        "originalLine": 405,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414469965,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       },
+       {
+        "isResolved": true,
+        "isOutdated": false,
+        "line": 460,
+        "originalLine": 357,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414469976,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       },
+       {
+        "isResolved": true,
+        "isOutdated": true,
+        "line": null,
+        "originalLine": 351,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414727737,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       },
+       {
+        "isResolved": true,
+        "isOutdated": true,
+        "line": null,
+        "originalLine": 443,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414807029,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       },
+       {
+        "isResolved": true,
+        "isOutdated": false,
+        "line": 424,
+        "originalLine": 419,
+        "resolvedBy": {
+         "__typename": "User",
+         "login": "a-person"
+        },
+        "comments": {
+         "nodes": [
+          {
+           "databaseId": 4414876959,
+           "author": {
+            "__typename": "Bot",
+            "login": "chatgpt-codex-connector"
+           },
+           "path": "synthetic/file1.go",
+           "body": "**<sub><sub>![P2 Badge](badge)</sub></sub>  Synthetic finding title**"
+          }
+         ]
+        }
+       }
+      ]
+     }
+    }
+   }
+  }
+ }
+]

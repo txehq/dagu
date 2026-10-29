@@ -71,6 +71,38 @@ class Sanitize(unittest.TestCase):
         self.assertNotIn("acquisition", text)
         self.assertNotIn("private-project", text)
 
+    def test_graphql_review_threads_keep_types_and_drop_private_text(self):
+        page = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "Y3Vyc29yOnYyOpK0" + SECRET},
+            "nodes": [{"isResolved": True, "isOutdated": False, "line": 4, "originalLine": 4, "id": "PRRT_private",
+                       "resolvedBy": {"__typename": "User", "login": "someone", "id": 42},
+                       "comments": {"nodes": [{"databaseId": 7, "path": "services/private.go", "url": SECRET,
+                                               "author": {"__typename": "Bot", "login": "chatgpt-codex-connector"},
+                                               "body": "![P1 Badge](https://img) " + SECRET}]}},
+                      {"isResolved": True, "isOutdated": False,
+                       "resolvedBy": {"__typename": "Bot", "login": "private-integration"},
+                       "comments": {"nodes": [{"databaseId": 8, "author": {"__typename": "User", "login": "x"},
+                                               "body": SECRET}]}}]}}}},
+            "errors": [{"message": SECRET, "type": "FORBIDDEN"}]}
+        out = sanitize.walk([page, page])
+        text = json.dumps(out)
+        for private in ("PRIVATE", "private", "PRRT_", "Y3Vyc29y", "42"):
+            self.assertNotIn(private, text)
+        threads = out[0]["data"]["repository"]["pullRequest"]["reviewThreads"]
+        first, second = threads["nodes"]
+        self.assertEqual(first["comments"]["nodes"][0]["author"], {"__typename": "Bot", "login": "chatgpt-codex-connector"})
+        self.assertEqual(first["resolvedBy"], {"__typename": "User", "login": "a-person"})
+        self.assertEqual(second["resolvedBy"], {"__typename": "Bot", "login": "another-app"})
+        self.assertEqual(second["comments"]["nodes"][0]["author"]["login"], "a-person")
+        self.assertIn("P1 Badge", first["comments"]["nodes"][0]["body"])
+        self.assertEqual((first["isResolved"], first["isOutdated"], first["line"]), (True, False, 4))
+        self.assertTrue(threads["pageInfo"]["hasNextPage"])
+        # one cursor maps to one synthetic cursor, a second to another, and a rerun keeps them
+        self.assertEqual(threads["pageInfo"]["endCursor"], out[1]["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"]["endCursor"])
+        self.assertNotEqual(sanitize.walk({"endCursor": "another"})["endCursor"], threads["pageInfo"]["endCursor"])
+        self.assertEqual(sanitize.walk(out), out)
+        self.assertEqual(out[0]["errors"][0]["message"], "synthetic error")
+
 
 if __name__ == "__main__":
     unittest.main()

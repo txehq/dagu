@@ -1,0 +1,134 @@
+[
+ {
+  "id": 5700564032,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `78b57e2e65`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T15:39:49Z",
+  "commit_id": "78b57e2e65680336d2832647b5592bc7ecc42e15"
+ },
+ {
+  "id": 5700903307,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `c8f31f612d`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:02:06Z",
+  "commit_id": "c8f31f612dc9db75e2441b7cf36368105f07791b"
+ },
+ {
+  "id": 5700981605,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:07:32Z",
+  "commit_id": "e7bd0a6fac2008b2e204ac24aa432ebd0c696a46"
+ },
+ {
+  "id": 5700982788,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:07:36Z",
+  "commit_id": "e7bd0a6fac2008b2e204ac24aa432ebd0c696a46"
+ },
+ {
+  "id": 5700986475,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:07:52Z",
+  "commit_id": "e7bd0a6fac2008b2e204ac24aa432ebd0c696a46"
+ },
+ {
+  "id": 5700987231,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:07:56Z",
+  "commit_id": "e7bd0a6fac2008b2e204ac24aa432ebd0c696a46"
+ },
+ {
+  "id": 5701003382,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `e7bd0a6fac`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:09:04Z",
+  "commit_id": "e7bd0a6fac2008b2e204ac24aa432ebd0c696a46"
+ },
+ {
+  "id": 5701067554,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:13:37Z",
+  "commit_id": "352a9e8e4888f1c956f8b4b997b6d8ddbde94910"
+ },
+ {
+  "id": 5701071057,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:13:52Z",
+  "commit_id": "352a9e8e4888f1c956f8b4b997b6d8ddbde94910"
+ },
+ {
+  "id": 5701090922,
+  "user": {
+   "type": "Bot",
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `352a9e8e48`",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:15:18Z",
+  "commit_id": "352a9e8e4888f1c956f8b4b997b6d8ddbde94910"
+ },
+ {
+  "id": 5701122760,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:17:29Z",
+  "commit_id": "352a9e8e4888f1c956f8b4b997b6d8ddbde94910"
+ },
+ {
+  "id": 5701159067,
+  "user": {
+   "type": "User",
+   "login": "a-person"
+  },
+  "body": "Synthetic comment.",
+  "state": "COMMENTED",
+  "submitted_at": "2026-10-29T16:19:56Z",
+  "commit_id": "b0eb595abb11f889c19bb30f7f9a16bdd856cc14"
+ }
+]
