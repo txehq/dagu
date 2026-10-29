@@ -48,6 +48,11 @@ for label in "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL"; do
   [ "$state" = "running" ] || rc=1
 done
 
+# The tunnel supervisor's latest line (TXE-5398): whether it is watching a failing forward
+# or last replaced one. Its lines name no argument, path or credential.
+last="$(grep -a '^tunnel-supervise:' "$TXE_DAGU_HOME/logs/tunnel.log" 2>/dev/null | tail -n 1)"
+[ -z "$last" ] || printf 'tunnel   %s\n' "${last#tunnel-supervise: }"
+
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$TXE_DAGU_UI_PORT/api/v1/health")"
 printf 'server   http://127.0.0.1:%s/api/v1/health -> %s\n' "$TXE_DAGU_UI_PORT" "$code"
 [ "$code" = "200" ] || rc=1

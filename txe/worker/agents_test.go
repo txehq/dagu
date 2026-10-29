@@ -58,7 +58,8 @@ func agentsOut(t *testing.T, credential string) (dir string, worker map[string]a
 	require.NoError(t, os.MkdirAll(dir, 0o700))
 	home := filepath.Join(base, "txe dagu")
 	_, stderr, err := python(t, script, "write", dir, home, "/opt/kube ctl/kubectl", agentsMachine, agentsOwner,
-		"/usr/bin:/bin", "com.txe.dagu.tunnel", "com.txe.dagu.worker", "dagu", "svc/dagu", "18080", "50055", credential)
+		"/usr/bin:/bin", "com.txe.dagu.tunnel", "com.txe.dagu.worker", "dagu", "svc/dagu", "18080", "50055", credential,
+		"/opt/py thon/bin/python3")
 	require.NoError(t, err, stderr)
 	dump, stderr, err := python(t, "-c", `import json, plistlib, sys; print(json.dumps(plistlib.load(open(sys.argv[1], "rb"))))`,
 		filepath.Join(dir, "com.txe.dagu.worker.plist"))
@@ -79,9 +80,19 @@ func TestAgentsWithoutACredential(t *testing.T) {
 	stdout, _, err := python(t, agentsScript(t), "credential", filepath.Join(dir, "com.txe.dagu.worker.plist"))
 	require.NoError(t, err)
 	assert.Empty(t, stdout)
-	tunnel, err := os.ReadFile(filepath.Join(dir, "com.txe.dagu.tunnel.plist"))
-	require.NoError(t, err)
-	assert.Contains(t, string(tunnel), "<string>/opt/kube ctl/kubectl</string>")
+	dump, stderr, err := python(t, "-c", `import json, plistlib, sys; print(json.dumps(plistlib.load(open(sys.argv[1], "rb"))))`,
+		filepath.Join(dir, "com.txe.dagu.tunnel.plist"))
+	require.NoError(t, err, stderr)
+	var tunnel map[string]any
+	require.NoError(t, json.Unmarshal([]byte(dump), &tunnel))
+	// The supervisor runs kubectl's unchanged command after "--" (TXE-5398).
+	assert.Equal(t, []any{"/opt/py thon/bin/python3", "-I", home + "/tunnel/tunnel-supervise.py",
+		"--ui-port", "18080", "--coord-port", "50055",
+		"--worker-log", home + "/logs/worker.log", "--state", home + "/tunnel/supervise-state.json", "--",
+		"/opt/kube ctl/kubectl", "--kubeconfig", home + "/tunnel/kubeconfig", "-n", "dagu",
+		"port-forward", "--address", "127.0.0.1", "svc/dagu", "18080:8080", "50055:50055"}, tunnel["ProgramArguments"])
+	assert.Equal(t, true, tunnel["KeepAlive"])
+	assert.Nil(t, tunnel["AbandonProcessGroup"], "launchd must end the whole process group, kubectl included")
 }
 
 // With a credential the worker agent passes its path, spaces and all, as one

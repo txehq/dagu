@@ -1,0 +1,368 @@
+// Copyright (C) 2026 TXE
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//go:build unix
+
+package worker_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// fakeForward stands in for `kubectl port-forward` (TXE-5398). It serves the UI and coordinator
+// ports in the mode named by its mode file, read on every connection:
+//
+//	ok            health 200, and the coordinator port answers the HTTP/2 preface with SETTINGS
+//	dead-streams  every new connection is accepted and closed, as kubectl does when it cannot
+//	              create a stream; the worker's existing connection is healthy (no log lines)
+//	dead-all      the same, and the worker logs a heartbeat failure every 0.2 s
+//	http-dead     health is closed, the coordinator still answers; the worker logs failures
+//	exit:N        exit with code N
+//
+// It records each signal it gets in its signal file, ends on SIGTERM unless the file "stubborn"
+// exists beside the mode file, and writes its pid to the pid file.
+const fakeForward = `
+import datetime, os, signal, socket, sys, threading, time
+mode_file, sig_file, pid_file, worker_log, ui, coord = sys.argv[1:7]
+d = os.path.dirname(mode_file)
+open(pid_file, "w").write(str(os.getpid()))
+def on_signal(n, _f):
+    with open(sig_file, "a") as f:
+        f.write(f"{n}\n")
+    if not os.path.exists(os.path.join(d, "stubborn")):
+        os._exit(0)
+for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(s, on_signal)
+def mode():
+    return open(mode_file).read().strip()
+def serve(port, kind):
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", int(port))); ls.listen(16)
+    while True:
+        c, _ = ls.accept()
+        m = mode()
+        try:
+            if m == "ok" or (m == "http-dead" and kind == "h2"):
+                if kind == "http":
+                    c.recv(4096)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                else:
+                    c.recv(64)
+                    c.sendall(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+                    time.sleep(0.05)
+        finally:
+            c.close()
+for port, kind in ((ui, "http"), (coord, "h2")):
+    threading.Thread(target=serve, args=(port, kind), daemon=True).start()
+while True:
+    m = mode()
+    if m.startswith("exit:"):
+        sys.exit(int(m[5:]))
+    if m in ("dead-all", "http-dead"):
+        with open(worker_log, "a") as f:
+            t = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="milliseconds")
+            f.write(f'time={t} level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x err="context deadline exceeded"\n')
+    time.sleep(0.2)
+`
+
+type supervised struct {
+	dir, modeFile, sigFile, pidFile, state string
+	cmd                                    *exec.Cmd
+	stderr                                 *bytes.Buffer
+	done                                   chan error
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return port
+}
+
+func supervisorScript(t *testing.T) string {
+	t.Helper()
+	agentsScript(t) // skips where the worker scripts do not run
+	script, err := filepath.Abs("tunnel-supervise.py")
+	require.NoError(t, err)
+	return script
+}
+
+// startSupervised runs the supervisor over the fake forward with short timings: rounds every
+// 0.2 s, a 1.5 s required unhealthy time, and the worker's failures counted with a 0.6 s gap.
+func startSupervised(t *testing.T, mode string, extra ...string) *supervised {
+	t.Helper()
+	script := supervisorScript(t)
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	s := &supervised{dir: t.TempDir()}
+	s.modeFile = filepath.Join(s.dir, "mode")
+	s.sigFile = filepath.Join(s.dir, "signals")
+	s.pidFile = filepath.Join(s.dir, "pid")
+	s.state = filepath.Join(s.dir, "supervise-state.json")
+	fake := filepath.Join(s.dir, "fake-kubectl.py")
+	workerLog := filepath.Join(s.dir, "worker.log")
+	require.NoError(t, os.WriteFile(fake, []byte(fakeForward), 0o600))
+	s.setMode(t, mode)
+	ui, coord := freePort(t), freePort(t)
+	args := []string{"-I", script, "--ui-port", fmt.Sprint(ui), "--coord-port", fmt.Sprint(coord),
+		"--worker-log", workerLog, "--state", s.state,
+		"--interval", "0.2", "--grace", "0.3", "--probe-timeout", "0.3", "--unhealthy-after", "1.5",
+		"--worker-gap", "0.6", "--kill-timeout", "0.5"}
+	args = append(args, extra...)
+	args = append(args, "--", py, "-I", fake, s.modeFile, s.sigFile, s.pidFile, workerLog, fmt.Sprint(ui), fmt.Sprint(coord))
+	s.cmd = exec.Command(py, args...)
+	s.stderr = &bytes.Buffer{}
+	s.cmd.Stdout, s.cmd.Stderr = s.stderr, s.stderr
+	s.cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	require.NoError(t, s.cmd.Start())
+	s.done = make(chan error, 1)
+	go func() { s.done <- s.cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = s.cmd.Process.Kill()
+		if pid := s.childPid(); pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	require.Eventually(t, func() bool { return s.childPid() > 0 }, 5*time.Second, 20*time.Millisecond)
+	return s
+}
+
+func (s *supervised) setMode(t *testing.T, mode string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(s.modeFile+".tmp", []byte(mode), 0o600))
+	require.NoError(t, os.Rename(s.modeFile+".tmp", s.modeFile))
+}
+
+func (s *supervised) childPid() int {
+	b, err := os.ReadFile(s.pidFile)
+	if err != nil {
+		return 0
+	}
+	var pid int
+	_, _ = fmt.Sscan(string(b), &pid)
+	return pid
+}
+
+func (s *supervised) signals() string {
+	b, _ := os.ReadFile(s.sigFile)
+	return string(b)
+}
+
+// exit waits for the supervisor and returns its exit code, or fails after limit.
+func (s *supervised) exit(t *testing.T, limit time.Duration) int {
+	t.Helper()
+	select {
+	case err := <-s.done:
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			return ee.ExitCode()
+		}
+		require.NoError(t, err)
+		return 0
+	case <-time.After(limit):
+		t.Fatalf("supervisor still running after %s; output:\n%s", limit, s.stderr)
+		return -1
+	}
+}
+
+func (s *supervised) stillRunning(t *testing.T, d time.Duration) {
+	t.Helper()
+	select {
+	case err := <-s.done:
+		t.Fatalf("supervisor exited (%v); output:\n%s", err, s.stderr)
+	case <-time.After(d):
+	}
+}
+
+func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+// A working forward is never replaced, and a SIGTERM to the supervisor (launchctl bootout or
+// kickstart) is passed to kubectl.
+func TestTunnelSuperviseLeavesAHealthyForward(t *testing.T) {
+	s := startSupervised(t, "ok")
+	s.stillRunning(t, 3*time.Second)
+	require.NoError(t, s.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 0, s.exit(t, 5*time.Second), "the supervisor exits with kubectl's code (the fake exits 0)")
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals())
+	assert.NotContains(t, s.stderr.String(), "replacing")
+	assert.NoFileExists(t, s.state)
+}
+
+// The forward is alive but every new stream fails, and the worker's heartbeats fail too: the
+// supervisor ends kubectl and exits 75 so that launchd starts a fresh forward, and not before
+// the required unhealthy time has passed since the first failed round.
+func TestTunnelSuperviseReplacesADeadForward(t *testing.T) {
+	s := startSupervised(t, "ok")
+	time.Sleep(600 * time.Millisecond)
+	start := time.Now()
+	s.setMode(t, "dead-all")
+	assert.Equal(t, 75, s.exit(t, 10*time.Second))
+	assert.GreaterOrEqual(t, time.Since(start), 1500*time.Millisecond)
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals())
+	assert.False(t, alive(s.childPid()), "kubectl is left running")
+	out := s.stderr.String()
+	assert.Contains(t, out, "tunnel-supervise: ")
+	assert.Contains(t, out, "replacing the forward: new streams failing for")
+	assert.NotContains(t, out, s.dir, "a supervisor line names a path")
+	var state map[string][]float64
+	b, err := os.ReadFile(s.state)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(b, &state))
+	assert.Len(t, state["restarts"], 1)
+}
+
+// New streams fail while the worker's existing connection keeps working (no heartbeat failure):
+// replacing kubectl would cut that connection, so the forward is left alone.
+func TestTunnelSuperviseKeepsAForwardTheWorkerStillUses(t *testing.T) {
+	s := startSupervised(t, "dead-streams")
+	s.stillRunning(t, 4*time.Second)
+	assert.Contains(t, s.stderr.String(), "new streams through the forward are failing")
+	assert.NotContains(t, s.stderr.String(), "replacing")
+}
+
+// Health fails but the coordinator still answers a new connection, while the worker's
+// heartbeats fail (a stall of the hub's API, not of the forward): a new stream works, so the
+// forward's connection is alive and replacing it cannot help. It is left alone.
+func TestTunnelSuperviseNeedsBothProbesToFail(t *testing.T) {
+	s := startSupervised(t, "http-dead")
+	s.stillRunning(t, 4*time.Second)
+	assert.NotContains(t, s.stderr.String(), "failing")
+	assert.NotContains(t, s.stderr.String(), "replacing")
+}
+
+// Each replacement in the last hour doubles the required unhealthy time.
+func TestTunnelSuperviseBacksOffAfterARecentReplacement(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.json")
+	require.NoError(t, os.WriteFile(state, []byte(fmt.Sprintf(`{"restarts": [%d]}`, time.Now().Unix()-60)), 0o600))
+	s := startSupervised(t, "ok", "--state", state)
+	time.Sleep(600 * time.Millisecond)
+	start := time.Now()
+	s.setMode(t, "dead-all")
+	assert.Equal(t, 75, s.exit(t, 15*time.Second))
+	assert.GreaterOrEqual(t, time.Since(start), 3000*time.Millisecond)
+}
+
+// A kubectl that ignores SIGTERM is killed after the kill timeout: nothing is left behind.
+func TestTunnelSuperviseKillsAStubbornForward(t *testing.T) {
+	s := startSupervised(t, "ok")
+	require.NoError(t, os.WriteFile(filepath.Join(s.dir, "stubborn"), nil, 0o600))
+	s.setMode(t, "dead-all")
+	assert.Equal(t, 75, s.exit(t, 10*time.Second))
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals())
+	assert.Eventually(t, func() bool { return !alive(s.childPid()) }, 2*time.Second, 20*time.Millisecond)
+}
+
+// kubectl ending by itself ends the supervisor with its code, as the agent did before.
+func TestTunnelSupervisePassesKubectlsExit(t *testing.T) {
+	s := startSupervised(t, "ok")
+	s.setMode(t, "exit:3")
+	assert.Equal(t, 3, s.exit(t, 5*time.Second))
+}
+
+// The decision itself, on an injected monotonic and wall clock: 30 s rounds, 90 s required.
+func TestTunnelSuperviseVerdictBoundaries(t *testing.T) {
+	script := supervisorScript(t)
+	program := `
+import importlib.util, json, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
+W = 1_000_000.0
+def run(rounds, restarts=()):
+    v = ts.Verdict(90, 600, list(restarts))
+    return [bool(v.observe(m, W + m, ok, None if ws is None else W + ws)) for m, ok, ws in rounds]
+out = {
+  # three failed 30 s rounds span only 60 s: no replacement until 90 s after the first
+  "at_60": run([(0, False, -100), (30, False, -100), (60, False, -100)]),
+  "at_89": run([(0, False, -100), (89.9, False, -100)]),
+  "at_90": run([(0, False, -100), (90, False, -100)]),
+  # a working round in between starts the count again
+  "reset": run([(0, False, -100), (45, True, None), (90, False, -100), (179, False, -100), (180, False, -100)]),
+  # the worker has been failing for only 80 s
+  "worker_short": run([(0, False, -100), (90, False, 10)]),
+  # no worker signal (healthy, or the log unreadable): never
+  "no_worker": run([(0, False, None), (600, False, None)]),
+  # one replacement 10 min ago: 180 s required
+  "backoff": run([(0, False, -1000), (179, False, -1000), (180, False, -1000)], restarts=[W - 600]),
+  # many recent replacements: capped at 600 s
+  "cap": run([(0, False, -1000), (600, False, -1000)], restarts=[W - 60] * 5),
+}
+print(json.dumps(out))
+`
+	stdout, stderr, err := python(t, "-c", program, script)
+	require.NoError(t, err, stderr)
+	var got map[string][]bool
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	assert.Equal(t, []bool{false, false, false}, got["at_60"])
+	assert.Equal(t, []bool{false, false}, got["at_89"])
+	assert.Equal(t, []bool{false, true}, got["at_90"])
+	assert.Equal(t, []bool{false, false, false, false, true}, got["reset"])
+	assert.Equal(t, []bool{false, false}, got["worker_short"])
+	assert.Equal(t, []bool{false, false}, got["no_worker"])
+	assert.Equal(t, []bool{false, false, true}, got["backoff"])
+	assert.Equal(t, []bool{false, true}, got["cap"])
+}
+
+// The worker's heartbeat failures are read from its log: the current run of failures with no
+// gap over the limit, and only when the latest is recent. Anything unreadable is no signal.
+func TestTunnelSuperviseReadsTheWorkersHeartbeatFailures(t *testing.T) {
+	script := supervisorScript(t)
+	dir := t.TempDir()
+	log := filepath.Join(dir, "worker.log")
+	fail := func(ts string) string {
+		return `time=` + ts + ` level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x err="context deadline exceeded"`
+	}
+	lines := []string{
+		fail("2026-10-29T15:10:00.000+08:00"), // an earlier, separate run of failures
+		`time=2026-10-29T15:15:00.000+08:00 level=INFO msg="Task execution completed successfully"`,
+		fail("2026-10-29T15:16:04.291+08:00"),
+		fail("2026-10-29T15:16:27.000+08:00"),
+		fail("2026-10-29T07:16:40"), // no offset: cannot be placed, ignored
+		fail("2026-10-29T15:16:50.000+08:00"),
+	}
+	require.NoError(t, os.WriteFile(log, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+	program := `
+import datetime, importlib.util, json, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
+at = lambda s: datetime.datetime.fromisoformat(s).timestamp()
+def since(now):
+    v = ts.worker_unhealthy_since(sys.argv[2], at(now), 45)
+    return None if v is None else datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
+print(json.dumps({"now": since("2026-10-29T07:17:00+00:00"), "stale": since("2026-10-29T07:18:00+00:00"),
+                  "missing": ts.worker_unhealthy_since(sys.argv[2] + ".absent", at("2026-10-29T07:17:00+00:00"), 45)}))
+`
+	stdout, stderr, err := python(t, "-c", program, script, log)
+	require.NoError(t, err, stderr)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	assert.Equal(t, "2026-10-29T07:16:04.291000+00:00", got["now"])
+	assert.Nil(t, got["stale"])
+	assert.Nil(t, got["missing"])
+}
+
+// The supervisor looks for the worker's own heartbeat failure message; if the worker's wording
+// changes, this fails instead of the supervisor silently seeing no failures.
+func TestTunnelSuperviseMatchesTheWorkersMessage(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "internal", "service", "worker", "worker.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(src), `logger.Warn(ctx, "Heartbeat send failed; will retry with backoff",`)
+	sup, err := os.ReadFile(supervisorScript(t))
+	require.NoError(t, err)
+	assert.Contains(t, string(sup), `HEARTBEAT_FAILED = 'msg="Heartbeat send failed'`)
+}
