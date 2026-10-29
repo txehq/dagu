@@ -44,10 +44,25 @@ var (
 // with the status file's lock held.
 var executionAbandonCheckedHook func(statusFile string)
 
+// attemptAbandonCheckedHook, when set by a test, runs after an attempt-level
+// abandonment checked the attempt and before it writes its record, with the
+// status file's lock held.
+var attemptAbandonCheckedHook func(statusFile string)
+
 // AbandonAttempt implements persis.DAGRunAttemptAbandoner. It holds the run's
 // data-root lock, the lock CompareAndSwapLatestAttemptStatus and CreateAttempt
 // take, so no other store write to the run interleaves with the check, the
 // record and the hide.
+//
+// A status append holds only the status file's lock, so for a whole attempt
+// that lock is taken too, after the data-root lock (the order every holder of
+// both uses), and held from the check through the record and, for the
+// marked_failed outcome, the Failed status. An append either lands before
+// the check, which then sees it, or after the record. The hidden outcome
+// releases the lock before the hide: the hide renames the directory that
+// holds the lock file, which Windows refuses while it is open, and holding
+// the lock across the rename would add nothing, since an append blocked on
+// it lands in the same file, hidden, once the rename is done.
 func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemptRequest) (*persis.AttemptAbandonment, error) {
 	record := req.Record
 	if record.AbandonedAttemptID == "" || req.DAGRun.ID == "" {
@@ -116,6 +131,20 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 		return nil, fmt.Errorf("%w: attempt %s not found", persis.ErrAttemptNotAbandonable, record.AbandonedAttemptID)
 	}
 
+	fileLock := flock.New(statusLockPath(latest.file))
+	if err := fileLock.Lock(); err != nil {
+		return nil, fmt.Errorf("lock attempt %s status: %w", latest.ID(), err)
+	}
+	locked := true
+	unlockStatus := func() {
+		if locked {
+			_ = fileLock.Unlock()
+			_ = fileLock.Close()
+			locked = false
+		}
+	}
+	defer unlockStatus()
+
 	recordPath := filepath.Join(filepath.Dir(latest.file), AbandonmentRecordFile)
 	existing, err := readAbandonmentRecord(latest.file)
 	switch {
@@ -156,6 +185,9 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 			record.ExpectedExecution = nil
 			record.PredecessorAbsent = true
 		}
+		if attemptAbandonCheckedHook != nil {
+			attemptAbandonCheckedHook(latest.file)
+		}
 		if err := writeRecordExclusive(recordPath, record); err != nil {
 			return nil, err
 		}
@@ -165,11 +197,12 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 
 	switch record.Outcome {
 	case persis.AbandonmentHidden:
+		unlockStatus()
 		if err := latest.Hide(ctx); err != nil {
 			return nil, fmt.Errorf("failed to hide abandoned attempt %s: %w", latest.ID(), err)
 		}
 	case persis.AbandonmentMarkedFailed:
-		if err := markNotDispatched(ctx, latest, record); err != nil {
+		if err := markNotDispatchedLocked(ctx, latest, record); err != nil {
 			return nil, err
 		}
 	}
@@ -467,10 +500,12 @@ func (store *Store) ReadExecutionAbandonment(ctx context.Context, dagRun, rootDA
 	return record, nil
 }
 
-// markNotDispatched marks a run's only, never-dispatched attempt Failed with
-// the record's reason, so the run stays visible. A status already Failed was
-// marked by an earlier, interrupted call.
-func markNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptAbandonment) error {
+// markNotDispatchedLocked marks a run's only, never-dispatched attempt Failed
+// with the record's reason, so the run stays visible. A status already Failed
+// was marked by an earlier, interrupted call. The caller holds the status
+// file's lock, so the append goes through a writer that does not take it
+// again, and the file is not compacted.
+func markNotDispatchedLocked(ctx context.Context, att *Attempt, record persis.AttemptAbandonment) error {
 	next := ir.DAGRunStatus{
 		Name:      record.Run.Name,
 		DAGRunID:  record.Run.ID,
@@ -498,15 +533,24 @@ func markNotDispatched(ctx context.Context, att *Attempt, record persis.AttemptA
 	if next.Error == "" {
 		next.Error = "not dispatched"
 	}
-	if err := att.Open(ctx); err != nil {
+	ir.NormalizeDAGRunConditions(&next)
+	if err := terminatePartialLine(att.file); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("mark abandoned attempt failed: %w", err)
+	}
+	writer := NewWriter(att.file)
+	if err := writer.Open(); err != nil {
 		return fmt.Errorf("open abandoned attempt: %w", err)
 	}
-	writeErr := att.Write(ctx, next)
-	closeErr := att.Close(ctx)
+	writeErr := writer.Write(ctx, next)
+	closeErr := writer.Close(ctx)
 	if writeErr != nil {
 		return fmt.Errorf("mark abandoned attempt failed: %w", writeErr)
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	att.afterWriteLocked(ctx, next)
+	return nil
 }
 
 // readWrittenStatus reads an attempt's status for an abandonment decision. It

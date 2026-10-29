@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -657,4 +659,175 @@ func TestListAttemptAbandonmentsStrictReportsADanglingRecord(t *testing.T) {
 
 	_, err = th.Repository.ReadAttemptAbandonment(th.Context, ref, ir.DAGRunRef{}, dangling.ID())
 	require.ErrorIs(t, err, persis.ErrAttemptAbandonmentConflict, "the single read refuses it too")
+}
+
+// A status writer that already has the attempt open, as a coordinator's
+// cached handle does, appends while an attempt-level abandonment runs. The
+// abandonment holds the status file's lock from its check through its record
+// (and, for a first attempt, the Failed mark): the append cannot land in
+// between, and once released it lands after the record. For the hidden
+// outcome it lands in the same file, now hidden.
+//
+// Not parallel: the hooks are package state.
+func TestAbandonAttemptHoldsTheStatusLock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		retry   bool
+		outcome string
+	}{
+		{"marked failed", false, persis.AbandonmentMarkedFailed},
+		{"hidden", true, persis.AbandonmentHidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.retry && runtime.GOOS == "windows" {
+				t.Skip("Windows does not rename a directory while a writer holds a file in it open")
+			}
+			th := setupTestRepository(t)
+			dag := th.DAG("abandon_lock_dag").DAG
+			var previous *Attempt
+			if tc.retry {
+				previous = createRunAttempt(t, th, dag, false, ir.Failed, "", "worker-1")
+			}
+			target := createRunAttempt(t, th, dag, tc.retry, ir.NotStarted, "", "")
+			statusFile := target.file
+			hiddenFile := filepath.Join(filepath.Dir(filepath.Dir(statusFile)), "."+filepath.Base(filepath.Dir(statusFile)), JSONLStatusFile)
+			writer, err := NewAttempt(statusFile, nil)
+			require.NoError(t, err)
+			require.NoError(t, writer.Open(th.Context))
+
+			// What the writer finds once it holds the lock.
+			appended := make(chan struct{})
+			var sawRecord bool
+			var sawStatus ir.Status
+			appendLockedHook = func(file string) {
+				if file != statusFile {
+					return
+				}
+				current := statusFile
+				if _, err := os.Stat(statusFile); err != nil {
+					current = hiddenFile
+				}
+				_, err := os.Stat(filepath.Join(filepath.Dir(current), AbandonmentRecordFile))
+				sawRecord = err == nil
+				if st, err := parseLatestStatusFromTail(th.Context, current); err == nil {
+					sawStatus = st.Status
+				}
+				close(appended)
+			}
+			t.Cleanup(func() { appendLockedHook = nil })
+
+			hooked := false
+			written := make(chan error, 1)
+			attemptAbandonCheckedHook = func(file string) {
+				hooked = true
+				probe := flock.New(statusLockPath(file))
+				locked, err := probe.TryLock()
+				assert.NoError(t, err)
+				assert.False(t, locked, "another descriptor must not get the status lock inside the abandonment")
+				if locked {
+					_ = probe.Unlock()
+				}
+				_ = probe.Close()
+
+				running := ir.InitialStatus(dag)
+				running.DAGRunID, running.AttemptID, running.Status, running.WorkerID = abandonRunID, target.ID(), ir.Running, "worker-2"
+				go func() { written <- writer.Write(th.Context, running) }()
+				select {
+				case <-appended:
+					t.Error("a status append landed between the check and the record")
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			t.Cleanup(func() { attemptAbandonCheckedHook = nil })
+
+			got, err := abandon(th, abandonRecord(dag, target.ID(), nil))
+			require.NoError(t, err)
+			require.True(t, hooked)
+			assert.Equal(t, tc.outcome, got.Outcome)
+			require.NoError(t, <-written)
+			attemptAbandonCheckedHook, appendLockedHook = nil, nil
+			_ = writer.Close(th.Context)
+
+			assert.True(t, sawRecord, "the append landed after the record")
+			if tc.retry {
+				assert.Equal(t, previous.ID(), latestAttemptID(t, th, dag), "the hidden attempt stays hidden")
+				assert.Equal(t, ir.Running, latestStatusOf(t, hiddenFile), "the late append is in the hidden attempt")
+			} else {
+				assert.Equal(t, ir.Failed, sawStatus, "the append landed after the Failed mark")
+			}
+			probe := flock.New(statusLockPath(statusFile))
+			if tc.retry {
+				probe = flock.New(statusLockPath(hiddenFile))
+			}
+			locked, err := probe.TryLock()
+			require.NoError(t, err)
+			assert.True(t, locked, "released after the abandonment")
+			_ = probe.Unlock()
+			_ = probe.Close()
+		})
+	}
+}
+
+// A status lock that cannot be taken refuses the abandonment before anything
+// is written. A Failed mark that fails leaves the record, releases the lock,
+// and the next call completes the mark.
+func TestAbandonAttemptStatusLockErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the lock cannot be taken", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("file permissions cannot make a directory unwritable for its owner on Windows")
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("root creates files in a read-only directory")
+		}
+		th := setupTestRepository(t)
+		dag := th.DAG("abandon_lock_dag").DAG
+		only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+		// No lock file, and none can be created beside the status.
+		dir := filepath.Dir(only.file)
+		require.NoError(t, os.Remove(statusLockPath(only.file)))
+		require.NoError(t, os.Chmod(dir, 0o500))       //nolint:gosec // test makes the directory read-only
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // restore for cleanup
+
+		_, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+		require.ErrorContains(t, err, "lock attempt "+only.ID()+" status")
+		assert.NotErrorIs(t, err, persis.ErrAttemptNotAbandonable)
+		_, statErr := os.Stat(filepath.Join(filepath.Dir(only.file), AbandonmentRecordFile))
+		assert.ErrorIs(t, statErr, os.ErrNotExist, "no record is written")
+		assert.Equal(t, ir.NotStarted, latestStatusOf(t, only.file))
+	})
+
+	t.Run("the Failed mark fails", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("file permissions cannot make a file unwritable for its owner on Windows")
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("root writes a read-only file")
+		}
+		th := setupTestRepository(t)
+		dag := th.DAG("abandon_lock_dag").DAG
+		only := createRunAttempt(t, th, dag, false, ir.NotStarted, "", "")
+		require.NoError(t, os.Chmod(only.file, 0o400))
+
+		_, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+		require.ErrorContains(t, err, "mark abandoned attempt failed")
+		_, statErr := os.Stat(filepath.Join(filepath.Dir(only.file), AbandonmentRecordFile))
+		require.NoError(t, statErr, "the record is kept")
+		assert.Equal(t, ir.NotStarted, latestStatusOf(t, only.file))
+		probe := flock.New(statusLockPath(only.file))
+		locked, err := probe.TryLock()
+		require.NoError(t, err)
+		assert.True(t, locked, "released after the failure")
+		_ = probe.Unlock()
+		_ = probe.Close()
+
+		require.NoError(t, os.Chmod(only.file, 0o600))
+		got, err := abandon(th, abandonRecord(dag, only.ID(), nil))
+		require.NoError(t, err)
+		assert.Equal(t, persis.AbandonmentMarkedFailed, got.Outcome)
+		assert.Equal(t, ir.Failed, latestStatusOf(t, only.file))
+	})
 }
