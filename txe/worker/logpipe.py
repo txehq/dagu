@@ -3,7 +3,10 @@
 The launchd worker agent runs this with `python3 -I`; it reads no environment.
 
   logpipe.py --path LOG --max-bytes N --backups K [--chunk-bytes C] [--write-stall-seconds S]
-             [--kill-timeout T] -- WORKER ARGS...
+             [--kill-timeout T] [--diag-path P] [--diag-max-bytes D] -- CHILD ARGS...
+
+It runs the worker agent's dagu worker and, after TXE-5398, the tunnel agent's supervisor
+with kubectl under it; "worker" below stands for whichever child it runs.
 
 Why: launchd appends the worker's output to logs/worker.log and nothing bounds it (103 MB in
 17 days). Renaming or compressing that file while launchd holds its descriptor bounds nothing:
@@ -49,14 +52,32 @@ Rotation failures (the rename or the reopen fails): writes continue to the curre
 is then over the target, and rotation is retried at most once a minute. If it keeps failing and
 the file passes twice --max-bytes, the same fail-stop applies: the active log never grows past
 that degraded limit (plus one line) under a claim of boundedness. A compression failure keeps
-the rotated file uncompressed, counted in the retained set. Every failure is reported on stderr
-(launchd's own file for this agent), at most one line a minute per kind, with the number of
-lines suppressed meanwhile; nothing is swallowed.
+the rotated file uncompressed, counted in the retained set. Every failure is reported, at most
+one line a minute per kind with the number of lines suppressed meanwhile; nothing is swallowed.
 
-Signals: SIGTERM, SIGINT and SIGHUP are forwarded to the worker; this process keeps draining
-until the worker's output ends, waits at most --kill-timeout seconds after a forwarded signal
-before SIGKILL, finishes the compression in progress, and exits with the worker's code
-(128 + signal if the worker died of one). It never restarts the worker.
+Diagnostics: this process's own lines go to --diag-path (default <stem>.logpipe.log beside LOG)
+through a best-effort writer that never retries or blocks: it appends, and when the file passes
+--diag-max-bytes (1 MiB) it renames it to <path>.1, keeping one previous copy. So the
+diagnostic file is at most twice --diag-max-bytes. Only if that write fails does the line fall
+back to stderr, launchd's own file for the agent, which otherwise receives nothing but a
+traceback should this process itself crash.
+
+Signals and descendants: the worker stays in this process's own process group, launchd's
+group for the agent, exactly as when launchd ran it directly. SIGTERM, SIGINT and SIGHUP are
+forwarded to the worker process alone, as launchd sends them, so the worker still decides how
+its children stop (step processes; the supervisor's kubectl). If the worker is still running
+--kill-timeout seconds after a forwarded signal (15, under launchd's 20 s ExitTimeOut) it is
+SIGKILLed. Whatever it leaves behind is launchd's: launchd.plist(5), AbandonProcessGroup,
+"When a job dies, launchd kills any remaining processes with the same process group ID as the
+job", and the agents do not set that key, so a grandchild still holding a port or the pipe is
+killed by launchd when this process exits, including when this process itself is killed. That
+is why this process never changes the group (no setsid, no killpg: a killpg would hit itself and
+everything launchd put in the group) and never needs Python 3.11's process_group.
+
+A grandchild that outlives the worker can hold the pipe open, so EOF alone is not the end:
+once the worker has exited, this process drains whatever still arrives for --orphan-grace
+seconds (5) and then stops, exits with the worker's code, and leaves the rest to launchd's
+group kill. It finishes the compression in progress first. It never restarts the worker.
 """
 import argparse
 import datetime
@@ -65,6 +86,7 @@ import gzip
 import os
 import queue
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -98,9 +120,13 @@ MARKER_PREFIX = re.compile(rb'^time=\S+ level=INFO msg="' + PREFIX.encode() + rb
 
 
 class Diag:
-    """stderr diagnostics, at most one line per DIAG_INTERVAL_S per kind, never dropped silently."""
+    """This process's own lines: at most one per DIAG_INTERVAL_S per kind (unless always), to a
+    small file bounded at twice max_bytes by a best-effort rename that never retries or blocks;
+    stderr only when that file cannot be written. Nothing is dropped silently: a suppressed
+    line is counted in the next one of its kind."""
 
-    def __init__(self):
+    def __init__(self, path=None, max_bytes=1 << 20):
+        self.path, self.max_bytes = path, max_bytes
         self.last = {}
         self.suppressed = {}
 
@@ -113,7 +139,22 @@ class Diag:
         n = self.suppressed.pop(kind, 0)
         self.last[kind] = now
         more = f" ({n} more of this kind in the last {DIAG_INTERVAL_S}s)" if n else ""
-        print(f"{PREFIX}: {utc_now().strftime('%Y-%m-%dT%H:%M:%SZ')} {text}{more}", file=sys.stderr, flush=True)
+        line = f"{PREFIX}: {utc_now().strftime('%Y-%m-%dT%H:%M:%SZ')} {text}{more}\n"
+        if self.path is None or not self._append(line):
+            print(line, end="", file=sys.stderr, flush=True)
+
+    def _append(self, line):
+        try:
+            if os.path.exists(self.path) and os.path.getsize(self.path) + len(line) > self.max_bytes:
+                os.replace(self.path, self.path + ".1")
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, line.encode())
+            finally:
+                os.close(fd)
+            return True
+        except OSError:
+            return False
 
 
 class Log:
@@ -347,13 +388,26 @@ def write_bounded(log, data, chunk_bytes, line_start):
     return line_start
 
 
-def drain(fd, log, chunk_bytes):
+def drain(fd, log, chunk_bytes, child=None, orphan_grace=5.0):
     """Copy the worker's output to the log: complete lines as they arrive, an open line in
-    pieces of at most chunk_bytes, and whatever is left (without a newline) at the end.
-    Raises FailStop when the log cannot be written within its bounds."""
+    pieces of at most chunk_bytes, and whatever is left (without a newline) at the end. The
+    end is EOF, or, when `child` has exited, no data for orphan_grace seconds: a grandchild
+    holding the pipe does not keep this running. Raises FailStop when the log cannot be
+    written within its bounds."""
     pending = b""
     line_start = True
+    exited_at = None
     while True:
+        ready, _, _ = select.select([fd], [], [], 1.0)
+        if not ready:
+            if child is not None and child.poll() is not None:
+                if exited_at is None:
+                    exited_at = time.monotonic()
+                elif time.monotonic() - exited_at >= orphan_grace:
+                    if pending:
+                        write_bounded(log, pending, chunk_bytes, line_start)
+                    return
+            continue
         try:
             data = os.read(fd, 65536)
         except InterruptedError:
@@ -373,7 +427,8 @@ def drain(fd, log, chunk_bytes):
 
 
 def stop_child(child, kill_timeout, diag):
-    """SIGTERM, then SIGKILL after kill_timeout; returns the child's exit code."""
+    """SIGTERM to the worker, then SIGKILL to it after kill_timeout; returns the worker's exit
+    code. Its remaining descendants are launchd's to kill with the group when this exits."""
     if child.poll() is None:
         try:
             child.terminate()
@@ -397,7 +452,10 @@ def main(argv):
     p.add_argument("--backups", type=int, required=True)
     p.add_argument("--chunk-bytes", type=int, default=1 << 20)
     p.add_argument("--write-stall-seconds", type=float, default=30)
-    p.add_argument("--kill-timeout", type=float, default=20)
+    p.add_argument("--kill-timeout", type=float, default=15)
+    p.add_argument("--diag-path", default=None)
+    p.add_argument("--diag-max-bytes", type=int, default=1 << 20)
+    p.add_argument("--orphan-grace", type=float, default=5)
     p.add_argument("command", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
     if a.command[:1] == ["--"]:
@@ -409,7 +467,10 @@ def main(argv):
     if a.backups < 1:
         p.error("--backups must be at least 1")
 
-    diag = Diag()
+    if a.diag_path is None:
+        stem, _ = os.path.splitext(a.path)
+        a.diag_path = stem + ".logpipe.log"
+    diag = Diag(a.diag_path, a.diag_max_bytes)
     log = Log(a.path, a.max_bytes, a.backups, a.write_stall_seconds, diag)
     try:
         log.open_at_start()
@@ -418,6 +479,8 @@ def main(argv):
               f"its output would be lost", file=sys.stderr, flush=True)
         return 1
 
+    # Same process group as this process, launchd's group for the agent: launchd kills what is
+    # left of it when this process exits (see the header), so no new group and no killpg.
     child = subprocess.Popen(a.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     forwarded = {}
 
@@ -447,7 +510,7 @@ def main(argv):
         signal.signal(s, forward)
 
     try:
-        drain(child.stdout.fileno(), log, a.chunk_bytes)
+        drain(child.stdout.fileno(), log, a.chunk_bytes, child, a.orphan_grace)
     except FailStop as e:
         diag.say("fail-stop", f"{e}; stopping the worker (its running tasks end) and exiting {EXIT_IOERR}; "
                               f"bytes not yet written are lost", always=True)

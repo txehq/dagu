@@ -1,6 +1,8 @@
 // Copyright (C) 2026 TXE
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//go:build !windows
+
 package worker_test
 
 import (
@@ -12,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,9 +76,6 @@ sys.exit(code)
 
 func startLogpipe(t *testing.T, logs string, maxBytes, backups, chunk int, extra []string, child ...string) *logpipeRun {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("the worker scripts run on the macOS worker only")
-	}
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
 	script, err := filepath.Abs("logpipe.py")
@@ -96,6 +94,20 @@ func startLogpipe(t *testing.T, logs string, maxBytes, backups, chunk int, extra
 	r.cmd.Stderr = &r.errOut
 	require.NoError(t, r.cmd.Start())
 	return r
+}
+
+// diag returns the wrapper's own diagnostic file (and its one previous copy), where its
+// lines go instead of stderr.
+func (r *logpipeRun) diag(t *testing.T) string {
+	t.Helper()
+	var out string
+	for _, name := range []string{"worker.logpipe.log.1", "worker.logpipe.log"} {
+		b, err := os.ReadFile(filepath.Join(r.logs, name))
+		if err == nil {
+			out += string(b)
+		}
+	}
+	return out
 }
 
 // exitCode waits for the wrapper and returns its exit code.
@@ -194,7 +206,8 @@ func TestLogpipeKeepsEveryByteWithinTheCap(t *testing.T) {
 	assert.Contains(t, markers[0], `msg="txe-logpipe: opened worker.log"`)
 	assert.Contains(t, markers[1], `msg="txe-logpipe: rotated worker.log"`)
 	assert.Regexp(t, `took_ms=\d+`, markers[1])
-	assert.Contains(t, r.errOut.String(), "compressed worker.log.", "compression is reported, rate-limited")
+	assert.Contains(t, r.diag(t), "compressed worker.log.", "compression is reported, rate-limited")
+	assert.Empty(t, r.errOut.String(), "launchd's file gets nothing on the normal path")
 }
 
 // Markers are in the worker's text format so TXE-5398's parser can place them, and their
@@ -346,9 +359,11 @@ func TestLogpipeRotationFailureIsBoundedByTheDegradedLimit(t *testing.T) {
 		fmt.Sprintf("chmod 0500 %q; %q %q 5000 '' 5 wait 0", logs, py, child))
 	assert.Equal(t, 74, r.exitCode(t), r.errOut.String())
 	require.NoError(t, os.Chmod(logs, 0o700))
-	assert.Contains(t, r.errOut.String(), "could not rotate worker.log")
-	assert.Contains(t, r.errOut.String(), "the next write would pass 2x its target; rotation has been failing")
-	assert.Contains(t, r.errOut.String(), "stopping the worker (its running tasks end) and exiting 74")
+	// The diagnostic file lives in the read-only directory too, so its lines fell back to stderr.
+	diag := r.diag(t) + r.errOut.String()
+	assert.Contains(t, diag, "could not rotate worker.log")
+	assert.Contains(t, diag, "the next write would pass 2x its target; rotation has been failing")
+	assert.Contains(t, diag, "stopping the worker (its running tasks end) and exiting 74")
 	set := reassemble(t, logs)
 	worker, sizes, rotated := set.worker, set.sizes, set.rotated
 	assert.Empty(t, rotated)
@@ -362,9 +377,6 @@ func TestLogpipeRotationFailureIsBoundedByTheDegradedLimit(t *testing.T) {
 // the stall bound elapses without waiting. It returns the script's stdout, stderr and exit code.
 func harness(t *testing.T, body string) (stdout, stderr string, code int) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("the worker scripts run on the macOS worker only")
-	}
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
 	dir, err := filepath.Abs(".")
@@ -379,6 +391,11 @@ def tracked_open(self):
     real_open(self)
     LOG_FDS.add(self.fd)
 logpipe.Log._open = tracked_open
+real_close = logpipe.Log._close_quietly
+def tracked_close(self):
+    LOG_FDS.discard(self.fd)
+    real_close(self)
+logpipe.Log._close_quietly = tracked_close
 
 ACTIONS = []            # per call on a log descriptor: "ok", "partial:N", "fail"; then "ok" forever
 real_write = os.write
@@ -513,12 +530,14 @@ code = logpipe.main(["--path", path, "--max-bytes", "1048576", "--backups", "2",
                      "--write-stall-seconds", "3", "--kill-timeout", "5", "--", sys.executable, child])
 print("exit", code)
 print("lines kept", worker_bytes(path).count(b"\n"))
+print("diag:", open(os.path.join(d, "worker.logpipe.log")).read())
 `)
 	require.Equal(t, 0, code, stderr)
 	assert.Contains(t, stdout, "exit 74")
 	assert.Contains(t, stdout, "lines kept 50")
-	assert.Contains(t, stderr, "could not write to worker.log for 3s")
-	assert.Contains(t, stderr, "stopping the worker (its running tasks end) and exiting 74; bytes not yet written are lost")
+	assert.Contains(t, stdout, "could not write to worker.log for 3s")
+	assert.Contains(t, stdout, "stopping the worker (its running tasks end) and exiting 74; bytes not yet written are lost")
+	assert.Empty(t, stderr)
 }
 
 // SIGTERM is forwarded; the wrapper keeps draining, then exits with the worker's code.
@@ -532,7 +551,7 @@ func TestLogpipeForwardsSignalsWithABoundedWait(t *testing.T) {
 	assert.Equal(t, 3, r.exitCode(t))
 	worker := reassemble(t, logs).worker
 	assert.True(t, bytes.HasSuffix(worker, []byte(fmt.Sprintf("signal %d\n", syscall.SIGTERM))), string(worker))
-	assert.Contains(t, r.errOut.String(), "forwarding signal 15 to the worker")
+	assert.Contains(t, r.diag(t), "forwarding signal 15 to the worker")
 
 	logs2 := filepath.Join(dir, "logs2") // a fresh log, so "ready" is this child's, after its handlers are installed
 	r = startLogpipe(t, logs2, 20000, 3, 4096, []string{"--kill-timeout", "1"}, "python3", childScript(t, dir), "5", "", "3", "stubborn", "0")
@@ -541,7 +560,83 @@ func TestLogpipeForwardsSignalsWithABoundedWait(t *testing.T) {
 	require.NoError(t, r.cmd.Process.Signal(syscall.SIGTERM))
 	assert.Equal(t, 137, r.exitCode(t), "128 + SIGKILL")
 	assert.Less(t, time.Since(start), 10*time.Second, "bounded by --kill-timeout, not by the worker")
-	assert.Contains(t, r.errOut.String(), "sending SIGKILL")
+	assert.Contains(t, r.diag(t), "sending SIGKILL")
+}
+
+// A grandchild that outlives the worker and still holds the pipe must not keep the wrapper
+// running: once the worker has exited and the pipe has been quiet for --orphan-grace, the
+// wrapper exits with the worker's code. The grandchild itself is launchd's to kill with the
+// group (AbandonProcessGroup is not set on the agents); here the test ends it.
+func TestLogpipeStopsWhenTheWorkerExitsThoughAGrandchildHoldsThePipe(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	grandchild := filepath.Join(dir, "grandchild.py")
+	require.NoError(t, os.WriteFile(grandchild, []byte("import os, sys, time\nprint('grandchild', os.getpid(), flush=True)\ntime.sleep(60)\n"), 0o600))
+	r := startLogpipe(t, logs, 100000, 2, 4096, []string{"--orphan-grace", "1"}, "sh", "-c",
+		fmt.Sprintf("%q %q & echo 'worker done'; exit 4", py, grandchild))
+	start := time.Now()
+	assert.Equal(t, 4, r.exitCode(t), "the worker's code, not the grandchild's")
+	assert.Less(t, time.Since(start), 8*time.Second, "bounded by --orphan-grace, not by the grandchild's lifetime")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "worker done")
+	if m := regexp.MustCompile(`grandchild (\d+)`).FindSubmatch(b); m != nil {
+		pid, _ := strconv.Atoi(string(m[1]))
+		_ = syscall.Kill(pid, syscall.SIGKILL) // what launchd's group kill does after the wrapper exits
+	}
+}
+
+// If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
+// does that when the agent's main process dies); the worker's next write hits the closed
+// pipe, so a writing worker ends on its own and nothing hangs. A silent worker would be ended
+// by launchd, which a test cannot stand in for.
+func TestLogpipeAbruptDeathLeavesTheWorkerToLaunchd(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	talker := filepath.Join(dir, "talker.py")
+	require.NoError(t, os.WriteFile(talker, []byte("import os, sys, time\nprint('talker', os.getpid(), flush=True)\nwhile True:\n    print('tick', flush=True); time.sleep(0.2)\n"), 0o600))
+	r := startLogpipe(t, logs, 100000, 2, 4096, nil, "python3", talker)
+	waitForLog(t, logs, "tick")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	m := regexp.MustCompile(`talker (\d+)`).FindSubmatch(b)
+	require.NotNil(t, m)
+	pid, err := strconv.Atoi(string(m[1]))
+	require.NoError(t, err)
+	require.NoError(t, r.cmd.Process.Kill())
+	assert.Equal(t, -1, r.exitCode(t), "killed")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if syscall.Kill(pid, 0) == nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("the worker kept running after its pipe closed")
+	}
+}
+
+// The wrapper's own diagnostic file is bounded by a best-effort rename at --diag-max-bytes,
+// keeps one previous copy, and never reaches stderr while it can be written.
+func TestLogpipeDiagnosticsAreBounded(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.logpipe.log")
+diag = logpipe.Diag(path, 2000)
+for i in range(200):
+    diag.say("kind%d" % i, "line %d of the diagnostic stream, long enough to fill the file" % i, always=True)
+sizes = {n: os.path.getsize(os.path.join(d, n)) for n in sorted(os.listdir(d))}
+print("files", sizes)
+print("bounded", all(s <= 2000 + 120 for s in sizes.values()), "copies", len(sizes))
+text = open(path).read()
+print("last", text.strip().splitlines()[-1][-30:])
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "bounded True copies 2")
+	assert.Contains(t, stdout, "long enough to fill the file")
+	assert.Empty(t, stderr, "nothing reached stderr")
 }
 
 // waitForLog waits until the active log holds text (the child's stderr goes through the
