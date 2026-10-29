@@ -368,6 +368,11 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 	if err != nil {
 		if loadErrs, ok := errors.AsType[ir.ErrorList](err); ok {
 			errs = loadErrs.ToStringList()
+		} else if _, ok := errors.AsType[*ir.ScheduleError](err); ok {
+			// A schedule that does not parse is refused like any other invalid
+			// definition: nothing was written, and the errors are the answer
+			// (TXE-5404; before, the file loader's raw error made it a 500).
+			errs = []string{err.Error()}
 		} else {
 			return nil, err
 		}

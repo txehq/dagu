@@ -503,3 +503,13 @@ func TestErrorList_WithWrappedErrors(t *testing.T) {
 		assert.True(t, errors.Is(errList, ErrInvalidSchedule))
 	})
 }
+
+func TestScheduleErrorKeepsTheMessageAndTheChain(t *testing.T) {
+	cause := errors.New("invalid cron expression \"1\"")
+	wrapped := fmt.Errorf("field 'schedule': %w", &ScheduleError{Err: cause})
+	scheduleErr, ok := errors.AsType[*ScheduleError](wrapped)
+	require.True(t, ok)
+	assert.Equal(t, cause.Error(), scheduleErr.Error())
+	assert.ErrorIs(t, wrapped, cause)
+	assert.Equal(t, "field 'schedule': invalid cron expression \"1\"", wrapped.Error())
+}

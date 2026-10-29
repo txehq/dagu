@@ -52,6 +52,18 @@ var (
 	ErrStepsMustBeArrayOrMap               = errors.New("steps must be an array or a map")
 )
 
+// ScheduleError is a schedule in a DAG definition that does not parse. It is
+// an error in what the author wrote, never an I/O or internal failure, so a
+// caller answering a request about a definition can report it as a
+// validation error (TXE-5404). Its message is the wrapped error's.
+type ScheduleError struct {
+	Err error
+}
+
+func (e *ScheduleError) Error() string { return e.Err.Error() }
+
+func (e *ScheduleError) Unwrap() error { return e.Err }
+
 // ErrorList is just a list of errors.
 // It is used to collect multiple errors in building a DAG.
 type ErrorList []error
