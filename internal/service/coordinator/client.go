@@ -156,6 +156,8 @@ type clientImpl struct {
 
 	stateCoordinatorMu sync.Mutex
 	stateCoordinators  map[string]pinnedStateCoordinator
+
+	healthLog *healthFailureLog // bounds the failed health check warnings (TXE-5406)
 }
 
 type pinnedStateCoordinator struct {
@@ -232,6 +234,7 @@ func New(registry serviceregistry.ServiceRegistry, config *Config) Client {
 		state: &Metrics{
 			IsConnected: true, // Assume connected initially
 		},
+		healthLog: newHealthFailureLog(time.Now),
 	}
 }
 
@@ -483,15 +486,12 @@ func (cli *clientImpl) attemptCall(ctx context.Context, members []serviceregistr
 
 		// Check if the coordinator is healthy
 		if err := cli.isHealthy(ctx, client); err != nil {
-			logger.Warn(ctx, "Failed to check coordinator health",
-				slog.String("coordinator-id", member.ID),
-				tag.Host(member.Host),
-				tag.Port(member.Port),
-				tag.Error(err))
+			cli.logHealthFailure(ctx, member, err)
 			cli.recordFailure(err)
 			lastErr = err
 			continue
 		}
+		cli.logHealthPassed(ctx, member)
 
 		// Create request
 		if err := callback(ctx, member, client); err != nil {
@@ -515,6 +515,46 @@ func (cli *clientImpl) attemptCall(ctx context.Context, members []serviceregistr
 	}
 
 	return lastErr
+}
+
+// logHealthFailure logs a failed health check: the first of an episode at
+// once, then a summary at most once a minute while the failures continue
+// (TXE-5406). Nothing else about the failure changes.
+func (cli *clientImpl) logHealthFailure(ctx context.Context, member serviceregistry.HostInfo, err error) {
+	switch action, ep := cli.healthLog.failed(coordinatorMemberKey(member)); action {
+	case healthLogFirst:
+		logger.Warn(ctx, "Failed to check coordinator health",
+			slog.String("coordinator-id", member.ID),
+			tag.Host(member.Host),
+			tag.Port(member.Port),
+			tag.Error(err))
+	case healthLogSummary:
+		logger.Warn(ctx, "Coordinator health check still failing",
+			slog.String("coordinator-id", member.ID),
+			tag.Host(member.Host),
+			tag.Port(member.Port),
+			slog.Int("attempts", ep.attempts),
+			slog.Int("suppressed", ep.unlogged),
+			slog.Time("failing-since", ep.since),
+			tag.Error(err))
+	case healthLogNothing:
+	}
+}
+
+// logHealthPassed ends a coordinator's episode of failed health checks, with
+// one line that counts it, so failures that no summary reported are counted.
+func (cli *clientImpl) logHealthPassed(ctx context.Context, member serviceregistry.HostInfo) {
+	ep, ended := cli.healthLog.passed(coordinatorMemberKey(member))
+	if !ended {
+		return
+	}
+	logger.Info(ctx, "Coordinator health check passing again",
+		slog.String("coordinator-id", member.ID),
+		tag.Host(member.Host),
+		tag.Port(member.Port),
+		slog.Int("attempts", ep.attempts),
+		slog.Int("suppressed", ep.unlogged),
+		slog.Time("failing-since", ep.since))
 }
 
 // callPinnedStateCoordinator keeps all state RPCs on one coordinator for this

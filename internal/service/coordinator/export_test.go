@@ -36,3 +36,15 @@ func SetDispatchPollWaitForTest(t testing.TB, h *Handler, initial, maxWait time.
 func NotifyDispatchAvailableForTest(h *Handler) {
 	h.notifyDispatchAvailable()
 }
+
+// SetHealthLogClockForTest gives the client's health-check warning log the
+// clock now (TXE-5406). A nil now removes it, so every failure is logged, as
+// before the change.
+func SetHealthLogClockForTest(c Client, now func() time.Time) {
+	cli := c.(*clientImpl)
+	if now == nil {
+		cli.healthLog = nil
+		return
+	}
+	cli.healthLog = newHealthFailureLog(now)
+}
