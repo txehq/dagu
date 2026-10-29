@@ -46,9 +46,10 @@
 #      failed (exit 2), never "no findings": a page with errors, or without its threads or a
 #      boolean pageInfo.hasNextPage; pages whose hasNextPage is not true on every page but the last
 #      and false on the last; an empty page among several; a cursor of a non-last page missing or
-#      repeated; a thread without boolean isResolved and isOutdated, without a first comment with
-#      a numeric databaseId, a string body and an author typed and named; or a resolvedBy that is
-#      neither null nor typed and named. (A thread whose first comment's author is a deleted
+#      repeated; a page whose errors are not absent, null or empty, whatever their message says; a
+#      thread without boolean isResolved and isOutdated, without a first comment with a numeric
+#      databaseId, a string body and an author typed and named (non-empty strings both); or a
+#      resolvedBy that is neither null nor typed and named the same way. (A thread whose first comment's author is a deleted
 #      account, null in GraphQL, is therefore unreadable too: the receipt or a person's
 #      review-override is the way past it.) Measured on txehq/dagu PRs 185
 #      (b0eb595ab, every live thread a P2: failed until a manual `@codex review` posted a receipt)
@@ -156,11 +157,19 @@ decide_on_live_threads() {
         pages="$(gh api graphql --paginate -F owner="${repo%%/*}" -F name="${repo#*/}" -F pr="$pr" \
             -f query="$THREADS_QUERY" | jq -s .)" || die_read "PR #$pr's review threads (the GraphQL error is above)"
     fi
-    bad="$(printf '%s' "$pages" | jq -r '[ .[]? | .errors[]? | .message // tostring ] | join("; ")')" \
+    # Any error fails the read, whatever its text: errors absent, null or [] on every page, or no verdict.
+    bad="$(printf '%s' "$pages" | jq -r '[ .[]?
+        | if type != "object" then "a page that is not an object"
+          elif .errors == null then empty
+          elif (.errors | type) != "array" then "errors that are not a list"
+          else .errors[] | if type == "object" and (.message | type) == "string" and .message != ""
+                           then .message else "an error without a message" end end ] | join("; ")')" \
         || die_read "PR #$pr's review threads (not JSON)"
     [ -z "$bad" ] || die_read "PR #$pr's review threads (GraphQL: $bad)"
     # One row per live P0/P1 of the connector at the head: ok|block, comment id, path:line, who, first line.
     live="$(printf '%s' "$pages" | jq -er --arg bot "$CONNECTOR_GRAPHQL_LOGIN" --arg b "$BLOCKING_BADGES" '
+        def named(a): (a.__typename | type) == "string" and a.__typename != ""
+                      and (a.login | type) == "string" and a.login != "";
         if type != "array" or length == 0 then error("no pages") else . end
         | [ .[] | .data.repository.pullRequest.reviewThreads
                 | if type != "object" or (.pageInfo.hasNextPage | type) != "boolean" or (.nodes | type) != "array"
@@ -175,10 +184,8 @@ decide_on_live_threads() {
         | [ $p[] | .nodes[] ]
         | map(if (.isResolved | type) == "boolean" and (.isOutdated | type) == "boolean"
                  and (.comments.nodes[0] | (.databaseId | type) == "number" and (.body | type) == "string"
-                      and (.author | type) == "object" and (.author.__typename | type) == "string"
-                      and (.author.login | type) == "string")
-                 and (.resolvedBy == null or ((.resolvedBy | type) == "object"
-                      and (.resolvedBy.__typename | type) == "string" and (.resolvedBy.login | type) == "string"))
+                      and (.author | type) == "object" and named(.author))
+                 and (.resolvedBy == null or ((.resolvedBy | type) == "object" and named(.resolvedBy)))
               then . else error("a thread whose resolution, first comment, author or resolver cannot be read") end)
         | map(.comments.nodes[0] as $c
               | select($c.author.login == $bot and $c.author.__typename == "Bot"

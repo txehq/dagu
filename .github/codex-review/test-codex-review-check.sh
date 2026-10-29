@@ -30,7 +30,7 @@ P2_ON_PREVIOUS=4297056843                                  # an inline P2 findin
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-review-test.XXXXXX")" || exit 2
 trap 'rm -rf "$TMP"' EXIT
-PASS=0; FAIL=0; UNREADABLE_N=0
+PASS=0; FAIL=0; UNREADABLE_N=0; ERROR_N=0
 
 # with_head_repo <dir> <owner/name> — the recordings were trimmed of .head.repo, which the API
 # always returns; the fork's check reads it (TXE-4719), so each case gets the PR's own repository.
@@ -496,6 +496,21 @@ expect_dagu 175 no-pages 2 "could not read PR #175's review threads (not what Gr
 # 12l. a GraphQL error, or no threads file: never a pass.
 dagu 175 graphql-error review-threads '[{data: null, errors: [{type: "RATE_LIMITED", message: "API rate limit exceeded for installation."}]}]'
 expect_dagu 175 graphql-error 2 "could not read PR #175's review threads (GraphQL: API rate limit exceeded for installation.)"
+# Any error fails, whatever its text or shape, with the data otherwise intact (PR 175's threads plus
+# the edit): an empty message, an error without one, errors that are not a list. Errors null or []
+# are no error: the threads decide (exit 1 on the open P1, so not a read failure).
+for edit in '.[0].errors = [{message: ""}]' '.[0].errors = [{}]' '.[0].errors = ["boom"]' \
+            '.[0].errors = "boom"' '.[0].errors = {message: "x"}' '.[0].errors = [{message: 7}]'; do
+    c="graphql-error-$((++ERROR_N))"
+    dagu 175 "$c" review-threads "$edit"
+    expect_dagu 175 "$c" 2 "could not read PR #175's review threads (GraphQL: "
+done
+dagu 175 graphql-errors-empty review-threads '.[0].errors = []'
+expect_dagu 175 graphql-errors-empty 1 "not resolved by a user: thread $P1_175 (unresolved)"
+dagu 175 graphql-errors-null review-threads '.[0].errors = null'
+expect_dagu 175 graphql-errors-null 1 "not resolved by a user: thread $P1_175 (unresolved)"
+dagu 175 page-not-object review-threads '. + ["a page"]'
+expect_dagu 175 page-not-object 2 "(GraphQL: a page that is not an object)"
 dagu 175 threads-missing
 rm "$TMP/threads-missing/review-threads.json"
 expect_dagu 175 threads-missing 2 "could not read PR #175's review threads"
@@ -505,7 +520,10 @@ for edit in 'del(.isOutdated)' '.isResolved = "false"' '.comments.nodes = []' 'd
             '.comments.nodes[0].author = null' '.comments.nodes[0].author |= del(.__typename)' \
             '.comments.nodes[0].author.login = null' '.comments.nodes[0].body = null' \
             '.comments.nodes[0] |= del(.databaseId)' '.isResolved = true | .resolvedBy = {login: "a-maintainer"}' \
-            '.isResolved = true | .resolvedBy = {__typename: "User"}' '.isResolved = true | .resolvedBy = "a-maintainer"'; do
+            '.isResolved = true | .resolvedBy = {__typename: "User"}' '.isResolved = true | .resolvedBy = "a-maintainer"' \
+            '.comments.nodes[0].author.__typename = ""' '.comments.nodes[0].author.login = ""' \
+            '.isResolved = true | .resolvedBy = {__typename: "User", login: ""}' \
+            '.isResolved = true | .resolvedBy = {__typename: "", login: "a-maintainer"}'; do
     c="unreadable-$((++UNREADABLE_N))"
     dagu 175 "$c" review-threads "$(on_175 "$edit")"
     expect_dagu 175 "$c" 2 "$UNREADABLE"
