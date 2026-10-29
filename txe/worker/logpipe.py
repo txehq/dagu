@@ -185,8 +185,9 @@ class Log:
         self.rotate_failing_since = None
         self.jobs = queue.Queue(maxsize=max(backups, 1))
         self.stopping = threading.Event()  # set by finish(): the compressor ends after its current job
-        self.names_lock = threading.Lock()  # held while listing and deleting rotated names, and while
-        self._compressing = ""              # a compression result is published; names the source in compression
+        self.names_lock = threading.Lock()  # held while listing and deleting rotated names, while a
+        self._compressing = ""              # compression result is published, and while a rotation takes
+                                            # a free name; names the source in compression
         # A daemon thread: the process must be able to exit however it ends; finish() waits for
         # the compression in progress, with a bound, on every normal path.
         self.compressor = threading.Thread(target=self._compress_loop, name="compress", daemon=True)
@@ -219,17 +220,21 @@ class Log:
         """Move src to name_for(stamp) without ever overwriting: link to the new name, which
         os.link refuses if it exists, then unlink the old name. A stamp is skipped, with "-N"
         tried next, when the name or any of its variants (its .gz, its .gz.tmp) exists, so a
-        later compression can never replace an earlier file either."""
+        later compression can never replace an earlier file either. The check and the link are
+        one step under names_lock: the compressor publishes a .gz and removes its plain name
+        under that lock, and between the two steps that would free the name for reuse, so the
+        next compression would replace the earlier .gz (TXE-5422)."""
         stamp = utc_now().strftime(STAMP)
         for n in range(0, 1000):
             name = name_for(stamp if n == 0 else f"{stamp}-{n}")
             dst = os.path.join(self.dir, name)
-            if any(os.path.lexists(dst + v) for v in variants):
-                continue
-            try:
-                os.link(src, dst)
-            except FileExistsError:
-                continue
+            with self.names_lock:
+                if any(os.path.lexists(dst + v) for v in variants):
+                    continue
+                try:
+                    os.link(src, dst)
+                except FileExistsError:
+                    continue
             os.unlink(src)
             return dst
         raise OSError(errno.EEXIST, "no free name for", src)
