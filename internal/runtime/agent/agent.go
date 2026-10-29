@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 	"log/slog"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1427,30 +1426,13 @@ func errorString(err error) string {
 // It iterates through nodes in execution order and collects output values.
 // Last value wins for key conflicts.
 func (a *Agent) collectOutputs(ctx context.Context) map[string]string {
-	outputs := make(map[string]string)
-
 	// Steps and lifecycle handlers both publish to the run's outputs.
 	nodes := a.runner.NodesInRunOrder(a.plan)
-
+	data := make([]runtime.NodeData, 0, len(nodes))
 	for _, node := range nodes {
-		nodeData := node.NodeData()
-		maps.Copy(outputs, nodeData.OutputsValueStringMap())
-		step := nodeData.Step
-
-		if step.Output == "" {
-			continue
-		}
-
-		value, ok := nodeData.StringFormOutputValue()
-		if !ok {
-			continue
-		}
-
-		key := stringutil.ScreamingSnakeToCamel(step.Output)
-
-		// Store the output (last one wins for conflicts)
-		outputs[key] = value
+		data = append(data, node.NodeData())
 	}
+	outputs := runtime.CollectRunOutputs(data)
 
 	// Warn if total size exceeds 1MB
 	if len(outputs) > 0 {

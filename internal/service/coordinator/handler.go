@@ -2280,6 +2280,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 				return nil, status.Error(codes.Internal, "failed to write status: "+err.Error())
 			}
 
+			outputsErr := writeRunOutputs(ctx, bootstrappedAttempt, dagRunStatus)
 			h.persistChatMessages(ctx, bootstrappedAttempt, dagRunStatus)
 
 			ownership := h.attemptOwnership()
@@ -2288,6 +2289,9 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, bootstrappedAttempt.ID(), req.ExecutionMarker)
 			h.finalizeAdmissionForStatus(ctx, dagRunStatus, bootstrappedAttempt.ID())
 			h.closeCachedInactiveAttempt(ctx, dagRunStatus, bootstrappedAttempt)
+			if outputsErr != nil {
+				return nil, status.Error(codes.Unavailable, outputsNotWritten+outputsErr.Error())
+			}
 
 			return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
 		}
@@ -2438,6 +2442,12 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 		}
 	}
 
+	// The outputs of an accepted terminal status, from the status as written
+	// (TXE-3757). A failure is reported only after the bookkeeping below, so
+	// the run is still tracked as finished, and the worker's replay of the
+	// same accepted report writes them again.
+	outputsErr := writeRunOutputs(ctx, attempt, dagRunStatus)
+
 	// Persist chat messages for each node.
 	h.persistChatMessages(ctx, attempt, dagRunStatus)
 
@@ -2446,6 +2456,9 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, attempt.ID(), req.ExecutionMarker)
 	h.finalizeAdmissionForStatus(ctx, dagRunStatus, attempt.ID())
 	h.closeCachedInactiveAttempt(ctx, dagRunStatus, attempt)
+	if outputsErr != nil {
+		return nil, status.Error(codes.Unavailable, outputsNotWritten+outputsErr.Error())
+	}
 
 	return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
 }

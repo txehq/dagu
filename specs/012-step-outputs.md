@@ -172,6 +172,13 @@ Escaped `\${steps.step_id.outputs.output_name}` is literal string content under 
 
 Step outputs are not stdout, stderr, logs, artifacts, or durable result storage. This spec does not define how the published values are stored on disk.
 
+Declared step outputs are step-scoped. They are not the run's outputs, the `outputs.json` that `GET /api/v1/dag-runs/{name}/{dagRunId}/outputs` returns. The run's outputs are collected, in run order with the later value winning, from:
+
+- each step's and lifecycle handler's own published outputs document;
+- each string-form `output: VAR`, under the camelCase form of `VAR`.
+
+A run executed on a worker has the same outputs. The coordinator derives them from the worker's accepted terminal status, which was masked before it left the worker.
+
 ## Errors
 
 Validation must fail when:

@@ -165,12 +165,14 @@ type testFixture struct {
 	workerClient        coordinator.Client
 	workerMaxActiveRuns int
 	workers             []*worker.Worker
-	scheduler           *scheduler.Scheduler
-	schedulerCancel     context.CancelFunc
-	schedulerCtx        context.Context
-	schedulerErrCh      chan error
-	schedulerErr        error
-	schedulerErrSet     bool
+	// workerDataDirs are the isolated workers' own data directories.
+	workerDataDirs  []string
+	scheduler       *scheduler.Scheduler
+	schedulerCancel context.CancelFunc
+	schedulerCtx    context.Context
+	schedulerErrCh  chan error
+	schedulerErr    error
+	schedulerErrSet bool
 }
 
 func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixture {
@@ -287,6 +289,7 @@ func (f *testFixture) setupWorkerMode(
 		cfgCopy := *workerConfig
 		pathsCopy := cfgCopy.Paths
 		workerDataDir := filepath.Join(f.t.TempDir(), workerID)
+		f.workerDataDirs = append(f.workerDataDirs, workerDataDir)
 		pathsCopy.DataDir = workerDataDir
 		pathsCopy.LogDir = filepath.Join(workerDataDir, "logs")
 		pathsCopy.ArtifactDir = filepath.Join(workerDataDir, "artifacts")
