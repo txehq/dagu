@@ -403,6 +403,12 @@ func TestTunnelSuperviseReadsTheWorkersHeartbeatFailures(t *testing.T) {
 			`time=2026-10-29T15:16:10.000+08:00 level=INFO msg="Starting worker" worker-id=mch_x max-concurrency=100`,
 			fail("2026-10-29T15:16:20.000+08:00"),
 			fail("2026-10-29T15:16:50.000+08:00")),
+		// the text format with debug: the source sits between level and msg, for failures and recoveries alike
+		"debug": write("debug.log",
+			`time=2026-10-29T15:15:00.000+08:00 level=WARN source=/src/internal/service/worker/worker.go:673 msg="Heartbeat send failed; will retry with backoff"`,
+			`time=2026-10-29T15:16:10.000+08:00 level=INFO source="/Users/some one/dagu/internal/service/coordinator/client.go:1054" msg="CoordinatorCli connection recovered" previous-consecutive-failures=1`,
+			`time=2026-10-29T15:16:20.000+08:00 level=WARN source=/src/internal/service/worker/worker.go:673 msg="Heartbeat send failed; will retry with backoff"`,
+			`time=2026-10-29T15:16:50.000+08:00 level=WARN source=/src/internal/service/worker/worker.go:673 msg="Heartbeat send failed; will retry with backoff"`),
 		// a silent stretch longer than the gap: not shown to be one episode
 		"gap": write("gap.log",
 			fail("2026-10-29T15:14:00.000+08:00"),
@@ -433,6 +439,7 @@ print(json.dumps(out))
 	assert.Equal(t, "2026-10-29T07:16:50+00:00", got["flapping"], "only the failure after the last recovery counts")
 	assert.Equal(t, "2026-10-29T07:16:50+00:00", got["flapping_json"])
 	assert.Equal(t, "2026-10-29T07:16:20+00:00", got["restarted"])
+	assert.Equal(t, "2026-10-29T07:16:20+00:00", got["debug"], "the recovery with a source is read too")
 	assert.Equal(t, "2026-10-29T07:16:20+00:00", got["gap"])
 	assert.Nil(t, got["stale"])
 	assert.Nil(t, got["missing"])

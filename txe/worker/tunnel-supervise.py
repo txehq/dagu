@@ -49,7 +49,8 @@ PREFIX = "tunnel-supervise:"
 HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"
 RECOVERED_MSG = "CoordinatorCli connection recovered"
 STARTED_MSG = "Starting worker"
-_TEXT = re.compile(r'^time=(\S+) level=\S+ msg="((?:[^"\\]|\\.)*)"')
+# time, level, the source when the worker runs with debug (AddSource), then msg: slog's text order.
+_TEXT = re.compile(r'^time=(\S+) level=\S+(?: source=(?:"(?:[^"\\]|\\.)*"|\S+))? msg="((?:[^"\\]|\\.)*)"')
 # HTTP/2 client connection preface and an empty SETTINGS frame (RFC 9113 3.4, 6.5).
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 H2_SETTINGS = 0x4

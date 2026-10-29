@@ -51,15 +51,20 @@ func (l *lockedLog) String() string {
 // recovered" line follows the first heartbeat failure. This drives the real client against a
 // coordinator whose heartbeat fails and recovers, writes the worker's heartbeat failure line
 // through the same logger as worker.go does, and feeds the real log, in the text and JSON
-// formats, to the supervisor's reader at each step.
+// formats, with and without debug (which adds the source to each record), to the supervisor's
+// reader at each step.
 func TestClientRecoveryLineIsTheSupervisorsSignal(t *testing.T) {
 	script, err := filepath.Abs(filepath.Join("..", "..", "..", "txe", "worker", "tunnel-supervise.py"))
 	require.NoError(t, err)
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
 
-	for _, format := range []string{"text", "json"} {
-		t.Run(format, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, format string
+		debug        bool
+	}{{"text", "text", false}, {"text-debug", "text", true}, {"json", "json", false}, {"json-debug", "json", true}} {
+		format := tc.format
+		t.Run(tc.name, func(t *testing.T) {
 			var (
 				mu        sync.Mutex
 				heartbeat error
@@ -88,8 +93,11 @@ func TestClientRecoveryLineIsTheSupervisorsSignal(t *testing.T) {
 			}, config)
 
 			out := &lockedLog{}
-			ctx := logger.WithFixedLogger(context.Background(),
-				logger.NewLogger(logger.WithFormat(format), logger.WithQuiet(), logger.WithWriter(out)))
+			opts := []logger.Option{logger.WithFormat(format), logger.WithQuiet(), logger.WithWriter(out)}
+			if tc.debug {
+				opts = append(opts, logger.WithDebug()) // the worker's debug: true adds source= to each record
+			}
+			ctx := logger.WithFixedLogger(context.Background(), logger.NewLogger(opts...))
 			logPath := filepath.Join(t.TempDir(), "worker.log")
 
 			// beat sends one heartbeat and, on failure, logs what worker.go's sendHeartbeats logs.
@@ -153,6 +161,9 @@ print("" if v is None else repr(v))
 			beat()
 			assert.Equal(t, 2, recoveries(), "only the first success after a failure is logged")
 
+			if tc.debug && format == "text" {
+				assert.Contains(t, out.String(), " source=", "debug text records carry the source")
+			}
 			if format == "json" {
 				for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
 					var rec map[string]any
