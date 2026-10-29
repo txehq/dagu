@@ -703,14 +703,22 @@ func TestAbandonAttemptHoldsTheStatusLock(t *testing.T) {
 				if file != statusFile {
 					return
 				}
-				current := statusFile
-				if _, err := os.Stat(statusFile); err != nil {
-					current = hiddenFile
+				// The hide may rename the directory at any moment once the
+				// lock is released, so each file is looked for where it was
+				// and then where it goes. The rename is atomic: a file missed
+				// at the first place is already at the second.
+				dirs := []string{filepath.Dir(statusFile), filepath.Dir(hiddenFile)}
+				for _, dir := range dirs {
+					if _, err := os.Stat(filepath.Join(dir, AbandonmentRecordFile)); err == nil {
+						sawRecord = true
+						break
+					}
 				}
-				_, err := os.Stat(filepath.Join(filepath.Dir(current), AbandonmentRecordFile))
-				sawRecord = err == nil
-				if st, err := parseLatestStatusFromTail(th.Context, current); err == nil {
-					sawStatus = st.Status
+				for _, dir := range dirs {
+					if st, err := parseLatestStatusFromTail(th.Context, filepath.Join(dir, JSONLStatusFile)); err == nil {
+						sawStatus = st.Status
+						break
+					}
 				}
 				close(appended)
 			}
