@@ -31,6 +31,11 @@ compressed or not yet, and the oldest beyond that are deleted. That deletion is 
 process did not rotate. A LOG that exists at start and was not written by this process (no
 marker as its first line) is the pre-activation log: it is moved to
 <stem>.legacy-<utc stamp><suffix> next to LOG, outside the pruned set, and never deleted here.
+Every move here is a hard link to a name that must not exist yet (os.link refuses an existing
+name) followed by the unlink of the old one, so no archive or rotated file is ever overwritten;
+a name that exists already gets a "-N" suffix. A compression writes <rotated>.gz.tmp and
+replaces it into place; on failure its own .tmp is removed, and at start a .tmp left by an
+earlier process is removed when its source or its result exists and kept, reported, otherwise.
 
 Markers: each file this process opens starts with one line in the worker's own text format,
   time=<RFC 3339> level=INFO msg="txe-logpipe: <what>" ...
@@ -74,10 +79,11 @@ killed by launchd when this process exits, including when this process itself is
 is why this process never changes the group (no setsid, no killpg: a killpg would hit itself and
 everything launchd put in the group) and never needs Python 3.11's process_group.
 
-A grandchild that outlives the worker can hold the pipe open, so EOF alone is not the end:
-once the worker has exited, this process drains whatever still arrives for --orphan-grace
-seconds (5) and then stops, exits with the worker's code, and leaves the rest to launchd's
-group kill. It finishes the compression in progress first. It never restarts the worker.
+A grandchild that outlives the worker can hold the pipe open, or keep writing to it, so EOF
+alone is not the end: once the worker has exited, this process drains for at most
+--orphan-grace seconds (5) more, whether or not data keeps arriving, then stops, exits with the
+worker's code, and leaves the rest to launchd's group kill. It finishes the compression in
+progress first. It never restarts the worker.
 """
 import argparse
 import datetime
@@ -99,7 +105,7 @@ DIAG_INTERVAL_S = 60
 RETRY_S = 1.0
 DEGRADED_FACTOR = 2
 STAMP = "%Y%m%dT%H%M%S%fZ"
-_STAMP_RE = r"\d{8}T\d{6}\d{6}Z"
+_STAMP_RE = r"\d{8}T\d{6}\d{6}Z(?:-\d+)?"   # a "-N" suffix when two names would collide
 
 
 class FailStop(Exception):
@@ -186,9 +192,9 @@ class Log:
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         if os.path.exists(self.path) and not os.path.isfile(self.path):
             raise OSError(errno.EISDIR if os.path.isdir(self.path) else errno.EINVAL, "not a regular file", self.path)
+        self._reconcile_leftovers()
         if os.path.isfile(self.path) and os.path.getsize(self.path) > 0 and not self._is_managed(self.path):
-            archive = os.path.join(self.dir, self.legacy_fmt.format(stamp=utc_now().strftime(STAMP)))
-            os.rename(self.path, archive)  # fails rather than overwrites if the stamp collides
+            archive = self._move_no_clobber(self.path, lambda stamp: self.legacy_fmt.format(stamp=stamp))
             self._open()
             self._write_all(marker("opened " + self.base, archived=os.path.basename(archive),
                                    archived_bytes=os.path.getsize(archive)).encode())
@@ -201,6 +207,61 @@ class Log:
         for name in self._managed_names():
             if not name.endswith(".gz"):
                 self._enqueue(os.path.join(self.dir, name))
+
+    def _move_no_clobber(self, src, name_for, variants=()):
+        """Move src to name_for(stamp) without ever overwriting: link to the new name, which
+        os.link refuses if it exists, then unlink the old name. A stamp is skipped, with "-N"
+        tried next, when the name or any of its variants (its .gz, its .gz.tmp) exists, so a
+        later compression can never replace an earlier file either."""
+        stamp = utc_now().strftime(STAMP)
+        for n in range(0, 1000):
+            name = name_for(stamp if n == 0 else f"{stamp}-{n}")
+            dst = os.path.join(self.dir, name)
+            if any(os.path.lexists(dst + v) for v in variants):
+                continue
+            try:
+                os.link(src, dst)
+            except FileExistsError:
+                continue
+            os.unlink(src)
+            return dst
+        raise OSError(errno.EEXIST, "no free name for", src)
+
+    def _reconcile_leftovers(self):
+        """Undo what a crash between two steps can leave: LOG still hard-linked to a rotated
+        name (the unlink after the link did not happen), and <rotated>.gz.tmp files."""
+        try:
+            names = set(os.listdir(self.dir))
+        except OSError:
+            return
+        if os.path.isfile(self.path):
+            try:
+                st = os.stat(self.path)
+                if st.st_nlink > 1:
+                    for n in names:
+                        if self.managed.match(n) and not n.endswith(".gz"):
+                            other = os.stat(os.path.join(self.dir, n))
+                            if (other.st_dev, other.st_ino) == (st.st_dev, st.st_ino):
+                                os.unlink(self.path)  # the content lives on under the rotated name
+                                self.diag.say("reconcile", f"{self.base} was still linked to {n}; unlinked it", always=True)
+                                break
+            except OSError as e:
+                self.diag.say("reconcile", f"could not check {self.base}'s links: {e.__class__.__name__}: {e}", always=True)
+        for n in sorted(names):
+            if not n.endswith(".gz.tmp"):
+                continue
+            stem = n[:-len(".gz.tmp")]
+            if not self.managed.match(stem):
+                continue
+            if stem in names or stem + ".gz" in names:
+                try:
+                    os.remove(os.path.join(self.dir, n))
+                    self.diag.say("reconcile", f"removed {n}, left by an interrupted compression; its source is intact", always=True)
+                except OSError as e:
+                    self.diag.say("reconcile", f"could not remove {n}: {e.__class__.__name__}: {e}", always=True)
+            else:
+                self.diag.say("reconcile", f"{n} is the only copy of {stem} left by an interrupted compression; kept, "
+                                           f"not counted as a backup; it may be incomplete", always=True)
 
     def _is_managed(self, path):
         try:
@@ -264,11 +325,10 @@ class Log:
         if self.rotate_failed_at is not None and now - self.rotate_failed_at < DIAG_INTERVAL_S:
             self._check_degraded(next_write)
             return
-        rotated = os.path.join(self.dir, f"{self.base}.{utc_now().strftime(STAMP)}")
         started = time.monotonic()
         try:
             self._close_quietly()
-            os.rename(self.path, rotated)
+            rotated = self._move_no_clobber(self.path, lambda stamp: f"{self.base}.{stamp}", variants=(".gz", ".gz.tmp"))
             self._open()
         except OSError as e:
             self.rotate_failed_at = now
@@ -318,7 +378,11 @@ class Log:
         except OSError as e:
             self.diag.say("prune", f"could not list {self.dir}: {e.__class__.__name__}: {e}")
             return []
-        names.sort(key=lambda n: self.managed.match(n).group(1))
+        def key(n):
+            s = self.managed.match(n).group(1)
+            base, _, suffix = s.partition("-")
+            return (base, int(suffix) if suffix else 0)
+        names.sort(key=key)
         return names
 
     def _compress_loop(self):
@@ -355,6 +419,10 @@ class Log:
         except OSError as e:
             self.diag.say("compress", f"could not compress {os.path.basename(rotated)} "
                                       f"({e.__class__.__name__}: {e}); it is kept uncompressed")
+            try:
+                os.remove(rotated + ".gz.tmp")  # only this attempt's own temporary file
+            except OSError:
+                pass
 
     def _prune(self):
         """Keep the newest `backups` rotated files, compressed or not; delete the rest."""
@@ -398,15 +466,14 @@ def drain(fd, log, chunk_bytes, child=None, orphan_grace=5.0):
     line_start = True
     exited_at = None
     while True:
-        ready, _, _ = select.select([fd], [], [], 1.0)
+        if child is not None and exited_at is None and child.poll() is not None:
+            exited_at = time.monotonic()
+        if exited_at is not None and time.monotonic() - exited_at >= orphan_grace:
+            if pending:
+                write_bounded(log, pending, chunk_bytes, line_start)
+            return  # the grace is absolute: data still arriving from a grandchild does not extend it
+        ready, _, _ = select.select([fd], [], [], 1.0 if exited_at is None else min(1.0, max(0.05, orphan_grace)))
         if not ready:
-            if child is not None and child.poll() is not None:
-                if exited_at is None:
-                    exited_at = time.monotonic()
-                elif time.monotonic() - exited_at >= orphan_grace:
-                    if pending:
-                        write_bounded(log, pending, chunk_bytes, line_start)
-                    return
             continue
         try:
             data = os.read(fd, 65536)

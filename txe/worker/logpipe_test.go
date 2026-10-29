@@ -417,12 +417,18 @@ def fake_sleep(s):
 logpipe.time.monotonic = lambda: CLOCK[0]
 
 def run_drain(log, payload, chunk=4096):
+    import threading
     r, w = os.pipe()
-    os.write(w, payload); os.close(w)
+    def feed():            # from a thread: a payload over the pipe buffer must not block the drain
+        view = memoryview(payload)
+        while view:
+            n = os.write(w, view); view = view[n:]
+        os.close(w)
+    t = threading.Thread(target=feed); t.start()
     try:
         logpipe.drain(r, log, chunk)
     finally:
-        os.close(r)
+        t.join(); os.close(r)
 
 def new_log(path, max_bytes=1 << 20, backups=3, stall=5.0):
     log = logpipe.Log(path, max_bytes, backups, stall, logpipe.Diag(), sleep=fake_sleep)
@@ -586,6 +592,115 @@ func TestLogpipeStopsWhenTheWorkerExitsThoughAGrandchildHoldsThePipe(t *testing.
 		pid, _ := strconv.Atoi(string(m[1]))
 		_ = syscall.Kill(pid, syscall.SIGKILL) // what launchd's group kill does after the wrapper exits
 	}
+}
+
+// A grandchild that keeps writing after the worker has exited must not keep the wrapper alive:
+// the orphan grace is absolute, so the wrapper exits with the worker's code after it whatever
+// still arrives. The grandchild is launchd's to kill with the group; here the test ends it.
+func TestLogpipeStopsWhenAGrandchildKeepsWritingAfterTheWorkerExits(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	chatter := filepath.Join(dir, "chatter.py")
+	require.NoError(t, os.WriteFile(chatter, []byte("import os, sys, time\nprint('chatter', os.getpid(), flush=True)\nwhile True:\n    print('still here', flush=True); time.sleep(0.01)\n"), 0o600))
+	r := startLogpipe(t, logs, 10000000, 2, 4096, []string{"--orphan-grace", "1"}, "sh", "-c",
+		fmt.Sprintf("%q %q & echo 'worker done'; exit 4", py, chatter))
+	start := time.Now()
+	assert.Equal(t, 4, r.exitCode(t), "the worker's code")
+	assert.Less(t, time.Since(start), 8*time.Second, "bounded by --orphan-grace though the grandchild never stops writing")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "worker done")
+	assert.Greater(t, bytes.Count(b, []byte("still here\n")), 10, "the grandchild was writing all along")
+	if m := regexp.MustCompile(`chatter (\d+)`).FindSubmatch(b); m != nil {
+		pid, _ := strconv.Atoi(string(m[1]))
+		_ = syscall.Kill(pid, syscall.SIGKILL) // what launchd's group kill does after the wrapper exits
+	}
+}
+
+// A compression that fails leaves no temporary file behind and keeps the rotated source; a
+// .gz.tmp left by an interrupted process is removed at start when its source or its result is
+// there, and kept, reported and never counted as a backup when it is the only copy.
+func TestLogpipeCompressionLeftoversAreReconciled(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import gzip, tempfile, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+real_gzip_open = logpipe.gzip.open
+def failing_gzip_open(*a, **k):
+    raise OSError(errno.EIO, "Input/output error")
+logpipe.gzip.open = failing_gzip_open
+log = new_log(path, max_bytes=20000, backups=3)
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(2000))
+run_drain(log, payload)
+log.finish()
+names = sorted(os.listdir(d))
+print("after failed compressions:", [n for n in names if n != "worker.log"])
+print("no tmp", not any(n.endswith(".gz.tmp") for n in names), "sources kept", sum(1 for n in names if logpipe.re.match(r"worker\.log\.\d", n) and not n.endswith(".gz")))
+logpipe.gzip.open = real_gzip_open
+
+# restart reconciliation: a tmp beside its intact source, and a lone tmp
+src = [n for n in names if logpipe.re.match(r"worker\.log\.\d", n) and not n.endswith(".gz")][0]
+open(os.path.join(d, src + ".gz.tmp"), "wb").write(b"partial")
+lone = "worker.log.20200101T000000000000Z.gz.tmp"
+open(os.path.join(d, lone), "wb").write(b"partial")
+log = new_log(path, max_bytes=20000, backups=3)
+log.finish()
+names = sorted(os.listdir(d))
+print("tmp beside source removed", src + ".gz.tmp" not in names, "source compressed", src + ".gz" in names)
+print("lone tmp kept", lone in names, "lone not a backup", lone not in log._managed_names())
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "no tmp True sources kept 3")
+	assert.Contains(t, stdout, "tmp beside source removed True source compressed True")
+	assert.Contains(t, stdout, "lone tmp kept True lone not a backup True")
+	assert.Contains(t, stderr, "could not compress")
+	assert.Contains(t, stderr, "left by an interrupted compression; its source is intact")
+	assert.Contains(t, stderr, "is the only copy of")
+}
+
+// Rotated and archived names are never overwritten: with a frozen clock two rotations get
+// distinct names (the second with a "-1" suffix), both kept in order, and a pre-activation
+// archive whose stamp already exists gets a suffix too, leaving the existing file untouched.
+func TestLogpipeNeverOverwritesOnATimestampCollision(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import datetime, tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+frozen = datetime.datetime(2026, 10, 29, 15, 0, 0, 123456, tzinfo=datetime.timezone.utc)
+logpipe.utc_now = lambda: frozen
+stamp = frozen.strftime(logpipe.STAMP)
+# a pre-activation log, an archive name for this very stamp already taken, and a compressed
+# rotated file at this stamp from "earlier" (its plain name is free again: the compressor removed it)
+open(path, "wb").write(b"old launchd line\n")
+taken = os.path.join(d, "worker.legacy-%s.log" % stamp)
+open(taken, "wb").write(b"EXISTING ARCHIVE\n")
+import gzip
+earlier = os.path.join(d, "worker.log.%s.gz" % stamp)
+gzip.open(earlier, "wb").write(b"EARLIER ROTATION\n")
+log = new_log(path, max_bytes=20000, backups=5)
+print("existing archive untouched", open(taken, "rb").read() == b"EXISTING ARCHIVE\n")
+print("new archive", sorted(n for n in os.listdir(d) if n.startswith("worker.legacy-")))
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(1200))
+run_drain(log, payload)   # two rotations at the same frozen stamp
+log.finish()
+rotated = log._managed_names()
+print("rotated", rotated)
+print("distinct", len(rotated) == len(set(rotated)), "ordered suffixes", rotated == sorted(rotated, key=lambda n: (n.split(".")[2].split("-")[0], int(n.split(".")[2].split("-")[1]) if "-" in n.split(".")[2] else 0)))
+import gzip
+contents = [gzip.open(os.path.join(d, n), "rb").read() for n in rotated]
+print("all different", len(set(contents)) == len(contents))
+print("earlier rotation untouched", gzip.open(earlier, "rb").read() == b"EARLIER ROTATION\n")
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "existing archive untouched True")
+	assert.Contains(t, stdout, "new archive ['worker.legacy-20261029T150000123456Z-1.log', 'worker.legacy-20261029T150000123456Z.log']")
+	assert.Contains(t, stdout, "rotated ['worker.log.20261029T150000123456Z.gz', 'worker.log.20261029T150000123456Z-1.gz', 'worker.log.20261029T150000123456Z-2.gz']",
+		"the stamp whose .gz exists is skipped; the two new rotations take -1 and -2")
+	assert.Contains(t, stdout, "distinct True ordered suffixes True")
+	assert.Contains(t, stdout, "all different True")
+	assert.Contains(t, stdout, "earlier rotation untouched True")
 }
 
 // If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
