@@ -703,6 +703,68 @@ print("earlier rotation untouched", gzip.open(earlier, "rb").read() == b"EARLIER
 	assert.Contains(t, stdout, "earlier rotation untouched True")
 }
 
+// TXE-5422: a rotation that has checked a name's .gz and .gz.tmp, while its plain name is still
+// taken, must not take that name after the compressor publishes its .gz and removes the plain
+// name; the next compression would replace the earlier .gz and lose a whole rotation. The
+// compressor is held until the second rotation has checked S-1's variants, then given up to a
+// second to publish S-1.gz before the rotation links. Every numbered line must be found once.
+func TestLogpipeRotationNeverTakesANameTheCompressorFreesAfterTheCheck(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import datetime, gzip, re, tempfile, threading
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+frozen = datetime.datetime(2026, 10, 29, 15, 0, 0, 123456, tzinfo=datetime.timezone.utc)
+logpipe.utc_now = lambda: frozen
+stamp = frozen.strftime(logpipe.STAMP)
+gzip.open(os.path.join(d, "worker.log.%s.gz" % stamp), "wb").write(b"EARLIER ROTATION\n")
+first = os.path.join(d, "worker.log.%s-1" % stamp)
+gate, published = threading.Event(), threading.Event()
+real_compress = logpipe.Log._compress
+def gated_compress(self, rotated):
+    gate.wait(10)
+    real_compress(self, rotated)
+    if rotated == first and os.path.exists(first + ".gz"):
+        published.set()
+logpipe.Log._compress = gated_compress
+armed = [False]
+window = {}
+real_lexists = os.path.lexists
+def racing_lexists(p):
+    r = real_lexists(p)
+    if armed[0] and p == first + ".gz.tmp" and threading.current_thread() is threading.main_thread():
+        armed[0] = False
+        gate.set()
+        window["published"] = published.wait(1.0)
+    return r
+os.path.lexists = racing_lexists
+log = new_log(path, max_bytes=2000, backups=10)
+lines = [b"line %05d some worker output text\n" % i for i in range(150)]
+for i, line in enumerate(lines):
+    if i == 80:
+        armed[0] = True    # the first rotation (S-1) is waiting for the compressor; the next one races it
+    log.write(line)
+gate.set()
+log.finish()
+print("rotations", log.stats["rotations"], "window reached", "published" in window)
+print("published inside the check window", window.get("published"))
+print("rotated", log._managed_names())
+found = {}
+for n in os.listdir(d):
+    p = os.path.join(d, n)
+    data = gzip.open(p, "rb").read() if n.endswith(".gz") else open(p, "rb").read()
+    for m in re.finditer(rb"line (\d{5}) ", data):
+        found.setdefault(int(m.group(1)), []).append(n)
+print("missing", [i for i in range(len(lines)) if i not in found])
+print("duplicated", [i for i, v in found.items() if len(v) > 1])
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "rotations 2 window reached True", "the second rotation reached the race window")
+	assert.Contains(t, stdout, "published inside the check window False", "the compressor cannot publish between the check and the link")
+	assert.Contains(t, stdout, "rotated ['worker.log.20261029T150000123456Z.gz', 'worker.log.20261029T150000123456Z-1.gz', 'worker.log.20261029T150000123456Z-2.gz']")
+	assert.Contains(t, stdout, "missing []", "every line of both rotations is kept")
+	assert.Contains(t, stdout, "duplicated []")
+}
+
 // A worker that cannot be started (no such executable) ends the wrapper at once with 127 and a
 // diagnostic, so launchd's KeepAlive retries once the executable is repaired; the compressor
 // thread must not keep the process alive.
