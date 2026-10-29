@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -519,6 +520,80 @@ print(json.dumps(out))
 	assert.Nil(t, got["cut_first"])
 	assert.Equal(t, 0.0, got["cut_second"])
 	assert.Nil(t, got["gone"])
+}
+
+// txe/worker/logpipe.py (TXE-4724) writes a marker as the first line of every file it opens or
+// rotates. The supervisor treats each as a boundary that resets the episode, never as a failure
+// and never joined across: what is not in this file may hold a recovery.
+func TestTunnelSuperviseResetsTheEpisodeOnLogpipeMarkers(t *testing.T) {
+	script := supervisorScript(t)
+	program := `
+import importlib.util, json, os, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
+d = sys.argv[2]; T0 = 1793250000.0
+def stamp(t): return __import__("datetime").datetime.fromtimestamp(t, __import__("datetime").timezone.utc).isoformat(timespec="microseconds")
+fail = lambda t: f'time={stamp(t)} level=WARN msg="Heartbeat send failed; will retry with backoff" worker-id=mch_x\n'
+def marker(t, what, extra=''): return f'time={stamp(t)} level=INFO msg="txe-logpipe: {what}"{extra}\n'
+out = {}
+cases = {
+    "opened": marker(T0 + 20, "opened worker.log", " max_bytes=67108864 backups=10"),
+    "rotated": marker(T0 + 20, "rotated worker.log", " previous=worker.log.20261029T150000000000Z previous_bytes=67108413 took_ms=0"),
+    "lost": marker(T0 + 20, "lost worker output", " bytes=1756 since=2026-10-29T15:00:00+00:00 until=2026-10-29T15:00:30+00:00"),
+    "json_rotated": json.dumps({"time": stamp(T0 + 20), "level": "INFO", "msg": "txe-logpipe: rotated worker.log"}) + "\n",
+    "other_logpipe": marker(T0 + 20, "compressed worker.log"),   # not a boundary: ignored
+}
+for name, line in cases.items():
+    p = os.path.join(d, name + ".log"); log = ts.WorkerLog(p, 45)
+    with open(p, "w") as f: f.write(fail(T0) + fail(T0 + 10))
+    before = log.poll(T0 + 11) - T0
+    with open(p, "a") as f: f.write(line + fail(T0 + 30))
+    after = log.poll(T0 + 31) - T0
+    with open(p, "a") as f: f.write(fail(T0 + 40))
+    later = log.poll(T0 + 41) - T0
+    out[name] = [before, after, later]
+# A marker alone is no failure: with no heartbeat failure after it there is no episode.
+p = os.path.join(d, "alone.log"); log = ts.WorkerLog(p, 45)
+with open(p, "w") as f: f.write(fail(T0) + marker(T0 + 10, "rotated worker.log"))
+out["alone"] = log.poll(T0 + 11)
+print(json.dumps(out))
+`
+	stdout, stderr, err := python(t, "-c", program, script, t.TempDir())
+	require.NoError(t, err, stderr)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(stdout), &got))
+	for _, name := range []string{"opened", "rotated", "lost", "json_rotated"} {
+		assert.Equal(t, []any{0.0, 30.0, 30.0}, got[name], "%s resets the episode: the failures after it start a new one", name)
+	}
+	assert.Equal(t, []any{0.0, 0.0, 0.0}, got["other_logpipe"], "a logpipe line that is not a boundary is ignored like any other")
+	assert.Nil(t, got["alone"], "a marker is never a failure")
+}
+
+// The markers the supervisor resets on are exactly what logpipe.py writes: its prefix and its
+// two marker kinds are read from its source, so a new kind there fails here until the
+// supervisor knows it. "lost worker output" is reserved in the supervisor and not emitted today.
+func TestTunnelSuperviseKnowsLogpipesMarkers(t *testing.T) {
+	src, err := os.ReadFile("logpipe.py")
+	require.NoError(t, err)
+	assert.Contains(t, string(src), `PREFIX = "txe-logpipe"`)
+	kinds := regexp.MustCompile(`marker\("([a-z ]+)" \+ self\.base`).FindAllStringSubmatch(string(src), -1)
+	seen := map[string]bool{}
+	var emitted []string
+	for _, k := range kinds { // "opened" has two call sites
+		m := "txe-logpipe: " + k[1] + "worker.log"
+		if !seen[m] {
+			seen[m] = true
+			emitted = append(emitted, m)
+		}
+	}
+	assert.ElementsMatch(t, []string{"txe-logpipe: opened worker.log", "txe-logpipe: rotated worker.log"}, emitted,
+		"logpipe.py's marker kinds, each pinned to a reset in the supervisor")
+	sup, err := os.ReadFile(supervisorScript(t))
+	require.NoError(t, err)
+	for _, want := range append(emitted, "txe-logpipe: lost worker output") {
+		assert.Contains(t, string(sup), `"`+want+`"`)
+	}
+	assert.NotContains(t, string(src), `"lost worker output"`, "logpipe.py drops nothing: the reserved marker is not emitted")
 }
 
 // The supervisor reads three of the worker's own log messages. Each is pinned to the code that

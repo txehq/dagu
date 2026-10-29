@@ -49,6 +49,14 @@ PREFIX = "tunnel-supervise:"
 HEARTBEAT_MSG = "Heartbeat send failed; will retry with backoff"
 RECOVERED_MSG = "CoordinatorCli connection recovered"
 STARTED_MSG = "Starting worker"
+# txe/worker/logpipe.py's markers in the worker's log (TXE-4724): each is a boundary of the file
+# (opened, rotated) or of its contents (lost output), after which an earlier failure episode
+# cannot be joined to a later one: a recovery or a start may lie in what is not there. Each
+# resets the episode, exactly like a recovery; none is ever evidence of failure. The strings
+# are pinned to logpipe.py's source by txe/worker's tests. "lost worker output" is reserved:
+# the current logpipe.py never drops output, but a reader must not join across it if it ever did.
+LOGPIPE_MARKERS = ("txe-logpipe: opened worker.log", "txe-logpipe: rotated worker.log",
+                   "txe-logpipe: lost worker output")
 # time, level, the source when the worker runs with debug (AddSource), then msg: slog's text order.
 _TEXT = re.compile(r'^time=(\S+) level=\S+(?: source=(?:"(?:[^"\\]|\\.)*"|\S+))? msg="((?:[^"\\]|\\.)*)"')
 # HTTP/2 client connection preface and an empty SETTINGS frame (RFC 9113 3.4, 6.5).
@@ -107,7 +115,7 @@ def _record(line):
         if not m:
             return None
         stamp, msg = m.group(1), m.group(2)
-    if msg not in (HEARTBEAT_MSG, RECOVERED_MSG, STARTED_MSG):
+    if msg not in (HEARTBEAT_MSG, RECOVERED_MSG, STARTED_MSG) and msg not in LOGPIPE_MARKERS:
         return None
     if stamp.endswith("Z"):                     # Go writes UTC as Z; fromisoformat accepts it only from 3.11
         stamp = stamp[:-1] + "+00:00"
@@ -153,7 +161,7 @@ class WorkerLog:
             return
         msg, t = rec
         if msg != HEARTBEAT_MSG:
-            self.start = self.last = None       # a success, or a new worker process
+            self.start = self.last = None       # a success, a new worker process, or a logpipe boundary
         elif self.last is not None and t - self.last <= self.gap:
             self.last = t
         else:

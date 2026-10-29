@@ -51,6 +51,12 @@ done
 # The tunnel supervisor's latest line (TXE-5398): whether it is watching a failing forward
 # or last replaced one. Its lines name no argument, path or credential.
 last="$(grep -a '^tunnel-supervise:' "$TXE_DAGU_HOME/logs/tunnel.log" 2>/dev/null | tail -n 1)"
+# After a rotation (TXE-4724) the latest line may be in the newest rotated file.
+if [ -z "$last" ]; then
+  newest=""
+  for f in "$TXE_DAGU_HOME"/logs/tunnel.log.*.gz; do [ -e "$f" ] && newest="$f"; done
+  [ -z "$newest" ] || last="$(gzip -dc "$newest" 2>/dev/null | grep -a '^tunnel-supervise:' | tail -n 1)"
+fi
 [ -z "$last" ] || printf 'tunnel   %s\n' "${last#tunnel-supervise: }"
 
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$TXE_DAGU_UI_PORT/api/v1/health")"

@@ -1,0 +1,898 @@
+// Copyright (C) 2026 TXE
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//go:build !windows
+
+package worker_test
+
+import (
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// The marker lines txe/worker/logpipe.py writes, in the worker's text format, and the three
+// worker messages TXE-5398's supervisor matches exactly: a marker must never equal one.
+var (
+	logpipeMarker   = regexp.MustCompile(`^time=(\S+) level=INFO msg="txe-logpipe: ([^"]*)"`)
+	workerTextLine  = regexp.MustCompile(`^time=(\S+) level=\S+ msg="((?:[^"\\]|\\.)*)"`)
+	supervisorMsgs  = []string{"Heartbeat send failed; will retry with backoff", "CoordinatorCli connection recovered", "Starting worker"}
+	rotatedFileName = regexp.MustCompile(`^worker\.log\.(\d{8}T\d{12}Z)(\.gz)?$`)
+)
+
+type logpipeRun struct {
+	logs   string
+	cmd    *exec.Cmd
+	errOut bytes.Buffer
+}
+
+// childScript is the fake worker: it writes `lines` numbered lines of about 36 bytes, then
+// `tail` without a newline, and exits with `code`. With wait=true it first waits for a
+// signal and reports it; with stubborn=true it ignores SIGTERM.
+func childScript(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "child.py")
+	require.NoError(t, os.WriteFile(path, []byte(`import os, signal, sys, time
+lines, tail, code, mode, big = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+out = sys.stdout.buffer
+for i in range(lines):
+    out.write(b"line %05d some worker output text\n" % i)
+if big:
+    out.write(b"B" * big + b"\n")
+out.write(tail.encode())
+out.flush()
+if mode in ("wait", "stubborn"):
+    got = []
+    def on(sig, _f):
+        got.append(sig)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on if mode == "wait" else (lambda sig, _f: None))
+    sys.stderr.write("ready\n"); sys.stderr.flush()
+    deadline = time.time() + 30
+    while time.time() < deadline and not got:
+        time.sleep(0.02)
+    if got:
+        out.write(("signal %d\n" % got[0]).encode()); out.flush()
+        sys.exit(code)
+    time.sleep(60)
+sys.exit(code)
+`), 0o600))
+	return path
+}
+
+func startLogpipe(t *testing.T, logs string, maxBytes, backups, chunk int, extra []string, child ...string) *logpipeRun {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	script, err := filepath.Abs("logpipe.py")
+	require.NoError(t, err)
+	args := []string{"-I", script, "--path", filepath.Join(logs, "worker.log"),
+		"--max-bytes", strconv.Itoa(maxBytes), "--backups", strconv.Itoa(backups), "--chunk-bytes", strconv.Itoa(chunk)}
+	args = append(args, extra...)
+	args = append(args, "--")
+	if len(child) > 0 && child[0] == "python3" {
+		child = append([]string{py}, child[1:]...)
+	}
+	args = append(args, child...)
+	r := &logpipeRun{logs: logs}
+	r.cmd = exec.Command(py, args...)
+	r.cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	r.cmd.Stderr = &r.errOut
+	require.NoError(t, r.cmd.Start())
+	return r
+}
+
+// diag returns the wrapper's own diagnostic file (and its one previous copy), where its
+// lines go instead of stderr.
+func (r *logpipeRun) diag(t *testing.T) string {
+	t.Helper()
+	var out string
+	for _, name := range []string{"worker.logpipe.log.1", "worker.logpipe.log"} {
+		b, err := os.ReadFile(filepath.Join(r.logs, name))
+		if err == nil {
+			out += string(b)
+		}
+	}
+	return out
+}
+
+// exitCode waits for the wrapper and returns its exit code.
+func (r *logpipeRun) exitCode(t *testing.T) int {
+	t.Helper()
+	err := r.cmd.Wait()
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, r.errOut.String())
+	return exitErr.ExitCode()
+}
+
+// logSet is what reassemble found: the worker's bytes with the marker lines removed, the
+// markers, the uncompressed size of every managed file, and the rotated file names oldest first.
+type logSet struct {
+	worker  []byte
+	markers []string
+	sizes   map[string]int
+	rotated []string
+}
+
+// reassemble joins every managed file oldest first (gunzipping the compressed ones).
+func reassemble(t *testing.T, logs string) logSet {
+	t.Helper()
+	var rotated []string
+	entries, err := os.ReadDir(logs)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if rotatedFileName.MatchString(e.Name()) {
+			rotated = append(rotated, e.Name())
+		}
+	}
+	sort.Slice(rotated, func(i, j int) bool {
+		return rotatedFileName.FindStringSubmatch(rotated[i])[1] < rotatedFileName.FindStringSubmatch(rotated[j])[1]
+	})
+	sizes := map[string]int{}
+	var all []byte
+	for _, name := range append(append([]string{}, rotated...), "worker.log") {
+		raw, err := os.ReadFile(filepath.Join(logs, name))
+		require.NoError(t, err)
+		if strings.HasSuffix(name, ".gz") {
+			zr, err := gzip.NewReader(bytes.NewReader(raw))
+			require.NoError(t, err)
+			raw, err = io.ReadAll(zr)
+			require.NoError(t, err)
+		}
+		sizes[name] = len(raw)
+		all = append(all, raw...)
+	}
+	var kept [][]byte
+	var markers []string
+	for _, line := range bytes.SplitAfter(all, []byte("\n")) {
+		if logpipeMarker.Match(line) {
+			markers = append(markers, strings.TrimRight(string(line), "\n"))
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return logSet{worker: bytes.Join(kept, nil), markers: markers, sizes: sizes, rotated: rotated}
+}
+
+func expectedOutput(lines int, big int, tail string) []byte {
+	var b bytes.Buffer
+	for i := range lines {
+		fmt.Fprintf(&b, "line %05d some worker output text\n", i)
+	}
+	if big > 0 {
+		b.Write(bytes.Repeat([]byte("B"), big))
+		b.WriteString("\n")
+	}
+	b.WriteString(tail)
+	return b.Bytes()
+}
+
+// Every byte the worker writes lands in the log, in order, including a final line without a
+// newline; every file stays within the cap; rotated files are compressed; the child's exit
+// code is the wrapper's. backups is large here so nothing is pruned and the reassembly is exact.
+func TestLogpipeKeepsEveryByteWithinTheCap(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 20000, 50, 4096, nil, "python3", childScript(t, dir), "5000", "partial-last", "7", "exit", "0")
+	assert.Equal(t, 7, r.exitCode(t))
+	set := reassemble(t, logs)
+	worker, markers, sizes, rotated := set.worker, set.markers, set.sizes, set.rotated
+	assert.Equal(t, expectedOutput(5000, 0, "partial-last"), worker, "worker bytes, in order, newline fidelity included")
+	require.NotEmpty(t, rotated)
+	for name, size := range sizes {
+		assert.LessOrEqual(t, size, 20000, name)
+	}
+	for _, name := range rotated {
+		assert.True(t, strings.HasSuffix(name, ".gz"), "rotated files are compressed: %s", name)
+	}
+	assert.Len(t, markers, len(rotated)+1, "one opening marker, one per rotation")
+	assert.Contains(t, markers[0], `msg="txe-logpipe: opened worker.log"`)
+	assert.Contains(t, markers[1], `msg="txe-logpipe: rotated worker.log"`)
+	assert.Regexp(t, `took_ms=\d+`, markers[1])
+	assert.Contains(t, r.diag(t), "compressed worker.log.", "compression is reported, rate-limited")
+	assert.Empty(t, r.errOut.String(), "launchd's file gets nothing on the normal path")
+}
+
+// Markers are in the worker's text format so TXE-5398's parser can place them, and their
+// message never equals a worker message, so none can pass for a start or a recovery.
+func TestLogpipeMarkersCannotMasqueradeAsWorkerLines(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 20000, 50, 4096, nil, "python3", childScript(t, dir), "3000", "", "0", "exit", "0")
+	require.Equal(t, 0, r.exitCode(t))
+	markers := reassemble(t, logs).markers
+	require.NotEmpty(t, markers)
+	for _, m := range markers {
+		sub := workerTextLine.FindStringSubmatch(m)
+		require.NotNil(t, sub, m)
+		_, err := time.Parse(time.RFC3339Nano, sub[1])
+		assert.NoError(t, err, "the stamp is RFC 3339 with an offset: %s", sub[1])
+		assert.True(t, strings.HasPrefix(sub[2], "txe-logpipe: "), m)
+		for _, w := range supervisorMsgs {
+			assert.NotEqual(t, w, sub[2])
+		}
+	}
+	// Each file this process opens starts with a marker.
+	first, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.True(t, logpipeMarker.Match(bytes.SplitN(first, []byte("\n"), 2)[0]))
+}
+
+// Only the newest `backups` rotated files are kept: the rest are deleted, and that is the
+// only deletion the wrapper does.
+func TestLogpipePrunesBeyondTheBackupCount(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 20000, 3, 4096, nil, "python3", childScript(t, dir), "5000", "", "0", "exit", "0")
+	require.Equal(t, 0, r.exitCode(t))
+	rotated := reassemble(t, logs).rotated
+	assert.Len(t, rotated, 3, rotated)
+	for _, name := range rotated {
+		assert.True(t, strings.HasSuffix(name, ".gz"), name)
+	}
+}
+
+// A worker.log that exists at start and was not written by the wrapper (launchd's file from
+// before activation) is moved aside untouched, to a name outside the pruned set, and a managed
+// file is appended to on the next start without another archive.
+func TestLogpipeArchivesThePreActivationLogOnce(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	require.NoError(t, os.MkdirAll(logs, 0o700))
+	legacy := []byte("old launchd line 1\nold launchd line 2\n")
+	require.NoError(t, os.WriteFile(filepath.Join(logs, "worker.log"), legacy, 0o644))
+
+	r := startLogpipe(t, logs, 20000, 1, 4096, nil, "python3", childScript(t, dir), "10", "", "0", "exit", "0")
+	require.Equal(t, 0, r.exitCode(t))
+	archives, err := filepath.Glob(filepath.Join(logs, "worker.legacy-*.log"))
+	require.NoError(t, err)
+	require.Len(t, archives, 1)
+	got, err := os.ReadFile(archives[0])
+	require.NoError(t, err)
+	assert.Equal(t, legacy, got, "archived verbatim")
+	assert.False(t, rotatedFileName.MatchString(filepath.Base(archives[0])), "outside the pruned set")
+	active, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(active), `msg="txe-logpipe: opened worker.log" archived=`+filepath.Base(archives[0]))
+
+	// Enough rotations to prune with backups=1: the archive survives.
+	r = startLogpipe(t, logs, 20000, 1, 4096, nil, "python3", childScript(t, dir), "3000", "", "0", "exit", "0")
+	require.Equal(t, 0, r.exitCode(t))
+	archives, err = filepath.Glob(filepath.Join(logs, "worker.legacy-*.log"))
+	require.NoError(t, err)
+	assert.Len(t, archives, 1, "no second archive, nothing pruned the first")
+	markers := reassemble(t, logs).markers
+	opened := 0
+	for _, m := range markers {
+		if strings.Contains(m, "txe-logpipe: opened") {
+			opened++
+		}
+	}
+	assert.Equal(t, 0, opened, "a managed file is appended to, not re-opened with a marker, after rotation; the first file's opening marker was rotated away")
+}
+
+// A line longer than --chunk-bytes is written in pieces to the current file and never split
+// across files: every byte is kept, every file holds whole lines only (so no marker can sit
+// inside a line and nothing can be joined across a boundary), and the only file over the cap
+// is over it by at most that one line.
+func TestLogpipeNeverSplitsALineAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	const big = 50000
+	r := startLogpipe(t, logs, 20000, 50, 4096, nil, "python3", childScript(t, dir), "1000", "", "0", "exit", strconv.Itoa(big))
+	require.Equal(t, 0, r.exitCode(t))
+	set := reassemble(t, logs)
+	worker, sizes, rotated := set.worker, set.sizes, set.rotated
+	assert.Equal(t, expectedOutput(1000, big, ""), worker)
+	over := 0
+	for name, size := range sizes {
+		assert.LessOrEqual(t, size, 20000+big+1, name)
+		if size > 20000 {
+			over++
+		}
+	}
+	assert.LessOrEqual(t, over, 1, "only the file holding the oversized line may exceed the cap")
+	for _, name := range append(rotated, "worker.log") {
+		raw, err := os.ReadFile(filepath.Join(logs, name))
+		require.NoError(t, err)
+		if strings.HasSuffix(name, ".gz") {
+			zr, err := gzip.NewReader(bytes.NewReader(raw))
+			require.NoError(t, err)
+			raw, err = io.ReadAll(zr)
+			require.NoError(t, err)
+		}
+		assert.True(t, logpipeMarker.Match(bytes.SplitN(raw, []byte("\n"), 2)[0]), "%s starts with a marker", name)
+		if name != "worker.log" {
+			assert.True(t, bytes.HasSuffix(raw, []byte("\n")), "%s ends at a line boundary", name)
+		}
+		for line := range bytes.SplitSeq(raw, []byte("\n")) {
+			if bytes.Contains(line, []byte("txe-logpipe: ")) {
+				assert.True(t, logpipeMarker.Match(line), "a marker is always a whole line of its own: %q", line)
+			}
+		}
+	}
+}
+
+// If the log cannot be opened at start the worker is not started: it would be silent loss.
+func TestLogpipeRefusesToStartWithoutALog(t *testing.T) {
+	dir := t.TempDir()
+	// --path dir/worker.log, where dir/worker.log is a directory, so it cannot be opened.
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "worker.log"), 0o700))
+	marker := filepath.Join(dir, "child-ran")
+	r := startLogpipe(t, dir, 20000, 3, 4096, nil, "sh", "-c", "touch "+marker)
+	assert.Equal(t, 1, r.exitCode(t))
+	assert.Contains(t, r.errOut.String(), "not starting the worker")
+	_, err := os.Stat(marker)
+	assert.True(t, os.IsNotExist(err), "the child never ran")
+}
+
+// A rotation that fails (the directory became read-only) is reported on stderr and writes
+// continue to the current file, but only up to twice the target: there the wrapper stops the
+// worker and exits 74 rather than let the active log grow without bound. Every byte written
+// before that is present, in order.
+func TestLogpipeRotationFailureIsBoundedByTheDegradedLimit(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	require.NoError(t, os.MkdirAll(logs, 0o700))
+	t.Cleanup(func() { _ = os.Chmod(logs, 0o700) })
+	child := childScript(t, dir)
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	r := startLogpipe(t, logs, 20000, 3, 4096, []string{"--kill-timeout", "2"}, "sh", "-c",
+		fmt.Sprintf("chmod 0500 %q; %q %q 5000 '' 5 wait 0", logs, py, child))
+	assert.Equal(t, 74, r.exitCode(t), r.errOut.String())
+	require.NoError(t, os.Chmod(logs, 0o700))
+	// The diagnostic file lives in the read-only directory too, so its lines fell back to stderr.
+	diag := r.diag(t) + r.errOut.String()
+	assert.Contains(t, diag, "could not rotate worker.log")
+	assert.Contains(t, diag, "the next write would pass 2x its target; rotation has been failing")
+	assert.Contains(t, diag, "stopping the worker (its running tasks end) and exiting 74")
+	set := reassemble(t, logs)
+	worker, sizes, rotated := set.worker, set.sizes, set.rotated
+	assert.Empty(t, rotated)
+	assert.LessOrEqual(t, sizes["worker.log"], 2*20000, "never past the degraded limit (a line here is shorter than a chunk)")
+	assert.Greater(t, sizes["worker.log"], 20000, "writes went on past the target while rotation failed")
+	assert.True(t, bytes.HasPrefix(expectedOutput(5000, 0, ""), worker), "a prefix of the worker's output, in order, nothing reordered or duplicated")
+}
+
+// harness runs a Python script that imports logpipe.py and drives Log and drain in-process,
+// with os.write scripted for the log's descriptor (ok, partial:N, fail) and a fake clock so
+// the stall bound elapses without waiting. It returns the script's stdout, stderr and exit code.
+func harness(t *testing.T, body string) (stdout, stderr string, code int) {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	dir, err := filepath.Abs(".")
+	require.NoError(t, err)
+	script := `import errno, os, sys
+sys.path.insert(0, sys.argv[1])
+import logpipe
+
+LOG_FDS = set()
+real_open = logpipe.Log._open
+def tracked_open(self):
+    real_open(self)
+    LOG_FDS.add(self.fd)
+logpipe.Log._open = tracked_open
+real_close = logpipe.Log._close_quietly
+def tracked_close(self):
+    LOG_FDS.discard(self.fd)
+    real_close(self)
+logpipe.Log._close_quietly = tracked_close
+
+ACTIONS = []            # per call on a log descriptor: "ok", "partial:N", "fail"; then "ok" forever
+real_write = os.write
+def scripted_write(fd, data):
+    if fd in LOG_FDS and ACTIONS:
+        action = ACTIONS.pop(0)
+        if action == "fail":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        if action.startswith("partial:"):
+            n = int(action.split(":")[1])
+            return real_write(fd, bytes(data)[:n])
+    return real_write(fd, data)
+os.write = scripted_write
+
+CLOCK = [0.0]
+SLEPT = []
+def fake_sleep(s):
+    SLEPT.append(s); CLOCK[0] += s
+logpipe.time.monotonic = lambda: CLOCK[0]
+
+def run_drain(log, payload, chunk=4096):
+    import threading
+    r, w = os.pipe()
+    def feed():            # from a thread: a payload over the pipe buffer must not block the drain
+        view = memoryview(payload)
+        while view:
+            n = os.write(w, view); view = view[n:]
+        os.close(w)
+    t = threading.Thread(target=feed); t.start()
+    try:
+        logpipe.drain(r, log, chunk)
+    finally:
+        t.join(); os.close(r)
+
+def new_log(path, max_bytes=1 << 20, backups=3, stall=5.0):
+    log = logpipe.Log(path, max_bytes, backups, stall, logpipe.Diag(), sleep=fake_sleep)
+    log.open_at_start()
+    return log
+
+def worker_bytes(path):
+    out = []
+    for line in open(path, "rb").read().split(b"\n"):
+        if line.startswith(b"time=") and b'msg="txe-logpipe: ' in line:
+            continue
+        out.append(line)
+    return b"\n".join(out)
+` + body
+	path := filepath.Join(t.TempDir(), "harness.py")
+	require.NoError(t, os.WriteFile(path, []byte(script), 0o600))
+	cmd := exec.Command(py, "-I", path, dir)
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err = cmd.Run()
+	code = 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr, errOut.String())
+		code = exitErr.ExitCode()
+	}
+	return out.String(), errOut.String(), code
+}
+
+// A write that fails is retried from the offset already written: a partial write is not
+// repeated, a transient failure costs a retry and nothing else, and the bytes come out exact.
+func TestLogpipeRetriesWritesFromTheOffsetWithoutDuplication(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path)
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(300)) + b"tail"
+ACTIONS[:] = ["partial:7", "fail", "fail", "partial:100", "fail", "ok"]
+run_drain(log, payload)
+log.finish()
+got = worker_bytes(path)
+print("exact", got == payload, len(got), len(payload))
+print("retries", log.stats["write_retries"], "slept", SLEPT)
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "exact True")
+	assert.Contains(t, stdout, "retries 3 slept [1.0, 1.0, 1.0]")
+	assert.Contains(t, stderr, "could not write")
+	assert.Contains(t, stderr, "works again after")
+}
+
+// Writes failing for longer than the stall bound end in FailStop: the bytes persisted before
+// the failure are intact, the unwritten remainder is named, and nothing is written twice.
+func TestLogpipeFailStopsAfterTheWriteStallBound(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path, stall=5.0)
+before = b"".join(b"line %05d some worker output text\n" % i for i in range(100))
+run_drain(log, before)
+ACTIONS[:] = ["fail"] * 1000
+try:
+    run_drain(log, b"after the disk filled\n")
+    print("no FailStop")
+except logpipe.FailStop as e:
+    print("FailStop:", e)
+log.finish()
+got = worker_bytes(path)
+print("persisted intact", got == before)
+print("slept", len(SLEPT), "x", SLEPT[0] if SLEPT else None, "clock", CLOCK[0])
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "FailStop: could not write to worker.log for 5s (OSError: [Errno 28] No space left on device); 22 bytes unwritten")
+	assert.Contains(t, stdout, "persisted intact True")
+	assert.Contains(t, stdout, "slept 5 x 1.0 clock 5.0", "retried once a second for the stall bound, then stopped")
+	assert.NotContains(t, stdout, "no FailStop")
+}
+
+// End to end: with the log unwritable past the stall bound, main() stops the worker with
+// SIGTERM, exits 74 and says so; the worker's lines written before the failure are kept.
+func TestLogpipeMainFailStopsAndStopsTheWorker(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import subprocess, sys, tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+child = os.path.join(d, "child.py")
+open(child, "w").write("import signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(3))\n"
+    "for i in range(50): print('line %05d some worker output text' % i)\n"
+    "sys.stdout.flush(); time.sleep(0.5)\n"  # the lines reach the log before the trigger
+    "print('ready', file=sys.stderr); sys.stderr.flush()\n"
+    "time.sleep(60)\n")
+# Fail every write once the child has written its lines: the 'ready' line is the trigger.
+real_scripted = os.write
+def write_until_ready(fd, data):
+    if fd in LOG_FDS and b"ready" in bytes(data):
+        ACTIONS[:] = ["fail"] * 100000
+    return real_scripted(fd, data)
+os.write = write_until_ready
+logpipe.time.sleep = fake_sleep  # the retry sleeps; kill_after still polls in real time
+code = logpipe.main(["--path", path, "--max-bytes", "1048576", "--backups", "2", "--chunk-bytes", "4096",
+                     "--write-stall-seconds", "3", "--kill-timeout", "5", "--", sys.executable, child])
+print("exit", code)
+print("lines kept", worker_bytes(path).count(b"\n"))
+print("diag:", open(os.path.join(d, "worker.logpipe.log")).read())
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "exit 74")
+	assert.Contains(t, stdout, "lines kept 50")
+	assert.Contains(t, stdout, "could not write to worker.log for 3s")
+	assert.Contains(t, stdout, "stopping the worker (its running tasks end) and exiting 74; bytes not yet written are lost")
+	assert.Empty(t, stderr)
+}
+
+// SIGTERM is forwarded; the wrapper keeps draining, then exits with the worker's code.
+// A worker that ignores it is killed after --kill-timeout and the wrapper exits 137.
+func TestLogpipeForwardsSignalsWithABoundedWait(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 20000, 3, 4096, nil, "python3", childScript(t, dir), "5", "", "3", "wait", "0")
+	waitForLog(t, logs, "ready")
+	require.NoError(t, r.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 3, r.exitCode(t))
+	worker := reassemble(t, logs).worker
+	assert.True(t, bytes.HasSuffix(worker, []byte(fmt.Sprintf("signal %d\n", syscall.SIGTERM))), string(worker))
+	assert.Contains(t, r.diag(t), "forwarding signal 15 to the worker")
+
+	logs2 := filepath.Join(dir, "logs2") // a fresh log, so "ready" is this child's, after its handlers are installed
+	r = startLogpipe(t, logs2, 20000, 3, 4096, []string{"--kill-timeout", "1"}, "python3", childScript(t, dir), "5", "", "3", "stubborn", "0")
+	waitForLog(t, logs2, "ready")
+	start := time.Now()
+	require.NoError(t, r.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 137, r.exitCode(t), "128 + SIGKILL")
+	assert.Less(t, time.Since(start), 10*time.Second, "bounded by --kill-timeout, not by the worker")
+	assert.Contains(t, r.diag(t), "sending SIGKILL")
+}
+
+// A grandchild that outlives the worker and still holds the pipe must not keep the wrapper
+// running: once the worker has exited and the pipe has been quiet for --orphan-grace, the
+// wrapper exits with the worker's code. The grandchild itself is launchd's to kill with the
+// group (AbandonProcessGroup is not set on the agents); here the test ends it.
+func TestLogpipeStopsWhenTheWorkerExitsThoughAGrandchildHoldsThePipe(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	grandchild := filepath.Join(dir, "grandchild.py")
+	require.NoError(t, os.WriteFile(grandchild, []byte("import os, sys, time\nprint('grandchild', os.getpid(), flush=True)\ntime.sleep(60)\n"), 0o600))
+	r := startLogpipe(t, logs, 100000, 2, 4096, []string{"--orphan-grace", "1"}, "sh", "-c",
+		fmt.Sprintf("%q %q & echo 'worker done'; exit 4", py, grandchild))
+	start := time.Now()
+	assert.Equal(t, 4, r.exitCode(t), "the worker's code, not the grandchild's")
+	assert.Less(t, time.Since(start), 8*time.Second, "bounded by --orphan-grace, not by the grandchild's lifetime")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "worker done")
+	if m := regexp.MustCompile(`grandchild (\d+)`).FindSubmatch(b); m != nil {
+		pid, _ := strconv.Atoi(string(m[1]))
+		_ = syscall.Kill(pid, syscall.SIGKILL) // what launchd's group kill does after the wrapper exits
+	}
+}
+
+// A grandchild that keeps writing after the worker has exited must not keep the wrapper alive:
+// the orphan grace is absolute, so the wrapper exits with the worker's code after it whatever
+// still arrives. The grandchild is launchd's to kill with the group; here the test ends it.
+func TestLogpipeStopsWhenAGrandchildKeepsWritingAfterTheWorkerExits(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	py, err := exec.LookPath("python3")
+	require.NoError(t, err)
+	chatter := filepath.Join(dir, "chatter.py")
+	require.NoError(t, os.WriteFile(chatter, []byte("import os, sys, time\nprint('chatter', os.getpid(), flush=True)\nwhile True:\n    print('still here', flush=True); time.sleep(0.01)\n"), 0o600))
+	r := startLogpipe(t, logs, 10000000, 2, 4096, []string{"--orphan-grace", "1"}, "sh", "-c",
+		fmt.Sprintf("%q %q & echo 'worker done'; exit 4", py, chatter))
+	start := time.Now()
+	assert.Equal(t, 4, r.exitCode(t), "the worker's code")
+	assert.Less(t, time.Since(start), 8*time.Second, "bounded by --orphan-grace though the grandchild never stops writing")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "worker done")
+	assert.Greater(t, bytes.Count(b, []byte("still here\n")), 10, "the grandchild was writing all along")
+	if m := regexp.MustCompile(`chatter (\d+)`).FindSubmatch(b); m != nil {
+		pid, _ := strconv.Atoi(string(m[1]))
+		_ = syscall.Kill(pid, syscall.SIGKILL) // what launchd's group kill does after the wrapper exits
+	}
+}
+
+// A compression that fails leaves no temporary file behind and keeps the rotated source; a
+// .gz.tmp left by an interrupted process is removed at start when its source or its result is
+// there, and kept, reported and never counted as a backup when it is the only copy.
+func TestLogpipeCompressionLeftoversAreReconciled(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import gzip, tempfile, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+real_gzip_open = logpipe.gzip.open
+def failing_gzip_open(*a, **k):
+    raise OSError(errno.EIO, "Input/output error")
+logpipe.gzip.open = failing_gzip_open
+log = new_log(path, max_bytes=20000, backups=3)
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(2000))
+run_drain(log, payload)
+log.finish()
+names = sorted(os.listdir(d))
+print("after failed compressions:", [n for n in names if n != "worker.log"])
+print("no tmp", not any(n.endswith(".gz.tmp") for n in names), "sources kept", sum(1 for n in names if logpipe.re.match(r"worker\.log\.\d", n) and not n.endswith(".gz")))
+logpipe.gzip.open = real_gzip_open
+
+# restart reconciliation: a tmp beside its intact source, and a lone tmp
+src = [n for n in names if logpipe.re.match(r"worker\.log\.\d", n) and not n.endswith(".gz")][0]
+open(os.path.join(d, src + ".gz.tmp"), "wb").write(b"partial")
+lone = "worker.log.20200101T000000000000Z.gz.tmp"
+open(os.path.join(d, lone), "wb").write(b"partial")
+log = new_log(path, max_bytes=20000, backups=3)
+log.finish()
+names = sorted(os.listdir(d))
+print("tmp beside source removed", src + ".gz.tmp" not in names, "source compressed", src + ".gz" in names)
+print("lone tmp kept", lone in names, "lone not a backup", lone not in log._managed_names())
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "no tmp True sources kept 3")
+	assert.Contains(t, stdout, "tmp beside source removed True source compressed True")
+	assert.Contains(t, stdout, "lone tmp kept True lone not a backup True")
+	assert.Contains(t, stderr, "could not compress")
+	assert.Contains(t, stderr, "left by an interrupted compression; its source is intact")
+	assert.Contains(t, stderr, "is the only copy of")
+}
+
+// Rotated and archived names are never overwritten: with a frozen clock two rotations get
+// distinct names (the second with a "-1" suffix), both kept in order, and a pre-activation
+// archive whose stamp already exists gets a suffix too, leaving the existing file untouched.
+func TestLogpipeNeverOverwritesOnATimestampCollision(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import datetime, tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+frozen = datetime.datetime(2026, 10, 29, 15, 0, 0, 123456, tzinfo=datetime.timezone.utc)
+logpipe.utc_now = lambda: frozen
+stamp = frozen.strftime(logpipe.STAMP)
+# a pre-activation log, an archive name for this very stamp already taken, and a compressed
+# rotated file at this stamp from "earlier" (its plain name is free again: the compressor removed it)
+open(path, "wb").write(b"old launchd line\n")
+taken = os.path.join(d, "worker.legacy-%s.log" % stamp)
+open(taken, "wb").write(b"EXISTING ARCHIVE\n")
+import gzip
+earlier = os.path.join(d, "worker.log.%s.gz" % stamp)
+gzip.open(earlier, "wb").write(b"EARLIER ROTATION\n")
+log = new_log(path, max_bytes=20000, backups=5)
+print("existing archive untouched", open(taken, "rb").read() == b"EXISTING ARCHIVE\n")
+print("new archive", sorted(n for n in os.listdir(d) if n.startswith("worker.legacy-")))
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(1200))
+run_drain(log, payload)   # two rotations at the same frozen stamp
+log.finish()
+rotated = log._managed_names()
+print("rotated", rotated)
+print("distinct", len(rotated) == len(set(rotated)), "ordered suffixes", rotated == sorted(rotated, key=lambda n: (n.split(".")[2].split("-")[0], int(n.split(".")[2].split("-")[1]) if "-" in n.split(".")[2] else 0)))
+import gzip
+contents = [gzip.open(os.path.join(d, n), "rb").read() for n in rotated]
+print("all different", len(set(contents)) == len(contents))
+print("earlier rotation untouched", gzip.open(earlier, "rb").read() == b"EARLIER ROTATION\n")
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "existing archive untouched True")
+	assert.Contains(t, stdout, "new archive ['worker.legacy-20261029T150000123456Z-1.log', 'worker.legacy-20261029T150000123456Z.log']")
+	assert.Contains(t, stdout, "rotated ['worker.log.20261029T150000123456Z.gz', 'worker.log.20261029T150000123456Z-1.gz', 'worker.log.20261029T150000123456Z-2.gz']",
+		"the stamp whose .gz exists is skipped; the two new rotations take -1 and -2")
+	assert.Contains(t, stdout, "distinct True ordered suffixes True")
+	assert.Contains(t, stdout, "all different True")
+	assert.Contains(t, stdout, "earlier rotation untouched True")
+}
+
+// A worker that cannot be started (no such executable) ends the wrapper at once with 127 and a
+// diagnostic, so launchd's KeepAlive retries once the executable is repaired; the compressor
+// thread must not keep the process alive.
+func TestLogpipeExitsWhenTheWorkerCannotStart(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	r := startLogpipe(t, logs, 100000, 2, 4096, nil, filepath.Join(dir, "no-such-worker"))
+	start := time.Now()
+	assert.Equal(t, 127, r.exitCode(t))
+	assert.Less(t, time.Since(start), 10*time.Second, "no thread keeps the wrapper alive")
+	assert.Contains(t, r.diag(t), "cannot start the worker")
+}
+
+// The rotation marker's size is taken before the file is exposed under its rotated name, so a
+// compressor sweep that compresses and removes it at once cannot fault the drain.
+func TestLogpipeRotationSurvivesTheSweepTakingTheFileAtOnce(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+real_move = logpipe.Log._move_no_clobber
+def move_then_vanish(self, src, name_for, variants=()):
+    dst = real_move(self, src, name_for, variants)
+    if not dst.endswith(".log"):      # a rotation, not the legacy archive: the sweep already took it
+        os.remove(dst)
+    return dst
+logpipe.Log._move_no_clobber = move_then_vanish
+log = new_log(path, max_bytes=20000, backups=3)
+payload = b"".join(b"line %05d some worker output text\n" % i for i in range(2000))
+run_drain(log, payload)
+log.finish()
+print("rotations", log.stats["rotations"])
+text = open(path, "rb").read()
+print("marker has size", b'msg="txe-logpipe: rotated worker.log" previous=' in text and b"previous_bytes=" in text)
+print("last line kept", text.endswith(b"line 01999 some worker output text\n"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "rotations 4", "70 KB of lines over a 20 KB target: every rotation completed although its file vanished at once")
+	assert.Contains(t, stdout, "marker has size True")
+	assert.Contains(t, stdout, "last line kept True")
+}
+
+// finish() ends the compressor within its timeout even when the job queue is full and the
+// compression in progress is stuck: the stop flag ends the loop, the sentinel is optional.
+func TestLogpipeFinishIsBoundedWithAFullQueueAndAStuckCompression(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile, threading, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path, max_bytes=20000, backups=1)   # queue of one
+release = threading.Event()
+def stuck_compress(self, rotated):
+    release.wait(10)   # a compression that does not return while the wrapper wants to exit
+logpipe.Log._compress = stuck_compress
+log._enqueue(os.path.join(d, "worker.log.20200101T000000000001Z"))   # taken by the loop at once
+time.sleep(0.2)
+log._enqueue(os.path.join(d, "worker.log.20200101T000000000002Z"))   # fills the queue
+print("queue full", log.jobs.full())
+t0 = time.monotonic(); log.finish(timeout=0.3); dt = time.monotonic() - t0
+print("finish returned in %.2fs bounded %s" % (dt, dt < 2.0))
+release.set()
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "queue full True")
+	assert.Contains(t, stdout, "bounded True")
+	assert.Contains(t, stderr, "compression did not finish within 0.3s at exit")
+}
+
+// A stale .gz.tmp beside its source is reclaimed during the process's life, at the next
+// prune, not only at start.
+func TestLogpipeReclaimsStaleTemporariesWhenPruning(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+log = new_log(path, max_bytes=20000, backups=3)
+stale = os.path.join(d, "worker.log.20200101T000000000000Z.gz")
+open(stale, "wb").write(b"not really gzip")
+open(stale + ".tmp", "wb").write(b"partial")
+run_drain(log, b"".join(b"line %05d some worker output text\n" % i for i in range(1000)))  # one rotation, one prune
+log.finish()
+print("stale tmp reclaimed", not os.path.exists(stale + ".tmp"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "stale tmp reclaimed True")
+}
+
+// Retention holds however far compression falls behind: with the first compression stuck,
+// rotations keep coming and the rotating thread prunes, so at most --backups rotated files
+// plus the one in compression exist; the stuck one is not deleted from under the compressor,
+// and once it finishes, a result whose source was pruned meanwhile is discarded.
+func TestLogpipeRetentionDoesNotWaitForTheCompressor(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile, threading, time
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.log")
+release = threading.Event()
+real_compress = logpipe.Log._compress
+calls = []
+def slow_compress(self, rotated):
+    calls.append(rotated)
+    if len(calls) == 1:
+        release.wait(20)   # the first compression is stuck for the whole run
+    return real_compress(self, rotated)
+logpipe.Log._compress = slow_compress
+log = new_log(path, max_bytes=20000, backups=3)
+counts = []
+real_prune = logpipe.Log._prune
+def counting_prune(self):
+    real_prune(self)
+    counts.append(len(self._managed_names()))
+logpipe.Log._prune = counting_prune
+run_drain(log, b"".join(b"line %05d some worker output text\n" % i for i in range(20000)))  # about 35 rotations
+worst = max(counts)
+print("max managed files seen", worst, "within bound", worst <= 3 + 1)
+release.set()
+log.finish()
+names = log._managed_names()
+print("final", len(names), "all compressed", all(n.endswith(".gz") for n in names))
+print("no tmp", not any(n.endswith(".gz.tmp") for n in os.listdir(d)))
+print("last line kept", open(path, "rb").read().endswith(b"line 19999 some worker output text\n"))
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "within bound True")
+	assert.Contains(t, stdout, "final 3 all compressed True")
+	assert.Contains(t, stdout, "no tmp True")
+	assert.Contains(t, stdout, "last line kept True")
+}
+
+// If the wrapper itself is killed, the worker is not stopped by it (launchd's group kill
+// does that when the agent's main process dies); the worker's next write hits the closed
+// pipe, so a writing worker ends on its own and nothing hangs. A silent worker would be ended
+// by launchd, which a test cannot stand in for.
+func TestLogpipeAbruptDeathLeavesTheWorkerToLaunchd(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	talker := filepath.Join(dir, "talker.py")
+	require.NoError(t, os.WriteFile(talker, []byte("import os, sys, time\nprint('talker', os.getpid(), flush=True)\nwhile True:\n    print('tick', flush=True); time.sleep(0.2)\n"), 0o600))
+	r := startLogpipe(t, logs, 100000, 2, 4096, nil, "python3", talker)
+	waitForLog(t, logs, "tick")
+	b, err := os.ReadFile(filepath.Join(logs, "worker.log"))
+	require.NoError(t, err)
+	m := regexp.MustCompile(`talker (\d+)`).FindSubmatch(b)
+	require.NotNil(t, m)
+	pid, err := strconv.Atoi(string(m[1]))
+	require.NoError(t, err)
+	require.NoError(t, r.cmd.Process.Kill())
+	assert.Equal(t, -1, r.exitCode(t), "killed")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if syscall.Kill(pid, 0) == nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("the worker kept running after its pipe closed")
+	}
+}
+
+// The wrapper's own diagnostic file is bounded by a best-effort rename at --diag-max-bytes,
+// keeps one previous copy, and never reaches stderr while it can be written.
+func TestLogpipeDiagnosticsAreBounded(t *testing.T) {
+	stdout, stderr, code := harness(t, `
+import tempfile
+d = tempfile.mkdtemp()
+path = os.path.join(d, "worker.logpipe.log")
+diag = logpipe.Diag(path, 2000)
+for i in range(200):
+    diag.say("kind%d" % i, "line %d of the diagnostic stream, long enough to fill the file" % i, always=True)
+sizes = {n: os.path.getsize(os.path.join(d, n)) for n in sorted(os.listdir(d))}
+print("files", sizes)
+print("bounded", all(s <= 2000 + 120 for s in sizes.values()), "copies", len(sizes))
+text = open(path).read()
+print("last", text.strip().splitlines()[-1][-30:])
+`)
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "bounded True copies 2")
+	assert.Contains(t, stdout, "long enough to fill the file")
+	assert.Empty(t, stderr, "nothing reached stderr")
+}
+
+// waitForLog waits until the active log holds text (the child's stderr goes through the
+// wrapper into the log, like the worker's).
+func waitForLog(t *testing.T, logs, text string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(filepath.Join(logs, "worker.log")); err == nil && strings.Contains(string(b), text) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the log never showed %q", text)
+}
