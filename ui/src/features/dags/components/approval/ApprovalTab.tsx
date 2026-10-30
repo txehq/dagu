@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { useRemoteNode } from '@/contexts/RemoteNodeContext';
 import { getManualActionState } from '@/features/dag-runs/lib/manualActionState';
 import { useClient } from '@/hooks/api';
+import { isActiveNodeStatus } from '@/lib/status-utils';
 import { components, Stream } from '../../../../api/v1/schema';
 import { InlineLogViewer } from '../common/InlineLogViewer';
 import PushBackHistory from '../common/PushBackHistory';
@@ -92,6 +93,7 @@ function ApprovalCard({
             stepName={step.name}
             stream={node.stdout ? Stream.stdout : Stream.stderr}
             dagRun={dagRun}
+            live={isActiveNodeStatus(node.status)}
           />
         </div>
       </div>
