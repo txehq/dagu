@@ -23,6 +23,13 @@ type Event struct {
 	Evidence      []string         `json:"evidence,omitempty"`
 	ObservedAt    time.Time        `json:"observed_at"`
 	Actor         *txeclient.Actor `json:"actor,omitempty"`
+	// ReporterJobID and ReporterJobVersion name the job, at the version its
+	// run or check was for, whose credentials the observation was made
+	// with. The registry applies what depends on the observer (a denied
+	// credential, an unreachable or timed-out target, an unconfirmed one,
+	// and a present target clearing those) to that job only.
+	ReporterJobID      string `json:"reporter_job_id,omitempty"`
+	ReporterJobVersion int    `json:"reporter_job_version,omitempty"`
 }
 
 // Disposition is what a recorded event did to one dependent job.
@@ -41,6 +48,9 @@ type RecordedEvent struct {
 	Complete     bool            `json:"complete"`
 	Dispositions []Disposition   `json:"dispositions"`
 	Reporter     txeclient.Actor `json:"reporter"`
+	// ReporterJobID is the job the observation was made for, shown only to
+	// a caller who can see that job.
+	ReporterJobID string `json:"reporter_job_id,omitempty"`
 }
 
 // Registry is what a check reads from and reports to.

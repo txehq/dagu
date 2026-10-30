@@ -20338,6 +20338,12 @@ components:
           format: date-time
         actor:
           $ref: "#/components/schemas/TxeActor"
+        reporter_job_id:
+          type: string
+          description: "The job whose check made the observation, with that job's own credentials. Required for a denied credential, an unreachable, timed-out or unconfirmed target, or a present target to change any job's availability: those apply to this job alone, at reporter_job_version. The caller must be allowed to write the job, and a machine reports only for its own jobs."
+        reporter_job_version:
+          type: integer
+          description: "The version of reporter_job_id the check was for. An observation for another version than the job's current one changes nothing."
       required: [target, observation]
 
     TxeResourceDisposition:
@@ -20379,6 +20385,11 @@ components:
           format: date-time
         reporter:
           $ref: "#/components/schemas/TxeActor"
+        reporter_job_id:
+          type: string
+          description: "The job the observation was made for. Shown only to a caller who can see that job."
+        reporter_job_version:
+          type: integer
         dispositions:
           type: array
           items:

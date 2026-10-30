@@ -346,7 +346,7 @@ func TestResourceUnavailabilityNeverRetires(t *testing.T) {
 		ResourceTimeout:     AvailabilityTargetUnreachable,
 		ResourceAuthDenied:  AvailabilityAuthRequired,
 	} {
-		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-9"), Observation: obs}, agent)
+		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-9"), Observation: obs}, agent)
 		require.NoError(t, err)
 		got, err := f.store.GetJob(f.ctx, job.JobID)
 		require.NoError(t, err)
@@ -354,7 +354,7 @@ func TestResourceUnavailabilityNeverRetires(t *testing.T) {
 		assert.Equal(t, want, got.Availability.State, string(obs))
 		assert.True(t, f.admit(job.JobID, "").Admit, "availability does not block scheduling")
 	}
-	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-9"), Observation: ResourcePresent}, agent)
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-9"), Observation: ResourcePresent}, agent)
 	require.NoError(t, err)
 	got, err := f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
@@ -910,9 +910,9 @@ func TestReplacementNotShadowedByIdentityResult(t *testing.T) {
 		v.Targets = []Target{a, b}
 		v.RetirementRules.OnReplacement = RuleRetire
 	})
-	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: a, Observation: ResourceUnreachable}, agent)
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: a, Observation: ResourceUnreachable}, agent)
 	require.NoError(t, err)
-	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: a, Observation: ResourcePresent}, agent)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: a, Observation: ResourcePresent}, agent)
 	require.NoError(t, err)
 	outcomes := map[string]ResourceOutcome{}
 	for _, d := range ev.Dispositions {
@@ -1139,10 +1139,10 @@ func TestUnknownObservationChangesNothing(t *testing.T) {
 		v.Targets = []Target{target("v-1")}
 		v.RetirementRules.OnTargetDeleted = RuleRetire
 	})
-	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Authoritative: true}, agent)
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-1"), Observation: ResourceUnknown, Authoritative: true}, agent)
 	assert.Equal(t, CodeInvalid, code(t, err))
 
-	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown, Detail: "issue lookup returned null"}, agent)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-1"), Observation: ResourceUnknown, Detail: "issue lookup returned null"}, agent)
 	require.NoError(t, err)
 	require.Len(t, ev.Dispositions, 1)
 	assert.Equal(t, OutcomeRecorded, ev.Dispositions[0].Outcome)
@@ -1232,7 +1232,7 @@ func TestUnknownPreRunTargetIsUnconfirmed(t *testing.T) {
 		v.Targets = []Target{pre}
 		v.RetirementRules.OnTargetDeleted = RuleRetire
 	})
-	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourceUnknown}, agent)
+	_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-1"), Observation: ResourceUnknown}, agent)
 	require.NoError(t, err)
 	got, err := f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
@@ -1240,7 +1240,7 @@ func TestUnknownPreRunTargetIsUnconfirmed(t *testing.T) {
 	assert.Equal(t, job.Lifecycle, got.Lifecycle)
 	assert.True(t, f.admit(job.JobID, "").Admit, "availability does not refuse runs")
 
-	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-1"), Observation: ResourcePresent}, agent)
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-1"), Observation: ResourcePresent}, agent)
 	require.NoError(t, err)
 	got, err = f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
@@ -1257,7 +1257,7 @@ func TestTargetConditionsResolvePerTarget(t *testing.T) {
 	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
 	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
 	report := func(tg Target, obs ResourceObservation) {
-		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		_, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: tg, Observation: obs}, agent)
 		require.NoError(t, err)
 		f.now = f.now.Add(time.Second)
 	}
@@ -1310,7 +1310,7 @@ func TestLegacyTargetExceptionAndFallbackDisposition(t *testing.T) {
 	a.ExistenceCheck, b.ExistenceCheck = CheckPreRun, CheckPreRun
 	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
 	report := func(tg Target, obs ResourceObservation) *ResourceEvent {
-		ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: tg, Observation: obs}, agent)
 		require.NoError(t, err)
 		f.now = f.now.Add(time.Second)
 		return ev
@@ -1350,7 +1350,7 @@ func TestLegacyTargetExceptionUsesOnlyItsOrigin(t *testing.T) {
 	f := newFixture(t)
 	a, b := target("v-1"), target("v-2")
 	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{a, b} })
-	evB, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourceUnreachable}, agent)
+	evB, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: b, Observation: ResourceUnreachable}, agent)
 	require.NoError(t, err)
 	f.now = f.now.Add(time.Second)
 	// A legacy exception whose originating event is missing, with the
@@ -1364,7 +1364,7 @@ func TestLegacyTargetExceptionUsesOnlyItsOrigin(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: b, Observation: ResourcePresent}, agent)
+	_, err = f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: b, Observation: ResourcePresent}, agent)
 	require.NoError(t, err)
 	got, err := f.store.GetJob(f.ctx, job.JobID)
 	require.NoError(t, err)
@@ -1394,11 +1394,184 @@ func TestResourceFailureCarriesNoStorageDetail(t *testing.T) {
 	require.NoError(t, os.Chmod(jobsDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(jobsDir, 0o700) })
 
-	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: target("v-31"), Observation: ResourceUnreachable}, agent)
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{ReporterJobID: job.JobID, ReporterJobVersion: job.Version, Target: target("v-31"), Observation: ResourceUnreachable}, agent)
 	require.NoError(t, err)
 	require.NotEmpty(t, ev.Failures, "the job could not be written")
 	for _, fl := range ev.Failures {
 		assert.NotContains(t, fl.Error, dataDir, "no hub path")
 		assert.NotContains(t, fl.Error, "permission denied", "no raw storage error")
 	}
+}
+
+// reportedBy marks ev as made with job's own credentials, at its version.
+func reportedBy(job *Job, ev ResourceEvent) ResourceEvent {
+	ev.ReporterJobID, ev.ReporterJobVersion = job.JobID, job.Version
+	return ev
+}
+
+// Two jobs name one target, each with its own credential. What one job's
+// check sees with its credential and route (a denied credential, an
+// unreachable or timed-out target) changes that job only; the other is left
+// unchanged, ready, with no condition. A present target clears only the
+// reporter's conditions. When both jobs' credentials fail, each job's own
+// check marks it.
+func TestObserverRelativeEventsApplyOnlyToTheReporter(t *testing.T) {
+	f := newFixture(t)
+	tg := target("v-40")
+	a := f.readyWith("job-a", func(v *JobVersion) { v.Targets = []Target{tg} })
+	b := f.readyWith("job-b", func(v *JobVersion) { v.Targets = []Target{tg} })
+	require.NoError(t, f.store.RebuildResourceIndex(f.ctx))
+	state := func(job *Job) (AvailabilityState, int) {
+		t.Helper()
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		open := 0
+		for _, e := range got.Exceptions {
+			if e.ResolvedAt == nil {
+				open++
+			}
+		}
+		return got.Availability.State, open
+	}
+	outcome := func(ev *ResourceEvent, job *Job) ResourceDisposition {
+		t.Helper()
+		for _, d := range ev.Dispositions {
+			if d.JobID == job.JobID {
+				return d
+			}
+		}
+		t.Fatalf("no disposition for %s", job.JobID)
+		return ResourceDisposition{}
+	}
+
+	for obs, want := range map[ResourceObservation]AvailabilityState{
+		ResourceAuthDenied:  AvailabilityAuthRequired,
+		ResourceUnreachable: AvailabilityTargetUnreachable,
+		ResourceTimeout:     AvailabilityTargetUnreachable,
+	} {
+		ev, err := f.store.RecordResourceEvent(f.ctx, reportedBy(a, ResourceEvent{Target: tg, Observation: obs, Detail: "401 Unauthorized"}), agent)
+		require.NoError(t, err)
+		assert.Equal(t, OutcomeAvailability, outcome(ev, a).Outcome, string(obs))
+		other := outcome(ev, b)
+		assert.Equal(t, OutcomeUnchanged, other.Outcome, string(obs))
+		assert.Equal(t, "observed with another job's credential and machine", other.Detail)
+		assert.NotContains(t, other.Detail, a.JobID, "the other job is not named")
+		got, _ := state(a)
+		assert.Equal(t, want, got, string(obs))
+		got, open := state(b)
+		assert.Equal(t, AvailabilityReady, got, "B's own credential works: %s", obs)
+		assert.Zero(t, open)
+
+		// B's healthy check does not clear A's condition; A's own does.
+		ev, err = f.store.RecordResourceEvent(f.ctx, reportedBy(b, ResourceEvent{Target: tg, Observation: ResourcePresent}), agent)
+		require.NoError(t, err)
+		assert.Equal(t, OutcomeUnchanged, outcome(ev, a).Outcome)
+		got, _ = state(a)
+		assert.Equal(t, want, got, "still %s after B's present", obs)
+		_, err = f.store.RecordResourceEvent(f.ctx, reportedBy(a, ResourceEvent{Target: tg, Observation: ResourcePresent}), agent)
+		require.NoError(t, err)
+		got, open = state(a)
+		assert.Equal(t, AvailabilityReady, got)
+		assert.Zero(t, open)
+		f.now = f.now.Add(time.Second)
+	}
+
+	// A credential the two jobs share fails for both: each job's own check
+	// reports it, and each is marked.
+	for _, job := range []*Job{a, b} {
+		_, err := f.store.RecordResourceEvent(f.ctx, reportedBy(job, ResourceEvent{Target: tg, Observation: ResourceAuthDenied}), agent)
+		require.NoError(t, err)
+	}
+	for _, job := range []*Job{a, b} {
+		got, open := state(job)
+		assert.Equal(t, AvailabilityAuthRequired, got)
+		assert.Equal(t, 1, open)
+		final, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, LifecycleActive, final.Lifecycle, "a denied credential never retires")
+	}
+}
+
+// An observation made for a version the reporting job has since left is
+// not applied: the new version may use another credential or machine.
+func TestObserverRelativeEventForAnEarlierVersionChangesNothing(t *testing.T) {
+	f := newFixture(t)
+	tg := target("v-41")
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{tg} })
+	stale := reportedBy(job, ResourceEvent{Target: tg, Observation: ResourceAuthDenied})
+	v := f.version(5)
+	v.Targets = []Target{tg}
+	_, err := f.store.UpdateVersion(f.ctx, job.JobID, "rotate-credential", job.Version, v, cli)
+	require.NoError(t, err)
+	saved, err := f.store.GetVersion(f.ctx, job.JobID, 2)
+	require.NoError(t, err)
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	_, err = f.store.MarkReady(f.ctx, job.JobID, got.Revision, PackageEvidence{Digest: saved.Package.Digest, Path: saved.Package.Path, MachineID: f.machine}, cli)
+	require.NoError(t, err)
+	require.NoError(t, f.store.RebuildResourceIndex(f.ctx))
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, stale, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 1)
+	assert.Equal(t, OutcomeUnchanged, ev.Dispositions[0].Outcome)
+	assert.Equal(t, "observed for version 1; the job is at version 2", ev.Dispositions[0].Detail)
+	got, err = f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State)
+}
+
+// A report that names no reporting job, as an earlier worker's, cannot say
+// whose credential or route it reflects: it changes no job's availability.
+// A fact about the target itself still applies to every dependent.
+func TestEventWithoutAReporterJobChangesOnlyTargetFacts(t *testing.T) {
+	f := newFixture(t)
+	tg := target("v-42")
+	a := f.readyWith("job-a", func(v *JobVersion) { v.Targets = []Target{tg}; v.RetirementRules.OnTargetDeleted = RuleRetire })
+	b := f.readyWith("job-b", func(v *JobVersion) { v.Targets = []Target{tg}; v.RetirementRules.OnTargetDeleted = RuleRetire })
+	require.NoError(t, f.store.RebuildResourceIndex(f.ctx))
+
+	for _, obs := range []ResourceObservation{ResourceAuthDenied, ResourceUnreachable, ResourceTimeout, ResourceUnknown, ResourcePresent} {
+		ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: obs}, agent)
+		require.NoError(t, err)
+		require.Len(t, ev.Dispositions, 2, string(obs))
+		for _, d := range ev.Dispositions {
+			assert.Equal(t, OutcomeUnchanged, d.Outcome, string(obs))
+			assert.Equal(t, "the report names no reporting job, so whose credential and route it reflects is unknown", d.Detail)
+		}
+		f.now = f.now.Add(time.Second)
+	}
+	for _, job := range []*Job{a, b} {
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, AvailabilityReady, got.Availability.State)
+	}
+
+	ev, err := f.store.RecordResourceEvent(f.ctx, ResourceEvent{Target: tg, Observation: ResourceDeleted, Authoritative: true}, agent)
+	require.NoError(t, err)
+	require.Len(t, ev.Dispositions, 2)
+	for _, job := range []*Job{a, b} {
+		got, err := f.store.GetJob(f.ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, LifecycleRetired, got.Lifecycle, "an authoritative deletion is a fact about the target")
+	}
+}
+
+// Reporter fields are checked before anything is saved.
+func TestResourceEventReporterFieldsAreValidated(t *testing.T) {
+	f := newFixture(t)
+	tg := target("v-43")
+	job := f.readyWith("k", func(v *JobVersion) { v.Targets = []Target{tg} })
+	for name, ev := range map[string]ResourceEvent{
+		"version without job": {Target: tg, Observation: ResourceAuthDenied, ReporterJobVersion: 1},
+		"job without version": {Target: tg, Observation: ResourceAuthDenied, ReporterJobID: job.JobID},
+		"not a job id":        {Target: tg, Observation: ResourceAuthDenied, ReporterJobID: "../jobs/x", ReporterJobVersion: 1},
+		"negative version":    {Target: tg, Observation: ResourceAuthDenied, ReporterJobID: job.JobID, ReporterJobVersion: -1},
+	} {
+		_, err := f.store.RecordResourceEvent(f.ctx, ev, agent)
+		require.Error(t, err, name)
+	}
+	got, err := f.store.GetJob(f.ctx, job.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AvailabilityReady, got.Availability.State)
 }

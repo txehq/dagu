@@ -8216,6 +8216,10 @@ export interface components {
             /** Format: date-time */
             observed_at?: string;
             actor?: components["schemas"]["TxeActor"];
+            /** @description The job whose check made the observation, with that job's own credentials. Required for a denied credential, an unreachable, timed-out or unconfirmed target, or a present target to change any job's availability: those apply to this job alone, at reporter_job_version. The caller must be allowed to write the job, and a machine reports only for its own jobs. */
+            reporter_job_id?: string;
+            /** @description The version of reporter_job_id the check was for. An observation for another version than the job's current one changes nothing. */
+            reporter_job_version?: number;
         };
         TxeResourceDisposition: {
             job_id: string;
@@ -8236,6 +8240,9 @@ export interface components {
             /** Format: date-time */
             observed_at: string;
             reporter: components["schemas"]["TxeActor"];
+            /** @description The job the observation was made for. Shown only to a caller who can see that job. */
+            reporter_job_id?: string;
+            reporter_job_version?: number;
             dispositions: components["schemas"]["TxeResourceDisposition"][];
             /** @description Dependents not yet updated; the server keeps retrying them */
             pending?: {

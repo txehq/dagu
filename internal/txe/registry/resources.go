@@ -123,23 +123,37 @@ type ResourceDisposition struct {
 // authoritative; anything ambiguous asks a person. Unreachable, denied or
 // timed-out observations change availability and never retire.
 //
+// What a deletion, an absence or a replacement says is a fact about the
+// target and applies to every dependent. What the other observations say
+// depends on the observer: a denied credential is the reporter's credential,
+// an unreachable, timed-out or unconfirmed target is seen from the
+// reporter's credential and route, and a present target only shows that
+// those work. Those apply to the reporting job alone (ReporterJobID, at
+// ReporterJobVersion); every other dependent is left unchanged. A report
+// that names no reporting job changes no job's availability.
+//
 // The event is saved before it is applied. Pending lists the dependents
 // still to apply, Failures the last error for each, and Complete says
 // whether every dependent was applied.
 type ResourceEvent struct {
-	Schema        int                   `json:"schema"`
-	EventID       string                `json:"event_id"`
-	Target        Target                `json:"target"`
-	Observation   ResourceObservation   `json:"observation"`
-	Authoritative bool                  `json:"authoritative"`
-	Detail        string                `json:"detail,omitempty"`
-	Evidence      []string              `json:"evidence,omitempty"`
-	ObservedAt    time.Time             `json:"observed_at"`
-	Reporter      Actor                 `json:"reporter"`
-	Dispositions  []ResourceDisposition `json:"dispositions"`
-	Pending       []ResourceDependent   `json:"pending,omitempty"`
-	Failures      []ResourceFailure     `json:"failures,omitempty"`
-	Complete      bool                  `json:"complete"`
+	Schema        int                 `json:"schema"`
+	EventID       string              `json:"event_id"`
+	Target        Target              `json:"target"`
+	Observation   ResourceObservation `json:"observation"`
+	Authoritative bool                `json:"authoritative"`
+	Detail        string              `json:"detail,omitempty"`
+	Evidence      []string            `json:"evidence,omitempty"`
+	ObservedAt    time.Time           `json:"observed_at"`
+	Reporter      Actor               `json:"reporter"`
+	// ReporterJobID and ReporterJobVersion name the job, at the version its
+	// check was for, whose credentials and machine the observation was made
+	// with. The caller checks that the reporter may report for that job.
+	ReporterJobID      string                `json:"reporter_job_id,omitempty"`
+	ReporterJobVersion int                   `json:"reporter_job_version,omitempty"`
+	Dispositions       []ResourceDisposition `json:"dispositions"`
+	Pending            []ResourceDependent   `json:"pending,omitempty"`
+	Failures           []ResourceFailure     `json:"failures,omitempty"`
+	Complete           bool                  `json:"complete"`
 }
 
 // ResourceDependent is a job an event still has to be applied to.
@@ -204,6 +218,16 @@ func (s *Store) RecordResourceEvent(ctx context.Context, ev ResourceEvent, by Ac
 	t := ev.Target
 	if t.Kind == "" || len(t.StableID) == 0 {
 		return nil, refuse(CodeInvalid, "target needs kind and stable_id")
+	}
+	if ev.ReporterJobID != "" {
+		if err := ValidateID(PrefixJob, ev.ReporterJobID); err != nil {
+			return nil, err
+		}
+		if ev.ReporterJobVersion < 1 {
+			return nil, refuse(CodeInvalid, "reporter_job_version is required with reporter_job_id")
+		}
+	} else if ev.ReporterJobVersion != 0 {
+		return nil, refuse(CodeInvalid, "reporter_job_version needs reporter_job_id")
 	}
 	switch ev.Observation {
 	case ResourceDeleted, ResourceAbsent, ResourcePresent, ResourceUnreachable, ResourceAuthDenied, ResourceTimeout:
@@ -395,6 +419,9 @@ func (s *Store) resumeResourceEvent(ctx context.Context, saved *ResourceEvent, s
 	return saved, nil
 }
 
+// sameReport compares what was observed. The reporting job is left out: a
+// resend continues the saved event, which keeps the reporting job it was
+// saved with, as an event an earlier hub saved without one keeps none.
 func sameReport(a, b *ResourceEvent) bool {
 	digest := func(e *ResourceEvent) string {
 		bs, _ := CanonicalJSON([]any{e.Target, e.Observation, e.Authoritative, e.Detail, e.Evidence})
@@ -543,6 +570,12 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		d.Outcome, d.Detail = OutcomeUnchanged, "job is "+string(job.Lifecycle)
 		return d, nil
 	}
+	if observerRelative(ev.Observation) {
+		if why := notTheObserver(job, ev); why != "" {
+			d.Outcome, d.Detail = OutcomeUnchanged, why
+			return d, nil
+		}
+	}
 	switch ev.Observation {
 	case ResourceDeleted, ResourceAbsent:
 		if !ev.Authoritative {
@@ -589,6 +622,34 @@ func (s *Store) applyIdentityEvent(ctx context.Context, jobID string, ev *Resour
 		return d, nil
 	}
 	return nil, refuse(CodeInvalid, "unknown observation %q", ev.Observation)
+}
+
+// observerRelative reports whether what an observation says depends on who
+// made it: with which credential, from which machine and route. Deletion,
+// absence and replacement are facts about the target.
+func observerRelative(o ResourceObservation) bool {
+	switch o {
+	case ResourceAuthDenied, ResourceUnreachable, ResourceTimeout, ResourceUnknown, ResourcePresent:
+		return true
+	case ResourceDeleted, ResourceAbsent:
+		return false
+	}
+	return false
+}
+
+// notTheObserver says why an observer-relative event does not apply to job,
+// or "" when job is the reporting job at the version it reported for. Another
+// job is not named: it may be another owner's.
+func notTheObserver(job *Job, ev *ResourceEvent) string {
+	switch {
+	case ev.ReporterJobID == "":
+		return "the report names no reporting job, so whose credential and route it reflects is unknown"
+	case job.JobID != ev.ReporterJobID:
+		return "observed with another job's credential and machine"
+	case job.Version != ev.ReporterJobVersion:
+		return fmt.Sprintf("observed for version %d; the job is at version %d", ev.ReporterJobVersion, job.Version)
+	}
+	return ""
 }
 
 func (s *Store) applyReplacement(ctx context.Context, jobID string, ev *ResourceEvent, by Actor, permitted ResourceJobFilter) (*ResourceDisposition, error) {
