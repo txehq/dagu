@@ -38,11 +38,7 @@ if [ -n "$hub_url" ]; then
   state="$(launchctl print "gui/$(id -u)/$TXE_DAGU_WORKER_LABEL" 2>/dev/null | awk -F'= ' '/^\tstate = /{print $2; exit}')"
   printf '%-22s %s\n' "$TXE_DAGU_WORKER_LABEL" "${state:-not loaded}"
   [ "$state" = "running" ] || rc=1
-  # A hub address with a path names its API root, as for the worker.
-  case "${hub_url#*://}" in
-    */*) health="${hub_url%/}/health" ;;
-    *) health="${hub_url%/}/api/v1/health" ;;
-  esac
+  health="$(python3 -I "$here/agents.py" hub-health "$hub_url")"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$health")"
   printf 'channel  %s -> %s\n' "$health" "$code"
   [ "$code" = "200" ] || rc=1

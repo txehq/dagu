@@ -137,6 +137,13 @@ def check_hub_url(raw):
         raise Refused(f"{raw!r} must use https, or http to a loopback address")
 
 
+def hub_health(raw):
+    """The health URL of a hub address, by the worker's rule: a path names the API root."""
+    hub = urllib.parse.urlsplit(raw)
+    root = hub.path.rstrip("/") or "/api/v1"
+    return urllib.parse.urlunsplit((hub.scheme, hub.netloc, f"{root}/health", "", ""))
+
+
 def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label, worker_label,
                  namespace, service, ui_port, coord_port, credential_file, python, hub_url=""):
     common = {"RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
@@ -197,6 +204,9 @@ def main(argv):
         except Refused as e:
             print(f"hub address refused: {e}", file=sys.stderr)
             return 1
+        return 0
+    if len(argv) == 2 and argv[0] == "hub-health":
+        print(hub_health(argv[1]))
         return 0
     if len(argv) in (15, 16) and argv[0] == "write":
         write_agents(*argv[1:])

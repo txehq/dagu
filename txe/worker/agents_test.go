@@ -420,6 +420,23 @@ func TestHubURLCheck(t *testing.T) {
 	}
 }
 
+// The same rule as the worker's: a path names the API root, however it is spelled.
+func TestHubHealthFollowsTheWorkersRule(t *testing.T) {
+	script := agentsScript(t)
+	for hub, want := range map[string]string{
+		"https://hub.example":       "https://hub.example/api/v1/health",
+		"https://hub.example/":      "https://hub.example/api/v1/health",
+		"https://hub.example//":     "https://hub.example/api/v1/health",
+		"https://hub.example/rest":  "https://hub.example/rest/health",
+		"https://hub.example/rest/": "https://hub.example/rest/health",
+		"http://127.0.0.1:18080":    "http://127.0.0.1:18080/api/v1/health",
+	} {
+		stdout, stderr, err := python(t, script, "hub-health", hub)
+		require.NoError(t, err, stderr)
+		assert.Equal(t, want+"\n", stdout, hub)
+	}
+}
+
 // An engineer's machine has neither: it gets as far as the credential.
 func TestInstallOnTheChannelNeedsACredentialAndNoKubectl(t *testing.T) {
 	agentsScript(t)
