@@ -295,3 +295,17 @@ func TestUnitsOnTheChannelHaveNoTunnel(t *testing.T) {
 	_, err = os.Stat(filepath.Join(dir, "txe-dagu-tunnel.service"))
 	assert.True(t, os.IsNotExist(err))
 }
+
+// units.py removes the tunnel's file, and systemd cannot disable a unit with no
+// file, so the old tunnel must be stopped first, and seen to have stopped.
+func TestInstallStopsTheOldTunnelBeforeRemovingItsUnit(t *testing.T) {
+	data, err := os.ReadFile("install-systemd.sh")
+	require.NoError(t, err)
+	script := string(data)
+	stop := strings.Index(script, `--user stop "$TXE_DAGU_TUNNEL_UNIT"`)
+	check := strings.Index(script, `is-active --quiet "$TXE_DAGU_TUNNEL_UNIT"`)
+	write := strings.Index(script, `"$here/units.py" write`)
+	require.Positive(t, stop)
+	assert.Less(t, stop, check)
+	assert.Less(t, check, write)
+}

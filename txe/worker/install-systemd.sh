@@ -139,6 +139,16 @@ if [ -z "$hub_url" ]; then
   [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
 fi
 
+# On the worker channel, stop a tunnel an earlier install left running, while its unit file still
+# exists: units.py removes it next, and a running tunnel would keep a Kubernetes credential in use.
+if [ -n "$hub_url" ]; then
+  "$systemctl_bin" --user stop "$TXE_DAGU_TUNNEL_UNIT" >/dev/null 2>&1 || true
+  "$systemctl_bin" --user disable "$TXE_DAGU_TUNNEL_UNIT" >/dev/null 2>&1 || true
+  if "$systemctl_bin" --user is-active --quiet "$TXE_DAGU_TUNNEL_UNIT"; then
+    die "the old tunnel $TXE_DAGU_TUNNEL_UNIT is still running; stop it and install again"
+  fi
+fi
+
 # PATH is the installing shell's, so scheduled scripts find the same tools; nothing else from the
 # environment is copied, and no credential.
 python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
@@ -146,11 +156,7 @@ python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubec
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$hub_url" || die "the units were not written"
 
 units=("$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT")
-if [ -n "$hub_url" ]; then
-  units=("$TXE_DAGU_WORKER_UNIT")
-  # units.py removed its file: stop a tunnel an earlier install left running.
-  "$systemctl_bin" --user disable --now "$TXE_DAGU_TUNNEL_UNIT" >/dev/null 2>&1 || true
-fi
+[ -z "$hub_url" ] || units=("$TXE_DAGU_WORKER_UNIT")
 "$systemctl_bin" --user daemon-reload
 for unit in "${units[@]}"; do
   "$systemctl_bin" --user enable "$unit" >/dev/null 2>&1 || die "systemctl --user enable $unit failed"
