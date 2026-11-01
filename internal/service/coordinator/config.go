@@ -44,6 +44,11 @@ type Config struct {
 	// ArtifactSegmentBytes is the most one artifact stream may carry. 0 means a
 	// stream may carry anything.
 	ArtifactSegmentBytes int64
+
+	// ArtifactStreamTime is how long one artifact stream of a segmented upload
+	// stays open, so that a slow link ends a stream before its deadline does.
+	// 0 means only its size bounds it.
+	ArtifactStreamTime time.Duration
 }
 
 // DefaultConfig returns a Config with default values

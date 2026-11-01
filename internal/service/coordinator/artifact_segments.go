@@ -140,6 +140,12 @@ func (h *artifactHandler) applySegment(
 	}
 	defer func() { _ = file.Close() }()
 
+	if done, err := alreadyCommitted(root, file, name, relPath, chunk); err != nil || done {
+		if done {
+			removeIfFinished(root, dir)
+		}
+		return chunk.GetTotalSize(), err
+	}
 	size, err := writeSegment(file, chunk.GetByteOffset(), chunk.Data)
 	if err != nil {
 		return 0, err
@@ -152,6 +158,38 @@ func (h *artifactHandler) applySegment(
 	}
 	removeIfFinished(root, dir)
 	return size, nil
+}
+
+// alreadyCommitted answers a final chunk that carries no data, to a writer whose
+// segments are gone, from the artifact: it is an upload repeated after its
+// acknowledgment was lost, and the file need not cross the link again. Any other
+// chunk, or a different artifact, goes on and is refused as it would be.
+func alreadyCommitted(root *os.Root, file *os.File, name, relPath string, chunk *coordinatorv1.ArtifactChunk) (bool, error) {
+	if !chunk.IsFinal || len(chunk.Data) > 0 || chunk.GetSha256() == "" || chunk.GetTotalSize() == 0 {
+		return false, nil
+	}
+	held, err := file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("read artifact segment: %w", err)
+	}
+	if held.Size() != 0 {
+		return false, nil
+	}
+	info, err := root.Lstat(relPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read artifact: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	same, err := sameArtifact(root, relPath, info, chunk.GetTotalSize(), chunk.GetSha256())
+	if err != nil || !same {
+		return false, err
+	}
+	return true, root.Remove(name)
 }
 
 func isUnder(p, dir string) bool {

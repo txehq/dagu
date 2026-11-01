@@ -193,6 +193,22 @@ type channelRig struct {
 	current atomic.Pointer[workerchannel.Handler]
 	marker  string
 	origin  *httptest.Server
+	// limits are the channel's defaults when zero.
+	limits workerchannel.Limits
+	// uploads, when set, is told every artifact stream that reaches the hub.
+	uploads *uploadTrace
+	// wholeStreams leaves a stream to its size alone, so that it meets the
+	// deadline on a slow link.
+	wholeStreams bool
+	// onFixture is told the fixture before its run is queued.
+	onFixture func(*testFixture)
+}
+
+func (r *channelRig) streamLimit() time.Duration {
+	if r.limits.Stream > 0 {
+		return r.limits.Stream
+	}
+	return workerchannel.DefaultLimits().Stream
 }
 
 // restartHub replaces the coordinator and cuts every connection to the hub, as
@@ -231,7 +247,7 @@ func (r *channelRig) bind(t testing.TB, coord *test.Coordinator) {
 	})
 	require.NoError(t, err)
 	handler, err := workerchannel.NewHandler(workerchannel.Config{
-		Auth: auth, Coordinator: coord.Handler(), Health: health.NewServer(),
+		Auth: auth, Coordinator: coord.Handler(), Health: health.NewServer(), Limits: r.limits,
 	})
 	require.NoError(t, err)
 	r.current.Store(handler)
@@ -266,6 +282,10 @@ func withChannelRig(rig *channelRig) fixtureOption {
 			rig.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// A real worker addresses the channel where a hub mounts it.
 				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api/v1"+workerchannel.MountPath)
+				if rig.uploads != nil {
+					rig.uploads.serve(rig.current.Load(), w, r)
+					return
+				}
 				rig.current.Load().ServeHTTP(w, r)
 			}))
 			t.Cleanup(rig.origin.Close)
@@ -274,12 +294,15 @@ func withChannelRig(rig *channelRig) fixtureOption {
 
 			conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
 				BaseURL:     "http://" + rig.proxy.listener.Addr().String(),
-				Credentials: rigAuth{token: rigToken},
+				Credentials: rigAuth{token: rigToken}, Limits: rig.limits,
 			})
 			require.NoError(t, err)
 			clientConfig := coordinator.ConfigFromPeer(coord.Config.Core.Peer)
 			clientConfig.Connect = func() coordinator.Connection { return conn }
 			clientConfig.ArtifactSegmentBytes = 16 << 20
+			if !rig.wholeStreams {
+				clientConfig.ArtifactStreamTime = rig.streamLimit() / 2
+			}
 			require.NoError(t, clientConfig.Validate())
 			registry, err := coordinator.NewStaticRegistry([]string{rig.proxy.listener.Addr().String()})
 			require.NoError(t, err)
