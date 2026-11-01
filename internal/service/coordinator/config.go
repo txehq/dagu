@@ -35,6 +35,11 @@ type Config struct {
 	// Credentials is sent on every call: a worker machine's token or the
 	// hub's key. Nil sends none, as before coordinator authentication.
 	Credentials credentials.PerRPCCredentials
+
+	// Connect, when set, supplies the connection for every coordinator, and no
+	// address is dialled: the worker channel reaches its hub by one URL. It
+	// must return a connection that may be closed more than once.
+	Connect func() Connection
 }
 
 // DefaultConfig returns a Config with default values

@@ -289,7 +289,15 @@ var (
 
 	workerCoordinatorsFlag = commandLineFlag{
 		name:      "worker.coordinators",
-		usage:     "Required coordinator addresses (format: host1:port1,host2:port2)",
+		usage:     "Coordinator addresses (format: host1:port1,host2:port2). Required unless --worker.hub-url is given",
+		bindViper: true,
+	}
+
+	// workerHubURLFlag reaches the hub by the worker channel over HTTPS.
+	workerHubURLFlag = commandLineFlag{
+		name:      "worker.hub-url",
+		viperKey:  "worker.hub_url",
+		usage:     "Hub address, reached by the worker channel over HTTPS (needs a machine credential)",
 		bindViper: true,
 	}
 )

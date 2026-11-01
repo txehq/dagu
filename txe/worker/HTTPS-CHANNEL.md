@@ -1,6 +1,6 @@
 # Worker channel over HTTPS (design)
 
-Status: proposed, TXE-5550. The hub can serve the channel behind `coordinator.worker_channel.enabled`, default off. No worker uses it yet. Nothing here is live, and no Cloudflare path has been tried.
+Status: proposed, TXE-5550. The hub can serve the channel behind `coordinator.worker_channel.enabled`, default off. A worker opts in with `worker.hub_url`. Nothing here is live, and no Cloudflare path has been tried.
 
 ## Why
 
@@ -56,7 +56,7 @@ Eleven of the 23 coordinator methods, plus `Health/Check`. The table is `methods
 | `GetDAGRunStatus`, `RequestCancel` | unary | **no** | Remote sub-DAGs |
 | `Dispatch`, `GetWorkers`, `PutWorkspaceBundle`, `HasWorkspaceBundle` | mixed | **no** | Hub's own processes |
 
-**Why exclusion does not break TXE jobs.** A bundle exists only for a DAG with file dependencies. `RenderDAG` writes a command chain with none, and a TXE task carries its definition. So `state` steps, sub-DAGs and bundles are out of reach of a TXE job. This is read from the code: the worker wiring PR must add a test that a rendered DAG has no file dependencies, and the rig runs a real job. A non-TXE DAG that needs them fails closed on this channel. It can keep the private path, or wait for TXE-4228.
+**Why exclusion does not break TXE jobs.** A bundle exists only for a DAG with file dependencies. `RenderDAG` writes a command chain with none, and a TXE task carries its definition. So `state` steps, sub-DAGs and bundles are out of reach of a TXE job. `TestARenderedJobHasNoFileDependencies` holds that for a rendered job, and the rig runs a real one. A non-TXE DAG that needs them fails closed on this channel. It can keep the private path, or wait for TXE-4228.
 
 ## Wire
 

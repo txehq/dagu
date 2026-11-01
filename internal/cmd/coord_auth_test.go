@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,6 +31,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/worker"
+	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -107,6 +109,11 @@ func (s *authTestCoordinator) last() transportauth.Caller {
 func (s *authTestCoordinator) Heartbeat(ctx context.Context, _ *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
 	s.record(ctx)
 	return &coordinatorv1.HeartbeatResponse{}, nil
+}
+
+func (s *authTestCoordinator) RunHeartbeat(ctx context.Context, _ *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+	s.record(ctx)
+	return &coordinatorv1.RunHeartbeatResponse{}, nil
 }
 
 func (s *authTestCoordinator) GetDAGRunStatus(ctx context.Context, _ *coordinatorv1.GetDAGRunStatusRequest) (*coordinatorv1.GetDAGRunStatusResponse, error) {
@@ -479,4 +486,82 @@ func TestWorkerChannelCreatesNoHubKeyWithTheModesOff(t *testing.T) {
 	require.NotNil(t, handler)
 	_, err = os.Stat(cfg.CoordinatorHubKeyFile())
 	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// The worker's real client, its real credential source and a real channel.
+// A task's owner advertises a loopback address nobody listens on: over the
+// channel it is never dialled.
+func TestWorkerReachesItsHubByTheChannel(t *testing.T) {
+	h := newAuthTestHub(t, config.TXEAuthzModeEnforce)
+	ctx := context.Background()
+	channel, err := newWorkerChannel(ctx, h.cfg, h.service, health.NewServer(), txeauth.WithKeySource(h.provider.keys()))
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	channel.Mount(router, "/api/v1")
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	cfg := *h.cfg
+	cfg.Worker.HubURL = server.URL
+	cfg.Worker.Auth.CredentialFile = h.credentialFile(t, "dagu-worker-"+h.machine, h.machine)
+	client, err := worker.NewCoordinatorClient(ctx, &cfg)
+	require.NoError(t, err)
+
+	_, err = client.Heartbeat(ctx, heartbeat(h.machine))
+	require.NoError(t, err)
+	caller := h.service.last()
+	assert.Equal(t, h.machine, caller.Machine.MachineID)
+	assert.True(t, caller.PinnedToMachine)
+
+	owner := serviceregistry.HostInfo{ID: "hub", Host: "127.0.0.1", Port: 1}
+	_, err = client.RunHeartbeatTo(ctx, owner, &coordinatorv1.RunHeartbeatRequest{WorkerId: h.machine})
+	require.NoError(t, err)
+}
+
+func TestWorkerFindsTheChannelUnderACustomAPIRoot(t *testing.T) {
+	h := newAuthTestHub(t, config.TXEAuthzModeEnforce)
+	ctx := context.Background()
+	channel, err := newWorkerChannel(ctx, h.cfg, h.service, health.NewServer(), txeauth.WithKeySource(h.provider.keys()))
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	channel.Mount(router, "/rest")
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	cfg := *h.cfg
+	cfg.Worker.HubURL = server.URL + "/rest/"
+	cfg.Worker.Auth.CredentialFile = h.credentialFile(t, "dagu-worker-"+h.machine, h.machine)
+	client, err := worker.NewCoordinatorClient(ctx, &cfg)
+	require.NoError(t, err)
+	_, err = client.Heartbeat(ctx, heartbeat(h.machine))
+	require.NoError(t, err)
+}
+
+func TestWorkerOnTheChannelNeedsItsCredentialAndOneRoute(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*config.Config)
+		want   string
+	}{
+		"no credential": {func(c *config.Config) {
+			c.Worker.HubURL = "https://hub.example"
+		}, "credential_file"},
+		"two routes": {func(c *config.Config) {
+			c.Worker.HubURL = "https://hub.example"
+			c.Worker.Coordinators = []string{"127.0.0.1:50055"}
+		}, "two routes"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.Config{}
+			tc.mutate(cfg)
+			_, err := worker.NewCoordinatorClient(context.Background(), cfg)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+	h := newAuthTestHub(t, config.TXEAuthzModeEnforce)
+	cfg := *h.cfg
+	cfg.Worker.HubURL = "http://hub.example"
+	cfg.Worker.Auth.CredentialFile = h.credentialFile(t, "dagu-worker-"+h.machine, h.machine)
+	_, err := worker.NewCoordinatorClient(context.Background(), &cfg)
+	require.ErrorContains(t, err, "loopback")
 }

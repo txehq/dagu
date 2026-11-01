@@ -1388,6 +1388,7 @@ func (l *ConfigLoader) loadWorkerConfig(cfg *Config, def Definition) {
 		cfg.Worker.ID = def.Worker.ID
 		cfg.Worker.MaxActiveRuns = def.Worker.MaxActiveRuns
 		cfg.Worker.HealthPort = def.Worker.HealthPort
+		cfg.Worker.HubURL = def.Worker.HubURL
 
 		if def.Worker.Labels != nil {
 			cfg.Worker.Labels = parseLabels(def.Worker.Labels)
@@ -2474,6 +2475,7 @@ var envBindings = []envBinding{
 	{key: "worker.max_active_runs", env: "WORKER_MAX_ACTIVE_RUNS"},
 	{key: "worker.labels", env: "WORKER_LABELS"},
 	{key: "worker.coordinators", env: "WORKER_COORDINATORS"},
+	{key: "worker.hub_url", env: "WORKER_HUB_URL"},
 	{key: "worker.health_port", env: "WORKER_HEALTH_PORT"},
 	{key: workerAuthCredentialFileKey, env: workerAuthCredentialFileEnv},
 

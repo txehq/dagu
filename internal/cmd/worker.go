@@ -74,6 +74,7 @@ var workerFlags = []commandLineFlag{
 	workerHealthPortFlag,
 	workerLabelsFlag,
 	workerCoordinatorsFlag,
+	workerHubURLFlag,
 	// Peer configuration flags for TLS
 	peerInsecureFlag,
 	peerCertFileFlag,
