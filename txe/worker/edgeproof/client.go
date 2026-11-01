@@ -217,7 +217,7 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 	}
 	next := cfg.Transport
 	if next == nil {
-		next = http.DefaultTransport
+		next = workerchannel.NewHTTPClient().Transport
 	}
 	c := &client{cfg: cfg, wire: &wire{next: next}}
 	limits := cfg.Limits

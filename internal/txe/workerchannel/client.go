@@ -76,7 +76,7 @@ func NewConn(cfg ClientConfig) (*Conn, error) {
 	if err := limits.validate(); err != nil {
 		return nil, err
 	}
-	client := newHTTPClient()
+	client := NewHTTPClient()
 	if cfg.HTTP != nil {
 		copied := *cfg.HTTP
 		client = &copied
@@ -117,7 +117,9 @@ func checkBaseURL(raw string) (string, error) {
 	return strings.TrimRight(raw, "/"), nil
 }
 
-func newHTTPClient() *http.Client {
+// NewHTTPClient is the client a Conn uses unless it is given another: a program
+// that measures the channel wraps its transport, to measure what a worker uses.
+func NewHTTPClient() *http.Client {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
