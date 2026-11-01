@@ -27,6 +27,9 @@ import (
 const (
 	contentTypeUnary  = "application/proto"
 	contentTypeStream = "application/connect+proto"
+
+	// admissionRead bounds a request's body until its caller is admitted.
+	admissionRead = 5 * time.Second
 )
 
 // Config configures a Handler.
@@ -94,6 +97,10 @@ func NewHandler(cfg Config) (*Handler, error) {
 // the body is read, and bounds the request before Connect reads it.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	// A refused request's unread body is drained when the answer is flushed,
+	// so even a caller that is never admitted is bound by a read deadline.
+	control := http.NewResponseController(w)
+	_ = control.SetReadDeadline(time.Now().Add(min(admissionRead, h.limits.Unary)))
 	ctx := incoming(r.Context(), r.Header)
 	caller, err := h.auth.Admit(ctx, r.URL.Path)
 	if err != nil {
@@ -118,7 +125,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// A stalled body is released by the read deadline: cancelling a context
 	// does not interrupt a read of it.
-	control := http.NewResponseController(w)
 	_ = control.SetReadDeadline(time.Now().Add(entry.limit))
 	_ = control.SetWriteDeadline(time.Now().Add(entry.limit + 5*time.Second))
 	r.Body = http.MaxBytesReader(w, r.Body, h.limits.MaxRequestBytes)

@@ -524,6 +524,24 @@ func TestSizeLimits(t *testing.T) {
 	assert.Equal(t, codes.ResourceExhausted, status.Code(sendErr), "%v", sendErr)
 }
 
+// The server drains a refused request's body, so a refused caller is bound too.
+func TestAStalledBodyOfARefusedRequestIsReleased(t *testing.T) {
+	limits := workerchannel.DefaultLimits()
+	limits.PollWait = 50 * time.Millisecond
+	limits.Unary = 100 * time.Millisecond
+	h := newHarness(t, limits)
+	conn, err := net.Dial("tcp", h.server.Listener.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = io.WriteString(conn, "POST /channel"+coordinatorv1.CoordinatorService_Heartbeat_FullMethodName+" HTTP/1.1\r\nHost: x\r\n"+
+		"Content-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nContent-Length: 100\r\n\r\nabc")
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	// The server closes the connection: reading to its end does not time out.
+	_, err = io.ReadAll(conn)
+	require.NoError(t, err)
+}
+
 func TestAMachineCannotHoldMoreThanItsCalls(t *testing.T) {
 	limits := workerchannel.DefaultLimits()
 	limits.MaxCallsPerMachine = 1
