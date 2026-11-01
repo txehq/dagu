@@ -40,6 +40,10 @@ type Config struct {
 	// address is dialled: the worker channel reaches its hub by one URL. It
 	// must return a connection that may be closed more than once.
 	Connect func() Connection
+
+	// ArtifactSegmentBytes is the most one artifact stream may carry. 0 means a
+	// stream may carry anything.
+	ArtifactSegmentBytes int64
 }
 
 // DefaultConfig returns a Config with default values

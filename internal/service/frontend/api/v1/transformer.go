@@ -497,7 +497,7 @@ func hasArtifactEntries(archiveDir string) bool {
 	}
 
 	for _, entry := range entries {
-		if !fileutil.IsSymlinkDirEntry(entry) {
+		if !fileutil.IsSymlinkDirEntry(entry) && entry.Name() != ir.ArtifactSegmentDir {
 			return true
 		}
 	}

@@ -132,12 +132,18 @@ func DirHasEntries(dir string) (bool, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	names, err := f.Readdirnames(1)
+	// Two: an upload in progress is not an entry, and it is at most one name.
+	names, err := f.Readdirnames(2)
 	if err != nil && len(names) == 0 {
 		if errors.Is(err, io.EOF) {
 			return false, nil
 		}
 		return false, err
 	}
-	return len(names) > 0, nil
+	for _, name := range names {
+		if name != ir.ArtifactSegmentDir {
+			return true, nil
+		}
+	}
+	return false, nil
 }

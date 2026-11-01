@@ -4898,7 +4898,7 @@ func listArtifactTreeNodes(rootDir, currentDir string, recursive bool) ([]api.Ar
 
 	nodes := make([]api.ArtifactTreeNode, 0, len(entries))
 	for _, entry := range entries {
-		if fileutil.IsSymlinkDirEntry(entry) {
+		if fileutil.IsSymlinkDirEntry(entry) || (currentDir == rootDir && entry.Name() == ir.ArtifactSegmentDir) {
 			continue
 		}
 		node, err := buildArtifactTreeNode(rootDir, currentDir, entry, recursive)

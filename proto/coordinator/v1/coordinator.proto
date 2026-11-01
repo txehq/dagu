@@ -418,6 +418,16 @@ message ArtifactChunk {
   string attempt_key = 12;
   // Task.execution_marker of the execution that produced the artifact.
   string execution_marker = 13;
+
+  // Fields from 1001 are this fork's, clear of upstream's numbers.
+
+  // Where data belongs in a segmented upload, one that crosses streams. Absent
+  // means the upload lives and ends in this stream.
+  optional uint64 byte_offset = 1001;
+  // The whole file's size and hex SHA-256, on the final chunk of a segmented
+  // upload.
+  uint64 total_size = 1002;
+  string sha256 = 1003;
 }
 
 // Response message for artifact streaming.
@@ -425,6 +435,9 @@ message StreamArtifactsResponse {
   uint64 chunks_received = 1;
   uint64 bytes_written = 2;
   string error = 3;
+  // How much of a segmented upload the hub holds durably. A hub that does not
+  // know segmented uploads leaves it unset, and the worker stops.
+  optional uint64 committed_offset = 1001;
 }
 
 // Workspace bundle descriptor.

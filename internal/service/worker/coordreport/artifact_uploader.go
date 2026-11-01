@@ -5,6 +5,8 @@ package coordreport
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -151,6 +153,24 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 		}
 	}()
 
+	// finishStream ends the current stream and reads its reply.
+	finishStream := func() error {
+		if stream == nil {
+			return nil
+		}
+		resp, err := stream.CloseAndRecv()
+		stream = nil
+		if err != nil {
+			return fmt.Errorf("finalize artifact upload: %w", err)
+		}
+		if resp != nil && resp.Error != "" {
+			return fmt.Errorf("artifact upload failed: %s", resp.Error)
+		}
+		return nil
+	}
+	limit := u.segmentBytes()
+	var streamBytes int64
+
 	sendChunk := func(chunk *coordinatorv1.ArtifactChunk) error {
 		if stream == nil {
 			var err error
@@ -181,6 +201,26 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 			return fmt.Errorf("resolve artifact relative path: %w", err)
 		}
 		relPath = filepath.ToSlash(relPath)
+
+		if limit > 0 {
+			info, err := d.Info()
+			if err != nil {
+				return fmt.Errorf("read artifact %s: %w", path, err)
+			}
+			if info.Size() > limit {
+				if err := finishStream(); err != nil {
+					return err
+				}
+				return u.uploadSegmented(ctx, path, relPath, attemptID, limit)
+			}
+			if streamBytes+info.Size() > limit {
+				if err := finishStream(); err != nil {
+					return err
+				}
+				streamBytes = 0
+			}
+			streamBytes += info.Size()
+		}
 
 		return func() error {
 			file, err := os.Open(filepath.Clean(path))
@@ -246,16 +286,108 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 		return err
 	}
 
-	if stream == nil {
+	return finishStream()
+}
+
+// segmentBytes is the most one stream may carry, or 0 when a stream may carry
+// anything, as on a gRPC connection.
+func (u *ArtifactUploader) segmentBytes() int64 {
+	if client, ok := u.client.(interface{ ArtifactSegmentBytes() int64 }); ok {
+		return client.ArtifactSegmentBytes()
+	}
+	return 0
+}
+
+// uploadSegmented sends a file that one stream cannot carry. Each stream must
+// be acknowledged exactly before the next: the final chunk is sent only to a hub
+// that has said it holds every byte, so a hub that does not know this form
+// commits nothing. Any failure starts the file again from its first byte, and
+// the hub keeps what it already holds by comparing it. A file changed during
+// the upload fails its digest.
+func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, attemptID string, limit int64) error {
+	file, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("open artifact %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	newChunk := func(offset uint64) *coordinatorv1.ArtifactChunk {
+		chunk := &coordinatorv1.ArtifactChunk{
+			WorkerId: u.workerID, DagRunId: u.dagRunID, DagName: u.dagName, RelativePath: relPath,
+			RootDagRunName: u.rootRef.Name, RootDagRunId: u.rootRef.ID, AttemptId: attemptID,
+			OwnerCoordinatorId: u.owner.ID, AttemptKey: u.attemptKey(attemptID), ExecutionMarker: u.getExecutionMarker(),
+		}
+		chunk.SetByteOffset(offset)
+		return chunk
+	}
+	// acknowledged ends one stream and checks the hub holds exactly offset.
+	acknowledged := func(stream coordinatorv1.CoordinatorService_StreamArtifactsClient, offset uint64) error {
+		resp, err := stream.CloseAndRecv()
+		if err != nil {
+			return fmt.Errorf("finalize artifact segment: %w", err)
+		}
+		if !resp.HasCommittedOffset() {
+			return fmt.Errorf("upload artifact %s: this hub does not accept segmented uploads", relPath)
+		}
+		if resp.GetCommittedOffset() != offset {
+			return fmt.Errorf("upload artifact %s: the hub holds %d of %d bytes", relPath, resp.GetCommittedOffset(), offset)
+		}
 		return nil
 	}
 
-	resp, err := stream.CloseAndRecv()
+	sum := sha256.New()
+	buf := make([]byte, maxChunkSize)
+	offset, seq := uint64(0), uint64(0)
+	for atEnd := false; !atEnd; {
+		var stream coordinatorv1.CoordinatorService_StreamArtifactsClient
+		for sent := int64(0); sent < limit && !atEnd; {
+			n, readErr := file.Read(buf[:min(int64(len(buf)), limit-sent)])
+			if n > 0 {
+				if stream == nil {
+					if stream, err = u.openStream(ctx); err != nil {
+						return err
+					}
+				}
+				seq++
+				chunk := newChunk(offset)
+				chunk.Sequence = seq
+				chunk.Data = append([]byte(nil), buf[:n]...)
+				if err := stream.Send(chunk); err != nil && !errors.Is(err, io.EOF) {
+					return fmt.Errorf("send artifact segment: %w", err)
+				} else if err != nil {
+					break // the reply says why
+				}
+				_, _ = sum.Write(buf[:n])
+				sent += int64(n)
+				offset += uint64(n) // #nosec G115 -- n is non-negative
+			}
+			if errors.Is(readErr, io.EOF) {
+				atEnd = true
+			} else if readErr != nil {
+				if stream != nil {
+					_ = stream.CloseSend()
+				}
+				return fmt.Errorf("read artifact %s: %w", path, readErr)
+			}
+		}
+		if stream != nil {
+			if err := acknowledged(stream, offset); err != nil {
+				return err
+			}
+		}
+	}
+
+	stream, err := u.openStream(ctx)
 	if err != nil {
-		return fmt.Errorf("finalize artifact upload: %w", err)
+		return err
 	}
-	if resp != nil && resp.Error != "" {
-		return fmt.Errorf("artifact upload failed: %s", resp.Error)
+	final := newChunk(offset)
+	final.Sequence = seq + 1
+	final.IsFinal = true
+	final.TotalSize = offset
+	final.Sha256 = hex.EncodeToString(sum.Sum(nil))
+	if err := stream.Send(final); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("send artifact final marker: %w", err)
 	}
-	return nil
+	return acknowledged(stream, offset)
 }

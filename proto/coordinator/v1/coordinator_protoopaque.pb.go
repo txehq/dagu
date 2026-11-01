@@ -3418,6 +3418,11 @@ type ArtifactChunk struct {
 	xxx_hidden_OwnerCoordinatorId string                 `protobuf:"bytes,11,opt,name=owner_coordinator_id,json=ownerCoordinatorId,proto3"`
 	xxx_hidden_AttemptKey         string                 `protobuf:"bytes,12,opt,name=attempt_key,json=attemptKey,proto3"`
 	xxx_hidden_ExecutionMarker    string                 `protobuf:"bytes,13,opt,name=execution_marker,json=executionMarker,proto3"`
+	xxx_hidden_ByteOffset         uint64                 `protobuf:"varint,1001,opt,name=byte_offset,json=byteOffset,proto3,oneof"`
+	xxx_hidden_TotalSize          uint64                 `protobuf:"varint,1002,opt,name=total_size,json=totalSize,proto3"`
+	xxx_hidden_Sha256             string                 `protobuf:"bytes,1003,opt,name=sha256,proto3"`
+	XXX_raceDetectHookData        protoimpl.RaceDetectHookData
+	XXX_presence                  [1]uint32
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -3538,6 +3543,27 @@ func (x *ArtifactChunk) GetExecutionMarker() string {
 	return ""
 }
 
+func (x *ArtifactChunk) GetByteOffset() uint64 {
+	if x != nil {
+		return x.xxx_hidden_ByteOffset
+	}
+	return 0
+}
+
+func (x *ArtifactChunk) GetTotalSize() uint64 {
+	if x != nil {
+		return x.xxx_hidden_TotalSize
+	}
+	return 0
+}
+
+func (x *ArtifactChunk) GetSha256() string {
+	if x != nil {
+		return x.xxx_hidden_Sha256
+	}
+	return ""
+}
+
 func (x *ArtifactChunk) SetWorkerId(v string) {
 	x.xxx_hidden_WorkerId = v
 }
@@ -3593,6 +3619,31 @@ func (x *ArtifactChunk) SetExecutionMarker(v string) {
 	x.xxx_hidden_ExecutionMarker = v
 }
 
+func (x *ArtifactChunk) SetByteOffset(v uint64) {
+	x.xxx_hidden_ByteOffset = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 13, 16)
+}
+
+func (x *ArtifactChunk) SetTotalSize(v uint64) {
+	x.xxx_hidden_TotalSize = v
+}
+
+func (x *ArtifactChunk) SetSha256(v string) {
+	x.xxx_hidden_Sha256 = v
+}
+
+func (x *ArtifactChunk) HasByteOffset() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 13)
+}
+
+func (x *ArtifactChunk) ClearByteOffset() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 13)
+	x.xxx_hidden_ByteOffset = 0
+}
+
 type ArtifactChunk_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
@@ -3614,6 +3665,13 @@ type ArtifactChunk_builder struct {
 	AttemptKey string
 	// Task.execution_marker of the execution that produced the artifact.
 	ExecutionMarker string
+	// Where data belongs in a segmented upload, one that crosses streams. Absent
+	// means the upload lives and ends in this stream.
+	ByteOffset *uint64
+	// The whole file's size and hex SHA-256, on the final chunk of a segmented
+	// upload.
+	TotalSize uint64
+	Sha256    string
 }
 
 func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
@@ -3633,17 +3691,26 @@ func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
 	x.xxx_hidden_OwnerCoordinatorId = b.OwnerCoordinatorId
 	x.xxx_hidden_AttemptKey = b.AttemptKey
 	x.xxx_hidden_ExecutionMarker = b.ExecutionMarker
+	if b.ByteOffset != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 13, 16)
+		x.xxx_hidden_ByteOffset = *b.ByteOffset
+	}
+	x.xxx_hidden_TotalSize = b.TotalSize
+	x.xxx_hidden_Sha256 = b.Sha256
 	return m0
 }
 
 // Response message for artifact streaming.
 type StreamArtifactsResponse struct {
-	state                     protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_ChunksReceived uint64                 `protobuf:"varint,1,opt,name=chunks_received,json=chunksReceived,proto3"`
-	xxx_hidden_BytesWritten   uint64                 `protobuf:"varint,2,opt,name=bytes_written,json=bytesWritten,proto3"`
-	xxx_hidden_Error          string                 `protobuf:"bytes,3,opt,name=error,proto3"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	state                      protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_ChunksReceived  uint64                 `protobuf:"varint,1,opt,name=chunks_received,json=chunksReceived,proto3"`
+	xxx_hidden_BytesWritten    uint64                 `protobuf:"varint,2,opt,name=bytes_written,json=bytesWritten,proto3"`
+	xxx_hidden_Error           string                 `protobuf:"bytes,3,opt,name=error,proto3"`
+	xxx_hidden_CommittedOffset uint64                 `protobuf:"varint,1001,opt,name=committed_offset,json=committedOffset,proto3,oneof"`
+	XXX_raceDetectHookData     protoimpl.RaceDetectHookData
+	XXX_presence               [1]uint32
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *StreamArtifactsResponse) Reset() {
@@ -3692,6 +3759,13 @@ func (x *StreamArtifactsResponse) GetError() string {
 	return ""
 }
 
+func (x *StreamArtifactsResponse) GetCommittedOffset() uint64 {
+	if x != nil {
+		return x.xxx_hidden_CommittedOffset
+	}
+	return 0
+}
+
 func (x *StreamArtifactsResponse) SetChunksReceived(v uint64) {
 	x.xxx_hidden_ChunksReceived = v
 }
@@ -3704,12 +3778,32 @@ func (x *StreamArtifactsResponse) SetError(v string) {
 	x.xxx_hidden_Error = v
 }
 
+func (x *StreamArtifactsResponse) SetCommittedOffset(v uint64) {
+	x.xxx_hidden_CommittedOffset = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 3, 4)
+}
+
+func (x *StreamArtifactsResponse) HasCommittedOffset() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 3)
+}
+
+func (x *StreamArtifactsResponse) ClearCommittedOffset() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 3)
+	x.xxx_hidden_CommittedOffset = 0
+}
+
 type StreamArtifactsResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	ChunksReceived uint64
 	BytesWritten   uint64
 	Error          string
+	// How much of a segmented upload the hub holds durably. A hub that does not
+	// know segmented uploads leaves it unset, and the worker stops.
+	CommittedOffset *uint64
 }
 
 func (b0 StreamArtifactsResponse_builder) Build() *StreamArtifactsResponse {
@@ -3719,6 +3813,10 @@ func (b0 StreamArtifactsResponse_builder) Build() *StreamArtifactsResponse {
 	x.xxx_hidden_ChunksReceived = b.ChunksReceived
 	x.xxx_hidden_BytesWritten = b.BytesWritten
 	x.xxx_hidden_Error = b.Error
+	if b.CommittedOffset != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 3, 4)
+		x.xxx_hidden_CommittedOffset = *b.CommittedOffset
+	}
 	return m0
 }
 
@@ -6503,7 +6601,7 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x12StreamLogsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\xc4\x03\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"\xb4\x04\n" +
 	"\rArtifactChunk\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1c\n" +
 	"\n" +
@@ -6521,11 +6619,19 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x14owner_coordinator_id\x18\v \x01(\tR\x12ownerCoordinatorId\x12\x1f\n" +
 	"\vattempt_key\x18\f \x01(\tR\n" +
 	"attemptKey\x12)\n" +
-	"\x10execution_marker\x18\r \x01(\tR\x0fexecutionMarker\"}\n" +
+	"\x10execution_marker\x18\r \x01(\tR\x0fexecutionMarker\x12%\n" +
+	"\vbyte_offset\x18\xe9\a \x01(\x04H\x00R\n" +
+	"byteOffset\x88\x01\x01\x12\x1e\n" +
+	"\n" +
+	"total_size\x18\xea\a \x01(\x04R\ttotalSize\x12\x17\n" +
+	"\x06sha256\x18\xeb\a \x01(\tR\x06sha256B\x0e\n" +
+	"\f_byte_offset\"\xc3\x01\n" +
 	"\x17StreamArtifactsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\x9e\x01\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12/\n" +
+	"\x10committed_offset\x18\xe9\a \x01(\x04H\x00R\x0fcommittedOffset\x88\x01\x01B\x13\n" +
+	"\x11_committed_offset\"\x9e\x01\n" +
 	"\x0fWorkspaceBundle\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x19\n" +
@@ -6859,6 +6965,8 @@ func file_proto_coordinator_v1_coordinator_proto_init() {
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[4].OneofWrappers = []any{}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[19].OneofWrappers = []any{}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[25].OneofWrappers = []any{}
+	file_proto_coordinator_v1_coordinator_proto_msgTypes[27].OneofWrappers = []any{}
+	file_proto_coordinator_v1_coordinator_proto_msgTypes[28].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
