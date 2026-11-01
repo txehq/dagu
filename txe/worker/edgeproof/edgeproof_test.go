@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -53,7 +54,8 @@ func run(t *testing.T, url string, names ...string) []Result {
 
 func TestEveryCheckPassesAgainstTheRealHandler(t *testing.T) {
 	server, log := startOrigin(t)
-	for _, result := range run(t, server.URL, defaultChecks...) {
+	names := slices.DeleteFunc(slices.Clone(defaultChecks), func(name string) bool { return name == "load" })
+	for _, result := range run(t, server.URL, names...) {
 		assert.True(t, result.Pass, "%s: %s", result.Check, result.Detail)
 		assert.Zero(t, result.HTTP.HTML, result.Check)
 	}
@@ -62,6 +64,16 @@ func TestEveryCheckPassesAgainstTheRealHandler(t *testing.T) {
 	assert.NotContains(t, log.String(), testToken)
 	assert.NotContains(t, log.String(), "Bearer")
 	assert.NotContains(t, log.String(), strings.TrimPrefix(server.URL, "http://"), "the log holds no address")
+}
+
+// The load check at a twentieth of its real wait: its heartbeats each open a
+// connection, so any faster measures the test machine's accept queue.
+func TestTheLoadCheckHoldsItsPollsBesideItsHeartbeats(t *testing.T) {
+	server, _ := startOrigin(t)
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: shortLimits(), Pause: 0.05}, []string{"load"})
+	require.NoError(t, err)
+	require.True(t, results[0].Pass, "%s: %v", results[0].Detail, results[0].Numbers)
+	assert.EqualValues(t, loadPolls+loadSeconds*loadHeartbeats, results[0].HTTP.Requests)
 }
 
 func TestTheOverLimitRefusalIsTheChannels(t *testing.T) {

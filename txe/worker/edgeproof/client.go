@@ -451,6 +451,8 @@ func checkLoad(ctx context.Context, c *client, api coordinatorv1.CoordinatorServ
 	var pollErr error
 	wg.Go(func() { pollNumbers, pollErr = polls(ctx, api, loadPolls) })
 	var failed atomic.Int64
+	var mu sync.Mutex
+	failures := map[string]int{}
 	sent := 0
 	for range loadSeconds {
 		for range loadHeartbeats {
@@ -458,13 +460,16 @@ func checkLoad(ctx context.Context, c *client, api coordinatorv1.CoordinatorServ
 			wg.Go(func() {
 				if _, err := api.Heartbeat(ctx, heartbeat()); err != nil {
 					failed.Add(1)
+					mu.Lock()
+					failures[status.Code(err).String()]++
+					mu.Unlock()
 				}
 			})
 		}
 		c.wait(ctx, time.Second)
 	}
 	wg.Wait()
-	numbers := map[string]any{"polls": pollNumbers, "heartbeats": sent, "heartbeats_failed": failed.Load()}
+	numbers := map[string]any{"polls": pollNumbers, "heartbeats": sent, "heartbeats_failed": failed.Load(), "heartbeat_failures": failures}
 	if pollErr != nil {
 		return numbers, pollErr
 	}
