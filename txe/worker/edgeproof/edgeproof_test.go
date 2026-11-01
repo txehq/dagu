@@ -109,6 +109,19 @@ func TestAnOutageIsTimedFromTheCallThatFailed(t *testing.T) {
 	assert.GreaterOrEqual(t, outage, 300*time.Millisecond)
 }
 
+func TestAnOutageStillOpenAtTheEndIsCounted(t *testing.T) {
+	server, _ := startOrigin(t)
+	url := server.URL
+	server.Close()
+	results, err := runChecks(context.Background(), clientConfig{URL: url, Token: testToken, Limits: shortLimits(), Pause: 0.05,
+		Watch: 200 * time.Millisecond}, []string{"reconnect"})
+	require.NoError(t, err)
+	assert.False(t, results[0].Pass)
+	outage, err := time.ParseDuration(results[0].Numbers["longest_outage"].(string))
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, outage, 100*time.Millisecond)
+}
+
 func TestAStoppedOriginReadsAsUnavailable(t *testing.T) {
 	server, _ := startOrigin(t)
 	url := server.URL

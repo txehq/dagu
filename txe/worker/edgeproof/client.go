@@ -519,6 +519,9 @@ func checkReconnect(ctx context.Context, c *client, api coordinatorv1.Coordinato
 		}
 		c.wait(ctx, time.Second)
 	}
+	if !down.IsZero() {
+		longest = max(longest, time.Since(down))
+	}
 	numbers := map[string]any{"beats": beats, "failed": failures, "longest_outage": longest.Round(time.Millisecond).String(), "codes": codesSeen}
 	if !down.IsZero() {
 		return numbers, finding("still down at the end of the watch")
