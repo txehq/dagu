@@ -518,6 +518,25 @@ func TestWorkerReachesItsHubByTheChannel(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestWorkerFindsTheChannelUnderACustomAPIRoot(t *testing.T) {
+	h := newAuthTestHub(t, config.TXEAuthzModeEnforce)
+	ctx := context.Background()
+	channel, err := newWorkerChannel(ctx, h.cfg, h.service, health.NewServer(), txeauth.WithKeySource(h.provider.keys()))
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	channel.Mount(router, "/rest")
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	cfg := *h.cfg
+	cfg.Worker.HubURL = server.URL + "/rest/"
+	cfg.Worker.Auth.CredentialFile = h.credentialFile(t, "dagu-worker-"+h.machine, h.machine)
+	client, err := worker.NewCoordinatorClient(ctx, &cfg)
+	require.NoError(t, err)
+	_, err = client.Heartbeat(ctx, heartbeat(h.machine))
+	require.NoError(t, err)
+}
+
 func TestWorkerOnTheChannelNeedsItsCredentialAndOneRoute(t *testing.T) {
 	cases := map[string]struct {
 		mutate func(*config.Config)

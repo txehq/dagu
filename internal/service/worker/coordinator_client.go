@@ -59,6 +59,19 @@ func NewCoordinatorClient(ctx context.Context, cfg *config.Config) (coordinator.
 	return coordinator.New(registry, clientConfig), nil
 }
 
+// channelBaseURL is where the hub serves the channel. As for the CLI's --hub, a
+// path names the hub's API root, for a hub with its own base path, and no path
+// means the default one.
+func channelBaseURL(hub *url.URL) string {
+	root := *hub
+	root.Path = strings.TrimRight(hub.Path, "/")
+	if root.Path == "" {
+		root.Path = "/api/v1"
+	}
+	root.Path += workerchannel.MountPath
+	return root.String()
+}
+
 // newChannelClient is the coordinator client over the worker channel. The hub
 // is the only coordinator, and an owner's advertised address is not dialled:
 // every member uses the one connection.
@@ -79,7 +92,7 @@ func newChannelClient(ctx context.Context, cfg *config.Config) (coordinator.Clie
 		return nil, fmt.Errorf("worker.auth.credential_file: %w", err)
 	}
 	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
-		BaseURL:     strings.TrimRight(cfg.Worker.HubURL, "/") + "/api/v1" + workerchannel.MountPath,
+		BaseURL:     channelBaseURL(hub),
 		Credentials: transportauth.NewWorkerCredentials(source),
 	})
 	if err != nil {
