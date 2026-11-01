@@ -108,7 +108,7 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 		return txeDoctorReport(ctx, checks, unfinished)
 	}
 	health, err := client.Health(ctx)
-	if !add("hub", err, "", "check that the tunnel to the hub is running") {
+	if !add("hub", err, "", "check this machine's route to the hub: the tunnel, or the worker channel's address") {
 		return txeDoctorReport(ctx, checks, unfinished)
 	}
 	checks[len(checks)-1].Detail = fmt.Sprintf("%s, build %s", health.Status, health.Version)

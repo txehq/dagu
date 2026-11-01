@@ -112,7 +112,6 @@ fi
 # nothing; the built binary checks it again below, as the worker will load it.
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
-[ -z "$hub_url" ] || [ -n "$credential" ] || die "--hub-url needs a machine credential: run \`dagu txe enrol\` first, or give --credential-file"
 
 # Binary: built from the tag, kept beside every earlier version.
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
@@ -143,6 +142,14 @@ fi
 ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
 link_dagu_on_path
+
+# enrol needs this binary and machine.json, so a machine with no credential yet stops here,
+# with neither running. There is nothing to roll back.
+if [ -n "$hub_url" ] && [ -z "$credential" ]; then
+  printf 'prepared %s (%s): no agent was started\n  machine %s\n  owner   %s\n' "$version" "$tag" "$machine_id" "$owner_id"
+  printf 'next:\n  dagu txe login --hub %s\n  dagu txe machine create\n  dagu txe enrol --client-id <this machine'"'"'s worker client> --wait 15m\n  run this install again with --hub-url\n' "$hub_url"
+  exit 0
+fi
 
 if [ -z "$hub_url" ]; then
   kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
