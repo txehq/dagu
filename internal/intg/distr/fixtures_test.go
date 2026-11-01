@@ -55,6 +55,8 @@ type fixtureConfig struct {
 	staleLeaseThreshold     time.Duration
 	zombieDetectionInterval time.Duration
 	transportAuth           *transportAuthConfig
+	// workerChannel, when set, makes the workers' client: the worker channel.
+	workerChannel func(testing.TB, *test.Coordinator) (coordinator.Client, string)
 }
 
 // transportAuthConfig makes the coordinator authenticate its callers: the
@@ -239,10 +241,18 @@ func newTestFixture(t *testing.T, yaml string, opts ...fixtureOption) *testFixtu
 		f.workerClient = coord.GetCoordinatorClientWithCredentials(t, cfg.transportAuth.worker)
 	}
 
+	var channelWorkerID string
+	if cfg.workerChannel != nil {
+		f.workerClient, channelWorkerID = cfg.workerChannel(t, coord)
+	}
+
 	for i := range cfg.workerCount {
 		workerID := fmt.Sprintf("worker-%d", i+1)
 		if cfg.transportAuth != nil && cfg.transportAuth.workerID != "" {
 			workerID = cfg.transportAuth.workerID
+		}
+		if channelWorkerID != "" {
+			workerID = channelWorkerID
 		}
 		w := f.setupWorkerMode(workerID, cfg.workerLabels, cfg.workerBaseConfigPath, cfg.isolatedWorker, nil)
 		f.workers = append(f.workers, w)
