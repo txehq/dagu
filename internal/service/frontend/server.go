@@ -148,6 +148,11 @@ func WithListener(l net.Listener) ServerOption {
 	}
 }
 
+// WithRoutes registers additional routes, as RegisterRoutes does.
+func WithRoutes(fn RouteRegistrar) ServerOption {
+	return func(srv *Server) { srv.RegisterRoutes(fn) }
+}
+
 // WithLicenseManager sets the license manager for feature gating.
 func WithLicenseManager(m *license.Manager) ServerOption {
 	return func(s *Server) {

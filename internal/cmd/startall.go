@@ -195,6 +195,14 @@ func runStartAll(ctx *Context, _ []string) error {
 		logger.Info(serviceCtx, "Coordinator disabled via configuration")
 	}
 
+	if ctx.Config.Coordinator.WorkerChannel.Enabled {
+		routes, err := workerChannelRoutes(serviceCtx, ctx.Config, coord)
+		if err != nil {
+			return fmt.Errorf("failed to initialize the worker channel: %w", err)
+		}
+		server.RegisterRoutes(routes)
+	}
+
 	// Persist monitor boundaries before any bundled service can emit DAG-run events.
 	if err := scheduler.BootstrapMonitors(serviceCtx); err != nil {
 		return fmt.Errorf("failed to bootstrap monitors: %w", err)

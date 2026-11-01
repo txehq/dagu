@@ -393,6 +393,15 @@ type CoordinatorDef struct {
 	Advertise  string `mapstructure:"advertise"` // Auto-detected if empty
 	Port       int    `mapstructure:"port"`
 	HealthPort int    `mapstructure:"health_port"`
+
+	WorkerChannel *CoordinatorWorkerChannelDef `mapstructure:"worker_channel"`
+}
+
+// CoordinatorWorkerChannelDef configures the route that carries workers' calls
+// over HTTPS.
+type CoordinatorWorkerChannelDef struct {
+	Enabled         bool  `mapstructure:"enabled"`
+	MaxRequestBytes int64 `mapstructure:"max_request_bytes"`
 }
 
 // WorkerDef configures the worker.

@@ -150,3 +150,10 @@ func TestLoad_ACoordinatorOnItsOwnRefusesOwners(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerChannelIsOffUnlessEnabled(t *testing.T) {
+	assert.Equal(t, CoordinatorWorkerChannel{}, loadFromYAML(t, "coordinator:\n  port: 50055\n").Coordinator.WorkerChannel)
+
+	cfg := loadFromYAML(t, "coordinator:\n  worker_channel:\n    enabled: true\n    max_request_bytes: 1048576\n")
+	assert.Equal(t, CoordinatorWorkerChannel{Enabled: true, MaxRequestBytes: 1 << 20}, cfg.Coordinator.WorkerChannel)
+}

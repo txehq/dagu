@@ -9,10 +9,12 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path"
 	"sync"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/go-chi/chi/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -91,6 +93,13 @@ func NewHandler(cfg Config) (*Handler, error) {
 	}
 	h.addMethods(cfg.Coordinator, cfg.Health)
 	return h, nil
+}
+
+// Mount serves the channel at MountPath under the API's base path, on a router
+// that does not hold the API's own authentication.
+func (h *Handler) Mount(r chi.Router, apiV1BasePath string) {
+	mount := path.Join(apiV1BasePath, MountPath)
+	r.Handle(mount+"/*", http.StripPrefix(mount, h))
 }
 
 // ServeHTTP implements http.Handler. It admits the caller before anything of

@@ -1176,6 +1176,22 @@
       "description": "Coordinator service configuration for distributed execution.",
       "additionalProperties": false,
       "properties": {
+        "worker_channel": {
+          "type": "object",
+          "description": "The route that carries workers' calls over HTTPS, served by start-all. Every call needs a machine credential, whatever the authorization modes say.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Serve the worker channel. It needs txe.authn. Default: false."
+            },
+            "max_request_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Largest single request. It must fit the edge's request body limit. 0 uses the default."
+            }
+          }
+        },
         "enabled": {
           "type": "boolean",
           "description": "Enable the coordinator service for distributed execution. Default: true."
