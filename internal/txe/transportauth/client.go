@@ -77,19 +77,41 @@ func (p *PerRPC) GetRequestMetadata(ctx context.Context, uri ...string) (map[str
 		return nil, status.Error(codes.Unauthenticated,
 			"transportauth: a credential is sent without transport security only to a loopback address")
 	}
+	value, err := p.authorization(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{AuthorizationHeader: value}, nil
+}
+
+// HTTPAuthorization returns the Authorization header value for a request to
+// target, which must be https or a loopback address, as on a gRPC connection.
+func (p *PerRPC) HTTPAuthorization(ctx context.Context, target string) (string, error) {
+	u, err := url.Parse(target)
+	if err != nil {
+		return "", status.Error(codes.Unauthenticated, "transportauth: the target is not a URL")
+	}
+	if u.Scheme != "https" && !allLoopback([]string{target}) {
+		return "", status.Error(codes.Unauthenticated,
+			"transportauth: a credential is sent without transport security only to a loopback address")
+	}
+	return p.authorization(ctx)
+}
+
+func (p *PerRPC) authorization(ctx context.Context) (string, error) {
 	token, err := p.source.Token(ctx)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrRevoked):
-		return nil, status.Error(codes.Unauthenticated, err.Error())
+		return "", status.Error(codes.Unauthenticated, err.Error())
 	case errors.Is(err, ErrProviderUnavailable):
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return "", status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return nil, status.FromContextError(err).Err()
+		return "", status.FromContextError(err).Err()
 	default:
-		return nil, status.Error(codes.Unauthenticated, err.Error())
+		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
-	return map[string]string{AuthorizationHeader: p.scheme + " " + token}, nil
+	return p.scheme + " " + token, nil
 }
 
 // RequireTransportSecurity implements credentials.PerRPCCredentials. It is

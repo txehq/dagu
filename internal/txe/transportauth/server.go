@@ -172,6 +172,10 @@ type ServerConfig struct {
 	Observe func(ctx context.Context, d Decision)
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
+	// MachinesOnly makes a Server for a route that faces the internet: it
+	// enforces whatever Mode says, needs no hub key and holds none, refuses
+	// the hub scheme, and asks a machine's credential even on a public method.
+	MachinesOnly bool
 }
 
 // Format prints the mode and nothing of the hub key, for every verb, for the
@@ -194,6 +198,8 @@ type Server struct {
 	resources ResourceAuthorizer
 	observe   func(context.Context, Decision)
 	now       func() time.Time
+
+	machinesOnly bool
 }
 
 // Format prints the mode and nothing of the hub key, for every verb.
@@ -216,7 +222,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Machines == nil {
 		return nil, errors.New("transportauth: a machine resolver is required")
 	}
-	if len(cfg.HubKey) < MinHubKeyBytes {
+	switch {
+	case cfg.MachinesOnly && cfg.Mode != authz.ModeEnforce:
+		return nil, errors.New("transportauth: a machines-only server enforces; it has no observe mode")
+	case cfg.MachinesOnly && len(cfg.HubKey) != 0:
+		return nil, errors.New("transportauth: a machines-only server holds no hub key")
+	case !cfg.MachinesOnly && len(cfg.HubKey) < MinHubKeyBytes:
 		return nil, fmt.Errorf("transportauth: the hub key must be at least %d bytes", MinHubKeyBytes)
 	}
 	now := cfg.Now
@@ -231,7 +242,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		resources: cfg.Resources,
 		observe:   cfg.Observe,
 		now:       now,
+
+		machinesOnly: cfg.MachinesOnly,
 	}, nil
+}
+
+// MachinesOnly reports whether the Server was built for a route that faces the
+// internet.
+func (s *Server) MachinesOnly() bool { return s.machinesOnly }
+
+// Admit authenticates a call before anything of its request is read. The
+// interceptors still decide the call: they are the only ones that see the
+// request.
+func (s *Server) Admit(ctx context.Context, method string) (Caller, error) {
+	return s.admit(ctx, method, nil)
 }
 
 // UnaryInterceptor authenticates each unary call before its handler runs.
@@ -271,7 +295,7 @@ func (s *Server) StreamInterceptor() grpc.StreamServerInterceptor {
 // are checked as they arrive.
 func (s *Server) admit(ctx context.Context, method string, req any) (Caller, error) {
 	surface, known := SurfaceOf(method)
-	if known && surface == SurfacePublic {
+	if known && surface == SurfacePublic && !s.machinesOnly {
 		return Caller{Kind: CallerNone}, nil
 	}
 	decision := Decision{Method: method, Mode: s.mode, Kind: CallerNone}
@@ -311,6 +335,10 @@ func (s *Server) evaluate(ctx context.Context, method string, surface Surface, k
 	}
 
 	if scheme == HubScheme {
+		if s.machinesOnly {
+			d.Reason = ReasonBadHubKey
+			return Caller{}, status.Error(codes.Unauthenticated, "transportauth: a hub key is not accepted here")
+		}
 		if subtle.ConstantTimeCompare([]byte(credential), s.hubKey) != 1 {
 			d.Reason = ReasonBadHubKey
 			return Caller{}, status.Error(codes.Unauthenticated, "transportauth: the hub key is not accepted")
@@ -364,9 +392,17 @@ func (s *Server) checkRequest(ctx context.Context, method string, surface Surfac
 			return status.Error(codes.PermissionDenied, "transportauth: this machine may not use this resource")
 		}
 		return nil
-	case SurfacePublic, SurfaceHub:
-		// Never reached for a machine: public methods are not evaluated and
-		// hub methods are refused before the request is looked at.
+	case SurfacePublic:
+		// Reached only on a machines-only server, which authenticated the
+		// caller; a public method's request says nothing about it.
+		if s.machinesOnly {
+			return nil
+		}
+		d.Reason = ReasonUnknownMethod
+		return status.Error(codes.PermissionDenied, "transportauth: this method is not open to a machine")
+	case SurfaceHub:
+		// Never reached for a machine: hub methods are refused before the
+		// request is looked at.
 		d.Reason = ReasonUnknownMethod
 		return status.Error(codes.PermissionDenied, "transportauth: this method is not open to a machine")
 	default:
