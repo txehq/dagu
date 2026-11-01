@@ -2222,6 +2222,9 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	if convErr != nil {
 		return nil, status.Error(codes.InvalidArgument, "failed to convert status: "+convErr.Error())
 	}
+	if dagRunStatus == nil {
+		return nil, status.Error(codes.InvalidArgument, "status is empty")
+	}
 	if len(dagRunStatus.Labels) == 0 {
 		dagRunStatus.Labels = splitTaskLabels(req.Labels)
 	}

@@ -46,6 +46,9 @@ import (
 const (
 	rigMachine = "mch_RIG"
 	rigToken   = "rig-token"
+	// The other owner's machine, with its own valid credential.
+	rigOtherMachine = "mch_RIGOTHER"
+	rigOtherToken   = "rig-other-token"
 )
 
 func needRealTime(t *testing.T) {
@@ -58,20 +61,23 @@ func needRealTime(t *testing.T) {
 type rigIdentity struct{}
 
 func (rigIdentity) Verify(_ context.Context, token string) (authn.Principal, error) {
-	if token != rigToken {
+	if token != rigToken && token != rigOtherToken {
 		return authn.Principal{}, errors.New("unknown token")
 	}
-	return authn.Principal{Class: authn.ClassWorker, ClientID: rigToken, Expires: time.Now().Add(time.Hour)}, nil
+	return authn.Principal{Class: authn.ClassWorker, ClientID: token, Expires: time.Now().Add(time.Hour)}, nil
 }
 
-func (rigIdentity) ResolveMachine(context.Context, authn.Principal) (authz.Machine, authz.Reason, error) {
+func (rigIdentity) ResolveMachine(_ context.Context, p authn.Principal) (authz.Machine, authz.Reason, error) {
+	if p.ClientID == rigOtherToken {
+		return authz.Machine{MachineID: rigOtherMachine, OwnerID: "own_RIGOTHER", Class: authn.ClassWorker}, "", nil
+	}
 	return authz.Machine{MachineID: rigMachine, OwnerID: "own_RIG", Class: authn.ClassWorker}, "", nil
 }
 
-type rigAuth struct{}
+type rigAuth struct{ token string }
 
-func (rigAuth) HTTPAuthorization(context.Context, string) (string, error) {
-	return "Bearer " + rigToken, nil
+func (a rigAuth) HTTPAuthorization(context.Context, string) (string, error) {
+	return "Bearer " + a.token, nil
 }
 
 // faultProxy forwards TCP to one target until told otherwise.
@@ -257,6 +263,8 @@ func withChannelRig(rig *channelRig) fixtureOption {
 			t.Helper()
 			rig.bind(t, coord)
 			rig.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// A real worker addresses the channel where a hub mounts it.
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api/v1"+workerchannel.MountPath)
 				rig.current.Load().ServeHTTP(w, r)
 			}))
 			t.Cleanup(rig.origin.Close)
@@ -265,7 +273,7 @@ func withChannelRig(rig *channelRig) fixtureOption {
 
 			conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
 				BaseURL:     "http://" + rig.proxy.listener.Addr().String(),
-				Credentials: rigAuth{},
+				Credentials: rigAuth{token: rigToken},
 			})
 			require.NoError(t, err)
 			clientConfig := coordinator.ConfigFromPeer(coord.Config.Core.Peer)

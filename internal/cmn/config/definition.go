@@ -406,10 +406,12 @@ type CoordinatorWorkerChannelDef struct {
 
 // WorkerDef configures the worker.
 type WorkerDef struct {
-	HubURL        string `mapstructure:"hub_url"`
-	ID            string `mapstructure:"id"`
-	MaxActiveRuns int    `mapstructure:"max_active_runs"`
-	HealthPort    int    `mapstructure:"health_port"`
+	HubURL string `mapstructure:"hub_url"`
+	// ArtifactSegmentBytes is the most one artifact stream carries.
+	ArtifactSegmentBytes int64  `mapstructure:"artifact_segment_bytes"`
+	ID                   string `mapstructure:"id"`
+	MaxActiveRuns        int    `mapstructure:"max_active_runs"`
+	HealthPort           int    `mapstructure:"health_port"`
 	// Labels accepts either a string "key=value,key2=value2,..." or map[string]string.
 	// When string, parsed as comma-separated key=value pairs.
 	Labels any `mapstructure:"labels"`
