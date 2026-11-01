@@ -359,8 +359,11 @@ func (j *freezableJob) freezeWith(t *testing.T, worker *osexec.Cmd) frozenGroups
 		if err != nil {
 			return false
 		}
-		group, err = strconv.Atoi(strings.TrimSpace(string(data)))
-		return err == nil && group > 1
+		if group, err = strconv.Atoi(strings.TrimSpace(string(data))); err != nil || group <= 1 {
+			return false
+		}
+		_, err = os.Stat(filepath.Join(j.dir, "ticks"))
+		return err == nil
 	}, distrTestTimeout(30*time.Second), 50*time.Millisecond)
 	frozen := frozenGroups{groups: []int{group, worker.Process.Pid}}
 	t.Cleanup(func() {
