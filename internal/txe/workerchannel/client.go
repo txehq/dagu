@@ -190,7 +190,7 @@ func addClientStream[Req, Res any](c *Conn, procedure string) {
 		callCtx, cancel := context.WithTimeout(ctx, c.limits.Stream+5*time.Second) //nolint:gosec // cancelled by RecvMsg, or by its own timeout
 		stream := client.CallClientStream(callCtx)
 		stream.RequestHeader().Set("Authorization", authorization)
-		return &clientStream[Req, Res]{ctx: ctx, cancel: cancel, stream: stream, limit: c.limits.MaxRequestBytes}, nil
+		return &clientStream[Req, Res]{ctx: ctx, cancel: cancel, stream: stream, limit: c.limits.MaxRequestBytes, closed: make(chan struct{})}, nil
 	}
 }
 
@@ -214,6 +214,11 @@ type clientStream[Req, Res any] struct {
 	sent     int64
 	refused  error
 	received bool
+
+	closing sync.Once
+	closed  chan struct{}
+	reply   *connect.Response[Res]
+	err     error
 }
 
 func (s *clientStream[Req, Res]) Header() (metadata.MD, error) { return nil, nil }
@@ -246,9 +251,19 @@ func (s *clientStream[Req, Res]) SendMsg(m any) error {
 // envelopeBytes is the Connect envelope around a stream's message.
 const envelopeBytes = 5
 
-// CloseSend is part of CloseAndRecv: closing and reading the reply are one
-// step of the Connect client.
-func (s *clientStream[Req, Res]) CloseSend() error { return nil }
+// CloseSend ends the request. Closing and reading the reply are one step of the
+// Connect client, so it runs here and RecvMsg reads what came of it: a caller
+// that gives up without reading the reply still frees the hub.
+func (s *clientStream[Req, Res]) CloseSend() error {
+	s.closing.Do(func() {
+		go func() {
+			defer close(s.closed)
+			defer s.cancel()
+			s.reply, s.err = s.stream.CloseAndReceive()
+		}()
+	})
+	return nil
+}
 
 // RecvMsg ends the stream and reads its one reply.
 func (s *clientStream[Req, Res]) RecvMsg(m any) error {
@@ -258,15 +273,15 @@ func (s *clientStream[Req, Res]) RecvMsg(m any) error {
 		return io.EOF
 	}
 	s.received = true
-	defer s.cancel()
 	if s.refused != nil {
 		return s.refused
 	}
-	resp, err := s.stream.CloseAndReceive()
-	if err != nil {
-		return callError(s.ctx, err)
+	_ = s.CloseSend()
+	<-s.closed
+	if s.err != nil {
+		return callError(s.ctx, s.err)
 	}
 	proto.Reset(m.(proto.Message))
-	proto.Merge(m.(proto.Message), any(resp.Msg).(proto.Message))
+	proto.Merge(m.(proto.Message), any(s.reply.Msg).(proto.Message))
 	return nil
 }

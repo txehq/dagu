@@ -404,6 +404,22 @@ func TestClientStreamCarriesEveryChunk(t *testing.T) {
 	assert.Equal(t, machineA, machine)
 }
 
+// An uploader that gives up closes the sending side and reads no reply.
+func TestAnAbandonedStreamFreesItsCall(t *testing.T) {
+	limits := workerchannel.DefaultLimits()
+	limits.MaxCallsPerMachine = 1
+	h := newHarness(t, limits)
+	client := h.client(t, tokenA)
+	stream, err := client.StreamLogs(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(chunk(machineA)))
+	require.NoError(t, stream.CloseSend())
+	require.Eventually(t, func() bool {
+		_, err := client.Heartbeat(context.Background(), heartbeat(machineA))
+		return err == nil
+	}, 3*time.Second, 20*time.Millisecond)
+}
+
 func TestEveryChunkIsChecked(t *testing.T) {
 	h := newHarness(t, workerchannel.Limits{})
 	var seen atomic.Int64
