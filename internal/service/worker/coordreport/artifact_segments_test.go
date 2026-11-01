@@ -33,6 +33,7 @@ type segmentHub struct {
 	held      bytes.Buffer
 	streams   [][]*coordinatorv1.ArtifactChunk
 	failClose map[int]error // by stream index, once
+	loseAck   map[int]bool  // takes the stream, then loses its reply
 	wrongAck  bool
 	commits   int
 	sawFinal  bool
@@ -73,6 +74,10 @@ func (s *segmentStream) CloseAndRecv() (*coordinatorv1.StreamArtifactsResponse, 
 			s.hub.sawFinal = true
 			s.hub.commits++
 		}
+	}
+	if s.hub.loseAck[s.index] {
+		delete(s.hub.loseAck, s.index)
+		return nil, status.Error(codes.Unavailable, "lost")
 	}
 	if s.hub.knowsThem {
 		offset := uint64(s.hub.held.Len())
@@ -188,4 +193,15 @@ func TestALostAcknowledgmentStartsTheFileAgain(t *testing.T) {
 		}
 	}
 	assert.True(t, restarted)
+}
+
+// The hub keeps two segments and the reply to the second is lost. The upload
+// starts again at byte zero while the hub holds more than that, and it must
+// finish, not stop at the first acknowledgment that runs ahead of it.
+func TestAReplayBehindWhatTheHubHoldsFinishes(t *testing.T) {
+	content := strings.Repeat("0123456789", 3)
+	hub := &segmentHub{limit: 10, knowsThem: true, loseAck: map[int]bool{1: true}}
+	require.NoError(t, uploaderFor(hub).UploadDir(context.Background(), dirWith(t, map[string]string{"big.bin": content})))
+	assert.Equal(t, content, hub.held.String())
+	assert.Equal(t, 1, hub.commits)
 }

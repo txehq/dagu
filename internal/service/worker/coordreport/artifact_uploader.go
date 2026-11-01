@@ -299,8 +299,8 @@ func (u *ArtifactUploader) segmentBytes() int64 {
 }
 
 // uploadSegmented sends a file that one stream cannot carry. Each stream must
-// be acknowledged exactly before the next: the final chunk is sent only to a hub
-// that has said it holds every byte, so a hub that does not know this form
+// be acknowledged before the next: the final chunk is sent only to a hub that
+// has said it holds every byte, so a hub that does not know this form
 // commits nothing. Any failure starts the file again from its first byte, and
 // the hub keeps what it already holds by comparing it. A file changed during
 // the upload fails its digest.
@@ -329,7 +329,10 @@ func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, a
 		if !resp.HasCommittedOffset() {
 			return fmt.Errorf("upload artifact %s: this hub does not accept segmented uploads", relPath)
 		}
-		if resp.GetCommittedOffset() != offset {
+		// Ahead is fine: after a lost acknowledgment the hub already holds more
+		// than this replay has reached, and it compared what was sent. The
+		// final chunk's size and digest settle the whole file.
+		if resp.GetCommittedOffset() < offset {
 			return fmt.Errorf("upload artifact %s: the hub holds %d of %d bytes", relPath, resp.GetCommittedOffset(), offset)
 		}
 		return nil

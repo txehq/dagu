@@ -101,7 +101,7 @@ Cloudflare's published limits: proxy read 125 s, proxy write 30 s, proxy idle 90
 
 A segmented upload adds `byte_offset`, `total_size` and `sha256` to `ArtifactChunk` and `committed_offset` to its reply, all with numbers from 1001, clear of upstream's. The rules:
 
-- **Presence, not zero.** `committed_offset` is an explicit `optional`, so 0 and absent differ on the wire. The worker sends the next stream only after the hub has acknowledged exactly what was sent. A file never goes as a segmented upload unless it exceeds a stream, so an empty file and a small one keep the form every hub knows.
+- **Presence, not zero.** `committed_offset` is an explicit `optional`, so 0 and absent differ on the wire. The worker sends the next stream only after the hub has acknowledged at least what was sent. Ahead is expected after a lost acknowledgment: the hub compared the replay, and the final chunk settles the exact size. A file never goes as a segmented upload unless it exceeds a stream, so an empty file and a small one keep the form every hub knows.
 - **Binding.** Segments wait in `.dagu-artifact-segments/<hash>/` inside the attempt's archive. The hash covers attempt key, worker, job, run, root, attempt, execution marker, and the authenticated machine and owner. Listings leave that directory out.
 - **Before any write.** Each chunk validates the attempt under its write lock, so an expired or superseded attempt changes nothing.
 - **Exact bytes.** An offset past the end is refused. Bytes the hub already holds are compared: a match is a repeat after a lost acknowledgment, and a mismatch is refused.
