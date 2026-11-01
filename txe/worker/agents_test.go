@@ -374,3 +374,69 @@ func TestInstallRefusesBothCredentialFlags(t *testing.T) {
 		assert.True(t, os.IsNotExist(statErr), "nothing was created")
 	}
 }
+
+func hubAgents(t *testing.T, hub string) (string, map[string]any) {
+	t.Helper()
+	script := agentsScript(t)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "com.txe.dagu.tunnel.plist"), []byte("left by an earlier install"), 0o600))
+	_, stderr, err := python(t, script, "write", dir, "/home/txe", "", agentsMachine, agentsOwner,
+		"/usr/bin:/bin", "com.txe.dagu.tunnel", "com.txe.dagu.worker", "dagu", "svc/dagu", "18080", "50055",
+		"/home/txe/worker-credential.json", "/usr/bin/python3", hub)
+	require.NoError(t, err, stderr)
+	dump, stderr, err := python(t, "-c", `import json, plistlib, sys; print(json.dumps(plistlib.load(open(sys.argv[1], "rb"))))`,
+		filepath.Join(dir, "com.txe.dagu.worker.plist"))
+	require.NoError(t, err, stderr)
+	var worker map[string]any
+	require.NoError(t, json.Unmarshal([]byte(dump), &worker))
+	return dir, worker
+}
+
+// On the worker channel nothing of the cluster is left on this machine.
+func TestAgentsOnTheChannelHaveNoTunnel(t *testing.T) {
+	dir, worker := hubAgents(t, "https://hub.example")
+	arguments := worker["ProgramArguments"].([]any)
+	assert.Contains(t, arguments, "--worker.hub-url")
+	assert.Contains(t, arguments, "https://hub.example")
+	assert.NotContains(t, arguments, "--worker.coordinators")
+	_, err := os.Stat(filepath.Join(dir, "com.txe.dagu.tunnel.plist"))
+	assert.True(t, os.IsNotExist(err), "an earlier tunnel agent is gone")
+
+	stdout, _, err := python(t, agentsScript(t), "hub-url", filepath.Join(dir, "com.txe.dagu.worker.plist"))
+	require.NoError(t, err)
+	assert.Equal(t, "https://hub.example\n", stdout)
+}
+
+func TestHubURLCheck(t *testing.T) {
+	script := agentsScript(t)
+	for _, good := range []string{"https://hub.example", "https://hub.example:8443/rest", "http://127.0.0.1:18080"} {
+		_, stderr, err := python(t, script, "check-hub-url", good)
+		require.NoError(t, err, "%s: %s", good, stderr)
+	}
+	for _, bad := range []string{"http://hub.example", "ftp://127.0.0.1", "https://user:pw@hub.example",
+		"https://hub.example?x=1", "https://hub.example#f", "hub.example", "https://", "http://127.0.0.1.hub.example"} {
+		_, _, err := python(t, script, "check-hub-url", bad)
+		assert.Error(t, err, bad)
+	}
+}
+
+// An engineer's machine has neither: it gets as far as the credential.
+func TestInstallOnTheChannelNeedsACredentialAndNoKubectl(t *testing.T) {
+	agentsScript(t)
+	install, err := filepath.Abs("install.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	home := t.TempDir()
+	run := func(args ...string) string {
+		cmd := exec.Command(bash, append([]string{install, "--tag", "txe-v2.18.2-19"}, args...)...)
+		cmd.Env = []string{"HOME=" + home, "TXE_DAGU_HOME=" + filepath.Join(home, "txe"), "PATH=/usr/bin:/bin"}
+		var errOut bytes.Buffer
+		cmd.Stderr = &errOut
+		require.Error(t, cmd.Run(), args)
+		return errOut.String()
+	}
+	assert.Contains(t, run("--hub-url", "https://hub.example", "--no-credential"), "needs a machine credential")
+	assert.Contains(t, run("--hub-url", "http://hub.example"), "fix --hub-url")
+	assert.NotContains(t, run("--hub-url", "https://hub.example"), "kubectl is not on PATH")
+}

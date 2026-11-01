@@ -14,7 +14,7 @@ Run by install-systemd.sh and uninstall-systemd.sh with `python3 -I`; it reads n
 
 The machine credential itself is checked by agents.py check-credential, shared with macOS.
 """
-import os, sys
+import contextlib, os, sys
 
 CREDENTIAL_ENV = "DAGU_WORKER_AUTH_CREDENTIAL_FILE"
 
@@ -48,8 +48,9 @@ def _unit(description, argv, environment, log):
 
 
 def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, worker_unit,
-                namespace, service, ui_port, coord_port, credential_file):
-    for name, value in (("the TXE home", home), ("kubectl", kubectl)):
+                namespace, service, ui_port, coord_port, credential_file, hub_url=""):
+    checked = (("the TXE home", home),) if hub_url else (("the TXE home", home), ("kubectl", kubectl))
+    for name, value in checked:
         if not os.path.isabs(value):
             raise ValueError(f"{name} must be an absolute path for a unit, got {value!r}")
     tunnel = _unit("TXE Dagu tunnel to the hub (kubectl port-forward, loopback only)", [
@@ -63,9 +64,15 @@ def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, w
         f"{home}/bin/dagu", "worker",
         "--worker.id", machine_id,
         "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
-        "--worker.coordinators", f"127.0.0.1:{coord_port}"], environment, f"{home}/logs/worker.log")
+        *(["--worker.hub-url", hub_url] if hub_url else ["--worker.coordinators", f"127.0.0.1:{coord_port}"])],
+        environment, f"{home}/logs/worker.log")
     os.makedirs(units, exist_ok=True)
-    for name, body in ((tunnel_unit, tunnel), (worker_unit, worker)):
+    # On the worker channel there is no tunnel, and a tunnel left behind would keep a
+    # Kubernetes credential in use.
+    if hub_url:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(units, tunnel_unit))
+    for name, body in (((worker_unit, worker),) if hub_url else ((tunnel_unit, tunnel), (worker_unit, worker))):
         target = os.path.join(units, name)
         tmp = target + ".tmp"
         with open(tmp, "w") as f:
@@ -89,7 +96,7 @@ def unit_credential(unit_file):
 
 
 def main(argv):
-    if len(argv) == 14 and argv[0] == "write":
+    if len(argv) in (14, 15) and argv[0] == "write":
         try:
             write_units(*argv[1:])
         except ValueError as e:

@@ -41,11 +41,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=txe/worker/lib.sh
 . "$here/lib.sh"
 
-tag="" owner_id="" credential="" credential_given=0
+tag="" owner_id="" credential="" credential_given=0 hub_url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:-}"; shift 2 ;;
     --owner-id) owner_id="${2:-}"; shift 2 ;;
+    --hub-url) hub_url="${2:-}"; [ -n "$hub_url" ] || die "--hub-url needs the hub's https address"; shift 2 ;;
     --credential-file)
       [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
       [ "$credential_given" != none ] || die "--credential-file and --no-credential cannot both be given"
@@ -61,7 +62,14 @@ done
 version="${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}"
 [ -z "$owner_id" ] || [[ "$owner_id" =~ ^own_[0-9A-HJKMNP-TV-Z]{26}$ ]] || die "--owner-id must be own_<ULID>"
 
-kubectl_bin="$(command -v kubectl)" || die "kubectl is not on PATH"
+# On the worker channel this machine needs no cluster access at all.
+if [ -n "$hub_url" ]; then
+  [ "$credential_given" != none ] || die "--hub-url needs a machine credential: --no-credential cannot be given with it"
+  python3 -I "$here/agents.py" check-hub-url "$hub_url" || die "not installing: fix --hub-url"
+  kubectl_bin=""
+else
+  kubectl_bin="$(command -v kubectl)" || die "kubectl is not on PATH"
+fi
 command -v go >/dev/null || die "go is not on PATH"
 
 umask 077
@@ -104,6 +112,7 @@ fi
 # nothing; the built binary checks it again below, as the worker will load it.
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
+[ -z "$hub_url" ] || [ -n "$credential" ] || die "--hub-url needs a machine credential: run \`dagu txe enrol\` first, or give --credential-file"
 
 # Binary: built from the tag, kept beside every earlier version.
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
@@ -135,8 +144,10 @@ ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
 link_dagu_on_path
 
-kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
-[ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
+if [ -z "$hub_url" ]; then
+  kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
+  [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
+fi
 
 # The tunnel supervisor (TXE-5398) runs from TXE_DAGU_HOME, never from a worktree, with
 # the interpreter python3 resolves to now: a version manager's shim needs an environment
@@ -154,14 +165,21 @@ mv -f "$TXE_DAGU_HOME/bin/logpipe.py.next" "$TXE_DAGU_HOME/bin/logpipe.py"
 mkdir -p "$TXE_DAGU_AGENTS_DIR"
 python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
-  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin"
+  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url"
 
-for label in "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL"; do
+labels=("$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL")
+if [ -n "$hub_url" ]; then
+  labels=("$TXE_DAGU_WORKER_LABEL")
+  # agents.py removed its file: stop a tunnel an earlier install left running.
+  launchctl bootout "gui/$(id -u)/$TXE_DAGU_TUNNEL_LABEL" 2>/dev/null || true
+fi
+for label in "${labels[@]}"; do
   # Waits for launchd to finish removing the old agent before loading the new one
   # (TXE-4185); fails naming the label rather than leaving it unloaded.
   launchd_reload "$label" "$TXE_DAGU_AGENTS_DIR/$label.plist"
 done
 
+[ -z "$hub_url" ] || printf 'worker channel: %s (no tunnel, no kubectl)\n' "$hub_url"
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
   "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"
 if [ "$credential_given" = none ] && [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then

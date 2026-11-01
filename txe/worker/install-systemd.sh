@@ -37,11 +37,12 @@ case "$TXE_DAGU_HOME" in /*) ;; *) TXE_DAGU_HOME="$PWD/$TXE_DAGU_HOME" ;; esac
 TXE_DAGU_TUNNEL_UNIT="txe-dagu-tunnel.service"
 TXE_DAGU_WORKER_UNIT="txe-dagu-worker.service"
 
-tag="" owner_id="" credential="" credential_given=0
+tag="" owner_id="" credential="" credential_given=0 hub_url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:-}"; shift 2 ;;
     --owner-id) owner_id="${2:-}"; shift 2 ;;
+    --hub-url) hub_url="${2:-}"; [ -n "$hub_url" ] || die "--hub-url needs the hub's https address"; shift 2 ;;
     --credential-file)
       [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
       [ "$credential_given" != none ] || die "--credential-file and --no-credential cannot both be given"
@@ -59,7 +60,14 @@ version="${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}"
 [ -z "$owner_id" ] || [[ "$owner_id" =~ ^own_[0-9A-HJKMNP-TV-Z]{26}$ ]] || die "--owner-id must be own_<ULID>"
 
 systemctl_bin="$(command -v systemctl)" || die "systemctl is not on PATH; this install needs systemd"
-kubectl_bin="$(command -v kubectl)" || die "kubectl is not on PATH"
+# On the worker channel this machine needs no cluster access at all.
+if [ -n "$hub_url" ]; then
+  [ "$credential_given" != none ] || die "--hub-url needs a machine credential: --no-credential cannot be given with it"
+  python3 -I "$here/agents.py" check-hub-url "$hub_url" || die "not installing: fix --hub-url"
+  kubectl_bin=""
+else
+  kubectl_bin="$(command -v kubectl)" || die "kubectl is not on PATH"
+fi
 command -v go >/dev/null || die "go is not on PATH"
 
 umask 077
@@ -97,6 +105,7 @@ fi
 
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
+[ -z "$hub_url" ] || [ -n "$credential" ] || die "--hub-url needs a machine credential: run \`dagu txe enrol\` first, or give --credential-file"
 
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
 if [ ! -x "$bin" ]; then
@@ -125,22 +134,30 @@ ln -sfn "dagu-$version" "$TXE_DAGU_HOME/bin/dagu.next"
 mv -f "$TXE_DAGU_HOME/bin/dagu.next" "$TXE_DAGU_HOME/bin/dagu"
 link_dagu_on_path
 
-kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
-[ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
+if [ -z "$hub_url" ]; then
+  kubeconfig="$TXE_DAGU_HOME/tunnel/kubeconfig"
+  [ -f "$kubeconfig" ] || die "no tunnel credential at $kubeconfig; run txe/worker/tunnel-credential.sh first"
+fi
 
 # PATH is the installing shell's, so scheduled scripts find the same tools; nothing else from the
 # environment is copied, and no credential.
 python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
-  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" || die "the units were not written"
+  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$hub_url" || die "the units were not written"
 
+units=("$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT")
+if [ -n "$hub_url" ]; then
+  units=("$TXE_DAGU_WORKER_UNIT")
+  # units.py removed its file: stop a tunnel an earlier install left running.
+  "$systemctl_bin" --user disable --now "$TXE_DAGU_TUNNEL_UNIT" >/dev/null 2>&1 || true
+fi
 "$systemctl_bin" --user daemon-reload
-for unit in "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT"; do
+for unit in "${units[@]}"; do
   "$systemctl_bin" --user enable "$unit" >/dev/null 2>&1 || die "systemctl --user enable $unit failed"
   "$systemctl_bin" --user restart "$unit" || die "systemctl --user restart $unit failed"
 done
 # A unit that exits right after starting (expired kubeconfig, port in use) is a failed install.
-"$here/systemd-wait-active.sh" "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" \
+"$here/systemd-wait-active.sh" "${units[@]}" \
   || die "installed, but a unit is not running; fix it and install again (the units stay installed)"
 
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
@@ -148,7 +165,7 @@ printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credentia
 if [ "$credential_given" = none ] && [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then
   printf '  kept %s; install again without --no-credential to pass it\n' "$TXE_DAGU_HOME/worker-credential.json"
 fi
-for unit in "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT"; do
+for unit in "${units[@]}"; do
   printf '  %s %s\n' "$unit" "$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)"
 done
 linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"

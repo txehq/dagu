@@ -10,6 +10,9 @@ service. Two launchd agents keep it running whether or not a coding session is o
 | `com.txe.dagu.tunnel` | `kubectl port-forward` from `127.0.0.1:18080` to the UI/API and from `127.0.0.1:50055` to the coordinator, using a credential that can only port-forward in `dagu`. It runs under `tunnel/tunnel-supervise.py`, which replaces a forward whose connection is dead (see "Tunnel drop") |
 | `com.txe.dagu.worker` | `dagu worker`. Its id is this machine's `mch_` id, its labels are `txe.machine` and `txe.owner`, and it reaches the coordinator at `127.0.0.1:50055`. Once the machine is enrolled, it presents the machine credential (see "Machine credential") |
 
+
+On the worker channel (`txe/worker/HTTPS-CHANNEL.md`), give `install.sh --hub-url <https address>`, or the same to `install-systemd.sh`. This machine then needs no `kubectl`, no kubeconfig and no tunnel, and a machine credential is required. No tunnel agent is written, and one left by an earlier install is stopped and removed. Installing again without `--hub-url` writes the tunnel back: that is the rollback.
+
 ## Layout
 
 Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
