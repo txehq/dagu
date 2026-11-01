@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,7 +44,9 @@ const (
 	chunkBytes = 1 << 20
 )
 
-var defaultChecks = []string{"unary", "refused", "poll", "bytes16", "bytes31", "over-limit", "gap25", "gap35", "hold", "load"}
+// defaultChecks run cheapest first: on a slow upload the large bodies take the
+// most, and what they cost must not take the rest of the run with it.
+var defaultChecks = []string{"unary", "refused", "poll", "gap25", "gap35", "hold", "load", "bytes16", "bytes31", "over-limit"}
 
 func allChecks() []string {
 	return append(slices.Clone(defaultChecks), "down", "reconnect")
@@ -59,12 +62,28 @@ type clientConfig struct {
 	Pause float64
 	// HTTP stands in for the real transport, for a test.
 	Transport http.RoundTripper
+	// CheckLimit overrides every check's own deadline, for a test.
+	CheckLimit time.Duration
+	// Emit receives each check's start and result as they happen, so that a run
+	// stopped from outside keeps what it measured. Nil keeps them to the return.
+	Emit func(Event)
+}
+
+// Event is a check starting, or its result.
+type Event struct {
+	Event   string `json:"event"`
+	At      string `json:"at"`
+	Check   string `json:"check"`
+	*Result `json:",omitempty"`
 }
 
 // Result is one check's outcome and what it measured.
 type Result struct {
-	Check   string         `json:"check"`
-	Pass    bool           `json:"pass"`
+	Check string `json:"check"`
+	Pass  bool   `json:"pass"`
+	// Skipped says why a check could not be run here. It is neither a pass nor a
+	// failure: nothing was measured.
+	Skipped string         `json:"skipped,omitempty"`
 	Took    string         `json:"took"`
 	Numbers map[string]any `json:"numbers,omitempty"`
 	Detail  string         `json:"detail,omitempty"`
@@ -151,6 +170,8 @@ func (b bearer) HTTPAuthorization(context.Context, string) (string, error) {
 type client struct {
 	cfg  clientConfig
 	wire *wire
+	// uploadRate is the bytes per second the last large body achieved.
+	uploadRate float64
 }
 
 func (c *client) conn(token string, limits workerchannel.Limits) (coordinatorv1.CoordinatorServiceClient, error) {
@@ -197,11 +218,11 @@ type check func(ctx context.Context, c *client, api coordinatorv1.CoordinatorSer
 func checkFor(name string) (check, bool) {
 	checks := map[string]check{
 		"unary": checkUnary, "refused": checkRefused, "poll": checkPoll,
-		"bytes16": func(ctx context.Context, _ *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
-			return streamBytes(ctx, api, 16)
+		"bytes16": func(ctx context.Context, c *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
+			return c.streamBytes(ctx, api, 16)
 		},
-		"bytes31": func(ctx context.Context, _ *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
-			return streamBytes(ctx, api, 31)
+		"bytes31": func(ctx context.Context, c *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
+			return c.streamBytes(ctx, api, 31)
 		},
 		"over-limit": checkOverLimit, "gap25": gapCheck(25 * time.Second), "gap35": gapCheck(35 * time.Second),
 		"hold": checkHold, "load": checkLoad, "down": checkDown, "reconnect": checkReconnect,
@@ -229,22 +250,36 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 	if err != nil {
 		return nil, err
 	}
+	emit := func(event string, name string, result *Result) {
+		if cfg.Emit != nil {
+			cfg.Emit(Event{Event: event, At: time.Now().UTC().Format(time.RFC3339), Check: name, Result: result})
+		}
+	}
 	var results []Result
 	for _, name := range names {
 		run, ok := checkFor(name)
 		if !ok {
 			return results, fmt.Errorf("unknown check %q", name)
 		}
+		emit("start", name, nil)
 		start := time.Now()
-		numbers, err := run(ctx, c, api)
+		var numbers map[string]any
+		var err error
+		reason := c.cannotFit(name)
+		if reason == "" {
+			checkCtx, cancel := context.WithTimeout(ctx, c.limitFor(name))
+			numbers, err = run(checkCtx, c, api)
+			cancel()
+		}
 		counts := c.wire.take()
-		result := Result{Check: name, Pass: err == nil, Took: time.Since(start).Round(time.Millisecond).String(),
+		result := Result{Check: name, Pass: err == nil && reason == "", Skipped: reason, Took: time.Since(start).Round(time.Millisecond).String(),
 			Numbers: numbers, Detail: says(err), HTTP: counts}
 		// A stopped origin and a restart are meant to meet an edge's error page.
 		if counts.Challenges > 0 || (counts.HTML > 0 && name != "down" && name != "reconnect") {
 			result.Pass, result.Detail = false, "an edge answered with a page: "+result.Detail
 		}
 		results = append(results, result)
+		emit("result", name, &result)
 		if c.wire.challenged.Load() {
 			return results, errors.New("stopped at a challenge")
 		}
@@ -253,6 +288,53 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 		}
 	}
 	return results, nil
+}
+
+// limitFor is the most one check may take, whatever is in between. Each is the
+// check's own length and the time for a call to fail. A stream's check is its
+// stream's limit and that time.
+func (c *client) limitFor(name string) time.Duration {
+	if c.cfg.CheckLimit > 0 {
+		return c.cfg.CheckLimit
+	}
+	const failing = 40 * time.Second
+	switch name {
+	case "gap25":
+		return 25*time.Second + failing
+	case "gap35":
+		return 35*time.Second + failing
+	case "load":
+		return loadSeconds*time.Second + c.cfg.Limits.PollWait + failing
+	case "reconnect":
+		return c.cfg.Watch + failing
+	case "poll":
+		return c.cfg.Limits.PollWait + failing
+	case "hold", "bytes16", "bytes31", "over-limit":
+		return c.cfg.Limits.Stream + failing
+	}
+	return failing
+}
+
+// cannotFit says why a large check would be cut by the stream limit at the rate
+// the last one reached, which measures the link and not the channel. It runs
+// only once a rate is known.
+func (c *client) cannotFit(name string) string {
+	var mib int
+	switch name {
+	case "bytes31":
+		mib = 31
+	case "over-limit":
+		mib = int(c.cfg.Limits.MaxRequestBytes/chunkBytes) + 2
+	default:
+		return ""
+	}
+	if c.uploadRate <= 0 {
+		return ""
+	}
+	if needs := time.Duration(float64(mib*chunkBytes) / c.uploadRate * float64(time.Second)); needs >= c.cfg.Limits.Stream {
+		return fmt.Sprintf("%d MiB at %.0f KiB/s needs %s, past the %s stream limit", mib, c.uploadRate/1024, needs.Round(time.Second), c.cfg.Limits.Stream)
+	}
+	return ""
 }
 
 func checkUnary(ctx context.Context, _ *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
@@ -329,36 +411,55 @@ func syntheticChunk(digest interface{ Write([]byte) (int, error) }, size int) (*
 }
 
 func finish(stream artifactStream, want []byte, sent uint64) (map[string]any, error) {
+	numbers := map[string]any{"bytes_sent": sent}
 	reply, err := stream.CloseAndRecv()
 	if err != nil {
-		return nil, err
+		return numbers, err
 	}
-	numbers := map[string]any{"bytes_sent": sent, "bytes_received": reply.BytesWritten, "chunks": reply.ChunksReceived}
-	if reply.BytesWritten != sent || reply.Error != hex.EncodeToString(want) {
+	numbers["bytes_received"], numbers["chunks"] = reply.BytesWritten, reply.ChunksReceived
+	digest, span, _ := strings.Cut(reply.Error, " ")
+	if ms, err := strconv.ParseInt(span, 10, 64); err == nil {
+		// Nothing, on a stream the sender took its time over, means something in
+		// between held the body until it ended.
+		numbers["origin_first_to_last_ms"] = ms
+	}
+	if reply.BytesWritten != sent || digest != hex.EncodeToString(want) {
 		return numbers, finding("the origin did not receive the bytes sent")
 	}
 	return numbers, nil
 }
 
-func streamBytes(ctx context.Context, api coordinatorv1.CoordinatorServiceClient, mib int) (map[string]any, error) {
+// streamBytes reports what it sent and the rate, on a stream that failed too.
+func (c *client) streamBytes(ctx context.Context, api coordinatorv1.CoordinatorServiceClient, mib int) (map[string]any, error) {
 	stream, err := api.StreamArtifacts(ctx)
 	if err != nil {
 		return nil, err
 	}
 	digest := sha256.New()
+	start := time.Now()
 	var sent uint64
+	rated := func(numbers map[string]any) map[string]any {
+		took := time.Since(start)
+		numbers["bytes_sent"], numbers["took_ms"] = sent, took.Milliseconds()
+		if took > 0 {
+			c.uploadRate = float64(sent) / took.Seconds()
+			numbers["upload_kib_s"] = int64(c.uploadRate / 1024)
+		}
+		return numbers
+	}
 	for range mib {
 		chunk, err := syntheticChunk(digest, chunkBytes)
 		if err != nil {
-			return nil, err
+			return rated(map[string]any{}), err
 		}
 		if err := stream.Send(chunk); err != nil {
 			_, recvErr := stream.CloseAndRecv()
-			return nil, errors.Join(err, recvErr)
+			return rated(map[string]any{}), errors.Join(err, recvErr)
 		}
 		sent += chunkBytes
 	}
-	return finish(stream, digest.Sum(nil), sent)
+	numbers, err := finish(stream, digest.Sum(nil), sent)
+	return rated(numbers), err
 }
 
 // checkOverLimit lifts the client's own limit, so that the origin's is what is
@@ -371,12 +472,12 @@ func checkOverLimit(ctx context.Context, c *client, _ coordinatorv1.CoordinatorS
 		return nil, err
 	}
 	over := int(c.cfg.Limits.MaxRequestBytes/chunkBytes) + 2
-	numbers, err := streamBytes(ctx, api, over)
+	numbers, err := c.streamBytes(ctx, api, over)
 	if err == nil {
 		return numbers, finding("the origin took a request over its limit")
 	}
 	code := status.Code(err)
-	numbers = map[string]any{"code": code.String(), "mib_offered": over}
+	numbers["code"], numbers["mib_offered"] = code.String(), over
 	if code != codes.ResourceExhausted {
 		return numbers, finding("over the limit read as " + code.String() + ", not as the channel's size refusal")
 	}

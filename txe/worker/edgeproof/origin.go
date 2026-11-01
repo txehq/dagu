@@ -65,30 +65,43 @@ func (oneToken) ResolveMachine(context.Context, authn.Principal) (authz.Machine,
 // method is unimplemented, so the origin can do nothing but echo sizes.
 type stubCoordinator struct {
 	coordinatorv1.UnimplementedCoordinatorServiceServer
+	log *originLog
 }
 
-func (stubCoordinator) Heartbeat(context.Context, *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
+func (*stubCoordinator) Heartbeat(context.Context, *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
 	return &coordinatorv1.HeartbeatResponse{}, nil
 }
 
-func (stubCoordinator) Poll(ctx context.Context, _ *coordinatorv1.PollRequest) (*coordinatorv1.PollResponse, error) {
+func (*stubCoordinator) Poll(ctx context.Context, _ *coordinatorv1.PollRequest) (*coordinatorv1.PollResponse, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
 
-// StreamArtifacts keeps nothing: it hashes what arrives and says the digest,
-// in the reply's free text.
-func (stubCoordinator) StreamArtifacts(stream coordinatorv1.CoordinatorService_StreamArtifactsServer) error {
+// StreamArtifacts keeps nothing: it hashes what arrives and says, in the reply's
+// free text, the digest and how long passed between the first chunk's arrival
+// and the last's. A proxy that holds a body until it ends makes that span nothing,
+// however long the sender took. An HTTP status cannot show a stream that was cut,
+// because a Connect error travels in the body, so each stream's end is logged.
+func (s *stubCoordinator) StreamArtifacts(stream coordinatorv1.CoordinatorService_StreamArtifactsServer) error {
 	digest := sha256.New()
 	var chunks, written uint64
+	var first, last time.Time
+	span := func() time.Duration { return last.Sub(first) }
 	for {
 		chunk, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			s.log.line("stream complete chunks=%d bytes=%d span=%s", chunks, written, span().Round(time.Millisecond))
 			return stream.SendAndClose(&coordinatorv1.StreamArtifactsResponse{
-				ChunksReceived: chunks, BytesWritten: written, Error: hex.EncodeToString(digest.Sum(nil))})
+				ChunksReceived: chunks, BytesWritten: written,
+				Error: fmt.Sprintf("%s %d", hex.EncodeToString(digest.Sum(nil)), span().Milliseconds())})
 		}
 		if err != nil {
+			s.log.line("stream cut chunks=%d bytes=%d span=%s", chunks, written, span().Round(time.Millisecond))
 			return err
+		}
+		last = time.Now()
+		if first.IsZero() {
+			first = last
 		}
 		_, _ = digest.Write(chunk.Data)
 		chunks++
@@ -129,12 +142,23 @@ func loggedMethod(requestPath string) string {
 	return "other"
 }
 
+// originLog serializes the log's lines.
+type originLog struct {
+	mu  sync.Mutex
+	out io.Writer
+}
+
+func (l *originLog) line(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = fmt.Fprintf(l.out, time.Now().UTC().Format(time.RFC3339)+" "+format+"\n", args...)
+}
+
 // logged writes one line per request, of the method's name, the status, and the
 // time taken. It is written to hold no header, no address and no token. It also
 // bounds the read of every request, a path outside the channel's included; the
 // channel sets its own deadline over this one.
-func logged(out io.Writer, next http.Handler) http.Handler {
-	var mu sync.Mutex
+func logged(log *originLog, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		_ = http.NewResponseController(w).SetReadDeadline(start.Add(originRead))
@@ -145,9 +169,7 @@ func logged(out io.Writer, next http.Handler) http.Handler {
 		if code == 0 {
 			code = http.StatusOK
 		}
-		mu.Lock()
-		defer mu.Unlock()
-		_, _ = fmt.Fprintf(out, "%s %s status=%d took=%s\n", start.UTC().Format(time.RFC3339), loggedMethod(r.URL.Path), code, time.Since(start).Round(time.Millisecond))
+		log.line("%s status=%d took=%s", loggedMethod(r.URL.Path), code, time.Since(start).Round(time.Millisecond))
 	})
 }
 
@@ -159,8 +181,9 @@ func originHandler(cfg originConfig) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	log := &originLog{out: cfg.Log}
 	channel, err := workerchannel.NewHandler(workerchannel.Config{
-		Auth: auth, Coordinator: stubCoordinator{}, Health: health.NewServer(), Limits: cfg.Limits,
+		Auth: auth, Coordinator: &stubCoordinator{log: log}, Health: health.NewServer(), Limits: cfg.Limits,
 	})
 	if err != nil {
 		return nil, err
@@ -168,7 +191,7 @@ func originHandler(cfg originConfig) (http.Handler, error) {
 	mount := path.Join(apiRoot, workerchannel.MountPath)
 	mux := http.NewServeMux()
 	mux.Handle(mount+"/", http.StripPrefix(mount, channel))
-	return logged(cfg.Log, mux), nil
+	return logged(log, mux), nil
 }
 
 func serveOrigin(ctx context.Context, cfg originConfig) error {

@@ -8,10 +8,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	neturl "net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,9 +39,27 @@ func shortLimits() workerchannel.Limits {
 	return limits
 }
 
-func startOrigin(t *testing.T) (*httptest.Server, *bytes.Buffer) {
+// lockedLog is an origin's log, read while the origin may still write it.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(data []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(data)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func startOrigin(t *testing.T) (*httptest.Server, *lockedLog) {
 	t.Helper()
-	log := &bytes.Buffer{}
+	log := &lockedLog{}
 	handler, err := originHandler(originConfig{Token: testToken, Log: log, Limits: shortLimits()})
 	require.NoError(t, err)
 	server := httptest.NewServer(handler)
@@ -59,8 +81,9 @@ func TestEveryCheckPassesAgainstTheRealHandler(t *testing.T) {
 		assert.True(t, result.Pass, "%s: %s", result.Check, result.Detail)
 		assert.Zero(t, result.HTTP.HTML, result.Check)
 	}
-	assert.Contains(t, log.String(), "Heartbeat status=200 ")
-	assert.Contains(t, log.String(), "StreamArtifacts status=200 ")
+	require.Eventually(t, func() bool {
+		return strings.Contains(log.String(), "Heartbeat status=200 ") && strings.Contains(log.String(), "StreamArtifacts status=200 ")
+	}, 5*time.Second, 10*time.Millisecond)
 	assert.NotContains(t, log.String(), testToken)
 	assert.NotContains(t, log.String(), "Bearer")
 	assert.NotContains(t, log.String(), strings.TrimPrefix(server.URL, "http://"), "the log holds no address")
@@ -215,6 +238,127 @@ func TestWhatACallerSendsNeverReachesTheLog(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, response.StatusCode)
 	assert.Contains(t, log.String(), " other status=404 ")
 	assert.NotContains(t, log.String(), "forged")
+}
+
+// bufferingProxy reads a whole request before it forwards any of it, and may
+// read it slowly.
+func bufferingProxy(t *testing.T, target string, bytesPerSecond int) *httptest.Server {
+	t.Helper()
+	address, err := neturl.Parse(target)
+	require.NoError(t, err)
+	forward := httputil.NewSingleHostReverseProxy(address)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body bytes.Buffer
+		buffer := make([]byte, 64<<10)
+		for {
+			n, err := r.Body.Read(buffer)
+			body.Write(buffer[:n])
+			if bytesPerSecond > 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(time.Duration(n) * time.Second / time.Duration(bytesPerSecond)):
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		r.Body, r.ContentLength = io.NopCloser(&body), int64(body.Len())
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy
+}
+
+func TestABufferedStreamShowsInTheOriginsSpan(t *testing.T) {
+	server, log := startOrigin(t)
+	direct := run(t, server.URL, "gap25")
+	require.True(t, direct[0].Pass, direct[0].Detail)
+	assert.GreaterOrEqual(t, direct[0].Numbers["origin_first_to_last_ms"], int64(15))
+
+	held := run(t, bufferingProxy(t, server.URL, 0).URL, "gap25")
+	require.True(t, held[0].Pass, held[0].Detail)
+	assert.LessOrEqual(t, held[0].Numbers["origin_first_to_last_ms"], int64(5), "the body arrived whole")
+	require.Eventually(t, func() bool { return strings.Contains(log.String(), "stream complete chunks=2 bytes=2048") },
+		5*time.Second, 10*time.Millisecond)
+}
+
+func TestASlowUploadReportsItsRateAndSkipsWhatCannotFit(t *testing.T) {
+	server, _ := startOrigin(t)
+	proxy := bufferingProxy(t, server.URL, 2<<20)
+	limits := shortLimits()
+	limits.Stream = time.Second
+	results, err := runChecks(context.Background(), clientConfig{URL: proxy.URL, Token: testToken, Limits: limits, CheckLimit: 3 * time.Second},
+		[]string{"bytes16", "bytes31", "over-limit"})
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	assert.False(t, results[0].Pass, "16 MiB does not fit a second at this rate")
+	assert.NotZero(t, results[0].Numbers["upload_kib_s"])
+	assert.Contains(t, results[1].Skipped, "past the 1s stream limit")
+	assert.False(t, results[1].Pass)
+	assert.Contains(t, results[2].Skipped, "past the 1s stream limit")
+}
+
+func TestAStalledEdgeCannotHoldACheckPastItsDeadline(t *testing.T) {
+	release := make(chan struct{})
+	edge := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(func() { close(release); edge.Close() })
+	start := time.Now()
+	results, err := runChecks(context.Background(), clientConfig{URL: edge.URL, Token: testToken, Limits: shortLimits(), CheckLimit: 300 * time.Millisecond},
+		[]string{"bytes16", "gap25", "unary"})
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	assert.Less(t, time.Since(start), 5*time.Second)
+	for _, result := range results {
+		assert.False(t, result.Pass, result.Check)
+	}
+}
+
+func TestAStopFromOutsideKeepsWhatWasMeasured(t *testing.T) {
+	server, _ := startOrigin(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var events []Event
+	emit := func(event Event) {
+		events = append(events, event)
+		if event.Event == "start" && event.Check == "poll" {
+			cancel()
+		}
+	}
+	_, err := runChecks(ctx, clientConfig{URL: server.URL, Token: testToken, Limits: shortLimits(), Emit: emit}, []string{"unary", "poll", "bytes16"})
+	require.ErrorIs(t, err, context.Canceled)
+	require.GreaterOrEqual(t, len(events), 3)
+	assert.Equal(t, "start", events[0].Event)
+	assert.Equal(t, "result", events[1].Event)
+	assert.True(t, events[1].Pass)
+}
+
+type fullDisk struct{}
+
+func (fullDisk) Write([]byte) (int, error) { return 0, errors.New("no space left") }
+
+func TestAResultThatCannotBeWrittenStopsTheRun(t *testing.T) {
+	server, _ := startOrigin(t)
+	results, err := runAndWrite(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: shortLimits()},
+		[]string{"unary", "poll", "bytes16"}, fullDisk{})
+	require.ErrorContains(t, err, "no space left")
+	assert.LessOrEqual(t, len(results), 1, "nothing goes on measuring what cannot be kept")
+}
+
+func TestACutStreamIsLoggedAsCut(t *testing.T) {
+	limits := shortLimits()
+	limits.Stream = 200 * time.Millisecond
+	log := &lockedLog{}
+	handler, err := originHandler(originConfig{Token: testToken, Log: log, Limits: limits})
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: limits, CheckLimit: 2 * time.Second}, []string{"gap35"})
+	require.NoError(t, err)
+	assert.Equal(t, false, results[0].Numbers["survived"])
+	require.Eventually(t, func() bool { return strings.Contains(log.String(), "stream cut chunks=1 bytes=1024") },
+		5*time.Second, 10*time.Millisecond)
 }
 
 type roundTripper func(*http.Request) (*http.Response, error)
