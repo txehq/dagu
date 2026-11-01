@@ -38,6 +38,7 @@ func NewCoordinatorClient(ctx context.Context, cfg *config.Config) (coordinator.
 
 	clientConfig := coordinator.ConfigFromPeer(cfg.Core.Peer)
 	clientConfig.WorkspaceBundleDir = workspacebundle.StoreDir(cfg.Paths.DataDir)
+	clientConfig.ArtifactSegmentBytes = cfg.Worker.ArtifactSegmentBytes
 	if err := clientConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
 	}
@@ -107,6 +108,9 @@ func newChannelClient(ctx context.Context, cfg *config.Config) (coordinator.Clie
 	clientConfig.WorkspaceBundleDir = workspacebundle.StoreDir(cfg.Paths.DataDir)
 	clientConfig.Connect = func() coordinator.Connection { return conn }
 	clientConfig.ArtifactSegmentBytes = channelSegmentBytes
+	if size := cfg.Worker.ArtifactSegmentBytes; size > 0 {
+		clientConfig.ArtifactSegmentBytes = size
+	}
 	if err := clientConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
 	}

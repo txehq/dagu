@@ -664,9 +664,12 @@ type Worker struct {
 	Labels        map[string]string // Capability matching labels
 	Coordinators  []string          // Static discovery addresses (host:port)
 	HubURL        string            // Hub reached by the worker channel over HTTPS, instead of Coordinators
-	HealthPort    int               // HTTP health check port (default: 8092, 0 disables)
-	PostgresPool  PostgresPoolConfig
-	Auth          WorkerAuth
+	// ArtifactSegmentBytes is the most one artifact stream carries; a larger
+	// upload goes in segments. 0 means the channel's default, and no limit on gRPC.
+	ArtifactSegmentBytes int64
+	HealthPort           int // HTTP health check port (default: 8092, 0 disables)
+	PostgresPool         PostgresPoolConfig
+	Auth                 WorkerAuth
 }
 
 // Proc represents local proc-file heartbeat configuration.

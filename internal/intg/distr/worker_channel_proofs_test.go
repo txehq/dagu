@@ -305,20 +305,33 @@ func TestChannelProofFreezeUnderTheOwnerTimeout(t *testing.T) {
 	assert.Equal(t, rigMachine, final.WorkerID)
 }
 
-// Past the owner timeout: the run is fenced, nothing replays it, and the same
-// worker, resumed, takes the next run with no restart.
+// Past the owner timeout, the worker and its job are frozen together, as on a
+// machine asleep. Resumed, the worker reaches the hub before it counts its owner
+// as lost, so the job carries on and finishes, once. Nothing replays it, and the
+// same worker takes the next run with no restart.
 func TestChannelProofFreezePastTheOwnerTimeout(t *testing.T) {
 	needRealTime(t)
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "started")
 	script := fmt.Sprintf("echo x >> %[1]s.runs\nif [ -f %[1]s ]; then echo again; exit 0; fi\ntouch %[1]s\nsleep 200\necho finished", marker)
-	f, rig, cmd := channelProcessRig(t, script)
-	rig.marker = marker
+	f, _, cmd := channelProcessRig(t, script)
 	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, distrTestTimeout(30*time.Second), 50*time.Millisecond)
 	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGSTOP))
 	t.Logf("rig: frozen for 2m")
 	time.Sleep(2 * time.Minute)
 	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT))
 	t.Logf("rig: resumed")
-	rig.fenced(t, f)
+
+	first := f.waitForStatusIn([]ir.Status{ir.Failed, ir.Aborted, ir.Succeeded}, 5*time.Minute)
+	t.Logf("rig: final status %s, error %q", first.Status, first.Error)
+	assert.Equal(t, ir.Succeeded, first.Status, "the job was frozen with its worker, and finishes")
+	runs, err := os.ReadFile(marker + ".runs")
+	require.NoError(t, err)
+	assert.Equal(t, 1, bytes.Count(runs, []byte("x")), "executed once")
+
+	require.NoError(t, f.enqueue())
+	require.Eventually(t, func() bool {
+		next, err := f.latestStatus()
+		return err == nil && next.DAGRunID != first.DAGRunID && next.Status == ir.Succeeded
+	}, 2*time.Minute, 200*time.Millisecond, "the same worker takes the next run")
 }
