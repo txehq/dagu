@@ -481,6 +481,7 @@ func TestInstallOnTheChannelPreparesAMachineWithNoCredential(t *testing.T) {
 	require.NoError(t, err, string(out))
 	assert.Contains(t, string(out), "no agent was started")
 	assert.Contains(t, string(out), "dagu txe login --hub https://hub.example")
+	assert.Contains(t, string(out), "dagu txe machine create", "enrol refuses a machine the hub does not know")
 	assert.FileExists(t, filepath.Join(txe, "machine.json"))
 	_, err = os.Stat(filepath.Join(home, "Library", "LaunchAgents", "com.txe.dagu.worker.plist"))
 	assert.True(t, os.IsNotExist(err), "no agent was written")

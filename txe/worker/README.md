@@ -32,7 +32,7 @@ dagu txe enrol --client-id <this machine's worker client> --wait 15m            
 txe/worker/install.sh --tag <tag> --hub-url https://<hub>
 ```
 
-To roll back, recreate the context on the port-forward, enrol against it, and install again without `--hub-url`, which writes the tunnel back. That needs `kubectl` and `tunnel-credential.sh`.
+To roll back, the tunnel comes back first, because the old address answers only through it. Run `tunnel-credential.sh`, which needs `kubectl`, and install again without `--hub-url`, which writes the tunnel back and starts the worker on it. Then point the `txe` context at the port-forward as above, and enrol again so that job steps' credential is bound to that address.
 
 ## Layout
 
