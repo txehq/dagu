@@ -11,7 +11,28 @@ service. Two launchd agents keep it running whether or not a coding session is o
 | `com.txe.dagu.worker` | `dagu worker`. Its id is this machine's `mch_` id, its labels are `txe.machine` and `txe.owner`, and it reaches the coordinator at `127.0.0.1:50055`. Once the machine is enrolled, it presents the machine credential (see "Machine credential") |
 
 
-On the worker channel (`txe/worker/HTTPS-CHANNEL.md`), give `install.sh --hub-url <https address>`, or the same to `install-systemd.sh`. This machine then needs no `kubectl`, no kubeconfig and no tunnel, and a machine credential is required. No tunnel agent is written, and one left by an earlier install is stopped and removed. Installing again without `--hub-url` writes the tunnel back: that is the rollback.
+On the worker channel (`txe/worker/HTTPS-CHANNEL.md`), give `install.sh --hub-url <https address>`, or the same to `install-systemd.sh`. This machine then needs no `kubectl`, no kubeconfig and no tunnel. No tunnel agent is written, and one left by an earlier install is stopped and removed.
+
+A new machine:
+
+```sh
+txe/worker/install.sh --tag <tag> --owner-id <own_...> --hub-url https://<hub>   # prepares; nothing starts
+dagu txe login --hub https://<hub>
+dagu txe machine create                                                          # once, by the owner
+dagu txe enrol --client-id <this machine's worker client> --wait 15m
+txe/worker/install.sh --tag <tag> --hub-url https://<hub>                        # the worker starts
+```
+
+A machine moving off the port-forward. Job, probe and reviewer steps reach the hub through this machine's `txe` context, and their credential is bound to that context's address, so the context moves first and enrolment follows it:
+
+```sh
+dagu txe login --hub https://<hub>   # refused while the context names the old address, and prints the
+                                     # exact command that removes it: run that, then sign in again
+dagu txe enrol --client-id <this machine's worker client> --wait 15m             # and the reviewer's, if it has one
+txe/worker/install.sh --tag <tag> --hub-url https://<hub>
+```
+
+To roll back, recreate the context on the port-forward, enrol against it, and install again without `--hub-url`, which writes the tunnel back. That needs `kubectl` and `tunnel-credential.sh`.
 
 ## Layout
 

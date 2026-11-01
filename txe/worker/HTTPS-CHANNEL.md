@@ -154,7 +154,7 @@ One child ticket per PR, all under TXE-5550.
 3. Worker: an opt-in hub URL. Calls go through `Conn`, an owner's advertised address is ignored, and a machine credential is required. Without the option nothing changes, so the port-forward stays as rollback, and old and new workers can run side by side. Adds the rendered-DAG test.
 4. Artifact segments, as above.
 5. Install: no tunnel agent, no `kubectl`, the context points at HTTPS; `status.sh` and `doctor` report the channel.
-6. Worker-side REST: job, probe and reviewer steps stop using local 18080 and present the machine's credential over HTTPS.
+6. Worker-side REST: nothing at runtime names local 18080. Job, probe and reviewer steps use the machine's `txe` context, and their credential is bound to its address, so this is the procedure in `README.md`, not a code change.
 7. Fault rig (below), then `txehq/txe` configuration in its own PR.
 
 Cutover stages, each with its own GO: integration on the rig; review and merge; release tag; hub with the channel enabled and no worker using it; one worker on the channel, port-forward kept; tunnel removed last. Upstream TXE-5506 stays separate: the channel touches the client's connection type, one hub mount and, for artifacts, one additive field. v2.24.0 has the same 23 RPCs, and the new dependency does not conflict with it.

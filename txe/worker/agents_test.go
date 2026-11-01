@@ -457,3 +457,31 @@ func TestInstallOnTheChannelNeedsACredentialAndNoKubectl(t *testing.T) {
 	assert.Contains(t, run("--hub-url", "http://hub.example"), "fix --hub-url")
 	assert.NotContains(t, run("--hub-url", "https://hub.example"), "kubectl is not on PATH")
 }
+
+// enrol needs the binary and machine.json, so a machine with no credential yet
+// is prepared and nothing starts.
+func TestInstallOnTheChannelPreparesAMachineWithNoCredential(t *testing.T) {
+	agentsScript(t)
+	install, err := filepath.Abs("install.sh")
+	require.NoError(t, err)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	home := t.TempDir()
+	txe := filepath.Join(home, "txe")
+	version := "2.18.2-txe.19"
+	require.NoError(t, os.MkdirAll(filepath.Join(txe, "bin"), 0o750))
+	stub := "#!/bin/sh\necho " + version + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(txe, "bin", "dagu-"+version), []byte(stub), 0o700)) //nolint:gosec // a test's stub
+
+	tools := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(tools, "go"), []byte("#!/bin/sh\n"), 0o700)) //nolint:gosec // a test's stub
+	cmd := exec.Command(bash, install, "--tag", "txe-v2.18.2-19", "--owner-id", "own_01M4GBBMJ7A2VKXJGAADCKV7RR", "--hub-url", "https://hub.example")
+	cmd.Env = []string{"HOME=" + home, "TXE_DAGU_HOME=" + txe, "PATH=" + tools + ":/usr/bin:/bin"}
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Contains(t, string(out), "no agent was started")
+	assert.Contains(t, string(out), "dagu txe login --hub https://hub.example")
+	assert.FileExists(t, filepath.Join(txe, "machine.json"))
+	_, err = os.Stat(filepath.Join(home, "Library", "LaunchAgents", "com.txe.dagu.worker.plist"))
+	assert.True(t, os.IsNotExist(err), "no agent was written")
+}
