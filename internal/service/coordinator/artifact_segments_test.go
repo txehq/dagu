@@ -469,3 +469,15 @@ func TestAWrongDigestCommitsNothing(t *testing.T) {
 	_, statErr := os.Stat(filepath.Join(f.archiveDir, "a.bin"))
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
 }
+
+// On the private gRPC path nothing recovers a handler's panic, so an empty
+// status from any caller would take the hub down.
+func TestAnEmptyStatusIsRefusedNotAPanic(t *testing.T) {
+	t.Parallel()
+	store := newMockDAGRunStore()
+	h := NewHandler(HandlerConfig{DAGRunRepository: store.repository})
+	_, err := h.ReportStatus(context.Background(), &coordinatorv1.ReportStatusRequest{
+		WorkerId: "worker-1", Status: &coordinatorv1.DAGRunStatusProto{},
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
+}
