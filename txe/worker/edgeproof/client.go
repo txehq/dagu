@@ -376,8 +376,8 @@ func checkOverLimit(ctx context.Context, c *client, _ coordinatorv1.CoordinatorS
 	}
 	code := status.Code(err)
 	numbers = map[string]any{"code": code.String(), "mib_offered": over}
-	if code == codes.Unavailable || code == codes.Unknown {
-		return numbers, finding("over the limit read as " + code.String() + ", not as the channel's refusal")
+	if code != codes.ResourceExhausted {
+		return numbers, finding("over the limit read as " + code.String() + ", not as the channel's size refusal")
 	}
 	return numbers, nil
 }
@@ -496,6 +496,7 @@ func checkReconnect(ctx context.Context, c *client, api coordinatorv1.Coordinato
 	codesSeen := map[string]int{}
 	for time.Now().Before(deadline) && ctx.Err() == nil {
 		beats++
+		sent := time.Now()
 		_, err := api.Heartbeat(ctx, heartbeat())
 		switch {
 		case err == nil && !down.IsZero():
@@ -505,8 +506,10 @@ func checkReconnect(ctx context.Context, c *client, api coordinatorv1.Coordinato
 		case err != nil:
 			failures++
 			codesSeen[status.Code(err).String()]++
+			// An outage starts when the call that failed was sent, however long
+			// that call took to fail.
 			if down.IsZero() {
-				down = time.Now()
+				down = sent
 			}
 		}
 		c.wait(ctx, time.Second)

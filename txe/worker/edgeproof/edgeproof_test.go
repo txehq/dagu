@@ -6,10 +6,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +28,9 @@ const testToken = "0123456789abcdef0123456789abcdef"
 func shortLimits() workerchannel.Limits {
 	limits := workerchannel.DefaultLimits()
 	limits.PollWait = 300 * time.Millisecond
+	// The load check is compressed here, so its calls overlap far more than
+	// they do at its real rate.
+	limits.MaxCallsPerMachine = 2000
 	return limits
 }
 
@@ -64,6 +69,32 @@ func TestTheOverLimitRefusalIsTheChannels(t *testing.T) {
 	results := run(t, server.URL, "over-limit")
 	require.True(t, results[0].Pass, results[0].Detail)
 	assert.Equal(t, "ResourceExhausted", results[0].Numbers["code"])
+}
+
+func TestOnlyTheSizeRefusalPassesTheOverLimitCheck(t *testing.T) {
+	server, _ := startOrigin(t)
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: strings.Repeat("x", 32), Limits: shortLimits()}, []string{"over-limit"})
+	require.NoError(t, err)
+	assert.False(t, results[0].Pass, "a wrong token is refused for another reason")
+}
+
+func TestAnOutageIsTimedFromTheCallThatFailed(t *testing.T) {
+	server, _ := startOrigin(t)
+	var calls atomic.Int64
+	transport := roundTripper(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			time.Sleep(300 * time.Millisecond)
+			return nil, errors.New("connection stalled")
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: shortLimits(), Pause: 0.001,
+		Watch: 400 * time.Millisecond, Transport: transport}, []string{"reconnect"})
+	require.NoError(t, err)
+	require.True(t, results[0].Pass, results[0].Detail)
+	outage, err := time.ParseDuration(results[0].Numbers["longest_outage"].(string))
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, outage, 300*time.Millisecond)
 }
 
 func TestAStoppedOriginReadsAsUnavailable(t *testing.T) {
