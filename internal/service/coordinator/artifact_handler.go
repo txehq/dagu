@@ -70,6 +70,8 @@ func (h *artifactHandler) handleStream(stream coordinatorv1.CoordinatorService_S
 	var chunksReceived uint64
 	var bytesWritten uint64
 	var validatedIdentity *attemptIdentity
+	var committed uint64
+	var segmented bool
 	activeWriters := make(map[string]*artifactWriter)
 
 	defer func() {
@@ -81,10 +83,14 @@ func (h *artifactHandler) handleStream(stream coordinatorv1.CoordinatorService_S
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
-			return stream.SendAndClose(&coordinatorv1.StreamArtifactsResponse{
+			resp := &coordinatorv1.StreamArtifactsResponse{
 				ChunksReceived: chunksReceived,
 				BytesWritten:   bytesWritten,
-			})
+			}
+			if segmented {
+				resp.SetCommittedOffset(committed)
+			}
+			return stream.SendAndClose(resp)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to receive artifact chunk: %w", err)
@@ -108,6 +114,17 @@ func (h *artifactHandler) handleStream(stream coordinatorv1.CoordinatorService_S
 				}
 				validatedIdentity = &identity
 			}
+		}
+
+		if chunk.HasByteOffset() {
+			if validatedIdentity == nil {
+				return status.Error(codes.FailedPrecondition, "segmented uploads need attempt validation")
+			}
+			if committed, err = h.applySegment(ctx, chunk, *validatedIdentity); err != nil {
+				return err
+			}
+			segmented = true
+			continue
 		}
 
 		if len(chunk.Data) == 0 && !chunk.IsFinal {

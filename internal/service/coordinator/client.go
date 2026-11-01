@@ -459,6 +459,9 @@ func (cli *clientImpl) Poll(ctx context.Context, policy backoff.RetryPolicy, req
 	return task, err
 }
 
+// ArtifactSegmentBytes is the most one artifact stream may carry, or 0.
+func (cli *clientImpl) ArtifactSegmentBytes() int64 { return cli.config.ArtifactSegmentBytes }
+
 // Metrics implements Client.
 func (cli *clientImpl) Metrics() Metrics {
 	cli.stateMu.RLock()

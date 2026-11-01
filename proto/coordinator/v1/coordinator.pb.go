@@ -3437,8 +3437,15 @@ type ArtifactChunk struct {
 	AttemptKey string `protobuf:"bytes,12,opt,name=attempt_key,json=attemptKey,proto3" json:"attempt_key,omitempty"`
 	// Task.execution_marker of the execution that produced the artifact.
 	ExecutionMarker string `protobuf:"bytes,13,opt,name=execution_marker,json=executionMarker,proto3" json:"execution_marker,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Where data belongs in a segmented upload, one that crosses streams. Absent
+	// means the upload lives and ends in this stream.
+	ByteOffset *uint64 `protobuf:"varint,1001,opt,name=byte_offset,json=byteOffset,proto3,oneof" json:"byte_offset,omitempty"`
+	// The whole file's size and hex SHA-256, on the final chunk of a segmented
+	// upload.
+	TotalSize     uint64 `protobuf:"varint,1002,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
+	Sha256        string `protobuf:"bytes,1003,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ArtifactChunk) Reset() {
@@ -3557,6 +3564,27 @@ func (x *ArtifactChunk) GetExecutionMarker() string {
 	return ""
 }
 
+func (x *ArtifactChunk) GetByteOffset() uint64 {
+	if x != nil && x.ByteOffset != nil {
+		return *x.ByteOffset
+	}
+	return 0
+}
+
+func (x *ArtifactChunk) GetTotalSize() uint64 {
+	if x != nil {
+		return x.TotalSize
+	}
+	return 0
+}
+
+func (x *ArtifactChunk) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
 func (x *ArtifactChunk) SetWorkerId(v string) {
 	x.WorkerId = v
 }
@@ -3612,6 +3640,29 @@ func (x *ArtifactChunk) SetExecutionMarker(v string) {
 	x.ExecutionMarker = v
 }
 
+func (x *ArtifactChunk) SetByteOffset(v uint64) {
+	x.ByteOffset = &v
+}
+
+func (x *ArtifactChunk) SetTotalSize(v uint64) {
+	x.TotalSize = v
+}
+
+func (x *ArtifactChunk) SetSha256(v string) {
+	x.Sha256 = v
+}
+
+func (x *ArtifactChunk) HasByteOffset() bool {
+	if x == nil {
+		return false
+	}
+	return x.ByteOffset != nil
+}
+
+func (x *ArtifactChunk) ClearByteOffset() {
+	x.ByteOffset = nil
+}
+
 type ArtifactChunk_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
@@ -3633,6 +3684,13 @@ type ArtifactChunk_builder struct {
 	AttemptKey string
 	// Task.execution_marker of the execution that produced the artifact.
 	ExecutionMarker string
+	// Where data belongs in a segmented upload, one that crosses streams. Absent
+	// means the upload lives and ends in this stream.
+	ByteOffset *uint64
+	// The whole file's size and hex SHA-256, on the final chunk of a segmented
+	// upload.
+	TotalSize uint64
+	Sha256    string
 }
 
 func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
@@ -3652,6 +3710,9 @@ func (b0 ArtifactChunk_builder) Build() *ArtifactChunk {
 	x.OwnerCoordinatorId = b.OwnerCoordinatorId
 	x.AttemptKey = b.AttemptKey
 	x.ExecutionMarker = b.ExecutionMarker
+	x.ByteOffset = b.ByteOffset
+	x.TotalSize = b.TotalSize
+	x.Sha256 = b.Sha256
 	return m0
 }
 
@@ -3661,8 +3722,11 @@ type StreamArtifactsResponse struct {
 	ChunksReceived uint64                 `protobuf:"varint,1,opt,name=chunks_received,json=chunksReceived,proto3" json:"chunks_received,omitempty"`
 	BytesWritten   uint64                 `protobuf:"varint,2,opt,name=bytes_written,json=bytesWritten,proto3" json:"bytes_written,omitempty"`
 	Error          string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// How much of a segmented upload the hub holds durably. A hub that does not
+	// know segmented uploads leaves it unset, and the worker stops.
+	CommittedOffset *uint64 `protobuf:"varint,1001,opt,name=committed_offset,json=committedOffset,proto3,oneof" json:"committed_offset,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StreamArtifactsResponse) Reset() {
@@ -3711,6 +3775,13 @@ func (x *StreamArtifactsResponse) GetError() string {
 	return ""
 }
 
+func (x *StreamArtifactsResponse) GetCommittedOffset() uint64 {
+	if x != nil && x.CommittedOffset != nil {
+		return *x.CommittedOffset
+	}
+	return 0
+}
+
 func (x *StreamArtifactsResponse) SetChunksReceived(v uint64) {
 	x.ChunksReceived = v
 }
@@ -3723,12 +3794,30 @@ func (x *StreamArtifactsResponse) SetError(v string) {
 	x.Error = v
 }
 
+func (x *StreamArtifactsResponse) SetCommittedOffset(v uint64) {
+	x.CommittedOffset = &v
+}
+
+func (x *StreamArtifactsResponse) HasCommittedOffset() bool {
+	if x == nil {
+		return false
+	}
+	return x.CommittedOffset != nil
+}
+
+func (x *StreamArtifactsResponse) ClearCommittedOffset() {
+	x.CommittedOffset = nil
+}
+
 type StreamArtifactsResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	ChunksReceived uint64
 	BytesWritten   uint64
 	Error          string
+	// How much of a segmented upload the hub holds durably. A hub that does not
+	// know segmented uploads leaves it unset, and the worker stops.
+	CommittedOffset *uint64
 }
 
 func (b0 StreamArtifactsResponse_builder) Build() *StreamArtifactsResponse {
@@ -3738,6 +3827,7 @@ func (b0 StreamArtifactsResponse_builder) Build() *StreamArtifactsResponse {
 	x.ChunksReceived = b.ChunksReceived
 	x.BytesWritten = b.BytesWritten
 	x.Error = b.Error
+	x.CommittedOffset = b.CommittedOffset
 	return m0
 }
 
@@ -6521,7 +6611,7 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x12StreamLogsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\xc4\x03\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"\xb4\x04\n" +
 	"\rArtifactChunk\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1c\n" +
 	"\n" +
@@ -6539,11 +6629,19 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x14owner_coordinator_id\x18\v \x01(\tR\x12ownerCoordinatorId\x12\x1f\n" +
 	"\vattempt_key\x18\f \x01(\tR\n" +
 	"attemptKey\x12)\n" +
-	"\x10execution_marker\x18\r \x01(\tR\x0fexecutionMarker\"}\n" +
+	"\x10execution_marker\x18\r \x01(\tR\x0fexecutionMarker\x12%\n" +
+	"\vbyte_offset\x18\xe9\a \x01(\x04H\x00R\n" +
+	"byteOffset\x88\x01\x01\x12\x1e\n" +
+	"\n" +
+	"total_size\x18\xea\a \x01(\x04R\ttotalSize\x12\x17\n" +
+	"\x06sha256\x18\xeb\a \x01(\tR\x06sha256B\x0e\n" +
+	"\f_byte_offset\"\xc3\x01\n" +
 	"\x17StreamArtifactsResponse\x12'\n" +
 	"\x0fchunks_received\x18\x01 \x01(\x04R\x0echunksReceived\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x04R\fbytesWritten\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\x9e\x01\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12/\n" +
+	"\x10committed_offset\x18\xe9\a \x01(\x04H\x00R\x0fcommittedOffset\x88\x01\x01B\x13\n" +
+	"\x11_committed_offset\"\x9e\x01\n" +
 	"\x0fWorkspaceBundle\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x19\n" +
@@ -6877,6 +6975,8 @@ func file_proto_coordinator_v1_coordinator_proto_init() {
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[4].OneofWrappers = []any{}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[19].OneofWrappers = []any{}
 	file_proto_coordinator_v1_coordinator_proto_msgTypes[25].OneofWrappers = []any{}
+	file_proto_coordinator_v1_coordinator_proto_msgTypes[27].OneofWrappers = []any{}
+	file_proto_coordinator_v1_coordinator_proto_msgTypes[28].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

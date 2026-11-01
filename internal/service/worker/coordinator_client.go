@@ -72,6 +72,10 @@ func channelBaseURL(hub *url.URL) string {
 	return root.String()
 }
 
+// channelSegmentBytes is the most an artifact stream carries over the channel,
+// well below workerchannel's request limit.
+const channelSegmentBytes = 16 << 20
+
 // newChannelClient is the coordinator client over the worker channel. The hub
 // is the only coordinator, and an owner's advertised address is not dialled:
 // every member uses the one connection.
@@ -102,6 +106,7 @@ func newChannelClient(ctx context.Context, cfg *config.Config) (coordinator.Clie
 	clientConfig := coordinator.ConfigFromPeer(cfg.Core.Peer)
 	clientConfig.WorkspaceBundleDir = workspacebundle.StoreDir(cfg.Paths.DataDir)
 	clientConfig.Connect = func() coordinator.Connection { return conn }
+	clientConfig.ArtifactSegmentBytes = channelSegmentBytes
 	if err := clientConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
 	}

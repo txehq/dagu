@@ -97,7 +97,27 @@ This is classification, not authenticity. Nothing on the wire proves that a Conn
 
 Cloudflare's published limits: proxy read 125 s, proxy write 30 s, proxy idle 900 s. A stream never idles past 30 s: a log writer closes its stream at each checkpoint, and artifact chunks are sent back to back.
 
-**Artifacts.** Hub artifacts have no size limit today, so a request limit must not become one. A run's artifacts must not fail because they exceed one request. The worker's uploader therefore needs bounded segments, the way logs already work: `ArtifactChunk` gains an optional byte offset, the hub resumes a named temporary file across requests and commits on the final chunk, and the uploader checkpoints below `MaxRequestBytes` and resumes after a failure. It is an additive field and is its own PR. **It is a gate for cutover.** Until it merges, an upload over the request limit fails with `ResourceExhausted`.
+**Artifacts.** Hub artifacts have no size limit today, so a request limit must not become one. Over the channel, a stream carries at most 16 MiB: the uploader rolls streams between files, and a larger file goes as a segmented upload. On gRPC nothing changes.
+
+A segmented upload adds `byte_offset`, `total_size` and `sha256` to `ArtifactChunk` and `committed_offset` to its reply, all with numbers from 1001, clear of upstream's. The rules:
+
+- **Presence, not zero.** `committed_offset` is an explicit `optional`, so 0 and absent differ on the wire. The worker sends the next stream only after the hub has acknowledged at least what was sent. Ahead is expected after a lost acknowledgment: the hub compared the replay, and the final chunk settles the exact size. A file never goes as a segmented upload unless it exceeds a stream, so an empty file and a small one keep the form every hub knows.
+- **Binding.** Segments wait in `.dagu-artifact-segments/<hash>/` inside the attempt's archive. The hash covers attempt key, worker, job, run, root, attempt, execution marker, and the authenticated machine and owner. Listings leave that directory out.
+- **Before any write.** Each chunk validates the attempt under its write lock, so an expired or superseded attempt changes nothing.
+- **Exact bytes.** An offset past the end is refused. Bytes the hub already holds are compared: a match is a repeat after a lost acknowledgment, and a mismatch is refused.
+- **Commit once.** The final chunk is checked against the whole file's size and SHA-256. A wrong one leaves whatever was committed. An identical committed artifact means the final acknowledgment was lost, and it succeeds without touching the file. A different one is another result and is left alone.
+- **Links.** Everything goes through `os.Root`. New files are created exclusively, an existing name must be a regular file and the same file after opening, and a target that is not a regular file is refused.
+- **Cleanup.** A directory goes only when the attempt's own fence refuses the identity recorded in it. Age proves nothing, so anything unreadable or not refused stays, and goes with the archive under retention.
+
+| Worker | Hub | Result |
+|---|---|---|
+| gRPC, any version | any | Unchanged: no offsets, no stream limit |
+| Channel, file within a stream | With segments | Unchanged form |
+| Channel, large file | With segments | Segmented, committed once |
+| Channel, large file | Channel but no segments (never released) | Stops at the first stream, nothing committed, the upload fails truthfully |
+| Old, no offsets | With segments | Unchanged, no `committed_offset` in the reply |
+
+**This is a source claim.** The hub half with channel and no segments is exercised by simulation (`TestAHubThatIgnoresTheOffsetCommitsNothing`, `TestAHubThatDoesNotKnowSegmentsGetsNoFinalChunk`). Real mixed versions are for the rig. A whole-file retry starts again at byte 0, and nothing replays an attempt that is no longer valid.
 
 Logs fit already: a writer retains at most 16 MiB and sends chunks of at most 3 MiB, so a checkpoint is below 32 MiB. If the zone's limit is lower than that, the retained size must follow it.
 
