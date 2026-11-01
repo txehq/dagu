@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -446,4 +447,36 @@ func TestWorkerIdentityMustNameTheEnrolledMachine(t *testing.T) {
 	_, _, err = machineWorkerIdentity(path, "", "h", original)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"os": "linux"}, original, "the configured labels are not changed in place")
+}
+
+func TestWorkerChannelNeedsItsCoordinatorAndProviderSettings(t *testing.T) {
+	cfg := &config.Config{}
+	_, err := workerChannelRoutes(context.Background(), cfg, nil)
+	require.ErrorContains(t, err, "needs the coordinator")
+
+	service, checks := &authTestCoordinator{}, health.NewServer()
+	_, err = newWorkerChannel(context.Background(), cfg, service, checks)
+	require.ErrorContains(t, err, "data directory")
+
+	cfg.Paths.DataDir = t.TempDir()
+	_, err = newWorkerChannel(context.Background(), cfg, service, checks)
+	require.ErrorContains(t, err, "txe.authn is not configured")
+}
+
+// Enabling the channel changes nothing of the coordinator's modes: it creates
+// no hub key, and it is served with both of them off.
+func TestWorkerChannelCreatesNoHubKeyWithTheModesOff(t *testing.T) {
+	h := newAuthTestHub(t, config.TXEAuthzModeEnforce)
+	cfg := *h.cfg
+	cfg.Coordinator.Auth.Mode = config.TXEAuthzModeOff
+	cfg.TXE.Authz.Mode = config.TXEAuthzModeOff
+	cfg.Paths.DataDir = t.TempDir()
+	cfg.Coordinator.Auth.HubKeyFile = filepath.Join(cfg.Paths.DataDir, "coordinator", "hub.key")
+
+	handler, err := newWorkerChannel(context.Background(), &cfg, &authTestCoordinator{}, health.NewServer(),
+		txeauth.WithKeySource(h.provider.keys()))
+	require.NoError(t, err)
+	require.NotNil(t, handler)
+	_, err = os.Stat(cfg.CoordinatorHubKeyFile())
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }

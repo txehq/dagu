@@ -101,6 +101,9 @@ type Caller struct {
 	Machine authz.Machine
 	// Principal is the verified token, for CallerMachine.
 	Principal authn.Principal
+	// PinnedToMachine says the call came by a machines-only route: the
+	// machine gets only what is pinned to it, whatever the hub's modes say.
+	PinnedToMachine bool
 }
 
 type callerKey struct{}
@@ -432,7 +435,7 @@ func (s *Server) machine(ctx context.Context, token string, d *Decision) (Caller
 		return Caller{}, err
 	}
 	d.Kind = CallerMachine
-	return Caller{Kind: CallerMachine, Machine: machine, Principal: principal}, nil
+	return Caller{Kind: CallerMachine, Machine: machine, Principal: principal, PinnedToMachine: s.machinesOnly}, nil
 }
 
 // unexpired refuses a token at or after its expiry, by the clock read now.

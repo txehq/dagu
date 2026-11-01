@@ -42,6 +42,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// MountPath is where the hub serves the channel, under the API's base path. It
+// is outside the API's own authentication: a Handler authenticates every call.
+const MountPath = "/txe/worker-channel"
+
 // Limits bounds what one request may take. The defaults sit below Cloudflare's
 // proxy read timeout of 125 s.
 type Limits struct {

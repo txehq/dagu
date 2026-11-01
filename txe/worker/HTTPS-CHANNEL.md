@@ -1,6 +1,6 @@
 # Worker channel over HTTPS (design)
 
-Status: proposed, TXE-5550. `internal/txe/workerchannel` is a library nothing imports yet. Nothing here is live, and no Cloudflare path has been tried.
+Status: proposed, TXE-5550. The hub can serve the channel behind `coordinator.worker_channel.enabled`, default off. No worker uses it yet. Nothing here is live, and no Cloudflare path has been tried.
 
 ## Why
 
@@ -79,7 +79,7 @@ This is classification, not authenticity. Nothing on the wire proves that a Conn
 - **Admit before read.** A credential is verified, and the enrolment read, before any body byte is read.
 - **Per call and per message.** The existing interceptors run unchanged: worker id and label compared with the enrolled machine, hub-only methods refused, a method nobody listed refused, and each stream message checked, with the enrolment re-read at most every second.
 - **Attempts.** A worker id is proved to belong to the machine, and the handler's existing checks tie a lease, claim, attempt and secret reference to that worker id. Nothing new is needed there.
-- **Machine pinning: a gap to close before wiring.** `Handler.machinePinning` comes from `txe.authz.mode`, so under off a task with no machine selector could go to any machine that polls. The hub wiring must make pinning `enforce` for every call that arrived on this route, in `Poll` and `ClaimAgentSessionCleanup`, whatever the mode.
+- **Machine pinning.** `Handler.machinePinning` follows `txe.authz.mode`, so under off a task with no machine selector could go to any machine that polls on gRPC. A call on this route carries `Caller.PinnedToMachine`, and `Poll` and `ClaimAgentSessionCleanup` use enforce pinning for it whatever the mode. A task with no machine selector is never handed over this route.
 - **TXE-4228** is not a dependency. Hub-only `state`, sub-DAG and bundle calls are refused on the channel exactly as under enforce. TXE job DAGs are command chains and do not make them.
 
 ## Bounds

@@ -67,6 +67,12 @@ func NewService(
 	}
 }
 
+// Handler is the service the coordinator's gRPC server runs.
+func (srv *Service) Handler() *Handler { return srv.handler }
+
+// Health is the health service the coordinator's gRPC server runs.
+func (srv *Service) Health() grpc_health_v1.HealthServer { return srv.grpcHealthServer }
+
 // DisableHealthServer disables the dedicated HTTP health check server.
 func (srv *Service) DisableHealthServer() {
 	srv.disableHealthServer = true

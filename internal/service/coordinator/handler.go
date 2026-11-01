@@ -460,7 +460,11 @@ func (h *Handler) Poll(ctx context.Context, req *coordinatorv1.PollRequest) (*co
 	if req.PollerId == "" {
 		return nil, status.Error(codes.InvalidArgument, "poller_id is required")
 	}
+	pinning := h.pinningFor(ctx)
 	if h.dispatchTaskStore == nil {
+		if pinning != h.machinePinning {
+			return nil, status.Error(codes.FailedPrecondition, "dispatch task store is not configured")
+		}
 		// Backward-compatible single-coordinator fallback for tests and legacy
 		// in-memory coordination paths.
 		h.mu.Lock()
@@ -503,7 +507,7 @@ func (h *Handler) Poll(ctx context.Context, req *coordinatorv1.PollRequest) (*co
 			Labels:         req.Labels,
 			Owner:          h.owner,
 			ClaimTimeout:   h.staleLeaseThreshold,
-			MachinePinning: h.machinePinning,
+			MachinePinning: pinning,
 		})
 		if err != nil {
 			return nil, status.Error(codes.Internal, "failed to claim task: "+err.Error())
@@ -1693,7 +1697,7 @@ func (h *Handler) ClaimAgentSessionCleanup(
 	// own processes as no machine. A worker id naming another machine, or a
 	// call nobody authenticated, is refused.
 	var mayTakeOver func(string) bool
-	if h.machinePinning == dispatch.MachinePinningEnforce {
+	if h.pinningFor(ctx) == dispatch.MachinePinningEnforce {
 		claimant, err := h.authenticatedCleanupClaimant(ctx, req.WorkerId)
 		if err != nil {
 			return nil, err
@@ -4012,16 +4016,29 @@ func finalizeNotStartedCancellation(ctx context.Context, attempt dagrun.Attempt)
 	return nil
 }
 
+func (h *Handler) caller(ctx context.Context) (transportauth.Caller, bool) {
+	if h.callerFrom != nil {
+		return h.callerFrom(ctx)
+	}
+	return transportauth.CallerFrom(ctx)
+}
+
+// pinningFor is the pinning that holds for this call. A call that came by the
+// worker channel is pinned to its machine whatever the hub's mode: that route
+// faces the internet, and the mode describes the private one.
+func (h *Handler) pinningFor(ctx context.Context) dispatch.MachinePinning {
+	if caller, ok := h.caller(ctx); ok && caller.PinnedToMachine {
+		return dispatch.MachinePinningEnforce
+	}
+	return h.machinePinning
+}
+
 // authenticatedCleanupClaimant is the machine a cleanup claim is made by,
 // from the caller the transport authenticated: an enrolled machine's own,
 // or "" for one of the hub's processes. The worker id must be of that
 // machine (or of none, for the hub).
 func (h *Handler) authenticatedCleanupClaimant(ctx context.Context, workerID string) (string, error) {
-	callerFrom := h.callerFrom
-	if callerFrom == nil {
-		callerFrom = transportauth.CallerFrom
-	}
-	caller, ok := callerFrom(ctx)
+	caller, ok := h.caller(ctx)
 	switch {
 	case ok && caller.Kind == transportauth.CallerMachine && transportauth.WorkerIDBelongsTo(workerID, caller.Machine.MachineID):
 		return caller.Machine.MachineID, nil

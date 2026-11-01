@@ -645,6 +645,16 @@ type Coordinator struct {
 	Port       int
 	HealthPort int // HTTP health check port (default: 8091, 0 disables)
 	Auth       CoordinatorAuth
+	// WorkerChannel is the route that carries workers' calls over HTTPS.
+	WorkerChannel CoordinatorWorkerChannel
+}
+
+// CoordinatorWorkerChannel configures the worker channel (start-all only).
+type CoordinatorWorkerChannel struct {
+	Enabled bool // Default: false
+	// MaxRequestBytes bounds one request; it must fit the edge's request body
+	// limit. 0 means the channel's default.
+	MaxRequestBytes int64
 }
 
 // Worker represents the worker configuration.

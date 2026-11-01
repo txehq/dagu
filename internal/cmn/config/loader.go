@@ -1363,6 +1363,11 @@ func (l *ConfigLoader) loadCoordinatorConfig(cfg *Config, def Definition) {
 		cfg.Coordinator.Advertise = def.Coordinator.Advertise
 		cfg.Coordinator.Port = def.Coordinator.Port
 		cfg.Coordinator.HealthPort = def.Coordinator.HealthPort
+		if channel := def.Coordinator.WorkerChannel; channel != nil {
+			cfg.Coordinator.WorkerChannel = CoordinatorWorkerChannel{
+				Enabled: channel.Enabled, MaxRequestBytes: channel.MaxRequestBytes,
+			}
+		}
 	}
 
 	l.setCoordinatorDefaults(cfg)
@@ -2459,6 +2464,8 @@ var envBindings = []envBinding{
 	{key: "coordinator.advertise", env: "COORDINATOR_ADVERTISE"},
 	{key: "coordinator.port", env: "COORDINATOR_PORT"},
 	{key: "coordinator.health_port", env: "COORDINATOR_HEALTH_PORT"},
+	{key: "coordinator.worker_channel.enabled", env: "COORDINATOR_WORKER_CHANNEL_ENABLED"},
+	{key: "coordinator.worker_channel.max_request_bytes", env: "COORDINATOR_WORKER_CHANNEL_MAX_REQUEST_BYTES"},
 	{key: coordinatorAuthModeKey, env: coordinatorAuthModeEnv},
 	{key: coordinatorAuthHubKeyFileKey, env: coordinatorAuthHubKeyFileEnv},
 
