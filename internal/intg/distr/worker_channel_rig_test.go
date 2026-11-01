@@ -186,6 +186,16 @@ type channelRig struct {
 	proxy   *faultProxy
 	current atomic.Pointer[workerchannel.Handler]
 	marker  string
+	origin  *httptest.Server
+}
+
+// restartHub replaces the coordinator and cuts every connection to the hub, as
+// a real restart does: the channel lives in the process that restarts.
+func (r *channelRig) restartHub(t *testing.T, coord *test.Coordinator) {
+	t.Helper()
+	coord.Restart(t)
+	r.origin.CloseClientConnections()
+	r.bind(t, coord)
 }
 
 // fenced checks a run past the owner timeout: it does not succeed, nothing
@@ -246,11 +256,11 @@ func withChannelRig(rig *channelRig) fixtureOption {
 		c.workerChannel = func(t testing.TB, coord *test.Coordinator) (coordinator.Client, string) {
 			t.Helper()
 			rig.bind(t, coord)
-			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rig.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				rig.current.Load().ServeHTTP(w, r)
 			}))
-			t.Cleanup(origin.Close)
-			front := edge(t, origin.URL)
+			t.Cleanup(rig.origin.Close)
+			front := edge(t, rig.origin.URL)
 			rig.proxy = newFaultProxy(t, front.Listener.Addr().String())
 
 			conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
@@ -339,18 +349,26 @@ func TestChannelRigHubRestart(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	f, rig := runThroughRig(t, "touch "+marker+"\nsleep 15\necho finished")
 	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, distrTestTimeout(30*time.Second), 50*time.Millisecond)
-	f.coord.Restart(t)
-	rig.bind(t, f.coord)
+	rig.restartHub(t, f.coord)
 	status := f.waitForStatus(ir.Succeeded, distrTestTimeout(90*time.Second))
 	assert.Equal(t, rigMachine, status.WorkerID)
 }
 
 // R10, logs: a cut during output loses no line, and none arrives twice.
 func TestChannelRigLogSurvivesACut(t *testing.T) {
-	f, rig := runThroughRig(t, "for i in $(seq 1 60); do echo line-$i; sleep 0.2; done")
-	time.Sleep(5 * time.Second)
+	gate := filepath.Join(t.TempDir(), "go-on")
+	script := fmt.Sprintf("for i in $(seq 1 30); do echo line-$i; sleep 0.1; done\n"+
+		"until [ -f %[1]s ]; do sleep 0.1; done\n"+
+		"for i in $(seq 31 60); do echo line-$i; sleep 0.1; done", gate)
+	f, rig := runThroughRig(t, script)
+	logRoot := f.coord.Config.Paths.LogDir
+	// The hub has the first part before the cut, and the rest is written during it.
+	require.Eventually(t, func() bool { return hubLogHolds(logRoot, "line-30") }, distrTestTimeout(60*time.Second), 50*time.Millisecond,
+		"the cut must fall inside the run's output")
 	rig.proxy.setMode("refuse")
-	time.Sleep(4 * time.Second)
+	require.NoError(t, os.WriteFile(gate, nil, 0o600))
+	time.Sleep(5 * time.Second)
+	assert.False(t, hubLogHolds(logRoot, "line-60"), "the end of the output must not have crossed during the cut")
 	rig.proxy.setMode("")
 	status := f.waitForStatus(ir.Succeeded, distrTestTimeout(60*time.Second))
 	files := findLogFiles(t, f.coord.Config.Paths.LogDir, status.Name, status.DAGRunID, "run", "stdout")
@@ -368,6 +386,21 @@ func TestChannelRigLogSurvivesACut(t *testing.T) {
 		}
 	}
 	assert.Equal(t, want, got)
+}
+
+// hubLogHolds reports whether any log the hub holds contains text.
+func hubLogHolds(root, text string) bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || found {
+			return nil //nolint:nilerr // a directory still being written is looked at again
+		}
+		if data, readErr := os.ReadFile(filepath.Clean(path)); readErr == nil && strings.Contains(string(data), text) {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 // R10 and R14, artifacts: a file larger than any stream, cut while its segments
