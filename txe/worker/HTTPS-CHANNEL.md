@@ -125,7 +125,7 @@ A segmented upload adds `byte_offset`, `total_size` and `sha256` to `ArtifactChu
 
 Only the hub's own word resets it: a higher offset than it has ever reported, or a newly committed file. A repeated acknowledgment, a repeated answer to the empty chunk, bytes sent but not acknowledged, and reading or hashing local files do not. The whole upload stays finite: a file has a size, and the offset only rises.
 
-When the run's own context ends, by a stop or the job's timeout, the upload gets 3 minutes from then and nothing resets that. The attempt's lease and the job's timeout are unchanged, and each chunk is still checked, so a superseded attempt stops at its next chunk. gRPC, and anything else that sends no segments, keeps exactly 3 minutes in all. An upload over the channel with no file above a stream's size keeps 3 minutes in all too.
+A stopped run's upload gets 3 minutes and nothing resets that. A job with a timeout never uploads past it by more than it always could: the upload has what is left of the timeout, or 3 minutes if that is more. The attempt's lease and the job's timeout are unchanged, and each chunk is still checked, so a superseded attempt stops at its next chunk. gRPC, and anything else that sends no segments, keeps exactly 3 minutes in all. An upload over the channel with no file above a stream's size keeps 3 minutes in all too.
 
 The floor is a chunk within a stream's limit, about 28 KiB/s at 110 s. Below it nothing becomes durable, and the upload ends after 3 minutes saying so. A hub that runs out of time checking a chunk answers `DeadlineExceeded`, which the worker retries. Before this it answered `Internal`, which ended the run.
 

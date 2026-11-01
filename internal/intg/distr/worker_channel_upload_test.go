@@ -271,7 +271,9 @@ func logUpload(t *testing.T, rig *channelRig, status ir.DAGRunStatus, took time.
 func TestChannelUploadCrossesADeadlineMidSegment(t *testing.T) {
 	rig := scaledRig(true)
 	const size = 20 << 20
-	f, status, took := uploadFile(t, size, rig, 60*time.Millisecond)
+	// Two chunks fit a stream here. At one, a chunk lands or not by chance: that
+	// is the floor, where an upload may stop moving and end.
+	f, status, took := uploadFile(t, size, rig, 35*time.Millisecond)
 	logUpload(t, rig, status, took, size)
 	rig.uploads.requireForwardOnly(t)
 	requireWholeFile(t, f, status, size)
@@ -281,7 +283,7 @@ func TestChannelUploadCrossesADeadlineMidSegment(t *testing.T) {
 func TestChannelUploadEndsItsStreamsBeforeTheDeadline(t *testing.T) {
 	rig := scaledRig(false)
 	const size = 20 << 20
-	f, status, took := uploadFile(t, size, rig, 60*time.Millisecond)
+	f, status, took := uploadFile(t, size, rig, 35*time.Millisecond)
 	logUpload(t, rig, status, took, size)
 	rig.uploads.requireForwardOnly(t)
 	requireWholeFile(t, f, status, size)
