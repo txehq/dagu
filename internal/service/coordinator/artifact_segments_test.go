@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -209,6 +211,83 @@ func TestALostFinalAcknowledgmentRepeatsWithoutHarm(t *testing.T) {
 	err = f.upload("m1", "a.bin", "other data")
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Equal(t, "the result", f.read("a.bin"), "another result is never replaced")
+}
+
+// An empty chunk asks what is held. It writes nothing, and a fenced attempt learns
+// nothing from it.
+func TestAnEmptyChunkAnswersTheDurableOffset(t *testing.T) {
+	t.Parallel()
+	f := newSegmentFixture(t)
+	reply, err := f.stream(segmentChunk("m1", "a.bin", 0, ""))
+	require.NoError(t, err)
+	require.True(t, reply.HasCommittedOffset())
+	assert.Zero(t, reply.GetCommittedOffset())
+
+	_, err = f.stream(segmentChunk("m1", "a.bin", 0, "the "))
+	require.NoError(t, err)
+	reply, err = f.stream(segmentChunk("m1", "a.bin", 0, ""))
+	require.NoError(t, err)
+	assert.EqualValues(t, 4, reply.GetCommittedOffset())
+
+	f.validate = func(context.Context, attemptIdentity) error {
+		return status.Error(codes.FailedPrecondition, "stale attempt")
+	}
+	_, err = f.stream(segmentChunk("m1", "a.bin", 0, ""))
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+// After a lost final acknowledgment the hub holds no segment. The final chunk
+// alone settles it, and only for the same file.
+func TestAFinalChunkAloneSettlesWhatIsCommitted(t *testing.T) {
+	t.Parallel()
+	f := newSegmentFixture(t)
+	require.NoError(t, f.upload("m1", "a.bin", "the result"))
+	before, err := os.Stat(filepath.Join(f.archiveDir, "a.bin"))
+	require.NoError(t, err)
+
+	asked, err := f.stream(segmentChunk("m1", "a.bin", 0, ""))
+	require.NoError(t, err)
+	assert.Zero(t, asked.GetCommittedOffset(), "nothing is held once committed")
+	reply, err := f.stream(finalChunk("m1", "a.bin", "the result"))
+	require.NoError(t, err)
+	assert.EqualValues(t, len("the result"), reply.GetCommittedOffset())
+	after, err := os.Stat(filepath.Join(f.archiveDir, "a.bin"))
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(before, after), "the committed file was not touched")
+	assert.Equal(t, []string{"a.bin"}, f.files(), "nothing is left behind")
+
+	_, err = f.stream(finalChunk("m1", "a.bin", "other data"))
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err), "a different file gets no acknowledgment")
+	assert.Equal(t, "the result", f.read("a.bin"))
+}
+
+// Hashing what is committed costs the hub more than the request cost the sender,
+// so it stops with the stream.
+func TestAFinalChunkAloneStopsWithItsStream(t *testing.T) {
+	t.Parallel()
+	f := newSegmentFixture(t)
+	require.NoError(t, f.upload("m1", "a.bin", "the result"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := &mockStreamArtifactsServer{ctx: ctx, chunks: []*coordinatorv1.ArtifactChunk{finalChunk("m1", "a.bin", "the result")}}
+	assert.Equal(t, codes.Canceled, status.Code(f.handler().handleStream(stream)))
+}
+
+func TestAFinalChunkAloneCommitsNothingNew(t *testing.T) {
+	t.Parallel()
+	f := newSegmentFixture(t)
+	_, err := f.stream(finalChunk("m1", "a.bin", "never sent"))
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.NotContains(t, f.files(), "a.bin")
+}
+
+// A fence the hub could not finish checking for lack of time is no refusal: the
+// writer may try again, and it must hear that.
+func TestAWriteCheckOutOfTimeCanBeRetried(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(writeValidationError("check", fmt.Errorf("read: %w", context.DeadlineExceeded))))
+	assert.Equal(t, codes.Canceled, status.Code(writeValidationError("check", context.Canceled)))
+	assert.Equal(t, codes.Internal, status.Code(writeValidationError("check", errors.New("disk"))))
 }
 
 func TestARefusedAttemptChangesNothing(t *testing.T) {

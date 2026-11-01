@@ -181,6 +181,12 @@ func (r *remoteRunReporter) StreamSchedulerLog(ctx context.Context, logFilePath 
 	return streamer.StreamSchedulerLog(ctx, logFilePath)
 }
 
+// BoundsItsOwnFinalize says what this reporter's uploaders say of themselves: it
+// stands between them and the agent, and they share its client.
+func (r *remoteRunReporter) BoundsItsOwnFinalize() bool {
+	return coordreport.SendsSegments(r.client)
+}
+
 func (r *remoteRunReporter) Finalize(ctx context.Context, attemptID, dir string) error {
 	uploader := r.artifactUploaderFor(r.metadataFromContext(ctx).withAttemptID(attemptID))
 	if uploader == nil {

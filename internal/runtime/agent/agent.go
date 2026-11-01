@@ -1259,7 +1259,7 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		logger.Info(ctx, "Finalizing DAG run artifacts before writing terminal status",
 			slog.String("artifact-dir", a.artifactDir),
 		)
-		finalizeCtx, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), artifactFinalizeTimeout)
+		finalizeCtx, cancelFinalize := artifactFinalizeContext(ctx, a.artifactFinalizer, a.finalizeLimit(finishedStatus.Status))
 		defer cancelFinalize()
 		if err := a.artifactFinalizer.Finalize(finalizeCtx, finishedStatus.AttemptID, a.artifactDir); err != nil {
 			logger.Error(ctx, "Failed to finalize DAG run artifacts before writing terminal status",
@@ -1995,7 +1995,61 @@ func (a *Agent) Signal(ctx context.Context, sig os.Signal) {
 
 // wait before read the running status
 const waitForRunning = time.Millisecond * 100
-const artifactFinalizeTimeout = 3 * time.Minute
+
+var artifactFinalizeTimeout = 3 * time.Minute
+
+// selfBoundedFinalizer is a finalizer that ends itself when it stops moving.
+type selfBoundedFinalizer interface {
+	BoundsItsOwnFinalize() bool
+}
+
+// finalizeLimit is the most a finalizer that bounds itself may take, or 0 for no
+// limit but its own. A run that was stopped has the fixed time. So has one past
+// its timeout, and one inside it has what is left, if that is more: the timeout
+// lives inside the runner, which has finished, so nothing else holds to it.
+func (a *Agent) finalizeLimit(status ir.Status) time.Duration {
+	if status == ir.Aborted {
+		return artifactFinalizeTimeout
+	}
+	if a.dag.Timeout <= 0 {
+		return 0
+	}
+	return max(artifactFinalizeTimeout, time.Until(a.plan.StartAt().Add(a.dag.Timeout)))
+}
+
+// artifactFinalizeContext outlives the run's context, so that a stopped run's
+// results still arrive, for a fixed time. A finalizer that bounds itself gets no
+// fixed time, since a healthy upload of a large result on a slow link can take
+// longer, and the run stays in its finishing phase while it does. It is held to
+// limit, when there is one. The run's own end still counts for it: once the run's
+// context is done, it has the fixed time and no more, and nothing resets that.
+func artifactFinalizeContext(ctx context.Context, finalizer ArtifactFinalizer, limit time.Duration) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if bounded, ok := finalizer.(selfBoundedFinalizer); !ok || !bounded.BoundsItsOwnFinalize() {
+		return context.WithTimeout(detached, artifactFinalizeTimeout)
+	}
+	finalizeCtx, cancel := context.WithCancel(detached)
+	if limit > 0 {
+		limited, cancelLimit := context.WithTimeout(finalizeCtx, limit)
+		stop := cancel
+		finalizeCtx, cancel = limited, func() { cancelLimit(); stop() }
+	}
+	go func() {
+		select {
+		case <-finalizeCtx.Done():
+			return
+		case <-ctx.Done():
+		}
+		shutdown := time.NewTimer(artifactFinalizeTimeout)
+		defer shutdown.Stop()
+		select {
+		case <-finalizeCtx.Done():
+		case <-shutdown.C:
+			cancel()
+		}
+	}()
+	return finalizeCtx, cancel
+}
 
 var remoteStatusPushTimeout = 5 * time.Second
 var remoteTerminalStatusPushTimeout = 3 * time.Minute

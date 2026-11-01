@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -35,7 +36,9 @@ type ArtifactUploader struct {
 	claimKey  string
 	rootRef   ir.DAGRunRef
 	owner     serviceregistry.HostInfo
-	mu        sync.RWMutex
+	// retryWindow is how long retries go on with nothing new durable.
+	retryWindow time.Duration
+	mu          sync.RWMutex
 	// executionMarker is the claimed task's execution marker.
 	executionMarker string
 }
@@ -62,6 +65,8 @@ func NewArtifactUploader(
 		attemptID: attemptID,
 		rootRef:   rootRef,
 		owner:     target,
+
+		retryWindow: finalDeliveryRetryTimeout,
 	}
 }
 
@@ -132,19 +137,91 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 	}
 
 	attemptID := u.getAttemptID()
-	err := u.uploadDir(ctx, dir, attemptID)
-	if !isRetryableStreamError(err) {
+	run := newDirUpload()
+
+	// One window covers everything, from before the directory is read. A
+	// segmented file's upload ends after the window with nothing new durable on
+	// the hub, not after the window: a long upload on a slow link outlives it,
+	// moving. Only the hub's own word moves it: a higher offset than it has ever
+	// reported, or a file committed. The caller's context, and the fences the hub
+	// checks on every chunk, still end it at any time. An upload with no
+	// segmented file keeps one fixed window.
+	uploadCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stalled := time.AfterFunc(u.retryWindow, func() { cancel(errUploadStalled) })
+	defer stalled.Stop()
+	run.progressed = func() { stalled.Reset(u.retryWindow) }
+
+	err := u.uploadDir(uploadCtx, dir, attemptID, run)
+	if isRetryableStreamError(err) {
+		err = backoff.Retry(uploadCtx, func(ctx context.Context) error {
+			return u.uploadDir(ctx, dir, attemptID, run)
+		}, finalDeliveryRetryPolicy(), isRetryableStreamError)
+	}
+	if !errors.Is(context.Cause(uploadCtx), errUploadStalled) {
 		return err
 	}
-
-	retryCtx, cancel := context.WithTimeout(ctx, finalDeliveryRetryTimeout)
-	defer cancel()
-	return backoff.Retry(retryCtx, func(ctx context.Context) error {
-		return u.uploadDir(ctx, dir, attemptID)
-	}, finalDeliveryRetryPolicy(), isRetryableStreamError)
+	if !run.segmented {
+		return context.DeadlineExceeded
+	}
+	return fmt.Errorf("%w for %s", errUploadStalled, u.retryWindow)
 }
 
-func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string) error {
+// BoundsItsOwnFinalize says this uploader holds its finalization to the window
+// above, so that the agent need not hold it to a fixed time. Only a client that
+// sends segments does: anything else keeps the fixed time.
+func (u *ArtifactUploader) BoundsItsOwnFinalize() bool { return SendsSegments(u.client) }
+
+// SendsSegments says the client sends files larger than a stream in segments.
+func SendsSegments(client coordinator.Client) bool { return segmentBytes(client) > 0 }
+
+// errUploadStalled ends an upload whose retries moved nothing.
+var errUploadStalled = errors.New("artifact upload: nothing new reached the hub")
+
+// dirUpload is what one UploadDir knows across its retries.
+type dirUpload struct {
+	// segmented says a file went by segments.
+	segmented bool
+	// committed are the segmented files the hub has acknowledged whole.
+	committed map[string]bool
+	// finalSent are those whose final chunk went out, acknowledged or not.
+	finalSent map[string]bool
+	// durable is the most the hub has acknowledged of each file.
+	durable map[string]uint64
+	// progressed is called when more of a file is durable.
+	progressed func()
+}
+
+func newDirUpload() *dirUpload {
+	return &dirUpload{committed: map[string]bool{}, finalSent: map[string]bool{}, durable: map[string]uint64{}}
+}
+
+// acknowledged takes what the hub reports it holds of a file. Only a higher
+// offset than it has ever reported is progress: a repeated acknowledgment, or an
+// answer to asking, is not.
+func (r *dirUpload) acknowledged(relPath string, offset uint64) {
+	if offset <= r.durable[relPath] {
+		return
+	}
+	r.durable[relPath] = offset
+	r.moved()
+}
+
+// finished records the hub's acknowledgment of a whole file, once.
+func (r *dirUpload) finished(relPath string) {
+	if !r.committed[relPath] {
+		r.committed[relPath] = true
+		r.moved()
+	}
+}
+
+func (r *dirUpload) moved() {
+	if r.progressed != nil {
+		r.progressed()
+	}
+}
+
+func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string, run *dirUpload) error {
 	seq := uint64(0)
 	var stream coordinatorv1.CoordinatorService_StreamArtifactsClient
 	defer func() {
@@ -168,7 +245,7 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 		}
 		return nil
 	}
-	limit := u.segmentBytes()
+	limit := segmentBytes(u.client)
 	var streamBytes int64
 
 	sendChunk := func(chunk *coordinatorv1.ArtifactChunk) error {
@@ -192,6 +269,9 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 		if walkErr != nil {
 			return walkErr
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if d.IsDir() || !d.Type().IsRegular() {
 			return nil
 		}
@@ -211,7 +291,10 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 				if err := finishStream(); err != nil {
 					return err
 				}
-				return u.uploadSegmented(ctx, path, relPath, attemptID, limit)
+				if run.committed[relPath] {
+					return nil
+				}
+				return u.uploadSegmented(ctx, path, relPath, attemptID, limit, run)
 			}
 			if streamBytes+info.Size() > limit {
 				if err := finishStream(); err != nil {
@@ -291,20 +374,50 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string)
 
 // segmentBytes is the most one stream may carry, or 0 when a stream may carry
 // anything, as on a gRPC connection.
-func (u *ArtifactUploader) segmentBytes() int64 {
-	if client, ok := u.client.(interface{ ArtifactSegmentBytes() int64 }); ok {
+func segmentBytes(client coordinator.Client) int64 {
+	if client, ok := client.(interface{ ArtifactSegmentBytes() int64 }); ok {
 		return client.ArtifactSegmentBytes()
+	}
+	return 0
+}
+
+// contextReader ends a long local read with its context, so that hashing what
+// the hub already holds cannot outlast the upload's window.
+type contextReader struct {
+	ctx    context.Context
+	source io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.source.Read(p)
+}
+
+// streamTime is how long one stream may stay open, or 0 when only its size
+// bounds it.
+func (u *ArtifactUploader) streamTime() time.Duration {
+	if client, ok := u.client.(interface{ ArtifactStreamTime() time.Duration }); ok {
+		return client.ArtifactStreamTime()
 	}
 	return 0
 }
 
 // uploadSegmented sends a file that one stream cannot carry. Each stream must
 // be acknowledged before the next: the final chunk is sent only to a hub that
-// has said it holds every byte, so a hub that does not know this form
-// commits nothing. Any failure starts the file again from its first byte, and
-// the hub keeps what it already holds by comparing it. A file changed during
-// the upload fails its digest.
-func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, attemptID string, limit int64) error {
+// has said it holds every byte, so a hub that does not know this form commits
+// nothing. A stream ends at its size or its time, whichever comes first, so a
+// link too slow to fill one in time still moves.
+//
+// It starts from what the hub holds, by asking: repeating a durable prefix on a
+// link that cannot carry it past the stream limit never gets beyond it. The
+// prefix is read here only for the digest, which settles the whole file, so a
+// file changed during the upload still fails. What is durable moves by whole
+// chunks, so a link that cannot carry one chunk within a stream's limit does not
+// move, and the upload ends with errUploadStalled.
+func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, attemptID string, limit int64, run *dirUpload) error {
+	run.segmented = true
 	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return fmt.Errorf("open artifact %s: %w", path, err)
@@ -320,43 +433,124 @@ func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, a
 		chunk.SetByteOffset(offset)
 		return chunk
 	}
-	// acknowledged ends one stream and checks the hub holds exactly offset.
-	acknowledged := func(stream coordinatorv1.CoordinatorService_StreamArtifactsClient, offset uint64) error {
+	// acknowledged ends one stream and returns what the hub holds.
+	acknowledged := func(stream coordinatorv1.CoordinatorService_StreamArtifactsClient) (uint64, error) {
 		resp, err := stream.CloseAndRecv()
 		if err != nil {
-			return fmt.Errorf("finalize artifact segment: %w", err)
+			return 0, fmt.Errorf("finalize artifact segment: %w", err)
 		}
 		if !resp.HasCommittedOffset() {
-			return fmt.Errorf("upload artifact %s: this hub does not accept segmented uploads", relPath)
+			return 0, fmt.Errorf("upload artifact %s: this hub does not accept segmented uploads", relPath)
 		}
-		// Ahead is fine: after a lost acknowledgment the hub already holds more
-		// than this replay has reached, and it compared what was sent. The
-		// final chunk's size and digest settle the whole file.
-		if resp.GetCommittedOffset() < offset {
-			return fmt.Errorf("upload artifact %s: the hub holds %d of %d bytes", relPath, resp.GetCommittedOffset(), offset)
+		run.acknowledged(relPath, resp.GetCommittedOffset())
+		return resp.GetCommittedOffset(), nil
+	}
+	// exactly ends one stream and checks the hub holds offset. Ahead is fine:
+	// the final chunk's size and digest settle the whole file.
+	exactly := func(stream coordinatorv1.CoordinatorService_StreamArtifactsClient, offset uint64) error {
+		held, err := acknowledged(stream)
+		if err != nil {
+			return err
+		}
+		if held < offset {
+			return fmt.Errorf("upload artifact %s: the hub holds %d of %d bytes", relPath, held, offset)
 		}
 		return nil
 	}
 
+	// An empty chunk passes the hub's fences as any other and answers its offset.
+	stream, err := u.openStream(ctx)
+	if err != nil {
+		return err
+	}
+	if err := stream.Send(newChunk(0)); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("ask the hub's artifact offset: %w", err)
+	}
+	offset, err := acknowledged(stream)
+	if err != nil {
+		return err
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("read artifact %s: %w", path, err)
+	}
+	if offset > uint64(info.Size()) { // #nosec G115 -- a file's size is non-negative
+		return fmt.Errorf("upload artifact %s: the hub holds %d bytes of a %d byte file", relPath, offset, info.Size())
+	}
 	sum := sha256.New()
+	source := &contextReader{ctx: ctx, source: file}
+	if _, err := io.CopyN(sum, source, int64(offset)); err != nil { // #nosec G115 -- below the file's size
+		return fmt.Errorf("read artifact %s: %w", path, err)
+	}
+	if offset == 0 && run.finalSent[relPath] {
+		// The file was committed and only the acknowledgment was lost: the hub
+		// holds no segment any more. Its final chunk alone settles it.
+		written, err := io.Copy(sum, source)
+		if err != nil {
+			return fmt.Errorf("read artifact %s: %w", path, err)
+		}
+		offset = uint64(written) // #nosec G115 -- a size read from a file
+	} else {
+		if offset, err = u.sendSegments(ctx, file, path, limit, offset, sum, newChunk, exactly); err != nil {
+			return err
+		}
+	}
+
+	stream, err = u.openStream(ctx)
+	if err != nil {
+		return err
+	}
+	final := newChunk(offset)
+	final.IsFinal = true
+	final.TotalSize = offset
+	final.Sha256 = hex.EncodeToString(sum.Sum(nil))
+	run.finalSent[relPath] = true
+	if err := stream.Send(final); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("send artifact final marker: %w", err)
+	}
+	if err := exactly(stream, offset); err != nil {
+		return err
+	}
+	run.finished(relPath)
+	return nil
+}
+
+// sendSegments sends the file from start, one acknowledged stream at a time,
+// and returns how far it reached.
+func (u *ArtifactUploader) sendSegments(
+	ctx context.Context,
+	file *os.File,
+	path string,
+	limit int64,
+	start uint64,
+	sum io.Writer,
+	newChunk func(uint64) *coordinatorv1.ArtifactChunk,
+	exactly func(coordinatorv1.CoordinatorService_StreamArtifactsClient, uint64) error,
+) (uint64, error) {
+	streamTime := u.streamTime()
 	buf := make([]byte, maxChunkSize)
-	offset, seq := uint64(0), uint64(0)
+	offset, seq := start, uint64(0)
 	for atEnd := false; !atEnd; {
 		var stream coordinatorv1.CoordinatorService_StreamArtifactsClient
-		for sent := int64(0); sent < limit && !atEnd; {
+		var opened time.Time
+		within := func() bool { return stream == nil || streamTime <= 0 || time.Since(opened) < streamTime }
+		for sent := int64(0); sent < limit && !atEnd && within(); {
 			n, readErr := file.Read(buf[:min(int64(len(buf)), limit-sent)])
 			if n > 0 {
 				if stream == nil {
+					var err error
 					if stream, err = u.openStream(ctx); err != nil {
-						return err
+						return 0, err
 					}
+					opened = time.Now()
 				}
 				seq++
 				chunk := newChunk(offset)
 				chunk.Sequence = seq
 				chunk.Data = append([]byte(nil), buf[:n]...)
 				if err := stream.Send(chunk); err != nil && !errors.Is(err, io.EOF) {
-					return fmt.Errorf("send artifact segment: %w", err)
+					return 0, fmt.Errorf("send artifact segment: %w", err)
 				} else if err != nil {
 					break // the reply says why
 				}
@@ -370,27 +564,14 @@ func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, a
 				if stream != nil {
 					_ = stream.CloseSend()
 				}
-				return fmt.Errorf("read artifact %s: %w", path, readErr)
+				return 0, fmt.Errorf("read artifact %s: %w", path, readErr)
 			}
 		}
 		if stream != nil {
-			if err := acknowledged(stream, offset); err != nil {
-				return err
+			if err := exactly(stream, offset); err != nil {
+				return 0, err
 			}
 		}
 	}
-
-	stream, err := u.openStream(ctx)
-	if err != nil {
-		return err
-	}
-	final := newChunk(offset)
-	final.Sequence = seq + 1
-	final.IsFinal = true
-	final.TotalSize = offset
-	final.Sha256 = hex.EncodeToString(sum.Sum(nil))
-	if err := stream.Send(final); err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("send artifact final marker: %w", err)
-	}
-	return acknowledged(stream, offset)
+	return offset, nil
 }

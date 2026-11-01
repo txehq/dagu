@@ -111,6 +111,8 @@ func newChannelClient(ctx context.Context, cfg *config.Config) (coordinator.Clie
 	if size := cfg.Worker.ArtifactSegmentBytes; size > 0 {
 		clientConfig.ArtifactSegmentBytes = size
 	}
+	// Half leaves the rest for what is still in buffers on the way to the hub.
+	clientConfig.ArtifactStreamTime = workerchannel.DefaultLimits().Stream / 2
 	if err := clientConfig.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
 	}

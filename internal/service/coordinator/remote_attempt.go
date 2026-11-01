@@ -235,6 +235,16 @@ func runningTaskIdentity(workerID string, task *coordinatorv1.RunningTask) (atte
 	}, nil
 }
 
+// writeValidationError says why a write could not be checked. A call that ran
+// out of time says so, and the writer may try again: the check did not refuse it,
+// and nothing was written.
+func writeValidationError(message string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return status.FromContextError(err).Err()
+	}
+	return status.Error(codes.Internal, message+": "+err.Error())
+}
+
 func (h *Handler) validateAttempt(ctx context.Context, identity attemptIdentity) error {
 	if _, err := h.attemptLease(ctx, identity); err != nil {
 		return err
@@ -260,14 +270,14 @@ func (h *Handler) refuseRequeuedExecution(ctx context.Context, identity attemptI
 		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
 			return nil
 		}
-		return status.Error(codes.Internal, "failed to resolve run for write validation: "+err.Error())
+		return writeValidationError("failed to resolve run for write validation", err)
 	}
 	runStatus, err := attempt.ReadStatus(ctx)
 	if err != nil {
 		if errors.Is(err, dagrun.ErrNoStatusData) {
 			return nil
 		}
-		return status.Error(codes.Internal, "failed to read run status for write validation: "+err.Error())
+		return writeValidationError("failed to read run status for write validation", err)
 	}
 	if runStatus == nil || runStatus.Status != ir.Queued {
 		return nil
@@ -292,7 +302,7 @@ func (h *Handler) attemptLease(ctx context.Context, identity attemptIdentity) (*
 		if errors.Is(err, dispatch.ErrDAGRunLeaseNotFound) || errors.Is(err, persis.ErrCorrupt) {
 			return nil, status.Error(codes.FailedPrecondition, remoteAttemptRejectedLeaseInactive)
 		}
-		return nil, status.Error(codes.Internal, "failed to load distributed run lease: "+err.Error())
+		return nil, writeValidationError("failed to load distributed run lease", err)
 	}
 	if err := h.validateAttemptLease(lease, identity); err != nil {
 		return nil, err

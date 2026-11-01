@@ -117,7 +117,17 @@ A segmented upload adds `byte_offset`, `total_size` and `sha256` to `ArtifactChu
 | Channel, large file | Channel but no segments (never released) | Stops at the first stream, nothing committed, the upload fails truthfully |
 | Old, no offsets | With segments | Unchanged, no `committed_offset` in the reply |
 
-**This is a source claim.** The hub half with channel and no segments is exercised by simulation (`TestAHubThatIgnoresTheOffsetCommitsNothing`, `TestAHubThatDoesNotKnowSegmentsGetsNoFinalChunk`). Real mixed versions are for the rig. A whole-file retry starts again at byte 0, and nothing replays an attempt that is no longer valid.
+**This is a source claim.** The hub half with channel and no segments is exercised by simulation (`TestAHubThatIgnoresTheOffsetCommitsNothing`, `TestAHubThatDoesNotKnowSegmentsGetsNoFinalChunk`). Real mixed versions are for the rig. Nothing replays an attempt that is no longer valid.
+
+**A slow link.** Durable progress moves by whole chunks of 3 MiB, and each stream ends at 16 MiB or 55 s, half the stream limit, whichever comes first, so what is still in buffers can drain. A retry does not repeat what the hub holds. The worker sends an empty chunk at offset 0, which passes the same fences as any chunk, and the reply says the durable offset. It hashes that prefix from its own file and goes on from there, and the final chunk's size and SHA-256 still settle the whole file, so a file changed during the upload fails. A file the hub has acknowledged is not sent again by a retry of its directory. After a lost final acknowledgment, the final chunk alone settles it, against the committed artifact, and a different file is refused.
+
+**The 3 minutes are a behaviour change for segmented uploads, and a visible tradeoff.** Hub artifacts are written before a run's terminal status, and the agent used to give that 3 minutes whatever the rate: about 36 MB at 200 KB/s, and a run with more failed with its job done. An uploader that sends segments now holds itself to 3 minutes with no durable progress, counted from before it reads the directory, and the agent gives it no fixed time. A large upload that is moving therefore extends the run's finishing phase, by its size over the link's rate. No constant was raised.
+
+Only the hub's own word resets it: a higher offset than it has ever reported, or a newly committed file. A repeated acknowledgment, a repeated answer to the empty chunk, bytes sent but not acknowledged, and reading or hashing local files do not. The whole upload stays finite: a file has a size, and the offset only rises.
+
+A stopped run's upload gets 3 minutes and nothing resets that. A job with a timeout never uploads past it by more than it always could: the upload has what is left of the timeout, or 3 minutes if that is more. The attempt's lease and the job's timeout are unchanged, and each chunk is still checked, so a superseded attempt stops at its next chunk. gRPC, and anything else that sends no segments, keeps exactly 3 minutes in all. An upload over the channel with no file above a stream's size keeps 3 minutes in all too.
+
+The floor is a chunk within a stream's limit, about 28 KiB/s at 110 s. Below it nothing becomes durable, and the upload ends after 3 minutes saying so. A hub that runs out of time checking a chunk answers `DeadlineExceeded`, which the worker retries. Before this it answered `Internal`, which ended the run.
 
 Logs fit already: a writer retains at most 16 MiB and sends chunks of at most 3 MiB, so a checkpoint is below 32 MiB. If the zone's limit is lower than that, the retained size must follow it.
 

@@ -462,6 +462,9 @@ func (cli *clientImpl) Poll(ctx context.Context, policy backoff.RetryPolicy, req
 // ArtifactSegmentBytes is the most one artifact stream may carry, or 0.
 func (cli *clientImpl) ArtifactSegmentBytes() int64 { return cli.config.ArtifactSegmentBytes }
 
+// ArtifactStreamTime is how long one stream of a segmented upload stays open.
+func (cli *clientImpl) ArtifactStreamTime() time.Duration { return cli.config.ArtifactStreamTime }
+
 // Metrics implements Client.
 func (cli *clientImpl) Metrics() Metrics {
 	cli.stateMu.RLock()
