@@ -261,6 +261,18 @@ func TestAFinalChunkAloneSettlesWhatIsCommitted(t *testing.T) {
 	assert.Equal(t, "the result", f.read("a.bin"))
 }
 
+// Hashing what is committed costs the hub more than the request cost the sender,
+// so it stops with the stream.
+func TestAFinalChunkAloneStopsWithItsStream(t *testing.T) {
+	t.Parallel()
+	f := newSegmentFixture(t)
+	require.NoError(t, f.upload("m1", "a.bin", "the result"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := &mockStreamArtifactsServer{ctx: ctx, chunks: []*coordinatorv1.ArtifactChunk{finalChunk("m1", "a.bin", "the result")}}
+	assert.Equal(t, codes.Canceled, status.Code(f.handler().handleStream(stream)))
+}
+
 func TestAFinalChunkAloneCommitsNothingNew(t *testing.T) {
 	t.Parallel()
 	f := newSegmentFixture(t)

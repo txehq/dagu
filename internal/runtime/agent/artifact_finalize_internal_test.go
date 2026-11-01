@@ -106,6 +106,21 @@ func TestALimitHoldsASelfBoundedFinalizer(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(time.Hour), deadline, time.Second)
 }
 
+// A job with hours of its timeout left that is cancelled has the fixed time, not
+// the hours.
+func TestARunThatEndsBoundsFinalizeUnderALimitToo(t *testing.T) {
+	shortenFinalize(t, 100*time.Millisecond)
+	run, stop := context.WithCancel(context.Background())
+	ctx, cancel := artifactFinalizeContext(run, boundedFinalizer{bounds: true}, time.Hour)
+	defer cancel()
+	stop()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bound did not hold")
+	}
+}
+
 func TestAPlainFinalizerIgnoresALimit(t *testing.T) {
 	ctx, cancel := artifactFinalizeContext(context.Background(), plainFinalizer{}, time.Hour)
 	defer cancel()

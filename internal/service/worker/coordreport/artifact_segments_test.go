@@ -344,10 +344,11 @@ func TestAnUploadThatDoesNotMoveEndsWithinItsWindow(t *testing.T) {
 
 func TestACancelledCallerStopsAMovingUpload(t *testing.T) {
 	hub := &slowHub{segmentHub: segmentHub{limit: MaxChunkSize, knowsThem: true}, pause: 20 * time.Millisecond}
+	dir := dirWith(t, map[string]string{"big.bin": strings.Repeat("c", 40*MaxChunkSize)})
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	err := stalledUploader(hub, time.Minute).UploadDir(ctx, dirWith(t, map[string]string{"big.bin": strings.Repeat("c", 200*MaxChunkSize)}))
+	err := stalledUploader(hub, time.Minute).UploadDir(ctx, dir)
 	require.Error(t, err)
 	assert.Less(t, time.Since(start), 5*time.Second, "the caller ends it, whatever the window")
 }

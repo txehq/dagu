@@ -140,7 +140,7 @@ func (h *artifactHandler) applySegment(
 	}
 	defer func() { _ = file.Close() }()
 
-	if done, err := alreadyCommitted(root, file, name, relPath, chunk); err != nil || done {
+	if done, err := alreadyCommitted(ctx, root, file, name, relPath, chunk); err != nil || done {
 		if done {
 			removeIfFinished(root, dir)
 		}
@@ -153,7 +153,7 @@ func (h *artifactHandler) applySegment(
 	if !chunk.IsFinal {
 		return size, nil
 	}
-	if err := commitSegments(root, file, name, relPath, size, chunk); err != nil {
+	if err := commitSegments(ctx, root, file, name, relPath, size, chunk); err != nil {
 		return 0, err
 	}
 	removeIfFinished(root, dir)
@@ -164,7 +164,7 @@ func (h *artifactHandler) applySegment(
 // segments are gone, from the artifact: it is an upload repeated after its
 // acknowledgment was lost, and the file need not cross the link again. Any other
 // chunk, or a different artifact, goes on and is refused as it would be.
-func alreadyCommitted(root *os.Root, file *os.File, name, relPath string, chunk *coordinatorv1.ArtifactChunk) (bool, error) {
+func alreadyCommitted(ctx context.Context, root *os.Root, file *os.File, name, relPath string, chunk *coordinatorv1.ArtifactChunk) (bool, error) {
 	if !chunk.IsFinal || len(chunk.Data) > 0 || chunk.GetSha256() == "" || chunk.GetTotalSize() == 0 {
 		return false, nil
 	}
@@ -185,7 +185,9 @@ func alreadyCommitted(root *os.Root, file *os.File, name, relPath string, chunk 
 	if !info.Mode().IsRegular() {
 		return false, nil
 	}
-	same, err := sameArtifact(root, relPath, info, chunk.GetTotalSize(), chunk.GetSha256())
+	// The request is small and the file need not be: its hash stops with the
+	// stream, and the attempt's lock lets one run at a time.
+	same, err := sameArtifact(ctx, root, relPath, info, chunk.GetTotalSize(), chunk.GetSha256())
 	if err != nil || !same {
 		return false, err
 	}
@@ -336,12 +338,12 @@ func writeSegment(file *os.File, offset uint64, data []byte) (uint64, error) {
 // changes nothing that is committed. An artifact already there with the same
 // size and digest is this upload repeated after a lost acknowledgment, and it
 // succeeds. A different one is another result, and it is left alone.
-func commitSegments(root *os.Root, file *os.File, name, relPath string, size uint64, chunk *coordinatorv1.ArtifactChunk) error {
+func commitSegments(ctx context.Context, root *os.Root, file *os.File, name, relPath string, size uint64, chunk *coordinatorv1.ArtifactChunk) error {
 	if chunk.GetSha256() == "" || chunk.GetTotalSize() != size {
 		_ = root.Remove(name)
 		return status.Error(codes.FailedPrecondition, "artifact segments do not add up to the file")
 	}
-	sum, err := digest(file)
+	sum, err := digest(ctx, file)
 	if err != nil {
 		return err
 	}
@@ -361,7 +363,7 @@ func commitSegments(root *os.Root, file *os.File, name, relPath string, size uin
 		_ = root.Remove(name)
 		return status.Error(codes.FailedPrecondition, "the artifact's path is not a regular file")
 	default:
-		same, err := sameArtifact(root, relPath, info, size, sum)
+		same, err := sameArtifact(ctx, root, relPath, info, size, sum)
 		if err != nil {
 			return err
 		}
@@ -380,7 +382,7 @@ func commitSegments(root *os.Root, file *os.File, name, relPath string, size uin
 	return nil
 }
 
-func sameArtifact(root *os.Root, relPath string, info fs.FileInfo, size uint64, sum string) (bool, error) {
+func sameArtifact(ctx context.Context, root *os.Root, relPath string, info fs.FileInfo, size uint64, sum string) (bool, error) {
 	if uint64(info.Size()) != size { // #nosec G115 -- a file's size is non-negative
 		return false, nil
 	}
@@ -389,22 +391,38 @@ func sameArtifact(root *os.Root, relPath string, info fs.FileInfo, size uint64, 
 		return false, fmt.Errorf("read artifact: %w", err)
 	}
 	defer func() { _ = existing.Close() }()
-	held, err := digest(existing)
+	held, err := digest(ctx, existing)
 	if err != nil {
 		return false, err
 	}
 	return held == sum, nil
 }
 
-func digest(file *os.File) (string, error) {
+func digest(ctx context.Context, file *os.File) (string, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", fmt.Errorf("read artifact segment: %w", err)
 	}
 	sum := sha256.New()
-	if _, err := io.Copy(sum, file); err != nil {
+	if _, err := io.Copy(sum, &contextFile{ctx: ctx, file: file}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", status.FromContextError(ctxErr).Err()
+		}
 		return "", fmt.Errorf("read artifact segment: %w", err)
 	}
 	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// contextFile ends a read of a file with its context.
+type contextFile struct {
+	ctx  context.Context
+	file *os.File
+}
+
+func (r *contextFile) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.file.Read(p)
 }
 
 // removeIfFinished removes the writer's directory once it holds no upload, and

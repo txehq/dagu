@@ -2028,10 +2028,12 @@ func artifactFinalizeContext(ctx context.Context, finalizer ArtifactFinalizer, l
 	if bounded, ok := finalizer.(selfBoundedFinalizer); !ok || !bounded.BoundsItsOwnFinalize() {
 		return context.WithTimeout(detached, artifactFinalizeTimeout)
 	}
-	if limit > 0 {
-		return context.WithTimeout(detached, limit)
-	}
 	finalizeCtx, cancel := context.WithCancel(detached)
+	if limit > 0 {
+		limited, cancelLimit := context.WithTimeout(finalizeCtx, limit)
+		stop := cancel
+		finalizeCtx, cancel = limited, func() { cancelLimit(); stop() }
+	}
 	go func() {
 		select {
 		case <-finalizeCtx.Done():
