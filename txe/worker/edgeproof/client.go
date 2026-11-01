@@ -151,7 +151,6 @@ func (b bearer) HTTPAuthorization(context.Context, string) (string, error) {
 type client struct {
 	cfg  clientConfig
 	wire *wire
-	host string
 }
 
 func (c *client) conn(token string, limits workerchannel.Limits) (coordinatorv1.CoordinatorServiceClient, error) {
@@ -176,12 +175,21 @@ func (c *client) wait(ctx context.Context, d time.Duration) {
 	}
 }
 
-// says is an error without the address it was sent to.
-func (c *client) says(err error) string {
+// finding is a failure in the check's own words. They hold no address.
+type finding string
+
+func (f finding) Error() string { return string(f) }
+
+// says prints an error for the results. Transport text can hold an address or a
+// certificate's names, so anything not a finding is reduced to its code.
+func says(err error) string {
 	if err == nil {
 		return ""
 	}
-	return strings.ReplaceAll(err.Error(), c.host, "<hub>")
+	if f, ok := errors.AsType[finding](err); ok {
+		return string(f)
+	}
+	return status.Code(err).String()
 }
 
 type check func(ctx context.Context, c *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error)
@@ -211,7 +219,7 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 	if next == nil {
 		next = http.DefaultTransport
 	}
-	c := &client{cfg: cfg, wire: &wire{next: next}, host: parsed.Host}
+	c := &client{cfg: cfg, wire: &wire{next: next}}
 	limits := cfg.Limits
 	if limits == (workerchannel.Limits{}) {
 		limits = workerchannel.DefaultLimits()
@@ -231,7 +239,7 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 		numbers, err := run(ctx, c, api)
 		counts := c.wire.take()
 		result := Result{Check: name, Pass: err == nil, Took: time.Since(start).Round(time.Millisecond).String(),
-			Numbers: numbers, Detail: c.says(err), HTTP: counts}
+			Numbers: numbers, Detail: says(err), HTTP: counts}
 		if counts.Challenges > 0 || (counts.HTML > 0 && name != "down") {
 			result.Pass, result.Detail = false, "an edge answered with a page: "+result.Detail
 		}
@@ -263,7 +271,7 @@ func checkRefused(ctx context.Context, c *client, _ coordinatorv1.CoordinatorSer
 	_, err = api.Heartbeat(ctx, heartbeat())
 	code := status.Code(err)
 	if code != codes.Unauthenticated {
-		return map[string]any{"code": code.String()}, fmt.Errorf("a wrong token got %s: %w", code, err)
+		return map[string]any{"code": code.String()}, finding("a wrong token got " + code.String())
 	}
 	return map[string]any{"code": code.String()}, nil
 }
@@ -296,7 +304,7 @@ func polls(ctx context.Context, api coordinatorv1.CoordinatorServiceClient, n in
 	wg.Wait()
 	numbers := map[string]any{"polls": n, "failed": failed.Load(), "slowest_ms": slowest.Load(), "failures": maps.Clone(failures)}
 	if failed.Load() > 0 {
-		return numbers, errors.New("a poll failed")
+		return numbers, finding("a poll failed")
 	}
 	return numbers, nil
 }
@@ -326,7 +334,7 @@ func finish(stream artifactStream, want []byte, sent uint64) (map[string]any, er
 	}
 	numbers := map[string]any{"bytes_sent": sent, "bytes_received": reply.BytesWritten, "chunks": reply.ChunksReceived}
 	if reply.BytesWritten != sent || reply.Error != hex.EncodeToString(want) {
-		return numbers, errors.New("the origin did not receive the bytes sent")
+		return numbers, finding("the origin did not receive the bytes sent")
 	}
 	return numbers, nil
 }
@@ -364,12 +372,12 @@ func checkOverLimit(ctx context.Context, c *client, _ coordinatorv1.CoordinatorS
 	over := int(c.cfg.Limits.MaxRequestBytes/chunkBytes) + 2
 	numbers, err := streamBytes(ctx, api, over)
 	if err == nil {
-		return numbers, errors.New("the origin took a request over its limit")
+		return numbers, finding("the origin took a request over its limit")
 	}
 	code := status.Code(err)
 	numbers = map[string]any{"code": code.String(), "mib_offered": over}
 	if code == codes.Unavailable || code == codes.Unknown {
-		return numbers, fmt.Errorf("over the limit read as %s, not as the channel's refusal: %w", code, err)
+		return numbers, finding("over the limit read as " + code.String() + ", not as the channel's refusal")
 	}
 	return numbers, nil
 }
@@ -461,7 +469,7 @@ func checkLoad(ctx context.Context, c *client, api coordinatorv1.CoordinatorServ
 		return numbers, pollErr
 	}
 	if failed.Load() > 0 {
-		return numbers, errors.New("a heartbeat failed")
+		return numbers, finding("a heartbeat failed")
 	}
 	return numbers, nil
 }
@@ -473,7 +481,7 @@ func checkDown(ctx context.Context, _ *client, api coordinatorv1.CoordinatorServ
 	code := status.Code(err)
 	numbers := map[string]any{"code": code.String()}
 	if code != codes.Unavailable {
-		return numbers, fmt.Errorf("a stopped origin read as %s", code)
+		return numbers, finding("a stopped origin read as " + code.String())
 	}
 	return numbers, nil
 }
@@ -505,11 +513,11 @@ func checkReconnect(ctx context.Context, c *client, api coordinatorv1.Coordinato
 	}
 	numbers := map[string]any{"beats": beats, "failed": failures, "longest_outage": longest.Round(time.Millisecond).String(), "codes": codesSeen}
 	if !down.IsZero() {
-		return numbers, errors.New("still down at the end of the watch")
+		return numbers, finding("still down at the end of the watch")
 	}
 	for code := range codesSeen {
 		if code != codes.Unavailable.String() {
-			return numbers, fmt.Errorf("an outage read as %s", code)
+			return numbers, finding("an outage read as " + code)
 		}
 	}
 	return numbers, nil

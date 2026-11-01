@@ -31,6 +31,8 @@ const (
 	originMachine = "mch_EDGEPROOF"
 	originOwner   = "own_EDGEPROOF"
 	apiRoot       = "/api/v1"
+	originRead    = 5 * time.Second
+	originIdle    = 2 * time.Minute
 )
 
 type originConfig struct {
@@ -116,17 +118,31 @@ func (s *statusRecorder) Flush() {
 
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
+// loggedMethod names a request by the method it called, from a closed set: what
+// a caller puts in a path never reaches the log.
+func loggedMethod(requestPath string) string {
+	for _, method := range []string{"Poll", "Heartbeat", "StreamArtifacts", "Check"} {
+		if strings.HasSuffix(requestPath, "/"+method) {
+			return method
+		}
+	}
+	return "other"
+}
+
 // logged writes one line per request, of the method's name, the status, and the
-// time taken. It is written to hold no header, no address and no token.
+// time taken. It is written to hold no header, no address and no token. It also
+// bounds the read of every request, a path outside the channel's included; the
+// channel sets its own deadline over this one.
 func logged(out io.Writer, next http.Handler) http.Handler {
 	var mu sync.Mutex
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		_ = http.NewResponseController(w).SetReadDeadline(start.Add(originRead))
 		recorder := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(recorder, r)
 		mu.Lock()
 		defer mu.Unlock()
-		_, _ = fmt.Fprintf(out, "%s %s status=%d took=%s\n", start.UTC().Format(time.RFC3339), path.Base(r.URL.Path), recorder.status, time.Since(start).Round(time.Millisecond))
+		_, _ = fmt.Fprintf(out, "%s %s status=%d took=%s\n", start.UTC().Format(time.RFC3339), loggedMethod(r.URL.Path), recorder.status, time.Since(start).Round(time.Millisecond))
 	})
 }
 
@@ -171,7 +187,7 @@ func serveOrigin(ctx context.Context, cfg originConfig) error {
 	}
 	_, _ = fmt.Fprintln(cfg.Log, "listening on", strings.Split(listener.Addr().String(), ":")[1:])
 	// WriteTimeout stays zero: the channel sets each request's own deadline.
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: originRead, IdleTimeout: originIdle}
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)

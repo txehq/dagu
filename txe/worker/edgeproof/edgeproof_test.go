@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/dagucloud/dagu/v2/internal/txe/workerchannel"
 )
@@ -119,6 +122,22 @@ func TestTheRequestBudgetHolds(t *testing.T) {
 		_, _ = w.RoundTrip(request) //nolint:bodyclose // nothing is returned
 	}
 	assert.Equal(t, maxRequests, calls)
+}
+
+func TestAnErrorIsPrintedWithoutItsAddress(t *testing.T) {
+	err := fmt.Errorf("dial tcp 192.0.2.7:443: certificate is valid for hub.example.test: %w", status.Error(codes.Unavailable, "connect failed to 192.0.2.7"))
+	assert.Equal(t, "Unavailable", says(err))
+	assert.Equal(t, "a poll failed", says(fmt.Errorf("wrapped: %w", finding("a poll failed"))))
+}
+
+func TestWhatACallerSendsNeverReachesTheLog(t *testing.T) {
+	server, log := startOrigin(t)
+	response, err := http.Post(server.URL+"/%0aforged%20line", "text/plain", strings.NewReader("x")) //nolint:noctx // a test's one request
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	assert.Equal(t, http.StatusNotFound, response.StatusCode)
+	assert.Contains(t, log.String(), " other status=404 ")
+	assert.NotContains(t, log.String(), "forged")
 }
 
 type roundTripper func(*http.Request) (*http.Response, error)
