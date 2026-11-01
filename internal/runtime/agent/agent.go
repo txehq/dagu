@@ -1248,6 +1248,11 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 
 	// Update the persisted terminal status.
 	finishedStatus := a.Status(ctx)
+	// Whoever cancelled the run may have said why. A plain cancel says nothing.
+	if cause := context.Cause(ctx); finishedStatus.Status == ir.Aborted && cause != nil &&
+		!errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+		finishedStatus.Error = appendDAGRunError(finishedStatus.Error, cause)
+	}
 
 	if a.artifactFinalizer != nil && a.artifactDir != "" {
 		artifactFinalizeStartedAt := time.Now()

@@ -48,7 +48,7 @@ type Worker struct {
 	pollerTasks  map[string]string            // pollerID -> attemptKey
 
 	// For cancellation support (key is AttemptKey)
-	cancelFuncs map[string]context.CancelFunc
+	cancelFuncs map[string]context.CancelCauseFunc
 	// For graceful shutdown requests to running tasks (key is AttemptKey)
 	runSignals map[string]*runSignal
 	stopping   bool
@@ -89,6 +89,12 @@ type TaskHandler interface {
 }
 
 var errTaskClaimRejectedBeforeExecution = errors.New("task claim rejected before execution")
+
+// What a run's final status says stopped it, when the worker decided alone.
+var (
+	errStoppedOwnerLost = errors.New("stopped by the worker: it could not reach its coordinator within the owner timeout")
+	errStoppedRefused   = errors.New("stopped by the worker: its coordinator refused this machine")
+)
 
 const (
 	ownerRunHeartbeatCallTimeout = 10 * time.Second
@@ -160,7 +166,7 @@ func NewWorker(
 		cfg:            cfg,
 		runningTasks:   make(map[string]*runningTaskState),
 		pollerTasks:    make(map[string]string),
-		cancelFuncs:    make(map[string]context.CancelFunc),
+		cancelFuncs:    make(map[string]context.CancelCauseFunc),
 		runSignals:     make(map[string]*runSignal),
 		healthServer:   healthcheck.NewServer("worker", healthPort),
 		openCodeHost:   opencodehost.New(context.Background(), openCodeConfig),
@@ -535,7 +541,8 @@ func (t *trackingHandler) Handle(ctx context.Context, task *coordinatorv1.Task) 
 
 	// Create a cancellable context for this task. It outlives the poll
 	// context so a graceful stop can finish; Stop cancels it through runsCtx.
-	taskCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	taskCtx, cancelCause := context.WithCancelCause(context.WithoutCancel(ctx))
+	cancel := func() { cancelCause(nil) }
 	defer cancel()
 	if t.worker.runsCtx != nil {
 		defer context.AfterFunc(t.worker.runsCtx, cancel)()
@@ -583,7 +590,7 @@ func (t *trackingHandler) Handle(ctx context.Context, task *coordinatorv1.Task) 
 		lastOwnerHeartbeatAt: t.worker.clock(),
 	}
 	t.worker.pollerTasks[pollerID] = attemptKey
-	t.worker.cancelFuncs[attemptKey] = cancel
+	t.worker.cancelFuncs[attemptKey] = cancelCause
 	t.worker.runSignals[attemptKey] = signal
 	stopping := t.worker.stopping
 	t.worker.pollersMu.Unlock()
@@ -850,7 +857,7 @@ func (w *Worker) cancelExpiredRefusals(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		cancelFunc()
+		cancelFunc(errStoppedRefused)
 		state.refusalCancelled = true
 		cancelled = append(cancelled, attemptKey)
 	}
@@ -885,7 +892,7 @@ func (w *Worker) cancelTasksForOwnerTimeout(ctx context.Context, owner servicere
 		timedOut = append(timedOut, &coordinatorv1.CancelledRun{AttemptKey: task.AttemptKey})
 	}
 	if len(timedOut) > 0 {
-		w.processCancellations(ctx, timedOut)
+		w.cancelRuns(ctx, timedOut, errStoppedOwnerLost)
 	}
 }
 
@@ -985,6 +992,12 @@ func (w *Worker) signalRunningTasks(sig os.Signal) {
 
 // processCancellations cancels tasks that the coordinator has marked for cancellation
 func (w *Worker) processCancellations(ctx context.Context, cancelledRuns []*coordinatorv1.CancelledRun) {
+	w.cancelRuns(ctx, cancelledRuns, nil)
+}
+
+// cancelRuns cancels runs. A cause is what the run's final status says stopped
+// it; a cancel the coordinator asked for needs none.
+func (w *Worker) cancelRuns(ctx context.Context, cancelledRuns []*coordinatorv1.CancelledRun, cause error) {
 	w.pollersMu.Lock()
 	defer w.pollersMu.Unlock()
 
@@ -1001,7 +1014,7 @@ func (w *Worker) processCancellations(ctx context.Context, cancelledRuns []*coor
 			logger.Info(ctx, "Cancelling task per coordinator directive",
 				tag.WorkerID(w.id),
 				tag.AttemptKey(run.AttemptKey))
-			cancelFunc()
+			cancelFunc(cause)
 		}
 	}
 }
