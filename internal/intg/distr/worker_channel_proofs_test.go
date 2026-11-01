@@ -545,6 +545,43 @@ fi`, first, gate, job.script(1))
 	t.Logf("rig: old worker said: %s", lastLines(oldOutput.String(), 3))
 }
 
+// At the production thresholds, with nothing shortened: a frozen worker's run
+// expires, and queued again it reaches another worker with no one releasing the
+// queue slot the expired attempt held.
+func TestChannelProofAnExpiredAttemptsQueueSlotComesBack(t *testing.T) {
+	needRealTime(t)
+	needPosixShell(t)
+	job := newFreezableJob(t)
+	first := filepath.Join(job.dir, "first")
+	script := fmt.Sprintf("if [ -f %[1]s ]; then echo NEW-ATTEMPT; exit 0; fi\ntouch %[1]s\n%[2]s", first, job.script(600))
+	rig := &channelRig{}
+	f := newTestFixture(t, rigDAG(script), withChannelRig(rig), withLogPersistence(), withWorkerCount(0),
+		withZombieDetectionInterval(45*time.Second))
+	t.Cleanup(f.cleanup)
+	old, _ := startIsolatedChannelWorker(t, f, rig, rigMachine+"@old")
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(distrTestTimeout(15 * time.Minute))
+
+	frozen := job.freezeWith(t, old)
+	frozenAt := time.Now()
+	expired := f.waitForStatus(ir.Failed, distrTestTimeout(5*time.Minute))
+	expiredAt := time.Now()
+	t.Logf("rig: expired %s after the freeze", expiredAt.Sub(frozenAt).Round(time.Second))
+
+	f.setupWorkerMode(rigMachine+"@new", map[string]string{txepkg.LabelMachine: rigMachine}, "", true, nil)
+	added, err := queue.EnqueueRetry(f.coord.Context, f.coord.DAGRunRepository, f.coord.QueueStore,
+		f.dagWrapper.DAG, &expired, queue.EnqueueRetryOptions{Processes: f.coord.ProcRepository})
+	require.NoError(t, err)
+	require.True(t, added)
+	newer := f.waitForStatus(ir.Succeeded, distrTestTimeout(5*time.Minute))
+	took := time.Since(expiredAt)
+	t.Logf("rig: the next dispatch finished %s after the expiry", took.Round(time.Second))
+	assert.Equal(t, rigMachine+"@new", newer.WorkerID)
+	assert.Less(t, took, 2*time.Minute, "the queue recovers by itself in bounded time")
+	frozen.thaw(t)
+}
+
 func lastLines(text string, n int) string {
 	lines := bytes.Split(bytes.TrimSpace([]byte(text)), []byte("\n"))
 	if len(lines) > n {
