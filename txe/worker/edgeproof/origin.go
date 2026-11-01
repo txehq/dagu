@@ -110,17 +110,7 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func (s *statusRecorder) Write(data []byte) (int, error) {
-	if s.status == 0 {
-		s.status = http.StatusOK
-	}
-	return s.ResponseWriter.Write(data)
-}
-
 func (s *statusRecorder) Flush() {
-	if s.status == 0 {
-		s.status = http.StatusOK
-	}
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -150,9 +140,14 @@ func logged(out io.Writer, next http.Handler) http.Handler {
 		_ = http.NewResponseController(w).SetReadDeadline(start.Add(originRead))
 		recorder := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(recorder, r)
+		// With no explicit header, net/http sends 200 when the handler returns.
+		code := recorder.status
+		if code == 0 {
+			code = http.StatusOK
+		}
 		mu.Lock()
 		defer mu.Unlock()
-		_, _ = fmt.Fprintf(out, "%s %s status=%d took=%s\n", start.UTC().Format(time.RFC3339), loggedMethod(r.URL.Path), recorder.status, time.Since(start).Round(time.Millisecond))
+		_, _ = fmt.Fprintf(out, "%s %s status=%d took=%s\n", start.UTC().Format(time.RFC3339), loggedMethod(r.URL.Path), code, time.Since(start).Round(time.Millisecond))
 	})
 }
 
