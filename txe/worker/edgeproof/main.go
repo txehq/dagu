@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"slices"
@@ -100,10 +101,7 @@ func runClientCommand(ctx context.Context, args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, *budget)
 	defer cancel()
-	// Each line is written as it happens: a run stopped from outside keeps them.
-	encoder := json.NewEncoder(os.Stdout)
-	emit := func(event Event) { _ = encoder.Encode(event) }
-	results, err := runChecks(ctx, clientConfig{URL: *url, Token: token, Watch: *watch, Emit: emit}, strings.Split(*checks, ","))
+	results, err := runAndWrite(ctx, clientConfig{URL: *url, Token: token, Watch: *watch}, strings.Split(*checks, ","), os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -111,6 +109,28 @@ func runClientCommand(ctx context.Context, args []string) error {
 		return errors.New("a check failed")
 	}
 	return nil
+}
+
+// runAndWrite writes each line as it happens: a run stopped from outside keeps
+// them. A line that cannot be written stops the run, since what it goes on to
+// measure would be lost too.
+func runAndWrite(ctx context.Context, cfg clientConfig, names []string, out io.Writer) ([]Result, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	encoder := json.NewEncoder(out)
+	var writeErr error
+	cfg.Emit = func(event Event) {
+		if writeErr == nil {
+			if writeErr = encoder.Encode(event); writeErr != nil {
+				cancel()
+			}
+		}
+	}
+	results, err := runChecks(ctx, cfg, names)
+	if writeErr != nil {
+		return results, fmt.Errorf("write results: %w", writeErr)
+	}
+	return results, err
 }
 
 func readToken(path string) (string, error) {
