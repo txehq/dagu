@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -97,6 +99,7 @@ func (i *identities) revoke(token string) {
 type service struct {
 	coordinatorv1.UnimplementedCoordinatorServiceServer
 	calls   atomic.Int64
+	chunks  atomic.Int64
 	callers sync.Map // method -> machine id
 	task    chan *coordinatorv1.Task
 	onChunk func(n int)
@@ -145,6 +148,7 @@ func (s *service) StreamLogs(stream coordinatorv1.CoordinatorService_StreamLogsS
 			return err
 		}
 		received++
+		s.chunks.Add(1)
 		if s.onChunk != nil {
 			s.onChunk(int(received))
 		}
@@ -183,7 +187,7 @@ func newHarness(t *testing.T, limits workerchannel.Limits) *harness {
 		Auth: auth, Coordinator: svc, Health: health.NewServer(), Limits: limits,
 	})
 	require.NoError(t, err)
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(http.StripPrefix("/channel", handler))
 	t.Cleanup(server.Close)
 	return &harness{ids: ids, service: svc, server: server}
 }
@@ -244,57 +248,112 @@ func TestRefusedCallsNeverReachTheService(t *testing.T) {
 	}
 }
 
-// rawCall sends a request no Conn would send, and returns its status code.
-func rawCall(t *testing.T, url, method string, headers map[string][]string, body []byte) codes.Code {
+// rawCall sends a request no Conn would send, and returns what the hub said:
+// its HTTP status and, when it answered with a Connect error, that error's code.
+func rawCall(t *testing.T, url, method, contentType string, headers map[string][]string, body []byte) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url+method, bytes.NewReader(body))
 	require.NoError(t, err)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Connect-Protocol-Version", "1")
 	maps.Copy(req.Header, headers)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, workerchannel.ChannelVersion, resp.Header.Get(workerchannel.HeaderChannel))
-	code, err := strconv.Atoi(resp.Header.Get(workerchannel.HeaderCode))
+	data, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	return codes.Code(code) // #nosec G115 -- a test's own response
+	var wire struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(data, &wire)
+	return resp.StatusCode, wire.Code
 }
 
 func TestTheRouteIsNeverAnOpenDoor(t *testing.T) {
 	hubKey := strings.Repeat("k", 40)
+	bearer := map[string][]string{"Authorization": {"Bearer " + tokenA}}
 	cases := []struct {
 		name    string
 		method  string
 		headers map[string][]string
-		code    codes.Code
+		code    string
 	}{
-		{"no credential", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName, nil, codes.Unauthenticated},
-		{"no credential on health", grpc_health_v1.Health_Check_FullMethodName, nil, codes.Unauthenticated},
+		{"no credential", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName, nil, "unauthenticated"},
+		{"no credential on health", grpc_health_v1.Health_Check_FullMethodName, nil, "unauthenticated"},
 		{"two credentials", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName,
-			map[string][]string{"Authorization": {"Bearer " + tokenA, "Bearer " + tokenB}}, codes.Unauthenticated},
+			map[string][]string{"Authorization": {"Bearer " + tokenA, "Bearer " + tokenB}}, "unauthenticated"},
 		{"the hub scheme", coordinatorv1.CoordinatorService_Dispatch_FullMethodName,
-			map[string][]string{"Authorization": {"TXE-Hub " + hubKey}}, codes.Unauthenticated},
-		{"a hub-only method", coordinatorv1.CoordinatorService_Dispatch_FullMethodName,
-			map[string][]string{"Authorization": {"Bearer " + tokenA}}, codes.PermissionDenied},
-		{"a resource with no authorizer", coordinatorv1.CoordinatorService_GetWorkspaceBundle_FullMethodName,
-			map[string][]string{"Authorization": {"Bearer " + tokenA}}, codes.Unimplemented},
-		{"a method nobody listed", "/coordinator.v1.CoordinatorService/Nope",
-			map[string][]string{"Authorization": {"Bearer " + tokenA}}, codes.PermissionDenied},
-		{"another service", "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
-			map[string][]string{"Authorization": {"Bearer " + tokenA}}, codes.PermissionDenied},
+			map[string][]string{"Authorization": {"TXE-Hub " + hubKey}}, "unauthenticated"},
+		{"a hub-only method", coordinatorv1.CoordinatorService_Dispatch_FullMethodName, bearer, "permission_denied"},
+		{"a resource with no authorizer", coordinatorv1.CoordinatorService_GetWorkspaceBundle_FullMethodName, bearer, "unimplemented"},
+		{"a method nobody listed", "/coordinator.v1.CoordinatorService/Nope", bearer, "permission_denied"},
+		{"another service", "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", bearer, "permission_denied"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, workerchannel.Limits{})
-			assert.Equal(t, tc.code, rawCall(t, h.server.URL, tc.method, tc.headers, nil))
+			_, code := rawCall(t, h.server.URL+"/channel", tc.method, "application/proto", tc.headers, nil)
+			assert.Equal(t, tc.code, code)
 			assert.Zero(t, h.service.calls.Load())
 		})
+	}
+}
+
+func TestOnlyConnectWithProtobufIsSpoken(t *testing.T) {
+	bearer := map[string][]string{"Authorization": {"Bearer " + tokenA}}
+	for _, contentType := range []string{"application/grpc", "application/grpc+proto", "application/grpc-web+proto", "application/json", "application/connect+json", ""} {
+		t.Run(contentType, func(t *testing.T) {
+			h := newHarness(t, workerchannel.Limits{})
+			status, _ := rawCall(t, h.server.URL+"/channel", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName, contentType, bearer, nil)
+			assert.Equal(t, http.StatusUnsupportedMediaType, status)
+			assert.Zero(t, h.service.calls.Load())
+		})
+	}
+	h := newHarness(t, workerchannel.Limits{})
+	data, err := proto.Marshal(heartbeat(machineA))
+	require.NoError(t, err)
+	compressed := map[string][]string{"Authorization": {"Bearer " + tokenA}, "Content-Encoding": {"gzip"}}
+	_, code := rawCall(t, h.server.URL+"/channel", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName, "application/proto", compressed, data)
+	assert.Equal(t, "unimplemented", code)
+	assert.Zero(t, h.service.calls.Load())
+}
+
+// The exact list of what the channel carries, against the transport policy.
+func TestCarriedMethodsAreExactlyTheTable(t *testing.T) {
+	carried := map[string]bool{}
+	for _, name := range []string{
+		"Poll", "Heartbeat", "AckTaskClaim", "RunHeartbeat", "ReportStatus", "StreamLogs", "StreamArtifacts",
+		"ResolveSecretReference", "ResolveRuntimeProfile", "ClaimAgentSessionCleanup", "CompleteAgentSessionCleanup",
+	} {
+		carried["/coordinator.v1.CoordinatorService/"+name] = true
+	}
+	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{BaseURL: "https://hub.example", Credentials: &staticAuth{token: tokenA}})
+	require.NoError(t, err)
+	desc := coordinatorv1.CoordinatorService_ServiceDesc
+	var names []string
+	for _, m := range desc.Methods {
+		names = append(names, "/"+desc.ServiceName+"/"+m.MethodName)
+	}
+	for _, s := range desc.Streams {
+		names = append(names, "/"+desc.ServiceName+"/"+s.StreamName)
+	}
+	require.Len(t, names, 23)
+	for _, name := range names {
+		surface, known := transportauth.SurfaceOf(name)
+		require.True(t, known, name)
+		assert.Equal(t, surface == transportauth.SurfaceWorker, carried[name], name)
+		if !carried[name] {
+			assert.Equal(t, codes.Unimplemented, status.Code(conn.Invoke(context.Background(), name, nil, nil)), name)
+			_, err := conn.NewStream(context.Background(), nil, name)
+			assert.Equal(t, codes.Unimplemented, status.Code(err), name)
+		}
 	}
 }
 
 func TestHealthAnswersAnEnrolledMachine(t *testing.T) {
 	h := newHarness(t, workerchannel.Limits{})
 	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
-		BaseURL: h.server.URL, Credentials: &staticAuth{token: tokenA},
+		BaseURL: h.server.URL + "/channel", Credentials: &staticAuth{token: tokenA},
 	})
 	require.NoError(t, err)
 	resp, err := grpc_health_v1.NewHealthClient(conn).Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
@@ -376,37 +435,80 @@ func TestAStreamStopsWhenItsEnrolmentIsRevoked(t *testing.T) {
 	assert.Equal(t, codes.Unauthenticated, status.Code(err), "%v", err)
 }
 
-func TestAStreamCutShortIsNotAFinishedStream(t *testing.T) {
+func TestAStreamCutInsideAMessageIsAnError(t *testing.T) {
 	h := newHarness(t, workerchannel.Limits{})
 	message, err := proto.Marshal(chunk(machineA))
 	require.NoError(t, err)
 	var body bytes.Buffer
+	body.WriteByte(0)
 	require.NoError(t, binary.Write(&body, binary.BigEndian, uint32(len(message)))) // #nosec G115 -- a test's own message
-	body.Write(message)
-	// A body that ends cleanly at a frame boundary, with no end frame.
-	assert.NotEqual(t, codes.OK, rawCall(t, h.server.URL, coordinatorv1.CoordinatorService_StreamLogs_FullMethodName,
-		map[string][]string{"Authorization": {"Bearer " + tokenA}}, body.Bytes()))
+	body.Write(message[:len(message)/2])
+	status, _ := rawCall(t, h.server.URL+"/channel", coordinatorv1.CoordinatorService_StreamLogs_FullMethodName, "application/connect+proto",
+		map[string][]string{"Authorization": {"Bearer " + tokenA}}, body.Bytes())
+	assert.Equal(t, http.StatusOK, status) // a stream's error is in its last frame
+	assert.EqualValues(t, 0, h.service.chunks.Load())
+}
+
+// A body that stops cleanly between messages is what Connect calls a finished
+// request, so nothing may depend on that: a log is finalized only by its final
+// chunk.
+func TestALogIsNotFinalizedByTheEndOfARequest(t *testing.T) {
+	dir, client := realLogHandler(t)
+	stream, err := client.StreamLogs(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(realChunk(0, "partial", false)))
+	_, err = stream.CloseAndRecv()
+	require.NoError(t, err)
+	files := filesUnder(t, dir)
+	require.Len(t, files, 1)
+	assert.False(t, strings.HasSuffix(files[0], ".final"))
+
+	stream, err = client.StreamLogs(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(realChunk(7, "", true)))
+	_, err = stream.CloseAndRecv()
+	require.NoError(t, err)
+	assert.Len(t, filesUnder(t, dir), 2)
+}
+
+// A stalled body must not hold a machine's call past the limit, though no read
+// of it notices a cancelled context.
+func TestAStalledBodyIsReleased(t *testing.T) {
+	limits := workerchannel.DefaultLimits()
+	limits.PollWait = 50 * time.Millisecond
+	limits.Unary = 100 * time.Millisecond
+	limits.MaxCallsPerMachine = 1
+	h := newHarness(t, limits)
+	conn, err := net.Dial("tcp", h.server.Listener.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = io.WriteString(conn, "POST /channel"+coordinatorv1.CoordinatorService_Heartbeat_FullMethodName+" HTTP/1.1\r\nHost: x\r\n"+
+		"Authorization: Bearer "+tokenA+"\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nContent-Length: 100\r\n\r\nabc")
+	require.NoError(t, err)
+	client := h.client(t, tokenA)
+	require.Eventually(t, func() bool {
+		_, err := client.Heartbeat(context.Background(), heartbeat(machineA))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
 }
 
 func TestSizeLimits(t *testing.T) {
 	limits := workerchannel.DefaultLimits()
 	limits.MaxMessageBytes = 1024
-	limits.MaxStreamBytes = 4096
+	limits.MaxRequestBytes = 4096
 	h := newHarness(t, limits)
 
 	huge := heartbeat(machineA)
 	huge.Labels["padding"] = strings.Repeat("x", 2048)
-	resp := func() codes.Code {
-		data, err := proto.Marshal(huge)
-		require.NoError(t, err)
-		return rawCall(t, h.server.URL, coordinatorv1.CoordinatorService_Heartbeat_FullMethodName,
-			map[string][]string{"Authorization": {"Bearer " + tokenA}}, data)
-	}()
-	assert.Equal(t, codes.ResourceExhausted, resp)
+	data, err := proto.Marshal(huge)
+	require.NoError(t, err)
+	_, code := rawCall(t, h.server.URL+"/channel", coordinatorv1.CoordinatorService_Heartbeat_FullMethodName, "application/proto",
+		map[string][]string{"Authorization": {"Bearer " + tokenA}}, data)
+	assert.Equal(t, "resource_exhausted", code)
 	assert.Zero(t, h.service.calls.Load())
 
 	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
-		BaseURL: h.server.URL, Credentials: &staticAuth{token: tokenA}, Limits: limits,
+		BaseURL: h.server.URL + "/channel", Credentials: &staticAuth{token: tokenA}, Limits: limits,
 	})
 	require.NoError(t, err)
 	stream, err := coordinatorv1.NewCoordinatorServiceClient(conn).StreamLogs(context.Background())
@@ -442,7 +544,7 @@ func TestAMachineCannotHoldMoreThanItsCalls(t *testing.T) {
 }
 
 func TestAnAnswerThatIsNotTheHubsIsUnavailable(t *testing.T) {
-	for _, code := range []int{http.StatusForbidden, http.StatusUnauthorized, http.StatusBadGateway, 524} {
+	for _, code := range []int{http.StatusOK, http.StatusForbidden, http.StatusUnauthorized, http.StatusNotFound, http.StatusBadGateway, 524} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
 			edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(code)
@@ -457,16 +559,13 @@ func TestAnAnswerThatIsNotTheHubsIsUnavailable(t *testing.T) {
 	}
 }
 
-func TestAStatusWithoutTheChannelMarkIsNotBelieved(t *testing.T) {
-	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(workerchannel.HeaderCode, strconv.Itoa(int(codes.Unauthenticated)))
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer edge.Close()
-	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{BaseURL: edge.URL, Credentials: &staticAuth{token: tokenA}})
-	require.NoError(t, err)
-	_, err = coordinatorv1.NewCoordinatorServiceClient(conn).Heartbeat(context.Background(), heartbeat(machineA))
-	assert.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+// A hub's refusal is told from an edge's status, and stays a refusal.
+func TestAHubsRefusalIsStillARefusal(t *testing.T) {
+	h := newHarness(t, workerchannel.Limits{})
+	_, err := h.client(t, "nobody").Heartbeat(context.Background(), heartbeat(machineA))
+	assert.Equal(t, codes.Unauthenticated, status.Code(err), "%v", err)
+	_, err = h.client(t, tokenA).Heartbeat(context.Background(), heartbeat(machineB))
+	assert.Equal(t, codes.PermissionDenied, status.Code(err), "%v", err)
 }
 
 func TestARedirectIsNeverFollowed(t *testing.T) {
@@ -532,9 +631,8 @@ func TestABaseURLIsRefusedBeforeACredentialCanLeak(t *testing.T) {
 	}
 }
 
-// The hub's real log handler, reached through the channel: a checkpointed log
-// resumes on a new request, which is how a worker's log writer already works.
-func TestARealLogHandlerResumesOnANewRequest(t *testing.T) {
+func realLogHandler(t *testing.T) (string, coordinatorv1.CoordinatorServiceClient) {
+	t.Helper()
 	dir := t.TempDir()
 	ids := newIdentities()
 	auth, err := transportauth.NewServer(transportauth.ServerConfig{
@@ -547,27 +645,24 @@ func TestARealLogHandlerResumesOnANewRequest(t *testing.T) {
 	})
 	require.NoError(t, err)
 	server := httptest.NewServer(handler)
-	defer server.Close()
+	t.Cleanup(server.Close)
 	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{BaseURL: server.URL, Credentials: &staticAuth{token: tokenA}})
 	require.NoError(t, err)
-	client := coordinatorv1.NewCoordinatorServiceClient(conn)
+	return dir, coordinatorv1.NewCoordinatorServiceClient(conn)
+}
 
-	send := func(offset uint64, data string, final bool) {
-		stream, err := client.StreamLogs(context.Background())
-		require.NoError(t, err)
-		c := &coordinatorv1.LogChunk{
-			WorkerId: machineA, DagName: "dag", DagRunId: "run", AttemptId: "attempt", StepName: "step",
-			RootDagRunName: "dag", RootDagRunId: "run", StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
-			Data: []byte(data), IsFinal: final,
-		}
-		c.SetByteOffset(offset)
-		require.NoError(t, stream.Send(c))
-		_, err = stream.CloseAndRecv()
-		require.NoError(t, err)
+func realChunk(offset uint64, data string, final bool) *coordinatorv1.LogChunk {
+	c := &coordinatorv1.LogChunk{
+		WorkerId: machineA, DagName: "dag", DagRunId: "run", AttemptId: "attempt", StepName: "step",
+		RootDagRunName: "dag", RootDagRunId: "run", StreamType: coordinatorv1.LogStreamType_LOG_STREAM_TYPE_STDOUT,
+		Data: []byte(data), IsFinal: final,
 	}
-	send(0, "first ", false)
-	send(6, "second", false)
+	c.SetByteOffset(offset)
+	return c
+}
 
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
 	var found []string
 	require.NoError(t, filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
@@ -575,6 +670,23 @@ func TestARealLogHandlerResumesOnANewRequest(t *testing.T) {
 		}
 		return err
 	}))
+	return found
+}
+
+// The hub's real log handler, reached through the channel: a checkpointed log
+// resumes on a new request, which is how a worker's log writer already works.
+func TestARealLogHandlerResumesOnANewRequest(t *testing.T) {
+	dir, client := realLogHandler(t)
+	send := func(offset uint64, data string) {
+		stream, err := client.StreamLogs(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(realChunk(offset, data, false)))
+		_, err = stream.CloseAndRecv()
+		require.NoError(t, err)
+	}
+	send(0, "first ")
+	send(6, "second")
+	found := filesUnder(t, dir)
 	require.Len(t, found, 1)
 	data, err := os.ReadFile(filepath.Clean(found[0]))
 	require.NoError(t, err)

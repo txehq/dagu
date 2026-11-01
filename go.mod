@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	cloud.google.com/go/secretmanager v1.20.0
+	connectrpc.com/connect v1.21.1
 	dario.cat/mergo v1.0.2
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1

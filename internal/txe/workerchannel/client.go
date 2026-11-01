@@ -4,19 +4,17 @@
 package workerchannel
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -45,16 +43,19 @@ type ClientConfig struct {
 	// refuse, so that a worker hears it before it has sent the bytes.
 	Limits Limits
 	// HTTP is the client to use; its redirect policy is replaced. Nil builds
-	// one with bounded connection setup and dead-connection detection.
+	// one with bounded connection setup.
 	HTTP *http.Client
 }
 
 // Conn is a grpc.ClientConnInterface that sends calls to a Handler.
 type Conn struct {
-	base   string
-	auth   Authorizer
-	limits Limits
-	http   *http.Client
+	base    string
+	auth    Authorizer
+	limits  Limits
+	http    *http.Client
+	options []connect.ClientOption
+	calls   map[string]func(ctx context.Context, args, reply any) error
+	streams map[string]func(ctx context.Context) (grpc.ClientStream, error)
 }
 
 var _ grpc.ClientConnInterface = (*Conn)(nil)
@@ -82,7 +83,18 @@ func NewConn(cfg ClientConfig) (*Conn, error) {
 	}
 	// A credential goes to the configured address and nowhere else.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Conn{base: base, auth: cfg.Credentials, limits: limits, http: client}, nil
+	c := &Conn{
+		base: base, auth: cfg.Credentials, limits: limits, http: client,
+		options: []connect.ClientOption{
+			connect.WithReadMaxBytes(limits.MaxMessageBytes),
+			connect.WithSendMaxBytes(limits.MaxMessageBytes),
+			connect.WithAcceptCompression("gzip", nil, nil),
+		},
+		calls:   make(map[string]func(context.Context, any, any) error),
+		streams: make(map[string]func(context.Context) (grpc.ClientStream, error)),
+	}
+	c.addMethods()
+	return c, nil
 }
 
 func checkBaseURL(raw string) (string, error) {
@@ -113,8 +125,9 @@ func newHTTPClient() *http.Client {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 2 * time.Minute,
 		IdleConnTimeout:       90 * time.Second,
-		// An idle connection that stopped answering is closed in bounded
-		// time, so a call never waits on one that has silently died.
+		// A connection to the edge that stopped answering is closed in
+		// bounded time. It says nothing about the hub behind the edge: that
+		// is what the worker's heartbeat calls are for.
 		HTTP2: &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 5 * time.Second},
 	}
 	return &http.Client{Transport: transport}
@@ -128,201 +141,132 @@ func (c *Conn) Close() error {
 
 // Invoke implements grpc.ClientConnInterface.
 func (c *Conn) Invoke(ctx context.Context, method string, args, reply any, _ ...grpc.CallOption) error {
-	request, ok := args.(proto.Message)
+	call, ok := c.calls[method]
 	if !ok {
-		return status.Error(codes.Internal, "workerchannel: not a protobuf message")
+		return status.Error(codes.Unimplemented, "workerchannel: this method is not carried")
 	}
-	data, err := proto.Marshal(request)
-	if err != nil {
-		return status.Error(codes.Internal, "workerchannel: the message cannot be written")
-	}
-	if int64(len(data)) > c.limits.MaxMessageBytes {
-		return status.Error(codes.ResourceExhausted, "workerchannel: the message is too large")
-	}
-	limit := c.limits.Unary + 5*time.Second
-	callCtx, cancel := context.WithTimeout(ctx, limit)
-	defer cancel()
-	req, err := c.newRequest(callCtx, ctx, method, contentTypeMessage, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.ContentLength = int64(len(data))
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return transportError(ctx, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return c.readResponse(resp, reply)
+	return call(ctx, args, reply)
 }
 
 // NewStream implements grpc.ClientConnInterface for client-streaming methods.
-// The request starts with the stream and its body is what SendMsg writes.
-func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
-	if !desc.ClientStreams || desc.ServerStreams {
-		return nil, status.Error(codes.Unimplemented, "workerchannel: only client streams are carried")
+func (c *Conn) NewStream(ctx context.Context, _ *grpc.StreamDesc, method string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
+	open, ok := c.streams[method]
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "workerchannel: this method is not carried")
 	}
-	streamCtx, cancel := context.WithTimeout(ctx, c.limits.Stream+5*time.Second)
-	reader, writer := io.Pipe()
-	req, err := c.newRequest(streamCtx, ctx, method, contentTypeFrames, reader)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	stream := &clientStream{
-		conn: c, ctx: ctx, callCtx: streamCtx, cancel: cancel, writer: writer,
-		done: make(chan struct{}),
-	}
-	go func() {
-		defer close(stream.done)
-		stream.resp, stream.err = c.http.Do(req) //nolint:bodyclose // closed by RecvMsg, or by ctx when nobody calls it
-		// A response ends the request, read to its end or not.
-		_ = reader.CloseWithError(io.ErrClosedPipe)
-	}()
-	return stream, nil
+	return open(ctx)
 }
 
-// newRequest builds a request. callerCtx is what the deadline header reports:
-// callCtx also holds the channel's own limit, which the hub applies itself.
-func (c *Conn) newRequest(callCtx, callerCtx context.Context, method, contentType string, body io.Reader) (*http.Request, error) {
-	target := c.base + method
-	authorization, err := c.auth.HTTPAuthorization(callCtx, target)
-	if err != nil {
-		return nil, err
+func addCall[Req, Res any](c *Conn, procedure string) {
+	target := c.base + procedure
+	client := connect.NewClient[Req, Res](c.http, target, c.options...)
+	c.calls[procedure] = func(ctx context.Context, args, reply any) error {
+		authorization, err := c.auth.HTTPAuthorization(ctx, target)
+		if err != nil {
+			return err
+		}
+		callCtx, cancel := context.WithTimeout(ctx, c.limits.Unary+5*time.Second)
+		defer cancel()
+		req := connect.NewRequest(args.(*Req))
+		req.Header().Set("Authorization", authorization)
+		resp, err := client.CallUnary(callCtx, req)
+		if err != nil {
+			return callError(ctx, err)
+		}
+		proto.Reset(reply.(proto.Message))
+		proto.Merge(reply.(proto.Message), any(resp.Msg).(proto.Message))
+		return nil
 	}
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, target, body)
-	if err != nil {
-		return nil, status.Error(codes.Internal, "workerchannel: the request cannot be built")
-	}
-	req.Header.Set("Authorization", authorization)
-	req.Header.Set("Content-Type", contentType)
-	if left := remaining(callerCtx); left > 0 {
-		req.Header.Set(HeaderTimeout, strconv.FormatInt(left.Milliseconds(), 10))
-	}
-	return req, nil
 }
 
-// readResponse believes a response only if it is the channel's own.
-func (c *Conn) readResponse(resp *http.Response, reply any) error {
-	if resp.Header.Get(HeaderChannel) != ChannelVersion {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBytes))
-		return status.Error(codes.Unavailable, fmt.Sprintf("workerchannel: an answer that is not the hub's (HTTP %d)", resp.StatusCode))
+func addClientStream[Req, Res any](c *Conn, procedure string) {
+	target := c.base + procedure
+	client := connect.NewClient[Req, Res](c.http, target, c.options...)
+	c.streams[procedure] = func(ctx context.Context) (grpc.ClientStream, error) {
+		authorization, err := c.auth.HTTPAuthorization(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+		callCtx, cancel := context.WithTimeout(ctx, c.limits.Stream+5*time.Second) //nolint:gosec // cancelled by RecvMsg, or by its own timeout
+		stream := client.CallClientStream(callCtx)
+		stream.RequestHeader().Set("Authorization", authorization)
+		return &clientStream[Req, Res]{ctx: ctx, cancel: cancel, stream: stream, limit: c.limits.MaxRequestBytes}, nil
 	}
-	code, err := strconv.Atoi(resp.Header.Get(HeaderCode))
-	if err != nil || code < 0 {
-		return status.Error(codes.Unavailable, "workerchannel: an answer with no status")
-	}
-	if codes.Code(code) != codes.OK { // #nosec G115 -- non-negative, and an unknown code is only reported
-		text, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes))
-		return status.Error(codes.Code(code), string(text)) // #nosec G115 -- as above
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, c.limits.MaxMessageBytes+1))
-	if err != nil {
-		return status.Error(codes.Unavailable, "workerchannel: the answer was cut short")
-	}
-	if int64(len(data)) > c.limits.MaxMessageBytes {
-		return status.Error(codes.ResourceExhausted, "workerchannel: the answer is too large")
-	}
-	return unmarshal(data, reply)
 }
 
-// transportError says what became of a call that got no response.
-func transportError(ctx context.Context, err error) error {
+// callError says what became of a call. The caller's own context comes first:
+// a cancelled call is not a hub that cannot be reached.
+func callError(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return status.FromContextError(ctxErr).Err()
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return status.Error(codes.DeadlineExceeded, "workerchannel: the call took too long")
-	}
-	return status.Error(codes.Unavailable, "workerchannel: the hub cannot be reached")
+	return fromConnect(err)
 }
 
-// clientStream is one client stream, written to a request's body.
-type clientStream struct {
-	conn    *Conn
-	ctx     context.Context
-	callCtx context.Context
-	cancel  context.CancelFunc
-	writer  *io.PipeWriter
+// clientStream is the generated client's view of one Connect client stream.
+type clientStream[Req, Res any] struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	stream *connect.ClientStreamForClient[Req, Res]
+	limit  int64
 
-	mu     sync.Mutex
-	sent   int64
-	closed bool
-
-	done chan struct{}
-	resp *http.Response
-	err  error
-
+	mu       sync.Mutex
+	sent     int64
+	refused  error
 	received bool
 }
 
-func (s *clientStream) Header() (metadata.MD, error) { return nil, nil }
-func (s *clientStream) Trailer() metadata.MD         { return nil }
-func (s *clientStream) Context() context.Context     { return s.ctx }
+func (s *clientStream[Req, Res]) Header() (metadata.MD, error) { return nil, nil }
+func (s *clientStream[Req, Res]) Trailer() metadata.MD         { return nil }
+func (s *clientStream[Req, Res]) Context() context.Context     { return s.ctx }
 
-// SendMsg writes one frame. As on gRPC, io.EOF says the call has ended and
+// SendMsg sends one message. As on gRPC, io.EOF says the call has ended and
 // RecvMsg holds why.
-func (s *clientStream) SendMsg(m any) error {
-	message, ok := m.(proto.Message)
-	if !ok {
-		return status.Error(codes.Internal, "workerchannel: not a protobuf message")
-	}
-	data, err := proto.Marshal(message)
-	if err != nil {
-		return status.Error(codes.Internal, "workerchannel: the message cannot be written")
-	}
+func (s *clientStream[Req, Res]) SendMsg(m any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return status.Error(codes.Internal, "workerchannel: the stream is closed")
+	message := m.(*Req)
+	size := int64(proto.Size(any(message).(proto.Message))) + envelopeBytes
+	if s.sent+size > s.limit {
+		// Cut off: the hub must not read what was sent as a finished stream.
+		s.refused = status.Error(codes.ResourceExhausted, "workerchannel: the request is over its size limit")
+		s.cancel()
+		return s.refused
 	}
-	size := int64(len(data)) + frameHeaderBytes
-	if int64(len(data)) > s.conn.limits.MaxMessageBytes || s.sent+size > s.conn.limits.MaxStreamBytes {
-		s.abandon()
-		return status.Error(codes.ResourceExhausted, "workerchannel: the stream is over its size limit")
-	}
-	if err := writeFrame(s.writer, data); err != nil {
-		return io.EOF
+	if err := s.stream.Send(message); err != nil {
+		if errors.Is(err, io.EOF) {
+			return io.EOF
+		}
+		return callError(s.ctx, err)
 	}
 	s.sent += size
 	return nil
 }
 
-// abandon cuts the request off, without the end frame.
-func (s *clientStream) abandon() {
-	s.closed = true
-	_ = s.writer.CloseWithError(errors.New("workerchannel: stream abandoned"))
-	s.cancel()
-}
+// envelopeBytes is the Connect envelope around a stream's message.
+const envelopeBytes = 5
 
-// CloseSend writes the end frame.
-func (s *clientStream) CloseSend() error {
+// CloseSend is part of CloseAndRecv: closing and reading the reply are one
+// step of the Connect client.
+func (s *clientStream[Req, Res]) CloseSend() error { return nil }
+
+// RecvMsg ends the stream and reads its one reply.
+func (s *clientStream[Req, Res]) RecvMsg(m any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-	if err := writeFrameEnd(s.writer); err != nil {
-		return nil //nolint:nilerr // the call has ended: RecvMsg holds why
-	}
-	return s.writer.Close()
-}
-
-// RecvMsg waits for the response and reads the stream's one reply.
-func (s *clientStream) RecvMsg(m any) error {
 	if s.received {
 		return io.EOF
 	}
 	s.received = true
 	defer s.cancel()
-	select {
-	case <-s.done:
-	case <-s.callCtx.Done():
-		<-s.done
+	if s.refused != nil {
+		return s.refused
 	}
-	if s.err != nil {
-		return transportError(s.ctx, s.err)
+	resp, err := s.stream.CloseAndReceive()
+	if err != nil {
+		return callError(s.ctx, err)
 	}
-	defer func() { _ = s.resp.Body.Close() }()
-	return s.conn.readResponse(s.resp, m)
+	proto.Reset(m.(proto.Message))
+	proto.Merge(m.(proto.Message), any(resp.Msg).(proto.Message))
+	return nil
 }

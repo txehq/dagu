@@ -1,6 +1,6 @@
 # Worker channel over HTTPS (design)
 
-Status: proposed, TXE-5550. `internal/txe/workerchannel` is a library nothing imports yet. Nothing here is live.
+Status: proposed, TXE-5550. `internal/txe/workerchannel` is a library nothing imports yet. Nothing here is live, and no Cloudflare path has been tried.
 
 ## Why
 
@@ -11,34 +11,67 @@ Today a worker reaches its hub through `kubectl port-forward` to `127.0.0.1:5005
 Change the transport and nothing above it.
 
 ```
-worker                                                       hub (dagu start-all)
-generated CoordinatorServiceClient                           generated service descriptor
-  -> workerchannel.Conn  (grpc.ClientConnInterface)            -> transportauth interceptors (enforce, machines only)
-       POST https://dag.txeinternal.com/<mount>/<service>/<method>  -> coordinator.Handler
-       protobuf body, bearer credential                          (leases, claim ack, report fence, unchanged)
-                 |                                                 ^
-                 +--> Cloudflare --> cloudflared --> dagu:8080 ----+
+worker                                                      hub (dagu start-all)
+generated CoordinatorServiceClient                          generated CoordinatorServiceServer
+  -> workerchannel.Conn (grpc.ClientConnInterface)            -> transportauth interceptors (enforce, machines only)
+       Connect client, binary protobuf                          -> coordinator.Handler
+                 |                                                 (leases, claim ack, report fence unchanged)
+                 +--> Cloudflare --> cloudflared --> dagu:8080 ----^
 ```
 
-The generated client only needs a `grpc.ClientConnInterface`, and the generated `ServiceDesc` hands out each method's own handler. So the 23 RPCs are not rewritten: the same request and reply messages reach the same handler, behind the same interceptors. The coordinator's gRPC port stays private, and no raw gRPC or admin proxy is exposed.
+Each carried method keeps its generated request and reply messages, its handler and its interceptor. The coordinator's gRPC port stays private, and this route never speaks gRPC.
 
 ## Options compared
 
 | Option | Verdict | Why |
 |---|---|---|
-| Bounded HTTP with generated protobuf, on the generated stubs and descriptor | **Chosen** | No new dependency, no RPC semantics rewritten, works through the Tunnel host as ordinary HTTP |
-| JSON REST for each RPC | Rejected | Rewrites 23 calls and their error semantics; two descriptions of one protocol |
-| Connect or gRPC-Web | Rejected | A new dependency or proxy and regenerated code for what two small files do. Cloudflare Tunnel public hostnames do not carry gRPC at all |
-| Proxied gRPC through Cloudflare | Rejected | Needs a public TLS origin on 443 |
-| WebSocket | Rejected | 23 RPCs: 19 unary, 3 client streams, 1 server stream, none bidirectional. The worker always dials out. Nothing demonstrates a need |
+| **Connect protocol, `connectrpc.com/connect` v1.21.1** | **Chosen** | A maintained, versioned protocol over ordinary HTTP/1.1 and HTTP/2. It has its own framing, timeouts, error model and size limits, so none of that is ours. A small typed adapter fits the existing generated code, with no regenerated stubs. Apache-2.0; its only non-test dependency is protobuf, already here |
+| Our own framing on the generated stubs | Rejected, after a prototype | The first version of this PR. It worked, and its wire was nearly Connect's, with every parser, timeout and error rule ours to maintain |
+| Connect v2.0.2 | Not now | Released 2026-10-21, with a different package layout. v1 is the proven line. Moving later is an adapter change |
+| gRPC-Web | Rejected | Needs its own proxy, or a server mode this repository does not use |
+| JSON REST for each RPC | Rejected | Rewrites each call and its error semantics |
+| Proxied gRPC through Cloudflare | Rejected | Needs a public TLS origin on 443. Tunnel public hostnames do not carry gRPC, which does not affect Connect: to the Tunnel, Connect is plain HTTP |
+| WebSocket | Rejected | No method is bidirectional and the worker always dials out. Nothing demonstrates a need |
+
+## What is carried
+
+Eleven of the 23 coordinator methods, plus `Health/Check`. The table is `methods.go`, and `TestCarriedMethodsAreExactlyTheTable` holds it against `transportauth`'s policy: exactly the worker surface is carried. A method added later is closed until someone lists it. All other methods fail closed, as they do on an enforcing coordinator (TXE-4228).
+
+| Method | Shape | Carried | Worker use |
+|---|---|---|---|
+| `Poll` | unary | yes | Take a task |
+| `Heartbeat` | unary | yes | Worker liveness |
+| `AckTaskClaim` | unary | yes | Confirm a claim |
+| `RunHeartbeat` | unary | yes | Refresh a run's lease, every 1 s |
+| `ReportStatus` | unary | yes | Status, including the final one |
+| `ResolveSecretReference` | unary | yes | Secret reference for a running attempt |
+| `ResolveRuntimeProfile` | unary | yes | Runtime profile for a running attempt |
+| `ClaimAgentSessionCleanup` | unary | yes | Agent session cleanup |
+| `CompleteAgentSessionCleanup` | unary | yes | Agent session cleanup |
+| `StreamLogs` | client stream | yes | Step logs |
+| `StreamArtifacts` | client stream | yes | Run artifacts |
+| `GetWorkspaceBundle` | server stream | **no** | A task with a workspace bundle digest (`materializeTaskWorkspace`) |
+| `GetDAG` | unary | **no** | Fallback when a local DAG store misses a definition (`remote_handler.go`) |
+| `GetState`, `PutState`, `DeleteState`, `ListState` | unary | **no** | `state` steps |
+| `GetDAGRunStatus`, `RequestCancel` | unary | **no** | Remote sub-DAGs |
+| `Dispatch`, `GetWorkers`, `PutWorkspaceBundle`, `HasWorkspaceBundle` | mixed | **no** | Hub's own processes |
+
+**Why exclusion does not break TXE jobs.** A bundle exists only for a DAG with file dependencies. `RenderDAG` writes a command chain with none, and a TXE task carries its definition. So `state` steps, sub-DAGs and bundles are out of reach of a TXE job. This is read from the code: the worker wiring PR must add a test that a rendered DAG has no file dependencies, and the rig runs a real job. A non-TXE DAG that needs them fails closed on this channel. It can keep the private path, or wait for TXE-4228.
 
 ## Wire
 
-- `POST <mount>/<service>/<method>`, `Authorization: Bearer <machine token>`, one header exactly.
-- Unary: the body is the request message. The response is the reply message.
-- Client stream: one request whose body is frames, a 4-byte big-endian length and a message, ended by the length `0xFFFFFFFF`. A body that ends anywhere else is a call cut short, never a finished stream. The reply comes when the handler returns.
-- Every channel response has `X-Txe-Worker-Channel: 1` and `X-Txe-Channel-Code: <gRPC code>`; a refusal's text is the body, at most 1 KiB. A response without the mark is an edge's and is `Unavailable`, whatever its status. So a Cloudflare 403 can never read as "this machine is refused".
-- No server streams are carried. Their one worker use, `GetWorkspaceBundle`, has no resource authorizer, and is refused on enforce today (TXE-4228).
+Connect unary and client streaming, binary protobuf (`application/proto`, `application/connect+proto`). The route answers 415 to anything else, gRPC and JSON included. Compression is off, so size limits count real bytes.
+
+**The end of a stream.** Connect ends a client stream with the end of the request body, with no end marker, as gRPC does with END_STREAM. A request that stops cleanly between messages therefore reads as finished. This was inspected, and it creates no false completion:
+
+- A log is finalized only by a chunk with `is_final`. Without it the file stays incomplete (`TestALogIsNotFinalizedByTheEndOfARequest`).
+- An artifact is committed only by its final chunk. Temporary files of uncommitted uploads are discarded when the stream ends.
+- A worker believes a stream delivered only when it reads the reply. A log writer keeps its bytes until then and resends by offset. A response cut short is an error, because Connect requires its end-of-stream frame.
+- A body cut inside a message is an error (`TestAStreamCutInsideAMessageIsAnError`).
+
+**A status is not a refusal.** Connect maps a bare HTTP 403 to `permission_denied`, which would read as a refused machine. So a Conn believes only `connect.IsWireError`, an error the peer sent as a Connect error body. Everything else is `Unavailable`, an edge page, a 200 with the wrong content type and a redirect included. A genuine hub refusal is always a wire error, so it is never reclassified (`TestAHubsRefusalIsStillARefusal`).
+
+This is classification, not authenticity. Nothing on the wire proves that a Connect error came from the hub. TLS ends at Cloudflare, so an edge could write one. The cost of that is availability only: a worker that believes a forged refusal stops within its refused-calls bound, and the hub's own decisions are unaffected. Failing the other way is deliberate too: if Cloudflare Access returned to this host, its 401 would be `Unavailable`, an outage that looks like one.
 
 ## Authorization
 
@@ -55,22 +88,34 @@ The generated client only needs a `grpc.ClientConnInterface`, and the generated 
 |---|---|---|
 | Unary call | 30 s | Below Cloudflare's 125 s proxy read timeout |
 | Poll wait | 25 s, then an empty reply | An empty Poll is the ordinary answer and counts as a success |
-| Client stream | 110 s | Logs already checkpoint every ~2 s; artifacts are one upload |
+| Client stream | 110 s | Log writers checkpoint about every 2 s |
 | Message | 16 MiB | The coordinator client's existing limit |
-| Stream | 64 MiB | Below the 100 MB body limit expected on Cloudflare's lower plans. **The zone's limit must be confirmed** |
+| Request | 32 MiB, configurable | Must fit the zone's request body limit, which is not confirmed and may be below the plan's maximum |
 | Calls per machine | 256 | A worker holds one Poll per run slot (default 100) |
 | Connection setup | 10 s dial, 10 s TLS | |
-| Dead connection | HTTP/2 ping at 15 s, 5 s to answer | Bounded stale detection, which gRPC keepalive never gave here |
+| Stalled body | The request's limit plus 1 s, by read deadline | Cancelling a context does not interrupt a read |
 
-Cloudflare's published limits: proxy read 125 s, proxy write 30 s, proxy idle 900 s. A stream never idles past 30 s: a log writer closes its stream at each ~2 s checkpoint, and artifact chunks are sent back to back.
+Cloudflare's published limits: proxy read 125 s, proxy write 30 s, proxy idle 900 s. A stream never idles past 30 s: a log writer closes its stream at each checkpoint, and artifact chunks are sent back to back.
 
-**Artifact limit.** One upload walks a whole directory on one stream, so a run's artifacts above 64 MiB fail with `ResourceExhausted`, a truthful failure. If a job needs more, roll the stream per file; that is a small change to the uploader, and it is not done until one does.
+**Artifacts.** Hub artifacts have no size limit today, so a request limit must not become one. A run's artifacts must not fail because they exceed one request. The worker's uploader therefore needs bounded segments, the way logs already work: `ArtifactChunk` gains an optional byte offset, the hub resumes a named temporary file across requests and commits on the final chunk, and the uploader checkpoints below `MaxRequestBytes` and resumes after a failure. It is an additive field and is its own PR. **It is a gate for cutover.** Until it merges, an upload over the request limit fails with `ResourceExhausted`.
+
+Logs fit already: a writer retains at most 16 MiB and sends chunks of at most 3 MiB, so a checkpoint is below 32 MiB. If the zone's limit is lower than that, the retained size must follow it.
+
+## Liveness
+
+Three things are often mistaken for one another:
+
+- **HTTP/2 pings** (15 s, then 5 s) are between the worker and the first hop, Cloudflare's edge. They close a dead connection quickly. **They prove nothing about cloudflared, the hub or the coordinator.** An edge can answer pings while the origin is gone.
+- **End-to-end liveness is the worker's own calls.** A `Heartbeat` or `RunHeartbeat` that returns has passed the edge, the tunnel, authentication and the coordinator's handler, and `RunHeartbeat` has refreshed the lease. These run with per-call deadlines, at 1 s per running task. That is what reports a worker connected, and what the 90 s owner timeout counts.
+- **The hub's view** is the existing 30 s stale-worker threshold and 90 s lease.
+
+So stale detection end to end is bounded by the call deadline plus the existing 90 s owner timeout, not by the ping interval.
 
 ## Failure behaviour
 
 | Event | What happens |
 |---|---|
-| Network loss or an edge error | The call is `Unavailable`. The existing client retries with backoff; the worker's connection state goes offline as it does today |
+| Network loss, an edge error or an edge page | The call is `Unavailable`. The existing client retries with backoff; the worker's connection state goes offline as it does today |
 | Outage under 90 s | A running task continues; reports retry |
 | Outage over 90 s | The worker cancels the run and the hub fails the lease, as today. The report is refused as a stale attempt. **No automatic replay.** Sealed outputs stay on disk and the owner's approved republish is the recovery |
 | Response lost after a claim | The claim expires and the task is claimed again, as on gRPC. There is no exactly-once promise |
@@ -86,16 +131,17 @@ One child ticket per PR, all under TXE-5550.
 
 1. Library and this design.
 2. Hub: `coordinator.worker_channel.enabled`, default off; mounted outside the API's auth middleware; start-all only; per-call pinning; refuse to start without `txe.authn`.
-3. Worker: an opt-in hub URL. Calls go through `Conn`, an owner's advertised address is ignored, and a machine credential is required. Without the option, nothing changes, so the port-forward stays as rollback, and old and new workers can run side by side.
-4. Install: no tunnel agent, no `kubectl`, the context points at HTTPS; `status.sh` and `doctor` report the channel.
-5. Worker-side REST: job, probe and reviewer steps stop using local 18080 and present the machine's credential over HTTPS.
-6. Fault rig (below), then `txehq/txe` configuration in its own PR.
+3. Worker: an opt-in hub URL. Calls go through `Conn`, an owner's advertised address is ignored, and a machine credential is required. Without the option nothing changes, so the port-forward stays as rollback, and old and new workers can run side by side. Adds the rendered-DAG test.
+4. Artifact segments, as above.
+5. Install: no tunnel agent, no `kubectl`, the context points at HTTPS; `status.sh` and `doctor` report the channel.
+6. Worker-side REST: job, probe and reviewer steps stop using local 18080 and present the machine's credential over HTTPS.
+7. Fault rig (below), then `txehq/txe` configuration in its own PR.
 
-Cutover stages, each with its own GO: integration on the rig; review and merge; release tag; hub with the channel enabled and no worker using it; one worker on the channel, port-forward kept; tunnel removed last. Upstream TXE-5506 stays separate: the channel touches only the client's connection type and one hub mount, and v2.24.0 has the same 23 RPCs.
+Cutover stages, each with its own GO: integration on the rig; review and merge; release tag; hub with the channel enabled and no worker using it; one worker on the channel, port-forward kept; tunnel removed last. Upstream TXE-5506 stays separate: the channel touches the client's connection type, one hub mount and, for artifacts, one additive field. v2.24.0 has the same 23 RPCs, and the new dependency does not conflict with it.
 
 ## Test plan
 
-Library, in this PR: identity isolation, missing, expired and revoked credentials, reviewer class, forged worker id and label, on unary and streams; hub key refused; hub-only and unlisted methods refused; health needs a credential; Poll bound; truncated stream; size and concurrency limits; edge answers; redirects; base URL checks; the real log handler resuming on a new request; TLS and HTTP/2.
+Library, in this PR: identity isolation, missing, expired and revoked credentials, reviewer class, forged worker id and label, on unary and streams; hub key refused; hub-only and unlisted methods refused; only Connect with protobuf accepted; the carried table; health needs a credential; Poll bound; cut and stalled requests; size and concurrency limits; edge answers and genuine refusals; redirects; base URL checks; the real log handler resuming and not finalizing early; TLS and HTTP/2.
 
 Isolated rig, before cutover. The endpoint allowlist is set before a worker starts; live 18080 and 50055 are never used; run first against the port-forward as a baseline.
 
@@ -113,10 +159,11 @@ Isolated rig, before cutover. The endpoint allowlist is set before a worker star
 | R10 | Cut during log and artifact upload | Complete or truthfully failed |
 | R11 | Duplicate claim and duplicate result | The fence refuses the second |
 | R12 | Nudge catch-up with GitHub stubbed | Once-per-sha markers hold, current head rechecked, no duplicate post, no real post |
-| R13 | A local proxy applying Cloudflare's limits | No call meets them |
+| R13 | A local proxy applying Cloudflare's limits, and cloudflared itself | No call meets them; Connect streams pass cloudflared |
+| R14 | Artifacts larger than one request, interrupted | Resumed and committed once |
 
 ## Open before wiring
 
-- The zone's request body limit and whether any Cloudflare bot or rate rule touches a non-browser client on this host.
+- The zone's real request body limit and whether any Cloudflare bot or rate rule touches a non-browser client on this host.
 - Run-slot count on real workers: 100 pollers at 25 s is about 4 requests a second before heartbeats.
 - `txe.authn` clients and the machine's enrolment on the hub, which are live changes for their own stage.

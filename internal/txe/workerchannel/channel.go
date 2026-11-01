@@ -1,65 +1,45 @@
 // Copyright (C) 2026 TXE
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package workerchannel carries a worker's coordinator calls over bounded
-// HTTPS requests, so that a machine reaches its hub with outbound 443 and no
-// cluster access.
+// Package workerchannel carries a worker's coordinator calls over the Connect
+// protocol, so that a machine reaches its hub with outbound 443 and no cluster
+// access.
 //
 // It changes the transport and nothing above it. The worker keeps its
-// generated client: Conn is the grpc.ClientConnInterface that client calls.
-// The hub keeps its generated service: Handler runs the service descriptor's
-// own handlers, behind the transportauth interceptors. No call is translated,
-// so leases, claims and the report fence are what they are on gRPC.
+// generated gRPC client: Conn is the grpc.ClientConnInterface that client
+// calls. The hub keeps its generated service: Handler calls it behind the
+// transportauth interceptors. The messages are the generated ones, so leases,
+// claims and the report fence are what they are on gRPC.
+//
+// A method is carried only if it is listed in methods.go. What a worker needs
+// that is not listed fails closed, as it does on an enforcing coordinator.
 //
 // The rules it holds:
 //
 //   - Every request is admitted before its body is read, and a machine's
 //     credential is required on every method. The hub key is never accepted.
-//   - Only unary and client-streaming methods are carried. A client stream is
-//     one request, ended by an explicit frame, so a request that is cut short
-//     never looks like one that finished.
+//   - Only Connect with binary protobuf is accepted. This route never speaks
+//     gRPC, gRPC-Web or JSON, and nothing is compressed.
 //   - Every request has a time limit below the edge's and a size limit. A
 //     Poll that finds no task answers empty before the limit.
-//   - Only a response that says it is the channel's is believed. Anything an
-//     edge answers on its own is Unavailable, never a refusal of the machine.
+//   - Only a Connect error is a refusal. A status from anything else, such as
+//     an edge, is Unavailable, because the HTTP status alone cannot say that
+//     the hub refused this machine.
 //   - No redirect is followed, so a credential goes only to the hub's address.
+//
+// A client stream ends when its request body ends, so a stream's end says
+// nothing about whether its work is complete. That is said where it always
+// was: a final chunk finalizes a log and commits an artifact, and a reply
+// reaches the worker only for a request it finished.
 package workerchannel
 
 import (
-	"context"
-	"encoding/binary"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/grpc/codes"
-)
-
-const (
-	// HeaderChannel marks a response as the channel's own.
-	HeaderChannel = "X-Txe-Worker-Channel"
-	// ChannelVersion is HeaderChannel's value.
-	ChannelVersion = "1"
-	// HeaderCode carries a call's gRPC status code on the channel's responses.
-	HeaderCode = "X-Txe-Channel-Code"
-	// HeaderTimeout carries what is left of the caller's deadline, in
-	// milliseconds. It can shorten a request's limit and never lengthen it.
-	HeaderTimeout = "X-Txe-Channel-Timeout-Ms"
-
-	contentTypeMessage = "application/x-protobuf"
-	contentTypeFrames  = "application/x-txe-frames"
-	contentTypeError   = "text/plain; charset=utf-8"
-
-	// frameHeaderBytes is the length prefix of a frame on a client stream.
-	frameHeaderBytes = 4
-	// frameEnd is the length that ends a stream. It is larger than any
-	// message may be.
-	frameEnd = uint32(0xFFFFFFFF)
-
-	// maxErrorBytes bounds a refusal's text.
-	maxErrorBytes = 1024
+	"google.golang.org/grpc/status"
 )
 
 // Limits bounds what one request may take. The defaults sit below Cloudflare's
@@ -71,10 +51,11 @@ type Limits struct {
 	PollWait time.Duration
 	// Stream is the longest a client stream may stay open.
 	Stream time.Duration
-	// MaxMessageBytes is the largest single message, and a unary body.
-	MaxMessageBytes int64
-	// MaxStreamBytes is the most one client stream may carry.
-	MaxStreamBytes int64
+	// MaxMessageBytes is the largest single message.
+	MaxMessageBytes int
+	// MaxRequestBytes is the most one request may carry. It must fit the
+	// edge's request body limit. A longer upload is several requests.
+	MaxRequestBytes int64
 	// MaxCallsPerMachine is how many calls of one machine run at once. A
 	// worker keeps one Poll open per run it may take.
 	MaxCallsPerMachine int
@@ -87,75 +68,48 @@ func DefaultLimits() Limits {
 		PollWait:           25 * time.Second,
 		Stream:             110 * time.Second,
 		MaxMessageBytes:    16 << 20,
-		MaxStreamBytes:     64 << 20,
+		MaxRequestBytes:    32 << 20,
 		MaxCallsPerMachine: 256,
 	}
 }
 
 func (l Limits) validate() error {
-	if l.Unary <= 0 || l.PollWait <= 0 || l.Stream <= 0 || l.MaxMessageBytes <= 0 || l.MaxStreamBytes <= 0 || l.MaxCallsPerMachine <= 0 {
+	if l.Unary <= 0 || l.PollWait <= 0 || l.Stream <= 0 || l.MaxMessageBytes <= 0 || l.MaxRequestBytes <= 0 || l.MaxCallsPerMachine <= 0 {
 		return errors.New("workerchannel: every limit must be positive")
 	}
 	if l.PollWait >= l.Unary {
 		return errors.New("workerchannel: a Poll must answer before the unary limit")
 	}
-	if l.MaxMessageBytes >= int64(frameEnd) {
-		return fmt.Errorf("workerchannel: a message must stay below %d bytes", frameEnd)
+	if int64(l.MaxMessageBytes) > l.MaxRequestBytes {
+		return errors.New("workerchannel: a message must fit in a request")
 	}
 	return nil
 }
 
-func writeFrame(w io.Writer, message []byte) error {
-	var header [frameHeaderBytes]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(message))) // #nosec G115 -- bounded by MaxMessageBytes
-	if _, err := w.Write(header[:]); err != nil {
+// toConnect gives a gRPC status error to the Connect protocol. The codes share
+// their numbers.
+func toConnect(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := errors.AsType[*connect.Error](err); ok {
 		return err
 	}
-	_, err := w.Write(message)
-	return err
+	s := status.Convert(asStatus(err))
+	return connect.NewError(connect.Code(s.Code()), errors.New(s.Message())) // #nosec G115 -- a gRPC code
 }
 
-func writeFrameEnd(w io.Writer) error {
-	var header [frameHeaderBytes]byte
-	binary.BigEndian.PutUint32(header[:], frameEnd)
-	_, err := w.Write(header[:])
-	return err
-}
-
-// statusOf is the HTTP status a code is answered with. It is for whoever
-// reads a proxy's logs: the code in HeaderCode is what a Conn believes.
-func statusOf(code codes.Code) int {
-	switch code { //nolint:exhaustive // every other code is a server error to a proxy
-	case codes.OK:
-		return http.StatusOK
-	case codes.InvalidArgument:
-		return http.StatusBadRequest
-	case codes.Unauthenticated:
-		return http.StatusUnauthorized
-	case codes.PermissionDenied:
-		return http.StatusForbidden
-	case codes.NotFound:
-		return http.StatusNotFound
-	case codes.FailedPrecondition:
-		return http.StatusPreconditionFailed
-	case codes.ResourceExhausted:
-		return http.StatusTooManyRequests
-	case codes.Unimplemented:
-		return http.StatusNotImplemented
-	case codes.Unavailable:
-		return http.StatusServiceUnavailable
-	case codes.DeadlineExceeded:
-		return http.StatusGatewayTimeout
-	default:
-		return http.StatusInternalServerError
+// fromConnect gives a call's error to the generated client. An error that did
+// not come from a Connect peer says nothing about this machine.
+func fromConnect(err error) error {
+	if err == nil {
+		return nil
 	}
-}
-
-// remaining is what is left of ctx's deadline, or 0 when it has none.
-func remaining(ctx context.Context) time.Duration {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return 0
+	if !connect.IsWireError(err) {
+		return status.Error(codes.Unavailable, "workerchannel: the hub did not answer: "+err.Error())
 	}
-	return max(time.Until(deadline), time.Millisecond)
+	if refusal, ok := errors.AsType[*connect.Error](err); ok {
+		return status.Error(codes.Code(refusal.Code()), refusal.Message())
+	}
+	return status.Error(codes.Unavailable, "workerchannel: the hub did not answer")
 }
