@@ -240,7 +240,8 @@ func runChecks(ctx context.Context, cfg clientConfig, names []string) ([]Result,
 		counts := c.wire.take()
 		result := Result{Check: name, Pass: err == nil, Took: time.Since(start).Round(time.Millisecond).String(),
 			Numbers: numbers, Detail: says(err), HTTP: counts}
-		if counts.Challenges > 0 || (counts.HTML > 0 && name != "down") {
+		// A stopped origin and a restart are meant to meet an edge's error page.
+		if counts.Challenges > 0 || (counts.HTML > 0 && name != "down" && name != "reconnect") {
 			result.Pass, result.Detail = false, "an edge answered with a page: "+result.Detail
 		}
 		results = append(results, result)

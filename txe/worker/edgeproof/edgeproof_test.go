@@ -122,6 +122,25 @@ func TestAnOutageStillOpenAtTheEndIsCounted(t *testing.T) {
 	assert.GreaterOrEqual(t, outage, 100*time.Millisecond)
 }
 
+func TestAnEdgePageDuringARestartIsAnOutageNotAFailure(t *testing.T) {
+	server, _ := startOrigin(t)
+	var calls atomic.Int64
+	transport := roundTripper(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			page := httptest.NewRecorder()
+			page.Header().Set("Content-Type", "text/html")
+			page.WriteHeader(http.StatusBadGateway)
+			return page.Result(), nil //nolint:bodyclose // the channel's client closes it
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: shortLimits(), Pause: 0.001,
+		Watch: 100 * time.Millisecond, Transport: transport}, []string{"reconnect"})
+	require.NoError(t, err)
+	assert.True(t, results[0].Pass, results[0].Detail)
+	assert.EqualValues(t, 1, results[0].HTTP.HTML)
+}
+
 func TestAStoppedOriginReadsAsUnavailable(t *testing.T) {
 	server, _ := startOrigin(t)
 	url := server.URL
