@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,9 @@ import (
 
 // maxOriginLife is the longest an origin lives, whatever it is asked.
 const maxOriginLife = 60 * time.Minute
+
+// maxBudget is the longest one client run may take, whatever it is asked.
+const maxBudget = 30 * time.Minute
 
 func main() {
 	if len(os.Args) < 2 {
@@ -80,6 +84,7 @@ func runClientCommand(ctx context.Context, args []string) error {
 	tokenFile := flags.String("token-file", "", "file holding the origin's token")
 	checks := flags.String("checks", strings.Join(defaultChecks, ","), "comma-separated checks; "+strings.Join(allChecks(), ", "))
 	watch := flags.Duration("watch", 2*time.Minute, "how long the reconnect check watches; at most 10m")
+	budget := flags.Duration("budget", 12*time.Minute, "how long the whole run may take; at most 30m")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -90,19 +95,19 @@ func runClientCommand(ctx context.Context, args []string) error {
 	if *watch <= 0 || *watch > maxWatch {
 		return fmt.Errorf("--watch must be above zero and at most %s", maxWatch)
 	}
-	results, err := runChecks(ctx, clientConfig{URL: *url, Token: token, Watch: *watch}, strings.Split(*checks, ","))
-	encoder := json.NewEncoder(os.Stdout)
-	failed := false
-	for _, r := range results {
-		failed = failed || !r.Pass
-		if encodeErr := encoder.Encode(r); encodeErr != nil {
-			return encodeErr
-		}
+	if *budget <= 0 || *budget > maxBudget {
+		return fmt.Errorf("--budget must be above zero and at most %s", maxBudget)
 	}
+	ctx, cancel := context.WithTimeout(ctx, *budget)
+	defer cancel()
+	// Each line is written as it happens: a run stopped from outside keeps them.
+	encoder := json.NewEncoder(os.Stdout)
+	emit := func(event Event) { _ = encoder.Encode(event) }
+	results, err := runChecks(ctx, clientConfig{URL: *url, Token: token, Watch: *watch, Emit: emit}, strings.Split(*checks, ","))
 	if err != nil {
 		return err
 	}
-	if failed {
+	if slices.ContainsFunc(results, func(r Result) bool { return !r.Pass && r.Skipped == "" }) {
 		return errors.New("a check failed")
 	}
 	return nil
