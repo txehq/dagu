@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Report the local Dagu worker's state without changing anything (TXE-3727).
-# Exit 0 when the tunnel and worker agents are running and the server answers.
+# Exit 0 when the worker agent, and the tunnel unless it is on the worker channel, are
+# running and the server answers.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +31,18 @@ else
     printf '  %s exists but the agent does not pass it (installed with --no-credential, or before enrolment)\n' \
       "$TXE_DAGU_HOME/worker-credential.json"
   fi
+fi
+
+hub_url="$(python3 -I "$here/agents.py" hub-url "$TXE_DAGU_AGENTS_DIR/$TXE_DAGU_WORKER_LABEL.plist" 2>/dev/null)"
+if [ -n "$hub_url" ]; then
+  state="$(launchctl print "gui/$(id -u)/$TXE_DAGU_WORKER_LABEL" 2>/dev/null | awk -F'= ' '/^\tstate = /{print $2; exit}')"
+  printf '%-22s %s\n' "$TXE_DAGU_WORKER_LABEL" "${state:-not loaded}"
+  [ "$state" = "running" ] || rc=1
+  health="$(python3 -I "$here/agents.py" hub-health "$hub_url")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$health")"
+  printf 'channel  %s -> %s\n' "$health" "$code"
+  [ "$code" = "200" ] || rc=1
+  exit "$rc"
 fi
 
 expires="$TXE_DAGU_HOME/tunnel/kubeconfig.expires"

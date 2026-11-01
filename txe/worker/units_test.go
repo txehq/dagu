@@ -276,3 +276,36 @@ esac
 		})
 	}
 }
+
+func TestUnitsOnTheChannelHaveNoTunnel(t *testing.T) {
+	agentsScript(t)
+	script, err := filepath.Abs("units.py")
+	require.NoError(t, err)
+	dir := filepath.Join(t.TempDir(), "user")
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "txe-dagu-tunnel.service"), []byte("left behind"), 0o600))
+	_, stderr, err := python(t, script, "write", dir, "/home/dev/txe", "", agentsMachine, agentsOwner,
+		"/usr/bin:/bin", "txe-dagu-tunnel.service", "txe-dagu-worker.service", "dagu", "svc/dagu", "18080", "50055",
+		"/home/dev/txe/worker-credential.json", "https://hub.example")
+	require.NoError(t, err, stderr)
+	worker, err := os.ReadFile(filepath.Join(dir, "txe-dagu-worker.service"))
+	require.NoError(t, err)
+	assert.Contains(t, string(worker), `"--worker.hub-url" "https://hub.example"`)
+	assert.NotContains(t, string(worker), "--worker.coordinators")
+	_, err = os.Stat(filepath.Join(dir, "txe-dagu-tunnel.service"))
+	assert.True(t, os.IsNotExist(err))
+}
+
+// units.py removes the tunnel's file, and systemd cannot disable a unit with no
+// file, so the old tunnel must be stopped first, and seen to have stopped.
+func TestInstallStopsTheOldTunnelBeforeRemovingItsUnit(t *testing.T) {
+	data, err := os.ReadFile("install-systemd.sh")
+	require.NoError(t, err)
+	script := string(data)
+	stop := strings.Index(script, `--user stop "$TXE_DAGU_TUNNEL_UNIT"`)
+	check := strings.Index(script, `is-active --quiet "$TXE_DAGU_TUNNEL_UNIT"`)
+	write := strings.Index(script, `"$here/units.py" write`)
+	require.Positive(t, stop)
+	assert.Less(t, stop, check)
+	assert.Less(t, check, write)
+}

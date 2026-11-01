@@ -21,7 +21,7 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
   agents.py credential PLIST
       Print the credential file a worker agent passes, or nothing.
 """
-import ipaddress, json, os, plistlib, re, stat, sys, urllib.parse
+import contextlib, ipaddress, json, os, plistlib, re, stat, sys, urllib.parse
 
 CREDENTIAL_ENV = "DAGU_WORKER_AUTH_CREDENTIAL_FILE"
 # transportauth.MachineCredential: the worker refuses any other field.
@@ -123,8 +123,29 @@ def check_credential(path, machine_id):
     return data["machine_id"], data["client_id"]
 
 
+def check_hub_url(raw):
+    """Refuse a hub address that could send the machine's credential anywhere unsafe."""
+    try:
+        hub = urllib.parse.urlsplit(raw)
+        hub.port  # a malformed port raises
+    except ValueError:
+        raise Refused(f"{raw!r} is not a URL")
+    host = _endpoint_host(hub.netloc)
+    if not host or "@" in hub.netloc or hub.query or hub.fragment:
+        raise Refused(f"{raw!r} must be an address with no user, query or fragment")
+    if hub.scheme != "https" and not (hub.scheme == "http" and _loopback(host)):
+        raise Refused(f"{raw!r} must use https, or http to a loopback address")
+
+
+def hub_health(raw):
+    """The health URL of a hub address, by the worker's rule: a path names the API root."""
+    hub = urllib.parse.urlsplit(raw)
+    root = hub.path.rstrip("/") or "/api/v1"
+    return urllib.parse.urlunsplit((hub.scheme, hub.netloc, f"{root}/health", "", ""))
+
+
 def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label, worker_label,
-                 namespace, service, ui_port, coord_port, credential_file, python):
+                 namespace, service, ui_port, coord_port, credential_file, python, hub_url=""):
     common = {"RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5,
               "ProcessType": "Background"}
     # launchd restarts the tunnel only when it exits, and a port-forward whose connection is
@@ -152,11 +173,16 @@ def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label
         f"{home}/bin/dagu", "worker",
         "--worker.id", machine_id,
         "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
-        "--worker.coordinators", f"127.0.0.1:{coord_port}"],
+        *(["--worker.hub-url", hub_url] if hub_url else ["--worker.coordinators", f"127.0.0.1:{coord_port}"])],
         EnvironmentVariables=environment,
         WorkingDirectory=f"{home}/worker-home",
         StandardOutPath=f"{home}/logs/worker.launchd.log", StandardErrorPath=f"{home}/logs/worker.launchd.log")
-    for label, body in ((tunnel_label, tunnel), (worker_label, worker)):
+    # On the worker channel there is no tunnel, and a tunnel left behind would keep a
+    # Kubernetes credential in use.
+    if hub_url:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(agents, f"{tunnel_label}.plist"))
+    for label, body in (((worker_label, worker),) if hub_url else ((tunnel_label, tunnel), (worker_label, worker))):
         target = os.path.join(agents, f"{label}.plist")
         with open(target + ".tmp", "wb") as f:
             plistlib.dump(body, f)
@@ -172,8 +198,27 @@ def main(argv):
             return 1
         print(f"credential {argv[1]} (machine {machine}, client {client})")
         return 0
-    if len(argv) == 15 and argv[0] == "write":
+    if len(argv) == 2 and argv[0] == "check-hub-url":
+        try:
+            check_hub_url(argv[1])
+        except Refused as e:
+            print(f"hub address refused: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if len(argv) == 2 and argv[0] == "hub-health":
+        print(hub_health(argv[1]))
+        return 0
+    if len(argv) in (15, 16) and argv[0] == "write":
         write_agents(*argv[1:])
+        return 0
+    if len(argv) == 2 and argv[0] == "hub-url":
+        try:
+            with open(argv[1], "rb") as f:
+                arguments = plistlib.load(f).get("ProgramArguments", [])
+        except FileNotFoundError:
+            return 0
+        if "--worker.hub-url" in arguments:
+            print(arguments[arguments.index("--worker.hub-url") + 1])
         return 0
     if len(argv) == 2 and argv[0] == "credential":
         try:
