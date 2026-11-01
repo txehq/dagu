@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -245,6 +246,24 @@ func credentialFor(t *testing.T) string {
 	return path
 }
 
+// lockedOutput is a running process's output, read while it still writes.
+type lockedOutput struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *lockedOutput) Write(data []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(data)
+}
+
+func (o *lockedOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
 // startChannelWorkerProcess is `dagu worker --worker.hub-url`: the real binary,
 // its real credential source, and no address of a coordinator.
 func startChannelWorkerProcess(t *testing.T, f *testFixture, rig *channelRig) *osexec.Cmd {
@@ -406,7 +425,7 @@ func TestChannelProofFreezePastTheOwnerTimeout(t *testing.T) {
 
 // startIsolatedChannelWorker is a worker process sharing nothing with the hub:
 // what it holds on disk can reach the hub only over the channel.
-func startIsolatedChannelWorker(t *testing.T, f *testFixture, rig *channelRig, workerID string) (*osexec.Cmd, *bytes.Buffer) {
+func startIsolatedChannelWorker(t *testing.T, f *testFixture, rig *channelRig, workerID string) (*osexec.Cmd, *lockedOutput) {
 	t.Helper()
 	home := t.TempDir()
 	cmd := osexec.Command(f.coord.Config.Paths.Executable, "worker",
@@ -417,7 +436,7 @@ func startIsolatedChannelWorker(t *testing.T, f *testFixture, rig *channelRig, w
 	cmdutil.SetupCommand(cmd)
 	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "DAGU_HOME=" + filepath.Join(home, "dagu"),
 		"DAGU_WORKER_AUTH_CREDENTIAL_FILE=" + credentialFor(t)}
-	output := &bytes.Buffer{}
+	output := &lockedOutput{}
 	cmd.Stdout, cmd.Stderr = output, output
 	require.NoError(t, cmd.Start())
 	t.Cleanup(func() {
