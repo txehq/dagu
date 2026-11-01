@@ -17,6 +17,9 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -30,9 +33,11 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
+	"github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 	"github.com/dagucloud/dagu/v2/internal/txe/workerchannel"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
@@ -241,6 +246,24 @@ func credentialFor(t *testing.T) string {
 	return path
 }
 
+// lockedOutput is a running process's output, read while it still writes.
+type lockedOutput struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *lockedOutput) Write(data []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(data)
+}
+
+func (o *lockedOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
 // startChannelWorkerProcess is `dagu worker --worker.hub-url`: the real binary,
 // its real credential source, and no address of a coordinator.
 func startChannelWorkerProcess(t *testing.T, f *testFixture, rig *channelRig) *osexec.Cmd {
@@ -291,18 +314,82 @@ func TestChannelProofARealWorkerProcessRunsAJob(t *testing.T) {
 	assert.True(t, hubLogHolds(f.coord.Config.Paths.LogDir, "from the real worker"))
 }
 
+// freezableJob is a job that says when it is working, so a test can stop it and
+// see that it stopped. A step's shell leads its own process group, apart from
+// the worker's, so stopping the worker alone leaves the job running.
+type freezableJob struct {
+	dir string
+}
+
+func newFreezableJob(t *testing.T) *freezableJob {
+	t.Helper()
+	return &freezableJob{dir: t.TempDir()}
+}
+
+func (j *freezableJob) script(ticks int) string {
+	return fmt.Sprintf("echo $$ > %[1]s\nfor i in $(seq %[2]d); do echo tick >> %[3]s; sleep 1; done",
+		filepath.Join(j.dir, "group"), ticks, filepath.Join(j.dir, "ticks"))
+}
+
+func (j *freezableJob) ticks(t *testing.T) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(j.dir, "ticks"))
+	require.NoError(t, err)
+	return bytes.Count(data, []byte("tick"))
+}
+
+type frozenGroups struct {
+	groups []int
+}
+
+func (g frozenGroups) thaw(t *testing.T) {
+	t.Helper()
+	for _, group := range g.groups {
+		require.NoError(t, syscall.Kill(-group, syscall.SIGCONT))
+	}
+}
+
+// freezeWith stops the job and its worker together, once the job has started,
+// and proves the job stopped.
+func (j *freezableJob) freezeWith(t *testing.T, worker *osexec.Cmd) frozenGroups {
+	t.Helper()
+	var group int
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(filepath.Join(j.dir, "group"))
+		if err != nil {
+			return false
+		}
+		group, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		return err == nil && group > 1
+	}, distrTestTimeout(30*time.Second), 50*time.Millisecond)
+	frozen := frozenGroups{groups: []int{group, worker.Process.Pid}}
+	t.Cleanup(func() {
+		for _, g := range frozen.groups {
+			_ = syscall.Kill(-g, syscall.SIGCONT)
+		}
+	})
+	for _, g := range frozen.groups {
+		require.NoError(t, syscall.Kill(-g, syscall.SIGSTOP))
+	}
+	time.Sleep(200 * time.Millisecond)
+	before := j.ticks(t)
+	time.Sleep(2 * time.Second)
+	require.Equal(t, before, j.ticks(t), "the job stopped with its worker")
+	return frozen
+}
+
 // The machine sleeping: the worker and its job stop together and resume with
 // the clock moved on. The machine's own OS is not slept. A short freeze changes
 // nothing.
 func TestChannelProofFreezeUnderTheOwnerTimeout(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "started")
-	f, _, cmd := channelProcessRig(t, "touch "+marker+"\nsleep 12\necho finished")
-	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, distrTestTimeout(30*time.Second), 50*time.Millisecond)
-	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGSTOP))
+	job := newFreezableJob(t)
+	f, _, cmd := channelProcessRig(t, job.script(12))
+	frozen := job.freezeWith(t, cmd)
 	time.Sleep(10 * time.Second)
-	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT))
+	frozen.thaw(t)
 	final := f.waitForStatus(ir.Succeeded, distrTestTimeout(90*time.Second))
 	assert.Equal(t, rigMachine, final.WorkerID)
+	assert.Equal(t, 12, job.ticks(t))
 }
 
 // Past the owner timeout, the worker and its job are frozen together, as on a
@@ -311,15 +398,14 @@ func TestChannelProofFreezeUnderTheOwnerTimeout(t *testing.T) {
 // same worker takes the next run with no restart.
 func TestChannelProofFreezePastTheOwnerTimeout(t *testing.T) {
 	needRealTime(t)
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "started")
-	script := fmt.Sprintf("echo x >> %[1]s.runs\nif [ -f %[1]s ]; then echo again; exit 0; fi\ntouch %[1]s\nsleep 200\necho finished", marker)
+	job := newFreezableJob(t)
+	marker := filepath.Join(job.dir, "started")
+	script := fmt.Sprintf("echo x >> %[1]s.runs\nif [ -f %[1]s ]; then echo again; exit 0; fi\ntouch %[1]s\n%[2]s", marker, job.script(20))
 	f, _, cmd := channelProcessRig(t, script)
-	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, distrTestTimeout(30*time.Second), 50*time.Millisecond)
-	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGSTOP))
+	frozen := job.freezeWith(t, cmd)
 	t.Logf("rig: frozen for 2m")
 	time.Sleep(2 * time.Minute)
-	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT))
+	frozen.thaw(t)
 	t.Logf("rig: resumed")
 
 	first := f.waitForStatusIn([]ir.Status{ir.Failed, ir.Aborted, ir.Succeeded}, 5*time.Minute)
@@ -328,10 +414,138 @@ func TestChannelProofFreezePastTheOwnerTimeout(t *testing.T) {
 	runs, err := os.ReadFile(marker + ".runs")
 	require.NoError(t, err)
 	assert.Equal(t, 1, bytes.Count(runs, []byte("x")), "executed once")
+	assert.Equal(t, 20, job.ticks(t), "it picked up where it stopped")
 
 	require.NoError(t, f.enqueue())
 	require.Eventually(t, func() bool {
 		next, err := f.latestStatus()
 		return err == nil && next.DAGRunID != first.DAGRunID && next.Status == ir.Succeeded
 	}, 2*time.Minute, 200*time.Millisecond, "the same worker takes the next run")
+}
+
+// startIsolatedChannelWorker is a worker process sharing nothing with the hub:
+// what it holds on disk can reach the hub only over the channel.
+func startIsolatedChannelWorker(t *testing.T, f *testFixture, rig *channelRig, workerID string) (*osexec.Cmd, *lockedOutput) {
+	t.Helper()
+	home := t.TempDir()
+	cmd := osexec.Command(f.coord.Config.Paths.Executable, "worker",
+		"--worker.id", workerID,
+		"--worker.health-port=0",
+		"--worker.labels", "txe.machine="+rigMachine+",txe.owner=own_RIG",
+		"--worker.hub-url", "http://"+rig.proxy.listener.Addr().String())
+	cmdutil.SetupCommand(cmd)
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "DAGU_HOME=" + filepath.Join(home, "dagu"),
+		"DAGU_WORKER_AUTH_CREDENTIAL_FILE=" + credentialFor(t)}
+	output := &lockedOutput{}
+	cmd.Stdout, cmd.Stderr = output, output
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT)
+		_ = cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination())
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("worker output:\n%s", output.String())
+		}
+	})
+	f.waitForWorkerRegistration(workerID, 20*time.Second)
+	return cmd, output
+}
+
+// The fence itself. A worker is frozen, its attempt expires on the hub, and
+// another worker of the machine finishes the run again. Then the old worker
+// wakes and does everything it would have: it finishes its script, writes the
+// result and reports. Nothing of that may land.
+func TestChannelProofAStaleAttemptNeverOverwritesTheNewer(t *testing.T) {
+	needRealTime(t)
+	needPosixShell(t)
+	dir := t.TempDir()
+	job := newFreezableJob(t)
+	first, gate := filepath.Join(dir, "first"), filepath.Join(dir, "gate")
+	script := fmt.Sprintf(`mkdir -p "${DAG_RUN_ARTIFACTS_DIR}/reports"
+if [ ! -f %[1]s ]; then
+  touch %[1]s
+  echo OLD-BEFORE
+  %[3]s
+  until [ -f %[2]s ]; do sleep 0.1; done
+  echo OLD-AFTER
+  printf old-attempt > "${DAG_RUN_ARTIFACTS_DIR}/reports/result.txt"
+else
+  echo NEW-ATTEMPT
+  printf new-attempt > "${DAG_RUN_ARTIFACTS_DIR}/reports/result.txt"
+fi`, first, gate, job.script(1))
+	rig := &channelRig{}
+	f := newTestFixture(t, rigDAG(script), withChannelRig(rig), withLogPersistence(), withArtifactPersistence(),
+		withWorkerCount(0), withStaleThresholds(3*time.Second, 8*time.Second), withZombieDetectionInterval(500*time.Millisecond))
+	t.Cleanup(f.cleanup)
+	old, oldOutput := startIsolatedChannelWorker(t, f, rig, rigMachine+"@old")
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(distrTestTimeout(10 * time.Minute))
+	require.Eventually(t, func() bool { _, err := os.Stat(first); return err == nil }, distrTestTimeout(30*time.Second), 50*time.Millisecond)
+
+	var stale ir.DAGRunStatus
+	require.Eventually(t, func() bool {
+		var err error
+		stale, err = f.latestStatus()
+		return err == nil && stale.Status == ir.Running && stale.AttemptKey != ""
+	}, distrTestTimeout(30*time.Second), 50*time.Millisecond)
+
+	frozen := job.freezeWith(t, old)
+	t.Logf("rig: old worker frozen on attempt %s", stale.AttemptID)
+	expired := f.waitForStatus(ir.Failed, distrTestTimeout(60*time.Second))
+	t.Logf("rig: hub expired it: %q", expired.Error)
+
+	f.setupWorkerMode(rigMachine+"@new", map[string]string{txepkg.LabelMachine: rigMachine}, "", true, nil)
+	added, err := queue.EnqueueRetry(f.coord.Context, f.coord.DAGRunRepository, f.coord.QueueStore,
+		f.dagWrapper.DAG, &expired, queue.EnqueueRetryOptions{Processes: f.coord.ProcRepository})
+	require.NoError(t, err)
+	require.True(t, added)
+	// The scheduler reclaims the expired attempt's queue slot on its own 90 s
+	// threshold, which this fixture does not shorten.
+	newer := f.waitForStatus(ir.Succeeded, distrTestTimeout(180*time.Second))
+	require.Equal(t, rigMachine+"@new", newer.WorkerID)
+	t.Logf("rig: newer attempt %s succeeded", newer.AttemptID)
+	result := filepath.Join(newer.ArchiveDir, "reports", "result.txt")
+	data, err := os.ReadFile(filepath.Clean(result))
+	require.NoError(t, err)
+	require.Equal(t, "new-attempt", string(data))
+
+	require.NoError(t, os.WriteFile(gate, nil, 0o600))
+	frozen.thaw(t)
+	t.Logf("rig: old worker resumed")
+	time.Sleep(15 * time.Second)
+
+	// Where the old worker's first refused call lands varies, so whether it
+	// reached its artifact upload varies too. The hub is sent one regardless.
+	late, err := rig.clientAs(t, rigToken).StreamArtifacts(f.coord.Context)
+	require.NoError(t, err)
+	_ = late.Send(&coordinatorv1.ArtifactChunk{WorkerId: rigMachine + "@old", DagName: stale.Name, DagRunId: stale.DAGRunID,
+		AttemptId: stale.AttemptID, AttemptKey: stale.AttemptKey, ExecutionMarker: stale.QueuedAt,
+		OwnerCoordinatorId: "coord-0", RelativePath: "reports/result.txt", Data: []byte("old-attempt"), IsFinal: true})
+	_, err = late.CloseAndRecv()
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err), "the old attempt's artifact: %v", err)
+
+	after, err := f.latestStatus()
+	require.NoError(t, err)
+	assert.Equal(t, ir.Succeeded, after.Status)
+	assert.Equal(t, newer.AttemptID, after.AttemptID)
+	assert.Equal(t, newer.WorkerID, after.WorkerID)
+	assert.Equal(t, newer.FinishedAt, after.FinishedAt)
+	data, err = os.ReadFile(filepath.Clean(result))
+	require.NoError(t, err)
+	assert.Equal(t, "new-attempt", string(data), "the old attempt's result never replaced it")
+	assert.False(t, hubLogHolds(f.coord.Config.Paths.LogDir, "OLD-AFTER"), "the old attempt's log never landed")
+	assert.True(t, hubLogHolds(f.coord.Config.Paths.LogDir, "NEW-ATTEMPT"))
+	_, err = os.Stat(filepath.Join(newer.ArchiveDir, ir.ArtifactSegmentDir))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.Contains(t, oldOutput.String(), "superseded by newer attempt", "the hub refused the old attempt in words")
+	t.Logf("rig: old worker said: %s", lastLines(oldOutput.String(), 3))
+}
+
+func lastLines(text string, n int) string {
+	lines := bytes.Split(bytes.TrimSpace([]byte(text)), []byte("\n"))
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return string(bytes.Join(lines, []byte(" | ")))
 }
