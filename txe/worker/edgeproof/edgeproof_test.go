@@ -52,6 +52,8 @@ func TestEveryCheckPassesAgainstTheRealHandler(t *testing.T) {
 		assert.True(t, result.Pass, "%s: %s", result.Check, result.Detail)
 		assert.Zero(t, result.HTTP.HTML, result.Check)
 	}
+	assert.Contains(t, log.String(), "Heartbeat status=200 ")
+	assert.Contains(t, log.String(), "StreamArtifacts status=200 ")
 	assert.NotContains(t, log.String(), testToken)
 	assert.NotContains(t, log.String(), "Bearer")
 	assert.NotContains(t, log.String(), strings.TrimPrefix(server.URL, "http://"), "the log holds no address")
