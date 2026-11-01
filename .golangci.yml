@@ -28,6 +28,11 @@ linters:
       - path: \.pb\.go
         linters:
           - gosec
+      # errcheck 1.21 reports a channel receive that drops an error. Waiting on
+      # a done channel is how these tests and shutdowns are written.
+      - linters:
+          - errcheck
+        source: "<-"
     paths:
       - .github
       - .vscode

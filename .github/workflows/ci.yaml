@@ -179,7 +179,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
         with:
-          version: v2.13.0
+          version: v2.15.0
           args: --timeout=10m
 
   test-ubuntu:

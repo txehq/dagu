@@ -564,7 +564,7 @@ func statBinary(t *testing.T, path string) string {
 	if err != nil {
 		t.Fatalf("resolving DAGU_BIN %q: %v", path, err)
 	}
-	if _, err := os.Stat(abs); err != nil {
+	if _, err := os.Stat(abs); err != nil { //nolint:gosec // DAGU_BIN is the test runner's own setting
 		t.Fatalf("checking DAGU_BIN %q: %v", abs, err)
 	}
 	return abs
