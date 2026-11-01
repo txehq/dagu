@@ -45,7 +45,7 @@ func TestProcessCancellationsScopesToExecutionMarker(t *testing.T) {
 				runningTasks: map[string]*runningTaskState{
 					key: {task: &coordinatorv1.RunningTask{AttemptKey: key, ExecutionMarker: tc.running}},
 				},
-				cancelFuncs: map[string]context.CancelFunc{key: cancel},
+				cancelFuncs: map[string]context.CancelCauseFunc{key: func(error) { cancel() }},
 			}
 
 			w.processCancellations(context.Background(), []*coordinatorv1.CancelledRun{tc.directive})

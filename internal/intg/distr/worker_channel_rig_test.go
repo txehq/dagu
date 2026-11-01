@@ -211,6 +211,7 @@ func (r *channelRig) fenced(t *testing.T, f *testFixture) {
 	status := f.waitForStatusIn([]ir.Status{ir.Failed, ir.Aborted, ir.Succeeded}, 5*time.Minute)
 	t.Logf("rig: final status %s, error %q", status.Status, status.Error)
 	assert.NotEqual(t, ir.Succeeded, status.Status, "a run past the owner timeout is fenced")
+	assert.Contains(t, status.Error, "owner timeout", "a person can read why")
 	time.Sleep(20 * time.Second)
 	runs, err := os.ReadFile(r.marker + ".runs")
 	require.NoError(t, err)

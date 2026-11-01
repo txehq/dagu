@@ -107,7 +107,7 @@ func newRefusalHarness(t *testing.T) *refusalHarness {
 		lastOwnerHeartbeatAt: h.start,
 	}
 	// Every canceller holds pollersMu when it calls this.
-	h.worker.cancelFuncs["attempt-1"] = func() {
+	h.worker.cancelFuncs["attempt-1"] = func(error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.cancelled < 0 {
@@ -292,7 +292,7 @@ func TestAHeartbeatAcceptedBeforeTheCancelKeepsTheRun(t *testing.T) {
 func TestARunIsCancelledForRefusalOnce(t *testing.T) {
 	h := newRefusalHarness(t)
 	calls := 0
-	h.worker.cancelFuncs["attempt-1"] = func() { calls++ }
+	h.worker.cancelFuncs["attempt-1"] = func(error) { calls++ }
 	h.worker.runningTasks["attempt-1"].firstRefusedAt = h.start
 	h.advance(RefusedCallsStopAfter)
 	for range 5 {
@@ -333,4 +333,20 @@ func TestIsDefinitiveRefusal(t *testing.T) {
 	assert.False(t, isDefinitiveRefusal(status.Error(codes.FailedPrecondition, "owner rejected")))
 	assert.False(t, isDefinitiveRefusal(context.DeadlineExceeded))
 	assert.False(t, isDefinitiveRefusal(nil))
+}
+
+// A run the worker stops on its own says why. One the coordinator asked to stop
+// needs no reason from here.
+func TestCancelRunsCarriesItsCause(t *testing.T) {
+	w := &Worker{cancelFuncs: map[string]context.CancelCauseFunc{}, runningTasks: map[string]*runningTaskState{}}
+	run := func(key string) context.Context {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		w.cancelFuncs[key] = cancel
+		return ctx
+	}
+	lost, asked := run("lost"), run("asked")
+	w.cancelRuns(context.Background(), []*coordinatorv1.CancelledRun{{AttemptKey: "lost"}}, errStoppedOwnerLost)
+	w.processCancellations(context.Background(), []*coordinatorv1.CancelledRun{{AttemptKey: "asked"}})
+	assert.ErrorIs(t, context.Cause(lost), errStoppedOwnerLost)
+	assert.ErrorIs(t, context.Cause(asked), context.Canceled)
 }
