@@ -7,12 +7,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
+	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
+	"github.com/dagucloud/dagu/v2/internal/txe/workerchannel"
 )
 
 // NewCoordinatorClient creates a client using the worker's configured coordinators.
@@ -21,7 +25,13 @@ import (
 // names one, and nothing otherwise. It never presents the hub's key, whatever
 // else the configuration says: a worker that has no credential of its own is
 // refused by a coordinator that authenticates, rather than let in as the hub.
+//
+// With worker.hub_url the worker reaches the hub by the worker channel over
+// HTTPS, and a machine credential is required.
 func NewCoordinatorClient(ctx context.Context, cfg *config.Config) (coordinator.Client, error) {
+	if cfg.Worker.HubURL != "" {
+		return newChannelClient(ctx, cfg)
+	}
 	if len(cfg.Worker.Coordinators) == 0 {
 		return nil, fmt.Errorf("worker.coordinators is required")
 	}
@@ -46,5 +56,51 @@ func NewCoordinatorClient(ctx context.Context, cfg *config.Config) (coordinator.
 	}
 	logger.Info(ctx, "Using static coordinator discovery",
 		slog.Any("coordinators", cfg.Worker.Coordinators))
+	return coordinator.New(registry, clientConfig), nil
+}
+
+// newChannelClient is the coordinator client over the worker channel. The hub
+// is the only coordinator, and an owner's advertised address is not dialled:
+// every member uses the one connection.
+func newChannelClient(ctx context.Context, cfg *config.Config) (coordinator.Client, error) {
+	if len(cfg.Worker.Coordinators) != 0 {
+		return nil, fmt.Errorf("worker.hub_url and worker.coordinators are two routes to a hub: give one")
+	}
+	path := cfg.Worker.Auth.CredentialFile
+	if path == "" {
+		return nil, fmt.Errorf("worker.hub_url needs worker.auth.credential_file: the channel admits only enrolled machines")
+	}
+	hub, err := url.Parse(cfg.Worker.HubURL)
+	if err != nil {
+		return nil, fmt.Errorf("worker.hub_url is not a URL")
+	}
+	source, err := transportauth.NewRefreshingSource(path)
+	if err != nil {
+		return nil, fmt.Errorf("worker.auth.credential_file: %w", err)
+	}
+	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{
+		BaseURL:     strings.TrimRight(cfg.Worker.HubURL, "/") + "/api/v1" + workerchannel.MountPath,
+		Credentials: transportauth.NewWorkerCredentials(source),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("worker.hub_url: %w", err)
+	}
+
+	clientConfig := coordinator.ConfigFromPeer(cfg.Core.Peer)
+	clientConfig.WorkspaceBundleDir = workspacebundle.StoreDir(cfg.Paths.DataDir)
+	clientConfig.Connect = func() coordinator.Connection { return conn }
+	if err := clientConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid coordinator client configuration: %w", err)
+	}
+	port := hub.Port()
+	if port == "" {
+		port = "443"
+	}
+	registry, err := coordinator.NewStaticRegistry([]string{net.JoinHostPort(hub.Hostname(), port)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create static registry: %w", err)
+	}
+	logger.Info(ctx, "Reaching the hub by the worker channel",
+		slog.String("hub", hub.Host), slog.String("machine", source.MachineID()))
 	return coordinator.New(registry, clientConfig), nil
 }

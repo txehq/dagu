@@ -406,6 +406,7 @@ type CoordinatorWorkerChannelDef struct {
 
 // WorkerDef configures the worker.
 type WorkerDef struct {
+	HubURL        string `mapstructure:"hub_url"`
 	ID            string `mapstructure:"id"`
 	MaxActiveRuns int    `mapstructure:"max_active_runs"`
 	HealthPort    int    `mapstructure:"health_port"`

@@ -663,6 +663,7 @@ type Worker struct {
 	MaxActiveRuns int               // Default: 100
 	Labels        map[string]string // Capability matching labels
 	Coordinators  []string          // Static discovery addresses (host:port)
+	HubURL        string            // Hub reached by the worker channel over HTTPS, instead of Coordinators
 	HealthPort    int               // HTTP health check port (default: 8092, 0 disables)
 	PostgresPool  PostgresPoolConfig
 	Auth          WorkerAuth

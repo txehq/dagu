@@ -166,12 +166,19 @@ type pinnedStateCoordinator struct {
 	lastUsed  time.Time
 }
 
+// Connection carries a coordinator client's calls: a gRPC connection, or
+// whatever Config.Connect supplies.
+type Connection interface {
+	grpc.ClientConnInterface
+	Close() error
+}
+
 // client holds the gRPC connection and clients for one coordinator endpoint.
 // The connection is closed when the endpoint is replaced or during cleanup.
 type client struct {
 	address      string
 	startedAt    time.Time
-	conn         *grpc.ClientConn
+	conn         Connection
 	client       coordinatorv1.CoordinatorServiceClient
 	healthClient grpc_health_v1.HealthClient
 }
@@ -1023,19 +1030,25 @@ func isOlderCoordinatorIncarnation(candidate, current time.Time) bool {
 
 // createClient creates a new gRPC client for the given coordinator
 func (cli *clientImpl) createClient(member serviceregistry.HostInfo) (*client, error) {
-	// Get dial options based on TLS configuration
-	dialOpts, err := getDialOptions(cli.config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure gRPC connection: %w", err)
-	}
-
 	// Construct address from host and port
 	address := coordinatorAddress(member)
 
-	// Create gRPC connection
-	conn, err := grpc.NewClient(address, dialOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create coordinator client for %s: %w", address, err)
+	var conn Connection
+	if cli.config.Connect != nil {
+		conn = cli.config.Connect()
+	} else {
+		// Get dial options based on TLS configuration
+		dialOpts, err := getDialOptions(cli.config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure gRPC connection: %w", err)
+		}
+
+		// Create gRPC connection
+		grpcConn, err := grpc.NewClient(address, dialOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create coordinator client for %s: %w", address, err)
+		}
+		conn = grpcConn
 	}
 
 	return &client{

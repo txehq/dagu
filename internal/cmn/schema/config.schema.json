@@ -1270,6 +1270,10 @@
       "description": "Worker process configuration for distributed execution.",
       "additionalProperties": false,
       "properties": {
+        "hub_url": {
+          "type": "string",
+          "description": "The hub's address, reached by the worker channel over HTTPS instead of worker.coordinators. It needs worker.auth.credential_file."
+        },
         "id": {
           "type": "string",
           "description": "Unique worker identifier."
