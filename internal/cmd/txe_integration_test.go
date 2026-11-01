@@ -49,15 +49,20 @@ type txeCLI struct {
 
 func (c *txeCLI) run(session string, args ...string) (string, error) {
 	c.t.Helper()
+	return c.runIn([]string{"TXE_SESSION=" + session}, args...)
+}
+
+// runIn runs a command with env added to what every run has.
+func (c *txeCLI) runIn(env []string, args ...string) (string, error) {
+	c.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.binary, args...) //nolint:gosec // the binary built by the test harness
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + c.userDir,
 		"TXE_DAGU_HOME=" + c.home,
-		"TXE_SESSION=" + session,
-	}
+	}, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
