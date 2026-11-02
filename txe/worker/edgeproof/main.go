@@ -64,7 +64,12 @@ func runOriginCommand(ctx context.Context, args []string) error {
 	listen := flags.String("listen", "127.0.0.1:0", "loopback address to serve on")
 	tokenFile := flags.String("token-file", "", "file holding the one token this origin accepts")
 	life := flags.Duration("life", maxOriginLife, "how long to serve; at most 60m")
+	maxRequest := flags.Int("max-request-mib", 0, "the request cap in MiB, lowered from the channel's default; the client must name the same")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	limits, err := cappedLimits(*maxRequest)
+	if err != nil {
 		return err
 	}
 	token, err := readToken(*tokenFile)
@@ -76,7 +81,7 @@ func runOriginCommand(ctx context.Context, args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, *life)
 	defer cancel()
-	return serveOrigin(ctx, originConfig{Listen: *listen, Token: token, Log: os.Stdout})
+	return serveOrigin(ctx, originConfig{Listen: *listen, Token: token, Log: os.Stdout, Limits: limits})
 }
 
 func runClientCommand(ctx context.Context, args []string) error {
@@ -86,7 +91,12 @@ func runClientCommand(ctx context.Context, args []string) error {
 	checks := flags.String("checks", strings.Join(defaultChecks, ","), "comma-separated checks; "+strings.Join(allChecks(), ", "))
 	watch := flags.Duration("watch", 2*time.Minute, "how long the reconnect check watches; at most 10m")
 	budget := flags.Duration("budget", 12*time.Minute, "how long the whole run may take; at most 30m")
+	maxRequest := flags.Int("max-request-mib", 0, "the origin's request cap in MiB, when it was lowered")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	limits, err := cappedLimits(*maxRequest)
+	if err != nil {
 		return err
 	}
 	token, err := readToken(*tokenFile)
@@ -101,7 +111,7 @@ func runClientCommand(ctx context.Context, args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, *budget)
 	defer cancel()
-	results, err := runAndWrite(ctx, clientConfig{URL: *url, Token: token, Watch: *watch}, strings.Split(*checks, ","), os.Stdout)
+	results, err := runAndWrite(ctx, clientConfig{URL: *url, Token: token, Watch: *watch, Limits: limits}, strings.Split(*checks, ","), os.Stdout)
 	if err != nil {
 		return err
 	}

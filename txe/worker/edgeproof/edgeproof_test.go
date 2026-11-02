@@ -364,3 +364,39 @@ func TestACutStreamIsLoggedAsCut(t *testing.T) {
 type roundTripper func(*http.Request) (*http.Response, error)
 
 func (f roundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A lowered cap puts the at-limit and over-limit requests within what a slow
+// link carries in a stream. The refusal over it is still the channel's own.
+func TestALoweredCapIsMetAtAndOverItsLimit(t *testing.T) {
+	limits := shortLimits()
+	limits.MaxRequestBytes = 4 * chunkBytes
+	limits.MaxMessageBytes = min(limits.MaxMessageBytes, 4*chunkBytes)
+	handler, err := originHandler(originConfig{Token: testToken, Log: &lockedLog{}, Limits: limits})
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: limits}, []string{"at-limit", "over-limit"})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.True(t, results[0].Pass, results[0].Detail)
+	assert.EqualValues(t, 3*chunkBytes, results[0].Numbers["bytes_received"], "a MiB below the cap")
+	assert.True(t, results[1].Pass, results[1].Detail)
+	assert.Equal(t, "ResourceExhausted", results[1].Numbers["code"])
+	assert.Equal(t, 6, results[1].Numbers["mib_offered"])
+}
+
+func TestTheCapIsBounded(t *testing.T) {
+	defaults, err := cappedLimits(0)
+	require.NoError(t, err)
+	assert.Equal(t, workerchannel.DefaultLimits(), defaults)
+	for _, mib := range []int{1, 33, -4} {
+		_, err := cappedLimits(mib)
+		assert.ErrorContains(t, err, "--max-request-mib must be from 2 to 32", "%d", mib)
+	}
+	capped, err := cappedLimits(4)
+	require.NoError(t, err)
+	assert.EqualValues(t, 4*chunkBytes, capped.MaxRequestBytes)
+	assert.Equal(t, 4*chunkBytes, capped.MaxMessageBytes, "a message never exceeds its request")
+	assert.Contains(t, allChecks(), "at-limit")
+	assert.NotContains(t, defaultChecks, "at-limit", "an approved default run does not change")
+}

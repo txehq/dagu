@@ -48,8 +48,26 @@ const (
 // most, and what they cost must not take the rest of the run with it.
 var defaultChecks = []string{"unary", "refused", "poll", "gap25", "gap35", "hold", "load", "bytes16", "bytes31", "over-limit"}
 
+// allChecks are the defaults and the checks a run names itself. at-limit is
+// meant beside a lowered request cap (--max-request-mib), where a slow link can
+// carry a request at the cap within a stream's limit.
 func allChecks() []string {
-	return append(slices.Clone(defaultChecks), "down", "reconnect")
+	return append(slices.Clone(defaultChecks), "down", "reconnect", "at-limit")
+}
+
+// cappedLimits are the channel's defaults with the request cap lowered to mib
+// MiB, or the defaults for 0. A message never exceeds its request.
+func cappedLimits(mib int) (workerchannel.Limits, error) {
+	limits := workerchannel.DefaultLimits()
+	if mib == 0 {
+		return limits, nil
+	}
+	if most := int(limits.MaxRequestBytes / chunkBytes); mib < 2 || mib > most {
+		return limits, fmt.Errorf("--max-request-mib must be from 2 to %d", most)
+	}
+	limits.MaxRequestBytes = int64(mib) * chunkBytes
+	limits.MaxMessageBytes = min(limits.MaxMessageBytes, mib*chunkBytes)
+	return limits, nil
 }
 
 type clientConfig struct {
@@ -224,6 +242,9 @@ func checkFor(name string) (check, bool) {
 		"bytes31": func(ctx context.Context, c *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
 			return c.streamBytes(ctx, api, 31)
 		},
+		"at-limit": func(ctx context.Context, c *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
+			return c.streamBytes(ctx, api, c.atLimitMiB())
+		},
 		"over-limit": checkOverLimit, "gap25": gapCheck(25 * time.Second), "gap35": gapCheck(35 * time.Second),
 		"hold": checkHold, "load": checkLoad, "down": checkDown, "reconnect": checkReconnect,
 	}
@@ -309,7 +330,7 @@ func (c *client) limitFor(name string) time.Duration {
 		return c.cfg.Watch + failing
 	case "poll":
 		return c.cfg.Limits.PollWait + failing
-	case "hold", "bytes16", "bytes31", "over-limit":
+	case "hold", "bytes16", "bytes31", "at-limit", "over-limit":
 		return c.cfg.Limits.Stream + failing
 	}
 	return failing
@@ -323,6 +344,8 @@ func (c *client) cannotFit(name string) string {
 	switch name {
 	case "bytes31":
 		mib = 31
+	case "at-limit":
+		mib = c.atLimitMiB()
 	case "over-limit":
 		mib = int(c.cfg.Limits.MaxRequestBytes/chunkBytes) + 2
 	default:
@@ -335,6 +358,12 @@ func (c *client) cannotFit(name string) string {
 		return fmt.Sprintf("%d MiB at %.0f KiB/s needs %s, past the %s stream limit", mib, c.uploadRate/1024, needs.Round(time.Second), c.cfg.Limits.Stream)
 	}
 	return ""
+}
+
+// atLimitMiB is the most a request carries below the cap, leaving a MiB for
+// framing.
+func (c *client) atLimitMiB() int {
+	return int(c.cfg.Limits.MaxRequestBytes/chunkBytes) - 1
 }
 
 func checkUnary(ctx context.Context, _ *client, api coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
