@@ -31,6 +31,7 @@ import (
 
 // uploadStream is one artifact stream as the hub saw it, decoded off the wire.
 type uploadStream struct {
+	Path     string // the file the stream's chunks belong to
 	From, To uint64 // the byte offsets the stream's chunks covered
 	Bytes    uint64
 	Final    bool
@@ -73,7 +74,7 @@ func (r *frameReader) Read(p []byte) (int, error) {
 		chunk := &coordinatorv1.ArtifactChunk{}
 		if r.pending[0] == 0 && proto.Unmarshal(r.pending[5:5+size], chunk) == nil && chunk.HasByteOffset() {
 			if !r.begun {
-				r.stream.From, r.begun = chunk.GetByteOffset(), true
+				r.stream.From, r.stream.Path, r.begun = chunk.GetByteOffset(), chunk.RelativePath, true
 			}
 			r.stream.To = chunk.GetByteOffset() + uint64(len(chunk.Data))
 			r.stream.Bytes += uint64(len(chunk.Data))
@@ -112,7 +113,9 @@ func (t *uploadTrace) serve(next http.Handler, w http.ResponseWriter, r *http.Re
 	start := time.Now()
 	next.ServeHTTP(reply, r)
 	stream.Took = time.Since(start)
-	stream.Held = t.held()
+	if t.held != nil {
+		stream.Held = t.held()
+	}
 	data := reply.body.Bytes()
 	if len(data) >= 5 && data[0] == 0 {
 		answer := &coordinatorv1.StreamArtifactsResponse{}
@@ -176,6 +179,19 @@ func (t *uploadTrace) report(tb testing.TB) (streams int, sent uint64) {
 		sent += s.Bytes
 	}
 	return len(t.streams), sent
+}
+
+// finals counts the final chunks the hub answered for each file.
+func (t *uploadTrace) finals() map[string]int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	finals := map[string]int{}
+	for _, s := range t.streams {
+		if s.Final && !s.Lost {
+			finals[s.Path]++
+		}
+	}
+	return finals
 }
 
 // requireForwardOnly fails an upload that repeated more than the one cut chunk.
@@ -253,12 +269,16 @@ func scaledRig(whole bool) *channelRig {
 	return &channelRig{limits: limits, wholeStreams: whole, uploads: &uploadTrace{}}
 }
 
+// uploadChunk is the uploader's chunk, its durable unit: a stream cut by its
+// deadline repeats at most the one chunk still in buffers when it was cut.
+const uploadChunk = 3 << 20
+
 func logUpload(t *testing.T, rig *channelRig, status ir.DAGRunStatus, took time.Duration, size int) {
 	t.Helper()
 	streams, sent := rig.uploads.report(t)
 	t.Logf("rig: %s after %s, %d streams, %d bytes sent for a %d byte file", status.Status, took.Round(time.Second), streams, sent, size)
 	require.Equal(t, ir.Succeeded, status.Status, "error %q", status.Error)
-	assert.LessOrEqual(t, sent, uint64(size)+uint64(streams)*(1<<20), "at most a chunk repeated for each stream")
+	assert.LessOrEqual(t, sent, uint64(size)+uint64(streams)*uploadChunk, "at most a chunk repeated for each stream")
 }
 
 // These proofs run the real uploader against the real handler over Connect,
@@ -371,4 +391,66 @@ func TestChannelUploadStopsWithinItsBoundAfterACancel(t *testing.T) {
 	assert.NotEqual(t, ir.Succeeded, status.Status)
 	assert.Less(t, since, 3*time.Minute+30*time.Second, "the fixed time and a stream's end")
 	assert.Less(t, sent, uint64(size))
+}
+
+// Before TXE-5662 a file of at most 16 MiB went whole in one stream with no time
+// budget, so at this rate it met the 110 s limit, began again at byte 0 and failed
+// the run after 3 minutes. Now a file larger than a chunk goes by segments. Real
+// limits, about 100 KiB/s; nothing is scaled.
+func TestChannelUploadAFileWithinOneStreamAtASlowRate(t *testing.T) {
+	rig := &channelRig{uploads: &uploadTrace{}}
+	const size = 14 << 20
+	f, status, took := uploadFile(t, size, rig, 320*time.Millisecond)
+	logUpload(t, rig, status, took, size)
+	rig.uploads.requireForwardOnly(t)
+	assert.Equal(t, map[string]int{"reports/large.bin": 1}, rig.uploads.finals(), "committed once")
+	requireWholeFile(t, f, status, size)
+}
+
+// Seven files of 6 MiB at the rate measured through a real edge, 146 KiB/s, take
+// longer than 3 minutes. Before TXE-5662 the fixed 3 minutes ended them. Now each
+// acknowledged file moves the bound. Real limits; nothing is scaled.
+func TestChannelUploadManyFilesAtTheMeasuredRate(t *testing.T) {
+	needRealTime(t)
+	needPosixShell(t)
+	const files, size = 7, 6 << 20
+	lines := []string{`mkdir -p "${DAG_RUN_ARTIFACTS_DIR}/r"`}
+	for i := range files {
+		name := fmt.Sprintf(`"${DAG_RUN_ARTIFACTS_DIR}/r/f%d.bin"`, i)
+		lines = append(lines,
+			fmt.Sprintf(`head -c %d /dev/urandom > %s`, size, name),
+			fmt.Sprintf(`(sha256sum %s || shasum -a 256 %s) | cut -d' ' -f1`, name, name))
+	}
+	rig := &channelRig{uploads: &uploadTrace{}}
+	f := newTestFixture(t, rigDAG(strings.Join(lines, "\n")), withChannelRig(rig), withLogPersistence(), withArtifactPersistence(), withIsolatedWorker())
+	t.Cleanup(f.cleanup)
+	rig.proxy.throttle.Store(int64(219 * time.Millisecond))
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	start := time.Now()
+	f.startScheduler(distrTestTimeout(30 * time.Minute))
+	status := f.waitForStatusIn([]ir.Status{ir.Succeeded, ir.Failed, ir.Aborted}, distrTestTimeout(20*time.Minute))
+	took := time.Since(start)
+	streams, sent := rig.uploads.report(t)
+	t.Logf("rig: %s after %s, %d streams, %d bytes sent for %d files of %d bytes", status.Status, took.Round(time.Second), streams, sent, files, size)
+	require.Equal(t, ir.Succeeded, status.Status, "error %q", status.Error)
+	assert.Greater(t, took, 3*time.Minute, "longer than the old fixed time")
+	assert.LessOrEqual(t, sent, uint64(files*size)+uint64(streams)*uploadChunk, "at most a chunk repeated for each stream")
+
+	logs := findLogFiles(t, f.coord.Config.Paths.LogDir, status.Name, status.DAGRunID, "run", "stdout")
+	require.NotEmpty(t, logs)
+	logged, err := os.ReadFile(filepath.Clean(logs[0]))
+	require.NoError(t, err)
+	finals := rig.uploads.finals()
+	for i := range files {
+		rel := fmt.Sprintf("r/f%d.bin", i)
+		data, err := os.ReadFile(filepath.Join(status.ArchiveDir, rel))
+		require.NoError(t, err)
+		require.Len(t, data, size)
+		sum := sha256.Sum256(data)
+		assert.Contains(t, string(logged), hex.EncodeToString(sum[:]), "the digest the job computed for %s", rel)
+		assert.Equal(t, 1, finals[rel], "%s committed once", rel)
+	}
+	_, err = os.Stat(filepath.Join(status.ArchiveDir, ir.ArtifactSegmentDir))
+	assert.ErrorIs(t, err, os.ErrNotExist, "no upload is left behind")
 }
