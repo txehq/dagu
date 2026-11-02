@@ -139,13 +139,13 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 	attemptID := u.getAttemptID()
 	run := newDirUpload()
 
-	// One window covers everything, from before the directory is read. A
-	// segmented file's upload ends after the window with nothing new durable on
-	// the hub, not after the window: a long upload on a slow link outlives it,
-	// moving. Only the hub's own word moves it: a higher offset than it has ever
-	// reported, or a file committed. The caller's context, and the fences the hub
-	// checks on every chunk, still end it at any time. An upload with no
-	// segmented file keeps one fixed window.
+	// One window covers everything, from before the directory is read. Over a
+	// client that sends segments, the upload ends after the window with nothing
+	// new durable on the hub, not after the window: a long upload on a slow link
+	// outlives it, moving. Only the hub's own word moves it: a higher offset than
+	// it has ever reported, or a file it acknowledged for the first time. The
+	// caller's context, and the fences the hub checks on every chunk, still end
+	// it at any time. Over gRPC the window is one fixed time, as it always was.
 	uploadCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stalled := time.AfterFunc(u.retryWindow, func() { cancel(errUploadStalled) })
@@ -161,7 +161,7 @@ func (u *ArtifactUploader) UploadDir(ctx context.Context, dir string) error {
 	if !errors.Is(context.Cause(uploadCtx), errUploadStalled) {
 		return err
 	}
-	if !run.segmented {
+	if !SendsSegments(u.client) {
 		return context.DeadlineExceeded
 	}
 	return fmt.Errorf("%w for %s", errUploadStalled, u.retryWindow)
@@ -180,9 +180,7 @@ var errUploadStalled = errors.New("artifact upload: nothing new reached the hub"
 
 // dirUpload is what one UploadDir knows across its retries.
 type dirUpload struct {
-	// segmented says a file went by segments.
-	segmented bool
-	// committed are the segmented files the hub has acknowledged whole.
+	// committed are the files the hub has acknowledged whole.
 	committed map[string]bool
 	// finalSent are those whose final chunk went out, acknowledged or not.
 	finalSent map[string]bool
@@ -230,6 +228,18 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string,
 		}
 	}()
 
+	limit := segmentBytes(u.client)
+	// Over a client that sends segments, a file larger than one chunk goes by
+	// segments, so that its progress is durable chunk by chunk whatever its size,
+	// and a stream of smaller files ends by its time as well as its size.
+	segmentAbove := min(limit, int64(maxChunkSize))
+	streamTime := u.streamTime()
+	var streamBytes int64
+	var opened time.Time
+	// inStream are the files of the open stream, committed when it is
+	// acknowledged.
+	var inStream []string
+
 	// finishStream ends the current stream and reads its reply.
 	finishStream := func() error {
 		if stream == nil {
@@ -237,16 +247,21 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string,
 		}
 		resp, err := stream.CloseAndRecv()
 		stream = nil
+		files := inStream
+		inStream = nil
 		if err != nil {
 			return fmt.Errorf("finalize artifact upload: %w", err)
 		}
 		if resp != nil && resp.Error != "" {
 			return fmt.Errorf("artifact upload failed: %s", resp.Error)
 		}
+		if limit > 0 {
+			for _, relPath := range files {
+				run.finished(relPath)
+			}
+		}
 		return nil
 	}
-	limit := segmentBytes(u.client)
-	var streamBytes int64
 
 	sendChunk := func(chunk *coordinatorv1.ArtifactChunk) error {
 		if stream == nil {
@@ -255,6 +270,7 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string,
 			if err != nil {
 				return err
 			}
+			opened = time.Now()
 		}
 		err := stream.Send(chunk)
 		if errors.Is(err, io.EOF) {
@@ -283,26 +299,28 @@ func (u *ArtifactUploader) uploadDir(ctx context.Context, dir, attemptID string,
 		relPath = filepath.ToSlash(relPath)
 
 		if limit > 0 {
+			if run.committed[relPath] {
+				return nil
+			}
 			info, err := d.Info()
 			if err != nil {
 				return fmt.Errorf("read artifact %s: %w", path, err)
 			}
-			if info.Size() > limit {
+			if info.Size() > segmentAbove {
 				if err := finishStream(); err != nil {
 					return err
 				}
-				if run.committed[relPath] {
-					return nil
-				}
 				return u.uploadSegmented(ctx, path, relPath, attemptID, limit, run)
 			}
-			if streamBytes+info.Size() > limit {
+			late := stream != nil && streamTime > 0 && time.Since(opened) >= streamTime
+			if streamBytes+info.Size() > limit || late {
 				if err := finishStream(); err != nil {
 					return err
 				}
 				streamBytes = 0
 			}
 			streamBytes += info.Size()
+			inStream = append(inStream, relPath)
 		}
 
 		return func() error {
@@ -404,7 +422,7 @@ func (u *ArtifactUploader) streamTime() time.Duration {
 	return 0
 }
 
-// uploadSegmented sends a file that one stream cannot carry. Each stream must
+// uploadSegmented sends a file larger than one chunk. Each stream must
 // be acknowledged before the next: the final chunk is sent only to a hub that
 // has said it holds every byte, so a hub that does not know this form commits
 // nothing. A stream ends at its size or its time, whichever comes first, so a
@@ -417,7 +435,6 @@ func (u *ArtifactUploader) streamTime() time.Duration {
 // chunks, so a link that cannot carry one chunk within a stream's limit does not
 // move, and the upload ends with errUploadStalled.
 func (u *ArtifactUploader) uploadSegmented(ctx context.Context, path, relPath, attemptID string, limit int64, run *dirUpload) error {
-	run.segmented = true
 	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return fmt.Errorf("open artifact %s: %w", path, err)

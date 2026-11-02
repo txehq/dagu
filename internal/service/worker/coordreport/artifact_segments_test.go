@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -429,3 +430,134 @@ type timedHub struct {
 }
 
 func (h *timedHub) ArtifactStreamTime() time.Duration { return h.streamTime }
+
+// Over the channel a file larger than one chunk goes by segments even when a
+// stream could carry it whole, so that a slow link moves it chunk by chunk.
+func TestAFileLargerThanAChunkGoesInSegments(t *testing.T) {
+	content := strings.Repeat("m", MaxChunkSize+1)
+	hub := &segmentHub{limit: 16 << 20, knowsThem: true}
+	require.NoError(t, uploaderFor(hub).UploadDir(context.Background(), dirWith(t, map[string]string{"mid.bin": content})))
+	assert.Equal(t, content, hub.committed)
+	assert.Equal(t, 1, hub.commits)
+	for _, stream := range hub.streams {
+		for _, chunk := range stream {
+			assert.True(t, chunk.HasByteOffset(), "every chunk carries its offset")
+		}
+	}
+}
+
+func TestAStreamOfSmallFilesEndsAtItsTime(t *testing.T) {
+	hub := &timedHub{segmentHub: segmentHub{limit: 1 << 20, knowsThem: true}, streamTime: time.Nanosecond}
+	uploader := NewArtifactUploader(hub, "worker-1", "run-1", "job", "attempt-1", ir.DAGRunRef{Name: "job", ID: "run-1"})
+	require.NoError(t, uploader.UploadDir(context.Background(), dirWith(t, map[string]string{"a": "a", "b": "b", "c": "c"})))
+	assert.Len(t, hub.streams, 3, "one file each, where size alone would put all three in one")
+}
+
+func filesSent(hub *segmentHub) map[string]int {
+	sent := map[string]int{}
+	for _, stream := range hub.streams {
+		for _, chunk := range stream {
+			if chunk.IsFinal {
+				sent[chunk.RelativePath]++
+			}
+		}
+	}
+	return sent
+}
+
+// A retry does not send again a small file whose stream the hub acknowledged.
+func TestAnAcknowledgedSmallFileIsNotSentAgain(t *testing.T) {
+	files := map[string]string{"a": "aaaaaaa", "b": "bbbbbbb", "c": "ccc"}
+	// Streams: [a], [b c] refused once, then [b c] again.
+	hub := &segmentHub{limit: 10, failClose: map[int]error{1: status.Error(codes.Unavailable, "cut")}}
+	require.NoError(t, uploaderFor(hub).UploadDir(context.Background(), dirWith(t, files)))
+	assert.Equal(t, map[string]int{"a": 1, "b": 2, "c": 2}, filesSent(hub))
+}
+
+// pausedHub answers each stream after a pause, as a slow link does.
+type pausedHub struct {
+	segmentHub
+	pause      time.Duration
+	streamTime time.Duration
+	refuse     bool
+}
+
+func (h *pausedHub) ArtifactStreamTime() time.Duration { return h.streamTime }
+
+func (h *pausedHub) StreamArtifacts(context.Context) (coordinatorv1.CoordinatorService_StreamArtifactsClient, error) {
+	h.streams = append(h.streams, nil)
+	return &pausedStream{segmentStream: segmentStream{hub: &h.segmentHub, index: len(h.streams) - 1}, owner: h}, nil
+}
+
+func (h *pausedHub) StreamArtifactsTo(ctx context.Context, _ serviceregistry.HostInfo) (coordinatorv1.CoordinatorService_StreamArtifactsClient, error) {
+	return h.StreamArtifacts(ctx)
+}
+
+type pausedStream struct {
+	segmentStream
+	owner *pausedHub
+}
+
+func (s *pausedStream) CloseAndRecv() (*coordinatorv1.StreamArtifactsResponse, error) {
+	time.Sleep(s.owner.pause)
+	if s.owner.refuse {
+		return nil, status.Error(codes.Unavailable, "cut")
+	}
+	return s.segmentStream.CloseAndRecv()
+}
+
+func pausedUploader(hub *pausedHub, window time.Duration) *ArtifactUploader {
+	uploader := NewArtifactUploader(hub, "worker-1", "run-1", "job", "attempt-1", ir.DAGRunRef{Name: "job", ID: "run-1"})
+	uploader.retryWindow = window
+	return uploader
+}
+
+func smallFiles(n int) map[string]string {
+	files := map[string]string{}
+	for i := range n {
+		files[fmt.Sprintf("f%02d", i)] = "data"
+	}
+	return files
+}
+
+// Many small files take far longer than the window, and each acknowledged one
+// moves it.
+func TestSmallFilesFinishWhileEachMovesTheWindow(t *testing.T) {
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 50 * time.Millisecond, streamTime: time.Nanosecond}
+	const window = 300 * time.Millisecond
+	start := time.Now()
+	require.NoError(t, pausedUploader(hub, window).UploadDir(context.Background(), dirWith(t, smallFiles(12))))
+	assert.Greater(t, time.Since(start), 2*window, "longer than the window")
+	assert.Len(t, filesSent(&hub.segmentHub), 12)
+}
+
+// Small files that never land end the upload after the window, as no progress.
+func TestSmallFilesThatNeverLandEndWithinTheWindow(t *testing.T) {
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: time.Millisecond, refuse: true}
+	start := time.Now()
+	err := pausedUploader(hub, 300*time.Millisecond).UploadDir(context.Background(), dirWith(t, smallFiles(3)))
+	require.ErrorIs(t, err, errUploadStalled)
+	assert.Less(t, time.Since(start), 3*time.Second)
+}
+
+// A repeated acknowledgment of a file already finished moves nothing: only the
+// first finish of each file counts.
+func TestARepeatedAcknowledgmentOfASmallFileDoesNotMoveTheWindow(t *testing.T) {
+	run := newDirUpload()
+	moved := 0
+	run.progressed = func() { moved++ }
+	for range 3 {
+		run.finished("a")
+	}
+	run.acknowledged("a", 0)
+	assert.Equal(t, 1, moved)
+}
+
+func TestACancelledCallerStopsSmallFiles(t *testing.T) {
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 20 * time.Millisecond, streamTime: time.Nanosecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := pausedUploader(hub, time.Minute).UploadDir(ctx, dirWith(t, smallFiles(100)))
+	require.Error(t, err)
+	assert.Less(t, len(filesSent(&hub.segmentHub)), 100)
+}
