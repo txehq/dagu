@@ -73,6 +73,16 @@ func channelBaseURL(hub *url.URL) string {
 	return root.String()
 }
 
+// ChannelBaseURL is where a hub at hubURL serves the worker channel, by the
+// worker's own rule.
+func ChannelBaseURL(hubURL string) (string, error) {
+	hub, err := url.Parse(hubURL)
+	if err != nil || hub.Host == "" {
+		return "", fmt.Errorf("%q is not a hub address", hubURL)
+	}
+	return channelBaseURL(hub), nil
+}
+
 // channelSegmentBytes is the most an artifact stream carries over the channel,
 // well below workerchannel's request limit.
 const channelSegmentBytes = 16 << 20

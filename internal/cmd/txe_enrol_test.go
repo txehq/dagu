@@ -431,4 +431,12 @@ func TestTXEEnrolCheck(t *testing.T) {
 
 	_, err := f.run("enrol")
 	assert.ErrorContains(t, err, "--client-id is required")
+
+	// --hub-url asks the channel only after the file passes as the worker
+	// loads it: a reviewer's credential never goes to the hub.
+	reviewer := write(t, func(c map[string]any) { c["class"] = "reviewer" })
+	_, err = f.run("enrol", "check", "--credential-file", reviewer, "--hub-url", "http://127.0.0.1:1")
+	assert.ErrorContains(t, err, "loads only this machine's worker credential")
+	_, err = f.run("enrol", "check", "--hub-url", "http://127.0.0.1:1")
+	assert.ErrorContains(t, err, "did not answer", "the flag reaches the channel check")
 }
