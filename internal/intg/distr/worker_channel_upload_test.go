@@ -269,12 +269,16 @@ func scaledRig(whole bool) *channelRig {
 	return &channelRig{limits: limits, wholeStreams: whole, uploads: &uploadTrace{}}
 }
 
+// uploadChunk is the uploader's chunk, its durable unit: a stream cut by its
+// deadline repeats at most the one chunk still in buffers when it was cut.
+const uploadChunk = 3 << 20
+
 func logUpload(t *testing.T, rig *channelRig, status ir.DAGRunStatus, took time.Duration, size int) {
 	t.Helper()
 	streams, sent := rig.uploads.report(t)
 	t.Logf("rig: %s after %s, %d streams, %d bytes sent for a %d byte file", status.Status, took.Round(time.Second), streams, sent, size)
 	require.Equal(t, ir.Succeeded, status.Status, "error %q", status.Error)
-	assert.LessOrEqual(t, sent, uint64(size)+uint64(streams)*(1<<20), "at most a chunk repeated for each stream")
+	assert.LessOrEqual(t, sent, uint64(size)+uint64(streams)*uploadChunk, "at most a chunk repeated for each stream")
 }
 
 // These proofs run the real uploader against the real handler over Connect,
@@ -431,7 +435,7 @@ func TestChannelUploadManyFilesAtTheMeasuredRate(t *testing.T) {
 	t.Logf("rig: %s after %s, %d streams, %d bytes sent for %d files of %d bytes", status.Status, took.Round(time.Second), streams, sent, files, size)
 	require.Equal(t, ir.Succeeded, status.Status, "error %q", status.Error)
 	assert.Greater(t, took, 3*time.Minute, "longer than the old fixed time")
-	assert.LessOrEqual(t, sent, uint64(files*size)+uint64(streams)*(1<<20), "at most a chunk repeated for each stream")
+	assert.LessOrEqual(t, sent, uint64(files*size)+uint64(streams)*uploadChunk, "at most a chunk repeated for each stream")
 
 	logs := findLogFiles(t, f.coord.Config.Paths.LogDir, status.Name, status.DAGRunID, "run", "stdout")
 	require.NotEmpty(t, logs)
