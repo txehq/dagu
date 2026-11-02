@@ -1,6 +1,6 @@
 # Worker channel over HTTPS (design)
 
-Status: proposed, TXE-5550. The hub can serve the channel behind `coordinator.worker_channel.enabled`, default off. A worker opts in with `worker.hub_url`. Nothing here is live, and no Cloudflare path has been tried.
+Status: proposed, TXE-5550. The hub can serve the channel behind `coordinator.worker_channel.enabled`, default off. A worker opts in with `worker.hub_url`. Nothing here is live. A synthetic proof through a Cloudflare Tunnel has run ("Through an edge", below); a real hub, worker and identity provider have not been tried behind one.
 
 ## Why
 
@@ -143,6 +143,26 @@ Three things are often mistaken for one another:
 
 So stale detection end to end is bounded by the call deadline plus the existing 90 s owner timeout, not by the ping interval.
 
+## Through an edge
+
+The fixture in `txe/worker/edgeproof` puts the real channel handler behind a Cloudflare Tunnel, with a synthetic origin that holds no job, no owner data and a single throwaway token. It tests the protocol and the edge, not the production uploader, a real hub, a real identity provider or a real worker. One run passed every check it executed:
+
+| Check | Result |
+|---|---|
+| Unary call, and a wrong token | Answered; the refusal arrived as the channel's `unauthenticated`, not as an edge page |
+| 100 polls held 25 s, beside 300 heartbeats | All answered, none failed, no challenge |
+| A stream idle 25 s, and 35 s, in the middle | Both completed |
+| A stream held 105 s | Completed |
+| 16 MiB in one request | Arrived whole, digest matching, in under the 110 s stream limit |
+| Connector restart during heartbeats | One call failed with an edge status read as `Unavailable`; the next succeeded, under 2 s later |
+| Origin stopped | The edge's 502 read as `Unavailable` |
+
+Every request reached the edge over HTTP/2.
+
+**Held bodies.** The edge held a small request body, a few KiB, until the request ended: the origin received it all at once, however long the client spread it out. Large bodies, in 1 MiB messages, streamed through as they were sent. The threshold between the two was not measured. The channel does not depend on either: a log writer closes its stream at each checkpoint, an artifact stream closes within 55 s, and nothing waits on a partial request.
+
+**Not run.** A request near the 32 MiB cap, and one over it, could not finish within the stream limit at the link's rate, so they were skipped by rule, not passed. No real request carries more than about 16 MiB of data: a log checkpoint and an artifact stream both stay under it. The fixture's `--max-request-mib` lowers the cap, so the same at-limit and over-limit checks fit a slow link.
+
 ## Failure behaviour
 
 | Event | What happens |
@@ -196,6 +216,6 @@ Isolated rig, before cutover. The endpoint allowlist is set before a worker star
 
 ## Open before wiring
 
-- The zone's real request body limit and whether any Cloudflare bot or rate rule touches a non-browser client on this host.
+- Whether any bot or rate rule touches a non-browser client on the real host, under real load. The synthetic proof saw no challenge.
 - Run-slot count on real workers: 100 pollers at 25 s is about 4 requests a second before heartbeats.
 - `txe.authn` clients and the machine's enrolment on the hub, which are live changes for their own stage.
