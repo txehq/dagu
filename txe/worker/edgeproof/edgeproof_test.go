@@ -368,21 +368,25 @@ func (f roundTripper) RoundTrip(r *http.Request) (*http.Response, error) { retur
 // A lowered cap puts the at-limit and over-limit requests within what a slow
 // link carries in a stream. The refusal over it is still the channel's own.
 func TestALoweredCapIsMetAtAndOverItsLimit(t *testing.T) {
-	limits := shortLimits()
-	limits.MaxRequestBytes = 4 * chunkBytes
-	limits.MaxMessageBytes = min(limits.MaxMessageBytes, 4*chunkBytes)
-	handler, err := originHandler(originConfig{Token: testToken, Log: &lockedLog{}, Limits: limits})
-	require.NoError(t, err)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: limits}, []string{"at-limit", "over-limit"})
-	require.NoError(t, err)
-	require.Len(t, results, 2)
-	assert.True(t, results[0].Pass, results[0].Detail)
-	assert.EqualValues(t, 3*chunkBytes, results[0].Numbers["bytes_received"], "a MiB below the cap")
-	assert.True(t, results[1].Pass, results[1].Detail)
-	assert.Equal(t, "ResourceExhausted", results[1].Numbers["code"])
-	assert.Equal(t, 6, results[1].Numbers["mib_offered"])
+	for _, mib := range []int{2, 4} {
+		t.Run(fmt.Sprintf("%d MiB", mib), func(t *testing.T) {
+			limits := shortLimits()
+			limits.MaxRequestBytes = int64(mib) * chunkBytes
+			limits.MaxMessageBytes = min(limits.MaxMessageBytes, mib*chunkBytes)
+			handler, err := originHandler(originConfig{Token: testToken, Log: &lockedLog{}, Limits: limits})
+			require.NoError(t, err)
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+			results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: limits}, []string{"at-limit", "over-limit"})
+			require.NoError(t, err)
+			require.Len(t, results, 2)
+			assert.True(t, results[0].Pass, results[0].Detail)
+			assert.EqualValues(t, (mib-1)*chunkBytes, results[0].Numbers["bytes_received"], "a MiB below the cap")
+			assert.True(t, results[1].Pass, results[1].Detail)
+			assert.Equal(t, "ResourceExhausted", results[1].Numbers["code"])
+			assert.Equal(t, mib+2, results[1].Numbers["mib_offered"])
+		})
+	}
 }
 
 func TestTheCapIsBounded(t *testing.T) {
@@ -399,4 +403,19 @@ func TestTheCapIsBounded(t *testing.T) {
 	assert.Equal(t, 4*chunkBytes, capped.MaxMessageBytes, "a message never exceeds its request")
 	assert.Contains(t, allChecks(), "at-limit")
 	assert.NotContains(t, defaultChecks, "at-limit", "an approved default run does not change")
+}
+
+// The over-limit probe never refuses itself: against an origin with a larger
+// cap than the client was told, the request reaches it and is taken, which
+// the check reports as a finding rather than a refusal it did not see.
+func TestTheOverLimitProbeIsNotRefusedByTheClient(t *testing.T) {
+	server, _ := startOrigin(t)
+	limits := shortLimits()
+	limits.MaxRequestBytes = 2 * chunkBytes
+	limits.MaxMessageBytes = min(limits.MaxMessageBytes, 2*chunkBytes)
+	results, err := runChecks(context.Background(), clientConfig{URL: server.URL, Token: testToken, Limits: limits}, []string{"over-limit"})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.False(t, results[0].Pass)
+	assert.Contains(t, results[0].Detail, "the origin took a request over its limit")
 }

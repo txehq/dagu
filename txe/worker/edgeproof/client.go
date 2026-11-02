@@ -494,8 +494,11 @@ func (c *client) streamBytes(ctx context.Context, api coordinatorv1.CoordinatorS
 // checkOverLimit lifts the client's own limit, so that the origin's is what is
 // met: a refusal from the channel, not an edge's page.
 func checkOverLimit(ctx context.Context, c *client, _ coordinatorv1.CoordinatorServiceClient) (map[string]any, error) {
+	// The client's own allowance must clear the offer, its framing included,
+	// or the client refuses it first. Doubling a small cap does not: 2 MiB
+	// doubled is the 4 MiB offered.
 	wide := c.cfg.Limits
-	wide.MaxRequestBytes *= 2
+	wide.MaxRequestBytes += 4 * chunkBytes
 	api, err := c.conn(c.cfg.Token, wide)
 	if err != nil {
 		return nil, err
