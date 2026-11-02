@@ -103,6 +103,9 @@ func TestTheChannelCheckSaysWhoRefused(t *testing.T) {
 // check fails, though the hub answered, because the worker would present a
 // retired token.
 func TestTheChannelCheckFailsWhenARotationCannotBeSaved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory, so the save cannot be made to fail this way")
+	}
 	h, hub := channelCheckHub(t)
 	rotating := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
