@@ -398,6 +398,17 @@ func txeChannelCheck(ctx context.Context, hubURL, path string) (string, error) {
 	defer func() { _ = conn.Close() }()
 	callCtx, cancel := context.WithTimeout(ctx, txeChannelCheckTimeout)
 	defer cancel()
+	// The credential is renewed first, so that what the machine and its
+	// provider refuse is never taken for the hub's refusal. The call below
+	// presents the token renewed here.
+	if _, err := source.Token(callCtx); err != nil {
+		return "", txeCredentialError(err)
+	}
+	// A renewal may have rotated the refresh token. Unless the file holds the
+	// new one, the worker would present a retired one.
+	if unsaved := source.Unsaved(); unsaved != nil {
+		return "", fmt.Errorf("this machine's renewed credential could not be saved, so the file still holds a refresh token the provider may have retired; fix the cause and run the check again before the worker starts: %w", unsaved)
+	}
 	resp, err := grpc_health_v1.NewHealthClient(conn).Check(callCtx, &grpc_health_v1.HealthCheckRequest{})
 	if err != nil {
 		return "", txeChannelCheckError(hubURL, err)
@@ -405,16 +416,21 @@ func txeChannelCheck(ctx context.Context, hubURL, path string) (string, error) {
 	return resp.GetStatus().String(), nil
 }
 
-// txeChannelCheckError says which party refused, in words a person can act on.
-func txeChannelCheckError(hubURL string, err error) error {
-	// The credential's errors reach here inside the call's status, so they are
-	// known by their words.
-	switch said := err.Error(); {
-	case errors.Is(err, transportauth.ErrRevoked) || strings.Contains(said, transportauth.ErrRevoked.Error()):
+// txeCredentialError says why the machine's credential could not be renewed.
+// Nothing was asked of the hub.
+func txeCredentialError(err error) error {
+	switch {
+	case errors.Is(err, transportauth.ErrRevoked):
 		return fmt.Errorf("the identity provider refused this machine's credential, so nothing was asked of the hub: %w", err)
-	case errors.Is(err, transportauth.ErrProviderUnavailable) || strings.Contains(said, transportauth.ErrProviderUnavailable.Error()):
+	case errors.Is(err, transportauth.ErrProviderUnavailable):
 		return fmt.Errorf("the identity provider could not renew this machine's credential, so nothing was asked of the hub: %w", err)
 	}
+	return fmt.Errorf("this machine's credential could not be renewed, so nothing was asked of the hub: %w", err)
+}
+
+// txeChannelCheckError says how the hub's channel answered, in words a person
+// can act on.
+func txeChannelCheckError(hubURL string, err error) error {
 	code := status.Code(err)
 	if code == codes.Unauthenticated || code == codes.PermissionDenied {
 		return fmt.Errorf("the hub at %s refused this machine on its worker channel: it is not enrolled there, or not for this credential's client and issuer: %w", hubURL, err)

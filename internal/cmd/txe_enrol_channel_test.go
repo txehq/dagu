@@ -5,8 +5,10 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -95,4 +97,33 @@ func TestTheChannelCheckSaysWhoRefused(t *testing.T) {
 		})
 	}
 	assert.Empty(t, h.service.last().Machine.MachineID, "nothing reached the coordinator")
+}
+
+// The provider rotates the refresh token and the file cannot take it: the
+// check fails, though the hub answered, because the worker would present a
+// retired token.
+func TestTheChannelCheckFailsWhenARotationCannotBeSaved(t *testing.T) {
+	h, hub := channelCheckHub(t)
+	rotating := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": h.provider.token(r.Form.Get("client_id")), "token_type": "Bearer", "expires_in": 300,
+			"refresh_token": "rotated",
+		})
+	}))
+	t.Cleanup(rotating.Close)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "machine.json")
+	require.NoError(t, transportauth.WriteMachineCredential(path, transportauth.MachineCredential{
+		Schema: transportauth.CredentialSchema, Issuer: authTestIssuer, TokenEndpoint: rotating.URL + "/token",
+		ClientID: "dagu-worker-" + h.machine, Class: authn.ClassWorker, MachineID: h.machine, RefreshToken: "offline",
+	}))
+	// The renewal's lock opens; only saving the rotated token fails.
+	require.NoError(t, os.WriteFile(path+".lock", nil, 0o600))
+	require.NoError(t, os.Chmod(dir, 0o500))       // #nosec G302 -- the test makes the save fail
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) // #nosec G302 -- restored for cleanup
+	_, err := txeChannelCheck(context.Background(), hub, path)
+	require.ErrorContains(t, err, "could not be saved")
+	assert.NotContains(t, err.Error(), "rotated", "no token in what is said")
 }
