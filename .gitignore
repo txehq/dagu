@@ -54,3 +54,7 @@ intg.test
 
 # Build output
 dist/
+
+# Python bytecode from running txe/worker scripts locally (TXE-5664)
+__pycache__/
+*.pyc
