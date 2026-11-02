@@ -19,11 +19,16 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
+	"github.com/dagucloud/dagu/v2/internal/txe/workerchannel"
 )
 
 var (
@@ -39,7 +44,13 @@ var (
 		usage: `The credential's class: "worker" for the worker and its jobs' steps, "reviewer" for the reviewer's steps`}
 	txeEnrolResumeFlag = commandLineFlag{name: "resume", isBool: true,
 		usage: "Apply again with the credential already written, without signing in"}
+	txeEnrolHubURLFlag = commandLineFlag{name: "hub-url",
+		usage: "Also ask the hub's worker channel at this address whether it admits the credential: one health check, no task"}
 )
+
+// txeChannelCheckTimeout bounds the whole channel check, the credential's
+// renewal included.
+const txeChannelCheckTimeout = 45 * time.Second
 
 // txeEnrolCredentialFile is the worker credential's default name in the TXE
 // home.
@@ -101,10 +112,16 @@ func txeEnrolCheckCommand() *cobra.Command {
 holding a machine credential with a usable token endpoint) and require it to be
 this machine's (machine.json). It signs in nowhere and contacts nothing. The
 worker installer runs it with the binary it built before it passes the file to
-the worker.`,
+the worker.
+
+With --hub-url it then does what the worker does on the worker channel, once:
+it renews the credential at the provider, which may rotate the refresh token in
+the file as the worker would, and asks the hub's health check over the channel.
+The hub answers only an enrolled machine. It asks for no task and prints no
+token. Use it before a worker is moved to the channel.`,
 		Args:        cobra.NoArgs,
 		Annotations: map[string]string{txeLocalAnnotation: "true"},
-	}, []commandLineFlag{txeEnrolFileFlag, txeJSONFlag}, runTXEEnrolCheck)
+	}, []commandLineFlag{txeEnrolFileFlag, txeEnrolHubURLFlag, txeJSONFlag}, runTXEEnrolCheck)
 }
 
 func runTXEEnrolCheck(ctx *Context, _ []string) error {
@@ -321,6 +338,10 @@ type txeEnrolChecked struct {
 	MachineID      string `json:"machine_id"`
 	ClientID       string `json:"client_id"`
 	Issuer         string `json:"issuer"`
+	// Hub and Channel are the worker channel asked with --hub-url, and the
+	// health it answered.
+	Hub     string `json:"hub,omitempty"`
+	Channel string `json:"channel,omitempty"`
 }
 
 // txeEnrolCheck loads the credential exactly as the worker does
@@ -339,9 +360,69 @@ func txeEnrolCheck(ctx *Context, machineID, path string) error {
 		return fmt.Errorf("%s is for machine %s, but this machine is %s", path, credential.MachineID, machineID)
 	}
 	view := txeEnrolChecked{CredentialFile: path, MachineID: credential.MachineID, ClientID: credential.ClientID, Issuer: credential.Issuer}
+	hubURL, err := ctx.StringParam("hub-url")
+	if err != nil {
+		return err
+	}
+	if hubURL != "" {
+		health, err := txeChannelCheck(ctx, hubURL, path)
+		if err != nil {
+			return err
+		}
+		view.Hub, view.Channel = hubURL, health
+	}
 	return txeOutput(ctx, view, func(p *txePrinter) {
 		p.f("credential %s: the worker can load it (machine %s, client %s at %s)\n", path, view.MachineID, view.ClientID, view.Issuer)
+		if view.Channel != "" {
+			p.f("worker channel %s: the hub admits machine %s and answers %s; no task was asked for\n", view.Hub, view.MachineID, view.Channel)
+		}
 	})
+}
+
+// txeChannelCheck renews the credential at path as the worker does and asks
+// the hub's health over the worker channel: the one call a hub answers an
+// enrolled machine that hands it nothing to run.
+func txeChannelCheck(ctx context.Context, hubURL, path string) (string, error) {
+	base, err := worker.ChannelBaseURL(hubURL)
+	if err != nil {
+		return "", fmt.Errorf("--hub-url: %w", err)
+	}
+	source, err := transportauth.NewRefreshingSource(path)
+	if err != nil {
+		return "", err
+	}
+	conn, err := workerchannel.NewConn(workerchannel.ClientConfig{BaseURL: base, Credentials: transportauth.NewWorkerCredentials(source)})
+	if err != nil {
+		return "", fmt.Errorf("--hub-url: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	callCtx, cancel := context.WithTimeout(ctx, txeChannelCheckTimeout)
+	defer cancel()
+	resp, err := grpc_health_v1.NewHealthClient(conn).Check(callCtx, &grpc_health_v1.HealthCheckRequest{})
+	if err != nil {
+		return "", txeChannelCheckError(hubURL, err)
+	}
+	return resp.GetStatus().String(), nil
+}
+
+// txeChannelCheckError says which party refused, in words a person can act on.
+func txeChannelCheckError(hubURL string, err error) error {
+	// The credential's errors reach here inside the call's status, so they are
+	// known by their words.
+	switch said := err.Error(); {
+	case errors.Is(err, transportauth.ErrRevoked) || strings.Contains(said, transportauth.ErrRevoked.Error()):
+		return fmt.Errorf("the identity provider refused this machine's credential, so nothing was asked of the hub: %w", err)
+	case errors.Is(err, transportauth.ErrProviderUnavailable) || strings.Contains(said, transportauth.ErrProviderUnavailable.Error()):
+		return fmt.Errorf("the identity provider could not renew this machine's credential, so nothing was asked of the hub: %w", err)
+	}
+	code := status.Code(err)
+	if code == codes.Unauthenticated || code == codes.PermissionDenied {
+		return fmt.Errorf("the hub at %s refused this machine on its worker channel: it is not enrolled there, or not for this credential's client and issuer: %w", hubURL, err)
+	}
+	if code == codes.Unavailable || code == codes.DeadlineExceeded {
+		return fmt.Errorf("the worker channel at %s did not answer: check the address, and that the hub serves the channel: %w", hubURL, err)
+	}
+	return fmt.Errorf("the worker channel at %s: %w", hubURL, err)
 }
 
 // txeEnrolPath is the credential file: the flag, made absolute, or the TXE
