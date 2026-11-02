@@ -446,10 +446,11 @@ func TestAFileLargerThanAChunkGoesInSegments(t *testing.T) {
 	}
 }
 
+// Each send takes longer than a stream's time, as on a slow link: a clock that
+// reads no time between two files would hide the bound.
 func TestAStreamOfSmallFilesEndsAtItsTime(t *testing.T) {
-	hub := &timedHub{segmentHub: segmentHub{limit: 1 << 20, knowsThem: true}, streamTime: time.Nanosecond}
-	uploader := NewArtifactUploader(hub, "worker-1", "run-1", "job", "attempt-1", ir.DAGRunRef{Name: "job", ID: "run-1"})
-	require.NoError(t, uploader.UploadDir(context.Background(), dirWith(t, map[string]string{"a": "a", "b": "b", "c": "c"})))
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20, knowsThem: true}, sendPause: 5 * time.Millisecond, streamTime: time.Millisecond}
+	require.NoError(t, pausedUploader(hub, time.Minute).UploadDir(context.Background(), dirWith(t, map[string]string{"a": "a", "b": "b", "c": "c"})))
 	assert.Len(t, hub.streams, 3, "one file each, where size alone would put all three in one")
 }
 
@@ -477,7 +478,8 @@ func TestAnAcknowledgedSmallFileIsNotSentAgain(t *testing.T) {
 // pausedHub answers each stream after a pause, as a slow link does.
 type pausedHub struct {
 	segmentHub
-	pause      time.Duration
+	pause      time.Duration // before each reply
+	sendPause  time.Duration // in each send
 	streamTime time.Duration
 	refuse     bool
 }
@@ -496,6 +498,11 @@ func (h *pausedHub) StreamArtifactsTo(ctx context.Context, _ serviceregistry.Hos
 type pausedStream struct {
 	segmentStream
 	owner *pausedHub
+}
+
+func (s *pausedStream) Send(chunk *coordinatorv1.ArtifactChunk) error {
+	time.Sleep(s.owner.sendPause)
+	return s.segmentStream.Send(chunk)
 }
 
 func (s *pausedStream) CloseAndRecv() (*coordinatorv1.StreamArtifactsResponse, error) {
@@ -523,7 +530,7 @@ func smallFiles(n int) map[string]string {
 // Many small files take far longer than the window, and each acknowledged one
 // moves it.
 func TestSmallFilesFinishWhileEachMovesTheWindow(t *testing.T) {
-	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 50 * time.Millisecond, streamTime: time.Nanosecond}
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 50 * time.Millisecond, sendPause: 5 * time.Millisecond, streamTime: time.Millisecond}
 	const window = 300 * time.Millisecond
 	start := time.Now()
 	require.NoError(t, pausedUploader(hub, window).UploadDir(context.Background(), dirWith(t, smallFiles(12))))
@@ -554,7 +561,7 @@ func TestARepeatedAcknowledgmentOfASmallFileDoesNotMoveTheWindow(t *testing.T) {
 }
 
 func TestACancelledCallerStopsSmallFiles(t *testing.T) {
-	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 20 * time.Millisecond, streamTime: time.Nanosecond}
+	hub := &pausedHub{segmentHub: segmentHub{limit: 1 << 20}, pause: 20 * time.Millisecond, sendPause: 5 * time.Millisecond, streamTime: time.Millisecond}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	err := pausedUploader(hub, time.Minute).UploadDir(ctx, dirWith(t, smallFiles(100)))
