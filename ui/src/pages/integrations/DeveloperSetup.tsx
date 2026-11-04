@@ -269,6 +269,23 @@ export function DeveloperSetup(): React.ReactElement {
             label={t('integrations.devSetup.workerTitle')}
           />
           <Expected>{t('integrations.devSetup.workerExpected')}</Expected>
+          <h5 className="pt-1 text-xs font-medium text-foreground">
+            {t('integrations.devSetup.workerCheckTitle')}
+          </h5>
+          <p>{t('integrations.devSetup.workerCheckBody')}</p>
+          <CommandBlock
+            command={cmd.enrolCheck}
+            label={t('integrations.devSetup.workerCheckTitle')}
+          />
+          <CommandBlock
+            command={cmd.enrolCheckChannel}
+            label={t('integrations.devSetup.workerCheckTitle')}
+          />
+          <Expected>{t('integrations.devSetup.workerCheckExpected')}</Expected>
+          <ul className="list-disc pl-4">
+            <li>{t('integrations.devSetup.workerCheckRefused')}</li>
+            <li>{t('integrations.devSetup.workerCheckUnanswered')}</li>
+          </ul>
         </Step>
         <Step n={8} title={t('integrations.devSetup.skillTitle')}>
           <p>{t('integrations.devSetup.skillBody')}</p>
