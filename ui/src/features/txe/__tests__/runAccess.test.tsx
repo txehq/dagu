@@ -471,25 +471,28 @@ describe('useJobsRunAllowed', () => {
       ])
     );
 
-    // The next read: the first job is now view-only, the second fails.
+    // A third job joins, so the set is read again: the first job is now
+    // view-only, the second's read fails, the third is allowed.
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
     GET.mockImplementation(
       async (_path: string, init: { params: { path: { jobId: string } } }) => {
-        if (init.params.path.jobId === JOB_B) throw new Error('hub away');
+        const jobId = init.params.path.jobId;
+        if (jobId === JOB_B) throw new Error('hub away');
         return {
           data: {
-            job_id: JOB,
-            access: { via: TxeJobAccessVia.share, permissions: [] },
+            job_id: jobId,
+            access:
+              jobId === JOB
+                ? { via: TxeJobAccessVia.share, permissions: [] }
+                : allowed,
           },
         };
       }
     );
-    rerender({ names: [JOB_B, JOB, JOB_B] });
-    await act(async () => {
-      await Promise.resolve();
-    });
-    rerender({ names: [JOB, JOB_B, 'nightly'] });
+    rerender({ names: [JOB, JOB_B, JOB_C] });
     await waitFor(() => expect(result.current.get(JOB)).toBe(false));
     expect(result.current.get(JOB_B)).toBe(true);
+    expect(result.current.get(JOB_C)).toBe(true);
   });
 
   it('asks nothing when no name is a job', () => {
