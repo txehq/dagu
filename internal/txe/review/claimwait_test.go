@@ -271,7 +271,10 @@ func TestRemoteAnApprovedActionRunsOnceAfterADeadClaimExpires(t *testing.T) {
 // own retries, calling a real step command (the fixture's, which runs the
 // same Steps.Execute and exits with the same codes as dagu's) against a
 // registry in which a dead review really holds the job's claim until that
-// claim's lifetime is over. Nobody retries anything by hand.
+// claim's lifetime is over. Nobody retries anything by hand. When the
+// lifetime ends is the test's to say, through the registry's record of the
+// claim, once a try has been seen to meet it: nothing here depends on how
+// fast a loaded machine starts a run (TXE-4387).
 func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh")
@@ -328,13 +331,42 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		w.decision = decided.ID
 		return w
 	}
-	// die is the next tick's review claiming the job and dying. It is called
-	// right before a run starts, and says when the claim's lifetime ends.
-	die := func(t *testing.T, w world, claimFor time.Duration) time.Time {
+	// die is the next tick's review claiming the job and dying. Its claim
+	// lives for longer than any run here takes to start, so the run's first
+	// try meets it however loaded the machine is (TXE-4387: with a lifetime
+	// of seconds, a try that came after it found no claim to wait for).
+	const deadClaimFor = 10 * time.Minute
+	die := func(t *testing.T, w world) review.Claim {
 		t.Helper()
-		claim, err := w.reg.AcquireClaim(ctx, review.ClaimRequest{JobID: w.job, Kind: review.ClaimReview, Holder: "tick-dead", TTL: claimFor})
+		claim, err := w.reg.AcquireClaim(ctx, review.ClaimRequest{JobID: w.job, Kind: review.ClaimReview, Holder: "tick-dead", TTL: deadClaimFor})
 		require.NoError(t, err)
-		return claim.ExpiresAt
+		return claim
+	}
+	// expire ends the dead claim's lifetime now, in the registry's own record
+	// of it, as the passing of time would: the claim is not released, and
+	// the next try finds it expired. It returns the lifetime's end.
+	expire := func(t *testing.T, w world, claim review.Claim) time.Time {
+		t.Helper()
+		var at time.Time
+		require.NoError(t, w.reg.Update(func(s *reviewtest.State) error {
+			held, ok := s.Claims[w.job]
+			if !ok || held.ID != claim.ID {
+				return fmt.Errorf("the job's claim is %+v, not the dead review's %s", held, claim.ID)
+			}
+			at = time.Now()
+			held.ExpiresAt = at
+			s.Claims[w.job] = held
+			return nil
+		}))
+		return at
+	}
+	// stillHeld says whether the dead review's claim is the job's live claim,
+	// by the registry's record.
+	stillHeld := func(w world, claim review.Claim) bool {
+		var held review.Claim
+		var ok bool
+		w.reg.View(func(s *reviewtest.State) { held, ok = s.Claims[w.job] })
+		return ok && held.ID == claim.ID && time.Now().Before(held.ExpiresAt)
 	}
 	// The execute step as the decision DAG carries it, with the one-second
 	// interval a test can wait for and the decision id given as a
@@ -423,10 +455,19 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		agent := dag.Agent()
 		runCtx, cancel := context.WithTimeout(agent.Context, 120*time.Second)
 		defer cancel()
-		// The claim is taken only now, with everything else ready, so the
-		// first try meets it.
-		expires := die(t, w, 10*time.Second)
-		require.NoError(t, agent.Run(runCtx), "the run succeeds by itself")
+		// The claim is taken only now, with everything else ready. The run
+		// waits on it until a try has been seen to meet it; then its
+		// lifetime ends, and the run must finish by itself.
+		claim := die(t, w)
+		ended := make(chan error, 1)
+		go func() { ended <- agent.Run(runCtx) }()
+		require.Eventually(t, func() bool {
+			seen := complete(w)
+			return len(seen) > 0 && seen[0].code == review.ExitClaimHeld
+		}, 60*time.Second, 100*time.Millisecond, "a try met the claim")
+		require.True(t, stillHeld(w, claim), "the dead review's claim is live while the run waits")
+		expires := expire(t, w, claim)
+		require.NoError(t, <-ended, "the run succeeds by itself")
 
 		got := tries(t, w)
 		require.GreaterOrEqual(t, len(got), 2, "the step was tried again: %v", got)
@@ -466,7 +507,7 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		th := test.Setup(t)
 		dag := th.DAG(t, stepDAG(t, w))
 		agent := dag.Agent()
-		expires := die(t, w, 20*time.Second)
+		claim := die(t, w)
 		// The run is cut only after a try is seen to have met the claim, so
 		// what is cut is a run that is waiting for it.
 		short, cancel := context.WithCancel(agent.Context)
@@ -475,15 +516,19 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 		require.Eventually(t, func() bool {
 			seen := complete(w)
 			return len(seen) > 0 && seen[0].code == review.ExitClaimHeld
-		}, 15*time.Second, 100*time.Millisecond, "a try met the claim")
+		}, 60*time.Second, 100*time.Millisecond, "a try met the claim")
 		cancel()
 		select {
-		case err := <-ended:
-			require.Error(t, err, "cut short while the claim was still live")
+		case <-ended:
+			// The stop may land while a try runs, which the runner then
+			// marks aborted and reports no error for, or during the wait
+			// before the next try, which keeps the last try's error. Either
+			// way the run is aborted, and that is what is asserted.
 		case <-time.After(30 * time.Second):
 			t.Fatal("the run did not end after it was cut")
 		}
-		require.True(t, time.Now().Before(expires), "the run ended before the claim did")
+		assert.Equal(t, ir.Aborted, agent.Status(ctx).Status, "cut short while the claim was still live")
+		require.True(t, stillHeld(w, claim), "the run ended before the claim did")
 		assert.Empty(t, effects(t, w))
 		assert.Empty(t, actions(w))
 		cut := tries(t, w)
@@ -492,7 +537,9 @@ func TestAnApprovedDecisionRunsItselfOnceTheDeadClaimExpires(t *testing.T) {
 			assert.Equal(t, review.ExitClaimHeld, held.code)
 		}
 
-		time.Sleep(time.Until(expires) + time.Second)
+		// The claim's lifetime ends, and the retry a person makes runs the
+		// action once.
+		expire(t, w, claim)
 		dagRetry := th.DAG(t, stepDAG(t, w))
 		retry := dagRetry.Agent()
 		runCtx, cancelRun := context.WithTimeout(retry.Context, 60*time.Second)
