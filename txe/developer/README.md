@@ -73,7 +73,7 @@ On a new machine the order is:
 1. `txe/developer/install.sh`, then `dagu txe login --hub <the hub's address>` as a person of the owner;
 2. `dagu txe machine create`, which mints the machine id and writes `machine.json`;
 3. the worker installer, which keeps that `machine.json`, so it needs no `--owner-id`;
-4. `dagu txe enrol` (below).
+4. `dagu txe enrol`, then the worker installer again (below).
 
 ## Enrolling this machine's worker
 
@@ -90,13 +90,15 @@ The worker installer (`txe/worker/install.sh` on macOS, `install-systemd.sh` on 
 
 Ask the hub's operators which route this hub supports before installing. A hub that does not serve the channel answers nothing at that address, and the port-forward stays the route until they say otherwise. Neither this page nor the hub's "Developer setup" page knows which it is.
 
-On either route the order on a machine with a worker is:
+On either route the order on a machine with a worker is the one in "Recording this machine in the hub": the worker installer runs once before enrolment, and again after it.
 
-1. **Hub:** `dagu txe machine create` has recorded the machine, and the hub's administrator lists the machine's worker client in `txe.authn.clients`. A machine that runs the reviewer has a reviewer client listed too.
-2. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub, naming the class, client, issuer and subject the command prints. For the reviewer: `dagu txe enrol --class reviewer --client-id <this machine's reviewer client> --wait 15m`. The command writes the credential into the TXE home (`worker-credential.json`, or the file given with `--credential-file`), readable by this user only.
-3. **Install the worker:** `txe/worker/install.sh --tag <the installed tag>`, with `--hub-url https://<hub>` for the channel. The installer checks the credential and stops rather than install without it. Its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
+1. **Prepare:** the worker installer, once (`txe/worker/install.sh --tag <tag>`, with `--hub-url https://<hub>` for the channel; `--owner-id` only when `dagu txe machine create` has not written `machine.json` yet). It writes the machine's identity and binary. On the channel route, with no credential yet, it starts nothing and prints the remaining steps. On the port-forward route, after `tunnel-credential.sh`, it starts the tunnel and an unenrolled worker.
+2. **The machine's own context:** `dagu txe enrol` reads the hub from the machine's own `txe` context, the TXE home's `client` store, and stops with "no \"txe\" context" until it exists. The developer wrapper keeps `dagu txe login` in the developer's store, so sign the machine's context in with the machine's binary: `~/.local/share/txe-dagu/bin/dagu txe login --hub https://<hub>`, as a person of the owner.
+3. **Hub:** `dagu txe machine create` has recorded the machine, and the hub's administrator lists the machine's worker client in `txe.authn.clients`. A machine that runs the reviewer has a reviewer client listed too.
+4. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub, naming the class, client, issuer and subject the command prints. For the reviewer: `dagu txe enrol --class reviewer --client-id <this machine's reviewer client> --wait 15m`. The command writes the credential into the TXE home (`worker-credential.json`, or the file given with `--credential-file`), readable by this user only.
+5. **Install again:** `txe/worker/install.sh --tag <the installed tag>`, with `--hub-url https://<hub>` for the channel. The installer checks the credential and stops rather than install without it; the worker then presents it. Its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
 
-Until step 2 completes, the steps keep the context's API key, and say so.
+Until step 4 completes, the steps keep the context's API key, and say so.
 
 ### Checking the credential and the route
 

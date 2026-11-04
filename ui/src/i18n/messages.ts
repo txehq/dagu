@@ -197,7 +197,7 @@ export const messages = {
     'integrations.devSetup.workerTitle':
       'Install and enrol a worker (needs an administrator)',
     'integrations.devSetup.workerBody':
-      "Only needed to run jobs on this machine, and not self-service today: an administrator lists this machine's worker client in the hub, and a person of the owner signs in and approves the application on this machine's page. The worker installer (txe/worker/README.md in the checkout) reaches the hub one of two ways. Without --hub-url it uses a port-forward, the route the deployed hubs use today, which needs the tunnel credential an administrator provides. With --hub-url it uses this hub's worker channel over https, with no kubectl, kubeconfig or tunnel on your machine; a hub serves that channel only where its operators have turned it on, so ask them which route this hub supports. The command below is the same on either route.",
+      "Only needed to run jobs on this machine, and not self-service today: an administrator lists this machine's worker client in the hub, and a person of the owner signs in and approves the application on this machine's page. The worker installer (txe/worker/README.md in the checkout) reaches the hub one of two ways. Without --hub-url it uses a port-forward, the route the deployed hubs use today, which needs the tunnel credential an administrator provides. With --hub-url it uses this hub's worker channel over https, with no kubectl, kubeconfig or tunnel on your machine; a hub serves that channel only where its operators have turned it on, so ask them which route this hub supports. On either route, run the worker installer once before enrolling (with --hub-url it prepares and starts nothing), sign the machine's own context in with the machine's binary, enrol with the command below, then run the installer again so the worker presents the credential.",
     'integrations.devSetup.workerExpected':
       "the enrol command waits until you approve, then reports the enrolment. The machine's page shows it as active.",
     'integrations.devSetup.workerCheckTitle':
@@ -476,7 +476,7 @@ export const messages = {
     'integrations.devSetup.machinesLink': '机器',
     'integrations.devSetup.workerTitle': '安装并注册 worker（需要管理员）',
     'integrations.devSetup.workerBody':
-      '仅在此机器上运行作业时需要，目前不能自助完成：管理员在 hub 中列出此机器的 worker 客户端，所有者的成员登录并在此机器的页面上批准申请。worker 安装程序（见检出目录中的 txe/worker/README.md）有两种到达 hub 的方式。不带 --hub-url 时走端口转发，这是目前已部署的 hub 所用的路线，需要管理员提供的隧道凭据。带 --hub-url 时走此 hub 的 https worker 通道，你的机器上不需要 kubectl、kubeconfig 或隧道；只有在运维人员开启后 hub 才提供该通道，请先向他们确认此 hub 支持哪种路线。下面的命令在两种路线上相同。',
+      '仅在此机器上运行作业时需要，目前不能自助完成：管理员在 hub 中列出此机器的 worker 客户端，所有者的成员登录并在此机器的页面上批准申请。worker 安装程序（见检出目录中的 txe/worker/README.md）有两种到达 hub 的方式。不带 --hub-url 时走端口转发，这是目前已部署的 hub 所用的路线，需要管理员提供的隧道凭据。带 --hub-url 时走此 hub 的 https worker 通道，你的机器上不需要 kubectl、kubeconfig 或隧道；只有在运维人员开启后 hub 才提供该通道，请先向他们确认此 hub 支持哪种路线。无论哪种路线，都先运行一次 worker 安装程序（带 --hub-url 时只做准备，不启动任何东西），用机器自己的二进制登录机器自己的上下文，再用下面的命令注册，然后再次运行安装程序，worker 才会出示凭据。',
     'integrations.devSetup.workerCheckTitle': '检查凭据和通道',
     'integrations.devSetup.workerCheckBody':
       '第一条命令以 worker 的方式加载凭据，不联系任何服务。第二条还会续期凭据，并通过 worker 通道向此 hub 请求一次健康检查，不索取任务：在把 worker 迁移到通道之前运行它，且仅当此 hub 提供该通道时。',
@@ -759,7 +759,7 @@ export const messages = {
     'integrations.devSetup.workerTitle':
       'ワーカーのインストールと登録（管理者が必要）',
     'integrations.devSetup.workerBody':
-      'このマシンでジョブを実行する場合にのみ必要で、現在はセルフサービスではありません。管理者がこのマシンのワーカークライアントをハブに登録し、オーナーのメンバーがサインインしてこのマシンのページで申請を承認します。ワーカーインストーラー（チェックアウト内の txe/worker/README.md）がハブに到達する方法は 2 つあります。--hub-url なしではポートフォワードを使います。これは現在デプロイ済みのハブが使う経路で、管理者が提供するトンネル認証情報が必要です。--hub-url ありではこのハブの https ワーカーチャネルを使い、マシンに kubectl、kubeconfig、トンネルは不要です。ハブがそのチャネルを提供するのは運用者が有効にした場合のみなので、このハブがどちらの経路に対応しているか先に確認してください。下のコマンドはどちらの経路でも同じです。',
+      'このマシンでジョブを実行する場合にのみ必要で、現在はセルフサービスではありません。管理者がこのマシンのワーカークライアントをハブに登録し、オーナーのメンバーがサインインしてこのマシンのページで申請を承認します。ワーカーインストーラー（チェックアウト内の txe/worker/README.md）がハブに到達する方法は 2 つあります。--hub-url なしではポートフォワードを使います。これは現在デプロイ済みのハブが使う経路で、管理者が提供するトンネル認証情報が必要です。--hub-url ありではこのハブの https ワーカーチャネルを使い、マシンに kubectl、kubeconfig、トンネルは不要です。ハブがそのチャネルを提供するのは運用者が有効にした場合のみなので、このハブがどちらの経路に対応しているか先に確認してください。どちらの経路でも、まずワーカーインストーラーを 1 回実行し（--hub-url ありでは準備のみで何も起動しません）、マシン自身のバイナリでマシン自身のコンテキストにサインインし、下のコマンドで登録してから、インストーラーを再度実行するとワーカーが認証情報を提示します。',
     'integrations.devSetup.workerCheckTitle': '認証情報とチャネルの確認',
     'integrations.devSetup.workerCheckBody':
       '最初のコマンドはワーカーと同じ方法で認証情報を読み込み、どこにも接続しません。2 つ目はさらに認証情報を更新し、ワーカーチャネル経由でこのハブのヘルスチェックを 1 回だけ、タスクを求めずに行います。ワーカーをチャネルへ移す前に、このハブがチャネルを提供している場合にのみ実行してください。',
