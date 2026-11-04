@@ -163,6 +163,9 @@ func (r *rule) matches(name string) bool {
 const (
 	machineIDPattern   = `mch_[0-9A-HJKMNP-TV-Z]{26}`
 	daguVersionPattern = `[0-9]+\.[0-9]+\.[0-9]+-txe\.[0-9]+`
+	// logpipeStampPattern is the UTC stamp logpipe.py names a moved log by,
+	// with the "-N" it adds when the name exists (STAMP, _STAMP_RE).
+	logpipeStampPattern = `[0-9]{8}T[0-9]{12}Z(-[0-9]+)?`
 )
 
 // machineHomeRules is a machine's TXE home as the worker installer
@@ -200,12 +203,26 @@ var machineHomeRules = []rule{
 		{name: "dagu", kind: kindLink, target: regexp.MustCompile(`^dagu-` + daguVersionPattern + `$`), policy: PolicyOperational},
 		{pattern: regexp.MustCompile(`^dagu-` + daguVersionPattern + `$`), kind: kindFile, policy: PolicyOperational},
 		{pattern: regexp.MustCompile(`^dagu-` + daguVersionPattern + `\.json$`), kind: kindFile, policy: PolicyOperational},
+		// The installer's copy of txe/worker/logpipe.py, which both agents
+		// run under since TXE-4724; replaced by every install.
+		{name: "logpipe.py", kind: kindFile, policy: PolicyOperational},
 	}},
 	// The launchd agents' output: diagnostics that grow while the agents
-	// run, not job data.
+	// run, not job data. Since TXE-4724 logpipe.py owns tunnel.log and
+	// worker.log and writes the other names here (txe/worker/logpipe.py),
+	// and launchd keeps one file per agent for logpipe's own output
+	// (txe/worker/agents.py). Only those exact names are classified.
 	{name: "logs", kind: kindDir, dir: []rule{
 		{name: "tunnel.log", kind: kindFile, policy: PolicyOperational},
 		{name: "worker.log", kind: kindFile, policy: PolicyOperational},
+		// A rotated log, compressed or not yet, and a compression in progress.
+		{pattern: regexp.MustCompile(`^(tunnel|worker)\.log\.` + logpipeStampPattern + `(\.gz|\.gz\.tmp)?$`), kind: kindFile, policy: PolicyOperational},
+		// The log launchd wrote before logpipe took it over, archived once
+		// and never deleted by logpipe.
+		{pattern: regexp.MustCompile(`^(tunnel|worker)\.legacy-` + logpipeStampPattern + `\.log$`), kind: kindFile, policy: PolicyOperational},
+		// logpipe's diagnostics and their one previous copy.
+		{pattern: regexp.MustCompile(`^(tunnel|worker)\.logpipe\.log(\.1)?$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^(tunnel|worker)\.launchd\.log$`), kind: kindFile, policy: PolicyOperational},
 	}},
 	// The worker's DAGU_HOME. Its data directory holds only credentials so
 	// far; anything else it gains blocks until it is classified.
