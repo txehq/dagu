@@ -17,6 +17,7 @@ import {
   ACCESS_REFRESH_MS,
   useJobProfileHeld,
   useJobRunAllowed,
+  useJobsRunAllowed,
 } from '../runAccess';
 
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
@@ -307,5 +308,83 @@ describe('useJobProfileHeld', () => {
 
     await waitFor(() => expect(result.current).toEqual([true, true]));
     expect(GET).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A queue page asks for every job among its loaded items at once: one read
+// per distinct job, an entry only where the hub's binding answer exists.
+describe('useJobsRunAllowed', () => {
+  const JOB_B = 'job_01M4XEETKWKZX504BK65ADBVYC';
+
+  function answersByJob(answers: Record<string, unknown>) {
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        const jobId = init.params.path.jobId;
+        const access = answers[jobId];
+        if (access === 'missing') return { response: { status: 404 } };
+        return { data: { job_id: jobId, ...(access ? { access } : {}) } };
+      }
+    );
+  }
+
+  it('answers per job, once per distinct job, for job names only', async () => {
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+      [JOB_B]: {
+        via: TxeJobAccessVia.share,
+        permissions: [TxeAccessPermission.view],
+      },
+    });
+    const { result } = renderHook(
+      () => useJobsRunAllowed([JOB, JOB_B, JOB, 'nightly', JOB_B]),
+      { wrapper }
+    );
+
+    await waitFor(() => expect(result.current.size).toBe(2));
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.get(JOB_B)).toBe(false);
+    expect(result.current.has('nightly')).toBe(false);
+    expect(GET).toHaveBeenCalledTimes(2);
+  });
+
+  it('has no entry for a job with no label, and refuses a job the hub does not know', async () => {
+    answersByJob({ [JOB]: undefined, [JOB_B]: 'missing' });
+    const { result } = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.size).toBe(1));
+    expect(result.current.has(JOB)).toBe(false);
+    expect(result.current.get(JOB_B)).toBe(false);
+  });
+
+  it.each([TxeIdentityAuthz_mode.observe, TxeIdentityAuthz_mode.off])(
+    'asks nothing for another caller in mode %s',
+    async (m) => {
+      mode.current = m;
+      answersByJob({});
+      const { result } = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+        wrapper,
+      });
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.size).toBe(0);
+      expect(GET).not.toHaveBeenCalled();
+    }
+  );
+
+  it('asks nothing when no name is a job', () => {
+    answersByJob({});
+    const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {
+      wrapper,
+    });
+
+    expect(result.current.size).toBe(0);
+    expect(GET).not.toHaveBeenCalled();
   });
 });
