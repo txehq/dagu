@@ -24,6 +24,7 @@ vi.mock('../../dag-execution', () => ({
   StartDAGModal: ({
     visible,
     onSubmit,
+    profileHeld,
   }: {
     visible: boolean;
     onSubmit: (
@@ -31,9 +32,11 @@ vi.mock('../../dag-execution', () => ({
       id?: string,
       immediate?: boolean
     ) => Promise<void>;
+    profileHeld?: boolean;
   }) =>
     visible ? (
       <>
+        <span data-testid="profile-held">{String(profileHeld === true)}</span>
         <button onClick={() => void onSubmit('', undefined, true)}>
           Submit start
         </button>
@@ -61,11 +64,14 @@ vi.mock('../../../../../hooks/api', () => ({
 }));
 
 const runAccess = vi.hoisted(() => ({
+  profileHeld: undefined as boolean | undefined,
   allowed: undefined as boolean | undefined,
   asked: [] as (string | undefined)[],
 }));
 
 vi.mock('@/features/txe/runAccess', () => ({
+  useJobProfileHeld: (name: string | undefined) =>
+    name ? runAccess.profileHeld : undefined,
   useJobRunAllowed: (name: string | undefined) => {
     runAccess.asked.push(name);
     return name ? runAccess.allowed : undefined;
@@ -99,6 +105,7 @@ function LocationProbe() {
 beforeEach(() => {
   vi.clearAllMocks();
   runAccess.allowed = undefined;
+  runAccess.profileHeld = undefined;
   runAccess.asked = [];
   client.GET.mockResolvedValue({ data: { dag: { name: 'example' } } });
   client.POST.mockResolvedValue({ data: { dagRunId: 'created-run' } });
@@ -184,6 +191,35 @@ describe('DAGActions', () => {
       screen.queryByRole('button', { name: 'Start' })
     ).not.toBeInTheDocument();
   });
+
+  // The hub's answer holds the caller to the job DAG's own profile (its
+  // owner, or a share): the Start dialog is told so. The platform
+  // administrator, and a page that does not ask, are not held.
+  it.each([
+    ['held by the hub', true, true, true],
+    ['not held, as the platform administrator', false, true, false],
+    ['not asked', true, false, false],
+  ])(
+    'tells the Start dialog whether the profile choice is held: %s',
+    (_case, held, ask, expected) => {
+      runAccess.allowed = true;
+      runAccess.profileHeld = held;
+      render(
+        <DAGActions
+          fileName="job_01M4XEETKWKZX504BK65ADBVYB"
+          dag={{ name: 'job_01M4XEETKWKZX504BK65ADBVYB' }}
+          displayMode="full"
+          checkJobAccess={ask}
+        />,
+        { wrapper: MemoryRouter }
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+      expect(screen.getByTestId('profile-held')).toHaveTextContent(
+        String(expected)
+      );
+    }
+  );
 
   // A list row does not ask: a page of job DAGs would ask once per row.
   it('does not ask for the job access unless the page asks it to', () => {
