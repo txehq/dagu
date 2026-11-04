@@ -2357,40 +2357,138 @@ func TestDAGSpecUpdateWithYAMLSyntaxErrorKeepsTheSavedSpec(t *testing.T) {
 	}
 }
 
-func TestDAGSpecUpdateWithBrokenBaseConfigIsNotAnsweredAsValidation(t *testing.T) {
+func TestDAGSpecUpdateWithUndecodableDocumentKeepsTheSavedSpec(t *testing.T) {
 	server := test.SetupServer(t)
 
-	// The update's loader reads the server's base config before the
-	// document, and a syntax error there is the parser's same type. It is a
-	// server problem, not the author's: the endpoint keeps answering it as
-	// an internal error and no text of that file reaches the client, whether
-	// or not the submitted spec parses.
+	// A document that is not a mapping, or a top-level field that does not
+	// decode, is refused by PUT /dags/{name}/spec the way the endpoint
+	// refuses any other invalid definition: 200 with the loader's error and
+	// nothing written. Before TXE-5797 the loader's raw error made it a 500
+	// internal_error.
 	const steps = "steps:\n  - id: a\n    run: echo hi\n"
-	name := "broken_base"
-	saved := "schedule: \"0 1 * * *\"\n" + steps
-	server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
-		Name: name, Spec: &saved,
-	}).ExpectStatus(http.StatusCreated).Send(t)
-	require.NoError(t, os.WriteFile(server.Config.Paths.BaseConfig,
-		[]byte("env:\n  BASE_ONLY_VALUE: not-for-clients\nsteps: [\n"), 0o600))
+	for _, tc := range []struct{ name, spec, want string }{
+		{
+			"scalar_document", "just a string\n",
+			"failed to decode document 0: [1:1] string was used where mapping is expected\n>  1 | just a string\n       ^\n",
+		},
+		{
+			"wrong_typed_name", "name: [a]\n" + steps,
+			"failed to process document 0: decoding failed due to the following error(s):\n\n'name' expected type 'string', got unconvertible type '[]interface {}'",
+		},
+		{
+			"wrong_typed_env", "env: 5\n" + steps,
+			"failed to process document 0: decoding failed due to the following error(s):\n\n'env' failed to unmarshal from YAML: env must be map or array, got uint64",
+		},
+		{
+			"unknown_top_level_key", "foo: 1\n" + steps,
+			"failed to process document 0: decoding failed due to the following error(s):\n\n'spec.dag' has invalid keys: foo",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "undecodable_" + tc.name
+			saved := "schedule: \"0 1 * * *\"\n" + steps
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &saved,
+			}).ExpectStatus(http.StatusCreated).Send(t)
 
-	response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
-		Spec: "schedule: \"0 2 * * *\"\n" + steps,
-	}).ExpectStatus(http.StatusInternalServerError).Send(t)
-	require.NotContains(t, string(response.Response.Body()), "not-for-clients")
-	require.NotContains(t, string(response.Response.Body()), "base config")
+			response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: tc.spec,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var update api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &update)
+			require.Equal(t, []string{tc.want}, update.Errors)
 
-	// A spec that does not parse is still answered with its own error only.
-	response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
-		Spec: "steps: [\n",
-	}).ExpectStatus(http.StatusOK).Send(t)
-	var update api.UpdateDAGSpec200JSONResponse
-	response.Unmarshal(t, &update)
-	require.Equal(t, []string{"[1:8] sequence end token ']' not found\n>  1 | steps: [\n              ^\n"}, update.Errors)
-	require.NotContains(t, string(response.Response.Body()), "not-for-clients")
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var kept api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &kept)
+			require.Equal(t, saved, kept.Spec)
+			server.Client().Get("/api/v1/dags/" + name).ExpectStatus(http.StatusOK).Send(t)
 
-	response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
-	var kept api.GetDAGSpec200JSONResponse
-	response.Unmarshal(t, &kept)
-	require.Equal(t, saved, kept.Spec)
+			// A valid update of the same DAG is saved, with no errors.
+			next := "schedule: \"0 2 * * *\"\n" + steps
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: next,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			update = api.UpdateDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &update)
+			require.Empty(t, update.Errors)
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			kept = api.GetDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &kept)
+			require.Equal(t, next, kept.Spec)
+		})
+	}
+}
+
+func TestDAGSpecUpdateWithBrokenBaseConfigIsNotAnsweredAsValidation(t *testing.T) {
+	// The update's loader reads the server's base config before the
+	// document, and a fault there has the same types as a fault in the
+	// document. It is a server problem, not the author's: the endpoint keeps
+	// answering it as an internal error and no text of that file reaches the
+	// client, whether or not the submitted spec has a fault of its own. A
+	// spec with a fault of the same kind is still answered with its own
+	// error only; one with a fault of another kind is not answered either.
+	const steps = "steps:\n  - id: a\n    run: echo hi\n"
+	const scalarDocument = "just a string\n"
+	const scalarDocumentError = "failed to decode document 0: [1:1] string was used where mapping is expected\n>  1 | just a string\n       ^\n"
+	const syntaxDocument = "steps: [\n"
+	const syntaxDocumentError = "[1:8] sequence end token ']' not found\n>  1 | steps: [\n              ^\n"
+	const unknownKeyDocument = "foo: 1\n" + steps
+	const unknownKeyDocumentError = "failed to process document 0: decoding failed due to the following error(s):\n\n'spec.dag' has invalid keys: foo"
+	for _, tc := range []struct {
+		name, base, marker     string
+		sameKind, sameKindWant string
+		otherKind              string
+	}{
+		{
+			name: "syntax", base: "env:\n  BASE_ONLY_VALUE: not-for-clients\nsteps: [\n", marker: "not-for-clients",
+			sameKind: syntaxDocument, sameKindWant: syntaxDocumentError, otherKind: scalarDocument,
+		},
+		{
+			name: "scalar_document", base: "not-for-clients base text\n", marker: "not-for-clients",
+			sameKind: scalarDocument, sameKindWant: scalarDocumentError, otherKind: syntaxDocument,
+		},
+		{
+			name: "wrong_typed_field", base: "env: 5\nname: not-for-clients\n", marker: "not-for-clients",
+			sameKind: unknownKeyDocument, sameKindWant: unknownKeyDocumentError, otherKind: scalarDocument,
+		},
+		{
+			name: "unknown_key", base: "not_for_clients_key: 1\n", marker: "not_for_clients",
+			sameKind: unknownKeyDocument, sameKindWant: unknownKeyDocumentError, otherKind: syntaxDocument,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := test.SetupServer(t)
+			name := "broken_base_" + tc.name
+			saved := "schedule: \"0 1 * * *\"\n" + steps
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &saved,
+			}).ExpectStatus(http.StatusCreated).Send(t)
+			require.NoError(t, os.WriteFile(server.Config.Paths.BaseConfig, []byte(tc.base), 0o600))
+
+			response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: "schedule: \"0 2 * * *\"\n" + steps,
+			}).ExpectStatus(http.StatusInternalServerError).Send(t)
+			require.NotContains(t, string(response.Response.Body()), tc.marker)
+			require.NotContains(t, string(response.Response.Body()), "base config")
+
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: tc.otherKind,
+			}).ExpectStatus(http.StatusInternalServerError).Send(t)
+			require.NotContains(t, string(response.Response.Body()), tc.marker)
+
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: tc.sameKind,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var update api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &update)
+			require.Equal(t, []string{tc.sameKindWant}, update.Errors)
+			require.NotContains(t, string(response.Response.Body()), tc.marker)
+
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var kept api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &kept)
+			require.Equal(t, saved, kept.Spec)
+		})
+	}
 }

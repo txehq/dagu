@@ -26,7 +26,6 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
-	"github.com/dagucloud/dagu/v2/internal/cmn/yamlutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -38,8 +37,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/goccy/go-yaml"
-	"github.com/goccy/go-yaml/parser"
 )
 
 const defaultHistoryLimit = 30
@@ -376,19 +375,17 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 			// definition: nothing was written, and the errors are the answer
 			// (TXE-5404; before, the file loader's raw error made it a 500).
 			errs = []string{err.Error()}
-		} else if _, ok := errors.AsType[*yaml.SyntaxError](err); ok {
-			// YAML that does not parse is an error in what the author wrote,
-			// refused the same way: nothing was written (TXE-5421; before,
-			// the parser's raw error made it a 500). The loader reads the
-			// server's base config before the document and a syntax error
-			// there has the same type, so only an error the submitted text
-			// reproduces on its own is answered; any other keeps its path,
+		} else if fault := submittedSpecFault(ctx, string(request.FileName), request.Body.Spec, err); fault != nil {
+			// YAML that does not parse, a document that is not a mapping or
+			// a field that does not decode is an error in what the author
+			// wrote, refused the same way: nothing was written (TXE-5421,
+			// TXE-5797; before, the loader's raw error made it a 500). The
+			// loader reads the server's base config before the document and
+			// a fault there has the same types, so only a fault of the
+			// update's kind that the submitted text reproduces on its own is
+			// answered, in that text's words; any other error keeps its path,
 			// and no server file reaches the client.
-			syntaxErr := submittedSpecSyntaxError(request.Body.Spec)
-			if syntaxErr == nil {
-				return nil, err
-			}
-			errs = []string{syntaxErr.Error()}
+			errs = fault.ToStringList()
 		} else {
 			return nil, err
 		}
@@ -402,13 +399,31 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 	}, nil
 }
 
-// submittedSpecSyntaxError returns the parser's syntax error for the
-// submitted spec alone, parsed as the loader parses a document, or nil when
-// it parses.
-func submittedSpecSyntaxError(spec string) *yaml.SyntaxError {
-	_, err := parser.ParseBytes(yamlutil.ClearEmptyDocumentSeparators([]byte(spec)), 0)
-	if syntaxErr, ok := errors.AsType[*yaml.SyntaxError](err); ok {
-		return syntaxErr
+// submittedSpecFaultKinds are the typed loader failures an author's text can
+// cause: YAML that does not parse, a document that is not a mapping, and a
+// field that does not decode (a wrong type or an unknown key).
+var submittedSpecFaultKinds = []func(error) bool{
+	func(err error) bool { _, ok := errors.AsType[*yaml.SyntaxError](err); return ok },
+	func(err error) bool { _, ok := errors.AsType[*yaml.UnexpectedNodeTypeError](err); return ok },
+	func(err error) bool { _, ok := errors.AsType[*mapstructure.DecodeError](err); return ok },
+}
+
+// submittedSpecFault returns the errors to answer for a spec update that
+// failed with updateErr: the fault of updateErr's kind that the submitted
+// text reproduces when loaded on its own, without the server's base or
+// workspace config, so its words are the submitted text's only. It is nil
+// when updateErr is of no such kind, or the text alone does not reproduce
+// one: an I/O, locate or server-config failure keeps its path.
+func submittedSpecFault(ctx context.Context, name, specText string, updateErr error) *ir.ErrorList {
+	for _, kind := range submittedSpecFaultKinds {
+		if !kind(updateErr) {
+			continue
+		}
+		_, err := spec.LoadYAML(ctx, []byte(specText), spec.WithoutEval(), spec.WithName(name))
+		if faults, ok := errors.AsType[ir.ErrorList](err); ok && kind(faults) {
+			return &faults
+		}
+		return nil
 	}
 	return nil
 }
