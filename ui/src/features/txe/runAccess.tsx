@@ -175,7 +175,8 @@ export function useJobsRunAllowed(
     identity?.principal?.class,
     identity?.principal?.issuer,
     identity?.principal?.subject,
-    identity?.principal?.username,
+    identity?.principal?.client_id,
+    identity?.principal?.shown?.username,
   ]
     .map((part) => part ?? '')
     .join('\u0000');
