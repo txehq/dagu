@@ -424,7 +424,7 @@ func txeEnsureHubContext(ctx *Context) error {
 	if hubURL == "" {
 		if !txeContextExplicit(ctx) && ctx.ContextStore != nil {
 			if _, gerr := ctx.ContextStore.Get(ctx, txeContextName); gerr != nil {
-				return fmt.Errorf("this machine has no hub yet: run \"dagu txe login --hub https://<the hub's address>\"")
+				return errors.New(txeNoHubHint)
 			}
 		}
 		return nil

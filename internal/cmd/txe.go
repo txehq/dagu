@@ -32,6 +32,11 @@ const txeContextName = "txe"
 // txeLocalAnnotation marks a subcommand that works without the hub.
 const txeLocalAnnotation = "txe.local"
 
+// txeNoHubHint says how a machine with no "txe" context yet gets one. It is
+// the answer of every command that needs the hub on such a machine, and of
+// "dagu txe login" run without --hub there.
+const txeNoHubHint = "this machine has no hub yet: run \"dagu txe login --hub https://<the hub's address>\""
+
 var (
 	txeJSONFlag = commandLineFlag{
 		name:   "json",
@@ -202,6 +207,13 @@ func txeDefaults(cmd *cobra.Command, _ []string) error {
 		if err := cmd.Flags().Set("context", txeContextName); err != nil {
 			return err
 		}
+		// Defaulted, not named: a store without it gets the login hint, not
+		// "context not found" (TXE-4723). A --context the caller named keeps
+		// the resolver's error.
+		if cmd.Annotations == nil {
+			cmd.Annotations = map[string]string{}
+		}
+		cmd.Annotations[defaultContextHintAnnotation] = txeNoHubHint
 	}
 	return nil
 }

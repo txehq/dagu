@@ -34,6 +34,17 @@ type txeAuthFixture struct {
 
 func newTXEAuthFixture(t *testing.T) *txeAuthFixture {
 	t.Helper()
+	f := newTXEStoreFixture(t)
+	store, err := newCLIContextStore(f.data, f.contexts)
+	require.NoError(t, err)
+	require.NoError(t, store.Create(context.Background(), &cliContext{Name: txeContextName, ServerURL: f.hub.API(), APIKey: "dagu_test_key"}))
+	return f
+}
+
+// newTXEStoreFixture is a TXE home whose context store exists but holds no
+// context yet: a machine after the developer install and before sign-in.
+func newTXEStoreFixture(t *testing.T) *txeAuthFixture {
+	t.Helper()
 	keepDaguEnvironment(t)
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
@@ -47,9 +58,8 @@ func newTXEAuthFixture(t *testing.T) *txeAuthFixture {
 		hub:      cliauthtest.NewHub(t),
 	}
 	t.Setenv("TXE_DAGU_HOME", f.home)
-	store, err := newCLIContextStore(f.data, f.contexts)
+	_, err = newCLIContextStore(f.data, f.contexts)
 	require.NoError(t, err)
-	require.NoError(t, store.Create(context.Background(), &cliContext{Name: txeContextName, ServerURL: f.hub.API(), APIKey: "dagu_test_key"}))
 	return f
 }
 
