@@ -163,6 +163,16 @@ type Node struct {
 	AgentSession *AgentSession `json:"agentSession,omitempty"`
 }
 
+// The output fields a stored node's other output fields may repeat. Upstream
+// Dagu v2.25.2 stores a repeated output once per status line and names the
+// field that holds it in outputsValueFrom or stepOutputsValueFrom; this fork
+// reads those references so a status file it did not write loses no output.
+// The fork's writer keeps every output field inline and never writes them.
+const (
+	outputValueField  = "outputValue"
+	outputsValueField = "outputsValue"
+)
+
 type nodeJSON Node
 
 // presentRawJSON returns the first candidate that carries a value, or nil when
@@ -190,7 +200,8 @@ func (n Node) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON restores the step definition and its runtime condition results,
-// and keeps agent state written under its legacy name readable.
+// keeps agent state written under its legacy name readable, and restores an
+// output that a stored node names instead of repeating.
 func (n *Node) UnmarshalJSON(data []byte) error {
 	var decoded nodeJSON
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -200,18 +211,47 @@ func (n *Node) UnmarshalJSON(data []byte) error {
 		Step struct {
 			Preconditions []ConditionResult `json:"preconditions"`
 		} `json:"step"`
-		LegacyAgentState json.RawMessage `json:"controllerState"`
+		LegacyAgentState     json.RawMessage `json:"controllerState"`
+		OutputsValueFrom     string          `json:"outputsValueFrom"`
+		StepOutputsValueFrom string          `json:"stepOutputsValueFrom"`
 	}
 	if err := json.Unmarshal(data, &runtimeState); err != nil {
 		return err
 	}
 	*n = Node(decoded)
 	n.AgentState = presentRawJSON(n.AgentState, runtimeState.LegacyAgentState)
+	// A stored node keeps a repeated output once; the fields that repeat it
+	// get it back. An inline value, an empty string included, wins over a
+	// reference. OutputsValue is restored first, as StepOutputsValue may
+	// repeat it.
+	if n.OutputsValue == nil {
+		n.OutputsValue = n.storedOutput(runtimeState.OutputsValueFrom)
+	}
+	if n.StepOutputsValue == nil {
+		n.StepOutputsValue = n.storedOutput(runtimeState.StepOutputsValueFrom)
+	}
 	n.PreconditionResults = slices.Clone(runtimeState.Step.Preconditions)
 	if n.PreconditionResults != nil {
 		n.Step = newStepSnapshot(n.Step, n.PreconditionResults).definition()
 	}
 	return nil
+}
+
+// storedOutput returns a copy of the output field a stored node names, or nil
+// when it names none or an unknown one.
+func (n *Node) storedOutput(field string) *string {
+	var value *string
+	switch field {
+	case outputValueField:
+		value = n.OutputValue
+	case outputsValueField:
+		value = n.OutputsValue
+	}
+	if value == nil {
+		return nil
+	}
+	stored := *value
+	return &stored
 }
 
 // SubDAGRun represents a sub DAG run associated with a node
