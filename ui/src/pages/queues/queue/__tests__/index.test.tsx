@@ -37,9 +37,11 @@ vi.mock('@/contexts/ConfigContext', async (importOriginal) => ({
 
 const runAccess = vi.hoisted(() => ({
   allowed: undefined as boolean | undefined,
+  byJob: new Map<string, boolean>(),
 }));
 vi.mock('@/features/txe/runAccess', () => ({
   useJobRunAllowed: () => runAccess.allowed,
+  useJobsRunAllowed: () => runAccess.byJob,
   ViewOnly: () => <span>View only</span>,
 }));
 
@@ -111,6 +113,7 @@ describe('QueueDetailsPage for a job the caller may only view', () => {
   beforeEach(() => {
     getMock.mockReset();
     useQueryMock.mockReset();
+    runAccess.byJob = new Map();
     getMock.mockResolvedValue({ data: { items: [item] }, error: undefined });
   });
 
@@ -164,10 +167,117 @@ describe('QueueDetailsPage for a job the caller may only view', () => {
   });
 });
 
+// A custom or shared queue holds runs of several jobs; each item is
+// selected, counted and dequeued only when the hub lets the caller run its
+// job (TXE-4754). An item with no answer is offered as before.
+describe('QueueDetailsPage for a queue of several jobs', () => {
+  const OWN = 'job_01M4XEETKWKZX504BK65ADBVYB';
+  const SHARED_VIEW_ONLY = 'job_01M4XEETKWKZX504BK65ADBVYC';
+  const customQueue: components['schemas']['Queue'] = {
+    name: 'nightly-batch',
+    type: QueueType.global,
+    maxConcurrency: 2,
+    runningCount: 0,
+    queuedCount: 3,
+    queuedCountCapped: false,
+    running: [],
+  };
+  const queuedItem = (name: string, dagRunId: string) => ({
+    name,
+    dagRunId,
+    status: 5,
+    statusLabel: 'queued',
+    queuedAt: '2026-10-21T00:00:00Z',
+    startedAt: '',
+    finishedAt: '',
+  });
+  const items = [
+    queuedItem(OWN, 'run-own'),
+    queuedItem(SHARED_VIEW_ONLY, 'run-shared'),
+    queuedItem('nightly', 'run-plain'),
+  ];
+
+  beforeEach(() => {
+    getMock.mockReset();
+    useQueryMock.mockReset();
+    getMock.mockResolvedValue({ data: { items }, error: undefined });
+    runAccess.allowed = undefined;
+    runAccess.byJob = new Map([
+      [OWN, true],
+      [SHARED_VIEW_ONLY, false],
+    ]);
+  });
+
+  it('lets only items the caller may run be selected, and counts only those', async () => {
+    const view = renderPage(customQueue);
+
+    const own = await screen.findByRole('checkbox', {
+      name: `Select ${OWN} run-own`,
+    });
+    const shared = screen.getByRole('checkbox', {
+      name: `Select ${SHARED_VIEW_ONLY} run-shared`,
+    });
+    const plain = screen.getByRole('checkbox', {
+      name: 'Select nightly run-plain',
+    });
+    expect(own).toBeEnabled();
+    expect(plain).toBeEnabled();
+    expect(shared).toBeDisabled();
+    expect(shared.closest('div')).toHaveAttribute(
+      'title',
+      'The hub does not let you run this job.'
+    );
+    expect(screen.queryByText('View only')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select all loaded' }));
+    expect(await screen.findByText('2 selected of 3 loaded')).toBeVisible();
+    expect(own).toBeChecked();
+    expect(plain).toBeChecked();
+    expect(shared).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /Dequeue selected/ }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('2 selected DAG runs');
+
+    // A selected item's access revoked while the confirmation is open:
+    // nothing snapshotted may still be submitted.
+    runAccess.byJob = new Map([
+      [OWN, false],
+      [SHARED_VIEW_ONLY, false],
+    ]);
+    view.rerender();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(await screen.findByText('1 selected of 3 loaded')).toBeVisible();
+  });
+
+  it('offers nothing to select when the caller may run none of the jobs', async () => {
+    runAccess.byJob = new Map([
+      [OWN, false],
+      [SHARED_VIEW_ONLY, false],
+    ]);
+    getMock.mockResolvedValue({
+      data: { items: items.slice(0, 2) },
+      error: undefined,
+    });
+    renderPage(customQueue);
+
+    expect(
+      await screen.findByRole('checkbox', { name: `Select ${OWN} run-own` })
+    ).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Select all loaded' })
+    ).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: /Dequeue selected/ })
+    ).toBeDisabled();
+  });
+});
+
 describe('QueueDetailsPage', () => {
   beforeEach(() => {
     getMock.mockReset();
     useQueryMock.mockReset();
+    runAccess.byJob = new Map();
     getMock.mockResolvedValue({
       data: { items: [] },
       error: undefined,

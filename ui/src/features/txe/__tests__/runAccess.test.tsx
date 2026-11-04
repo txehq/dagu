@@ -17,11 +17,13 @@ import {
   ACCESS_REFRESH_MS,
   useJobProfileHeld,
   useJobRunAllowed,
+  useJobsRunAllowed,
 } from '../runAccess';
 
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
 const mode = vi.hoisted(() => ({ current: 'enforce' as string | undefined }));
 const principal = vi.hoisted(() => ({ current: 'platform_admin' }));
+const subject = vi.hoisted(() => ({ current: 'alice' }));
 const GET = vi.fn();
 
 vi.mock('@/hooks/api', () => ({
@@ -32,7 +34,10 @@ vi.mock('../identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../identity')>()),
   useTxeIdentity: () => ({
     identity: mode.current
-      ? { authz_mode: mode.current, principal: { class: principal.current } }
+      ? {
+          authz_mode: mode.current,
+          principal: { class: principal.current, subject: subject.current },
+        }
       : undefined,
   }),
 }));
@@ -55,6 +60,7 @@ beforeEach(() => {
   GET.mockReset();
   mode.current = TxeIdentityAuthz_mode.enforce;
   principal.current = TxeIdentityPrincipalClass.platform_admin;
+  subject.current = 'alice';
 });
 
 describe('useJobRunAllowed', () => {
@@ -307,5 +313,284 @@ describe('useJobProfileHeld', () => {
 
     await waitFor(() => expect(result.current).toEqual([true, true]));
     expect(GET).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A queue page asks for every job among its loaded items at once: one read
+// per distinct job, an entry only where the hub's binding answer exists.
+describe('useJobsRunAllowed', () => {
+  const JOB_B = 'job_01M4XEETKWKZX504BK65ADBVYC';
+
+  function answersByJob(answers: Record<string, unknown>) {
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        const jobId = init.params.path.jobId;
+        const access = answers[jobId];
+        if (access === 'missing') return { response: { status: 404 } };
+        return { data: { job_id: jobId, ...(access ? { access } : {}) } };
+      }
+    );
+  }
+
+  it('answers per job, once per distinct job, for job names only', async () => {
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+      [JOB_B]: {
+        via: TxeJobAccessVia.share,
+        permissions: [TxeAccessPermission.view],
+      },
+    });
+    const { result } = renderHook(
+      () => useJobsRunAllowed([JOB, JOB_B, JOB, 'nightly', JOB_B]),
+      { wrapper }
+    );
+
+    await waitFor(() => expect(result.current.size).toBe(2));
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.get(JOB_B)).toBe(false);
+    expect(result.current.has('nightly')).toBe(false);
+    expect(GET).toHaveBeenCalledTimes(2);
+  });
+
+  it('has no entry for a job with no label, and refuses a job the hub does not know', async () => {
+    answersByJob({ [JOB]: undefined, [JOB_B]: 'missing' });
+    const { result } = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.size).toBe(1));
+    expect(result.current.has(JOB)).toBe(false);
+    expect(result.current.get(JOB_B)).toBe(false);
+  });
+
+  it.each([TxeIdentityAuthz_mode.observe, TxeIdentityAuthz_mode.off])(
+    'asks nothing for another caller in mode %s',
+    async (m) => {
+      mode.current = m;
+      answersByJob({});
+      const { result } = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+        wrapper,
+      });
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.size).toBe(0);
+      expect(GET).not.toHaveBeenCalled();
+    }
+  );
+
+  // Loading more items brings a new job into the set, and the read for the
+  // new set may be pending or fail: the answers already given stay, so a
+  // control the hub refused does not come back between reads.
+  it("keeps each job's last answer while the set of jobs changes", async () => {
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+      [JOB_B]: {
+        via: TxeJobAccessVia.share,
+        permissions: [TxeAccessPermission.view],
+      },
+    });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() => expect(result.current.size).toBe(2));
+
+    // The read for the larger set fails.
+    GET.mockRejectedValue(new Error('hub away'));
+    rerender({ names: [JOB, JOB_B, JOB_C] });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.get(JOB_B)).toBe(false);
+    expect(result.current.has(JOB_C)).toBe(false);
+
+    // An item of the refused job leaving the set drops it; the rest stay.
+    rerender({ names: [JOB] });
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.has(JOB_B)).toBe(false);
+
+    // Back in the set, before any read answers again, it is still refused.
+    rerender({ names: [JOB, JOB_B] });
+    expect(result.current.get(JOB_B)).toBe(false);
+  });
+
+  // A set the page showed before is served from the cache at once when it
+  // comes back; an answer a later read gave is not replaced by it.
+  it('does not let a cached older set replace a newer refusal', async () => {
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    const viewOnly = { via: TxeJobAccessVia.share, permissions: [] };
+    answersByJob({ [JOB]: allowed, [JOB_B]: allowed });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() => expect(result.current.get(JOB)).toBe(true));
+
+    // The read for the larger set sees the first job's access revoked.
+    answersByJob({ [JOB]: viewOnly, [JOB_B]: allowed, [JOB_C]: allowed });
+    rerender({ names: [JOB, JOB_B, JOB_C] });
+    await waitFor(() => expect(result.current.get(JOB)).toBe(false));
+
+    // The third job leaves: the older set's cached answers are served again,
+    // and every read from now on fails.
+    GET.mockRejectedValue(new Error('hub away'));
+    rerender({ names: [JOB, JOB_B] });
+    expect(result.current.get(JOB)).toBe(false);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.get(JOB)).toBe(false);
+    expect(result.current.get(JOB_B)).toBe(true);
+  });
+
+  // One job's read failing does not hold back the others' answers: a new
+  // refusal reaches the controls, and the failed job keeps its last answer.
+  it("publishes the other jobs' answers when one job's read fails", async () => {
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    answersByJob({ [JOB]: allowed, [JOB_B]: allowed });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() =>
+      expect([result.current.get(JOB), result.current.get(JOB_B)]).toEqual([
+        true,
+        true,
+      ])
+    );
+
+    // A third job joins, so the set is read again: the first job is now
+    // view-only, the second's read fails, the third is allowed.
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        const jobId = init.params.path.jobId;
+        if (jobId === JOB_B) throw new Error('hub away');
+        return {
+          data: {
+            job_id: jobId,
+            access:
+              jobId === JOB
+                ? { via: TxeJobAccessVia.share, permissions: [] }
+                : allowed,
+          },
+        };
+      }
+    );
+    rerender({ names: [JOB, JOB_B, JOB_C] });
+    await waitFor(() => expect(result.current.get(JOB)).toBe(false));
+    expect(result.current.get(JOB_B)).toBe(true);
+    expect(result.current.get(JOB_C)).toBe(true);
+  });
+
+  // The page is left and opened again while a job's reads keep failing: the
+  // cache now holds only the jobs that answered, and the job's refusal is
+  // kept beside that cache rather than in the page that is gone.
+  it("keeps a job's refusal across remounts while its reads fail", async () => {
+    const shared = new Map();
+    const sharedWrapper = ({ children }: { children: React.ReactNode }) => (
+      <SWRConfig value={{ provider: () => shared, dedupingInterval: 0 }}>
+        {children}
+      </SWRConfig>
+    );
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    answersByJob({
+      [JOB]: { via: TxeJobAccessVia.share, permissions: [] },
+      [JOB_B]: allowed,
+    });
+    const first = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(first.result.current.get(JOB)).toBe(false));
+    first.unmount();
+
+    // From now on the refused job's reads fail and the other's succeed.
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        if (init.params.path.jobId === JOB) throw new Error('hub away');
+        return { data: { job_id: JOB_B, access: allowed } };
+      }
+    );
+    const second = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() =>
+      expect(GET).toHaveBeenCalledWith('/txe/jobs/{jobId}', {
+        params: { path: { jobId: JOB_B } },
+      })
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(second.result.current.get(JOB)).toBe(false);
+    second.unmount();
+
+    const third = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    expect(third.result.current.get(JOB)).toBe(false);
+    expect(third.result.current.get(JOB_B)).toBe(true);
+  });
+
+  // The memory is the signed-in principal's: another sign-in on the same
+  // cache starts with no answers, and gets its own from the hub.
+  it("does not hand one principal's answers to the next sign-in", async () => {
+    const shared = new Map();
+    const sharedWrapper = ({ children }: { children: React.ReactNode }) => (
+      <SWRConfig value={{ provider: () => shared, dedupingInterval: 0 }}>
+        {children}
+      </SWRConfig>
+    );
+    answersByJob({ [JOB]: { via: TxeJobAccessVia.share, permissions: [] } });
+    const alice = renderHook(() => useJobsRunAllowed([JOB]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(alice.result.current.get(JOB)).toBe(false));
+    alice.unmount();
+
+    // Bob signs in: before the hub answers him he has no answer, hers
+    // included; then he has his own.
+    subject.current = 'bob';
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+    });
+    const bob = renderHook(() => useJobsRunAllowed([JOB]), {
+      wrapper: sharedWrapper,
+    });
+    expect(bob.result.current.has(JOB)).toBe(false);
+    await waitFor(() => expect(bob.result.current.get(JOB)).toBe(true));
+  });
+
+  it('asks nothing when no name is a job', () => {
+    answersByJob({});
+    const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {
+      wrapper,
+    });
+
+    expect(result.current.size).toBe(0);
+    expect(GET).not.toHaveBeenCalled();
   });
 });

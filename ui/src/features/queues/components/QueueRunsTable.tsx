@@ -26,6 +26,9 @@ interface QueueRunsTableProps {
   disableSelection?: boolean;
   headerCheckboxState?: boolean | 'indeterminate';
   isSelected?: (dagRun: QueueDAGRun) => boolean;
+  /** Whether a row may be selected at all; a row that may not shows a
+   * disabled checkbox and says why. Every row may when absent. */
+  isSelectable?: (dagRun: QueueDAGRun) => boolean;
   onToggleSelection?: (dagRun: QueueDAGRun) => void;
   onToggleAll?: (checked: boolean) => void;
   showQueuedAt?: boolean;
@@ -81,6 +84,7 @@ function QueueRunsTable({
   disableSelection = false,
   headerCheckboxState = false,
   isSelected,
+  isSelectable,
   onToggleSelection,
   onToggleAll,
   showQueuedAt = false,
@@ -140,7 +144,9 @@ function QueueRunsTable({
         </thead>
         <tbody className="divide-y divide-border/50">
           {items.map((dagRun) => {
-            const selected = selectable && Boolean(isSelected?.(dagRun));
+            const rowSelectable =
+              selectable && (isSelectable?.(dagRun) ?? true);
+            const selected = rowSelectable && Boolean(isSelected?.(dagRun));
             const queuedConditionSummary =
               dagRun.status === Status.Queued
                 ? getQueuedConditionSummary(dagRun.conditions)
@@ -169,14 +175,21 @@ function QueueRunsTable({
                     onClick={(event) => event.stopPropagation()}
                     onKeyDown={(event) => event.stopPropagation()}
                   >
-                    <div className="flex h-8 w-8 items-center justify-center">
+                    <div
+                      className="flex h-8 w-8 items-center justify-center"
+                      title={
+                        rowSelectable
+                          ? undefined
+                          : ts('The hub does not let you run this job.')
+                      }
+                    >
                       <Checkbox
                         aria-label={ts('Select {name} {runId}', {
                           name: dagRun.name,
                           runId: dagRun.dagRunId,
                         })}
                         checked={selected}
-                        disabled={disableSelection}
+                        disabled={disableSelection || !rowSelectable}
                         onCheckedChange={() => onToggleSelection?.(dagRun)}
                       />
                     </div>

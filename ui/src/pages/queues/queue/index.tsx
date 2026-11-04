@@ -29,7 +29,11 @@ import {
   QueueBatchResult,
   useQueueBatchDequeue,
 } from '@/features/queues/hooks/useQueueBatchDequeue';
-import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
+import {
+  useJobRunAllowed,
+  useJobsRunAllowed,
+  ViewOnly,
+} from '@/features/txe/runAccess';
 import { useQueuedItemsFeed } from '@/features/queues/hooks/useQueuedItemsFeed';
 import { useQueueSelection } from '@/features/queues/hooks/useQueueSelection';
 import { useQuery } from '@/hooks/api';
@@ -161,6 +165,22 @@ function QueueDetailsPage() {
     handleLoadMore
   );
 
+  // A custom or shared queue holds runs of several jobs, each with its own
+  // answer from the hub: an item is selected, counted and dequeued only when
+  // the hub lets the caller run its job (TXE-4754). An item with no answer
+  // (not a job's, or the answer does not bind the caller) is offered as
+  // before; the hub decides either way.
+  const itemAccess = useJobsRunAllowed(
+    React.useMemo(() => queuedItems.map((item) => item.name), [queuedItems])
+  );
+  const mayDequeueItem = React.useCallback(
+    (item: { name: string }) => itemAccess.get(item.name) !== false,
+    [itemAccess]
+  );
+  const dequeueableItems = React.useMemo(
+    () => queuedItems.filter(mayDequeueItem),
+    [queuedItems, mayDequeueItem]
+  );
   const {
     clearSelection,
     isSelected,
@@ -169,7 +189,7 @@ function QueueDetailsPage() {
     selectedCount,
     selectedRuns,
     toggleSelection,
-  } = useQueueSelection(queuedItems);
+  } = useQueueSelection(dequeueableItems);
 
   const {
     activeBatch,
@@ -199,9 +219,9 @@ function QueueDetailsPage() {
   );
 
   const headerCheckboxState =
-    queuedItems.length === 0
+    dequeueableItems.length === 0
       ? false
-      : selectedCount === queuedItems.length
+      : selectedCount === dequeueableItems.length
         ? true
         : selectedCount > 0
           ? 'indeterminate'
@@ -215,13 +235,16 @@ function QueueDetailsPage() {
   const totalBatchCount = activeBatch?.snapshot.length ?? 0;
   const isDialogLocked = phase === 'running' || progress.isRefreshing;
 
-  // Access revoked while the confirmation is open: nothing snapshotted may
-  // still be submitted.
+  // Access revoked while the confirmation is open, for the queue's job or
+  // for any snapshotted item's: nothing snapshotted may still be submitted.
+  const snapshotHeld =
+    phase === 'confirm' &&
+    (activeBatch?.snapshot.some((run) => !mayDequeueItem(run)) ?? false);
   React.useEffect(() => {
-    if (!dequeueAllowed && phase === 'confirm') {
+    if ((!dequeueAllowed || snapshotHeld) && phase === 'confirm') {
       closeDialog();
     }
-  }, [dequeueAllowed, phase, closeDialog]);
+  }, [dequeueAllowed, snapshotHeld, phase, closeDialog]);
   const isProcessing = phase === 'running' || phase === 'complete';
   const utilization = queue?.maxConcurrency
     ? Math.round(((queue.runningCount || 0) / queue.maxConcurrency) * 100)
@@ -402,7 +425,7 @@ function QueueDetailsPage() {
                       size="sm"
                       variant="outline"
                       onClick={selectAllLoaded}
-                      disabled={queuedItems.length === 0 || isRunning}
+                      disabled={dequeueableItems.length === 0 || isRunning}
                     >
                       <I18nText text={'Select all loaded'} />
                     </Button>
@@ -443,6 +466,7 @@ function QueueDetailsPage() {
                     disableSelection={isRunning}
                     headerCheckboxState={headerCheckboxState}
                     isSelected={isSelected}
+                    isSelectable={mayDequeueItem}
                     onToggleAll={(checked) => {
                       if (checked) {
                         selectAllLoaded();
