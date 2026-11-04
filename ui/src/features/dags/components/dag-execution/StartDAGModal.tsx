@@ -104,6 +104,10 @@ type Props = {
   profilesLoading?: boolean;
   defaultProfile?: string;
   defaultProfileLoading?: boolean;
+  /** The hub holds the caller to the DAG's own profile (a caller it labels
+   * as the job's owner or a share): no profile choice is offered, and the
+   * run is started without one, so the hub applies the default. */
+  profileHeld?: boolean;
 };
 
 const DAG_DEFAULT_PROFILE_VALUE = '__dag_default__';
@@ -289,6 +293,7 @@ function StartDAGModal({
   profilesLoading = false,
   defaultProfile = '',
   defaultProfileLoading = false,
+  profileHeld = false,
 }: Props) {
   const canUseProtectedProfiles = useIsAdmin();
   const dagDetails = dag as components['schemas']['DAGDetails'] | undefined;
@@ -359,10 +364,11 @@ function StartDAGModal({
   );
   const hasDefaultProfile = defaultProfile !== '';
   const showProfileSelector =
-    defaultProfileLoading ||
-    profilesLoading ||
-    hasDefaultProfile ||
-    activeProfiles.length > 0;
+    !profileHeld &&
+    (defaultProfileLoading ||
+      profilesLoading ||
+      hasDefaultProfile ||
+      activeProfiles.length > 0);
   const parameterCount = useSchemaFields
     ? Object.keys(paramSchema.properties ?? {}).length
     : useTypedFields
@@ -517,10 +523,10 @@ function StartDAGModal({
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const profileOverride = profileOverrideForSelection(
-        profileSelection,
-        hasDefaultProfile
-      );
+      // A held caller names no profile: the hub applies the DAG's default.
+      const profileOverride = profileHeld
+        ? undefined
+        : profileOverrideForSelection(profileSelection, hasDefaultProfile);
       if (isBuild) {
         await onSubmit(
           paramsPayload,

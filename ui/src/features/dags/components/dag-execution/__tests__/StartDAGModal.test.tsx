@@ -452,6 +452,52 @@ describe('StartDAGModal', () => {
     );
   });
 
+  // The hub holds the caller to the DAG's own profile (TXE-4753): there is
+  // no profile choice, and the run is started without one, with or without a
+  // DAG default and whatever profiles the caller could otherwise pick.
+  it.each([
+    ['with a DAG default', 'prod'],
+    ['with no DAG default', ''],
+  ])(
+    'offers no profile choice and names no profile when the caller is held, %s',
+    async (_case, defaultProfile) => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+      render(
+        <StartDAGModal
+          visible={true}
+          dismissModal={vi.fn()}
+          onSubmit={onSubmit}
+          dag={{ name: 'profile-dag' } as never}
+          defaultProfile={defaultProfile}
+          profileHeld
+          profiles={[
+            {
+              id: 'prod-id',
+              name: 'prod',
+              status: RuntimeProfileStatus.active,
+              protected: false,
+              description: '',
+              entries: [],
+              createdAt: '2026-01-01T00:00:00Z',
+              updatedAt: '2026-01-01T00:00:00Z',
+            },
+          ]}
+        />
+      );
+
+      expect(
+        screen.queryByRole('combobox', { name: /profile/i })
+      ).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Start' }));
+
+      await waitFor(() =>
+        expect(onSubmit).toHaveBeenCalledWith('', undefined, true)
+      );
+    }
+  );
+
   it('can disable reuse for a build run', async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);

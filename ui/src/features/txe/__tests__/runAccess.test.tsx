@@ -13,7 +13,11 @@ import {
   TxeJobAccessVia,
 } from '@/api/v1/schema';
 
-import { ACCESS_REFRESH_MS, useJobRunAllowed } from '../runAccess';
+import {
+  ACCESS_REFRESH_MS,
+  useJobProfileHeld,
+  useJobRunAllowed,
+} from '../runAccess';
 
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
 const mode = vi.hoisted(() => ({ current: 'enforce' as string | undefined }));
@@ -232,5 +236,76 @@ describe('useJobRunAllowed', () => {
     await waitFor(() => expect(GET).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 20));
     expect(result.current).toBeUndefined();
+  });
+});
+
+// The hub holds a caller it labels as the job's owner or a share to the DAG's
+// own runtime profile (TXE-4704, TXE-4710); the platform administrator is
+// not held, and nor is a caller the answer does not bind.
+describe('useJobProfileHeld', () => {
+  it.each([
+    ["the job's owner", TxeJobAccessVia.owner],
+    ['a share', TxeJobAccessVia.share],
+  ])('holds %s to the DAG profile', async (_who, via) => {
+    answer([TxeAccessPermission.view, TxeAccessPermission.execute], via);
+    const { result } = renderHook(() => useJobProfileHeld(JOB), { wrapper });
+
+    await waitFor(() => expect(result.current).toBe(true));
+  });
+
+  it('does not hold the platform administrator', async () => {
+    answer(
+      [TxeAccessPermission.view, TxeAccessPermission.execute],
+      TxeJobAccessVia.platform_admin
+    );
+    const { result } = renderHook(() => useJobProfileHeld(JOB), { wrapper });
+
+    await waitFor(() => expect(result.current).toBe(false));
+  });
+
+  it('holds a person in every mode', async () => {
+    mode.current = TxeIdentityAuthz_mode.off;
+    principal.current = TxeIdentityPrincipalClass.person;
+    answer([TxeAccessPermission.execute], TxeJobAccessVia.owner);
+    const { result } = renderHook(() => useJobProfileHeld(JOB), { wrapper });
+
+    await waitFor(() => expect(result.current).toBe(true));
+  });
+
+  it.each([TxeIdentityAuthz_mode.observe, TxeIdentityAuthz_mode.off])(
+    'says nothing for another caller in mode %s',
+    async (m) => {
+      mode.current = m;
+      answer([TxeAccessPermission.execute], TxeJobAccessVia.owner);
+      const { result } = renderHook(() => useJobProfileHeld(JOB), { wrapper });
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current).toBeUndefined();
+      expect(GET).not.toHaveBeenCalled();
+    }
+  );
+
+  it('says nothing for a DAG that is not a job, or a job with no label', async () => {
+    const other = renderHook(() => useJobProfileHeld('example'), { wrapper });
+    expect(other.result.current).toBeUndefined();
+    expect(GET).not.toHaveBeenCalled();
+
+    GET.mockResolvedValue({ data: { job_id: JOB } });
+    const { result } = renderHook(() => useJobProfileHeld(JOB), { wrapper });
+    await waitFor(() => expect(GET).toHaveBeenCalled());
+    expect(result.current).toBeUndefined();
+  });
+
+  it('asks the hub once for the run and the profile answers together', async () => {
+    answer([TxeAccessPermission.execute], TxeJobAccessVia.owner);
+    const { result } = renderHook(
+      () => [useJobRunAllowed(JOB), useJobProfileHeld(JOB)],
+      { wrapper }
+    );
+
+    await waitFor(() => expect(result.current).toEqual([true, true]));
+    expect(GET).toHaveBeenCalledTimes(1);
   });
 });

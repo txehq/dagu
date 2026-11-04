@@ -40,7 +40,11 @@ import { pushRunProgress, StartDAGModal } from '../dag-execution';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
+import {
+  useJobProfileHeld,
+  useJobRunAllowed,
+  ViewOnly,
+} from '@/features/txe/runAccess';
 
 // startUnconfirmedRunId is the run the hub handed over without seeing it
 // start (504 start_unconfirmed, TXE-4712), or undefined for any other answer.
@@ -90,6 +94,10 @@ function DAGActions({
   const { ts } = useI18n();
   const dagContext = React.useContext(DAGContext);
   const runAllowed = useJobRunAllowed(checkJobAccess ? fileName : undefined);
+  // On a job's DAG the hub's answer may hold the caller to the DAG's own
+  // runtime profile (TXE-4753).
+  const profileHeld =
+    useJobProfileHeld(checkJobAccess ? fileName : undefined) === true;
   const config = useConfig();
   const { hasUnsavedChanges } = useUnsavedChanges();
   const { showError } = useErrorModal();
@@ -869,6 +877,7 @@ function DAGActions({
           profilesLoading={profilesLoading}
           defaultProfile={dagSettingsData?.profile}
           defaultProfileLoading={dagSettingsLoading}
+          profileHeld={profileHeld}
           onSubmit={async (params, dagRunId, immediate, profile, noReuse) => {
             if (dagContext.onEnqueue) {
               const result = await dagContext.onEnqueue(
