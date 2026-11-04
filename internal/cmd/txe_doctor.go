@@ -104,7 +104,7 @@ func runTXEDoctor(ctx *Context, _ []string) error {
 	}
 
 	client, err := txeClient(ctx)
-	if !add("hub context", err, txeContextName, "create the context with the worker installer, or pass --context") {
+	if !add("hub context", err, txeContextName, txeNoHubHint+", or pass --context") {
 		return txeDoctorReport(ctx, checks, unfinished)
 	}
 	health, err := client.Health(ctx)

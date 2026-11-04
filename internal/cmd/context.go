@@ -202,7 +202,7 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 			selectedContextName, selectedContext, err = resolveCLIContext(cmd, contextStore, requestedContextName)
 			if err != nil {
 				if shouldFailForContextResolutionError(scope, requestedContextName) {
-					return nil, err
+					return nil, defaultContextHint(cmd, err)
 				}
 				contextStoreWarning = fmt.Errorf("failed to resolve context selection, using local context: %w", err)
 				selectedContextName = localContextName
@@ -476,6 +476,22 @@ func shouldFailForContextStoreError(cmd *cobra.Command, scope commandScope, requ
 		return false
 	}
 	return requested != "" && requested != localContextName
+}
+
+// defaultContextHintAnnotation holds, on a command whose --context a pre-run
+// hook defaulted rather than the caller named, what to say when the store has
+// no such context: how to create it. Without it, and for any error other than
+// a missing context, the resolver's error stands.
+const defaultContextHintAnnotation = "cmd.defaultContextHint"
+
+// defaultContextHint returns the command's hint for a defaulted context the
+// store does not have, or err as it is.
+func defaultContextHint(cmd *cobra.Command, err error) error {
+	hint := cmd.Annotations[defaultContextHintAnnotation]
+	if hint == "" || !errors.Is(err, errCLIContextNotFound) {
+		return err
+	}
+	return errors.New(hint)
 }
 
 func shouldFailForContextResolutionError(scope commandScope, requested string) bool {
