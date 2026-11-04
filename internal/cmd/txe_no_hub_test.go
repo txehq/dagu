@@ -28,6 +28,11 @@ func TestTXEHubCommandsWithoutAContextSayToLogIn(t *testing.T) {
 		require.Error(t, err, args)
 		assert.Contains(t, err.Error(), txeNoHubHint, "%v: %s", args, out)
 		assert.NotContains(t, err.Error(), "context not found", args)
+		if args[0] != "login" {
+			// The store it was missing from is named, for a log of a step
+			// that ran with the wrong store.
+			assert.Contains(t, err.Error(), `no context "txe" in `+f.contexts+": ", args)
+		}
 	}
 }
 

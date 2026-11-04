@@ -202,7 +202,7 @@ func NewContext(cmd *cobra.Command, flags []commandLineFlag) (*Context, error) {
 			selectedContextName, selectedContext, err = resolveCLIContext(cmd, contextStore, requestedContextName)
 			if err != nil {
 				if shouldFailForContextResolutionError(scope, requestedContextName) {
-					return nil, defaultContextHint(cmd, err)
+					return nil, defaultContextHint(cmd, requestedContextName, cfg.Paths.ContextsDir, err)
 				}
 				contextStoreWarning = fmt.Errorf("failed to resolve context selection, using local context: %w", err)
 				selectedContextName = localContextName
@@ -484,14 +484,16 @@ func shouldFailForContextStoreError(cmd *cobra.Command, scope commandScope, requ
 // a missing context, the resolver's error stands.
 const defaultContextHintAnnotation = "cmd.defaultContextHint"
 
-// defaultContextHint returns the command's hint for a defaulted context the
-// store does not have, or err as it is.
-func defaultContextHint(cmd *cobra.Command, err error) error {
+// defaultContextHint answers a defaulted context the store does not have by
+// naming the context and the store, then the command's hint for creating
+// it, so a log of a step that ran with the wrong store says which; or err
+// as it is.
+func defaultContextHint(cmd *cobra.Command, name, contextsDir string, err error) error {
 	hint := cmd.Annotations[defaultContextHintAnnotation]
 	if hint == "" || !errors.Is(err, errCLIContextNotFound) {
 		return err
 	}
-	return errors.New(hint)
+	return fmt.Errorf("no context %q in %s: %s", name, contextsDir, hint)
 }
 
 func shouldFailForContextResolutionError(scope commandScope, requested string) bool {
