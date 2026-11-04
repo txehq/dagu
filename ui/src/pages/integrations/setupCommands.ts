@@ -114,6 +114,12 @@ export function setupCommands(tag: string, hub: string) {
     doctor: 'dagu txe doctor',
     enrol:
       'dagu txe enrol --client-id <this machine’s worker client> --wait 15m',
+    // The check loads the credential as the worker does and contacts nothing;
+    // with --hub-url it also asks this hub's health over the worker channel,
+    // once, with no task: for a worker about to move to the channel, and
+    // only where this hub serves it.
+    enrolCheck: 'dagu txe enrol check',
+    enrolCheckChannel: `dagu txe enrol check --hub-url ${shellQuote(hub)}`,
   };
 }
 

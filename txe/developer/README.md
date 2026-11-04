@@ -33,7 +33,7 @@ Four stages, each checked on the machine, in order:
 |---|---|
 | CLI and skill installed | `install.sh --check` ends with `ok.` |
 | Identity bound | `dagu txe whoami` says `bound, owner own_…`; `unbound` or `pending` waits on an administrator |
-| Machine and worker ready | `dagu txe doctor` says ok on every line, `machine on hub` included, and the machine's page in the hub shows an active enrolment. The worker install and its enrolment need an administrator today: the tunnel credential, and the worker client listed in the hub |
+| Machine and worker ready | `dagu txe doctor` says ok on every line, `machine on hub` included, and the machine's page in the hub shows an active enrolment. The worker install and its enrolment need an administrator today: this machine's worker client listed in the hub and, on the port-forward route, the tunnel credential. On the worker channel the machine needs no tunnel and no kubeconfig. See "Enrolling this machine's worker" |
 | A job ran and its result reached the hub | the smoke test below |
 
 `smoke/` is the smoke test. The page writes it into a new directory under `~/txe-dev-setup-smoke`. The shell that runs the page's command fills in `{{STAMP}}` and `{{EXPIRES_AT}}`: the job key, and a lifetime of fifteen minutes from then. The job runs every minute. Each run prints one line and writes only its `result.json`, which is published to the hub; it calls no external service. Then:
@@ -57,7 +57,7 @@ When the lifetime ends, the registry retires the job (`Lifecycle: retired`), and
 | `~/.local/share/txe-dagu/client/` | the machine's own context store, which this machine's jobs run with | the worker installer |
 | `~/.local/share/txe-dagu/bin/dagu` | the binary this machine's worker and its jobs run | `txe/worker/install.sh` |
 
-The developer's sign-in and the machine's store are kept apart. On a machine with a worker, the machine's `txe` context reaches the hub over the local tunnel with the machine's credential, and `dagu txe login --hub` would refuse to replace it. A job a signed-in developer registers still runs its steps with the machine's own store. Registration checks that store first: the sign-in must be bound to the machine's owner, and both stores must reach the same registry (TXE-4706).
+The developer's sign-in and the machine's store are kept apart. On a machine with a worker, the machine's `txe` context reaches the hub with the machine's credential, over the local tunnel or, when the worker was installed with `--hub-url`, over the hub's worker channel at that address, and `dagu txe login --hub` would refuse to replace it. A job a signed-in developer registers still runs its steps with the machine's own store. Registration checks that store first: the sign-in must be bound to the machine's owner, and both stores must reach the same registry (TXE-4706).
 
 ## Recording this machine in the hub
 
@@ -79,13 +79,41 @@ On a new machine the order is:
 
 `dagu txe enrol` is the machine's, not the developer's. The wrapper leaves it on the machine's own store, the TXE home's `client`. The hub the enrolment records is therefore the one this machine's job steps reach. A step presents the machine credential only to that hub (TXE-4707), so an enrolment made through the developer's store would leave the steps refusing to run.
 
-Order on a machine with a worker:
+### Two routes to the hub
 
-1. **Hub:** `dagu txe machine create` has recorded the machine, and the hub's administrator lists the machine's worker client in `txe.authn.clients`.
-2. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub.
-3. **Upgrade the worker:** its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
+The worker installer (`txe/worker/install.sh` on macOS, `install-systemd.sh` on Linux; `txe/worker/README.md`) reaches the hub one of two ways. The route is chosen per machine, by the install; nothing in the CLI or the hub changes the default.
+
+| Route | What the machine needs | Who has to act |
+|---|---|---|
+| Port-forward, the route the deployed hubs use today: `install.sh --tag <tag>` with no `--hub-url` | `kubectl` and the tunnel credential (`txe/worker/tunnel-credential.sh`) | an administrator provides the tunnel credential, and lists this machine's worker client in the hub |
+| Worker channel over https, opt in: `install.sh --tag <tag> --hub-url https://<hub>` | no `kubectl`, no kubeconfig and no tunnel; this machine's credential, and a hub that serves the channel | the hub's operators turn the channel on (`coordinator.worker_channel.enabled`, off by default; `txe/worker/HTTPS-CHANNEL.md`), and an administrator lists this machine's worker client in the hub |
+
+Ask the hub's operators which route this hub supports before installing. A hub that does not serve the channel answers nothing at that address, and the port-forward stays the route until they say otherwise. Neither this page nor the hub's "Developer setup" page knows which it is.
+
+On either route the order on a machine with a worker is:
+
+1. **Hub:** `dagu txe machine create` has recorded the machine, and the hub's administrator lists the machine's worker client in `txe.authn.clients`. A machine that runs the reviewer has a reviewer client listed too.
+2. **Enrol:** `dagu txe enrol --client-id <this machine's worker client> --wait 15m`. A person of the owner signs in, then approves in the hub, naming the class, client, issuer and subject the command prints. For the reviewer: `dagu txe enrol --class reviewer --client-id <this machine's reviewer client> --wait 15m`. The command writes the credential into the TXE home (`worker-credential.json`, or the file given with `--credential-file`), readable by this user only.
+3. **Install the worker:** `txe/worker/install.sh --tag <the installed tag>`, with `--hub-url https://<hub>` for the channel. The installer checks the credential and stops rather than install without it. Its jobs' steps run `~/.local/share/txe-dagu/bin/dagu`.
 
 Until step 2 completes, the steps keep the context's API key, and say so.
+
+### Checking the credential and the route
+
+`dagu txe enrol check` loads the credential file exactly as the worker does and requires it to be this machine's. It signs in nowhere and contacts nothing. With `--hub-url https://<hub>` it also does what the worker does on the channel, once: it renews the credential at the identity provider and asks the hub's health check over the channel. The hub answers only an enrolled machine; no task is asked for and no token is printed. Run it before a worker is moved to the channel.
+
+| Line | Meaning, and what to do |
+|---|---|
+| `credential <path>: the worker can load it (machine mch_…, client … at …)` | ok |
+| `worker channel https://<hub>: the hub admits machine mch_… and answers SERVING; no task was asked for` | ok: the hub serves the channel and this machine is enrolled there |
+| `the hub at … refused this machine on its worker channel: it is not enrolled there, or not for this credential's client and issuer` | the hub serves the channel but does not admit this credential. Enrol again at this hub (step 2), and have the administrator confirm the client is listed; an enrolment is per hub |
+| `the worker channel at … did not answer: check the address, and that the hub serves the channel` | the address is wrong, or this hub does not serve the channel. Check that it is the hub's https address, and ask the operators. The port-forward route is unaffected |
+| `the identity provider refused this machine's credential, so nothing was asked of the hub` | the credential was revoked. Enrol again without `--resume` |
+| `the identity provider could not renew this machine's credential, so nothing was asked of the hub` | the provider could not be reached from this machine. Try again; nothing was changed |
+| `this machine's renewed credential could not be saved, so the file still holds a refresh token the provider may have retired; fix the cause and run the check again before the worker starts` | the credential's directory is not writable. Fix that and run the check again before the worker starts |
+| `<path> holds a reviewer credential; the worker loads only this machine's worker credential`, or `<path> is for machine …, but this machine is …` | the file is not this machine's worker credential. Enrol on this machine, for the worker |
+
+`dagu txe doctor` then reads the route the machine's `txe` context uses. Its `hub` line fails with "check this machine's route to the hub: the tunnel, or the worker channel's address" when the hub does not answer there, and `machine on hub` fails when the hub has no record of this machine (`dagu txe machine create`). `txe/worker/status.sh` shows the credential the worker agent passes and, on the channel, the hub address it uses.
 
 ## Skill links
 

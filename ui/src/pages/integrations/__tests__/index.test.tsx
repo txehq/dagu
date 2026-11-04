@@ -253,6 +253,38 @@ describe('DeveloperSetup', () => {
     ).toBeVisible();
   });
 
+  // The worker's route is the installer's: a port-forward, which needs the
+  // tunnel credential, or the opt-in worker channel, which needs none but a
+  // hub that serves it. The page tells them apart and claims neither for
+  // this hub (TXE-5804).
+  it("tells the worker's two routes apart and shows the enrol check", () => {
+    renderPage();
+
+    expect(
+      screen.getByText(/Without --hub-url it uses a port-forward/)
+    ).toBeVisible();
+    expect(
+      screen.getByText(/With --hub-url it uses this hub's worker channel/)
+    ).toBeVisible();
+    expect(
+      screen.getByText(/only where its operators have turned it on/)
+    ).toBeVisible();
+    expect(
+      screen.queryByText(/needs the hub's tunnel credential/)
+    ).not.toBeInTheDocument();
+    expect(codeBlocks()).toContain(
+      'dagu txe enrol --client-id <this machine’s worker client> --wait 15m'
+    );
+    expect(codeBlocks()).toContain('dagu txe enrol check');
+    expect(codeBlocks()).toContain(
+      `dagu txe enrol check --hub-url '${window.location.origin}'`
+    );
+    expect(
+      screen.getByText(/answers SERVING; no task was asked for/)
+    ).toBeVisible();
+    expect(screen.getByText(/"did not answer"/)).toBeVisible();
+  });
+
   // The browser cannot see the machine: it shows nothing as the machine's
   // state, and the one thing it reads is labelled as this browser's.
   it("names this browser's account only as the browser's", () => {
