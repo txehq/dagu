@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/cmdutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -131,12 +133,20 @@ func (e *commandExecutor) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		// Context cancelled (timeout or manual cancellation)
-		// Kill the process to ensure it doesn't hang
-		_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonTimeout})
-		// Wait for cmd.Wait() to return after killing
-		<-waitDone
-		e.exitCode = 124 // Standard timeout exit code
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// Timeout: kill the process to ensure it doesn't hang
+			_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonTimeout})
+			// Wait for cmd.Wait() to return after killing
+			<-waitDone
+			e.exitCode = 124 // Standard timeout exit code
+			return ctx.Err()
+		}
+		// Manual cancellation: let the process group clean up on SIGTERM for
+		// the DAG's max_clean_up_time, then kill it. The agent's own stop
+		// escalation keeps its earlier deadline: its forced stop ends the
+		// wait below as soon as the process is gone.
+		e.stopGracefullyThenForce(ctx, waitDone)
+		e.exitCode = 124
 		return ctx.Err()
 	case err := <-waitDone:
 		if err != nil {
@@ -176,6 +186,48 @@ func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
 	}
 	_, err := e.process.Stop(req)
 	return err
+}
+
+// stopGracefullyThenForce sends the process group SIGTERM and waits for the
+// root process to exit for the cancellation grace period, forcing termination
+// once the grace is over. It returns once cmd.Wait() has returned, and the
+// group is always force-stopped before it returns: the root's exit ends the
+// grace for whatever of its group outlived it, so a cancellation still ends
+// the whole group as it did before the graceful step. A zero or negative
+// grace forces at once.
+func (e *commandExecutor) stopGracefullyThenForce(ctx context.Context, waitDone <-chan error) {
+	force := cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonCancel}
+	grace := cancelGracePeriod(ctx)
+	if grace > 0 {
+		_ = e.stop(cmdutil.StopRequest{
+			Intent: cmdutil.GracefulTermination(syscall.SIGTERM),
+			Reason: cmdutil.StopReasonCancel,
+		})
+		timer := time.NewTimer(grace)
+		select {
+		case <-waitDone:
+			timer.Stop()
+			_ = e.stop(force)
+			return
+		case <-timer.C:
+		}
+	}
+	_ = e.stop(force)
+	<-waitDone
+}
+
+// cancelGracePeriod is how long a cancelled step's process group may clean up
+// on SIGTERM before it is killed: the DAG's max_clean_up_time, which the agent
+// also uses as the bound for its own stop escalation. A DAG loaded from a file
+// or rebuilt from its YAML carries the ir default (5 s) when the file sets
+// none or zero; a DAG built in code or parsed without those defaults may
+// carry zero, which forces at once.
+func cancelGracePeriod(ctx context.Context) time.Duration {
+	env := runtime.GetEnv(ctx)
+	if env.DAG == nil {
+		return 0
+	}
+	return env.DAG.MaxCleanUpTime
 }
 
 // resolveStdinPath expands a leading tilde and anchors a relative path to the
@@ -235,6 +287,8 @@ func (cfg *commandConfig) newCmd(ctx context.Context, scriptFile string) (*exec.
 	}
 
 	var cmd *exec.Cmd
+	// cmdCtx is the context the command is bound to; the cancel hook reads it.
+	cmdCtx := ctx
 	switch {
 	case cfg.Command != "" && scriptFile != "":
 		cmdBuilder := &shellCommandBuilder{
@@ -264,7 +318,8 @@ func (cfg *commandConfig) newCmd(ctx context.Context, scriptFile string) (*exec.
 			if err != nil {
 				return nil, err
 			}
-			cmd = exec.CommandContext(cfg.Ctx, shebangPath, append(shebangArgs, scriptFile)...) // nolint: gosec
+			cmdCtx = cfg.Ctx
+			cmd = exec.CommandContext(cmdCtx, shebangPath, append(shebangArgs, scriptFile)...) // nolint: gosec
 			cmdutil.SetupCommand(cmd)
 			break
 		}
@@ -315,7 +370,8 @@ func (cfg *commandConfig) newCmd(ctx context.Context, scriptFile string) (*exec.
 			args = append(tmp, args...)
 		}
 		command = resolveRuntimeToolCommand(ctx, command)
-		cmd = createDirectCommand(cfg.Ctx, command, args, scriptFile)
+		cmdCtx = cfg.Ctx
+		cmd = createDirectCommand(cmdCtx, command, args, scriptFile)
 	}
 
 	cmd.Env = append(cmd.Env, runtime.AllEnvs(ctx)...)
@@ -324,8 +380,27 @@ func (cfg *commandConfig) newCmd(ctx context.Context, scriptFile string) (*exec.
 	cmd.Stdout = cfg.Stdout
 	cmd.Stderr = cfg.Stderr
 	cmdutil.SetupCommand(cmd)
+	cmd.Cancel = cancelHook(cmdCtx, cmd)
 
 	return cmd, nil
+}
+
+// cancelHook replaces exec.CommandContext's default cancel hook, which kills
+// the group leader the moment its context is done. A timeout keeps that
+// behaviour. A manual cancellation leaves the process alone here so that
+// Run's graceful stop reaches a live process group: the hook is the first of
+// the two kill paths that used to end a cancelled step before its TERM
+// handlers could run (TXE-4262).
+func cancelHook(ctx context.Context, cmd *exec.Cmd) func() error {
+	return func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
 }
 
 func (cfg *commandConfig) detectShebang() (string, []string, error) {
