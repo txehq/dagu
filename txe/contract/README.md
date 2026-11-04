@@ -24,6 +24,18 @@ Read from v2.18.2-13 (9bb941da0a31). Re-read them before relying on a newer pin.
 - Remote CLI contexts need `builtin` auth and a `dagu_` API key. The community edition allows two
   keys. RBAC, OIDC and the audit log are licence-gated upstream; phase two adapts them (TXE-3415).
 
+## Status files written by upstream v2.25.2
+
+Upstream v2.25.2 (8ced76f9e596) stores a step output that is repeated under a node's
+`outputsValue` or `stepOutputsValue` once per status line and names the source field in
+`outputsValueFrom` or `stepOutputsValueFrom`. The fork's node reader restores those references
+(TXE-5795, `internal/ir/run_node.go`); its writer still puts every field inline and never writes a
+reference. So a fork build from that change on reads a status file an upstream writer left, and
+any older fork build reads what this fork writes. A fork build before it silently loses the
+referenced outputs, so no release before TXE-5795 is a rollback target once an upstream-format
+writer has run. The fixtures in `internal/ir/testdata/upstream_v2.25.2_stored_status.jsonl` were
+produced by that upstream version's own writer.
+
 ## Identities
 
 Every id is opaque and minted once: `<prefix>_<ULID>` (`txe/worker/mint-id.sh`). None is derived
