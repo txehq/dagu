@@ -91,6 +91,15 @@ function useJobAccessAnswer(
   return data;
 }
 
+// A read of several jobs' answers, numbered in the order the reads were
+// made: a later read's answers are newer than an earlier read's, whatever
+// order they arrive in or are served from the cache.
+type JobsAccessRead = {
+  readAt: number;
+  answers: Record<string, JobAccessAnswer | null>;
+};
+let jobsAccessReads = 0;
+
 // useJobsRunAllowed is useJobRunAllowed for every job DAG among `names` at
 // once: a map from a job's DAG name to whether the hub lets the caller run
 // it, with an entry only where the hub's binding answer exists. A name that
@@ -98,11 +107,11 @@ function useJobAccessAnswer(
 // not bind the caller have no entry, and a page offers its controls for them
 // as before. The hub is asked once per distinct job per read, however many
 // items name it, so a queue page's lookups stay bounded by the jobs it
-// shows (TXE-4754). A job's last answer is kept while the set of jobs
-// changes, as a page loads more items or an item leaves, and while a read
-// fails: an answer the hub gave is never replaced by no answer, so a
-// control the hub refused does not come back between reads. Display only;
-// the hub decides every action.
+// shows (TXE-4754). A job's answer is replaced only by a newer read's: it
+// is kept while the set of jobs changes, as a page loads more items or an
+// item leaves, while a read fails, and when a set the page showed before is
+// served again from the cache, so a control the hub refused does not come
+// back between reads. Display only; the hub decides every action.
 export function useJobsRunAllowed(
   names: readonly string[]
 ): ReadonlyMap<string, boolean> {
@@ -113,29 +122,38 @@ export function useJobsRunAllowed(
     [names]
   );
   const key = jobIds.join('\u0000');
-  const { data } = useSWR<Record<string, JobAccessAnswer | null>>(
+  const { data } = useSWR<JobsAccessRead>(
     binding && jobIds.length > 0 ? ['txe', 'jobs-access', key] : null,
     async () => {
+      const readAt = ++jobsAccessReads;
       const answers = await Promise.all(
         jobIds.map((jobId) => readJobAccess(client, jobId))
       );
-      return Object.fromEntries(
-        jobIds.map((jobId, i) => [jobId, answers[i] ?? null])
-      );
+      return {
+        readAt,
+        answers: Object.fromEntries(
+          jobIds.map((jobId, i) => [jobId, answers[i] ?? null])
+        ),
+      };
     },
     accessSWROptions
   );
-  // Each job's last answer, across reads. Kept in a ref so a read for a
-  // changed set of jobs, pending or failed, leaves the others' answers.
-  const known = React.useRef(new Map<string, boolean>());
+  // Each job's newest answer, with the read it came from. Kept in a ref so
+  // a read for a changed set of jobs, pending, failed or served stale from
+  // the cache, leaves every newer answer as it is.
+  const known = React.useRef(
+    new Map<string, { allowed: boolean; readAt: number }>()
+  );
   return React.useMemo(() => {
     if (data) {
-      for (const [jobId, answer] of Object.entries(data)) {
+      for (const [jobId, answer] of Object.entries(data.answers)) {
+        const held = known.current.get(jobId);
+        if (held && held.readAt > data.readAt) continue;
         if (answer) {
-          known.current.set(
-            jobId,
-            answer.permissions.includes(TxeAccessPermission.execute)
-          );
+          known.current.set(jobId, {
+            allowed: answer.permissions.includes(TxeAccessPermission.execute),
+            readAt: data.readAt,
+          });
         } else {
           known.current.delete(jobId);
         }
@@ -144,8 +162,8 @@ export function useJobsRunAllowed(
     const allowed = new Map<string, boolean>();
     if (!binding) return allowed;
     for (const jobId of jobIds) {
-      const answer = known.current.get(jobId);
-      if (answer !== undefined) allowed.set(jobId, answer);
+      const held = known.current.get(jobId);
+      if (held) allowed.set(jobId, held.allowed);
     }
     return allowed;
   }, [binding, data, jobIds]);

@@ -419,6 +419,39 @@ describe('useJobsRunAllowed', () => {
     expect(result.current.get(JOB_B)).toBe(false);
   });
 
+  // A set the page showed before is served from the cache at once when it
+  // comes back; an answer a later read gave is not replaced by it.
+  it('does not let a cached older set replace a newer refusal', async () => {
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    const viewOnly = { via: TxeJobAccessVia.share, permissions: [] };
+    answersByJob({ [JOB]: allowed, [JOB_B]: allowed });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() => expect(result.current.get(JOB)).toBe(true));
+
+    // The read for the larger set sees the first job's access revoked.
+    answersByJob({ [JOB]: viewOnly, [JOB_B]: allowed, [JOB_C]: allowed });
+    rerender({ names: [JOB, JOB_B, JOB_C] });
+    await waitFor(() => expect(result.current.get(JOB)).toBe(false));
+
+    // The third job leaves: the older set's cached answers are served again,
+    // and every read from now on fails.
+    GET.mockRejectedValue(new Error('hub away'));
+    rerender({ names: [JOB, JOB_B] });
+    expect(result.current.get(JOB)).toBe(false);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.get(JOB)).toBe(false);
+    expect(result.current.get(JOB_B)).toBe(true);
+  });
+
   it('asks nothing when no name is a job', () => {
     answersByJob({});
     const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {
