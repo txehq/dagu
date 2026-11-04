@@ -254,9 +254,11 @@ wait
 	requireProcessGone(t, bg)
 }
 
-// A second SIGTERM during the trap, which the agent's resend sends, leaves the
-// trap to finish once.
-func TestCommandExecutor_CancelDuplicateTermRunsTrapOnce(t *testing.T) {
+// A second SIGTERM during the trap, which the agent's own stop sends, does not
+// stop the trap from completing or the group from ending. How the shell
+// treats the second signal is its own: bash finishes the running handler,
+// dash re-enters it, so the handler may run once or twice.
+func TestCommandExecutor_CancelDuplicateTermStillEndsTheRun(t *testing.T) {
 	r := startCancelRun(t, 5*time.Second, `
 trap 'echo trapped >> "$MARKER"; sleep 0.3; exit 1' TERM
 sleep 30 &
@@ -275,9 +277,11 @@ wait
 	err := r.wait(t, 10*time.Second)
 
 	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 124, r.exitCode(t))
 	data, readErr := os.ReadFile(r.marker)
 	require.NoError(t, readErr)
-	assert.Equal(t, "trapped\n", string(data), "the trap ran exactly once")
+	assert.GreaterOrEqual(t, strings.Count(string(data), "trapped\n"), 1, "the trap ran")
+	assert.LessOrEqual(t, strings.Count(string(data), "trapped\n"), 2, "the trap ran at most once per SIGTERM")
 	requireProcessGone(t, bg)
 }
 
