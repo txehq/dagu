@@ -188,11 +188,15 @@ func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
 	return err
 }
 
-// stopGracefullyThenForce sends the process group SIGTERM and waits for it to
-// exit for the cancellation grace period, forcing termination once the grace
-// is over. It returns once cmd.Wait() has returned. A zero or negative grace
-// forces at once.
+// stopGracefullyThenForce sends the process group SIGTERM and waits for the
+// root process to exit for the cancellation grace period, forcing termination
+// once the grace is over. It returns once cmd.Wait() has returned, and the
+// group is always force-stopped before it returns: the root's exit ends the
+// grace for whatever of its group outlived it, so a cancellation still ends
+// the whole group as it did before the graceful step. A zero or negative
+// grace forces at once.
 func (e *commandExecutor) stopGracefullyThenForce(ctx context.Context, waitDone <-chan error) {
+	force := cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonCancel}
 	grace := cancelGracePeriod(ctx)
 	if grace > 0 {
 		_ = e.stop(cmdutil.StopRequest{
@@ -203,11 +207,12 @@ func (e *commandExecutor) stopGracefullyThenForce(ctx context.Context, waitDone 
 		select {
 		case <-waitDone:
 			timer.Stop()
+			_ = e.stop(force)
 			return
 		case <-timer.C:
 		}
 	}
-	_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonCancel})
+	_ = e.stop(force)
 	<-waitDone
 }
 

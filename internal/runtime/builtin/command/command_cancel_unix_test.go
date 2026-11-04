@@ -231,6 +231,29 @@ func TestCommandExecutor_CancelGraceDoesNotExtendAnExternalForcedStop(t *testing
 	requireProcessGone(t, bg)
 }
 
+// A child that ignores SIGTERM and holds no output pipe outlives the trap's
+// exit; the group is still swept once the root is gone, as a cancellation
+// killed the whole group before the graceful step.
+func TestCommandExecutor_CancelSweepsGroupAfterRootExits(t *testing.T) {
+	r := startCancelRun(t, 5*time.Second, `
+trap 'exit 1' TERM
+(trap '' TERM; exec sleep 30 >/dev/null 2>&1) &
+echo $! > "$PIDFILE"
+touch "$READY"
+wait
+`)
+	bg := r.backgroundPID(t)
+
+	cancelledAt := time.Now()
+	r.cancel()
+	err := r.wait(t, 10*time.Second)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 124, r.exitCode(t))
+	assert.Less(t, r.finished.Sub(cancelledAt), 3*time.Second, "the root's exit ends the run")
+	requireProcessGone(t, bg)
+}
+
 // A second SIGTERM during the trap, which the agent's resend sends, leaves the
 // trap to finish once.
 func TestCommandExecutor_CancelDuplicateTermRunsTrapOnce(t *testing.T) {
