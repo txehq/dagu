@@ -37,6 +37,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/service/scheduler"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
+	"github.com/goccy/go-yaml"
 )
 
 const defaultHistoryLimit = 30
@@ -372,6 +373,13 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 			// A schedule that does not parse is refused like any other invalid
 			// definition: nothing was written, and the errors are the answer
 			// (TXE-5404; before, the file loader's raw error made it a 500).
+			errs = []string{err.Error()}
+		} else if _, ok := errors.AsType[*yaml.SyntaxError](err); ok {
+			// YAML that does not parse is an error in what the author wrote,
+			// refused the same way: nothing was written (TXE-5421; before,
+			// the parser's raw error made it a 500). Only the parser's typed
+			// syntax error is classified; I/O, locate and base-config
+			// failures keep their path.
 			errs = []string{err.Error()}
 		} else {
 			return nil, err

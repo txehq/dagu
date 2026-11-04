@@ -2288,3 +2288,71 @@ func TestDAGSpecUpdateWithInvalidScheduleKeepsTheSavedSpec(t *testing.T) {
 		})
 	}
 }
+
+func TestDAGSpecUpdateWithYAMLSyntaxErrorKeepsTheSavedSpec(t *testing.T) {
+	server := test.SetupServer(t)
+
+	// YAML that does not parse is refused by PUT /dags/{name}/spec the way the
+	// endpoint refuses any other invalid definition: 200 with the parser's
+	// error and nothing written. Before TXE-5421 the loader's raw syntax
+	// error made it a 500 internal_error.
+	const steps = "steps:\n  - id: a\n    run: echo hi\n"
+	for _, tc := range []struct{ name, spec, want string }{
+		{
+			"unterminated_flow_sequence", "steps: [\n",
+			"[1:8] sequence end token ']' not found\n>  1 | steps: [\n              ^\n",
+		},
+		{
+			"unterminated_quote", "name: \"abc\n" + steps,
+			"[1:7] could not find end character of double-quoted text\n>  1 | name: \"abc\n   2 | steps:\n   3 |   - id: a\n   4 |     run: echo hi\n             ^\n",
+		},
+		{
+			"tab_indent", "steps:\n\t- id: a\n\t  run: echo hi\n",
+			"[2:1] found character '\t' that cannot start any token\n   1 | steps:\n>  2 | \t- id:\n       ^\n   3 |  a\n   4 | \t  run: echo hi",
+		},
+		{
+			"duplicate_key", "name: x\nname: y\n" + steps,
+			"[2:1] mapping key \"name\" already defined at [1:1]\n   1 | name: x\n>  2 | name: y\n       ^\n   3 | steps:\n   4 |   - id: a\n   5 |     run: echo hi",
+		},
+		{
+			"unclosed_flow_mapping", "steps: {a: [}\n",
+			"[1:13] could not find '{' character corresponding to '}'\n>  1 | steps: {a: [}\n                   ^\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "bad_yaml_" + tc.name
+			saved := "schedule: \"0 1 * * *\"\n" + steps
+			server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+				Name: name, Spec: &saved,
+			}).ExpectStatus(http.StatusCreated).Send(t)
+
+			response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: tc.spec,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			var update api.UpdateDAGSpec200JSONResponse
+			response.Unmarshal(t, &update)
+			require.Equal(t, []string{tc.want}, update.Errors)
+
+			// Nothing was written: the stored spec is byte-identical and the
+			// DAG still reads.
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			var kept api.GetDAGSpec200JSONResponse
+			response.Unmarshal(t, &kept)
+			require.Equal(t, saved, kept.Spec)
+			server.Client().Get("/api/v1/dags/" + name).ExpectStatus(http.StatusOK).Send(t)
+
+			// A valid update of the same DAG is saved, with no errors.
+			next := "schedule: \"0 2 * * *\"\n" + steps
+			response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+				Spec: next,
+			}).ExpectStatus(http.StatusOK).Send(t)
+			update = api.UpdateDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &update)
+			require.Empty(t, update.Errors)
+			response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+			kept = api.GetDAGSpec200JSONResponse{}
+			response.Unmarshal(t, &kept)
+			require.Equal(t, next, kept.Spec)
+		})
+	}
+}
