@@ -23,6 +23,7 @@ import {
 const JOB = 'job_01M4XEETKWKZX504BK65ADBVYB';
 const mode = vi.hoisted(() => ({ current: 'enforce' as string | undefined }));
 const principal = vi.hoisted(() => ({ current: 'platform_admin' }));
+const subject = vi.hoisted(() => ({ current: 'alice' }));
 const GET = vi.fn();
 
 vi.mock('@/hooks/api', () => ({
@@ -33,7 +34,10 @@ vi.mock('../identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../identity')>()),
   useTxeIdentity: () => ({
     identity: mode.current
-      ? { authz_mode: mode.current, principal: { class: principal.current } }
+      ? {
+          authz_mode: mode.current,
+          principal: { class: principal.current, subject: subject.current },
+        }
       : undefined,
   }),
 }));
@@ -56,6 +60,7 @@ beforeEach(() => {
   GET.mockReset();
   mode.current = TxeIdentityAuthz_mode.enforce;
   principal.current = TxeIdentityPrincipalClass.platform_admin;
+  subject.current = 'alice';
 });
 
 describe('useJobRunAllowed', () => {
@@ -545,6 +550,38 @@ describe('useJobsRunAllowed', () => {
     });
     expect(third.result.current.get(JOB)).toBe(false);
     expect(third.result.current.get(JOB_B)).toBe(true);
+  });
+
+  // The memory is the signed-in principal's: another sign-in on the same
+  // cache starts with no answers, and gets its own from the hub.
+  it("does not hand one principal's answers to the next sign-in", async () => {
+    const shared = new Map();
+    const sharedWrapper = ({ children }: { children: React.ReactNode }) => (
+      <SWRConfig value={{ provider: () => shared, dedupingInterval: 0 }}>
+        {children}
+      </SWRConfig>
+    );
+    answersByJob({ [JOB]: { via: TxeJobAccessVia.share, permissions: [] } });
+    const alice = renderHook(() => useJobsRunAllowed([JOB]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(alice.result.current.get(JOB)).toBe(false));
+    alice.unmount();
+
+    // Bob signs in: before the hub answers him he has no answer, hers
+    // included; then he has his own.
+    subject.current = 'bob';
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+    });
+    const bob = renderHook(() => useJobsRunAllowed([JOB]), {
+      wrapper: sharedWrapper,
+    });
+    expect(bob.result.current.has(JOB)).toBe(false);
+    await waitFor(() => expect(bob.result.current.get(JOB)).toBe(true));
   });
 
   it('asks nothing when no name is a job', () => {

@@ -124,18 +124,31 @@ async function readJobsAccess(
 }
 
 // Each job's newest answer, with the read it came from, kept beside the SWR
-// cache the reads went through: it lives as long as that cache does, across
-// the pages that mount and unmount, so a refusal is not forgotten when a
-// later read for the job failed and the cache holds only the jobs that
-// answered. A test's own cache keeps its own.
+// cache the reads went through and for the signed-in principal the hub
+// answered: it lives as long as that cache does, across the pages that
+// mount and unmount, so a refusal is not forgotten when a later read for the
+// job failed and the cache holds only the jobs that answered. Another
+// principal signing in on the same cache starts with none of them: an
+// answer is the hub's to one caller. A test's own cache keeps its own.
 type KnownAnswer = { allowed: boolean; readAt: number };
-const knownByCache = new WeakMap<object, Map<string, KnownAnswer>>();
+const knownByCache = new WeakMap<
+  object,
+  Map<string, Map<string, KnownAnswer>>
+>();
 
-function knownAnswers(cache: object): Map<string, KnownAnswer> {
-  let known = knownByCache.get(cache);
+function knownAnswers(
+  cache: object,
+  principal: string
+): Map<string, KnownAnswer> {
+  let byPrincipal = knownByCache.get(cache);
+  if (!byPrincipal) {
+    byPrincipal = new Map();
+    knownByCache.set(cache, byPrincipal);
+  }
+  let known = byPrincipal.get(principal);
   if (!known) {
     known = new Map();
-    knownByCache.set(cache, known);
+    byPrincipal.set(principal, known);
   }
   return known;
 }
@@ -157,6 +170,15 @@ export function useJobsRunAllowed(
   names: readonly string[]
 ): ReadonlyMap<string, boolean> {
   const binding = useAccessBinding();
+  const { identity } = useTxeIdentity();
+  const principal = [
+    identity?.principal?.class,
+    identity?.principal?.issuer,
+    identity?.principal?.subject,
+    identity?.principal?.username,
+  ]
+    .map((part) => part ?? '')
+    .join('\u0000');
   const client = useClient();
   const { cache } = useSWRConfig();
   const jobIds = React.useMemo(
@@ -164,13 +186,17 @@ export function useJobsRunAllowed(
     [names]
   );
   const key = jobIds.join('\u0000');
+  // The read is the principal's as well: another sign-in on the same page
+  // is not served a previous principal's answers from the cache.
   const { data } = useSWR<JobsAccessRead>(
-    binding && jobIds.length > 0 ? ['txe', 'jobs-access', key] : null,
+    binding && jobIds.length > 0
+      ? ['txe', 'jobs-access', principal, key]
+      : null,
     () => readJobsAccess(client, jobIds),
     accessSWROptions
   );
   return React.useMemo(() => {
-    const known = knownAnswers(cache);
+    const known = knownAnswers(cache, principal);
     if (data) {
       for (const [jobId, answer] of Object.entries(data.answers)) {
         const held = known.get(jobId);
@@ -192,7 +218,7 @@ export function useJobsRunAllowed(
       if (held) allowed.set(jobId, held.allowed);
     }
     return allowed;
-  }, [binding, cache, data, jobIds]);
+  }, [binding, cache, data, jobIds, principal]);
 }
 
 // useJobRunAllowed is whether the hub lets the caller run, stop and retry the
