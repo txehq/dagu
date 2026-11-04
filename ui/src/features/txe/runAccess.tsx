@@ -93,12 +93,35 @@ function useJobAccessAnswer(
 
 // A read of several jobs' answers, numbered in the order the reads were
 // made: a later read's answers are newer than an earlier read's, whatever
-// order they arrive in or are served from the cache.
+// order they arrive in or are served from the cache. A job whose own read
+// failed is absent: the others' answers are published, and it keeps its
+// previous answer. A read in which every job failed throws instead, so SWR
+// keeps the last read and tries again.
 type JobsAccessRead = {
   readAt: number;
   answers: Record<string, JobAccessAnswer | null>;
 };
 let jobsAccessReads = 0;
+
+async function readJobsAccess(
+  client: ReturnType<typeof useClient>,
+  jobIds: readonly string[]
+): Promise<JobsAccessRead> {
+  const readAt = ++jobsAccessReads;
+  const settled = await Promise.allSettled(
+    jobIds.map((jobId) => readJobAccess(client, jobId))
+  );
+  const answers: Record<string, JobAccessAnswer | null> = {};
+  settled.forEach((result, i) => {
+    if (result.status === 'fulfilled') {
+      answers[jobIds[i] as string] = result.value;
+    }
+  });
+  if (Object.keys(answers).length === 0) {
+    throw new Error('job access could not be read');
+  }
+  return { readAt, answers };
+}
 
 // useJobsRunAllowed is useJobRunAllowed for every job DAG among `names` at
 // once: a map from a job's DAG name to whether the hub lets the caller run
@@ -124,18 +147,7 @@ export function useJobsRunAllowed(
   const key = jobIds.join('\u0000');
   const { data } = useSWR<JobsAccessRead>(
     binding && jobIds.length > 0 ? ['txe', 'jobs-access', key] : null,
-    async () => {
-      const readAt = ++jobsAccessReads;
-      const answers = await Promise.all(
-        jobIds.map((jobId) => readJobAccess(client, jobId))
-      );
-      return {
-        readAt,
-        answers: Object.fromEntries(
-          jobIds.map((jobId, i) => [jobId, answers[i] ?? null])
-        ),
-      };
-    },
+    () => readJobsAccess(client, jobIds),
     accessSWROptions
   );
   // Each job's newest answer, with the read it came from. Kept in a ref so

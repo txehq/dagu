@@ -452,6 +452,46 @@ describe('useJobsRunAllowed', () => {
     expect(result.current.get(JOB_B)).toBe(true);
   });
 
+  // One job's read failing does not hold back the others' answers: a new
+  // refusal reaches the controls, and the failed job keeps its last answer.
+  it("publishes the other jobs' answers when one job's read fails", async () => {
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    answersByJob({ [JOB]: allowed, [JOB_B]: allowed });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() =>
+      expect([result.current.get(JOB), result.current.get(JOB_B)]).toEqual([
+        true,
+        true,
+      ])
+    );
+
+    // The next read: the first job is now view-only, the second fails.
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        if (init.params.path.jobId === JOB_B) throw new Error('hub away');
+        return {
+          data: {
+            job_id: JOB,
+            access: { via: TxeJobAccessVia.share, permissions: [] },
+          },
+        };
+      }
+    );
+    rerender({ names: [JOB_B, JOB, JOB_B] });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    rerender({ names: [JOB, JOB_B, 'nightly'] });
+    await waitFor(() => expect(result.current.get(JOB)).toBe(false));
+    expect(result.current.get(JOB_B)).toBe(true);
+  });
+
   it('asks nothing when no name is a job', () => {
     answersByJob({});
     const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {
