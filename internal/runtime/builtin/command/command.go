@@ -21,6 +21,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/signal"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/dagucloud/dagu/v2/internal/executor/registry"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -43,6 +44,14 @@ type commandExecutor struct {
 	exitCode   int
 	// stderrTail stores a rolling tail of recent stderr lines
 	stderrTail *executor.TailWriter
+	// gracefulSent holds the graceful stop signals that reached the process
+	// group during this execution (a send that failed is not recorded, so it
+	// is tried again). cancelGrace is true while Run's cancellation path waits
+	// out its grace; only then is a repeat of a signal already sent suppressed,
+	// so the agent's own stop and the executor's do not both land on the group.
+	// Both are reset when a process starts and guarded by mu.
+	gracefulSent map[os.Signal]bool
+	cancelGrace  bool
 }
 
 // ExitCode implements ExitCoder.
@@ -115,6 +124,8 @@ func (e *commandExecutor) Run(ctx context.Context) error {
 		return err
 	}
 	e.process = process
+	e.gracefulSent = nil
+	e.cancelGrace = false
 	if guard := resourcelimit.FromContext(ctx); guard != nil {
 		if err := guard.AssignProcess(process.PID()); err != nil {
 			logger.Warn(ctx, "Resource limits requested but process assignment failed", tag.Error(err))
@@ -177,6 +188,12 @@ func (e *commandExecutor) Stop(intent cmdutil.TerminationIntent) error {
 	return e.stop(cmdutil.StopRequest{Intent: intent})
 }
 
+// stop delivers a stop request to the process group. A forceful request
+// always goes through at once. A graceful request goes through unless the
+// cancellation path is inside its grace and the same signal has already
+// reached the group in this execution: Dagu then delivers at most one graceful
+// signal of a kind per cancellation, whichever path sends it first. A graceful
+// request with a different signal always goes through.
 func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -184,8 +201,37 @@ func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
 	if e.process == nil {
 		return nil
 	}
+	if req.Intent.IsForce() {
+		_, err := e.process.Stop(req)
+		return err
+	}
+	sig := gracefulSignal(req.Intent)
+	if e.cancelGrace && e.gracefulSent[sig] {
+		return nil
+	}
 	_, err := e.process.Stop(req)
+	if err == nil {
+		if e.gracefulSent == nil {
+			e.gracefulSent = make(map[os.Signal]bool)
+		}
+		e.gracefulSent[sig] = true
+	}
 	return err
+}
+
+// gracefulSignal is the signal a graceful intent delivers; the platform
+// adapter sends SIGTERM when none is set.
+func gracefulSignal(intent cmdutil.TerminationIntent) os.Signal {
+	if intent.Signal == nil {
+		return syscall.SIGTERM
+	}
+	return intent.Signal
+}
+
+func (e *commandExecutor) setCancelGrace(active bool) {
+	e.mu.Lock()
+	e.cancelGrace = active
+	e.mu.Unlock()
 }
 
 // stopGracefullyThenForce sends the process group SIGTERM and waits for the
@@ -198,11 +244,11 @@ func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
 func (e *commandExecutor) stopGracefullyThenForce(ctx context.Context, waitDone <-chan error) {
 	force := cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonCancel}
 	grace := cancelGracePeriod(ctx)
-	if grace > 0 {
-		_ = e.stop(cmdutil.StopRequest{
-			Intent: cmdutil.GracefulTermination(syscall.SIGTERM),
-			Reason: cmdutil.StopReasonCancel,
-		})
+	intent := cancelStopIntent(ctx)
+	if grace > 0 && !intent.IsForce() {
+		e.setCancelGrace(true)
+		defer e.setCancelGrace(false)
+		_ = e.stop(cmdutil.StopRequest{Intent: intent, Reason: cmdutil.StopReasonCancel})
 		timer := time.NewTimer(grace)
 		select {
 		case <-waitDone:
@@ -214,6 +260,18 @@ func (e *commandExecutor) stopGracefullyThenForce(ctx context.Context, waitDone 
 	}
 	_ = e.stop(force)
 	<-waitDone
+}
+
+// cancelStopIntent is the graceful stop a cancelled step receives: SIGTERM,
+// or the step's signal_on_stop when it sets one, exactly as the agent's own
+// stop request resolves it (Node.stopIntentToSend). A force-class signal there
+// makes the cancellation force at once.
+func cancelStopIntent(ctx context.Context) cmdutil.TerminationIntent {
+	intent := cmdutil.GracefulTermination(syscall.SIGTERM)
+	if name := runtime.GetEnv(ctx).Step.SignalOnStop; name != "" {
+		intent = intent.WithSignal(syscall.Signal(signal.GetSignalNum(name)))
+	}
+	return intent
 }
 
 // cancelGracePeriod is how long a cancelled step's process group may clean up
