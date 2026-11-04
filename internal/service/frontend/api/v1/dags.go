@@ -26,6 +26,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
+	"github.com/dagucloud/dagu/v2/internal/cmn/yamlutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -38,6 +39,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/parser"
 )
 
 const defaultHistoryLimit = 30
@@ -377,10 +379,16 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 		} else if _, ok := errors.AsType[*yaml.SyntaxError](err); ok {
 			// YAML that does not parse is an error in what the author wrote,
 			// refused the same way: nothing was written (TXE-5421; before,
-			// the parser's raw error made it a 500). Only the parser's typed
-			// syntax error is classified; I/O, locate and base-config
-			// failures keep their path.
-			errs = []string{err.Error()}
+			// the parser's raw error made it a 500). The loader reads the
+			// server's base config before the document and a syntax error
+			// there has the same type, so only an error the submitted text
+			// reproduces on its own is answered; any other keeps its path,
+			// and no server file reaches the client.
+			syntaxErr := submittedSpecSyntaxError(request.Body.Spec)
+			if syntaxErr == nil {
+				return nil, err
+			}
+			errs = []string{syntaxErr.Error()}
 		} else {
 			return nil, err
 		}
@@ -392,6 +400,17 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 	return api.UpdateDAGSpec200JSONResponse{
 		Errors: errs,
 	}, nil
+}
+
+// submittedSpecSyntaxError returns the parser's syntax error for the
+// submitted spec alone, parsed as the loader parses a document, or nil when
+// it parses.
+func submittedSpecSyntaxError(spec string) *yaml.SyntaxError {
+	_, err := parser.ParseBytes(yamlutil.ClearEmptyDocumentSeparators([]byte(spec)), 0)
+	if syntaxErr, ok := errors.AsType[*yaml.SyntaxError](err); ok {
+		return syntaxErr
+	}
+	return nil
 }
 
 func (a *API) RenameDAG(ctx context.Context, request api.RenameDAGRequestObject) (api.RenameDAGResponseObject, error) {

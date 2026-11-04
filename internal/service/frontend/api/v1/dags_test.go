@@ -2356,3 +2356,41 @@ func TestDAGSpecUpdateWithYAMLSyntaxErrorKeepsTheSavedSpec(t *testing.T) {
 		})
 	}
 }
+
+func TestDAGSpecUpdateWithBrokenBaseConfigIsNotAnsweredAsValidation(t *testing.T) {
+	server := test.SetupServer(t)
+
+	// The update's loader reads the server's base config before the
+	// document, and a syntax error there is the parser's same type. It is a
+	// server problem, not the author's: the endpoint keeps answering it as
+	// an internal error and no text of that file reaches the client, whether
+	// or not the submitted spec parses.
+	const steps = "steps:\n  - id: a\n    run: echo hi\n"
+	name := "broken_base"
+	saved := "schedule: \"0 1 * * *\"\n" + steps
+	server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+		Name: name, Spec: &saved,
+	}).ExpectStatus(http.StatusCreated).Send(t)
+	require.NoError(t, os.WriteFile(server.Config.Paths.BaseConfig,
+		[]byte("env:\n  BASE_ONLY_VALUE: not-for-clients\nsteps: [\n"), 0o600))
+
+	response := server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+		Spec: "schedule: \"0 2 * * *\"\n" + steps,
+	}).ExpectStatus(http.StatusInternalServerError).Send(t)
+	require.NotContains(t, string(response.Response.Body()), "not-for-clients")
+	require.NotContains(t, string(response.Response.Body()), "base config")
+
+	// A spec that does not parse is still answered with its own error only.
+	response = server.Client().Put("/api/v1/dags/"+name+"/spec", api.UpdateDAGSpecJSONRequestBody{
+		Spec: "steps: [\n",
+	}).ExpectStatus(http.StatusOK).Send(t)
+	var update api.UpdateDAGSpec200JSONResponse
+	response.Unmarshal(t, &update)
+	require.Equal(t, []string{"[1:8] sequence end token ']' not found\n>  1 | steps: [\n              ^\n"}, update.Errors)
+	require.NotContains(t, string(response.Response.Body()), "not-for-clients")
+
+	response = server.Client().Get("/api/v1/dags/" + name + "/spec").ExpectStatus(http.StatusOK).Send(t)
+	var kept api.GetDAGSpec200JSONResponse
+	response.Unmarshal(t, &kept)
+	require.Equal(t, saved, kept.Spec)
+}
