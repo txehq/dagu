@@ -495,6 +495,58 @@ describe('useJobsRunAllowed', () => {
     expect(result.current.get(JOB_C)).toBe(true);
   });
 
+  // The page is left and opened again while a job's reads keep failing: the
+  // cache now holds only the jobs that answered, and the job's refusal is
+  // kept beside that cache rather than in the page that is gone.
+  it("keeps a job's refusal across remounts while its reads fail", async () => {
+    const shared = new Map();
+    const sharedWrapper = ({ children }: { children: React.ReactNode }) => (
+      <SWRConfig value={{ provider: () => shared, dedupingInterval: 0 }}>
+        {children}
+      </SWRConfig>
+    );
+    const allowed = {
+      via: TxeJobAccessVia.owner,
+      permissions: [TxeAccessPermission.execute],
+    };
+    answersByJob({
+      [JOB]: { via: TxeJobAccessVia.share, permissions: [] },
+      [JOB_B]: allowed,
+    });
+    const first = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(first.result.current.get(JOB)).toBe(false));
+    first.unmount();
+
+    // From now on the refused job's reads fail and the other's succeed.
+    GET.mockImplementation(
+      async (_path: string, init: { params: { path: { jobId: string } } }) => {
+        if (init.params.path.jobId === JOB) throw new Error('hub away');
+        return { data: { job_id: JOB_B, access: allowed } };
+      }
+    );
+    const second = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() =>
+      expect(GET).toHaveBeenCalledWith('/txe/jobs/{jobId}', {
+        params: { path: { jobId: JOB_B } },
+      })
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(second.result.current.get(JOB)).toBe(false);
+    second.unmount();
+
+    const third = renderHook(() => useJobsRunAllowed([JOB, JOB_B]), {
+      wrapper: sharedWrapper,
+    });
+    expect(third.result.current.get(JOB)).toBe(false);
+    expect(third.result.current.get(JOB_B)).toBe(true);
+  });
+
   it('asks nothing when no name is a job', () => {
     answersByJob({});
     const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import React from 'react';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 
 import {
   TxeAccessPermission,
@@ -123,6 +123,23 @@ async function readJobsAccess(
   return { readAt, answers };
 }
 
+// Each job's newest answer, with the read it came from, kept beside the SWR
+// cache the reads went through: it lives as long as that cache does, across
+// the pages that mount and unmount, so a refusal is not forgotten when a
+// later read for the job failed and the cache holds only the jobs that
+// answered. A test's own cache keeps its own.
+type KnownAnswer = { allowed: boolean; readAt: number };
+const knownByCache = new WeakMap<object, Map<string, KnownAnswer>>();
+
+function knownAnswers(cache: object): Map<string, KnownAnswer> {
+  let known = knownByCache.get(cache);
+  if (!known) {
+    known = new Map();
+    knownByCache.set(cache, known);
+  }
+  return known;
+}
+
 // useJobsRunAllowed is useJobRunAllowed for every job DAG among `names` at
 // once: a map from a job's DAG name to whether the hub lets the caller run
 // it, with an entry only where the hub's binding answer exists. A name that
@@ -132,14 +149,16 @@ async function readJobsAccess(
 // items name it, so a queue page's lookups stay bounded by the jobs it
 // shows (TXE-4754). A job's answer is replaced only by a newer read's: it
 // is kept while the set of jobs changes, as a page loads more items or an
-// item leaves, while a read fails, and when a set the page showed before is
-// served again from the cache, so a control the hub refused does not come
-// back between reads. Display only; the hub decides every action.
+// item leaves, while a read fails, when a set the page showed before is
+// served again from the cache, and across the page's remounts, so a
+// control the hub refused does not come back between reads. Display only;
+// the hub decides every action.
 export function useJobsRunAllowed(
   names: readonly string[]
 ): ReadonlyMap<string, boolean> {
   const binding = useAccessBinding();
   const client = useClient();
+  const { cache } = useSWRConfig();
   const jobIds = React.useMemo(
     () => [...new Set(names.filter((name) => JOB_DAG_NAME.test(name)))].sort(),
     [names]
@@ -150,35 +169,30 @@ export function useJobsRunAllowed(
     () => readJobsAccess(client, jobIds),
     accessSWROptions
   );
-  // Each job's newest answer, with the read it came from. Kept in a ref so
-  // a read for a changed set of jobs, pending, failed or served stale from
-  // the cache, leaves every newer answer as it is.
-  const known = React.useRef(
-    new Map<string, { allowed: boolean; readAt: number }>()
-  );
   return React.useMemo(() => {
+    const known = knownAnswers(cache);
     if (data) {
       for (const [jobId, answer] of Object.entries(data.answers)) {
-        const held = known.current.get(jobId);
+        const held = known.get(jobId);
         if (held && held.readAt > data.readAt) continue;
         if (answer) {
-          known.current.set(jobId, {
+          known.set(jobId, {
             allowed: answer.permissions.includes(TxeAccessPermission.execute),
             readAt: data.readAt,
           });
         } else {
-          known.current.delete(jobId);
+          known.delete(jobId);
         }
       }
     }
     const allowed = new Map<string, boolean>();
     if (!binding) return allowed;
     for (const jobId of jobIds) {
-      const held = known.current.get(jobId);
+      const held = known.get(jobId);
       if (held) allowed.set(jobId, held.allowed);
     }
     return allowed;
-  }, [binding, data, jobIds]);
+  }, [binding, cache, data, jobIds]);
 }
 
 // useJobRunAllowed is whether the hub lets the caller run, stop and retry the
