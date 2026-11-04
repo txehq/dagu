@@ -103,7 +103,7 @@ Accepted root fields:
 | `timeout_sec` | No | Workflow timeout in seconds. |
 | `delay_sec` | No | Workflow start delay in seconds. |
 | `max_active_steps` | No | Maximum concurrently running steps. |
-| `max_clean_up_time_sec` | No | Cleanup timeout in seconds. |
+| `max_clean_up_time_sec` | No | Cleanup timeout in seconds: a stopped or cancelled step receives its stop signal (its `signal_on_stop`, by default SIGTERM) once and has this long to finish before its process group is killed. |
 | `max_output_size` | No | Maximum captured output size. |
 | `container` | No | Default Docker container settings. |
 | `ssh` | No | Default SSH settings. |

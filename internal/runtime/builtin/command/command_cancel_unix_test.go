@@ -8,7 +8,9 @@ package command
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -401,4 +403,218 @@ func TestCancelGracePeriod(t *testing.T) {
 	t.Run("no DAG in context", func(t *testing.T) {
 		assert.Equal(t, time.Duration(0), cancelGracePeriod(context.Background()))
 	})
+}
+
+// cleanupTraceScript records each run of its TERM handler and exits from it;
+// the handler's sleep is a child command, which a second TERM would kill.
+const cleanupTraceScript = `
+trap 'echo start >> "$MARKER"; sleep 0.3; echo end >> "$MARKER"; exit 1' TERM
+sleep 30 &
+echo $! > "$PIDFILE"
+touch "$READY"
+wait
+`
+
+// cleanupShells are the shells a step may run under: sh as the user names it
+// (bash on macOS, dash on Debian-family Linux), bash with the errexit a step
+// without an explicit shell gets, and dash where it is installed.
+func cleanupShells(t *testing.T) []ir.Step {
+	t.Helper()
+	shells := []ir.Step{
+		{Shell: "sh"},
+		{Shell: "bash", ShellArgs: []string{"-e"}},
+	}
+	if _, err := exec.LookPath("dash"); err == nil {
+		shells = append(shells, ir.Step{Shell: "dash"})
+	} else {
+		t.Log("dash not installed, its case is skipped")
+	}
+	return shells
+}
+
+func shellName(s ir.Step) string {
+	return strings.Join(append([]string{s.Shell}, s.ShellArgs...), " ")
+}
+
+// startCancelRunWith is startCancelRun with the step's shell and stop signal
+// taken from the given step.
+func startCancelRunWith(t *testing.T, grace time.Duration, script string, shell ir.Step) *cancelRun {
+	t.Helper()
+	dir := t.TempDir()
+	r := &cancelRun{
+		dir:     dir,
+		ready:   filepath.Join(dir, "ready"),
+		marker:  filepath.Join(dir, "marker"),
+		pidFile: filepath.Join(dir, "pid"),
+		done:    make(chan error, 1),
+	}
+	step := ir.Step{
+		Name:         "cancel-test",
+		Script:       script,
+		Shell:        shell.Shell,
+		ShellArgs:    shell.ShellArgs,
+		SignalOnStop: shell.SignalOnStop,
+		Dir:          dir,
+	}
+	dag := &ir.DAG{
+		Name:           "cancel-test",
+		MaxCleanUpTime: grace,
+		Env: []string{
+			"READY=" + r.ready,
+			"MARKER=" + r.marker,
+			"PIDFILE=" + r.pidFile,
+		},
+	}
+	base := setupTestContext(t, dag, step)
+	env := runtime.GetEnv(base)
+	env.WorkingDir = dir
+	base = runtime.WithEnv(base, env)
+	ctx, cancel := context.WithCancel(base)
+	r.cancel = cancel
+	t.Cleanup(cancel)
+
+	ex, err := NewCommand(ctx, step)
+	require.NoError(t, err)
+	var stdout, stderr bytes.Buffer
+	ex.SetStdout(&stdout)
+	ex.SetStderr(&stderr)
+	r.exec = ex
+	go func() {
+		err := ex.Run(ctx)
+		r.finished = time.Now()
+		r.done <- err
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(r.ready)
+		return err == nil
+	}, 10*time.Second, 20*time.Millisecond, "script should report ready")
+	return r
+}
+
+func (r *cancelRun) markerCounts(t *testing.T) (starts, ends int) {
+	t.Helper()
+	data, err := os.ReadFile(r.marker)
+	require.NoError(t, err, "the trap should have run")
+	return strings.Count(string(data), "start\n"), strings.Count(string(data), "end\n")
+}
+
+func (r *cancelRun) stopper(t *testing.T) executor.Stopper {
+	t.Helper()
+	s, ok := r.exec.(executor.Stopper)
+	require.True(t, ok)
+	return s
+}
+
+// The agent's own stop and the executor's cancellation both ask for SIGTERM.
+// Whichever is first reaches the group; the other is not sent, so the trap
+// runs once and completes under every shell, including bash -e, whose
+// handler a second TERM would cut short at its child command.
+func TestCommandExecutor_CancelAndAgentStopDeliverOneTerm(t *testing.T) {
+	for _, shell := range cleanupShells(t) {
+		t.Run(shellName(shell)+"/cancel first", func(t *testing.T) {
+			r := startCancelRunWith(t, 5*time.Second, cleanupTraceScript, shell)
+			bg := r.backgroundPID(t)
+			r.cancel()
+			require.Eventually(t, func() bool {
+				_, err := os.Stat(r.marker)
+				return err == nil
+			}, 5*time.Second, 5*time.Millisecond, "the trap should start")
+			require.NoError(t, r.stopper(t).Stop(cmdutil.GracefulTermination(syscall.SIGTERM)))
+			err := r.wait(t, 10*time.Second)
+
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, 124, r.exitCode(t))
+			starts, ends := r.markerCounts(t)
+			assert.Equal(t, 1, starts, "the handler ran once")
+			assert.Equal(t, 1, ends, "the handler completed")
+			requireProcessGone(t, bg)
+		})
+		t.Run(shellName(shell)+"/agent stop first", func(t *testing.T) {
+			r := startCancelRunWith(t, 5*time.Second, cleanupTraceScript, shell)
+			bg := r.backgroundPID(t)
+			require.NoError(t, r.stopper(t).Stop(cmdutil.GracefulTermination(syscall.SIGTERM)))
+			require.Eventually(t, func() bool {
+				_, err := os.Stat(r.marker)
+				return err == nil
+			}, 5*time.Second, 5*time.Millisecond, "the trap should start")
+			r.cancel()
+			err := r.wait(t, 10*time.Second)
+
+			require.ErrorIs(t, err, context.Canceled)
+			starts, ends := r.markerCounts(t)
+			assert.Equal(t, 1, starts, "the handler ran once")
+			assert.Equal(t, 1, ends, "the handler completed")
+			requireProcessGone(t, bg)
+		})
+	}
+}
+
+// A step with signal_on_stop receives that signal on cancellation, as it does
+// from the agent; a repeat of it is not sent, a different signal is.
+func TestCommandExecutor_CancelHonoursSignalOnStopAndPassesDistinctSignals(t *testing.T) {
+	r := startCancelRunWith(t, 10*time.Second, `
+trap 'echo int >> "$MARKER"' INT
+trap 'echo term >> "$MARKER"; exit 1' TERM
+sleep 30 &
+echo $! > "$PIDFILE"
+touch "$READY"
+while kill -0 "$!" 2>/dev/null; do wait; done
+`, ir.Step{Shell: "sh", SignalOnStop: "SIGINT"})
+	bg := r.backgroundPID(t)
+
+	r.cancel()
+	require.Eventually(t, func() bool {
+		data, _ := os.ReadFile(r.marker)
+		return strings.Contains(string(data), "int\n")
+	}, 5*time.Second, 5*time.Millisecond, "the INT trap should run on cancellation")
+	time.Sleep(100 * time.Millisecond)
+
+	// The agent's request for the same step resolves to SIGINT too: not sent again.
+	agentIntent := cmdutil.TerminationFromSignal(syscall.SIGTERM).WithSignal(syscall.SIGINT)
+	require.NoError(t, r.stopper(t).Stop(agentIntent))
+	time.Sleep(200 * time.Millisecond)
+	data, _ := os.ReadFile(r.marker)
+	assert.Equal(t, 1, strings.Count(string(data), "int\n"), "a repeat of the signal already delivered is not sent")
+	assert.NotContains(t, string(data), "term\n", "no SIGTERM was sent for a step whose stop signal is SIGINT")
+
+	// A different signal is a distinct request and goes through.
+	require.NoError(t, r.stopper(t).Stop(cmdutil.GracefulTermination(syscall.SIGTERM)))
+	err := r.wait(t, 10*time.Second)
+	require.ErrorIs(t, err, context.Canceled)
+	data, _ = os.ReadFile(r.marker)
+	assert.Equal(t, 1, strings.Count(string(data), "term\n"), "the distinct signal reached the group")
+	assert.Equal(t, 1, strings.Count(string(data), "int\n"))
+	requireProcessGone(t, bg)
+}
+
+// A step whose signal_on_stop is a force-class signal is forced at once on
+// cancellation, as it is by the agent.
+func TestCommandExecutor_CancelWithForceSignalOnStopForcesAtOnce(t *testing.T) {
+	r := startCancelRunWith(t, 10*time.Second, trapScript, ir.Step{Shell: "sh", SignalOnStop: "SIGKILL"})
+	bg := r.backgroundPID(t)
+	cancelledAt := time.Now()
+	r.cancel()
+	err := r.wait(t, 10*time.Second)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 124, r.exitCode(t))
+	assert.Less(t, r.finished.Sub(cancelledAt), 2*time.Second)
+	assert.NoFileExists(t, r.marker, "no graceful signal is sent")
+	requireProcessGone(t, bg)
+}
+
+// A send that fails is not recorded as delivered: once the group is gone,
+// every graceful stop is attempted and reports the failure.
+func TestCommandExecutor_StopAfterExitReportsFailureEachTime(t *testing.T) {
+	r := startCancelRun(t, 5*time.Second, trapScript)
+	bg := r.backgroundPID(t)
+	r.cancel()
+	require.ErrorIs(t, r.wait(t, 10*time.Second), context.Canceled)
+	requireProcessGone(t, bg)
+
+	first := r.stopper(t).Stop(cmdutil.GracefulTermination(syscall.SIGTERM))
+	second := r.stopper(t).Stop(cmdutil.GracefulTermination(syscall.SIGTERM))
+	require.Error(t, first, "the group is gone")
+	require.Error(t, second, "a failed send is not remembered as a delivery")
+	assert.True(t, errors.Is(first, syscall.ESRCH) || errors.Is(first, syscall.EPERM), "got %v", first)
 }
