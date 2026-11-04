@@ -378,6 +378,47 @@ describe('useJobsRunAllowed', () => {
     }
   );
 
+  // Loading more items brings a new job into the set, and the read for the
+  // new set may be pending or fail: the answers already given stay, so a
+  // control the hub refused does not come back between reads.
+  it("keeps each job's last answer while the set of jobs changes", async () => {
+    const JOB_C = 'job_01M4XEETKWKZX504BK65ADBVYD';
+    answersByJob({
+      [JOB]: {
+        via: TxeJobAccessVia.owner,
+        permissions: [TxeAccessPermission.execute],
+      },
+      [JOB_B]: {
+        via: TxeJobAccessVia.share,
+        permissions: [TxeAccessPermission.view],
+      },
+    });
+    const { result, rerender } = renderHook(
+      ({ names }: { names: string[] }) => useJobsRunAllowed(names),
+      { wrapper, initialProps: { names: [JOB, JOB_B] } }
+    );
+    await waitFor(() => expect(result.current.size).toBe(2));
+
+    // The read for the larger set fails.
+    GET.mockRejectedValue(new Error('hub away'));
+    rerender({ names: [JOB, JOB_B, JOB_C] });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.get(JOB_B)).toBe(false);
+    expect(result.current.has(JOB_C)).toBe(false);
+
+    // An item of the refused job leaving the set drops it; the rest stay.
+    rerender({ names: [JOB] });
+    expect(result.current.get(JOB)).toBe(true);
+    expect(result.current.has(JOB_B)).toBe(false);
+
+    // Back in the set, before any read answers again, it is still refused.
+    rerender({ names: [JOB, JOB_B] });
+    expect(result.current.get(JOB_B)).toBe(false);
+  });
+
   it('asks nothing when no name is a job', () => {
     answersByJob({});
     const { result } = renderHook(() => useJobsRunAllowed(['nightly', 'etl']), {

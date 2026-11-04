@@ -98,7 +98,11 @@ function useJobAccessAnswer(
 // not bind the caller have no entry, and a page offers its controls for them
 // as before. The hub is asked once per distinct job per read, however many
 // items name it, so a queue page's lookups stay bounded by the jobs it
-// shows (TXE-4754). Display only; the hub decides every action.
+// shows (TXE-4754). A job's last answer is kept while the set of jobs
+// changes, as a page loads more items or an item leaves, and while a read
+// fails: an answer the hub gave is never replaced by no answer, so a
+// control the hub refused does not come back between reads. Display only;
+// the hub decides every action.
 export function useJobsRunAllowed(
   names: readonly string[]
 ): ReadonlyMap<string, boolean> {
@@ -121,19 +125,30 @@ export function useJobsRunAllowed(
     },
     accessSWROptions
   );
+  // Each job's last answer, across reads. Kept in a ref so a read for a
+  // changed set of jobs, pending or failed, leaves the others' answers.
+  const known = React.useRef(new Map<string, boolean>());
   return React.useMemo(() => {
-    const allowed = new Map<string, boolean>();
-    if (!binding || !data) return allowed;
-    for (const [jobId, answer] of Object.entries(data)) {
-      if (answer) {
-        allowed.set(
-          jobId,
-          answer.permissions.includes(TxeAccessPermission.execute)
-        );
+    if (data) {
+      for (const [jobId, answer] of Object.entries(data)) {
+        if (answer) {
+          known.current.set(
+            jobId,
+            answer.permissions.includes(TxeAccessPermission.execute)
+          );
+        } else {
+          known.current.delete(jobId);
+        }
       }
     }
+    const allowed = new Map<string, boolean>();
+    if (!binding) return allowed;
+    for (const jobId of jobIds) {
+      const answer = known.current.get(jobId);
+      if (answer !== undefined) allowed.set(jobId, answer);
+    }
     return allowed;
-  }, [binding, data]);
+  }, [binding, data, jobIds]);
 }
 
 // useJobRunAllowed is whether the hub lets the caller run, stop and retry the
