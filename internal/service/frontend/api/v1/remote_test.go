@@ -5,10 +5,12 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/remotenode"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -141,6 +144,85 @@ func TestRemoteSyncAuthorization(t *testing.T) {
 	}
 }
 
+func TestRemoteLicenseAuthorization(t *testing.T) {
+	viewer := &auth.User{Role: auth.RoleViewer, WorkspaceAccess: auth.AllWorkspaceAccess()}
+	admin := &auth.User{Role: auth.RoleAdmin, WorkspaceAccess: auth.AllWorkspaceAccess()}
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		user       *auth.User
+		wantCall   bool
+		wantStatus int
+	}{
+		{name: "viewer reads status", method: http.MethodGet, path: "/api/v1/license/status", user: viewer, wantCall: true},
+		{name: "viewer cannot deactivate", method: http.MethodPost, path: "/api/v1/license/deactivate", user: viewer},
+		{name: "viewer cannot start a connection", method: http.MethodPost, path: "/api/v1/license/connect", user: viewer},
+		{name: "viewer cannot read a connection", method: http.MethodGet, path: "/api/v1/license/connect", user: viewer},
+		{name: "admin can start a connection", method: http.MethodPost, path: "/api/v1/license/connect", user: admin, wantCall: true},
+		// The proxy forwards paths in clean form, so these would otherwise reach
+		// the remote node's license endpoints without the local check.
+		{name: "doubled slash", method: http.MethodPost, path: "/api/v1//license/deactivate", user: viewer, wantStatus: http.StatusBadRequest},
+		{name: "dot segment", method: http.MethodPost, path: "/api/v1/x/../license/deactivate", user: viewer, wantStatus: http.StatusBadRequest},
+		{name: "encoded slash", method: http.MethodPost, path: "/api/v1/%2Flicense/deactivate", user: viewer, wantStatus: http.StatusBadRequest},
+		{name: "doubled slash to sync", method: http.MethodPost, path: "/api/v1//sync/push", user: viewer, wantStatus: http.StatusBadRequest},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var remoteCalled atomic.Bool
+			remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				remoteCalled.Store(true)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			t.Cleanup(remoteServer.Close)
+
+			a := &API{
+				config: &config.Config{Server: config.Server{
+					APIBasePath: "/api/v1",
+					Auth:        config.Auth{Mode: config.AuthModeBuiltin},
+				}},
+				authService: remoteSyncAuthService{user: test.user},
+				remoteNodeResolver: remotenode.NewResolver([]config.RemoteNode{{
+					Name:       "edge",
+					APIBaseURL: remoteServer.URL + "/api/v1",
+				}}, nil),
+			}
+			router := chi.NewRouter()
+			require.NoError(t, a.ConfigureRoutes(t.Context(), router, time.Second))
+
+			request := httptest.NewRequest(test.method, test.path+"?remoteNode=edge", nil)
+			request.Header.Set("Authorization", "Bearer caller-token")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+
+			assert.Equal(t, test.wantCall, remoteCalled.Load())
+			if !test.wantCall {
+				want := test.wantStatus
+				if want == 0 {
+					want = http.StatusForbidden
+				}
+				assert.Equal(t, want, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestIsCleanPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/api/v1/license/status":  true,
+		"/api/v1/dags/":           true,
+		"/":                       true,
+		"/api/v1//license/status": false,
+		"/api/v1/./license":       false,
+		"/api/v1/x/../license":    false,
+		"/api/v1/dags//":          false,
+	} {
+		assert.Equal(t, want, isCleanPath(p), p)
+	}
+}
+
 func TestRemoteNodeProxyPreservesHumanTaskCompletionRequest(t *testing.T) {
 	const rawBody = "{\n  \"count\": 9007199254740993\n}\n"
 	type receivedRequest struct {
@@ -258,16 +340,25 @@ func TestLegacyWikiProxyPath(t *testing.T) {
 	}
 }
 
-func TestRemoteStepLogDownloadStreams(t *testing.T) {
-	for _, suffix := range []string{"/steps/log/download", "/sub-dag-runs/child/steps/log/download"} {
-		t.Run(suffix, func(t *testing.T) {
-			first := bytes.Repeat([]byte("archive bytes"), 4096)
+func TestRemoteLogDownloadStreams(t *testing.T) {
+	for _, test := range []struct {
+		suffix      string
+		contentType string
+	}{
+		{suffix: "/steps/log/download", contentType: stepLogArchiveContentType},
+		{suffix: "/sub-dag-runs/child/steps/log/download", contentType: stepLogArchiveContentType},
+		{suffix: "/log/download", contentType: "text/plain"},
+		{suffix: "/steps/build/log/download", contentType: "text/plain"},
+		{suffix: "/sub-dag-runs/child/log/download", contentType: "text/plain"},
+		{suffix: "/sub-dag-runs/child/steps/build/log/download", contentType: "text/plain"},
+	} {
+		t.Run(test.suffix, func(t *testing.T) {
+			first := bytes.Repeat([]byte("log bytes"), 4096)
 			release := make(chan struct{})
 			remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, "/api/v1/dag-runs/example/run"+suffix, r.URL.Path)
-				assert.Equal(t, "identity", r.Header.Get("Accept-Encoding"))
-				w.Header().Set("Content-Type", stepLogArchiveContentType)
-				w.Header().Set("Content-Disposition", `attachment; filename="remote.zip"`)
+				assert.Equal(t, "/api/v1/dag-runs/example/run"+test.suffix, r.URL.Path)
+				w.Header().Set("Content-Type", test.contentType)
+				w.Header().Set("Content-Disposition", `attachment; filename="remote.log"`)
 				_, _ = w.Write(first)
 				_ = http.NewResponseController(w).Flush()
 				select {
@@ -286,11 +377,11 @@ func TestRemoteStepLogDownloadStreams(t *testing.T) {
 			defer proxy.Close()
 			client := proxy.Client()
 			client.Timeout = 5 * time.Second
-			resp, err := client.Get(proxy.URL + "/dagu/api/v1/dag-runs/example/run" + suffix + "?remoteNode=edge")
+			resp, err := client.Get(proxy.URL + "/dagu/api/v1/dag-runs/example/run" + test.suffix + "?remoteNode=edge")
 			require.NoError(t, err)
 			defer func() { _ = resp.Body.Close() }()
-			require.Equal(t, stepLogArchiveContentType, resp.Header.Get("Content-Type"))
-			require.Equal(t, `attachment; filename="remote.zip"`, resp.Header.Get("Content-Disposition"))
+			require.Equal(t, test.contentType, resp.Header.Get("Content-Type"))
+			require.Equal(t, `attachment; filename="remote.log"`, resp.Header.Get("Content-Disposition"))
 			got := make([]byte, 4096)
 			_, err = io.ReadFull(resp.Body, got)
 			require.NoError(t, err)
@@ -305,19 +396,130 @@ func TestRemoteStepLogDownloadStreams(t *testing.T) {
 	}
 }
 
-func TestRemoteStepLogDownloadAbort(t *testing.T) {
+func TestRemoteLogDownloadAbort(t *testing.T) {
+	for _, suffix := range []string{"/steps/log/download", "/steps/build/log/download"} {
+		t.Run(suffix, func(t *testing.T) {
+			remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", "100")
+				_, _ = w.Write([]byte("partial"))
+			}))
+			defer remote.Close()
+			resolver := remotenode.NewResolver([]config.RemoteNode{{Name: "edge", APIBaseURL: remote.URL + "/api/v1"}}, nil)
+			handler := WithRemoteNode(resolver, "/api/v1")(http.NotFoundHandler())
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run"+suffix+"?remoteNode=edge", nil)
+			recorder := httptest.NewRecorder()
+			require.PanicsWithValue(t, http.ErrAbortHandler, func() { handler.ServeHTTP(recorder, request) })
+			require.Equal(t, "partial", recorder.Body.String())
+		})
+	}
+}
+
+// Log download bodies are forwarded unchanged, so the remote may only pick an
+// encoding the client accepts.
+func TestRemoteLogDownloadEncoding(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		accept     string
+		wantAccept string
+	}{
+		{name: "gzip", accept: "gzip", wantAccept: "gzip"},
+		{name: "none", wantAccept: "identity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			remote := httptest.NewServer(middleware.Compress(5)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, test.wantAccept, r.Header.Get("Accept-Encoding"))
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("log body"))
+			})))
+			defer remote.Close()
+			resolver := remotenode.NewResolver([]config.RemoteNode{{Name: "edge", APIBaseURL: remote.URL + "/api/v1"}}, nil)
+			handler := WithRemoteNode(resolver, "/api/v1")(http.NotFoundHandler())
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run/log/download?remoteNode=edge", nil)
+			if test.accept != "" {
+				request.Header.Set("Accept-Encoding", test.accept)
+			}
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			body := io.Reader(recorder.Body)
+			if test.accept == "gzip" {
+				require.Equal(t, "gzip", recorder.Header().Get("Content-Encoding"))
+				require.Contains(t, recorder.Header().Values("Vary"), "Accept-Encoding")
+				reader, err := gzip.NewReader(body)
+				require.NoError(t, err)
+				body = reader
+			} else {
+				require.Empty(t, recorder.Header().Get("Content-Encoding"))
+			}
+			got, err := io.ReadAll(body)
+			require.NoError(t, err)
+			require.Equal(t, "log body", string(got))
+		})
+	}
+}
+
+// Writers that cannot flush still receive the whole log download.
+func TestRemoteLogDownloadWithoutFlush(t *testing.T) {
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", stepLogArchiveContentType)
-		w.Header().Set("Content-Length", "100")
-		_, _ = w.Write([]byte("partial"))
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("log body"))
 	}))
 	defer remote.Close()
 	resolver := remotenode.NewResolver([]config.RemoteNode{{Name: "edge", APIBaseURL: remote.URL + "/api/v1"}}, nil)
 	handler := WithRemoteNode(resolver, "/api/v1")(http.NotFoundHandler())
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run/steps/log/download?remoteNode=edge", nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run/log/download?remoteNode=edge", nil)
 	recorder := httptest.NewRecorder()
-	require.PanicsWithValue(t, http.ErrAbortHandler, func() { handler.ServeHTTP(recorder, request) })
-	require.Equal(t, "partial", recorder.Body.String())
+	handler.ServeHTTP(struct{ http.ResponseWriter }{recorder}, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, "log body", recorder.Body.String())
+}
+
+// A remote that stops sending mid-download fails the transfer instead of
+// holding the client connection open.
+func TestRemoteLogDownloadIdleTimeout(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("partial"))
+		_ = http.NewResponseController(w).Flush()
+		<-r.Context().Done()
+	}))
+	defer remote.Close()
+	proxy := remoteNodeProxy{
+		remoteNode:     &remotenode.RemoteNode{APIBaseURL: remote.URL + "/api/v1"},
+		apiBasePath:    "/api/v1",
+		logIdleTimeout: 50 * time.Millisecond,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run/log/download?remoteNode=edge", nil)
+	resp, err := proxy.proxy(request)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Equal(t, "partial", string(body))
+}
+
+func TestIsLogDownload(t *testing.T) {
+	for _, suffix := range []string{
+		"/log/download",
+		"/steps/build/log/download",
+		"/steps/log/download",
+		"/sub-dag-runs/child/log/download",
+		"/sub-dag-runs/child/steps/build/log/download",
+		"/sub-dag-runs/child/steps/log/download",
+		"/steps/loop/foreach/0/steps/build/log/download",
+		"/sub-dag-runs/child/steps/loop/foreach/0/steps/build/log/download",
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/dag-runs/example/run"+suffix, nil)
+		assert.True(t, isLogDownload(request, "/api/v1"), suffix)
+	}
+	for _, path := range []string{
+		"/api/v1/dag-runs/example/run/log",
+		"/api/v1/dag-runs/example/run/steps/build/log",
+		"/api/v1/dags/example/log/download",
+	} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		assert.False(t, isLogDownload(request, "/api/v1"), path)
+	}
 }
 
 func TestRemoteStepLogForm(t *testing.T) {

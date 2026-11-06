@@ -103,9 +103,11 @@ describe('StartDAGModal', () => {
     expect(
       within(runSettings).getByRole('checkbox', { name: 'Enqueue' })
     ).toBeInTheDocument();
+    // The word shows once in the settings, as the checkbox label.
+    expect(within(runSettings).getAllByText('Enqueue')).toHaveLength(1);
     expect(
       within(runSettings).getByRole('textbox', {
-        name: 'DAG-Run ID (optional)',
+        name: 'Run ID (optional)',
       })
     ).toBeInTheDocument();
     expect(
@@ -114,6 +116,44 @@ describe('StartDAGModal', () => {
 
     const parameters = screen.getByRole('region', { name: 'Parameters' });
     expect(within(parameters).getByLabelText(/region/i)).toBeInTheDocument();
+  });
+
+  it('leaves out parameters for a workflow without any', () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={
+          {
+            name: 'example-dag',
+            runConfig: { disableParamEdit: true },
+          } as never
+        }
+      />
+    );
+
+    expect(
+      screen.queryByRole('region', { name: 'Parameters' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText('Parameter editing is disabled.')
+    ).not.toBeInTheDocument();
+  });
+
+  // The dialog has no empty band between the run settings and the buttons.
+  it('has no body band for a workflow without parameters', () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={{ name: 'example-dag' } as never}
+      />
+    );
+
+    expect(screen.queryByTestId('start-dag-body')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Enqueue' })).toBeInTheDocument();
   });
 
   it('toggles between compact and fullscreen layouts', async () => {
@@ -159,7 +199,7 @@ describe('StartDAGModal', () => {
       />
     );
 
-    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Backend unavailable');
@@ -220,13 +260,13 @@ describe('StartDAGModal', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Update schema form' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith(
         '{"region":"us-west-2","count":5}',
         undefined,
-        true
+        false
       )
     );
   });
@@ -292,6 +332,94 @@ describe('StartDAGModal', () => {
     expect(screen.getByLabelText(/region/i)).toBeInTheDocument();
   });
 
+  it('labels a typed field by its title and keeps its name visible', () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={
+          {
+            name: 'typed-dag',
+            paramDefs: [
+              {
+                name: 'region',
+                title: 'AWS region',
+                description: 'Region the instances are launched in.',
+                type: 'string',
+                required: true,
+              },
+            ],
+          } as never
+        }
+      />
+    );
+
+    // The name joins the accessible name, so params sharing a title differ.
+    const input = screen.getByRole('textbox', { name: 'AWS region * region' });
+    // The description is read before the value is entered.
+    const description = screen.getByText(
+      'Region the instances are launched in.'
+    );
+    expect(
+      description.compareDocumentPosition(input) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    expect(input).toHaveAccessibleDescription(
+      'Region the instances are launched in.'
+    );
+  });
+
+  it('marks a typed field invalid and describes its error', async () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={
+          {
+            name: 'typed-dag',
+            paramDefs: [{ name: 'region', type: 'string', required: true }],
+          } as never
+        }
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enqueue' }));
+
+    const input = screen.getByRole('textbox', { name: 'region *' });
+    await waitFor(() => expect(input).toHaveAttribute('aria-invalid', 'true'));
+    expect(input).toHaveAccessibleDescription('Required');
+  });
+
+  it('labels a typed boolean switch', () => {
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={vi.fn()}
+        dag={
+          {
+            name: 'typed-dag',
+            paramDefs: [
+              {
+                name: 'dry_run',
+                title: 'Dry run',
+                type: 'boolean',
+                default: false,
+                required: false,
+              },
+            ],
+          } as never
+        }
+      />
+    );
+
+    expect(
+      screen.getByRole('switch', { name: 'Dry run dry_run' })
+    ).toBeInTheDocument();
+  });
+
   it('submits typed param fields as a JSON array payload', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
 
@@ -326,13 +454,13 @@ describe('StartDAGModal', () => {
     fireEvent.change(screen.getByLabelText(/count/i), {
       target: { value: '5' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith(
         '[{"region":"us-west-2"},{"count":"5"}]',
         undefined,
-        true
+        false
       )
     );
   });
@@ -397,10 +525,37 @@ describe('StartDAGModal', () => {
 
     await user.click(screen.getByRole('combobox', { name: /profile/i }));
     await user.click(await screen.findByRole('option', { name: 'prod' }));
-    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('', undefined, true, 'prod')
+      expect(onSubmit).toHaveBeenCalledWith('', undefined, false, 'prod')
+    );
+  });
+
+  // A run waits in the queue unless the user unchecks Enqueue.
+  it('enqueues by default, and starts at once without Enqueue', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <StartDAGModal
+        visible={true}
+        dismissModal={vi.fn()}
+        onSubmit={onSubmit}
+        dag={{ name: 'queue-dag' } as never}
+      />
+    );
+
+    expect(screen.getByRole('checkbox', { name: 'Enqueue' })).toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenLastCalledWith('', undefined, false)
+    );
+
+    await user.click(screen.getByRole('checkbox', { name: 'Enqueue' }));
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenLastCalledWith('', undefined, true)
     );
   });
 
@@ -422,10 +577,10 @@ describe('StartDAGModal', () => {
       screen.getByRole('combobox', { name: /profile/i })
     ).toHaveTextContent(/dag default/i);
 
-    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('', undefined, true)
+      expect(onSubmit).toHaveBeenCalledWith('', undefined, false)
     );
   });
 
@@ -445,10 +600,10 @@ describe('StartDAGModal', () => {
 
     await user.click(screen.getByRole('combobox', { name: /profile/i }));
     await user.click(await screen.findByRole('option', { name: 'No profile' }));
-    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
-      expect(onSubmit).toHaveBeenCalledWith('', undefined, true, '')
+      expect(onSubmit).toHaveBeenCalledWith('', undefined, false, '')
     );
   });
 
@@ -490,10 +645,11 @@ describe('StartDAGModal', () => {
       expect(
         screen.queryByRole('combobox', { name: /profile/i })
       ).not.toBeInTheDocument();
-      await user.click(screen.getByRole('button', { name: 'Start' }));
+      // A run waits in the queue by default; no profile is named either way.
+      await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
       await waitFor(() =>
-        expect(onSubmit).toHaveBeenCalledWith('', undefined, true)
+        expect(onSubmit).toHaveBeenCalledWith('', undefined, false)
       );
     }
   );
@@ -516,13 +672,13 @@ describe('StartDAGModal', () => {
         name: /disable reuse for this run/i,
       })
     );
-    await user.click(screen.getByRole('button', { name: 'Start' }));
+    await user.click(screen.getByRole('button', { name: 'Enqueue' }));
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith(
         '',
         undefined,
-        true,
+        false,
         undefined,
         true
       )

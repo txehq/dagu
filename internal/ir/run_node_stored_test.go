@@ -154,7 +154,7 @@ func TestUpstreamStoredLinesKeepOtherNodeFields(t *testing.T) {
 
 // A fork build reads every stored line of a run, so a line of a run that
 // began under the fork and continued under the upstream writer reads too.
-func TestStatusLinesWrittenBeforeStoringOutputsOnceStillRead(t *testing.T) {
+func TestForkInlineStatusLinesStillRead(t *testing.T) {
 	t.Parallel()
 
 	line := `{"name":"review","dagRunId":"run-1","nodes":[{"step":{"name":"fetch"},"status":4,` +

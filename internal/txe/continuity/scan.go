@@ -784,12 +784,27 @@ func lockShape(p, name string) (bool, error) {
 		return true, nil
 	}
 	for _, e := range entries {
-		// The lock's owner token (dirlock lockOwnerFileName).
-		if e.Name() != "owner" || !e.Type().IsRegular() {
+		if !lockOwnerFileName(e.Name()) || !e.Type().IsRegular() {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// lockOwnerFileName reports whether name is a directory lock's owner file:
+// "owner" from releases before upstream v2.25, and from v2.25 on "owner."
+// or, while a releaser removes the instance, "claimed." with a per-instance
+// suffix (internal/cmn/dirlock ownerFilePrefix, claimedFilePrefix).
+func lockOwnerFileName(name string) bool {
+	if name == "owner" {
+		return true
+	}
+	for _, prefix := range []string{"owner.", "claimed."} {
+		if suffix, ok := strings.CutPrefix(name, prefix); ok && suffix != "" && !strings.ContainsAny(suffix, `/\`) {
+			return true
+		}
+	}
+	return false
 }
 
 func fileDigest(p string) (int64, string, error) {

@@ -18,7 +18,11 @@ type Props = {
   ) => void;
 };
 
-function WikiPageBacklinksPanel({ wikiPagePath, workspace, onSelectWikiPage }: Props) {
+function WikiPageBacklinksPanel({
+  wikiPagePath,
+  workspace,
+  onSelectWikiPage,
+}: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const appBarContext = useContext(AppBarContext);
   const remoteNode = appBarContext.selectedRemoteNode || 'local';
@@ -47,7 +51,7 @@ function WikiPageBacklinksPanel({ wikiPagePath, workspace, onSelectWikiPage }: P
         type="button"
         onClick={() => setCollapsed((c) => !c)}
         aria-expanded={!collapsed}
-        className="w-full flex items-center gap-1 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        className="w-full flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
       >
         {collapsed ? (
           <ChevronRight className="h-3 w-3" />
@@ -55,7 +59,7 @@ function WikiPageBacklinksPanel({ wikiPagePath, workspace, onSelectWikiPage }: P
           <ChevronDown className="h-3 w-3" />
         )}
         <Link2 className="h-3 w-3" />
-        <I18nText text={"Backlinks"} />
+        <I18nText text={'Backlinks'} />
         <span className="ml-auto text-[10px] font-normal normal-case">
           {items.length}
         </span>

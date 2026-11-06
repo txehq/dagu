@@ -37,14 +37,20 @@ export function StepReviewModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const inputFields = step.approval?.input || [];
   const requiredFields = step.approval?.required || [];
+  // The server refuses an approval without its required inputs, so Approve
+  // shows the fields when some are required.
+  const showInputs = !onApprove || requiredFields.length > 0;
+  const inputFields = [
+    ...(step.approval?.input || []),
+    ...requiredFields.filter(
+      (field) => !(step.approval?.input || []).includes(field)
+    ),
+  ];
 
-  const isValid =
-    onApprove ||
-    requiredFields.every(
-      (field) => inputs[field] && inputs[field].trim() !== ''
-    );
+  const isValid = requiredFields.every(
+    (field) => inputs[field] && inputs[field].trim() !== ''
+  );
 
   useEffect(() => {
     if (visible) {
@@ -109,13 +115,15 @@ export function StepReviewModal({
 
         <div className="py-2 space-y-3" onKeyDown={handleKeyDown}>
           {onPushBack && pushBackHistory && pushBackHistory.length > 0 && (
-            <I18nProps><PushBackHistory
-              history={pushBackHistory}
-              title="Previous Push-backs"
-            /></I18nProps>
+            <I18nProps>
+              <PushBackHistory
+                history={pushBackHistory}
+                title="Previous Push-backs"
+              />
+            </I18nProps>
           )}
 
-          {inputFields.length > 0 && !onApprove && (
+          {inputFields.length > 0 && showInputs && (
             <div className="space-y-3">
               {inputFields.map((field) => {
                 const isRequired = requiredFields.includes(field);
@@ -163,7 +171,7 @@ export function StepReviewModal({
             disabled={loading}
           >
             <X className="h-4 w-4" />
-            <I18nText text={"Cancel"} />
+            <I18nText text={'Cancel'} />
           </Button>
           <Button
             size="sm"

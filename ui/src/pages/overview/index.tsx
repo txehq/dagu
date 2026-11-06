@@ -5,9 +5,11 @@ import { Tab, Tabs } from '@/components/ui/tabs';
 import { useCanWrite, useCanWriteForWorkspace } from '@/contexts/AuthContext';
 import { ViewEditorDialog } from '@/features/views/ViewEditorDialog';
 import { ViewPanel } from '@/features/views/ViewPanel';
+import { PeekHost } from '@/features/peek/PeekHost';
 import { View, useViews } from '@/hooks/useViews';
-import { Clock3, Gauge, LayoutGrid, Pencil, Plus } from 'lucide-react';
+import { Activity, Gauge, LayoutGrid, Pencil, Plus } from 'lucide-react';
 import React from 'react';
+import { useScrollFade } from '@/hooks/useScrollFade';
 import Dashboard from '..';
 import CockpitPage from '../cockpit';
 import { I18nProps } from '@/i18n/I18nProps';
@@ -32,7 +34,9 @@ function isBuiltinTab(value: string | null | undefined): value is BuiltinTab {
   return value === 'timeline' || value === 'cockpit';
 }
 
-function isViewTab(value: string | null | undefined): value is `view:${string}` {
+function isViewTab(
+  value: string | null | undefined
+): value is `view:${string}` {
   return typeof value === 'string' && value.startsWith(VIEW_TAB_PREFIX);
 }
 
@@ -70,6 +74,7 @@ export default function OverviewPage({
   );
   const [editorOpen, setEditorOpen] = React.useState(false);
   const [editingView, setEditingView] = React.useState<View | null>(null);
+  const [tabRowRef, tabRowFade] = useScrollFade<HTMLDivElement>('x');
 
   React.useEffect(() => {
     if (initialTab) {
@@ -89,7 +94,9 @@ export default function OverviewPage({
   const activeView = activeViewId
     ? views.find((v) => v.id === activeViewId)
     : undefined;
-  const canEditActiveView = useCanWriteForWorkspace(activeView?.workspace ?? '');
+  const canEditActiveView = useCanWriteForWorkspace(
+    activeView?.workspace ?? ''
+  );
 
   // If the active view tab references a view that no longer exists once views
   // have loaded, fall back to the default tab instead of a blank panel.
@@ -122,7 +129,7 @@ export default function OverviewPage({
               onClick={() => openEdit(activeView)}
               className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
             >
-              <Pencil className="h-3 w-3" /> <I18nText text={"Edit"} />
+              <Pencil className="h-3 w-3" /> <I18nText text={'Edit'} />
             </button>
           )}
         </div>
@@ -139,65 +146,78 @@ export default function OverviewPage({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <I18nProps><Tabs
-        role="tablist"
-        aria-label="Overview views"
-        className="mb-3 shrink-0 overflow-x-auto"
+      <h1 className="sr-only">
+        <I18nText text={'Overview'} />
+      </h1>
+      <div
+        ref={tabRowRef}
+        style={tabRowFade}
+        className="mb-3 flex shrink-0 items-center overflow-x-auto border-b border-border"
       >
-        <Tab
-          id={tabElementId('timeline')}
-          role="tab"
-          aria-selected={activeTab === 'timeline'}
-          aria-controls="overview-panel"
-          isActive={activeTab === 'timeline'}
-          onClick={() => setActiveTab('timeline')}
-          className="cursor-pointer gap-2"
-        >
-          <Clock3 className="h-4 w-4" />
-          <I18nText text={"Timeline"} />
-        </Tab>
-        <Tab
-          id={tabElementId('cockpit')}
-          role="tab"
-          aria-selected={activeTab === 'cockpit'}
-          aria-controls="overview-panel"
-          isActive={activeTab === 'cockpit'}
-          onClick={() => setActiveTab('cockpit')}
-          className="cursor-pointer gap-2"
-        >
-          <Gauge className="h-4 w-4" />
-          <I18nText text={"Cockpit"} />
-        </Tab>
-        {views.map((view) => {
-          const tab = viewTabId(view.id);
-          return (
+        <I18nProps>
+          <Tabs
+            role="tablist"
+            aria-label="Overview views"
+            className="shrink-0 border-b-0"
+          >
             <Tab
-              key={view.id}
-              id={tabElementId(tab)}
+              id={tabElementId('timeline')}
               role="tab"
-              aria-selected={activeTab === tab}
+              aria-selected={activeTab === 'timeline'}
               aria-controls="overview-panel"
-              isActive={activeTab === tab}
-              onClick={() => setActiveTab(tab)}
+              isActive={activeTab === 'timeline'}
+              onClick={() => setActiveTab('timeline')}
               className="cursor-pointer gap-2"
             >
-              <LayoutGrid className="h-4 w-4" />
-              {view.name}
+              <Activity className="h-4 w-4" />
+              <I18nText text={'Activity'} />
             </Tab>
-          );
-        })}
+            <Tab
+              id={tabElementId('cockpit')}
+              role="tab"
+              aria-selected={activeTab === 'cockpit'}
+              aria-controls="overview-panel"
+              isActive={activeTab === 'cockpit'}
+              onClick={() => setActiveTab('cockpit')}
+              className="cursor-pointer gap-2"
+            >
+              <Gauge className="h-4 w-4" />
+              <I18nText text={'Cockpit'} />
+            </Tab>
+            {views.map((view) => {
+              const tab = viewTabId(view.id);
+              return (
+                <Tab
+                  key={view.id}
+                  id={tabElementId(tab)}
+                  role="tab"
+                  aria-selected={activeTab === tab}
+                  aria-controls="overview-panel"
+                  isActive={activeTab === tab}
+                  onClick={() => setActiveTab(tab)}
+                  className="cursor-pointer gap-2"
+                >
+                  <LayoutGrid className="h-4 w-4" />
+                  {view.name}
+                </Tab>
+              );
+            })}
+          </Tabs>
+        </I18nProps>
         {canWrite && (
-          <I18nProps><button
-            type="button"
-            onClick={openCreate}
-            aria-label="Create view"
-            className="inline-flex h-12 cursor-pointer items-center gap-1 px-3 text-sm font-medium text-text-secondary hover:text-foreground"
-          >
-            <Plus className="h-4 w-4" />
-            <I18nText text={"New"} />
-          </button></I18nProps>
+          <I18nProps>
+            <button
+              type="button"
+              onClick={openCreate}
+              aria-label="Create view"
+              className="inline-flex h-11 shrink-0 cursor-pointer items-center gap-1 px-3 text-sm font-medium text-muted-foreground hover:text-foreground"
+            >
+              <Plus className="h-4 w-4" />
+              <I18nText text={'New view'} />
+            </button>
+          </I18nProps>
         )}
-      </Tabs></I18nProps>
+      </div>
 
       <div
         id="overview-panel"
@@ -205,7 +225,7 @@ export default function OverviewPage({
         aria-labelledby={tabElementId(activeTab)}
         className="min-h-0 flex-1 overflow-hidden"
       >
-        {panel}
+        <PeekHost>{panel}</PeekHost>
       </div>
 
       <ViewEditorDialog

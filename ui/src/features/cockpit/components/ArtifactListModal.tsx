@@ -194,23 +194,25 @@ export function ArtifactListModal({
 
   return createPortal(
     <div className="fixed inset-0 z-[60] flex justify-end">
-      <I18nProps><button
-        type="button"
-        tabIndex={-1}
-        aria-label="Close artifact preview"
-        className={cn(
-          'absolute inset-0 h-full w-full cursor-default bg-black/20 transition-opacity duration-200 ease-out',
-          isVisible ? 'opacity-100' : 'opacity-0'
-        )}
-        onClick={onClose}
-      /></I18nProps>
+      <I18nProps>
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label="Close artifact preview"
+          className={cn(
+            'absolute inset-0 h-full w-full cursor-default bg-black/20 transition-opacity duration-200 ease-out',
+            isVisible ? 'opacity-100' : 'opacity-0'
+          )}
+          onClick={onClose}
+        />
+      </I18nProps>
       <aside
         ref={drawerRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="cockpit-artifacts-title"
         className={cn(
-          'relative z-10 flex h-full w-full flex-col border-l border-border bg-background shadow-xl transition-all duration-200 ease-out will-change-transform sm:w-[calc(100vw-2rem)]',
+          'relative z-10 flex h-full w-full flex-col border-l border-border bg-background shadow-xl transition-[translate,opacity] duration-200 ease-out sm:w-[calc(100vw-2rem)]',
           isVisible ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'
         )}
       >
@@ -221,7 +223,7 @@ export function ArtifactListModal({
               className="flex items-center gap-2 text-lg font-semibold leading-none tracking-tight"
             >
               <Archive className="h-5 w-5 text-primary" />
-              <I18nText text={"Artifacts"} />
+              <I18nText text={'Artifacts'} />
               {isValidating && (
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               )}
@@ -230,16 +232,18 @@ export function ArtifactListModal({
               {visibleRun.name} / {visibleRun.dagRunId}
             </p>
           </div>
-          <I18nProps><Button
-            ref={closeButtonRef}
-            type="button"
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            title="Close artifact preview"
-          >
-            <X className="h-4 w-4" />
-          </Button></I18nProps>
+          <I18nProps>
+            <Button
+              ref={closeButtonRef}
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              title="Close artifact preview"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </I18nProps>
         </header>
 
         <div className="min-h-0 flex-1 overflow-hidden px-5 py-4">
@@ -250,7 +254,11 @@ export function ArtifactListModal({
           ) : error && !displayDetails ? (
             <div className="flex items-start gap-2 rounded-md bg-destructive/5 px-3 py-3 text-sm text-destructive">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>{error.message || <I18nText text={"Failed to load DAG run details"} />}</span>
+              <span>
+                {error.message || (
+                  <I18nText text={'Failed to load DAG run details'} />
+                )}
+              </span>
             </div>
           ) : displayDetails ? (
             <ArtifactsTab

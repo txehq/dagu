@@ -37,6 +37,12 @@ func toSchedule(s ir.Schedule) api.Schedule {
 		schedule.At = &at
 	}
 	schedule.Profile = toRuntimeProfileName(s.Profile)
+	if s.HasCalendar() {
+		schedule.Calendar = ptrOf(s.Calendar)
+	}
+	if len(s.BusinessDays) > 0 {
+		schedule.BusinessDays = ptrOf(append([]int(nil), s.BusinessDays...))
+	}
 	return schedule
 }
 
@@ -374,6 +380,7 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 		FinishedAt:         s.FinishedAt,
 		ArtifactsAvailable: artifactsAvailable,
 		NoReuse:            ptrOf(s.NoReuse),
+		Ephemeral:          ephemeralFlag(s),
 		Status:             api.Status(s.Status),
 		StatusLabel:        api.StatusLabel(s.Status.String()),
 		WorkerId:           ptrOf(s.WorkerID),
@@ -383,6 +390,36 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 		Labels:             &s.Labels,
 		Tags:               &s.Labels,
 	}
+}
+
+// ephemeralFlag reports the ephemeral flag of a run, absent for a normal run.
+func ephemeralFlag(s ir.DAGRunStatus) *bool {
+	if !s.Ephemeral {
+		return nil
+	}
+	return ptrOf(true)
+}
+
+// toReusedInputs converts the provenance of the carried outputs of a run.
+func toReusedInputs(inputs []ir.ReusedInput) *[]api.ReusedInput {
+	if len(inputs) == 0 {
+		return nil
+	}
+	out := make([]api.ReusedInput, 0, len(inputs))
+	for _, input := range inputs {
+		item := api.ReusedInput{Step: input.Step, RunId: input.RunID, Via: api.ReusedInputVia(input.Via)}
+		if input.CapturedAt != "" {
+			item.CapturedAt = ptrOf(input.CapturedAt)
+		}
+		if input.StartedAt != "" {
+			item.StartedAt = ptrOf(input.StartedAt)
+		}
+		if input.FinishedAt != "" {
+			item.FinishedAt = ptrOf(input.FinishedAt)
+		}
+		out = append(out, item)
+	}
+	return &out
 }
 
 func toDAGRunsPageResponse(page persis.DAGRunStatusPage) api.DAGRunsPageResponse {
@@ -443,6 +480,8 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		ParentDAGRunId:         ptrOf(s.Parent.ID),
 		ArtifactsAvailable:     artifactsAvailable,
 		NoReuse:                ptrOf(s.NoReuse),
+		Ephemeral:              ephemeralFlag(s),
+		ReusedInputs:           toReusedInputs(s.ReusedInputs),
 		Log:                    s.Log,
 		Name:                   s.Name,
 		Params:                 ptrOf(s.Params),
@@ -478,7 +517,51 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 		OnWait:                 ptrOf(toNode(s.OnWait)),
 		Labels:                 &s.Labels,
 		Tags:                   &s.Labels,
+		ModelUsage:             toRunModelUsage(s),
 	}
+}
+
+// toRunModelUsage maps what a run used on models. A run recorded by an
+// engine that records usage always has it, empty when the run used no
+// model; one recorded before has it only when its steps report some.
+func toRunModelUsage(s ir.DAGRunStatus) *api.RunModelUsage {
+	usage := s.ModelUsageTotal()
+	if len(usage) == 0 {
+		if !s.ModelUsageRecorded {
+			return nil
+		}
+		return &api.RunModelUsage{}
+	}
+	return &api.RunModelUsage{Models: ptrOf(toModelUsage(usage))}
+}
+
+// toStepModelUsage maps what a step used on models, its own calls and what
+// the tools it ran reported, or nil when there is nothing to show.
+func toStepModelUsage(usage *ir.StepModelUsage) *api.StepModelUsage {
+	total := usage.Total()
+	if len(total) == 0 && (usage == nil || usage.NotReported == "") {
+		return nil
+	}
+	return &api.StepModelUsage{Models: ptrOf(toModelUsage(total)), NotReported: ptrOf(usage.NotReported)}
+}
+
+func toModelUsage(usage []ir.ModelUsage) []api.ModelUsage {
+	result := make([]api.ModelUsage, len(usage))
+	for i, u := range usage {
+		result[i] = api.ModelUsage{
+			Provider:          u.Provider,
+			Model:             u.Model,
+			Calls:             u.Calls,
+			InputTokens:       ptrOf(u.InputTokens),
+			CachedInputTokens: ptrOf(u.CachedInputTokens),
+			CacheWriteTokens:  ptrOf(u.CacheWriteTokens),
+			OutputTokens:      ptrOf(u.OutputTokens),
+			ReasoningTokens:   ptrOf(u.ReasoningTokens),
+			Cost:              ptrOf(u.Cost),
+			CostReportedCalls: ptrOf(u.CostReportedCalls),
+		}
+	}
+	return result
 }
 
 func hasArtifactEntries(archiveDir string) bool {
@@ -502,6 +585,14 @@ func hasArtifactEntries(archiveDir string) bool {
 		}
 	}
 	return false
+}
+
+// continuousFlag gives the API value of Node.continuous: set only when true.
+func continuousFlag(continuous bool) *bool {
+	if !continuous {
+		return nil
+	}
+	return ptrOf(true)
 }
 
 func toNode(node *ir.Node) api.Node {
@@ -529,6 +620,7 @@ func toNode(node *ir.Node) api.Node {
 		Error:                  ptrOf(node.Error),
 		SubRuns:                ptrOf(toSubDAGRuns(node.SubRuns)),
 		SubRunsRepeated:        ptrOf(toSubDAGRuns(node.SubRunsRepeated)),
+		Continuous:             continuousFlag(isContinuousNode(node)),
 		HumanTaskCompletedBy:   ptrOf(node.HumanTaskCompletedBy),
 		HumanTaskCompletedById: ptrOf(node.HumanTaskCompletedByID),
 		ApprovedAt:             ptrOf(node.ApprovedAt),
@@ -546,6 +638,7 @@ func toNode(node *ir.Node) api.Node {
 	if node.AgentSession != nil {
 		result.AgentSession = toAgentSession(node.AgentSession)
 	}
+	result.ModelUsage = toStepModelUsage(node.ModelUsage)
 	if node.Build != nil {
 		result.Build = &api.BuildExecution{
 			Decision:           api.BuildExecutionDecision(node.Build.Decision),
@@ -614,6 +707,7 @@ func toAgentSessionEvent(event ir.AgentSessionEvent) api.AgentSessionEvent {
 		Sequence: event.Sequence, Id: event.ID, Type: event.Type,
 		Timestamp: ptrOf(event.Timestamp), Role: ptrOf(event.Role), Content: ptrOf(event.Content),
 		Name: ptrOf(event.Name), Status: ptrOf(event.Status), Files: ptrOf(event.Files),
+		Position: ptrOf(event.Position), Via: ptrOf(event.Via), DurationMs: ptrOf(event.DurationMs), Tokens: ptrOf(event.Tokens),
 	}
 }
 
@@ -887,6 +981,9 @@ func toParamDefs(defs []ir.ParamDef) []api.ParamDef {
 			if ok {
 				paramDef.Default = &value
 			}
+		}
+		if def.Title != "" {
+			paramDef.Title = ptrOf(def.Title)
 		}
 		if def.Description != "" {
 			paramDef.Description = ptrOf(def.Description)

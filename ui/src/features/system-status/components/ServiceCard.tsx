@@ -53,39 +53,55 @@ function ServiceCard({
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b">
         <div className="text-muted-foreground">{icon}</div>
-        <h3 className="text-sm font-medium">{title}</h3>
+        <h2 className="text-sm font-medium">{title}</h2>
         <span className="text-xs text-muted-foreground ml-auto">
-          {activeCount}/{instances.length} <I18nText text={"active"} />
+          {activeCount}/{instances.length} <I18nText text={'active'} />
         </span>
       </div>
 
       {/* Instances List */}
       <div className="divide-y">
         {isLoading && instances.length === 0 && (
-          <div className="px-3 py-2 text-xs text-muted-foreground"><I18nText text={"Loading..."} /></div>
+          <div className="px-3 py-2 text-xs text-muted-foreground">
+            <I18nText text={'Loading...'} />
+          </div>
         )}
 
-        {error && (
-          <div className="px-3 py-2 text-xs text-error">{error}</div>
-        )}
+        {error && <div className="px-3 py-2 text-xs text-error">{error}</div>}
 
         {!error && instances.length === 0 && !isLoading && (
-          <div className="px-3 py-2 text-xs text-muted-foreground"><I18nText text={"No instances"} /></div>
+          <div className="px-3 py-2 text-xs text-muted-foreground">
+            <I18nText text={'No instances'} />
+          </div>
         )}
 
         {instances.map((instance) => (
-          <div key={instance.instanceId} className="flex items-center gap-3 px-3 py-1.5 text-xs">
+          <div
+            key={instance.instanceId}
+            className="flex items-center gap-3 px-3 py-1.5 text-xs"
+          >
             {/* Status indicator */}
             <div className="relative flex-shrink-0">
-              <div className={cn('w-1.5 h-1.5 rounded-full', getStatusColor(instance.status))} />
+              <div
+                className={cn(
+                  'w-1.5 h-1.5 rounded-full',
+                  getStatusColor(instance.status)
+                )}
+              />
               {instance.status === 'active' && (
-                <div className={cn('absolute inset-0 rounded-full animate-ping opacity-75', getStatusColor(instance.status))} />
+                <div
+                  className={cn(
+                    'absolute inset-0 rounded-full animate-ping opacity-75',
+                    getStatusColor(instance.status)
+                  )}
+                />
               )}
             </div>
 
             {/* Host:Port */}
             <span className="font-mono text-muted-foreground">
-              {instance.host}{instance.port ? `:${instance.port}` : ''}
+              {instance.host}
+              {instance.port ? `:${instance.port}` : ''}
             </span>
 
             {/* Uptime */}

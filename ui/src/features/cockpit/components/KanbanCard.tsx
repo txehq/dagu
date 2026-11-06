@@ -17,7 +17,7 @@ type DAGRunSummary = components['schemas']['DAGRunSummary'];
 
 interface Props {
   run: DAGRunSummary;
-  onClick: () => void;
+  onClick: (event?: React.MouseEvent) => void;
   onArtifactsClick?: () => void;
 }
 
@@ -132,7 +132,7 @@ export function KanbanCard({
             <div
               className={`text-[11px] text-muted-foreground ${showArtifacts ? 'pr-10' : ''}`}
             >
-              <I18nText text={"Scheduled"} /> {scheduleTime}
+              <I18nText text={'Scheduled'} /> {scheduleTime}
             </div>
           )}
           {params && (
@@ -155,7 +155,9 @@ export function KanbanCard({
                 <Archive className="h-4 w-4" />
               </button>
             </TooltipTrigger>
-            <TooltipContent><I18nText text={"View artifacts"} /></TooltipContent>
+            <TooltipContent>
+              <I18nText text={'View artifacts'} />
+            </TooltipContent>
           </Tooltip>
         )}
       </div>

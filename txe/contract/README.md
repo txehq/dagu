@@ -10,7 +10,9 @@ upstream files untouched unless a change cannot live here, so the fork stays a s
 
 ## Pinned Dagu facts this contract relies on
 
-Read from v2.18.2-13 (9bb941da0a31). Re-read them before relying on a newer pin.
+Read from v2.18.2-13 (9bb941da0a31). Re-read them before relying on a newer pin; for v2.25.8 see
+[Upstream v2.25.8](#upstream-v2258-txe-5923), which changes the direct-start answer in `off` and
+`observe`.
 
 - A worker connects to the coordinator; the coordinator never connects to a worker. The worker
   returns status, logs and artifacts over gRPC, and their durable copies live on the server.
@@ -35,6 +37,31 @@ any older fork build reads what this fork writes. A fork build before it silentl
 referenced outputs, so no release before TXE-5795 is a rollback target once an upstream-format
 writer has run. The fixtures in `internal/ir/testdata/upstream_v2.25.2_stored_status.jsonl` were
 produced by that upstream version's own writer.
+
+## Upstream v2.25.8 (TXE-5923)
+
+The fork's source is merged with upstream v2.25.8 (28022fee38b5). Where upstream changed
+behaviour the fork depends on, the fork keeps its own:
+
+- **Status outputs.** The writer and compaction keep every output field inline and never call
+  `ir.StoredStatus`, so a fork build before TXE-5795 still reads every output. Compaction, now
+  also triggered by size, always reads the last record under the status file's lock.
+- **No matching worker.** Upstream holds such a dispatch as Queued for
+  `coordinator.worker_wait_timeout` (default 2m) instead of refusing it. With machines pinned
+  (`enforce`) the fork never holds: the dispatch is refused at once with FailedPrecondition, the
+  same answer whether no worker or only other owners' machines are connected. In `off` and
+  `observe` the hold applies. A held dispatch keeps the queuedAt it was prepared with, so its
+  execution identity (attempt id, execution marker) does not change.
+- **Unclaimed tasks.** Upstream keeps an unclaimed pending task until its run moves on. The fork
+  removes an unheld one after the reservation time, so reconciliation abandons the prepared attempt
+  with a record. A held task ends when its wait passes, as upstream does.
+- **Access.** The owner filters for whole-hub lists and queues apply inside upstream's new list
+  paths. Upstream's run-outputs and step-sample endpoints use the per-DAG owner check.
+- **Credentials.** `DAGU_COORDINATOR_AUTH_HUB_KEY_FILE` and `DAGU_WORKER_AUTH_CREDENTIAL_FILE` count
+  as Dagu credentials, so workflow steps no longer inherit them (upstream's credential env filter).
+- **UI.** Upstream replaced the DAG and run pages with the workflow workspace. A person's tab
+  limits and the hidden incident feature apply there now, and so do the job-access Start button and
+  the unconfirmed-start handling.
 
 ## Identities
 

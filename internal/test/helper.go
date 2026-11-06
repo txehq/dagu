@@ -88,6 +88,7 @@ type Options struct {
 	WithArtifactPersistence bool          // Enable artifact persistence to filesystem
 	StaleHeartbeatThreshold time.Duration // Override for handler's stale heartbeat threshold
 	StaleLeaseThreshold     time.Duration // Override for handler's stale lease threshold
+	WorkerWaitTimeout       time.Duration // How long the coordinator holds a dispatch for a matching worker; 0 refuses at once
 	// CoordinatorServerOptions are added to the test coordinator's gRPC
 	// server, such as authentication interceptors.
 	CoordinatorServerOptions []grpc.ServerOption
@@ -173,6 +174,15 @@ func WithStaleThresholds(heartbeat, lease time.Duration) HelperOption {
 	return func(opts *Options) {
 		opts.StaleHeartbeatThreshold = heartbeat
 		opts.StaleLeaseThreshold = lease
+	}
+}
+
+// WithWorkerWaitTimeout makes the test coordinator hold a dispatch with no
+// healthy matching worker for this long before failing the run. Tests that do
+// not set it keep the immediate refusal.
+func WithWorkerWaitTimeout(timeout time.Duration) HelperOption {
+	return func(opts *Options) {
+		opts.WorkerWaitTimeout = timeout
 	}
 }
 
@@ -344,6 +354,7 @@ func Setup(t *testing.T, opts ...HelperOption) Helper {
 		ServerOptions:             options.ServerOptions,
 		StaleHeartbeatThreshold:   options.StaleHeartbeatThreshold,
 		StaleLeaseThreshold:       options.StaleLeaseThreshold,
+		WorkerWaitTimeout:         options.WorkerWaitTimeout,
 
 		tmpDir: tmpDir,
 	}
@@ -556,6 +567,7 @@ type Helper struct {
 	ServerOptions             []frontend.ServerOption
 	StaleHeartbeatThreshold   time.Duration
 	StaleLeaseThreshold       time.Duration
+	WorkerWaitTimeout         time.Duration
 
 	tmpDir string
 }

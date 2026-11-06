@@ -278,6 +278,15 @@ export function useAuth() {
   return context;
 }
 
+/**
+ * useAuth outside an AuthProvider answers null instead of throwing. The TXE
+ * fork's identity read uses it: a component rendered without a provider has
+ * no signed-in caller and so no TXE identity.
+ */
+export function useOptionalAuth() {
+  return useContext(AuthContext);
+}
+
 export function useIsAdmin(): boolean {
   const { user } = useAuth();
   const config = useConfig();
@@ -298,14 +307,43 @@ export function useCanWrite(): boolean {
   );
 }
 
-export function useCanWriteForWorkspace(workspace?: string | null): boolean {
+/**
+ * Whether the user can change calendar files. A calendar serves DAGs in
+ * every workspace, so the user's global role decides.
+ */
+export function useCanWriteCalendars(): boolean {
   const { user } = useAuth();
   const config = useConfig();
-  if (config.authMode !== 'builtin') return config.permissions.writeDags;
-  if (!user) return false;
-  return roleAtLeast(
-    effectiveWorkspaceRole(user, workspace ?? ''),
-    UserRole.developer
+  if (!config.permissions.writeDags) return false;
+  if (config.authMode !== 'builtin') return true;
+  return roleAtLeast(user?.role ?? null, UserRole.developer);
+}
+
+export function useCanWriteForWorkspace(workspace?: string | null): boolean {
+  return useWorkspaceWriteCheck()(workspace);
+}
+
+/**
+ * Returns a check for whether the current user can write in a workspace, for
+ * lists whose items belong to different workspaces.
+ */
+export function useWorkspaceWriteCheck(): (
+  workspace?: string | null
+) => boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  const { authMode } = config;
+  const { writeDags } = config.permissions;
+  return useCallback(
+    (workspace?: string | null) => {
+      if (authMode !== 'builtin') return writeDags;
+      if (!user) return false;
+      return roleAtLeast(
+        effectiveWorkspaceRole(user, workspace ?? ''),
+        UserRole.developer
+      );
+    },
+    [authMode, user, writeDags]
   );
 }
 
@@ -366,6 +404,37 @@ export function useCanManageWebhooks(): boolean {
   if (config.authMode !== 'builtin') return false;
   if (!user) return false;
   return roleAtLeast(user.role, UserRole.developer);
+}
+
+/**
+ * Reports whether this server delivers to local command channels. They run
+ * shell commands on the server, so they need DAGs to be writable and runnable.
+ */
+export function useCommandChannelsEnabled(): boolean {
+  const { permissions } = useConfig();
+  return permissions.writeDags && permissions.runDags;
+}
+
+/**
+ * Reports whether the current user may add, change, or test local command
+ * channels on this server.
+ */
+export function useCanManageCommandChannels(): boolean {
+  const isAdmin = useIsAdmin();
+  const enabled = useCommandChannelsEnabled();
+  return isAdmin && enabled;
+}
+
+/**
+ * Reports whether the current user may manage notification channels and
+ * rules, which takes a server-wide developer role whatever the workspace
+ * grants.
+ */
+export function useCanManageNotifications(): boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  if (config.authMode !== 'builtin') return config.permissions.writeDags;
+  return roleAtLeast(user?.role ?? null, UserRole.developer);
 }
 
 export function useCanViewAuditLogs(): boolean {

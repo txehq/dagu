@@ -30,7 +30,7 @@ export function ProtectedRoute({
   }
 
   if (setupRequired && !isAuthenticated) {
-    return <Navigate to="/setup" replace />;
+    return <Navigate to="/setup" state={{ from: location }} replace />;
   }
 
   if (!isAuthenticated) {

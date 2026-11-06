@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useEffect, useRef } from 'react';
-import { useRemoteNode } from '@/contexts/RemoteNodeContext';
-import { useQuery } from '@/hooks/api';
-import { whenEnabled } from '@/hooks/queryUtils';
 import { AnsiLine } from '@/lib/ansi';
 import { components, Stream } from '../../../../api/v1/schema';
 import { I18nText } from '@/i18n/I18nText';
+import {
+  type ForeachLogTarget,
+  useStepLogQuery,
+} from '../../hooks/useStepLogQuery';
 
 // How often a step's log is fetched again while the step can still write to it.
 const LIVE_LOG_REFRESH_MS = 2000;
@@ -26,74 +27,29 @@ export function InlineLogViewer({
   stepName,
   stream,
   dagRun,
-  live,
+  foreach,
+  live = false,
 }: {
   dagName: string;
   dagRunId: string;
   stepName: string;
   stream: components['schemas']['Stream'];
   dagRun?: components['schemas']['DAGRunDetails'];
-  live: boolean;
+  /** Reads a body step log of a foreach item instead of a run step log. */
+  foreach?: ForeachLogTarget;
+  /** Whether to keep polling for new output. */
+  live?: boolean;
 }) {
-  const remoteNode = useRemoteNode();
-  const refreshInterval = live ? LIVE_LOG_REFRESH_MS : 0;
-
-  // Determine if this is a sub DAG run - check both rootDAGRunId AND rootDAGRunName
-  const isSubDAGRun =
-    dagRun &&
-    dagRun.rootDAGRunId &&
-    dagRun.rootDAGRunName &&
-    dagRun.rootDAGRunId !== dagRun.dagRunId;
-
-  // Fetch sub-DAG-run step log (only when isSubDAGRun is true)
-  const subDAGQuery = useQuery(
-    '/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/log',
-    whenEnabled(!!isSubDAGRun, {
-      params: {
-        query: {
-          remoteNode,
-          stream,
-          tail: 100,
-        },
-        path: {
-          name: dagRun?.rootDAGRunName as string,
-          dagRunId: dagRun?.rootDAGRunId as string,
-          subDAGRunId: dagRun?.dagRunId as string,
-          stepName,
-        },
-      },
-    }),
+  const { data, isLoading, mutate } = useStepLogQuery(
+    { dagName, dagRunId, stepName, dagRun, foreach },
+    { stream, tail: 100 },
     {
-      refreshInterval,
+      refreshInterval: live ? LIVE_LOG_REFRESH_MS : 0,
+      // Shorter than the interval, or SWR skips every other refresh.
+      dedupingInterval: 1000,
       revalidateOnFocus: false,
     }
   );
-
-  // Fetch regular DAG-run step log (only when isSubDAGRun is false)
-  const dagRunQuery = useQuery(
-    '/dag-runs/{name}/{dagRunId}/steps/{stepName}/log',
-    whenEnabled(!isSubDAGRun, {
-      params: {
-        query: {
-          remoteNode,
-          stream,
-          tail: 100,
-        },
-        path: {
-          name: dagName,
-          dagRunId,
-          stepName,
-        },
-      },
-    }),
-    {
-      refreshInterval,
-      revalidateOnFocus: false,
-    }
-  );
-
-  // Use the appropriate query based on whether this is a sub-DAG-run
-  const { data, isLoading, mutate } = isSubDAGRun ? subDAGQuery : dagRunQuery;
 
   // When the step stops, fetch once more: the last poll may predate its last
   // lines.

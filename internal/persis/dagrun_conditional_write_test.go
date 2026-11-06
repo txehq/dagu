@@ -22,7 +22,7 @@ type noConditionalAttempt struct {
 func TestEventingAttemptWriteIfLatestUnsupported(t *testing.T) {
 	t.Parallel()
 
-	writer, ok := newEventingAttempt(&noConditionalAttempt{}, nil).(dagrun.ConditionalWriter)
+	writer, ok := newEventingAttempt(&noConditionalAttempt{}, nil, false).(dagrun.ConditionalWriter)
 	require.True(t, ok)
 	err := writer.WriteIfLatest(context.Background(), ir.DAGRunStatus{}, func(*ir.DAGRunStatus) error {
 		require.FailNow(t, "the check must not run")

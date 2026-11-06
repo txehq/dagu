@@ -22,10 +22,6 @@ vi.mock('@/hooks/api', () => ({
   useQuery: useQueryMock,
 }));
 
-vi.mock('@/features/dag-runs/components/dag-run-details', () => ({
-  DAGRunDetailsModal: () => null,
-}));
-
 vi.mock('@/contexts/ConfigContext', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/contexts/ConfigContext')>()),
   useConfig: () => ({

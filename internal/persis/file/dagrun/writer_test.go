@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,5 +131,36 @@ func TestWriterErrorHandling(t *testing.T) {
 		require.NoError(t, json.Unmarshal(bytes.TrimRight(data, "\n"), &decoded))
 
 		assert.Equal(t, byte('\n'), data[len(data)-1])
+	})
+
+	// TXE fork: the writer keeps every output field inline and never writes
+	// upstream's outputsValueFrom references, so a fork build before TXE-5795
+	// that cannot read a reference still reads every output (TXE-5923).
+	t.Run("KeepsEveryOutputInline", func(t *testing.T) {
+		writerPath := filepath.Join(th.TmpDir, "outputs.dat")
+		writer := NewWriter(writerPath)
+		require.NoError(t, writer.Open())
+
+		dag := th.DAG("test_outputs_once")
+		status := ir.NewStatusBuilder(dag.DAG).Create(uuid.Must(uuid.NewV7()).String(), ir.Succeeded, 1, time.Now())
+		large := `{"diff":"` + strings.Repeat("+added line\n", 20000) + `end of diff"}`
+		status.Nodes = []*ir.Node{{Step: ir.Step{Name: "fetch"}, Status: ir.NodeSucceeded,
+			OutputValue: &large, OutputsValue: &large, StepOutputsValue: &large}}
+
+		require.NoError(t, writer.write(status))
+		require.NoError(t, writer.close())
+
+		data, err := os.ReadFile(writerPath)
+		require.NoError(t, err)
+		assert.Equal(t, 3, bytes.Count(data, []byte("end of diff")))
+		assert.NotContains(t, string(data), "ValueFrom")
+
+		read, err := ParseStatusFile(writerPath)
+		require.NoError(t, err)
+		node := read.Nodes[0]
+		for _, value := range []*string{node.OutputValue, node.OutputsValue, node.StepOutputsValue} {
+			require.NotNil(t, value)
+			assert.Equal(t, large, *value)
+		}
 	})
 }

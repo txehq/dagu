@@ -32,6 +32,9 @@ type ScheduleValue struct {
 	restarts []ir.Schedule // Restart schedules
 }
 
+// startScheduleOptions accepts the schedule forms only start schedules take.
+var startScheduleOptions = ir.ScheduleParseOptions{AllowAt: true, AllowCalendar: true}
+
 // UnmarshalYAML implements BytesUnmarshaler for goccy/go-yaml. Every error is
 // an *ir.ScheduleError: the value as written is not a schedule.
 func (s *ScheduleValue) UnmarshalYAML(data []byte) error {
@@ -55,7 +58,7 @@ func (s *ScheduleValue) unmarshalYAML(data []byte) error {
 		if v == "" {
 			return nil
 		}
-		schedule, err := ir.ParseScheduleValue(v, ir.ScheduleParseOptions{AllowAt: true})
+		schedule, err := ir.ParseScheduleValue(v, startScheduleOptions)
 		if err != nil {
 			return fmt.Errorf("schedule: %w", err)
 		}
@@ -64,7 +67,7 @@ func (s *ScheduleValue) unmarshalYAML(data []byte) error {
 
 	case []any:
 		for i, item := range v {
-			schedule, err := ir.ParseScheduleValue(item, ir.ScheduleParseOptions{AllowAt: true})
+			schedule, err := ir.ParseScheduleValue(item, startScheduleOptions)
 			if err != nil {
 				return fmt.Errorf("schedule[%d]: %w", i, err)
 			}
@@ -77,7 +80,7 @@ func (s *ScheduleValue) unmarshalYAML(data []byte) error {
 		return nil
 	case []string:
 		for i, item := range v {
-			schedule, err := ir.ParseScheduleValue(item, ir.ScheduleParseOptions{AllowAt: true})
+			schedule, err := ir.ParseScheduleValue(item, startScheduleOptions)
 			if err != nil {
 				return fmt.Errorf("schedule[%d]: %w", i, err)
 			}
@@ -106,7 +109,7 @@ func (s *ScheduleValue) parseScheduleMap(m map[string]any) error {
 		switch key {
 		case "start":
 			target = &s.starts
-			opts.AllowAt = true
+			opts = startScheduleOptions
 		case "stop":
 			target = &s.stops
 		case "restart":
@@ -160,6 +163,28 @@ func parseScheduleEntry(v any, opts ir.ScheduleParseOptions) ([]ir.Schedule, err
 		return []ir.Schedule{schedule}, nil
 	default:
 		return nil, fmt.Errorf("expected string, object, or array, got %T", v)
+	}
+}
+
+// StartPath returns the YAML path of start schedule i in the document, such
+// as schedule[1] or schedule.start, and false when the document has none.
+func (s ScheduleValue) StartPath(i int) (string, bool) {
+	switch v := s.raw.(type) {
+	case string:
+		return "schedule", i == 0 && v != ""
+	case []any:
+		return fmt.Sprintf("schedule[%d]", i), i < len(v)
+	case map[string]any:
+		switch start := v["start"].(type) {
+		case nil:
+			return "", false
+		case []any:
+			return fmt.Sprintf("schedule.start[%d]", i), i < len(start)
+		default:
+			return "schedule.start", i == 0
+		}
+	default:
+		return "", false
 	}
 }
 
