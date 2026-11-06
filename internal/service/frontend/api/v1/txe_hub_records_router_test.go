@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +96,9 @@ func TestTxeHubRecordsLegacyInEnforceThroughTheRouter(t *testing.T) {
 		{"GET /dags/search", func(listsHub) string { return "/api/v1/dags/search?q=marker-of" }},
 		{"GET /artifacts", func(listsHub) string { return "/api/v1/artifacts" }},
 	}
-	records := []string{"/api/v1/event-logs", "/api/v1/audit", "/api/v1/workers"}
+	// /dag-run-activity aggregates runs, queues and schedules across the hub
+	// (upstream v2.25, TXE-5923).
+	records := []string{"/api/v1/event-logs", "/api/v1/audit", "/api/v1/workers", "/api/v1/dag-run-activity"}
 
 	t.Run("enforce", func(t *testing.T) {
 		h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
@@ -130,4 +133,21 @@ func TestTxeHubRecordsLegacyInEnforceThroughTheRouter(t *testing.T) {
 			require.NotContains(t, body, "hub_records_not_permitted", path)
 		}
 	})
+}
+
+// Upstream v2.25's foreach reads of a root run decide the run as every other
+// run read does, by its DAG's owner: under enforce a legacy credential is
+// refused before anything of the run is read, while the platform
+// administrator reaches the run, here to learn that it has no such step
+// (TXE-5923).
+func TestTxeForeachReadsDecideTheRunsOwner(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	for _, name := range h.names {
+		path := "/api/v1/dag-runs/" + name + "/run-" + strings.ReplaceAll(name, "_", "-") + "/steps/s/foreach"
+		status, body := h.send(t, path, h.legacy)
+		require.NotEqual(t, http.StatusOK, status, body)
+		require.NotContains(t, body, "step s", "a legacy credential in enforce read run %s", name)
+		_, body = h.send(t, path, h.admin)
+		require.Contains(t, body, "step s not found in DAG", "the platform administrator reads run %s", name)
+	}
 }

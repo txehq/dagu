@@ -56,7 +56,8 @@ func (a *API) setDAGPinned(ctx context.Context, fileName string, pinned bool) er
 	}
 	workspaceName := dagWorkspaceName(dag)
 	// Visibility comes first so that a hidden DAG answers 404 rather than 403.
-	if err := a.requireWorkspaceVisible(ctx, workspaceName); err != nil {
+	// The fork's per-DAG owner check applies as well as the workspace check.
+	if err := a.requireNamedDAGVisible(ctx, dag.Name, workspaceName); err != nil {
 		return err
 	}
 	// Pins never change DAG files, so Git sync read-only mode allows them.

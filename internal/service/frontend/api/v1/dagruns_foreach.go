@@ -284,7 +284,9 @@ func (a *API) rootForeachNode(ctx context.Context, name, dagRunID, stepName stri
 			Message: fmt.Sprintf("dag-run ID %s not found for DAG %s", dagRunID, name),
 		}, nil
 	}
-	if err := a.requireWorkspaceVisible(ctx, statusWorkspaceName(dagStatus)); err != nil {
+	// The fork's per-run owner check, as subForeachNode and the other run
+	// reads apply, not the workspace check alone.
+	if err := a.requireDAGRunStatusVisible(ctx, dagStatus); err != nil {
 		return nil, nil, err
 	}
 	return foreachNode(dagStatus, stepName, name)

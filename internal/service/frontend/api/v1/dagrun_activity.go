@@ -195,6 +195,12 @@ func activityBadRequest(message string) *Error {
 }
 
 func (a *API) dagRunActivity(ctx context.Context, query activityQuery) (api.DAGRunActivity, error) {
+	// The activity aggregates runs, queues and schedules across the hub with
+	// workspace filtering only, so under owner scope it is hidden as the
+	// fork's other whole-hub reads are (TXE-4752).
+	if a.txeHubHidden(ctx) {
+		return api.DAGRunActivity{}, errTxeHubRecords
+	}
 	return withDAGRunReadTimeout(ctx, dagRunReadRequestInfo{
 		endpoint: "/dag-run-activity",
 	}, func(readCtx context.Context) (api.DAGRunActivity, error) {

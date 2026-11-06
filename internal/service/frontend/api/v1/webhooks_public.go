@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	txeauthz "github.com/dagucloud/dagu/v2/internal/txe/authz"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -26,6 +27,9 @@ import (
 // Requires developer role or above.
 func (a *API) GetDAGWebhookPublic(ctx context.Context, request api.GetDAGWebhookPublicRequestObject) (api.GetDAGWebhookPublicResponseObject, error) {
 	if err := a.requirePublicWebhooks(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionView); err != nil {
 		return nil, err
 	}
 	webhook, err := a.authService.GetWebhookByDAGName(ctx, request.FileName)
@@ -50,6 +54,9 @@ func (a *API) GetDAGWebhookPublic(ctx context.Context, request api.GetDAGWebhook
 // Requires admin role.
 func (a *API) EnableDAGWebhookPublic(ctx context.Context, request api.EnableDAGWebhookPublicRequestObject) (api.EnableDAGWebhookPublicResponseObject, error) {
 	if err := a.requirePublicWebhookAdmin(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if !a.connectedToDaguCloud() {
@@ -81,6 +88,9 @@ func (a *API) DisableDAGWebhookPublic(ctx context.Context, request api.DisableDA
 	if err := a.requirePublicWebhookAdmin(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	webhook, err := a.authService.DisablePublicWebhook(ctx, request.FileName)
 	if err != nil {
 		return nil, a.publicWebhookError(ctx, err, request.FileName, "turn off public webhook URL")
@@ -100,6 +110,9 @@ func (a *API) RegenerateDAGWebhookPublicURL(ctx context.Context, request api.Reg
 	if err := a.requirePublicWebhookAdmin(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
+		return nil, err
+	}
 	webhook, err := a.authService.RegeneratePublicWebhookToken(ctx, request.FileName)
 	if err != nil {
 		return nil, a.publicWebhookError(ctx, err, request.FileName, "replace public webhook URL")
@@ -117,6 +130,9 @@ func (a *API) RegenerateDAGWebhookPublicURL(ctx context.Context, request api.Reg
 // Requires admin role.
 func (a *API) ConfigureDAGWebhookPublicSender(ctx context.Context, request api.ConfigureDAGWebhookPublicSenderRequestObject) (api.ConfigureDAGWebhookPublicSenderResponseObject, error) {
 	if err := a.requirePublicWebhookAdmin(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
@@ -157,6 +173,9 @@ func (a *API) ConfigureDAGWebhookPublicSender(ctx context.Context, request api.C
 // Requires admin role.
 func (a *API) DismissDAGWebhookPublicMissed(ctx context.Context, request api.DismissDAGWebhookPublicMissedRequestObject) (api.DismissDAGWebhookPublicMissedResponseObject, error) {
 	if err := a.requirePublicWebhookAdmin(ctx); err != nil {
+		return nil, err
+	}
+	if err := a.txeDAGFileRoute(ctx, string(request.FileName), txeauthz.PermissionAuthor); err != nil {
 		return nil, err
 	}
 	webhook, err := a.authService.GetWebhookByDAGName(ctx, request.FileName)
