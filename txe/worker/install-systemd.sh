@@ -19,6 +19,10 @@
 #   txe-dagu-worker.service  dagu worker, id = this machine's mch_ id, labels
 #                            txe.machine and txe.owner, coordinator 127.0.0.1:50055
 #
+# Each runs under bin/logpipe.py, which owns logs/tunnel.log or logs/worker.log and keeps it
+# bounded, as on macOS (TXE-5408). A log an earlier install's unit appended to is moved to
+# logs/<name>.legacy-<utc stamp>.log when the unit next starts, and is never deleted.
+#
 # User units stop at logout unless lingering is on for the user (`loginctl enable-linger`, which
 # may need an administrator); the install says which. machine.json, the credential rules and the
 # build are exactly install.sh's; see its header. No token is ever in a unit, an argument or a log:
@@ -137,7 +141,7 @@ link_dagu_on_path
 # with neither running. There is nothing to roll back.
 if [ -n "$hub_url" ] && [ -z "$credential" ]; then
   printf 'prepared %s (%s): no unit was started\n  machine %s\n  owner   %s\n' "$version" "$tag" "$machine_id" "$owner_id"
-  printf 'next:\n  dagu txe login --hub %s\n  dagu txe machine create\n  dagu txe enrol --client-id <this machine'"'"'s worker client> --wait 15m\n  run this install again with --hub-url\n' "$hub_url"
+  channel_next_steps "$hub_url"
   exit 0
 fi
 
@@ -156,11 +160,17 @@ if [ -n "$hub_url" ]; then
   fi
 fi
 
+# The log wrapper (TXE-4724) runs from TXE_DAGU_HOME, never from a worktree, with the
+# interpreter python3 resolves to now: a unit has an absolute path and no shell to find one.
+python_bin="$(python3 -I -c 'import sys; print(sys.executable)')" || die "python3 is not on PATH"
+install -m 0644 "$here/logpipe.py" "$TXE_DAGU_HOME/bin/logpipe.py.next"
+mv -f "$TXE_DAGU_HOME/bin/logpipe.py.next" "$TXE_DAGU_HOME/bin/logpipe.py"
+
 # PATH is the installing shell's, so scheduled scripts find the same tools; nothing else from the
 # environment is copied, and no credential.
 python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
-  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$hub_url" || die "the units were not written"
+  "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url" || die "the units were not written"
 
 units=("$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT")
 [ -z "$hub_url" ] || units=("$TXE_DAGU_WORKER_UNIT")

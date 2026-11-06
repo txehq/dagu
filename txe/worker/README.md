@@ -16,8 +16,10 @@ On the worker channel (`txe/worker/HTTPS-CHANNEL.md`), give `install.sh --hub-ur
 A new machine:
 
 ```sh
-txe/worker/install.sh --tag <tag> --owner-id <own_...> --hub-url https://<hub>   # prepares; nothing starts
-dagu txe login --hub https://<hub>
+txe/worker/install.sh --tag <tag> --owner-id <own_...> --hub-url https://<hub>   # prepares; nothing starts, and it
+                                                                                 # prints these steps with this machine's binary by path
+~/.local/share/txe-dagu/bin/dagu txe login --hub https://<hub>                   # the machine's own binary: a `dagu` on PATH may be the
+                                                                                 # developer CLI, whose login signs the developer's store in
 dagu txe machine create                                                          # once, by the owner
 dagu txe enrol --client-id <this machine's worker client> --wait 15m
 txe/worker/install.sh --tag <tag> --hub-url https://<hub>                        # the worker starts
@@ -26,8 +28,9 @@ txe/worker/install.sh --tag <tag> --hub-url https://<hub>                       
 A machine moving off the port-forward. Job, probe and reviewer steps reach the hub through this machine's `txe` context, and their credential is bound to that context's address, so the context moves first and enrolment follows it:
 
 ```sh
-dagu txe login --hub https://<hub>   # refused while the context names the old address, and prints the
-                                     # exact command that removes it: run that, then sign in again
+~/.local/share/txe-dagu/bin/dagu txe login --hub https://<hub>   # the machine's own binary, as above; refused while the
+                                                                 # context names the old address, and prints the exact
+                                                                 # command that removes it: run that, then sign in again
 dagu txe enrol --client-id <this machine's worker client> --wait 15m             # and the reviewer's, if it has one
 txe/worker/install.sh --tag <tag> --hub-url https://<hub>
 ```
@@ -205,6 +208,9 @@ user** units into `~/.config/systemd/user` and starts them:
 | `txe-dagu-tunnel.service` | the same `kubectl port-forward` as `com.txe.dagu.tunnel`, without its supervisor: systemd restarts it only when kubectl exits |
 | `txe-dagu-worker.service` | the same `dagu worker` as `com.txe.dagu.worker`; once enrolled, it gets the credential file's path in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`, never its contents |
 
+Each unit runs its program under `bin/logpipe.py`, as the macOS agents do, so both logs are bounded
+with the same limits (TXE-5408).
+
 ```sh
 txe/worker/tunnel-credential.sh                                  # needs this machine's cluster access
 txe/worker/install-systemd.sh --tag txe-v2.18.2-<n> --owner-id own_...   # first install
@@ -218,8 +224,28 @@ txe/worker/uninstall-systemd.sh --purge    # and delete the TXE home (irreversib
   (2026-10-20). That run used a local hub in enforce mode: an enrolled worker ran its pinned DAG,
   and uninstall removed the units and kept `machine.json` and the credential. Other distributions
   with systemd user instances should work but are not claimed.
+- **The bounded logs were tested on** Ubuntu 24.04 arm64 with systemd 255 and Python 3.12, in a
+  container with no network (2026-11-06): an upgrade from the earlier units while a step was
+  running, then stops, crashes and restarts, with a worker that got its tasks from a hub on the
+  container's own loopback. `TXE_DAGU_SYSTEMD_LIFECYCLE=1 go test ./txe/worker -run
+  TestSystemdLifecycle` repeats the unit's part of it; it installs and starts units of its own
+  in your systemd manager, so run it in a disposable machine.
 - **Lingering:** user units stop at logout unless lingering is on (`loginctl enable-linger <user>`,
   which may need an administrator). The install reports which.
-- **Logs:** `$TXE_DAGU_HOME/logs/{tunnel,worker}.log`. `StandardOutput=append:` takes the path
-  unquoted, so a TXE home whose path holds a space, `%` or `$` is refused.
+- **Logs:** `$TXE_DAGU_HOME/logs/{tunnel,worker}.log`, each kept bounded by `bin/logpipe.py`:
+  `worker.log` is rotated at 64 MiB with the newest 10 rotated files kept, `tunnel.log` at 8 MiB
+  with 5, compressed, as `<name>.log.<utc stamp>.gz`. Nothing else is ever deleted. A log that an
+  install from before TXE-5408 left, which systemd appended to without a limit, is moved whole to
+  `<name>.legacy-<utc stamp>.log` when its unit next starts, and stays until you remove it. The
+  wrapper's own diagnostics are in `<name>.logpipe.log` and one previous copy, 1 MiB each.
+  `python3` must be on the installing shell's PATH; the unit runs that interpreter by its
+  absolute path.
+- **The journal** (`journalctl --user -u txe-dagu-worker.service`) holds what systemd says about
+  a unit, and the wrapper's own output if it cannot write its diagnostics or stops on an error.
+  The worker's and kubectl's output is only in the files above.
+- **Stopping** a unit sends SIGTERM to the wrapper alone, which passes it to the worker alone
+  (`KillMode=mixed`), so the worker stops its running steps itself and each step gets its stop
+  signal once. The worker has 90 seconds; then the wrapper kills it, and systemd kills whatever
+  is left of the unit. Before TXE-5408 systemd signalled every process of the unit itself, and a
+  step got SIGTERM from systemd as well as from the worker.
 - Uninstalling does not revoke the machine's enrolment; revoke it in the hub.

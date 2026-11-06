@@ -3,11 +3,16 @@
 Run by install-systemd.sh and uninstall-systemd.sh with `python3 -I`; it reads no environment.
 
   units.py write UNITS HOME KUBECTL MACHINE_ID OWNER_ID PATH TUNNEL_UNIT WORKER_UNIT
-                 NAMESPACE SERVICE UI_PORT COORD_PORT CREDENTIAL_FILE
-      Write the tunnel and worker units into UNITS (a systemd user unit directory). They run the same
-      programs with the same arguments as the macOS agents. CREDENTIAL_FILE, when not empty, is
-      passed to the worker as DAGU_WORKER_AUTH_CREDENTIAL_FILE: the path only, never the contents.
-      With an empty CREDENTIAL_FILE the units are exactly those of an install without one.
+                 NAMESPACE SERVICE UI_PORT COORD_PORT CREDENTIAL_FILE PYTHON [HUB_URL]
+      Write the tunnel and worker units into UNITS (a systemd user unit directory). The worker
+      runs with the macOS agent's arguments; the tunnel is the same kubectl port-forward, without
+      the macOS supervisor. CREDENTIAL_FILE, when not empty, is passed to the worker as
+      DAGU_WORKER_AUTH_CREDENTIAL_FILE: the path only, never the contents. With an empty
+      CREDENTIAL_FILE the units are exactly those of an install without one.
+      Each program runs under HOME/bin/logpipe.py with PYTHON, which owns HOME/logs/worker.log or
+      tunnel.log and keeps it bounded with the macOS agents' limits (TXE-5408); install-systemd.sh
+      puts the script there. systemd's own stream for a unit goes to the journal and holds only
+      what the wrapper itself writes to stderr, so no second descriptor is open on either log.
 
   units.py credential UNIT_FILE
       Print the credential file a worker unit passes, or nothing.
@@ -32,40 +37,63 @@ def _quote(word, exec_line):
     return '"' + word + '"'
 
 
-def _unit(description, argv, environment, log):
+# A unit's stop, in seconds. STOP_WAIT_S is how long the wrapper waits for its child after
+# passing on the stop signal before it kills it: the 90 s systemd gives a unit by default, which
+# is what the worker had to finish its tasks when the unit ran it directly. The unit then gets
+# STOP_MARGIN_S more, for the wrapper to drain what a descendant still writes (5 s at most)
+# and to end its compression.
+STOP_WAIT_S, STOP_MARGIN_S = 90, 15
+
+
+def _logged(python, home, stem, max_bytes, backups, argv):
+    """argv under logpipe.py, which owns HOME/logs/STEM.log and bounds it (TXE-4724)."""
+    return [python, "-I", f"{home}/bin/logpipe.py", "--path", f"{home}/logs/{stem}.log",
+            "--max-bytes", str(max_bytes), "--backups", str(backups),
+            "--kill-timeout", str(STOP_WAIT_S), "--", *argv]
+
+
+def _unit(description, argv, environment):
     lines = ["[Unit]", f"Description={description}", "After=network-online.target", "",
              "[Service]", "Type=simple"]
     lines += [f"Environment={_quote(f'{k}={v}', False)}" for k, v in environment.items()]
     lines += ["ExecStart=" + " ".join(_quote(a, True) for a in argv),
               # As launchd's KeepAlive with ThrottleInterval 5: always restarted, 5 s apart.
               "Restart=always", "RestartSec=5",
-              f"StandardOutput=append:{log}", f"StandardError=append:{log}", "",
+              # Stop as launchd stops an agent: SIGTERM to the wrapper alone, which passes it to
+              # its child alone, so the worker stops its steps itself and each gets its stop
+              # signal once; whatever is left of the control group when the wrapper exits is
+              # killed. Under the default, control-group, systemd also signals every process
+              # itself: the worker and each step then get SIGTERM twice (measured, systemd 255).
+              "KillMode=mixed", f"TimeoutStopSec={STOP_WAIT_S + STOP_MARGIN_S}",
+              # The wrapper exits 143 when SIGTERM ended its child, as it ends kubectl. systemd
+              # counts a main process ended by SIGTERM as stopped, not failed; so is this code.
+              "SuccessExitStatus=143",
+              "StandardOutput=journal", "StandardError=journal", "SyslogIdentifier=%N", "",
               "[Install]", "WantedBy=default.target", ""]
-    for p in (log,):
-        if any(c in p for c in " \t\n%$\"\\"):
-            raise ValueError(f"the log path must have no space or special character for StandardOutput=append: {p!r}")
     return "\n".join(lines)
 
 
 def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, worker_unit,
-                namespace, service, ui_port, coord_port, credential_file, hub_url=""):
-    checked = (("the TXE home", home),) if hub_url else (("the TXE home", home), ("kubectl", kubectl))
+                namespace, service, ui_port, coord_port, credential_file, python, hub_url=""):
+    checked = [("the TXE home", home), ("python3", python)] + ([] if hub_url else [("kubectl", kubectl)])
     for name, value in checked:
         if not os.path.isabs(value):
             raise ValueError(f"{name} must be an absolute path for a unit, got {value!r}")
-    tunnel = _unit("TXE Dagu tunnel to the hub (kubectl port-forward, loopback only)", [
-        kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
-        "port-forward", "--address", "127.0.0.1", service,
-        f"{ui_port}:8080", f"{coord_port}:{coord_port}"], {"PATH": path}, f"{home}/logs/tunnel.log")
+    # The log limits are the macOS agents' (agents.py); txe/worker's tests hold the two together.
+    tunnel = _unit("TXE Dagu tunnel to the hub (kubectl port-forward, loopback only)",
+                   _logged(python, home, "tunnel", 8388608, 5, [
+                       kubectl, "--kubeconfig", f"{home}/tunnel/kubeconfig", "-n", namespace,
+                       "port-forward", "--address", "127.0.0.1", service,
+                       f"{ui_port}:8080", f"{coord_port}:{coord_port}"]), {"PATH": path})
     environment = {"DAGU_HOME": f"{home}/worker-home", "PATH": path}
     if credential_file:
         environment[CREDENTIAL_ENV] = credential_file
-    worker = _unit(f"TXE Dagu worker {machine_id}", [
+    worker = _unit(f"TXE Dagu worker {machine_id}", _logged(python, home, "worker", 67108864, 10, [
         f"{home}/bin/dagu", "worker",
         "--worker.id", machine_id,
         "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
-        *(["--worker.hub-url", hub_url] if hub_url else ["--worker.coordinators", f"127.0.0.1:{coord_port}"])],
-        environment, f"{home}/logs/worker.log")
+        *(["--worker.hub-url", hub_url] if hub_url else ["--worker.coordinators", f"127.0.0.1:{coord_port}"])]),
+        environment)
     os.makedirs(units, exist_ok=True)
     # On the worker channel there is no tunnel, and a tunnel left behind would keep a
     # Kubernetes credential in use.
@@ -96,7 +124,7 @@ def unit_credential(unit_file):
 
 
 def main(argv):
-    if len(argv) in (14, 15) and argv[0] == "write":
+    if len(argv) in (15, 16) and argv[0] == "write":
         try:
             write_units(*argv[1:])
         except ValueError as e:

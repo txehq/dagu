@@ -678,7 +678,8 @@ taken = os.path.join(d, "worker.legacy-%s.log" % stamp)
 open(taken, "wb").write(b"EXISTING ARCHIVE\n")
 import gzip
 earlier = os.path.join(d, "worker.log.%s.gz" % stamp)
-gzip.open(earlier, "wb").write(b"EARLIER ROTATION\n")
+with gzip.open(earlier, "wb") as f:   # closed here: Python 3.12 writes nothing until an unclosed one is collected
+    f.write(b"EARLIER ROTATION\n")
 log = new_log(path, max_bytes=20000, backups=5)
 print("existing archive untouched", open(taken, "rb").read() == b"EXISTING ARCHIVE\n")
 print("new archive", sorted(n for n in os.listdir(d) if n.startswith("worker.legacy-")))
