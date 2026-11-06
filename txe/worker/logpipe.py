@@ -1,6 +1,7 @@
 """Run the worker and keep its log bounded (TXE-4724).
 
-The launchd worker agent runs this with `python3 -I`; it reads no environment.
+The launchd agents (macOS) and the systemd user units (Linux, TXE-5408) run this with
+`python3 -I`; it reads no environment.
 
   logpipe.py --path LOG --max-bytes N --backups K [--chunk-bytes C] [--write-stall-seconds S]
              [--kill-timeout T] [--diag-path P] [--diag-max-bytes D] -- CHILD ARGS...
@@ -86,6 +87,15 @@ alone is not the end: once the worker has exited, this process drains for at mos
 --orphan-grace seconds (5) more, whether or not data keeps arriving, then stops, exits with the
 worker's code, and leaves the rest to launchd's group kill. It finishes the compression in
 progress first. It never restarts the worker.
+
+Under systemd (txe/worker/units.py) all of the above holds with systemd in launchd's place.
+The units set KillMode=mixed: systemd sends SIGTERM to this process alone and, once this
+process has exited, kills what is left of the unit's control group, a step in its own process
+group included. Its default, control-group, also signals the worker and every step directly,
+so each would get the stop signal twice. The units pass --kill-timeout 90, the time systemd
+gives a unit to stop by default, inside a TimeoutStopSec of 105, and count this process's exit
+143 (SIGTERM ended the child) as a clean stop. A unit's own output goes to the journal, which
+journald bounds, never to a file: that is where a diagnostic line falls back to.
 """
 import argparse
 import datetime
@@ -562,7 +572,8 @@ def drain(fd, log, chunk_bytes, child=None, orphan_grace=5.0):
 
 def stop_child(child, kill_timeout, diag):
     """SIGTERM to the worker, then SIGKILL to it after kill_timeout; returns the worker's exit
-    code. Its remaining descendants are launchd's to kill with the group when this exits."""
+    code. Its remaining descendants are launchd's to kill with the group when this exits
+    (systemd's, with the unit's control group)."""
     if child.poll() is None:
         try:
             child.terminate()
@@ -615,10 +626,11 @@ def main(argv):
 
     # Same process group as this process, launchd's group for the agent: launchd kills what is
     # left of it when this process exits (see the header), so no new group and no killpg.
+    # systemd does the same with the unit's control group.
     try:
         child = subprocess.Popen(a.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except OSError as e:
-        diag.say("start", f"cannot start the worker ({e.__class__.__name__}: {e}); exiting 127 so launchd retries",
+        diag.say("start", f"cannot start the worker ({e.__class__.__name__}: {e}); exiting 127 so the service is restarted",
                  always=True)
         log.finish()
         return 127
