@@ -16,8 +16,10 @@ On the worker channel (`txe/worker/HTTPS-CHANNEL.md`), give `install.sh --hub-ur
 A new machine:
 
 ```sh
-txe/worker/install.sh --tag <tag> --owner-id <own_...> --hub-url https://<hub>   # prepares; nothing starts
-dagu txe login --hub https://<hub>
+txe/worker/install.sh --tag <tag> --owner-id <own_...> --hub-url https://<hub>   # prepares; nothing starts, and it
+                                                                                 # prints these steps with this machine's binary by path
+~/.local/share/txe-dagu/bin/dagu txe login --hub https://<hub>                   # the machine's own binary: a `dagu` on PATH may be the
+                                                                                 # developer CLI, whose login signs the developer's store in
 dagu txe machine create                                                          # once, by the owner
 dagu txe enrol --client-id <this machine's worker client> --wait 15m
 txe/worker/install.sh --tag <tag> --hub-url https://<hub>                        # the worker starts
@@ -26,8 +28,9 @@ txe/worker/install.sh --tag <tag> --hub-url https://<hub>                       
 A machine moving off the port-forward. Job, probe and reviewer steps reach the hub through this machine's `txe` context, and their credential is bound to that context's address, so the context moves first and enrolment follows it:
 
 ```sh
-dagu txe login --hub https://<hub>   # refused while the context names the old address, and prints the
-                                     # exact command that removes it: run that, then sign in again
+~/.local/share/txe-dagu/bin/dagu txe login --hub https://<hub>   # the machine's own binary, as above; refused while the
+                                                                 # context names the old address, and prints the exact
+                                                                 # command that removes it: run that, then sign in again
 dagu txe enrol --client-id <this machine's worker client> --wait 15m             # and the reviewer's, if it has one
 txe/worker/install.sh --tag <tag> --hub-url https://<hub>
 ```
