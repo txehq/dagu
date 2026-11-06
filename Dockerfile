@@ -67,6 +67,9 @@ RUN set -eux; \
       rm -rf /var/lib/apt/lists/*; \
       apt-get update -o Acquire::Retries=5 \
                      -o APT::Update::Error-Mode=any && \
+      # apt 2.8.3 in the ubuntu:24.04 base carries CVE-2026-109518 (HIGH),
+      # fixed in 2.8.4ubuntu0.1; take the fix until the base image has it.
+      apt-get -o Acquire::Retries=5 install -y --only-upgrade apt && \
       apt-get -o Acquire::Retries=5 install -y \
       sudo \
       tini \

@@ -8,7 +8,6 @@ import { expect, signIn, test } from './fixtures';
 // settings path held the runtime profile: it opens the Overview tab.
 const PANEL_PATHS = [
   { path: 'notifications', wtab: 'notifications', label: 'Notifications' },
-  { path: 'incidents', wtab: 'incidents', label: 'Incidents' },
   { path: 'wiki', wtab: 'wiki', label: 'Wiki' },
 ] as const;
 
@@ -86,7 +85,8 @@ test.describe('workspace runtime profile', () => {
 
     const tabs = page.getByTestId('ww-workflow-tabs');
     // A narrow strip shows the tabs as icons: their names stay.
-    const names = ['Overview', 'Wiki', 'Incidents', 'Notifications'];
+    // The fork does not offer the licensed incident feature (TXE-5923).
+    const names = ['Overview', 'Wiki', 'Notifications'];
     await expect(tabs.getByRole('tab')).toHaveCount(names.length);
     for (const [index, name] of names.entries()) {
       await expect(tabs.getByRole('tab').nth(index)).toHaveAccessibleName(name);

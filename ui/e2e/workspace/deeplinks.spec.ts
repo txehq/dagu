@@ -274,7 +274,9 @@ test.describe('workspace deep links', () => {
         from: '/incidents',
         to: '',
         query: { wtab: 'incidents', panel: null },
-        zone: 'incidents',
+        // The fork does not offer the licensed incident feature: the link
+        // keeps its wtab and shows the Overview (TXE-5923).
+        zone: 'overview',
       },
       {
         rule: 'R10',

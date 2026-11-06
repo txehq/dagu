@@ -131,7 +131,9 @@ func pinningName(p dispatch.MachinePinning) string {
 		return "off"
 	case dispatch.MachinePinningObserve:
 		return "observe"
-	default:
+	case dispatch.MachinePinningEnforce:
 		return "enforce"
+	default:
+		return "unknown"
 	}
 }
