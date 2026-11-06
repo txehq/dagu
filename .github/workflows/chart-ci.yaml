@@ -106,7 +106,11 @@ jobs:
 
       # The templates follow main and the default image is Chart.appVersion,
       # so an older appVersion renders settings its image does not know.
+      # TXE fork: the fork carries upstream's chart unchanged and holds none of
+      # upstream's release tags (its own are txe-v*), so the newest v* tag here
+      # is an old upstream one. The check is upstream's to run (TXE-5923).
       - name: Require the latest Dagu release as appVersion
+        if: github.repository == 'dagucloud/dagu'
         shell: bash
         run: |
           app_version="$(awk -F': ' '$1=="appVersion"{gsub(/"/,"",$2); print $2; exit}' charts/dagu/Chart.yaml)"
