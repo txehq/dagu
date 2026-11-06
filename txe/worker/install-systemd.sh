@@ -137,7 +137,7 @@ link_dagu_on_path
 # with neither running. There is nothing to roll back.
 if [ -n "$hub_url" ] && [ -z "$credential" ]; then
   printf 'prepared %s (%s): no unit was started\n  machine %s\n  owner   %s\n' "$version" "$tag" "$machine_id" "$owner_id"
-  printf 'next:\n  dagu txe login --hub %s\n  dagu txe machine create\n  dagu txe enrol --client-id <this machine'"'"'s worker client> --wait 15m\n  run this install again with --hub-url\n' "$hub_url"
+  channel_next_steps "$hub_url"
   exit 0
 fi
 

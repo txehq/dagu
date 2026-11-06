@@ -107,6 +107,30 @@ except OSError:
   esac
 }
 
+# shell_word WORD: WORD as one word of a command that can be run as printed: as it
+# is when it holds only letters, digits and _ . / : @ + -, otherwise single-quoted.
+shell_word() {
+  case "$1" in
+    "" | *[!A-Za-z0-9_./:@+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# channel_next_steps HUB_URL: what a machine prepared on the worker channel with no
+# credential yet does next (TXE-5806). The sign-in names this install's binary by its
+# absolute path, never `dagu`: on a machine with the developer CLI, `dagu` on PATH is
+# its wrapper, which keeps `dagu txe login` in the developer's own context store, so
+# the machine's `txe` context, the one `dagu txe enrol` reads the hub from, would never
+# be created. `machine create` works from either store, enrol always runs with the
+# machine's (TXE-4734), and the install line is this script's own.
+channel_next_steps() {
+  local hub_url="$1" bin="$TXE_DAGU_HOME/bin/dagu"
+  case "$bin" in /*) ;; *) bin="$PWD/$bin" ;; esac
+  printf 'next:\n  %s txe login --hub %s\n' "$(shell_word "$bin")" "$(shell_word "$hub_url")"
+  printf '    (this machine'"'"'s own binary, by path: a dagu on PATH may be the developer CLI, whose login signs the developer'"'"'s store in, not this machine'"'"'s)\n'
+  printf '  dagu txe machine create\n  dagu txe enrol --client-id <this machine'"'"'s worker client> --wait 15m\n  run this install again with --hub-url\n'
+}
+
 # worker_credential GIVEN PATH MACHINE_ID: print the machine credential file the
 # worker agent is to pass, or nothing. GIVEN is 1 when --credential-file named PATH,
 # and "none" for --no-credential: nothing is passed and no file is read, moved or
