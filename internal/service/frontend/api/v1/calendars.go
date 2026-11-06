@@ -55,7 +55,11 @@ func (a *API) ListCalendars(ctx context.Context, request api.ListCalendarsReques
 	}
 	var usage calendarUsage
 	if request.Params.IncludeUsage != nil && *request.Params.IncludeUsage {
-		if usage, err = a.calendarUsage(ctx, summaries, a.workspaceFilterForContext(ctx)); err != nil {
+		scope, err := a.txeWholeHubListScope(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if usage, err = a.calendarUsage(ctx, summaries, a.workspaceFilterForContext(ctx), scope); err != nil {
 			return nil, err
 		}
 	}
@@ -97,7 +101,11 @@ func (a *API) GetCalendar(ctx context.Context, request api.GetCalendarRequestObj
 	if err != nil {
 		return nil, err
 	}
-	usage, err := a.calendarUsage(ctx, summaries, a.workspaceFilterForContext(ctx))
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	usage, err := a.calendarUsage(ctx, summaries, a.workspaceFilterForContext(ctx), scope)
 	if err != nil {
 		return nil, err
 	}
@@ -208,11 +216,15 @@ func (a *API) DeleteCalendar(ctx context.Context, request api.DeleteCalendarRequ
 	}
 	// Every DAG counts, so a calendar is not deleted from under DAGs the
 	// caller cannot see; only the visible ones are named.
-	usage, err := a.calendarUsage(ctx, summaries, nil)
+	usage, err := a.calendarUsage(ctx, summaries, nil, txeListScope{})
 	if err != nil {
 		return nil, err
 	}
-	if reason := usage.inUse(request.Name, a.workspaceFilterForContext(ctx)); reason != "" {
+	scope, err := a.txeWholeHubListScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if reason := usage.inUse(request.Name, a.workspaceFilterForContext(ctx), scope.dag); reason != "" {
 		return nil, &Error{
 			HTTPStatus: http.StatusConflict,
 			Code:       api.ErrorCodeConflict,
@@ -378,8 +390,9 @@ type calendarUse struct {
 }
 
 // calendarUsage reads the DAG catalog, with the DAGs of the extra search
-// directories and limited by filter, and the include lists of summaries.
-func (a *API) calendarUsage(ctx context.Context, summaries []spec.CalendarSummary, filter *workspace.WorkspaceFilter) (calendarUsage, error) {
+// directories and limited by filter and by the fork's owner scope, and the
+// include lists of summaries. A zero scope narrows nothing.
+func (a *API) calendarUsage(ctx context.Context, summaries []spec.CalendarSummary, filter *workspace.WorkspaceFilter, scope txeListScope) (calendarUsage, error) {
 	usage := calendarUsage{}
 	use := func(name string) *calendarUse {
 		if usage[name] == nil {
@@ -391,7 +404,9 @@ func (a *API) calendarUsage(ctx context.Context, summaries []spec.CalendarSummar
 		use(summary.Name).includes = summary.Includes
 	}
 	paginator := pagination.NewPaginator(1, math.MaxInt)
-	result, _, err := a.dagRepository.ListIncludingSearchPaths(ctx, persis.DAGListOptions{Paginator: &paginator, WorkspaceFilter: filter})
+	opts := persis.DAGListOptions{Paginator: &paginator, WorkspaceFilter: filter}
+	scope.apply(&opts)
+	result, _, err := a.dagRepository.ListIncludingSearchPaths(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +475,9 @@ func (u calendarUsage) users(name string) []api.CalendarUser {
 }
 
 // inUse explains why calendar name cannot be deleted, naming only the DAGs
-// that visible matches, or returns "".
-func (u calendarUsage) inUse(name string, visible *workspace.WorkspaceFilter) string {
+// that visible matches and, when set, the fork's owner scope (named) admits,
+// or returns "". The others are only counted.
+func (u calendarUsage) inUse(name string, visible *workspace.WorkspaceFilter, named func(persis.DAGListItem) bool) string {
 	var reasons []string
 	if dependents := u.dependents(name); len(dependents) > 0 {
 		reasons = append(reasons, "included by calendar "+strings.Join(dependents, ", "))
@@ -471,7 +487,7 @@ func (u calendarUsage) inUse(name string, visible *workspace.WorkspaceFilter) st
 		var names []string
 		hidden := 0
 		for _, user := range users {
-			if !visible.MatchesLabels(u.labels(user.FileName)) || len(names) == calendarInUseListLimit {
+			if !visible.MatchesLabels(u.labels(user.FileName)) || !u.admits(user.FileName, named) || len(names) == calendarInUseListLimit {
 				hidden++
 				continue
 			}
@@ -487,6 +503,22 @@ func (u calendarUsage) inUse(name string, visible *workspace.WorkspaceFilter) st
 		reasons = append(reasons, reason)
 	}
 	return strings.Join(reasons, "; ")
+}
+
+// admits reports whether named admits the DAG fileName; a nil named admits
+// every DAG.
+func (u calendarUsage) admits(fileName string, named func(persis.DAGListItem) bool) bool {
+	if named == nil {
+		return true
+	}
+	for _, use := range u {
+		for _, dag := range use.dags {
+			if dag.ID == fileName {
+				return named(dag)
+			}
+		}
+	}
+	return false
 }
 
 func (u calendarUsage) labels(fileName string) ir.Labels {

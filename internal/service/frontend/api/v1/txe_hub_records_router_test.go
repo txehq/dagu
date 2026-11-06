@@ -151,3 +151,46 @@ func TestTxeForeachReadsDecideTheRunsOwner(t *testing.T) {
 		require.Contains(t, body, "step s not found in DAG", "the platform administrator reads run %s", name)
 	}
 }
+
+// Upstream v2.25's calendar reads list the DAGs that use a calendar. Under
+// enforce they name only what the caller's DAG lists show it: a legacy
+// credential none, the platform administrator every DAG. A delete still
+// counts every DAG, so a calendar in use is not deleted from under DAGs the
+// caller cannot see; it names none of them (TXE-5923).
+func TestTxeCalendarUsageFollowsTheOwnerScope(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "ops"}).
+		WithBearerToken(h.admin).ExpectStatus(http.StatusCreated).Send(t)
+	users := []string{"job_01M5YYYYYYYYYYYYYYYYYYYYYY", "nightly-calendar"}
+	for _, name := range users {
+		spec := []byte("calendar: ops\nschedule: \"0 9 * * *\"\nsteps:\n  - name: s\n    run: echo hi\n")
+		h.server.CreateDAGFile(t, h.server.Config.Paths.DAGsDir, name, spec)
+	}
+	mentioned := func(body string) []string {
+		var out []string
+		for _, name := range users {
+			if strings.Contains(body, name) {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+
+	status, body := h.send(t, "/api/v1/calendars/ops", h.admin)
+	require.Equal(t, http.StatusOK, status, body)
+	require.ElementsMatch(t, users, mentioned(body), "the platform administrator")
+	status, body = h.send(t, "/api/v1/calendars/ops", h.legacy)
+	require.Equal(t, http.StatusOK, status, body)
+	require.Empty(t, mentioned(body), "a legacy credential in enforce")
+	status, body = h.send(t, "/api/v1/calendars?includeUsage=true", h.legacy)
+	require.Equal(t, http.StatusOK, status, body)
+	require.NotContains(t, body, `"dagCount":2`, "a legacy credential in enforce counts no DAG")
+
+	resp := h.server.Client().Delete("/api/v1/calendars/ops").WithBearerToken(h.legacy).Send(t)
+	if resp.Response.StatusCode() == http.StatusConflict {
+		require.Empty(t, mentioned(resp.Body), "a delete names no DAG the caller cannot see")
+	}
+	resp = h.server.Client().Delete("/api/v1/calendars/ops").WithBearerToken(h.admin).Send(t)
+	require.Equal(t, http.StatusConflict, resp.Response.StatusCode(), "a calendar in use is not deleted")
+	require.ElementsMatch(t, users, mentioned(resp.Body))
+}
