@@ -820,8 +820,11 @@ type Coordinator struct {
 	WorkerWaitTimeout time.Duration
 	// UnclaimedDispatchTimeout bounds how long a dispatched task no worker
 	// has claimed waits for one (TXE-5923). Each task gets its deadline once,
-	// when first enqueued; past it the task is no longer handed out and its
-	// attempt ends. It bounds only the wait for a claim: a claimed task and
+	// when first enqueued. At the deadline the task stops being handed out
+	// and is removed on the coordinator's next pass; the run shows the end
+	// later (a journaled attempt is abandoned as not dispatched no sooner
+	// than 10 minutes after it was prepared). It bounds only the wait for a
+	// claim: a claimed task and
 	// the run it starts are never ended by it, however long they run.
 	// Default: 24h; 0 means no ceiling. A held dispatch waits for
 	// WorkerWaitTimeout instead.

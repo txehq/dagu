@@ -59,8 +59,11 @@ behaviour the fork depends on, the fork keeps its own:
   deadline is set once, when the task is first enqueued, and is stored with it. A restart, a
   released claim, a republication of the same execution or a later change of the setting never
   moves it; a new attempt gets its own. A record from before the field takes its deadline from its
-  stored enqueue time, and fails closed without one. Past the deadline the task is never handed
-  out. The coordinator then removes that exact record and settles the attempt:
+  stored enqueue time, and fails closed without one. From the deadline the task is never handed
+  out. The coordinator removes that exact record on its next pass and settles the attempt. The
+  deadline is the cutoff for a claim, not the moment the run's status changes: a journaled
+  attempt is abandoned only once it is at least 10 minutes old (abandonedPreparationMinAge).
+  Measured with a 2m ceiling: removal at about 126 s, abandonment at about 620 s. The two paths:
   - a journaled attempt is abandoned with the usual record;
   - any other attempt is failed first, then loses its task.
 
