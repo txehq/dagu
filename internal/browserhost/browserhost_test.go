@@ -415,3 +415,29 @@ func startHungBrowserProcess(t *testing.T) (int, string, <-chan struct{}) {
 	require.NoError(t, err)
 	return cmd.Process.Pid, strings.TrimSpace(line), exited
 }
+
+// A record from before browsers had gates names an address this code does
+// not reach. When its browser process has already exited there is nothing
+// to end, and the record and its files are released rather than kept for
+// every later sweep.
+func TestReleaseLegacyRecordWhoseBrowserExited(t *testing.T) {
+	t.Parallel()
+
+	exited := exec.Command(os.Args[0], "-test.run=^$")
+	require.NoError(t, exited.Start())
+	pid := exited.Process.Pid
+	startedAt, ok := procutil.StartTime(pid)
+	require.True(t, ok)
+	require.NoError(t, exited.Wait())
+
+	store := browserhost.NewStore(t.TempDir())
+	record := ownedRecord(t, "http://127.0.0.1:9222")
+	record.BrowserPID = pid
+	record.BrowserStartedAt = startedAt
+	require.NoError(t, store.Save(record))
+
+	require.NoError(t, browserhost.Release(context.Background(), store, record))
+	_, err := store.Load(record.ID)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NoDirExists(t, record.UserDataDir)
+}

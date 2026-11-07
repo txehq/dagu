@@ -5,6 +5,9 @@ package browserhost
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
@@ -37,4 +40,13 @@ func TestRecordedBrowserGone(t *testing.T) {
 
 	assert.True(t, recordedBrowserGone(ctx, Record{CDPURL: address}), "without a process, an address nothing answers at is gone")
 	assert.True(t, recordedBrowserGone(ctx, Record{CDPURL: "http://127.0.0.1:9222"}), "a record from before gates, without a process, cannot be reached and is gone")
+
+	// A gate that still answers means the browser is there, whatever the
+	// recorded process says about itself.
+	answering := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/x"}`)
+	}))
+	t.Cleanup(answering.Close)
+	stillThere := Record{CDPURL: answering.URL + "/TESTTOKEN0000000000000000A", BrowserPID: pid, BrowserStartedAt: startedAt}
+	assert.False(t, recordedBrowserGone(ctx, stillThere), "an answering gate is not gone")
 }

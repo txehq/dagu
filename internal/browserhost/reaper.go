@@ -82,6 +82,11 @@ func closeRecordedBrowser(ctx context.Context, record Record) error {
 	if err == nil {
 		return nil
 	}
+	// A browser that is already gone, as one recorded before gates whose
+	// process exited, needs no ending.
+	if recordedBrowserGone(ctx, record) {
+		return nil
+	}
 	if endProcess(record.GatePID, record.GateStartedAt) && waitForRecordedExit(ctx, record) {
 		return nil
 	}
@@ -111,23 +116,26 @@ func waitForRecordedExit(ctx context.Context, record Record) bool {
 	}
 }
 
-// recordedBrowserGone reports whether the recorded browser process has
-// exited, or, when no process is recorded, whether its address no longer
-// answers.
+// recordedBrowserGone reports whether the recorded browser is gone: its
+// gate's address no longer answers, and the recorded browser process, when
+// there is one, has exited. A record from before gates has no address this
+// code reaches, so its process alone decides.
 func recordedBrowserGone(ctx context.Context, record Record) bool {
-	if record.BrowserPID > 0 {
-		matched, _, ok := procutil.MatchesStartTime(record.BrowserPID, record.BrowserStartedAt)
-		if !ok {
-			// No start time to compare: a process that is gone is gone;
-			// one that is alive is taken to be the browser.
-			return !procutil.IsAlive(record.BrowserPID)
-		}
-		return !matched
+	if TokenOf(record.CDPURL) != "" && !errors.Is(Probe(ctx, record.CDPURL), ErrUnreachable) {
+		return false
 	}
-	if TokenOf(record.CDPURL) == "" {
+	if record.BrowserPID <= 0 {
 		return true
 	}
-	return errors.Is(Probe(ctx, record.CDPURL), ErrUnreachable)
+	// A process that has exited is gone, even while a handle to it is still
+	// open and its start time can still be read. One that is alive is the
+	// browser unless its start time says the ID was reused; with no start
+	// time to compare, it is taken to be the browser.
+	if !procutil.IsAlive(record.BrowserPID) {
+		return true
+	}
+	matched, _, ok := procutil.MatchesStartTime(record.BrowserPID, record.BrowserStartedAt)
+	return ok && !matched
 }
 
 // endProcess ends pid when it is still the process that started at
@@ -142,6 +150,9 @@ func endProcess(pid int, startedAt int64) bool {
 	if err != nil {
 		return false
 	}
+	// The handle is let go at once: on Windows an open handle keeps an ended
+	// process queryable, as if it had not gone.
+	defer func() { _ = process.Release() }()
 	return process.Kill() == nil
 }
 

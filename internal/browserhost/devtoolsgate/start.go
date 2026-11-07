@@ -44,6 +44,15 @@ func Start(ctx context.Context, executable string, cfg Config) (*Handle, error) 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	// The gate runs in the executable's directory, so every path it is
+	// given must stand on its own.
+	executable, err := filepath.Abs(executable)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the dagu executable: %w", err)
+	}
+	if cfg.Executable, err = filepath.Abs(cfg.Executable); err != nil {
+		return nil, fmt.Errorf("resolve the browser executable: %w", err)
+	}
 	input, err := json.Marshal(wireConfig{Version: configVersion, Config: cfg})
 	if err != nil {
 		return nil, err

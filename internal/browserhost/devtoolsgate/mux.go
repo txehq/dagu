@@ -391,7 +391,9 @@ func (m *mux) handleEventLocked(msg message, data []byte) {
 		return
 	}
 	if c, ok := m.explicitSessions[msg.SessionID]; ok {
-		c.deliver(data)
+		// A page endpoint's client never named its root session, so an
+		// event on it arrives without one, as it would from the browser.
+		c.deliverEvent(msg.SessionID, msg.Method, msg.Params)
 		return
 	}
 	if t, ok := m.gateSessions[msg.SessionID]; ok && m.onGateEvent != nil {

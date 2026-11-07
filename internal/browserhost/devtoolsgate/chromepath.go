@@ -15,11 +15,20 @@ import (
 // ErrBrowserNotFound reports that no browser was found to launch.
 var ErrBrowserNotFound = errors.New("no Chrome installation found; set CHROME_PATH or browser.executable")
 
-// FindBrowser returns the browser to launch: explicit when set, else the
-// CHROME_PATH environment variable, else the installation the SDK's own
-// launcher would have picked on this platform.
+// FindBrowser returns the browser to launch, as an absolute path: explicit
+// when set, else the CHROME_PATH environment variable, else the installation
+// the SDK's own launcher would have picked on this platform. The path is
+// made absolute here because the gate helper runs in another directory.
 func FindBrowser(explicit string) (string, error) {
-	return findBrowser(explicit, runtime.GOOS, os.Getenv, exec.LookPath, isFile)
+	path, err := findBrowser(explicit, runtime.GOOS, os.Getenv, exec.LookPath, isFile)
+	if err != nil {
+		return "", err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve browser executable %q: %w", path, err)
+	}
+	return absolute, nil
 }
 
 func findBrowser(explicit, goos string, getenv func(string) string, lookPath func(string) (string, error), fileExists func(string) bool) (string, error) {

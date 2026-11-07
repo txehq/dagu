@@ -336,3 +336,33 @@ func TestMuxAutoAttachUnderExplicitSession(t *testing.T) {
 		return true
 	}, "the client's sessions, the child's included, detached with it")
 }
+
+// A page endpoint's client never named its root session: events on it
+// arrive without a session id, as they would from the browser, while events
+// on a child it attached keep the child's.
+func TestMuxPageEndpointEventsDropRootSession(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	page := tg.dial("T1")
+	page.mustCall("", "Runtime.enable", nil)
+	browser := tg.dial("")
+	state := tg.state(browser)
+	var root string
+	for _, s := range state.Sessions {
+		if s.TargetID == "T1" && !s.Auto {
+			root = s.ID
+		}
+	}
+	require.NotEmpty(t, root)
+
+	browser.mustCall("", "Fake.event", map[string]any{"sessionId": root, "method": "Runtime.executionContextCreated", "params": map[string]any{"context": map[string]any{"id": 1}}})
+	event := page.waitEvent("Runtime.executionContextCreated", nil)
+	assert.Equal(t, "", event.SessionID, "the root session is implied")
+
+	page.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	browser.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	worker := decodeAttached(t, page.waitEvent("Target.attachedToTarget", nil))
+	browser.mustCall("", "Fake.event", map[string]any{"sessionId": worker.SessionID, "method": "Runtime.executionContextCreated", "params": map[string]any{"context": map[string]any{"id": 2}}})
+	child := page.waitEvent("Runtime.executionContextCreated", nil)
+	assert.Equal(t, worker.SessionID, child.SessionID, "a child session keeps its id")
+}

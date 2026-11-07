@@ -5,6 +5,7 @@ package devtoolsgate
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -68,4 +69,23 @@ func TestFindBrowser(t *testing.T) {
 	assert.ErrorIs(t, err, ErrBrowserNotFound)
 	_, err = findBrowser("", "plan9", noEnv, noLook, exists)
 	assert.ErrorContains(t, err, "not supported")
+}
+
+// The helper runs in the dagu executable's directory, so a relative browser
+// path from the configuration or CHROME_PATH is made absolute first.
+func TestFindBrowserReturnsAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	chrome := filepath.Join(dir, "chrome")
+	require.NoError(t, os.WriteFile(chrome, []byte("#!/bin/sh\n"), 0o700))
+	t.Chdir(dir)
+
+	path, err := FindBrowser("chrome")
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(path), path)
+	assert.Equal(t, chrome, path)
+
+	t.Setenv("CHROME_PATH", "./chrome")
+	path, err = FindBrowser("")
+	require.NoError(t, err)
+	assert.Equal(t, chrome, path)
 }
