@@ -67,6 +67,8 @@ that polls the folder and leaves empty runs behind.
   off is new when it returns.
 - A suspended DAG starts no runs; its files wait and run once it resumes.
   A file whose run could not be queued is tried again at the next reading.
+  A waiting file that changes waits to hold still again, and only its new
+  version runs.
 - A folder that cannot be read is reported once in the scheduler log, and
   read again every interval until it can be.
 - The record of watched folders is kept with the scheduler's state and

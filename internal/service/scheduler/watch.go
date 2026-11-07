@@ -235,8 +235,9 @@ func (w *folderWatcher) read(ctx context.Context, entry DAGEntry) bool {
 }
 
 // settle compares what the folder holds with what the ledger remembers:
-// a file that has held still since the last reading arrives, and a file
-// that is gone is forgotten, so it arrives again if it comes back.
+// a file that has held still since the last reading arrives, a file that
+// is gone is forgotten, so it arrives again if it comes back, and an
+// arrival whose file changed before its run was queued is dropped.
 func (w *folderWatcher) settle(ctx context.Context, entry DAGEntry, dir string, found map[string]schedulerstate.FileMark) {
 	dag := entry.DAG
 	w.mu.Lock()
@@ -261,8 +262,17 @@ func (w *folderWatcher) settle(ctx context.Context, entry DAGEntry, dir string, 
 		w.pending[dag.Name] = pending
 	}
 	for name, mark := range found {
-		if file, ok := ledger.Files[name]; ok && file.Same(mark) {
-			continue
+		if file, ok := ledger.Files[name]; ok {
+			if file.Same(mark) {
+				continue
+			}
+			// The version an arrival came with changed before its run was
+			// queued: the arrival is dropped, and the new version arrives
+			// once it holds still, so no run takes a file still being written.
+			if file.Unqueued {
+				delete(ledger.Files, name)
+				w.unsaved = true
+			}
 		}
 		if !pending[name].Same(mark) {
 			pending[name] = mark

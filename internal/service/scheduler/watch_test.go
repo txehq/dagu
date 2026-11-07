@@ -186,6 +186,44 @@ func TestWatchHoldsFilesWhileSuspended(t *testing.T) {
 	assert.Equal(t, []string{WatchRuntimeParams(path)}, f.runs(), "the file runs once the DAG resumes")
 }
 
+// An arrival whose run waits, while the DAG is suspended or its run cannot
+// be queued, is dropped when the file changes: the new version waits to
+// hold still, and only it runs.
+func TestWatchDropsAWaitingArrivalWhenTheFileChanges(t *testing.T) {
+	t.Parallel()
+
+	for _, hold := range []string{"suspended", "failing"} {
+		t.Run(hold, func(t *testing.T) {
+			t.Parallel()
+
+			f := newWatchFixture(t, "", nil)
+			f.read()
+			setHold := func(on bool) {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if hold == "suspended" {
+					f.suspended = on
+				} else {
+					f.fail = on
+				}
+			}
+			setHold(true)
+			path := f.write("a.csv", "part", f.now)
+			f.read()
+			f.read()
+			require.Empty(t, f.runs())
+			f.write("a.csv", "part of the file", f.now.Add(5*time.Second))
+			setHold(false)
+			f.read()
+			assert.Empty(t, f.runs(), "the changed file has not held still")
+			f.read()
+			assert.Equal(t, []string{WatchRuntimeParams(path)}, f.runs(), "one run, for the version that held still")
+			f.read()
+			assert.Len(t, f.runs(), 1)
+		})
+	}
+}
+
 func TestWatchRetriesAFileWhoseRunDidNotStart(t *testing.T) {
 	t.Parallel()
 
