@@ -10,10 +10,12 @@ import {
   paramsDiffer,
   pickReuseSource,
   planRun,
+  staleReusedInputs,
   staleUpstream,
   stepNeeds,
   type ReuseRun,
 } from '../reuseSource';
+import { inputLabel } from '../inputProvenance';
 import type { CacheEntry } from '../outputCache';
 import type { RunSpecDiff } from '../runSpecDiff';
 
@@ -177,6 +179,64 @@ describe('pickReuseSource', () => {
       holds: yes,
     });
     expect(pick.source?.dagRunId).toBe('chain');
+  });
+});
+
+// A -> B -> C. A was edited, and B was run on its own with A's old outputs:
+// that run's definition shows the edited A, and its labels record that A was
+// reused stale. Taken as C's source, it must not pass A or B for fresh.
+describe('a source run that reused a changed step', () => {
+  const deps = stepNeeds([
+    { name: 'a' },
+    { name: 'b', depends: ['a'] },
+    { name: 'c', depends: ['b'] },
+  ]);
+  const label = (stale: boolean) =>
+    inputLabel({
+      step: 'a',
+      source: 'run',
+      runId: 'old',
+      stale,
+      capturedAt: 1_700_000_000_000,
+    }) as string;
+  const sourceRun = (labels: string[]): ReuseRun => ({
+    ...runOf('b-only', Status.Success, [
+      node('a', NodeStatus.Skipped),
+      node('b'),
+    ]),
+    labels,
+  });
+
+  it('names the reused step its provenance records as stale', () => {
+    expect(staleReusedInputs(sourceRun([label(true)]))).toEqual(['a']);
+  });
+
+  it('names nothing for a reused step that was fresh', () => {
+    expect(staleReusedInputs(sourceRun([]))).toEqual([]);
+    expect(staleReusedInputs(null)).toEqual([]);
+  });
+
+  it('marks the stale input and everything downstream of it, though the definitions match', () => {
+    const run = sourceRun([label(true)]);
+    expect(
+      staleUpstream({
+        diff: diffOf(),
+        previous: ['a', 'b'],
+        deps,
+        staleInputs: staleReusedInputs(run),
+      })
+    ).toEqual(['a', 'b']);
+  });
+
+  it('keeps a source whose reused steps were fresh', () => {
+    expect(
+      staleUpstream({
+        diff: diffOf(),
+        previous: ['a', 'b'],
+        deps,
+        staleInputs: staleReusedInputs(sourceRun([])),
+      })
+    ).toEqual([]);
   });
 });
 

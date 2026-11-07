@@ -4,6 +4,7 @@
 import type { components } from '@/api/v1/schema';
 import { NodeStatus } from '@/api/v1/schema';
 import { parseParams } from '@/lib/parseParams';
+import { runInputProvenance } from './inputProvenance';
 import type { CacheEntries, CacheEntry } from './outputCache';
 import type { RunSpecDiff } from './runSpecDiff';
 import { isReusedNode, isRunActive } from './stepRunInfo';
@@ -52,6 +53,12 @@ export function staleUpstream(p: {
   diff: RunSpecDiff;
   previous: readonly string[];
   deps: StepNeeds;
+  /**
+   * Steps whose outputs in the run were reused although the step had
+   * changed (staleReusedInputs): the run's own definition matches them, but
+   * their values do not, and nothing downstream of them is fresh either.
+   */
+  staleInputs?: readonly string[];
 }): string[] {
   if (p.diff.headChanged) return [...p.previous];
   const previous = new Set(p.previous);
@@ -61,7 +68,10 @@ export function staleUpstream(p: {
     p.diff.changed.has(name) ||
     p.diff.removedFromLive.has(name) ||
     p.diff.addedInLive.has(name);
-  const stale = new Set(p.previous.filter(touched));
+  const stale = new Set([
+    ...p.previous.filter(touched),
+    ...(p.staleInputs ?? []),
+  ]);
   for (let grew = true; grew; ) {
     grew = false;
     for (const name of previous) {
@@ -73,6 +83,19 @@ export function staleUpstream(p: {
     }
   }
   return p.previous.filter((name) => stale.has(name));
+}
+
+/**
+ * The steps that a run reused although they had changed since their source,
+ * as its provenance records (`stale`). The run's definition shows such a
+ * step as it is now, so comparing definitions alone would take the outputs
+ * the run gives it, and every step that consumed them, for fresh.
+ */
+export function staleReusedInputs(run: ReuseRun | null): string[] {
+  if (!run) return [];
+  return [...runInputProvenance(run).values()]
+    .filter((record) => record.stale)
+    .map((record) => record.step);
 }
 
 /** True when the node of a step holds a state that a new run can copy. */

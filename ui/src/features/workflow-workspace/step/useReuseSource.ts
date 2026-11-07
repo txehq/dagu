@@ -10,6 +10,7 @@ import {
   nodeHoldsOutputs,
   paramsDiffer as paramsDiffer_,
   pickReuseSource,
+  staleReusedInputs,
   staleUpstream,
   stepNeeds,
   type ReusePick,
@@ -371,7 +372,15 @@ export function useReuseSource(p: {
 
   const deps = useMemo(() => stepNeeds(dagData.dag?.steps), [dagData.dag]);
   const runStale = useMemo(
-    () => (diff && source ? staleUpstream({ diff, previous, deps }) : []),
+    () =>
+      diff && source
+        ? staleUpstream({
+            diff,
+            previous,
+            deps,
+            staleInputs: staleReusedInputs(source),
+          })
+        : [],
     [deps, diff, previous, source]
   );
   const runMissing = useMemo(
