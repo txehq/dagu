@@ -401,15 +401,18 @@ func TestLoadManifestRefusesBadShapes(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
 		return path
 	}
-	good := `{"builds":[{"name":"a","path":"/x/dagu","sha256":"` + strings.Repeat("0", 64) + `"}]}`
+	// An absolute path of this OS, with forward slashes so it is JSON as is
+	// (a drive-letter path with slashes is absolute on Windows too).
+	abs := filepath.ToSlash(t.TempDir())
+	good := `{"builds":[{"name":"a","path":"` + abs + `/dagu","sha256":"` + strings.Repeat("0", 64) + `"}]}`
 	_, err := loadManifest(write(t, good))
 	require.NoError(t, err)
 	for name, body := range map[string]string{
 		"no builds":      `{"builds":[]}`,
-		"short digest":   `{"builds":[{"name":"a","path":"/x","sha256":"abc"}]}`,
-		"upper digest":   `{"builds":[{"name":"a","path":"/x","sha256":"` + strings.Repeat("A", 64) + `"}]}`,
-		"twice":          `{"builds":[{"name":"a","path":"/x","sha256":"` + strings.Repeat("0", 64) + `"},{"name":"a","path":"/y","sha256":"` + strings.Repeat("1", 64) + `"}]}`,
-		"name with path": `{"builds":[{"name":"a/b","path":"/x","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
+		"short digest":   `{"builds":[{"name":"a","path":"` + abs + `/x","sha256":"abc"}]}`,
+		"upper digest":   `{"builds":[{"name":"a","path":"` + abs + `/x","sha256":"` + strings.Repeat("A", 64) + `"}]}`,
+		"twice":          `{"builds":[{"name":"a","path":"` + abs + `/x","sha256":"` + strings.Repeat("0", 64) + `"},{"name":"a","path":"` + abs + `/y","sha256":"` + strings.Repeat("1", 64) + `"}]}`,
+		"name with path": `{"builds":[{"name":"a/b","path":"` + abs + `/x","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
 		"no path":        `{"builds":[{"name":"a","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
 		"relative path":  `{"builds":[{"name":"a","path":"dagu","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
 	} {
