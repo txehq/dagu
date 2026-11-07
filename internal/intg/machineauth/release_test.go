@@ -682,11 +682,14 @@ func (run *matrixRun) staleAttempt() string {
 	if after.attempt != s.attempt {
 		outcome = fmt.Sprintf("recorded, not claimed: the hub handed the run out again as attempt %s to the machine's healthy worker (%s)", after.attempt, after.status)
 	}
-	detector := "coordinator"
-	if byScheduler {
-		detector = "scheduler zombie scan"
+	detector := "the log names neither detector as the one that failed it"
+	switch {
+	case byScheduler:
+		detector = "failed by the scheduler's zombie scan"
+	case confirmed:
+		detector = "failed by the coordinator's reconciliation"
 	}
-	return fmt.Sprintf("attempt %s expired %s after the freeze (%s, threshold %s; failed by the %s); %s; after the thaw: status refused ×%d, log streams refused ×%d, artifact refusals ×%d, all for attempt %s; %s",
+	return fmt.Sprintf("attempt %s expired %s after the freeze (%s, threshold %s; %s); %s; after the thaw: status refused ×%d, log streams refused ×%d, artifact refusals ×%d, all for attempt %s; %s",
 		s.attempt, expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, detector, confirmation, len(statusRefused), len(streamsRefused), len(artifactRefused), s.attempt, outcome)
 }
 
