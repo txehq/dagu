@@ -38,6 +38,8 @@ import (
 //	flapping      new connections fail as in dead-streams; the worker's heartbeats fail and
 //	              succeed in turn (a failure line, then the client's recovery line, every 0.2 s)
 //	exit:N        exit with code N
+//	slow-exit:S   serves as ok, and exits 0 only S seconds after a signal, as kubectl takes a
+//	              moment to stop (TXE-6189)
 //
 // The worker log lines are SIMULATED: they copy the worker's message text and format, but no
 // real worker writes them here.
@@ -49,15 +51,19 @@ import datetime, os, signal, socket, sys, threading, time
 mode_file, sig_file, pid_file, worker_log, ui, coord = sys.argv[1:7]
 d = os.path.dirname(mode_file)
 open(pid_file, "w").write(str(os.getpid()))
+def mode():
+    return open(mode_file).read().strip()
 def on_signal(n, _f):
     with open(sig_file, "a") as f:
         f.write(f"{n}\n")
+    m = mode()
+    if m.startswith("slow-exit:"):
+        time.sleep(float(m[10:]))
+        os._exit(0)
     if not os.path.exists(os.path.join(d, "stubborn")):
         os._exit(0)
 for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(s, on_signal)
-def mode():
-    return open(mode_file).read().strip()
 held = []
 def serve(port, kind):
     ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -69,7 +75,7 @@ def serve(port, kind):
             held.append(c)
             continue
         try:
-            if m == "ok" or (m == "http-dead" and kind == "h2"):
+            if m == "ok" or m.startswith("slow-exit:") or (m == "http-dead" and kind == "h2"):
                 if kind == "http":
                     c.recv(4096)
                     c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
@@ -338,6 +344,32 @@ func TestTunnelSuperviseKillsAStubbornForward(t *testing.T) {
 	s.setMode(t, "dead-all")
 	assert.Equal(t, 75, s.exit(t, 10*time.Second))
 	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals())
+	assert.Eventually(t, func() bool { return !alive(s.childPid()) }, 2*time.Second, 20*time.Millisecond)
+}
+
+// A kubectl that takes longer than a round to stop after the passed SIGTERM still ends the
+// supervisor with its own code, and gets the signal once (TXE-6189). This forces the race CI
+// hit on a shared runner: the round's deadline passes while kubectl is still stopping. The kill
+// timeout is kept well clear of the stop, so only the exit rule is under test.
+func TestTunnelSuperviseExitsWithKubectlsCodeWhenItStopsSlowly(t *testing.T) {
+	s := startSupervised(t, "slow-exit:0.3", "--kill-timeout", "2")
+	s.stillRunning(t, time.Second)
+	require.NoError(t, s.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 0, s.exit(t, 5*time.Second), "the supervisor exits with kubectl's code (the fake exits 0, 0.3 s after the signal)")
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals(), "the signal is passed once")
+	assert.NotContains(t, s.stderr.String(), "replacing")
+	assert.NoFileExists(t, s.state)
+}
+
+// A kubectl that ignores the passed SIGTERM is killed after the kill timeout, and only then does
+// the supervisor exit 128 + the signal: the one case where the code is not kubectl's own.
+func TestTunnelSuperviseKillsAStubbornForwardAfterAPassedSignal(t *testing.T) {
+	s := startSupervised(t, "ok")
+	require.NoError(t, os.WriteFile(filepath.Join(s.dir, "stubborn"), nil, 0o600))
+	s.stillRunning(t, time.Second)
+	require.NoError(t, s.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 128+int(syscall.SIGTERM), s.exit(t, 5*time.Second))
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals(), "the signal is passed once; the kill is not a signal the fake records")
 	assert.Eventually(t, func() bool { return !alive(s.childPid()) }, 2*time.Second, 20*time.Millisecond)
 }
 
