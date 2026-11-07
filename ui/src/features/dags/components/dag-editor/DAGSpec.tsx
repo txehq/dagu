@@ -125,6 +125,7 @@ import { useDraftRecovery } from '@/features/visual-editor/run/useDraftRecovery'
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
+import { draftStorageKey } from '@/features/visual-editor/run/draftStorage';
 import type {
   DAGSpecHostProps,
   EditorNotice,
@@ -430,7 +431,7 @@ function DAGSpec({
 
   // Unsaved text stays in browser storage and is offered back after a reload.
   const { draft, discard: discardDraft } = useDraftRecovery({
-    storageKey: `dagu:draft:${remoteNode}:${fileName}`,
+    storageKey: draftStorageKey(remoteNode, fileName),
     serverText: serverSpec ?? undefined,
     currentText: currentValue ?? undefined,
     isDirty: localHasUnsavedChanges,

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { clearSessionData } from '@/lib/sessionData';
 import {
   createContext,
   useContext,
@@ -80,6 +81,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [setupRequired, setSetupRequired] = useState(config.setupRequired);
 
   const clearLocalSession = useCallback(() => {
+    // What this account read or wrote ends with its session (TXE-5923).
+    clearSessionData();
     setToken(null);
     setUser(null);
     sseManager.disposeAll();
@@ -184,6 +187,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       const data = await response.json();
+      // A sign-in never inherits what another session left in this browser.
+      clearSessionData();
       setAuthSession(data.token, data.expiresAt, 'login');
       setToken(data.token);
       setUser(data.user);
@@ -217,6 +222,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const completeSetup = useCallback((result: SetupResult) => {
     setAuthSession(result.token, result.expiresAt, 'setup');
+    clearSessionData();
     setToken(result.token);
     setUser(result.user);
     setSetupRequired(false);

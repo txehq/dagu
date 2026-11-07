@@ -316,23 +316,29 @@ export function defaultChoice(p: {
   return p.stale.length > 0 || p.missing.length > 0 ? 'changed' : 'only';
 }
 
-// The server lists the parameters of a run unquoted (`A=1`) and the defaults
-// of a workflow quoted (`A="1"`): both read as unquoted pairs.
-function normalizeParams(params: string | null | undefined): string {
+// The server lists the parameters of a run unquoted (`A=1 MSG=hi there`) and
+// the defaults of a workflow quoted (`A="1" MSG="hi there"`). The defaults are
+// parsed, so each value is kept exactly, and rendered the way a run lists
+// them.
+function renderDefaults(params: string | null | undefined): string {
   return parseParams(params ?? '')
     .map((param) => (param.Name ? `${param.Name}=${param.Value}` : param.Value))
-    .join(' ')
-    .trim()
-    .replace(/\s+/g, ' ');
+    .join(' ');
 }
 
 /**
  * True when the parameters of the source run differ from the defaults of the
- * workflow. A new step run uses the defaults. Spacing and quotes do not count.
+ * workflow. A new step run uses the defaults. Quotes do not count. Whitespace
+ * does: a run's listing is unquoted, so `A=a  b` and `A=a b`, or a value with
+ * an escaped newline and one with a space, could not be told apart if it were
+ * collapsed, and outputs of a run with other inputs would be reused
+ * (TXE-5923). Only the listing as the defaults render it matches; a run that
+ * differs only in spacing counts as different, which costs a reuse and never
+ * gives a wrong one.
  */
 export function paramsDiffer(
   runParams: string | null | undefined,
   defaults: string | null | undefined
 ): boolean {
-  return normalizeParams(runParams) !== normalizeParams(defaults);
+  return (runParams ?? '').trim() !== renderDefaults(defaults);
 }

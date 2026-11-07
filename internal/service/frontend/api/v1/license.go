@@ -428,6 +428,15 @@ func (a *API) requireCloudReport(ctx context.Context) error {
 	if err := a.requireAdmin(ctx); err != nil {
 		return err
 	}
+	// The report carries every owner's runs and failures, and its level
+	// decides what leaves the hub: under owner enforcement it is the
+	// platform administrator's, as the hub's other whole-hub records are
+	// (TXE-4752, TXE-5923). An admin-role API key or another administrator
+	// the owner model does not take for the platform administrator neither
+	// reads nor changes it.
+	if a.txeHubHidden(ctx) {
+		return errTxeHubRecords
+	}
 	if a.cloudReport == nil {
 		return &Error{
 			Code:       api.ErrorCodeBadRequest,

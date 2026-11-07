@@ -1,6 +1,11 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import {
+  OUTPUT_CACHE_PREFIX,
+  registerSessionDataReset,
+} from '@/lib/sessionData';
+
 /**
  * What the browser remembers of the upstream steps: for each step, a
  * reference to a run in which it succeeded (`runId`, `capturedAt`) and the
@@ -170,7 +175,7 @@ export interface OutputCache {
   clear(): void;
 }
 
-const KEY_PREFIX = 'dagu.output-cache.v1:';
+const KEY_PREFIX = OUTPUT_CACHE_PREFIX;
 
 /**
  * The cache with a storage behind it. The entries stay in memory, so the
@@ -257,3 +262,6 @@ export function createOutputCache(
 export const outputCache: OutputCache = createOutputCache(() =>
   typeof window === 'undefined' ? null : window.localStorage
 );
+
+// Its entries are an account's run outputs: they end with the session.
+registerSessionDataReset(() => outputCache.clear());

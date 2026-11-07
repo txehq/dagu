@@ -1,7 +1,16 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { DRAFT_PREFIX } from '@/lib/sessionData';
 import type { StoredDraft } from '../contracts';
+
+/**
+ * The key of the draft of a DAG on a node. Drafts are an account's session
+ * data (src/lib/sessionData.ts): they are removed when its session ends.
+ */
+export function draftStorageKey(remoteNode: string, fileName: string): string {
+  return `${DRAFT_PREFIX}${remoteNode}:${fileName}`;
+}
 
 function isStoredDraft(value: unknown): value is StoredDraft {
   if (typeof value !== 'object' || value === null) return false;

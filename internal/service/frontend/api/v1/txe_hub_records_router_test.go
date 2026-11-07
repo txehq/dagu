@@ -274,3 +274,22 @@ func TestTxeHostExecutionNeedsThePlatformAdministratorUnderEnforce(t *testing.T)
 	// channel's above. Either way no terminal opens.
 	require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, terminal.StatusCode, string(terminalBody))
 }
+
+// Under owner enforcement the Dagu Console report, which carries every
+// owner's runs and failures, is the platform administrator's: an admin-role
+// API key can neither read it nor change what it sends (TXE-5923).
+func TestTxeCloudReportIsThePlatformAdministratorsUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	key := createAPIKeyForRole(t, h.server, h.admin, "legacy-admin-report", api.UserRoleAdmin)
+
+	status, body := h.send(t, "/api/v1/license/monitoring", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "hub_records_not_permitted")
+	resp := h.server.Client().Put("/api/v1/license/monitoring", api.UpdateLicenseMonitoringJSONRequestBody{Level: "runs"}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "hub_records_not_permitted")
+
+	status, body = h.send(t, "/api/v1/license/monitoring", h.admin)
+	require.NotContains(t, body, "hub_records_not_permitted", "the platform administrator is decided by the hub's own checks (%d)", status)
+}

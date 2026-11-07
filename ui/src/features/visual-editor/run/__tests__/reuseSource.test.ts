@@ -483,9 +483,19 @@ describe('paramsDiffer', () => {
     expect(paramsDiffer('A=1', undefined)).toBe(true);
   });
 
-  it('ignores spacing and treats no parameters as equal', () => {
-    expect(paramsDiffer(' A=1   B=2 ', 'A=1 B=2')).toBe(false);
+  // TXE fork (TXE-5923): spacing inside a run's listing counts, because the
+  // listing is unquoted and collapsing it would match a run whose values
+  // differ only in whitespace. Upstream ignored it.
+  it('ignores surrounding space and treats no parameters as equal', () => {
+    expect(paramsDiffer(' A=1 B=2 ', 'A=1 B=2')).toBe(false);
     expect(paramsDiffer(undefined, '')).toBe(false);
+  });
+
+  it('keeps the whitespace inside values', () => {
+    expect(paramsDiffer('A=a  b', 'A="a b"')).toBe(true);
+    expect(paramsDiffer('A=a b', 'A="a\\nb"')).toBe(true);
+    expect(paramsDiffer('A=a  b', 'A="a  b"')).toBe(false);
+    expect(paramsDiffer(' A=1   B=2 ', 'A=1 B=2')).toBe(true);
   });
 
   // The server quotes each default value and none of a run.
