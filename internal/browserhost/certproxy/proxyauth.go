@@ -81,7 +81,7 @@ func (s *server) isBrowserGate(authority string) bool {
 // relayToGate splices a tunnel to the browser's DevTools gate, unread and
 // direct, presenting nothing and asking the device's routes nothing.
 func (s *server) relayToGate(w http.ResponseWriter, address string) {
-	raw, err := net.DialTimeout("tcp", address, handshakeTimeout)
+	raw, err := net.DialTimeout("tcp", address, handshakeTimeout) //nolint:gosec // the gate's own loopback address, which the starting process named; a client names it only to match it
 	if err != nil {
 		http.Error(w, "the browser's DevTools gate does not answer", http.StatusBadGateway)
 		return
@@ -91,7 +91,7 @@ func (s *server) relayToGate(w http.ResponseWriter, address string) {
 		_ = raw.Close()
 		return
 	}
-	var client net.Conn = conn
+	client := conn
 	if reader.Buffered() > 0 {
 		client = &bufferedConn{Conn: conn, reader: reader}
 	}

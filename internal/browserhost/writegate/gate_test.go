@@ -4,7 +4,6 @@
 package writegate_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -234,24 +233,6 @@ func startBrowserOn(t *testing.T, profile string) *browser {
 		}
 	})
 	return b
-}
-
-// output keeps what a browser prints, to show when it does not start.
-type output struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (o *output) Write(p []byte) (int, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.buf.Write(p)
-}
-
-func (o *output) String() string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.buf.String()
 }
 
 // guard runs a gate in mode rehearse on the browser until the test ends,

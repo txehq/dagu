@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -147,9 +148,7 @@ func TestRealChromeAnswersProxyChallenge(t *testing.T) {
 			return
 		}
 		defer func() { _ = response.Body.Close() }()
-		for key, values := range response.Header {
-			w.Header()[key] = values
-		}
+		maps.Copy(w.Header(), response.Header)
 		w.WriteHeader(response.StatusCode)
 		_, _ = io.Copy(w, response.Body)
 	}))
