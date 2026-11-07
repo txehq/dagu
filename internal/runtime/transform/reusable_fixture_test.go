@@ -40,7 +40,7 @@ type reusableNodeCase struct {
 
 func reusableNodeCases() []reusableNodeCase {
 	var cases []reusableNodeCase
-	for status := ir.NodeStatus(0); status < 64; status++ {
+	for status := range ir.NodeStatus(64) {
 		if status.String() == "unknown" {
 			continue
 		}
