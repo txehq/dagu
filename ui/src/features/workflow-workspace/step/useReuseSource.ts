@@ -490,7 +490,7 @@ export function useReuseSource(p: {
     cacheTimes: cover.times,
     headChanged: diff?.headChanged ?? false,
     paramsDiffer: source
-      ? paramsDiffer_(source.params, dagData.dag?.defaultParams)
+      ? paramsDiffer_(source.paramsList, dagData.dag?.defaultParams)
       : false,
     loading:
       current === null ||

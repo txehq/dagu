@@ -231,6 +231,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return addAuthSessionListener((change) => {
       if (change.token) {
+        // A new token is a new sign-in, in this tab or another, perhaps of
+        // another account: what the last session left ends as at logout.
+        clearSessionData();
         setToken(change.token);
         setIsLoading(true);
         void refreshUser();

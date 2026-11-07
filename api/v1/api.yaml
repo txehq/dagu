@@ -19497,6 +19497,11 @@ components:
         params:
           type: string
           description: "Runtime parameters passed to the DAG-run in JSON format"
+        paramsList:
+          type: array
+          items:
+            type: string
+          description: "The run's parameters, one NAME=value (or a bare positional value) per item, exactly as the run received them. Absent when the run's record does not keep them as a list; params then only shows a joined, unquoted listing."
         profileName:
           allOf:
             - $ref: "#/components/schemas/RuntimeProfileName"

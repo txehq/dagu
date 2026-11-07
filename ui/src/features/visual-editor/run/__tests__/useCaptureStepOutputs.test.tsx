@@ -40,6 +40,8 @@ vi.mock('@/hooks/api', () => ({
         data: {
           dagRunDetails: {
             params: h.runParams,
+            // The run's parameters as the server lists them (paramsList).
+            paramsList: h.runParams ? h.runParams.split(' ') : [],
             nodes: steps.map((step) => ({ step })),
           },
         },

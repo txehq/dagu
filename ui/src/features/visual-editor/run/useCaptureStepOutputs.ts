@@ -123,7 +123,7 @@ export function useCaptureStepOutputs(p: {
   const ranWithDefaults =
     run.data && workflow.data
       ? !paramsDiffer(
-          run.data.dagRunDetails.params,
+          run.data.dagRunDetails.paramsList,
           workflow.data.dag?.defaultParams
         )
       : null;

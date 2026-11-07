@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
@@ -364,6 +365,7 @@ func toDAGRunSummary(s ir.DAGRunStatus) api.DAGRunSummary {
 	artifactsAvailable := hasArtifactEntries(s.ArchiveDir)
 
 	return api.DAGRunSummary{
+		ParamsList:         runParamsList(s),
 		Name:               s.Name,
 		DagRunId:           s.DAGRunID,
 		AttemptId:          optionalString(s.AttemptID),
@@ -472,6 +474,7 @@ func ToDAGRunDetails(s ir.DAGRunStatus) api.DAGRunDetails {
 	}
 
 	return api.DAGRunDetails{
+		ParamsList:             runParamsList(s),
 		AgentTasks:             agentTaskProgress(s.Nodes),
 		AgentEvents:            agentTimeline(s.Nodes),
 		RootDAGRunName:         s.Root.Name,
@@ -1188,4 +1191,18 @@ func toRetryRequest(r *ir.RetryRequest) *api.RetryRequest {
 		return nil
 	}
 	return &api.RetryRequest{Id: r.ID, ActionId: r.ActionID, ActionAttempt: r.ActionAttempt, BindingDigest: r.BindingDigest, RetryOf: r.RetryOf}
+}
+
+// runParamsList is the run's parameters as the list they were received in,
+// or nil when the record does not keep one although the run had parameters:
+// a joined, unquoted listing cannot be split back without ambiguity, so the
+// client then treats the parameters as unknown (TXE-5923).
+func runParamsList(s ir.DAGRunStatus) *[]string {
+	if s.ParamsList == nil {
+		if s.Params != "" {
+			return nil
+		}
+		return &[]string{}
+	}
+	return ptrOf(slices.Clone(s.ParamsList))
 }

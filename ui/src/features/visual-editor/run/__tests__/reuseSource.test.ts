@@ -479,30 +479,35 @@ describe('defaultChoice with the cache', () => {
 
 describe('paramsDiffer', () => {
   it('is true for other parameters', () => {
-    expect(paramsDiffer('A=2', 'A=1')).toBe(true);
-    expect(paramsDiffer('A=1', undefined)).toBe(true);
+    expect(paramsDiffer(['A=2'], 'A=1')).toBe(true);
+    expect(paramsDiffer(['A=1'], undefined)).toBe(true);
   });
 
-  // TXE fork (TXE-5923): spacing inside a run's listing counts, because the
-  // listing is unquoted and collapsing it would match a run whose values
-  // differ only in whitespace. Upstream ignored it.
-  it('ignores surrounding space and treats no parameters as equal', () => {
-    expect(paramsDiffer(' A=1 B=2 ', 'A=1 B=2')).toBe(false);
-    expect(paramsDiffer(undefined, '')).toBe(false);
+  it('treats no parameters as equal', () => {
+    expect(paramsDiffer([], '')).toBe(false);
+    expect(paramsDiffer([], undefined)).toBe(false);
   });
 
-  it('keeps the whitespace inside values', () => {
-    expect(paramsDiffer('A=a  b', 'A="a b"')).toBe(true);
-    expect(paramsDiffer('A=a b', 'A="a\\nb"')).toBe(true);
-    expect(paramsDiffer('A=a  b', 'A="a  b"')).toBe(false);
-    expect(paramsDiffer(' A=1   B=2 ', 'A=1 B=2')).toBe(true);
-  });
-
-  // The server quotes each default value and none of a run.
-  it('reads the quoted defaults of the workflow', () => {
-    expect(paramsDiffer('A=1 MSG=hi there', 'A="1" MSG="hi there"')).toBe(
+  // The server quotes each default value; a run's list holds them bare.
+  it('reads quoted defaults against the run list', () => {
+    expect(paramsDiffer(['A=1', 'MSG=hi there'], 'A="1" MSG="hi there"')).toBe(
       false
     );
-    expect(paramsDiffer('A=2', 'A="1"')).toBe(true);
+    expect(paramsDiffer(['A=2'], 'A="1"')).toBe(true);
+  });
+
+  // TXE fork (TXE-5923): the list, not the joined listing, is compared, so
+  // neither whitespace inside a value nor where one value ends is lost.
+  it('compares every value exactly, and where each one ends', () => {
+    expect(paramsDiffer(['A=a  b'], 'A="a b"')).toBe(true);
+    expect(paramsDiffer(['A=a b'], 'A="a\\nb"')).toBe(true);
+    expect(paramsDiffer(['A=a  b'], 'A="a  b"')).toBe(false);
+    expect(paramsDiffer(['A=1', 'B=2'], 'A="1 B=2"')).toBe(true);
+    expect(paramsDiffer(['A=1 B=2'], 'A=1 B=2')).toBe(true);
+  });
+
+  it('counts an unknown run list as different', () => {
+    expect(paramsDiffer(undefined, '')).toBe(true);
+    expect(paramsDiffer(null, 'A=1')).toBe(true);
   });
 });
