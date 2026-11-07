@@ -10,7 +10,6 @@ import type { RunSpecDiff } from './runSpecDiff';
 import { isReusedNode, isRunActive } from './stepRunInfo';
 
 type DAGRunDetails = components['schemas']['DAGRunDetails'];
-type Node = components['schemas']['Node'];
 
 /** What the choice of a source needs of a run. */
 export type ReuseRun = Pick<DAGRunDetails, 'dagRunId' | 'status'> &
