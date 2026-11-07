@@ -91,6 +91,24 @@ steps:
     expect(after.get('b')).not.toBe(before.get('b'));
   });
 
+  // A chain step that names dependencies of its own still depends on the
+  // step before it: the builder adds that edge whatever depends says.
+  it('follows the step before it in a chain even with explicit depends', () => {
+    const spec = `type: chain
+steps:
+  - name: a
+    run: echo a
+  - name: b
+    run: echo b
+  - name: c
+    depends: [a]
+    run: echo c
+`;
+    const before = stepHashes(spec);
+    const after = stepHashes(spec.replace('echo b', 'echo B'));
+    expect(after.get('c')).not.toBe(before.get('c'));
+  });
+
   // A chain step with no name or id is still the step before the next one.
   it('follows a step with no name in a chain', () => {
     const spec = `type: chain

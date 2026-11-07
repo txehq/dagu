@@ -162,7 +162,10 @@ function computeStepHashes(
       const target = lookup(match[1] as string);
       if (target && target !== item) found.add(target);
     }
-    if (model.dagType === 'chain' && item.written.length === 0) {
+    // `injectChainDependencies` in internal/spec/builder.go makes a chain
+    // step depend on the entry before it whether or not it names
+    // dependencies of its own.
+    if (model.dagType === 'chain') {
       for (const previous of entries[item.entry - 1] ?? []) found.add(previous);
     }
     // `transformRouterSteps` in internal/spec/dag.go makes each target of a
