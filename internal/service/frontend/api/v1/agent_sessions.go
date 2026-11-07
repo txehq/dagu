@@ -291,7 +291,9 @@ func browserSessionWaiting(ctx context.Context, dataDir, dagRunID, stepName stri
 		return false, nil
 	}
 	err = browserhost.Probe(ctx, record.CDPURL)
-	if errors.Is(err, browserhost.ErrUnreachable) {
+	// A record from before browsers had gates names a browser this code no
+	// longer reaches; like one that stopped answering, it is not waiting.
+	if errors.Is(err, browserhost.ErrUnreachable) || errors.Is(err, browserhost.ErrUntokenizedAddress) {
 		return false, nil
 	}
 	return err == nil, err

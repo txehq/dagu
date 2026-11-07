@@ -81,11 +81,18 @@ type launchOptions struct {
 
 // browserHandle locates a running browser.
 type browserHandle struct {
+	// CDPURL is the browser's DevTools address behind its gate. It carries
+	// the gate's token, so it is kept in the record and never written
+	// anywhere else.
 	CDPURL       string
 	ExtensionID  string
 	ExtensionDir string
 	// BrowserPID is the browser process ID, or zero when it is unknown.
 	BrowserPID int
+	// GatePID and GateStartedAt identify the gate process serving the
+	// browser; ending it closes the browser's pipe, and so the browser.
+	GatePID       int
+	GateStartedAt int64
 }
 
 // dialog is a JavaScript dialog the browser accepted.

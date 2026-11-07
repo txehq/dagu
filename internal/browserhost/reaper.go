@@ -55,10 +55,11 @@ func Release(ctx context.Context, store *Store, record Record) error {
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 	defer cancel()
 	// A browser that did not close keeps its record and files, so a later
-	// sweep can try again.
+	// sweep can try again. The address is a credential, so the error names
+	// the session instead.
 	if record.CDPURL != "" {
 		if err := closeRecordedBrowser(closeCtx, record); err != nil {
-			return fmt.Errorf("close browser at %s: %w", record.CDPURL, err)
+			return fmt.Errorf("close the browser of session %s: %w", record.ID, RedactError(err, record.CDPURL))
 		}
 	}
 	var errs []error
@@ -73,17 +74,70 @@ func Release(ctx context.Context, store *Store, record Record) error {
 }
 
 // closeRecordedBrowser closes the browser over DevTools. When the browser
-// does not answer, it ends the recorded browser process instead, provided
-// the process ID still belongs to that browser.
+// does not answer, it ends the recorded gate, whose pipe the browser lives
+// on, and then the recorded browser process, each provided the process ID
+// still belongs to the process the record saw.
 func closeRecordedBrowser(ctx context.Context, record Record) error {
 	err := CloseBrowser(ctx, record.CDPURL)
-	if err == nil {
+	// Whatever the address said, the browser is closed only once it is gone:
+	// an address nothing answers at means the gate is gone, not that the
+	// browser behind it has left, and one recorded before gates whose
+	// process exited needs no ending at all.
+	if waitForRecordedExit(ctx, record) {
 		return nil
 	}
-	if endProcess(record.BrowserPID, record.BrowserStartedAt) && waitForExit(ctx, record.CDPURL) {
+	if endProcess(record.GatePID, record.GateStartedAt) && waitForRecordedExit(ctx, record) {
 		return nil
+	}
+	if endProcess(record.BrowserPID, record.BrowserStartedAt) && waitForRecordedExit(ctx, record) {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("the browser process did not exit")
 	}
 	return err
+}
+
+// waitForRecordedExit waits for the recorded browser to be gone. When the
+// record knows the browser's process, that process must have exited: its
+// gate's address going quiet only says the gate is gone, and a browser that
+// hangs on its way out may still hold the profile. Without a process, the
+// address is all there is.
+func waitForRecordedExit(ctx context.Context, record Record) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exitTimeout)
+	defer cancel()
+	for {
+		if recordedBrowserGone(ctx, record) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(exitPollInterval):
+		}
+	}
+}
+
+// recordedBrowserGone reports whether the recorded browser is gone: its
+// gate's address no longer answers, and the recorded browser process, when
+// there is one, has exited. A record from before gates has no address this
+// code reaches, so its process alone decides.
+func recordedBrowserGone(ctx context.Context, record Record) bool {
+	if TokenOf(record.CDPURL) != "" && !errors.Is(Probe(ctx, record.CDPURL), ErrUnreachable) {
+		return false
+	}
+	if record.BrowserPID <= 0 {
+		return true
+	}
+	// A process that has exited is gone, even while a handle to it is still
+	// open and its start time can still be read. One that is alive is the
+	// browser unless its start time says the ID was reused; with no start
+	// time to compare, it is taken to be the browser.
+	if !procutil.IsAlive(record.BrowserPID) {
+		return true
+	}
+	matched, _, ok := procutil.MatchesStartTime(record.BrowserPID, record.BrowserStartedAt)
+	return ok && !matched
 }
 
 // endProcess ends pid when it is still the process that started at
@@ -98,6 +152,9 @@ func endProcess(pid int, startedAt int64) bool {
 	if err != nil {
 		return false
 	}
+	// The handle is let go at once: on Windows an open handle keeps an ended
+	// process queryable, as if it had not gone.
+	defer func() { _ = process.Release() }()
 	return process.Kill() == nil
 }
 

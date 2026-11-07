@@ -110,7 +110,7 @@ type fakeAct struct {
 }
 
 func newFakeEngine() *fakeEngine {
-	return &fakeEngine{handle: browserHandle{CDPURL: "http://127.0.0.1:1", ExtensionID: "ext"}}
+	return &fakeEngine{handle: browserHandle{CDPURL: "http://127.0.0.1:1/" + fakeToken, ExtensionID: "ext"}}
 }
 
 func (e *fakeEngine) attach(generate generateFunc) {
@@ -375,14 +375,18 @@ func pageModel(extracts map[string]string, trueStatements ...string) func(req *l
 	}
 }
 
+// fakeToken is the gate token the fake browsers serve under: every browser
+// address the runtime accepts carries one.
+const fakeToken = "FAKETOKEN0000000000000000A"
+
 // serveHungBrowser serves the DevTools endpoint of a browser that
 // acknowledges every command, including Browser.close, and keeps running.
 func serveHungBrowser(t *testing.T) string {
 	t.Helper()
 	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server = httptest.NewServer(http.StripPrefix("/"+fakeToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/json/version" {
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/devtools/browser/hung"
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/" + fakeToken + "/devtools/browser/hung"
 			_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": wsURL})
 			return
 		}
@@ -401,7 +405,7 @@ func serveHungBrowser(t *testing.T) string {
 		_ = json.Unmarshal(data, &request)
 		response, _ := json.Marshal(map[string]any{"id": request.ID, "result": map[string]any{}})
 		_ = conn.Write(r.Context(), websocket.MessageText, response)
-	}))
+	})))
 	t.Cleanup(server.Close)
-	return server.URL
+	return server.URL + "/" + fakeToken
 }

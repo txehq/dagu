@@ -102,9 +102,12 @@ func (r *run) resumeSession(ctx context.Context, recordID string, session *ir.Ag
 		Generate:       r.bridge.generate,
 	}
 	eng, err := r.exec.launcher.Reattach(ctx, browserHandle{
-		CDPURL:       record.CDPURL,
-		ExtensionID:  record.ExtensionID,
-		ExtensionDir: record.ExtensionDir,
+		CDPURL:        record.CDPURL,
+		ExtensionID:   record.ExtensionID,
+		ExtensionDir:  record.ExtensionDir,
+		BrowserPID:    record.BrowserPID,
+		GatePID:       record.GatePID,
+		GateStartedAt: record.GateStartedAt,
 	}, opts)
 	if err != nil {
 		return 0, err

@@ -17,7 +17,31 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 )
+
+// ErrUntokenizedAddress reports a browser address without a gate token. Every
+// browser this package reaches sits behind a gate, so an address a client
+// could reach without a credential is refused before a connection is made.
+var ErrUntokenizedAddress = errors.New("browser address has no gate token")
+
+// TokenOf returns the gate token in a browser address, or "" when it has
+// none.
+func TokenOf(cdpURL string) string {
+	return devtoolsgate.TokenOf(cdpURL)
+}
+
+// RedactCDPURL returns s with the token of cdpURL replaced. Anything that
+// prints text about a browser passes it through here.
+func RedactCDPURL(s, cdpURL string) string {
+	return devtoolsgate.RedactString(s, cdpURL)
+}
+
+// RedactError returns err with the token of cdpURL replaced in its message;
+// the chain is kept for errors.Is and errors.As.
+func RedactError(err error, cdpURL string) error {
+	return devtoolsgate.Redact(err, cdpURL)
+}
 
 // StagehandExtensionName is the name the Stagehand runtime extension reports
 // to Chrome.
@@ -161,6 +185,9 @@ func classifyDialError(err error) error {
 }
 
 func browserWebSocketURL(ctx context.Context, cdpURL string) (string, error) {
+	if TokenOf(cdpURL) == "" {
+		return "", ErrUntokenizedAddress
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cdpURL, "/")+"/json/version", nil)
 	if err != nil {
 		return "", err
