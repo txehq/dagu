@@ -229,7 +229,9 @@ gh api "repos/$repo/git/commits/$mergesha" --jq "$commit_tsv" >"$tmp/merge.tsv" 
 read -r mergetree mergeparents <"$tmp/merge.tsv" || merged_but "its merge commit $mergesha could not be read (no fields)"
 # GitHub's merge commit has main as it was at the merge first and the PR head second.
 p1="${mergeparents%%,*}"; p2="${mergeparents#*,}"
-[ "$p2" = "$want" ] && [[ "$p1" =~ ^[0-9a-f]{40}$ ]] && [ "$p1" != "$p2" ] || merged_but "its merge commit $mergesha has parents '$mergeparents', not main and the head $want"
+if [ "$p2" != "$want" ] || ! [[ "$p1" =~ ^[0-9a-f]{40}$ ]] || [ "$p1" = "$p2" ]; then
+  merged_but "its merge commit $mergesha has parents '$mergeparents', not main and the head $want"
+fi
 moved=""
 [ "$p1" = "$maintip" ] || moved=" (main had moved from $maintip to $p1 by the merge)"
 if [ "$repair" = true ]; then
