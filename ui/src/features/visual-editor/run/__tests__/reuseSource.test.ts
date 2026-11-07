@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   NodeStatus,
@@ -665,4 +667,69 @@ describe('paramsDiffer', () => {
     expect(paramsDiffer(undefined, '')).toBe(true);
     expect(paramsDiffer(null, 'A=1')).toBe(true);
   });
+});
+
+// The server's own rule for which nodes a new run can be given
+// (transform.Reusable), over every node status, as
+// internal/runtime/transform's TestReusableNodesFixtureIsTheServersOwn writes
+// and checks it. A node the UI holds is always one the server carries, and
+// every carried node the server records is held. A carried node from a
+// server that kept no record is the one the UI may leave out: the step then
+// runs again, which is safe. A new status or a change of the server's rule
+// fails here until the UI agrees.
+describe('runHoldsOutputs follows the server', () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      path.resolve(
+        'src/features/visual-editor/run/__tests__/testdata/reusable-nodes.json'
+      ),
+      'utf8'
+    )
+  ) as {
+    name: string;
+    status: number;
+    finished: boolean;
+    recorded: boolean;
+    reusable: boolean;
+  }[];
+
+  it('has a case for every status', () => {
+    const statuses = new Set(fixture.map((c) => c.status));
+    for (const status of Object.values(NodeStatus)) {
+      if (typeof status === 'number') expect(statuses).toContain(status);
+    }
+  });
+
+  for (const c of fixture) {
+    it(c.name, () => {
+      const run: ReuseRun = {
+        dagRunId: 'r',
+        status: Status.Success,
+        nodes: [
+          {
+            step: { name: 's' },
+            status: c.status as NodeStatus,
+            doneCount: c.finished ? 1 : 0,
+            finishedAt: c.finished ? '2026-10-01T00:00:05Z' : '-',
+          } as Node,
+        ],
+        ...(c.recorded
+          ? {
+              reusedInputs: [
+                { step: 's', runId: 'earlier', via: ReusedInputVia.run },
+              ],
+            }
+          : {}),
+      };
+      const holds = runHoldsOutputs(run, 's');
+      if (holds)
+        expect(c.reusable, 'held, so the server carries it').toBe(true);
+      const carriedSkip = c.status === NodeStatus.Skipped;
+      if (c.reusable && (!carriedSkip || (c.recorded && c.finished))) {
+        expect(holds, 'the server carries it, and the run records it').toBe(
+          true
+        );
+      }
+    });
+  }
 });
