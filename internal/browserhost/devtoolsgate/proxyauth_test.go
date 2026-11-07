@@ -6,19 +6,13 @@ package devtoolsgate
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"maps"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"runtime"
+	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,360 +51,219 @@ func TestProxyResponderForgetsOldRequests(t *testing.T) {
 	assert.LessOrEqual(t, len(r.answered), maxAnsweredChallenges)
 }
 
-// A new target is held until the gate's interception and auto-attach
-// beneath it are in place, and its interception lives on the gate's own
-// session.
-func TestProxyResponderHoldsNewTargets(t *testing.T) {
-	t.Parallel()
-	tg := startTestGate(t)
-	tg.mux.mu.Lock()
-	newProxyResponder(tg.mux, ProxyAuth{Addresses: []string{"127.0.0.1:1"}, Username: "u", Password: "p"}).install()
-	tg.mux.mu.Unlock()
+// The proxy of the fake-browser tests, and the credential the gate holds
+// for it.
+const (
+	fakeProxyOrigin = "http://127.0.0.1:41234"
+	fakeProxyUser   = "dagu"
+	fakeProxySecret = "proxy-secret"
+)
 
-	a := tg.dial("")
-	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
-	a.waitEvent("Target.attachedToTarget", nil)
-	created := a.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
-	var child struct {
-		TargetID string `json:"targetId"`
-	}
-	require.NoError(t, json.Unmarshal(created, &child))
-	eventually(t, 5*time.Second, func() bool {
-		return slices.Contains(tg.state(a).Resumed, child.TargetID)
-	}, "the target resumes once the gate's setup is in place")
-
-	tg.mux.mu.Lock()
-	var gateSession string
-	for _, target := range tg.mux.targets {
-		if target.id == child.TargetID {
-			gateSession = target.gateSession
-			assert.True(t, target.nestedAutoAttach, "the target's own children are held too")
-		}
-	}
-	tg.mux.mu.Unlock()
-	require.NotEmpty(t, gateSession)
-	for _, s := range tg.state(a).Sessions {
-		if s.ID == gateSession {
-			assert.True(t, s.FetchAuth, "the gate intercepts on its own session")
-		}
-	}
+// startTestGateWithProxy starts a test gate whose browser sends every
+// request to a proxy that challenges, with the gate holding the credential,
+// as run does when Config.ProxyAuth is set.
+func startTestGateWithProxy(t *testing.T) *testGate {
+	t.Helper()
+	return startTestGateWith(t, func(m *mux, f *fakeBrowser) {
+		f.mu.Lock()
+		f.proxyOrigin = fakeProxyOrigin
+		f.mu.Unlock()
+		newProxyResponder(m, ProxyAuth{Addresses: []string{"127.0.0.1:41234"}, Username: fakeProxyUser, Password: fakeProxySecret}).install()
+	})
 }
 
-// A target that takes neither interception nor auto-attach is not held
-// for ever: the gate lets it run once both refusals are in, and what it
-// sends without the credential the proxy refuses.
-func TestProxyResponderReleasesATargetThatRefusesSetup(t *testing.T) {
-	t.Parallel()
-	tg := startTestGate(t)
-	tg.fake.mu.Lock()
-	tg.fake.refuseTargetSetup = true
-	tg.fake.mu.Unlock()
-	tg.mux.mu.Lock()
-	newProxyResponder(tg.mux, ProxyAuth{Addresses: []string{"127.0.0.1:1"}, Username: "u", Password: "p"}).install()
-	tg.mux.mu.Unlock()
-
-	a := tg.dial("")
-	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
-	a.waitEvent("Target.attachedToTarget", nil)
-	created := a.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
-	var child struct {
-		TargetID string `json:"targetId"`
-	}
-	require.NoError(t, json.Unmarshal(created, &child))
-	eventually(t, 5*time.Second, func() bool {
-		return slices.Contains(tg.state(a).Resumed, child.TargetID)
-	}, "the target runs once its setup was refused")
+// browserSessionOf reads the gate's own browser-level session id.
+func (tg *testGate) browserSession() string {
 	tg.mux.mu.Lock()
 	defer tg.mux.mu.Unlock()
-	for _, target := range tg.mux.targets {
-		if target.id == child.TargetID {
-			assert.False(t, target.nestedAutoAttach, "a refused auto-attach is not taken as in place")
-			assert.Zero(t, target.holds)
+	return tg.mux.browserSession
+}
+
+// The responder's interception is on a session of the gate's own on the
+// browser target, in place before the gate asks for its auto-attach, so no
+// target can exist, let alone run, before it; and it is the only
+// interception the gate holds: none on the targets themselves.
+func TestProxyResponderInterceptsBeforeAnyTargetCanRun(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	a := tg.dial("")
+	state := tg.state(a)
+
+	indexOfLog := func(prefix string) int {
+		return slices.IndexFunc(state.Log, func(entry string) bool { return strings.HasPrefix(entry, prefix) })
+	}
+	attach, enable, autoAttach := indexOfLog("Target.attachToBrowserTarget"), indexOfLog("Fetch.enable"), indexOfLog("Target.setAutoAttach")
+	require.True(t, attach >= 0 && enable >= 0 && autoAttach >= 0, "the setup and the auto-attach are all in the log: %v", state.Log)
+	assert.Less(t, attach, enable, "the session comes before its interception: %v", state.Log)
+	assert.Less(t, enable, autoAttach, "the interception comes before the auto-attach: %v", state.Log)
+	assert.Contains(t, state.Log[enable], "auth=true", "the interception handles the proxy's challenges")
+
+	browserSession := tg.browserSession()
+	require.NotEmpty(t, browserSession)
+	var browserSessions int
+	for _, s := range state.Sessions {
+		if s.Browser {
+			browserSessions++
+			assert.Equal(t, browserSession, s.ID, "the gate knows its session")
+			assert.True(t, s.FetchOn && s.FetchAuth, "the gate's session intercepts and handles auth")
+			continue
+		}
+		assert.False(t, s.FetchOn, "no target of its own is intercepted by the gate: %+v", s)
+	}
+	assert.Equal(t, 1, browserSessions, "one browser-level session of the gate's own")
+}
+
+// A target created with a URL starts its first request before any session
+// on it exists, as the browser process does: the request is paused by the
+// gate's browser-level interception alone, the proxy's challenge is answered
+// with the credential, and the target then runs. No client hears of the
+// request or the challenge.
+func TestProxyResponderAnswersTheFirstRequestOfATargetCreatedNavigating(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	a := tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	a.waitEvent("Target.attachedToTarget", nil)
+	created := a.mustCall("", "Target.createTarget", map[string]any{"url": "https://site.test/first"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+	request := "nav:" + child.TargetID
+
+	eventually(t, 5*time.Second, func() bool {
+		state := tg.state(a)
+		return slices.Contains(state.Completed, request) && slices.Contains(state.Resumed, child.TargetID)
+	}, "the first request completes and the target resumes")
+	state := tg.state(a)
+	assert.Equal(t, fakeProxyUser+":"+fakeProxySecret, state.Credentials[request], "the proxy's challenge was answered with the gate's credential")
+	assert.Empty(t, state.Refused, "nothing was refused")
+	requested, resumed := slices.Index(state.Log, "request "+request), slices.Index(state.Log, "resume "+child.TargetID)
+	assert.Less(t, requested, resumed, "the request left before the target could be held, and was answered all the same: %v", state.Log)
+	a.noEvent("Fetch.requestPaused", 200*time.Millisecond)
+	a.noEvent("Fetch.authRequired", 200*time.Millisecond)
+}
+
+// Through the browser, as in the unit test: a site's own challenge, or
+// another proxy's, gets the browser's default handling and no credential,
+// so the request fails rather than carry the credential anywhere else.
+func TestProxyResponderGivesTheCredentialToNoOtherChallenge(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	a := tg.dial("")
+	a.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "site", "url": "https://site.test/private",
+		"challenge": map[string]any{"source": "Server", "origin": "https://site.test"}})
+	a.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "other", "url": "https://site.test/",
+		"challenge": map[string]any{"source": "Proxy", "origin": "http://127.0.0.1:9999"}})
+	a.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "own", "url": "https://site.test/"})
+	eventually(t, 5*time.Second, func() bool {
+		state := tg.state(a)
+		return len(state.Refused) == 2 && len(state.Completed) == 1
+	}, "the three requests settle")
+	state := tg.state(a)
+	assert.ElementsMatch(t, []string{"site", "other"}, state.Refused)
+	assert.Equal(t, map[string]string{"own": fakeProxyUser + ":" + fakeProxySecret}, state.Credentials, "only the proxy's own challenge got the credential")
+}
+
+// A client's own browser-level interception, as the write gate's on the
+// shared browser session, runs beside the gate's: both see each request, the
+// client decides its part, the gate answers the proxy, the client never
+// sees the challenge, and the client turning its interception off leaves
+// the gate's in place.
+func TestProxyResponderCoexistsWithAClientsBrowserLevelFetch(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	b := tg.dial("")
+	b.mustCall("", "Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "*", "requestStage": "Request"}}})
+	result := b.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "R1", "url": "https://site.test/"})
+	assert.Contains(t, string(result), `"delivered":2`, "the request paused on the client's interception and the gate's")
+	paused := b.waitEvent("Fetch.requestPaused", nil)
+	assert.Equal(t, "", paused.SessionID, "the client's interception is on the browser session")
+	time.Sleep(100 * time.Millisecond)
+	assert.Empty(t, tg.state(b).Completed, "the request waits for the client's decision")
+	b.mustCall("", "Fetch.continueRequest", map[string]any{"requestId": "R1"})
+	eventually(t, 5*time.Second, func() bool { return slices.Contains(tg.state(b).Completed, "R1") }, "the request completes")
+	state := tg.state(b)
+	assert.Equal(t, fakeProxyUser+":"+fakeProxySecret, state.Credentials["R1"], "the gate answered the proxy")
+	b.noEvent("Fetch.authRequired", 200*time.Millisecond)
+
+	b.mustCall("", "Fetch.disable", nil)
+	for _, s := range tg.state(b).Sessions {
+		if s.Browser {
+			assert.True(t, s.FetchOn && s.FetchAuth, "the gate's interception survives the client's Fetch.disable")
+		}
+	}
+	b.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "R2", "url": "https://site.test/2"})
+	eventually(t, 5*time.Second, func() bool { return slices.Contains(tg.state(b).Completed, "R2") }, "the next request is still answered for")
+}
+
+// The gate's session is the gate's alone: a client cannot address it, turn
+// its interception off or detach it, however it learned the id.
+func TestProxyResponderSessionIsNotAClients(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	browserSession := tg.browserSession()
+	require.NotEmpty(t, browserSession)
+	a := tg.dial("")
+	_, err := a.call(browserSession, "Fetch.disable", nil)
+	assert.ErrorContains(t, err, "Session with given id not found")
+	_, err = a.call("", "Target.detachFromTarget", map[string]any{"sessionId": browserSession})
+	assert.ErrorContains(t, err, "no session with the given id")
+	for _, s := range tg.state(a).Sessions {
+		if s.ID == browserSession {
+			assert.True(t, s.FetchOn && s.FetchAuth, "the gate's interception is untouched")
 		}
 	}
 }
 
-// Real Chrome, behind the gate, reaches a page through a proxy that
-// requires a credential: the gate answers the proxy's challenge, and gives
-// that credential to nobody else, such as a site asking for a password.
-func TestRealChromeAnswersProxyChallenge(t *testing.T) {
-	chrome := requireChrome(t)
-	self, err := os.Executable()
-	require.NoError(t, err)
-
-	var mu sync.Mutex
-	var siteAuthorizations []string
-	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/private" {
-			mu.Lock()
-			siteAuthorizations = append(siteAuthorizations, r.Header.Get("Authorization"))
-			mu.Unlock()
-			w.Header().Set("WWW-Authenticate", `Basic realm="site"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		_, _ = io.WriteString(w, "reached through the proxy")
-	}))
-	t.Cleanup(site.Close)
-	const wantAuthorization = "Basic ZGFndTpwcm94eS1zZWNyZXQ=" // dagu:proxy-secret
-	var challenged, authorized int
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.String(), site.URL) {
-			http.Error(w, "this proxy carries only the test site", http.StatusForbidden)
-			return
-		}
-		mu.Lock()
-		if r.Header.Get("Proxy-Authorization") != wantAuthorization {
-			challenged++
-			mu.Unlock()
-			w.Header().Set("Proxy-Authenticate", `Basic realm="dagu"`)
-			w.WriteHeader(http.StatusProxyAuthRequired)
-			return
-		}
-		authorized++
-		mu.Unlock()
-		outbound, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		outbound.Header = r.Header.Clone()
-		outbound.Header.Del("Proxy-Authorization")
-		response, err := http.DefaultTransport.RoundTrip(outbound)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = response.Body.Close() }()
-		maps.Copy(w.Header(), response.Header)
-		w.WriteHeader(response.StatusCode)
-		_, _ = io.Copy(w, response.Body)
-	}))
-	t.Cleanup(proxy.Close)
-	proxyAddress := proxy.Listener.Addr().String()
-
-	profile, err := os.MkdirTemp("", "dagu-gate-proxy-auth-")
-	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	handle, err := Start(ctx, self, Config{
-		Token:      NewToken(),
-		Executable: chrome,
-		Args: ChromeArgs(LaunchOptions{
-			UserDataDir: profile,
-			Headless:    true,
-			NoSandbox:   os.Getenv("CI") != "" || (runtime.GOOS == "linux" && os.Geteuid() == 0),
-			Extra:       []string{"--proxy-server=" + proxyAddress, "--proxy-bypass-list=<-loopback>"},
-		}),
-		ProxyAuth: &ProxyAuth{Addresses: []string{proxyAddress}, Username: "dagu", Password: "proxy-secret"},
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = handle.Kill()
-		// Chrome's last processes may still be writing as it exits.
-		eventually(t, 15*time.Second, func() bool {
-			return !procutil.IsAlive(handle.BrowserPID) && os.RemoveAll(profile) == nil
-		}, "the browser exits and its profile is removed")
-	})
-
-	_, body := get(t, handle.URL+"/json/version")
-	var version map[string]string
-	require.NoError(t, json.Unmarshal([]byte(body), &version))
-	c := dialWS(t, version["webSocketDebuggerUrl"], nil)
-	created := c.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
-	var page struct {
-		TargetID string `json:"targetId"`
+// A browser that lets go of the gate's session has nothing answering for
+// its requests any more: the gate closes, and the browser with it, rather
+// than serve a browser whose every proxied request would fail.
+func TestProxyResponderEndsWithItsSession(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	a := tg.dial("")
+	a.mustCall("", "Browser.getVersion", nil)
+	// The browser's own doing, not a command's: the gate closes on the
+	// event, so no reply could reach a client anyway.
+	tg.fake.event("", "Target.detachedFromTarget", map[string]any{"sessionId": tg.browserSession(), "targetId": ""})
+	select {
+	case <-tg.mux.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate did not close after losing its session")
 	}
-	require.NoError(t, json.Unmarshal(created, &page))
-	attached := c.mustCall("", "Target.attachToTarget", map[string]any{"targetId": page.TargetID, "flatten": true})
-	var session struct {
-		SessionID string `json:"sessionId"`
-	}
-	require.NoError(t, json.Unmarshal(attached, &session))
-
-	text := func() string {
-		result := c.mustCall(session.SessionID, "Runtime.evaluate", map[string]any{"expression": "document.body ? document.body.innerText : ''", "returnByValue": true})
-		var evaluated struct {
-			Result struct {
-				Value string `json:"value"`
-			} `json:"result"`
-		}
-		_ = json.Unmarshal(result, &evaluated)
-		return evaluated.Result.Value
-	}
-	c.mustCall(session.SessionID, "Page.navigate", map[string]any{"url": site.URL + "/"})
-	eventually(t, 30*time.Second, func() bool { return strings.Contains(text(), "reached through the proxy") }, "the page loads through the proxy")
-	mu.Lock()
-	assert.Positive(t, challenged, "the proxy challenged the browser")
-	assert.Positive(t, authorized, "the browser answered with the gate's credential")
-	mu.Unlock()
-
-	// A site asking for a password gets nothing from the gate.
-	c.mustCall(session.SessionID, "Page.navigate", map[string]any{"url": site.URL + "/private"})
-	eventually(t, 30*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(siteAuthorizations) > 0
-	}, "the site's challenge was reached")
-	time.Sleep(time.Second)
-	mu.Lock()
-	defer mu.Unlock()
-	for _, authorization := range siteAuthorizations {
-		assert.Empty(t, authorization, "the proxy's credential is never given to a site")
+	select {
+	case <-a.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client was not disconnected")
 	}
 }
 
-// A service worker's own requests reach the site through a proxy that
-// requires a credential: the gate holds the worker's target and answers the
-// proxy's challenge on it. The proxy challenges the worker's request with a
-// realm of its own, so a credential Chrome kept from the page's requests
-// does not answer it: only the gate's answer on the worker's target does.
-func TestRealChromeAnswersProxyChallengeForAServiceWorker(t *testing.T) {
-	chrome := requireChrome(t)
+// A browser that refuses the gate's browser-level interception is not
+// served: the helper reports the refusal and ends the browser, and no
+// address is ever handed out, so nothing runs with the proxy's challenges
+// unanswered.
+func TestProxyResponderFailsClosedWhenTheBrowserRefusesInterception(t *testing.T) {
+	t.Parallel()
 	self, err := os.Executable()
 	require.NoError(t, err)
-
-	var mu sync.Mutex
-	var fromWorker int
-	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/sw.js":
-			w.Header().Set("Content-Type", "text/javascript")
-			_, _ = io.WriteString(w, `self.addEventListener('install', event => event.waitUntil(fetch('/from-sw').then(r => { if (!r.ok) throw new Error(r.status); })));`)
-		case "/from-sw":
-			mu.Lock()
-			fromWorker++
-			mu.Unlock()
-			_, _ = io.WriteString(w, "worker")
-		default:
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = io.WriteString(w, `<p id="state">registering</p><script>
-navigator.serviceWorker.register('/sw.js')
-  .then(reg => new Promise((resolve, reject) => {
-    const worker = reg.installing || reg.waiting || reg.active;
-    if (worker.state === 'activated' || worker.state === 'installed') return resolve(worker.state);
-    worker.addEventListener('statechange', () => {
-      if (worker.state === 'installed' || worker.state === 'activated') resolve(worker.state);
-      if (worker.state === 'redundant') reject(new Error('the worker did not install'));
-    });
-  }))
-  .then(state => { document.getElementById('state').textContent = 'installed'; })
-  .catch(err => { document.getElementById('state').textContent = 'failed: ' + err.message; });
-</script>`)
-		}
-	}))
-	t.Cleanup(site.Close)
-
-	const wantAuthorization = "Basic ZGFndTpwcm94eS1zZWNyZXQ=" // dagu:proxy-secret
-	challengedWorker := false
-	var workerChallenges, workerAuthorized int
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.String(), site.URL) {
-			http.Error(w, "this proxy carries only the test site", http.StatusForbidden)
-			return
-		}
-		mu.Lock()
-		worker := r.URL.Path == "/from-sw"
-		authorized := r.Header.Get("Proxy-Authorization") == wantAuthorization
-		switch {
-		case worker && !challengedWorker:
-			// A realm Chrome holds no credential for yet.
-			challengedWorker = true
-			workerChallenges++
-			mu.Unlock()
-			w.Header().Set("Proxy-Authenticate", `Basic realm="worker"`)
-			w.WriteHeader(http.StatusProxyAuthRequired)
-			return
-		case !authorized:
-			if worker {
-				workerChallenges++
-			}
-			mu.Unlock()
-			w.Header().Set("Proxy-Authenticate", `Basic realm="dagu"`)
-			w.WriteHeader(http.StatusProxyAuthRequired)
-			return
-		}
-		if worker {
-			workerAuthorized++
-		}
-		mu.Unlock()
-		outbound, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		outbound.Header = r.Header.Clone()
-		outbound.Header.Del("Proxy-Authorization")
-		response, err := http.DefaultTransport.RoundTrip(outbound)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = response.Body.Close() }()
-		maps.Copy(w.Header(), response.Header)
-		w.WriteHeader(response.StatusCode)
-		_, _ = io.Copy(w, response.Body)
-	}))
-	t.Cleanup(proxy.Close)
-	proxyAddress := proxy.Listener.Addr().String()
-
-	profile, err := os.MkdirTemp("", "dagu-gate-proxy-worker-")
-	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	marker := filepath.Join(t.TempDir(), "exit")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	handle, err := Start(ctx, self, Config{
-		Token:      NewToken(),
-		Executable: chrome,
-		Args: ChromeArgs(LaunchOptions{
-			UserDataDir: profile,
-			Headless:    true,
-			NoSandbox:   os.Getenv("CI") != "" || (runtime.GOOS == "linux" && os.Geteuid() == 0),
-			Extra:       []string{"--proxy-server=" + proxyAddress, "--proxy-bypass-list=<-loopback>"},
-		}),
-		ProxyAuth: &ProxyAuth{Addresses: []string{proxyAddress}, Username: "dagu", Password: "proxy-secret"},
+	token := NewToken()
+	_, err = Start(ctx, self, Config{
+		Token:      token,
+		Executable: self,
+		Args:       fakeBrowserArgs("--refuse-browser-fetch", "--exit-marker="+marker),
+		ProxyAuth:  &ProxyAuth{Addresses: []string{"127.0.0.1:41234"}, Username: fakeProxyUser, Password: fakeProxySecret},
 	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = handle.Kill()
-		eventually(t, 15*time.Second, func() bool {
-			return !procutil.IsAlive(handle.BrowserPID) && os.RemoveAll(profile) == nil
-		}, "the browser exits and its profile is removed")
-	})
-
-	_, body := get(t, handle.URL+"/json/version")
-	var version map[string]string
-	require.NoError(t, json.Unmarshal([]byte(body), &version))
-	c := dialWS(t, version["webSocketDebuggerUrl"], nil)
-	created := c.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
-	var page struct {
-		TargetID string `json:"targetId"`
-	}
-	require.NoError(t, json.Unmarshal(created, &page))
-	attached := c.mustCall("", "Target.attachToTarget", map[string]any{"targetId": page.TargetID, "flatten": true})
-	var session struct {
-		SessionID string `json:"sessionId"`
-	}
-	require.NoError(t, json.Unmarshal(attached, &session))
-	c.mustCall(session.SessionID, "Page.navigate", map[string]any{"url": site.URL + "/"})
-
-	state := func() string {
-		result := c.mustCall(session.SessionID, "Runtime.evaluate", map[string]any{"expression": "document.getElementById('state') ? document.getElementById('state').textContent : ''", "returnByValue": true})
-		var evaluated struct {
-			Result struct {
-				Value string `json:"value"`
-			} `json:"result"`
-		}
-		_ = json.Unmarshal(result, &evaluated)
-		return evaluated.Result.Value
-	}
-	eventually(t, 45*time.Second, func() bool {
-		settled := state()
-		return settled != "" && settled != "registering"
-	}, "the worker settles")
-	assert.Equal(t, "installed", state(), "the worker's own request through the proxy succeeded")
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Positive(t, workerChallenges, "the proxy challenged the worker's request")
-	assert.Positive(t, workerAuthorized, "the worker's request carried the gate's credential")
-	assert.Positive(t, fromWorker, "the worker's request reached the site")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "turn on the proxy's answer for the browser")
+	assert.Contains(t, err.Error(), "Fetch.enable")
+	assert.NotContains(t, err.Error(), token)
+	assert.NotContains(t, err.Error(), fakeProxySecret)
+	eventually(t, 15*time.Second, func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	}, "the browser's exit on end-of-file")
 }

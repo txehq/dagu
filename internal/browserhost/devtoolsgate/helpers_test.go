@@ -59,6 +59,13 @@ type testGate struct {
 // startTestGate runs a fake browser and a gate over pipes in this process.
 func startTestGate(t *testing.T) *testGate {
 	t.Helper()
+	return startTestGateWith(t, nil)
+}
+
+// startTestGateWith is startTestGate with setup run on the mux and the fake
+// before the mux starts, where run installs the gate's own hooks.
+func startTestGateWith(t *testing.T, setup func(m *mux, f *fakeBrowser)) *testGate {
+	t.Helper()
 	browserRead, gateWrite, err := os.Pipe()
 	require.NoError(t, err)
 	gateRead, browserWrite, err := os.Pipe()
@@ -67,6 +74,9 @@ func startTestGate(t *testing.T) *testGate {
 	go func() { _ = fake.serve() }()
 
 	m := newMux(newPipe(gateRead, gateWrite))
+	if setup != nil {
+		setup(m, fake)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
 	go func() { runErr <- m.run(ctx) }()
@@ -200,6 +210,26 @@ func (c *cdpConn) call(sessionID, method string, params any) (json.RawMessage, e
 		c.t.Fatalf("no reply to %s within 10s", method)
 		return nil, nil
 	}
+}
+
+// send sends a command without waiting for its reply, which read drops as
+// nobody's. It never fails the test, so a goroutine may use it.
+func (c *cdpConn) send(sessionID, method string, params any) {
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	command := map[string]any{"id": id, "method": method, "params": params}
+	if sessionID != "" {
+		command["sessionId"] = sessionID
+	}
+	data, err := json.Marshal(command)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = c.conn.Write(ctx, websocket.MessageText, data)
 }
 
 // mustCall fails the test on a protocol error.
