@@ -1504,7 +1504,7 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 		// configuration. The handler authenticates by itself, so the
 		// request is authenticated once more in front of it.
 		authOpts := srv.buildStreamAuthOptions("restricted")
-		r.With(terminalQueryTokenOnly, auth.Middleware(authOpts), srv.apiV1.TxePersonRefused()).Get(wsPath, termHandler.ServeHTTP)
+		r.With(terminalQueryTokenOnly, auth.Middleware(authOpts), srv.apiV1.TxePersonRefused(), srv.apiV1.TxeHostExecutionRefused()).Get(wsPath, termHandler.ServeHTTP)
 		logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
 		return
 	}

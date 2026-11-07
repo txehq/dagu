@@ -3,6 +3,7 @@
 
 import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useRemoteNode } from '@/contexts/RemoteNodeContext';
+import { startUnconfirmedRunId } from '@/features/txe/startUnconfirmed';
 import { useClient } from '@/hooks/api';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { EditorRunActions, StepRunInputs } from '../contracts';
@@ -47,6 +48,14 @@ export function useEditorRunActions(args: Args): EditorRunActions {
       const { ts } = latest.current;
       try {
         const { data, error, response } = await call();
+        // A start handed over but not seen to start may still run: follow
+        // that run rather than report a failure and invite a second start
+        // (504 start_unconfirmed, TXE-4712).
+        const unconfirmed = startUnconfirmedRunId(error);
+        if (unconfirmed) {
+          setError(serverMessage(error));
+          return unconfirmed;
+        }
         if (error !== undefined || !data) {
           setError(
             serverMessage(error) ??

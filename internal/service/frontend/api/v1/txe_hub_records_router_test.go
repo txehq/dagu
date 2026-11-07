@@ -6,6 +6,7 @@ package api_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -239,4 +240,37 @@ func TestTxeRemoteNodeNeedsThePlatformAdministratorUnderEnforce(t *testing.T) {
 
 	status, _ = h.send(t, "/api/v1/dags", h.legacy)
 	require.NotEqual(t, http.StatusForbidden, status, "a request for this server is not the remote decision's")
+}
+
+// Under owner enforcement a capability that runs commands on the hub's host
+// needs the platform administrator: an admin-role API key, which the owner
+// model never takes for the platform administrator, can neither save a
+// command notification channel nor open the terminal (TXE-5923). The
+// platform administrator gets past this decision to the hub's own checks.
+func TestTxeHostExecutionNeedsThePlatformAdministratorUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	key := createAPIKeyForRole(t, h.server, h.admin, "legacy-admin-key", api.UserRoleAdmin)
+	channel := api.NotificationChannelInput{
+		Name: "host", Enabled: true, Type: api.NotificationProviderTypeCommand,
+		Command: &api.NotificationCommandTarget{Command: "id"},
+	}
+
+	resp := h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "host_execution_not_permitted")
+
+	resp = h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(h.admin).Send(t)
+	require.NotContains(t, resp.Body, "host_execution_not_permitted", "the platform administrator is decided by the hub's own checks")
+
+	// The terminal takes its token from the query only.
+	terminal, err := http.Get(h.base + "/api/v1/terminal/ws?token=" + key) //nolint:noctx // test request
+	require.NoError(t, err)
+	defer func() { _ = terminal.Body.Close() }()
+	terminalBody, err := io.ReadAll(terminal.Body)
+	require.NoError(t, err)
+	// An API key has no terminal surface, so authentication refuses it first;
+	// any other administrator the owner model does not take for the platform
+	// administrator meets TxeHostExecutionRefused, the same decision as the
+	// channel's above. Either way no terminal opens.
+	require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, terminal.StatusCode, string(terminalBody))
 }

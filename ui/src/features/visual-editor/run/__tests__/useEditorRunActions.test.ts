@@ -319,4 +319,24 @@ describe('useEditorRunActions', () => {
     expect(result.current.isStarting).toBe(false);
     await expect(pending).resolves.toBe('run-9');
   });
+
+  // TXE fork (TXE-5923): a draft the coordinator accepted but did not see
+  // start may still run, so the editor follows it instead of failing.
+  it('follows the run of an unconfirmed draft start', async () => {
+    POST.mockResolvedValue({
+      error: {
+        code: 'timeout',
+        message: 'not seen to start; read run r-9 before starting it again',
+        details: { code: 'start_unconfirmed', dag_run_id: 'r-9' },
+      },
+      response: { status: 504 },
+    });
+    const { result } = setup({ isDirty: true });
+    let id: string | null = null;
+    await act(async () => {
+      id = await result.current.runDraft();
+    });
+    expect(id).toBe('r-9');
+    expect(result.current.error).toContain('read run r-9');
+  });
 });

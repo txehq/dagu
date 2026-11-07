@@ -304,11 +304,7 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 		}()
 	}
 	if err != nil {
-		return nil, &Error{
-			HTTPStatus: http.StatusInternalServerError,
-			Code:       api.ErrorCodeInternalError,
-			Message:    fmt.Sprintf("failed to start dag-run: %s", err.Error()),
-		}
+		return nil, startFailure(err)
 	}
 
 	detailsMap := map[string]any{

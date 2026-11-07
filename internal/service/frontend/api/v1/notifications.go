@@ -480,6 +480,9 @@ func (a *API) requireCommandChannelAccess(ctx context.Context) error {
 		}
 		return err
 	}
+	if err := a.txeHostExecution(ctx); err != nil {
+		return err
+	}
 	if !a.notificationService.CommandChannelsEnabled() {
 		return errCommandChannelsDisabled
 	}
