@@ -105,8 +105,9 @@ func (r *proxyResponder) start(ctx context.Context) error {
 // the proxy's challenge and nobody answered). Turning Fetch on and off again
 // on the gate's own session of such a target makes the browser give it new
 // loaders, built with the interception in place. A target that takes no
-// Fetch is left as it is; one that takes it on but not off would hold its
-// requests for nobody, so that ends the start.
+// Fetch, or that went away meanwhile, is left as it is; one that takes it
+// on but not off would hold its requests for nobody, so that ends the
+// start.
 func (r *proxyResponder) coverExisting(ctx context.Context) error {
 	r.m.mu.Lock()
 	sessions := make([]string, 0, len(r.m.gateSessions))
@@ -119,6 +120,14 @@ func (r *proxyResponder) coverExisting(ctx context.Context) error {
 			continue
 		}
 		if _, err := r.m.call(ctx, session, "Fetch.disable", map[string]any{}); err != nil {
+			r.m.mu.Lock()
+			_, held := r.m.gateSessions[session]
+			r.m.mu.Unlock()
+			if !held {
+				// The target closed between the two: nothing of it is left
+				// to hold a request.
+				continue
+			}
 			return fmt.Errorf("turn on the proxy's answer for the browser's first targets: %w", err)
 		}
 	}
