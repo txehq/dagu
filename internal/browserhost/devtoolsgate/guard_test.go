@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -91,7 +92,14 @@ func TestGuardOneBrowserLaunch(t *testing.T) {
 		"internal/browserhost/devtoolsgate/launch.go": true,
 		"internal/browserhost/devtoolsgate/start.go":  true,
 	}
-	var sdkLaunches, portFlags, execs, portFuncs []string
+	// The gate names the pipe flags where it builds and validates them, and
+	// nowhere else may a remote-debugging flag be spelled, whole or in part.
+	allowedDebuggingLiteral := map[string]bool{
+		"internal/browserhost/devtoolsgate/launch_unix.go":    true,
+		"internal/browserhost/devtoolsgate/launch_windows.go": true,
+		"internal/browserhost/devtoolsgate/config.go":         true,
+	}
+	var sdkLaunches, debuggingLiterals, execs, portFuncs []string
 	for path, file := range files {
 		sdk := importName(file, sdkModule)
 		execName := importName(file, "os/exec")
@@ -103,23 +111,21 @@ func TestGuardOneBrowserLaunch(t *testing.T) {
 					portFuncs = append(portFuncs, path)
 				}
 			case *ast.BasicLit:
-				if node.Kind == token.STRING && strings.Contains(node.Value, "--remote-debugging-port") {
-					portFlags = append(portFlags, path)
+				if node.Kind == token.STRING && strings.Contains(strings.ToLower(node.Value), "remote-debugging") && !allowedDebuggingLiteral[path] {
+					debuggingLiterals = append(debuggingLiterals, path)
 				}
-			case *ast.CallExpr:
-				selector, ok := node.Fun.(*ast.SelectorExpr)
+			case *ast.SelectorExpr:
+				// Any mention, not only a call: a function value assigned
+				// and called later is the same launch.
+				pkg, ok := node.X.(*ast.Ident)
 				if !ok {
 					return true
 				}
-				pkg, ok := selector.X.(*ast.Ident)
-				if !ok {
-					return true
-				}
-				if sdk != "" && pkg.Name == sdk && selector.Sel.Name == "LaunchLocalBrowser" {
+				if sdk != "" && pkg.Name == sdk && node.Sel.Name == "LaunchLocalBrowser" {
 					sdkLaunches = append(sdkLaunches, path)
 				}
 				if browserPackage && execName != "" && pkg.Name == execName &&
-					(selector.Sel.Name == "Command" || selector.Sel.Name == "CommandContext") && !allowedExec[path] {
+					(node.Sel.Name == "Command" || node.Sel.Name == "CommandContext") && !allowedExec[path] {
 					execs = append(execs, path)
 				}
 			}
@@ -127,14 +133,16 @@ func TestGuardOneBrowserLaunch(t *testing.T) {
 		})
 	}
 	assert.Empty(t, sdkLaunches, "stagehand.LaunchLocalBrowser starts Chrome on a port; launch through devtoolsgate.Start")
-	assert.Empty(t, portFlags, "--remote-debugging-port opens an unauthenticated port; the gate uses the pipe")
+	assert.Empty(t, debuggingLiterals, "a remote-debugging flag is spelled only where the gate builds the pipe flags")
 	assert.Empty(t, portFuncs, "no browser debugging port is reserved anywhere")
 	assert.Empty(t, execs, "the browser packages start processes only in the gate's launch.go and start.go")
 }
 
 // TestGuardAddressNeverFormatted: a browser address carries the gate's
 // token, so no code in the browser packages hands one to a formatting,
-// logging or error-building function. Redact it first.
+// logging or error-building function. Redact it first. The check reads
+// names, so an address copied into a variable with another name escapes it;
+// reviews of the browser packages read for that.
 func TestGuardAddressNeverFormatted(t *testing.T) {
 	t.Parallel()
 	root := moduleRoot(t)
@@ -211,12 +219,7 @@ func namesAddress(expr ast.Expr) bool {
 				return false
 			}
 		}
-		for _, arg := range node.Args {
-			if namesAddress(arg) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(node.Args, namesAddress)
 	}
 	return false
 }

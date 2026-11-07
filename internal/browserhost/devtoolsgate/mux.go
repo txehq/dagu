@@ -34,7 +34,9 @@ import (
 // a client's.
 
 // outQueue is how many messages may wait for the pipe before a writer blocks.
-const outQueue = 1 << 12
+// The queue to the browser is unbounded: a client's command is never held
+// under the multiplexer's lock, and a browser that stops reading is found
+// by the gate's heartbeat and ended within seconds.
 
 // cdpError is the error object of a failed DevTools command.
 type cdpError struct {
@@ -105,7 +107,11 @@ type attachRequest struct {
 // mux multiplexes clients onto the one pipe.
 type mux struct {
 	pipe *pipe
-	out  chan []byte
+	// outMu guards outQueue, the messages waiting for the pipe; outSignal
+	// wakes the writer.
+	outMu     sync.Mutex
+	outQueue  [][]byte
+	outSignal chan struct{}
 
 	mu      sync.Mutex
 	nextID  uint64
@@ -143,7 +149,7 @@ type mux struct {
 func newMux(p *pipe) *mux {
 	m := &mux{
 		pipe:             p,
-		out:              make(chan []byte, outQueue),
+		outSignal:        make(chan struct{}, 1),
 		nextID:           1,
 		pending:          make(map[uint64]*pendingCommand),
 		clients:          make(map[*client]struct{}),
@@ -186,10 +192,25 @@ func (m *mux) run(ctx context.Context) error {
 }
 
 func (m *mux) writeLoop() {
-	for data := range m.out {
-		if err := m.pipe.write(data); err != nil {
-			// The browser's end is gone; the read loop reports it.
+	for {
+		select {
+		case <-m.outSignal:
+		case <-m.done:
 			return
+		}
+		for {
+			m.outMu.Lock()
+			if len(m.outQueue) == 0 {
+				m.outMu.Unlock()
+				break
+			}
+			data := m.outQueue[0]
+			m.outQueue = m.outQueue[1:]
+			m.outMu.Unlock()
+			if err := m.pipe.write(data); err != nil {
+				// The browser's end is gone; the read loop reports it.
+				return
+			}
 		}
 	}
 }
@@ -211,11 +232,14 @@ func (m *mux) close() {
 	})
 }
 
-// enqueue hands a message to the pipe writer.
+// enqueue hands a message to the pipe writer without waiting for it.
 func (m *mux) enqueue(data []byte) {
+	m.outMu.Lock()
+	m.outQueue = append(m.outQueue, data)
+	m.outMu.Unlock()
 	select {
-	case m.out <- data:
-	case <-m.done:
+	case m.outSignal <- struct{}{}:
+	default:
 	}
 }
 
@@ -394,6 +418,13 @@ func (m *mux) onAttachedLocked(msg message) {
 	}
 	if len(m.attaching[info.TargetID]) > 0 {
 		m.stashed[info.TargetID] = append(m.stashed[info.TargetID], msg)
+		return
+	}
+	// A client that asked for auto-attach on a session it attached itself
+	// gets that session's children as its own, as the browser gives them.
+	if owner, ok := m.explicitSessions[msg.SessionID]; ok && msg.SessionID != "" {
+		m.explicitSessions[params.SessionID] = owner
+		owner.deliverEvent(msg.SessionID, "Target.attachedToTarget", msg.Params)
 		return
 	}
 	m.gateAttachedLocked(msg.SessionID, params.SessionID, info, params.TargetInfo, params.WaitingForDebugger)
@@ -649,6 +680,12 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 	if sessionID == "" {
 		sessionID = c.root
 	}
+	// A session is addressed only by the client it belongs to, as over a
+	// port, where a session id is meaningless on another connection.
+	if !m.ownsSessionLocked(c, sessionID) {
+		c.deliverError(msg.ID, msg.SessionID, "Session with given id not found.")
+		return
+	}
 	switch msg.Method {
 	case "Target.setAutoAttach":
 		m.setAutoAttachLocked(c, msg, sessionID)
@@ -663,6 +700,19 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 	default:
 		m.forwardLocked(c, msg, sessionID)
 	}
+}
+
+// ownsSessionLocked reports whether sessionID is the browser itself, c's
+// root, a private session made for c, or a session c attached itself.
+func (m *mux) ownsSessionLocked(c *client, sessionID string) bool {
+	if sessionID == "" || sessionID == c.root {
+		return true
+	}
+	if t, ok := m.privateSessions[sessionID]; ok {
+		return t.private[c] == sessionID
+	}
+	owner, ok := m.explicitSessions[sessionID]
+	return ok && owner == c
 }
 
 // forwardLocked passes a command through with a remapped id.

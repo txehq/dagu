@@ -5,6 +5,7 @@ package devtoolsgate
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -100,12 +101,7 @@ func TestMuxWaitForDebuggerGatesResume(t *testing.T) {
 	late.mustCall(lateHeld.SessionID, "Runtime.runIfWaitingForDebugger", nil)
 	eventually(t, 5*time.Second, func() bool {
 		state := tg.state(other)
-		for _, id := range state.Resumed {
-			if id == target.TargetID {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(state.Resumed, target.TargetID)
 	}, "the resume after every waiting client resumed")
 }
 
@@ -189,7 +185,7 @@ func TestMuxDiscoveryAndIDs(t *testing.T) {
 
 	// A late discoverer is replayed what exists; ids are the client's own.
 	b := tg.dial("")
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		b.mustCall("", "Browser.getVersion", nil)
 	}
 	b.mustCall("", "Target.setDiscoverTargets", map[string]any{"discover": true})
@@ -247,4 +243,96 @@ func indexOf(s, needle string) int {
 		}
 	}
 	return -1
+}
+
+// A client addresses only its own sessions: another client's private or
+// explicit session id is unknown to it, as it would be over a port.
+func TestMuxSessionOwnershipEnforced(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a, b := tg.dial(""), tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	private := decodeAttached(t, a.waitEvent("Target.attachedToTarget", nil)).SessionID
+
+	_, err := b.call(private, "Runtime.evaluate", map[string]any{"expression": "1"})
+	assert.ErrorContains(t, err, "Session with given id not found")
+	_, err = b.call(private, "Runtime.runIfWaitingForDebugger", nil)
+	assert.ErrorContains(t, err, "Session with given id not found")
+	a.mustCall(private, "Runtime.evaluate", map[string]any{"expression": "1"})
+
+	explicit := sessionOf(a.mustCall("", "Target.attachToTarget", map[string]any{"targetId": "T1", "flatten": true}))
+	require.NotEmpty(t, explicit)
+	_, err = b.call(explicit, "Fetch.disable", nil)
+	assert.ErrorContains(t, err, "Session with given id not found")
+	a.mustCall(explicit, "Fetch.disable", nil)
+}
+
+// A client's nested auto-attach on its private session gets the target's
+// children as private sessions of its own, held until the client resumes
+// them.
+func TestMuxNestedAutoAttachUnderPrivateSession(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a := tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	page := decodeAttached(t, a.waitEvent("Target.attachedToTarget", nil))
+	a.mustCall(page.SessionID, "Target.setAutoAttach", autoAttach(true))
+
+	created := a.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+	event := a.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.Type == "worker"
+	})
+	assert.Equal(t, page.SessionID, event.SessionID, "the child arrives under the client's own session of the parent")
+	worker := decodeAttached(t, event)
+	assert.True(t, worker.WaitingForDebugger)
+	assert.NotEqual(t, page.SessionID, worker.SessionID)
+	time.Sleep(100 * time.Millisecond)
+	assert.Contains(t, tg.state(a).Paused, child.TargetID, "the child is held for the client")
+
+	a.mustCall(worker.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+	eventually(t, 5*time.Second, func() bool {
+		return slices.Contains(tg.state(a).Resumed, child.TargetID)
+	}, "the child's resume")
+}
+
+// Auto-attach on a session a client attached itself gives the client that
+// session's children, as the browser does over a port; nobody else can
+// address them, and they go with the client.
+func TestMuxAutoAttachUnderExplicitSession(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	page := tg.dial("T1")
+	page.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	browser := tg.dial("")
+	created := browser.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+
+	event := page.waitEvent("Target.attachedToTarget", nil)
+	assert.Equal(t, "", event.SessionID, "the client's root session is implied")
+	worker := decodeAttached(t, event)
+	assert.True(t, worker.WaitingForDebugger)
+	page.mustCall(worker.SessionID, "Runtime.evaluate", map[string]any{"expression": "1"})
+	_, err := browser.call(worker.SessionID, "Runtime.evaluate", map[string]any{"expression": "1"})
+	assert.ErrorContains(t, err, "Session with given id not found")
+	page.mustCall(worker.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+	eventually(t, 5*time.Second, func() bool {
+		return slices.Contains(tg.state(browser).Resumed, child.TargetID)
+	}, "the child's resume")
+
+	page.close()
+	eventually(t, 5*time.Second, func() bool {
+		for _, s := range tg.state(browser).Sessions {
+			if !s.Auto {
+				return false
+			}
+		}
+		return true
+	}, "the client's sessions, the child's included, detached with it")
 }

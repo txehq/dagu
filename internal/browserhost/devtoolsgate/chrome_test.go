@@ -108,7 +108,7 @@ func assertNoListeningSocket(t *testing.T, pid int) {
 			t.Log("netstat failed; the listening-socket check is skipped")
 			return
 		}
-		for _, line := range strings.Split(string(out), "\n") {
+		for line := range strings.SplitSeq(string(out), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) >= 5 && fields[3] == "LISTENING" && fields[4] == strconv.Itoa(pid) {
 				t.Errorf("the browser listens on a TCP port: %s", line)

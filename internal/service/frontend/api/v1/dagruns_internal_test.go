@@ -1932,6 +1932,9 @@ func TestBrowserSessionWaiting(t *testing.T) {
 	t.Cleanup(failing.Close)
 	closed := httptest.NewServer(http.NotFoundHandler())
 	closed.Close()
+	// A browser's address carries its gate's token; the fakes above answer
+	// under any path.
+	const token = "/TESTTOKEN0000000000000000A"
 
 	now := time.Now()
 	for _, test := range []struct {
@@ -1940,12 +1943,15 @@ func TestBrowserSessionWaiting(t *testing.T) {
 		want    bool
 		wantErr bool
 	}{
-		{name: "open", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: devtools.URL}, want: true},
+		{name: "open", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: devtools.URL + token}, want: true},
 		{name: "no record"},
-		{name: "expired", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(-time.Minute), CDPURL: devtools.URL}},
-		{name: "unreachable", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: closed.URL}},
-		{name: "running", record: &browserhost.Record{State: browserhost.StateRunning, Deadline: now.Add(time.Hour), CDPURL: devtools.URL}},
-		{name: "unknown", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: failing.URL}, wantErr: true},
+		{name: "expired", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(-time.Minute), CDPURL: devtools.URL + token}},
+		{name: "unreachable", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: closed.URL + token}},
+		{name: "running", record: &browserhost.Record{State: browserhost.StateRunning, Deadline: now.Add(time.Hour), CDPURL: devtools.URL + token}},
+		{name: "unknown", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: failing.URL + token}, wantErr: true},
+		// A record written before browsers had gates names a browser that
+		// is not reached without a token; it is not waiting.
+		{name: "legacy address", record: &browserhost.Record{State: browserhost.StateDetached, Deadline: now.Add(time.Hour), CDPURL: devtools.URL}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

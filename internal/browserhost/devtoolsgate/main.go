@@ -106,6 +106,12 @@ func run(ctx context.Context, cfg Config, stdout io.Writer) error {
 
 	lifetime := time.NewTimer(cfg.maxLifetime())
 	defer lifetime.Stop()
+	// The pipe's end-of-file is not the only sign of a browser that is
+	// gone: a helper process of the browser can keep the pipe's handles
+	// open after the browser process was ended, so the gate also watches
+	// the process and asks the browser for its version at intervals.
+	heartbeat := make(chan error, 1)
+	go func() { heartbeat <- heartbeatBrowser(ctx, m) }()
 	select {
 	case err := <-runErr:
 		// The browser closed its pipe, which it does on its way out, or ctx
@@ -118,9 +124,47 @@ func run(ctx context.Context, cfg Config, stdout io.Writer) error {
 			return browser.end()
 		}
 		return errors.Join(err, browser.end())
+	case <-browser.done:
+		m.close()
+		return browser.end()
+	case <-heartbeat:
+		m.close()
+		return browser.end()
 	case <-lifetime.C:
 		closeBrowser(m, browser)
 		return nil
+	}
+}
+
+const (
+	// heartbeatInterval spaces the gate's liveness checks of the browser.
+	heartbeatInterval = 3 * time.Second
+	// heartbeatTimeout is how long an unanswered check means the browser is
+	// gone. Browser.getVersion is answered by the browser process itself,
+	// not a page, so a healthy browser answers it in milliseconds.
+	heartbeatTimeout = 10 * time.Second
+)
+
+// heartbeatBrowser asks the browser for its version at intervals and returns
+// once an answer does not come in time, which means the browser is gone
+// although its pipe is still open.
+func heartbeatBrowser(ctx context.Context, m *mux) error {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.done:
+			return io.EOF
+		case <-ticker.C:
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
+		_, err := m.call(checkCtx, "", "Browser.getVersion", map[string]any{})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("the browser stopped answering: %w", err)
+		}
 	}
 }
 

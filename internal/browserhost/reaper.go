@@ -91,17 +91,16 @@ func closeRecordedBrowser(ctx context.Context, record Record) error {
 	return err
 }
 
-// waitForRecordedExit waits for the recorded browser to be gone: its address
-// stops answering, or, for a record from before browsers had gates, its
-// process exits.
+// waitForRecordedExit waits for the recorded browser to be gone. When the
+// record knows the browser's process, that process must have exited: its
+// gate's address going quiet only says the gate is gone, and a browser that
+// hangs on its way out may still hold the profile. Without a process, the
+// address is all there is.
 func waitForRecordedExit(ctx context.Context, record Record) bool {
-	if TokenOf(record.CDPURL) != "" {
-		return waitForExit(ctx, record.CDPURL)
-	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exitTimeout)
 	defer cancel()
 	for {
-		if record.BrowserPID <= 0 || !procutil.IsAlive(record.BrowserPID) {
+		if recordedBrowserGone(ctx, record) {
 			return true
 		}
 		select {
@@ -110,6 +109,25 @@ func waitForRecordedExit(ctx context.Context, record Record) bool {
 		case <-time.After(exitPollInterval):
 		}
 	}
+}
+
+// recordedBrowserGone reports whether the recorded browser process has
+// exited, or, when no process is recorded, whether its address no longer
+// answers.
+func recordedBrowserGone(ctx context.Context, record Record) bool {
+	if record.BrowserPID > 0 {
+		matched, _, ok := procutil.MatchesStartTime(record.BrowserPID, record.BrowserStartedAt)
+		if !ok {
+			// No start time to compare: a process that is gone is gone;
+			// one that is alive is taken to be the browser.
+			return !procutil.IsAlive(record.BrowserPID)
+		}
+		return !matched
+	}
+	if TokenOf(record.CDPURL) == "" {
+		return true
+	}
+	return errors.Is(Probe(ctx, record.CDPURL), ErrUnreachable)
 }
 
 // endProcess ends pid when it is still the process that started at

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -70,6 +71,7 @@ type fakeSession struct {
 	fetchOn    bool
 	fetchAuth  bool
 	nestedAuto bool
+	nestedWait bool
 }
 
 func newFakeBrowser(in io.Reader, out io.Writer) *fakeBrowser {
@@ -187,6 +189,7 @@ func (f *fakeBrowser) handle(data []byte) {
 		if cmd.SessionID != "" {
 			if s, ok := f.sessions[cmd.SessionID]; ok {
 				s.nestedAuto = boolean("autoAttach")
+				s.nestedWait = boolean("waitForDebuggerOnStart")
 			}
 			f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 			return
@@ -316,6 +319,33 @@ func (f *fakeBrowser) handle(data []byte) {
 			}
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"delivered": delivered})
+	case "Fake.createChild":
+		// A child target (a worker, a frame) is attached only through the
+		// sessions of its parent that asked for auto-attach, under each of
+		// them, as Chrome does.
+		parent, ok := f.targets[str("targetId")]
+		if !ok {
+			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		typ := str("type")
+		if typ == "" {
+			typ = "worker"
+		}
+		child := f.addTargetLocked(typ, "child://"+parent.id, "child")
+		for _, s := range f.sortedSessions() {
+			if s.targetID != parent.id || !s.nestedAuto {
+				continue
+			}
+			cs := f.newSessionLocked(child.id, true)
+			if s.nestedWait {
+				child.pausedBy = cs.id
+			}
+			f.event(s.id, "Target.attachedToTarget", map[string]any{
+				"sessionId": cs.id, "targetInfo": f.targetInfo(child), "waitingForDebugger": s.nestedWait,
+			})
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetId": child.id})
 	case "Fake.event":
 		var raw struct {
 			SessionID string          `json:"sessionId"`
@@ -409,9 +439,7 @@ func (f *fakeBrowser) stateLocked() fakeState {
 			state.Paused = append(state.Paused, t.id)
 		}
 	}
-	for s, n := range f.continues {
-		state.Continues[s] = n
-	}
+	maps.Copy(state.Continues, f.continues)
 	return state
 }
 

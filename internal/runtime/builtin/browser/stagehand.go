@@ -143,7 +143,12 @@ func (stagehandLauncher) Launch(ctx context.Context, opts launchOptions) (engine
 	if err != nil {
 		return nil, errors.Join(devtoolsgate.Redact(err, cdpURL), endUnstartedBrowser(ctx, browser, gate))
 	}
-	eng.handle.BrowserPID = gate.BrowserPID
+	// The browser names its own process; the gate's is the process it
+	// started, which stands in when the browser does not say.
+	eng.handle.BrowserPID, _ = browserhost.BrowserProcessID(ctx, cdpURL)
+	if eng.handle.BrowserPID == 0 {
+		eng.handle.BrowserPID = gate.BrowserPID
+	}
 	eng.handle.GatePID = gate.PID
 	eng.handle.GateStartedAt = gate.StartedAt
 	extension, err := browserhost.StagehandExtension(ctx, cdpURL)
