@@ -178,3 +178,24 @@ steps:
     expect(stepHashes('steps: [').size).toBe(0);
   });
 });
+
+// The hashes and diffRunSpec share one head (headOf): a handler that runs
+// before or among the steps changes every hash, an end-of-run handler none.
+describe('stepHashes and the handlers', () => {
+  const withHandler = (handler: string, command: string) =>
+    `${SPEC}handler_on:\n  ${handler}:\n    run: ${command}\n`;
+
+  it('changes every hash when the init handler changes', () => {
+    const before = stepHashes(withHandler('init', 'echo prepare > input'));
+    const after = stepHashes(withHandler('init', 'echo other > input'));
+    expect(before.size).toBeGreaterThan(0);
+    for (const [name, hash] of before)
+      expect(after.get(name), name).not.toBe(hash);
+  });
+
+  it('keeps every hash when an end-of-run handler changes', () => {
+    const before = stepHashes(withHandler('success', 'echo done'));
+    const after = stepHashes(withHandler('success', 'echo finished'));
+    expect([...after]).toEqual([...before]);
+  });
+});

@@ -19,9 +19,10 @@ export function normalizeSpec(spec: string): string {
  */
 export interface RunSpecDiff {
   /**
-   * A top-level key other than `steps` and the handlers differs, a later
-   * document (a local sub-DAG) differs, or a text cannot be read. Then every
-   * step can behave differently.
+   * A top-level key other than `steps` and the end-of-run handlers differs,
+   * a handler that runs before or among the steps differs (see
+   * `END_OF_RUN_HANDLERS`), a later document (a local sub-DAG) differs, or a
+   * text cannot be read. Then every step can behave differently.
    */
   headChanged: boolean;
   /** Steps in both definitions whose parsed definition differs. */
@@ -39,11 +40,41 @@ export interface RunSpecNames {
 }
 
 // Top-level keys that hold steps and not the head of the DAG.
-const NON_HEAD_KEYS: ReadonlySet<string> = new Set([
-  'steps',
-  'handler_on',
-  'handlerOn',
+const STEP_KEYS: ReadonlySet<string> = new Set(['steps']);
+
+// Top-level keys that hold the lifecycle handlers.
+const HANDLER_KEYS: ReadonlySet<string> = new Set(['handler_on', 'handlerOn']);
+
+/**
+ * The handlers that run only after every step has finished
+ * (`handlersAfterSteps` in internal/runtime/runner.go, without `wait`): they
+ * cannot change what a step produced, so editing them leaves outputs fresh.
+ * Every other handler is part of the head: `init` runs before the steps, in a
+ * run of selected steps too (`Runner.setup`), and `wait` runs while the DAG
+ * waits for an approval, before the steps that follow it. A handler key not
+ * listed here, a new one included, counts as head: the safe answer.
+ * TestEndOfRunHandlersAreClassified checks the list against the handler keys
+ * of the DAG schema.
+ */
+export const END_OF_RUN_HANDLERS: ReadonlySet<string> = new Set([
+  'success',
+  'failure',
+  'abort',
+  'exit',
 ]);
+
+/** The handlers of a `handler_on` value that can change a step's outputs. */
+function handlersInHead(value: unknown): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    // Not a map: it is not read as handlers, so all of it counts.
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(
+      ([key]) => !END_OF_RUN_HANDLERS.has(key)
+    )
+  );
+}
 
 /** JSON text with sorted keys: equal values give equal text. */
 export function canonical(value: unknown): string {
@@ -65,14 +96,17 @@ function headValue(js: unknown): unknown {
   if (js === null || js === undefined) return {};
   if (typeof js !== 'object' || Array.isArray(js)) return js;
   return Object.fromEntries(
-    Object.entries(js as Record<string, unknown>).filter(
-      ([key]) => !NON_HEAD_KEYS.has(key)
-    )
+    Object.entries(js as Record<string, unknown>)
+      .filter(([key]) => !STEP_KEYS.has(key))
+      .map(([key, value]) =>
+        HANDLER_KEYS.has(key) ? [key, handlersInHead(value)] : [key, value]
+      )
   );
 }
 
 /**
- * The parsed top-level keys without the steps and the handlers, with the
+ * The parsed top-level keys without the steps and the end-of-run handlers,
+ * with the
  * later documents: they define the local sub-DAGs that steps can call. Null
  * when the text cannot be read.
  */

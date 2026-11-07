@@ -3,7 +3,14 @@
 
 import { describe, expect, it } from 'vitest';
 import { yamlUnindentedQuote } from '../../testing/fixtures';
-import { diffRunSpec, normalizeSpec, specTextDiffers } from '../runSpecDiff';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import {
+  diffRunSpec,
+  END_OF_RUN_HANDLERS,
+  normalizeSpec,
+  specTextDiffers,
+} from '../runSpecDiff';
 
 const BASE = `name: demo
 env:
@@ -83,15 +90,38 @@ steps:
     expect(diffRunSpec(child, `${BASE}---\nname: [\n`).headChanged).toBe(true);
   });
 
-  it('does not count a handler as the head', () => {
-    const withHandler = `${BASE}handler_on:
-  failure:
-    run: echo failed
-`;
-    const changed = withHandler.replace('echo failed', 'echo broken');
-    const diff = diffRunSpec(withHandler, changed);
-    expect(diff.headChanged).toBe(false);
-    expect([...diff.changed]).toEqual([]);
+  it.each([...END_OF_RUN_HANDLERS])(
+    'does not count the end-of-run handler %s as the head',
+    (handler) => {
+      for (const key of ['handler_on', 'handlerOn']) {
+        const withHandler = `${BASE}${key}:\n  ${handler}:\n    run: echo ran\n`;
+        const changed = withHandler.replace('echo ran', 'echo edited');
+        const diff = diffRunSpec(withHandler, changed);
+        expect(diff.headChanged).toBe(false);
+        expect([...diff.changed]).toEqual([]);
+      }
+    }
+  );
+
+  // init runs before the steps, in a run of selected steps too, and wait
+  // before the steps after an approval: either can change what a step reads.
+  it.each(['init', 'wait', 'a_new_handler'])(
+    'counts the handler %s as the head',
+    (handler) => {
+      for (const key of ['handler_on', 'handlerOn']) {
+        const withHandler = `${BASE}${key}:\n  ${handler}:\n    run: echo ran\n`;
+        const changed = withHandler.replace('echo ran', 'echo edited');
+        expect(diffRunSpec(withHandler, changed).headChanged).toBe(true);
+        expect(diffRunSpec(BASE, withHandler).headChanged).toBe(true);
+      }
+    }
+  );
+
+  it('counts a handler value that is not a map as the head', () => {
+    expect(
+      diffRunSpec(`${BASE}handler_on: one\n`, `${BASE}handler_on: two\n`)
+        .headChanged
+    ).toBe(true);
   });
 
   it('lists added and removed steps', () => {
@@ -196,5 +226,50 @@ describe('normalizeSpec', () => {
     expect(normalizeSpec('a\r\nb\n\n')).toBe('a\nb');
     expect(specTextDiffers('a\r\nb\n', 'a\nb')).toBe(false);
     expect(specTextDiffers('a', 'b')).toBe(true);
+  });
+});
+
+// TestEndOfRunHandlersAreClassified: every handler the DAG schema accepts is
+// either an end-of-run handler, listed with the runner's after-steps
+// handlers, or counts as the head. A handler added to the schema fails here
+// until it is classified.
+describe('END_OF_RUN_HANDLERS', () => {
+  const root = path.resolve('..');
+  const schema = JSON.parse(
+    readFileSync(path.join(root, 'internal/cmn/schema/dag.schema.json'), 'utf8')
+  ) as { properties: { handler_on: { properties: Record<string, unknown> } } };
+  const runner = readFileSync(
+    path.join(root, 'internal/runtime/runner.go'),
+    'utf8'
+  );
+  const afterSteps =
+    /handlersAfterSteps\s*=\s*\[\]ir\.HandlerType\{([^}]*)\}/.exec(
+      runner
+    )?.[1] ?? '';
+  const runtimeName: Record<string, string> = {
+    init: 'HandlerOnInit',
+    success: 'HandlerOnSuccess',
+    failure: 'HandlerOnFailure',
+    abort: 'HandlerOnAbort',
+    exit: 'HandlerOnExit',
+    wait: 'HandlerOnWait',
+  };
+  const classifiedAsHead = new Set(['init', 'wait']);
+
+  it('classifies every handler of the DAG schema', () => {
+    for (const key of Object.keys(schema.properties.handler_on.properties)) {
+      expect(
+        END_OF_RUN_HANDLERS.has(key) || classifiedAsHead.has(key),
+        `handler_on.${key} is classified`
+      ).toBe(true);
+    }
+  });
+
+  it('lists only handlers the runner runs after the steps', () => {
+    expect(afterSteps).not.toBe('');
+    for (const key of END_OF_RUN_HANDLERS) {
+      expect(runtimeName[key], key).toBeDefined();
+      expect(afterSteps, key).toContain(`ir.${runtimeName[key]}`);
+    }
   });
 });
