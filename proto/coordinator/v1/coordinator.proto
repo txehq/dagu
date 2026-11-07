@@ -659,4 +659,7 @@ message RuntimeProfileLayer {
 message ResolveRuntimeProfileResponse {
   RuntimeProfileLayer defaults = 1;
   RuntimeProfileLayer selected = 2;
+  // Names the stored state of every layer the values were read from, taken
+  // in the same reads; empty is unknown (an older coordinator sends none).
+  string runtime_identity = 3;
 }

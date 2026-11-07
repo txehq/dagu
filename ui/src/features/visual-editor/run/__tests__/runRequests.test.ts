@@ -143,6 +143,26 @@ describe('runRequests', () => {
     expect('ephemeral' in buildStartBody({ steps: ['a'] })).toBe(false);
     expect('ephemeral' in buildStartBody()).toBe(false);
   });
+
+  // TXE-6145: the steps whose run the editor chose on its own are named, so
+  // that the server holds them to the runtime profile state of the new run.
+  it('names the automatically reused steps, and no key without any', () => {
+    expect(
+      buildStartBody({
+        steps: ['c'],
+        outputsFromRuns: { a: 'r1' },
+        automaticReuse: ['a'],
+      })
+    ).toEqual({
+      steps: ['c'],
+      outputsFromRuns: { a: 'r1' },
+      automaticReuse: ['a'],
+      labels: [EDITOR_RUN_LABEL],
+    });
+    expect(
+      'automaticReuse' in buildStartBody({ steps: ['c'], automaticReuse: [] })
+    ).toBe(false);
+  });
 });
 
 describe('the labels of the reused inputs', () => {

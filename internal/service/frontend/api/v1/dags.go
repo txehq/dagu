@@ -1212,24 +1212,8 @@ func (a *API) GetDAGDAGRunDetails(ctx context.Context, request api.GetDAGDAGRunD
 }
 
 func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObject) (api.ExecuteDAGResponseObject, error) {
-	if err := a.isAllowed(config.PermissionRunDAGs); err != nil {
-		return nil, err
-	}
-	dag, err := a.dagRepository.GetDetails(ctx, request.FileName, persis.DAGLoadOptions{AllowBuildErrors: true})
+	dag, err := a.loadSavedRunDAG(ctx, request.FileName)
 	if err != nil {
-		return nil, &Error{
-			HTTPStatus: http.StatusNotFound,
-			Code:       api.ErrorCodeNotFound,
-			Message:    fmt.Sprintf("DAG %s not found", request.FileName),
-		}
-	}
-	if err := a.requireDAGExecute(ctx, dag); err != nil {
-		return nil, err
-	}
-	if err := a.txeAdmitDAG(ctx, dag); err != nil {
-		return nil, err
-	}
-	if err := a.txeRefuseLocalJobRun(dag); err != nil {
 		return nil, err
 	}
 
@@ -1245,7 +1229,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		}
 	}
 
-	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.OutputsFromRuns, request.Body.Outputs, request.Body.OutputsSources, request.Body.Ephemeral)
+	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.OutputsFromRuns, request.Body.Outputs, request.Body.OutputsSources, request.Body.Ephemeral, request.Body.AutomaticReuse)
 	if err != nil {
 		return nil, err
 	}

@@ -134,6 +134,10 @@ type DAG struct {
 	RootEnvSpan EnvSpan `json:"-"`
 	// RuntimeResolved reports whether dotenv resolution is complete for Env.
 	RuntimeResolved bool `json:"-"`
+	// DotenvLoaded reports that a dotenv file was read into Env, by this
+	// process or the one that resolved Env for it: context the hub keeps no
+	// version of (TXE-6145). It travels with RuntimeResolved.
+	DotenvLoaded bool `json:"-"`
 	// PresolvedBuildEnv stores resolved DAG/base-config env entries needed to
 	// rebuild the DAG from persisted YAML during retry/restart paths.
 	// It is serialized with dag.json because direct retry/restart cannot rely on

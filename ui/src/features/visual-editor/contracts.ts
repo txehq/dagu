@@ -655,6 +655,11 @@ export interface StepRunInputs {
   outputsFromRuns?: Readonly<Record<string, string>>;
   /** Where the outputs of the skipped steps come from, for the run record shown at once. */
   reused?: readonly InputProvenance[];
+  /**
+   * The skipped steps whose run the editor chose on its own: the server
+   * reuses them only from a run of the step run's runtime profile state.
+   */
+  automaticReuse?: readonly string[];
 }
 export interface EditorRunActions {
   runDag(): Promise<string | null>; // saved definition

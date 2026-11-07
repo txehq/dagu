@@ -20,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/launcher"
 	"github.com/dagucloud/dagu/v2/internal/opencodehost"
 	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtimeenv"
 	runtimeenvtransport "github.com/dagucloud/dagu/v2/internal/runtimeenv/transport"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 )
@@ -476,6 +477,8 @@ func (e *DAGExecutor) prepareDAGForSubprocess(ctx context.Context, dag *ir.DAG, 
 	// Planner entries are metadata-only and carry no dotenv list, so no dotenv
 	// was loaded here; the subprocess loads it from the full definition.
 	prepared.RuntimeResolved = dag.RuntimeResolved || len(dag.Dotenv) > 0
+	// A full snapshot did load its dotenv files here: the run must know.
+	runtimeenv.MarkDotenv(prepared, result)
 	return prepared, nil
 }
 

@@ -143,6 +143,8 @@ type buildOpts struct {
 	BuildEnv map[string]string
 	// RuntimeResolved reports whether BuildEnv contains the complete runtime environment.
 	RuntimeResolved bool
+	// DotenvLoaded reports that a dotenv file was read into BuildEnv.
+	DotenvLoaded bool
 }
 
 // Has reports whether the flag is enabled on the current buildOpts.

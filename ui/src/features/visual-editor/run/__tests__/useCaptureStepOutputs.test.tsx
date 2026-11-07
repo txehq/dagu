@@ -262,13 +262,13 @@ describe('useCaptureStepOutputs', () => {
 
   // TXE fork (TXE-5923): a profile can set what the definition's hash does
   // not see, so a run under a runtime profile is not cached.
-  it('keeps nothing from a run under a runtime profile', () => {
+  // TXE-6145: the entry keeps the run; whether a step run may use it is the
+  // server's comparison of runtime profile states, made when it would be
+  // used (useReuseSource), never a guess here.
+  it('keeps a run under a runtime profile, for the server to admit', () => {
     h.runProfile = 'prod';
-    const view = capture({ data: outputs(), runId: 'profiled' });
-    expect(outputCache.entries(SCOPE)['fetch']).toBeUndefined();
-    h.runProfile = '';
-    view.rerender({ data: outputs(), runId: 'plain' });
-    expect(outputCache.entries(SCOPE)['fetch']?.runId).toBe('plain');
+    capture({ data: outputs(), runId: 'profiled' });
+    expect(outputCache.entries(SCOPE)['fetch']?.runId).toBe('profiled');
   });
 
   // TXE fork (TXE-5923): a step whose upstream was reused from an earlier

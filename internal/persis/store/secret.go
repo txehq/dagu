@@ -232,48 +232,72 @@ func (s *SecretStore) Update(ctx context.Context, sec *secret.Secret) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existingRec, err := s.col.Get(ctx, sec.ID)
+	return retryConflict(ctx, func(ctx context.Context) error {
+		existingRec, existing, err := s.getForWrite(ctx, sec.ID, "Update")
+		if err != nil {
+			return err
+		}
+
+		oldRef := secretRefKey(existing.Secret.Workspace, existing.Secret.Ref)
+		newRef := secretRefKey(updated.Workspace, updated.Ref)
+
+		if oldRef != newRef {
+			if existingID, taken := s.byRef[newRef]; taken && existingID != sec.ID {
+				return secret.ErrAlreadyExists
+			}
+		}
+
+		// The versions are the store's: a caller's copy may be older than a
+		// write that landed since, and must not move the current version
+		// back, or the next write would reuse a version number (TXE-6145).
+		next := updated.Clone()
+		next.CurrentVersion = existing.Secret.CurrentVersion
+		next.LastRotatedAt = existing.Secret.LastRotatedAt
+		existing.Secret = next
+		data, err := persis.Encode(existing)
+		if err != nil {
+			return err
+		}
+		if err := s.swap(ctx, existingRec, data); err != nil {
+			return err
+		}
+		if oldRef != newRef {
+			delete(s.byRef, oldRef)
+			s.byRef[newRef] = sec.ID
+		}
+		return nil
+	})
+}
+
+// getForWrite reads a secret record and its decoded content for a write
+// that replaces it with swap.
+func (s *SecretStore) getForWrite(ctx context.Context, id, op string) (*persis.Record, *secretStoredRecord, error) {
+	rec, err := s.col.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, persis.ErrNotFound) {
-			return secret.ErrNotFound
+			return nil, nil, secret.ErrNotFound
 		}
-		return err
+		return nil, nil, err
 	}
-	var existing secretStoredRecord
-	if err := persis.Decode(existingRec, &existing); err != nil {
-		return fmt.Errorf("secret store: decode existing: %w", err)
+	var sr secretStoredRecord
+	if err := persis.Decode(rec, &sr); err != nil {
+		return nil, nil, fmt.Errorf("secret store: decode for %s: %w", op, err)
 	}
-	if existing.Secret == nil {
-		return fmt.Errorf("secret store: record %q has nil secret payload", sec.ID)
+	if sr.Secret == nil {
+		return nil, nil, fmt.Errorf("secret store: decode for %s %q: missing secret payload", op, id)
 	}
+	return rec, &sr, nil
+}
 
-	oldRef := secretRefKey(existing.Secret.Workspace, existing.Secret.Ref)
-	newRef := secretRefKey(updated.Workspace, updated.Ref)
-
-	if oldRef != newRef {
-		if existingID, taken := s.byRef[newRef]; taken && existingID != sec.ID {
-			return secret.ErrAlreadyExists
-		}
+// swap replaces rec with data only if rec is still what is stored: it
+// returns persis.ErrConflict when another write landed since rec was read,
+// and secret.ErrNotFound when the secret was removed.
+func (s *SecretStore) swap(ctx context.Context, rec *persis.Record, data []byte) error {
+	err := s.col.CompareAndSwap(ctx, rec.ID, rec.Data, data)
+	if errors.Is(err, persis.ErrNotFound) {
+		return secret.ErrNotFound
 	}
-
-	existing.Secret = updated
-	data, err := persis.Encode(&existing)
-	if err != nil {
-		return err
-	}
-	if err := s.col.Put(ctx, &persis.Record{
-		ID:        sec.ID,
-		Data:      data,
-		CreatedAt: existingRec.CreatedAt,
-		UpdatedAt: time.Now().UTC(),
-	}); err != nil {
-		return err
-	}
-	if oldRef != newRef {
-		delete(s.byRef, oldRef)
-		s.byRef[newRef] = sec.ID
-	}
-	return nil
+	return err
 }
 
 // Delete removes a secret by its ID.
@@ -306,40 +330,36 @@ func (s *SecretStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// WriteValue appends a new encrypted version to the secret.
+// WriteValue appends a new encrypted version to the secret. The record is
+// replaced only if no other write landed since it was read (a retry reads it
+// again), so versions are append-only across processes: a version number
+// names one value for the life of the secret (TXE-6145).
 func (s *SecretStore) WriteValue(ctx context.Context, id string, input secret.WriteValueInput) (*secret.Secret, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, err := s.col.Get(ctx, id)
-	if err != nil {
-		if errors.Is(err, persis.ErrNotFound) {
-			return nil, secret.ErrNotFound
+	var written *secret.Secret
+	err := retryConflict(ctx, func(ctx context.Context) error {
+		rec, sr, err := s.getForWrite(ctx, id, "WriteValue")
+		if err != nil {
+			return err
 		}
-		return nil, err
-	}
-	var sr secretStoredRecord
-	if err := persis.Decode(rec, &sr); err != nil {
-		return nil, fmt.Errorf("secret store: decode for WriteValue: %w", err)
-	}
-	if sr.Secret == nil {
-		return nil, fmt.Errorf("secret store: decode for WriteValue %q: missing secret payload", id)
-	}
-	if err := s.appendVersion(&sr, input); err != nil {
-		return nil, err
-	}
-	data, err := persis.Encode(&sr)
+		if err := s.appendVersion(sr, input); err != nil {
+			return err
+		}
+		data, err := persis.Encode(sr)
+		if err != nil {
+			return err
+		}
+		if err := s.swap(ctx, rec, data); err != nil {
+			return err
+		}
+		written = sr.Secret.Clone()
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if err := s.col.Put(ctx, &persis.Record{
-		ID:        rec.ID,
-		Data:      data,
-		CreatedAt: rec.CreatedAt,
-		UpdatedAt: time.Now().UTC(),
-	}); err != nil {
-		return nil, err
-	}
-	return sr.Secret.Clone(), nil
+	return written, nil
 }
 
 // GetCurrentVersion returns metadata about the current version without decrypting.
@@ -355,41 +375,34 @@ func (s *SecretStore) GetCurrentVersion(ctx context.Context, id string) (*secret
 	return secretVersionMetadata(v), nil
 }
 
-// ResolveValue decrypts and returns the current plaintext value.
+// ResolveValue decrypts and returns the current plaintext value, with the
+// version it was read at. The read is recorded only if the record did not
+// change since: a write that landed in between is kept, never replaced by
+// this record's older versions.
 func (s *SecretStore) ResolveValue(ctx context.Context, id string) (string, *secret.VersionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, err := s.col.Get(ctx, id)
+	rec, sr, err := s.getForWrite(ctx, id, "ResolveValue")
 	if err != nil {
-		if errors.Is(err, persis.ErrNotFound) {
-			return "", nil, secret.ErrNotFound
-		}
 		return "", nil, err
 	}
-	var sr secretStoredRecord
-	if err := persis.Decode(rec, &sr); err != nil {
-		return "", nil, fmt.Errorf("secret store: decode for ResolveValue: %w", err)
-	}
-	if sr.Secret == nil {
-		return "", nil, fmt.Errorf("secret store: decode for ResolveValue %q: missing secret payload", id)
-	}
-	plaintext, v, err := s.decryptCurrent(&sr)
+	plaintext, v, err := s.decryptCurrent(sr)
 	if err != nil {
 		return "", nil, err
 	}
 	now := time.Now().UTC()
 	sr.Secret.LastResolvedAt = &now
 	sr.Secret.UpdatedAt = now
-	data, err := persis.Encode(&sr)
+	data, err := persis.Encode(sr)
 	if err != nil {
 		return "", nil, err
 	}
-	if err := s.col.Put(ctx, &persis.Record{
-		ID:        rec.ID,
-		Data:      data,
-		CreatedAt: rec.CreatedAt,
-		UpdatedAt: now,
-	}); err != nil {
+	err = s.swap(ctx, rec, data)
+	if errors.Is(err, persis.ErrConflict) {
+		// Another write changed the record; the value was current when read.
+		err = nil
+	}
+	if err != nil {
 		return "", nil, fmt.Errorf("secret store: persist resolve metadata %q: %w", id, err)
 	}
 	return plaintext, secretVersionMetadata(v), nil

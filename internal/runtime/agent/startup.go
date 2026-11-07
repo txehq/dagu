@@ -25,6 +25,7 @@ type startupResolution struct {
 	profileName       string
 	profileResolvedAt string
 	profileEntries    []ir.RuntimeProfileEntry
+	profileIdentity   string
 	panicValue        any
 	panicStack        []byte
 }
@@ -62,6 +63,7 @@ func (a *Agent) resolveStartup(ctx context.Context) (startupResolution, error) {
 		result.profileName = snapshot.profileName
 		result.profileResolvedAt = snapshot.profileResolvedAt
 		result.profileEntries = snapshot.profileEntries
+		result.profileIdentity = snapshot.profileIdentity
 		// Secrets read profile entries. After a profile failure they are
 		// skipped, so the profile error is the one reported.
 		if result.profileErr != nil || ctx.Err() != nil {

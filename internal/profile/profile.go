@@ -53,11 +53,17 @@ type Profile struct {
 	Status         Status
 	Protected      bool
 	DefaultProfile string `json:"defaultProfile,omitempty"`
-	Entries        []Entry
-	CreatedBy      string
-	CreatedAt      time.Time
-	UpdatedBy      string
-	UpdatedAt      time.Time
+	// Generation names this stored state of the profile. The store gives it
+	// a new random value on every write and ignores what a caller sets, so
+	// two states never share one, whatever the clock says or whichever path
+	// wrote them. Empty for a record written before generations existed, or
+	// rewritten by a build that drops the field: its state is unknown.
+	Generation string `json:"generation,omitempty"`
+	Entries    []Entry
+	CreatedBy  string
+	CreatedAt  time.Time
+	UpdatedBy  string
+	UpdatedAt  time.Time
 }
 
 type Entry struct {

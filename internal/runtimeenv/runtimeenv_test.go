@@ -40,3 +40,18 @@ func TestResolveUsesCompletedRuntimeSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "first", buildenv.ToMap(reused.Env)["VALUE"])
 }
+
+// Applying a resolve marks the DAG as taking context from the dotenv files
+// it read, and never clears a mark an earlier resolve left (TXE-6145).
+func TestApplyMarksDotenvFiles(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{}
+	runtimeenv.Apply(dag, runtimeenv.Result{Env: []string{"A=1"}})
+	require.True(t, dag.RuntimeResolved)
+	require.False(t, dag.DotenvLoaded)
+	runtimeenv.Apply(dag, runtimeenv.Result{Env: []string{"A=1"}, DotenvFiles: []string{"/w/.env"}})
+	require.True(t, dag.DotenvLoaded)
+	runtimeenv.Apply(dag, runtimeenv.Result{Env: []string{"A=1"}})
+	require.True(t, dag.DotenvLoaded, "a later resolve that read nothing keeps the mark")
+}

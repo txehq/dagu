@@ -192,6 +192,7 @@ func WithBuildEnvSnapshot(snapshot buildenv.Snapshot) LoadOption {
 	return func(o *buildOpts) {
 		o.BuildEnv = snapshot.Env
 		o.RuntimeResolved = snapshot.RuntimeResolved
+		o.DotenvLoaded = snapshot.DotenvLoaded
 	}
 }
 

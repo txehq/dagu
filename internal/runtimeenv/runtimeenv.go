@@ -23,6 +23,10 @@ import (
 type Result struct {
 	Env      []string
 	Warnings []string
+	// DotenvFiles are the dotenv files that were found and read, whether or
+	// not they parsed: context the run took that the hub keeps no version
+	// of (TXE-6145).
+	DotenvFiles []string
 }
 
 // Resolve returns the runtime environment without mutating the DAG definition.
@@ -59,6 +63,23 @@ func Resolve(ctx context.Context, dag *ir.DAG) (Result, error) {
 		return result, errs
 	}
 	return result, nil
+}
+
+// Apply sets dag's environment to a result of Resolve, marked complete, and
+// marks it as taking context from dotenv files when the result read any.
+// Every process that resolves the environment ahead of a run applies it
+// here, so that the run knows where its environment came from (TXE-6145).
+func Apply(dag *ir.DAG, result Result) {
+	dag.Env = result.Env
+	dag.RuntimeResolved = true
+	MarkDotenv(dag, result)
+}
+
+// MarkDotenv marks dag as taking context from dotenv files when result read
+// any, keeping a mark an earlier resolve left. A process that takes the
+// environment of a resolve without Apply calls it (TXE-6145).
+func MarkDotenv(dag *ir.DAG, result Result) {
+	dag.DotenvLoaded = dag.DotenvLoaded || len(result.DotenvFiles) > 0
 }
 
 // LoadEnvFiles reads dotenv-syntax files and returns their variables as
@@ -187,8 +208,33 @@ func loadFile(
 	path string,
 	result *Result,
 ) error {
-	if strings.TrimSpace(path) == "" {
+	resolvedPath, found, err := dotenvFile(ctx, dag, resolver, path)
+	if err != nil || !found {
+		return err
+	}
+
+	result.DotenvFiles = append(result.DotenvFiles, resolvedPath)
+	vars, err := godotenv.Read(resolvedPath)
+	if err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to load .env file %q: %v", resolvedPath, err))
 		return nil
+	}
+	for key, value := range vars {
+		result.Env = append(result.Env, key+"="+value)
+	}
+	return nil
+}
+
+// dotenvFile finds the file a dotenv path of dag names, and whether it
+// exists. It reads nothing from the file.
+func dotenvFile(
+	ctx context.Context,
+	dag *ir.DAG,
+	resolver *fileutil.FileResolver,
+	path string,
+) (string, bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", false, nil
 	}
 
 	valueResolver := cmnvalue.NewResolver(
@@ -202,23 +248,47 @@ func loadFile(
 	)
 	evaluatedPath, err := valueResolver.String(ctx, path, cmnvalue.DotenvPathField("dotenv"))
 	if err != nil {
-		return fmt.Errorf("failed to evaluate dotenv path %q: %w", path, err)
+		return "", false, fmt.Errorf("failed to evaluate dotenv path %q: %w", path, err)
 	}
 
 	resolvedPath, err := resolver.ResolveFilePathLiteral(evaluatedPath)
 	if err != nil || !fileutil.FileExists(resolvedPath) {
-		return nil
+		return "", false, nil
 	}
+	return resolvedPath, true, nil
+}
 
-	vars, err := godotenv.Read(resolvedPath)
-	if err != nil {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to load .env file %q: %v", resolvedPath, err))
+// DotenvFilesPresent lists the dotenv files of dag that exist now, found as
+// Resolve finds them, also for a DAG whose environment was resolved before
+// (RuntimeResolved): the files a run of it takes context from. It reads
+// nothing from them. A path that cannot be evaluated is listed as given: its
+// file is not known not to exist (TXE-6145).
+func DotenvFilesPresent(ctx context.Context, dag *ir.DAG) []string {
+	if dag == nil || len(dag.Dotenv) == 0 {
 		return nil
 	}
-	for key, value := range vars {
-		result.Env = append(result.Env, key+"="+value)
+	scope := dotenvEnvScope(dag)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return nil
+	ctx = cmnvalue.WithEnvScope(ctx, scope)
+	workingDir := expandDotenvPath(dag, dag.WorkingDir, scope)
+	relativeTos := []string{workingDir}
+	if fileDir := filepath.Dir(dag.Location); dag.Location != "" && fileDir != workingDir {
+		relativeTos = append(relativeTos, fileDir)
+	}
+	resolver := fileutil.NewFileResolver(relativeTos)
+	var present []string
+	for _, path := range deduplicate(append([]string{".env"}, dag.Dotenv...)) {
+		resolved, found, err := dotenvFile(ctx, dag, resolver, path)
+		switch {
+		case err != nil:
+			present = append(present, path)
+		case found:
+			present = append(present, resolved)
+		}
+	}
+	return present
 }
 
 func deduplicate(values []string) []string {

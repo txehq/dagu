@@ -80,3 +80,19 @@ func TestLoadLegacyMap(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, Snapshot{Env: map[string]string{"KEY": "value"}}, loaded)
 }
+
+// The mark of dotenv files read into the environment crosses the process
+// boundary with it (TXE-6145).
+func TestPrepareAndLoadCarryTheDotenvMark(t *testing.T) {
+	snapshot := NewSnapshot([]string{"REGION=eu"}, true)
+	snapshot.DotenvLoaded = true
+	extraEnv, cleanup, err := Prepare(snapshot)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cleanup()) })
+	_, path, _ := strings.Cut(extraEnv[0], "=")
+	t.Setenv(PresolvedEnvFileKey, path)
+
+	loaded, err := Load()
+	require.NoError(t, err)
+	assert.True(t, loaded.DotenvLoaded)
+}

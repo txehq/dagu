@@ -482,6 +482,24 @@ describe('coverFromCache', () => {
     expect(cover.capturedAt).toBe(1000);
   });
 
+  // TXE-6145: an entry whose run took another runtime profile state, or one
+  // that is not known, covers nothing and is listed apart.
+  it('does not cover a step whose run took another runtime profile state', () => {
+    const cover = coverFromCache({
+      previous,
+      stale: [],
+      missing: [],
+      hasSource: false,
+      entries: { a: entry(), b: entry({ stepHash: 'h-b' }) },
+      hashes,
+      check: (step) => (step === 'a' ? 'otherRuntime' : 'ok'),
+    });
+    expect(cover.cached).toEqual(['b']);
+    expect(cover.otherRuntime).toEqual(['a']);
+    expect(Object.keys(cover.runs)).toEqual(['b']);
+    expect(cover.missing).toEqual(['a']);
+  });
+
   // Every cached value is sent with the run that it was read from.
   it('names the run and the time of each covered step', () => {
     const cover = coverFromCache({

@@ -147,6 +147,9 @@ function freshReuse(extra: Partial<ReuseSourceState> = {}): ReuseSourceState {
     cached: [],
     cachedRuns: {},
     gone: [],
+    otherRuntime: [],
+    automaticSource: true,
+    runtimeDiffers: false,
     stepRuns: {},
     cacheCapturedAt: null,
     cacheTimes: {},
@@ -1167,6 +1170,7 @@ describe('useStepRunActions run with references', () => {
       reads: ['extract orders', 'extract users'],
       followedUpstreamRunId: null,
       liveText: 'steps: [live]',
+      unsaved: false,
     });
   });
 
@@ -1567,6 +1571,9 @@ describe('useStepRunActions step run choices', () => {
       body: {
         steps: ['extract orders', 'extract users', 'merge'],
         outputsFromRunId: 'run-1',
+        // The editor chose run-1 on its own: the server reuses seed from
+        // it only for a run of the same runtime profile state (TXE-6145).
+        automaticReuse: ['seed'],
         labels: ['dagu.source=editor', 'dagu.outputs-from=run-1'],
       },
     });
@@ -1591,9 +1598,48 @@ describe('useStepRunActions step run choices', () => {
       body: {
         steps: ['merge'],
         outputsFromRunId: 'run-1',
+        automaticReuse: ['seed', 'extract orders', 'extract users'],
         labels: ['dagu.source=editor', 'dagu.outputs-from=run-1'],
       },
     });
+  });
+
+  // TXE-6145: a run the user chose is reused as the user named it, with a
+  // warning when its runtime profile state differs; no step is automatic.
+  it('names no automatic reuse for a run the user chose, and warns when its profile differs', async () => {
+    editorRun.real = true;
+    api.post.mockResolvedValue({
+      data: { dagRunId: 'run-2' },
+      response: { status: 200 },
+    });
+    reuse.value = freshReuse({ automaticSource: false, runtimeDiffers: true });
+    await open();
+    expect(screen.getByTestId('run-source-other-runtime')).toHaveTextContent(
+      'ran under another runtime profile'
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Step only' }));
+
+    await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1));
+    expect(api.post).toHaveBeenCalledWith('/dags/{fileName}/start', {
+      params: {
+        path: { fileName: 'example.yaml' },
+        query: { remoteNode: 'edge' },
+      },
+      body: {
+        steps: ['merge'],
+        outputsFromRunId: 'run-1',
+        labels: ['dagu.source=editor', 'dagu.outputs-from=run-1'],
+      },
+    });
+  });
+
+  it('marks a cached step whose run took another runtime profile', async () => {
+    reuse.value = freshReuse({ source: null, otherRuntime: ['seed'] });
+    await open();
+    expect(screen.getByTestId('run-step-other-runtime')).toHaveTextContent(
+      'cached under another runtime profile'
+    );
   });
 
   it('sends the previous steps and no source with Run', async () => {

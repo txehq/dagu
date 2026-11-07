@@ -216,6 +216,7 @@ func (b *SubCmdBuilder) Start(dag *ir.DAG, opts StartOptions) CmdSpec {
 		Env:             b.parentEnv(definitionIDEnv(opts.DefinitionID)...),
 		BuildEnv:        append([]string{}, dag.Env...),
 		RuntimeResolved: dag.RuntimeResolved,
+		DotenvLoaded:    dag.DotenvLoaded,
 	}
 }
 
@@ -269,6 +270,7 @@ func (b *SubCmdBuilder) Enqueue(dag *ir.DAG, opts EnqueueOptions) CmdSpec {
 		Env:             b.filteredEnv(definitionIDEnv(opts.DefinitionID)...),
 		BuildEnv:        append([]string{}, dag.Env...),
 		RuntimeResolved: dag.RuntimeResolved,
+		DotenvLoaded:    dag.DotenvLoaded,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
 	}
@@ -313,6 +315,7 @@ func (b *SubCmdBuilder) Restart(dag *ir.DAG, opts RestartOptions) CmdSpec {
 		Env:             b.parentEnv(definitionIDEnv(opts.DefinitionID)...),
 		BuildEnv:        append([]string{}, dag.Env...),
 		RuntimeResolved: dag.RuntimeResolved,
+		DotenvLoaded:    dag.DotenvLoaded,
 	}
 }
 
@@ -350,6 +353,7 @@ func (b *SubCmdBuilder) Retry(dag *ir.DAG, opts RetryOptions) CmdSpec {
 		Env:             b.parentEnv(),
 		BuildEnv:        append([]string{}, dag.Env...),
 		RuntimeResolved: dag.RuntimeResolved,
+		DotenvLoaded:    dag.DotenvLoaded,
 	}
 	if opts.QueueDispatch {
 		spec.Env = append(spec.Env, runenv.EnvKeyQueueDispatchRetry+"=1")
@@ -370,8 +374,10 @@ type CmdSpec struct {
 	Env             []string
 	BuildEnv        []string
 	RuntimeResolved bool
-	Stdout          io.Writer
-	Stderr          io.Writer
+	// DotenvLoaded reports that a dotenv file was read into BuildEnv.
+	DotenvLoaded bool
+	Stdout       io.Writer
+	Stderr       io.Writer
 }
 
 // StartOptions contains options for initiating a dag-run.
@@ -569,7 +575,9 @@ func newCommand(ctx context.Context, spec CmdSpec, withContext bool) (*exec.Cmd,
 	if spec.Env != nil {
 		env = append([]string{}, spec.Env...)
 	}
-	extraEnv, cleanup, err := buildenv.Prepare(buildenv.NewSnapshot(spec.BuildEnv, spec.RuntimeResolved))
+	snapshot := buildenv.NewSnapshot(spec.BuildEnv, spec.RuntimeResolved)
+	snapshot.DotenvLoaded = spec.DotenvLoaded
+	extraEnv, cleanup, err := buildenv.Prepare(snapshot)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare presolved build env transport: %w", err)
 	}

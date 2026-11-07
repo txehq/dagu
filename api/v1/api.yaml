@@ -1095,6 +1095,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /dags/{fileName}/reuse-runtime:
+    post:
+      summary: "Compare the runtime profile identity of runs with a new step run"
+      description: "Answers, for each named run of the DAG, whether it ran under the same runtime profile identity as a step run of the DAG started now: the same stored state of the global and workspace profile defaults and of the profile the run selects, including the version of each profile secret. The server decides which profile the step run takes (the DAG default; none for a draft) and never returns an identity. A run that does not exist, is not of this DAG, or that the caller may not reuse, answers unknown, the same as a run whose identity was never recorded or a run, or a DAG, with context that has no version (DAG secrets, dotenv, base configuration, sub-DAG steps). Only same may be reused automatically."
+      operationId: "checkDAGReuseRuntime"
+      tags:
+        - "dags"
+      parameters:
+        - $ref: "#/components/parameters/RemoteNode"
+        - $ref: "#/components/parameters/DAGFileName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - runIds
+              properties:
+                runIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    $ref: "#/components/schemas/DAGRunId"
+                  description: "Runs of the DAG to compare, at most 50; duplicates count once."
+                spec:
+                  type: string
+                  description: "The unsaved draft whose steps would run (as with POST /dag-runs); omit for the saved DAG."
+                name:
+                  type: string
+                  description: "With spec: the DAG name the draft runs as."
+      responses:
+        "200":
+          description: "The answer for each named run, in the order of runIds without duplicates"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReuseRuntimeCheck"
+        "400":
+          description: "Invalid run IDs, more than 50 runs, or an invalid draft"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          description: "Generic error response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /dags/{fileName}/start:
     post:
       summary: "Create and execute a DAG-run from DAG"
@@ -1157,6 +1209,12 @@ paths:
                   description: "The run that each skipped step carries its outputs from, keyed by step name or ID. A step named here takes its outputs from that run in place of outputsFromRunId; the work directory still comes only from outputsFromRunId. Each run must exist for the same DAG (a normal or an ephemeral run), be finished, and hold a node of the step that succeeded or that carries copied outputs; otherwise the request returns 400 with a message that names the step and the run. A step selected to run cannot be a key. The web UI names the run of each reused step with this field and never sends values. Requires steps."
                   additionalProperties:
                     $ref: "#/components/schemas/DAGRunId"
+                automaticReuse:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                  description: "Skipped steps, by step name or ID, whose outputs the client reuses on its own choice (from its cache or its automatic pick of a run), not because the user named the run. For each, the run in outputsFromRuns, or else outputsFromRunId, must have run under the same runtime profile identity as this run (see POST /dags/{fileName}/reuse-runtime); otherwise, or when either identity is unknown, the request returns 409 naming the step and nothing starts. The run records the identity it was admitted for and fails before any step when its own resolve of the runtime profiles differs. A step not listed is reused as the request names it. A step listed must be a skipped step whose outputs come from a run. Requires steps."
                 outputs:
                   type: object
                   description: "Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps."
@@ -2290,6 +2348,12 @@ paths:
                   description: "The run that each skipped step carries its outputs from, keyed by step name or ID. A step named here takes its outputs from that run in place of outputsFromRunId; the work directory still comes only from outputsFromRunId. Each run must exist for the same DAG (a normal or an ephemeral run), be finished, and hold a node of the step that succeeded or that carries copied outputs; otherwise the request returns 400 with a message that names the step and the run. A step selected to run cannot be a key. The web UI names the run of each reused step with this field and never sends values. Requires steps."
                   additionalProperties:
                     $ref: "#/components/schemas/DAGRunId"
+                automaticReuse:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+                  description: "Skipped steps, by step name or ID, whose outputs the client reuses on its own choice (from its cache or its automatic pick of a run), not because the user named the run. For each, the run in outputsFromRuns, or else outputsFromRunId, must have run under the same runtime profile identity as this run (see POST /dags/{fileName}/reuse-runtime); otherwise, or when either identity is unknown, the request returns 409 naming the step and nothing starts. The run records the identity it was admitted for and fails before any step when its own resolve of the runtime profiles differs. A step not listed is reused as the request names it. A step listed must be a skipped step whose outputs come from a run. Requires steps."
                 outputs:
                   type: object
                   description: "Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps."
@@ -19542,6 +19606,28 @@ components:
         - artifactsAvailable
         - autoRetryCount
 
+    ReuseRuntimeCheck:
+      type: object
+      required:
+        - runs
+      properties:
+        runs:
+          type: array
+          items:
+            type: object
+            required:
+              - dagRunId
+              - runtime
+            properties:
+              dagRunId:
+                $ref: "#/components/schemas/DAGRunId"
+              runtime:
+                type: string
+                enum:
+                  - same
+                  - different
+                  - unknown
+                description: "same: the run's outputs may be reused automatically. different: the run took another state of the runtime profiles. unknown: no automatic reuse."
     ReusedOutputSource:
       type: object
       description: "The run that a step's supplied outputs were captured from."

@@ -221,8 +221,9 @@ func runtimeProfileToProto(resolved *profilepkg.RuntimeResolved) *coordinatorv1.
 		return &coordinatorv1.ResolveRuntimeProfileResponse{}
 	}
 	return &coordinatorv1.ResolveRuntimeProfileResponse{
-		Defaults: runtimeProfileLayerToProto(resolved.Defaults),
-		Selected: runtimeProfileLayerToProto(resolved.Selected),
+		Defaults:        runtimeProfileLayerToProto(resolved.Defaults),
+		Selected:        runtimeProfileLayerToProto(resolved.Selected),
+		RuntimeIdentity: resolved.Identity,
 	}
 }
 
@@ -255,7 +256,8 @@ func runtimeProfileFromProto(resp *coordinatorv1.ResolveRuntimeProfileResponse) 
 	if err != nil {
 		return nil, err
 	}
-	return &profilepkg.RuntimeResolved{Defaults: defaults, Selected: selected}, nil
+	// An older coordinator sends no identity: the run's is unknown.
+	return &profilepkg.RuntimeResolved{Defaults: defaults, Selected: selected, Identity: resp.GetRuntimeIdentity()}, nil
 }
 
 func runtimeProfileLayerFromProto(layer *coordinatorv1.RuntimeProfileLayer) (*profilepkg.Resolved, error) {

@@ -29,6 +29,7 @@ var restoredFields = map[string]bool{
 	"Redis":              true,
 	"RegistryAuths":      true,
 	"RuntimeResolved":    true,
+	"DotenvLoaded":       true,
 	"RootEnvSpan":        true,
 	"Harness":            true,
 	"Harnesses":          true,

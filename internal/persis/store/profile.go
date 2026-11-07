@@ -12,6 +12,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/profile"
+	"github.com/google/uuid"
 )
 
 var _ profile.Store = (*ProfileStore)(nil)
@@ -39,6 +40,7 @@ func (s *ProfileStore) Create(ctx context.Context, p *profile.Profile) error {
 		return err
 	}
 	stored := p.Clone()
+	stored.Generation = newProfileGeneration()
 	data, err := persis.Encode(&profileStoredRecord{Profile: stored})
 	if err != nil {
 		return err
@@ -50,6 +52,7 @@ func (s *ProfileStore) Create(ctx context.Context, p *profile.Profile) error {
 		UpdatedAt: stored.UpdatedAt,
 	})
 	if err == nil {
+		p.Generation = stored.Generation
 		return nil
 	}
 	if errors.Is(err, persis.ErrConflict) {
@@ -133,16 +136,30 @@ func (s *ProfileStore) Update(ctx context.Context, p *profile.Profile) error {
 		return err
 	}
 	stored := p.Clone()
+	stored.Generation = newProfileGeneration()
 	data, err := persis.Encode(&profileStoredRecord{Profile: stored})
 	if err != nil {
 		return err
 	}
-	return s.col.Put(ctx, &persis.Record{
+	if err := s.col.Put(ctx, &persis.Record{
 		ID:        stored.Name,
 		Data:      data,
 		CreatedAt: rec.CreatedAt,
 		UpdatedAt: time.Now().UTC(),
-	})
+	}); err != nil {
+		return err
+	}
+	p.Generation = stored.Generation
+	return nil
+}
+
+// newProfileGeneration names a state the store is about to write. It is
+// random, not a counter or a time: the content and its generation go to
+// storage in one write, so every stored state has its own, whichever path
+// or clock wrote it, and a build that drops the field leaves it empty
+// rather than repeating an old one (TXE-6145).
+func newProfileGeneration() string {
+	return uuid.NewString()
 }
 
 func (s *ProfileStore) Delete(ctx context.Context, name string) error {

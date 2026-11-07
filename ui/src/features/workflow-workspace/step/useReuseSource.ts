@@ -34,6 +34,11 @@ import {
 } from '@/features/visual-editor/run/useOutputCacheEntries';
 import { useRunSpecDiff } from '@/features/visual-editor/run/useRunSpecStale';
 import { useLiveStepHashes } from '@/features/visual-editor/run/useStepHashes';
+import {
+  MAX_RUNTIME_RUNS,
+  requestReuseRuntime,
+  type RuntimeMatch,
+} from '@/features/visual-editor/run/reuseRuntime';
 import type { StepRunRef } from '@/features/visual-editor/run/inputProvenance';
 import { useClient } from '@/hooks/api';
 import { useWorkspaceData } from '../data/context';
@@ -47,6 +52,12 @@ export const MAX_OUTPUT_REQUESTS = 3;
 
 // The step that stands for the agent in the runs of an agent DAG.
 const AGENT_RUN_STEP = '__agent__';
+
+/** How long the unsaved text stays still before the server is asked again. */
+const RUNTIME_SPEC_DEBOUNCE_MS = 800;
+
+/** How long an answer of the server about a run's runtime state is kept. */
+const RUNTIME_ANSWER_TTL_MS = 30_000;
 
 export interface ReuseSourceState {
   /**
@@ -80,6 +91,22 @@ export interface ReuseSourceState {
   cachedRuns: Record<string, { runId: string; capturedAt: number }>;
   /** Previous steps with a fresh entry whose source run is no longer available. */
   gone: string[];
+  /**
+   * Previous steps with a fresh entry whose run took another runtime profile
+   * state than the step run would, or one that is not known (TXE-6145).
+   */
+  otherRuntime: string[];
+  /**
+   * True when the source run was chosen automatically: the request names
+   * each step it carries as reused automatically, and the server refuses it
+   * unless the run took the same runtime profile state.
+   */
+  automaticSource: boolean;
+  /**
+   * The run the user chose took another runtime profile state than the step
+   * run will, or one that is not known: allowed, with a warning.
+   */
+  runtimeDiffers: boolean;
   /**
    * The run of each previous step that a run gives (the source run or the run
    * of the cache), with the times that the step had there.
@@ -127,6 +154,8 @@ export function useReuseSource(p: {
   followedUpstreamRunId: string | null;
   /** The editor text; the saved definition when undefined. */
   liveText?: string;
+  /** The step runs from the unsaved editor text (`liveText`). */
+  unsaved?: boolean;
 }): ReuseSourceState {
   const { dagData, run, remoteNode } = useWorkspaceData('useReuseSource');
   const client = useClient();
@@ -139,6 +168,76 @@ export function useReuseSource(p: {
     [history.runs]
   );
 
+  // Which runs a step run may reuse without the user naming them is the
+  // server's to say: it decides the runtime profile the step run takes, from
+  // the unsaved text when the step runs from it (TXE-6145).
+  const draftSpec =
+    p.unsaved && p.liveText !== undefined ? p.liveText : undefined;
+  const [runtimeSpec, setRuntimeSpec] = useState(draftSpec);
+  useEffect(() => {
+    const timer = setTimeout(
+      () => setRuntimeSpec(draftSpec),
+      RUNTIME_SPEC_DEBOUNCE_MS
+    );
+    return () => clearTimeout(timer);
+  }, [draftSpec]);
+  const runtimeKey = `${p.fileName}\u0001${remoteNode}\u0001${runtimeSpec ?? '\u0002saved'}`;
+  // Answers are shared within one period of RUNTIME_ANSWER_TTL_MS. One that
+  // says "unknown" is not kept (a run that had not recorded its state yet
+  // asks again). Each period starts afresh, and the choices that rest on the
+  // answers are made again, while the current choice stays shown: a profile
+  // that changed since is seen within one period. The server checks again
+  // when the step run starts in any case.
+  const [runtimeEpoch, setRuntimeEpoch] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(
+      () => setRuntimeEpoch((epoch) => epoch + 1),
+      RUNTIME_ANSWER_TTL_MS
+    );
+    return () => clearInterval(timer);
+  }, []);
+  const runtimeAsked = useRef({
+    epoch: 0,
+    answers: new Map<string, Promise<RuntimeMatch>>(),
+  });
+  const askRuntime = useCallback(
+    (ids: readonly string[]): Promise<Record<string, RuntimeMatch>> => {
+      const held = runtimeAsked.current;
+      if (held.epoch !== runtimeEpoch) {
+        held.epoch = runtimeEpoch;
+        held.answers = new Map();
+      }
+      const cache = held.answers;
+      const keyOf = (id: string) => `${runtimeKey}\u0000${id}`;
+      const missingIds = [...new Set(ids)].filter(
+        (id) => !cache.has(keyOf(id))
+      );
+      if (missingIds.length > 0) {
+        const batch = requestReuseRuntime(clientRef.current, {
+          fileName: p.fileName,
+          dagName,
+          remoteNode,
+          runIds: missingIds,
+          ...(runtimeSpec !== undefined ? { spec: runtimeSpec } : {}),
+        });
+        for (const id of missingIds) {
+          const key = keyOf(id);
+          const answer = batch.then((answers) => answers[id] ?? 'unknown');
+          cache.set(key, answer);
+          void answer.then((match) => {
+            if (match === 'unknown' && cache.get(key) === answer) {
+              cache.delete(key);
+            }
+          });
+        }
+      }
+      return Promise.all(ids.map((id) => cache.get(keyOf(id))!)).then(
+        (answers) => Object.fromEntries(ids.map((id, i) => [id, answers[i]!]))
+      );
+    },
+    [dagName, p.fileName, remoteNode, runtimeEpoch, runtimeKey, runtimeSpec]
+  );
+
   const selected = run.details;
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
@@ -147,7 +246,7 @@ export function useReuseSource(p: {
 
   const readsKey = p.reads.join('\u0000');
   const selectedKey = selected ? `${selected.dagRunId}:${selected.status}` : '';
-  const evaluation = `${dagName}\u0001${remoteNode}\u0001${readsKey}\u0001${p.followedUpstreamRunId ?? ''}\u0001${selectedKey}`;
+  const evaluation = `${dagName}\u0001${remoteNode}\u0001${readsKey}\u0001${p.followedUpstreamRunId ?? ''}\u0001${selectedKey}\u0001${runtimeKey}`;
 
   const [picked, setPicked] = useState<{
     key: string;
@@ -170,10 +269,25 @@ export function useReuseSource(p: {
             ? selectedNow
             : null));
     let budget = MAX_OUTPUT_REQUESTS;
+    // One request compares every candidate with the step run's runtime
+    // profile state; only a run of the same state is chosen automatically.
+    const candidates = [
+      ...(followed ? [followed.dagRunId] : []),
+      ...(selectedNow && !selectedNow.ephemeral ? [selectedNow.dagRunId] : []),
+      ...runs.map((r) => r.dagRunId),
+    ].slice(0, MAX_RUNTIME_RUNS);
+    const runtimeAnswers = askRuntime(candidates);
+    const sameRuntime = async (candidate: ReuseRun): Promise<boolean> => {
+      const answers = candidates.includes(candidate.dagRunId)
+        ? await runtimeAnswers
+        : await askRuntime([candidate.dagRunId]);
+      return answers[candidate.dagRunId] === 'same';
+    };
     // The nodes of the run already show the reads as complete. The request
     // confirms that the outputs exist; a run that the budget cannot cover
     // stays trusted on its nodes.
     const holds = async (candidate: ReuseRun): Promise<boolean> => {
+      if (!(await sameRuntime(candidate))) return false;
       if (reads.length === 0 || reads.length > budget) return true;
       budget -= reads.length;
       try {
@@ -209,15 +323,23 @@ export function useReuseSource(p: {
       history: runs,
       reads,
       holds,
-    }).then((pick) => {
-      if (!cancelled) setPicked({ key: evaluation, runs: keptRuns, pick });
-    });
+    })
+      .then(async (pick) =>
+        // The followed run is taken without `holds`: it is held to the same
+        // runtime profile state too.
+        pick.source && !(await sameRuntime(pick.source))
+          ? { source: null, waitingFor: null }
+          : pick
+      )
+      .then((pick) => {
+        if (!cancelled) setPicked({ key: evaluation, runs: keptRuns, pick });
+      });
     return () => {
       cancelled = true;
     };
     // The selected run is read through a ref; its id and status are in the
-    // key. The live text does not change the choice.
-  }, [evaluation, keptRuns]);
+    // key. The live text changes the choice only through the runtime state.
+  }, [evaluation, keptRuns, askRuntime]);
 
   // A pick of an older history stays until the new evaluation ends, so the
   // source does not blink away when the history changes.
@@ -301,16 +423,51 @@ export function useReuseSource(p: {
         });
     }
   }, [dagName, history.isLoading, remoteNode, runIds, runOfId]);
+  // The runtime profile state of the runs of the entries and of the chosen
+  // run, as the server compares it with the step run's.
+  const [runtime, setRuntime] = useState<{
+    key: string;
+    answers: Record<string, RuntimeMatch>;
+  }>({ key: runtimeKey, answers: {} });
+  useEffect(() => {
+    if (runIds.length === 0) return;
+    let cancelled = false;
+    void askRuntime(runIds).then((answers) => {
+      if (cancelled) return;
+      setRuntime((held) => ({
+        key: runtimeKey,
+        answers: {
+          ...(held.key === runtimeKey ? held.answers : {}),
+          ...answers,
+        },
+      }));
+    });
+    return () => {
+      cancelled = true;
+    };
+    // A change of the history (a run finished) asks again for what is not
+    // fresh or not known.
+  }, [askRuntime, runIds, runtimeKey, listed]);
+  const runtimeOf = useCallback(
+    (id: string): RuntimeMatch | undefined =>
+      runtime.key === runtimeKey ? runtime.answers[id] : undefined,
+    [runtime, runtimeKey]
+  );
   const check = useCallback(
     (step: string, entry: { runId: string }): RunCheck => {
       const found = runOfId(entry.runId);
       if (found === undefined) return 'checking';
       if (found === 'gone') return 'gone';
+      // The cache is reused without the user naming the run: only a run of
+      // the step run's runtime profile state covers a step.
+      const match = runtimeOf(entry.runId);
+      if (match === undefined) return 'checking';
+      if (match !== 'same') return 'otherRuntime';
       if (found === 'unknown') return 'ok';
       if (isActive(found)) return 'active';
       return runHoldsOutputs(found, step) ? 'ok' : 'gone';
     },
-    [runOfId]
+    [runOfId, runtimeOf]
   );
 
   // The run that the user chose, when it still exists and holds the reads.
@@ -493,6 +650,13 @@ export function useReuseSource(p: {
     cached: cover.cached,
     cachedRuns: cover.runs,
     gone: cover.gone,
+    otherRuntime: cover.otherRuntime,
+    automaticSource: source !== null && chosenRun === null,
+    runtimeDiffers:
+      source !== null &&
+      chosenRun !== null &&
+      runtimeOf(source.dagRunId) !== undefined &&
+      runtimeOf(source.dagRunId) !== 'same',
     stepRuns,
     cacheCapturedAt: cover.capturedAt,
     cacheTimes: cover.times,

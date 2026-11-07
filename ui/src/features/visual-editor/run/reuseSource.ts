@@ -250,12 +250,14 @@ export function planRun(p: {
 
 /**
  * Whether the run that a cache entry names can still give the step: 'ok' when
- * the run exists and its node of the step succeeded, 'gone' when it does not
- * (removed, or a test run that expired), 'active' while the run has not
- * finished (the server reuses outputs of a finished run only) and 'checking'
- * while the server has not answered.
+ * the run exists, its node of the step succeeded and the server says it ran
+ * under the runtime profile state the step run takes, 'gone' when it does not
+ * exist (removed, or a test run that expired), 'active' while the run has not
+ * finished (the server reuses outputs of a finished run only),
+ * 'otherRuntime' when the server says its runtime profile state differs or
+ * is not known (TXE-6145), and 'checking' while the server has not answered.
  */
-export type RunCheck = 'ok' | 'gone' | 'active' | 'checking';
+export type RunCheck = 'ok' | 'gone' | 'active' | 'otherRuntime' | 'checking';
 
 /** What the cache of the browser gives to the previous steps of a step run. */
 export interface CacheCover {
@@ -275,6 +277,11 @@ export interface CacheCover {
   runs: Record<string, { runId: string; capturedAt: number }>;
   /** Steps with a fresh entry whose run is gone: no longer available. */
   gone: string[];
+  /**
+   * Steps with a fresh entry whose run took another runtime profile state,
+   * or one that is not known: not reused without the user naming the run.
+   */
+  otherRuntime: string[];
   /** True while a run that an entry names has not been checked. */
   checking: boolean;
   /** The oldest capture time of the covered steps; null when none is covered. */
@@ -289,8 +296,9 @@ export interface CacheCover {
  * takes its outputs from that run, never from the cache. An entry covers a
  * step when its hash is the current hash of the step, which includes the
  * steps that it needs, and its run can still give the step (`check`); a stale
- * entry, or one whose run is gone, covers nothing. `hashes` is null while the
- * current definition is not known: then nothing is covered.
+ * entry, one whose run is gone, or one whose run took another runtime
+ * profile state, covers nothing. `hashes` is null while the current
+ * definition is not known: then nothing is covered.
  */
 export function coverFromCache(p: {
   previous: readonly string[];
@@ -303,6 +311,7 @@ export function coverFromCache(p: {
 }): CacheCover {
   const cached: string[] = [];
   const gone: string[] = [];
+  const otherRuntime: string[] = [];
   const runs: Record<string, { runId: string; capturedAt: number }> = {};
   const times: Record<string, number> = {};
   let capturedAt: number | null = null;
@@ -320,6 +329,10 @@ export function coverFromCache(p: {
     }
     if (state === 'gone') {
       gone.push(name);
+      continue;
+    }
+    if (state === 'otherRuntime') {
+      otherRuntime.push(name);
       continue;
     }
     if (state === 'active') continue;
@@ -345,6 +358,7 @@ export function coverFromCache(p: {
     cached,
     runs,
     gone,
+    otherRuntime,
     checking,
     capturedAt,
     times,

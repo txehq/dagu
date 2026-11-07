@@ -42,15 +42,26 @@ func CreateTask(
 	// every such worker advertises, so the selector gates it on every path
 	// that matches workers, whatever order the options came in.
 	if task.AcceptFailedPrerequisites {
-		selector := maps.Clone(task.WorkerSelector)
-		if selector == nil {
-			selector = map[string]string{}
-		}
-		selector[dispatch.AcceptFailedPrerequisitesLabel] = dispatch.CapabilityLabelValue
-		task.WorkerSelector = selector
+		requireCapability(task, dispatch.AcceptFailedPrerequisitesLabel)
+	}
+	// A run seeded with automatically reused outputs is checked against the
+	// runtime identity they were reused for; a worker that cannot check it
+	// would run the steps on whatever it resolves.
+	if task.PreviousStatus != nil && task.PreviousStatus.ExpectedRuntimeIdentity != "" {
+		requireCapability(task, dispatch.RuntimeIdentityCheckLabel)
 	}
 
 	return task
+}
+
+// requireCapability adds a capability label to the task's selector.
+func requireCapability(task *dispatch.DispatchTask, label string) {
+	selector := maps.Clone(task.WorkerSelector)
+	if selector == nil {
+		selector = map[string]string{}
+	}
+	selector[label] = dispatch.CapabilityLabelValue
+	task.WorkerSelector = selector
 }
 
 // TaskOption is a function that modifies a dispatch task.

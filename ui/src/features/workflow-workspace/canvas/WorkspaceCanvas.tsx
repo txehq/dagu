@@ -167,6 +167,8 @@ function useInputRun(p: {
     reads,
     followedUpstreamRunId,
     ...(p.liveText !== undefined ? { liveText: p.liveText } : {}),
+    // The canvas has the text only while it is unsaved.
+    unsaved: p.liveText !== undefined,
   });
   const { source, waitingFor, stale, missing } = reuse;
   const { cached, cacheCapturedAt, cacheTimes, cachedRuns } = reuse;

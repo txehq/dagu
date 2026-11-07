@@ -6794,11 +6794,12 @@ func (b0 RuntimeProfileLayer_builder) Build() *RuntimeProfileLayer {
 }
 
 type ResolveRuntimeProfileResponse struct {
-	state               protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_Defaults *RuntimeProfileLayer   `protobuf:"bytes,1,opt,name=defaults,proto3"`
-	xxx_hidden_Selected *RuntimeProfileLayer   `protobuf:"bytes,2,opt,name=selected,proto3"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state                      protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Defaults        *RuntimeProfileLayer   `protobuf:"bytes,1,opt,name=defaults,proto3"`
+	xxx_hidden_Selected        *RuntimeProfileLayer   `protobuf:"bytes,2,opt,name=selected,proto3"`
+	xxx_hidden_RuntimeIdentity string                 `protobuf:"bytes,3,opt,name=runtime_identity,json=runtimeIdentity,proto3"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *ResolveRuntimeProfileResponse) Reset() {
@@ -6840,12 +6841,23 @@ func (x *ResolveRuntimeProfileResponse) GetSelected() *RuntimeProfileLayer {
 	return nil
 }
 
+func (x *ResolveRuntimeProfileResponse) GetRuntimeIdentity() string {
+	if x != nil {
+		return x.xxx_hidden_RuntimeIdentity
+	}
+	return ""
+}
+
 func (x *ResolveRuntimeProfileResponse) SetDefaults(v *RuntimeProfileLayer) {
 	x.xxx_hidden_Defaults = v
 }
 
 func (x *ResolveRuntimeProfileResponse) SetSelected(v *RuntimeProfileLayer) {
 	x.xxx_hidden_Selected = v
+}
+
+func (x *ResolveRuntimeProfileResponse) SetRuntimeIdentity(v string) {
+	x.xxx_hidden_RuntimeIdentity = v
 }
 
 func (x *ResolveRuntimeProfileResponse) HasDefaults() bool {
@@ -6875,6 +6887,9 @@ type ResolveRuntimeProfileResponse_builder struct {
 
 	Defaults *RuntimeProfileLayer
 	Selected *RuntimeProfileLayer
+	// Names the stored state of every layer the values were read from, taken
+	// in the same reads; empty is unknown (an older coordinator sends none).
+	RuntimeIdentity string
 }
 
 func (b0 ResolveRuntimeProfileResponse_builder) Build() *ResolveRuntimeProfileResponse {
@@ -6883,6 +6898,7 @@ func (b0 ResolveRuntimeProfileResponse_builder) Build() *ResolveRuntimeProfileRe
 	_, _ = b, x
 	x.xxx_hidden_Defaults = b.Defaults
 	x.xxx_hidden_Selected = b.Selected
+	x.xxx_hidden_RuntimeIdentity = b.RuntimeIdentity
 	return m0
 }
 
@@ -7277,10 +7293,11 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x05value\x18\x03 \x01(\tR\x05value\"h\n" +
 	"\x13RuntimeProfileLayer\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12=\n" +
-	"\aentries\x18\x02 \x03(\v2#.coordinator.v1.RuntimeProfileEntryR\aentries\"\xa1\x01\n" +
+	"\aentries\x18\x02 \x03(\v2#.coordinator.v1.RuntimeProfileEntryR\aentries\"\xcc\x01\n" +
 	"\x1dResolveRuntimeProfileResponse\x12?\n" +
 	"\bdefaults\x18\x01 \x01(\v2#.coordinator.v1.RuntimeProfileLayerR\bdefaults\x12?\n" +
-	"\bselected\x18\x02 \x01(\v2#.coordinator.v1.RuntimeProfileLayerR\bselected*P\n" +
+	"\bselected\x18\x02 \x01(\v2#.coordinator.v1.RuntimeProfileLayerR\bselected\x12)\n" +
+	"\x10runtime_identity\x18\x03 \x01(\tR\x0fruntimeIdentity*P\n" +
 	"\tOperation\x12\x19\n" +
 	"\x15OPERATION_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fOPERATION_START\x10\x01\x12\x13\n" +

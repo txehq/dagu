@@ -1130,6 +1130,7 @@ func (s *dagBuildState) capturePresolvedBuildEnv() {
 func (s *dagBuildState) markEnvEvaluated() {
 	s.result.EnvEvaluated = !s.ctx.opts.Has(buildFlagNoEval)
 	s.result.RuntimeResolved = s.ctx.opts.RuntimeResolved || (s.result.EnvEvaluated && len(s.result.Dotenv) == 0)
+	s.result.DotenvLoaded = s.ctx.opts.DotenvLoaded
 	s.result.RootEnvSpan = ir.EnvSpan{}
 	if s.result.EnvEvaluated {
 		end := len(s.result.Env)

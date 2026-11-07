@@ -114,6 +114,9 @@ export function useEditorRunActions(args: Args): EditorRunActions {
           ? { outputsFromRuns: opts.outputsFromRuns }
           : {}),
         ...(opts?.reused ? { reused: opts.reused } : {}),
+        ...(opts?.automaticReuse
+          ? { automaticReuse: opts.automaticReuse }
+          : {}),
       };
       // The steps of an unsaved buffer run from the buffer, not the saved
       // file. They are a test of a draft: the run leaves no trace.

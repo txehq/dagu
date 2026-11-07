@@ -412,24 +412,26 @@ func TestWorkerRejectsConflictingPlatformLabels(t *testing.T) {
 	require.ErrorContains(t, err, `worker label "os" conflicts with built-in platform value`)
 }
 
-// The capability label is built in: a worker of this build advertises it,
-// and configuration cannot say otherwise (TXE-5067).
+// The capability labels are built in: a worker of this build advertises
+// them, and configuration cannot say otherwise (TXE-5067, TXE-6145).
 func TestWorkerRejectsConflictingCapabilityLabel(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	w := worker.NewWorker(
-		"conflicting-capability",
-		1,
-		newMockCoordinatorCli(),
-		map[string]string{dispatch.AcceptFailedPrerequisitesLabel: "false"},
-		&config.Config{},
-	)
-	w.SetHandler(&mockHandler{})
+	for _, label := range []string{dispatch.AcceptFailedPrerequisitesLabel, dispatch.RuntimeIdentityCheckLabel} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		w := worker.NewWorker(
+			"conflicting-capability",
+			1,
+			newMockCoordinatorCli(),
+			map[string]string{label: "false"},
+			&config.Config{},
+		)
+		w.SetHandler(&mockHandler{})
 
-	err := w.Start(ctx)
-	require.ErrorContains(t, err, `worker label "`+dispatch.AcceptFailedPrerequisitesLabel+`" conflicts`)
+		err := w.Start(ctx)
+		require.ErrorContains(t, err, `worker label "`+label+`" conflicts`)
+	}
 }
 
 func TestWorkerHeartbeat(t *testing.T) {
