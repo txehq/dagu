@@ -138,6 +138,79 @@ func TestGuardOneBrowserLaunch(t *testing.T) {
 	assert.Empty(t, execs, "the browser packages start processes only in the gate's launch.go and start.go")
 }
 
+// TestGuardOneLifetimeClock: the gate ends a healthy browser by time in one
+// place, the keeper in attend.go, on ticks of the gate's clock. No file of
+// the package arms a timer (time.NewTimer, time.After, time.AfterFunc), and a
+// ticker is made only where the clock is defined; so a new concern cannot
+// end the browser on a clock of its own, and the policy's defaults are
+// resolved by Config.lifetime alone (TXE-6201).
+func TestGuardOneLifetimeClock(t *testing.T) {
+	t.Parallel()
+	root := moduleRoot(t)
+	files := goSources(t, root)
+	forbidden := map[string]bool{"NewTimer": true, "After": true, "AfterFunc": true}
+	var timers, tickers, lifetimeReads []string
+	for path, file := range files {
+		if !strings.HasPrefix(path, "internal/browserhost/devtoolsgate/") {
+			continue
+		}
+		timeName := importName(file, "time")
+		ast.Inspect(file, func(n ast.Node) bool {
+			selector, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if timeName != "" && pkg.Name == timeName {
+				if forbidden[selector.Sel.Name] {
+					timers = append(timers, path+": time."+selector.Sel.Name)
+				}
+				if selector.Sel.Name == "NewTicker" && path != "internal/browserhost/devtoolsgate/attend.go" {
+					tickers = append(tickers, path)
+				}
+			}
+			// The policy's fields are read through Config.lifetime, nowhere else.
+			if (selector.Sel.Name == "MaxLifetime" || selector.Sel.Name == "MaxUnattended") &&
+				!strings.HasSuffix(path, "/attend.go") && !strings.HasSuffix(path, "/config.go") {
+				lifetimeReads = append(lifetimeReads, path+": "+selector.Sel.Name)
+			}
+			return true
+		})
+	}
+	assert.Empty(t, timers, "the gate arms no timer; the keeper's ticks end a browser by time")
+	assert.Empty(t, tickers, "a ticker comes from the gate's clock in attend.go")
+	assert.Empty(t, lifetimeReads, "the lifetime fields are resolved by Config.lifetime only")
+
+	// A permanent helper outside the package opts in through
+	// HelperHandshake, never by spelling the marker itself, so the marker
+	// has one source and a consumer cannot copy it half right.
+	var markerCopies []string
+	for path, file := range files {
+		if strings.HasPrefix(path, "internal/browserhost/devtoolsgate/") {
+			continue
+		}
+		gateName := importName(file, "github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate")
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.SelectorExpr:
+				pkg, ok := node.X.(*ast.Ident)
+				if ok && gateName != "" && pkg.Name == gateName && (node.Sel.Name == "HelperHeader" || node.Sel.Name == "HelperValue") {
+					markerCopies = append(markerCopies, path+": devtoolsgate."+node.Sel.Name)
+				}
+			case *ast.BasicLit:
+				if node.Kind == token.STRING && (strings.Contains(node.Value, HelperHeader) || strings.Contains(node.Value, HelperValue)) {
+					markerCopies = append(markerCopies, path+": "+node.Value)
+				}
+			}
+			return true
+		})
+	}
+	assert.Empty(t, markerCopies, "a helper opts in with devtoolsgate.HelperHandshake(); the marker is spelled only in the gate")
+}
+
 // TestGuardAddressNeverFormatted: a browser address carries the gate's
 // token, so no code in the browser packages hands one to a formatting,
 // logging or error-building function. Redact it first. The check reads

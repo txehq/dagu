@@ -19,12 +19,13 @@ func TestConfigValidate(t *testing.T) {
 	require.NoError(t, valid.validate())
 
 	cases := map[string]Config{
-		"no token":        {Executable: "/usr/bin/chrome"},
-		"token with path": {Token: "a/b", Executable: "/usr/bin/chrome"},
-		"no executable":   {Token: NewToken()},
-		"negative cap":    {Token: NewToken(), Executable: "/usr/bin/chrome", MaxLifetime: -time.Second},
-		"port flag":       {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-port=9222"}},
-		"pipe flag":       {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-pipe"}},
+		"no token":                {Executable: "/usr/bin/chrome"},
+		"token with path":         {Token: "a/b", Executable: "/usr/bin/chrome"},
+		"no executable":           {Token: NewToken()},
+		"negative cap":            {Token: NewToken(), Executable: "/usr/bin/chrome", MaxLifetime: -time.Second},
+		"negative unattended cap": {Token: NewToken(), Executable: "/usr/bin/chrome", MaxUnattended: -time.Second},
+		"port flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-port=9222"}},
+		"pipe flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-pipe"}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -33,8 +34,12 @@ func TestConfigValidate(t *testing.T) {
 	}
 	assert.True(t, errors.Is(cases["port flag"].validate(), ErrDebuggingFlagInArgs))
 	assert.True(t, errors.Is(cases["no token"].validate(), ErrTokenRequired))
-	assert.Equal(t, DefaultMaxLifetime, Config{}.maxLifetime())
-	assert.Equal(t, time.Hour, Config{MaxLifetime: time.Hour}.maxLifetime())
+	// The lifetime policy is resolved in one place: zero MaxUnattended is
+	// the default, zero MaxLifetime is no hard cap, explicit values stand.
+	assert.Equal(t, lifetimePolicy{hardCap: 0, unattended: DefaultMaxUnattended}, Config{}.lifetime())
+	assert.Equal(t, lifetimePolicy{hardCap: time.Hour, unattended: DefaultMaxUnattended}, Config{MaxLifetime: time.Hour}.lifetime())
+	assert.Equal(t, lifetimePolicy{hardCap: 0, unattended: 90 * time.Minute}, Config{MaxUnattended: 90 * time.Minute}.lifetime())
+	assert.Equal(t, lifetimePolicy{hardCap: time.Hour, unattended: time.Minute}, Config{MaxLifetime: time.Hour, MaxUnattended: time.Minute}.lifetime())
 }
 
 func TestTokenAndBaseURL(t *testing.T) {

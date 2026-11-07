@@ -25,8 +25,12 @@
 // person's input keeps its gate. The helper reads its configuration from
 // stdin, so the token never appears in a process listing, writes one ready
 // line to stdout, and exits when Chrome exits. Chrome, for its part, closes
-// itself when the pipe closes, so neither outlives the other. A lifetime cap
-// ends a gate nobody came back for.
+// itself when the pipe closes, so neither outlives the other. A browser with
+// a connected DevTools client runs as long as the client does; one that has
+// had no client for the unattended cap (24 h by default) is closed with its
+// gate, and an explicit lifetime cap ends a run whatever its clients. A
+// permanent helper of the hub's own marks its handshake (HelperHeader) and
+// is not counted as a client for that purpose (attend.go, TXE-6201).
 //
 // Scope. The gate keeps another local account from driving the browser or
 // reading what it holds. Code running as the same user can already read the
