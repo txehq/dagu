@@ -625,12 +625,24 @@ func (run *matrixRun) staleAttempt() string {
 	// interval and a margin, so the thawed worker's writes are late by the
 	// contract's own clock and must be refused.
 	confirmDeadline := time.Now().Add(defaultZombieDetectionInterval + 15*time.Second)
+	confirmed := false
 	for time.Now().Before(confirmDeadline) {
 		if len(r.hubLinesSinceMark("Marked stale distributed run as FAILED", id)) > 0 {
+			confirmed = true
 			break
 		}
 		time.Sleep(2 * time.Second)
 	}
+	// Which detector failed the run is recorded: the coordinator's own
+	// reconciliation says so in words and drops the lease at once; when the
+	// scheduler's zombie scan got there first, the coordinator's next scan
+	// drops the lease without a line of its own, and only the wait stands for it.
+	confirmation := "the coordinator confirmed the stale run (observed in its log) before the thaw"
+	if !confirmed {
+		confirmation = fmt.Sprintf("coordinator confirmation not observed in the log; waited one scan interval and a margin (%s) before the thaw — a limitation under load, bounded by the repair check below",
+			defaultZombieDetectionInterval+15*time.Second)
+	}
+	byScheduler := len(r.hubLinesSinceMark("Confirmed zombie DAG run", id)) > 0
 	r.thaw(old)
 	// The thawed worker's late writes for the expired attempt must land
 	// nowhere: the hub refuses its status (its log says so), the worker's
@@ -645,26 +657,37 @@ func (run *matrixRun) staleAttempt() string {
 		seen = append(seen, fmt.Sprintf("%s/%s/%s", now.status, now.worker, now.attempt))
 	}
 	after := r.run("hold-a", id)
-	repaired := r.hubLinesSinceMark("Repaired stale distributed run failure from fresh heartbeat")
-	require.Empty(t, repaired, "the hub took the thawed worker's heartbeat as fresh and repaired the failure; the thaw came too early for a late-write proof; seen: %v", seen)
-	statusRefused := r.hubLinesSinceMark("Rejected remote status update", "stale attempt")
-	require.NotEmpty(t, statusRefused, "the hub did not refuse the thawed worker's status as stale; run after the thaw: %+v; seen: %v", after, seen)
-	oldLines := linesOfLog(t, old.log, 0)
+	repaired := r.hubLinesSinceMark("Repaired stale distributed run failure from fresh heartbeat", id)
+	require.Empty(t, repaired, "the hub took the thawed worker's heartbeat as fresh and repaired the failure; the thaw came inside the repair window (%s); seen: %v", confirmation, seen)
+	// Every late write is refused for the expired attempt by name: the
+	// status by the hub, the log streams and the artifact upload at the worker.
+	statusRefused := r.hubLinesSinceMark("Rejected remote status update", "stale attempt", id, "attempt-id="+s.attempt)
+	require.NotEmpty(t, statusRefused, "the hub did not refuse the thawed worker's status for attempt %s as stale; run after the thaw: %+v; seen: %v", s.attempt, after, seen)
+	oldLines := linesWith(linesOfLog(t, old.log, 0), s.attempt)
 	streamsRefused := linesWith(oldLines, "stale attempt", "FailedPrecondition")
-	require.NotEmpty(t, streamsRefused, "the thawed worker's streams were not refused as stale")
-	artifactRefused := len(linesWith(oldLines, "rtifact", "stale attempt"))
-	var outcome string
-	switch {
-	case after.attempt == s.attempt:
+	require.NotEmpty(t, streamsRefused, "the thawed worker's streams for attempt %s were not refused as stale", s.attempt)
+	artifactRefused := linesWith(oldLines, "rtifact", "stale attempt")
+	require.NotEmpty(t, artifactRefused, "the thawed worker's artifact upload for attempt %s was not refused as stale", s.attempt)
+	// The hub's record of the expired attempt did not move: same state, same
+	// end, same attempt. A run the hub hands out again is a different attempt
+	// and is only recorded here, never claimed.
+	if after.attempt == s.attempt {
 		require.Equal(t, s.status, after.status, "the expired attempt came back to life: %+v; seen: %v", after, seen)
 		require.Equal(t, s.finished, after.finished, "the expired attempt's end moved: %+v; seen: %v", after, seen)
-		outcome = "the run stayed " + s.status + " on the expired attempt"
-	default:
+		require.Equal(t, s.errText, after.errText, "the expired attempt's error changed: %+v", after)
+	} else {
 		require.Equal(t, r.A().id+"@new", after.worker, "a new attempt %s ran on %s, not on the machine's healthy worker; seen: %v", after.attempt, after.worker, seen)
-		outcome = fmt.Sprintf("the hub handed the run again as attempt %s to the healthy worker (%s)", after.attempt, after.status)
 	}
-	return fmt.Sprintf("attempt %s expired %s after the freeze (%s, threshold %s); after the thaw: status refused ×%d, streams refused ×%d, artifact refusals %d; %s",
-		s.attempt, expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, len(statusRefused), len(streamsRefused), artifactRefused, outcome)
+	outcome := "the expired attempt stayed " + s.status + " with its end and error unchanged"
+	if after.attempt != s.attempt {
+		outcome = fmt.Sprintf("recorded, not claimed: the hub handed the run out again as attempt %s to the machine's healthy worker (%s)", after.attempt, after.status)
+	}
+	detector := "coordinator"
+	if byScheduler {
+		detector = "scheduler zombie scan"
+	}
+	return fmt.Sprintf("attempt %s expired %s after the freeze (%s, threshold %s; failed by the %s); %s; after the thaw: status refused ×%d, log streams refused ×%d, artifact refusals ×%d, all for attempt %s; %s",
+		s.attempt, expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, detector, confirmation, len(statusRefused), len(streamsRefused), len(artifactRefused), s.attempt, outcome)
 }
 
 // defaultZombieDetectionInterval is the scheduler's default
