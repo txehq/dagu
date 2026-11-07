@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 )
 
@@ -119,7 +120,10 @@ func Serve(ctx context.Context, cfg Config, ready func(Ready)) error {
 	// The process is ended when the browser does not close when asked.
 	browserPID, _ := browserhost.BrowserProcessID(ctx, cfg.CDPURL)
 	browserStartedAt, _ := procutil.StartTime(browserPID)
-	conn, response, err := websocket.Dial(ctx, wsURL, nil)
+	// The gate's connection lasts the browser's whole life, so it is marked
+	// a helper: it never keeps a browser no one else attends running
+	// (TXE-6201).
+	conn, response, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: devtoolsgate.HelperHandshake()})
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}

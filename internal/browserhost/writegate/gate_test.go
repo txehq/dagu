@@ -6,6 +6,7 @@ package writegate_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -210,6 +211,13 @@ func holdBrowserSlot(t *testing.T) {
 // DevTools gate this test binary serves, as dagu does.
 func startBrowserOn(t *testing.T, profile string) *browser {
 	t.Helper()
+	return startBrowserFor(t, profile, 0)
+}
+
+// startBrowserFor is startBrowserOn with the gate's unattended cap; zero is
+// the gate's default.
+func startBrowserFor(t *testing.T, profile string, maxUnattended time.Duration) *browser {
+	t.Helper()
 	path := chrometest.Require(t)
 	holdBrowserSlot(t)
 	startupSlot <- struct{}{}
@@ -217,9 +225,10 @@ func startBrowserOn(t *testing.T, profile string) *browser {
 	self, err := os.Executable()
 	require.NoError(t, err)
 	gate, err := devtoolsgate.Start(t.Context(), self, devtoolsgate.Config{
-		Token:      devtoolsgate.NewToken(),
-		Executable: path,
-		Args:       devtoolsgate.ChromeArgs(devtoolsgate.LaunchOptions{UserDataDir: profile, Headless: true, NoSandbox: true}),
+		Token:         devtoolsgate.NewToken(),
+		Executable:    path,
+		Args:          devtoolsgate.ChromeArgs(devtoolsgate.LaunchOptions{UserDataDir: profile, Headless: true, NoSandbox: true}),
+		MaxUnattended: maxUnattended,
 	})
 	require.NoError(t, err, "the browser did not start behind its gate")
 	b := &browser{gate: gate, cdpURL: gate.URL, profile: profile}
@@ -829,4 +838,52 @@ func TestGateKeepsEachWriteOnce(t *testing.T) {
 	assert.Equal(t, writegate.ClassSignIn, list[0].Class)
 	assert.Equal(t, 200, list[0].Status)
 	assert.True(t, list[1].Consequential())
+}
+
+// shortUnattended is an unattended cap a test can wait out: long enough for
+// the write gate to start on a loaded host, since the gate's clock runs from
+// launch.
+const shortUnattended = 10 * time.Second
+
+// The write gate's connection lasts the browser's whole life, and is marked
+// a helper (TXE-6201): a browser whose only client is the write gate is
+// unattended, and its gate ends it at the cap, as a parked session's is.
+func TestBrowserWithOnlyItsWriteGateEndsWhenUnattended(t *testing.T) {
+	t.Parallel()
+
+	b := startBrowserFor(t, profileDir(t), shortUnattended)
+	_, _, done := guard(t, b, writegate.Policy{}, nil)
+	require.Eventually(t, func() bool {
+		return errors.Is(browserhost.Probe(context.Background(), b.cdpURL), browserhost.ErrUnreachable)
+	}, shortUnattended+30*time.Second, 200*time.Millisecond, "the gate ends a browser only its write gate attends")
+	b.waitExited(t)
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the write gate did not end with its browser")
+	}
+}
+
+// A browser a client attends is never ended by the unattended cap, however
+// long the client stays; the clock starts when the last one leaves.
+func TestAttendedBrowserOutlivesTheUnattendedCap(t *testing.T) {
+	t.Parallel()
+
+	b := startBrowserFor(t, profileDir(t), shortUnattended)
+	_, _, _ = guard(t, b, writegate.Policy{}, nil)
+	wsURL, err := browserhost.BrowserID(t.Context(), b.cdpURL)
+	require.NoError(t, err)
+	conn, response, err := websocket.Dial(t.Context(), wsURL, nil)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	require.NoError(t, err)
+
+	time.Sleep(shortUnattended + 5*time.Second)
+	require.NoError(t, browserhost.Probe(context.Background(), b.cdpURL), "an attended browser outlives the cap")
+
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	require.Eventually(t, func() bool {
+		return errors.Is(browserhost.Probe(context.Background(), b.cdpURL), browserhost.ErrUnreachable)
+	}, shortUnattended+30*time.Second, 200*time.Millisecond, "the cap runs once the last client left")
 }

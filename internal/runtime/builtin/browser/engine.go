@@ -173,6 +173,10 @@ type launchOptions struct {
 	// Waiting reports, once, that the launch waits for another browser to
 	// close.
 	Waiting func()
+	// MaxUnattended is how long the browser's gate keeps it with no client
+	// connected before it ends it; zero is the gate's default, 24 hours. A
+	// browser with a connected client is never ended by it.
+	MaxUnattended time.Duration
 }
 
 // browserHandle locates a running browser.

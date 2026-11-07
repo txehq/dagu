@@ -40,6 +40,9 @@ const (
 	DefaultSessionIdleTimeout = 30 * time.Minute
 	// MaxSessionIdleTimeout bounds how long a session's browser waits.
 	MaxSessionIdleTimeout = 24 * time.Hour
+	// sessionUnattendedGrace is how long past a parked session's idle
+	// deadline its browser's gate waits before it ends the browser itself.
+	sessionUnattendedGrace = 5 * time.Minute
 	// DefaultOutlineChars bounds the outline a command reports after an
 	// operation, and DefaultDescribeChars the one it reports when asked.
 	DefaultOutlineChars  = 4000
@@ -422,6 +425,11 @@ func (s *Sessions) Open(ctx context.Context, opts SessionOptions) (OpenResult, e
 		Warn:               func(message string) { warnings = append(warnings, message) },
 		BrowserDir:         browserDir,
 		MaxOpen:            cmnconfig.GetConfig(ctx).Browser.MaxOpen,
+		// Each command reconnects, which restarts the gate's clock as it
+		// renews the idle deadline, so the gate ends a parked browser only
+		// just after the reaper should have: a backstop for a reaper that
+		// never came, not a second idle timeout.
+		MaxUnattended: idle + sessionUnattendedGrace,
 	}
 	if opts.Viewport != nil {
 		launch.Viewport = &viewport{Width: opts.Viewport.Width, Height: opts.Viewport.Height}

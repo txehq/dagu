@@ -134,6 +134,33 @@ func sessionCode(err error) string {
 
 // A session opens its browser, runs one operation per command against the
 // same browser, and leaves the browser waiting between commands.
+// A parked session's browser is ended by its gate only after the session's
+// idle timeout and a grace, never sooner: each command reconnects, which
+// restarts the gate's clock as it renews the idle deadline, so the gate is a
+// backstop for a reaper that never came (TXE-6201).
+func TestSessionGateEndsAParkedBrowserJustAfterItsIdleDeadline(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		idle time.Duration
+		want time.Duration
+	}{
+		"default": {0, DefaultSessionIdleTimeout + sessionUnattendedGrace},
+		"chosen":  {2 * time.Hour, 2*time.Hour + sessionUnattendedGrace},
+		"longest": {MaxSessionIdleTimeout, MaxSessionIdleTimeout + sessionUnattendedGrace},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ts := newTestSessions(t, pageModel(nil))
+			ts.engine.snapshot = fixtureSnapshot(t, "login")
+			ts.open(SessionOptions{URL: "https://portal.example.com/login", Headless: true, IdleTimeout: tc.idle})
+			ts.launcher.mu.Lock()
+			defer ts.launcher.mu.Unlock()
+			require.Len(t, ts.launcher.launches, 1)
+			assert.Equal(t, tc.want, ts.launcher.launches[0].MaxUnattended)
+		})
+	}
+}
+
 // The whole address, the credential that reaches the browser, is in the
 // result only when the caller asks for it.
 func TestSessionRevealsItsAddressOnlyWhenAsked(t *testing.T) {

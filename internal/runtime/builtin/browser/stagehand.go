@@ -376,6 +376,9 @@ func (l stagehandLauncher) start(ctx context.Context, opts launchOptions, userAg
 		Executable: executable,
 		Args:       devtoolsgate.ChromeArgs(launch),
 		ProxyAuth:  proxyAuth,
+		// Unset, a step's browser is ended only after the gate's default
+		// with no client; a running step holds one, so it is never capped.
+		MaxUnattended: opts.MaxUnattended,
 	})
 	if err != nil {
 		return startedBrowser{}, errors.Join(fmt.Errorf("launch browser: %w%s", err, sandboxHint(opts.NoSandbox)), killCertProxy(proxy))
