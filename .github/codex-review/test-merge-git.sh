@@ -51,7 +51,7 @@ g merge -q -s ours --no-ff -m "main recorded onto upstream: the parents the wron
 g checkout -q main
 TAG="$(g rev-parse 'v9.9.9^{commit}')"; UP1="$(g rev-parse 'v9.9.9~1')"; UP3="$(g rev-parse upstream)"; MAIN="$(g rev-parse main)"; BASE="$(g rev-parse main~1)"
 MAIN_TREE="$(g rev-parse 'main^{tree}')"; TAGOBJ="$(g rev-parse v9.9.9-annotated)"
-[ "$TAGOBJ" != "$TAG" ] && [ "$(g cat-file -t "$TAGOBJ")" = tag ] || { echo "fixture: the annotated tag should be its own object" >&2; exit 2; }
+if [ "$TAGOBJ" = "$TAG" ] || [ "$(g cat-file -t "$TAGOBJ")" != tag ]; then echo "fixture: the annotated tag should be its own object" >&2; exit 2; fi
 [ "$(g rev-parse 'repair^{tree}')" = "$MAIN_TREE" ] || { echo "fixture: the repair should have main's tree" >&2; exit 2; }
 
 mkdir -p "$TMP/bin"
