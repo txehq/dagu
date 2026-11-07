@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { hashText, stepHashes } from '../stepHashes';
+import { hashText, stepHashes, stepNeeds } from '../stepHashes';
 
 const SPEC = `type: graph
 steps:
@@ -265,3 +265,35 @@ describe('stepHashes reference lookups', () => {
     );
   });
 });
+
+// The builder's own dependencies, which internal/spec's
+// TestBuilderEdgesFixtureIsTheBuildersOwn writes and checks: every edge the
+// builder gives a step is one the hash follows, so a dependency rule the hash
+// copies wrongly, or a new one it misses, fails here for each case.
+describe('stepHashes follows every edge the builder builds', () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      path.resolve(
+        'src/features/visual-editor/run/__tests__/testdata/builder-edges.json'
+      ),
+      'utf8'
+    )
+  ) as { name: string; spec: string; depends: Record<string, string[]> }[];
+
+  it('has cases', () => {
+    expect(fixture.length).toBeGreaterThan(0);
+  });
+
+  for (const c of fixture) {
+    it(c.name, () => {
+      const needs = stepNeeds(c.spec);
+      for (const [step, deps] of Object.entries(c.depends)) {
+        const followed = needs.get(step) ?? [];
+        for (const dep of deps) {
+          expect(followed, `${step} needs ${dep}`).toContain(dep);
+        }
+      }
+    });
+  }
+});
+

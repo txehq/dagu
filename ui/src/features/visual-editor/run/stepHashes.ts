@@ -95,15 +95,74 @@ export function stepHashes(
   return hashes;
 }
 
+/** The steps of a definition and what each one needs. */
+interface StepGraph {
+  head: string;
+  items: Item[];
+  needs: Map<Item, Set<Item>>;
+}
+
+/**
+ * What each named step of a definition needs, by name: the graph its hash
+ * follows. It holds every dependency the server's builder gives the step
+ * (`depends`, the chain's entry before it, the routers that route to it),
+ * and the steps whose outputs it references. Exported so the graph can be
+ * checked against the builder's own edges.
+ */
+export function stepNeeds(
+  text: string,
+  details?: ApiDAGDetails
+): ReadonlyMap<string, readonly string[]> {
+  const out = new Map<string, string[]>();
+  const graph = buildStepGraph(text, details);
+  if (!graph) return out;
+  for (const item of graph.items) {
+    if (item.name === undefined) continue;
+    const needed = [...(graph.needs.get(item) ?? [])].flatMap((n) =>
+      n.name !== undefined ? [n.name] : []
+    );
+    out.set(item.name, needed.sort());
+  }
+  return out;
+}
+
 function computeStepHashes(
   text: string,
   details: ApiDAGDetails | undefined
 ): Map<string, string> {
   const out = new Map<string, string>();
+  const graph = buildStepGraph(text, details);
+  if (!graph) return out;
+  const { head, items, needs } = graph;
+
+  const memo = new Map<Item, string>();
+  const visiting = new Set<Item>();
+  const hashOf = (item: Item): string => {
+    const known = memo.get(item);
+    if (known !== undefined) return known;
+    // A cycle is a fault of the definition: it hashes to a fixed text.
+    if (visiting.has(item)) return 'cycle';
+    visiting.add(item);
+    const upstream = [...(needs.get(item) ?? [])].map(hashOf).sort();
+    visiting.delete(item);
+    const hash = hashText([head, item.canon, ...upstream].join('\u0000'));
+    memo.set(item, hash);
+    return hash;
+  };
+  for (const item of items) {
+    if (item.name !== undefined) out.set(item.name, hashOf(item));
+  }
+  return out;
+}
+
+function buildStepGraph(
+  text: string,
+  details: ApiDAGDetails | undefined
+): StepGraph | null {
   const model = parseDagDocLenient(text);
-  if (!model.ok) return out;
+  if (!model.ok) return null;
   const head = headOf(model);
-  if (head === null) return out;
+  if (head === null) return null;
   const names = resolveStepNames(model, details).byKey;
 
   const items: Item[] = [];
@@ -176,22 +235,5 @@ function computeStepHashes(
     }
   }
 
-  const memo = new Map<Item, string>();
-  const visiting = new Set<Item>();
-  const hashOf = (item: Item): string => {
-    const known = memo.get(item);
-    if (known !== undefined) return known;
-    // A cycle is a fault of the definition: it hashes to a fixed text.
-    if (visiting.has(item)) return 'cycle';
-    visiting.add(item);
-    const upstream = [...(needs.get(item) ?? [])].map(hashOf).sort();
-    visiting.delete(item);
-    const hash = hashText([head, item.canon, ...upstream].join('\u0000'));
-    memo.set(item, hash);
-    return hash;
-  };
-  for (const item of items) {
-    if (item.name !== undefined) out.set(item.name, hashOf(item));
-  }
-  return out;
+  return { head, items, needs };
 }
