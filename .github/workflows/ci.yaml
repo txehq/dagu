@@ -120,7 +120,7 @@ jobs:
           windows_installer_changed=false
           while IFS= read -r file; do
             case "${file}" in
-              *.go|go.mod|go.sum|Makefile|scripts/ci/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
+              *.go|go.mod|go.sum|Makefile|scripts/ci/*|txe/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
                 go_changed=true
                 ;;
             esac
