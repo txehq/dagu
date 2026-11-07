@@ -437,6 +437,7 @@ func TestMuxPrivateAttachInFlightIsNotRepeated(t *testing.T) {
 	}
 	target := tg.mux.targets["T1"]
 	require.NotNil(t, target)
+	c.autoAttach[""] = autoAttachSub{filter: defaultTargetFilter}
 	tg.mux.attachPrivateLocked(c, target, false)
 	tg.mux.attachPrivateLocked(c, target, false)
 	tg.mux.mu.Unlock()
@@ -448,5 +449,115 @@ func TestMuxPrivateAttachInFlightIsNotRepeated(t *testing.T) {
 	tg.mux.mu.Lock()
 	assert.Equal(t, first.SessionID, target.private[c])
 	assert.Empty(t, target.privateAttaching)
+	tg.mux.mu.Unlock()
+}
+
+// Ending a client's auto-attach at one scope ends what hung from it: its
+// private sessions on the children, its subscriptions beneath them and the
+// sessions those brought, and the holds it had on any of them.
+func TestMuxUnsubscribeDropsNestedSubscriptions(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a := tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	page := decodeAttached(t, a.waitEvent("Target.attachedToTarget", nil))
+	a.mustCall(page.SessionID, "Target.setAutoAttach", autoAttach(true))
+	created := a.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+	worker := decodeAttached(t, a.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.Type == "worker"
+	}))
+	assert.True(t, worker.WaitingForDebugger)
+
+	a.mustCall("", "Target.setAutoAttach", map[string]any{"autoAttach": false})
+	eventually(t, 5*time.Second, func() bool {
+		state := tg.state(a)
+		for _, s := range state.Sessions {
+			if !s.Auto {
+				return false
+			}
+		}
+		return slices.Contains(state.Resumed, child.TargetID)
+	}, "the page and worker sessions detached and the worker's hold released")
+	tg.mux.mu.Lock()
+	var c *client
+	for client := range tg.mux.clients {
+		c = client
+	}
+	assert.Empty(t, c.autoAttach, "no subscription survives at any scope")
+	tg.mux.mu.Unlock()
+
+	// Nothing more is attached for the client.
+	a.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	a.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+}
+
+// A private attach that answers after the client unsubscribed is let go of
+// again, and the client hears nothing of it.
+func TestMuxPendingAttachAfterUnsubscribeIsDetached(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a := tg.dial("")
+	a.mustCall("", "Browser.getVersion", nil)
+	before := len(tg.state(a).Sessions)
+
+	tg.mux.mu.Lock()
+	var c *client
+	for client := range tg.mux.clients {
+		c = client
+	}
+	target := tg.mux.targets["T1"]
+	c.autoAttach[""] = autoAttachSub{filter: defaultTargetFilter}
+	tg.mux.attachPrivateLocked(c, target, false)
+	delete(c.autoAttach, "")
+	tg.mux.mu.Unlock()
+
+	a.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+	eventually(t, 5*time.Second, func() bool { return len(tg.state(a).Sessions) == before }, "the unwanted session detached")
+	tg.mux.mu.Lock()
+	assert.Empty(t, target.private)
+	tg.mux.mu.Unlock()
+}
+
+// A child attach that answers after its parent target was detached neither
+// panics the gate nor keeps the session.
+func TestMuxChildAttachAfterParentGone(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a := tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	page := decodeAttached(t, a.waitEvent("Target.attachedToTarget", nil))
+	a.mustCall(page.SessionID, "Target.setAutoAttach", autoAttach(false))
+	created := a.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+	a.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.Type == "worker"
+	})
+
+	tg.mux.mu.Lock()
+	var c *client
+	for client := range tg.mux.clients {
+		c = client
+	}
+	worker := tg.mux.targets[child.TargetID]
+	parent := tg.mux.targets["T1"]
+	require.NotNil(t, worker)
+	require.NotNil(t, parent)
+	tg.mux.forgetPrivateLocked(c, worker, false)
+	tg.mux.attachPrivateLocked(c, worker, false)
+	tg.mux.forgetTargetLocked(parent)
+	tg.mux.mu.Unlock()
+
+	a.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+	// The gate still answers: it did not panic on the reply.
+	a.mustCall("", "Browser.getVersion", nil)
+	tg.mux.mu.Lock()
+	assert.Empty(t, worker.private, "the session for a parentless child is let go of")
 	tg.mux.mu.Unlock()
 }

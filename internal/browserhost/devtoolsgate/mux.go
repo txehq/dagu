@@ -519,7 +519,13 @@ func (m *mux) attachPrivateLocked(c *client, t *target, wait bool) {
 			t.attaching--
 			delete(t.privateAttaching, c)
 			session := sessionOf(result)
-			if cdpErr != nil || session == "" || !m.clientAlive(c) {
+			// Between the request and this reply the client may have gone
+			// or unsubscribed, and the target or its parent may have been
+			// detached; a session nobody wants is let go of again.
+			sub, wanted := c.autoAttach[t.parent]
+			parent, parentKnown := m.targets[t.parent]
+			stillThere := m.targets[t.id] == t && (t.parent == "" || parentKnown)
+			if cdpErr != nil || session == "" || !m.clientAlive(c) || !wanted || !sub.filter.matches(t.typ) || !stillThere {
 				if session != "" {
 					m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
 				}
@@ -531,8 +537,8 @@ func (m *mux) attachPrivateLocked(c *client, t *target, wait bool) {
 			t.private[c] = session
 			m.privateSessions[session] = t
 			outer := ""
-			if t.parent != "" {
-				outer = m.targets[t.parent].private[c]
+			if parentKnown {
+				outer = parent.private[c]
 			}
 			c.deliverEvent(outer, "Target.attachedToTarget", map[string]any{
 				"sessionId":          session,
@@ -651,6 +657,12 @@ func (m *mux) forgetTargetLocked(t *target) {
 	}
 	for c := range t.waiting {
 		delete(t.waiting, c)
+	}
+	// A subscription to the children of a target that is gone has nothing
+	// left to attach; the children's own detach events follow from the
+	// browser.
+	for c := range m.clients {
+		delete(c.autoAttach, t.id)
 	}
 	delete(m.gateSessions, t.gateSession)
 	delete(m.targets, t.id)
@@ -838,17 +850,26 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 func (m *mux) unsubscribeAutoAttachLocked(c *client, scope string) {
 	delete(c.autoAttach, scope)
 	for _, t := range m.targets {
-		if t.parent != scope {
-			continue
+		if t.parent == scope {
+			m.dropPrivateLocked(c, t)
 		}
-		if session, ok := t.private[c]; ok {
-			m.forgetPrivateLocked(c, t, false)
-			m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
-		}
-		if _, waiting := t.waiting[c]; waiting {
-			delete(t.waiting, c)
-			m.maybeResumeLocked(t)
-		}
+	}
+}
+
+// dropPrivateLocked ends c's private session on t, lets go of c's wait on
+// t, and, since c's sessions beneath t were attached through that one,
+// ends c's subscription to t's children and their sessions too.
+func (m *mux) dropPrivateLocked(c *client, t *target) {
+	if session, ok := t.private[c]; ok {
+		m.forgetPrivateLocked(c, t, false)
+		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+	}
+	if _, waiting := t.waiting[c]; waiting {
+		delete(t.waiting, c)
+		m.maybeResumeLocked(t)
+	}
+	if _, nested := c.autoAttach[t.id]; nested {
+		m.unsubscribeAutoAttachLocked(c, t.id)
 	}
 }
 
@@ -953,12 +974,7 @@ func (m *mux) detachFromTargetLocked(c *client, msg message, sessionID string) {
 		return
 	}
 	if t, ok := m.privateSessions[params.SessionID]; ok && t.private[c] == params.SessionID {
-		m.forgetPrivateLocked(c, t, false)
-		if _, waiting := t.waiting[c]; waiting {
-			delete(t.waiting, c)
-			m.maybeResumeLocked(t)
-		}
-		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, nil)
+		m.dropPrivateLocked(c, t)
 		c.deliverResult(msg.ID, sessionID, map[string]any{})
 		return
 	}
@@ -1013,14 +1029,7 @@ func (m *mux) removeClient(c *client) {
 		}
 	}
 	for _, t := range m.targets {
-		if session, ok := t.private[c]; ok {
-			m.forgetPrivateLocked(c, t, false)
-			m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
-		}
-		if _, waiting := t.waiting[c]; waiting {
-			delete(t.waiting, c)
-			m.maybeResumeLocked(t)
-		}
+		m.dropPrivateLocked(c, t)
 	}
 	if c.root != "" {
 		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": c.root}, nil)

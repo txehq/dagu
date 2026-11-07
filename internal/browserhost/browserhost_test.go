@@ -441,3 +441,29 @@ func TestReleaseLegacyRecordWhoseBrowserExited(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrNotExist)
 	assert.NoDirExists(t, record.UserDataDir)
 }
+
+// When nothing answers at a browser's address, only its gate is known to be
+// gone. A browser process the record still names must have exited before
+// its record and profile go; one that is alive is ended first.
+func TestReleaseEndsBrowserWhoseGateIsGone(t *testing.T) {
+	t.Parallel()
+
+	pid, _, exited := startHungBrowserProcess(t)
+	startedAt, ok := procutil.StartTime(pid)
+	require.True(t, ok)
+	store := browserhost.NewStore(t.TempDir())
+	record := ownedRecord(t, unreachableURL)
+	record.BrowserPID = pid
+	record.BrowserStartedAt = startedAt
+	require.NoError(t, store.Save(record))
+
+	require.NoError(t, browserhost.Release(context.Background(), store, record))
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the browser process was not ended")
+	}
+	_, err := store.Load(record.ID)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NoDirExists(t, record.UserDataDir)
+}

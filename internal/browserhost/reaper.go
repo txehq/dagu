@@ -79,12 +79,11 @@ func Release(ctx context.Context, store *Store, record Record) error {
 // still belongs to the process the record saw.
 func closeRecordedBrowser(ctx context.Context, record Record) error {
 	err := CloseBrowser(ctx, record.CDPURL)
-	if err == nil {
-		return nil
-	}
-	// A browser that is already gone, as one recorded before gates whose
-	// process exited, needs no ending.
-	if recordedBrowserGone(ctx, record) {
+	// Whatever the address said, the browser is closed only once it is gone:
+	// an address nothing answers at means the gate is gone, not that the
+	// browser behind it has left, and one recorded before gates whose
+	// process exited needs no ending at all.
+	if waitForRecordedExit(ctx, record) {
 		return nil
 	}
 	if endProcess(record.GatePID, record.GateStartedAt) && waitForRecordedExit(ctx, record) {
@@ -92,6 +91,9 @@ func closeRecordedBrowser(ctx context.Context, record Record) error {
 	}
 	if endProcess(record.BrowserPID, record.BrowserStartedAt) && waitForRecordedExit(ctx, record) {
 		return nil
+	}
+	if err == nil {
+		err = errors.New("the browser process did not exit")
 	}
 	return err
 }
