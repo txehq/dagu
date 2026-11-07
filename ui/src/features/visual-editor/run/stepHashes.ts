@@ -24,7 +24,9 @@ export function hashText(text: string): string {
 }
 
 // A reference to the output of another step: ${steps.<id>.outputs.<name>}.
-const STEP_REFERENCE = /\$\{steps\.([A-Za-z0-9_-]+)\./g;
+// The braces may pad the expression with spaces, which `scanReferences` in
+// internal/cmn/value/references.go trims before it reads the reference.
+const STEP_REFERENCE = /\$\{\s*steps\.([A-Za-z0-9_-]+)\./g;
 
 // The targets of a router: `with.routes`, or the deprecated top-level
 // `routes`. Targets are trimmed, as `buildStepRouter` in internal/spec/step.go

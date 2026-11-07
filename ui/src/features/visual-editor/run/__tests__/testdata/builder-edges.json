@@ -66,5 +66,33 @@
         "b"
       ]
     }
+  },
+  {
+    "name": "graph with an output reference braced",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo \"${steps.a.outputs.x}\"\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ]
+    }
+  },
+  {
+    "name": "graph with an output reference padded",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo \"${ steps.a.outputs.x }\"\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ]
+    }
+  },
+  {
+    "name": "graph with an output reference unbraced",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo $steps.a.outputs.x\n",
+    "depends": {
+      "a": [],
+      "b": []
+    }
   }
 ]

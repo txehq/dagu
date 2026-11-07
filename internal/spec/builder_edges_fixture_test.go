@@ -50,7 +50,9 @@ func TestBuilderEdgesFixtureIsTheBuildersOwn(t *testing.T) {
 		built := map[string][]string{}
 		for _, step := range dag.Steps {
 			deps := []string{}
-			for _, dep := range step.Depends {
+			// Every edge the step runs after: its depends, the chain's, and
+			// those inferred from the step outputs it references.
+			for _, dep := range step.AllDepends() {
 				name, ok := byKey[dep]
 				require.True(t, ok, "%s: %s depends on unknown %s", c.Name, step.Name, dep)
 				deps = append(deps, name)
