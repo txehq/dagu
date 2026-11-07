@@ -70,8 +70,13 @@ Two rules, both in `merge.sh` and both behind every check above:
   provenance repair. It merges with a merge commit, after the same checks, and in addition requires
   the repository to allow merge commits (read from the API, never assumed), the expected ancestor to
   be a commit's own id, reachable from the head and not yet from main, and then reads the merge
-  commit back and prints it only once the ancestor is reachable from it. For a repair it re-reads
-  main's tip as the last thing before the merge and refuses if main moved. `--repair` declares a provenance repair that
+  commit back and prints it only once the ancestor is reachable from it and its second parent is
+  the head. For a repair it re-reads main's tip as the last thing before the merge and refuses if
+  main moved. That is not an atomic check (`--match-head-commit` pins the head, not main): a move
+  in the seconds after that read is merged by GitHub onto the new tip, and the readback judges the
+  merge commit itself: a tree equal to its actual first parent's (main as it was at the merge) is
+  accepted and the move reported; a tree that differs is reported as **merged, with an error**
+  (exit 1) and left as it is, for a person to read main. Nothing is retried or rewritten. `--repair` declares a provenance repair that
   changes no file (`git merge -s ours --no-ff <upstream>` on main's tip): the head's parents must be
   exactly main's current tip and the expected ancestor, and its tree must be main's; a main that
   moved, a wrong parent or any file change refuses. A head with main's tree is accepted only this
@@ -93,7 +98,8 @@ Two rules, both in `merge.sh` and both behind every check above:
    has a flag that skips a check, and neither replaces the wrapper with a direct push.
    `test-merge-git.sh` runs both methods over a real git fixture: the squash of a sync loses the
    tag and the merge keeps it, the guard refuses the sync under squash, and the repair path refuses
-   a moved main, swapped parents, a wrong ancestor and a changed tree.
+   a moved main, swapped parents, a wrong ancestor and a changed tree, accepts a main that moved
+   after the last read, and reports a merge commit that differs from its first parent.
 
 `review-override` is a person's decision: the check names who added it, and refuses one a bot
 added. Adding or removing the label re-runs the check, so removing it revokes the pass.

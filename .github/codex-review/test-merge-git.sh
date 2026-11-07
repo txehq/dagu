@@ -70,8 +70,11 @@ compare() { # <a> <b>: the API's status of a...b
 merge_into_main() { # <squash|merge>
   [ "${*: -1}" = "$head" ] || { echo "gh: head mismatch" >&2; exit 1; }  # --match-head-commit
   g checkout -q main || exit 1
+  if [ -n "${ADVANCE_MAIN_AT_MERGE:-}" ]; then echo late >"$REPO/late" && g add late && g commit -q -m "main moved after the last read, before the merge"; fi
   if [ "$1" = squash ] || [ "${MERGE_AS:-}" = squash ]; then g merge -q --squash "$head" >/dev/null && g commit -q -m "PR #7 squashed" || exit 1
   else g merge -q --no-ff -m "Merge pull request #7" "$head" || exit 1; fi
+  # MERGE_TAINT: what GitHub must not do, a merge commit whose tree is not its first parent's.
+  if [ -n "${MERGE_TAINT:-}" ]; then echo taint >"$REPO/taint" && g add taint && g commit -q --amend --no-edit; fi
   g rev-parse HEAD >"$REPO/.merged"; echo merged
 }
 case "$*" in
@@ -107,7 +110,8 @@ run() {
     local name="$1" want_rc="$2" want="$3" merged="$4" branch="$5" out rc log; shift 5
     fresh "$name"; log="$TMP/$name.log"; : >"$log"
     out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="${FAIL_ON:-}" ALLOW_MERGE="${ALLOW_MERGE:-true}" MERGE_AS="${MERGE_AS:-}" \
-        ADVANCE_MAIN_AT_CHECKS="${ADVANCE_MAIN_AT_CHECKS:-}" REPO="$REPO" PR_HEAD="$branch" \
+        ADVANCE_MAIN_AT_CHECKS="${ADVANCE_MAIN_AT_CHECKS:-}" ADVANCE_MAIN_AT_MERGE="${ADVANCE_MAIN_AT_MERGE:-}" MERGE_TAINT="${MERGE_TAINT:-}" \
+        REPO="$REPO" PR_HEAD="$branch" \
         bash "$HERE/merge.sh" "$@" 7 "$(r rev-parse "$branch")" 2>&1)"; rc=$?
     if [ "$rc" = "$want_rc" ] && [[ "$out" == *"$want"* ]] \
        && { { [ "$merged" = merged ] && [ -s "$REPO/.merged" ]; } || { [ "$merged" = not-merged ] && [ ! -e "$REPO/.merged" ] && [ "$(r rev-parse main)" = "$MAIN" ]; } \
@@ -160,6 +164,16 @@ run repair-changed 1 "declared a repair but its tree" not-merged repair-changed 
 run repair-changed-is-a-sync 0 "is reachable from it" merged repair-changed --method merge --expect-ancestor "$TAG"
 # Main moves between the checks and the merge: the last read before the merge refuses.
 ADVANCE_MAIN_AT_CHECKS=1 run repair-main-moves-late 1 "main moved from $MAIN to " not-merged-moved repair --method merge --expect-ancestor "$TAG" --repair
+# Main moves after the last read, before the merge: GitHub merges the repair onto the new tip. The
+# merge commit's tree is its first parent's (the new main) and it reaches v9.9.9, so it is accepted
+# and the move is reported.
+ADVANCE_MAIN_AT_MERGE=1 run repair-main-moves-after-last-read 0 "(main had moved from $MAIN to " merged repair --method merge --expect-ancestor "$TAG" --repair
+check "repair-main-moves-after-last-read: tree is the new main's, v9.9.9 reachable, second parent is the repair" \
+    'reaches "$TAG" && [ "$(r rev-parse "main^{tree}")" = "$(r rev-parse "main^1^{tree}")" ] && [ -e "$REPO/late" ] && [ "$(r rev-parse main^2)" = "$(g rev-parse repair)" ]'
+# A merge commit whose tree is not its first parent'"'"'s is reported as merged, with an error, and left.
+MERGE_TAINT=1 run repair-tainted-merge 1 "PR #7 was merged, but the repair's merge commit" merged repair --method merge --expect-ancestor "$TAG" --repair
+check "repair-tainted-merge: the message names the tree and nothing was rewritten" \
+    '[[ "$(cat "$TMP/repair-tainted-merge.log")" == *"git/commits/$(r rev-parse main) "* ]] && [ -e "$REPO/taint" ] && reaches "$TAG"'
 # Main moved after the repair was built: its first parent is no longer main's tip.
 fresh repair-stale-build; r checkout -q main && echo later >"$REPO/later" && r add later && r commit -q -m "fork 2, after the repair was built"
 STALE="$TMP/repair-stale-build"

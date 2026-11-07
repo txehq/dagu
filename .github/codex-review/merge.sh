@@ -42,8 +42,15 @@
 #
 # Residual window, stated rather than hidden: a connector review or a run that changes on the SAME
 # head in the seconds between 4 and 5 is not seen; run this once the connector's state is final.
-# For a repair, main moving in those seconds makes GitHub merge the repair onto the new tip; the
-# readback then reports the tree and exits 1, and the result is checked by hand.
+# --match-head-commit pins the PR's head, not main: there is no atomic check of main's tip against
+# the merge. For a repair, main's tip is re-read as the last call before the merge and a moved main
+# refuses, but a move in the seconds after that read is merged by GitHub onto the new tip. So the
+# readback judges what was merged, from the merge commit itself: its second parent must be the
+# head, it must reach the expected ancestor, and for a repair its tree must equal its ACTUAL first
+# parent's tree (main as it was at the merge), not the tip read earlier, so a main that moved late
+# and took the repair with no file change is accepted and reported, while a merge commit that
+# differs from its first parent is reported as MERGED with an error (exit 1) and left as it is:
+# nothing is retried or rewritten, and the person reads main.
 #
 # Exit 0 merged (and, for --method merge, the readback confirmed); 1 refused, or merged but the
 # readback did not confirm (the message says which); 2 usage or a read failure (nothing merged).
@@ -199,8 +206,8 @@ if [ "$method" = squash ]; then
   exit 0
 fi
 if [ "$repair" = true ]; then
-  # The last read before the merge: a main that moved would make GitHub merge the repair onto the
-  # new tip, a different tree from the one checked. The window after this read is stated above.
+  # The last read before the merge: a main that moved is refused here; a move after this read is
+  # judged by the readback below. Neither is an atomic check (stated above).
   gh api "repos/$repo/branches/main" --jq .commit.sha >"$tmp/main2.sha" || unread "main's tip before the merge"
   read -r maintip2 <"$tmp/main2.sha" || unread "main's tip before the merge (empty)"
   [ "$maintip2" = "$maintip" ] || refuse "main moved from $maintip to $maintip2 while the repair was checked; rebuild the repair on its tip"
@@ -220,7 +227,14 @@ case "$reach" in
 esac
 gh api "repos/$repo/git/commits/$mergesha" --jq "$commit_tsv" >"$tmp/merge.tsv" || merged_but "its merge commit $mergesha could not be read"
 read -r mergetree mergeparents <"$tmp/merge.tsv" || merged_but "its merge commit $mergesha could not be read (no fields)"
+# GitHub's merge commit has main as it was at the merge first and the PR head second.
+p1="${mergeparents%%,*}"; p2="${mergeparents#*,}"
+[ "$p2" = "$want" ] && [[ "$p1" =~ ^[0-9a-f]{40}$ ]] && [ "$p1" != "$p2" ] || merged_but "its merge commit $mergesha has parents '$mergeparents', not main and the head $want"
+moved=""
+[ "$p1" = "$maintip" ] || moved=" (main had moved from $maintip to $p1 by the merge)"
 if [ "$repair" = true ]; then
-  [ "$mergetree" = "$maintree" ] || merged_but "the repair's merge commit $mergesha has tree $mergetree, not main's $maintree"
+  gh api "repos/$repo/git/commits/$p1" --jq "$commit_tsv" >"$tmp/p1.tsv" || merged_but "its merge commit's first parent $p1 could not be read"
+  read -r p1tree _ <"$tmp/p1.tsv" || merged_but "its merge commit's first parent $p1 could not be read (no fields)"
+  [ "$mergetree" = "$p1tree" ] || merged_but "the repair's merge commit $mergesha has tree $mergetree, not its first parent's $p1tree: the repair changed files$moved"
 fi
-echo "merge.sh: merged PR #$pr as $mergesha (parents $mergeparents, tree $mergetree); $anc is reachable from it"
+echo "merge.sh: merged PR #$pr as $mergesha (parents $mergeparents, tree $mergetree)$moved; $anc is reachable from it"
