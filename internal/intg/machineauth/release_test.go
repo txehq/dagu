@@ -62,7 +62,7 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 	}
 	for _, mb := range m.Builds {
 		b := builds[mb.Name]
-		run := newMatrixRun(t, b, record)
+		run := newMatrixRun(t, b, resultsDir, record)
 		res.Builds = append(res.Builds, resultBuild{Name: b.name, Path: b.path, SHA256: b.sha256, Version: run.version})
 		run.cells()
 		// The pairs run while A's credential is still good at the issuer: the
@@ -93,7 +93,7 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 	}
 	require.Empty(t, failed, "cells failed")
 	if res.Partial {
-		t.Logf("PARTIAL: the long cells were not run; this result is a smoke of %d build(s), not a release proof", len(res.Builds))
+		t.Logf("PARTIAL: some cells were not run (see the table); this result is a smoke of %d build(s), not a release proof", len(res.Builds))
 	} else if problems := verifyResults(m, res, true); len(problems) > 0 {
 		t.Fatalf("the run passed its cells but the verifier does not hold it as a proof:\n  %s", strings.Join(problems, "\n  "))
 	} else {
@@ -140,18 +140,19 @@ func loadMatrixSpec(t *testing.T, spec string) (*manifest, string) {
 
 // matrixRun is one build's run: its own rig, hub and store.
 type matrixRun struct {
-	t       *testing.T
-	b       build
-	r       *rig
-	version string
-	record  func(cellResult)
+	t          *testing.T
+	b          build
+	r          *rig
+	version    string
+	record     func(cellResult)
+	resultsDir string
 	// ok is false once setup failed; later cells are then not run.
 	ok bool
 }
 
-func newMatrixRun(t *testing.T, b build, record func(cellResult)) *matrixRun {
+func newMatrixRun(t *testing.T, b build, resultsDir string, record func(cellResult)) *matrixRun {
 	t.Helper()
-	run := &matrixRun{t: t, b: b, r: newRig(t), record: record, ok: true}
+	run := &matrixRun{t: t, b: b, r: newRig(t), record: record, resultsDir: resultsDir, ok: true}
 	run.cell("setup", run.setup)
 	return run
 }
@@ -185,10 +186,39 @@ func (run *matrixRun) cellAs(name string, worker build, body func() string) {
 	})
 	c.Reasons = run.r.refusalsSinceMark()
 	c.Status, c.Detail = cellStatus(passed, ran, detail)
-	if c.Status == statusFail && name == "setup" {
-		run.ok = false
+	if c.Status == statusFail {
+		run.keepLogs(name)
+		if name == "setup" {
+			run.ok = false
+		}
 	}
 	run.record(c)
+}
+
+// keepLogs copies the rig's process logs beside the results when a cell
+// fails: the test's directory is gone when the test ends, and a failed gate
+// needs its evidence. Tokens never reach these logs.
+func (run *matrixRun) keepLogs(cell string) {
+	if run.resultsDir == "" {
+		return
+	}
+	dst := filepath.Join(run.resultsDir, fmt.Sprintf("machineauth-logs-%s-%s-%s", run.b.name, cell, time.Now().UTC().Format("20060102T150405Z")))
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		run.t.Logf("keep logs: %v", err)
+		return
+	}
+	entries, err := os.ReadDir(filepath.Join(run.r.dir, "logs"))
+	if err != nil {
+		run.t.Logf("keep logs: %v", err)
+		return
+	}
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(run.r.dir, "logs", e.Name()))
+		if err == nil {
+			_ = os.WriteFile(filepath.Join(dst, e.Name()), raw, 0o600)
+		}
+	}
+	run.t.Logf("logs of the failed cell %s kept under %s", cell, dst)
 }
 
 func (run *matrixRun) notRun(name, why string) {
@@ -587,21 +617,54 @@ func (run *matrixRun) staleAttempt() string {
 	// zombie scan, every defaultZombieDetectionInterval.
 	require.GreaterOrEqual(t, expiredAfter, dagrun.DefaultStaleLeaseThreshold-5*time.Second, "the attempt expired before the lease threshold")
 	require.LessOrEqual(t, expiredAfter, dagrun.DefaultStaleLeaseThreshold+defaultZombieDetectionInterval+15*time.Second, "the attempt expired long after the lease threshold")
+	// Between the failure and the coordinator's own reconciliation of the
+	// lease (its zombie scan, every defaultZombieDetectionInterval), a run
+	// heartbeat from the worker repairs the failure: the hub's rule for a worker
+	// that was alive after all, not a late write. The thaw waits for the
+	// coordinator to confirm the stale run (its log says so) or for a scan
+	// interval and a margin, so the thawed worker's writes are late by the
+	// contract's own clock and must be refused.
+	confirmDeadline := time.Now().Add(defaultZombieDetectionInterval + 15*time.Second)
+	for time.Now().Before(confirmDeadline) {
+		if len(r.hubLinesSinceMark("Marked stale distributed run as FAILED", id)) > 0 {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
 	r.thaw(old)
-	time.Sleep(20 * time.Second)
+	// The thawed worker's late writes for the expired attempt must land
+	// nowhere: the hub refuses its status (its log says so), the worker's
+	// streams fail (FailedPrecondition). The run itself may move on without
+	// it: the hub may hand the expired attempt again to the healthy worker of
+	// the machine, as a new attempt; that is recorded, and held to be the new
+	// worker's. What may never happen is the expired attempt coming back.
+	var seen []string
+	for range 12 {
+		time.Sleep(5 * time.Second)
+		now := r.run("hold-a", id)
+		seen = append(seen, fmt.Sprintf("%s/%s/%s", now.status, now.worker, now.attempt))
+	}
 	after := r.run("hold-a", id)
-	require.Equal(t, s.status, after.status, "the thawed worker changed the run's state")
-	require.Equal(t, s.finished, after.finished, "the thawed worker changed the run's end")
-	// Each late write of the thawed worker is refused on its own: the status
-	// by the hub (its log says so), the streams at the worker (FailedPrecondition).
+	repaired := r.hubLinesSinceMark("Repaired stale distributed run failure from fresh heartbeat")
+	require.Empty(t, repaired, "the hub took the thawed worker's heartbeat as fresh and repaired the failure; the thaw came too early for a late-write proof; seen: %v", seen)
 	statusRefused := r.hubLinesSinceMark("Rejected remote status update", "stale attempt")
-	require.NotEmpty(t, statusRefused, "the hub did not refuse the thawed worker's status as stale")
+	require.NotEmpty(t, statusRefused, "the hub did not refuse the thawed worker's status as stale; run after the thaw: %+v; seen: %v", after, seen)
 	oldLines := linesOfLog(t, old.log, 0)
 	streamsRefused := linesWith(oldLines, "stale attempt", "FailedPrecondition")
 	require.NotEmpty(t, streamsRefused, "the thawed worker's streams were not refused as stale")
 	artifactRefused := len(linesWith(oldLines, "rtifact", "stale attempt"))
-	return fmt.Sprintf("attempt expired %s after the freeze (%s, threshold %s); after the thaw: status refused ×%d, streams refused ×%d, artifact refusals %d; final state unchanged",
-		expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, len(statusRefused), len(streamsRefused), artifactRefused)
+	var outcome string
+	switch {
+	case after.attempt == s.attempt:
+		require.Equal(t, s.status, after.status, "the expired attempt came back to life: %+v; seen: %v", after, seen)
+		require.Equal(t, s.finished, after.finished, "the expired attempt's end moved: %+v; seen: %v", after, seen)
+		outcome = "the run stayed " + s.status + " on the expired attempt"
+	default:
+		require.Equal(t, r.A().id+"@new", after.worker, "a new attempt %s ran on %s, not on the machine's healthy worker; seen: %v", after.attempt, after.worker, seen)
+		outcome = fmt.Sprintf("the hub handed the run again as attempt %s to the healthy worker (%s)", after.attempt, after.status)
+	}
+	return fmt.Sprintf("attempt %s expired %s after the freeze (%s, threshold %s); after the thaw: status refused ×%d, streams refused ×%d, artifact refusals %d; %s",
+		s.attempt, expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, len(statusRefused), len(streamsRefused), artifactRefused, outcome)
 }
 
 // defaultZombieDetectionInterval is the scheduler's default
