@@ -18,6 +18,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/service/worker"
 	"github.com/dagucloud/dagu/v2/internal/test"
 )
 
@@ -62,12 +64,15 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 		b := builds[mb.Name]
 		run := newMatrixRun(t, b, record)
 		res.Builds = append(res.Builds, resultBuild{Name: b.name, Path: b.path, SHA256: b.sha256, Version: run.version})
-		run.cells(m.Long)
+		run.cells()
+		// The pairs run while A's credential is still good at the issuer: the
+		// long cells end with the provider refusing it.
 		for _, other := range m.Builds {
 			if other.Name != b.name {
 				run.pair(builds[other.Name])
 			}
 		}
+		run.longCells(m.Long)
 		run.close()
 	}
 	for _, c := range res.Cells {
@@ -170,20 +175,18 @@ func (run *matrixRun) cellAs(name string, worker build, body func() string) {
 	}
 	run.r.markLog()
 	var detail string
+	ran := false
 	passed := run.t.Run(fmt.Sprintf("%s/%s/%s", run.b.name, worker.name, name), func(t *testing.T) {
 		saved := run.r.t
 		run.r.t = t
 		defer func() { run.r.t = saved }()
 		detail = body()
+		ran = true
 	})
 	c.Reasons = run.r.refusalsSinceMark()
-	if passed {
-		c.Status, c.Detail = statusPass, detail
-	} else {
-		c.Status, c.Detail = statusFail, "see the subtest output"
-		if name == "setup" {
-			run.ok = false
-		}
+	c.Status, c.Detail = cellStatus(passed, ran, detail)
+	if c.Status == statusFail && name == "setup" {
+		run.ok = false
 	}
 	run.record(c)
 }
@@ -192,8 +195,8 @@ func (run *matrixRun) notRun(name, why string) {
 	run.record(cellResult{Name: name, HubBuild: run.b.name, WorkerBuild: run.b.name, Status: statusNotRun, Detail: why})
 }
 
-// cells runs every cell of one build, the long ones only when asked.
-func (run *matrixRun) cells(long bool) {
+// cells runs every short cell of one build.
+func (run *matrixRun) cells() {
 	run.cell("pos-native", func() string { return run.pinnedRun("a-native", run.b, "native") })
 	run.cell("pos-channel-http", func() string { return run.pinnedRun("a-channel", run.b, "channel") })
 	run.cell("pos-channel-tls", func() string { return run.pinnedRun("a-tls", run.b, "tls") })
@@ -207,6 +210,10 @@ func (run *matrixRun) cells(long bool) {
 	run.cell("cancel", run.cancelFromHub)
 	run.cell("revoke-owner", run.revokeOwner)
 	run.cell("reenrol", run.reenrol)
+}
+
+// longCells runs the slow cells, or records them as not run.
+func (run *matrixRun) longCells(long bool) {
 	if !long {
 		for _, name := range longCells {
 			run.notRun(name, "long cells are off (manifest long=false / DAGU_MACHINEAUTH_LONG unset): a smoke, not a release proof")
@@ -271,7 +278,8 @@ func (run *matrixRun) setup() string {
 	}
 	r.writeDAG("pin-a", r.A(), `echo "pinned to A"`, "sleep 2", "echo done-a")
 	r.writeDAG("pin-b", r.B(), `echo "pinned to B"`, "sleep 2", "echo done-b")
-	r.writeDAG("hold-a", r.A(), "echo hold-start", "for i in $(seq 1 300); do echo tick $i; sleep 1; done", "echo hold-end")
+	r.writeDAG("hold-a", r.A(), "echo hold-start", `mkdir -p "$DAG_RUN_ARTIFACTS_DIR" && echo late > "$DAG_RUN_ARTIFACTS_DIR/late.txt"`,
+		"for i in $(seq 1 300); do echo tick $i; sleep 1; done", "echo hold-end")
 	return fmt.Sprintf("hub %s version %s; owners, persons, machines A and B enrolled (worker and reviewer) through the issuer", run.b.name, run.version)
 }
 
@@ -512,16 +520,20 @@ func (run *matrixRun) revokeOwner() string {
 	require.NotEqual(t, "succeeded", s.status, "the revoked worker's run succeeded")
 	counts := r.refusalsSinceMark()
 	require.Positive(t, counts["not_enrolled"], "no not_enrolled refusal logged: %v", counts)
-	tail, err := os.ReadFile(w.log)
-	require.NoError(t, err)
-	require.Contains(t, string(tail), "refused this worker for the whole bound", "the worker did not report stopping at the bound")
-	lateWrites := 0
-	for reason, n := range counts {
-		if reason == "not_enrolled" {
-			lateWrites += n
-		}
-	}
-	return fmt.Sprintf("run %s after %s; %d late calls refused not_enrolled; the worker stopped the step at its bound", s.status, ended, lateWrites)
+	// The worker's own account, with times: the first refusal it met, and the
+	// moment it cancelled the run, which the contract puts no later than
+	// RefusedCallsStopAfter after that first refusal.
+	lines := linesOfLog(t, w.log, 0)
+	firstRefusal, ok := firstTime(lines, "Owner coordinator refuses this worker")
+	require.True(t, ok, "the worker did not log the coordinator's first refusal")
+	require.LessOrEqual(t, firstRefusal.Sub(t0), 10*time.Second, "the first refusal came %s after the revocation", firstRefusal.Sub(t0))
+	cancelled, ok := firstTime(lines, "refused this worker for the whole bound")
+	require.True(t, ok, "the worker did not report stopping at the bound")
+	stopAfter := cancelled.Sub(firstRefusal)
+	require.LessOrEqual(t, stopAfter, worker.RefusedCallsStopAfter+5*time.Second, "the worker stopped the step %s after the first refusal; the bound is %s", stopAfter, worker.RefusedCallsStopAfter)
+	require.GreaterOrEqual(t, stopAfter, worker.RefusedCallsStopAfter-5*time.Second, "the worker stopped the step %s after the first refusal, before its bound %s", stopAfter, worker.RefusedCallsStopAfter)
+	return fmt.Sprintf("first refusal %s after the revoke; the worker cancelled the run %s after it (bound %s); run %s %s after the revoke; %d late calls refused not_enrolled",
+		firstRefusal.Sub(t0).Round(time.Second), stopAfter.Round(time.Second), worker.RefusedCallsStopAfter, s.status, ended, counts["not_enrolled"])
 }
 
 // reenrol: enrolling the revoked machine again is a new generation of the
@@ -570,15 +582,31 @@ func (run *matrixRun) staleAttempt() string {
 	expiredAfter := time.Since(frozenAt).Round(time.Second)
 	require.True(t, terminal(s.status), "the frozen attempt did not expire in 400 s: %+v", s)
 	require.Contains(t, s.errText, "lease expired", "the run's error names the expired lease: %q", s.errText)
+	// The production thresholds: the lease expires DefaultStaleLeaseThreshold
+	// after the last accepted run heartbeat, and the scheduler notices on its
+	// zombie scan, every defaultZombieDetectionInterval.
+	require.GreaterOrEqual(t, expiredAfter, dagrun.DefaultStaleLeaseThreshold-5*time.Second, "the attempt expired before the lease threshold")
+	require.LessOrEqual(t, expiredAfter, dagrun.DefaultStaleLeaseThreshold+defaultZombieDetectionInterval+15*time.Second, "the attempt expired long after the lease threshold")
 	r.thaw(old)
 	time.Sleep(20 * time.Second)
 	after := r.run("hold-a", id)
 	require.Equal(t, s.status, after.status, "the thawed worker changed the run's state")
 	require.Equal(t, s.finished, after.finished, "the thawed worker changed the run's end")
-	stale := r.hubLinesSinceMark("stale attempt")
-	require.NotEmpty(t, stale, "the hub logged no stale-attempt refusal after the thaw")
-	return fmt.Sprintf("attempt expired %s after the freeze (%s); %d stale-attempt refusals after the thaw; final state unchanged", expiredAfter, s.status, len(stale))
+	// Each late write of the thawed worker is refused on its own: the status
+	// by the hub (its log says so), the streams at the worker (FailedPrecondition).
+	statusRefused := r.hubLinesSinceMark("Rejected remote status update", "stale attempt")
+	require.NotEmpty(t, statusRefused, "the hub did not refuse the thawed worker's status as stale")
+	oldLines := linesOfLog(t, old.log, 0)
+	streamsRefused := linesWith(oldLines, "stale attempt", "FailedPrecondition")
+	require.NotEmpty(t, streamsRefused, "the thawed worker's streams were not refused as stale")
+	artifactRefused := len(linesWith(oldLines, "rtifact", "stale attempt"))
+	return fmt.Sprintf("attempt expired %s after the freeze (%s, threshold %s); after the thaw: status refused ×%d, streams refused ×%d, artifact refusals %d; final state unchanged",
+		expiredAfter, s.status, dagrun.DefaultStaleLeaseThreshold, len(statusRefused), len(streamsRefused), artifactRefused)
 }
+
+// defaultZombieDetectionInterval is the scheduler's default
+// (scheduler.zombie_detection_interval), as the configuration loader sets it.
+const defaultZombieDetectionInterval = 45 * time.Second
 
 // revokeAtIssuer: the provider refuses the worker's refresh; the worker ends
 // and presents nothing more. Run last: A's client stays refused.
@@ -604,12 +632,22 @@ func (run *matrixRun) revokeAtIssuer() string {
 	}
 	require.True(t, noticed, "the worker did not notice the provider's refusal within 330 s")
 	noticedAfter := time.Since(t0).Round(time.Second)
+	// From here the worker must present nothing: the hub refuses nothing from
+	// it (no refusal lines) and hears nothing from it (its last heartbeat does
+	// not advance; or it is no longer listed), and a run for its machine is
+	// not taken.
 	r.markLog()
+	heardBefore, listedBefore := r.workerLastHeartbeat(r.A().id)
 	id := r.enqueue("pin-a")
 	time.Sleep(45 * time.Second)
 	s := r.run("pin-a", id)
 	require.Equal(t, "queued", s.status, "a run was handed to a worker whose credential the provider refused: %+v", s)
 	counts := r.refusalsSinceMark()
 	require.Empty(t, counts, "the worker presented a token after the provider refused it: %v", counts)
-	return fmt.Sprintf("%d refresh token(s) dropped; the worker noticed at its renewal %s later and presented nothing more; a new run stayed queued", dropped, noticedAfter)
+	heardAfter, listedAfter := r.workerLastHeartbeat(r.A().id)
+	if listedBefore && listedAfter {
+		require.Equal(t, heardBefore, heardAfter, "the hub heard the worker again after the provider's refusal")
+	}
+	return fmt.Sprintf("%d refresh token(s) dropped; the worker noticed at its renewal %s later; afterwards no refusal, no heartbeat heard (listed before=%v after=%v), a new run stayed queued",
+		dropped, noticedAfter, listedBefore, listedAfter)
 }

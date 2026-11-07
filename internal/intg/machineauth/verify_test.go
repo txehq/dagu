@@ -155,6 +155,8 @@ func verifyResults(m *manifest, r *results, checkDisk bool) []string {
 		switch {
 		case !known:
 			add("results hold build %s, which the manifest does not name", b.Name)
+		case b.Path != mb.Path:
+			add("build %s ran from %s, the manifest names %s", b.Name, b.Path, mb.Path)
 		case b.SHA256 != mb.SHA256:
 			add("build %s ran as sha256 %s, the manifest names %s", b.Name, b.SHA256, mb.SHA256)
 		case mb.Version != "" && b.Version != mb.Version:
@@ -334,6 +336,9 @@ func TestVerifyFailsClosed(t *testing.T) {
 		{"a digest that is not the manifest's", func(_ *manifest, r *results) {
 			r.Builds[1].SHA256 = strings.Repeat("d", 64)
 		}, "ran as sha256 dddd"},
+		{"a path that is not the manifest's", func(_ *manifest, r *results) {
+			r.Builds[0].Path = "/elsewhere/dagu"
+		}, "ran from /elsewhere/dagu"},
 		{"a version that is not the manifest's", func(_ *manifest, r *results) {
 			r.Builds[0].Version = "0.0.0-txe.18"
 		}, `reported version "0.0.0-txe.18", the manifest names "0.0.0-txe.19"`},
@@ -405,6 +410,35 @@ func TestLoadManifestRefusesBadShapes(t *testing.T) {
 		_, err := loadManifest(write(t, body))
 		assert.Error(t, err, name)
 	}
+}
+
+// cellStatus turns a subtest's outcome into a cell status. t.Run reports true
+// for a subtest the -run filter excluded or that skipped itself, so a body that
+// did not run to its end is never a pass.
+func cellStatus(passed, ran bool, detail string) (string, string) {
+	switch {
+	case passed && ran:
+		return statusPass, detail
+	case passed:
+		return statusNotRun, "the subtest did not run to its end (excluded by the test filter, or skipped)"
+	default:
+		return statusFail, "see the subtest output"
+	}
+}
+
+// A subtest the -run filter excluded, or that skipped itself, reports true
+// from t.Run without having run; the cell is then not run, never a pass.
+func TestCellStatusNeverPassesWhatDidNotRun(t *testing.T) {
+	t.Parallel()
+	status, _ := cellStatus(true, true, "ok")
+	assert.Equal(t, statusPass, status)
+	status, detail := cellStatus(true, false, "")
+	assert.Equal(t, statusNotRun, status)
+	assert.Contains(t, detail, "did not run")
+	status, _ = cellStatus(false, false, "")
+	assert.Equal(t, statusFail, status)
+	status, _ = cellStatus(false, true, "")
+	assert.Equal(t, statusFail, status)
 }
 
 // DAGU_MACHINEAUTH_VERIFY=<results.json> with DAGU_MACHINEAUTH_MATRIX=<manifest>

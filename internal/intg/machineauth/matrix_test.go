@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -157,17 +158,34 @@ func contractReasons(t *testing.T) []string {
 			}
 			for _, spec := range gen.Specs {
 				vs := spec.(*ast.ValueSpec)
-				if ident, ok := vs.Type.(*ast.Ident); !ok || ident.Name != "Reason" {
-					continue
-				}
-				for _, n := range vs.Names {
-					names = append(names, n.Name)
+				for i, n := range vs.Names {
+					if isReasonConst(vs, i) {
+						names = append(names, n.Name)
+					}
 				}
 			}
 		}
 	}
 	sort.Strings(names)
 	return names
+}
+
+// isReasonConst says whether the i-th name of a const spec is a Reason: typed
+// so, written as a Reason(...) conversion, or named Reason… as the package
+// names them (a constant inheriting its type from an earlier spec has no type
+// of its own in the source).
+func isReasonConst(vs *ast.ValueSpec, i int) bool {
+	if ident, ok := vs.Type.(*ast.Ident); ok && ident.Name == "Reason" {
+		return true
+	}
+	if i < len(vs.Values) {
+		if call, ok := vs.Values[i].(*ast.CallExpr); ok {
+			if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "Reason" {
+				return true
+			}
+		}
+	}
+	return strings.HasPrefix(vs.Names[i].Name, "Reason")
 }
 
 // reasonValues maps the contract's constant names to their values, from the

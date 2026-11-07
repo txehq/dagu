@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -259,8 +260,8 @@ func (r *rig) stopAll() {
 	r.mu.Lock()
 	procs := append([]*proc{}, r.procs...)
 	r.mu.Unlock()
-	for i := len(procs) - 1; i >= 0; i-- {
-		r.stop(procs[i], 10*time.Second)
+	for _, proc := range slices.Backward(procs) {
+		r.stop(proc, 10*time.Second)
 	}
 	if r.edge != nil {
 		r.edge.Close()
@@ -346,52 +347,117 @@ func (r *rig) markLog() {
 
 var reasonRE = regexp.MustCompile(`msg="Coordinator call refused".* reason=([a-z_]+)`)
 
-// refusalsSinceMark counts the hub's refusals by reason since the last mark.
+// refusalsSinceMark counts the hub's refusals by reason since the last mark. A
+// log that cannot be read fails the test: zero refusals must mean none.
 func (r *rig) refusalsSinceMark() map[string]int {
 	counts := map[string]int{}
 	if r.hub == nil {
 		return counts
 	}
-	f, err := os.Open(r.hub.log)
-	if err != nil {
-		return counts
-	}
-	defer func() { _ = f.Close() }()
-	_, _ = f.Seek(r.logMark, io.SeekStart)
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
-	for sc.Scan() {
-		if m := reasonRE.FindStringSubmatch(sc.Text()); m != nil {
+	for _, line := range linesOfLog(r.t, r.hub.log, r.logMark) {
+		if m := reasonRE.FindStringSubmatch(line); m != nil {
 			counts[m[1]]++
 		}
 	}
 	return counts
 }
 
-// hubLinesSinceMark returns the hub's log lines since the mark that contain any
+// hubLinesSinceMark returns the hub's log lines since the mark that contain all
 // of the given fragments.
 func (r *rig) hubLinesSinceMark(fragments ...string) []string {
-	var out []string
 	if r.hub == nil {
 		return nil
 	}
-	f, err := os.Open(r.hub.log)
-	if err != nil {
-		return nil
-	}
+	return linesWith(linesOfLog(r.t, r.hub.log, r.logMark), fragments...)
+}
+
+// linesOfLog reads a log file from offset; it fails the test when it cannot.
+func linesOfLog(t *testing.T, path string, offset int64) []string {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err, "read the log %s", filepath.Base(path))
 	defer func() { _ = f.Close() }()
-	_, _ = f.Seek(r.logMark, io.SeekStart)
+	_, err = f.Seek(offset, io.SeekStart)
+	require.NoError(t, err)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	var lines []string
 	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	require.NoError(t, sc.Err(), "read the log %s", filepath.Base(path))
+	return lines
+}
+
+// linesWith keeps the lines holding every fragment.
+func linesWith(lines []string, fragments ...string) []string {
+	var out []string
+	for _, line := range lines {
+		keep := true
 		for _, fr := range fragments {
-			if strings.Contains(sc.Text(), fr) {
-				out = append(out, sc.Text())
+			if !strings.Contains(line, fr) {
+				keep = false
 				break
 			}
 		}
+		if keep {
+			out = append(out, line)
+		}
 	}
 	return out
+}
+
+// logTimeRE finds a line's timestamp in either of the formats the processes
+// write: text (time=2026-…Z) and JSON ("time":"2026-…Z").
+var logTimeRE = regexp.MustCompile(`(?:^time=|"time":")(\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2}))`)
+
+// firstTime returns the timestamp of the first line holding every fragment.
+func firstTime(lines []string, fragments ...string) (time.Time, bool) {
+	for _, line := range linesWith(lines, fragments...) {
+		if m := logTimeRE.FindStringSubmatch(line); m != nil {
+			if ts, err := time.Parse(time.RFC3339Nano, m[1]); err == nil {
+				return ts, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// urlRE finds URLs in text that is about to be shown.
+var urlRE = regexp.MustCompile(`https?://[^\s"']+`)
+
+// redactText keeps each URL's host and path only, so no query (a code, a
+// state, a challenge) reaches a test log.
+func redactText(s string) string {
+	return urlRE.ReplaceAllStringFunc(s, redactURL)
+}
+
+// redactErr is err with its URLs redacted, for a message.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", redactText(err.Error()))
+}
+
+// workerLastHeartbeat reports when the hub last heard worker id, and whether
+// the hub lists it at all.
+func (r *rig) workerLastHeartbeat(id string) (string, bool) {
+	code, raw := r.api(http.MethodGet, "/workers", r.tokens["admin"], nil)
+	require.Equal(r.t, http.StatusOK, code, "list workers")
+	var out struct {
+		Workers []struct {
+			ID            string `json:"id"`
+			LastHeartbeat string `json:"lastHeartbeatAt"`
+		} `json:"workers"`
+	}
+	require.NoError(r.t, json.Unmarshal(raw, &out))
+	for _, w := range out.Workers {
+		if w.ID == id {
+			return w.LastHeartbeat, true
+		}
+	}
+	return "", false
 }
 
 // ── REST ─────────────────────────────────────────────────────────────────────
@@ -512,7 +578,7 @@ func (r *rig) hubSignIn(person string) string {
 	next := r.hubURL() + "/oidc-login"
 	for range 8 {
 		resp, err := b.get(next)
-		require.NoError(r.t, err)
+		require.NoError(r.t, redactErr(err))
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		location := resp.Header.Get("Location")
@@ -520,7 +586,7 @@ func (r *rig) hubSignIn(person string) string {
 			r.t.Fatalf("browser sign-in of %s stopped at HTTP %d (%s)", person, resp.StatusCode, redactURL(next))
 		}
 		loc, err := resp.Location()
-		require.NoError(r.t, err)
+		require.NoError(r.t, redactErr(err))
 		if strings.HasPrefix(loc.Fragment, "token=") {
 			token, _ := strings.CutPrefix(loc.Fragment, "token=")
 			token, _, _ = strings.Cut(token, "&")
@@ -558,41 +624,83 @@ func (r *rig) cliEnv(m *machineHome) []string {
 	return []string{"PATH=" + rigPath, "HOME=" + m.home(), "TXE_DAGU_HOME=" + m.txe(), "DAGU_HOME=" + m.dagu(), "TXE_SESSION=machineauth-matrix"}
 }
 
-// cli runs the CLI of the current hub build as machine m's person and returns
-// its stdout; it fails the test on a non-zero exit.
+// cliTimeout bounds one CLI command.
+const cliTimeout = 120 * time.Second
+
+// cliCommand makes a bounded CLI command of the current hub build as machine
+// m's person, in its own process group, which the test's cleanup ends if the
+// command is still running then.
+func (r *rig) cliCommand(m *machineHome, args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	cmd := exec.CommandContext(ctx, r.hubBuild.path, args...)
+	cmd.Env = r.cliEnv(m)
+	cmdutil.SetupCommand(cmd)
+	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
+	cmd.WaitDelay = 5 * time.Second
+	r.t.Cleanup(func() {
+		cancel()
+		if cmd.Process != nil && cmd.ProcessState == nil {
+			_ = cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination())
+		}
+	})
+	return cmd, cancel
+}
+
+// cli runs a CLI command and returns its stdout; it fails the test on a
+// non-zero exit, showing stderr with its URLs redacted.
 func (r *rig) cli(m *machineHome, args ...string) []byte {
 	r.t.Helper()
-	cmd := exec.Command(r.hubBuild.path, args...)
-	cmd.Env = r.cliEnv(m)
+	cmd, cancel := r.cliCommand(m, args...)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	require.NoError(r.t, cmd.Run(), "dagu %s: %s", strings.Join(args, " "), truncate(stderr.String(), 400))
+	require.NoError(r.t, cmd.Run(), "dagu %s: %s", strings.Join(args, " "), truncate(redactText(stderr.String()), 400))
 	return stdout.Bytes()
 }
 
 var signInURLRE = regexp.MustCompile(`https?://127\.0\.0\.1:\d+/auth\?\S+`)
 
+// lockedText is a string builder two goroutines share.
+type lockedText struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedText) write(s string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.b.WriteString(s)
+}
+
+func (l *lockedText) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 // cliSignIn runs a CLI command that signs the person in (txe login, txe
 // enrol) with --no-browser: it reads the sign-in address the CLI prints, opens
 // it as person and follows the issuer's redirect to the CLI's loopback
-// listener, then returns the CLI's stdout.
+// listener, then returns the CLI's stdout. Its diagnostics never show a URL's
+// query.
 func (r *rig) cliSignIn(m *machineHome, person string, args ...string) []byte {
 	r.t.Helper()
-	cmd := exec.Command(r.hubBuild.path, append(args, "--no-browser")...)
-	cmd.Env = r.cliEnv(m)
+	cmd, cancel := r.cliCommand(m, append(args, "--no-browser")...)
+	defer cancel()
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	stderr, err := cmd.StderrPipe()
 	require.NoError(r.t, err)
-	cmdutil.SetupCommand(cmd)
 	require.NoError(r.t, cmd.Start())
 	found := make(chan string, 1)
-	var errText strings.Builder
+	var errText lockedText
+	scanned := make(chan struct{})
 	go func() {
+		defer close(scanned)
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
 			line := sc.Text()
-			errText.WriteString(line + "\n")
+			errText.write(redactText(line) + "\n")
 			if u := signInURLRE.FindString(line); u != "" {
 				select {
 				case found <- u:
@@ -602,32 +710,38 @@ func (r *rig) cliSignIn(m *machineHome, person string, args ...string) []byte {
 		}
 	}()
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		<-scanned
+		done <- cmd.Wait()
+	}()
+	what := "dagu " + strings.Join(args, " ")
 	select {
 	case u := <-found:
 		b := newBrowser()
 		resp, err := b.get(withLoginHint(u, person))
-		require.NoError(r.t, err)
+		require.NoError(r.t, redactErr(err))
 		_ = resp.Body.Close()
 		require.Equal(r.t, http.StatusFound, resp.StatusCode, "the issuer did not approve the sign-in")
 		loc, err := resp.Location()
-		require.NoError(r.t, err)
+		require.NoError(r.t, redactErr(err))
 		resp, err = b.get(loc.String())
-		require.NoError(r.t, err)
+		require.NoError(r.t, redactErr(err))
 		_ = resp.Body.Close()
 		require.Equal(r.t, http.StatusOK, resp.StatusCode, "the CLI's listener did not take the callback")
 	case err := <-done:
-		r.t.Fatalf("dagu %s ended before printing a sign-in address: %v\n%s", strings.Join(args, " "), err, truncate(errText.String(), 600))
+		r.t.Fatalf("%s ended before printing a sign-in address: %v\n%s", what, err, truncate(errText.String(), 600))
 	case <-time.After(40 * time.Second):
-		_ = cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination())
-		r.t.Fatalf("dagu %s printed no sign-in address in 40 s", strings.Join(args, " "))
+		cancel()
+		<-done
+		r.t.Fatalf("%s printed no sign-in address in 40 s", what)
 	}
 	select {
 	case err := <-done:
-		require.NoError(r.t, err, "dagu %s: %s", strings.Join(args, " "), truncate(errText.String(), 600))
+		require.NoError(r.t, err, "%s: %s", what, truncate(errText.String(), 600))
 	case <-time.After(60 * time.Second):
-		_ = cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination())
-		r.t.Fatalf("dagu %s did not finish after the sign-in", strings.Join(args, " "))
+		cancel()
+		<-done
+		r.t.Fatalf("%s did not finish after the sign-in", what)
 	}
 	return stdout.Bytes()
 }
@@ -642,7 +756,7 @@ func lastJSON(t *testing.T, out []byte) map[string]any {
 	}
 	require.GreaterOrEqual(t, start, -1, "no JSON in CLI output")
 	var doc map[string]any
-	require.NoError(t, json.Unmarshal([]byte(text[start+1:]), &doc), "CLI output: %s", truncate(text, 300))
+	require.NoError(t, json.Unmarshal([]byte(text[start+1:]), &doc), "CLI output: %s", truncate(redactText(text), 300))
 	return doc
 }
 

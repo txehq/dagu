@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +52,6 @@ type issuer struct {
 	codes    map[string]issuerCode
 	refresh  map[string]issuerRefresh
 	revoked  map[string]bool
-	seq      int
 	refreshN map[string]int
 }
 
@@ -133,8 +133,8 @@ func (s *issuer) jwks(w http.ResponseWriter, _ *http.Request) {
 	}}})
 }
 
+// nextID is a random id; it needs no lock.
 func (s *issuer) nextID(prefix string) string {
-	s.seq++
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return prefix + hex.EncodeToString(b[:])
@@ -283,12 +283,7 @@ func challengeS256(verifier string) string {
 }
 
 func hasScope(scopes []string, want string) bool {
-	for _, s := range scopes {
-		if s == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, want)
 }
 
 func (s *issuer) tokenSet(client, person string, scopes []string, nonce string) (map[string]any, error) {
