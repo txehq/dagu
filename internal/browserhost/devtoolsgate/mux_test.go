@@ -419,3 +419,34 @@ func TestMuxGateSetupHoldsTarget(t *testing.T) {
 		}
 	}
 }
+
+// A private attach already in flight for a client and a target is not
+// started again: a replay of existing targets racing the live attach of the
+// same target makes one session, not two.
+func TestMuxPrivateAttachInFlightIsNotRepeated(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	a := tg.dial("")
+	a.mustCall("", "Browser.getVersion", nil)
+	before := len(tg.state(a).Sessions)
+
+	tg.mux.mu.Lock()
+	var c *client
+	for client := range tg.mux.clients {
+		c = client
+	}
+	target := tg.mux.targets["T1"]
+	require.NotNil(t, target)
+	tg.mux.attachPrivateLocked(c, target, false)
+	tg.mux.attachPrivateLocked(c, target, false)
+	tg.mux.mu.Unlock()
+
+	first := decodeAttached(t, a.waitEvent("Target.attachedToTarget", nil))
+	a.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+	state := tg.state(a)
+	assert.Len(t, state.Sessions, before+1, "one session was attached for the client")
+	tg.mux.mu.Lock()
+	assert.Equal(t, first.SessionID, target.private[c])
+	assert.Empty(t, target.privateAttaching)
+	tg.mux.mu.Unlock()
+}

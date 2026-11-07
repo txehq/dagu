@@ -96,8 +96,11 @@ type target struct {
 	// nestedAutoAttach is set once the gate asked for auto-attach on
 	// gateSession, so the target's own children are held too.
 	nestedAutoAttach bool
-	// private maps a client to its private session on the target.
-	private map[*client]string
+	// private maps a client to its private session on the target;
+	// privateAttaching holds the clients whose private attach is in flight,
+	// so a replay racing a live attach makes one session, not two.
+	private          map[*client]string
+	privateAttaching map[*client]struct{}
 }
 
 // attachRequest is a Target.attachToTarget the gate issued and whose reply
@@ -460,9 +463,10 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		info:        rawInfo,
 		parent:      parent,
 		gateSession: session,
-		paused:      waiting,
-		waiting:     make(map[*client]struct{}),
-		private:     make(map[*client]string),
+		paused:           waiting,
+		waiting:          make(map[*client]struct{}),
+		private:          make(map[*client]string),
+		privateAttaching: make(map[*client]struct{}),
 	}
 	m.targets[t.id] = t
 	m.gateSessions[session] = t
@@ -500,6 +504,10 @@ func (m *mux) attachPrivateLocked(c *client, t *target, wait bool) {
 	if _, has := t.private[c]; has {
 		return
 	}
+	if _, inFlight := t.privateAttaching[c]; inFlight {
+		return
+	}
+	t.privateAttaching[c] = struct{}{}
 	if wait && t.paused {
 		t.waiting[c] = struct{}{}
 	}
@@ -509,6 +517,7 @@ func (m *mux) attachPrivateLocked(c *client, t *target, wait bool) {
 		func(result json.RawMessage, cdpErr *cdpError) {
 			m.popAttachLocked(t.id)
 			t.attaching--
+			delete(t.privateAttaching, c)
 			session := sessionOf(result)
 			if cdpErr != nil || session == "" || !m.clientAlive(c) {
 				if session != "" {

@@ -132,6 +132,12 @@ func (h *Handle) Kill() error {
 	if h == nil || h.PID <= 0 {
 		return nil
 	}
+	// A gate that has exited needs no ending. On Windows an ended process
+	// stays queryable, with its start time, while a handle to it is open,
+	// and ending it again is refused; liveness is asked by exit code.
+	if !procutil.IsAlive(h.PID) {
+		return nil
+	}
 	matched, _, ok := procutil.MatchesStartTime(h.PID, h.StartedAt)
 	if !ok || !matched {
 		return nil
@@ -141,7 +147,7 @@ func (h *Handle) Kill() error {
 		return nil
 	}
 	defer func() { _ = process.Release() }()
-	if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) && procutil.IsAlive(h.PID) {
 		return fmt.Errorf("end the devtools gate: %w", err)
 	}
 	return nil
