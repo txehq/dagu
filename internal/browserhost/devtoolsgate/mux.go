@@ -458,11 +458,11 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		parent = pt.id
 	}
 	t := &target{
-		id:          info.TargetID,
-		typ:         info.Type,
-		info:        rawInfo,
-		parent:      parent,
-		gateSession: session,
+		id:               info.TargetID,
+		typ:              info.Type,
+		info:             rawInfo,
+		parent:           parent,
+		gateSession:      session,
 		paused:           waiting,
 		waiting:          make(map[*client]struct{}),
 		private:          make(map[*client]string),
