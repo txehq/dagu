@@ -631,8 +631,12 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 
 	// From creating the attempt to publishing its task, hold the run's write
 	// lock: reconciliation of never-dispatched attempts takes it too, so it
-	// can never abandon an attempt whose task is about to be published.
-	unlockRun := h.attemptWriteLocks.lock(taskRootRef(req.Task))
+	// can never abandon an attempt whose task is about to be published. The
+	// deferred release covers every return, so no error path can keep the
+	// lock (a kept lock would block every run on its stripe); the paths that
+	// must release it early still call unlockRun, which runs once.
+	unlockRun := sync.OnceFunc(h.attemptWriteLocks.lock(taskRootRef(req.Task)))
+	defer unlockRun()
 	prepared, err := h.prepareAttemptForDispatch(ctx, req.Task)
 	if err != nil {
 		h.abandonFailedPreparation(ctx, err)
@@ -656,6 +660,7 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		dispatchTask.HoldUntil = time.Now().Add(h.workerWaitTimeout).UTC()
 		if err := h.markPreparedAttemptHeld(ctx, req.Task, prepared, shortfall); err != nil {
 			h.markPreparedAttemptDispatchFailed(ctx, req.Task, prepared, err)
+			unlockRun()
 			h.releaseAdmissionToken(ctx, admissionToken)
 			return nil, status.Error(codes.Internal, "failed to queue task for a worker: "+err.Error())
 		}
@@ -667,9 +672,10 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 		return nil, status.Error(dispatchBindErrorCode(err), "failed to enqueue task: "+err.Error())
 	}
 	// The preparation entry stays until a worker's claim is acknowledged
-	// (recordTaskClaim): a published task that no worker claims expires from
-	// the dispatch store, and the entry is then what lets reconciliation
-	// abandon the attempt instead of leaving it waiting for nothing.
+	// (recordTaskClaim): a published task that no worker claims by its claim
+	// deadline is removed (expireUnclaimedDispatches), and the entry is then
+	// what lets reconciliation abandon the attempt instead of leaving it
+	// waiting for nothing.
 	unlockRun()
 	h.notifyDispatchAvailable()
 	return admittedResponse(req.Task, prepared), nil

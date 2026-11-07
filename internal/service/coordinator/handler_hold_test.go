@@ -410,3 +410,33 @@ func TestDropOrphanedDispatchesChecksRun(t *testing.T) {
 		})
 	}
 }
+
+// A held dispatch whose queued status cannot be written fails, and releases
+// the run's write lock as every other failure does: a kept lock would block
+// every later dispatch, claim and worker write of any run on its stripe.
+func TestDispatchHoldFailureReleasesTheRunLock(t *testing.T) {
+	f := newHoldFixture(t, holdWait)
+	dispatchPublishHook = func(task *coordinatorv1.Task) {
+		if attempt := f.runs.attempts[task.GetDagRunId()]; attempt != nil {
+			attempt.mu.Lock()
+			attempt.writeError = errors.New("injected: the queued status cannot be written")
+			attempt.mu.Unlock()
+		}
+	}
+	t.Cleanup(func() { dispatchPublishHook = nil })
+
+	task := cpuTask("run-held-fails")
+	_, err := f.h.Dispatch(t.Context(), &coordinatorv1.DispatchRequest{Task: task})
+	require.Error(t, err)
+
+	locked := make(chan struct{})
+	go func() {
+		f.h.attemptWriteLocks.lock(taskRootRef(task))()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run's write lock was kept after the held dispatch failed")
+	}
+}

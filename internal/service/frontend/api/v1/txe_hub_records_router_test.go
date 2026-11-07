@@ -194,3 +194,27 @@ func TestTxeCalendarUsageFollowsTheOwnerScope(t *testing.T) {
 	require.Equal(t, http.StatusConflict, resp.Response.StatusCode(), "a calendar in use is not deleted")
 	require.ElementsMatch(t, users, mentioned(resp.Body))
 }
+
+// A shared calendar decides when every owner's calendar-backed workflows run,
+// so in enforce only the platform administrator creates, changes or deletes
+// one; a legacy credential, even a manager, is refused before anything is
+// written.
+func TestTxeSharedCalendarWritesArePlatformOnly(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "ops"}).
+		WithBearerToken(h.admin).ExpectStatus(http.StatusCreated).Send(t)
+
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "rogue"}).
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+	h.server.Client().Put("/api/v1/calendars/ops", api.UpdateCalendarJSONRequestBody{Spec: "name: ops\n"}).
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+	h.server.Client().Delete("/api/v1/calendars/ops").
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+
+	status, body := h.send(t, "/api/v1/calendars/ops", h.admin)
+	require.Equal(t, http.StatusOK, status, body, "the calendar is unchanged and still there")
+	status, _ = h.send(t, "/api/v1/calendars/rogue", h.admin)
+	require.Equal(t, http.StatusNotFound, status, "nothing was created")
+	h.server.Client().Delete("/api/v1/calendars/ops").
+		WithBearerToken(h.admin).ExpectStatus(http.StatusNoContent).Send(t)
+}

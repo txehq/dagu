@@ -318,6 +318,9 @@ func (a *API) requireCalendarWrite(ctx context.Context) error {
 	if err := a.requireDeveloperOrAbove(ctx); err != nil {
 		return err
 	}
+	if err := a.txePlatformResourceWrite(ctx); err != nil {
+		return err
+	}
 	if a.dagWritesDisabled {
 		return errCalendarWritesDisabled
 	}
