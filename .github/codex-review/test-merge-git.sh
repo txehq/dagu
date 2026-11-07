@@ -27,6 +27,7 @@ g checkout -q -b upstream
 commit up1 "upstream 1"
 commit up2 "upstream 2"
 g tag v9.9.9
+g tag -a -m "the same release, annotated" v9.9.9-annotated
 commit up3 "upstream 3, after the pin"
 g checkout -q main
 commit fork1 "fork 1"
@@ -49,7 +50,8 @@ g checkout -q -b repair-swapped v9.9.9
 g merge -q -s ours --no-ff -m "main recorded onto upstream: the parents the wrong way round" main
 g checkout -q main
 TAG="$(g rev-parse 'v9.9.9^{commit}')"; UP1="$(g rev-parse 'v9.9.9~1')"; UP3="$(g rev-parse upstream)"; MAIN="$(g rev-parse main)"; BASE="$(g rev-parse main~1)"
-MAIN_TREE="$(g rev-parse 'main^{tree}')"
+MAIN_TREE="$(g rev-parse 'main^{tree}')"; TAGOBJ="$(g rev-parse v9.9.9-annotated)"
+[ "$TAGOBJ" != "$TAG" ] && [ "$(g cat-file -t "$TAGOBJ")" = tag ] || { echo "fixture: the annotated tag should be its own object" >&2; exit 2; }
 [ "$(g rev-parse 'repair^{tree}')" = "$MAIN_TREE" ] || { echo "fixture: the repair should have main's tree" >&2; exit 2; }
 
 mkdir -p "$TMP/bin"
@@ -77,13 +79,13 @@ case "$*" in
   *"pulls/7 --jq [.merged"*) fail "$@"; if [ -s "$REPO/.merged" ]; then printf 'true\t%s\n' "$(cat "$REPO/.merged")"; else printf 'false\t\n'; fi ;;
   *pulls/7*) if [ -s "$REPO/.merged" ]; then state=closed; else state=open; fi; printf '%s\tfalse\t%s\tmain\n' "$state" "$head" ;;
   *branches/main*) g rev-parse main ;;
-  *git/commits/*) sha="${all#*git/commits/}"; sha="${sha%% *}"; g cat-file -e "$sha^{commit}" 2>/dev/null || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
-    printf '%s\t%s\n' "$(g rev-parse "$sha^{tree}")" "$(g log -1 --format=%P "$sha" | tr ' ' ',')" ;;
+  *git/commits/*) sha="${all#*git/commits/}"; sha="${sha%% *}"; [ "$(g cat-file -t "$sha" 2>/dev/null)" = commit ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    case "$all" in *"--jq .sha") echo "$sha" ;; *) printf '%s\t%s\n' "$(g rev-parse "$sha^{tree}")" "$(g log -1 --format=%P "$sha" | tr ' ' ',')" ;; esac ;;
   *compare/*) spec="${all#*compare/}"; spec="${spec%%\?*}"; a="${spec%%...*}"; b="${spec##*...}"; st="$(compare "$a" "$b")" || exit 1
     case "$*" in *"per_page=1 "*) printf '%s\t%s\n' "$st" "$(g rev-list --count "$b" "^$a")" ;; *) g rev-list --reverse --parents "$b" "^$a" ;; esac ;;
   "api repos/txehq/dagu --jq .allow_merge_commit") echo "${ALLOW_MERGE:-true}" ;;
   *actions/runs*) printf '%s\n' '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}' ;;
-  *check-runs*) printf '%s\n' '{"name":"CI","app":{"id":1},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-11-08T00:00:00Z"}' ;;
+  *check-runs*) if [ -n "${ADVANCE_MAIN_AT_CHECKS:-}" ]; then g checkout -q main && echo moved >"$REPO/moved" && g add moved && g commit -q -m "main moved during the checks"; fi; printf '%s\n' '{"name":"CI","app":{"id":1},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-11-08T00:00:00Z"}' ;;
   */status*) printf 'success\t1\n' ;;
   "pr merge 7 -R txehq/dagu --squash --match-head-commit "*) merge_into_main squash "$@" ;;
   "pr merge 7 -R txehq/dagu --merge --match-head-commit "*) merge_into_main merge "$@" ;;
@@ -104,10 +106,12 @@ reaches() { r merge-base --is-ancestor "$1" main; }  # <sha> is an ancestor of t
 run() {
     local name="$1" want_rc="$2" want="$3" merged="$4" branch="$5" out rc log; shift 5
     fresh "$name"; log="$TMP/$name.log"; : >"$log"
-    out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="${FAIL_ON:-}" ALLOW_MERGE="${ALLOW_MERGE:-true}" MERGE_AS="${MERGE_AS:-}" REPO="$REPO" PR_HEAD="$branch" \
+    out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="${FAIL_ON:-}" ALLOW_MERGE="${ALLOW_MERGE:-true}" MERGE_AS="${MERGE_AS:-}" \
+        ADVANCE_MAIN_AT_CHECKS="${ADVANCE_MAIN_AT_CHECKS:-}" REPO="$REPO" PR_HEAD="$branch" \
         bash "$HERE/merge.sh" "$@" 7 "$(r rev-parse "$branch")" 2>&1)"; rc=$?
     if [ "$rc" = "$want_rc" ] && [[ "$out" == *"$want"* ]] \
-       && { { [ "$merged" = merged ] && [ -s "$REPO/.merged" ]; } || { [ "$merged" = not-merged ] && [ ! -e "$REPO/.merged" ] && [ "$(r rev-parse main)" = "$MAIN" ]; }; }; then
+       && { { [ "$merged" = merged ] && [ -s "$REPO/.merged" ]; } || { [ "$merged" = not-merged ] && [ ! -e "$REPO/.merged" ] && [ "$(r rev-parse main)" = "$MAIN" ]; } \
+            || { [ "$merged" = not-merged-moved ] && [ ! -e "$REPO/.merged" ]; }; }; then
         ok "$name"
     else
         bad "$name" "exit $rc (wanted $want_rc), main $(r rev-parse --short main), output:
@@ -137,6 +141,8 @@ check "sync-merge: v9.9.9 reachable, tree is the sync's, parents are main and th
     'reaches "$TAG" && [ "$(r rev-parse "main^{tree}")" = "$(g rev-parse "sync^{tree}")" ] && [ "$(r log -1 --format=%P main)" = "$MAIN $(g rev-parse sync)" ]'
 run plain-merge    0 "is reachable from it" merged plain --method merge --expect-ancestor "$(g rev-parse plain)"
 run sync-wrong-anc 1 "does not reach the expected ancestor $UP3 (compare says diverged)" not-merged sync --method merge --expect-ancestor "$UP3"
+# The ancestor is a commit id: the annotated tag's own object is a read failure, not peeled to v9.9.9.
+run sync-anc-tag-object 2 "could not read the expected ancestor $TAGOBJ as a commit (if it is an annotated tag's object" not-merged sync --method merge --expect-ancestor "$TAGOBJ"
 run sync-anc-in-main 1 "already reachable from main" not-merged sync --method merge --expect-ancestor "$BASE"
 run sync-anc-is-main 1 "already reachable from main" not-merged sync --method merge --expect-ancestor "$MAIN"
 ALLOW_MERGE=false run sync-no-merge-commits 1 "does not allow merge commits (allow_merge_commit is false)" not-merged sync --method merge --expect-ancestor "$TAG"
@@ -152,6 +158,8 @@ run repair-swapped 1 "a repair's parents must be main's tip and the expected anc
 run repair-wrong-anc 1 "does not reach the expected ancestor $UP3" not-merged repair --method merge --expect-ancestor "$UP3" --repair
 run repair-changed 1 "declared a repair but its tree" not-merged repair-changed --method merge --expect-ancestor "$TAG" --repair
 run repair-changed-is-a-sync 0 "is reachable from it" merged repair-changed --method merge --expect-ancestor "$TAG"
+# Main moves between the checks and the merge: the last read before the merge refuses.
+ADVANCE_MAIN_AT_CHECKS=1 run repair-main-moves-late 1 "main moved from $MAIN to " not-merged-moved repair --method merge --expect-ancestor "$TAG" --repair
 # Main moved after the repair was built: its first parent is no longer main's tip.
 fresh repair-stale-build; r checkout -q main && echo later >"$REPO/later" && r add later && r commit -q -m "fork 2, after the repair was built"
 STALE="$TMP/repair-stale-build"

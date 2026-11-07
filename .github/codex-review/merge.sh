@@ -30,8 +30,9 @@
 #     parent. An ordinary PR, including one that merged main into its branch, has none; a sync has;
 #   - `--method merge --expect-ancestor <sha>` merges with a merge commit, after every check above,
 #     and in addition requires the repository to allow merge commits (read, never assumed), the
-#     expected ancestor to be reachable from the head and not yet from main, and, after the merge,
-#     reads the merge commit back and proves the ancestor is now reachable from it;
+#     expected ancestor to be a commit's own id (an annotated tag's object id is refused, never
+#     peeled to something else), reachable from the head and not yet from main, and, after the
+#     merge, reads the merge commit back and proves the ancestor is now reachable from it;
 #   - `--repair` declares a provenance repair that changes no file: the head's tree must equal
 #     main's, and its parents must be exactly main's current tip and the expected ancestor, so a
 #     main that moved, a wrong parent or any file change refuses. A head with main's tree is
@@ -68,7 +69,7 @@ pr="${1:-}"; want="${2:-}"
 [ $# -eq 2 ] || usage
 [[ "$pr" =~ ^[0-9]+$ && "$want" =~ ^[0-9a-f]{40}$ ]] || usage
 case "$method" in
-  squash) [ -z "$anc" ] && [ "$repair" = false ] || { echo "merge.sh: --expect-ancestor and --repair go with --method merge" >&2; exit 2; } ;;
+  squash) if [ -n "$anc" ] || [ "$repair" = true ]; then echo "merge.sh: --expect-ancestor and --repair go with --method merge" >&2; exit 2; fi ;;
   merge) [[ "$anc" =~ ^[0-9a-f]{40}$ ]] || { echo "merge.sh: --method merge needs --expect-ancestor <40-hex sha>" >&2; exit 2; } ;;
   *) echo "merge.sh: --method is squash or merge, not '$method'" >&2; exit 2 ;;
 esac
@@ -134,6 +135,11 @@ case "$method" in
   merge)
     gh api "repos/$repo" --jq .allow_merge_commit >"$tmp/allow.txt" || unread "the repository's merge settings"
     [ "$(cat "$tmp/allow.txt")" = true ] || refuse "the repository does not allow merge commits (allow_merge_commit is $(cat "$tmp/allow.txt"))"
+    # The ancestor is a commit's own id: git/commits answers for nothing else, so an annotated tag's
+    # object id (whose commit is another sha) or a tree is a read failure, never a different ancestor.
+    gh api "repos/$repo/git/commits/$anc" --jq .sha >"$tmp/anc.sha" \
+      || unread "the expected ancestor $anc as a commit (if it is an annotated tag's object, pass the commit it points to)"
+    [ "$(cat "$tmp/anc.sha")" = "$anc" ] || unread "the expected ancestor $anc as a commit (the API answered for $(cat "$tmp/anc.sha"))"
     compare_status "$anc" "$want" >"$tmp/anc-head.tsv" || unread "the comparison of $anc with $want"
     read -r ancstatus _ <"$tmp/anc-head.tsv" || unread "the comparison of $anc with $want (no fields)"
     case "$ancstatus" in
@@ -192,13 +198,20 @@ if [ "$method" = squash ]; then
   gh pr merge "$pr" -R "$repo" --squash --match-head-commit "$want"
   exit 0
 fi
+if [ "$repair" = true ]; then
+  # The last read before the merge: a main that moved would make GitHub merge the repair onto the
+  # new tip, a different tree from the one checked. The window after this read is stated above.
+  gh api "repos/$repo/branches/main" --jq .commit.sha >"$tmp/main2.sha" || unread "main's tip before the merge"
+  read -r maintip2 <"$tmp/main2.sha" || unread "main's tip before the merge (empty)"
+  [ "$maintip2" = "$maintip" ] || refuse "main moved from $maintip to $maintip2 while the repair was checked; rebuild the repair on its tip"
+fi
 gh pr merge "$pr" -R "$repo" --merge --match-head-commit "$want"
 
 # ── Readback: the merge commit exists, reaches the expected ancestor and, for a repair, kept the tree ──
 merged_but() { echo "merge.sh: PR #$pr was merged, but $*; check main by hand" >&2; exit 1; }
 gh api "repos/$repo/pulls/$pr" --jq '[.merged, .merge_commit_sha] | @tsv' >"$tmp/merged.tsv" || merged_but "its merge commit could not be read"
 read -r merged mergesha <"$tmp/merged.tsv" || merged_but "its merge commit could not be read (no fields)"
-[ "$merged" = true ] && [[ "$mergesha" =~ ^[0-9a-f]{40}$ ]] || merged_but "the API does not show it merged ($merged, '$mergesha')"
+if [ "$merged" != true ] || ! [[ "$mergesha" =~ ^[0-9a-f]{40}$ ]]; then merged_but "the API does not show it merged ($merged, '$mergesha')"; fi
 compare_status "$anc" "$mergesha" >"$tmp/anc-merge.tsv" || merged_but "whether $mergesha reaches $anc could not be read"
 read -r reach _ <"$tmp/anc-merge.tsv" || merged_but "whether $mergesha reaches $anc could not be read (no fields)"
 case "$reach" in

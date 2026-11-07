@@ -69,16 +69,20 @@ Two rules, both in `merge.sh` and both behind every check above:
 - **`--method merge --expect-ancestor <sha>` keeps the history**, for an upstream sync or a
   provenance repair. It merges with a merge commit, after the same checks, and in addition requires
   the repository to allow merge commits (read from the API, never assumed), the expected ancestor to
-  be reachable from the head and not yet from main, and then reads the merge commit back and prints
-  it only once the ancestor is reachable from it. `--repair` declares a provenance repair that
+  be a commit's own id, reachable from the head and not yet from main, and then reads the merge
+  commit back and prints it only once the ancestor is reachable from it. For a repair it re-reads
+  main's tip as the last thing before the merge and refuses if main moved. `--repair` declares a provenance repair that
   changes no file (`git merge -s ours --no-ff <upstream>` on main's tip): the head's parents must be
   exactly main's current tip and the expected ancestor, and its tree must be main's; a main that
   moved, a wrong parent or any file change refuses. A head with main's tree is accepted only this
   way.
 
    ```bash
-   # the upstream tag's commit, from upstream's own repository
-   anc="$(gh api repos/dagucloud/dagu/git/ref/tags/v2.25.8 --jq .object.sha)"
+   # the commit the upstream tag points to, from upstream's own repository: .object.type is
+   # "commit" for a lightweight tag; for an annotated tag ("tag") read git/tags/<sha> and take its
+   # .object.sha. The wrapper takes a commit id only and refuses a tag object rather than peel it.
+   gh api repos/dagucloud/dagu/git/ref/tags/v2.25.8 --jq '.object | "\(.type) \(.sha)"'
+   anc=<that commit sha>   # v2.25.8: 28022fee38b59c1474491fecf571791fbde8e9e7, a lightweight tag (read 2026-11-08)
    git show origin/main:.github/codex-review/merge.sh | bash -s -- --method merge --expect-ancestor "$anc" <n> <head sha>
    # a provenance repair: no file changes
    git show origin/main:.github/codex-review/merge.sh | bash -s -- --method merge --expect-ancestor "$anc" --repair <n> <head sha>
