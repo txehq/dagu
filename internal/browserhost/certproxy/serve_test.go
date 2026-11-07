@@ -285,11 +285,17 @@ func TestServeControlPaths(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, status(base+"/"))
 
 		// A request for another site sent through the proxy does not reach
-		// the control paths.
+		// the control paths, with the proxy's credential or without it.
 		proxyURL, err := url.Parse(base)
 		require.NoError(t, err)
 		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 		response, err := client.Get("http://portal.example.com/" + cfg.Token + "/events")
+		require.NoError(t, err)
+		_ = response.Body.Close()
+		assert.Equal(t, http.StatusProxyAuthRequired, response.StatusCode)
+		proxyURL.User = url.UserPassword(ProxyUser, testCredential)
+		client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+		response, err = client.Get("http://portal.example.com/" + cfg.Token + "/events")
 		require.NoError(t, err)
 		_ = response.Body.Close()
 		assert.Equal(t, http.StatusNotFound, response.StatusCode)
@@ -323,10 +329,10 @@ func TestServeRejectsInvalidConfig(t *testing.T) {
 	broken := entry
 	broken.KeyPEM = "not a key"
 	for name, cfg := range map[string]Config{
-		"NoToken":   {CDPURL: "http://127.0.0.1:1", Entries: []Entry{entry}},
-		"NoBrowser": {Token: "t", Entries: []Entry{entry}},
-		"NoEntries": {Token: "t", CDPURL: "http://127.0.0.1:1"},
-		"BadKey":    {Token: "t", CDPURL: "http://127.0.0.1:1", Entries: []Entry{broken}},
+		"NoToken":      {Credential: "c", Entries: []Entry{entry}},
+		"NoCredential": {Token: "t", Entries: []Entry{entry}},
+		"NoEntries":    {Token: "t", Credential: "c"},
+		"BadKey":       {Token: "t", Credential: "c", Entries: []Entry{broken}},
 	} {
 		err := Serve(t.Context(), cfg, func(Ready) { t.Errorf("%s: ready", name) })
 		assert.Error(t, err, name)

@@ -60,7 +60,7 @@ func TestWatchBrowser(t *testing.T) {
 	t.Run("EndsWhenBrowserStops", func(t *testing.T) {
 		t.Parallel()
 		browser := newFakeBrowser(t)
-		done := watch(t, browser.server.URL, time.Minute)
+		done := watch(t, browser.url(), time.Minute)
 		assertRunning(t, done)
 		browser.server.Close()
 		assertEnds(t, done)
@@ -69,7 +69,7 @@ func TestWatchBrowser(t *testing.T) {
 	t.Run("EndsWhenAnotherBrowserAnswers", func(t *testing.T) {
 		t.Parallel()
 		browser := newFakeBrowser(t)
-		done := watch(t, browser.server.URL, time.Minute)
+		done := watch(t, browser.url(), time.Minute)
 		assertRunning(t, done)
 		browser.id.Store("second")
 		assertEnds(t, done)
@@ -79,7 +79,7 @@ func TestWatchBrowser(t *testing.T) {
 	t.Run("EndsWhenSomethingElseAnswers", func(t *testing.T) {
 		t.Parallel()
 		browser := newFakeBrowser(t)
-		done := watch(t, browser.server.URL, time.Minute)
+		done := watch(t, browser.url(), time.Minute)
 		assertRunning(t, done)
 		browser.replaced.Store(true)
 		assertEnds(t, done)
@@ -101,7 +101,7 @@ func TestWatchBrowser(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			watchBrowser(ctx, browser.server.URL, time.Minute, testPollInterval)
+			watchBrowser(ctx, browser.url(), time.Minute, testPollInterval)
 		}()
 		assertRunning(t, done)
 		cancel()

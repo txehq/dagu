@@ -54,7 +54,7 @@ func TestChooseFilesGivesTheFilesToThePicker(t *testing.T) {
 	fake := newScriptedBrowser(t, chooserScript)
 	paths := []string{"/data/invoice.pdf", "/data/receipt.png"}
 	var armed []string
-	err := browserhost.ChooseFiles(context.Background(), fake.server.URL, paths, 5*time.Second, func(context.Context) error {
+	err := browserhost.ChooseFiles(context.Background(), fake.url(), paths, 5*time.Second, func(context.Context) error {
 		armed = interceptingSessions(fake)
 		fake.emit(chooserOpened("frame-1", "selectMultiple", 42))
 		return nil
@@ -73,7 +73,7 @@ func TestChooseFilesRefusesSeveralFilesForASingleFilePicker(t *testing.T) {
 	t.Parallel()
 
 	fake := newScriptedBrowser(t, chooserScript)
-	err := browserhost.ChooseFiles(context.Background(), fake.server.URL, []string{"/a.pdf", "/b.pdf"}, 5*time.Second, func(context.Context) error {
+	err := browserhost.ChooseFiles(context.Background(), fake.url(), []string{"/a.pdf", "/b.pdf"}, 5*time.Second, func(context.Context) error {
 		fake.emit(chooserOpened("page-1", "selectSingle", 7))
 		return nil
 	})
@@ -102,7 +102,7 @@ func TestChooseFilesReportsATargetThatCannotIntercept(t *testing.T) {
 				return ""
 			})
 			opened := false
-			err := browserhost.ChooseFiles(context.Background(), fake.server.URL, []string{"/a.pdf"}, 50*time.Millisecond, func(context.Context) error {
+			err := browserhost.ChooseFiles(context.Background(), fake.url(), []string{"/a.pdf"}, 50*time.Millisecond, func(context.Context) error {
 				opened = true
 				return nil
 			})
@@ -120,7 +120,7 @@ func TestChooseFilesReportsNoPicker(t *testing.T) {
 	t.Parallel()
 
 	fake := newScriptedBrowser(t, chooserScript)
-	err := browserhost.ChooseFiles(context.Background(), fake.server.URL, []string{"/a.pdf"}, 50*time.Millisecond, func(context.Context) error { return nil })
+	err := browserhost.ChooseFiles(context.Background(), fake.url(), []string{"/a.pdf"}, 50*time.Millisecond, func(context.Context) error { return nil })
 	require.ErrorIs(t, err, browserhost.ErrNoFileChooser)
 }
 
@@ -129,7 +129,7 @@ func TestChooseFilesReturnsTheOpenError(t *testing.T) {
 
 	fake := newScriptedBrowser(t, chooserScript)
 	clickErr := errors.New("element is not visible")
-	err := browserhost.ChooseFiles(context.Background(), fake.server.URL, []string{"/a.pdf"}, time.Second, func(context.Context) error { return clickErr })
+	err := browserhost.ChooseFiles(context.Background(), fake.url(), []string{"/a.pdf"}, time.Second, func(context.Context) error { return clickErr })
 	require.ErrorIs(t, err, clickErr)
 }
 

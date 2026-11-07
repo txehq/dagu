@@ -179,6 +179,6 @@ func TestCarryAllRoutesTunnelByScheme(t *testing.T) {
 // plainClient sends plain HTTP requests through the proxy, as the browser
 // does with a manual proxy.
 func plainClient(ready Ready) *http.Client {
-	proxyURL := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", ready.Port)}
+	proxyURL := &url.URL{Scheme: "http", User: url.UserPassword(ProxyUser, testCredential), Host: fmt.Sprintf("127.0.0.1:%d", ready.Port)}
 	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 }

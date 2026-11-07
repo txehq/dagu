@@ -18,6 +18,7 @@ import (
 	stagehand "github.com/browserbase/stagehand/packages/sdk-go/v4"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/certproxy"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
@@ -171,25 +172,24 @@ func learnUserAgent(ctx context.Context, opts launchOptions, key string) (headed
 	// A browser that just exited can still hold profile files open for a
 	// moment on Windows.
 	defer func() { _ = fileutil.RemoveAll(dir) }()
-	port, err := freeLoopbackPort()
+	executable, err := devtoolsgate.FindBrowser(opts.Executable)
 	if err != nil {
-		return headedUserAgent{}, err
+		return headedUserAgent{}, fmt.Errorf("start the browser: %w", err)
 	}
-	cdpURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	browser, err := stagehand.LaunchLocalBrowser(ctx, &stagehand.LocalBrowserLaunchOptions{
-		ExecutablePath:  opts.Executable,
-		Headless:        true,
-		Port:            port,
-		UserDataDir:     dir,
-		ChromiumSandbox: new(!opts.NoSandbox),
+	// The probe, like every browser, is reached only through its gate.
+	gate, err := devtoolsgate.Start(ctx, daguExecutable(ctx), devtoolsgate.Config{
+		Token:      devtoolsgate.NewToken(),
+		Executable: executable,
+		Args:       devtoolsgate.ChromeArgs(devtoolsgate.LaunchOptions{UserDataDir: dir, Headless: true, NoSandbox: opts.NoSandbox}),
 	})
 	if err != nil {
-		return headedUserAgent{}, errors.Join(fmt.Errorf("start the browser: %w", err), endUnstartedBrowser(ctx, nil, cdpURL, dir))
+		return headedUserAgent{}, fmt.Errorf("start the browser: %w", err)
 	}
 	version, err := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (browserhost.Version, error) {
-		return browserhost.BrowserVersion(ctx, cdpURL)
+		return browserhost.BrowserVersion(ctx, gate.URL)
 	})
-	if endErr := (startedBrowser{browser: browser, cdpURL: cdpURL}).end(ctx); endErr != nil && opts.Warn != nil {
+	err = devtoolsgate.Redact(err, gate.URL)
+	if endErr := (startedBrowser{cdpURL: gate.URL, devtools: gate}).end(ctx); endErr != nil && opts.Warn != nil {
 		opts.Warn("end the browser that told its user agent: " + endErr.Error())
 	}
 	if err != nil {
@@ -214,8 +214,13 @@ func warnUserAgent(opts launchOptions, err error) {
 
 // startedBrowser is a browser a launch started, before its runtime starts.
 type startedBrowser struct {
+	// browser is the runtime's connection; nil for a browser only asked
+	// about itself.
 	browser *stagehand.Browser
-	cdpURL  string
+	// cdpURL is the browser's address behind devtools, the gate that owns
+	// its DevTools pipe.
+	cdpURL   string
+	devtools *devtoolsgate.Handle
 	// proxy presents the browser's client certificates; nil when it presents
 	// none.
 	proxy *certproxy.Handle
@@ -231,8 +236,14 @@ func (b startedBrowser) end(ctx context.Context) error {
 	pid, _ := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (int, error) {
 		return browserhost.BrowserProcessID(ctx, b.cdpURL)
 	})
+	if pid <= 0 {
+		pid = b.devtools.BrowserPID
+	}
 	startedAt, _ := procutil.StartTime(pid)
-	return errors.Join(closeBrowser(ctx, pid, startedAt, b.browser.Close), killCertProxy(b.proxy), killWriteGate(b.gate))
+	closeRuntime := func(ctx context.Context) error {
+		return endUnstartedBrowser(ctx, b.browser, b.devtools)
+	}
+	return errors.Join(closeBrowser(ctx, pid, startedAt, closeRuntime), killCertProxy(b.proxy), killWriteGate(b.gate))
 }
 
 // warnOnce returns warn reporting each message once, as a browser started

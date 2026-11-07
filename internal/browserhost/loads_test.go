@@ -62,7 +62,7 @@ func TestFrameLoadWatcherTellsLoadingFrames(t *testing.T) {
 		}
 		return nil
 	})
-	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 	read := eventReader(t, fake)
@@ -96,7 +96,7 @@ func TestFrameLoadWatcherTellsCrossOriginFrames(t *testing.T) {
 		}
 		return nil
 	})
-	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 
@@ -117,7 +117,7 @@ func TestFrameLoadWatcherTellsWindows(t *testing.T) {
 		}
 		return nil
 	})
-	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchFrameLoads(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 	read := eventReader(t, fake)

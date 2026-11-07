@@ -147,6 +147,8 @@ func recordedHandle(record browserhost.Record) browserHandle {
 		ExtensionDir:     record.ExtensionDir,
 		BrowserPID:       record.BrowserPID,
 		BrowserStartedAt: record.BrowserStartedAt,
+		GatePID:          record.GatePID,
+		GateStartedAt:    record.GateStartedAt,
 	}
 	if record.CertProxyURL != "" {
 		handle.CertProxy = &certproxy.Handle{URL: record.CertProxyURL, PID: record.CertProxyPID, StartedAt: record.CertProxyStartedAt}

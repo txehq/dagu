@@ -63,11 +63,13 @@ func portOf(t *testing.T, hostport string) string {
 
 func TestChromeArgsUsesManualProxyForLoopback(t *testing.T) {
 	t.Parallel()
-	handle := Handle{PACURL: "data:pac", SPKI: "abc", Port: 9, Manual: true, DebugPort: 9222}
+	// The browser opens no debugging port to keep direct: its gate serves
+	// DevTools over a pipe.
+	handle := Handle{PACURL: "data:pac", SPKI: "abc", Port: 9, Manual: true}
 	assert.Equal(t, []string{
 		"--proxy-server=127.0.0.1:9",
 		"--ignore-certificate-errors-spki-list=abc",
-		"--proxy-bypass-list=<-loopback>;127.0.0.1:9222",
+		"--proxy-bypass-list=<-loopback>",
 	}, handle.ChromeArgs())
 
 	handle.Manual = false

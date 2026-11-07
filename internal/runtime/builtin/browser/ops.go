@@ -756,6 +756,8 @@ func (r *run) startSession(ctx context.Context) (int, error) {
 		DownloadsDir:     opts.DownloadsDir,
 		BrowserPID:       handle.BrowserPID,
 		BrowserStartedAt: handle.BrowserStartedAt,
+		GatePID:          handle.GatePID,
+		GateStartedAt:    handle.GateStartedAt,
 	}
 	recordCertProxy(&r.record, handle.CertProxy)
 	recordWriteGate(&r.record, handle.WriteGate)

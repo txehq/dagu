@@ -181,8 +181,11 @@ type OpenResult struct {
 	// TLSVerified confirms the proxy verified the final HTTPS page's host.
 	// False means no such evidence was available, not a certificate failure.
 	TLSVerified bool `json:"tls_verified"`
-	// CDPURL is the browser's DevTools address, where an application can
-	// show the page and let a person act on it.
+	// CDPURL is the browser's DevTools address behind its gate, where an
+	// application can show the page and let a person act on it. Its token is
+	// the credential that reaches the browser, so it is given only to the
+	// account that opened the session, in the command's own output, and is
+	// written nowhere else.
 	CDPURL       string    `json:"cdp_url"`
 	Headless     bool      `json:"headless"`
 	Profile      string    `json:"profile,omitempty"`
@@ -297,9 +300,11 @@ type SessionSummary struct {
 	ID string `json:"id"`
 	// State is idle, busy while a command runs, or ended once the browser
 	// closed.
-	State        string     `json:"state"`
-	URL          string     `json:"url"`
-	Title        string     `json:"title"`
+	State string `json:"state"`
+	URL   string `json:"url"`
+	Title string `json:"title"`
+	// CDPURL is the browser's address behind its gate, as OpenResult gives
+	// it, for the account whose sessions are listed.
 	CDPURL       string     `json:"cdp_url,omitempty"`
 	Profile      string     `json:"profile,omitempty"`
 	Headless     bool       `json:"headless"`
@@ -454,6 +459,8 @@ func (s *Sessions) Open(ctx context.Context, opts SessionOptions) (OpenResult, e
 		DownloadsDir:     downloadsDir,
 		BrowserPID:       handle.BrowserPID,
 		BrowserStartedAt: handle.BrowserStartedAt,
+		GatePID:          handle.GatePID,
+		GateStartedAt:    handle.GateStartedAt,
 		WorkDir:          workDir,
 	}
 	recordCertProxy(&record, handle.CertProxy)

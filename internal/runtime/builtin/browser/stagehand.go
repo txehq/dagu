@@ -24,6 +24,7 @@ import (
 	stagehand "github.com/browserbase/stagehand/packages/sdk-go/v4"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/certproxy"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
 	cmnconfig "github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/hostpattern"
@@ -59,10 +60,6 @@ const (
 	// runtime failed to start, so a slow request cannot use up the next one's
 	// time.
 	unstartedCallTimeout = 5 * time.Second
-	// exitRequestTimeout bounds the request that asks a launched browser to
-	// exit, so one that stops answering DevTools is ended by the runtime
-	// instead of holding up the close.
-	exitRequestTimeout = 2 * time.Second
 	// settleQuiet is how long a page goes without a request in flight or a
 	// change to its document before what an action started counts as done;
 	// settleTimeout bounds the wait, and settlePoll spaces its checks.
@@ -257,7 +254,7 @@ func (l stagehandLauncher) Launch(ctx context.Context, opts launchOptions) (engi
 	}
 	slot, err := browserhost.TakeSlot(ctx, opts.BrowserDir, opts.MaxOpen, opts.Waiting)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("launch browser: %w", err)
 	}
 	eng, err := l.launch(ctx, opts)
 	if err != nil {
@@ -301,53 +298,56 @@ func (l stagehandLauncher) launch(ctx context.Context, opts launchOptions) (*sta
 	}
 	eng, err := startEngine(ctx, started.browser, cdpURL, opts)
 	if err != nil {
-		return nil, errors.Join(err, endUnstartedBrowser(ctx, started.browser, cdpURL, opts.UserDataDir), killCertProxy(started.proxy), killWriteGate(started.gate))
+		return nil, errors.Join(devtoolsgate.Redact(err, cdpURL), endUnstartedBrowser(ctx, started.browser, started.devtools), killCertProxy(started.proxy), killWriteGate(started.gate))
 	}
 	eng.handle.CertProxy = started.proxy
 	eng.handle.WriteGate = started.gate
+	eng.handle.GatePID = started.devtools.PID
+	eng.handle.GateStartedAt = started.devtools.StartedAt
+	// The browser names its own process; the one its gate started stands
+	// in when it does not say. Without a process ID, a browser that stops
+	// answering cannot be ended.
+	eng.handle.BrowserPID, _ = browserhost.BrowserProcessID(ctx, cdpURL)
+	if eng.handle.BrowserPID <= 0 {
+		eng.handle.BrowserPID = started.devtools.BrowserPID
+	}
+	eng.handle.BrowserStartedAt, _ = procutil.StartTime(eng.handle.BrowserPID)
 	extension, err := browserhost.StagehandExtension(ctx, cdpURL)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("locate browser runtime extension: %w", err), eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(fmt.Errorf("locate browser runtime extension: %w", devtoolsgate.Redact(err, cdpURL)), eng.Close(context.WithoutCancel(ctx)))
 	}
 	eng.handle.ExtensionID = extension.ID
 	eng.handle.ExtensionDir = extension.Path
-	// Without a process ID, a browser that stops answering cannot be ended.
-	eng.handle.BrowserPID, _ = browserhost.BrowserProcessID(ctx, cdpURL)
-	eng.handle.BrowserStartedAt, _ = procutil.StartTime(eng.handle.BrowserPID)
 	if err := eng.handleDownloads(ctx, opts.DownloadsDir); err != nil {
-		return nil, errors.Join(err, eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, cdpURL), eng.Close(context.WithoutCancel(ctx)))
 	}
 	return eng, nil
 }
 
-// start launches the browser opts describe, with the certificate proxy it
-// needs, sending userAgent when it is set.
+// start launches the browser opts describe behind its DevTools gate, with
+// the certificate proxy it needs, sending userAgent when it is set. The
+// browser listens on no port: the gate owns its DevTools pipe and serves it
+// behind a token only this process and the record know.
 func (l stagehandLauncher) start(ctx context.Context, opts launchOptions, userAgent string) (startedBrowser, error) {
-	port, err := freeLoopbackPort()
+	executable, err := devtoolsgate.FindBrowser(opts.Executable)
 	if err != nil {
-		return startedBrowser{}, err
+		return startedBrowser{}, fmt.Errorf("launch browser: %w", err)
 	}
-	launch := &stagehand.LocalBrowserLaunchOptions{
-		ExecutablePath: opts.Executable,
-		Headless:       opts.Headless,
-		Port:           port,
-		UserDataDir:    opts.UserDataDir,
-		KeepAlive:      true,
+	launch := devtoolsgate.LaunchOptions{
+		UserDataDir: opts.UserDataDir,
+		Headless:    opts.Headless,
+		ProxyServer: opts.Proxy,
+		NoSandbox:   opts.NoSandbox,
 	}
-	launch.ChromiumSandbox = new(!opts.NoSandbox)
 	if opts.Viewport != nil {
-		launch.Viewport = &stagehand.LocalViewport{Width: opts.Viewport.Width, Height: opts.Viewport.Height}
-	}
-	if opts.Proxy != "" {
-		launch.Proxy = &stagehand.LocalProxyConfig{Server: opts.Proxy}
+		launch.Viewport = &devtoolsgate.Viewport{Width: opts.Viewport.Width, Height: opts.Viewport.Height}
 	}
 	if userAgent != "" {
-		launch.Args = append(launch.Args, "--user-agent="+userAgent)
+		launch.Extra = append(launch.Extra, "--user-agent="+userAgent)
 	}
 	if opts.Headless {
-		launch.Args = append(launch.Args, headlessScreen(opts.Viewport))
+		launch.Extra = append(launch.Extra, headlessScreen(opts.Viewport))
 	}
-	cdpURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	if opts.WriteGate != nil {
 		// A service worker a site registered in an earlier run can start
 		// with the browser, before the gate, to send a pending background
@@ -357,22 +357,55 @@ func (l stagehandLauncher) start(ctx context.Context, opts launchOptions, userAg
 		}
 	}
 	var proxy *certproxy.Handle
+	var proxyAuth *devtoolsgate.ProxyAuth
 	if len(opts.ClientCertificates) > 0 || len(opts.TrustedCAs) > 0 || opts.Guard {
-		if proxy, err = l.startCertProxy(ctx, cdpURL, opts); err != nil {
+		// The proxy carries a request only with this credential, which
+		// the browser's gate gives it when it asks.
+		credential := rand.Text()
+		if proxy, err = l.startCertProxy(ctx, credential, opts); err != nil {
 			return startedBrowser{}, err
 		}
 		// The proxy routes the browser's requests, through browser.proxy
-		// where one is set. The debugging port stays direct.
-		launch.Proxy = nil
-		proxy.DebugPort = port
-		launch.Args = append(launch.Args, proxy.ChromeArgs()...)
+		// where one is set.
+		launch.ProxyServer = ""
+		launch.Extra = append(launch.Extra, proxy.ChromeArgs()...)
+		proxyAuth = &devtoolsgate.ProxyAuth{Addresses: proxy.ProxyAddresses(), Username: certproxy.ProxyUser, Password: credential}
 	}
-	browser, err := stagehand.LaunchLocalBrowser(ctx, launch)
+	gate, err := devtoolsgate.Start(ctx, daguExecutable(ctx), devtoolsgate.Config{
+		Token:      devtoolsgate.NewToken(),
+		Executable: executable,
+		Args:       devtoolsgate.ChromeArgs(launch),
+		ProxyAuth:  proxyAuth,
+	})
 	if err != nil {
-		launchErr := fmt.Errorf("launch browser: %w%s", err, sandboxHint(opts.NoSandbox))
-		return startedBrowser{}, errors.Join(launchErr, endUnstartedBrowser(ctx, nil, cdpURL, opts.UserDataDir), killCertProxy(proxy))
+		return startedBrowser{}, errors.Join(fmt.Errorf("launch browser: %w%s", err, sandboxHint(opts.NoSandbox)), killCertProxy(proxy))
 	}
-	return startedBrowser{browser: browser, cdpURL: cdpURL, proxy: proxy}, nil
+	cdpURL := gate.URL
+	if proxy != nil {
+		// The proxy watches the browser it serves and ends with it.
+		if err := certproxy.SetBrowser(ctx, proxy.URL, cdpURL); err != nil {
+			return startedBrowser{}, errors.Join(err, endUnstartedBrowser(ctx, nil, gate), killCertProxy(proxy))
+		}
+	}
+	browser, err := stagehand.ConnectLocalBrowser(ctx, stagehand.LocalBrowserConnectOptions{CDPURL: cdpURL})
+	if err != nil {
+		launchErr := fmt.Errorf("launch browser: %w%s", devtoolsgate.Redact(err, cdpURL), sandboxHint(opts.NoSandbox))
+		return startedBrowser{}, errors.Join(launchErr, endUnstartedBrowser(ctx, nil, gate), killCertProxy(proxy))
+	}
+	return startedBrowser{browser: browser, cdpURL: cdpURL, devtools: gate, proxy: proxy}, nil
+}
+
+// daguExecutable is the binary whose `browser devtools-gate` command runs
+// the gate: the configured one, else this process's.
+func daguExecutable(ctx context.Context) string {
+	if cfg := cmnconfig.GetConfig(ctx); cfg != nil && cfg.Paths.Executable != "" {
+		return cfg.Paths.Executable
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "dagu"
+	}
+	return executable
 }
 
 func (stagehandLauncher) Reattach(ctx context.Context, handle browserHandle, opts launchOptions) (engine, error) {
@@ -381,33 +414,36 @@ func (stagehandLauncher) Reattach(ctx context.Context, handle browserHandle, opt
 		ExtensionID: handle.ExtensionID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("reattach browser: %w", err)
+		return nil, fmt.Errorf("reattach browser: %w", devtoolsgate.Redact(err, handle.CDPURL))
 	}
 	eng, err := startEngine(ctx, browser, handle.CDPURL, opts)
 	if err != nil {
-		return nil, errors.Join(err, browser.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, handle.CDPURL), browser.Close(context.WithoutCancel(ctx)))
 	}
 	eng.handle.ExtensionID = handle.ExtensionID
 	eng.handle.ExtensionDir = handle.ExtensionDir
 	// Closing waits for the browser's process tree, which only the recorded
-	// process identifies.
+	// process identifies, and ends the browser through its gate, which the
+	// record identifies too.
 	eng.handle.BrowserPID = handle.BrowserPID
 	eng.handle.BrowserStartedAt = handle.BrowserStartedAt
+	eng.handle.GatePID = handle.GatePID
+	eng.handle.GateStartedAt = handle.GateStartedAt
 	eng.handle.CertProxy = handle.CertProxy
 	eng.handle.WriteGate = handle.WriteGate
 	// What the proxy reported before the browser was reattached belongs to
 	// the process that drove it then.
 	_, _ = eng.TakeCertificateEvents(ctx)
 	if err := eng.handleDownloads(ctx, opts.DownloadsDir); err != nil {
-		return nil, errors.Join(err, eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, handle.CDPURL), eng.Close(context.WithoutCancel(ctx)))
 	}
 	return eng, nil
 }
 
 // startCertProxy starts the proxy that presents opts.ClientCertificates for
-// the browser at cdpURL and routes every other request the way this device
-// does.
-func (l stagehandLauncher) startCertProxy(ctx context.Context, cdpURL string, opts launchOptions) (*certproxy.Handle, error) {
+// the browser started next and routes every other request the way this
+// device does, carrying only requests that give credential.
+func (l stagehandLauncher) startCertProxy(ctx context.Context, credential string, opts launchOptions) (*certproxy.Handle, error) {
 	pac, warnings, err := sysproxy.Detect(ctx, opts.Proxy)
 	if err != nil {
 		return nil, fmt.Errorf("browser.proxy: %w", err)
@@ -421,9 +457,9 @@ func (l stagehandLauncher) startCertProxy(ctx context.Context, cdpURL string, op
 	if start == nil {
 		start = certproxy.Start
 	}
-	proxy, err := start(ctx, cmnconfig.GetConfig(ctx).Paths.Executable, certproxy.Config{
+	proxy, err := start(ctx, daguExecutable(ctx), certproxy.Config{
 		Token:      rand.Text(),
-		CDPURL:     cdpURL,
+		Credential: credential,
 		SystemPAC:  pac,
 		Entries:    opts.ClientCertificates,
 		TrustedCAs: opts.TrustedCAs,
@@ -442,7 +478,7 @@ func (l stagehandLauncher) startWriteGate(ctx context.Context, cdpURL string, op
 	if start == nil {
 		start = writegate.Start
 	}
-	gate, err := start(ctx, cmnconfig.GetConfig(ctx).Paths.Executable, writegate.Config{
+	gate, err := start(ctx, daguExecutable(ctx), writegate.Config{
 		Token:        rand.Text(),
 		CDPURL:       cdpURL,
 		Mode:         opts.WriteGate.Mode,
@@ -479,35 +515,26 @@ func killCertProxy(proxy *certproxy.Handle) error {
 	return proxy.Kill()
 }
 
-// endUnstartedBrowser ends the browser launched with profileDir at cdpURL
-// after its runtime failed to start. The SDK leaves a kept-alive browser
-// running then, and browser, when known, may no longer reach it, so the
-// browser is asked to exit over DevTools. The debugging port was only free
-// when chosen, so the browser is closed only when it uses profileDir.
-func endUnstartedBrowser(ctx context.Context, browser *stagehand.Browser, cdpURL, profileDir string) error {
+// endUnstartedBrowser ends the browser behind gate after its runtime failed
+// to start. The browser is the gate's own, so it is asked to exit over
+// DevTools and, failing that, its gate is ended, which closes the pipe the
+// browser lives on.
+func endUnstartedBrowser(ctx context.Context, browser *stagehand.Browser, gate *devtoolsgate.Handle) error {
 	ctx = context.WithoutCancel(ctx)
-	var err error
-	if profileDir != "" {
-		owned, ownErr := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (bool, error) {
-			return browserhost.UsesProfile(ctx, cdpURL, profileDir)
-		})
-		switch {
-		case errors.Is(ownErr, browserhost.ErrUnreachable):
-		case ownErr != nil:
-			err = fmt.Errorf("identify browser: %w", ownErr)
-		case owned:
-			_, err = boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
-				return struct{}{}, browserhost.CloseBrowser(ctx, cdpURL)
-			})
-		}
-	}
+	var errs []error
 	if browser != nil {
 		_, closeErr := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
 			return struct{}{}, browser.Close(ctx)
 		})
-		err = errors.Join(err, closeErr)
+		errs = append(errs, devtoolsgate.Redact(closeErr, gate.URL))
 	}
-	return err
+	_, err := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, browserhost.CloseBrowser(ctx, gate.URL)
+	})
+	if err != nil {
+		errs = append(errs, devtoolsgate.Redact(err, gate.URL), gate.Kill())
+	}
+	return errors.Join(errs...)
 }
 
 func startEngine(ctx context.Context, browser *stagehand.Browser, cdpURL string, opts launchOptions) (*stagehandEngine, error) {
@@ -1515,58 +1542,27 @@ func (e *stagehandEngine) Detach(ctx context.Context) error {
 func (e *stagehandEngine) Close(ctx context.Context) error {
 	defer e.slot.Release()
 	releaseErr := e.release(ctx)
-	// The runtime asks a browser it reattached to exit itself.
-	if e.browser.Origin() == stagehand.BrowserOriginLaunched {
-		exitLaunchedBrowser(ctx, e.handle)
-	}
 	return errors.Join(
 		releaseErr,
-		closeBrowser(ctx, e.handle.BrowserPID, e.handle.BrowserStartedAt, e.browser.Close),
+		closeBrowser(ctx, e.handle.BrowserPID, e.handle.BrowserStartedAt, e.closeRuntime),
 		killCertProxy(e.handle.CertProxy),
 		killWriteGate(e.handle.WriteGate),
 	)
 }
 
-// exitLaunchedBrowser asks a browser it launched to exit over DevTools and
-// waits up to browserExitTimeout for its processes to exit. Exiting on
-// request, the browser first writes what its profile keeps, such as the
-// cookies of a sign-in, and it stops answering DevTools before it is done.
-// The runtime ends a launched browser's processes all at once, which loses
-// what is not written yet, so it ends only a browser that does not exit on
-// request or in time.
-func exitLaunchedBrowser(ctx context.Context, handle browserHandle) {
-	var tree *browserProcessTree
-	if handle.BrowserPID > 0 {
-		tree = recordBrowserProcessTree(handle.BrowserPID, handle.BrowserStartedAt)
+// closeRuntime ends the browser: the runtime asks it over DevTools, through
+// its gate, to exit, which lets it write what its profile keeps, such as the
+// cookies of a sign-in, and closeBrowser waits for its processes to finish.
+// When the browser does not answer, its gate is ended, which closes the pipe
+// the browser lives on.
+func (e *stagehandEngine) closeRuntime(ctx context.Context) error {
+	err := devtoolsgate.Redact(e.browser.Close(ctx), e.handle.CDPURL)
+	closeErr := browserhost.CloseBrowser(ctx, e.handle.CDPURL)
+	if closeErr != nil {
+		gate := &devtoolsgate.Handle{URL: e.handle.CDPURL, PID: e.handle.GatePID, StartedAt: e.handle.GateStartedAt}
+		closeErr = errors.Join(devtoolsgate.Redact(closeErr, e.handle.CDPURL), gate.Kill())
 	}
-	if tree != nil {
-		defer tree.release()
-	}
-	if askToExit(ctx, handle.CDPURL) != nil || tree == nil {
-		return
-	}
-	ticker := time.NewTicker(exitPollInterval)
-	defer ticker.Stop()
-	deadline := time.NewTimer(browserExitTimeout)
-	defer deadline.Stop()
-	for !tree.exited() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-deadline.C:
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// askToExit asks the browser at cdpURL to exit over DevTools, giving up on
-// the request after exitRequestTimeout.
-func askToExit(ctx context.Context, cdpURL string) error {
-	_, err := boundCall(ctx, exitRequestTimeout, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, browserhost.CloseBrowser(ctx, cdpURL)
-	})
-	return err
+	return errors.Join(err, closeErr)
 }
 
 // closeBrowser terminates a launched browser with closeRuntime. The browser's
@@ -1791,15 +1787,6 @@ func messageText(content stagehand.LLMMessageContent) (string, error) {
 		}
 	}
 	return text.String(), nil
-}
-
-func freeLoopbackPort() (int, error) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return 0, fmt.Errorf("reserve browser debugging port: %w", err)
-	}
-	defer func() { _ = listener.Close() }()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
 // telemetrySink accepts and discards trace exports on loopback.

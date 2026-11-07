@@ -134,6 +134,8 @@ func serve(ctx context.Context, cfg Config, public *x509.CertPool, ready func(Re
 	s := &server{
 		ctx:         ctx,
 		token:       cfg.Token,
+		credential:  cfg.Credential,
+		browser:     make(chan string, 1),
 		entries:     entries,
 		trustedCAs:  authorities,
 		pac:         evaluator,
@@ -169,10 +171,24 @@ func serve(ctx context.Context, cfg Config, public *x509.CertPool, ready func(Re
 	if grace <= 0 {
 		grace = defaultGrace
 	}
+	if cfg.CDPURL != "" {
+		s.setBrowser(cfg.CDPURL)
+	}
 	watched := make(chan struct{})
 	go func() {
 		defer close(watched)
-		watchBrowser(ctx, cfg.CDPURL, grace, browserPollInterval)
+		// The browser starts with the proxy's flags, so the proxy hears
+		// its address after it is ready; one never named within grace
+		// never started.
+		deadline := time.Now().Add(grace)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(grace):
+			return
+		case cdpURL := <-s.browser:
+			watchBrowser(ctx, cdpURL, time.Until(deadline), browserPollInterval)
+		}
 	}()
 	var failure error
 	select {
@@ -208,8 +224,8 @@ func (c Config) validate() error {
 	switch {
 	case c.Token == "":
 		return errors.New("the certificate proxy config has no token")
-	case c.CDPURL == "":
-		return errors.New("the certificate proxy config names no browser")
+	case c.Credential == "":
+		return errors.New("the certificate proxy config has no credential")
 	case len(c.Entries) == 0 && len(c.TrustedCAs) == 0 && !c.Guard:
 		return errors.New("the certificate proxy config has no certificates and no guard")
 	}

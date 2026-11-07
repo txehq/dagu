@@ -43,7 +43,7 @@ func TestNavigateReturnsForADocumentParsedBeforeItsEventsWereOn(t *testing.T) {
 	fake := loadingPage(t, "complete", func(cdpCommand) []cdpEvent { return nil })
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	load, err := browserhost.Navigate(ctx, fake.server.URL, "target", "http://site.test/next")
+	load, err := browserhost.Navigate(ctx, fake.url(), "target", "http://site.test/next")
 	require.NoError(t, err)
 	require.True(t, load.Document)
 }
@@ -63,7 +63,7 @@ func TestNavigateWaitsForADocumentStillLoading(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	load, err := browserhost.Navigate(ctx, fake.server.URL, "target", "http://site.test/next")
+	load, err := browserhost.Navigate(ctx, fake.url(), "target", "http://site.test/next")
 	require.NoError(t, err)
 	require.True(t, load.Document)
 }
@@ -104,7 +104,7 @@ func TestNavigateReadsAgainADocumentReplacedWhileItReads(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	load, err := browserhost.Navigate(ctx, fake.server.URL, "target", "http://site.test/next")
+	load, err := browserhost.Navigate(ctx, fake.url(), "target", "http://site.test/next")
 	require.NoError(t, err)
 	require.True(t, load.Document)
 	require.Equal(t, int32(2), reads.Load(), "the page is read again after the document it showed was replaced")
@@ -144,7 +144,7 @@ func TestNavigateWaitsForEventsWhenThePageShowsNoDocument(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	load, err := browserhost.Navigate(ctx, fake.server.URL, "target", "http://site.test/next")
+	load, err := browserhost.Navigate(ctx, fake.url(), "target", "http://site.test/next")
 	require.NoError(t, err)
 	require.True(t, load.Document)
 }

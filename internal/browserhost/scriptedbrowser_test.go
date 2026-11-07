@@ -63,14 +63,19 @@ func newAnsweringBrowser(t *testing.T, script func(cdpCommand) []cdpEvent, answe
 
 func startScriptedBrowser(t *testing.T, fake *scriptedBrowser) *scriptedBrowser {
 	t.Helper()
-	fake.server = httptest.NewServer(http.HandlerFunc(fake.serve))
+	fake.server = httptest.NewServer(http.StripPrefix("/"+testToken, http.HandlerFunc(fake.serve)))
 	t.Cleanup(fake.server.Close)
 	return fake
 }
 
+// url is the browser's address as a gate would serve it.
+func (f *scriptedBrowser) url() string {
+	return f.server.URL + "/" + testToken
+}
+
 func (f *scriptedBrowser) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/json/version" {
-		wsURL := "ws" + strings.TrimPrefix(f.server.URL, "http") + "/devtools/browser/test"
+		wsURL := "ws" + strings.TrimPrefix(f.url(), "http") + "/devtools/browser/test"
 		_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": wsURL})
 		return
 	}

@@ -191,17 +191,36 @@ func newFakeBrowser(t *testing.T) *fakeBrowser {
 	fake := &fakeBrowser{}
 	// Like Chrome, every browser has an identity of its own.
 	fake.id.Store(rand.Text())
-	fake.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fake.server = httptest.NewServer(http.StripPrefix("/"+testGateToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/json/version" || fake.replaced.Load() {
 			http.NotFound(w, r)
 			return
 		}
-		url := "ws://" + r.Host + "/devtools/browser/" + fake.id.Load().(string)
+		url := "ws://" + r.Host + "/" + testGateToken + "/devtools/browser/" + fake.id.Load().(string)
 		_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": url})
 		fake.answered.Add(1)
-	}))
+	})))
 	t.Cleanup(fake.server.Close)
 	return fake
+}
+
+// testGateToken is the token the fake browsers serve under, as a browser's
+// DevTools gate does.
+const testGateToken = "TESTGATETOKEN000000000000A"
+
+// url is the fake browser's address behind its gate.
+func (b *fakeBrowser) url() string {
+	return b.server.URL + "/" + testGateToken
+}
+
+// testCredential is the credential of the proxies the tests start, which
+// their clients give as the browser's gate does.
+const testCredential = "TESTCREDENTIAL0000000000000A"
+
+// testProxyAuthorization is the Proxy-Authorization a client of a test
+// proxy sends.
+func testProxyAuthorization() string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(ProxyUser+":"+testCredential))
 }
 
 // serveProxy runs Serve until the test ends.
@@ -248,17 +267,28 @@ func runProxy(t *testing.T, run func(context.Context, func(Ready)) error) Ready 
 // testConfig returns a configuration serving entries for a fake browser.
 func testConfig(t *testing.T, systemPAC string, entries ...Entry) Config {
 	t.Helper()
-	return Config{Token: rand.Text(), CDPURL: newFakeBrowser(t).server.URL, SystemPAC: systemPAC, Entries: entries}
+	return Config{Token: rand.Text(), Credential: testCredential, CDPURL: newFakeBrowser(t).url(), SystemPAC: systemPAC, Entries: entries}
 }
 
 // connectThrough opens a CONNECT tunnel to target through the HTTP proxy
-// at proxyAddr and returns the status it answered.
+// at proxyAddr, giving the proxy's credential, and returns the status it
+// answered.
 func connectThrough(proxyAddr, target string) (net.Conn, int, error) {
+	return connectWith(proxyAddr, target, testProxyAuthorization())
+}
+
+// connectWith is connectThrough sending authorization as the request's
+// Proxy-Authorization, or none when it is empty.
+func connectWith(proxyAddr, target, authorization string) (net.Conn, int, error) {
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
 		return nil, 0, err
 	}
-	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+	header := ""
+	if authorization != "" {
+		header = "Proxy-Authorization: " + authorization + "\r\n"
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", target, target, header); err != nil {
 		_ = conn.Close()
 		return nil, 0, err
 	}

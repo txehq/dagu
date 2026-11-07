@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,16 +15,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	"github.com/dagucloud/dagu/v2/internal/test/chrometest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -374,8 +375,11 @@ func TestGuardPassesChromesOwnHandshake(t *testing.T) {
 
 // runChrome opens url in a headless Chrome that reaches every site through
 // the guard alone, until the test ends: the proxy's PAC script would let
-// Chrome go around a guard connection that fails. Chrome accepts any server
-// certificate, so a handshake of its own that reaches the site completes.
+// Chrome go around a guard connection that fails. Chrome runs behind its
+// DevTools gate, which answers the guard's challenge for the proxy's
+// credential, as every browser the runtime starts does. Chrome accepts any
+// server certificate, so a handshake of its own that reaches the site
+// completes.
 func runChrome(t *testing.T, chrome string, ready Ready, url string) {
 	t.Helper()
 	profile, err := os.MkdirTemp("", "dagu-certproxy-chrome-")
@@ -385,45 +389,109 @@ func runChrome(t *testing.T, chrome string, ready Ready, url string) {
 		assert.Eventually(t, func() bool { return os.RemoveAll(profile) == nil },
 			10*time.Second, 200*time.Millisecond, "remove the browser profile")
 	})
+	executable, err := os.Executable()
+	require.NoError(t, err)
 	pac := fmt.Sprintf(`function FindProxyForURL() { return "PROXY 127.0.0.1:%d"; }`, ready.GuardPort)
-	cmd := exec.Command(chrome,
-		"--headless",
-		"--no-sandbox",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-background-networking",
-		"--disable-component-update",
-		"--ignore-certificate-errors",
-		"--remote-debugging-port=0",
-		"--user-data-dir="+profile,
-		"--proxy-pac-url="+pacDataURLPrefix+base64.StdEncoding.EncodeToString([]byte(pac)),
-		"--ignore-certificate-errors-spki-list="+ready.SPKI,
-		url,
-	)
-	require.NoError(t, cmd.Start())
-	t.Cleanup(func() { closeChrome(cmd, profile) })
+	gate, err := devtoolsgate.Start(t.Context(), executable, devtoolsgate.Config{
+		Token:      devtoolsgate.NewToken(),
+		Executable: chrome,
+		Args: []string{
+			"--headless",
+			"--no-sandbox",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-background-networking",
+			"--disable-component-update",
+			"--ignore-certificate-errors",
+			"--user-data-dir=" + profile,
+			"--proxy-pac-url=" + pacDataURLPrefix + base64.StdEncoding.EncodeToString([]byte(pac)),
+			"--ignore-certificate-errors-spki-list=" + ready.SPKI,
+			"about:blank",
+		},
+		ProxyAuth: &devtoolsgate.ProxyAuth{
+			Addresses: []string{fmt.Sprintf("127.0.0.1:%d", ready.GuardPort)},
+			Username:  ProxyUser,
+			Password:  testCredential,
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { closeChrome(gate) })
+	// The page opens once the gate holds every target, as the runtime's
+	// pages do: a page Chrome opened before the gate attached would send
+	// its first requests with nobody to answer the proxy's challenge.
+	openPage(t, gate.URL, url)
 }
 
-// closeChrome closes the Chrome cmd runs through its DevTools port, which
-// ends every process it started; killing it alone would leave them running.
-// It kills Chrome only when that does not end it in time.
-func closeChrome(cmd *exec.Cmd, profile string) {
+// openPage opens url in a new page of the browser behind the gate at
+// cdpURL, keeping the DevTools connection that asked until the test ends.
+// The page starts blank and then navigates, as the runtime's pages do: the
+// first request of a page created with its address can leave before the
+// gate holds the page.
+func openPage(t *testing.T, cdpURL, url string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, cdpURL+"/json/version", nil)
+	require.NoError(t, err)
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	var version struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	err = json.NewDecoder(response.Body).Decode(&version)
+	_ = response.Body.Close()
+	require.NoError(t, err)
+	conn, dialResponse, err := websocket.Dial(ctx, version.WebSocketDebuggerURL, nil)
+	if dialResponse != nil && dialResponse.Body != nil {
+		_ = dialResponse.Body.Close()
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	nextID := 0
+	call := func(sessionID, method string, params map[string]any) json.RawMessage {
+		nextID++
+		command := map[string]any{"id": nextID, "method": method, "params": params}
+		if sessionID != "" {
+			command["sessionId"] = sessionID
+		}
+		data, err := json.Marshal(command)
+		require.NoError(t, err)
+		require.NoError(t, conn.Write(ctx, websocket.MessageText, data))
+		for {
+			_, data, err := conn.Read(ctx)
+			require.NoError(t, err)
+			var reply struct {
+				ID     int             `json:"id"`
+				Result json.RawMessage `json:"result"`
+				Error  json.RawMessage `json:"error"`
+			}
+			if json.Unmarshal(data, &reply) == nil && reply.ID == nextID {
+				require.Empty(t, reply.Error, method)
+				return reply.Result
+			}
+		}
+	}
+	var page struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(call("", "Target.createTarget", map[string]any{"url": "about:blank"}), &page))
+	var session struct {
+		SessionID string `json:"sessionId"`
+	}
+	require.NoError(t, json.Unmarshal(call("", "Target.attachToTarget", map[string]any{"targetId": page.TargetID, "flatten": true}), &session))
+	call(session.SessionID, "Page.navigate", map[string]any{"url": url})
+}
+
+// closeChrome closes the Chrome behind gate over DevTools, which ends every
+// process it started, and ends the gate, and so Chrome, when that does not
+// end it in time.
+func closeChrome(gate *devtoolsgate.Handle) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	exited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(exited)
-	}()
-	// Chrome writes the port it chose to the profile's DevToolsActivePort.
-	if data, err := os.ReadFile(filepath.Join(profile, "DevToolsActivePort")); err == nil {
-		port, _, _ := strings.Cut(string(data), "\n")
-		_ = browserhost.CloseBrowser(ctx, "http://127.0.0.1:"+port)
+	if browserhost.CloseBrowser(ctx, gate.URL) != nil {
+		_ = gate.Kill()
 	}
-	select {
-	case <-exited:
-	case <-ctx.Done():
-		_ = cmd.Process.Kill()
-		<-exited
+	for procutil.IsAlive(gate.BrowserPID) && ctx.Err() == nil {
+		time.Sleep(100 * time.Millisecond)
 	}
 }

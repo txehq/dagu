@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,18 +57,6 @@ const shopPage = `<!doctype html><html><head><title>Shop</title></head><body>
 // testBrowserDir keeps what test browsers learn about the executable, so
 // only the first headless launch of a test process learns its user agent.
 var testBrowserDir string
-
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "dagu-browser-state-")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	testBrowserDir = dir
-	code := m.Run()
-	_ = os.RemoveAll(dir)
-	os.Exit(code)
-}
 
 // elementIDPattern finds a node ID in the accessibility tree the runtime
 // sends to the model, such as "[0-23] button: Submit".
@@ -1654,47 +1643,6 @@ func TestStagehandCloseKeepsProfileCookies(t *testing.T) {
 	require.Contains(t, text, "Welcome back", "the profile keeps the session cookie the first browser received")
 }
 
-// A browser that stops answering DevTools does not hold up its close: the
-// request to exit gives up, so the runtime can end the browser.
-func TestAskToExitGivesUpOnASilentBrowser(t *testing.T) {
-	t.Parallel()
-
-	started := time.Now()
-	err := askToExit(context.Background(), serveSilentBrowser(t))
-	require.ErrorIs(t, err, errBrowserUnresponsive)
-	require.Less(t, time.Since(started), exitRequestTimeout+10*time.Second)
-}
-
-// A browser asked to exit stops answering DevTools before it has finished
-// writing its profile. Exiting a launched browser returns only once its
-// process has gone, so the runtime does not end it partway through.
-func TestExitLaunchedBrowserWaitsForProcess(t *testing.T) {
-	t.Parallel()
-
-	browser := startSleeper(t)
-	reaped := make(chan struct{})
-	go func() {
-		_ = browser.Wait()
-		close(reaped)
-	}()
-	var finished atomic.Bool
-	cdpURL := serveExitingBrowser(t, func() {
-		// The browser takes a while to write its profile before it exits.
-		time.Sleep(500 * time.Millisecond)
-		finished.Store(true)
-		_ = browser.Process.Kill()
-	})
-	startedAt, _ := procutil.StartTime(browser.Process.Pid)
-
-	exitLaunchedBrowser(t.Context(), browserHandle{
-		CDPURL:           cdpURL,
-		BrowserPID:       browser.Process.Pid,
-		BrowserStartedAt: startedAt,
-	})
-	assert.True(t, finished.Load(), "returned while the browser was still exiting")
-	<-reaped
-}
-
 // dialogPage opens an alert, a confirm, and a prompt while it loads, and
 // shows how the confirm and the prompt were answered.
 const dialogPage = `<p id="result"></p><script>
@@ -1863,11 +1811,12 @@ func TestStagehandFailedLaunchEndsBrowser(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits out the runtime's fixed startup minute")
 	}
-	// The wrapper records the browser's arguments and disables extensions,
-	// so the runtime extension never starts.
+	// The wrapper records the browser's arguments and its process ID, which
+	// exec makes the browser's, and disables extensions, so the runtime
+	// extension never starts.
 	wrapper := filepath.Join(t.TempDir(), "chrome")
 	chrome := "'" + strings.ReplaceAll(chrometest.Path(), "'", `'\''`) + "'"
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > \"$0.args\"\nexec %s \"$@\" --disable-extensions\n", chrome)
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > \"$0.args\"\nprintf '%%s' \"$$\" > \"$0.pid\"\nexec %s \"$@\" --disable-extensions\n", chrome)
 	require.NoError(t, os.WriteFile(wrapper, []byte(script), 0o700))
 
 	// A kept user agent spares the probe, which would wait out the same
@@ -1889,11 +1838,15 @@ func TestStagehandFailedLaunchEndsBrowser(t *testing.T) {
 
 	args, err := os.ReadFile(wrapper + ".args")
 	require.NoError(t, err, "the browser started")
-	port := regexp.MustCompile(`--remote-debugging-port=(\d+)`).FindSubmatch(args)
-	require.NotNil(t, port, string(args))
+	assert.Contains(t, string(args), "--remote-debugging-pipe", "the browser is driven over its pipe")
+	assert.NotContains(t, string(args), "--remote-debugging-port", "the browser opens no port")
+	pidText, err := os.ReadFile(wrapper + ".pid")
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		return errors.Is(browserhost.Probe(context.Background(), "http://127.0.0.1:"+string(port[1])), browserhost.ErrUnreachable)
-	}, 10*time.Second, 200*time.Millisecond, "the failed launch ends the browser")
+		return !procutil.IsAlive(pid)
+	}, 15*time.Second, 200*time.Millisecond, "the failed launch ends the browser")
 }
 
 // serveUserAgent serves a page showing the user agent its request came

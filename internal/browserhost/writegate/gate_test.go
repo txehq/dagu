@@ -7,14 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -25,7 +23,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	"github.com/dagucloud/dagu/v2/internal/test/chrometest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -142,11 +142,19 @@ func (s *site) written() map[string]int {
 }
 
 // browser is a headless Chrome started for a test, as the browser runtime
-// starts one: unpacked extensions may be loaded over DevTools.
+// starts one: behind its DevTools gate, where unpacked extensions may be
+// loaded over DevTools.
 type browser struct {
-	cmd     *exec.Cmd
+	gate    *devtoolsgate.Handle
 	cdpURL  string
 	profile string
+}
+
+// waitExited waits for the browser's process to exit.
+func (b *browser) waitExited(t *testing.T) {
+	t.Helper()
+	require.Eventually(t, func() bool { return !procutil.IsAlive(b.gate.BrowserPID) },
+		30*time.Second, 50*time.Millisecond, "the browser did not exit")
 }
 
 func startBrowser(t *testing.T) *browser {
@@ -199,48 +207,33 @@ func holdBrowserSlot(t *testing.T) {
 	})
 }
 
-// startBrowserOn starts the browser on the profile directory. The browser
-// chooses its DevTools port and writes it to the profile, so no other
-// process can take the port between choosing and listening.
+// startBrowserOn starts the browser on the profile directory, behind a
+// DevTools gate this test binary serves, as dagu does.
 func startBrowserOn(t *testing.T, profile string) *browser {
 	t.Helper()
 	path := chrometest.Require(t)
 	holdBrowserSlot(t)
 	startupSlot <- struct{}{}
 	defer func() { <-startupSlot }()
-	activePort := filepath.Join(profile, "DevToolsActivePort")
-	// A profile used before still names the port of the browser that used it.
-	if err := os.Remove(activePort); !errors.Is(err, os.ErrNotExist) {
-		require.NoError(t, err)
-	}
-	cmd := exec.Command(path, "--headless", "--no-sandbox", "--no-first-run", "--no-default-browser-check",
-		"--enable-unsafe-extension-debugging", "--remote-allow-origins=*", "--password-store=basic", "--use-mock-keychain",
-		"--remote-debugging-port=0", "--user-data-dir="+profile, "about:blank")
-	var out output
-	cmd.Stdout, cmd.Stderr = &out, &out
-	require.NoError(t, cmd.Start())
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+	self, err := os.Executable()
+	require.NoError(t, err)
+	gate, err := devtoolsgate.Start(t.Context(), self, devtoolsgate.Config{
+		Token:      devtoolsgate.NewToken(),
+		Executable: path,
+		Args:       devtoolsgate.ChromeArgs(devtoolsgate.LaunchOptions{UserDataDir: profile, Headless: true, NoSandbox: true}),
 	})
-	cdpURL := make(chan string, 1)
-	started := assert.Eventually(t, func() bool {
-		data, err := os.ReadFile(activePort) //nolint:gosec // the test's own profile
-		port, _, _ := strings.Cut(string(data), "\n")
-		if err != nil || port == "" {
-			return false
+	require.NoError(t, err, "the browser did not start behind its gate")
+	b := &browser{gate: gate, cdpURL: gate.URL, profile: profile}
+	t.Cleanup(func() {
+		_ = gate.Kill()
+		for range 300 {
+			if !procutil.IsAlive(gate.BrowserPID) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		address := "http://127.0.0.1:" + port
-		if browserhost.Probe(t.Context(), address) != nil {
-			return false
-		}
-		cdpURL <- address
-		return true
-	}, 30*time.Second, 50*time.Millisecond)
-	if !started {
-		t.Fatalf("the browser did not answer on DevTools; it printed:\n%s", out.String())
-	}
-	return &browser{cmd: cmd, cdpURL: <-cdpURL, profile: profile}
+	})
+	return b
 }
 
 // output keeps what a browser prints, to show when it does not start.
@@ -748,7 +741,7 @@ func TestGateExtensionLeavesTheProfileAsItWas(t *testing.T) {
 	_, _, _ = guard(t, b, writegate.Policy{}, nil)
 	require.Contains(t, extensionNames(t, b), "Dagu write gate")
 	require.NoError(t, browserhost.CloseBrowser(t.Context(), b.cdpURL))
-	_, _ = b.cmd.Process.Wait()
+	b.waitExited(t)
 
 	again := startBrowserOn(t, profile)
 	assert.NotContains(t, extensionNames(t, again), "Dagu write gate")

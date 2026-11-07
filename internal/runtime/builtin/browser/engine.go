@@ -177,6 +177,9 @@ type launchOptions struct {
 
 // browserHandle locates a running browser.
 type browserHandle struct {
+	// CDPURL is the browser's DevTools address behind its gate. It carries
+	// the gate's token, so it is kept in the record and never written
+	// anywhere else.
 	CDPURL       string
 	ExtensionID  string
 	ExtensionDir string
@@ -191,6 +194,10 @@ type browserHandle struct {
 	CertProxy *certproxy.Handle
 	// WriteGate is the gate deciding the browser's writes, or nil.
 	WriteGate *writegate.Handle
+	// GatePID and GateStartedAt identify the gate process serving the
+	// browser; ending it closes the browser's pipe, and so the browser.
+	GatePID       int
+	GateStartedAt int64
 }
 
 // writeGateOptions configures the write gate a browser starts with.

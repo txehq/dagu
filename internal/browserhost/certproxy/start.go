@@ -25,17 +25,12 @@ import (
 )
 
 // configVersion versions the configuration a starting process hands the
-// proxy, which may run an executable replaced in the meantime.
-const configVersion = 2
+// proxy, which may run an executable replaced in the meantime. Version 3
+// added the credential every carried request needs.
+const configVersion = 3
 
-const (
-	// startAttempts bounds the starts of a proxy that took the browser's
-	// debugging port.
-	startAttempts = 2
-	// readyTimeout bounds the wait for a starting proxy to accept
-	// connections.
-	readyTimeout = 10 * time.Second
-)
+// readyTimeout bounds the wait for a starting proxy to accept connections.
+const readyTimeout = 10 * time.Second
 
 // wireConfig is the configuration as the proxy process reads it.
 type wireConfig struct {
@@ -62,13 +57,21 @@ type Handle struct {
 	SPKI      string `json:"spki"`
 	// Port is the proxy port the browser connects to.
 	Port int `json:"port,omitempty"`
+	// GuardPort is the port of the guard, or zero without one.
+	GuardPort int `json:"guard_port,omitempty"`
 	// Manual reports that ChromeArgs uses a manual proxy, because a PAC
 	// script cannot route a configured destination.
 	Manual bool `json:"manual,omitempty"`
-	// DebugPort is the browser's debugging port. A manual proxy leaves it
-	// direct: <-loopback> would send the runtime's own WebSocket through
-	// the proxy.
-	DebugPort int `json:"-"`
+}
+
+// ProxyAddresses are the host:port addresses the browser sends requests
+// to, each of which challenges for the proxy's credential.
+func (h Handle) ProxyAddresses() []string {
+	addresses := []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(h.Port))}
+	if h.GuardPort != 0 {
+		addresses = append(addresses, net.JoinHostPort("127.0.0.1", strconv.Itoa(h.GuardPort)))
+	}
+	return addresses
 }
 
 // ChromeArgs returns the browser flags that send the certificate hosts to
@@ -82,13 +85,9 @@ func (h Handle) ChromeArgs() []string {
 	}
 	args := []string{route, "--ignore-certificate-errors-spki-list=" + h.SPKI}
 	if h.Manual {
-		// An explicit port bypass stays after <-loopback> removes the
-		// implicit loopback rules, so the debugging socket is not proxied.
-		bypass := "<-loopback>"
-		if h.DebugPort > 0 {
-			bypass += fmt.Sprintf(";127.0.0.1:%d", h.DebugPort)
-		}
-		args = append(args, "--proxy-bypass-list="+bypass)
+		// The browser opens no debugging socket of its own, which its gate
+		// serves over a pipe, so every loopback request may go to the proxy.
+		args = append(args, "--proxy-bypass-list=<-loopback>")
 	}
 	return args
 }
@@ -113,32 +112,39 @@ func (h Handle) Kill() error {
 
 // Start runs executable's browser cert-proxy command with cfg and returns
 // once the proxy accepts connections. The proxy outlives the caller and
-// exits once the browser at cfg.CDPURL is gone.
+// exits once the browser it serves is gone, or when it is not named with
+// SetBrowser within the proxy's grace period.
 func Start(ctx context.Context, executable string, cfg Config) (*Handle, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	cdpPort := urlPort(cfg.CDPURL)
-	for range startAttempts {
-		handle, ready, err := startProcess(ctx, executable, cfg)
-		if err != nil {
-			return nil, err
-		}
-		if !ready.listensOn(cdpPort) {
-			return handle, nil
-		}
-		// The browser's debugging port was only free when chosen, and the
-		// proxy, or its guard, took it before the browser started.
-		if err := handle.Kill(); err != nil {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("the certificate proxy kept taking the browser's debugging port %d", cdpPort)
+	handle, _, err := startProcess(ctx, executable, cfg)
+	return handle, err
 }
 
-// listensOn reports whether the proxy, or its guard, listens on port.
-func (r Ready) listensOn(port int) bool {
-	return r.Port == port || r.GuardPort != 0 && r.GuardPort == port
+// SetBrowser names the browser the proxy at handleURL serves, by its
+// DevTools address behind its gate, once the browser started with the
+// proxy's flags. The address carries the gate's token, so it travels only
+// on the proxy's token-protected control path.
+func SetBrowser(ctx context.Context, handleURL, cdpURL string) error {
+	body, err := json.Marshal(browserRequest{CDPURL: cdpURL})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, handleURL+"/"+browserPath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("name the browser to the certificate proxy: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("name the browser to the certificate proxy: the proxy answered %s", response.Status)
+	}
+	return nil
 }
 
 // startProcess starts one proxy process and returns it with what it said
@@ -178,6 +184,7 @@ func startProcess(ctx context.Context, executable string, cfg Config) (*Handle, 
 		PACURL:    ready.PACURL,
 		SPKI:      ready.SPKI,
 		Port:      ready.Port,
+		GuardPort: ready.GuardPort,
 		Manual:    ready.Manual,
 	}, ready, nil
 }
@@ -272,18 +279,4 @@ func getControl(ctx context.Context, address string, v any) error {
 // controlURL returns the base of the control paths of the proxy on port.
 func controlURL(port int, token string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/%s", port, token)
-}
-
-// urlPort returns the port of rawURL, or zero when it names none.
-func urlPort(rawURL string) int {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return 0
-	}
-	_, port, err := net.SplitHostPort(parsed.Host)
-	if err != nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(port)
-	return n
 }

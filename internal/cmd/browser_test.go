@@ -12,6 +12,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmd"
 	"github.com/dagucloud/dagu/v2/internal/cmn/replaycache"
 	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -72,6 +73,23 @@ steps:
 		require.NoError(t, err)
 		assert.Empty(t, browserReplayCacheSteps(t, th, "explicit-billing"))
 	})
+}
+
+// The gate that serves a browser's DevTools behind a token is a hidden
+// helper of the browser command, started by the browser step with its
+// configuration on stdin.
+func TestBrowserDevToolsGateCommand(t *testing.T) {
+	t.Parallel()
+
+	var gate *cobra.Command
+	for _, sub := range cmd.Browser().Commands() {
+		if sub.Name() == "devtools-gate" {
+			gate = sub
+		}
+	}
+	require.NotNil(t, gate, "browser devtools-gate is registered")
+	assert.True(t, gate.Hidden, "the helper is not offered to people")
+	assert.True(t, gate.SilenceUsage)
 }
 
 func runBrowserCacheClear(th test.Command, args ...string) (string, error) {

@@ -52,7 +52,7 @@ func TestPageResponseWatcherKeepsPageDocuments(t *testing.T) {
 		}
 		return nil
 	})
-	watcher, err := browserhost.WatchPageResponses(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchPageResponses(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 

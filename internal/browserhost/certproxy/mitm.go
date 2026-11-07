@@ -75,8 +75,11 @@ const (
 	pendingPath  = "pending"
 	verifiedPath = "verified"
 	pacPath      = "proxy.pac"
-	afterParam   = "after"
-	hostParam    = "host"
+	// browserPath is where the starting process names the browser the
+	// proxy serves, once its DevTools gate is up.
+	browserPath = "browser"
+	afterParam  = "after"
+	hostParam   = "host"
 )
 
 // rejectionAlerts are the TLS alerts by which a server refuses a client
@@ -90,14 +93,22 @@ type server struct {
 	// ctx ends when the proxy stops.
 	ctx        context.Context
 	token      string
-	entries    []*upstreamEntry
-	trustedCAs []scopedAuthority
-	pac        *pacEvaluator
-	issuer     *leafIssuer
-	events     *eventLog
-	verified   *verifiedHosts
-	pacScript  string // served when too large for a data: URL
-	pending    *pendingLog
+	credential string
+	// browser receives the DevTools address of the browser the proxy
+	// serves, once, when the starting process names it.
+	browser     chan string
+	browserOnce sync.Once
+	// gateAddress is the host:port of the browser's DevTools gate, once the
+	// browser is named.
+	gateAddress atomic.Pointer[string]
+	entries     []*upstreamEntry
+	trustedCAs  []scopedAuthority
+	pac         *pacEvaluator
+	issuer      *leafIssuer
+	events      *eventLog
+	verified    *verifiedHosts
+	pacScript   string // served when too large for a data: URL
+	pending     *pendingLog
 	// guardEntry presents no certificate, to the hosts the guard carries.
 	guardEntry *upstreamEntry
 	// publicRoots are the authorities whose sites the guard may pass the
@@ -186,6 +197,17 @@ type upstreamConn struct {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect && s.isBrowserGate(r.Host) {
+		s.relayToGate(w, r.Host)
+		return
+	}
+	// A request the proxy would carry, a tunnel or a plain request for
+	// another site, needs the proxy's credential.
+	carried := r.Method == http.MethodConnect || r.URL.IsAbs()
+	if carried && !s.proxyAuthorized(r) {
+		challenge(w)
+		return
+	}
 	if r.Method == http.MethodConnect {
 		s.handleConnect(w, r, false)
 		return
@@ -196,7 +218,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The control paths answer only requests made to the proxy itself, not
 	// requests for another site that a client sends through it.
-	if r.Method != http.MethodGet || r.URL.IsAbs() {
+	if r.URL.IsAbs() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == s.controlPath(browserPath) {
+		s.serveBrowser(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
 		http.NotFound(w, r)
 		return
 	}
@@ -245,6 +275,10 @@ type guardHandler struct{ s *server }
 func (g guardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodConnect {
 		http.NotFound(w, r)
+		return
+	}
+	if !g.s.proxyAuthorized(r) {
+		challenge(w)
 		return
 	}
 	g.s.handleConnect(w, r, true)

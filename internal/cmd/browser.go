@@ -9,6 +9,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/certproxy"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/replaycache"
 	"github.com/spf13/cobra"
@@ -29,7 +30,7 @@ func Browser() *cobra.Command {
 		return ctx.Command.Help()
 	})
 
-	cmd.AddCommand(browserCacheCommand(), browserSessionCommand(), browserWritesCommand(), browserCertProxyCommand(), browserWriteGateCommand())
+	cmd.AddCommand(browserCacheCommand(), browserSessionCommand(), browserWritesCommand(), browserCertProxyCommand(), browserWriteGateCommand(), browserDevToolsGateCommand())
 	return cmd
 }
 
@@ -65,6 +66,24 @@ func browserCertProxyCommand() *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return certproxy.Main(cmd.Context(), os.Stdin, os.Stdout)
+		},
+	}
+}
+
+// browserDevToolsGateCommand runs the gate that launches a browser on a pipe
+// and serves it behind a token. The process starting it hands it its
+// configuration on stdin and reads one line from stdout, so it loads no
+// Dagu configuration and prints nothing else.
+func browserDevToolsGateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:           "devtools-gate",
+		Short:         "Serve a browser's DevTools behind a token",
+		Hidden:        true,
+		Args:          cobra.NoArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return devtoolsgate.Main(cmd.Context(), os.Stdin, os.Stdout)
 		},
 	}
 }

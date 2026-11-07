@@ -33,11 +33,15 @@ const hungBrowserEnv = "BROWSERHOST_TEST_HUNG_BROWSER"
 // hungBrowserLifetime bounds a helper browser process the test failed to end.
 const hungBrowserLifetime = time.Minute
 
+// testToken is the gate token the fakes serve under: every browser address
+// the package accepts carries one.
+const testToken = "TESTTOKEN0000000000000000A"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(hungBrowserEnv) != "" {
 		fake := &fakeBrowser{hung: true}
 		fake.start()
-		fmt.Println(fake.server.URL)
+		fmt.Println(fake.url())
 		time.Sleep(hungBrowserLifetime)
 		return
 	}
@@ -73,12 +77,17 @@ func newHungBrowser(t *testing.T) *fakeBrowser {
 }
 
 func (f *fakeBrowser) start() {
-	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
+	f.server = httptest.NewServer(http.StripPrefix("/"+testToken, http.HandlerFunc(f.serve)))
+}
+
+// url is the browser's address as a gate would serve it.
+func (f *fakeBrowser) url() string {
+	return f.server.URL + "/" + testToken
 }
 
 func (f *fakeBrowser) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/json/version" {
-		wsURL := "ws" + strings.TrimPrefix(f.server.URL, "http") + "/devtools/browser/test"
+		wsURL := "ws" + strings.TrimPrefix(f.url(), "http") + "/devtools/browser/test"
 		_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": wsURL, "Browser": fakeProduct, "User-Agent": fakeUserAgent})
 		return
 	}
@@ -128,7 +137,21 @@ const (
 
 // unreachableURL is a DevTools URL nothing can listen on. A port freed by a
 // closed server is not used, since a concurrent test may bind it again.
-const unreachableURL = "http://127.0.0.1:0"
+const unreachableURL = "http://127.0.0.1:0/" + testToken
+
+// A browser address without a gate token is refused before anything is
+// dialed: it would name a browser any local account could reach.
+func TestUntokenizedAddressRefused(t *testing.T) {
+	t.Parallel()
+	for _, address := range []string{"http://127.0.0.1:9222", "http://127.0.0.1:9222/"} {
+		assert.ErrorIs(t, browserhost.Probe(context.Background(), address), browserhost.ErrUntokenizedAddress, address)
+		assert.ErrorIs(t, browserhost.CloseBrowser(context.Background(), address), browserhost.ErrUntokenizedAddress, address)
+		_, err := browserhost.StagehandExtension(context.Background(), address)
+		assert.ErrorIs(t, err, browserhost.ErrUntokenizedAddress, address)
+	}
+	assert.Equal(t, testToken, browserhost.TokenOf(unreachableURL))
+	assert.Equal(t, "browser at http://127.0.0.1:0/<token> is gone", browserhost.RedactCDPURL("browser at "+unreachableURL+" is gone", unreachableURL))
+}
 
 func TestStoreRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -183,13 +206,13 @@ func TestStagehandExtension(t *testing.T) {
 		browserhost.Extension{ID: "disabled", Name: browserhost.StagehandExtensionName, Path: "/y", Enabled: false},
 		browserhost.Extension{ID: "runtime", Name: browserhost.StagehandExtensionName, Path: "/z", Enabled: true},
 	)
-	extension, err := browserhost.StagehandExtension(context.Background(), fake.server.URL)
+	extension, err := browserhost.StagehandExtension(context.Background(), fake.url())
 	require.NoError(t, err)
 	assert.Equal(t, "runtime", extension.ID)
 	assert.Equal(t, "/z", extension.Path)
 
 	empty := newFakeBrowser(t)
-	_, err = browserhost.StagehandExtension(context.Background(), empty.server.URL)
+	_, err = browserhost.StagehandExtension(context.Background(), empty.url())
 	assert.ErrorIs(t, err, browserhost.ErrExtensionNotFound)
 }
 
@@ -197,9 +220,9 @@ func TestProbeAndClose(t *testing.T) {
 	t.Parallel()
 
 	fake := newFakeBrowser(t)
-	require.NoError(t, browserhost.Probe(context.Background(), fake.server.URL))
+	require.NoError(t, browserhost.Probe(context.Background(), fake.url()))
 	// CloseBrowser returns nil only after the browser stops accepting connections.
-	require.NoError(t, browserhost.CloseBrowser(context.Background(), fake.server.URL))
+	require.NoError(t, browserhost.CloseBrowser(context.Background(), fake.url()))
 	assert.Equal(t, []string{"Browser.close"}, fake.calls())
 
 	assert.ErrorIs(t, browserhost.Probe(context.Background(), unreachableURL), browserhost.ErrUnreachable)
@@ -210,12 +233,12 @@ func TestBrowserID(t *testing.T) {
 	t.Parallel()
 
 	first, second := newFakeBrowser(t), newFakeBrowser(t)
-	id, err := browserhost.BrowserID(context.Background(), first.server.URL)
+	id, err := browserhost.BrowserID(context.Background(), first.url())
 	require.NoError(t, err)
-	again, err := browserhost.BrowserID(context.Background(), first.server.URL)
+	again, err := browserhost.BrowserID(context.Background(), first.url())
 	require.NoError(t, err)
 	assert.Equal(t, id, again)
-	other, err := browserhost.BrowserID(context.Background(), second.server.URL)
+	other, err := browserhost.BrowserID(context.Background(), second.url())
 	require.NoError(t, err)
 	assert.NotEqual(t, id, other)
 
@@ -226,7 +249,7 @@ func TestBrowserID(t *testing.T) {
 func TestBrowserVersion(t *testing.T) {
 	t.Parallel()
 
-	version, err := browserhost.BrowserVersion(context.Background(), newFakeBrowser(t).server.URL)
+	version, err := browserhost.BrowserVersion(context.Background(), newFakeBrowser(t).url())
 	require.NoError(t, err)
 	assert.Equal(t, browserhost.Version{Product: fakeProduct, UserAgent: fakeUserAgent}, version)
 
@@ -247,7 +270,7 @@ func TestUsesProfile(t *testing.T) {
 		"/tmp/profile":       false,
 		"/tmp/profile-2":     false,
 	} {
-		got, err := browserhost.UsesProfile(context.Background(), fake.server.URL, dir)
+		got, err := browserhost.UsesProfile(context.Background(), fake.url(), dir)
 		require.NoError(t, err)
 		assert.Equal(t, want, got, dir)
 	}
@@ -316,7 +339,7 @@ func TestSweep(t *testing.T) {
 			userDataDir := t.TempDir()
 			record := tc.record
 			record.ID = "session"
-			record.CDPURL = fake.server.URL
+			record.CDPURL = fake.url()
 			record.ExtensionDir = extensionDir
 			record.UserDataDir = userDataDir
 			record.OwnsUserDataDir = true
@@ -375,7 +398,7 @@ func TestSweepSessions(t *testing.T) {
 			record.ID = "ab2cd3ef4g"
 			record.Interactive = history
 			if record.State != browserhost.StateEnded {
-				record.CDPURL = fake.server.URL
+				record.CDPURL = fake.url()
 				record.ExtensionDir = t.TempDir()
 				record.UserDataDir = t.TempDir()
 				record.OwnsUserDataDir = true
@@ -424,8 +447,8 @@ func TestSweepAllCoversStepsAndSessions(t *testing.T) {
 	browserDir := t.TempDir()
 	stepBrowser, sessionBrowser := newFakeBrowser(t), newFakeBrowser(t)
 	steps, sessions := browserhost.NewStore(browserDir), browserhost.NewInteractiveStore(browserDir)
-	require.NoError(t, steps.Save(browserhost.Record{ID: "step", State: browserhost.StateDetached, Deadline: now.Add(-time.Second), CDPURL: stepBrowser.server.URL}))
-	require.NoError(t, sessions.Save(browserhost.Record{ID: "session", State: browserhost.StateInteractive, Deadline: now.Add(-time.Second), CDPURL: sessionBrowser.server.URL}))
+	require.NoError(t, steps.Save(browserhost.Record{ID: "step", State: browserhost.StateDetached, Deadline: now.Add(-time.Second), CDPURL: stepBrowser.url()}))
+	require.NoError(t, sessions.Save(browserhost.Record{ID: "session", State: browserhost.StateInteractive, Deadline: now.Add(-time.Second), CDPURL: sessionBrowser.url()}))
 
 	require.NoError(t, browserhost.SweepAll(context.Background(), browserDir, now, nil))
 
@@ -445,7 +468,7 @@ func TestReleaseRemovesSessionFiles(t *testing.T) {
 	store := browserhost.NewInteractiveStore(t.TempDir())
 	workDir := store.WorkDir("session")
 	require.NoError(t, os.MkdirAll(filepath.Join(workDir, "screenshots"), 0o700))
-	record := browserhost.Record{ID: "session", State: browserhost.StateInteractive, CDPURL: newFakeBrowser(t).server.URL, WorkDir: workDir}
+	record := browserhost.Record{ID: "session", State: browserhost.StateInteractive, CDPURL: newFakeBrowser(t).url(), WorkDir: workDir}
 	require.NoError(t, store.Save(record))
 
 	require.NoError(t, browserhost.Release(context.Background(), store, record))
@@ -462,7 +485,7 @@ func TestReleaseKeepsHungBrowser(t *testing.T) {
 
 	fake := newHungBrowser(t)
 	store := browserhost.NewStore(t.TempDir())
-	record := ownedRecord(t, fake.server.URL)
+	record := ownedRecord(t, fake.url())
 	require.NoError(t, store.Save(record))
 
 	assert.Error(t, browserhost.Release(context.Background(), store, record))
@@ -554,4 +577,56 @@ func startHungBrowserProcess(t *testing.T) (int, string, <-chan struct{}) {
 	line, err := bufio.NewReader(stdout).ReadString('\n')
 	require.NoError(t, err)
 	return cmd.Process.Pid, strings.TrimSpace(line), exited
+}
+
+// A record from before browsers had gates names an address this code does
+// not reach. When its browser process has already exited there is nothing
+// to end, and the record and its files are released rather than kept for
+// every later sweep.
+func TestReleaseLegacyRecordWhoseBrowserExited(t *testing.T) {
+	t.Parallel()
+
+	exited := exec.Command(os.Args[0], "-test.run=^$")
+	require.NoError(t, exited.Start())
+	pid := exited.Process.Pid
+	startedAt, ok := procutil.StartTime(pid)
+	require.True(t, ok)
+	require.NoError(t, exited.Wait())
+
+	store := browserhost.NewStore(t.TempDir())
+	record := ownedRecord(t, "http://127.0.0.1:9222")
+	record.BrowserPID = pid
+	record.BrowserStartedAt = startedAt
+	require.NoError(t, store.Save(record))
+
+	require.NoError(t, browserhost.Release(context.Background(), store, record))
+	_, err := store.Load(record.ID)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NoDirExists(t, record.UserDataDir)
+}
+
+// When nothing answers at a browser's address, only its gate is known to be
+// gone. A browser process the record still names must have exited before
+// its record and profile go; one that is alive is ended first.
+func TestReleaseEndsBrowserWhoseGateIsGone(t *testing.T) {
+	t.Parallel()
+
+	pid, _, exited := startHungBrowserProcess(t)
+	startedAt, ok := procutil.StartTime(pid)
+	require.True(t, ok)
+	store := browserhost.NewStore(t.TempDir())
+	record := ownedRecord(t, unreachableURL)
+	record.BrowserPID = pid
+	record.BrowserStartedAt = startedAt
+	require.NoError(t, store.Save(record))
+
+	require.NoError(t, browserhost.Release(context.Background(), store, record))
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the browser process was not ended")
+	}
+	_, err := store.Load(record.ID)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NoDirExists(t, record.UserDataDir)
 }

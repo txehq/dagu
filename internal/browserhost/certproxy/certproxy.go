@@ -58,9 +58,14 @@ type TrustedCA struct {
 type Config struct {
 	// Token is a random value that prefixes the proxy's control paths.
 	Token string `json:"token"`
-	// CDPURL is the DevTools address of the browser the proxy serves, such
-	// as http://127.0.0.1:9333.
-	CDPURL string `json:"cdp_url"`
+	// Credential is what the browser must give, with ProxyUser, in the
+	// Proxy-Authorization of every request the proxy carries. The browser's
+	// DevTools gate answers the proxy's challenge with it.
+	Credential string `json:"credential"`
+	// CDPURL is the DevTools address of the browser the proxy serves, behind
+	// its gate. Empty, the starting process names it with SetBrowser once
+	// the browser is up, as the browser starts with the proxy's flags.
+	CDPURL string `json:"cdp_url,omitempty"`
 	// SystemPAC is a PAC script for the device's own routing. Empty routes
 	// everything directly.
 	SystemPAC string `json:"system_pac"`
