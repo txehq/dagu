@@ -168,6 +168,12 @@ func (a *API) StartLicenseConnect(ctx context.Context, request api.StartLicenseC
 		}
 		remoteAccess = new(config.RemoteAccessLevel(*request.Body.RemoteAccess))
 	}
+	// Choosing what leaves the hub is decided before the connection starts.
+	if report != "" || remoteAccess != nil {
+		if err := a.txeCloudEgress(ctx); err != nil {
+			return nil, err
+		}
+	}
 
 	status, err := a.licenseManager.Connect()
 	switch {
@@ -360,6 +366,9 @@ func (a *API) UpdateLicenseMonitoring(ctx context.Context, request api.UpdateLic
 // setReportLevel chooses what this server reports to Dagu Console and audits
 // the change. It fails as Monitoring.SetLevel does.
 func (a *API) setReportLevel(ctx context.Context, level config.ReportLevel) error {
+	if err := a.txeCloudEgress(ctx); err != nil {
+		return err
+	}
 	previous, err := a.cloudReport.Status(ctx)
 	if err != nil {
 		return err
@@ -434,8 +443,8 @@ func (a *API) requireCloudReport(ctx context.Context) error {
 	// (TXE-4752, TXE-5923). An admin-role API key or another administrator
 	// the owner model does not take for the platform administrator neither
 	// reads nor changes it.
-	if a.txeHubHidden(ctx) {
-		return errTxeHubRecords
+	if err := a.txeCloudEgress(ctx); err != nil {
+		return err
 	}
 	if a.cloudReport == nil {
 		return &Error{

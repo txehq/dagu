@@ -61,3 +61,18 @@ func (a *API) TxeHostExecutionRefused() func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// txeCloudEgress decides a choice of what leaves the hub for Dagu Cloud: the
+// report level, which carries every owner's runs and failures to Dagu
+// Console, and the remote access level, which lets calls through Dagu Cloud
+// reach every owner's workflows (TXE-5923). Under owner enforcement it is the
+// platform administrator's, as the hub's other whole-hub records are
+// (txeHubHidden); a caller held to its owner never makes it. Every route that
+// reads or changes them, and the two setters every change goes through
+// (setReportLevel, chooseRemoteAccessLevel), apply it.
+func (a *API) txeCloudEgress(ctx context.Context) error {
+	if a.txeHubHidden(ctx) {
+		return errTxeHubRecords
+	}
+	return nil
+}

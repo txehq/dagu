@@ -68,3 +68,54 @@ func TestEveryCommandChannelPathDecidesHostExecution(t *testing.T) {
 	}
 	assert.NotEmpty(t, reached, "the guard found the handlers")
 }
+
+// What leaves the hub for Dagu Cloud is written only by setReportLevel and
+// chooseRemoteAccessLevel, or by UpdateLicenseRemoteAccess behind
+// requireCloudAccess, and each of them makes the egress decision
+// (txeCloudEgress, TXE-5923). A new writer of either level fails here.
+func TestEveryCloudEgressWriterDecides(t *testing.T) {
+	t.Parallel()
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	fset := gotoken.NewFileSet()
+	writers := map[string]bool{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			writes, decides := false, false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if recv, ok := sel.X.(*ast.SelectorExpr); ok &&
+					((recv.Sel.Name == "cloudReport" && sel.Sel.Name == "SetLevel") ||
+						(recv.Sel.Name == "cloudAccess" && sel.Sel.Name == "Set")) {
+					writes = true
+				}
+				if sel.Sel.Name == "txeCloudEgress" || sel.Sel.Name == "requireCloudAccess" {
+					decides = true
+				}
+				return true
+			})
+			if writes {
+				writers[fn.Name.Name] = true
+				assert.True(t, decides, "%s writes what leaves the hub without txeCloudEgress", fn.Name.Name)
+			}
+		}
+	}
+	assert.Equal(t, map[string]bool{"setReportLevel": true, "chooseRemoteAccessLevel": true, "UpdateLicenseRemoteAccess": true}, writers)
+}

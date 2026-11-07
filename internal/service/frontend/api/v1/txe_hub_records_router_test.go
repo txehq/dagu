@@ -292,4 +292,14 @@ func TestTxeCloudReportIsThePlatformAdministratorsUnderEnforce(t *testing.T) {
 
 	status, body = h.send(t, "/api/v1/license/monitoring", h.admin)
 	require.NotContains(t, body, "hub_records_not_permitted", "the platform administrator is decided by the hub's own checks (%d)", status)
+	// The connect route's report and remote access choices, and the remote
+	// access route, are the same decision: refused before anything starts.
+	report := api.LicenseMonitoringLevel("errors")
+	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{Report: &report}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "hub_records_not_permitted")
+	status, body = h.send(t, "/api/v1/license/remote-access", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "hub_records_not_permitted")
 }

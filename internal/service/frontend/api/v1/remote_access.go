@@ -72,6 +72,9 @@ func (a *API) UpdateLicenseRemoteAccess(ctx context.Context, request api.UpdateL
 // chooseRemoteAccessLevel records level as the administrator's choice of how
 // far calls from Dagu Cloud may go, unless configuration fixes the level.
 func (a *API) chooseRemoteAccessLevel(ctx context.Context, level config.RemoteAccessLevel) error {
+	if err := a.txeCloudEgress(ctx); err != nil {
+		return err
+	}
 	previous, err := a.cloudAccess.Status(ctx)
 	if err != nil {
 		return err
@@ -90,6 +93,9 @@ func (a *API) chooseRemoteAccessLevel(ctx context.Context, level config.RemoteAc
 
 func (a *API) requireCloudAccess(ctx context.Context) error {
 	if err := a.requireAdmin(ctx); err != nil {
+		return err
+	}
+	if err := a.txeCloudEgress(ctx); err != nil {
 		return err
 	}
 	if a.cloudAccess == nil {
