@@ -33,6 +33,9 @@ type client struct {
 	// autoAttach are the client's Target.setAutoAttach subscriptions by
 	// scope: "" for the browser, or the target id of the parent.
 	autoAttach map[string]autoAttachSub
+	// helper marks a permanent helper connection (HelperHeader): an
+	// ordinary client in every way but the attendance count.
+	helper bool
 
 	send      chan []byte
 	closeOnce sync.Once

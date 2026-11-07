@@ -7,14 +7,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
-
-// DefaultMaxLifetime is how long a gate runs at most when its configuration
-// sets no cap. A browser nobody closes is ended with its gate after it.
-const DefaultMaxLifetime = 24 * time.Hour
 
 // configVersion is the version of the configuration the helper reads from
 // stdin. A helper of another version refuses the configuration rather than
@@ -31,9 +28,15 @@ type Config struct {
 	// Args are the browser's arguments without any remote-debugging flag:
 	// the gate adds the pipe flags itself. ChromeArgs builds them.
 	Args []string `json:"args"`
-	// MaxLifetime caps how long the gate, and so the browser, runs. Zero
-	// means DefaultMaxLifetime.
+	// MaxLifetime is a hard cap on how long the gate, and so the browser,
+	// runs, whether or not a client is connected. Zero means no hard cap:
+	// the browser then ends by MaxUnattended alone (TXE-6201).
 	MaxLifetime time.Duration `json:"max_lifetime,omitempty"`
+	// MaxUnattended is how long the gate stays with no admitted client
+	// before it closes the browser; the clock restarts when the last
+	// client leaves. Zero means DefaultMaxUnattended. A browser with an
+	// admitted client is never ended by it.
+	MaxUnattended time.Duration `json:"max_unattended,omitempty"`
 }
 
 // wireConfig is the envelope on stdin.
@@ -75,6 +78,8 @@ func (c Config) validate() error {
 		return errors.New("devtools gate: the browser executable is required")
 	case c.MaxLifetime < 0:
 		return errors.New("devtools gate: the lifetime cap cannot be negative")
+	case c.MaxUnattended < 0:
+		return errors.New("devtools gate: the unattended cap cannot be negative")
 	}
 	for _, arg := range c.Args {
 		if strings.HasPrefix(arg, "--remote-debugging-") {
@@ -84,11 +89,27 @@ func (c Config) validate() error {
 	return nil
 }
 
-func (c Config) maxLifetime() time.Duration {
-	if c.MaxLifetime == 0 {
-		return DefaultMaxLifetime
-	}
-	return c.MaxLifetime
+// HelperHeader on a websocket handshake, with exactly HelperValue, marks a
+// permanent helper connection of the hub's own, such as the write gate that
+// intercepts requests for the browser's whole life: it is admitted like any
+// other client, with the same token, the same Origin rule, the same session
+// ownership and the same commands, and is only left out of the attendance
+// count, so a browser whose only client is a helper is unattended
+// (TXE-6201). The header is read after the token and Origin checks and
+// grants nothing: any token holder can attend, and declaring itself a helper
+// only lets the unattended clock run against the connection's own browser.
+// A header present with any other value refuses the handshake, so a
+// mistyped marker neither counts nor exempts quietly.
+const (
+	HelperHeader = "X-Dagu-DevTools-Helper"
+	HelperValue  = "attendance-exempt"
+)
+
+// HelperHandshake returns the header a permanent helper sends on its
+// websocket handshake, so a consumer opts in with one call and no copy of
+// the marker.
+func HelperHandshake() http.Header {
+	return http.Header{HelperHeader: []string{HelperValue}}
 }
 
 // NewToken returns a fresh URL-safe credential.

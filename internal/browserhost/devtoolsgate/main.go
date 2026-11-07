@@ -25,14 +25,15 @@ const (
 
 // Main runs the gate: it reads its configuration from stdin, starts the
 // browser, writes one ready line to stdout and serves until the browser
-// exits, ctx ends or the lifetime cap passes. It loads no Dagu configuration.
+// exits, ctx ends, or the lifetime policy ends it: the hard cap, or no
+// admitted client for the unattended cap. It loads no Dagu configuration.
 func Main(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
 	cfg, err := readConfig(stdin)
 	if err != nil {
 		writeReadyLine(stdout, readyLine{Error: err.Error()})
 		return err
 	}
-	return run(ctx, cfg, stdout)
+	return run(ctx, cfg, stdout, realClock{})
 }
 
 func readConfig(stdin io.Reader) (Config, error) {
@@ -57,13 +58,17 @@ func writeReadyLine(stdout io.Writer, line readyLine) {
 	_, _ = stdout.Write(append(data, '\n'))
 }
 
-func run(ctx context.Context, cfg Config, stdout io.Writer) error {
+func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	browser, err := launchBrowser(cfg)
 	if err != nil {
 		writeReadyLine(stdout, readyLine{Error: err.Error()})
 		return err
 	}
 	m := newMux(browser.pipe)
+	// The keeper counts admitted clients from the first one: it is on the
+	// multiplexer before the gate listens.
+	k := newKeeper(clk.Now, cfg.lifetime())
+	m.attendance = k
 	runErr := make(chan error, 1)
 	go func() { runErr <- m.run(ctx) }()
 
@@ -104,14 +109,16 @@ func run(ctx context.Context, cfg Config, stdout io.Writer) error {
 		BrowserStartedAt: browser.startedAt,
 	}})
 
-	lifetime := time.NewTimer(cfg.maxLifetime())
-	defer lifetime.Stop()
+	// The lifetime policy is decided on one clock's ticks, with the client
+	// count (attend.go); the keeper's clock started at launch, so the
+	// browser's startup counts against the caps, as it did before.
+	ended := k.watch(ctx, clk)
 	// The pipe's end-of-file is not the only sign of a browser that is
 	// gone: a helper process of the browser can keep the pipe's handles
 	// open after the browser process was ended, so the gate also watches
 	// the process and asks the browser for its version at intervals.
 	heartbeat := make(chan error, 1)
-	go func() { heartbeat <- heartbeatBrowser(ctx, m) }()
+	go func() { heartbeat <- heartbeatBrowser(ctx, m, clk) }()
 	select {
 	case err := <-runErr:
 		// The browser closed its pipe, which it does on its way out, or ctx
@@ -130,7 +137,7 @@ func run(ctx context.Context, cfg Config, stdout io.Writer) error {
 	case <-heartbeat:
 		m.close()
 		return browser.end()
-	case <-lifetime.C:
+	case <-ended:
 		closeBrowser(m, browser)
 		return nil
 	}
@@ -148,8 +155,8 @@ const (
 // heartbeatBrowser asks the browser for its version at intervals and returns
 // once an answer does not come in time, which means the browser is gone
 // although its pipe is still open.
-func heartbeatBrowser(ctx context.Context, m *mux) error {
-	ticker := time.NewTicker(heartbeatInterval)
+func heartbeatBrowser(ctx context.Context, m *mux, clk clock) error {
+	ticker := clk.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -157,7 +164,7 @@ func heartbeatBrowser(ctx context.Context, m *mux) error {
 			return ctx.Err()
 		case <-m.done:
 			return io.EOF
-		case <-ticker.C:
+		case <-ticker.C():
 		}
 		checkCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 		_, err := m.call(checkCtx, "", "Browser.getVersion", map[string]any{})
