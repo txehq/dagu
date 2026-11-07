@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -119,6 +120,10 @@ func loadManifest(path string) (*manifest, error) {
 			return nil, fmt.Errorf("manifest: build %q named twice", b.Name)
 		case b.Path == "":
 			return nil, fmt.Errorf("manifest: build %q has no path", b.Name)
+		case !filepath.IsAbs(b.Path):
+			// A relative path would be hashed in one place and run from another
+			// (exec resolves a bare name through PATH): the proof must name one file.
+			return nil, fmt.Errorf("manifest: build %q needs an absolute path, got %q", b.Name, b.Path)
 		case len(b.SHA256) != 64 || strings.ToLower(b.SHA256) != b.SHA256:
 			return nil, fmt.Errorf("manifest: build %q needs a full lower-case sha256", b.Name)
 		}
@@ -406,6 +411,7 @@ func TestLoadManifestRefusesBadShapes(t *testing.T) {
 		"twice":          `{"builds":[{"name":"a","path":"/x","sha256":"` + strings.Repeat("0", 64) + `"},{"name":"a","path":"/y","sha256":"` + strings.Repeat("1", 64) + `"}]}`,
 		"name with path": `{"builds":[{"name":"a/b","path":"/x","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
 		"no path":        `{"builds":[{"name":"a","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
+		"relative path":  `{"builds":[{"name":"a","path":"dagu","sha256":"` + strings.Repeat("0", 64) + `"}]}`,
 	} {
 		_, err := loadManifest(write(t, body))
 		assert.Error(t, err, name)
