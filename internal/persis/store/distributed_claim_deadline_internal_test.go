@@ -65,10 +65,15 @@ func TestDispatchTaskPayloadsHaveOneMaker(t *testing.T) {
 								"%s: a claim record is made outside claimNextPending, which never hands out a task past its claim deadline", fset.Position(n.Pos()))
 						}
 					}
-					if !ok || !isIdent(sel.X, "persis") || sel.Sel.Name != "Encode" || len(n.Args) != 1 {
+					// Any encoder, not only persis.Encode: json.Marshal of a
+					// payload would bypass the stamp just the same.
+					if !ok || len(n.Args) == 0 || !encoders[sel.Sel.Name] {
 						return true
 					}
-					arg := n.Args[0]
+					arg := n.Args[len(n.Args)-1]
+					if sel.Sel.Name != "Encode" || !isIdent(sel.X, "persis") {
+						arg = n.Args[0]
+					}
 					if u, ok := arg.(*ast.UnaryExpr); ok {
 						arg = u.X
 					}
@@ -141,6 +146,9 @@ func taskPayloadVars(fn *ast.FuncDecl) map[string]bool {
 	})
 	return vars
 }
+
+// encoders are the calls that turn a value into stored bytes.
+var encoders = map[string]bool{"Encode": true, "Marshal": true, "MarshalIndent": true}
 
 func isIdent(expr ast.Expr, name string) bool {
 	id, ok := expr.(*ast.Ident)
