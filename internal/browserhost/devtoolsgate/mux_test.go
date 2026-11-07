@@ -366,3 +366,56 @@ func TestMuxPageEndpointEventsDropRootSession(t *testing.T) {
 	child := page.waitEvent("Runtime.executionContextCreated", nil)
 	assert.Equal(t, worker.SessionID, child.SessionID, "a child session keeps its id")
 }
+
+// Setup the gate itself needs on a new target, such as enabling Fetch on its
+// own session before the target's first request, holds the target until the
+// setup's reply arrives, whatever the clients asked for.
+func TestMuxGateSetupHoldsTarget(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	setup := make(chan *target, 1)
+	tg.mux.mu.Lock()
+	tg.mux.onGateAttached = func(target *target) {
+		tg.mux.holdLocked(target)
+		setup <- target
+	}
+	tg.mux.mu.Unlock()
+
+	a := tg.dial("")
+	a.mustCall("", "Target.setAutoAttach", autoAttach(false))
+	a.waitEvent("Target.attachedToTarget", nil)
+	created := a.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
+	var child struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &child))
+	free := decodeAttached(t, a.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.TargetID == child.TargetID
+	}))
+	assert.False(t, free.WaitingForDebugger, "the client did not ask to wait")
+
+	var held *target
+	select {
+	case held = <-setup:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate was not told of the new target")
+	}
+	time.Sleep(200 * time.Millisecond)
+	assert.Contains(t, tg.state(a).Paused, child.TargetID, "the gate's setup holds the target")
+
+	// The setup runs on the gate's own session and releases from its reply.
+	tg.mux.mu.Lock()
+	tg.mux.gateCommand(held.gateSession, "Fetch.enable", map[string]any{"handleAuthRequests": true}, func(_ json.RawMessage, cdpErr *cdpError) {
+		assert.Nil(t, cdpErr)
+		tg.mux.releaseHoldLocked(held)
+	})
+	tg.mux.mu.Unlock()
+	eventually(t, 5*time.Second, func() bool {
+		return slices.Contains(tg.state(a).Resumed, child.TargetID)
+	}, "the resume once the gate's setup is in place")
+	for _, s := range tg.state(a).Sessions {
+		if s.ID == held.gateSession {
+			assert.True(t, s.FetchAuth, "the gate's Fetch state lives on its own session")
+		}
+	}
+}

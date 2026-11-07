@@ -89,6 +89,10 @@ type target struct {
 	// attaching counts the private attaches in flight for the target; the
 	// target is not resumed while any is.
 	attaching int
+	// holds counts the gate's own setup pending on the target, such as a
+	// Fetch.enable on gateSession that must be in place before the target
+	// runs; the target is not resumed while any is.
+	holds int
 	// nestedAutoAttach is set once the gate asked for auto-attach on
 	// gateSession, so the target's own children are held too.
 	nestedAutoAttach bool
@@ -144,6 +148,12 @@ type mux struct {
 	// onGateEvent receives events on the gate's own sessions, for the gate's
 	// own protocol use.
 	onGateEvent func(t *target, m message)
+	// onGateAttached runs, with mu held, once the gate's auto-attach holds a
+	// new target and before any client is attached to it. Setup the gate
+	// needs in place before the target runs calls holdLocked, sends its
+	// commands on t.gateSession with gateCommand, and calls
+	// releaseHoldLocked from the reply.
+	onGateAttached func(t *target)
 }
 
 func newMux(p *pipe) *mux {
@@ -456,12 +466,30 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 	}
 	m.targets[t.id] = t
 	m.gateSessions[session] = t
+	if m.onGateAttached != nil {
+		m.onGateAttached(t)
+	}
 	for c := range m.clients {
 		sub, ok := c.autoAttach[parent]
 		if !ok || !sub.filter.matches(t.typ) {
 			continue
 		}
 		m.attachPrivateLocked(c, t, sub.wait)
+	}
+	m.maybeResumeLocked(t)
+}
+
+// holdLocked keeps t from being resumed until releaseHoldLocked is called
+// as many times. m.mu must be held.
+func (m *mux) holdLocked(t *target) {
+	t.holds++
+}
+
+// releaseHoldLocked lets go of one hold on t and resumes it when nothing
+// else holds it. m.mu must be held, as it is in a gateCommand reply.
+func (m *mux) releaseHoldLocked(t *target) {
+	if t.holds > 0 {
+		t.holds--
 	}
 	m.maybeResumeLocked(t)
 }
@@ -568,9 +596,10 @@ func (m *mux) dropStashedLocked(targetID, session string) message {
 }
 
 // maybeResumeLocked lets a held target run once every client that asked to
-// wait for it has resumed it, and no private attach is in flight.
+// wait for it has resumed it, no private attach is in flight, and the gate's
+// own setup on it is done.
 func (m *mux) maybeResumeLocked(t *target) {
-	if !t.paused || len(t.waiting) > 0 || t.attaching > 0 {
+	if !t.paused || len(t.waiting) > 0 || t.attaching > 0 || t.holds > 0 {
 		return
 	}
 	t.paused = false
