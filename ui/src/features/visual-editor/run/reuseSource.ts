@@ -119,24 +119,35 @@ export function staleReusedInputs(run: ReuseRun | null): string[] {
     });
 }
 
-/** True when the node of a step holds a state that a new run can copy. */
-export function nodeHoldsOutputs(node: Node | undefined): boolean {
-  return (
-    node !== undefined &&
-    (node.status === NodeStatus.Success ||
-      node.status === NodeStatus.PartialSuccess ||
-      isReusedNode(node))
-  );
+/**
+ * True when the run holds a state of the step that a new run can copy, as
+ * the server decides it (`transform.Reusable`): the step succeeded, or the
+ * run itself carried it from another run. A skipped node holds outputs only
+ * when the server's record names it as reused (`reusedInputs`): a step that
+ * its precondition skipped has a finish time too, and the server copies
+ * nothing of it, so the step would run without its inputs. A run that kept
+ * no record (an older server) is not taken at its word: such a skip counts
+ * as missing, and the step runs again.
+ */
+export function runHoldsOutputs(run: ReuseRun, step: string): boolean {
+  const node = (run.nodes ?? []).find((n) => n.step.name === step);
+  if (!node) return false;
+  if (
+    node.status === NodeStatus.Success ||
+    node.status === NodeStatus.PartialSuccess
+  ) {
+    return true;
+  }
+  return isReusedNode(node) && (fromDetails(run)?.has(step) ?? false);
 }
 
-/** The previous steps that the run has no reusable node for. */
+/** The previous steps that the run has no reusable state for. */
 export function missingIn(
   run: ReuseRun | null,
   previous: readonly string[]
 ): string[] {
   if (!run) return [];
-  const byName = new Map((run.nodes ?? []).map((n) => [n.step.name, n]));
-  return previous.filter((name) => !nodeHoldsOutputs(byName.get(name)));
+  return previous.filter((name) => !runHoldsOutputs(run, name));
 }
 
 // isRunActive reads only the status.

@@ -13,6 +13,7 @@ import {
   defaultChoice,
   missingIn,
   paramsDiffer,
+  runHoldsOutputs,
   pickReuseSource,
   planRun,
   staleReusedInputs,
@@ -179,11 +180,40 @@ describe('pickReuseSource', () => {
     const pick = await pickReuseSource({
       followedUpstream: null,
       selected: null,
-      history: [runOf('chain', Status.Success, [reused, node('b')])],
+      history: [
+        {
+          ...runOf('chain', Status.Success, [reused, node('b')]),
+          reusedInputs: [{ step: 'a', runId: 'old', via: ReusedInputVia.run }],
+        },
+      ],
       reads,
       holds: yes,
     });
     expect(pick.source?.dagRunId).toBe('chain');
+  });
+
+  // A precondition skip has a finish time too, and the server copies nothing
+  // of it (transform.Reusable): only the server's record of a reuse makes a
+  // skipped node hold outputs. A run that kept no record is not taken at its
+  // word.
+  it('does not count a skip the server did not record as a reuse', async () => {
+    const skipped = {
+      ...node('a', NodeStatus.Skipped),
+      doneCount: 1,
+    } as Node;
+    const run = runOf('skipped', Status.Success, [skipped, node('b')]);
+    expect(missingIn(run, ['a', 'b'])).toEqual(['a']);
+    expect(runHoldsOutputs(run, 'a')).toBe(false);
+    expect(runHoldsOutputs(run, 'b')).toBe(true);
+    expect(runHoldsOutputs(run, 'absent')).toBe(false);
+    const pick = await pickReuseSource({
+      followedUpstream: null,
+      selected: null,
+      history: [run],
+      reads,
+      holds: yes,
+    });
+    expect(pick.source).toBeNull();
   });
 });
 

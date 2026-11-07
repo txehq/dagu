@@ -7,7 +7,7 @@ import {
   coverFromCache,
   isActive,
   missingIn,
-  nodeHoldsOutputs,
+  runHoldsOutputs,
   paramsDiffer as paramsDiffer_,
   pickReuseSource,
   staleReusedInputs,
@@ -308,8 +308,7 @@ export function useReuseSource(p: {
       if (found === 'gone') return 'gone';
       if (found === 'unknown') return 'ok';
       if (isActive(found)) return 'active';
-      const node = (found.nodes ?? []).find((n) => n.step.name === step);
-      return nodeHoldsOutputs(node) ? 'ok' : 'gone';
+      return runHoldsOutputs(found, step) ? 'ok' : 'gone';
     },
     [runOfId]
   );

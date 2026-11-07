@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it } from 'vitest';
-import { NodeStatus, Status } from '@/api/v1/schema';
+import { NodeStatus, ReusedInputVia, Status } from '@/api/v1/schema';
 import {
   buildSourceOptions,
   CACHE_OPTION_ID,
@@ -93,6 +93,10 @@ describe('buildSourceOptions', () => {
         finishedAt: '2026-10-01T00:00:05Z',
       },
     ] as never;
+    // The server's record says the run carried it.
+    carried.reusedInputs = [
+      { step: 'middle', runId: 'earlier', via: ReusedInputVia.run },
+    ];
     const [option] = buildSourceOptions({
       runs: [carried],
       auto: null,
@@ -100,6 +104,28 @@ describe('buildSourceOptions', () => {
       cache: null,
     });
     expect(option?.blocked).toBeUndefined();
+  });
+
+  // A step its precondition skipped has a finish time too, and the server
+  // carries nothing of it: such a run cannot give the step's outputs.
+  it('blocks a run whose skipped step the server did not record as reused', () => {
+    const skipped = run('a', ['slow']);
+    skipped.nodes = [
+      ...(skipped.nodes ?? []),
+      {
+        step: { name: 'middle' },
+        status: NodeStatus.Skipped,
+        doneCount: 1,
+        finishedAt: '2026-10-01T00:00:05Z',
+      },
+    ] as never;
+    const [option] = buildSourceOptions({
+      runs: [skipped],
+      auto: null,
+      reads,
+      cache: null,
+    });
+    expect(option?.blocked).toBeDefined();
   });
 
   it('marks a test run and keeps it choosable', () => {
