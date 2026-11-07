@@ -160,7 +160,7 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]placement.P
 	if err := placement.Written(spec); err != nil {
 		return nil, errTxeSpecUnverified
 	}
-	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
+	dag, err := a.loadSpecBeforeDecision(ctx, spec, "", persis.DAGLoadOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -310,13 +310,16 @@ func (a *API) txeNativeWriteDenied(ctx context.Context, name string) error {
 }
 
 // txeRunPlacement decides the machine a per-run worker selector sends a run
-// to (TXE-5923), as txeNativeWrite decides a spec's: a run sent to a machine
-// needs author on that machine, because the machine's worker runs the
-// caller's definition; and a machine's own DAG runs only on that machine. A
-// selector that keeps the machine the DAG itself names places nothing new;
-// one that names no machine lands on no machine worker while machines are
-// pinned. Decided for a caller held to its owner in every mode, and for the
-// others as the mode decides, as a write is.
+// to (TXE-5923), as txeNativeWrite decides a spec's. A per-run selector
+// replaces the definition's, so:
+//   - a DAG the definition pins to a machine, and a machine's own DAG, keep
+//     that machine: an override may neither change it nor drop it, since
+//     without the pin a worker that is no machine's would take the run;
+//   - a DAG with no pin may be sent to a machine only by a caller with
+//     author on that machine, whose worker runs the caller's definition.
+//
+// Decided for a caller held to its owner in every mode, and for the others
+// as the mode decides, as a write is.
 func (a *API) txeRunPlacement(ctx context.Context, dag *ir.DAG, selector map[string]string) error {
 	if a.txeAuth == nil {
 		return nil
@@ -329,14 +332,21 @@ func (a *API) txeRunPlacement(ctx context.Context, dag *ir.DAG, selector map[str
 		return nil
 	}
 	machine := selector[dispatch.MachineLabel]
-	if machine == "" {
-		return nil
-	}
 	identity := txeOwnedIdentity(dag)
+	pinned := dag.WorkerSelector[dispatch.MachineLabel]
+	if own, ok := txeauth.MachineOfDAG(identity); ok && pinned == "" {
+		pinned = own
+	}
 	if own, ok := txeauth.MachineOfDAG(identity); ok && machine != own {
 		return a.txeNativeWriteMisplaced(ctx, c, identity)
 	}
-	if machine == dag.WorkerSelector[dispatch.MachineLabel] {
+	if pinned != "" {
+		if machine != pinned {
+			return a.txeNativeWriteMisplaced(ctx, c, identity)
+		}
+		return nil
+	}
+	if machine == "" {
 		return nil
 	}
 	if _, ok := txeauth.MachineOfDAG(txeauth.MachineDAGs(machine)[0]); !ok {

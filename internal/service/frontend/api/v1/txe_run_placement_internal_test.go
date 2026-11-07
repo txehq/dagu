@@ -36,6 +36,17 @@ func TestTxeRunPlacementDecidesTheMachine(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, statusOf(err))
 	require.NoError(t, w.api.txeRunPlacement(w.cliA, machineDAG, pin(w.machineA)), "its own machine, unchanged")
 
+	// An override replaces the definition's selector: dropping the pin would
+	// let a worker that is no machine's take the run.
+	require.Error(t, w.api.txeRunPlacement(w.cliA, machineDAG, map[string]string{"os": "linux"}),
+		"a machine DAG's pin cannot be dropped")
+	pinnedJob := &ir.DAG{Name: "pinned", WorkerSelector: pin(w.machineA)}
+	require.Error(t, w.api.txeRunPlacement(w.cliA, pinnedJob, map[string]string{"os": "linux"}),
+		"nor can a DAG's own machine pin")
+	require.Error(t, w.api.txeRunPlacement(w.cliA, pinnedJob, pin(w.machineB)), "nor changed")
+	require.NoError(t, w.api.txeRunPlacement(w.cliA, pinnedJob, map[string]string{dispatch.MachineLabel: w.machineA, "os": "linux"}),
+		"a selector that keeps the pin may add labels")
+
 	plain := &ir.DAG{Name: "nightly"}
 	require.Error(t, w.api.txeRunPlacement(w.cliA, plain, pin(w.machineB)), "another owner's machine")
 	require.Error(t, w.api.txeRunPlacement(w.personA, plain, pin(w.machineB)), "for a person too")
@@ -95,4 +106,47 @@ func TestEveryRunSelectorIsDecided(t *testing.T) {
 		}
 	}
 	assert.GreaterOrEqual(t, len(readers), 5, "the run routes were found: %v", readers)
+}
+
+// A spec a caller supplies is loaded with its schema reference resolved only
+// behind a write decision. Every other load of a caller's spec goes through
+// loadSpecBeforeDecision, which leaves the reference unread (TXE-5923). A
+// new LoadSpec call fails here until it is listed with the decision it
+// follows.
+func TestEveryCallerSpecLoadIsDecided(t *testing.T) {
+	t.Parallel()
+	decided := map[string]string{
+		"loadSpecBeforeDecision": "the helper itself: SkipSchemaValidation",
+		"ValidateDAGSpecData":    "resolves the schema only when RequireHostFileRead passes",
+		"CreateNewDAG":           "the whole load follows txeNativeWrite",
+		"UpdateDAGSpec":          "the load follows txeNativeWrite",
+	}
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	fset := gotoken.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "LoadSpec" {
+					_, listed := decided[fn.Name.Name]
+					assert.True(t, listed, "%s loads a spec without a listed write decision", fn.Name.Name)
+				}
+				return true
+			})
+		}
+	}
 }

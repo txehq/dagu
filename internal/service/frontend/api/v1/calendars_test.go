@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -392,4 +393,28 @@ func TestRequireHostFileRead(t *testing.T) {
 	}))
 	readOnlyAPI := newCalendarAPI(t, readOnly, localapi.WithAuthService(stubAuthService{}))
 	require.Error(t, readOnlyAPI.RequireHostFileRead(as(auth.RoleAdmin)))
+}
+
+// A spec's params.schema reference is resolved only for a caller who may
+// write DAGs: a viewer's validation (the editor, an MCP preview) leaves the
+// file unread, so it reads nothing from the host and learns nothing about
+// what is there; a developer's still reports a schema it cannot load
+// (TXE-5923).
+func TestValidationReadsSchemaReferencesOnlyForWriters(t *testing.T) {
+	t.Parallel()
+	helper := test.Setup(t)
+	apiImpl := newCalendarAPI(t, helper, localapi.WithAuthService(stubAuthService{}))
+	as := func(role auth.Role) context.Context {
+		return auth.WithUser(context.Background(), &auth.User{Username: string(role), Role: role, WorkspaceAccess: auth.AllWorkspaceAccess()})
+	}
+	missing := filepath.Join(t.TempDir(), "absent-schema.json")
+	spec := "params:\n  schema: " + missing + "\nsteps:\n  - run: echo hi\n"
+
+	viewer, _, err := apiImpl.ValidateDAGSpecData(as(auth.RoleViewer), "probe", spec)
+	require.NoError(t, err)
+	assert.NotContains(t, strings.Join(viewer.Errors, "\n"), "absent-schema", "the viewer's validation read nothing")
+
+	developer, _, err := apiImpl.ValidateDAGSpecData(as(auth.RoleDeveloper), "probe", spec)
+	require.NoError(t, err)
+	assert.Contains(t, strings.Join(developer.Errors, "\n"), "schema", "the developer's validation resolves the reference")
 }

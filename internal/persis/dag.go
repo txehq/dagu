@@ -70,6 +70,10 @@ type DAGDefinitionStore interface {
 type DAGLoadOptions struct {
 	// AllowBuildErrors returns a partially built DAG with its build errors attached.
 	AllowBuildErrors bool
+	// SkipSchemaValidation leaves a params.schema reference unresolved: no
+	// file is read and no URL is fetched for it. A spec a caller supplies is
+	// loaded so before the caller is authorized to write DAGs (TXE-5923).
+	SkipSchemaValidation bool
 }
 
 // DAGRepositoryOptions configures DAG specification loading.

@@ -124,11 +124,15 @@ func (a *API) ValidateDAGSpec(ctx context.Context, request api.ValidateDAGSpecRe
 }
 
 // ValidateDAGSpecData validates a DAG spec and returns its canonical form.
+// A params.schema reference is resolved, by reading its file or fetching its
+// URL, only for a caller who may write DAGs (RequireHostFileRead): for
+// anyone else, a viewer previewing through the editor or MCP among them, the
+// rest of the spec is validated and the reference is left unread (TXE-5923).
 func (a *API) ValidateDAGSpecData(ctx context.Context, name, source string) (*api.ValidateDAGSpec200JSONResponse, *ir.DAG, error) {
 	dag, err := a.dagRepository.LoadSpec(ctx,
 		[]byte(source),
 		name,
-		persis.DAGLoadOptions{AllowBuildErrors: true},
+		persis.DAGLoadOptions{AllowBuildErrors: true, SkipSchemaValidation: a.RequireHostFileRead(ctx) != nil},
 	)
 
 	var errs []string
@@ -184,11 +188,8 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 	var yamlSpec []byte
 	var workspaceName, declaredName string
 	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
-		dag, err := a.dagRepository.LoadSpec(ctx,
-			[]byte(*request.Body.Spec),
-			request.Body.Name,
-			persis.DAGLoadOptions{},
-		)
+		// Read for its workspace and name, before the write is decided.
+		dag, err := a.loadSpecBeforeDecision(ctx, []byte(*request.Body.Spec), request.Body.Name, persis.DAGLoadOptions{})
 
 		if err != nil {
 			if verrs, ok := errors.AsType[ir.ErrorList](err); ok {
@@ -215,6 +216,16 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, workspaceName) },
 		yamlSpec, request.Body.Name, declaredName); err != nil {
 		return nil, err
+	}
+	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
+		// The write is allowed: the spec is validated whole, its schema
+		// reference included.
+		if _, err := a.dagRepository.LoadSpec(ctx, yamlSpec, request.Body.Name, persis.DAGLoadOptions{}); err != nil {
+			if verrs, ok := errors.AsType[ir.ErrorList](err); ok {
+				return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: strings.Join(verrs.ToStringList(), "; ")}
+			}
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
+		}
 	}
 
 	if err := a.dagRepository.Create(ctx, request.Body.Name, yamlSpec); err != nil {
@@ -2910,4 +2921,14 @@ func parseIntParam(s string, defaultVal int) int {
 		return v
 	}
 	return defaultVal
+}
+
+// loadSpecBeforeDecision loads a spec a caller supplies before the caller is
+// authorized to write it, to learn what it names: a params.schema reference
+// is left unread, so no file is read and no URL fetched on behalf of a caller
+// not yet allowed to (TXE-5923). TestEveryCallerSpecLoadIsDecided keeps every
+// other load of a caller's spec behind a write decision.
+func (a *API) loadSpecBeforeDecision(ctx context.Context, source []byte, name string, opts persis.DAGLoadOptions) (*ir.DAG, error) {
+	opts.SkipSchemaValidation = true
+	return a.dagRepository.LoadSpec(ctx, source, name, opts)
 }

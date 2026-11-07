@@ -43,10 +43,14 @@ func (r *DAGRepository) loadOptions(opts ...spec.LoadOption) []spec.LoadOption {
 }
 
 func repositoryLoadOptions(opts DAGLoadOptions) []spec.LoadOption {
+	var out []spec.LoadOption
 	if opts.AllowBuildErrors {
-		return []spec.LoadOption{spec.WithAllowBuildErrors()}
+		out = append(out, spec.WithAllowBuildErrors())
 	}
-	return nil
+	if opts.SkipSchemaValidation {
+		out = append(out, spec.SkipSchemaValidation())
+	}
+	return out
 }
 
 func (r *DAGRepository) Create(ctx context.Context, id string, source []byte) error {
