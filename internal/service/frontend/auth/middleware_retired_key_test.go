@@ -141,10 +141,24 @@ func TestMiddleware_RetiredKeyLeavesHubCredentialsAlone(t *testing.T) {
 func TestMiddleware_ProviderRefusalIsLoggedByCategoryOnly(t *testing.T) {
 	opts, sign, claims := retiredKeySetup(t)
 	claims = withClaim(claims, "sub", "subject-that-must-not-be-logged")
+	issued := claims["iat"].(int64)
 	var buf bytes.Buffer
 	ctx := logger.WithLogger(context.Background(), logger.NewLogger(logger.WithDebug(), logger.WithFormat("json"), logger.WithWriter(&buf)))
 
-	for _, token := range []string{sign("k2", claims), sign("k1", withClaim(claims, "exp", claims["iat"]))} {
+	for _, c := range []struct {
+		token string
+		// marks are the categorical attributes the line carries; absent
+		// are the ones it must not.
+		marks, absent []string
+	}{
+		// Signed with a key the issuer no longer publishes.
+		{sign("k2", claims), []string{`"reason":"unknown_key"`, `"retired_key_of_issuer":true`}, []string{"issuer_named"}},
+		// Expired, or its times unusable: the retired-key mark means nothing
+		// for any reason but unknown_key and is not logged.
+		{sign("k1", withClaim(withClaim(claims, "iat", issued-600), "exp", issued-300)), []string{`"reason":"expired"`}, []string{"retired_key_of_issuer", "issuer_named"}},
+		{sign("k1", withClaim(claims, "exp", claims["iat"])), []string{`"reason":"times"`}, []string{"retired_key_of_issuer", "issuer_named"}},
+	} {
+		token := c.token
 		buf.Reset()
 		h := Middleware(opts)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("refused tokens reach no handler") }))
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/txe/identity", nil).WithContext(ctx)
@@ -159,5 +173,11 @@ func TestMiddleware_ProviderRefusalIsLoggedByCategoryOnly(t *testing.T) {
 		}
 		require.NotContains(t, out, "subject-that-must-not-be-logged")
 		require.NotContains(t, out, retiredKeyIssuer)
+		for _, m := range c.marks {
+			require.Contains(t, out, m)
+		}
+		for _, m := range c.absent {
+			require.NotContains(t, out, m)
+		}
 	}
 }
