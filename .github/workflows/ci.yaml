@@ -22,6 +22,9 @@ on:
       - "scripts/installer.cmd"
       - "scripts/installer.iss"
       - "scripts/installer.ps1"
+      # Go tests under txe/ run its Python and shell scripts (tunnel-supervise.py, logpipe.py,
+      # install.sh): a change to one of those alone must run them (TXE-6144).
+      - "txe/**"
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
@@ -47,6 +50,9 @@ on:
       - "scripts/installer.cmd"
       - "scripts/installer.iss"
       - "scripts/installer.ps1"
+      # Go tests under txe/ run its Python and shell scripts (tunnel-supervise.py, logpipe.py,
+      # install.sh): a change to one of those alone must run them (TXE-6144).
+      - "txe/**"
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
