@@ -43,7 +43,9 @@ long new streams failed, what the worker showed, and both bounds.
 Replacing means: one log line, SIGTERM to kubectl, SIGKILL after --kill-timeout, then exit 75,
 so launchd (KeepAlive) is the only thing that starts a new forward. If kubectl exits by itself,
 this exits with its code, as the agent did before. SIGTERM, SIGINT and SIGHUP are passed to
-kubectl, and this exits with the code kubectl then exits with. Lines this writes start "tunnel-supervise:" and name no argument, path or credential.
+kubectl, and this exits with the code kubectl then exits with, whatever the round's phase when the
+signal arrives; only a kubectl that has to be killed after --kill-timeout ends this with 128 + the
+signal (TXE-6189). Lines this writes start "tunnel-supervise:" and name no argument, path or credential.
 """
 import argparse, datetime, json, os, re, signal, socket, subprocess, sys, time, urllib.request
 
@@ -285,6 +287,21 @@ def stop(child, kill_timeout):
         child.wait()
 
 
+def exit_after_signal(child, kill_timeout, signum):
+    """The exit code once a signal has been passed to kubectl: kubectl's own code if it stops
+    within kill_timeout (a death by signal as 128 + that signal, as everywhere here), and 128 +
+    the passed signal only when it had to be killed. The round's deadline has no say in it: before
+    TXE-6189 a kubectl still stopping when the round ended got a second SIGTERM and the supervisor
+    exited 128 + signal, so the code depended on where in the round the signal landed."""
+    try:
+        rc = child.wait(kill_timeout)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+        return 128 + signum
+    return rc if rc >= 0 else 128 - rc
+
+
 def parse(argv):
     p = argparse.ArgumentParser(prog="tunnel-supervise.py")
     p.add_argument("--ui-port", type=int, required=True)
@@ -334,8 +351,7 @@ def main(argv):
             if rc is not None:
                 return rc if rc >= 0 else 128 - rc
             if signalled:                       # the child is still stopping after a passed signal
-                stop(child, a.kill_timeout)
-                return 128 + signalled[0]
+                return exit_after_signal(child, a.kill_timeout, signalled[0])
             next_round = time.monotonic() + a.interval
             # One new stream that works shows the forward's connection is alive: replacing it
             # cannot help, whatever the hub is doing.
