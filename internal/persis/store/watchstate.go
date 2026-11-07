@@ -15,8 +15,13 @@ import (
 )
 
 const (
-	watchStateVersion = 1
-	watchStateID      = "watch"
+	// Version 2 numbers each arrival and saves it before its run is queued
+	// (schedulerstate.WatchLedger). A record of version 1 is read as one of
+	// version 2 whose files all have no arrival and their runs queued, which
+	// is what version 1 recorded.
+	watchStateVersion      = 2
+	watchStateVersionFirst = 1
+	watchStateID           = "watch"
 )
 
 type watchStateRecord struct {
@@ -38,7 +43,7 @@ func NewWatchStateStore(col persis.Collection) *WatchStateStore {
 
 // LoadWatch reads the ledgers, starting fresh when the record is missing,
 // corrupt, or of a version this build does not know; a folder is then
-// watched as if for the first time.
+// watched as if for the first time. A record of version 1 is read as it is.
 func (s *WatchStateStore) LoadWatch(ctx context.Context) (map[string]schedulerstate.WatchLedger, error) {
 	var record watchStateRecord
 	found, err := s.rec.Load(ctx, &record)
@@ -49,7 +54,8 @@ func (s *WatchStateStore) LoadWatch(ctx context.Context) (map[string]schedulerst
 	if err != nil {
 		return nil, fmt.Errorf("watch state store: get: %w", err)
 	}
-	if !found || record.SchemaVersion != watchStateVersion || record.DAGs == nil {
+	known := record.SchemaVersion == watchStateVersion || record.SchemaVersion == watchStateVersionFirst
+	if !found || !known || record.DAGs == nil {
 		return map[string]schedulerstate.WatchLedger{}, nil
 	}
 	return record.DAGs, nil
