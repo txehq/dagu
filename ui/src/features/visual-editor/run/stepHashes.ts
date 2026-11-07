@@ -140,6 +140,14 @@ function computeStepHashes(
   );
   const lookup = (ref: string): Item | undefined =>
     byName.get(ref) ?? byId.get(ref);
+  // A router's targets, indexed as `transformRouterSteps` indexes them: each
+  // step's name, then its id, in the order of the file, a later key
+  // replacing an earlier one.
+  const routeTarget = new Map<string, Item>();
+  for (const item of items) {
+    if (item.name !== undefined) routeTarget.set(item.name, item);
+    if (item.id) routeTarget.set(item.id, item);
+  }
 
   const needs = new Map<Item, Set<Item>>(
     items.map((item) => [item, new Set()])
@@ -158,9 +166,9 @@ function computeStepHashes(
       for (const previous of entries[item.entry - 1] ?? []) found.add(previous);
     }
     // `transformRouterSteps` in internal/spec/dag.go makes each target of a
-    // router depend on it.
+    // router depend on it. A target is named by a step's name or its id.
     for (const ref of item.routes) {
-      const target = byName.get(ref);
+      const target = routeTarget.get(ref);
       if (target && target !== item) needs.get(target)?.add(item);
     }
   }

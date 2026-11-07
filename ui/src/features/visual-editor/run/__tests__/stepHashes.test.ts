@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { hashText, stepHashes } from '../stepHashes';
 
@@ -197,5 +199,51 @@ describe('stepHashes and the handlers', () => {
     const before = stepHashes(withHandler('success', 'echo done'));
     const after = stepHashes(withHandler('success', 'echo finished'));
     expect([...after]).toEqual([...before]);
+  });
+});
+
+// `transformRouterSteps` accepts a router target by name or by id.
+describe('stepHashes and router targets', () => {
+  const routed = (route: string) => `type: graph
+steps:
+  - id: decide
+    name: decide
+    action: router.route
+    with:
+      value: \${CODE}
+      routes:
+        ${route}: [target_id]
+  - id: target_id
+    name: target
+    run: echo target
+  - id: after
+    name: after
+    depends: [target]
+    run: echo after
+`;
+
+  it('changes the hash of a target named by its id, and of what follows it', () => {
+    const before = stepHashes(routed('ok'));
+    const after = stepHashes(routed('done'));
+    expect(after.get('decide')).not.toBe(before.get('decide'));
+    expect(after.get('target')).not.toBe(before.get('target'));
+    expect(after.get('after')).not.toBe(before.get('after'));
+  });
+});
+
+// The server resolves a step reference by name or id (`transformRouterSteps`,
+// the depends and output references). Every lookup here goes through
+// `lookup` or the router's own index: a name-only lookup fails this check.
+describe('stepHashes reference lookups', () => {
+  it('resolves every reference by name or id', () => {
+    const source = readFileSync(
+      path.resolve('src/features/visual-editor/run/stepHashes.ts'),
+      'utf8'
+    );
+    const lookups = source.match(/\b(byName|byId)\.get\(/g) ?? [];
+    expect(lookups, 'only `lookup` reads byName and byId').toHaveLength(2);
+    expect(source).toMatch(
+      /const lookup = \(ref: string\): Item \| undefined =>\s*byName\.get\(ref\) \?\? byId\.get\(ref\);/
+    );
   });
 });

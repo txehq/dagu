@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NodeStatus, NodeStatusLabel } from '@/api/v1/schema';
@@ -25,6 +27,8 @@ const h = vi.hoisted(() => ({
   defaultParams: '',
   /** The server names of the steps, in the run and in the workflow. */
   stepNames: [] as string[],
+  /** The run's nodes, when a test sets them; else one per step name. */
+  runNodes: undefined as unknown[] | undefined,
   paths: [] as string[],
 }));
 
@@ -44,7 +48,7 @@ vi.mock('@/hooks/api', () => ({
             // The run's parameters as the server lists them (paramsList).
             paramsList: h.runParams ? h.runParams.split(' ') : [],
             ...(h.runProfile ? { profileName: h.runProfile } : {}),
-            nodes: steps.map((step) => ({ step })),
+            nodes: h.runNodes ?? steps.map((step) => ({ step })),
           },
         },
       };
@@ -111,6 +115,7 @@ beforeEach(() => {
   h.runProfile = '';
   h.defaultParams = '';
   h.stepNames = [];
+  h.runNodes = undefined;
   h.paths = [];
 });
 
@@ -266,6 +271,36 @@ describe('useCaptureStepOutputs', () => {
     expect(outputCache.entries(SCOPE)['fetch']?.runId).toBe('plain');
   });
 
+  // TXE fork (TXE-5923): a step whose upstream was reused from an earlier
+  // run read outputs of a definition the run does not hold.
+  it.each([NodeStatus.Skipped, NodeStatus.NotStarted])(
+    'keeps nothing when an upstream step did not run in the run (%s)',
+    (upstream) => {
+      forgetCaptures(SCOPE, 'use');
+      const nodes = (fetch: NodeStatus) => [
+        { step: { name: 'fetch' }, status: fetch },
+        {
+          step: { name: 'use', depends: ['fetch'] },
+          status: NodeStatus.Success,
+        },
+      ];
+      h.runNodes = nodes(upstream);
+      const view = capture({
+        data: outputs({ stepName: 'use' }),
+        step: 'use',
+        runId: 'stepOnly',
+      });
+      expect(outputCache.entries(SCOPE)['use']).toBeUndefined();
+      h.runNodes = nodes(NodeStatus.Success);
+      view.rerender({
+        data: outputs({ stepName: 'use' }),
+        step: 'use',
+        runId: 'full',
+      });
+      expect(outputCache.entries(SCOPE)['use']?.runId).toBe('full');
+    }
+  );
+
   it('waits for the saved definition', () => {
     h.saved = false;
     capture({ data: outputs() });
@@ -333,5 +368,34 @@ steps:
       runId: 'r2',
       values: { data: '{"n":2}' },
     });
+  });
+});
+
+// The capture is the one writer of the output cache, so its gates (the
+// defaults, no profile, every upstream step ran in the run) hold for every
+// entry. A new writer fails here until it shares them (TXE-5923).
+describe('output cache writers', () => {
+  it('has one writer outside the tests', () => {
+    const writers: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== '__tests__' && entry.name !== 'node_modules')
+            walk(file);
+        } else if (
+          /\.tsx?$/.test(entry.name) &&
+          !/\.test\.tsx?$/.test(entry.name)
+        ) {
+          if (/\boutputCache\.put\(/.test(readFileSync(file, 'utf8'))) {
+            writers.push(path.relative('src', file));
+          }
+        }
+      }
+    };
+    walk(path.resolve('src'));
+    expect(writers).toEqual([
+      path.join('features', 'visual-editor', 'run', 'useCaptureStepOutputs.ts'),
+    ]);
   });
 });

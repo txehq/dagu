@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useEffect, useMemo } from 'react';
+import type { components } from '@/api/v1/schema';
 import { NodeStatus } from '@/api/v1/schema';
 import { useQuery } from '@/hooks/api';
 import type { ApiDAGDetails, StepOutputs } from '../contracts';
@@ -13,8 +14,40 @@ import {
   type CacheScope,
 } from './outputCache';
 import { paramsDiffer } from './reuseSource';
+import { upstreamStepNames } from './upstreamSteps';
 import { useCacheScope, useOutputCacheEntries } from './useOutputCacheEntries';
 import { useLiveStepHashes, useRunStepHashes } from './useStepHashes';
+
+type Node = components['schemas']['Node'];
+
+/**
+ * True when every step that `step` needs, transitively, ran in this run: none
+ * was reused from an earlier run, skipped or left unstarted. The run's nodes
+ * carry the server's dependencies, chain and router ones included. A step
+ * whose inputs came from a reused step read outputs of a definition the run
+ * does not hold, so its values cannot be kept under the run's hash: a "Step
+ * only" run after an upstream edit would otherwise make the edited workflow
+ * look fresh (TXE-5923). A plain skip cannot be told from a reused one by the
+ * node alone, so it blocks the capture too: the safe answer.
+ */
+export function upstreamRanInRun(
+  nodes: ReadonlyArray<Node> | undefined,
+  step: string
+): boolean | null {
+  if (!nodes) return null;
+  const byName = new Map(nodes.map((node) => [node.step.name, node]));
+  return upstreamStepNames(
+    nodes.map((node) => node.step),
+    step
+  ).every((name) => {
+    const status = byName.get(name)?.status;
+    return (
+      status !== undefined &&
+      status !== NodeStatus.NotStarted &&
+      status !== NodeStatus.Skipped
+    );
+  });
+}
 
 /**
  * The values of a step that succeeded, by output name, or null when there is
@@ -133,6 +166,8 @@ export function useCaptureStepOutputs(p: {
           workflow.data.dag?.defaultParams
         ) && !run.data.dagRunDetails.profileName
       : null;
+  // Null until the run answers.
+  const upstreamRan = upstreamRanInRun(runNodes, step);
   const held = entries[step];
   const hash = hashes?.get(step);
   const savedHash = saved?.get(step);
@@ -142,6 +177,7 @@ export function useCaptureStepOutputs(p: {
     // fresh entry for a moment.
     if (saved === null) return;
     if (ranWithDefaults !== true) return;
+    if (upstreamRan !== true) return;
     if (
       held !== undefined &&
       savedHash !== undefined &&
@@ -172,6 +208,7 @@ export function useCaptureStepOutputs(p: {
     savedHash,
     saved === null,
     ranWithDefaults,
+    upstreamRan,
     JSON.stringify(values),
     held,
   ]);
