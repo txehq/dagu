@@ -5,9 +5,12 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -210,10 +213,85 @@ func hostVaultAddress(configured string) string {
 	return api.DefaultAddress
 }
 
-// sameVaultAddress reports whether two Vault addresses name the same server,
-// as written apart from a trailing slash.
+// sameVaultAddress reports whether two Vault addresses name the same server
+// and path: the same scheme, host and port (a default port written or not,
+// case aside), and the same path apart from a trailing slash. An address that
+// does not parse, carries user information, a query or a fragment, or is not
+// HTTP or HTTPS is never the host's: the comparison fails closed, keeping the
+// host's credentials back.
 func sameVaultAddress(a, b string) bool {
-	return strings.TrimRight(strings.TrimSpace(a), "/") == strings.TrimRight(strings.TrimSpace(b), "/")
+	ca, okA := canonicalVaultAddress(a)
+	cb, okB := canonicalVaultAddress(b)
+	return okA && okB && ca == cb
+}
+
+func canonicalVaultAddress(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return "", false
+	}
+	origin, ok := vaultOrigin(u)
+	if !ok {
+		return "", false
+	}
+	return origin + strings.TrimRight(u.EscapedPath(), "/"), true
+}
+
+// vaultOrigin is the scheme, host and port of u, lower case and with the
+// scheme's default port filled in; false for a scheme other than HTTP or
+// HTTPS.
+func vaultOrigin(u *url.URL) (string, bool) {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	switch scheme {
+	case "http":
+		if port == "" {
+			port = "80"
+		}
+	case "https":
+		if port == "" {
+			port = "443"
+		}
+	default:
+		return "", false
+	}
+	if u.Hostname() == "" {
+		return "", false
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port), true
+}
+
+// errVaultRedirectOrigin refuses a Vault redirect that leaves the server the
+// request went to. It names no address: an address can carry what the
+// redirect was after.
+var errVaultRedirectOrigin = errors.New("vault: refused a redirect to another server")
+
+// originBoundTransport keeps a Vault client's credentials with the server
+// each request went to. The Vault client follows a redirect itself and sends
+// the same request again, its token and client certificate included, to
+// wherever the redirect points; a redirect to another scheme, host or port is
+// refused instead, so the request fails rather than carrying them there. A
+// redirect within the same server passes.
+type originBoundTransport struct {
+	base http.RoundTripper
+}
+
+func (t originBoundTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || resp.StatusCode < 300 || resp.StatusCode > 399 || resp.Header.Get("Location") == "" {
+		return resp, err
+	}
+	target, locErr := resp.Location()
+	from, fromOK := vaultOrigin(req.URL)
+	to, toOK := "", false
+	if locErr == nil {
+		to, toOK = vaultOrigin(target)
+	}
+	if locErr != nil || !fromOK || !toOK || from != to {
+		_ = resp.Body.Close()
+		return nil, errVaultRedirectOrigin
+	}
+	return resp, nil
 }
 
 func (r *vaultResolver) newClient(settings vaultClientSettings) (vaultClient, error) {
@@ -245,6 +323,8 @@ func (r *vaultResolver) newClient(settings vaultClientSettings) (vaultClient, er
 	if err := cfg.ConfigureTLS(tlsConfig); err != nil {
 		return nil, fmt.Errorf("failed to configure vault TLS: %w", err)
 	}
+	// Set once TLS is configured, which needs the plain transport.
+	cfg.HttpClient.Transport = originBoundTransport{base: cfg.HttpClient.Transport}
 
 	client, err := api.NewClient(cfg)
 	if err != nil {
