@@ -57,6 +57,9 @@ func (a *API) ActivateLicense(ctx context.Context, request api.ActivateLicenseRe
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeCloudEgress(ctx); err != nil {
+		return nil, err
+	}
 
 	if a.licenseManager == nil {
 		return nil, &Error{
@@ -120,6 +123,9 @@ func (a *API) DeactivateLicense(ctx context.Context, _ api.DeactivateLicenseRequ
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
+	if err := a.txeCloudEgress(ctx); err != nil {
+		return nil, err
+	}
 
 	if a.licenseManager == nil {
 		return nil, &Error{
@@ -167,12 +173,6 @@ func (a *API) StartLicenseConnect(ctx context.Context, request api.StartLicenseC
 			return nil, unknownRemoteAccessLevelError("remoteAccess")
 		}
 		remoteAccess = new(config.RemoteAccessLevel(*request.Body.RemoteAccess))
-	}
-	// Choosing what leaves the hub is decided before the connection starts.
-	if report != "" || remoteAccess != nil {
-		if err := a.txeCloudEgress(ctx); err != nil {
-			return nil, err
-		}
 	}
 
 	status, err := a.licenseManager.Connect()
@@ -309,6 +309,12 @@ func renameServerError(err error) error {
 
 func (a *API) requireLicenseManagement(ctx context.Context) error {
 	if err := a.requireAdmin(ctx); err != nil {
+		return err
+	}
+	// The Dagu Console link is what the hub's reports and remote calls travel
+	// on: opening, approving, reading or keeping it sends whatever level is
+	// in effect, a level chosen earlier included (TXE-5923).
+	if err := a.txeCloudEgress(ctx); err != nil {
 		return err
 	}
 	if a.licenseManager == nil {

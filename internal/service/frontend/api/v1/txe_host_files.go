@@ -62,10 +62,11 @@ func (a *API) TxeHostExecutionRefused() func(http.Handler) http.Handler {
 	}
 }
 
-// txeCloudEgress decides a choice of what leaves the hub for Dagu Cloud: the
+// txeCloudEgress decides what leaves the hub for Dagu Cloud (TXE-5923): the
 // report level, which carries every owner's runs and failures to Dagu
-// Console, and the remote access level, which lets calls through Dagu Cloud
-// reach every owner's workflows (TXE-5923). Under owner enforcement it is the
+// Console; the remote access level, which lets calls through Dagu Cloud reach
+// every owner's workflows; and the Dagu Console link both travel on, which
+// sends whatever level is in effect once it is opened or approved. Under owner enforcement it is the
 // platform administrator's, as the hub's other whole-hub records are
 // (txeHubHidden); a caller held to its owner never makes it. Every route that
 // reads or changes them, and the two setters every change goes through

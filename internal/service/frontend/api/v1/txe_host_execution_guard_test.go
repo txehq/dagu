@@ -15,6 +15,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// linkActs are the license manager calls that open, approve, read, refresh,
+// rename or end the Dagu Console link; the rest only read the license for a
+// feature check.
+var linkActs = map[string]bool{
+	"ActivateWithKey": true, "Connect": true, "ConnectStatus": true, "CancelConnect": true,
+	"Refresh": true, "RenameServer": true, "Deactivate": true, "CloudCredentials": true,
+}
+
 // commandChannelExecutors are the notification service calls through which a
 // handler can make a command channel run its text on the hub's host: saving
 // one, testing one, and testing a DAG's routes.
@@ -79,6 +87,7 @@ func TestEveryCloudEgressWriterDecides(t *testing.T) {
 	require.NoError(t, err)
 	fset := gotoken.NewFileSet()
 	writers := map[string]bool{}
+	linkUsers, linkDecided, egressDecided := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -106,8 +115,16 @@ func TestEveryCloudEgressWriterDecides(t *testing.T) {
 						(recv.Sel.Name == "cloudAccess" && sel.Sel.Name == "Set")) {
 					writes = true
 				}
+				// Every use of the Dagu Console link: opening, approving,
+				// reading, refreshing or ending it.
+				if recv, ok := sel.X.(*ast.SelectorExpr); ok && recv.Sel.Name == "licenseManager" && linkActs[sel.Sel.Name] {
+					linkUsers[fn.Name.Name] = true
+				}
 				if sel.Sel.Name == "txeCloudEgress" || sel.Sel.Name == "requireCloudAccess" {
 					decides = true
+				}
+				if sel.Sel.Name == "requireLicenseManagement" {
+					linkDecided[fn.Name.Name] = true
 				}
 				return true
 			})
@@ -115,7 +132,25 @@ func TestEveryCloudEgressWriterDecides(t *testing.T) {
 				writers[fn.Name.Name] = true
 				assert.True(t, decides, "%s writes what leaves the hub without txeCloudEgress", fn.Name.Name)
 			}
+			if decides {
+				egressDecided[fn.Name.Name] = true
+			}
 		}
 	}
 	assert.Equal(t, map[string]bool{"setReportLevel": true, "chooseRemoteAccessLevel": true, "UpdateLicenseRemoteAccess": true}, writers)
+	// A handler that uses the Dagu Console link decides egress first, itself
+	// or through requireLicenseManagement. Helpers that only describe a
+	// status the handler read are listed here, by name, with that reason.
+	describesOnly := map[string]bool{
+		// Reports only whether a link exists, for the public webhook route,
+		// and discards the credentials.
+		"connectedToDaguCloud": true,
+	}
+	for name := range linkUsers {
+		if describesOnly[name] {
+			continue
+		}
+		assert.True(t, egressDecided[name] || linkDecided[name], "%s uses the Dagu Console link without txeCloudEgress", name)
+	}
+	assert.NotEmpty(t, linkUsers)
 }

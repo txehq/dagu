@@ -30,6 +30,11 @@ func (a *API) GetWorkspaceDeprecation(ctx context.Context, _ api.GetWorkspaceDep
 	if err := a.requireAdmin(ctx); err != nil {
 		return nil, err
 	}
+	// It reads every workspace's settings, secret references and profile
+	// keys among them: a whole-hub record (TXE-4752, TXE-5923).
+	if a.txeHubHidden(ctx) {
+		return nil, errTxeHubRecords
+	}
 
 	found, err := deprecation.Find(ctx, a.workspaceDeprecation)
 	if err != nil {

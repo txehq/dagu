@@ -302,4 +302,16 @@ func TestTxeCloudReportIsThePlatformAdministratorsUnderEnforce(t *testing.T) {
 	status, body = h.send(t, "/api/v1/license/remote-access", key)
 	require.Equal(t, http.StatusForbidden, status, body)
 	require.Contains(t, body, "hub_records_not_permitted")
+	// Opening the link at all sends whatever level is in effect, one chosen
+	// earlier included: an empty connect request is refused too.
+	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "hub_records_not_permitted")
+	status, body = h.send(t, "/api/v1/license/connect", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	// The deprecation inventory reads every workspace's settings.
+	status, body = h.send(t, "/api/v1/workspaces/deprecation", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "hub_records_not_permitted")
 }
