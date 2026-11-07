@@ -240,7 +240,7 @@ func paramPlanHasEval(plan *dagParamPlan) bool {
 
 func buildDAGParamPlan(ctx buildContext, d *dag) (*dagParamPlan, error) {
 	if _, ok := extractParamsSchemaDeclaration(d.Params); ok {
-		if ctx.opts.Has(buildFlagSkipSchemaValidation) {
+		if ctx.opts.Has(buildFlagSkipSchemaValidation) || schemaReferencesRefused(ctx.ctx) {
 			return buildLegacyParamPlan(extractSchemaValues(d.Params))
 		}
 		return buildExternalSchemaParamPlan(d.Params, d.WorkingDir, ctx.file)

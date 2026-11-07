@@ -601,6 +601,7 @@ func (a *API) ConfigureRoutes(ctx context.Context, r chi.Router, writeTimeout ti
 		r.Use(WebhookRequestContextMiddleware(a.webhookMaxPayloadSize()))
 
 		middlewares := []api.StrictMiddlewareFunc{
+			a.scopeSpecLoading,
 			validateDAGFileNameMiddleware,
 			resetSyncWriteDeadline(writeTimeout),
 		}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 )
 
 // RequireHostFileRead decides a read of a file on the hub's own host that no
@@ -76,4 +77,24 @@ func (a *API) txeCloudEgress(ctx context.Context) error {
 		return errTxeHubRecords
 	}
 	return nil
+}
+
+// SpecLoadContext marks ctx for a caller who may not read the hub's own files
+// (RequireHostFileRead): every spec loaded under it leaves params.schema
+// references unread (spec.WithoutSchemaReferences, TXE-5923). The API applies
+// it to every request (scopeSpecLoading) and the MCP server to every tool
+// call, so no load path, present or future, reads a host file or fetches a
+// URL for such a caller.
+func (a *API) SpecLoadContext(ctx context.Context) context.Context {
+	if a.RequireHostFileRead(ctx) != nil {
+		return spec.WithoutSchemaReferences(ctx)
+	}
+	return ctx
+}
+
+// scopeSpecLoading applies SpecLoadContext to every API operation.
+func (a *API) scopeSpecLoading(f api.StrictHandlerFunc, _ string) api.StrictHandlerFunc {
+	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
+		return f(a.SpecLoadContext(ctx), w, r, request)
+	}
 }

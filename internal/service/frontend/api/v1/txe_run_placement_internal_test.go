@@ -150,3 +150,21 @@ func TestEveryCallerSpecLoadIsDecided(t *testing.T) {
 		}
 	}
 }
+
+// Every API operation runs under SpecLoadContext (scopeSpecLoading is in the
+// router's middleware), and so does every MCP tool (addTool): a load of a
+// spec, by whatever path, reads no params.schema reference for a caller who
+// may not read the hub's files (TXE-5923).
+func TestEveryRequestScopesSpecLoading(t *testing.T) {
+	t.Parallel()
+	for file, want := range map[string]string{"api.go": "scopeSpecLoading", "../../../mcp/server.go": "SpecLoadContext"} {
+		data, err := os.ReadFile(file)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), want, file)
+	}
+	src, err := os.ReadFile("api.go")
+	require.NoError(t, err)
+	i := strings.Index(string(src), "middlewares := []api.StrictMiddlewareFunc{")
+	require.Positive(t, i)
+	assert.Contains(t, string(src)[i:i+200], "a.scopeSpecLoading", "the spec-loading scope is in the strict middleware list")
+}

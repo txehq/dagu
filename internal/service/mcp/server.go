@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"net/http"
 	"net/url"
 	"strings"
@@ -228,11 +229,24 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 
 // addTool offers tool on server, except on the server for Dagu Cloud when
 // cloudTools does not allow it.
+//
+// Every call is scoped for spec loading (frontendapi.API.SpecLoadContext): a
+// caller who may not read the hub's files loads no params.schema reference
+// through any tool.
 func addTool(server *mcpsdk.Server, svc *Service, tool *mcpsdk.Tool, handler mcpsdk.ToolHandler) {
 	if svc.remote != nil && !cloudTools[tool.Name] {
 		return
 	}
-	server.AddTool(tool, handler)
+	server.AddTool(tool, func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		switch {
+		case svc.remote != nil:
+			// A call from Dagu Cloud never reads this server's files.
+			ctx = spec.WithoutSchemaReferences(ctx)
+		case svc.api != nil:
+			ctx = svc.api.SpecLoadContext(ctx)
+		}
+		return handler(ctx, req)
+	})
 }
 
 func registerResources(server *mcpsdk.Server, svc *Service) {
