@@ -848,11 +848,21 @@ func (a *API) isAllowed(perm config.Permission) error {
 	return nil
 }
 
-// requireAdmin checks if the current user has admin role.
-// Returns nil if auth is not enabled (authService is nil).
+// requireAdmin decides a route of the txeAdminPlatform class (TXE-6139):
+// the installation's own, or every owner's at once. The hub's administrator
+// role as before, and on top of it the platform rule: under owner
+// enforcement only the platform administrator passes, and a caller held to
+// its owner never does (txePlatformReserved). Returns nil if auth is not
+// enabled (authService is nil). Every caller is classified in
+// txeAdminOperations.
 func (a *API) requireAdmin(ctx context.Context) error {
 	if a.authService == nil {
 		return nil
+	}
+	if a.txeOwnerOnly(ctx) {
+		// No hub role to check: held to its owner, it administers nothing
+		// of the platform's, whatever role the hub's account carries.
+		return a.txeRequirePlatform(ctx)
 	}
 	user, ok := auth.UserFromContext(ctx)
 	if !ok {
@@ -861,11 +871,14 @@ func (a *API) requireAdmin(ctx context.Context) error {
 	if !user.Role.IsAdmin() {
 		return errInsufficientPermissions
 	}
-	return nil
+	return a.txeRequirePlatform(ctx)
 }
 
 // requireManagerOrAbove checks if the current user has manager or admin role.
-// Returns nil if auth is not enabled (authService is nil).
+// Returns nil if auth is not enabled (authService is nil). It is the hub's
+// role check alone: each caller is classified in txeAdminOperations, and
+// the owner rule its class names (txeHubHidden for the hub's records, the
+// DAG's owner for a DAG's own settings) is the caller's to apply (TXE-6139).
 func (a *API) requireManagerOrAbove(ctx context.Context) error {
 	if a.authService == nil {
 		return nil

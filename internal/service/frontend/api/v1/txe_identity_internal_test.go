@@ -32,6 +32,8 @@ type identityFixture struct {
 	api   *API
 	svc   *txeauth.Service
 	owner string
+	// dataDir holds the owner store, for a test that makes it unreadable.
+	dataDir string
 }
 
 func newIdentityFixture(t *testing.T, mode string) *identityFixture {
@@ -50,7 +52,7 @@ func newIdentityFixture(t *testing.T, mode string) *identityFixture {
 	require.NoError(t, err)
 	a := New(repo, nil, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil,
 		WithTxeRegistry(store), WithTxeAuth(svc), WithAuthService(struct{ AuthService }{}))
-	return &identityFixture{api: a, svc: svc, owner: owner}
+	return &identityFixture{api: a, svc: svc, owner: owner, dataDir: dataDir}
 }
 
 func (f *identityFixture) identity(t *testing.T, ctx context.Context) apigen.TxeIdentity {
