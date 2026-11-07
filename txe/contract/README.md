@@ -73,7 +73,12 @@ behaviour the fork depends on, the fork keeps its own:
   expires an unheld pending task after the 90s reservation time, as it always did. So after a
   rollback, a task that was waiting for a busy worker ends as not dispatched. Drain pending
   dispatches before rolling back (a gate, not a lossless rollback); claimed and running work is
-  not affected.
+  not affected. The rollout's rollback procedure must enforce the drain with a check, TXE-6057.
+
+  The deadline is made in one place: every new pending task's payload comes from
+  `newPendingPayload`, every task record is encoded by `newDispatchRecord` (which stamps a missing
+  deadline), and only `claimNextPending` turns a task into a claim, refusing one past its deadline.
+  `TestDispatchTaskPayloadsHaveOneMaker` fails a writer or claimer added anywhere else.
 - **Access.** The owner filters for whole-hub lists and queues apply inside upstream's new list
   paths. Upstream's run-outputs and step-sample endpoints use the per-DAG owner check.
 - **Credentials.** `DAGU_COORDINATOR_AUTH_HUB_KEY_FILE` and `DAGU_WORKER_AUTH_CREDENTIAL_FILE` count

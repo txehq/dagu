@@ -595,18 +595,12 @@ func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *dispatch.Dispatch
 	}
 	enqueuedAt := s.now()
 	fileName := fmt.Sprintf("task_%020d_%s.json", enqueuedAt.UnixMilli(), uuid.NewString())
-	payload := dispatchTaskPayload{
-		Version:      dispatchTaskStoreVersion,
-		Task:         cloneDispatchTask(task),
-		TaskFileName: fileName,
-		EnqueuedAt:   enqueuedAt.UnixMilli(),
-	}
-	s.assignClaimDeadline(&payload, enqueuedAt)
+	payload := s.newPendingPayload(task, fileName, "", enqueuedAt)
 	pendingID, err := pendingDispatchRecordID(fileName)
 	if err != nil {
 		return err
 	}
-	rec, err := s.newDispatchRecord(pendingID, payload, enqueuedAt, enqueuedAt)
+	rec, err := s.newDispatchRecord(pendingID, &payload, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return err
 	}
@@ -731,9 +725,6 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 		transition := func(lockCtx context.Context) error {
 			claimToken := uuid.NewString()
 			claimedAt := s.now()
-			// A record from before the claim deadline keeps the one its
-			// enqueue time gives it once it is a claim.
-			s.stampClaimDeadline(&payload, rec.CreatedAt)
 			task, err := applyDispatchTaskClaim(payload.Task, claim.Owner, claimToken)
 			if err != nil {
 				return err
@@ -745,7 +736,7 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 			payload.PollerID = claim.PollerID
 			payload.Owner = claim.Owner
 
-			claimRec, err := s.newDispatchRecord(claimDispatchRecordID(claimToken), payload, rec.CreatedAt, claimedAt)
+			claimRec, err := s.newDispatchRecord(claimDispatchRecordID(claimToken), &payload, rec.CreatedAt, claimedAt)
 			if err != nil {
 				return err
 			}
@@ -1360,7 +1351,8 @@ func (s *DispatchTaskStore) releaseClaim(
 
 func (s *DispatchTaskStore) releaseClaimRecord(ctx context.Context, rec *persis.Record, payload dispatchTaskPayload, now time.Time) error {
 	// The release re-stamps EnqueuedAt below, so a record from before the
-	// claim deadline first gets the one its enqueue time gives it.
+	// claim deadline gets the one its enqueue time gives it first; the stamp
+	// newDispatchRecord applies would read the new enqueue time.
 	s.stampClaimDeadline(&payload, rec.CreatedAt)
 	releasedAt := now
 	enqueuedAt := now.UnixMilli()
@@ -1380,7 +1372,7 @@ func (s *DispatchTaskStore) releaseClaimRecord(ctx context.Context, rec *persis.
 	if err != nil {
 		return err
 	}
-	pendingRec, err := s.newDispatchRecord(pendingID, payload, releasedAt, releasedAt)
+	pendingRec, err := s.newDispatchRecord(pendingID, &payload, releasedAt, releasedAt)
 	if err != nil {
 		return err
 	}
@@ -1499,7 +1491,29 @@ func (s *DispatchTaskStore) listDispatchRecordIDs(ctx context.Context, prefix st
 	return ids, nil
 }
 
-func (s *DispatchTaskStore) newDispatchRecord(id string, payload dispatchTaskPayload, createdAt, updatedAt time.Time) (*persis.Record, error) {
+// newPendingPayload is the payload of a task enqueued at now, with its claim
+// deadline. It is the one place a new pending task is made, whatever made it
+// (a start, a retry, a sub-DAG run, a queued execution, an admission), so each
+// gets its deadline the same way; TestDispatchTaskPayloadsHaveOneMaker fails a
+// new writer that builds its own.
+func (s *DispatchTaskStore) newPendingPayload(task *dispatch.DispatchTask, fileName, reservationToken string, now time.Time) dispatchTaskPayload {
+	payload := dispatchTaskPayload{
+		Version:                   dispatchTaskStoreVersion,
+		Task:                      cloneDispatchTask(task),
+		TaskFileName:              fileName,
+		EnqueuedAt:                now.UnixMilli(),
+		AdmissionReservationToken: reservationToken,
+	}
+	s.assignClaimDeadline(&payload, now)
+	return payload
+}
+
+// newDispatchRecord encodes payload into a record. It is the one place a task
+// record is encoded (TestDispatchTaskPayloadsHaveOneMaker), and it writes into
+// a payload with no claim deadline the one its enqueue time gives it, so no
+// writer stores a task whose wait is unbounded by omission.
+func (s *DispatchTaskStore) newDispatchRecord(id string, payload *dispatchTaskPayload, createdAt, updatedAt time.Time) (*persis.Record, error) {
+	s.stampClaimDeadline(payload, createdAt)
 	data, err := persis.Encode(payload)
 	if err != nil {
 		return nil, err

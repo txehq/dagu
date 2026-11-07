@@ -584,15 +584,8 @@ func (s *DispatchTaskStore) createPendingRecord(
 		return err
 	}
 	now := s.now()
-	payload := dispatchTaskPayload{
-		Version:                   dispatchTaskStoreVersion,
-		Task:                      cloneDispatchTask(task),
-		TaskFileName:              attempt.PendingFileName,
-		EnqueuedAt:                now.UnixMilli(),
-		AdmissionReservationToken: attempt.ReservationToken,
-	}
-	s.assignClaimDeadline(&payload, now)
-	rec, err := s.newDispatchRecord(attempt.PendingRecordID, payload, now, now)
+	payload := s.newPendingPayload(task, attempt.PendingFileName, attempt.ReservationToken, now)
+	rec, err := s.newDispatchRecord(attempt.PendingRecordID, &payload, now, now)
 	if err != nil {
 		return err
 	}

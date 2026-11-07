@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
@@ -407,5 +408,54 @@ func TestClaimDeadline_ConcurrentClaimAtTheDeadline(t *testing.T) {
 		claimed, err := s.ClaimNext(ctx, anyWorker)
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "iteration %d: nothing is left to claim", i)
+	}
+}
+
+// Every way a task reaches the store gets its deadline from the same maker: a
+// start, a retry, a sub-DAG run, a queued execution and an admission bind.
+func TestClaimDeadline_EveryKindOfDispatchGetsOne(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	backend := testutil.NewMemoryBackend()
+	clock := newFakeClock(time.Now().UTC().Truncate(time.Millisecond))
+	enqueuedAt := clock.Now()
+	s := deadlineStore(backend.Collection("dispatch_tasks"), clock, time.Hour,
+		store.WithDispatchAdmissionLiveness(
+			store.NewDAGRunLeaseStore(backend.Collection("dag_run_leases")),
+			store.NewActiveDistributedRunStore(backend.Collection("active_runs"))))
+
+	start := deadlineTask("start")
+	start.Operation = dispatch.DispatchOperationStart
+	retry := deadlineTask("retry")
+	retry.Operation = dispatch.DispatchOperationRetry
+	sub := deadlineTask("sub")
+	sub.Operation = dispatch.DispatchOperationStart
+	sub.RootDAGRunName, sub.RootDAGRunID = "parent-dag", "parent-run"
+	sub.ParentDAGRunName, sub.ParentDAGRunID = "parent-dag", "parent-run"
+	queued := deadlineTask("queued")
+	queued.Operation = dispatch.DispatchOperationRetry
+	queued.ExecutionMarker = "2026-11-07T12:00:00+08:00"
+	for _, task := range []*dispatch.DispatchTask{start, retry, sub, queued} {
+		require.NoError(t, s.Enqueue(ctx, task))
+	}
+
+	decision, err := s.ReserveAdmission(ctx, dispatch.DispatchAdmissionRequest{
+		QueueName: "queue-a", MaxConcurrency: 1, AttemptKey: "key-admitted", AttemptID: "attempt-admitted",
+		DAGRun: ir.NewDAGRunRef("dag-admitted", "admitted"), StaleThreshold: time.Minute,
+	})
+	require.NoError(t, err)
+	require.True(t, decision.Reserved)
+	admitted := deadlineTask("admitted")
+	admitted.Operation = dispatch.DispatchOperationRetry
+	admitted.QueueName = "queue-a"
+	require.NoError(t, s.BindAdmission(ctx, dispatch.DispatchAdmissionBindRequest{
+		ReservationToken: decision.ReservationToken, Task: admitted,
+	}))
+
+	assert.Empty(t, pastDeadline(t, s, enqueuedAt.Add(time.Hour-time.Millisecond)))
+	past := pastDeadline(t, s, enqueuedAt.Add(time.Hour))
+	assert.ElementsMatch(t, []string{"start", "retry", "sub", "queued", "admitted"}, runIDs(past))
+	for _, u := range past {
+		assert.Equal(t, enqueuedAt.Add(time.Hour), u.Deadline, u.Task.DAGRunID)
 	}
 }
