@@ -51,6 +51,10 @@ type fakeBrowser struct {
 	// exitMarker is a file the process form writes when it exits on EOF.
 	exitMarker string
 	argv       []string
+	// closing is set by Browser.close: the fake exits, as Chrome does, so a
+	// gate that closed the browser sees its process end and not only its
+	// pipe.
+	closing bool
 }
 
 type fakeTarget struct {
@@ -119,6 +123,12 @@ func (f *fakeBrowser) serve() error {
 			return err
 		}
 		f.handle(data[:len(data)-1])
+		f.mu.Lock()
+		closing := f.closing
+		f.mu.Unlock()
+		if closing {
+			return nil
+		}
 	}
 }
 
@@ -181,7 +191,8 @@ func (f *fakeBrowser) handle(data []byte) {
 		})
 	case "Browser.close":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
-		// Chrome exits; the pipe closes with it.
+		// Chrome exits; the pipe closes with it, and so does the process.
+		f.closing = true
 		if closer, ok := f.out.(io.Closer); ok {
 			_ = closer.Close()
 		}
