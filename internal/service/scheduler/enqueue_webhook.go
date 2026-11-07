@@ -41,9 +41,10 @@ func EnqueueWebhookRun(
 	params string,
 	profileName string,
 	now time.Time,
+	unbound intake.UnboundTrigger,
 ) error {
 	return enqueueTriggeredRun(ctx, dagRunRepository, queueStore, baseLogDir, baseArtifactDir, baseConfig, workspaceBaseConfigDir,
-		definitionID, dag, runID, params, profileName, now, ir.TriggerTypeWebhook, publicwebhook.ErrInvalidRun)
+		definitionID, dag, runID, params, profileName, now, ir.TriggerTypeWebhook, publicwebhook.ErrInvalidRun, unbound)
 }
 
 // enqueueTriggeredRun enqueues a run an outside event asks for, a webhook
@@ -66,6 +67,7 @@ func enqueueTriggeredRun(
 	now time.Time,
 	triggerType ir.TriggerType,
 	invalid error,
+	unbound intake.UnboundTrigger,
 ) error {
 	dagRun := ir.NewDAGRunRef(dag.Name, runID)
 
@@ -108,6 +110,7 @@ func enqueueTriggeredRun(
 		ProfileName:      profileName,
 		DefinitionID:     definitionID,
 		Now:              func() time.Time { return now },
+		Unbound:          unbound,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to enqueue %s run: %w", triggerType, err)

@@ -6,8 +6,8 @@ package api
 import (
 	"context"
 	"errors"
-	"path/filepath"
-	"strings"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -71,22 +71,38 @@ func (a *API) txeDAGFileRoute(ctx context.Context, fileName string, permission a
 // logged as one enforce would refuse. A job's DAG is admitted as any start
 // of it is, in every mode: a retired or paused job is not run by its
 // webhook either.
-func (a *API) txeWebhookTrigger(ctx context.Context, dag *ir.DAG) error {
+//
+// The owner rule itself is txeauth.DecideUnboundTrigger, shared with the
+// Dagu Cloud public-webhook relay; the decision it returns is what lets the
+// run be queued (intake.QueueRequest.Unbound).
+func (a *API) txeWebhookTrigger(ctx context.Context, dag *ir.DAG) (intake.UnboundTrigger, error) {
 	if a.txeAuth == nil {
-		return nil
+		decision, err := txeauth.DecideUnboundTrigger(authz.ModeOff, true, dag, func(string) (bool, error) { return false, nil })
+		return decision.Trigger, err
 	}
-	res, owned, err := a.txeNativeResource(ctx, txeOwnedIdentity(dag))
 	mode := a.txeAuth.Mode()
+	var res authz.Resource
+	decision, err := txeauth.DecideUnboundTrigger(mode, true, dag, func(identity string) (bool, error) {
+		found, owned, err := a.txeNativeResource(ctx, identity)
+		res = found
+		return owned, err
+	})
 	switch {
-	case err != nil && mode == authz.ModeEnforce:
-		return errTxeAuthzUnavailable
-	case err == nil && owned && mode == authz.ModeEnforce:
-		return errTxeNativeNotFound
-	case err == nil && owned && mode == authz.ModeObserve:
+	case errors.Is(err, txeauth.ErrUnboundOwnerUnknown):
+		return intake.UnboundTrigger{}, errTxeAuthzUnavailable
+	case errors.Is(err, txeauth.ErrUnboundOwnerDAG):
+		return intake.UnboundTrigger{}, errTxeNativeNotFound
+	case err != nil:
+		return intake.UnboundTrigger{}, err
+	}
+	if decision.WouldDeny {
 		a.txeLogDecision(ctx, txeCall{mode: mode}, authz.PermissionExecute, res, authz.Decision{
 			Allowed: true, Mode: mode, Evaluated: true, WouldDeny: true, Reason: authz.ReasonUnbound})
 	}
-	return a.txeAdmitDAG(ctx, dag)
+	if err := a.txeAdmitDAG(ctx, dag); err != nil {
+		return intake.UnboundTrigger{}, err
+	}
+	return decision.Trigger, nil
 }
 
 // txeWebhookVisible reports whether the caller may see the webhook of the
@@ -107,22 +123,10 @@ func (a *API) txeWebhookVisible(ctx context.Context, dagName string) bool {
 // owner's DAG is decided as that DAG and never as one of no owner. A run
 // is stored under the name its DAG declares, so a run's DAG is read from
 // its attempt.
+//
+// The definition is txeauth.OwnedDAGIdentity, which the scheduler shares.
 func txeOwnedIdentity(dag *ir.DAG) string {
-	stem := func(path string) string {
-		if path == "" {
-			return ""
-		}
-		return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	}
-	// The file's name only when it has a location: without one,
-	// SuspendFlagName falls back to the declared name, which must not come
-	// before the source file's.
-	for _, name := range []string{stem(dag.Location), stem(dag.SourceFile), dag.Name} {
-		if name != "" && txeNativeOwnedName(name) {
-			return name
-		}
-	}
-	return dag.SuspendFlagName()
+	return txeauth.OwnedDAGIdentity(dag)
 }
 
 // txeRunRoute decides permission on a run's DAG after the route's own

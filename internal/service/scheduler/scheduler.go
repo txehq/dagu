@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/intake"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -1079,6 +1080,9 @@ func (s *Scheduler) enqueueFileRun(ctx context.Context, entry DAGEntry, runID, p
 		s.clock(),
 		ir.TriggerTypeFile,
 		errInvalidFileRun,
+		// A file the DAG itself watches is its own trigger, as a schedule
+		// is, so no unbound decision is needed (ir.TriggerType.Unbound).
+		intake.UnboundTrigger{},
 	)
 }
 

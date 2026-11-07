@@ -17,6 +17,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/profile"
 	"github.com/dagucloud/dagu/v2/internal/publicwebhook"
 	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
 
@@ -71,6 +73,20 @@ func (r *webhookRuns) Queued(ctx context.Context, dag *ir.DAG) (int, error) {
 }
 
 func (r *webhookRuns) Enqueue(ctx context.Context, dagName string, dag *ir.DAG, runID, params string) error {
+	// The owner rule the hub's webhook route applies (TXE-5923). The relay
+	// runs in the scheduler, which knows the owner mode only when it loaded
+	// the TXE configuration (start-all does; a scheduler started on its
+	// own does not). Without the mode it decides as enforce, so an owner's
+	// DAG is refused, failing closed. It has no owner store, so a DAG with
+	// an owner's DAG name is taken for an owner's.
+	var mode authz.Mode
+	if r.config != nil {
+		mode = authz.Mode(r.config.TXE.Authz.Mode)
+	}
+	decision, err := txeauth.DecideUnboundTrigger(mode, mode != "", dag, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", publicwebhook.ErrInvalidRun, dagName, err)
+	}
 	profileName, err := r.dagExecutor.defaultProfileName(ctx, dagName, dag)
 	switch {
 	case errors.Is(err, profile.ErrInvalidName), errors.Is(err, profile.ErrNotFound),
@@ -93,5 +109,6 @@ func (r *webhookRuns) Enqueue(ctx context.Context, dagName string, dag *ir.DAG, 
 		params,
 		profileName,
 		time.Now(),
+		decision.Trigger,
 	)
 }

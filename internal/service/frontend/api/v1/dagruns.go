@@ -3882,7 +3882,7 @@ func (a *API) rescheduleDAGRun(ctx context.Context, dagName, dagRunID string, op
 			definitionID: status.DAGDefinitionID(),
 		})
 	} else {
-		enqueueErr = a.enqueuePreparedDAGRun(ctx, dag, paramsToUse, newDagRunID, ir.TriggerTypeManual, profileName, status.NoReuse, rescheduleSelector)
+		enqueueErr = a.enqueuePreparedDAGRun(ctx, dag, paramsToUse, newDagRunID, ir.TriggerTypeManual, profileName, status.NoReuse, rescheduleSelector, intake.UnboundTrigger{})
 	}
 	if enqueueErr != nil {
 		return rescheduleDAGRunResult{}, fmt.Errorf("failed to enqueue dag-run: %w", enqueueErr)
@@ -3916,6 +3916,7 @@ func (a *API) enqueuePreparedDAGRun(
 	profileName string,
 	noReuse bool,
 	workerSelector map[string]string,
+	unbound intake.UnboundTrigger,
 ) error {
 	resolvedDAG, err := spec.ResolveRuntimeParams(ctx, dag, params, spec.ResolveRuntimeParamsOptions{
 		BaseConfig: a.config.Paths.BaseConfig,
@@ -3963,6 +3964,7 @@ func (a *API) enqueuePreparedDAGRun(
 		ProceedOnStatusCloseErr: true,
 		ProfileName:             profileName,
 		NoReuse:                 noReuse,
+		Unbound:                 unbound,
 	})
 	if err != nil {
 		return err

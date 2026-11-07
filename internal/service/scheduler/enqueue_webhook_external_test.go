@@ -4,6 +4,8 @@
 package scheduler_test
 
 import (
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 	"testing"
 	"time"
 
@@ -31,7 +33,17 @@ func enqueueWebhookRun(th test.Helper, dag *ir.DAG, runID, params string) error 
 		params,
 		"prod",
 		time.Now(),
+		unboundAllowed(dag),
 	)
+}
+
+// unboundAllowed is the owner rule's allowance for a DAG of no owner.
+func unboundAllowed(dag *ir.DAG) intake.UnboundTrigger {
+	decision, err := txeauth.DecideUnboundTrigger(authz.ModeOff, true, dag, nil)
+	if err != nil {
+		panic(err)
+	}
+	return decision.Trigger
 }
 
 // A delivery sent again names the same run, which is queued once.

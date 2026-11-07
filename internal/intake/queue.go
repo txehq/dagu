@@ -45,6 +45,10 @@ type QueueRequest struct {
 
 	AttemptOptions persis.DAGRunCreateAttemptOptions
 
+	// Unbound is the owner rule's decision for a run no hub principal asks
+	// for (TriggerType.Unbound). Without it such a run is refused.
+	Unbound UnboundTrigger
+
 	// ProceedOnStatusCloseErr preserves legacy CLI enqueue behavior: publish
 	// the queue item after best-effort close so readers can see the queued status.
 	ProceedOnStatusCloseErr bool
@@ -132,6 +136,11 @@ func EnqueueRun(ctx context.Context, req QueueRequest) (*QueuedRun, error) {
 }
 
 func (r QueueRequest) validate() error {
+	// First, so nothing else about the request is looked at for a run the
+	// owner rule did not allow.
+	if r.TriggerType.Unbound() && !r.Unbound.decided {
+		return fmt.Errorf("%w: a %s run", ErrUnboundTriggerUndecided, r.TriggerType)
+	}
 	if r.DAGRunRepository == nil {
 		return fmt.Errorf("DAG-run repository is required")
 	}

@@ -142,6 +142,26 @@ const (
 	TriggerTypeFile
 )
 
+// Unbound reports whether a run of this trigger type is asked for by no hub
+// principal: a webhook delivery, local or through Dagu Cloud, comes from an
+// outside sender the hub's roles and owners know nothing of. Such a run is
+// queued only with the owner rule's decision (intake.QueueRequest.Unbound,
+// TXE-5923). Every other trigger is a principal's own act or one its DAG
+// declares (a schedule, a catch-up, a file it watches), or follows one (a
+// retry, a sub-DAG). The switch names every trigger type, so a new one is
+// classified here before it builds (the exhaustive linter).
+func (t TriggerType) Unbound() bool {
+	switch t {
+	case TriggerTypeWebhook:
+		return true
+	case TriggerTypeUnknown, TriggerTypeScheduler, TriggerTypeManual, TriggerTypeSubDAG,
+		TriggerTypeRetry, TriggerTypeCatchUp, TriggerTypeFile:
+		return false
+	}
+	// A value outside the declared ones is unbound: it fails closed.
+	return true
+}
+
 // String returns the canonical lowercase token for the trigger type.
 func (t TriggerType) String() string {
 	switch t {
