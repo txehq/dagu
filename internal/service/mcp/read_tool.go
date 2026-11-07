@@ -214,6 +214,9 @@ func (svc *Service) readTool(ctx context.Context, req *mcpsdk.CallToolRequest) (
 }
 
 func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.CallToolResult, map[string]any, error) {
+	if err := svc.authorizeReadTarget(ctx, input.Target); err != nil {
+		return nil, nil, err
+	}
 	var (
 		data any
 		err  error

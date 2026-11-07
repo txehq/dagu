@@ -369,3 +369,19 @@ func TestCalendarHTTP(t *testing.T) {
 	server.Client().Get("/api/v1/calendars/no.such").ExpectStatus(http.StatusBadRequest).Send(t)
 	server.Client().Delete("/api/v1/calendars/ops").ExpectStatus(http.StatusNoContent).Send(t)
 }
+
+// A read of a file on the hub's host, such as the MCP workbook target, needs
+// what writing DAGs needs: a viewer or operator is refused (TXE-5923).
+func TestRequireHostFileRead(t *testing.T) {
+	t.Parallel()
+	helper := test.Setup(t)
+	apiImpl := newCalendarAPI(t, helper, localapi.WithAuthService(stubAuthService{}))
+	as := func(role auth.Role) context.Context {
+		return auth.WithUser(context.Background(), &auth.User{Username: string(role), Role: role, WorkspaceAccess: auth.AllWorkspaceAccess()})
+	}
+	require.Error(t, apiImpl.RequireHostFileRead(as(auth.RoleViewer)))
+	require.Error(t, apiImpl.RequireHostFileRead(as(auth.RoleOperator)))
+	require.NoError(t, apiImpl.RequireHostFileRead(as(auth.RoleDeveloper)))
+	require.NoError(t, apiImpl.RequireHostFileRead(as(auth.RoleAdmin)))
+	require.Error(t, apiImpl.RequireHostFileRead(context.Background()), "no caller")
+}

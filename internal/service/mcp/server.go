@@ -187,7 +187,7 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 	falsePtr := new(false)
 	truePtr := new(true)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Meta:        runInspectorToolMeta(),
 		Name:        toolRead,
 		Title:       "Read Dagu state",
@@ -200,7 +200,7 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 		},
 	}, svc.readTool)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Name:        toolChange,
 		Title:       "Preview or apply Dagu changes",
 		Description: "Validate and optionally apply DAG definitions, DAG default profiles, or Markdown Wiki changes. Wiki changes are workspace-aware. Use mode=preview before mode=apply unless the user explicitly asked to write immediately.",
@@ -212,7 +212,7 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 		},
 	}, svc.changeTool)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Meta:        runInspectorToolMeta(),
 		Name:        toolExecute,
 		Title:       "Execute DAG-runs and decide waiting steps",
@@ -224,6 +224,15 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 			Title:           "Execute DAG-runs and decide waiting steps",
 		},
 	}, svc.executeTool)
+}
+
+// addTool offers tool on server, except on the server for Dagu Cloud when
+// cloudTools does not allow it.
+func addTool(server *mcpsdk.Server, svc *Service, tool *mcpsdk.Tool, handler mcpsdk.ToolHandler) {
+	if svc.remote != nil && !cloudTools[tool.Name] {
+		return
+	}
+	server.AddTool(tool, handler)
 }
 
 func registerResources(server *mcpsdk.Server, svc *Service) {
