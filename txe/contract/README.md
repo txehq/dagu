@@ -141,10 +141,10 @@ mode.
 
 | Class | What it reaches | Under enforce |
 |---|---|---|
-| platform | the installation, or every owner at once: accounts, API keys, remote nodes, the license, Git sync, the scheduler, protected and inherited runtime profiles | the platform administrator alone (`platform_admin_required`); a caller held to its owner never, in any mode |
+| platform | the installation, or every owner at once: accounts, API keys, remote nodes, the license, Git sync, the scheduler, inherited runtime profile defaults, protected runtime profiles, and every write to a runtime profile | the platform administrator alone (`platform_admin_required`); a caller held to its owner never, in any mode |
 | hub records | audit and event logs | hidden from everyone but the platform administrator (`hub_records_not_permitted`, TXE-4752) |
 | owner scoped | one DAG's webhook profile tokens and settings | the DAG's owner decision, made before or around the role |
-| unowned | runtime profiles that are not protected | the manager role, as before |
+| unowned | reads of runtime profiles that are not protected | the manager role, as before |
 
 One rule decides what is the platform's, `txePlatformReserved`: a caller held to its owner, or
 under enforce anyone but the platform administrator. `requireAdmin`, `txeHubHidden` and the writes
@@ -157,10 +157,15 @@ admin-role key can be found before the switch. An owner store that cannot be rea
 only where the mode decides (enforce, and always for a caller held to its owner); a legacy caller
 and the builtin administrator read no store, so an outage changes nothing for them.
 
-The unowned class is the rule as it stood: under enforce a legacy manager still creates and changes
-runtime profiles that are not protected, whose values reach runs on DAGs of no owner and on owners'
-DAGs the platform administrator attached them to. Whether those writes should also be the platform
-administrator's alone is a separate decision; this change neither widens nor narrows it.
+A runtime profile's values reach every run that names it, on DAGs of no owner and on owners' DAGs
+the platform administrator attached it to, so its writes are the platform's whether or not it is
+protected (Connor, 2026-11-07). One function decides every write (`requireRuntimeProfileWrite`):
+creating, describing, protecting or removing a profile and setting or removing its variables and
+secrets. A protected profile's write is the administrator role's, as before. Any other profile's
+write is the manager role, as before, and then the platform rule: in `off` and `observe` the manager
+role still writes; under enforce the platform administrator alone does, with
+`platform_admin_required`. Listing and reading profiles that are not protected stay the manager
+role's in every mode, and a caller held to its owner names no profile anywhere (TXE-4704).
 
 ## Who edits what
 

@@ -62,17 +62,31 @@ func serviceAPIError(err error) *api.Error {
 }
 
 func (a *API) requireRuntimeProfileManage(ctx context.Context, item *profilepkg.Profile) error {
-	if item.Protected {
-		return a.requireAdmin(ctx)
-	}
-	return a.requireManagerOrAbove(ctx)
+	return a.requireRuntimeProfileWrite(ctx, item.Protected)
 }
 
 func (a *API) requireRuntimeProfileUpdate(ctx context.Context, item *profilepkg.Profile, protectedRequested bool) error {
-	if item.Protected || protectedRequested {
+	return a.requireRuntimeProfileWrite(ctx, item.Protected || protectedRequested)
+}
+
+// requireRuntimeProfileWrite guards every write to a runtime profile: its
+// creation, its description, its protection, its variables, its secrets
+// and its removal. A protected profile is the administrator role's, as it
+// always was. Any other profile is the manager role's, as it always was,
+// and then the platform rule (TXE-6139): a profile's values reach every run
+// that names it, on DAGs of no owner and on owners' DAGs the platform
+// administrator attached it to, so under enforce the write is the platform
+// administrator's alone, while in off and observe the manager role decides
+// as before. Reads of a profile that is not protected are the manager
+// role's in every mode.
+func (a *API) requireRuntimeProfileWrite(ctx context.Context, protected bool) error {
+	if protected {
 		return a.requireAdmin(ctx)
 	}
-	return a.requireManagerOrAbove(ctx)
+	if err := a.requireManagerOrAbove(ctx); err != nil {
+		return err
+	}
+	return a.txeRequirePlatform(ctx)
 }
 
 func (a *API) requireRuntimeProfileView(ctx context.Context, item *profilepkg.Profile) error {
@@ -112,17 +126,12 @@ func (a *API) CreateRuntimeProfile(ctx context.Context, request api.CreateRuntim
 	if a.profileStore == nil {
 		return nil, profileStoreUnavailable()
 	}
-	if err := a.requireManagerOrAbove(ctx); err != nil {
+	protected := request.Body != nil && valueOf(request.Body.Protected)
+	if err := a.requireRuntimeProfileWrite(ctx, protected); err != nil {
 		return nil, err
 	}
 	if request.Body == nil {
 		return api.CreateRuntimeProfile400JSONResponse(runtimeProfileBadRequest("Request body is required")), nil
-	}
-	protected := valueOf(request.Body.Protected)
-	if protected {
-		if err := a.requireAdmin(ctx); err != nil {
-			return nil, err
-		}
 	}
 
 	now := time.Now().UTC()

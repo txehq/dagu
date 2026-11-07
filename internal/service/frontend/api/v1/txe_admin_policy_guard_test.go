@@ -26,7 +26,7 @@ import (
 // It returns one line per violation, so a negative control can read them.
 func txeAdminGuardFindings(files []*ast.File, inventory map[string]txeAdminOperation) []string {
 	type calls struct {
-		admin, manager, hubHidden, dagDecided bool
+		admin, platform, manager, hubHidden, dagDecided bool
 	}
 	seen := map[string]calls{}
 	for _, file := range files {
@@ -48,6 +48,8 @@ func txeAdminGuardFindings(files []*ast.File, inventory map[string]txeAdminOpera
 				switch sel.Sel.Name {
 				case "requireAdmin":
 					c.admin = true
+				case "txeRequirePlatform":
+					c.platform = true
 				case "requireManagerOrAbove":
 					c.manager = true
 				case "txeHubHidden":
@@ -75,8 +77,8 @@ func txeAdminGuardFindings(files []*ast.File, inventory map[string]txeAdminOpera
 		}
 		switch op.class {
 		case txeAdminPlatform:
-			if !c.admin {
-				findings = append(findings, fmt.Sprintf("%s is classified %s and never calls requireAdmin, which carries the platform rule", name, op.class))
+			if !c.admin && !c.platform {
+				findings = append(findings, fmt.Sprintf("%s is classified %s and never calls requireAdmin or txeRequirePlatform, which carry the platform rule", name, op.class))
 			}
 		case txeAdminHubRecords:
 			if !c.hubHidden {
@@ -260,7 +262,10 @@ func TestAdminRoleGuardCatchesEachDrift(t *testing.T) {
 			map[string]txeAdminOperation{}, "NewRoute asks for the administrator or manager role and is not classified"},
 		{"a platform class on a manager-only call",
 			`func (a *API) NewRoute(ctx context.Context) error { return a.requireManagerOrAbove(ctx) }`,
-			map[string]txeAdminOperation{"NewRoute": ok}, "never calls requireAdmin, which carries the platform rule"},
+			map[string]txeAdminOperation{"NewRoute": ok}, "never calls requireAdmin or txeRequirePlatform, which carry the platform rule"},
+		{"a platform write that drops the platform rule after the manager role",
+			`func (a *API) NewWrite(ctx context.Context) error { if err := a.requireManagerOrAbove(ctx); err != nil { return err }; return nil }`,
+			map[string]txeAdminOperation{"NewWrite": {txeAdminPlatform, "writes what every run shares"}}, "NewWrite is classified platform and never calls requireAdmin or txeRequirePlatform"},
 		{"hub records without txeHubHidden",
 			`func (a *API) NewRoute(ctx context.Context) error { return a.requireManagerOrAbove(ctx) }`,
 			map[string]txeAdminOperation{"NewRoute": {txeAdminHubRecords, "reads records"}}, "does not apply txeHubHidden"},
@@ -292,9 +297,10 @@ func (a *API) P(ctx context.Context) error { return a.requireAdmin(ctx) }
 func (a *API) H(ctx context.Context) error { if err := a.requireManagerOrAbove(ctx); err != nil { return err }; if a.txeHubHidden(ctx) { return errTxeHubRecords }; return nil }
 func (a *API) O(ctx context.Context, name string) error { return a.txeNativeWriteClosed(ctx, func() error { return a.requireManagerOrAbove(ctx) }, nil, name) }
 func (a *API) U(ctx context.Context) error { return a.requireManagerOrAbove(ctx) }
+func (a *API) W(ctx context.Context) error { if err := a.requireManagerOrAbove(ctx); err != nil { return err }; return a.txeRequirePlatform(ctx) }
 `
 	findings := txeAdminGuardFindings(parseSnippet(t, clean), map[string]txeAdminOperation{
-		"P": ok, "H": {txeAdminHubRecords, "reads"}, "O": {txeAdminOwnerScoped, "writes a DAG"}, "U": {txeAdminUnowned, "changes a profile"},
+		"P": ok, "H": {txeAdminHubRecords, "reads"}, "O": {txeAdminOwnerScoped, "writes a DAG"}, "U": {txeAdminUnowned, "reads a profile"}, "W": {txeAdminPlatform, "writes a profile"},
 	})
 	assert.Empty(t, findings, strings.Join(findings, "\n"))
 	assert.True(t, slices.Contains([]txeAdminClass{txeAdminPlatform, txeAdminHubRecords, txeAdminOwnerScoped, txeAdminUnowned}, ok.class))

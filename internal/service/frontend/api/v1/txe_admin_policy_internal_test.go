@@ -100,6 +100,61 @@ func TestRequireAdminDecidesEachCallerInEachMode(t *testing.T) {
 	}
 }
 
+// Every write to a runtime profile goes through requireRuntimeProfileWrite
+// (TXE-6139, Connor 2026-11-07). A protected profile's write is the
+// administrator role's, decided as requireAdmin decides. Any other
+// profile's write is the manager role and then the platform rule: in off
+// and observe every manager and administrator the hub's roles admit
+// writes, as before; under enforce the platform administrator alone does;
+// a caller held to its owner never does; a request with no hub user is
+// refused by the role check first, as before.
+func TestRequireRuntimeProfileWriteIsTheManagerRoleThenThePlatformRule(t *testing.T) {
+	type want struct{ off, observe, enforce error }
+	legacyAdmin := want{nil, nil, errTxePlatformAdmin}
+	protectedWants := map[string]want{
+		"the builtin administrator":                                          {nil, nil, nil},
+		"a second builtin account with the administrator role":               {nil, nil, nil},
+		"the platform administrator signed in through the identity provider": {nil, nil, nil},
+		"an admin-role API key":                                              legacyAdmin,
+		"an administrator a trusted proxy named":                             legacyAdmin,
+		"a builtin manager":                                                  {errInsufficientPermissions, errInsufficientPermissions, errInsufficientPermissions},
+		"an administrator account from the provider naming no identity":      legacyAdmin,
+		"a person the hub gave the administrator role":                       {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
+		"a bound person the hub gave the administrator role":                 {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
+		"an owner's command-line token":                                      {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
+		"nobody":                                                             {errAuthRequired, errAuthRequired, errAuthRequired},
+	}
+	legacy := legacyAdmin
+	wants := map[string]want{
+		"the builtin administrator":                                          {nil, nil, nil},
+		"a second builtin account with the administrator role":               {nil, nil, nil},
+		"the platform administrator signed in through the identity provider": {nil, nil, nil},
+		"an admin-role API key":                                              legacy,
+		"an administrator a trusted proxy named":                             legacy,
+		"a builtin manager":                                                  legacy,
+		"an administrator account from the provider naming no identity":      legacy,
+		"a person the hub gave the administrator role":                       {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
+		"a bound person the hub gave the administrator role":                 {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
+		"an owner's command-line token":                                      {errAuthRequired, errAuthRequired, errAuthRequired},
+		"nobody":                                                             {errAuthRequired, errAuthRequired, errAuthRequired},
+	}
+	for _, mode := range []string{config.TXEAuthzModeOff, config.TXEAuthzModeObserve, config.TXEAuthzModeEnforce} {
+		t.Run(mode, func(t *testing.T) {
+			f := newIdentityFixture(t, mode)
+			callers := adminCallers(f, t)
+			require.Len(t, wants, len(callers))
+			require.Len(t, protectedWants, len(callers))
+			pick := func(w want) error {
+				return map[string]error{config.TXEAuthzModeOff: w.off, config.TXEAuthzModeObserve: w.observe, config.TXEAuthzModeEnforce: w.enforce}[mode]
+			}
+			for name, ctx := range callers {
+				assert.Equal(t, pick(wants[name]), f.api.requireRuntimeProfileWrite(ctx, false), "%s writes a plain profile in %s", name, mode)
+				assert.Equal(t, pick(protectedWants[name]), f.api.requireRuntimeProfileWrite(ctx, true), "%s writes a protected profile in %s", name, mode)
+			}
+		})
+	}
+}
+
 // Without the owner model (no txe.authn), requireAdmin is the role check it
 // always was, and a hub with no authentication at all asks nothing.
 func TestRequireAdminWithoutOwnersIsTheRoleCheck(t *testing.T) {

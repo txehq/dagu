@@ -127,7 +127,27 @@ func newAdminHub(t *testing.T, mode string) adminHub {
 	yes := true
 	server.Client().Post("/api/v1/profiles", api.CreateRuntimeProfileJSONRequestBody{Name: h.protected, Protected: &yes}).
 		WithBearerToken(admin).ExpectStatus(http.StatusCreated).Send(t)
+	// What a caller may remove is its own: a profile per caller, and an
+	// entry per caller on the plain profile, so a removal that passes
+	// leaves nothing in another caller's way.
+	for _, caller := range adminHubCallers {
+		server.Client().Post("/api/v1/profiles", api.CreateRuntimeProfileJSONRequestBody{Name: "del-" + slug(caller)}).
+			WithBearerToken(admin).ExpectStatus(http.StatusCreated).Send(t)
+		server.Client().Put("/api/v1/profiles/"+h.plain+"/variables/"+callerKey(caller), map[string]any{"value": "v"}).
+			WithBearerToken(admin).ExpectStatus(http.StatusOK).Send(t)
+	}
 	return h
+}
+
+// callerKey is an environment key naming the caller, for an entry of its own.
+func callerKey(caller string) string {
+	return "K_" + strings.ToUpper(strings.ReplaceAll(slug(caller), "-", "_"))
+}
+
+// routePath fills a route's path for the caller: {caller} is the caller's
+// slug and {key} its environment key.
+func routePath(path, caller string) string {
+	return strings.NewReplacer("{caller}", slug(caller), "{key}", callerKey(caller)).Replace(path)
 }
 
 // proxyLogin signs a user the trusted proxy names in, with the groups the
@@ -184,7 +204,8 @@ type adminRoute struct {
 	class                 string
 	// managerPasses says whether the builtin manager passes the route's
 	// own role check: an owner-scoped or unowned route the manager role
-	// opens.
+	// opens, or a platform-class write the manager role opens in off and
+	// observe (a profile that is not protected).
 	managerPasses bool
 	// dagFirst marks a platform-class decision reached only after the
 	// DAG's owner decision (a run with a protected profile): under enforce
@@ -242,9 +263,10 @@ func (h adminHub) adminRoutes() []adminRoute {
 		p("syncProxyAuthorization", http.MethodPost, "/api/v1/sync/test-connection?remoteNode=nope", none),
 		p("UpdateSchedulerPauseState", http.MethodPost, "/api/v1/services/scheduler/pause", func(string) any { return map[string]any{"paused": false} }),
 		p("requireRuntimeProfileView", http.MethodGet, "/api/v1/profiles/"+h.protected, none),
-		p("requireRuntimeProfileUpdate", http.MethodPatch, "/api/v1/profiles/"+h.protected, func(string) any { return map[string]any{"description": "touched"} }),
-		p("requireRuntimeProfileManage", http.MethodPut, "/api/v1/profiles/"+h.protected+"/variables/K", func(string) any { return map[string]any{"value": "v"} }),
-		p("CreateRuntimeProfile", http.MethodPost, "/api/v1/profiles", func(c string) any {
+		// Writes to a protected profile: the administrator role, as before.
+		p("requireRuntimeProfileWrite", http.MethodPatch, "/api/v1/profiles/"+h.protected, func(string) any { return map[string]any{"description": "touched"} }),
+		p("requireRuntimeProfileWrite", http.MethodPut, "/api/v1/profiles/"+h.protected+"/variables/K", func(string) any { return map[string]any{"value": "v"} }),
+		p("requireRuntimeProfileWrite", http.MethodPost, "/api/v1/profiles", func(c string) any {
 			yes := true
 			return api.CreateRuntimeProfileJSONRequestBody{Name: "protected-of-" + slug(c), Protected: &yes}
 		}),
@@ -259,12 +281,19 @@ func (h adminHub) adminRoutes() []adminRoute {
 		}, class: classPlatform, dagFirst: true},
 
 		{handler: "ListRuntimeProfiles", method: http.MethodGet, path: "/api/v1/profiles", body: none, class: classUnowned, managerPasses: true},
-		{handler: "CreateRuntimeProfile", method: http.MethodPost, path: "/api/v1/profiles", body: func(c string) any {
-			return api.CreateRuntimeProfileJSONRequestBody{Name: "plain-of-" + slug(c)}
-		}, class: classUnowned, managerPasses: true},
 		{handler: "getRuntimeProfileForView", method: http.MethodGet, path: "/api/v1/profiles/" + h.plain, body: none, class: classUnowned, managerPasses: true},
-		{handler: "requireRuntimeProfileUpdate", method: http.MethodPatch, path: "/api/v1/profiles/" + h.plain, body: func(string) any { return map[string]any{"description": "touched"} }, class: classUnowned, managerPasses: true},
-		{handler: "requireRuntimeProfileManage", method: http.MethodPut, path: "/api/v1/profiles/" + h.plain + "/variables/K", body: func(string) any { return map[string]any{"value": "v"} }, class: classUnowned, managerPasses: true},
+
+		// Every write to a profile that is not protected: the manager role
+		// in off and observe, the platform administrator alone under
+		// enforce (requireRuntimeProfileWrite).
+		{handler: "requireRuntimeProfileWrite", method: http.MethodPost, path: "/api/v1/profiles", body: func(c string) any {
+			return api.CreateRuntimeProfileJSONRequestBody{Name: "plain-of-" + slug(c)}
+		}, class: classPlatform, managerPasses: true},
+		{handler: "requireRuntimeProfileWrite", method: http.MethodPatch, path: "/api/v1/profiles/" + h.plain, body: func(string) any { return map[string]any{"description": "touched"} }, class: classPlatform, managerPasses: true},
+		{handler: "requireRuntimeProfileWrite", method: http.MethodPut, path: "/api/v1/profiles/" + h.plain + "/variables/K", body: func(string) any { return map[string]any{"value": "v"} }, class: classPlatform, managerPasses: true},
+		{handler: "requireRuntimeProfileWrite", method: http.MethodPut, path: "/api/v1/profiles/" + h.plain + "/secrets/S", body: func(string) any { return map[string]any{"value": "v"} }, class: classPlatform, managerPasses: true},
+		{handler: "requireRuntimeProfileWrite", method: http.MethodDelete, path: "/api/v1/profiles/" + h.plain + "/entries/{key}", body: none, class: classPlatform, managerPasses: true},
+		{handler: "requireRuntimeProfileWrite", method: http.MethodDelete, path: "/api/v1/profiles/del-{caller}", body: none, class: classPlatform, managerPasses: true},
 
 		{handler: "ListAuditLogs", method: http.MethodGet, path: "/api/v1/audit", body: none, class: classHubRecords, managerPasses: true},
 		{handler: "ListEventLogs", method: http.MethodGet, path: "/api/v1/event-logs", body: none, class: classHubRecords, managerPasses: true},
@@ -336,7 +365,12 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 			if enforce && route.dagFirst {
 				return ownerNotFound
 			}
-			return insufficient
+			if !route.managerPasses {
+				return insufficient
+			}
+			if enforce {
+				return platformAdminRequired
+			}
 		case classHubRecords:
 			if enforce {
 				return hubRecordsHidden
@@ -371,7 +405,7 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 
 func (h adminHub) outcome(t *testing.T, caller string, route adminRoute) (guardOutcome, string) {
 	t.Helper()
-	status, body := h.call(t, route.method, route.path, route.body(caller), caller)
+	status, body := h.call(t, route.method, routePath(route.path, caller), route.body(caller), caller)
 	var e api.Error
 	_ = json.Unmarshal([]byte(body), &e)
 	code := ""
@@ -400,9 +434,10 @@ func (h adminHub) outcome(t *testing.T, caller string, route adminRoute) (guardO
 // role guards answers each kind of caller as the policy says, in each mode
 // (TXE-6139). Under enforce an admin-role API key and a trusted-proxy
 // administrator lose the platform's routes, with platform_admin_required,
-// and keep what the manager role has always opened to them; in off and
-// observe nothing changes for them; the platform administrator keeps
-// everything; a caller held to its owner never administers the platform.
+// among them every write to a runtime profile, and keep the reads the
+// manager role has always opened to them; in off and observe nothing
+// changes for them; the platform administrator keeps everything; a caller
+// held to its owner never administers the platform.
 func TestTxeAdminRoutesDecideEachCallerThroughTheRouter(t *testing.T) {
 	for _, mode := range []string{config.TXEAuthzModeOff, config.TXEAuthzModeObserve, config.TXEAuthzModeEnforce} {
 		t.Run(mode, func(t *testing.T) {
@@ -510,6 +545,13 @@ func TestTxeProtectedProfilesArePlatformOnlyUnderEnforce(t *testing.T) {
 		}
 		return names
 	}
+	deletable := func() []string {
+		var names []string
+		for _, caller := range adminHubCallers {
+			names = append(names, "del-"+slug(caller))
+		}
+		return names
+	}
 	start := func(t *testing.T, h adminHub, caller, profile string) (int, string) {
 		t.Helper()
 		runID := "run-" + slug(caller) + "-" + profile
@@ -518,8 +560,8 @@ func TestTxeProtectedProfilesArePlatformOnlyUnderEnforce(t *testing.T) {
 
 	t.Run("enforce", func(t *testing.T) {
 		h := newAdminHub(t, config.TXEAuthzModeEnforce)
-		require.ElementsMatch(t, []string{h.plain}, listed(t, h, callerAdminKey), "the key lists the plain profile only")
-		require.ElementsMatch(t, []string{h.plain, h.protected}, listed(t, h, callerPlatformAdmin))
+		require.ElementsMatch(t, append([]string{h.plain}, deletable()...), listed(t, h, callerAdminKey), "the key lists the profiles that are not protected only")
+		require.ElementsMatch(t, append([]string{h.plain, h.protected}, deletable()...), listed(t, h, callerPlatformAdmin))
 		for _, caller := range []string{callerAdminKey, callerProxyAdmin} {
 			got, answer := h.outcome(t, caller, adminRoute{method: http.MethodGet, path: "/api/v1/profiles/" + h.protected, body: none})
 			require.Equal(t, platformAdminRequired, got, "%s reads the protected profile: %s", caller, answer)
@@ -529,9 +571,11 @@ func TestTxeProtectedProfilesArePlatformOnlyUnderEnforce(t *testing.T) {
 			}})
 			require.Equal(t, platformAdminRequired, got, "%s protects a profile: %s", caller, answer)
 			got, answer = h.outcome(t, caller, adminRoute{method: http.MethodPatch, path: "/api/v1/profiles/" + h.plain, body: func(string) any {
-				return map[string]any{"description": "still the manager role's"}
+				return map[string]any{"description": "the platform administrator's under enforce"}
 			}})
-			require.Equal(t, passes, got, "%s changes the plain profile: %s", caller, answer)
+			require.Equal(t, platformAdminRequired, got, "%s changes the plain profile: %s", caller, answer)
+			got, answer = h.outcome(t, caller, adminRoute{method: http.MethodGet, path: "/api/v1/profiles/" + h.plain, body: none})
+			require.Equal(t, passes, got, "%s reads the plain profile: %s", caller, answer)
 		}
 		// The run path: a legacy caller sees no DAG under enforce, so the
 		// protected profile's rule is not what refuses it there; the
@@ -544,7 +588,11 @@ func TestTxeProtectedProfilesArePlatformOnlyUnderEnforce(t *testing.T) {
 
 	t.Run("observe", func(t *testing.T) {
 		h := newAdminHub(t, config.TXEAuthzModeObserve)
-		require.ElementsMatch(t, []string{h.plain, h.protected}, listed(t, h, callerAdminKey), "unchanged in observe")
+		require.ElementsMatch(t, append([]string{h.plain, h.protected}, deletable()...), listed(t, h, callerAdminKey), "unchanged in observe")
+		got, answer := h.outcome(t, callerAdminKey, adminRoute{method: http.MethodPatch, path: "/api/v1/profiles/" + h.plain, body: func(string) any {
+			return map[string]any{"description": "still the manager role's in observe"}
+		}})
+		require.Equal(t, passes, got, "the key changes the plain profile in observe: %s", answer)
 		status, body := start(t, h, callerAdminKey, h.protected)
 		require.Equal(t, http.StatusOK, status, body)
 		var started api.ExecuteDAG200JSONResponse

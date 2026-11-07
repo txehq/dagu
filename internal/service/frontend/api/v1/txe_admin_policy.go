@@ -39,12 +39,15 @@ import (
 //     owner by txeNativeWriteClosed or txeDAGFileRoute. The role is the hub's
 //     own check for the callers the hub's roles govern; the owner decision
 //     is what refuses a legacy caller under enforce.
-//   - txeAdminUnowned: a runtime profile that is not protected: a resource
-//     of the whole hub that the hub's manager role has always administered
-//     and that no owner holds. The manager role alone decides, as before;
-//     what a caller held to its owner may do with a profile is decided
-//     where it would use one (explicitRunProfile), and the protected ones
-//     are txeAdminPlatform.
+//   - txeAdminUnowned: a read of a runtime profile that is not protected:
+//     a resource of the whole hub that no owner holds and that the hub's
+//     manager role has always read. The manager role alone decides, as
+//     before; what a caller held to its owner may do with a profile is
+//     decided where it would use one (explicitRunProfile). Every write to
+//     a profile is txeAdminPlatform (requireRuntimeProfileWrite): a
+//     profile's values reach every run that names it, so under enforce the
+//     platform administrator alone makes it, and in off and observe the
+//     manager role does as before (Connor, 2026-11-07).
 //
 // Every function in this package that calls requireAdmin or
 // requireManagerOrAbove is classified in txeAdminOperations, with what it
@@ -65,8 +68,8 @@ const (
 	// txeAdminOwnerScoped is an operation on one DAG, decided on that DAG's
 	// owner before or around the role.
 	txeAdminOwnerScoped txeAdminClass = "owner_scoped"
-	// txeAdminUnowned is a resource of the whole hub that no owner holds and
-	// the manager role has always administered.
+	// txeAdminUnowned is a read of a resource of the whole hub that no owner
+	// holds and the manager role has always read.
 	txeAdminUnowned txeAdminClass = "unowned"
 )
 
@@ -110,19 +113,19 @@ var txeAdminOperations = map[string]txeAdminOperation{
 	"UpdateSyncConfig":       {txeAdminPlatform, "changes where every owner's DAG files are published"},
 	// The scheduler runs every owner's schedules.
 	"UpdateSchedulerPauseState": {txeAdminPlatform, "pauses or resumes every owner's schedules at once"},
-	// Runtime profiles: a protected profile, and the defaults every
-	// workflow inherits, carry values into every owner's runs.
-	"requireRuntimeProfileManage":            {txeAdminUnowned, "changes a profile; a protected one is the platform's"},
-	"requireRuntimeProfileUpdate":            {txeAdminUnowned, "changes a profile or protects it; a protected one is the platform's"},
+	// Runtime profiles carry values into every run that names them: a
+	// write to any profile, and the defaults every workflow inherits, are
+	// the platform's; a read of one that is not protected is the manager
+	// role's.
+	"requireRuntimeProfileWrite":             {txeAdminPlatform, "creates, changes, protects or removes a profile, or sets or removes its entries: a protected one by the administrator role, any other by the manager role and then the platform rule"},
 	"requireRuntimeProfileView":              {txeAdminPlatform, "reads a protected profile's entries"},
 	"ListRuntimeProfiles":                    {txeAdminUnowned, "lists the profiles; protected ones only for the platform administrator"},
-	"CreateRuntimeProfile":                   {txeAdminUnowned, "creates a profile; a protected one is the platform's"},
 	"GetGlobalRuntimeProfileDefaults":        {txeAdminPlatform, "reads the values every owner's run inherits"},
 	"UpdateGlobalRuntimeProfileDefaults":     {txeAdminPlatform, "changes the values every owner's run inherits"},
 	"SetGlobalRuntimeProfileDefaultVariable": {txeAdminPlatform, "sets a value every owner's run inherits"},
 	"SetGlobalRuntimeProfileDefaultSecret":   {txeAdminPlatform, "sets a secret every owner's run inherits"},
 	"DeleteGlobalRuntimeProfileDefaultEntry": {txeAdminPlatform, "removes a value every owner's run inherits"},
-	"getRuntimeProfileForView":               {txeAdminUnowned, "reads a profile"},
+	"getRuntimeProfileForView":               {txeAdminUnowned, "reads a profile that is not protected"},
 	"ensureRunnableRuntimeProfileAccess":     {txeAdminPlatform, "runs with a protected profile's values"},
 	// Webhooks: decided on the DAG first; the role is reached only by the
 	// callers the hub's roles govern.
