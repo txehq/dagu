@@ -162,9 +162,13 @@ type mux struct {
 	// client addressing it is refused like any session it does not own.
 	browserSession string
 	// beforeAttach, when set, runs in start before the gate's auto-attach is
-	// asked for: setup that must be in place before any target can run. An
-	// error ends the start, and the gate does not serve.
+	// asked for: setup that must be in place before any target can run.
+	// afterAttach, when set, runs once the auto-attach is in place and the
+	// targets that already existed are in gateSessions: setup for what was
+	// there before beforeAttach's work could cover it. An error from either
+	// ends the start, and the gate does not serve.
 	beforeAttach func(ctx context.Context) error
+	afterAttach  func(ctx context.Context) error
 	// onGateEvent receives events on the gate's own sessions, the browser
 	// session and the auto-attach sessions, for the gate's own protocol
 	// use; session names the one the event arrived on. It runs with mu held.
@@ -339,10 +343,11 @@ func (m *mux) call(ctx context.Context, sessionID, method string, params any) (j
 	}
 }
 
-// start puts the gate's own setup in place (beforeAttach), then asks the
-// browser for the root auto-attach the gate holds. Every new target is then
-// held until the gate resumes it. The order is the point: nothing the setup
-// must cover can run before the setup's outcome is known, and a setup the
+// start puts the gate's own setup in place (beforeAttach), asks the browser
+// for the root auto-attach the gate holds, then completes the setup for the
+// targets that already existed (afterAttach). Every new target is held
+// until the gate resumes it. The order is the point: nothing the setup must
+// cover can run before the setup's outcome is known, and a setup the
 // browser refuses ends the start.
 func (m *mux) start(ctx context.Context) error {
 	if m.beforeAttach != nil {
@@ -350,11 +355,16 @@ func (m *mux) start(ctx context.Context) error {
 			return err
 		}
 	}
+	// The browser reports the targets that exist before it answers, so
+	// gateSessions holds them when the call returns.
 	_, err := m.call(ctx, "", "Target.setAutoAttach", map[string]any{
 		"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
 	})
 	if err != nil {
 		return fmt.Errorf("attach to the browser's targets: %w", err)
+	}
+	if m.afterAttach != nil {
+		return m.afterAttach(ctx)
 	}
 	return nil
 }
@@ -464,6 +474,12 @@ func (m *mux) onAttachedLocked(msg message) {
 	}
 	var info targetInfo
 	if err := json.Unmarshal(params.TargetInfo, &info); err != nil || info.TargetID == "" {
+		return
+	}
+	if info.Type == "browser" {
+		// The gate's own session on the browser target, announced before
+		// the reply that names it (start): the auto-attach never holds the
+		// browser itself, and the browser is no target of the gate's.
 		return
 	}
 	if len(m.attaching[info.TargetID]) > 0 {
@@ -771,6 +787,11 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 		m.attachToTargetLocked(c, msg, sessionID)
 	case "Target.detachFromTarget":
 		m.detachFromTargetLocked(c, msg, sessionID)
+	case "Target.attachToBrowserTarget":
+		// A client's connection is its session on the browser already;
+		// another would be a session of nobody's, kept until the browser
+		// ends and addressed by no one.
+		c.deliverError(msg.ID, sessionID, "the connection is the browser session: send browser-level commands without a session id")
 	case "Runtime.runIfWaitingForDebugger":
 		m.runIfWaitingLocked(c, msg, sessionID)
 	case "Browser.close":

@@ -100,6 +100,12 @@ func TestProxyResponderInterceptsBeforeAnyTargetCanRun(t *testing.T) {
 
 	browserSession := tg.browserSession()
 	require.NotEmpty(t, browserSession)
+	tg.mux.mu.Lock()
+	for _, target := range tg.mux.targets {
+		assert.NotEqual(t, "browser", target.typ, "the browser is no target of the gate's, though its session was announced like one")
+		assert.NotEqual(t, browserSession, target.gateSession, "the gate's browser session is no target's")
+	}
+	tg.mux.mu.Unlock()
 	var browserSessions int
 	for _, s := range state.Sessions {
 		if s.Browser {
@@ -140,8 +146,38 @@ func TestProxyResponderAnswersTheFirstRequestOfATargetCreatedNavigating(t *testi
 	assert.Empty(t, state.Refused, "nothing was refused")
 	requested, resumed := slices.Index(state.Log, "request "+request), slices.Index(state.Log, "resume "+child.TargetID)
 	assert.Less(t, requested, resumed, "the request left before the target could be held, and was answered all the same: %v", state.Log)
-	a.noEvent("Fetch.requestPaused", 200*time.Millisecond)
-	a.noEvent("Fetch.authRequired", 200*time.Millisecond)
+	a.noEvents(200*time.Millisecond, "Fetch.requestPaused", "Fetch.authRequired")
+}
+
+// The browser's first page exists before the responder's interception, with
+// request loaders built without it. The responder turns Fetch on and off on
+// the gate's own session of every such target, so the browser builds their
+// loaders again, and a request from the first page is answered for like any
+// other; nothing stays intercepted on the target itself.
+func TestProxyResponderCoversTheTargetsThatExistedBeforeIt(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWithProxy(t)
+	a := tg.dial("")
+	state := tg.state(a)
+	autoAttach := slices.Index(state.Log, "Target.setAutoAttach")
+	on := slices.IndexFunc(state.Log, func(entry string) bool {
+		return strings.HasPrefix(entry, "Fetch.enable S") && strings.HasSuffix(entry, " on T1")
+	})
+	off := slices.IndexFunc(state.Log, func(entry string) bool {
+		return strings.HasPrefix(entry, "Fetch.disable S") && strings.HasSuffix(entry, " on T1")
+	})
+	require.True(t, autoAttach >= 0 && on >= 0 && off >= 0, "the first page's loaders were rebuilt after the auto-attach: %v", state.Log)
+	assert.Less(t, autoAttach, on, "the rebuild comes once the gate holds the page: %v", state.Log)
+	assert.Less(t, on, off, "the rebuild turns Fetch on, then off: %v", state.Log)
+	for _, s := range state.Sessions {
+		assert.False(t, !s.Browser && s.FetchOn, "nothing stays intercepted on the target: %+v", s)
+	}
+
+	result := a.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "R1", "url": "https://site.test/"})
+	assert.Contains(t, string(result), `"delivered":1`, "the first page's request pauses on the gate's browser-level interception")
+	eventually(t, 5*time.Second, func() bool { return slices.Contains(tg.state(a).Completed, "R1") }, "the request completes")
+	assert.Equal(t, fakeProxyUser+":"+fakeProxySecret, tg.state(a).Credentials["R1"])
+	a.noEvents(200*time.Millisecond, "Fetch.requestPaused", "Fetch.authRequired")
 }
 
 // Through the browser, as in the unit test: a site's own challenge, or
@@ -175,7 +211,14 @@ func TestProxyResponderCoexistsWithAClientsBrowserLevelFetch(t *testing.T) {
 	tg := startTestGateWithProxy(t)
 	b := tg.dial("")
 	b.mustCall("", "Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "*", "requestStage": "Request"}}})
-	result := b.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "R1", "url": "https://site.test/"})
+	// A page made after the client's interception has loaders built with
+	// it, as the pages the runtime makes do.
+	created := b.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
+	var page struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &page))
+	result := b.mustCall("", "Fake.request", map[string]any{"targetId": page.TargetID, "requestId": "R1", "url": "https://site.test/"})
 	assert.Contains(t, string(result), `"delivered":2`, "the request paused on the client's interception and the gate's")
 	paused := b.waitEvent("Fetch.requestPaused", nil)
 	assert.Equal(t, "", paused.SessionID, "the client's interception is on the browser session")
@@ -193,7 +236,7 @@ func TestProxyResponderCoexistsWithAClientsBrowserLevelFetch(t *testing.T) {
 			assert.True(t, s.FetchOn && s.FetchAuth, "the gate's interception survives the client's Fetch.disable")
 		}
 	}
-	b.mustCall("", "Fake.request", map[string]any{"targetId": "T1", "requestId": "R2", "url": "https://site.test/2"})
+	b.mustCall("", "Fake.request", map[string]any{"targetId": page.TargetID, "requestId": "R2", "url": "https://site.test/2"})
 	eventually(t, 5*time.Second, func() bool { return slices.Contains(tg.state(b).Completed, "R2") }, "the next request is still answered for")
 }
 
@@ -209,6 +252,8 @@ func TestProxyResponderSessionIsNotAClients(t *testing.T) {
 	assert.ErrorContains(t, err, "Session with given id not found")
 	_, err = a.call("", "Target.detachFromTarget", map[string]any{"sessionId": browserSession})
 	assert.ErrorContains(t, err, "no session with the given id")
+	_, err = a.call("", "Target.attachToBrowserTarget", nil)
+	assert.ErrorContains(t, err, "the connection is the browser session", "a client gets no second session on the browser")
 	for _, s := range tg.state(a).Sessions {
 		if s.ID == browserSession {
 			assert.True(t, s.FetchOn && s.FetchAuth, "the gate's interception is untouched")

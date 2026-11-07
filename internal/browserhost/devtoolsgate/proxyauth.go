@@ -61,12 +61,17 @@ func newProxyResponder(m *mux, auth ProxyAuth) *proxyResponder {
 }
 
 // install sets the responder's hooks on its mux: its interception is put in
-// place by mux.start before the gate's auto-attach, and the events of its
-// session come to it. It must run before the mux reads the pipe.
+// place by mux.start before the gate's auto-attach, the targets that existed
+// before it are brought under it right after, and the events of its session
+// come to it. It must run before the mux reads the pipe.
 func (r *proxyResponder) install() {
 	r.m.beforeAttach = r.start
+	r.m.afterAttach = r.coverExisting
 	r.m.onGateEvent = r.event
 }
+
+// fetchPatterns intercepts every request at its start.
+var fetchPatterns = []map[string]any{{"urlPattern": "*", "requestStage": "Request"}}
 
 // start attaches the responder's own session on the browser target and
 // turns on its interception there, with the proxy's challenges handled. It
@@ -85,22 +90,46 @@ func (r *proxyResponder) start(ctx context.Context) error {
 	r.m.mu.Lock()
 	r.m.browserSession = session
 	r.m.mu.Unlock()
-	_, err = r.m.call(ctx, session, "Fetch.enable", map[string]any{
-		"handleAuthRequests": true,
-		"patterns":           []map[string]any{{"urlPattern": "*", "requestStage": "Request"}},
-	})
+	_, err = r.m.call(ctx, session, "Fetch.enable", map[string]any{"handleAuthRequests": true, "patterns": fetchPatterns})
 	if err != nil {
 		return fmt.Errorf("turn on the proxy's answer for the browser: %w", err)
 	}
 	return nil
 }
 
-// event answers the interception events on the responder's session. m.mu is
+// coverExisting brings the targets that existed before start under the
+// browser-level interception. A document keeps the request loaders it was
+// given when it was made, and the interception is in those made from then
+// on: the browser's first page, open before the gate could speak to it,
+// would send its requests past the responder (measured: a fetch from it met
+// the proxy's challenge and nobody answered). Turning Fetch on and off again
+// on the gate's own session of such a target makes the browser give it new
+// loaders, built with the interception in place. A target that takes no
+// Fetch is left as it is; one that takes it on but not off would hold its
+// requests for nobody, so that ends the start.
+func (r *proxyResponder) coverExisting(ctx context.Context) error {
+	r.m.mu.Lock()
+	sessions := make([]string, 0, len(r.m.gateSessions))
+	for session := range r.m.gateSessions {
+		sessions = append(sessions, session)
+	}
+	r.m.mu.Unlock()
+	for _, session := range sessions {
+		if _, err := r.m.call(ctx, session, "Fetch.enable", map[string]any{"patterns": fetchPatterns}); err != nil {
+			continue
+		}
+		if _, err := r.m.call(ctx, session, "Fetch.disable", map[string]any{}); err != nil {
+			return fmt.Errorf("turn on the proxy's answer for the browser's first targets: %w", err)
+		}
+	}
+	return nil
+}
+
+// event answers the interception events on the gate's sessions: a paused
+// request is let go on wherever it paused, and a challenge is answered on
+// the responder's own session, the only one that handles them. m.mu is
 // held.
 func (r *proxyResponder) event(session string, msg message) {
-	if session != r.m.browserSession {
-		return
-	}
 	switch msg.Method {
 	case "Fetch.requestPaused":
 		var params struct {
@@ -111,6 +140,9 @@ func (r *proxyResponder) event(session string, msg message) {
 		}
 		r.m.gateCommand(session, "Fetch.continueRequest", map[string]any{"requestId": params.RequestID}, nil)
 	case "Fetch.authRequired":
+		if session != r.m.browserSession {
+			return
+		}
 		var params struct {
 			RequestID     string `json:"requestId"`
 			AuthChallenge struct {

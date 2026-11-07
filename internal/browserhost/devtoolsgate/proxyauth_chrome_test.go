@@ -223,6 +223,12 @@ func startProxiedChrome(t *testing.T, proxy *credentialProxy) (*Handle, *cdpConn
 	require.NoError(t, err)
 	profile, err := os.MkdirTemp("", "dagu-gate-proxy-auth-")
 	require.NoError(t, err)
+	// Registered first, so it runs last: the profile goes whether or not the
+	// browser started. Chrome's last processes may still be writing as it
+	// exits.
+	t.Cleanup(func() {
+		eventually(t, 15*time.Second, func() bool { return os.RemoveAll(profile) == nil }, "the profile is removed")
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancel)
 	handle, err := Start(ctx, self, Config{
@@ -239,10 +245,7 @@ func startProxiedChrome(t *testing.T, proxy *credentialProxy) (*Handle, *cdpConn
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = handle.Kill()
-		// Chrome's last processes may still be writing as it exits.
-		eventually(t, 15*time.Second, func() bool {
-			return !procutil.IsAlive(handle.BrowserPID) && os.RemoveAll(profile) == nil
-		}, "the browser exits and its profile is removed")
+		eventually(t, 15*time.Second, func() bool { return !procutil.IsAlive(handle.BrowserPID) }, "the browser exits")
 	})
 	_, body := get(t, handle.URL+"/json/version")
 	var version map[string]string
@@ -396,6 +399,31 @@ func TestRealChromeAnswersProxyChallengeForATargetCreatedNavigating(t *testing.T
 	defer helperMu.Unlock()
 	assert.Positive(t, helperPaused, "the client's own browser-level interception saw the requests")
 	assert.Zero(t, helperChallenged, "the proxy's challenge is the gate's to answer, not a client's")
+}
+
+// The browser's first page exists before the gate's interception, with
+// request loaders built without it; the gate has the browser build them
+// again. A fetch from that page, as the browser's very first proxied
+// request, is answered for. (Measured without the rebuild: it met the
+// challenge and hung, nobody answering.)
+func TestRealChromeAnswersProxyChallengeForTheFirstPage(t *testing.T) {
+	site := newTestSite(t)
+	proxy := newCredentialProxy(t, site)
+	_, c := startProxiedChrome(t, proxy)
+	var first []string
+	eventually(t, 10*time.Second, func() bool {
+		first = c.targetsOfType("page", "about:blank")
+		return len(first) == 1
+	}, "the browser's first page")
+	session := c.attach(first[0])
+	started := c.evaluateString(session, "window.outcome = 'pending'; fetch('"+site.server.URL+"/first-page', {mode: 'no-cors'})"+
+		".then(r => { window.outcome = 'answered ' + r.type; }).catch(e => { window.outcome = 'failed ' + e.message; }); 'started'", false)
+	require.Equal(t, "started", started)
+	eventually(t, 30*time.Second, func() bool { return c.evaluateString(session, "window.outcome", false) != "pending" }, "the fetch settles")
+	assert.Equal(t, "answered opaque", c.evaluateString(session, "window.outcome", false), "the fetch got the site's answer")
+	challenged, authorized := proxy.counts("/first-page")
+	assert.Positive(t, challenged, "the proxy challenged the first page's request")
+	assert.Positive(t, authorized, "the first page's request was answered with the gate's credential")
 }
 
 // A popup opened with an address is a new target created already

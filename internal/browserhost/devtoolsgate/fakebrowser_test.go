@@ -27,11 +27,15 @@ import (
 // session intercepting it, the browser-level ones and its target's, and
 // reaches the network once every one of them continued it. There, when a
 // proxy is set (Fake.proxy), a request without a credential is challenged:
-// the challenge goes to the first intercepting session that handles auth,
+// the challenge goes to the first session it paused on that handles auth,
 // and a request no session answers for is refused, as a 407 nobody answers
 // fails. A target created with a URL starts its navigation request as it
 // is created, before any session on it exists, as the browser process does:
-// only browser-level interception can see that request.
+// only browser-level interception can see that request. And a target keeps
+// the request loaders it was given when it was made: a browser-level
+// interception turned on later does not reach it until Fetch is turned on
+// or off on one of its own sessions, which makes the browser build its
+// loaders again.
 type fakeBrowser struct {
 	in  *bufio.Reader
 	out io.Writer
@@ -102,6 +106,11 @@ type fakeTarget struct {
 	// pausedBy is the auto-attached session holding the target, "" when it
 	// runs.
 	pausedBy string
+	// loaders are the browser-level sessions whose interception the
+	// target's request loaders were built with: those intercepting when the
+	// target was made, or when Fetch was last turned on or off on one of
+	// its sessions.
+	loaders map[string]bool
 }
 
 type fakeSession struct {
@@ -132,7 +141,9 @@ type fakeRequest struct {
 	targetID  string
 	url       string
 	challenge *fakeChallenge
-	// pendingOn are the sessions that have not continued the request yet.
+	// chain are the sessions the request paused on, in order; pendingOn
+	// are those that have not continued it yet.
+	chain     []*fakeSession
 	pendingOn map[string]bool
 	// authOn is the session asked to answer the challenge, "" when none was.
 	authOn string
@@ -174,7 +185,19 @@ func (f *fakeBrowser) addTargetLocked(typ, url, title string) *fakeTarget {
 	f.nextTarget++
 	t := &fakeTarget{id: fmt.Sprintf("T%d", f.nextTarget), typ: typ, url: url, title: title}
 	f.targets[t.id] = t
+	f.rebuildLoadersLocked(t)
 	return t
+}
+
+// rebuildLoadersLocked gives t request loaders built with the browser-level
+// interception in place now.
+func (f *fakeBrowser) rebuildLoadersLocked(t *fakeTarget) {
+	t.loaders = map[string]bool{}
+	for _, s := range f.interceptorsLocked() {
+		if s.browser && s.fetchOn {
+			t.loaders[s.id] = true
+		}
+	}
 }
 
 func (f *fakeBrowser) newSessionLocked(targetID string, auto bool) *fakeSession {
@@ -287,6 +310,12 @@ func (f *fakeBrowser) handle(data []byte) {
 		s := f.newSessionLocked("", false)
 		s.browser = true
 		f.log = append(f.log, "Target.attachToBrowserTarget -> "+s.id)
+		// Chrome announces the session before it answers, as for any
+		// attach, with the browser as the target.
+		f.event("", "Target.attachedToTarget", map[string]any{
+			"sessionId": s.id, "waitingForDebugger": false,
+			"targetInfo": map[string]any{"targetId": "B1", "type": "browser", "url": "", "title": "", "attached": true},
+		})
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"sessionId": s.id})
 	case "Target.setAutoAttach":
 		if cmd.SessionID != "" {
@@ -402,11 +431,19 @@ func (f *fakeBrowser) handle(data []byte) {
 		if s.browser && s != f.root {
 			f.log = append(f.log, fmt.Sprintf("Fetch.enable %s auth=%t", s.id, s.fetchAuth))
 		}
+		if t, ok := f.targets[s.targetID]; ok && !s.browser {
+			f.rebuildLoadersLocked(t)
+			f.log = append(f.log, "Fetch.enable "+s.id+" on "+t.id)
+		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Fetch.disable":
 		if s, ok := f.sessionLocked(cmd.SessionID); ok {
 			s.fetchOn = false
 			s.fetchAuth = false
+			if t, ok := f.targets[s.targetID]; ok && !s.browser {
+				f.rebuildLoadersLocked(t)
+				f.log = append(f.log, "Fetch.disable "+s.id+" on "+t.id)
+			}
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Fetch.continueRequest":
@@ -531,21 +568,30 @@ func (f *fakeBrowser) proxyChallenge() *fakeChallenge {
 }
 
 // requestLocked makes a request on targetID: it pauses once on every session
-// intercepting it, the browser-level ones and the target's, as Chrome chains
-// interceptors across sessions, and reaches the network at once when none
-// does. It returns how many sessions it paused on.
+// intercepting it, the browser-level ones the target's loaders were built
+// with and the target's own, as Chrome chains interceptors across sessions,
+// and reaches the network at once when none does. It returns how many
+// sessions it paused on.
 func (f *fakeBrowser) requestLocked(requestID, targetID, url string, challenge *fakeChallenge) int {
 	r := &fakeRequest{id: requestID, targetID: targetID, url: url, challenge: challenge, pendingOn: map[string]bool{}}
 	f.inFlight[requestID] = r
 	f.log = append(f.log, "request "+requestID)
+	t := f.targets[targetID]
 	for _, s := range f.interceptorsLocked() {
-		if !s.fetchOn || (!s.browser && s.targetID != targetID) {
+		if !s.fetchOn {
+			continue
+		}
+		if s.browser && (t == nil || !t.loaders[s.id]) {
+			continue
+		}
+		if !s.browser && s.targetID != targetID {
 			continue
 		}
 		if f.requests[s.id] == nil {
 			f.requests[s.id] = make(map[string]bool)
 		}
 		f.requests[s.id][requestID] = true
+		r.chain = append(r.chain, s)
 		r.pendingOn[s.id] = true
 		f.event(s.id, "Fetch.requestPaused", map[string]any{
 			"requestId": requestID, "request": map[string]any{"url": url},
@@ -558,7 +604,7 @@ func (f *fakeBrowser) requestLocked(requestID, targetID, url string, challenge *
 }
 
 // networkLocked takes a request every interceptor continued to the network.
-// A challenge there goes to the first intercepting session that handles
+// A challenge there goes to the first session it paused on that handles
 // auth; with none, the request is refused, as a 407 nobody answers fails.
 func (f *fakeBrowser) networkLocked(r *fakeRequest) {
 	if r.challenge == nil {
@@ -566,8 +612,8 @@ func (f *fakeBrowser) networkLocked(r *fakeRequest) {
 		f.completed = append(f.completed, r.id)
 		return
 	}
-	for _, s := range f.interceptorsLocked() {
-		if !s.fetchOn || !s.fetchAuth || (!s.browser && s.targetID != r.targetID) {
+	for _, s := range r.chain {
+		if !s.fetchAuth {
 			continue
 		}
 		r.authOn = s.id

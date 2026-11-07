@@ -261,12 +261,20 @@ func (c *cdpConn) waitEvent(method string, accept func(message) bool) message {
 // noEvent asserts that no event with method arrives within wait.
 func (c *cdpConn) noEvent(method string, wait time.Duration) {
 	c.t.Helper()
+	c.noEvents(wait, method)
+}
+
+// noEvents asserts that no event with any of methods arrives within wait,
+// in one watch, so one forbidden event cannot slip by while another is
+// watched for.
+func (c *cdpConn) noEvents(wait time.Duration, methods ...string) {
+	c.t.Helper()
 	deadline := time.After(wait)
 	for {
 		select {
 		case event := <-c.events:
-			if event.Method == method {
-				c.t.Fatalf("unexpected %s event: %s", method, event.Params)
+			if slices.Contains(methods, event.Method) {
+				c.t.Fatalf("unexpected %s event: %s", event.Method, event.Params)
 			}
 		case <-deadline:
 			return
