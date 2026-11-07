@@ -1508,7 +1508,10 @@ func (srv *Server) setupTerminalRoute(ctx context.Context, r *chi.Mux, apiV1Base
 		logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
 		return
 	}
-	r.Get(wsPath, termHandler.ServeHTTP)
+	// The host-execution decision is applied here too, so every terminal
+	// route carries it (TestEveryTerminalRouteDecidesHostExecution); without
+	// owners it lets the hub's own admin check decide.
+	r.With(srv.apiV1.TxeHostExecutionRefused()).Get(wsPath, termHandler.ServeHTTP)
 	logger.Info(ctx, "Terminal WebSocket route configured", slog.String("path", wsPath))
 }
 
