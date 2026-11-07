@@ -107,7 +107,7 @@ function StatusUpdateModal({ visible, dismissModal, step, onSubmit }: Props) {
       <DialogContent className="sm:max-w-[400px]">
         <DialogHeader>
           <DialogTitle className="text-base font-mono">
-            <I18nText text={"Update Status"} />
+            <I18nText text={'Update status'} />
           </DialogTitle>
           <p className="text-sm text-muted-foreground font-mono mt-1">
             {step.name}
@@ -119,7 +119,7 @@ function StatusUpdateModal({ visible, dismissModal, step, onSubmit }: Props) {
             <button
               ref={successButtonRef}
               className={`
-                group relative overflow-hidden rounded-lg border p-4 transition-all duration-200 focus:outline-none
+                group relative overflow-hidden rounded-lg border p-4 transition-colors duration-200 focus:outline-none
                 ${
                   selectedButton === 0
                     ? 'border-success bg-success-muted'
@@ -131,14 +131,16 @@ function StatusUpdateModal({ visible, dismissModal, step, onSubmit }: Props) {
             >
               <div className="flex flex-col items-center gap-2">
                 <CheckCircle2 className="h-8 w-8 text-success" />
-                <span className="font-mono text-sm"><I18nText text={"Success"} /></span>
+                <span className="font-mono text-sm">
+                  <I18nText text={'Success'} />
+                </span>
               </div>
             </button>
 
             <button
               ref={failedButtonRef}
               className={`
-                group relative overflow-hidden rounded-lg border p-4 transition-all duration-200 focus:outline-none
+                group relative overflow-hidden rounded-lg border p-4 transition-colors duration-200 focus:outline-none
                 ${
                   selectedButton === 1
                     ? 'border-error bg-error-muted'
@@ -150,18 +152,26 @@ function StatusUpdateModal({ visible, dismissModal, step, onSubmit }: Props) {
             >
               <div className="flex flex-col items-center gap-2">
                 <XCircle className="h-8 w-8 text-error" />
-                <span className="font-mono text-sm"><I18nText text={"Failed"} /></span>
+                <span className="font-mono text-sm">
+                  <I18nText text={'Failed'} />
+                </span>
               </div>
             </button>
           </div>
         </div>
 
         <div className="flex items-center gap-3 text-xs text-muted-foreground font-mono pt-2 border-t border-border">
-          <span><I18nText text={"←→ Select"} /></span>
+          <span>
+            <I18nText text={'←→ Select'} />
+          </span>
           <span className="opacity-40">•</span>
-          <span><I18nText text={"Enter: Confirm"} /></span>
+          <span>
+            <I18nText text={'Enter: Confirm'} />
+          </span>
           <span className="opacity-40">•</span>
-          <span><I18nText text={"ESC: Cancel"} /></span>
+          <span>
+            <I18nText text={'ESC: Cancel'} />
+          </span>
         </div>
       </DialogContent>
     </Dialog>

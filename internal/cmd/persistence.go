@@ -33,6 +33,7 @@ type Persistence struct {
 	StateStore                dagrun.StateStore
 	SchedulerStateStore       schedulerstate.Store
 	SchedulerPauseStore       schedulerstate.PauseStore
+	WatchStateStore           schedulerstate.WatchStore
 	ServiceRegistry           serviceregistry.ServiceRegistry
 	DispatchTaskStore         dispatch.DispatchTaskStore
 	WorkerHeartbeatStore      dispatch.WorkerHeartbeatStore
@@ -88,6 +89,7 @@ func newFilePersistence(
 	schedulerPauseStore := store.NewSchedulerPauseStore(
 		backend.Collection(persis.CollectionSchedulerState),
 	)
+	watchStateStore := store.NewWatchStateStore(backend.Collection(persis.CollectionWatchState))
 	serviceRegistry := file.NewServiceRegistry(cfg)
 	bundleStore := workspacebundle.NewStore(
 		workspacebundle.StoreDir(cfg.Paths.DataDir),
@@ -97,6 +99,7 @@ func newFilePersistence(
 		backend.Collection(persis.CollectionDispatchTasks),
 		store.WithDispatchAdmissionLiveness(dagRunLeaseStore, activeDistributedRunStore),
 		store.WithDispatchTransitionLock(bundleStore.WithLock),
+		store.WithUnclaimedDispatchTimeout(cfg.Coordinator.UnclaimedDispatchTimeout),
 	)
 	workerHeartbeatStore := store.NewWorkerHeartbeatStore(
 		backend.Collection(persis.CollectionWorkerHeartbeats),
@@ -115,6 +118,7 @@ func newFilePersistence(
 		StateStore:                stateStore,
 		SchedulerStateStore:       schedulerStateStore,
 		SchedulerPauseStore:       schedulerPauseStore,
+		WatchStateStore:           watchStateStore,
 		ServiceRegistry:           serviceRegistry,
 		DispatchTaskStore:         dispatchTaskStore,
 		WorkerHeartbeatStore:      workerHeartbeatStore,

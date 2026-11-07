@@ -6,6 +6,9 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/txe/authz"
+	"github.com/dagucloud/dagu/v2/internal/txe/txeauth"
 	"testing"
 	"time"
 
@@ -28,10 +31,14 @@ func TestEnqueueWebhookRun_PropagatesFindAttemptErrors(t *testing.T) {
 		t.TempDir(),
 		t.TempDir(),
 		"",
+		"",
+		"ci.yaml",
 		&ir.DAG{Name: "ci"},
 		"run-1",
 		"",
+		"",
 		time.Now(),
+		allowedUnbound(t, &ir.DAG{Name: "ci"}),
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to check existing webhook run")
@@ -68,4 +75,13 @@ type findAttemptErrStore struct {
 
 func (s *findAttemptErrStore) FindAttempt(context.Context, ir.DAGRunRef) (dagrun.Attempt, error) {
 	return nil, s.err
+}
+
+// allowedUnbound is the owner rule's allowance for a DAG of no owner, as the
+// relay gets it.
+func allowedUnbound(t *testing.T, dag *ir.DAG) intake.UnboundTrigger {
+	t.Helper()
+	decision, err := txeauth.DecideUnboundTrigger(authz.ModeOff, true, dag, nil)
+	require.NoError(t, err)
+	return decision.Trigger
 }

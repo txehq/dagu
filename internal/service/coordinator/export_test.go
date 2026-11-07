@@ -4,6 +4,7 @@
 package coordinator
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -47,4 +48,15 @@ func SetHealthLogClockForTest(c Client, now func() time.Time) {
 		return
 	}
 	cli.healthLog = newHealthFailureLog(now)
+}
+
+// ExpireHeldDispatchesForTest fails held dispatches whose wait passed at now.
+func ExpireHeldDispatchesForTest(h *Handler, now time.Time) {
+	h.expireHeldDispatches(context.Background(), now)
+}
+
+// DropOrphanedDispatchesForTest drops the pending dispatches, long pending at
+// now, whose runs no longer await them.
+func DropOrphanedDispatchesForTest(h *Handler, now time.Time) {
+	h.dropOrphanedDispatches(context.Background(), now)
 }

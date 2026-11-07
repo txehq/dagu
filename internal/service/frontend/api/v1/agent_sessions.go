@@ -280,7 +280,7 @@ func (a *API) requireLocalBrowserSession(ctx context.Context, ref ir.DAGRunRef, 
 // waiting to be resumed. An error means the browser's state is unknown.
 func browserSessionWaiting(ctx context.Context, dataDir, dagRunID, stepName string, now time.Time) (bool, error) {
 	store := browserhost.NewStore(filepath.Join(dataDir, browserhost.DataDirName))
-	record, err := store.Load(browserhost.RecordID(dagRunID, stepName))
+	record, err := store.Load(browserhost.RecordID(dagRunID, "", stepName))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -431,7 +431,7 @@ func (a *API) respondAgentInteraction(ctx context.Context, root ir.DAGRunRef, su
 		if subDAGRunID == "" {
 			err = a.resumeWaitingDAGRun(ctx, root, updated)
 		} else {
-			err = a.resumeSubDAGRun(ctx, root, subDAGRunID)
+			err = a.resumeResolvedSubDAGRun(ctx, root, mutationRef, subDAGRunID, stepName)
 		}
 		if err != nil {
 			_ = a.rollbackPushBack(ctx, mutationRef, applied, original)
@@ -493,7 +493,7 @@ func (a *API) restartAgentSession(ctx context.Context, root ir.DAGRunRef, subDAG
 	if subDAGRunID == "" {
 		err = a.resumeWaitingDAGRun(ctx, root, updated)
 	} else {
-		err = a.resumeSubDAGRun(ctx, root, subDAGRunID)
+		err = a.resumeResolvedSubDAGRun(ctx, root, mutationRef, subDAGRunID, stepName)
 	}
 	if err != nil {
 		_ = a.rollbackPushBack(ctx, mutationRef, applied, original)
@@ -574,6 +574,9 @@ func validateAgentInteractionResponse(interaction ir.AgentInteraction, body *api
 			return errors.New("permission response requires a decision")
 		}
 		decision := string(*body.Decision)
+		if decision == ir.AgentDecisionSkip && interaction.Permission == ir.AgentPermissionBrowserWrite {
+			return nil
+		}
 		if decision != "once" && decision != "session" && decision != "reject" {
 			return errors.New("permission decision must be once, session, or reject")
 		}

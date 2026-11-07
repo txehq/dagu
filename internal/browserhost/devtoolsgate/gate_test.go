@@ -150,3 +150,30 @@ func TestGatePageEndpoint(t *testing.T) {
 		assert.Equal(t, websocket.StatusPolicyViolation, closeErr.Code)
 	}
 }
+
+// A browser that agreed to close is not served any more, as Chrome stops
+// answering on a port as soon as it starts to exit, though it can take
+// seconds more to finish writing its profile: a client that closed the
+// browser sees it gone at once, and nothing reaches it meanwhile.
+func TestGateStopsServingABrowserThatIsClosing(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	tg.fake.mu.Lock()
+	tg.fake.exitsSlowly = true
+	tg.fake.mu.Unlock()
+	tg.mux.mu.Lock()
+	tg.mux.onBrowserClosing = tg.gate.stopServing
+	tg.mux.mu.Unlock()
+
+	status, _ := get(t, tg.baseURL()+"/json/version")
+	require.Equal(t, http.StatusOK, status)
+	a := tg.dial("")
+	a.mustCall("", "Browser.close", map[string]any{})
+	eventually(t, 5*time.Second, func() bool {
+		response, err := http.Get(tg.baseURL() + "/json/version") //nolint:noctx // a test probe
+		if err == nil {
+			_ = response.Body.Close()
+		}
+		return err != nil
+	}, "the gate refuses connections once the browser is closing")
+}

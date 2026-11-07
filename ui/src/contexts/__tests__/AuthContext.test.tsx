@@ -101,6 +101,36 @@ describe('AuthProvider logout', () => {
     vi.restoreAllMocks();
   });
 
+  // TXE fork (TXE-5923): what an account read or wrote in this browser ends
+  // with its session, at logout and when another sign-in, in this tab or
+  // another, replaces it. Preferences stay.
+  it('clears session data at logout and at a new sign-in, and keeps preferences', async () => {
+    mocks.config.oidcSessionEnabled = false;
+    installFetch(() => Promise.resolve(new Response(null, { status: 204 })));
+    await renderSignedIn();
+    localStorage.setItem('dagu.output-cache.v1:local:a.yaml', '{}');
+    localStorage.setItem('dagu:draft:local:a.yaml', '{}');
+    localStorage.setItem('sidebarExpanded', 'true');
+
+    await signOut();
+    expect(
+      localStorage.getItem('dagu.output-cache.v1:local:a.yaml')
+    ).toBeNull();
+    expect(localStorage.getItem('dagu:draft:local:a.yaml')).toBeNull();
+    expect(localStorage.getItem('sidebarExpanded')).toBe('true');
+
+    act(() => setAuthSession('second-token', FAR_FUTURE, 'login'));
+    await waitFor(() => expect(auth?.isAuthenticated).toBe(true));
+    localStorage.setItem('dagu.output-cache.v1:local:b.yaml', '{}');
+    act(() => setAuthSession('third-token', FAR_FUTURE, 'login'));
+    await waitFor(() =>
+      expect(
+        localStorage.getItem('dagu.output-cache.v1:local:b.yaml')
+      ).toBeNull()
+    );
+    expect(localStorage.getItem('sidebarExpanded')).toBe('true');
+  });
+
   it('only clears this browser when OIDC sessions are off', async () => {
     mocks.config.oidcSessionEnabled = false;
     const fetchMock = installFetch(() =>

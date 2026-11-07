@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -441,6 +442,15 @@ func TestExecuteInputValidation(t *testing.T) {
 		{name: "wait timeout rejects zero", input: `{"action":"start","name":"etl","wait":true,"waitTimeoutSeconds":0}`, wantField: executeFieldWaitTimeoutSeconds},
 		{name: "wait timeout range", input: `{"action":"start","name":"etl","wait":true,"waitTimeoutSeconds":301}`, wantField: executeFieldWaitTimeoutSeconds},
 		{name: "params must be string or object", input: `{"action":"start","name":"etl","params":[1]}`, wantField: executeFieldParams},
+		{name: "approve requires step name", input: `{"action":"approve","name":"etl","dagRunId":"run-1"}`, wantField: executeFieldStepName},
+		{name: "reject requires dagRunId", input: `{"action":"reject","name":"etl","stepName":"gate"}`, wantField: executeFieldDAGRunID},
+		{name: "push back requires run target", input: `{"action":"push_back","targetType":"dag","name":"etl","dagRunId":"run-1","stepName":"gate"}`, wantField: executeFieldTargetType},
+		{name: "inputs must be object", input: `{"action":"approve","name":"etl","dagRunId":"run-1","stepName":"gate","inputs":"ticket=1"}`, wantField: executeFieldInputs},
+		{name: "reject rejects inputs", input: `{"action":"reject","name":"etl","dagRunId":"run-1","stepName":"gate","inputs":{}}`, wantField: executeFieldInputs},
+		{name: "approve rejects reason", input: `{"action":"approve","name":"etl","dagRunId":"run-1","stepName":"gate","reason":"no"}`, wantField: executeFieldReason},
+		{name: "approve rejects downstream", input: `{"action":"approve","name":"etl","dagRunId":"run-1","stepName":"gate","includeDownstream":true}`, wantField: executeFieldIncludeDownstream},
+		{name: "retry rejects attempt ID", input: `{"action":"retry","name":"etl","dagRunId":"run-1","attemptId":"a-1"}`, wantField: executeFieldAttemptID},
+		{name: "stop rejects sub-DAG run ID", input: `{"action":"stop","name":"etl","dagRunId":"run-1","subDAGRunId":"child-1"}`, wantField: executeFieldSubDAGRunID},
 	}
 
 	for _, test := range tests {
@@ -689,6 +699,72 @@ func TestHTTPHandlerServesStreamableMCP(t *testing.T) {
 	resource, err := session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: runInspectorURI})
 	require.NoError(t, err)
 	require.Len(t, resource.Contents, 1)
+}
+
+// Each call from Dagu Cloud stands alone, so the handler keeps no sessions
+// and offers no subscriptions.
+func TestCloudHandlerIsStateless(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testConnectTimeout)
+	defer cancel()
+	httpServer := httptest.NewServer(NewCloudHandler(nil, func(context.Context) bool { return false }))
+	t.Cleanup(httpServer.Close)
+
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "dagu-cloud-test", Version: "v0.0.0"}, nil)
+	session, err := client.Connect(ctx, &mcpsdk.StreamableClientTransport{
+		Endpoint:             httpServer.URL,
+		DisableStandaloneSSE: true,
+	}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+	require.Empty(t, session.ID())
+	require.False(t, session.InitializeResult().Capabilities.Resources.Subscribe)
+
+	result, err := session.ListTools(ctx, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Tools, 3)
+
+	res, err := http.Get(httpServer.URL)
+	require.NoError(t, err)
+	_ = res.Body.Close()
+	require.Equal(t, http.StatusMethodNotAllowed, res.StatusCode)
+}
+
+// Turning remote access off ends the calls in flight, so a tool's work must
+// end with its request even in protocol versions where the SDK keeps it going.
+func TestCloudHandlerEndsAToolWithItsRequest(t *testing.T) {
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "test", Version: "v0.0.0"}, nil)
+	started, ended := make(chan struct{}), make(chan struct{})
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "block"},
+		func(ctx context.Context, _ *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, any, error) {
+			close(started)
+			<-ctx.Done()
+			close(ended)
+			return &mcpsdk.CallToolResult{}, nil, nil
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"block","arguments":{}}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Protocol-Version", "2025-06-18")
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		newCloudHandler(server).ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(testConnectTimeout):
+		t.Fatal("the tool did not start")
+	}
+	cancel()
+	select {
+	case <-ended:
+	case <-time.After(testConnectTimeout):
+		t.Fatal("the tool kept running after its request ended")
+	}
+	<-served
 }
 
 func TestServerExposesReferenceResourcesAndPrompts(t *testing.T) {
@@ -1079,10 +1155,12 @@ func TestNormalizeRunDetailsIncludesStepsAndFailureDetails(t *testing.T) {
 	stepError := "exit status 1"
 	queuedAt := "2026-08-23T01:00:00Z"
 	params := `{"TARGET":"orders"}`
+	attemptID := "attempt-1"
 	raw := daguapi.GetDAGRunDetails200JSONResponse{
 		DagRunDetails: daguapi.DAGRunDetails{
 			Name:        "etl",
 			DagRunId:    "run-1",
+			AttemptId:   &attemptID,
 			Status:      2,
 			StatusLabel: "failed",
 			StartedAt:   "2026-08-23T01:00:05Z",
@@ -1118,6 +1196,7 @@ func TestNormalizeRunDetailsIncludesStepsAndFailureDetails(t *testing.T) {
 	require.Equal(t, "run-1", data["dagRunId"])
 	require.Equal(t, "dagu://runs/etl/run-1", data["uri"])
 	require.Equal(t, "dagu://runs/etl/run-1/logs", data["logsUri"])
+	require.Equal(t, attemptID, data["attemptId"])
 	require.Equal(t, "2026-08-23T01:00:05Z", data["startedAt"])
 	require.Equal(t, "2026-08-23T01:00:09Z", data["finishedAt"])
 	require.Equal(t, queuedAt, data["queuedAt"])
@@ -1391,6 +1470,28 @@ func TestNormalizeRunListIncludesTimestampsAndCursor(t *testing.T) {
 	require.NotContains(t, items[1], "finishedAt")
 }
 
+// Fire times keep the offset of the zone each schedule runs in, so an agent
+// can read the wall-clock time a run starts.
+func TestNormalizeDAGDetailsIncludesUpcomingRuns(t *testing.T) {
+	t.Parallel()
+
+	tokyo := time.FixedZone("JST", 9*60*60)
+	raw := daguapi.GetDAGDetails200JSONResponse{
+		Dag: &daguapi.DAGDetails{
+			Name:     "payroll",
+			Schedule: &[]daguapi.Schedule{{Expression: "CRON_TZ=Asia/Tokyo 0 9 25 * *"}},
+			UpcomingRuns: &[]daguapi.UpcomingRun{
+				{Time: time.Date(2027, 1, 25, 9, 0, 0, 0, tokyo), Timezone: "Asia/Tokyo"},
+				{Time: time.Date(2027, 2, 25, 9, 0, 0, 0, tokyo), Timezone: "Asia/Tokyo"},
+			},
+		},
+	}
+
+	data, err := normalizeDAGDetails(raw, "payroll")
+	require.NoError(t, err)
+	require.Equal(t, []string{"2027-01-25T09:00:00+09:00", "2027-02-25T09:00:00+09:00"}, data["upcomingRuns"])
+}
+
 func TestNormalizeDAGListIncludesSummaryFields(t *testing.T) {
 	t.Parallel()
 
@@ -1593,4 +1694,69 @@ func findResource(t *testing.T, resources []*mcpsdk.Resource, uri string) *mcpsd
 	}
 	t.Fatalf("resource %q not found", uri)
 	return nil
+}
+
+func TestForeachResourceURIs(t *testing.T) {
+	t.Parallel()
+
+	addr := runAddress{name: "demo dag", dagRunID: "run/1"}
+	for _, tc := range []struct {
+		uri        string
+		target     string
+		subRunID   string
+		item       string
+		bodyStep   string
+		linkName   string
+		queryAllow bool
+	}{
+		{uri: addr.foreachItemsURI("each"), target: readTargetForeachItems, linkName: "dag_run_foreach_items", queryAllow: true},
+		{uri: addr.foreachItemURI("each", "2.inner.0"), target: readTargetForeachItem, item: "2.inner.0", linkName: "dag_run_foreach_item"},
+		{uri: addr.foreachStepLogURI("each", "0", "body step"), target: readTargetStepLog, item: "0", bodyStep: "body step", linkName: "dag_run_foreach_step_log", queryAllow: true},
+		{uri: addr.subRunAddress("child").foreachItemsURI("each"), target: readTargetForeachItems, subRunID: "child", linkName: "sub_dag_run_foreach_items", queryAllow: true},
+		{uri: addr.subRunAddress("child").foreachStepLogURI("each", "0", "body"), target: readTargetStepLog, subRunID: "child", item: "0", bodyStep: "body", linkName: "sub_dag_run_foreach_step_log", queryAllow: true},
+	} {
+		input, readErr := parseReadResourceURI(tc.uri)
+		require.Nil(t, readErr, tc.uri)
+		require.Equal(t, tc.target, input.Target, tc.uri)
+		require.Equal(t, "demo dag", input.Name)
+		require.Equal(t, "run/1", input.DAGRunID)
+		require.Equal(t, tc.subRunID, input.SubRunID)
+		require.Equal(t, "each", input.StepName)
+		require.Equal(t, tc.item, input.Item)
+		require.Equal(t, tc.bodyStep, input.BodyStepName)
+		require.Equal(t, tc.uri, input.URI)
+
+		links := readResourceLinks(tc.uri)
+		require.Len(t, links, 1)
+		require.Equal(t, tc.linkName, links[0].name)
+
+		_, readErr = parseReadResourceURI(tc.uri + "?page=2")
+		require.Equal(t, tc.queryAllow && tc.target == readTargetForeachItems, readErr == nil, tc.uri)
+	}
+
+	// Target mode builds the same URIs and insists on item and bodyStepName together.
+	input, readErr := parseReadToolInput(json.RawMessage(`{"target":"foreach_items","name":"demo dag","dagRunId":"run/1","stepName":"each","query":"status=failed&perPage=10"}`))
+	require.Nil(t, readErr)
+	require.Equal(t, addr.foreachItemsURI("each")+"?status=failed&perPage=10", input.URI)
+	query := foreachItemsQuery(input.Query)
+	require.Equal(t, "failed", query.Status)
+	require.Equal(t, 10, query.PerPage)
+
+	input, readErr = parseReadToolInput(json.RawMessage(`{"target":"step_log","name":"demo dag","dagRunId":"run/1","stepName":"each","item":"0","bodyStepName":"body step"}`))
+	require.Nil(t, readErr)
+	require.Equal(t, addr.foreachStepLogURI("each", "0", "body step"), input.URI)
+
+	for _, raw := range []string{
+		`{"target":"step_log","name":"demo","dagRunId":"run-1","stepName":"each","item":"0"}`,
+		`{"target":"step_log","name":"demo","dagRunId":"run-1","stepName":"each","bodyStepName":"body"}`,
+		`{"target":"foreach_item","name":"demo","dagRunId":"run-1","stepName":"each"}`,
+		`{"target":"foreach_items","name":"demo","dagRunId":"run-1"}`,
+		`{"target":"foreach_items","name":"demo","dagRunId":"run-1","stepName":"each","query":"status=weird"}`,
+		`{"target":"foreach_items","name":"demo","dagRunId":"run-1","stepName":"each","query":"perPage=501"}`,
+		`{"target":"run","name":"demo","dagRunId":"run-1","item":"0"}`,
+	} {
+		_, readErr := parseReadToolInput(json.RawMessage(raw))
+		require.NotNil(t, readErr, raw)
+		require.Equal(t, readErrorInvalidToolInput, readErr.Code, raw)
+	}
 }

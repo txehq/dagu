@@ -279,7 +279,7 @@ func (a *API) txeCheckWorkspaces(ctx context.Context, jobID, spec string, strict
 		// workspaces do not apply to it.
 		return nil
 	}
-	dag, err := a.dagRepository.LoadSpec(ctx, []byte(spec), jobID, persis.DAGLoadOptions{AllowBuildErrors: true})
+	dag, err := a.loadSpecBeforeDecision(ctx, []byte(spec), jobID, persis.DAGLoadOptions{AllowBuildErrors: true})
 	switch {
 	case err == nil:
 		if err := check(ctx, dagWorkspaceName(dag)); err != nil {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/pagination"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"github.com/dagucloud/dagu/v2/internal/textsearch"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
 )
@@ -47,6 +48,11 @@ type DAGDefinitionStore interface {
 	Delete(ctx context.Context, id string) error
 	Get(ctx context.Context, id string) (DAGDefinition, error)
 	Update(ctx context.Context, id string, source []byte) error
+	// UpdateIfMatch is Update for a source that is still the one with the
+	// SHA-256 expectedSHA256, in hex. Otherwise it writes nothing and returns an
+	// error that wraps ErrConflict. The check and the write are atomic for every
+	// process that shares the store.
+	UpdateIfMatch(ctx context.Context, id, expectedSHA256 string, source []byte) error
 	Rename(ctx context.Context, oldID, newID string) error
 	GetMetadata(ctx context.Context, id string) (*ir.DAG, error)
 	Catalog(ctx context.Context) (DAGCatalog, error)
@@ -64,12 +70,18 @@ type DAGDefinitionStore interface {
 type DAGLoadOptions struct {
 	// AllowBuildErrors returns a partially built DAG with its build errors attached.
 	AllowBuildErrors bool
+	// SkipSchemaValidation leaves a params.schema reference unresolved: no
+	// file is read and no URL is fetched for it. A spec a caller supplies is
+	// loaded so before the caller is authorized to write DAGs (TXE-5923).
+	SkipSchemaValidation bool
 }
 
 // DAGRepositoryOptions configures DAG specification loading.
 type DAGRepositoryOptions struct {
 	BaseConfigPath         string
 	WorkspaceBaseConfigDir string
+	// Calendars loads the calendar files that schedules name.
+	Calendars *spec.CalendarSource
 }
 
 // DAGListOptions contains parameters for paginated DAG listing.
@@ -87,6 +99,9 @@ type DAGListOptions struct {
 	// the other filters, before sorting and pagination, so pages and counts
 	// are of the items it keeps.
 	Include func(DAGListItem) bool
+	// PinnedIDs holds DAG IDs listed before all other DAGs. Sort and Order
+	// apply within the pinned and unpinned parts. Nil disables pinning.
+	PinnedIDs map[string]struct{}
 }
 
 // DAGSearchOptions contains parameters for cursor-based DAG search.

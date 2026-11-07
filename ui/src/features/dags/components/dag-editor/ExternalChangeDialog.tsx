@@ -2,6 +2,7 @@ import { Button } from '@/components/ui/button';
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -59,22 +60,40 @@ function ExternalChangeDialog({ visible, onDiscard, onIgnore }: Props) {
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <AlertTriangle className="h-5 w-5 text-warning" />
-            <I18nText text={"External Changes Detected"} />
+            <I18nText text={'External Changes Detected'} />
           </DialogTitle>
         </DialogHeader>
 
         <div className="py-4 space-y-3">
-          <p className="text-sm text-muted-foreground">
-            <I18nText text={"The DAG specification has been modified externally while you were editing."} />
-          </p>
+          <DialogDescription className="text-sm text-muted-foreground">
+            <I18nText
+              text={
+                'The DAG specification has been modified externally while you were editing.'
+              }
+            />
+          </DialogDescription>
           <div className="text-sm space-y-1">
-            <p className="font-medium"><I18nText text={"What would you like to do?"} /></p>
+            <p className="font-medium">
+              <I18nText text={'What would you like to do?'} />
+            </p>
             <ul className="text-muted-foreground space-y-1 ml-4 list-disc">
               <li>
-                <strong><I18nText text={"Discard & Reload:"} /></strong> <I18nText text={"Lose your changes and load the latest version"} />
+                <strong>
+                  <I18nText text={'Discard & Reload:'} />
+                </strong>{' '}
+                <I18nText
+                  text={'Lose your changes and load the latest version'}
+                />
               </li>
               <li>
-                <strong><I18nText text={"Ignore:"} /></strong> <I18nText text={"Keep your changes (you may overwrite external changes when saving)"} />
+                <strong>
+                  <I18nText text={'Ignore:'} />
+                </strong>{' '}
+                <I18nText
+                  text={
+                    'Keep your changes (you may overwrite external changes when saving)'
+                  }
+                />
               </li>
             </ul>
           </div>
@@ -83,11 +102,11 @@ function ExternalChangeDialog({ visible, onDiscard, onIgnore }: Props) {
         <DialogFooter>
           <Button ref={ignoreButtonRef} variant="ghost" onClick={onIgnore}>
             <X className="h-4 w-4" />
-            <I18nText text={"Ignore"} />
+            <I18nText text={'Ignore'} />
           </Button>
           <Button ref={discardButtonRef} variant="primary" onClick={onDiscard}>
             <RefreshCw className="h-4 w-4" />
-            <I18nText text={"Discard & Reload"} />
+            <I18nText text={'Discard & Reload'} />
           </Button>
         </DialogFooter>
       </DialogContent>

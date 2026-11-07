@@ -10,7 +10,7 @@ import {
   TxeIdentityState,
   type components,
 } from '@/api/v1/schema';
-import { useAuth } from '@/contexts/AuthContext';
+import * as authContext from '@/contexts/AuthContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useClient } from '@/hooks/api';
 import { setPersonSignal } from './personSignal';
@@ -64,6 +64,26 @@ export function identityRefreshInterval(
 // without a reload.
 const WAITING_REFRESH_MS = 30_000;
 
+// useSignedInAuth is the auth state when an AuthProvider is above, else
+// null: run controls that ask for the identity are also rendered without one,
+// and then there is no signed-in caller. A module stand-in without the
+// accessor counts as no provider; which branch runs is fixed per module, so
+// the hook order never changes between renders.
+function useSignedInAuth(): ReturnType<typeof authContext.useOptionalAuth> {
+  let read: (() => ReturnType<typeof authContext.useOptionalAuth>) | undefined;
+  try {
+    read = authContext.useOptionalAuth;
+  } catch {
+    // A stand-in with only useAuth is a provider that is always there.
+    try {
+      read = authContext.useAuth;
+    } catch {
+      read = undefined;
+    }
+  }
+  return read ? read() : null;
+}
+
 // useTxeIdentity reads who the hub takes the signed-in caller to be
 // (GET /txe/identity). It is read only with builtin authentication, the only
 // mode in which a person signs in individually. Nothing here is derived from
@@ -75,7 +95,9 @@ export function useTxeIdentity(): {
   reload: () => Promise<unknown>;
 } {
   const config = useConfig();
-  const { isAuthenticated, token } = useAuth();
+  const auth = useSignedInAuth();
+  const isAuthenticated = auth?.isAuthenticated ?? false;
+  const token = auth?.token ?? null;
   const client = useClient();
   const enabled = config.authMode === 'builtin' && isAuthenticated;
   const { data, error, isLoading, mutate } = useSWR<TxeIdentity>(
@@ -114,7 +136,7 @@ export function TxePersonGate({
   personApp: React.ReactNode;
 }): React.ReactElement | null {
   const { identity, isLoading, reload } = useTxeIdentity();
-  const { logout } = useAuth();
+  const { logout } = authContext.useAuth();
   const access = useTxeAccessApi();
   const [requesting, setRequesting] = React.useState(false);
   const [requestError, setRequestError] = React.useState<string>();

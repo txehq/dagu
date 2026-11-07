@@ -122,3 +122,13 @@ func TestNodeStatus_IsDone(t *testing.T) {
 		})
 	}
 }
+
+// Every trigger type is classified bound or unbound; only a webhook is
+// unbound, and a value outside the declared ones fails closed (TXE-5923).
+func TestTriggerTypeUnbound(t *testing.T) {
+	t.Parallel()
+	for tt := TriggerTypeUnknown; tt <= TriggerTypeFile; tt++ {
+		assert.Equal(t, tt == TriggerTypeWebhook, tt.Unbound(), tt.String())
+	}
+	assert.True(t, TriggerType(99).Unbound())
+}

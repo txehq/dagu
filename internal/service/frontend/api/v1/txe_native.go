@@ -201,11 +201,7 @@ func txeNativeDAGName(dag *ir.DAG) string {
 
 // txeNativeOwnedName reports whether a DAG name is one an owner's DAG has.
 func txeNativeOwnedName(name string) bool {
-	if registry.IsJobDAG(name) {
-		return true
-	}
-	_, ok := txeauth.MachineOfDAG(name)
-	return ok
+	return txeauth.IsOwnedDAGName(name)
 }
 
 // requireDAGVisible applies the hub's workspace check, or for a caller held

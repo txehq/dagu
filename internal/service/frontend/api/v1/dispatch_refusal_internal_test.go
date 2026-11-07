@@ -110,3 +110,19 @@ func TestTargetedRetryRefusalNamesTheSessionWorker(t *testing.T) {
 	requireAnswer(t, a.retryDispatchRefusal(errRefusedNoMatch, dag, &dispatch.DispatchTask{}), http.StatusConflict, "no_eligible_worker")
 	assert.Nil(t, a.retryDispatchRefusal(fmt.Errorf("%w: %w", coordinator.ErrDispatchOutcomeUnknown, errRefusedNoMatch), dag, targeted))
 }
+
+// A start of an inline spec keeps a structured answer: an unconfirmed start
+// still names its run, so the workspace follows it instead of starting the
+// draft again (TXE-5923).
+func TestStartFailureKeepsAStructuredAnswer(t *testing.T) {
+	unconfirmed := fmt.Errorf("error starting dag-run: %w", errStartUnconfirmed("r-9", time.Second))
+	requireAnswer(t, startFailure(unconfirmed), http.StatusGatewayTimeout, "start_unconfirmed")
+	var apiErr *Error
+	require.True(t, errors.As(startFailure(unconfirmed), &apiErr))
+	assert.Equal(t, "r-9", apiErr.Details["dag_run_id"])
+
+	plain := startFailure(errors.New("boom"))
+	require.True(t, errors.As(plain, &apiErr))
+	assert.Equal(t, http.StatusInternalServerError, apiErr.HTTPStatus)
+	assert.Contains(t, apiErr.Message, "boom")
+}

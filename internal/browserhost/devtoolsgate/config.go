@@ -15,8 +15,8 @@ import (
 
 // configVersion is the version of the configuration the helper reads from
 // stdin. A helper of another version refuses the configuration rather than
-// guessing at it.
-const configVersion = 1
+// guessing at it. Version 2 added ProxyAuth.
+const configVersion = 2
 
 // Config is what the process starting a gate hands it on stdin.
 type Config struct {
@@ -37,6 +37,21 @@ type Config struct {
 	// client leaves. Zero means DefaultMaxUnattended. A browser with an
 	// admitted client is never ended by it.
 	MaxUnattended time.Duration `json:"max_unattended,omitempty"`
+	// ProxyAuth, when set, is the credential of the local proxy the browser
+	// sends its requests to. The gate answers that proxy's challenges for
+	// every target, and no other challenge.
+	ProxyAuth *ProxyAuth `json:"proxy_auth,omitempty"`
+}
+
+// ProxyAuth is the credential of a local proxy that requires one.
+type ProxyAuth struct {
+	// Addresses are the proxy's host:port addresses, such as
+	// 127.0.0.1:41234. Only a challenge from one of them is answered.
+	Addresses []string `json:"addresses"`
+	Username  string   `json:"username"`
+	// Password is the credential. Like Token, it never appears on a
+	// command line, in a log or in an error.
+	Password string `json:"password"`
 }
 
 // wireConfig is the envelope on stdin.
@@ -80,6 +95,8 @@ func (c Config) validate() error {
 		return errors.New("devtools gate: the lifetime cap cannot be negative")
 	case c.MaxUnattended < 0:
 		return errors.New("devtools gate: the unattended cap cannot be negative")
+	case c.ProxyAuth != nil && (len(c.ProxyAuth.Addresses) == 0 || c.ProxyAuth.Username == "" || c.ProxyAuth.Password == ""):
+		return errors.New("devtools gate: the proxy credential needs the proxy's addresses, a user name and a password")
 	}
 	for _, arg := range c.Args {
 		if strings.HasPrefix(arg, "--remote-debugging-") {

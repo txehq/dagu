@@ -86,15 +86,17 @@ export function RenameWikiPageModal({
       <DialogContent className="sm:max-w-[425px]">
         <form onSubmit={handleSubmit}>
           <DialogHeader>
-            <DialogTitle><I18nText text={"Rename Wiki page"} /></DialogTitle>
+            <DialogTitle>
+              <I18nText text={'Rename Wiki page'} />
+            </DialogTitle>
             <DialogDescription>
-              <I18nText text={"Enter a new path for the Wiki page."} />
+              <I18nText text={'Enter a new path for the Wiki page.'} />
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 py-4">
             <div className="grid grid-cols-4 items-center gap-4">
               <Label className="text-right text-muted-foreground">
-                <I18nText text={"Current"} />
+                <I18nText text={'Current'} />
               </Label>
               <div className="col-span-3 font-mono text-sm bg-muted px-3 py-1.5 rounded-md truncate">
                 {currentPath}
@@ -102,17 +104,19 @@ export function RenameWikiPageModal({
             </div>
             <div className="grid grid-cols-4 items-center gap-4">
               <Label htmlFor="new-wiki-page-path" className="text-right">
-                <I18nText text={"New Path"} />
+                <I18nText text={'New Path'} />
               </Label>
-              <I18nProps><Input
-                id="new-wiki-page-path"
-                value={newPath}
-                onChange={handlePathChange}
-                className="col-span-3 font-mono"
-                placeholder="runbooks/deployment"
-                autoFocus
-                disabled={isLoading}
-              /></I18nProps>
+              <I18nProps>
+                <Input
+                  id="new-wiki-page-path"
+                  value={newPath}
+                  onChange={handlePathChange}
+                  className="col-span-3 font-mono"
+                  placeholder="runbooks/deployment"
+                  autoFocus
+                  disabled={isLoading}
+                />
+              </I18nProps>
             </div>
             {currentError && (
               <div className="text-destructive text-sm px-4">
@@ -128,11 +132,15 @@ export function RenameWikiPageModal({
               disabled={isLoading}
             >
               <X className="h-4 w-4" />
-              <I18nText text={"Cancel"} />
+              <I18nText text={'Cancel'} />
             </Button>
-            <Button type="submit" disabled={isLoading}>
+            <Button type="submit" variant="primary" disabled={isLoading}>
               <Pencil className="h-4 w-4" />
-              {isLoading ? <I18nText text={"Renaming..."} /> : <I18nText text={"Rename"} />}
+              {isLoading ? (
+                <I18nText text={'Renaming...'} />
+              ) : (
+                <I18nText text={'Rename'} />
+              )}
             </Button>
           </DialogFooter>
         </form>

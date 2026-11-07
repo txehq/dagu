@@ -21,8 +21,11 @@ import { I18nProps } from '@/i18n/I18nProps';
 type Props = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** The name and the ID of the root run, for a step of a sub-run. */
   dagName: string;
   dagRunId: string;
+  /** The sub-run that holds the step, when the step is not in the root run. */
+  subDAGRunId?: string;
   stepName: string;
   onSettled: () => void;
 };
@@ -32,6 +35,7 @@ export function RejectDAGRunDialog({
   onOpenChange,
   dagName,
   dagRunId,
+  subDAGRunId,
   stepName,
   onSettled,
 }: Props) {
@@ -52,16 +56,28 @@ export function RejectDAGRunDialog({
     const rejectionReason = reason || undefined;
     handleOpenChange(false);
     try {
-      const { error } = await client.POST(
-        '/dag-runs/{name}/{dagRunId}/steps/{stepName}/reject',
-        {
-          params: {
-            path: { name: dagName, dagRunId, stepName },
-            query: { remoteNode },
-          },
-          body: { reason: rejectionReason },
-        }
-      );
+      const body = { reason: rejectionReason };
+      const { error } = subDAGRunId
+        ? await client.POST(
+            '/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/reject',
+            {
+              params: {
+                path: { name: dagName, dagRunId, subDAGRunId, stepName },
+                query: { remoteNode },
+              },
+              body,
+            }
+          )
+        : await client.POST(
+            '/dag-runs/{name}/{dagRunId}/steps/{stepName}/reject',
+            {
+              params: {
+                path: { name: dagName, dagRunId, stepName },
+                query: { remoteNode },
+              },
+              body,
+            }
+          );
 
       if (error) {
         showError(
@@ -85,20 +101,24 @@ export function RejectDAGRunDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-[450px]">
         <DialogHeader>
-          <DialogTitle><I18nText text={"Reject DAG Run"} /></DialogTitle>
+          <DialogTitle>
+            <I18nText text={'Reject run'} />
+          </DialogTitle>
         </DialogHeader>
         <div className="py-2">
           <label htmlFor="rejection-reason" className="sr-only">
-            <I18nText text={"Rejection reason (optional)"} />
+            <I18nText text={'Rejection reason (optional)'} />
           </label>
-          <I18nProps><textarea
-            id="rejection-reason"
-            className="w-full px-3 py-1 text-sm border border-border rounded bg-background focus:outline-none focus:border-ring resize-none"
-            placeholder="Reason (optional)..."
-            rows={2}
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-          /></I18nProps>
+          <I18nProps>
+            <textarea
+              id="rejection-reason"
+              className="w-full px-3 py-1 text-sm border border-border rounded bg-background focus:outline-none focus:border-ring resize-none"
+              placeholder="Reason (optional)..."
+              rows={2}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </I18nProps>
         </div>
         <DialogFooter>
           <Button
@@ -106,10 +126,10 @@ export function RejectDAGRunDialog({
             size="sm"
             onClick={() => handleOpenChange(false)}
           >
-            <X className="h-4 w-4" /> <I18nText text={"Cancel"} />
+            <X className="h-4 w-4" /> <I18nText text={'Cancel'} />
           </Button>
           <Button variant="default" size="sm" onClick={() => void reject()}>
-            <Ban className="h-4 w-4" /> <I18nText text={"Reject"} />
+            <Ban className="h-4 w-4" /> <I18nText text={'Reject'} />
           </Button>
         </DialogFooter>
       </DialogContent>

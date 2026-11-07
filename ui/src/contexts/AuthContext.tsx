@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { clearSessionData } from '@/lib/sessionData';
 import {
   createContext,
   useContext,
@@ -80,6 +81,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [setupRequired, setSetupRequired] = useState(config.setupRequired);
 
   const clearLocalSession = useCallback(() => {
+    // What this account read or wrote ends with its session (TXE-5923).
+    clearSessionData();
     setToken(null);
     setUser(null);
     sseManager.disposeAll();
@@ -184,6 +187,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       const data = await response.json();
+      // A sign-in never inherits what another session left in this browser.
+      clearSessionData();
       setAuthSession(data.token, data.expiresAt, 'login');
       setToken(data.token);
       setUser(data.user);
@@ -217,6 +222,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const completeSetup = useCallback((result: SetupResult) => {
     setAuthSession(result.token, result.expiresAt, 'setup');
+    clearSessionData();
     setToken(result.token);
     setUser(result.user);
     setSetupRequired(false);
@@ -225,6 +231,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return addAuthSessionListener((change) => {
       if (change.token) {
+        // A new token is a new sign-in, in this tab or another, perhaps of
+        // another account: what the last session left ends as at logout.
+        clearSessionData();
         setToken(change.token);
         setIsLoading(true);
         void refreshUser();
@@ -278,6 +287,15 @@ export function useAuth() {
   return context;
 }
 
+/**
+ * useAuth outside an AuthProvider answers null instead of throwing. The TXE
+ * fork's identity read uses it: a component rendered without a provider has
+ * no signed-in caller and so no TXE identity.
+ */
+export function useOptionalAuth() {
+  return useContext(AuthContext);
+}
+
 export function useIsAdmin(): boolean {
   const { user } = useAuth();
   const config = useConfig();
@@ -298,14 +316,43 @@ export function useCanWrite(): boolean {
   );
 }
 
-export function useCanWriteForWorkspace(workspace?: string | null): boolean {
+/**
+ * Whether the user can change calendar files. A calendar serves DAGs in
+ * every workspace, so the user's global role decides.
+ */
+export function useCanWriteCalendars(): boolean {
   const { user } = useAuth();
   const config = useConfig();
-  if (config.authMode !== 'builtin') return config.permissions.writeDags;
-  if (!user) return false;
-  return roleAtLeast(
-    effectiveWorkspaceRole(user, workspace ?? ''),
-    UserRole.developer
+  if (!config.permissions.writeDags) return false;
+  if (config.authMode !== 'builtin') return true;
+  return roleAtLeast(user?.role ?? null, UserRole.developer);
+}
+
+export function useCanWriteForWorkspace(workspace?: string | null): boolean {
+  return useWorkspaceWriteCheck()(workspace);
+}
+
+/**
+ * Returns a check for whether the current user can write in a workspace, for
+ * lists whose items belong to different workspaces.
+ */
+export function useWorkspaceWriteCheck(): (
+  workspace?: string | null
+) => boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  const { authMode } = config;
+  const { writeDags } = config.permissions;
+  return useCallback(
+    (workspace?: string | null) => {
+      if (authMode !== 'builtin') return writeDags;
+      if (!user) return false;
+      return roleAtLeast(
+        effectiveWorkspaceRole(user, workspace ?? ''),
+        UserRole.developer
+      );
+    },
+    [authMode, user, writeDags]
   );
 }
 
@@ -366,6 +413,37 @@ export function useCanManageWebhooks(): boolean {
   if (config.authMode !== 'builtin') return false;
   if (!user) return false;
   return roleAtLeast(user.role, UserRole.developer);
+}
+
+/**
+ * Reports whether this server delivers to local command channels. They run
+ * shell commands on the server, so they need DAGs to be writable and runnable.
+ */
+export function useCommandChannelsEnabled(): boolean {
+  const { permissions } = useConfig();
+  return permissions.writeDags && permissions.runDags;
+}
+
+/**
+ * Reports whether the current user may add, change, or test local command
+ * channels on this server.
+ */
+export function useCanManageCommandChannels(): boolean {
+  const isAdmin = useIsAdmin();
+  const enabled = useCommandChannelsEnabled();
+  return isAdmin && enabled;
+}
+
+/**
+ * Reports whether the current user may manage notification channels and
+ * rules, which takes a server-wide developer role whatever the workspace
+ * grants.
+ */
+export function useCanManageNotifications(): boolean {
+  const { user } = useAuth();
+  const config = useConfig();
+  if (config.authMode !== 'builtin') return config.permissions.writeDags;
+  return roleAtLeast(user?.role ?? null, UserRole.developer);
 }
 
 export function useCanViewAuditLogs(): boolean {

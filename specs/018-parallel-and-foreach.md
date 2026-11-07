@@ -87,7 +87,17 @@ An item run is one represented child DAG run or enqueue request created by
 
 - `max_concurrent` must be an integer from `1` through `1000`.
 
-- When `max_concurrent` is omitted, Dagu uses `10`.
+- When `max_concurrent` is omitted, Dagu uses the inherited
+  `defaults.max_concurrent`, or `10` when no default is configured.
+
+- `defaults.max_concurrent` follows the same integer rules. It applies to
+  every `parallel` and `foreach` step, including steps inside a `foreach`
+  body, in every item source form, and never adds `parallel` or `foreach` to a
+  step.
+
+- The nearest `defaults.max_concurrent` wins: the DAG, then the workspace base
+  configuration, then the global base configuration. Setting other `defaults`
+  fields does not reset an inherited `max_concurrent`.
 
 - `max_concurrent` does not limit normal top-level graph scheduling outside the
   owning expansion step.
@@ -490,6 +500,11 @@ Rules:
 
 - `${foreach.<as>.field}` resolves to a top-level object field.
 
+- A field name that starts with a letter or underscore and continues with
+  letters, marks, digits, or underscores, in any script, may be written
+  unquoted. Any other field name is written as `${foreach.<as>."name"}` or
+  `${foreach.<as>["name"]}`.
+
 - Nested item field paths such as `${foreach.item.a.b}` are outside this spec.
 
 - Item scope is available to `foreach.key`.
@@ -502,11 +517,26 @@ Rules:
 - The uppercase `${ITEM}` item reference is owned by `parallel`. It is not a
   `foreach` item reference.
 
+- `${<as>.field}` without the `foreach.` namespace is not an item reference.
+  When a field with item scope is evaluated, an unescaped `${<as>.field}`
+  whose field may be written unquoted fails that item unless another source
+  resolves it: an environment value named `<as>` holding a JSON object with
+  that field, from any source the field reads (root `env`, dotenv, params,
+  step `env`, an output variable, or the process environment where the field
+  reads it), or a step property such as `${<as>.stdout}` of a step whose id
+  is `<as>`. Validation cannot decide this, because run-time params, dotenv
+  files, and the process environment may define `<as>`. `${<as>}` and
+  `$<as>.field` are not affected, so shell variables keep their meaning.
+
 #### Body Step Scope
 
 `foreach.steps` defines steps scoped to one item body.
 
 Rules:
+
+- Body steps inherit the DAG's step `defaults` as top-level steps do. A field
+  set on a body step overrides the inherited default, except `env` and
+  `preconditions`, which add to the inherited entries.
 
 - Body step ids must be unique inside the body.
 
@@ -691,6 +721,8 @@ Runtime execution must fail when:
 - item expansion produces more than `1000` items.
 - `foreach.key` resolves to an empty string.
 - two item slots resolve to the same item key.
+- a field with item scope keeps `${<as>.field}` without the `foreach.`
+  namespace, as the Item Scope section defines; that item fails.
 - every item body fails; a collect expression that fails to resolve after
   its item body succeeded counts as that item's failure. When some item
   bodies fail and others succeed, the step is `partially_succeeded`, as the

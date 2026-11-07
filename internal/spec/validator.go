@@ -173,7 +173,7 @@ func validateBuildRuntimeOutputReferences(dag *ir.DAG, errs *ir.ErrorList) {
 	}
 	for _, field := range ReferenceFields(dag) {
 		for _, producer := range producers {
-			if !cmnvalue.HasStepRuntimeOutputReference(field.Value, producer.ID) {
+			if !field.Field.HasStepRuntimeOutputReference(field.Value, producer.ID) {
 				continue
 			}
 			*errs = append(*errs, ir.NewValidationError(field.Path, field.Value,
@@ -611,6 +611,21 @@ func validateHumanTaskStep(step ir.Step) error {
 	if len(step.Commands) > 0 || step.Command != "" || step.CmdWithArgs != "" || step.CmdArgsSys != "" ||
 		step.ShellCmdArgs != "" || step.Script != "" || len(step.Args) > 0 {
 		return ir.NewValidationError("command", nil, fmt.Errorf("human task cannot execute commands"))
+	}
+	return nil
+}
+
+// ValidateStepID reports whether id can identify a step: it starts with a
+// letter, holds only letters, digits, and underscores, is not too long,
+// and is not a reserved word.
+func ValidateStepID(id string) error {
+	switch {
+	case !isValidStepID(id):
+		return fmt.Errorf("invalid step ID format: must match %s (use '_' instead of '-')", stepIDPattern.String())
+	case len(id) > maxStepIDLen:
+		return ir.ErrStepIDTooLong
+	case isReservedWord(id):
+		return fmt.Errorf("step ID '%s' is a reserved word", id)
 	}
 	return nil
 }

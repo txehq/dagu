@@ -13,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -66,6 +68,55 @@ func TestToExecStatus_MapsRemoteFieldsExplicitly(t *testing.T) {
 	require.Len(t, status.Nodes[0].Step.Commands, 1)
 	assert.Equal(t, "echo", status.Nodes[0].Step.Commands[0].Command)
 	assert.Equal(t, []string{"hello"}, status.Nodes[0].Step.Commands[0].Args)
+}
+
+func TestIsLikelyLocalDAGArg(t *testing.T) {
+	t.Parallel()
+
+	// A forward slash always reads as a local path. A bare backslash can be a
+	// valid character in a remote file ID, so only Windows drive-letter and
+	// UNC prefixes read as local.
+	tests := []struct {
+		name string
+		arg  string
+		want bool
+	}{
+		{name: "yaml suffix", arg: "workflow.yaml", want: true},
+		{name: "yml suffix", arg: "workflow.yml", want: true},
+		{name: "uppercase yaml suffix", arg: "workflow.YAML", want: true},
+		{name: "mixed case yml suffix", arg: "workflow.Yml", want: true},
+		{name: "misleading yaml suffix", arg: "workflow.yaml.bak", want: false},
+		{name: "posix separator", arg: "dir/workflow", want: true},
+		{name: "windows drive path", arg: `C:\dags\workflow`, want: true},
+		{name: "windows unc path", arg: `\\server\dags\workflow`, want: true},
+		{name: "windows forward slashes", arg: "C:/dags/workflow", want: true},
+		{name: "remote dag name", arg: "workflow", want: false},
+		{name: "remote dag fileName", arg: "etl-dag", want: false},
+		{name: "remote id with backslash", arg: `dir\workflow`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isLikelyLocalDAGArg(tt.arg))
+		})
+	}
+}
+
+// TestRemoteResolveLocalYAML verifies mixed-case local YAML arguments are rejected before HTTP.
+func TestRemoteResolveLocalYAML(t *testing.T) {
+	t.Parallel()
+
+	var requested atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requested.Store(true)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := &remoteClient{baseURL: server.URL, client: server.Client()}
+	_, err := client.resolveDAG(context.Background(), "FLOW.YAML")
+	require.ErrorContains(t, err, "remote contexts only operate on DAGs")
+	assert.False(t, requested.Load())
 }
 
 func TestRemoteStatusValueRejectsNone(t *testing.T) {
@@ -244,7 +295,8 @@ func TestRemoteStartSendsSteps(t *testing.T) {
 	initFlags(command, startFlags...)
 	require.NoError(t, command.Flags().Set("only", "load"))
 	require.NoError(t, command.Flags().Set("outputs-from", "source"))
-	require.NoError(t, command.Flags().Set("output", "extract.rows=3"))
+	require.NoError(t, command.Flags().Set("output-from", "extract=run-9"))
+	require.NoError(t, command.Flags().Set("output", "transform.rows=3"))
 	ctx := &Context{
 		Context: context.Background(),
 		Command: command,
@@ -258,8 +310,10 @@ func TestRemoteStartSendsSteps(t *testing.T) {
 	assert.Equal(t, []string{"load"}, *body.Steps)
 	require.NotNil(t, body.OutputsFromRunId)
 	assert.Equal(t, "source", *body.OutputsFromRunId)
+	require.NotNil(t, body.OutputsFromRuns)
+	assert.Equal(t, map[string]string{"extract": "run-9"}, *body.OutputsFromRuns)
 	require.NotNil(t, body.Outputs)
-	assert.Equal(t, map[string]map[string]string{"extract": {"rows": "3"}}, *body.Outputs)
+	assert.Equal(t, map[string]map[string]string{"transform": {"rows": "3"}}, *body.Outputs)
 }
 
 // These cases replace process stdin and must remain sequential.
@@ -587,4 +641,68 @@ func TestEnrichRemoteHistoryStatusPopulatesErrorAndMetadata(t *testing.T) {
 	assert.Equal(t, []string{"env=prod"}, status.Labels)
 	assert.Equal(t, "worker-a", status.WorkerID)
 	assert.Contains(t, status.Error, "boom")
+}
+
+func TestRemoteClientDecodesAPIErrorMessage(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"boom"}`))
+	}))
+	defer server.Close()
+
+	client := &remoteClient{baseURL: server.URL, client: server.Client()}
+	_, err := client.getCurrentUser(context.Background())
+	require.Error(t, err)
+
+	var rerr *remoteError
+	require.ErrorAs(t, err, &rerr)
+	assert.Equal(t, http.StatusBadRequest, rerr.StatusCode)
+	assert.Equal(t, "boom", rerr.Message)
+}
+
+func TestRemoteClientCapsErrorResponseBody(t *testing.T) {
+	t.Parallel()
+
+	// Multibyte content makes the byte cap land mid-rune; the surfaced
+	// message must stay bounded and valid UTF-8.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(strings.Repeat("界", maxRemoteErrorBodyBytes)))
+	}))
+	defer server.Close()
+
+	client := &remoteClient{baseURL: server.URL, client: server.Client()}
+	_, err := client.getCurrentUser(context.Background())
+	require.Error(t, err)
+
+	var rerr *remoteError
+	require.ErrorAs(t, err, &rerr)
+	assert.Equal(t, http.StatusInternalServerError, rerr.StatusCode)
+	assert.LessOrEqual(t, len(rerr.Message), maxRemoteErrorBodyBytes)
+	assert.True(t, utf8.ValidString(rerr.Message))
+	assert.True(t, strings.HasSuffix(rerr.Message, "…"))
+}
+
+func TestRemoteClientPreservesExactLimitErrorResponseBody(t *testing.T) {
+	t.Parallel()
+
+	// A body at exactly the limit must pass through unmodified, without the
+	// truncation ellipsis.
+	body := strings.Repeat("x", maxRemoteErrorBodyBytes)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := &remoteClient{baseURL: server.URL, client: server.Client()}
+	_, err := client.getCurrentUser(context.Background())
+	require.Error(t, err)
+
+	var rerr *remoteError
+	require.ErrorAs(t, err, &rerr)
+	assert.Equal(t, body, rerr.Message)
 }

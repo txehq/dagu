@@ -69,6 +69,9 @@ type pendingCommand struct {
 	clientID json.RawMessage
 	// onReply, when set, handles the reply in place of routing it.
 	onReply func(result json.RawMessage, cdpErr *cdpError)
+	// closesBrowser marks a client's Browser.close, whose success means the
+	// browser is on its way out.
+	closesBrowser bool
 }
 
 // target is a target the gate's own auto-attach holds a session on.
@@ -161,6 +164,9 @@ type mux struct {
 	// commands on t.gateSession with gateCommand, and calls
 	// releaseHoldLocked from the reply.
 	onGateAttached func(t *target)
+	// onBrowserClosing runs, with mu held, once the browser acknowledged a
+	// client's Browser.close. It must not block.
+	onBrowserClosing func()
 }
 
 func newMux(p *pipe) *mux {
@@ -375,6 +381,9 @@ func (m *mux) handleReplyLocked(msg message) {
 		return
 	}
 	p.client.deliverReply(p.clientID, msg)
+	if p.closesBrowser && len(msg.Error) == 0 && m.onBrowserClosing != nil {
+		m.onBrowserClosing()
+	}
 }
 
 func (m *mux) handleEventLocked(msg message, data []byte) {
@@ -753,6 +762,13 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 		m.detachFromTargetLocked(c, msg, sessionID)
 	case "Runtime.runIfWaitingForDebugger":
 		m.runIfWaitingLocked(c, msg, sessionID)
+	case "Browser.close":
+		// Chrome stops answering DevTools on a port as soon as it starts
+		// to exit, though it can take seconds more to finish writing its
+		// profile; the gate does the same once the browser agreed to close.
+		if _, err := m.sendLocked(sessionID, msg.Method, msg.Params, &pendingCommand{client: c, clientID: msg.ID, closesBrowser: true}); err != nil {
+			c.deliverError(msg.ID, sessionID, err.Error())
+		}
 	default:
 		m.forwardLocked(c, msg, sessionID)
 	}

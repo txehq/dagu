@@ -54,6 +54,9 @@ function baseConfig(): Config {
     gitSyncEnabled: false,
     updateAvailable: false,
     latestVersion: '',
+    upgradeCommand: '',
+    restartRequired: false,
+    restartCommand: '',
     permissions: { writeDags: true, runDags: true },
     license: {
       valid: true,
@@ -174,10 +177,10 @@ describe('UsersPage', () => {
       await screen.findByRole('button', { name: 'Actions for local-user' })
     );
     expect(
-      screen.queryByRole('menuitem', { name: 'Reset Password' })
+      screen.queryByRole('menuitem', { name: 'Reset password' })
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: 'Add User' })
+      screen.queryByRole('button', { name: 'Add user' })
     ).not.toBeInTheDocument();
     expect(
       screen.getByText(/Password sign-in is disabled on this hub/)
@@ -207,7 +210,7 @@ describe('UsersPage', () => {
       await screen.findByRole('button', { name: 'Actions for local-user' })
     );
     expect(
-      screen.getByRole('menuitem', { name: 'Reset Password' })
+      screen.getByRole('menuitem', { name: 'Reset password' })
     ).toBeVisible();
     expect(
       screen.queryByText(/Password sign-in is disabled on this hub/)
@@ -222,7 +225,7 @@ describe('UsersPage', () => {
     });
 
     expect(
-      await screen.findByRole('button', { name: 'Add User' })
+      await screen.findByRole('button', { name: 'Add user' })
     ).toBeVisible();
     expect(
       screen.queryByText(/Password sign-in is disabled on this hub/)
@@ -341,7 +344,7 @@ describe('UsersPage', () => {
     );
 
     expect(
-      screen.queryByRole('menuitem', { name: 'Reset Password' })
+      screen.queryByRole('menuitem', { name: 'Reset password' })
     ).not.toBeInTheDocument();
   });
 
@@ -364,7 +367,7 @@ describe('UsersPage', () => {
       screen.getByRole('button', { name: 'Actions for proxy-user' })
     );
     expect(
-      screen.queryByRole('menuitem', { name: 'Reset Password' })
+      screen.queryByRole('menuitem', { name: 'Reset password' })
     ).not.toBeInTheDocument();
   });
 
@@ -387,7 +390,7 @@ describe('UsersPage', () => {
     );
 
     expect(
-      screen.getByRole('menuitem', { name: 'Reset Password' })
+      screen.getByRole('menuitem', { name: 'Reset password' })
     ).toBeVisible();
   });
 

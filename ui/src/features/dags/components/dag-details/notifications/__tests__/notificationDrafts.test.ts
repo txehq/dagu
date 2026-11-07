@@ -45,9 +45,9 @@ describe('notificationDrafts', () => {
   });
 
   it('detects provider-generated names before replacing them on type change', () => {
-    expect(
-      isDefaultDeliveryName('Email', NotificationProviderType.email)
-    ).toBe(true);
+    expect(isDefaultDeliveryName('Email', NotificationProviderType.email)).toBe(
+      true
+    );
     expect(
       isDefaultDeliveryName('Generic Webhook', NotificationProviderType.webhook)
     ).toBe(true);
@@ -113,6 +113,26 @@ describe('notificationDrafts', () => {
     draft.teams.webhookUrl = 'https://example.webhook.office.com/webhookb2/abc';
     expect(channelInput(draft)).toMatchObject({
       teams: { webhookUrl: 'https://example.webhook.office.com/webhookb2/abc' },
+    });
+  });
+
+  it('round-trips a custom command channel', () => {
+    const draft = draftChannelFromAPI({
+      id: 'command-1',
+      name: 'Desktop',
+      type: NotificationProviderType.command,
+      enabled: true,
+      createdAt: '2026-10-09T00:00:00Z',
+      updatedAt: '2026-10-09T00:00:00Z',
+      command: {
+        command: 'notify-send "$DAG_NAME" "$STATUS"',
+      },
+    });
+
+    expect(draft.command.command).toBe('notify-send "$DAG_NAME" "$STATUS"');
+    expect(channelInput(draft)).toMatchObject({
+      type: NotificationProviderType.command,
+      command: { command: 'notify-send "$DAG_NAME" "$STATUS"' },
     });
   });
 

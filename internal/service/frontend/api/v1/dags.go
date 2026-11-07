@@ -4,7 +4,10 @@
 package api
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	osrt "runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +29,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	cmnvalue "github.com/dagucloud/dagu/v2/internal/cmn/value"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
@@ -41,7 +46,18 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
-const defaultHistoryLimit = 30
+// maxRunSortDAGs caps how many matching DAGs the server will read when sorting
+// by status or lastRun. The sort key is the latest run of each DAG, which is
+// only known after reading every matching DAG, so the set is bounded to keep
+// the per-DAG status reads reasonable. Above the cap the list falls back to
+// the name sort.
+const maxRunSortDAGs = 300
+
+const (
+	defaultHistoryLimit = 30
+	// upcomingRunsLimit caps the fire times listed in DAG details.
+	upcomingRunsLimit = 10
+)
 
 // resolveDAGName returns the DAG name from metadata, or falls back to fileName if metadata lookup fails.
 func (a *API) resolveDAGName(ctx context.Context, fileName string) string {
@@ -108,11 +124,15 @@ func (a *API) ValidateDAGSpec(ctx context.Context, request api.ValidateDAGSpecRe
 }
 
 // ValidateDAGSpecData validates a DAG spec and returns its canonical form.
-func (a *API) ValidateDAGSpecData(ctx context.Context, name, spec string) (*api.ValidateDAGSpec200JSONResponse, *ir.DAG, error) {
+// A params.schema reference is resolved, by reading its file or fetching its
+// URL, only for a caller who may write DAGs (RequireHostFileRead): for
+// anyone else, a viewer previewing through the editor or MCP among them, the
+// rest of the spec is validated and the reference is left unread (TXE-5923).
+func (a *API) ValidateDAGSpecData(ctx context.Context, name, source string) (*api.ValidateDAGSpec200JSONResponse, *ir.DAG, error) {
 	dag, err := a.dagRepository.LoadSpec(ctx,
-		[]byte(spec),
+		[]byte(source),
 		name,
-		persis.DAGLoadOptions{AllowBuildErrors: true},
+		persis.DAGLoadOptions{AllowBuildErrors: true, SkipSchemaValidation: a.RequireHostFileRead(ctx) != nil},
 	)
 
 	var errs []string
@@ -123,17 +143,24 @@ func (a *API) ValidateDAGSpecData(ctx context.Context, name, spec string) (*api.
 	}
 
 	if dag != nil && len(dag.BuildErrors) > 0 {
-		for _, e := range dag.BuildErrors {
-			errs = append(errs, e.Error())
-		}
+		errs = append(errs, spec.ErrorMessages([]byte(source), dag.BuildErrors)...)
 	}
 
 	details := toDAGDetails(dag)
+	if details != nil {
+		details.UpcomingRuns = a.scheduleFires(dag)
+		details.UpcomingRunsHold = a.upcomingRunsHold(ctx, name, details.UpcomingRuns)
+	}
+
+	notices := a.specValueReferenceNotices(ctx, name, source)
 
 	response := &api.ValidateDAGSpec200JSONResponse{
-		Valid:  len(errs) == 0,
-		Dag:    details,
-		Errors: errs,
+		Valid:                 len(errs) == 0,
+		Dag:                   details,
+		Errors:                errs,
+		Issues:                buildValidationIssues(err, dag, notices),
+		ValueReferenceNotices: toAPIValueReferenceNotices(notices),
+		ReferenceScope:        buildReferenceScope(dag),
 	}
 	if dag != nil {
 		response.Warnings = dag.BuildWarnings
@@ -161,11 +188,8 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 	var yamlSpec []byte
 	var workspaceName, declaredName string
 	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
-		dag, err := a.dagRepository.LoadSpec(ctx,
-			[]byte(*request.Body.Spec),
-			request.Body.Name,
-			persis.DAGLoadOptions{},
-		)
+		// Read for its workspace and name, before the write is decided.
+		dag, err := a.loadSpecBeforeDecision(ctx, []byte(*request.Body.Spec), request.Body.Name, persis.DAGLoadOptions{})
 
 		if err != nil {
 			if verrs, ok := errors.AsType[ir.ErrorList](err); ok {
@@ -192,6 +216,16 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
 	if err := a.txeNativeWrite(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, workspaceName) },
 		yamlSpec, request.Body.Name, declaredName); err != nil {
 		return nil, err
+	}
+	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
+		// The write is allowed: the spec is validated whole, its schema
+		// reference included.
+		if _, err := a.dagRepository.LoadSpec(ctx, yamlSpec, request.Body.Name, persis.DAGLoadOptions{}); err != nil {
+			if verrs, ok := errors.AsType[ir.ErrorList](err); ok {
+				return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: strings.Join(verrs.ToStringList(), "; ")}
+			}
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
+		}
 	}
 
 	if err := a.dagRepository.Create(ctx, request.Body.Name, yamlSpec); err != nil {
@@ -232,13 +266,18 @@ func (a *API) DeleteDAG(ctx context.Context, request api.DeleteDAGRequestObject)
 	}
 
 	if a.authService != nil && a.authService.HasWebhookStore() {
+		webhook, _ := a.authService.GetWebhookByDAGName(ctx, request.FileName)
 		if err := a.authService.DeleteWebhook(ctx, request.FileName); err != nil && !errors.Is(err, auth.ErrWebhookNotFound) {
 			logger.Warn(ctx, "Failed to delete webhook for deleted DAG",
 				tag.Name(request.FileName),
 				tag.Error(err),
 			)
+		} else {
+			a.deletePublicWebhookLog(ctx, webhook)
 		}
 	}
+
+	a.removeDAGPinAfterDelete(ctx, request.FileName)
 
 	a.logAudit(ctx, audit.CategoryDAG, "dag_delete", map[string]any{"dag_name": request.FileName})
 
@@ -256,6 +295,7 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 		spec.WithAllowBuildErrors(),
 		spec.WithoutEval(),
 		spec.WithWorkspaceBaseConfigDir(workspace.BaseConfigDir(a.config.Paths.DAGsDir)),
+		spec.WithCalendars(a.calendarSource()),
 	}
 	if a.config.Paths.BaseConfig != "" {
 		loadOpts = append(loadOpts, spec.WithBaseConfig(a.config.Paths.BaseConfig))
@@ -284,7 +324,7 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 			errs = append(errs, err.Error())
 		}
 	} else {
-		errs = append(errs, extractBuildErrors(dag.BuildErrors)...)
+		errs = append(errs, spec.ErrorMessages([]byte(yamlSpec), dag.BuildErrors)...)
 	}
 	if err := a.requireDAGVisible(ctx, dag); err != nil {
 		return nil, err
@@ -300,11 +340,14 @@ func (a *API) GetDAGSpec(ctx context.Context, request api.GetDAGSpecRequestObjec
 			}
 		}
 		details.NextRun = a.projectNextRun(ctx, projectionDAG)
+		details.UpcomingRuns = a.scheduleFires(dag)
+		details.UpcomingRunsHold = a.upcomingRunsHold(ctx, request.FileName, details.UpcomingRuns)
 	}
 
 	return &api.GetDAGSpec200JSONResponse{
 		Dag:                   details,
 		Spec:                  yamlSpec,
+		Sha256:                specSHA256(yamlSpec),
 		Errors:                errs,
 		Warnings:              dag.BuildWarnings,
 		ValueReferenceNotices: valueReferenceNotices,
@@ -346,6 +389,16 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 		nil, string(request.FileName), currentDAG.Name); err != nil {
 		return nil, err
 	}
+	expected := request.Body.ExpectedSha256
+	if expected != nil {
+		current, err := a.dagRepository.GetSpec(ctx, request.FileName)
+		if err != nil {
+			return nil, err
+		}
+		if actual := specSHA256(current); actual != *expected {
+			return specConflict(request.FileName, *expected, actual), nil
+		}
+	}
 	nextDAG, err := a.dagRepository.LoadSpec(ctx,
 		[]byte(request.Body.Spec),
 		string(request.FileName),
@@ -363,7 +416,20 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 		}
 	}
 
-	err = a.dagRepository.UpdateSpec(ctx, request.FileName, []byte(request.Body.Spec))
+	if expected != nil {
+		// The check above answers early; this one holds against a write that
+		// lands after it.
+		err = a.dagRepository.UpdateSpecIfMatch(ctx, request.FileName, *expected, []byte(request.Body.Spec))
+	} else {
+		err = a.dagRepository.UpdateSpec(ctx, request.FileName, []byte(request.Body.Spec))
+	}
+	if errors.Is(err, persis.ErrConflict) {
+		current, readErr := a.dagRepository.GetSpec(ctx, request.FileName)
+		if readErr != nil {
+			return nil, readErr
+		}
+		return specConflict(request.FileName, *expected, specSHA256(current)), nil
+	}
 
 	var errs []string
 
@@ -394,8 +460,18 @@ func (a *API) UpdateDAGSpec(ctx context.Context, request api.UpdateDAGSpecReques
 	a.logAudit(ctx, audit.CategoryDAG, "dag_update", map[string]any{"dag_name": request.FileName})
 	a.notifyDAGMutation(request.FileName)
 
+	written := request.Body.Spec
+	if len(errs) > 0 {
+		// The repository rejected the spec, so the file still holds the old bytes.
+		current, err := a.dagRepository.GetSpec(ctx, request.FileName)
+		if err != nil {
+			return nil, err
+		}
+		written = current
+	}
 	return api.UpdateDAGSpec200JSONResponse{
 		Errors: errs,
+		Sha256: specSHA256(written),
 	}, nil
 }
 
@@ -426,6 +502,20 @@ func submittedSpecFault(ctx context.Context, name, specText string, updateErr er
 		return nil
 	}
 	return nil
+}
+
+// specConflict answers a save of a spec that changed since the client read it.
+func specConflict(fileName, expected, actual string) api.UpdateDAGSpec409JSONResponse {
+	return api.UpdateDAGSpec409JSONResponse{
+		Code:    api.ErrorCodeConflict,
+		Message: fmt.Sprintf("DAG %s changed since it was read: expected sha256 %s, current sha256 %s", fileName, expected, actual),
+	}
+}
+
+// specSHA256 returns the lowercase hex SHA-256 of the spec bytes.
+func specSHA256(spec string) string {
+	sum := sha256.Sum256([]byte(spec))
+	return hex.EncodeToString(sum[:])
 }
 
 func (a *API) RenameDAG(ctx context.Context, request api.RenameDAGRequestObject) (api.RenameDAGResponseObject, error) {
@@ -483,10 +573,18 @@ func (a *API) RenameDAG(ctx context.Context, request api.RenameDAGRequestObject)
 		}
 	}
 
+	webhookMoved, err := a.moveWebhookForRename(ctx, request.FileName, request.Body.NewFileName)
+	if err != nil {
+		return nil, err
+	}
 	if err := a.dagRepository.Rename(ctx, request.FileName, request.Body.NewFileName); err != nil {
+		if webhookMoved {
+			a.restoreWebhookAfterFailedRename(ctx, request.FileName, request.Body.NewFileName)
+		}
 		return nil, fmt.Errorf("failed to move DAG: %w", err)
 	}
 	a.migrateDAGSettingsAfterRename(ctx, request.FileName, request.Body.NewFileName)
+	a.migrateDAGPinAfterRename(ctx, request.FileName, request.Body.NewFileName)
 
 	a.logAudit(ctx, audit.CategoryDAG, "dag_rename", map[string]any{
 		"old_name": request.FileName,
@@ -509,8 +607,19 @@ func (a *API) GetDAGDAGRunHistory(ctx context.Context, request api.GetDAGDAGRunH
 		return nil, err
 	}
 	dagName := a.resolveDAGName(ctx, request.FileName)
-	response, err := a.buildDAGRunHistoryResponse(ctx, dag, dagName)
+	limit := defaultHistoryLimit
+	if request.Params.Limit != nil {
+		limit = *request.Params.Limit
+	}
+	response, err := a.buildDAGRunHistoryResponse(ctx, dag, dagName, persis.RecentStatusesPageOptions{
+		Limit:            limit,
+		Cursor:           valueOf(request.Params.Cursor),
+		IncludeEphemeral: valueOf(request.Params.IncludeEphemeral),
+	})
 	if err != nil {
+		if apiErr := dagRunListBadRequest(err); apiErr != nil {
+			return nil, apiErr
+		}
 		return nil, &Error{
 			HTTPStatus: http.StatusInternalServerError,
 			Code:       api.ErrorCodeInternalError,
@@ -524,21 +633,28 @@ func (a *API) buildDAGRunHistoryResponse(
 	ctx context.Context,
 	dag *ir.DAG,
 	dagName string,
+	options persis.RecentStatusesPageOptions,
 ) (api.GetDAGDAGRunHistory200JSONResponse, error) {
-	recentHistory, err := a.dagRunRepository.RecentStatuses(ctx, dagName, defaultHistoryLimit)
+	page, err := a.dagRunRepository.RecentStatusesPage(ctx, dagName, options)
 	if err != nil {
 		return api.GetDAGDAGRunHistory200JSONResponse{}, fmt.Errorf("list recent DAG runs for %s: %w", dagName, err)
 	}
 
-	dagRuns := make([]api.DAGRunDetails, 0, len(recentHistory))
-	for _, status := range recentHistory {
-		dagRuns = append(dagRuns, ToDAGRunDetails(status))
+	recentHistory := make([]ir.DAGRunStatus, 0, len(page.Items))
+	dagRuns := make([]api.DAGRunDetails, 0, len(page.Items))
+	for _, status := range page.Items {
+		recentHistory = append(recentHistory, *status)
+		dagRuns = append(dagRuns, ToDAGRunDetails(*status))
 	}
 
-	return api.GetDAGDAGRunHistory200JSONResponse{
+	response := api.GetDAGDAGRunHistory200JSONResponse{
 		DagRuns:  dagRuns,
 		GridData: a.readHistoryData(ctx, dag, recentHistory),
-	}, nil
+	}
+	if page.NextCursor != "" {
+		response.NextCursor = &page.NextCursor
+	}
+	return response, nil
 }
 
 func (a *API) GetDAGDetails(ctx context.Context, request api.GetDAGDetailsRequestObject) (api.GetDAGDetailsResponseObject, error) {
@@ -589,6 +705,8 @@ func (a *API) getDAGDetailsData(ctx context.Context, fileName string) (api.GetDA
 	details := toDAGDetails(dag)
 	if details != nil {
 		details.NextRun = a.projectNextRun(ctx, dag)
+		details.UpcomingRuns = a.scheduleFires(dag)
+		details.UpcomingRunsHold = a.upcomingRunsHold(ctx, fileName, details.UpcomingRuns)
 	}
 
 	localDAGs := make([]api.LocalDag, 0, len(dag.LocalDAGs))
@@ -608,6 +726,7 @@ func (a *API) getDAGDetailsData(ctx context.Context, fileName string) (api.GetDA
 		Dag:          details,
 		LatestDAGRun: ToDAGRunDetails(dagStatus),
 		Suspended:    suspended,
+		Pinned:       a.isDAGPinned(ctx, fileName),
 		LocalDags:    localDAGs,
 		Errors:       extractBuildErrors(dag.BuildErrors),
 		Warnings:     dag.BuildWarnings,
@@ -1126,7 +1245,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		}
 	}
 
-	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.Outputs)
+	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.OutputsFromRuns, request.Body.Outputs, request.Body.OutputsSources, request.Body.Ephemeral)
 	if err != nil {
 		return nil, err
 	}
@@ -1152,6 +1271,10 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 			}
 		}
 		dag.Name = nameOverride
+	}
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
+	if err != nil {
+		return nil, err
 	}
 
 	if dagRunId == "" {
@@ -1183,16 +1306,25 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 
 	if len(selection.steps) > 0 {
 		if err := a.startSelectedSteps(ctx, dag, selectedStepsStart{
-			selection:   selection,
-			params:      params,
-			dagRunID:    dagRunId,
-			labels:      labels,
-			profileName: profileName,
-			noReuse:     valueOf(request.Body.NoReuse),
+			selection:      selection,
+			params:         params,
+			dagRunID:       dagRunId,
+			labels:         labels,
+			profileName:    profileName,
+			noReuse:        valueOf(request.Body.NoReuse),
+			workerSelector: workerSelector,
 		}); err != nil {
 			return nil, err
 		}
-	} else if _, err := a.startDAGRun(ctx, dag, params, dagRunId, nameOverride, labels, profileName, valueOf(request.Body.NoReuse)); err != nil {
+	} else if _, err := a.startDAGRun(ctx, dag, manualStart{
+		params:         params,
+		dagRunID:       dagRunId,
+		nameOverride:   nameOverride,
+		labels:         labels,
+		profileName:    profileName,
+		noReuse:        valueOf(request.Body.NoReuse),
+		workerSelector: workerSelector,
+	}); err != nil {
 		return nil, fmt.Errorf("error starting dag-run: %w", err)
 	}
 
@@ -1202,6 +1334,9 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 	}
 	if params != "" {
 		detailsMap["params"] = params
+	}
+	if len(workerSelector) > 0 {
+		detailsMap["worker_selector"] = workerSelector
 	}
 	addSelectedStepsAudit(detailsMap, selection)
 	a.logAudit(ctx, audit.CategoryDAG, "dag_execute", detailsMap)
@@ -1273,6 +1408,10 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 		}
 		dag.Name = nameOverride
 	}
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
+	if err != nil {
+		return nil, err
+	}
 
 	if dagRunId == "" {
 		var err error
@@ -1301,7 +1440,15 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 		return nil, err
 	}
 
-	if _, err := a.startDAGRun(ctx, dag, params, dagRunId, nameOverride, labels, profileName, valueOf(request.Body.NoReuse)); err != nil {
+	if _, err := a.startDAGRun(ctx, dag, manualStart{
+		params:         params,
+		dagRunID:       dagRunId,
+		nameOverride:   nameOverride,
+		labels:         labels,
+		profileName:    profileName,
+		noReuse:        valueOf(request.Body.NoReuse),
+		workerSelector: workerSelector,
+	}); err != nil {
 		return nil, fmt.Errorf("error starting dag-run: %w", err)
 	}
 
@@ -1312,6 +1459,9 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 	}
 	if params != "" {
 		detailsMap["params"] = params
+	}
+	if len(workerSelector) > 0 {
+		detailsMap["worker_selector"] = workerSelector
 	}
 	a.logAudit(ctx, audit.CategoryDAG, "dag_execute_sync", detailsMap)
 
@@ -1402,22 +1552,71 @@ func (a *API) readDAGRunStatusForSync(ctx context.Context, dag *ir.DAG, dagRunID
 	return status, nil
 }
 
-func (a *API) startDAGRun(
-	ctx context.Context,
-	dag *ir.DAG,
-	params, dagRunID, nameOverride, labels, profileName string,
-	noReuse bool,
-) (*launcher.StartResult, error) {
+// manualStart is what a start request asks for a run started by a person or
+// an API caller.
+type manualStart struct {
+	params       string
+	dagRunID     string
+	nameOverride string
+	labels       string
+	profileName  string
+	noReuse      bool
+	// workerSelector is the request's override, already applied to the DAG;
+	// it travels to the start subprocess, which reloads the DAG from its file.
+	workerSelector map[string]string
+}
+
+func (a *API) startDAGRun(ctx context.Context, dag *ir.DAG, req manualStart) (*launcher.StartResult, error) {
 	return a.startDAGRunWithOptions(ctx, dag, startDAGRunOptions{
-		params:       params,
-		dagRunID:     dagRunID,
-		nameOverride: nameOverride,
-		triggerType:  ir.TriggerTypeManual,
-		triggerActor: triggerActorFromContext(ctx),
-		labels:       labels,
-		profileName:  profileName,
-		noReuse:      noReuse,
+		params:         req.params,
+		dagRunID:       req.dagRunID,
+		nameOverride:   req.nameOverride,
+		triggerType:    ir.TriggerTypeManual,
+		triggerActor:   triggerActorFromContext(ctx),
+		labels:         req.labels,
+		profileName:    req.profileName,
+		noReuse:        req.noReuse,
+		workerSelector: req.workerSelector,
 	})
+}
+
+// applyWorkerSelectorOverride replaces the loaded DAG's worker selector with
+// the request's, when one was given, and returns it for the launch options
+// and the audit record.
+//
+// A per-run selector places the run, as a spec's worker_selector does, so it
+// is decided as one (txeRunPlacement, TXE-5923) before it is applied: it is
+// the only way a request's selector reaches a DAG
+// (TestEveryRunSelectorIsDecided).
+func (a *API) applyWorkerSelectorOverride(ctx context.Context, dag *ir.DAG, override *api.WorkerSelectorOverride) (map[string]string, error) {
+	if override == nil || len(*override) == 0 {
+		return nil, nil
+	}
+	selector := map[string]string(*override)
+	if err := a.txeRunPlacement(ctx, dag, selector); err != nil {
+		return nil, err
+	}
+	if err := reapplyWorkerSelector(dag, selector); err != nil {
+		return nil, err
+	}
+	return selector, nil
+}
+
+// reapplyWorkerSelector puts a per-run selector on a DAG. Runtime-param
+// resolution rebuilds the DAG from its YAML, so every path that resolves
+// applies the request's selector again to the DAG it goes on to use.
+func reapplyWorkerSelector(dag *ir.DAG, selector map[string]string) error {
+	if len(selector) == 0 {
+		return nil
+	}
+	if err := dag.ApplyWorkerSelector(selector); err != nil {
+		return &Error{
+			HTTPStatus: http.StatusBadRequest,
+			Code:       api.ErrorCodeBadRequest,
+			Message:    "invalid workerSelector: " + err.Error(),
+		}
+	}
+	return nil
 }
 
 // extractLabelsParam validates and serializes an optional labels array into a comma-separated string.
@@ -1502,6 +1701,8 @@ type startDAGRunOptions struct {
 	labels       string
 	profileName  string
 	noReuse      bool
+	// workerSelector is a per-run override, passed to the start subprocess.
+	workerSelector map[string]string
 }
 
 // waitForDAGStatusChange waits until the DAG status transitions from NotStarted.
@@ -1679,6 +1880,11 @@ func (a *API) startDAGRunWithOptions(ctx context.Context, dag *ir.DAG, opts star
 			Message:    err.Error(),
 		}
 	}
+	// Resolution rebuilt the DAG from its YAML; the request's selector goes on
+	// the DAG the dispatch reads.
+	if err := reapplyWorkerSelector(resolvedDAG, opts.workerSelector); err != nil {
+		return nil, err
+	}
 	dag = resolvedDAG
 
 	if err := buildErrorsToAPIError(dag.BuildErrors); err != nil {
@@ -1724,6 +1930,9 @@ func (a *API) startPreparedDAGRunWithOptions(
 	if opts.triggerType != ir.TriggerTypeUnknown {
 		triggerTypeStr = opts.triggerType.String()
 	}
+	if err := launchParamsError(dispatchParams); err != nil {
+		return nil, err
+	}
 	target := opts.target
 	fromRunID := opts.fromRunID
 	if fromRunID != "" && dispatchParams != "" && len(dag.YamlData) > 0 {
@@ -1738,18 +1947,19 @@ func (a *API) startPreparedDAGRunWithOptions(
 		}
 	}
 	spec := a.subCmdBuilder.Start(dag, launcher.StartOptions{
-		Params:       dispatchParams,
-		DAGRunID:     opts.dagRunID,
-		Quiet:        true,
-		NameOverride: opts.nameOverride,
-		FromRunID:    fromRunID,
-		Target:       target,
-		SourceFile:   &dag.SourceFile,
-		TriggerType:  triggerTypeStr,
-		TriggerActor: opts.triggerActor,
-		Labels:       opts.labels,
-		ProfileName:  opts.profileName,
-		NoReuse:      opts.noReuse,
+		Params:         dispatchParams,
+		DAGRunID:       opts.dagRunID,
+		Quiet:          true,
+		NameOverride:   opts.nameOverride,
+		FromRunID:      fromRunID,
+		Target:         target,
+		SourceFile:     &dag.SourceFile,
+		TriggerType:    triggerTypeStr,
+		TriggerActor:   opts.triggerActor,
+		Labels:         opts.labels,
+		ProfileName:    opts.profileName,
+		NoReuse:        opts.noReuse,
+		WorkerSelector: opts.workerSelector,
 	})
 	spec.Env = append(spec.Env, a.managedOpenCodeEnv(ctx, dag)...)
 	started, err := launcher.StartProcess(ctx, spec)
@@ -1763,6 +1973,18 @@ func (a *API) startPreparedDAGRunWithOptions(
 	}
 
 	return started, a.waitForLocalDAGStart(ctx, dag, opts.dagRunID, started, timeout)
+}
+
+// launchParamsError refuses params larger than a launched run takes.
+func launchParamsError(params string) error {
+	if len(params) <= launcher.MaxParamsSize {
+		return nil
+	}
+	return &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Code:       api.ErrorCodeBadRequest,
+		Message:    fmt.Sprintf("params exceed the %d byte limit", launcher.MaxParamsSize),
+	}
 }
 
 func buildRequiresLocalAPIError() *Error {
@@ -1852,6 +2074,10 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 		}
 		dag.Name = nameOverride
 	}
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
+	if err != nil {
+		return nil, err
+	}
 
 	dagRunId := valueOf(request.Body.DagRunId)
 	if err := validateDAGRunID(dagRunId); err != nil {
@@ -1884,7 +2110,17 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 		return nil, err
 	}
 
-	if err := a.enqueueDAGRun(ctx, dag, valueOf(request.Body.Params), dagRunId, nameOverride, ir.TriggerTypeManual, labels, profileName, valueOf(request.Body.NoReuse), request.FileName); err != nil {
+	if err := a.enqueueDAGRun(ctx, dag, enqueueRequest{
+		params:         valueOf(request.Body.Params),
+		dagRunID:       dagRunId,
+		nameOverride:   nameOverride,
+		triggerType:    ir.TriggerTypeManual,
+		labels:         labels,
+		profileName:    profileName,
+		noReuse:        valueOf(request.Body.NoReuse),
+		definitionID:   request.FileName,
+		workerSelector: workerSelector,
+	}); err != nil {
 		return nil, fmt.Errorf("error enqueuing dag-run: %w", err)
 	}
 
@@ -1895,6 +2131,9 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	if request.Body.Params != nil && *request.Body.Params != "" {
 		enqueueDetails["params"] = *request.Body.Params
 	}
+	if len(workerSelector) > 0 {
+		enqueueDetails["worker_selector"] = workerSelector
+	}
 	a.logAudit(ctx, audit.CategoryDAG, "dag_enqueue", enqueueDetails)
 
 	return api.EnqueueDAGDAGRun200JSONResponse{
@@ -1902,7 +2141,26 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 	}, nil
 }
 
-func (a *API) enqueueDAGRun(ctx context.Context, dag *ir.DAG, params, dagRunID, nameOverride string, triggerType ir.TriggerType, labels, profileName string, noReuse bool, definitionID string) error {
+// enqueueRequest is what an enqueue asks for one queued run.
+type enqueueRequest struct {
+	params       string
+	dagRunID     string
+	nameOverride string
+	triggerType  ir.TriggerType
+	labels       string
+	profileName  string
+	noReuse      bool
+	definitionID string
+	// workerSelector is the request's override, already applied to the DAG;
+	// it travels to the enqueue subprocess, which reloads the DAG from its file.
+	workerSelector map[string]string
+}
+
+func (a *API) enqueueDAGRun(ctx context.Context, dag *ir.DAG, req enqueueRequest) error {
+	params, dagRunID := req.params, req.dagRunID
+	if err := launchParamsError(params); err != nil {
+		return err
+	}
 	resolvedDAG, err := spec.ResolveRuntimeParams(ctx, dag, params, spec.ResolveRuntimeParamsOptions{
 		BaseConfig: a.config.Paths.BaseConfig,
 	})
@@ -1912,6 +2170,9 @@ func (a *API) enqueueDAGRun(ctx context.Context, dag *ir.DAG, params, dagRunID, 
 			Code:       api.ErrorCodeBadRequest,
 			Message:    err.Error(),
 		}
+	}
+	if err := reapplyWorkerSelector(resolvedDAG, req.workerSelector); err != nil {
+		return err
 	}
 	dag = resolvedDAG
 
@@ -1931,19 +2192,20 @@ func (a *API) enqueueDAGRun(ctx context.Context, dag *ir.DAG, params, dagRunID, 
 
 	// Only pass trigger type if it's a known value (not TriggerTypeUnknown)
 	triggerTypeStr := ""
-	if triggerType != ir.TriggerTypeUnknown {
-		triggerTypeStr = triggerType.String()
+	if req.triggerType != ir.TriggerTypeUnknown {
+		triggerTypeStr = req.triggerType.String()
 	}
 	opts := launcher.EnqueueOptions{
-		Params:       params,
-		DAGRunID:     dagRunID,
-		NameOverride: nameOverride,
-		TriggerType:  triggerTypeStr,
-		TriggerActor: triggerActorFromContext(ctx),
-		Labels:       labels,
-		ProfileName:  profileName,
-		DefinitionID: definitionID,
-		NoReuse:      noReuse,
+		Params:         params,
+		DAGRunID:       dagRunID,
+		NameOverride:   req.nameOverride,
+		TriggerType:    triggerTypeStr,
+		TriggerActor:   triggerActorFromContext(ctx),
+		Labels:         req.labels,
+		ProfileName:    req.profileName,
+		DefinitionID:   req.definitionID,
+		NoReuse:        req.noReuse,
+		WorkerSelector: req.workerSelector,
 	}
 	if dag.Queue != "" {
 		opts.Queue = dag.Queue
@@ -2135,24 +2397,31 @@ func (a *API) GetDAGHistoryData(ctx context.Context, fileName string) (any, erro
 		}
 
 		dagName := a.resolveDAGName(readCtx, fileName)
-		return a.buildDAGRunHistoryResponse(readCtx, dag, dagName)
+		return a.buildDAGRunHistoryResponse(readCtx, dag, dagName, persis.RecentStatusesPageOptions{Limit: defaultHistoryLimit})
 	})
 }
 
-// GetDAGsListData returns DAGs list for SSE.
+// GetDAGsListData returns DAGs list for SSE, with pinned DAGs first.
 // Identifier format: URL query string (e.g., "page=1&perPage=100&name=mydag")
 func (a *API) GetDAGsListData(ctx context.Context, queryString string) (any, error) {
-	return a.getDAGsListData(ctx, queryString, false)
+	return a.getDAGsListData(ctx, queryString, dagListSource{pinnedFirst: true})
 }
 
 // GetDAGsListDataIncludingAltDirs is like GetDAGsListData but the returned list
 // also includes DAGs found under paths.alt_dags_dir. Query semantics are applied
-// to the combined collection.
+// to the combined collection, and pins do not affect the order.
 func (a *API) GetDAGsListDataIncludingAltDirs(ctx context.Context, queryString string) (any, error) {
-	return a.getDAGsListData(ctx, queryString, true)
+	return a.getDAGsListData(ctx, queryString, dagListSource{includeSearchPaths: true})
 }
 
-func (a *API) getDAGsListData(ctx context.Context, queryString string, includeSearchPaths bool) (any, error) {
+// dagListSource selects which DAGs a list includes and whether pinned DAGs
+// come first. Every list reports which DAGs are pinned.
+type dagListSource struct {
+	includeSearchPaths bool
+	pinnedFirst        bool
+}
+
+func (a *API) getDAGsListData(ctx context.Context, queryString string, source dagListSource) (any, error) {
 	return withDAGRunReadTimeout(ctx, dagRunReadRequestInfo{
 		endpoint: "/dags",
 	}, func(readCtx context.Context) (any, error) {
@@ -2160,7 +2429,7 @@ func (a *API) getDAGsListData(ctx context.Context, queryString string, includeSe
 		if err != nil {
 			return nil, err
 		}
-		return a.listDAGsDataWithSearchPaths(readCtx, listOpts, includeSearchPaths)
+		return a.listDAGsDataWithSearchPaths(readCtx, listOpts, source)
 	})
 }
 
@@ -2228,25 +2497,36 @@ func (a *API) buildDAGListOptions(ctx context.Context, queryString string) (pers
 }
 
 func (a *API) listDAGsData(ctx context.Context, listOpts persis.DAGListOptions) (api.ListDAGs200JSONResponse, error) {
-	return a.listDAGsDataWithSearchPaths(ctx, listOpts, false)
+	return a.listDAGsDataWithSearchPaths(ctx, listOpts, dagListSource{pinnedFirst: true})
 }
 
-// listDAGsDataWithSearchPaths lists DAGs and, when includeSearchPaths is true,
-// also includes DAGs found under the configured alternate directory
+// listDAGsDataWithSearchPaths lists DAGs and, when source.includeSearchPaths
+// is true, also includes DAGs found under the configured alternate directory
 // (paths.alt_dags_dir). Query semantics are applied to the combined collection.
-func (a *API) listDAGsDataWithSearchPaths(ctx context.Context, listOpts persis.DAGListOptions, includeSearchPaths bool) (api.ListDAGs200JSONResponse, error) {
+func (a *API) listDAGsDataWithSearchPaths(ctx context.Context, listOpts persis.DAGListOptions, source dagListSource) (api.ListDAGs200JSONResponse, error) {
+	// Sorting by status or lastRun needs the latest run of every matching DAG,
+	// which is only known after the catalog is loaded. Route those sorts to a
+	// dedicated path that reads all matching DAGs, sorts, and then paginates.
+	if listOpts.Sort == "status" || listOpts.Sort == "lastRun" {
+		return a.listDAGsDataSortedByRun(ctx, listOpts, source)
+	}
+
 	projectionTime := time.Now()
 	nextRunProjection := a.nextRunProjection(ctx)
 
 	listOpts.Time = &projectionTime
 	listOpts.NextRunProjection = nextRunProjection
+	pinnedIDs := a.pinnedDAGIDs(ctx)
+	if source.pinnedFirst {
+		listOpts.PinnedIDs = pinnedIDs
+	}
 
 	var (
 		result  pagination.PaginatedResult[persis.DAGListItem]
 		errList []string
 		err     error
 	)
-	if includeSearchPaths {
+	if source.includeSearchPaths {
 		result, errList, err = a.dagRepository.ListIncludingSearchPaths(ctx, listOpts)
 	} else {
 		result, errList, err = a.dagRepository.List(ctx, listOpts)
@@ -2267,10 +2547,12 @@ func (a *API) listDAGsDataWithSearchPaths(ctx context.Context, listOpts persis.D
 			nextRunAt = &nextRun
 		}
 
+		_, pinned := pinnedIDs[item.ID]
 		dagFile := api.DAGFile{
 			FileName:     item.ID,
 			LatestDAGRun: toDAGRunSummary(dagStatus),
 			Suspended:    item.Suspended,
+			Pinned:       pinned,
 			Dag:          toDAG(item.DAG),
 			NextRun:      nextRunAt,
 			Errors:       extractBuildErrors(item.BuildErrors),
@@ -2288,12 +2570,312 @@ func (a *API) listDAGsDataWithSearchPaths(ctx context.Context, listOpts persis.D
 	}, nil
 }
 
+// listDAGsDataSortedByRun lists DAGs and sorts them by the latest run of each
+// DAG (status or lastRun). The sort key is only known after reading each DAG's
+// latest run, so every matching DAG is loaded, keyed, sorted, and then
+// paginated. The number of DAGs is capped by a.runSortDAGLimit; a larger match
+// set is listed with the name sort instead, and errors[] says so.
+func (a *API) listDAGsDataSortedByRun(ctx context.Context, listOpts persis.DAGListOptions, source dagListSource) (api.ListDAGs200JSONResponse, error) {
+	projectionTime := time.Now()
+	listOpts.Time = &projectionTime
+	listOpts.NextRunProjection = a.nextRunProjection(ctx)
+	nextRunProjection := listOpts.NextRunProjection
+	pinnedIDs := a.pinnedDAGIDs(ctx)
+	if source.pinnedFirst {
+		listOpts.PinnedIDs = pinnedIDs
+	}
+
+	// Save the caller's paginator. It is replaced below with an unbounded one
+	// so the repository returns every matching DAG for the sort, then restored
+	// for the final pagination of the sorted result.
+	callerPaginator := listOpts.Paginator
+	all := pagination.NewPaginator(1, int(^uint(0)>>1))
+	listOpts.Paginator = &all
+
+	var (
+		result  pagination.PaginatedResult[persis.DAGListItem]
+		errList []string
+		err     error
+	)
+	if source.includeSearchPaths {
+		result, errList, err = a.dagRepository.ListIncludingSearchPaths(ctx, listOpts)
+	} else {
+		result, errList, err = a.dagRepository.List(ctx, listOpts)
+	}
+	if err != nil {
+		return api.ListDAGs200JSONResponse{}, fmt.Errorf("error listing DAGs: %w", err)
+	}
+	limit := a.runSortDAGLimit
+	if limit <= 0 {
+		limit = maxRunSortDAGs
+	}
+	if result.TotalCount > limit {
+		// Too many DAGs to read every latest run. List them by name in the
+		// requested order instead of failing, so API clients, the SSE topic
+		// and a ui.dags.sort_field default keep working on big installs.
+		requested := listOpts.Sort
+		listOpts.Sort = "name"
+		listOpts.Paginator = callerPaginator
+		resp, fallbackErr := a.listDAGsDataWithSearchPaths(ctx, listOpts, source)
+		if fallbackErr != nil {
+			return resp, fallbackErr
+		}
+		resp.Errors = append(resp.Errors, fmt.Sprintf(
+			"sorting by %s is limited to %d matching DAGs (found %d); sorted by name instead",
+			requested, limit, result.TotalCount,
+		))
+		return resp, nil
+	}
+
+	// Build the sort key (latest run status or start time) for each DAG. A
+	// failed status read is reported below, only for the DAGs on the page,
+	// as the other list paths do.
+	type keyedItem struct {
+		item      persis.DAGListItem
+		dagStatus ir.DAGRunStatus
+		statusErr error
+		status    ir.Status
+		lastRun   time.Time
+	}
+	keyed := make([]keyedItem, 0, len(result.Items))
+	for _, item := range result.Items {
+		dagStatus, statusErr := a.dagRunMgr.GetLatestStatus(ctx, item.DAG)
+		// An empty or unparseable start time yields the zero time, which
+		// sorts as "never ran".
+		lastRun, _ := stringutil.ParseTime(dagStatus.StartedAt)
+		keyed = append(keyed, keyedItem{
+			item:      item,
+			dagStatus: dagStatus,
+			statusErr: statusErr,
+			status:    dagStatus.Status,
+			lastRun:   lastRun,
+		})
+	}
+
+	// Sort pinned DAGs first when the list asks for it, then by the requested
+	// key, then by name and ID so pages stay stable between requests.
+	direction := 1
+	if listOpts.Order == "desc" {
+		direction = -1
+	}
+	slices.SortFunc(keyed, func(a, b keyedItem) int {
+		if source.pinnedFirst {
+			if c := comparePinned(pinnedIDs, a.item.ID, b.item.ID); c != 0 {
+				return c
+			}
+		}
+		var c int
+		if listOpts.Sort == "status" {
+			c = compareRunStatus(a.status, b.status, direction)
+		} else {
+			c = compareRunTime(a.lastRun, b.lastRun, direction)
+		}
+		if c != 0 {
+			return c
+		}
+		if c = strings.Compare(strings.ToLower(a.item.Name), strings.ToLower(b.item.Name)); c != 0 {
+			return c
+		}
+		return strings.Compare(a.item.ID, b.item.ID)
+	})
+
+	// Paginate the sorted result with the caller's paginator.
+	pg := callerPaginator
+	totalCount := len(keyed)
+	start := pg.Offset()
+	end := min(start+pg.Limit(), totalCount)
+	var pageKeyed []keyedItem
+	if start < totalCount {
+		pageKeyed = keyed[start:end]
+	}
+	items := make([]persis.DAGListItem, 0, len(pageKeyed))
+	for _, k := range pageKeyed {
+		items = append(items, k.item)
+	}
+	paged := pagination.NewPaginatedResult(items, totalCount, *pg)
+
+	dagFiles := make([]api.DAGFile, 0, len(paged.Items))
+	for _, k := range pageKeyed {
+		item := k.item
+		var nextRun time.Time
+		if !item.Suspended {
+			nextRun = nextRunProjection(item.DAG, projectionTime)
+		}
+		var nextRunAt *time.Time
+		if !nextRun.IsZero() {
+			nextRunAt = &nextRun
+		}
+		_, pinned := pinnedIDs[item.ID]
+		dagFile := api.DAGFile{
+			FileName:     item.ID,
+			LatestDAGRun: toDAGRunSummary(k.dagStatus),
+			Suspended:    item.Suspended,
+			Pinned:       pinned,
+			Dag:          toDAG(item.DAG),
+			NextRun:      nextRunAt,
+			Errors:       extractBuildErrors(item.BuildErrors),
+		}
+		if k.statusErr != nil {
+			errList = append(errList, k.statusErr.Error())
+		}
+		dagFiles = append(dagFiles, dagFile)
+	}
+
+	return api.ListDAGs200JSONResponse{
+		Dags:       dagFiles,
+		Errors:     errList,
+		Pagination: toPagination(paged),
+	}, nil
+}
+
+// runStatusRank is the ascending order of the status sort: live runs first,
+// then runs that need attention, then finished runs from worst to best. The
+// table is explicit so that adding a value to ir.Status does not silently
+// reorder the API. Keep it in sync with the `status` sort in api.yaml.
+var runStatusRank = map[ir.Status]int{
+	ir.Running:            0,
+	ir.Waiting:            1,
+	ir.Queued:             2,
+	ir.Failed:             3,
+	ir.Rejected:           4,
+	ir.Aborted:            5,
+	ir.PartiallySucceeded: 6,
+	ir.Succeeded:          7,
+}
+
+// rankRunStatus returns the sort rank of a status. A status missing from
+// runStatusRank sorts after every listed one.
+func rankRunStatus(s ir.Status) int {
+	if rank, ok := runStatusRank[s]; ok {
+		return rank
+	}
+	return len(runStatusRank)
+}
+
+// compareRunStatus compares two run statuses in the requested direction using
+// runStatusRank. A zero (not started) status sorts after any real status in
+// both ascending and descending order.
+func compareRunStatus(a, b ir.Status, direction int) int {
+	if a == ir.NotStarted && b == ir.NotStarted {
+		return 0
+	}
+	if a == ir.NotStarted {
+		return 1
+	}
+	if b == ir.NotStarted {
+		return -1
+	}
+	return direction * cmp.Compare(rankRunStatus(a), rankRunStatus(b))
+}
+
+// compareRunTime compares two run start times in the requested direction. A
+// zero time sorts after any real time in both ascending and descending order.
+func compareRunTime(a, b time.Time, direction int) int {
+	if a.IsZero() && b.IsZero() {
+		return 0
+	}
+	if a.IsZero() {
+		return 1
+	}
+	if b.IsZero() {
+		return -1
+	}
+	return direction * a.Compare(b)
+}
+
+// comparePinned orders pinned DAGs before unpinned ones. It returns a negative
+// value when a is pinned and b is not, a positive value when b is pinned and a
+// is not, and zero when both are pinned or both are unpinned. It matches
+// persis.comparePinned, which is not exported.
+func comparePinned(pinned map[string]struct{}, a, b string) int {
+	_, aPinned := pinned[a]
+	_, bPinned := pinned[b]
+	switch {
+	case aPinned == bPinned:
+		return 0
+	case aPinned:
+		return -1
+	default:
+		return 1
+	}
+}
+
 func (a *API) projectNextRun(ctx context.Context, dag *ir.DAG) *time.Time {
 	nextRun := a.nextRunProjection(ctx)(dag, time.Now())
 	if nextRun.IsZero() {
 		return nil
 	}
 	return &nextRun
+}
+
+// scheduleFires lists the next fire times of a DAG's start schedules, each
+// labeled with the zone its schedule is evaluated in.
+func (a *API) scheduleFires(dag *ir.DAG) *[]api.UpcomingRun {
+	if dag == nil || len(dag.Schedule) == 0 {
+		return nil
+	}
+	location := time.Local
+	if a.config != nil && a.config.Core.Location != nil {
+		location = a.config.Core.Location
+	}
+
+	fires := dag.UpcomingFires(time.Now().In(location), upcomingRunsLimit)
+	runs := make([]api.UpcomingRun, 0, len(fires))
+	for _, fire := range fires {
+		run := api.UpcomingRun{
+			Time:          fire.Time,
+			ScheduleIndex: fire.ScheduleIndex,
+			Timezone:      fireZoneLabel(fire.Time),
+		}
+		if len(fire.SkippedHolidays) > 0 {
+			holidays := make([]api.Holiday, 0, len(fire.SkippedHolidays))
+			for _, holiday := range fire.SkippedHolidays {
+				entry := api.Holiday{Date: toAPIDate(holiday.Date)}
+				if holiday.Name != "" {
+					entry.Name = ptrOf(holiday.Name)
+				}
+				holidays = append(holidays, entry)
+			}
+			run.SkippedHolidays = &holidays
+		}
+		if fire.BusinessDay != 0 {
+			run.BusinessDay = ptrOf(fire.BusinessDay)
+		}
+		if fire.ExtraBusinessDay {
+			run.ExtraBusinessDay = ptrOf(true)
+		}
+		runs = append(runs, run)
+	}
+	return &runs
+}
+
+// upcomingRunsHold reports why listed upcoming runs will not start: the
+// scheduler is paused, or the DAG is suspended. fileName may name a DAG that
+// is not saved yet, which is never suspended.
+func (a *API) upcomingRunsHold(ctx context.Context, fileName string, runs *[]api.UpcomingRun) *api.UpcomingRunsHold {
+	if runs == nil || len(*runs) == 0 {
+		return nil
+	}
+	if a.schedulerPauseStore != nil {
+		if paused, err := a.schedulerPauseStore.IsPaused(ctx); err == nil && paused {
+			return ptrOf(api.UpcomingRunsHoldSchedulerPaused)
+		}
+	}
+	if fileName != "" {
+		if suspended, err := a.dagRepository.IsSuspended(ctx, fileName); err == nil && suspended {
+			return ptrOf(api.UpcomingRunsHoldSuspended)
+		}
+	}
+	return nil
+}
+
+// fireZoneLabel names the zone of a fire time: its time zone name, or its
+// UTC offset when the zone has none, as with the host's local zone.
+func fireZoneLabel(fire time.Time) string {
+	if name := fire.Location().String(); name != "" && name != "Local" {
+		return name
+	}
+	return "UTC" + fire.Format("-07:00")
 }
 
 func (a *API) nextRunProjection(ctx context.Context) func(*ir.DAG, time.Time) time.Time {
@@ -2339,4 +2921,14 @@ func parseIntParam(s string, defaultVal int) int {
 		return v
 	}
 	return defaultVal
+}
+
+// loadSpecBeforeDecision loads a spec a caller supplies before the caller is
+// authorized to write it, to learn what it names: a params.schema reference
+// is left unread, so no file is read and no URL fetched on behalf of a caller
+// not yet allowed to (TXE-5923). TestEveryCallerSpecLoadIsDecided keeps every
+// other load of a caller's spec behind a write decision.
+func (a *API) loadSpecBeforeDecision(ctx context.Context, source []byte, name string, opts persis.DAGLoadOptions) (*ir.DAG, error) {
+	opts.SkipSchemaValidation = true
+	return a.dagRepository.LoadSpec(ctx, source, name, opts)
 }

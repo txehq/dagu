@@ -103,7 +103,8 @@ type Node struct {
 	RetriedAt           string            `json:"retriedAt,omitempty"`
 	RetryCount          int               `json:"retryCount,omitempty"`
 	DoneCount           int               `json:"doneCount,omitempty"`
-	Repeated            bool              `json:"repeated,omitempty"` // indicates if the node has been repeated
+	Repeated            bool              `json:"repeated,omitempty"`   // indicates if the node has been repeated
+	Continuous          bool              `json:"continuous,omitempty"` // the step repeats without a limit (spec 083)
 	SkippedByRetry      bool              `json:"skippedByRetry,omitempty"`
 	// FailureAcceptedByRetry records that this failed step was treated as
 	// satisfied by the step retry of the execution that wrote the status. It
@@ -161,13 +162,24 @@ type Node struct {
 	ToolDefinitions []ToolDefinition `json:"toolDefinitions,omitempty"`
 	// AgentSession stores managed coding-agent state for display and durable resume.
 	AgentSession *AgentSession `json:"agentSession,omitempty"`
+	// ModelUsage is what the step's calls to models used, over every attempt
+	// of the step in this run.
+	ModelUsage *StepModelUsage `json:"modelUsage,omitempty"`
+
+	// outputsValueFrom and stepOutputsValueFrom name the output field whose
+	// value a stored node repeats, so a status file holds that value once.
+	// Only StoredStatus sets them; reading a node restores the value.
+	outputsValueFrom     string
+	stepOutputsValueFrom string
 }
 
 // The output fields a stored node's other output fields may repeat. Upstream
-// Dagu v2.25.2 stores a repeated output once per status line and names the
-// field that holds it in outputsValueFrom or stepOutputsValueFrom; this fork
-// reads those references so a status file it did not write loses no output.
-// The fork's writer keeps every output field inline and never writes them.
+// Dagu from v2.25.2 stores a repeated output once per status line (StoredStatus)
+// and names the field that holds it in outputsValueFrom or
+// stepOutputsValueFrom; this fork reads those references so a status file it
+// did not write loses no output. The fork's status writer does not call
+// StoredStatus: it keeps every output field inline, so fork builds before
+// TXE-5795, which cannot read a reference, lose nothing on rollback.
 const (
 	outputValueField  = "outputValue"
 	outputsValueField = "outputsValue"
@@ -193,9 +205,13 @@ func (n Node) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Step stepSnapshot `json:"step,omitzero"`
 		nodeJSON
+		OutputsValueFrom     string `json:"outputsValueFrom,omitempty"`
+		StepOutputsValueFrom string `json:"stepOutputsValueFrom,omitempty"`
 	}{
-		Step:     newStepSnapshot(n.Step, n.PreconditionResults),
-		nodeJSON: nodeJSON(n),
+		Step:                 newStepSnapshot(n.Step, n.PreconditionResults),
+		nodeJSON:             nodeJSON(n),
+		OutputsValueFrom:     n.outputsValueFrom,
+		StepOutputsValueFrom: n.stepOutputsValueFrom,
 	})
 }
 
@@ -252,6 +268,32 @@ func (n *Node) storedOutput(field string) *string {
 	}
 	stored := *value
 	return &stored
+}
+
+// storedNode returns the node as a status file stores it: an output field
+// that repeats another one's value names that field instead of holding the
+// value again. A step's outputs usually fill all three fields with the same
+// text, so a large output would otherwise be written three times per line.
+func storedNode(n *Node) *Node {
+	if n == nil {
+		return nil
+	}
+	stored := *n
+	if sameOutput(n.OutputsValue, n.OutputValue) {
+		stored.OutputsValue, stored.outputsValueFrom = nil, outputValueField
+	}
+	switch {
+	case sameOutput(n.StepOutputsValue, n.OutputValue):
+		stored.StepOutputsValue, stored.stepOutputsValueFrom = nil, outputValueField
+	case sameOutput(n.StepOutputsValue, n.OutputsValue):
+		stored.StepOutputsValue, stored.stepOutputsValueFrom = nil, outputsValueField
+	}
+	return &stored
+}
+
+// sameOutput reports whether two set output fields hold the same text.
+func sameOutput(value, other *string) bool {
+	return value != nil && other != nil && *value == *other
 }
 
 // SubDAGRun represents a sub DAG run associated with a node

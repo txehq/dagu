@@ -84,9 +84,11 @@ function AgentTimeline({
     return (
       <div className="rounded-md border border-dashed border-border p-5 text-center text-sm text-muted-foreground">
         {isStepSession ? (
-          <I18nText text={"No timeline events yet."} />
+          <I18nText text={'No timeline events yet.'} />
         ) : (
-          <I18nText text={"OpenCode has not emitted any timeline events yet."} />
+          <I18nText
+            text={'OpenCode has not emitted any timeline events yet.'}
+          />
         )}
       </div>
     );
@@ -122,7 +124,11 @@ function AgentTimeline({
               <div className="mt-2 flex flex-wrap gap-2 font-mono text-xs text-muted-foreground">
                 {event.files.map((file) =>
                   artifactRun && isImageArtifact(file) ? (
-                    <ArtifactThumbnail key={file} run={artifactRun} path={file} />
+                    <ArtifactThumbnail
+                      key={file}
+                      run={artifactRun}
+                      path={file}
+                    />
                   ) : (
                     <div key={file} className="w-full truncate" title={file}>
                       {file}
@@ -164,7 +170,7 @@ function InteractionCard({
         <div>
           <div className="flex items-center gap-2 font-medium">
             <ShieldAlert className="h-4 w-4 text-warning" />
-            <I18nText text={"Permission requested"} />
+            <I18nText text={'Permission requested'} />
           </div>
           <div className="mt-1 text-sm">{interaction.permission}</div>
           {interaction.patterns && interaction.patterns.length > 0 && (
@@ -176,7 +182,7 @@ function InteractionCard({
           )}
           {!!interaction.allowForSessionPatterns?.length && (
             <div className="mt-2 text-xs text-muted-foreground">
-              <I18nText text={"Session scope:"} />{' '}
+              <I18nText text={'Session scope:'} />{' '}
               <span className="font-mono">
                 {interaction.allowForSessionPatterns.join(', ')}
               </span>
@@ -191,7 +197,7 @@ function InteractionCard({
               onPermission(AgentInteractionResponseRequestDecision.once)
             }
           >
-            <Check className="h-4 w-4" /> <I18nText text={"Allow once"} />
+            <Check className="h-4 w-4" /> <I18nText text={'Allow once'} />
           </Button>
           {!!interaction.allowForSessionPatterns?.length && (
             <Button
@@ -203,7 +209,7 @@ function InteractionCard({
                 onPermission(AgentInteractionResponseRequestDecision.session)
               }
             >
-              <I18nText text={"Allow for this Dagu session"} />
+              <I18nText text={'Allow for this Dagu session'} />
             </Button>
           )}
           <Button
@@ -214,7 +220,7 @@ function InteractionCard({
               onPermission(AgentInteractionResponseRequestDecision.reject)
             }
           >
-            <X className="h-4 w-4" /> <I18nText text={"Reject"} />
+            <X className="h-4 w-4" /> <I18nText text={'Reject'} />
           </Button>
         </div>
       </div>
@@ -253,11 +259,11 @@ function InteractionCard({
       <div className="flex items-center gap-2 font-medium">
         <Bot className="h-4 w-4 text-warning" />{' '}
         {provider === BROWSER_PROVIDER ? (
-          <I18nText text={"The browser step needs an answer"} />
+          <I18nText text={'The browser step needs an answer'} />
         ) : provider === COMPUTER_PROVIDER ? (
-          <I18nText text={"The computer step needs an answer"} />
+          <I18nText text={'The computer step needs an answer'} />
         ) : (
-          <I18nText text={"OpenCode needs an answer"} />
+          <I18nText text={'OpenCode needs an answer'} />
         )}
       </div>
       {interaction.expiresAt && (
@@ -273,7 +279,7 @@ function InteractionCard({
       {questions.map((question, questionIndex) => (
         <div key={`${interaction.id}-${questionIndex}`} className="space-y-2">
           <div>
-            <div className="text-xs font-medium uppercase text-muted-foreground">
+            <div className="text-xs font-medium text-muted-foreground">
               {question.header}
             </div>
             <div className="text-sm">{question.question}</div>
@@ -313,19 +319,21 @@ function InteractionCard({
             })}
           </div>
           {question.custom && (
-            <I18nProps><input
-              type="text"
-              disabled={busy}
-              placeholder="Type a custom answer"
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              value={customAnswers[questionIndex] || ''}
-              onChange={(event) =>
-                setCustomAnswers((current) => ({
-                  ...current,
-                  [questionIndex]: event.target.value,
-                }))
-              }
-            /></I18nProps>
+            <I18nProps>
+              <input
+                type="text"
+                disabled={busy}
+                placeholder="Type a custom answer"
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={customAnswers[questionIndex] || ''}
+                onChange={(event) =>
+                  setCustomAnswers((current) => ({
+                    ...current,
+                    [questionIndex]: event.target.value,
+                  }))
+                }
+              />
+            </I18nProps>
           )}
         </div>
       ))}
@@ -337,7 +345,7 @@ function InteractionCard({
             onQuestion(questions.map((_, index) => questionAnswers(index)))
           }
         >
-          <Check className="h-4 w-4" /> <I18nText text={"Submit answer"} />
+          <Check className="h-4 w-4" /> <I18nText text={'Submit answer'} />
         </Button>
         <Button
           size="sm"
@@ -345,7 +353,7 @@ function InteractionCard({
           disabled={busy}
           onClick={() => onQuestion()}
         >
-          <X className="h-4 w-4" /> <I18nText text={"Reject"} />
+          <X className="h-4 w-4" /> <I18nText text={'Reject'} />
         </Button>
       </div>
     </div>
@@ -472,7 +480,7 @@ function AgentSessionCard({
             </span>
             {session.generation && session.generation > 1 && (
               <span className="text-xs text-muted-foreground">
-                <I18nText text={"Session"} /> {session.generation}
+                <I18nText text={'Session'} /> {session.generation}
               </span>
             )}
           </div>
@@ -481,11 +489,11 @@ function AgentSessionCard({
               .filter(Boolean)
               .join(' · ') ||
               (isBrowser ? (
-                <I18nText text={"Browser session"} />
+                <I18nText text={'Browser session'} />
               ) : isComputer ? (
-                <I18nText text={"Computer session"} />
+                <I18nText text={'Computer session'} />
               ) : (
-                <I18nText text={"OpenCode managed session"} />
+                <I18nText text={'OpenCode managed session'} />
               ))}
             {session.providerVersion &&
               ` · OpenCode ${session.providerVersion}`}
@@ -498,7 +506,8 @@ function AgentSessionCard({
             disabled={busy}
             onClick={() => setConfirmRestart(true)}
           >
-            <RotateCcw className="h-4 w-4" /> <I18nText text={"Start clean session"} />
+            <RotateCcw className="h-4 w-4" />{' '}
+            <I18nText text={'Start clean session'} />
           </Button>
         )}
       </div>
@@ -542,7 +551,8 @@ function AgentSessionCard({
           <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             <CircleDollarSign className="h-4 w-4" />
             <span>
-              {(session.usage.totalTokens || 0).toLocaleString()} <I18nText text={"tokens"} />
+              {(session.usage.totalTokens || 0).toLocaleString()}{' '}
+              <I18nText text={'tokens'} />
             </span>
             {(session.usage.cost || 0) > 0 && (
               <span>${session.usage.cost!.toFixed(4)}</span>
@@ -551,7 +561,9 @@ function AgentSessionCard({
         )}
 
       <div>
-        <h4 className="mb-2 text-sm font-medium"><I18nText text={"Session timeline"} /></h4>
+        <h4 className="mb-2 text-sm font-medium">
+          <I18nText text={'Session timeline'} />
+        </h4>
         <AgentTimeline
           events={session.events || []}
           isStepSession={isStepSession}
@@ -559,28 +571,42 @@ function AgentSessionCard({
         />
       </div>
 
-      <I18nProps><ConfirmDialog
-        title={
-          isBrowser
-            ? 'Start this browser step over?'
-            : isComputer
-              ? 'Start this computer step over?'
-              : 'Start a clean OpenCode session?'
-        }
-        buttonText="Start clean session"
-        visible={confirmRestart}
-        dismissModal={() => setConfirmRestart(false)}
-        onSubmit={restart}
-        submitDisabled={busy}
-      >
-        {isBrowser ? (
-          <I18nText text={"This closes the browser if it is still open and runs the step again from its first operation."} />
-        ) : isComputer ? (
-          <I18nText text={"This runs the step again from its first operation. Windows the step opened stay as they are."} />
-        ) : (
-          <I18nText text={"This starts a new conversation and retries this step with its original prompt. The previous conversation is retained until this DAG run is deleted. Files already changed in the workspace are not reverted."} />
-        )}
-      </ConfirmDialog></I18nProps>
+      <I18nProps>
+        <ConfirmDialog
+          title={
+            isBrowser
+              ? 'Start this browser step over?'
+              : isComputer
+                ? 'Start this computer step over?'
+                : 'Start a clean OpenCode session?'
+          }
+          buttonText="Start clean session"
+          visible={confirmRestart}
+          dismissModal={() => setConfirmRestart(false)}
+          onSubmit={restart}
+          submitDisabled={busy}
+        >
+          {isBrowser ? (
+            <I18nText
+              text={
+                'This closes the browser if it is still open and runs the step again from its first operation.'
+              }
+            />
+          ) : isComputer ? (
+            <I18nText
+              text={
+                'This runs the step again from its first operation. Windows the step opened stay as they are.'
+              }
+            />
+          ) : (
+            <I18nText
+              text={
+                'This starts a new conversation and retries this step with its original prompt. The previous conversation is retained until this DAG run is deleted. Files already changed in the workspace are not reverted.'
+              }
+            />
+          )}
+        </ConfirmDialog>
+      </I18nProps>
     </section>
   );
 }
@@ -624,7 +650,7 @@ export function AgentSessionTab({
   if (!selectedNode) {
     return (
       <div className="py-8 text-center text-sm text-muted-foreground">
-        <I18nText text={"No managed agent sessions in this run."} />
+        <I18nText text={'No managed agent sessions in this run.'} />
       </div>
     );
   }
@@ -666,38 +692,40 @@ export function AgentSessionTab({
   return (
     <div className="space-y-4">
       {nodes.length > 1 && (
-        <I18nProps><Tabs
-          role="tablist"
-          aria-label="Agent conversations"
-          className="flex w-full overflow-x-auto overflow-y-hidden"
-        >
-          {nodes.map((node, index) => {
-            const selected = node.step.name === selectedNode.step.name;
-            return (
-              <Tab
-                key={node.step.name}
-                id={tabId(index)}
-                role="tab"
-                isActive={selected}
-                aria-selected={selected}
-                aria-controls={panelId}
-                tabIndex={selected ? 0 : -1}
-                onClick={() => selectNode(index)}
-                onKeyDown={(event) => handleTabKeyDown(event, index)}
-                className="h-9 shrink-0 gap-2 px-3"
-              >
-                <span>{node.step.name}</span>
-                <span
-                  className={`rounded-full border px-1.5 py-0.5 text-[11px] ${stateClasses(
-                    node.agentSession!.state
-                  )}`}
+        <I18nProps>
+          <Tabs
+            role="tablist"
+            aria-label="Agent conversations"
+            className="flex w-full overflow-x-auto overflow-y-hidden"
+          >
+            {nodes.map((node, index) => {
+              const selected = node.step.name === selectedNode.step.name;
+              return (
+                <Tab
+                  key={node.step.name}
+                  id={tabId(index)}
+                  role="tab"
+                  isActive={selected}
+                  aria-selected={selected}
+                  aria-controls={panelId}
+                  tabIndex={selected ? 0 : -1}
+                  onClick={() => selectNode(index)}
+                  onKeyDown={(event) => handleTabKeyDown(event, index)}
+                  className="h-9 shrink-0 gap-2 px-3"
                 >
-                  {node.agentSession!.state}
-                </span>
-              </Tab>
-            );
-          })}
-        </Tabs></I18nProps>
+                  <span>{node.step.name}</span>
+                  <span
+                    className={`rounded-full border px-1.5 py-0.5 text-[11px] ${stateClasses(
+                      node.agentSession!.state
+                    )}`}
+                  >
+                    {node.agentSession!.state}
+                  </span>
+                </Tab>
+              );
+            })}
+          </Tabs>
+        </I18nProps>
       )}
       <div
         {...(nodes.length > 1

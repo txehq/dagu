@@ -78,7 +78,7 @@ function WikiPageOutlinePanel({ markdown, onHeadingClick }: Props) {
     <div className="border-t border-border">
       <button
         type="button"
-        className="flex items-center gap-1.5 w-full px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        className="flex items-center gap-1.5 w-full px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
         onClick={() => setCollapsed((c) => !c)}
         aria-expanded={!collapsed}
       >
@@ -88,7 +88,7 @@ function WikiPageOutlinePanel({ markdown, onHeadingClick }: Props) {
           <ChevronDown className="h-3 w-3" />
         )}
         <List className="h-3 w-3" />
-        <I18nText text={"Outline"} />
+        <I18nText text={'Outline'} />
       </button>
       {!collapsed && (
         <div className="overflow-y-auto max-h-48 pb-1">

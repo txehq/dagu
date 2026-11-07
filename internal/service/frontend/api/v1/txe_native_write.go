@@ -5,6 +5,8 @@ package api
 
 import (
 	"context"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -158,7 +160,7 @@ func (a *API) txeSpecPlacements(ctx context.Context, spec []byte) ([]placement.P
 	if err := placement.Written(spec); err != nil {
 		return nil, errTxeSpecUnverified
 	}
-	dag, err := a.dagRepository.LoadSpec(ctx, spec, "", persis.DAGLoadOptions{})
+	dag, err := a.loadSpecBeforeDecision(ctx, spec, "", persis.DAGLoadOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -305,4 +307,51 @@ func (a *API) txeNativeWriteDenied(ctx context.Context, name string) error {
 		return errTxeForbidden
 	}
 	return errTxeNativeNotFound
+}
+
+// txeRunPlacement decides the machine a per-run worker selector sends a run
+// to (TXE-5923), as txeNativeWrite decides a spec's. A per-run selector
+// replaces the definition's, so:
+//   - a DAG the definition pins to a machine, and a machine's own DAG, keep
+//     that machine: an override may neither change it nor drop it, since
+//     without the pin a worker that is no machine's would take the run;
+//   - a DAG with no pin may be sent to a machine only by a caller with
+//     author on that machine, whose worker runs the caller's definition.
+//
+// Decided for a caller held to its owner in every mode, and for the others
+// as the mode decides, as a write is.
+func (a *API) txeRunPlacement(ctx context.Context, dag *ir.DAG, selector map[string]string) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return err
+	}
+	if !c.ownerOnly() && c.mode == authz.ModeOff {
+		return nil
+	}
+	machine := selector[dispatch.MachineLabel]
+	identity := txeOwnedIdentity(dag)
+	pinned := dag.WorkerSelector[dispatch.MachineLabel]
+	if own, ok := txeauth.MachineOfDAG(identity); ok && pinned == "" {
+		pinned = own
+	}
+	if own, ok := txeauth.MachineOfDAG(identity); ok && machine != own {
+		return a.txeNativeWriteMisplaced(ctx, c, identity)
+	}
+	if pinned != "" {
+		if machine != pinned {
+			return a.txeNativeWriteMisplaced(ctx, c, identity)
+		}
+		return nil
+	}
+	if machine == "" {
+		return nil
+	}
+	if _, ok := txeauth.MachineOfDAG(txeauth.MachineDAGs(machine)[0]); !ok {
+		// Not a machine id: no machine worker carries it.
+		return nil
+	}
+	return a.txeNativeWriteName(ctx, c, txeauth.MachineDAGs(machine)[0])
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
 	"github.com/dagucloud/dagu/v2/internal/runtime/executor"
+	"github.com/dagucloud/dagu/v2/internal/runtime/modelusage"
 )
 
 var (
@@ -42,6 +43,8 @@ type foreachExecutor struct {
 	statusDetails []ir.NodeStatusDetail
 	// outcome is what the last Run saw, for DetermineNodeStatus.
 	outcome runOutcome
+	// stepDir holds the item bodies' logs and records for the current run.
+	stepDir string
 }
 
 // runOutcome counts the item bodies of one run and keeps the error a run
@@ -111,6 +114,15 @@ func (e *foreachExecutor) Run(ctx context.Context) error {
 		e.outcome.err = err
 		return err
 	}
+
+	stepDir, cleanup, err := e.resolveStepDir(ctx)
+	if err != nil {
+		e.outcome.err = err
+		return err
+	}
+	defer cleanup()
+	e.stepDir = stepDir
+	writeItems(ctx, stepDir, items)
 
 	results, dispatchErr := e.runItems(ctx, items)
 	e.statusDetails = foreachStatusDetails(items, results, e.step.Foreach.Key != "")
@@ -231,7 +243,7 @@ func (e *foreachExecutor) expandItems(ctx context.Context) ([]expandedItem, erro
 	for idx, value := range values {
 		key := strconv.Itoa(idx)
 		if cfg.Key != "" {
-			itemCtx, err := contextWithItemScope(ctx, cfg.As, idx, "", value)
+			itemCtx, err := contextWithItemScope(ctx, e.step.Name, cfg.As, idx, "", value)
 			if err != nil {
 				return nil, err
 			}
@@ -338,38 +350,68 @@ dispatch:
 }
 
 func (e *foreachExecutor) runItem(ctx context.Context, item expandedItem) itemResult {
-	itemCtx, err := contextWithItemScope(ctx, e.step.Foreach.As, item.index, item.key, item.value)
-	if err != nil {
+	logDir := filepath.Join(e.stepDir, strconv.Itoa(item.index))
+	recorder := newItemRecorder(ctx, logDir, item)
+	// An item that fails before its body runs is still recorded, so the
+	// record and the aggregate agree on it.
+	failed := func(err error) itemResult {
+		recorder.finished(ctx, ir.NodeFailed, err.Error())
 		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
+	}
+
+	itemCtx, err := contextWithItemScope(ctx, e.step.Name, e.step.Foreach.As, item.index, item.key, item.value)
+	if err != nil {
+		return failed(err)
 	}
 
 	plan, err := runtime.NewPlan(cloneSteps(e.step.Foreach.Steps)...)
 	if err != nil {
-		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
+		return failed(err)
 	}
+	recorder.planned(plan)
 
-	logDir, cleanup, err := bodyLogDir(ctx, item.index)
-	if err != nil {
-		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
-	}
-	defer cleanup()
-
-	bodyRunID := bodyDAGRunID(ctx, item.index)
 	runner := runtime.New(&runtime.Config{
 		LogDir:   logDir,
-		DAGRunID: bodyRunID,
+		DAGRunID: bodyDAGRunID(ctx, item.index),
 	})
-	err = runner.Run(itemCtx, plan, nil)
-	status := runner.Status(itemCtx, plan)
-	if err != nil || status != ir.Succeeded {
+	progressCh := make(chan runtime.ProgressUpdate)
+	recorded := make(chan struct{})
+	go func() {
+		defer close(recorded)
+		recorder.progress(ctx, progressCh)
+	}()
+	err = runner.Run(itemCtx, plan, progressCh)
+	close(progressCh)
+	<-recorded
+	// The body's steps are not saved with the run, so what they used on
+	// models counts toward the foreach step.
+	modelusage.FromContext(ctx).Add(bodyModelUsage(plan))
+
+	result := e.itemResult(itemCtx, plan, item, err, runner.Status(itemCtx, plan))
+	recorder.finished(ctx, recordedItemStatus(ctx, result), result.Error)
+	return result
+}
+
+// bodyModelUsage sums what an item's body steps used on models.
+func bodyModelUsage(plan *runtime.Plan) []ir.ModelUsage {
+	var total []ir.ModelUsage
+	for _, node := range plan.Nodes() {
+		total = ir.MergeModelUsage(total, node.ModelUsage().Total()...)
+	}
+	return total
+}
+
+// itemResult turns a body run's outcome into the item's aggregate entry.
+func (e *foreachExecutor) itemResult(ctx context.Context, plan *runtime.Plan, item expandedItem, runErr error, status ir.Status) itemResult {
+	if runErr != nil || status != ir.Succeeded {
 		message := status.String()
-		if err != nil {
-			message = err.Error()
+		if runErr != nil {
+			message = runErr.Error()
 		}
 		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: message}
 	}
 
-	outputs, err := e.collectOutputs(itemCtx, plan)
+	outputs, err := e.collectOutputs(ctx, plan)
 	if err != nil {
 		return itemResult{Index: item.index, Key: item.key, Status: ir.NodeFailed.String(), Error: err.Error()}
 	}
@@ -379,6 +421,15 @@ func (e *foreachExecutor) runItem(ctx context.Context, item expandedItem) itemRe
 		Status:  ir.NodeSucceeded.String(),
 		Outputs: outputs,
 	}
+}
+
+// recordedItemStatus is the status an item's record keeps. The aggregate
+// reports a cancelled item as failed; the record tells it apart as aborted.
+func recordedItemStatus(ctx context.Context, result itemResult) ir.NodeStatus {
+	if result.Status == ir.NodeFailed.String() && errors.Is(ctx.Err(), context.Canceled) {
+		return ir.NodeAborted
+	}
+	return foreachItemStatus(result.Status)
 }
 
 func cloneSteps(steps []ir.Step) []ir.Step {
@@ -432,7 +483,9 @@ func resolveStringValue(ctx context.Context, raw, key string) (string, error) {
 	return value, nil
 }
 
-func contextWithItemScope(ctx context.Context, alias string, index int, key string, item any) (context.Context, error) {
+// contextWithItemScope returns ctx with the scope of the item at index of
+// the foreach step named stepName.
+func contextWithItemScope(ctx context.Context, stepName, alias string, index int, key string, item any) (context.Context, error) {
 	env := runtime.GetEnv(ctx)
 	scope := env.Scope
 	if scope == nil {
@@ -450,6 +503,10 @@ func contextWithItemScope(ctx context.Context, alias string, index int, key stri
 	}
 	env.Scope = scope.WithEntry("foreach", string(data), cmnvalue.EnvSourceStepEnv)
 	env.Foreach = cmnvalue.Values(payload)
+	// An item nested in another extends that item's identity. The quoted
+	// name keeps one step's item apart from another's whose name holds
+	// brackets.
+	env.ForeachItem += fmt.Sprintf("%q[%d]", stepName, index)
 	return runtime.WithEnv(ctx, env), nil
 }
 
@@ -498,26 +555,25 @@ func (e *foreachExecutor) writeAggregate(results []itemResult) error {
 // runs that have no log directory of their own.
 const scratchLogDirPrefix = "dagu-foreach-"
 
-// bodyLogDir returns the directory an item's body logs are written to.
-// Body logs belong to the parent step's log directory, where run removal
-// finds them. A run without a log directory gets a scratch directory that
-// the returned cleanup removes once the body has finished.
-func bodyLogDir(ctx context.Context, index int) (string, func(), error) {
-	itemDir := strconv.Itoa(index)
+// resolveStepDir returns the directory holding the item bodies' logs and
+// records. It sits beside the parent step's log file, where run removal
+// finds it. A run without a log directory gets a scratch directory that the
+// returned cleanup removes once the step has finished.
+func (e *foreachExecutor) resolveStepDir(ctx context.Context) (string, func(), error) {
 	keep := func() {}
 	env := runtime.GetEnv(ctx)
 	if env.Scope != nil {
 		if stdout, ok := env.Scope.Get(runenv.EnvKeyDAGRunStepStdoutFile); ok && stdout != "" {
-			return filepath.Join(filepath.Dir(stdout), logpath.ForeachLogDirName, itemDir), keep, nil
+			return logpath.ForeachStepDir(stdout, e.step.Name), keep, nil
 		}
 	}
 	rCtx := runtime.GetDAGContext(ctx)
 	if rCtx.DAGRunLogDir != "" {
-		return filepath.Join(rCtx.DAGRunLogDir, logpath.ForeachLogDirName, itemDir), keep, nil
+		return filepath.Join(rCtx.DAGRunLogDir, logpath.ForeachLogDirName, fileutil.SafeName(e.step.Name)), keep, nil
 	}
 	dir, err := os.MkdirTemp("", scratchLogDirPrefix)
 	if err != nil {
-		return "", keep, fmt.Errorf("failed to create scratch log directory for item %d: %w", index, err)
+		return "", keep, fmt.Errorf("failed to create scratch log directory: %w", err)
 	}
 	cleanup := func() {
 		if err := fileutil.RemoveAll(dir); err != nil {

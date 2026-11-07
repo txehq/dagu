@@ -21,7 +21,8 @@ function WorkerMetrics({ metrics, isLoading }: WorkerMetricsProps) {
       value: metrics.totalWorkers,
       subValue: `${metrics.healthyWorkers} healthy`,
       icon: <Server className="h-3 w-3 text-muted-foreground" />,
-      valueClass: metrics.totalWorkers > 0 ? 'text-foreground' : 'text-muted-foreground',
+      valueClass:
+        metrics.totalWorkers > 0 ? 'text-foreground' : 'text-muted-foreground',
     },
     {
       title: 'Pollers',
@@ -65,23 +66,25 @@ function WorkerMetrics({ metrics, isLoading }: WorkerMetricsProps) {
                 </div>
               </div>
             </div>
-            <div className={cn(
-              "text-lg font-bold transition-all duration-300",
-              isLoading && "opacity-50",
-              card.valueClass
-            )}>
+            <div
+              className={cn(
+                'text-lg font-bold transition-opacity duration-300',
+                isLoading && 'opacity-50',
+                card.valueClass
+              )}
+            >
               {card.value}
             </div>
           </div>
         ))}
       </div>
-      
+
       {/* Utilization bar */}
       <div className="px-3 pb-2">
         <div className="h-1 bg-muted rounded-full overflow-hidden">
           <div
             className={cn(
-              "h-full transition-all duration-500 ease-out",
+              'h-full transition-[width,background-color] duration-500 ease-out',
               getUtilizationBarColor(metrics.utilization)
             )}
             style={{ width: `${metrics.utilization}%` }}

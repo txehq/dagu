@@ -202,7 +202,11 @@ func (n *Node) setupContextWithTimeout(ctx context.Context) (context.Context, co
 		stepTimeout = step.Timeout
 		ctx, cancel := context.WithTimeout(ctx, stepTimeout)
 		n.setExecCancel(cancel)
-		logger.Info(ctx, "Step execution started with timeout",
+		logExec := logger.Info
+		if isContinuousStep(step) {
+			logExec = logger.Debug // once for each execution, for years
+		}
+		logExec(ctx, "Step execution started with timeout",
 			tag.Timeout(stepTimeout),
 		)
 		return ctx, func() {
@@ -366,7 +370,7 @@ func (n *Node) captureOutput(ctx context.Context) error {
 
 	var schemaOutput string
 	var schemaErr error
-	if step.HasOutputSchema() {
+	if step.HasOutputSchema() && n.Error() == nil {
 		raw, err := captureStdout()
 		if err != nil {
 			schemaErr = fmt.Errorf("failed to capture stdout for output_schema: %w", err)
@@ -378,7 +382,7 @@ func (n *Node) captureOutput(ctx context.Context) error {
 				schemaOutput = value
 			}
 		}
-		if schemaErr != nil && n.Error() == nil {
+		if schemaErr != nil {
 			return schemaErr
 		}
 	}
@@ -395,6 +399,11 @@ func (n *Node) captureOutput(ctx context.Context) error {
 		}
 	}
 
+	// Failed attempts retain legacy variables but do not decode or publish named outputs.
+	if n.Error() != nil {
+		return nil
+	}
+
 	// The last mechanism to publish wins, matching the order the legacy outputs
 	// object is built below.
 	var capturedOutputs string
@@ -409,9 +418,6 @@ func (n *Node) captureOutput(ctx context.Context) error {
 		capturedOutputs = value
 	}
 
-	// A failed step leaves schemaOutput empty because the schema error is
-	// suppressed above in favor of the step's own error. Publishing it would
-	// make the output resolve as present and empty rather than absent.
 	if step.HasOutputSchema() && !step.HasStructuredOutput() && schemaOutput != "" {
 		n.setOutputValue(schemaOutput)
 		capturedOutputs = schemaOutput
@@ -930,7 +936,8 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 	// carries a reference, would otherwise be indistinguishable from an unset
 	// field and leave the step reading empty standard input.
 	if raw := n.Step().Stdin; raw != "" {
-		resolved, err := resolveRuntimeString(ctx, raw, cmnvalue.StepArtifactOutputField("stdin"))
+		field := cmnvalue.StepArtifactOutputField("stdin")
+		resolved, err := resolveRuntimeString(ctx, raw, field)
 		if err != nil {
 			return ctx, nil, fmt.Errorf("failed to eval stdin: %w", err)
 		}
@@ -938,7 +945,7 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 		if resolved == "" {
 			return ctx, nil, fmt.Errorf("stdin %q resolved to an empty path", raw)
 		}
-		if cmnvalue.HasValueReference(resolved) {
+		if field.HasValueReference(resolved) {
 			return ctx, nil, fmt.Errorf("stdin %q must resolve before execution", raw)
 		}
 		n.SetStdin(resolved)
@@ -972,6 +979,7 @@ func (n *Node) setupExecutor(ctx context.Context) (context.Context, executor.Exe
 }
 
 func (n *Node) setupStepOutputFile(ctx context.Context) (context.Context, error) {
+	n.clearOutputValue()
 	n.clearOutputsValue()
 	n.clearStepOutputsValue()
 	n.setStepOutputFile("")
@@ -1017,16 +1025,16 @@ func (n *Node) cleanupStepOutputFile() error {
 
 func evalExecutorConfig(ctx context.Context, step ir.Step) (map[string]any, error) {
 	if step.ExecutorConfig.Type == "template" {
-		return evalTemplateConfig(ctx, step.ExecutorConfig.Config)
+		return evalTemplateConfig(ctx, step.ExecutorConfig.Config, registry.PathInputs(step))
 	}
-	got, err := resolveRuntimeObject(ctx, step.ExecutorConfig.Config, cmnvalue.ExecutorConfigField("with"))
+	got, err := resolveRuntimeObject(ctx, step.ExecutorConfig.Config, registry.ConfigField(step, "with"))
 	if err != nil {
 		return nil, err
 	}
 	return objectAsConfig(got)
 }
 
-func evalTemplateConfig(ctx context.Context, config map[string]any) (map[string]any, error) {
+func evalTemplateConfig(ctx context.Context, config map[string]any, pathKeys []string) (map[string]any, error) {
 	env := GetEnv(ctx)
 	scope := env.Scope
 	if scope == nil {
@@ -1038,7 +1046,7 @@ func evalTemplateConfig(ctx context.Context, config map[string]any) (map[string]
 	rawRef, hasRef := config["template_ref"]
 	delete(config, "template_ref")
 
-	got, err := resolveRuntimeObjectWithScope(ctx, env, scope, config, cmnvalue.TemplateConfigField("with"))
+	got, err := resolveRuntimeObjectWithScope(ctx, env, scope, config, cmnvalue.TemplateConfigField("with").WithPathKeys(pathKeys...))
 	if err != nil {
 		return nil, err
 	}
@@ -1068,7 +1076,7 @@ func evalTemplateConfig(ctx context.Context, config map[string]any) (map[string]
 }
 
 func scriptField(ctx context.Context, step ir.Step) cmnvalue.Field {
-	if step.ExecutorConfig.Type == "template" {
+	if step.ExecutorConfig.IsVerbatimScript() {
 		return cmnvalue.TemplateScriptField("run")
 	}
 	command := registry.ScriptResolution(ctx, step)
@@ -1337,7 +1345,9 @@ func (n *Node) ResetForRerun(step ir.Step) {
 	n.cmdEvaluated.Store(false)
 }
 
-func (n *Node) resetForBuildAttempt(step ir.Step) {
+// resetForAttempt restores the declared step so that the next execution
+// resolves its fields against the current context.
+func (n *Node) resetForAttempt(step ir.Step) {
 	n.SetStep(step)
 	n.cmdEvaluated.Store(false)
 }

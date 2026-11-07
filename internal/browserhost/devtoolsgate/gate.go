@@ -77,6 +77,13 @@ func (g *gate) close() {
 	_ = g.server.Close()
 }
 
+// stopServing refuses every request from now on, while the browser exits:
+// the listener and the HTTP connections kept alive are closed. The DevTools
+// connections already open end with the browser.
+func (g *gate) stopServing() {
+	_ = g.server.Close()
+}
+
 // wsBase is the websocket address of the gate.
 func (g *gate) wsBase() string {
 	return fmt.Sprintf("ws://127.0.0.1:%d/%s", g.port(), g.token)

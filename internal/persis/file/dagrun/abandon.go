@@ -165,7 +165,7 @@ func (store *Store) AbandonAttempt(ctx context.Context, req persis.AbandonAttemp
 			// abandon once its status can be read.
 			return nil, fmt.Errorf("read attempt %s status: %w", latest.ID(), err)
 		case status == nil:
-		case status.Status != ir.NotStarted || status.WorkerID != "":
+		case !persis.AttemptNeverStarted(status):
 			return nil, fmt.Errorf("%w: attempt %s is %s with worker %q",
 				persis.ErrAttemptNotAbandonable, latest.ID(), status.Status, status.WorkerID)
 		default:
@@ -522,7 +522,7 @@ func markNotDispatchedLocked(ctx context.Context, att *Attempt, record persis.At
 	case status == nil:
 	case status.Status == ir.Failed:
 		return nil
-	case status.Status != ir.NotStarted:
+	case !persis.AttemptNeverStarted(status):
 		return fmt.Errorf("%w: attempt %s became %s", persis.ErrAttemptAbandonmentConflict, att.ID(), status.Status)
 	default:
 		next = *status
