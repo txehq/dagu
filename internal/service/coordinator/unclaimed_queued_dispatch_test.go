@@ -99,7 +99,7 @@ func TestReconcileFailsAnUnclaimedQueuedExecution(t *testing.T) {
 	_, err = f.dispatches.HasOutstandingAttempt(t.Context(), f.attemptKey(queued), 0)
 	require.NoError(t, err)
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 
 	assert.Empty(t, f.preparationEntries(t))
 	assert.Equal(t, queued, f.latest(t), "the attempt stays; only its execution failed")
@@ -137,7 +137,7 @@ func TestReconcileFailsOnlyTheUnclaimedQueuedRetry(t *testing.T) {
 	require.Len(t, f.preparationEntries(t), 1)
 
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 
 	assert.Empty(t, f.preparationEntries(t))
 	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, retried, marker)
@@ -203,7 +203,7 @@ func TestAFailedQueuedDispatchKeepsItsExecutionEntryForTheNextDispatch(t *testin
 func TestAFailedDuplicateDispatchKeepsThePublishedExecutionsEntry(t *testing.T) {
 	registerCommandExecutorCapsForCoordinatorTest()
 	dispatches := &scriptedEnqueueStore{
-		DispatchTaskStore: store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "d")), store.WithDispatchReservationTTL(shortReservation)),
+		DispatchTaskStore: store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "d")), store.WithDispatchReservationTTL(shortReservation), store.WithUnclaimedDispatchTimeout(shortReservation)),
 		fail:              map[int]bool{1: true},
 	}
 	f := newStrandedFixture(t, dispatches)
@@ -217,7 +217,7 @@ func TestAFailedDuplicateDispatchKeepsThePublishedExecutionsEntry(t *testing.T) 
 	require.Len(t, f.preparationEntries(t), 1, "the published execution stays journaled")
 
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
 	require.NoError(t, err)
 	require.NotNil(t, record, "the expired execution is failed, not left queued")
@@ -300,7 +300,7 @@ func TestALiveClaimOfAFailedQueuedExecutionIsRefused(t *testing.T) {
 	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
 	require.NoError(t, err)
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
 	require.NoError(t, err)
 	require.NotNil(t, record)
@@ -518,7 +518,7 @@ func TestRepeatedFailedQueuedDispatchesFailTheExecutionOnlyAfterTheLastExpires(t
 	registerCommandExecutorCapsForCoordinatorTest()
 	dispatches := &scriptedEnqueueStore{
 		DispatchTaskStore: store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "distributed")),
-			store.WithDispatchReservationTTL(shortReservation)),
+			store.WithDispatchReservationTTL(shortReservation), store.WithUnclaimedDispatchTimeout(shortReservation)),
 		fail: map[int]bool{0: true, 1: true, 2: true},
 	}
 	f := newStrandedFixture(t, dispatches)
@@ -556,7 +556,7 @@ func TestRepeatedFailedQueuedDispatchesFailTheExecutionOnlyAfterTheLastExpires(t
 	_, err = f.dispatches.HasOutstandingAttempt(t.Context(), f.attemptKey(queued), 0)
 	require.NoError(t, err)
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 	assert.Empty(t, f.records(t), "a lease names the execution")
 
 	require.NoError(t, f.leases.Delete(t.Context(), f.attemptKey(queued)))

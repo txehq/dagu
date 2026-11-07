@@ -1301,6 +1301,10 @@
         "worker_wait_timeout": {
           "type": "string",
           "description": "How long a dispatch with no healthy worker matching its selector is held, as a queued run, for such a worker to register before the run fails. Default: '2m'. Set to '0' to refuse the dispatch at once. This fork never holds a dispatch while machines are pinned (txe.authz.mode enforce): it is refused at once."
+        },
+        "unclaimed_dispatch_timeout": {
+          "type": "string",
+          "description": "How long a dispatched task that no worker has claimed waits for one, such as while every matching worker is busy. Each task gets its deadline once, when it is first enqueued; a coordinator restart, a released claim or a republication of the same execution does not move it, and changing this setting does not move a deadline already given. Past it the task is no longer handed out and its run's attempt ends as not dispatched. Default: '24h' (also when empty or absent). Set to '0' for no ceiling: the task then waits until a worker claims it or its run moves on. A negative, malformed or overflowing value refuses to load the configuration. A held dispatch (worker_wait_timeout) waits for that instead."
         }
       }
     },

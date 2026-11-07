@@ -3468,13 +3468,19 @@ func (h *Handler) detectAndCleanupZombies(ctx context.Context) {
 	// restarts or owner coordinator loss.
 	h.detectStaleLeases(ctx)
 
-	// Pass 3: attempts a coordinator created but stopped before dispatching.
+	// Pass 3: pending dispatches no worker claimed by their claim deadline.
+	// It runs before pass 4 so a journaled attempt it leaves without a task
+	// is abandoned in the same sitting.
+	h.expireUnclaimedDispatches(ctx, time.Now().UTC())
+
+	// Pass 4: attempts a coordinator created but stopped before dispatching,
+	// or whose task pass 3 removed.
 	h.reconcileAbandonedPreparations(ctx, time.Now())
 
-	// Pass 4: held dispatches whose wait for a matching worker has passed.
+	// Pass 5: held dispatches whose wait for a matching worker has passed.
 	h.expireHeldDispatches(ctx, time.Now().UTC())
 
-	// Pass 5: pending dispatches left behind by runs that moved on.
+	// Pass 6: pending dispatches left behind by runs that moved on.
 	h.dropOrphanedDispatches(ctx, time.Now().UTC())
 }
 

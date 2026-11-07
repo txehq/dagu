@@ -431,6 +431,10 @@ type CoordinatorDef struct {
 	// WorkerWaitTimeout is a duration string such as "2m". Default: 2m; "0"
 	// refuses a dispatch with no healthy matching worker at once.
 	WorkerWaitTimeout string `mapstructure:"worker_wait_timeout"`
+	// UnclaimedDispatchTimeout is a duration string such as "24h". Empty or
+	// absent gives the default, 24h; an explicit "0" means no ceiling; any
+	// other value that is not a non-negative duration refuses to load.
+	UnclaimedDispatchTimeout string `mapstructure:"unclaimed_dispatch_timeout"`
 
 	WorkerChannel *CoordinatorWorkerChannelDef `mapstructure:"worker_channel"`
 }

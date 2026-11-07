@@ -1445,6 +1445,14 @@ func (s *queueConditionDispatchTaskStore) ListExpiredHeld(context.Context, time.
 	return nil, nil
 }
 
+func (s *queueConditionDispatchTaskStore) ListPastClaimDeadline(context.Context, time.Time) ([]dispatch.UnclaimedDispatch, error) {
+	return nil, nil
+}
+
+func (s *queueConditionDispatchTaskStore) DeletePastClaimDeadline(context.Context, dispatch.UnclaimedDispatch, time.Time) (bool, error) {
+	return false, nil
+}
+
 func (s *queueConditionDispatchTaskStore) ListStalePending(context.Context, time.Time) ([]*dispatch.DispatchTask, error) {
 	return nil, nil
 }

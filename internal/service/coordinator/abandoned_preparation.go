@@ -25,11 +25,12 @@ import (
 // rolling replacement, may still be about to publish. The claim check below
 // refuses such a publication anyway.
 //
-// It also stays above the longest an unacknowledged dispatch can remain
-// reserved: a pending task expires after the reservation TTL, and a claim
-// never acknowledged is released to pending after one TTL and then expires
-// after another. Both TTLs are dagrun.DefaultStaleLeaseThreshold, so the bound
-// is derived from it and grows with it.
+// It also stays above the longest an unacknowledged claim can remain reserved
+// before its release to pending, two reservation TTLs at most. Both TTLs are
+// dagrun.DefaultStaleLeaseThreshold, so the bound is derived from it and grows
+// with it. A pending task keeps its attempt in flight until its claim deadline
+// (coordinator.unclaimed_dispatch_timeout), when expireUnclaimedDispatches
+// removes it and this reconciliation abandons the attempt.
 const abandonedPreparationMinAge = max(10*time.Minute, 2*dagrun.DefaultStaleLeaseThreshold+time.Minute)
 
 // errAttemptAbandoned refuses a claim of an attempt that has an abandonment
@@ -48,7 +49,8 @@ func (h *Handler) canAbandonPreparations() bool {
 // errDispatchInFlight means the attempt may be with a worker: a task is pending
 // or claimed, or a lease or active-run record exists. The attempt is not
 // abandoned, and its entry stays until the attempt settles: a worker that has
-// acknowledged its claim reports progress, and an unacknowledged task expires.
+// acknowledged its claim reports progress, and an unclaimed task is removed at
+// its claim deadline.
 var errDispatchInFlight = errors.New("dispatch may be in flight")
 
 // errAbandonmentUnavailable means this coordinator is not configured to

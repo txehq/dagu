@@ -52,9 +52,22 @@ behaviour the fork depends on, the fork keeps its own:
   same answer whether no worker or only other owners' machines are connected. In `off` and
   `observe` the hold applies. A held dispatch keeps the queuedAt it was prepared with, so its
   execution identity (attempt id, execution marker) does not change.
-- **Unclaimed tasks.** Upstream keeps an unclaimed pending task until its run moves on. The fork
-  removes an unheld one after the reservation time, so reconciliation abandons the prepared attempt
-  with a record. A held task ends when its wait passes, as upstream does.
+- **Unclaimed tasks.** Upstream keeps an unclaimed pending task until its run moves on, however
+  long. The fork keeps it the same way, so a task waits while every matching worker is busy, but
+  only until its claim deadline: `coordinator.unclaimed_dispatch_timeout`, default 24h; an explicit
+  `0` means no ceiling; any other value that is not a non-negative duration refuses to load. The
+  deadline is set once, when the task is first enqueued, and is stored with it. A restart, a
+  released claim, a republication of the same execution or a later change of the setting never
+  moves it; a new attempt gets its own. A record from before the field takes its deadline from its
+  stored enqueue time, and fails closed without one. Past the deadline the task is never handed
+  out. The coordinator then removes that exact record and settles the attempt:
+  - a journaled attempt is abandoned with the usual record;
+  - any other attempt is failed first, then loses its task.
+
+  Neither path ends an attempt a worker holds (worker, lease or active-run record) or one that is
+  not its run's latest. A held task ends when its wait passes, as upstream does. Rolled back to
+  txe-v2.18.2-19, a coordinator ignores the field and expires unheld tasks after the reservation
+  time, as it always did.
 - **Access.** The owner filters for whole-hub lists and queues apply inside upstream's new list
   paths. Upstream's run-outputs and step-sample endpoints use the per-DAG owner check.
 - **Credentials.** `DAGU_COORDINATOR_AUTH_HUB_KEY_FILE` and `DAGU_WORKER_AUTH_CREDENTIAL_FILE` count

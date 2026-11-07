@@ -171,7 +171,8 @@ func TestLoad_Env(t *testing.T) {
 		"DAGU_COORDINATOR_PORT":        "50099",
 		"DAGU_COORDINATOR_HEALTH_PORT": "50101",
 
-		"DAGU_COORDINATOR_WORKER_WAIT_TIMEOUT": "90s",
+		"DAGU_COORDINATOR_WORKER_WAIT_TIMEOUT":        "90s",
+		"DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT": "36h",
 
 		"DAGU_WORKER_ID":              "test-worker-123",
 		"DAGU_WORKER_MAX_ACTIVE_RUNS": "200",
@@ -353,6 +354,8 @@ func TestLoad_Env(t *testing.T) {
 			Port:              50099,
 			HealthPort:        50101,
 			WorkerWaitTimeout: 90 * time.Second,
+
+			UnclaimedDispatchTimeout: 36 * time.Hour,
 		},
 		Worker: Worker{
 			ID:              "test-worker-123",
@@ -459,6 +462,64 @@ func TestLoad_WorkerWaitTimeout(t *testing.T) {
 			assert.Equal(t, tc.want, cfg.Coordinator.WorkerWaitTimeout)
 		})
 	}
+}
+
+// The ceiling on an unclaimed dispatch defaults to 24h, also when the key is
+// present but empty; only an explicit zero removes it; and a value that is not
+// a non-negative duration refuses to load, naming the key, instead of falling
+// back to the default (TXE-5923).
+func TestLoad_UnclaimedDispatchTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		yaml string
+		want time.Duration
+	}{
+		"absent":         {yaml: "# minimal config", want: 24 * time.Hour},
+		"empty":          {yaml: "coordinator:\n  unclaimed_dispatch_timeout: \"\"\n", want: 24 * time.Hour},
+		"set":            {yaml: "coordinator:\n  unclaimed_dispatch_timeout: 90m\n", want: 90 * time.Minute},
+		"zero":           {yaml: "coordinator:\n  unclaimed_dispatch_timeout: \"0\"\n", want: 0},
+		"zero seconds":   {yaml: "coordinator:\n  unclaimed_dispatch_timeout: 0s\n", want: 0},
+		"unquoted zero":  {yaml: "coordinator:\n  unclaimed_dispatch_timeout: 0\n", want: 0},
+		"other sections": {yaml: "coordinator:\n  worker_wait_timeout: 45s\n", want: 24 * time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT", "")
+			assert.Equal(t, tc.want, loadFromYAML(t, tc.yaml).Coordinator.UnclaimedDispatchTimeout)
+		})
+	}
+
+	for name, value := range map[string]string{
+		"negative":  "-1s",
+		"malformed": "soon",
+		"no unit":   "86400",
+		"overflow":  "9999999999999h",
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			t.Setenv("DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT", "")
+			configFile := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(configFile, []byte("coordinator:\n  unclaimed_dispatch_timeout: \""+value+"\"\n"), 0600))
+			err := testLoadWithError(t, WithConfigFile(configFile))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "coordinator.unclaimed_dispatch_timeout")
+		})
+	}
+
+	t.Run("refuses an invalid environment value", func(t *testing.T) {
+		t.Setenv("DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT", "-5m")
+		err := testLoadWithError(t)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "coordinator.unclaimed_dispatch_timeout")
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT", "0")
+		assert.Zero(t, testLoad(t).Coordinator.UnclaimedDispatchTimeout)
+	})
+
+	t.Run("a service without the coordinator section keeps the default", func(t *testing.T) {
+		t.Setenv("DAGU_COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT", "")
+		cfg := loadFromYAMLForService(t, ServiceAgent, "coordinator:\n  unclaimed_dispatch_timeout: soon\n")
+		assert.Equal(t, 24*time.Hour, cfg.Coordinator.UnclaimedDispatchTimeout)
+	})
 }
 
 func TestLoad_WorkerShutdownTimeout(t *testing.T) {
@@ -1164,6 +1225,8 @@ scheduler:
 			Port:              8081,
 			HealthPort:        8091,
 			WorkerWaitTimeout: 2 * time.Minute,
+
+			UnclaimedDispatchTimeout: 24 * time.Hour,
 		},
 		Worker: Worker{
 			ID:              "worker-1",

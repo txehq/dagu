@@ -580,7 +580,10 @@ func (s *DispatchTaskStore) createPendingRecord(
 	task *dispatch.DispatchTask,
 	taskFingerprint string,
 ) error {
-	now := time.Now().UTC()
+	if err := s.ensureDispatchIndex(ctx); err != nil {
+		return err
+	}
+	now := s.now()
 	payload := dispatchTaskPayload{
 		Version:                   dispatchTaskStoreVersion,
 		Task:                      cloneDispatchTask(task),
@@ -588,6 +591,7 @@ func (s *DispatchTaskStore) createPendingRecord(
 		EnqueuedAt:                now.UnixMilli(),
 		AdmissionReservationToken: attempt.ReservationToken,
 	}
+	s.assignClaimDeadline(&payload, now)
 	rec, err := s.newDispatchRecord(attempt.PendingRecordID, payload, now, now)
 	if err != nil {
 		return err

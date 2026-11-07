@@ -1239,6 +1239,14 @@ func (m *mockDispatchTaskStore) ListExpiredHeld(context.Context, time.Time) ([]*
 	return nil, nil
 }
 
+func (m *mockDispatchTaskStore) ListPastClaimDeadline(context.Context, time.Time) ([]dispatch.UnclaimedDispatch, error) {
+	return nil, nil
+}
+
+func (m *mockDispatchTaskStore) DeletePastClaimDeadline(context.Context, dispatch.UnclaimedDispatch, time.Time) (bool, error) {
+	return false, nil
+}
+
 func (m *mockDispatchTaskStore) ListStalePending(context.Context, time.Time) ([]*dispatch.DispatchTask, error) {
 	return nil, nil
 }

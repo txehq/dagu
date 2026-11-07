@@ -818,6 +818,12 @@ type Coordinator struct {
 	// such a dispatch at once. While machines are pinned (txe.authz.mode
 	// enforce) a dispatch is never held, whatever this says.
 	WorkerWaitTimeout time.Duration
+	// UnclaimedDispatchTimeout bounds how long a dispatched task no worker
+	// has claimed waits for one (TXE-5923). Each task gets its deadline once,
+	// when first enqueued; past it the task is no longer handed out and its
+	// attempt ends. Default: 24h; 0 means no ceiling. A held dispatch waits
+	// for WorkerWaitTimeout instead.
+	UnclaimedDispatchTimeout time.Duration
 	// WorkerChannel is the route that carries workers' calls over HTTPS.
 	WorkerChannel CoordinatorWorkerChannel
 }
@@ -1042,6 +1048,9 @@ func (c *Config) validateCoordinator() error {
 	}
 	if c.Coordinator.WorkerWaitTimeout < 0 {
 		return fmt.Errorf("invalid coordinator.worker_wait_timeout: %s (must not be negative)", c.Coordinator.WorkerWaitTimeout)
+	}
+	if c.Coordinator.UnclaimedDispatchTimeout < 0 {
+		return fmt.Errorf("invalid coordinator.unclaimed_dispatch_timeout: %s (must not be negative; 0 means no ceiling)", c.Coordinator.UnclaimedDispatchTimeout)
 	}
 	return nil
 }

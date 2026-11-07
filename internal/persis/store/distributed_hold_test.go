@@ -29,11 +29,9 @@ func heldTask(runID string, holdUntil time.Time) *dispatch.DispatchTask {
 	}
 }
 
-// A held task outlives the reservation time and is dropped only by the
-// coordinator once its wait has passed. In this fork an unheld pending task
-// does not: one no worker claims within the reservation time is removed, so
-// the attempt's preparation entry lets reconciliation abandon the attempt
-// with a record (TXE-5923). Upstream keeps the unheld task too.
+// A pending task outlives the reservation TTL, held or not: it waits until a
+// matching worker claims it, its claim deadline passes (a held one: its
+// HoldUntil) or the coordinator drops it.
 func TestDispatchTaskStore_PendingOutlivesReservationTTL(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -43,19 +41,18 @@ func TestDispatchTaskStore_PendingOutlivesReservationTTL(t *testing.T) {
 	require.NoError(t, s.Enqueue(ctx, heldTask("plain", time.Time{})))
 	time.Sleep(60 * time.Millisecond)
 
+	outstanding, err := s.HasOutstandingAttempt(ctx, "key-plain", time.Minute)
+	require.NoError(t, err)
+	assert.True(t, outstanding)
+
 	var claimedRuns []string
 	for range 2 {
 		claimed, err := s.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "w", PollerID: "p", Labels: map[string]string{"type": "cpu"}})
 		require.NoError(t, err)
-		if claimed != nil {
-			claimedRuns = append(claimedRuns, claimed.Task.DAGRunID)
-		}
+		require.NotNil(t, claimed)
+		claimedRuns = append(claimedRuns, claimed.Task.DAGRunID)
 	}
-	assert.Equal(t, []string{"held"}, claimedRuns)
-
-	outstanding, err := s.HasOutstandingAttempt(ctx, "key-plain", time.Minute)
-	require.NoError(t, err)
-	assert.False(t, outstanding, "the unclaimed unheld task expired")
+	assert.ElementsMatch(t, []string{"held", "plain"}, claimedRuns)
 }
 
 // ListStalePending lists the unheld tasks enqueued before the cutoff and

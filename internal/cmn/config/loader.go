@@ -496,6 +496,9 @@ func (l *ConfigLoader) workspaceAccessKeys() []string {
 func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	cfg := Config{
 		UI: UI{MaxDashboardPageLimit: 1},
+		// Set before the sections load, so a process that does not load
+		// the coordinator section still bounds unclaimed dispatches.
+		Coordinator: Coordinator{UnclaimedDispatchTimeout: DefaultCoordinatorUnclaimedDispatchTimeout},
 		Server: Server{
 			Port: 8080,
 			Auth: Auth{Mode: AuthModeNone},
@@ -521,7 +524,7 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	l.loadEventStoreConfig(&cfg, def)
 
 	// Load service-specific sections
-	var licenseErr error
+	var licenseErr, coordinatorErr error
 	sectionLoaders := []struct {
 		section ConfigSection
 		load    func()
@@ -529,7 +532,7 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 		{SectionServer, func() { l.loadServerConfig(&cfg, def) }},
 		{SectionUI, func() { l.loadUIConfig(&cfg, def) }},
 		{SectionQueues, func() { l.loadQueuesConfig(&cfg, def) }},
-		{SectionCoordinator, func() { l.loadCoordinatorConfig(&cfg, def) }},
+		{SectionCoordinator, func() { coordinatorErr = l.loadCoordinatorConfig(&cfg, def) }},
 		{SectionWorker, func() { l.loadWorkerConfig(&cfg, def) }},
 		{SectionProc, func() { l.loadProcConfig(&cfg, def) }},
 		{SectionScheduler, func() { l.loadSchedulerConfig(&cfg, def) }},
@@ -547,6 +550,9 @@ func (l *ConfigLoader) buildConfig(def Definition) (*Config, error) {
 	}
 	if licenseErr != nil {
 		return nil, licenseErr
+	}
+	if coordinatorErr != nil {
+		return nil, coordinatorErr
 	}
 	if l.requires(SectionServer) {
 		if err := l.loadTXEConfig(&cfg); err != nil {
@@ -1603,9 +1609,35 @@ func (l *ConfigLoader) loadQueuesConfig(cfg *Config, def Definition) {
 // failed, while an unroutable run still fails within the same sitting.
 const defaultCoordinatorWorkerWaitTimeout = 2 * time.Minute
 
-func (l *ConfigLoader) loadCoordinatorConfig(cfg *Config, def Definition) {
+// DefaultCoordinatorUnclaimedDispatchTimeout is how long a dispatched task no
+// worker claims waits for one by default (coordinator.unclaimed_dispatch_timeout).
+const DefaultCoordinatorUnclaimedDispatchTimeout = 24 * time.Hour
+
+// parseUnclaimedDispatchTimeout reads coordinator.unclaimed_dispatch_timeout.
+// Empty gives the default and an explicit zero ("0", "0s") means no ceiling.
+// Anything else must be a duration time.ParseDuration accepts that is not
+// negative; a value that is not, or that overflows, refuses to load rather
+// than fall back to the default, because a ceiling silently other than the
+// one configured would end or keep runs nobody expects.
+func parseUnclaimedDispatchTimeout(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return DefaultCoordinatorUnclaimedDispatchTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid coordinator.unclaimed_dispatch_timeout %q: %w", value, err)
+	}
+	if timeout < 0 {
+		return 0, fmt.Errorf("invalid coordinator.unclaimed_dispatch_timeout %q: must not be negative (0 means no ceiling)", value)
+	}
+	return timeout, nil
+}
+
+func (l *ConfigLoader) loadCoordinatorConfig(cfg *Config, def Definition) error {
 	cfg.Coordinator.Enabled = l.resolveCoordinatorEnabled(def)
 	cfg.Coordinator.WorkerWaitTimeout = defaultCoordinatorWorkerWaitTimeout
+	cfg.Coordinator.UnclaimedDispatchTimeout = DefaultCoordinatorUnclaimedDispatchTimeout
 
 	if def.Coordinator != nil {
 		cfg.Coordinator.Host = def.Coordinator.Host
@@ -1625,9 +1657,15 @@ func (l *ConfigLoader) loadCoordinatorConfig(cfg *Config, def Definition) {
 				cfg.Coordinator.WorkerWaitTimeout = timeout
 			}
 		}
+		timeout, err := parseUnclaimedDispatchTimeout(def.Coordinator.UnclaimedDispatchTimeout)
+		if err != nil {
+			return err
+		}
+		cfg.Coordinator.UnclaimedDispatchTimeout = timeout
 	}
 
 	l.setCoordinatorDefaults(cfg)
+	return nil
 }
 
 func (l *ConfigLoader) resolveCoordinatorEnabled(def Definition) bool {
@@ -2779,6 +2817,7 @@ var envBindings = []envBinding{
 	{key: coordinatorAuthModeKey, env: coordinatorAuthModeEnv},
 	{key: coordinatorAuthHubKeyFileKey, env: coordinatorAuthHubKeyFileEnv, secret: true},
 	{key: "coordinator.worker_wait_timeout", env: "COORDINATOR_WORKER_WAIT_TIMEOUT"},
+	{key: "coordinator.unclaimed_dispatch_timeout", env: "COORDINATOR_UNCLAIMED_DISPATCH_TIMEOUT"},
 
 	// Worker
 	{key: "worker.id", env: "WORKER_ID"},

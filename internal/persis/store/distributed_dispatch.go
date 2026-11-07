@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"path/filepath"
 	"sort"
@@ -20,8 +19,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
-	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -33,6 +30,10 @@ const (
 	defaultDispatchReservationTTL = dagrun.DefaultStaleLeaseThreshold
 	minDispatchCleanupInterval    = 100 * time.Millisecond
 	maxDispatchCleanupInterval    = time.Second
+
+	// DefaultUnclaimedDispatchTimeout bounds how long an unheld pending task
+	// waits for a worker to claim it (coordinator.unclaimed_dispatch_timeout).
+	DefaultUnclaimedDispatchTimeout = 24 * time.Hour
 
 	dispatchPendingPrefix = "pending/"
 	dispatchClaimsPrefix  = "claims/"
@@ -67,6 +68,8 @@ func WithDispatchTransitionLock(
 type DispatchTaskStore struct {
 	col                      persis.Collection
 	reservationTTL           time.Duration
+	unclaimedTimeout         time.Duration
+	clock                    func() time.Time
 	admissionLeaseStore      dispatch.DAGRunLeaseStore
 	admissionActiveRunStore  dispatch.ActiveDistributedRunStore
 	lastReservationCleanupAt time.Time
@@ -98,9 +101,12 @@ type dispatchTaskIndexEntry struct {
 	claimedAt      int64
 	// holdUntil is the task's HoldUntil in Unix milliseconds, 0 when the
 	// task was not held for a worker.
-	holdUntil int64
-	createdAt time.Time
-	updatedAt time.Time
+	holdUntil       int64
+	claimDeadline   int64
+	claimUnbounded  bool
+	executionMarker string
+	createdAt       time.Time
+	updatedAt       time.Time
 }
 
 type dispatchTaskPayload struct {
@@ -114,6 +120,15 @@ type dispatchTaskPayload struct {
 	PollerID                  string                       `json:"pollerId,omitempty"`
 	Owner                     dispatch.CoordinatorEndpoint `json:"owner,omitzero"`
 	AdmissionReservationToken string                       `json:"admissionReservationToken,omitempty"`
+	// ClaimDeadline is when, in Unix milliseconds, a task no worker has
+	// claimed stops being handed out (TXE-5923). It is set once, when the
+	// task is first enqueued, and kept unchanged through claims, their
+	// release, restarts and a republication of the same execution. It is 0
+	// on a record written before the field existed; see claimDeadlineOf.
+	ClaimDeadline int64 `json:"claimDeadline,omitempty"`
+	// ClaimUnbounded marks a task enqueued with no ceiling: an explicit
+	// coordinator.unclaimed_dispatch_timeout of 0.
+	ClaimUnbounded bool `json:"claimUnbounded,omitempty"`
 }
 
 type legacyDAGRunStatusProto struct {
@@ -304,15 +319,6 @@ func (idx *dispatchTaskIndex) hasExpired(now time.Time, ttl time.Duration) bool 
 	if idx == nil {
 		return false
 	}
-	for _, entry := range idx.pending {
-		if entry.holdUntil != 0 {
-			continue
-		}
-		enqueuedAt := dispatchRecordTimestamp(entry.enqueuedAt, entry.createdAt)
-		if now.Sub(enqueuedAt) >= ttl {
-			return true
-		}
-	}
 	for _, entry := range idx.claims {
 		claimedAt := dispatchRecordTimestamp(entry.claimedAt, entry.updatedAt)
 		if now.Sub(claimedAt) >= ttl {
@@ -354,9 +360,13 @@ func dispatchTaskIndexEntryFromRecord(rec *persis.Record, payload dispatchTaskPa
 		claimedAt:    payload.ClaimedAt,
 		createdAt:    rec.CreatedAt,
 		updatedAt:    rec.UpdatedAt,
+
+		claimDeadline:  payload.ClaimDeadline,
+		claimUnbounded: payload.ClaimUnbounded,
 	}
 	if payload.Task != nil {
 		entry.hasTask = true
+		entry.executionMarker = payload.Task.ExecutionMarker
 		entry.queueName = payload.Task.QueueName
 		entry.attemptKey = payload.Task.AttemptKey
 		entry.targetWorkerID = payload.Task.TargetWorkerID
@@ -406,12 +416,34 @@ func dispatchClaimShapeKey(workerID string, labels map[string]string) string {
 
 // WithDispatchReservationTTL sets how long a claim can go unacknowledged before
 // its task returns to pending, and how long a queue admission can go without
-// execution evidence before cleanup releases it. In this fork it also bounds an
-// unheld pending task: one no worker claims within it is removed
-// (recycleExpiredPending); a held task waits for its HoldUntil instead.
+// execution evidence before cleanup releases it. A pending task outlives it:
+// an unheld one waits until its claim deadline (WithUnclaimedDispatchTimeout),
+// a held one until its HoldUntil.
 func WithDispatchReservationTTL(ttl time.Duration) DispatchTaskStoreOption {
 	return func(store *DispatchTaskStore) {
 		store.reservationTTL = normalizeDispatchReservationTTL(ttl)
+	}
+}
+
+// WithUnclaimedDispatchTimeout sets the claim deadline given to a task when it
+// is first enqueued: that long after, a task no worker has claimed is no
+// longer handed out, and the coordinator ends its attempt (TXE-5923). 0 gives
+// no deadline. A negative value keeps the default, 24h; configuration refuses
+// one before it gets here.
+func WithUnclaimedDispatchTimeout(timeout time.Duration) DispatchTaskStoreOption {
+	return func(store *DispatchTaskStore) {
+		if timeout >= 0 {
+			store.unclaimedTimeout = timeout
+		}
+	}
+}
+
+// WithDispatchClock sets the store's clock, for tests.
+func WithDispatchClock(now func() time.Time) DispatchTaskStoreOption {
+	return func(store *DispatchTaskStore) {
+		if now != nil {
+			store.clock = now
+		}
 	}
 }
 
@@ -430,8 +462,10 @@ func WithDispatchAdmissionLiveness(
 // NewDispatchTaskStore creates a DispatchTaskStore backed by col.
 func NewDispatchTaskStore(col persis.Collection, opts ...DispatchTaskStoreOption) *DispatchTaskStore {
 	s := &DispatchTaskStore{
-		col:            col,
-		reservationTTL: defaultDispatchReservationTTL,
+		col:              col,
+		reservationTTL:   defaultDispatchReservationTTL,
+		unclaimedTimeout: DefaultUnclaimedDispatchTimeout,
+		clock:            time.Now,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -556,7 +590,10 @@ func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *dispatch.Dispatch
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	enqueuedAt := time.Now().UTC()
+	if err := s.ensureDispatchIndex(ctx); err != nil {
+		return err
+	}
+	enqueuedAt := s.now()
 	fileName := fmt.Sprintf("task_%020d_%s.json", enqueuedAt.UnixMilli(), uuid.NewString())
 	payload := dispatchTaskPayload{
 		Version:      dispatchTaskStoreVersion,
@@ -564,6 +601,7 @@ func (s *DispatchTaskStore) Enqueue(ctx context.Context, task *dispatch.Dispatch
 		TaskFileName: fileName,
 		EnqueuedAt:   enqueuedAt.UnixMilli(),
 	}
+	s.assignClaimDeadline(&payload, enqueuedAt)
 	pendingID, err := pendingDispatchRecordID(fileName)
 	if err != nil {
 		return err
@@ -650,7 +688,7 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 		return nil, false, nil
 	}
 
-	now := time.Now().UTC()
+	now := s.now()
 	for _, id := range ids {
 		rec, err := s.col.Get(ctx, id)
 		if err != nil {
@@ -673,18 +711,10 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 			s.index.addPending(rec, payload)
 			continue
 		}
-		// TXE fork: an unheld task past the reservation time is never handed
-		// out; it is removed (see recycleExpiredPending).
-		enqueuedAt := dispatchRecordTimestamp(payload.EnqueuedAt, rec.CreatedAt)
-		if payload.Task.HoldUntil.IsZero() && now.Sub(enqueuedAt) >= s.reservationTTL {
-			if err := s.col.CompareAndDelete(ctx, rec); err != nil {
-				if errors.Is(err, persis.ErrNotFound) || errors.Is(err, persis.ErrConflict) {
-					s.index.removePending(id)
-					return nil, true, nil
-				}
-				return nil, false, err
-			}
-			s.index.removePending(id)
+		if s.pastClaimDeadline(payload, rec.CreatedAt, now) {
+			// No worker claimed it in time: it is never handed out, and the
+			// coordinator ends its attempt and drops it (TXE-5923).
+			s.index.addPending(rec, payload)
 			continue
 		}
 		if payload.Task.TargetWorkerID != "" && payload.Task.TargetWorkerID != claim.WorkerID {
@@ -700,7 +730,10 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 		var stale bool
 		transition := func(lockCtx context.Context) error {
 			claimToken := uuid.NewString()
-			claimedAt := time.Now().UTC()
+			claimedAt := s.now()
+			// A record from before the claim deadline keeps the one its
+			// enqueue time gives it once it is a claim.
+			s.stampClaimDeadline(&payload, rec.CreatedAt)
 			task, err := applyDispatchTaskClaim(payload.Task, claim.Owner, claimToken)
 			if err != nil {
 				return err
@@ -752,7 +785,7 @@ func (s *DispatchTaskStore) claimNextPending(ctx context.Context, claim dispatch
 }
 
 func (s *DispatchTaskStore) maybeRecycleExpiredReservations(ctx context.Context) (bool, error) {
-	now := time.Now().UTC()
+	now := s.now()
 	due := s.lastReservationCleanupAt.IsZero() ||
 		now.Sub(s.lastReservationCleanupAt) >= dispatchCleanupInterval(s.reservationTTL)
 	needed := s.index != nil && s.index.hasExpired(now, s.reservationTTL)
@@ -809,7 +842,7 @@ func (s *DispatchTaskStore) ReleaseClaim(ctx context.Context, claimToken string)
 	if payload.Task == nil || payload.ClaimToken == "" || payload.ClaimToken != claimToken || payload.ClaimedAt == 0 {
 		return dispatch.ErrDispatchTaskNotFound
 	}
-	return s.releaseClaim(ctx, rec, payload, time.Now().UTC())
+	return s.releaseClaim(ctx, rec, payload, s.now())
 }
 
 func (s *DispatchTaskStore) DeleteClaim(ctx context.Context, claimToken string) error {
@@ -1051,6 +1084,204 @@ func (s *DispatchTaskStore) DeletePending(ctx context.Context, attemptKey string
 	return nil
 }
 
+// now reads the store's clock.
+func (s *DispatchTaskStore) now() time.Time {
+	return s.clock().UTC()
+}
+
+// assignClaimDeadline gives a task being enqueued at now its claim deadline.
+// A republication of an execution the store already holds, pending or
+// claimed, keeps the earliest deadline the store has for it, so publishing
+// again never extends the wait; a new attempt or a new execution of a
+// reused attempt gets a deadline of its own. The caller holds s.mu with the
+// index loaded.
+func (s *DispatchTaskStore) assignClaimDeadline(payload *dispatchTaskPayload, now time.Time) {
+	payload.ClaimDeadline, payload.ClaimUnbounded = 0, false
+	if s.unclaimedTimeout == 0 {
+		payload.ClaimUnbounded = true
+	} else {
+		payload.ClaimDeadline = now.Add(s.unclaimedTimeout).UnixMilli()
+	}
+	task := payload.Task
+	if task == nil || task.AttemptKey == "" || s.index == nil {
+		return
+	}
+	inherit := func(entry dispatchTaskIndexEntry) {
+		if !entry.hasTask || entry.attemptKey != task.AttemptKey || entry.executionMarker != task.ExecutionMarker {
+			return
+		}
+		deadline, bounded := s.claimDeadlineOf(entry.claimDeadline, entry.claimUnbounded, entry.enqueuedAt, entry.createdAt)
+		if !bounded {
+			return
+		}
+		if payload.ClaimUnbounded || deadline.UnixMilli() < payload.ClaimDeadline {
+			payload.ClaimDeadline, payload.ClaimUnbounded = deadline.UnixMilli(), false
+		}
+	}
+	for _, entry := range s.index.pending {
+		inherit(entry)
+	}
+	for _, entry := range s.index.claims {
+		inherit(entry)
+	}
+}
+
+// stampClaimDeadline writes into a record from before the claim deadline
+// existed the deadline its enqueue time gives it, so a later re-stamp of
+// EnqueuedAt (a claim's release) does not move it.
+func (s *DispatchTaskStore) stampClaimDeadline(payload *dispatchTaskPayload, createdAt time.Time) {
+	if payload.ClaimDeadline != 0 || payload.ClaimUnbounded {
+		return
+	}
+	deadline, bounded := s.claimDeadlineOf(0, false, payload.EnqueuedAt, createdAt)
+	if !bounded {
+		payload.ClaimUnbounded = true
+		return
+	}
+	payload.ClaimDeadline = deadline.UnixMilli()
+	if payload.ClaimDeadline <= 0 {
+		// Fail closed, and keep it closed once written: 1 ms after the
+		// epoch is long past.
+		payload.ClaimDeadline = 1
+	}
+}
+
+// claimDeadlineOf is when a task stops being handed out, and false when it
+// has no deadline. A record written before the field existed derives it from
+// its persisted enqueue time, EnqueuedAt or else the record's creation time,
+// never from the present; with neither, it fails closed and is already past.
+func (s *DispatchTaskStore) claimDeadlineOf(deadline int64, unbounded bool, enqueuedAt int64, createdAt time.Time) (time.Time, bool) {
+	switch {
+	case unbounded:
+		return time.Time{}, false
+	case deadline > 0:
+		return time.UnixMilli(deadline).UTC(), true
+	case s.unclaimedTimeout == 0:
+		return time.Time{}, false
+	case enqueuedAt > 0:
+		return time.UnixMilli(enqueuedAt).Add(s.unclaimedTimeout).UTC(), true
+	case !createdAt.IsZero():
+		return createdAt.Add(s.unclaimedTimeout).UTC(), true
+	default:
+		return time.UnixMilli(0).UTC(), true
+	}
+}
+
+// pastClaimDeadline reports whether an unheld pending task's claim deadline
+// has passed at now. A held task waits for its HoldUntil instead.
+func (s *DispatchTaskStore) pastClaimDeadline(payload dispatchTaskPayload, createdAt time.Time, now time.Time) bool {
+	if payload.Task == nil || !payload.Task.HoldUntil.IsZero() {
+		return false
+	}
+	deadline, bounded := s.claimDeadlineOf(payload.ClaimDeadline, payload.ClaimUnbounded, payload.EnqueuedAt, createdAt)
+	return bounded && !now.Before(deadline)
+}
+
+// ListPastClaimDeadline returns the unheld pending tasks whose claim deadline
+// has passed at now. They are no longer handed out; each stays in the store
+// until DeletePastClaimDeadline removes that exact record, so a coordinator
+// that stops part way through ending one finds it again on its next pass.
+func (s *DispatchTaskStore) ListPastClaimDeadline(ctx context.Context, now time.Time) ([]dispatch.UnclaimedDispatch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureDispatchIndex(ctx); err != nil {
+		return nil, err
+	}
+	var past []dispatch.UnclaimedDispatch
+	for _, id := range append([]string(nil), s.index.pendingIDs...) {
+		entry, ok := s.index.pending[id]
+		if !ok || !entry.hasTask || entry.holdUntil != 0 {
+			continue
+		}
+		deadline, bounded := s.claimDeadlineOf(entry.claimDeadline, entry.claimUnbounded, entry.enqueuedAt, entry.createdAt)
+		if !bounded || now.Before(deadline) {
+			continue
+		}
+		rec, err := s.col.Get(ctx, id)
+		if err != nil {
+			if errors.Is(err, persis.ErrNotFound) {
+				s.index.removePending(id)
+				continue
+			}
+			return nil, err
+		}
+		payload, err := dispatchTaskPayloadFromRecord(rec)
+		if err != nil {
+			return nil, err
+		}
+		if !s.pastClaimDeadline(payload, rec.CreatedAt, now) {
+			s.index.addPending(rec, payload)
+			continue
+		}
+		deadline, _ = s.claimDeadlineOf(payload.ClaimDeadline, payload.ClaimUnbounded, payload.EnqueuedAt, rec.CreatedAt)
+		past = append(past, dispatch.UnclaimedDispatch{
+			Task:     cloneDispatchTask(payload.Task),
+			RecordID: id,
+			Deadline: deadline,
+		})
+	}
+	return past, nil
+}
+
+// DeletePastClaimDeadline removes the one pending record that unclaimed
+// names, and only while it is still pending, still for the same attempt and
+// execution, and still past its claim deadline at now. It never removes
+// another record of the same run: a newer attempt's task, or the task's
+// claim. It reports whether it removed the record; one already gone is not
+// an error.
+func (s *DispatchTaskStore) DeletePastClaimDeadline(ctx context.Context, unclaimed dispatch.UnclaimedDispatch, now time.Time) (bool, error) {
+	if unclaimed.Task == nil || !strings.HasPrefix(unclaimed.RecordID, dispatchPendingPrefix) {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureDispatchIndex(ctx); err != nil {
+		return false, err
+	}
+	rec, err := s.col.Get(ctx, unclaimed.RecordID)
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) {
+			s.index.removePending(unclaimed.RecordID)
+			return false, nil
+		}
+		return false, err
+	}
+	payload, err := dispatchTaskPayloadFromRecord(rec)
+	if err != nil {
+		return false, err
+	}
+	if payload.Task == nil || payload.Task.AttemptKey != unclaimed.Task.AttemptKey ||
+		payload.Task.ExecutionMarker != unclaimed.Task.ExecutionMarker ||
+		!s.pastClaimDeadline(payload, rec.CreatedAt, now) {
+		s.index.addPending(rec, payload)
+		return false, nil
+	}
+	remove := func(lockCtx context.Context) error {
+		return s.col.CompareAndDelete(lockCtx, rec)
+	}
+	if payload.Task.WorkspaceBundleDigest != "" {
+		err = s.withTransitionLock(ctx, remove)
+	} else {
+		err = remove(ctx)
+	}
+	if err != nil {
+		if errors.Is(err, persis.ErrNotFound) {
+			s.index.removePending(unclaimed.RecordID)
+			return false, nil
+		}
+		if errors.Is(err, persis.ErrConflict) {
+			// Changed since it was read; the next pass reads it again.
+			s.index.invalidateDerivedState()
+			return false, nil
+		}
+		return false, err
+	}
+	s.index.removePending(unclaimed.RecordID)
+	return true, nil
+}
+
 func (s *DispatchTaskStore) recycleExpiredReservations(ctx context.Context) error {
 	if s.index == nil {
 		if err := s.rebuildDispatchIndex(ctx); err != nil {
@@ -1060,81 +1291,14 @@ func (s *DispatchTaskStore) recycleExpiredReservations(ctx context.Context) erro
 	if err := s.recycleExpiredClaims(ctx); err != nil {
 		return err
 	}
-	if err := s.removePendingRecordsWithActiveClaims(ctx); err != nil {
-		return err
-	}
-	return s.recycleExpiredPending(ctx)
-}
-
-// recycleExpiredPending removes the pending tasks, held ones aside, that no
-// worker claimed within the reservation time (TXE fork). Upstream keeps such a
-// task until its run moves on; the fork bounds it instead, because each
-// published attempt has a preparation journal entry that reconciliation turns
-// into an abandonment record once the task is gone, so an attempt nobody can
-// take ends with a record rather than waiting for a worker forever. A held
-// task waits for its HoldUntil and is dropped by the coordinator.
-func (s *DispatchTaskStore) recycleExpiredPending(ctx context.Context) error {
-	if s.index == nil {
-		return nil
-	}
-	now := time.Now().UTC()
-	ids := append([]string(nil), s.index.pendingIDs...)
-	for _, id := range ids {
-		entry, ok := s.index.pending[id]
-		if !ok || entry.holdUntil != 0 {
-			continue
-		}
-		enqueuedAt := dispatchRecordTimestamp(entry.enqueuedAt, entry.createdAt)
-		if now.Sub(enqueuedAt) < s.reservationTTL {
-			continue
-		}
-		rec, err := s.col.Get(ctx, id)
-		if err != nil {
-			if errors.Is(err, persis.ErrNotFound) {
-				s.index.removePending(id)
-				continue
-			}
-			return err
-		}
-		payload, err := dispatchTaskPayloadFromRecord(rec)
-		if err != nil {
-			return err
-		}
-		if payload.Task != nil && !payload.Task.HoldUntil.IsZero() {
-			s.index.addPending(rec, payload)
-			continue
-		}
-		enqueuedAt = dispatchRecordTimestamp(payload.EnqueuedAt, rec.CreatedAt)
-		if now.Sub(enqueuedAt) < s.reservationTTL {
-			s.index.addPending(rec, payload)
-			continue
-		}
-		if err := s.col.CompareAndDelete(ctx, rec); err != nil {
-			if errors.Is(err, persis.ErrNotFound) || errors.Is(err, persis.ErrConflict) {
-				s.index.removePending(id)
-				continue
-			}
-			return err
-		}
-		s.index.removePending(id)
-		// No worker claimed the task in time and nothing requeues it: say so,
-		// because the run will not start from this dispatch.
-		if task := payload.Task; task != nil {
-			logger.Warn(ctx, "Expired an unclaimed dispatch task; no worker claimed it within the reservation time",
-				tag.RunID(task.DAGRunID), tag.Target(task.Target), tag.AttemptID(task.AttemptID),
-				tag.AttemptKey(task.AttemptKey), slog.Duration("reservation_ttl", s.reservationTTL))
-		} else {
-			logger.Warn(ctx, "Expired an unclaimed dispatch task with no payload", tag.Name(id))
-		}
-	}
-	return nil
+	return s.removePendingRecordsWithActiveClaims(ctx)
 }
 
 func (s *DispatchTaskStore) recycleExpiredClaims(ctx context.Context) error {
 	if s.index == nil {
 		return nil
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	ids := make([]string, 0, len(s.index.claims))
 	for id := range s.index.claims {
 		ids = append(ids, id)
@@ -1195,6 +1359,9 @@ func (s *DispatchTaskStore) releaseClaim(
 }
 
 func (s *DispatchTaskStore) releaseClaimRecord(ctx context.Context, rec *persis.Record, payload dispatchTaskPayload, now time.Time) error {
+	// The release re-stamps EnqueuedAt below, so a record from before the
+	// claim deadline first gets the one its enqueue time gives it.
+	s.stampClaimDeadline(&payload, rec.CreatedAt)
 	releasedAt := now
 	enqueuedAt := now.UnixMilli()
 	if payload.ClaimedAt >= enqueuedAt {
@@ -1236,7 +1403,7 @@ func (s *DispatchTaskStore) removePendingRecordsWithActiveClaims(ctx context.Con
 	if s.index == nil || len(s.index.claims) == 0 {
 		return nil
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	activeTaskFiles := make(map[string]time.Time, len(s.index.claims))
 	for _, entry := range s.index.claims {
 		if entry.taskFileName == "" || entry.claimToken == "" || entry.claimedAt == 0 {

@@ -121,6 +121,23 @@ type DispatchTaskStore interface {
 	// DeletePending removes the pending task of an attempt, if any. A task
 	// already claimed is left alone.
 	DeletePending(ctx context.Context, attemptKey string) error
+	// ListPastClaimDeadline returns the unheld pending tasks whose claim
+	// deadline has passed at now (TXE-5923). They are no longer claimable;
+	// the coordinator ends their attempts and removes each with
+	// DeletePastClaimDeadline.
+	ListPastClaimDeadline(ctx context.Context, now time.Time) ([]UnclaimedDispatch, error)
+	// DeletePastClaimDeadline removes the one pending record named, only
+	// while it is still that task and still past its deadline at now, and
+	// reports whether it did.
+	DeletePastClaimDeadline(ctx context.Context, unclaimed UnclaimedDispatch, now time.Time) (bool, error)
+}
+
+// UnclaimedDispatch is a pending task no worker claimed by its claim
+// deadline, with the record that holds it.
+type UnclaimedDispatch struct {
+	Task     *DispatchTask
+	RecordID string
+	Deadline time.Time
 }
 
 // WorkerHeartbeatRecord is the shared presence record for a worker.

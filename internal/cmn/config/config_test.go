@@ -136,6 +136,15 @@ func TestConfig_Validate(t *testing.T) {
 		assert.Contains(t, err.Error(), "invalid coordinator.worker_wait_timeout")
 	})
 
+	t.Run("InvalidCoordinatorUnclaimedDispatchTimeout", func(t *testing.T) {
+		t.Parallel()
+		cfg := validBaseConfig()
+		cfg.Coordinator.UnclaimedDispatchTimeout = -time.Second
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid coordinator.unclaimed_dispatch_timeout")
+	})
+
 	t.Run("ValidCoordinatorHealthPortDisabled", func(t *testing.T) {
 		t.Parallel()
 		cfg := validBaseConfig()

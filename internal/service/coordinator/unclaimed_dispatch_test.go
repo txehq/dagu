@@ -20,22 +20,32 @@ import (
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
-// shortReservation is the dispatch reservation time these tests run with, so
-// an unclaimed task expires within the test. It leaves a test enough time to
-// claim a task it has just published, even on a loaded machine.
+// shortReservation is the dispatch reservation time these tests run with, and
+// the claim deadline (coordinator.unclaimed_dispatch_timeout) they give a task,
+// so an unclaimed task passes its deadline within the test. It leaves a test
+// enough time to claim a task it has just published, even on a loaded machine.
 const shortReservation = 300 * time.Millisecond
 
 func newShortReservationFixture(t *testing.T) *strandedFixture {
 	t.Helper()
 	dispatches := store.NewDispatchTaskStore(file.NewCollection(filepath.Join(t.TempDir(), "distributed")),
-		store.WithDispatchReservationTTL(shortReservation))
+		store.WithDispatchReservationTTL(shortReservation), store.WithUnclaimedDispatchTimeout(shortReservation))
 	return newStrandedFixture(t, dispatches)
 }
 
-// A retry is published while no worker can claim it. Its task expires from the
-// dispatch store, and the preparation entry, kept until a claim is
-// acknowledged, lets reconciliation abandon the attempt with a record instead
-// of leaving it waiting for a worker that will never receive it.
+// reconcilePastClaimDeadline runs the passes the zombie detector runs in this
+// order: the one that removes tasks past their claim deadline, now, and then
+// reconciliation of the preparation journal, late enough to judge every entry.
+func (f *strandedFixture) reconcilePastClaimDeadline(t *testing.T) {
+	t.Helper()
+	f.h.expireUnclaimedDispatches(t.Context(), time.Now().UTC())
+	f.h.reconcileAbandonedPreparations(t.Context(), later())
+}
+
+// A retry is published while no worker can claim it. Its task passes its claim
+// deadline and is removed from the dispatch store, and the preparation entry,
+// kept until a claim is acknowledged, lets reconciliation abandon the attempt
+// with a record instead of leaving it waiting for a worker that never takes it.
 func TestReconcileAbandonsAnUnclaimedDispatchOnceItExpires(t *testing.T) {
 	registerCommandExecutorCapsForCoordinatorTest()
 	f := newShortReservationFixture(t)
@@ -46,7 +56,7 @@ func TestReconcileAbandonsAnUnclaimedDispatchOnceItExpires(t *testing.T) {
 	require.Equal(t, []string{attempt}, f.preparations(t))
 
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 
 	assert.Empty(t, f.preparations(t))
 	assert.Equal(t, f.previous, f.latest(t), "the previous execution is the latest again")
@@ -75,13 +85,13 @@ func TestALateAcknowledgementOfAnExpiredClaimIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 
-	// The claim is released to pending after one reservation time and the
-	// pending task expires after another.
+	// The claim is released to pending after one reservation time, past the
+	// claim deadline its first enqueue gave it, which the release keeps.
 	time.Sleep(3 * shortReservation)
 	_, err = f.dispatches.HasOutstandingAttempt(t.Context(), f.attemptKey(attempt), 0)
 	require.NoError(t, err)
 	time.Sleep(3 * shortReservation)
-	f.h.reconcileAbandonedPreparations(t.Context(), later())
+	f.reconcilePastClaimDeadline(t)
 	require.Len(t, f.records(t), 1)
 
 	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{

@@ -99,6 +99,7 @@ func newFilePersistence(
 		backend.Collection(persis.CollectionDispatchTasks),
 		store.WithDispatchAdmissionLiveness(dagRunLeaseStore, activeDistributedRunStore),
 		store.WithDispatchTransitionLock(bundleStore.WithLock),
+		store.WithUnclaimedDispatchTimeout(cfg.Coordinator.UnclaimedDispatchTimeout),
 	)
 	workerHeartbeatStore := store.NewWorkerHeartbeatStore(
 		backend.Collection(persis.CollectionWorkerHeartbeats),
