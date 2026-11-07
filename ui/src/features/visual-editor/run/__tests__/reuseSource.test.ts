@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it, vi } from 'vitest';
-import { NodeStatus, Status, type components } from '@/api/v1/schema';
+import {
+  NodeStatus,
+  ReusedInputVia,
+  Status,
+  type components,
+} from '@/api/v1/schema';
 import {
   coverFromCache,
   defaultChoice,
@@ -183,60 +188,120 @@ describe('pickReuseSource', () => {
 });
 
 // A -> B -> C. A was edited, and B was run on its own with A's old outputs:
-// that run's definition shows the edited A, and its labels record that A was
-// reused stale. Taken as C's source, it must not pass A or B for fresh.
-describe('a source run that reused a changed step', () => {
+// that run's definition shows the edited A, so only the run's provenance can
+// say whether A's values are fresh. A reused step is fresh only when the
+// server's record names it and no label marks it stale; any other reused
+// node is unverified and counts as stale, so unknown provenance never makes
+// automatic reuse look fresh.
+describe('a source run that reused a step', () => {
   const deps = stepNeeds([
     { name: 'a' },
     { name: 'b', depends: ['a'] },
     { name: 'c', depends: ['b'] },
   ]);
-  const label = (stale: boolean) =>
-    inputLabel({
-      step: 'a',
-      source: 'run',
-      runId: 'old',
-      stale,
-      capturedAt: 1_700_000_000_000,
-    }) as string;
-  const sourceRun = (labels: string[]): ReuseRun => ({
+  const staleLabel = inputLabel({
+    step: 'a',
+    source: 'run',
+    runId: 'old',
+    stale: true,
+    capturedAt: 1_700_000_000_000,
+  }) as string;
+  const record = [
+    { step: 'a', runId: 'old', via: ReusedInputVia.run },
+  ] as ReuseRun['reusedInputs'];
+  const sourceRun = (
+    p: { labels?: string[]; reusedInputs?: ReuseRun['reusedInputs'] } = {}
+  ): ReuseRun => ({
     ...runOf('b-only', Status.Success, [
       node('a', NodeStatus.Skipped),
       node('b'),
     ]),
-    labels,
+    ...p,
   });
 
-  it('names the reused step its provenance records as stale', () => {
-    expect(staleReusedInputs(sourceRun([label(true)]))).toEqual(['a']);
+  it.each<
+    [
+      string,
+      { labels?: string[]; reusedInputs?: ReuseRun['reusedInputs'] },
+      string[],
+    ]
+  >([
+    [
+      'recorded by the server and not marked stale',
+      { reusedInputs: record },
+      [],
+    ],
+    [
+      'recorded and marked stale by its label',
+      { reusedInputs: record, labels: [staleLabel] },
+      ['a'],
+    ],
+    [
+      'marked stale by a label of a run with no record',
+      { labels: [staleLabel] },
+      ['a'],
+    ],
+    [
+      'named only by the old outputs-from label',
+      { labels: ['dagu.outputs-from=old'] },
+      ['a'],
+    ],
+    ['with no provenance at all, as a plain skip', {}, ['a']],
+  ])('a reused step %s', (_, p, want) => {
+    expect(staleReusedInputs(sourceRun(p))).toEqual(want);
   });
 
-  it('names nothing for a reused step that was fresh', () => {
-    expect(staleReusedInputs(sourceRun([]))).toEqual([]);
+  it('names no step that ran, whatever its labels say', () => {
+    const run: ReuseRun = {
+      ...runOf('retried', Status.Success, [node('a'), node('b')]),
+      labels: [staleLabel],
+    };
+    expect(staleReusedInputs(run)).toEqual([]);
     expect(staleReusedInputs(null)).toEqual([]);
   });
 
-  it('marks the stale input and everything downstream of it, though the definitions match', () => {
-    const run = sourceRun([label(true)]);
+  it('marks an unverified input and everything downstream of it, though the definitions match', () => {
     expect(
       staleUpstream({
         diff: diffOf(),
         previous: ['a', 'b'],
         deps,
-        staleInputs: staleReusedInputs(run),
+        staleInputs: staleReusedInputs(sourceRun({ labels: [staleLabel] })),
       })
     ).toEqual(['a', 'b']);
   });
 
-  it('keeps a source whose reused steps were fresh', () => {
+  it('keeps a source whose reused steps the server records as fresh', () => {
     expect(
       staleUpstream({
         diff: diffOf(),
         previous: ['a', 'b'],
         deps,
-        staleInputs: staleReusedInputs(sourceRun([])),
+        staleInputs: staleReusedInputs(sourceRun({ reusedInputs: record })),
       })
     ).toEqual([]);
+  });
+
+  // The steps' dependencies are the server's, chain, parallel and router
+  // edges included: a stale input reaches every step after it along them.
+  it('propagates through a parallel group and a router target', () => {
+    const graph = stepNeeds([
+      { name: 'a' },
+      { name: 'p1', depends: ['a'] },
+      { name: 'p2', depends: ['a'] },
+      { name: 'join', depends: ['p1', 'p2'] },
+      { name: 'route', depends: ['join'] },
+      { name: 'target', depends: ['route'] },
+      { name: 'apart' },
+    ]);
+    expect(
+      staleUpstream({
+        diff: diffOf(),
+        previous: ['a', 'p1', 'p2', 'join', 'route', 'target', 'apart'],
+        deps: graph,
+        staleInputs: ['a'],
+      })
+    ).toEqual(['a', 'p1', 'p2', 'join', 'route', 'target']);
   });
 });
 

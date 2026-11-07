@@ -4,7 +4,7 @@
 import type { components } from '@/api/v1/schema';
 import { NodeStatus } from '@/api/v1/schema';
 import { parseParams } from '@/lib/parseParams';
-import { runInputProvenance } from './inputProvenance';
+import { fromDetails } from './inputProvenance';
 import type { CacheEntries, CacheEntry } from './outputCache';
 import type { RunSpecDiff } from './runSpecDiff';
 import { isReusedNode, isRunActive } from './stepRunInfo';
@@ -17,7 +17,13 @@ export type ReuseRun = Pick<DAGRunDetails, 'dagRunId' | 'status'> &
   Partial<
     Pick<
       DAGRunDetails,
-      'nodes' | 'params' | 'paramsList' | 'labels' | 'startedAt' | 'finishedAt'
+      | 'nodes'
+      | 'params'
+      | 'paramsList'
+      | 'labels'
+      | 'startedAt'
+      | 'finishedAt'
+      | 'reusedInputs'
     >
   >;
 
@@ -86,16 +92,31 @@ export function staleUpstream(p: {
 }
 
 /**
- * The steps that a run reused although they had changed since their source,
- * as its provenance records (`stale`). The run's definition shows such a
- * step as it is now, so comparing definitions alone would take the outputs
- * the run gives it, and every step that consumed them, for fresh.
+ * The steps that a run reused whose outputs are not known to be fresh for
+ * the run's own definition. The run's definition shows a reused step as it
+ * is now, so comparing definitions alone would take the outputs the run
+ * gives it, and every step that consumed them, for fresh.
+ *
+ * A reused step is fresh only when the server's record names it
+ * (`reusedInputs`) and no `dagu.input` label marks it stale. Every other
+ * reused node is unverified and counts as stale: one recorded stale, one
+ * from a server or a run that kept no record (only `dagu.outputs-from`, or
+ * nothing), and a plain skip, which the node alone cannot tell from a
+ * reused one. Unknown provenance never makes automatic reuse look fresh.
+ *
+ * The cache capture is stricter still (`upstreamRanInRun`): it keeps a
+ * step's outputs only when every step upstream of it ran in the run.
  */
 export function staleReusedInputs(run: ReuseRun | null): string[] {
   if (!run) return [];
-  return [...runInputProvenance(run).values()]
-    .filter((record) => record.stale)
-    .map((record) => record.step);
+  const recorded = fromDetails(run);
+  return (run.nodes ?? [])
+    .filter(isReusedNode)
+    .map((node) => node.step.name)
+    .filter((name) => {
+      const record = recorded?.get(name);
+      return !record || record.stale;
+    });
 }
 
 /** True when the node of a step holds a state that a new run can copy. */
