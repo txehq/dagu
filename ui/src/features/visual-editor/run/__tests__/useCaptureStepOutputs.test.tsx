@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   saved: true,
   /** The parameters of the run, and the defaults of the workflow. */
   runParams: '',
+  runProfile: '',
   defaultParams: '',
   /** The server names of the steps, in the run and in the workflow. */
   stepNames: [] as string[],
@@ -42,6 +43,7 @@ vi.mock('@/hooks/api', () => ({
             params: h.runParams,
             // The run's parameters as the server lists them (paramsList).
             paramsList: h.runParams ? h.runParams.split(' ') : [],
+            ...(h.runProfile ? { profileName: h.runProfile } : {}),
             nodes: steps.map((step) => ({ step })),
           },
         },
@@ -106,6 +108,7 @@ beforeEach(() => {
   h.runSpec = undefined;
   h.saved = true;
   h.runParams = '';
+  h.runProfile = '';
   h.defaultParams = '';
   h.stepNames = [];
   h.paths = [];
@@ -250,6 +253,17 @@ describe('useCaptureStepOutputs', () => {
     h.runParams = 'ENV=dev';
     view.rerender({ data: outputs(), runId: 'dev' });
     expect(outputCache.entries(SCOPE)['fetch']?.runId).toBe('dev');
+  });
+
+  // TXE fork (TXE-5923): a profile can set what the definition's hash does
+  // not see, so a run under a runtime profile is not cached.
+  it('keeps nothing from a run under a runtime profile', () => {
+    h.runProfile = 'prod';
+    const view = capture({ data: outputs(), runId: 'profiled' });
+    expect(outputCache.entries(SCOPE)['fetch']).toBeUndefined();
+    h.runProfile = '';
+    view.rerender({ data: outputs(), runId: 'plain' });
+    expect(outputCache.entries(SCOPE)['fetch']?.runId).toBe('plain');
   });
 
   it('waits for the saved definition', () => {

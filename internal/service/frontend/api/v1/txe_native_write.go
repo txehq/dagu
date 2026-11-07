@@ -5,6 +5,8 @@ package api
 
 import (
 	"context"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -305,4 +307,41 @@ func (a *API) txeNativeWriteDenied(ctx context.Context, name string) error {
 		return errTxeForbidden
 	}
 	return errTxeNativeNotFound
+}
+
+// txeRunPlacement decides the machine a per-run worker selector sends a run
+// to (TXE-5923), as txeNativeWrite decides a spec's: a run sent to a machine
+// needs author on that machine, because the machine's worker runs the
+// caller's definition; and a machine's own DAG runs only on that machine. A
+// selector that keeps the machine the DAG itself names places nothing new;
+// one that names no machine lands on no machine worker while machines are
+// pinned. Decided for a caller held to its owner in every mode, and for the
+// others as the mode decides, as a write is.
+func (a *API) txeRunPlacement(ctx context.Context, dag *ir.DAG, selector map[string]string) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	c, err := a.txeResolve(ctx)
+	if err != nil {
+		return err
+	}
+	if !c.ownerOnly() && c.mode == authz.ModeOff {
+		return nil
+	}
+	machine := selector[dispatch.MachineLabel]
+	if machine == "" {
+		return nil
+	}
+	identity := txeOwnedIdentity(dag)
+	if own, ok := txeauth.MachineOfDAG(identity); ok && machine != own {
+		return a.txeNativeWriteMisplaced(ctx, c, identity)
+	}
+	if machine == dag.WorkerSelector[dispatch.MachineLabel] {
+		return nil
+	}
+	if _, ok := txeauth.MachineOfDAG(txeauth.MachineDAGs(machine)[0]); !ok {
+		// Not a machine id: no machine worker carries it.
+		return nil
+	}
+	return a.txeNativeWriteName(ctx, c, txeauth.MachineDAGs(machine)[0])
 }

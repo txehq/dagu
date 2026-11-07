@@ -1261,7 +1261,7 @@ func (a *API) ExecuteDAG(ctx context.Context, request api.ExecuteDAGRequestObjec
 		}
 		dag.Name = nameOverride
 	}
-	workerSelector, err := applyWorkerSelectorOverride(dag, request.Body.WorkerSelector)
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -1397,7 +1397,7 @@ func (a *API) ExecuteDAGSync(ctx context.Context, request api.ExecuteDAGSyncRequ
 		}
 		dag.Name = nameOverride
 	}
-	workerSelector, err := applyWorkerSelectorOverride(dag, request.Body.WorkerSelector)
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -1572,11 +1572,19 @@ func (a *API) startDAGRun(ctx context.Context, dag *ir.DAG, req manualStart) (*l
 // applyWorkerSelectorOverride replaces the loaded DAG's worker selector with
 // the request's, when one was given, and returns it for the launch options
 // and the audit record.
-func applyWorkerSelectorOverride(dag *ir.DAG, override *api.WorkerSelectorOverride) (map[string]string, error) {
+//
+// A per-run selector places the run, as a spec's worker_selector does, so it
+// is decided as one (txeRunPlacement, TXE-5923) before it is applied: it is
+// the only way a request's selector reaches a DAG
+// (TestEveryRunSelectorIsDecided).
+func (a *API) applyWorkerSelectorOverride(ctx context.Context, dag *ir.DAG, override *api.WorkerSelectorOverride) (map[string]string, error) {
 	if override == nil || len(*override) == 0 {
 		return nil, nil
 	}
 	selector := map[string]string(*override)
+	if err := a.txeRunPlacement(ctx, dag, selector); err != nil {
+		return nil, err
+	}
 	if err := reapplyWorkerSelector(dag, selector); err != nil {
 		return nil, err
 	}
@@ -2055,7 +2063,7 @@ func (a *API) EnqueueDAGDAGRun(ctx context.Context, request api.EnqueueDAGDAGRun
 		}
 		dag.Name = nameOverride
 	}
-	workerSelector, err := applyWorkerSelectorOverride(dag, request.Body.WorkerSelector)
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
 	}

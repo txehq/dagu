@@ -120,12 +120,18 @@ export function useCaptureStepOutputs(p: {
     enabled: values !== null && !!fileName,
   });
   // Null until the run and the workflow answer.
+  // A run is cached for the defaults only when nothing but the definition
+  // decided its inputs: the default parameters, and no runtime profile. A
+  // profile can set variables and secrets that the definition's hash does
+  // not see, and which profile a new step run resolves is the server's to
+  // decide, so a run under any profile is not cached (TXE-5923; TXE-6145
+  // tracks a profile-aware cache).
   const ranWithDefaults =
     run.data && workflow.data
       ? !paramsDiffer(
           run.data.dagRunDetails.paramsList,
           workflow.data.dag?.defaultParams
-        )
+        ) && !run.data.dagRunDetails.profileName
       : null;
   const held = entries[step];
   const hash = hashes?.get(step);

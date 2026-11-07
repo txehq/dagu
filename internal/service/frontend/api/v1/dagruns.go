@@ -250,7 +250,7 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 		[]byte(request.Body.Spec), dag.Name); err != nil {
 		return nil, err
 	}
-	workerSelector, err := applyWorkerSelectorOverride(dag, request.Body.WorkerSelector)
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +389,7 @@ func (a *API) EnqueueDAGRunFromSpec(ctx context.Context, request api.EnqueueDAGR
 	if request.Body.Queue != nil && *request.Body.Queue != "" {
 		dag.Queue = *request.Body.Queue
 	}
-	workerSelector, err := applyWorkerSelectorOverride(dag, request.Body.WorkerSelector)
+	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
 	}
