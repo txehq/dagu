@@ -160,6 +160,24 @@ func TestTunnelToTheBrowsersGateNeedsNoCredential(t *testing.T) {
 	conn, status, err = connectWith(proxyAddr, other, "")
 	require.NoError(t, err)
 	_ = conn.Close()
-	assert.Equal(t, http.StatusProxyAuthRequired, status)
+	assert.Equal(t, http.StatusProxyAuthRequired, status, "another loopback port needs the credential")
 	assert.Zero(t, accepted.Load())
+
+	// Only a tunnel is exempt: a plain request the proxy would forward to
+	// the gate's very address needs the credential like any other.
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	response, err := client.Get("http://" + gate.Addr().String() + "/" + testGateToken + "/json/version")
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	assert.Equal(t, http.StatusProxyAuthRequired, response.StatusCode, "a plain request to the gate's address")
+
+	// The exemption is the gate's whole authority: the same host on the
+	// gate's port written another way is not it.
+	_, gatePort, err := net.SplitHostPort(gate.Addr().String())
+	require.NoError(t, err)
+	conn, status, err = connectWith(proxyAddr, "localhost:"+gatePort, "")
+	require.NoError(t, err)
+	_ = conn.Close()
+	assert.Equal(t, http.StatusProxyAuthRequired, status, "another spelling of the gate's address")
 }
